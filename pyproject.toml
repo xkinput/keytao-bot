@@ -1,0 +1,27 @@
+[project]
+name = "keytao-bot"
+version = "0.1.0"
+description = "keytao-bot"
+readme = "README.md"
+requires-python = ">=3.10, <4.0"
+dependencies = [
+    "nonebot2[fastapi]>=2.4.4",
+    "nonebot-adapter-telegram>=0.1.0b20",
+    "nonebot-adapter-qq>=1.6.6"
+]
+
+[tool.nonebot]
+plugin_dirs = []
+builtin_plugins = []
+
+[tool.nonebot.adapters]
+nonebot-adapter-telegram = [
+    { name = "Telegram", module_name = "nonebot.adapters.telegram" }
+]
+nonebot-adapter-qq = [
+    { name = "QQ", module_name = "nonebot.adapters.qq" }
+]
+"@local" = []
+
+[tool.nonebot.plugins]
+"@local" = []
