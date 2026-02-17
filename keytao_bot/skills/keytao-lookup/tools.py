@@ -36,7 +36,7 @@ async def keytao_lookup_by_code(code: str) -> Dict:
             response = await client.get(url, params={"code": code, "page": "1"})
             response.raise_for_status()
             data = response.json()
-            phrases = data.get("phrases", [])[:10]  # Limit to 10 results
+            phrases = data.get("phrases", [])
             
             if not phrases:
                 return {
@@ -45,8 +45,18 @@ async def keytao_lookup_by_code(code: str) -> Dict:
                     "phrases": []
                 }
             
-            # Sort by weight
-            sorted_phrases = sorted(phrases, key=lambda x: x.get("weight", 0))
+            # Filter to ensure exact code match (API might return similar codes)
+            exact_matches = [p for p in phrases if p.get("code", "") == code]
+            
+            if not exact_matches:
+                return {
+                    "success": True,
+                    "code": code,
+                    "phrases": []
+                }
+            
+            # Sort by weight and limit to 10 results
+            sorted_phrases = sorted(exact_matches, key=lambda x: x.get("weight", 0))
             
             # Type mapping to Chinese labels
             type_labels = {
