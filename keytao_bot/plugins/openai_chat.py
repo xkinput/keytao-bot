@@ -259,8 +259,9 @@ async def should_handle(bot: Bot, event: Event) -> bool:
 
 
 def remove_urls(text: str) -> str:
-    """Remove URLs from text for QQ platform compatibility"""
-    url_pattern = r'(https?://\S+|ftp://\S+|www\.\S+|\S+\.(com|cn|net|org|app|dev|io|vercel\.app)\S*)'
+    """Remove URLs and file names from text for QQ platform compatibility"""
+    # Match URLs and file names with extensions
+    url_pattern = r'(https?://\S+|ftp://\S+|www\.\S+|\S+\.(com|cn|net|org|app|dev|io|vercel\.app|md|js|ts|py|json|yaml|yml|txt|html|css|jsx|tsx|vue|go|rs|java|cpp|c|h)\S*)'
     cleaned = re.sub(url_pattern, '[链接已隐藏]', text, flags=re.IGNORECASE)
     return cleaned
 
@@ -435,8 +436,14 @@ async def handle_ai_chat(bot: Bot, event: Event):
     
     # Platform-specific reply handling
     try:
+        # Detect platform by bot class name (more reliable)
+        bot_class_name = bot.__class__.__name__
+        bot_module_name = bot.__class__.__module__
+        
+        logger.debug(f"Bot type: {bot_class_name}, Module: {bot_module_name}")
+        
         # Telegram: keep URLs (supports links)
-        if TelegramBot and isinstance(bot, TelegramBot):
+        if 'telegram' in bot_module_name.lower():
             if TGGroupMessageEvent and isinstance(event, TGGroupMessageEvent):
                 message_id = event.message_id
                 await bot.send(
@@ -449,13 +456,14 @@ async def handle_ai_chat(bot: Bot, event: Event):
             raise FinishedException
         
         # QQ: remove URLs (API restriction)
-        elif QQBot and isinstance(bot, QQBot):
+        elif 'qq' in bot_module_name.lower() or bot_class_name == 'Bot':
             filtered_response = remove_urls(response)
-            logger.debug(f"QQ message, filtered URLs. Original: {len(response)} chars, Filtered: {len(filtered_response)} chars")
+            logger.info(f"QQ platform detected, filtering URLs. Original: {len(response)} chars, Filtered: {len(filtered_response)} chars")
             await ai_chat.finish(filtered_response)
         
         # Other platforms: send normally
         else:
+            logger.warning(f"Unknown platform, sending without filtering: {bot_class_name}")
             await ai_chat.finish(response)
             
     except FinishedException:

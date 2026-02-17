@@ -127,7 +127,7 @@ async def keytao_fetch_docs(query: str) -> Dict:
                             break
                     
                     content_parts.append(f"【{title}】\n\n{cleaned}")
-                    sources.append(f"https://keytao-docs.vercel.app/{doc_path.replace('.md', '')}")
+                    sources.append(f"https://keytao-docs.vercel.app/{doc_path.replace('.md', '.html')}")
         
         if content_parts:
             combined = "\n\n---\n\n".join(content_parts)
