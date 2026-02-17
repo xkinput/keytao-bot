@@ -4,6 +4,7 @@ DashScope (Qwen) Chat plugin
 通过 Skills 系统动态加载工具
 """
 import json
+import re
 from typing import Optional, List, Dict
 
 from nonebot import on_message, get_driver
@@ -168,7 +169,7 @@ for 每个编码 in result.phrases:
 
 • 基于工具返回的实际数据，不要编造
 • 使用纯文本格式（不要 Markdown）
-• 如果查询失败，引导访问官网
+• 如果查询失败，引导访问官网或文档
 • 遵守中华人民共和国法律法规
 
 【资源链接】
@@ -255,6 +256,13 @@ async def should_handle(bot: Bot, event: Event) -> bool:
     except Exception as e:
         logger.error(f"Error in should_handle rule: {e}")
         return False
+
+
+def remove_urls(text: str) -> str:
+    """Remove URLs from text for QQ platform compatibility"""
+    url_pattern = r'(https?://\S+|ftp://\S+|www\.\S+|\S+\.(com|cn|net|org|app|dev|io|vercel\.app)\S*)'
+    cleaned = re.sub(url_pattern, '[链接已隐藏]', text, flags=re.IGNORECASE)
+    return cleaned
 
 
 # Create chat handler with custom rule
@@ -427,17 +435,26 @@ async def handle_ai_chat(bot: Bot, event: Event):
     
     # Platform-specific reply handling
     try:
-        # Telegram group: use reply_to_message_id
-        if TelegramBot and TGGroupMessageEvent and isinstance(bot, TelegramBot) and isinstance(event, TGGroupMessageEvent):
-            message_id = event.message_id
-            await bot.send(
-                event=event,
-                message=response,
-                reply_to_message_id=message_id
-            )
+        # Telegram: keep URLs (supports links)
+        if TelegramBot and isinstance(bot, TelegramBot):
+            if TGGroupMessageEvent and isinstance(event, TGGroupMessageEvent):
+                message_id = event.message_id
+                await bot.send(
+                    event=event,
+                    message=response,
+                    reply_to_message_id=message_id
+                )
+            else:
+                await ai_chat.finish(response)
             raise FinishedException
         
-        # Other platforms: send normally (QQ doesn't support message reference in official API)
+        # QQ: remove URLs (API restriction)
+        elif QQBot and isinstance(bot, QQBot):
+            filtered_response = remove_urls(response)
+            logger.debug(f"QQ message, filtered URLs. Original: {len(response)} chars, Filtered: {len(filtered_response)} chars")
+            await ai_chat.finish(filtered_response)
+        
+        # Other platforms: send normally
         else:
             await ai_chat.finish(response)
             
@@ -445,7 +462,11 @@ async def handle_ai_chat(bot: Bot, event: Event):
         raise
     except Exception as e:
         logger.error(f"Error sending reply: {e}")
-        # Fallback to normal send
-        await ai_chat.finish(response)
+        # Fallback: try with URL filtering for safety
+        try:
+            filtered_response = remove_urls(response)
+            await ai_chat.finish(filtered_response)
+        except:
+            await ai_chat.finish(response)
 
 
