@@ -221,23 +221,26 @@ async def handle_ai_chat(bot: Bot, event: Event):
     response = await get_openai_response(message_text)
     
     # Check adapter type
-    from nonebot.adapters.telegram import Bot as TelegramBot
+    from nonebot.adapters.telegram import Bot as TelegramBot, MessageEvent as TelegramMessageEvent
     from nonebot.adapters.qq import Bot as QQBot
     
     if isinstance(bot, TelegramBot):
-        # Telegram: edit typing message to final response
-        if typing_msg and hasattr(typing_msg, 'message_id'):
+        # Telegram: edit typing message to final response (works for both private and group chats)
+        if typing_msg and hasattr(typing_msg, 'message_id') and hasattr(typing_msg, 'chat'):
             try:
+                logger.debug(f"Editing Telegram message {typing_msg.message_id} in chat {typing_msg.chat.id}")
                 await bot.edit_message_text(
                     chat_id=typing_msg.chat.id,
                     message_id=typing_msg.message_id,
                     text=response
                 )
+                logger.info(f"Successfully edited message in {'group' if isinstance(event, TelegramMessageEvent) and event.chat.type in ['group', 'supergroup'] else 'private'} chat")
             except Exception as e:
                 logger.error(f"Failed to edit Telegram message: {e}")
                 # Fallback: send as new message
                 await bot.send(event, response)
         else:
+            logger.warning(f"Cannot edit message: missing attributes (has message_id: {hasattr(typing_msg, 'message_id')}, has chat: {hasattr(typing_msg, 'chat')})")
             await bot.send(event, response)
     
     elif isinstance(bot, QQBot):
