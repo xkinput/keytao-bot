@@ -247,13 +247,13 @@ async def call_tool_function(tool_name: str, arguments: Dict) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-async def get_openai_response(message: str, max_iterations: int = 3) -> Optional[str]:
+async def get_openai_response(message: str, max_iterations: int = 6) -> Optional[str]:
     """
     Call DashScope (Qwen) API to get response with function calling support
     
     Args:
         message: User message
-        max_iterations: Maximum number of function calling iterations
+        max_iterations: Maximum number of function calling iterations (default 6)
     """
     if not DASHSCOPE_API_KEY:
         return "❌ DashScope API Key 未配置，请联系管理员"
