@@ -4,6 +4,7 @@ DashScope (Qwen) Chat plugin
 通过 Skills 系统动态加载工具
 """
 import json
+import asyncio
 from typing import Optional, List, Dict
 
 from nonebot import on_message, get_driver
@@ -27,6 +28,9 @@ DASHSCOPE_BASE_URL = getattr(config, "dashscope_base_url", "https://dashscope.al
 DASHSCOPE_MODEL = getattr(config, "dashscope_model", "qwen-plus")
 DASHSCOPE_MAX_TOKENS = getattr(config, "dashscope_max_tokens", 1000)
 DASHSCOPE_TEMPERATURE = getattr(config, "dashscope_temperature", 0.7)
+
+# Message auto-recall configuration (in seconds, 0 = disabled)
+AUTO_RECALL_DELAY = getattr(config, "auto_recall_delay", 0)
 
 # Initialize skills manager and load all skills
 skills_manager = SkillsManager()
@@ -211,10 +215,63 @@ async def handle_ai_chat(bot: Bot, event: Event):
         return
     
     # Show typing indicator
-    await ai_chat.send("🤔 思考中...")
+    typing_msg = await ai_chat.send("🤔 思考中...")
     
     # Get AI response
     response = await get_openai_response(message_text)
     
-    # Send response
-    await ai_chat.finish(response)
+    # Check adapter type
+    from nonebot.adapters.telegram import Bot as TelegramBot
+    from nonebot.adapters.qq import Bot as QQBot
+    
+    if isinstance(bot, TelegramBot):
+        # Telegram: edit typing message to final response
+        if typing_msg and hasattr(typing_msg, 'message_id'):
+            try:
+                await bot.edit_message_text(
+                    chat_id=typing_msg.chat.id,
+                    message_id=typing_msg.message_id,
+                    text=response
+                )
+            except Exception as e:
+                logger.error(f"Failed to edit Telegram message: {e}")
+                # Fallback: send as new message
+                await bot.send(event, response)
+        else:
+            await bot.send(event, response)
+    
+    elif isinstance(bot, QQBot):
+        # QQ: send new message and optionally recall
+        reply_msg = await bot.send(event, response)
+        
+        # Auto-recall both typing and reply messages if enabled
+        if AUTO_RECALL_DELAY > 0:
+            if typing_msg and hasattr(typing_msg, 'id'):
+                asyncio.create_task(_schedule_recall_qq(bot, event, typing_msg.id, AUTO_RECALL_DELAY))
+            if reply_msg and hasattr(reply_msg, 'id'):
+                asyncio.create_task(_schedule_recall_qq(bot, event, reply_msg.id, AUTO_RECALL_DELAY))
+    
+    else:
+        # Other adapters: just send
+        await bot.send(event, response)
+
+
+async def _schedule_recall_qq(bot, event: Event, message_id: str, delay: int):
+    """Schedule QQ message recall after delay"""
+    try:
+        await asyncio.sleep(delay)
+        
+        # Import event types
+        from nonebot.adapters.qq import C2CMessageCreateEvent, GroupAtMessageCreateEvent
+        
+        # QQ adapter: different recall methods for C2C and Group
+        if isinstance(event, C2CMessageCreateEvent):
+            await bot.delete_c2c_message(openid=event.author.id, message_id=message_id)
+            logger.debug(f"Recalled C2C message {message_id}")
+        elif isinstance(event, GroupAtMessageCreateEvent):
+            await bot.delete_group_message(group_openid=event.group_openid, message_id=message_id)
+            logger.debug(f"Recalled Group message {message_id}")
+        else:
+            logger.warning(f"Auto-recall not supported for event type: {type(event)}")
+    except Exception as e:
+        logger.error(f"Failed to recall message {message_id}: {e}")
