@@ -319,12 +319,12 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 **API 端点：**
 
-- 按编码查询: `GET {KEYTAO_NEXT_URL}/api/phrases/by-code?code={code}&page=1`
-- 按词条查询: `GET {KEYTAO_NEXT_URL}/api/phrases/by-word?word={word}&page=1`
+- 按编码查询: `GET {KEYTAO_API_BASE}/api/phrases/by-code?code={code}&page=1`
+- 按词条查询: `GET {KEYTAO_API_BASE}/api/phrases/by-word?word={word}&page=1`
 
 **配置变量：**
 
-- `KEYTAO_NEXT_URL`: 默认为 "https://keytao.vercel.app"
+- `KEYTAO_API_BASE`: 默认为 "https://keytao.vercel.app"
 
 **注意事项：**
 

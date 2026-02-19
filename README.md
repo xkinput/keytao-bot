@@ -82,7 +82,7 @@ telegram_bots='[{"token": "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz"}]'
 查词功能使用 Keytao Next API，默认配置为：
 
 ```bash
-KEYTAO_NEXT_URL="https://keytao.vercel.app"
+KEYTAO_API_BASE="https://keytao.vercel.app"
 ```
 
 如果你部署了自己的 Keytao Next 实例，可以修改此 URL。

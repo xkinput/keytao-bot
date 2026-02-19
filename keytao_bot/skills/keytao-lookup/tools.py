@@ -7,12 +7,12 @@ from typing import Dict, List, Optional
 
 
 def get_keytao_url() -> str:
-    """Get Keytao Next URL from config"""
+    """Get Keytao API base URL from config"""
     try:
         from nonebot import get_driver
         driver = get_driver()
         config = driver.config
-        return getattr(config, "keytao_next_url", "https://keytao.vercel.app")
+        return getattr(config, "keytao_api_base", "https://keytao.vercel.app")
     except:
         # Fallback to default if NoneBot not initialized
         return "https://keytao.vercel.app"
@@ -29,8 +29,8 @@ async def keytao_lookup_by_code(code: str) -> Dict:
     Returns:
         dict: Query result with phrases list and duplicate labels
     """
-    KEYTAO_NEXT_URL = get_keytao_url()
-    url = f"{KEYTAO_NEXT_URL}/api/phrases/by-code"
+    KEYTAO_API_BASE = get_keytao_url()
+    url = f"{KEYTAO_API_BASE}/api/phrases/by-code"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(url, params={"code": code, "page": "1"})
@@ -140,8 +140,8 @@ async def keytao_lookup_by_word(word: str) -> Dict:
     Returns:
         dict: Query result with phrases list and duplicate analysis
     """
-    KEYTAO_NEXT_URL = get_keytao_url()
-    url = f"{KEYTAO_NEXT_URL}/api/phrases/by-word"
+    KEYTAO_API_BASE = get_keytao_url()
+    url = f"{KEYTAO_API_BASE}/api/phrases/by-word"
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             # First request to get total pages

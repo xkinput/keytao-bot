@@ -5,7 +5,8 @@ DashScope (Qwen) Chat plugin
 """
 import json
 import re
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
+from collections import defaultdict
 
 from nonebot import on_message, get_driver
 from nonebot.adapters import Bot, Event
@@ -35,8 +36,31 @@ skills_manager = SkillsManager()
 skills_manager.load_all_skills()
 logger.info(f"Loaded {len(skills_manager.get_tools())} tools from skills")
 
+# Conversation history storage
+# key: (platform, user_id), value: list of messages
+conversation_history: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
+MAX_HISTORY_MESSAGES = 10  # Keep last 10 messages (5 rounds of conversation)
+
 # System prompt with compliance requirements  
 SYSTEM_PROMPT = """⚠️⚠️⚠️ 执行前必读 ⚠️⚠️⚠️
+
+【安全规则 - 最高优先级】
+
+1️⃣ **确认类回复的上下文检查**（防止误操作）：
+   - 如果用户只说"是"、"确认"、"确定"、"好"等简短肯定词
+   - **必须检查对话历史**中你的上一条消息（assistant的最后一条）
+   - 只有当上一条消息**明确询问用户确认某个操作**时，才能执行对应操作
+   - 如果上一条消息不是询问确认，则回复："没有待确认的操作哦～有什么可以帮你的吗？"
+
+2️⃣ **批次所有权验证**：
+   - 所有批次操作（创建/删除/提交）都会自动验证用户身份
+   - API会确保只有批次创建者本人才能提交该批次
+   - 你不需要额外检查，但应该知道这个机制
+
+3️⃣ **对话历史隔离**：
+   - 每个用户的对话历史是独立的（按platform + user_id）
+   - 在群聊中，用户A和用户B看到的历史是不同的
+   - 不会串台或混淆操作
 
 【工作流程 - 强制执行】
 
@@ -92,6 +116,219 @@ SYSTEM_PROMPT = """⚠️⚠️⚠️ 执行前必读 ⚠️⚠️⚠️
 → 回复："hello～ >w<\n\n顺便查了下编码：\n[展示查询结果]"
 
 关键：既要打招呼，又要展示查询结果，两者结合！
+
+---
+
+【创建词条功能 - 重要】
+
+⚠️ 当用户表达以下意图时，调用创建词条工具而非查询工具：
+
+触发关键词和格式（必须调用 keytao_create_phrase 或 keytao_batch_create_phrases）：
+• "加词 [词] [编码]" → 创建操作
+• "添加 [词] [编码]" → 创建操作
+• "改词 [旧词] [新词] [编码]" → 修改操作
+• "修改 [旧词] [新词] [编码]" → 修改操作
+• "删除 [词]" → 删除操作（注意：需要先查询编码）
+• "删词 [词]" → 删除操作
+• "移除 [词]" → 删除操作
+
+⚠️⚠️⚠️ 关键判断规则 - 必须仔细识别 ⚠️⚠️⚠️
+
+如何区分"操作意图"和"查询意图"：
+
+1. **操作意图**（调用创建工具）：
+   • 格式："操作词 + 目标词 [+ 编码]"
+   • 示例：
+     - "加词 测试 ushi" ✅ 操作
+     - "删除 如果" ✅ 操作（只有词，需要先查询编码）
+     - "改词 旧词 新词 abc" ✅ 操作
+     - "添加词条 你好 nh" ✅ 操作
+
+2. **查询意图**（调用查询工具）：
+   • 格式："目标词 + 怎么打/什么编码/查询"
+   • 或者：单独一个词（不带操作动词）
+   • 示例：
+     - "删除 怎么打" ✅ 查询"删除"这个词
+     - "如果 编码是什么" ✅ 查询
+     - "测试" ✅ 查询（没有操作动词）
+     - "abc" ✅ 查询编码对应的词
+
+判断流程：
+```
+用户输入 → 检查是否以操作词开头（加/添加/改/修改/删除/删词/移除）
+↓ 是
+→ 检查后面是否跟着"怎么打/什么编码/查询"等查询词
+  ↓ 否（只有词或词+编码）
+  → **操作意图** → 调用创建工具
+  
+↓ 否（没有操作词）
+→ **查询意图** → 调用查询工具
+```
+
+示例对比：
+• "加词 测试 ushi" → ✅ 操作：调用 keytao_create_phrase(word="测试", code="ushi")
+• "删除 如果" → ✅ 操作：先查询"如果"的编码，然后确认是否删除
+• "删除 怎么打" → ✅ 查询：调用 keytao_lookup_by_word(word="删除")
+• "测试 怎么打" → ✅ 查询：调用 keytao_lookup_by_word(word="测试")
+• "ushi 是什么" → ✅ 查询：调用 keytao_lookup_by_code(code="ushi")
+• "测试" → ✅ 查询：调用 keytao_lookup_by_word(word="测试")
+
+删除操作的特殊处理：
+⚠️ 删除操作必须先查询，不能猜测词或编码！
+
+判断用户输入的是词还是编码：
+• 纯字母（如"ri"、"abc"）→ 编码
+• 包含中文或其他字符（如"如果"、"测试"）→ 词
+
+情况1：用户说"删除 [编码]"（纯字母）
+1. 先调用 keytao_lookup_by_code(code="编码") 查询该编码对应的词
+2. 向用户展示结果：
+   - 如果只有一个词：询问"确认要删除 [词]（编码：xxx）吗？"
+   - 如果有多个词（重码）：列出所有词，询问"要删除哪个词？"
+3. 用户确认后，调用 keytao_create_phrase(word="词", code="编码", action="Delete")
+
+情况2：用户说"删除 [词]"（中文）
+1. 先调用 keytao_lookup_by_word(word="词") 查询该词的所有编码
+2. 向用户展示结果：
+   - 如果只有一个编码：询问"确认要删除 [词]（编码：xxx）吗？"
+   - 如果有多个编码：列出所有编码，询问"要删除哪个编码的词条？"
+3. 用户确认后，调用 keytao_create_phrase(word="词", code="xxx", action="Delete")
+
+示例：
+用户："删除 ri"
+AI → 识别"ri"是编码（纯字母）
+AI → 调用 keytao_lookup_by_code(code="ri")
+返回：[{word: "如果", code: "ri", ...}]
+AI 回复：
+"查询到编码 ri 对应的词条：
+• 如果
+
+确认要删除这个词条吗？回复'确认'或'是'即可～"
+
+用户："确认"
+AI → 调用 keytao_create_phrase(word="如果", code="ri", action="Delete")
+
+用户："删除 如果"
+AI → 识别"如果"是词（包含中文）
+AI → 调用 keytao_lookup_by_word(word="如果")
+返回：[{word: "如果", code: "rg", ...}, {word: "如果", code: "ri", ...}]
+AI 回复：
+"查询到词条【如果】的所有编码：
+• rg
+• ri
+
+要删除哪个编码的词条？请回复编码（如 rg）～"
+
+工具调用：
+• 创建：keytao_create_phrase(word, code, action="Create", type?, remark?)
+• 删除：keytao_create_phrase(word, code, action="Delete")
+  ⚠️ 删除前必须先查询，获取准确的词和编码
+• 修改：目前暂不支持直接修改，告知用户"需要先删除旧词，再添加新词"
+
+⚠️ 关键注意事项：
+- 删除操作**绝对不能猜测**词或编码
+- 必须先调用查询工具确认存在
+- action="Delete" 时必须同时提供准确的 word 和 code
+- 不需要提供 platform 和 platform_id，系统会自动识别
+
+⚠️⚠️⚠️ 冲突和警告处理流程（极其重要！）⚠️⚠️⚠️
+
+当工具返回 success=false 且 requiresConfirmation=true 时，说明操作**尚未完成**，需要用户确认：
+
+1️⃣ 第一次调用工具（confirmed=false 或未设置）：
+   - 返回 { success: false, requiresConfirmation: true, warnings: [...] }
+   - 此时词条**尚未创建/删除**
+   - 你必须：
+     * 向用户说明警告内容（如重码情况）
+     * 询问是否确认操作
+     * **记住本次调用的所有参数**（word, code, action等）
+
+2️⃣ 用户确认后（说"是"、"确认"、"确定"等）：
+   - 你必须**立即**再次调用**同一个工具**
+   - 使用**完全相同的参数**（word, code, action等）
+   - **唯一区别**：添加 confirmed=true
+   - 示例：
+     ```
+     第一次：keytao_create_phrase(word="如果", code="ri", action="Delete")
+     返回警告 → 询问用户
+     用户确认 → 第二次：keytao_create_phrase(word="如果", code="ri", action="Delete", confirmed=true)
+     ```
+
+3️⃣ 第二次调用后：
+   - 如果返回 success=true → 操作成功，显示批次ID
+   - 如果返回 conflicts → 真冲突，告知用户无法操作
+   - **绝对不要**让用户重新开始流程！
+
+❌ 错误做法：
+- 用户确认后，让用户"重新输入删除指令"
+- 忘记之前的参数，让用户重新提供
+- 不调用工具，只是回复提示信息
+
+✅ 正确做法：
+- 用户确认后，**立即调用工具** + confirmed=true
+- 使用相同的 word, code, action 参数
+- 直接完成操作
+
+真冲突处理：
+• 如果返回 conflicts（真冲突）：
+  - 向用户说明冲突原因
+  - 不允许强制创建
+• 如果返回 message="未找到绑定账号"：
+  - 提示用户使用 /bind 命令绑定账号
+
+成功创建后的流程：
+⚠️⚠️⚠️ 极其重要！创建成功后的标准流程 ⚠️⚠️⚠️
+
+当 keytao_create_phrase 或 keytao_batch_create_phrases 返回 success=true 时：
+
+📌 关键第一步：**必须记住并显示 batchId**
+• 工具返回的 response.batchId 是提交审核的唯一凭证
+• 你**必须**在回复中明确显示它，格式：「批次ID: 实际的batchId」
+• 这样下次用户说"提交"时，你能从对话历史中找到这个ID
+
+标准流程：
+1. **告知用户创建成功**（词条已保存为草稿）
+2. **显示批次ID**：「批次ID: [实际batchId]」
+3. **询问是否提交审核**：
+   - "是否立即提交审核？"
+   - "回复'提交'或'是'即可提交审核哦～"
+4. **等待用户回复**
+5. 如果用户回复"提交"、"是"、"确认"等肯定意图：
+   - 从你的上一条消息中查找「批次ID: xxx」
+   - 提取冒号后面的ID值
+   - 调用 keytao_submit_batch(batch_id=提取到的ID)
+   - 根据返回结果告知用户提交状态
+6. 如果找不到批次ID：
+   - 告诉用户需要重新创建词条
+
+示例流程：
+用户："加词 测试 ushi"
+AI → 调用 keytao_create_phrase
+返回：{"success": true, "batchId": "cm3abc123", "pullRequestCount": 1}
+AI 回复：
+"✅ 成功创建词条！
+• 词：测试
+• 编码：ushi
+
+词条已保存为草稿 📝
+批次ID: cm3abc123
+
+是否立即提交审核？回复'提交'或'是'即可～"
+
+用户："提交"
+AI → 在对话历史中搜索"批次ID:"，找到 cm3abc123
+AI → 调用 keytao_submit_batch(batch_id="cm3abc123")
+返回：{"success": true, "message": "批次已提交审核"}
+AI 回复：
+"🎉 太棒啦！批次已提交审核～
+管理员审核通过后，词条就会生效啦 owo"
+
+⚠️ 重要注意事项：
+- 创建成功后**必须**显示「批次ID: xxx」
+- 显示格式必须是：批次ID: [实际ID]（冒号后有空格）
+- 提交时**必须**从对话历史中提取这个ID
+- 不要凭记忆或猜测 batch_id，必须使用实际返回的值
+- 如果找不到批次ID，让用户重新创建
 
 ---
 
@@ -266,17 +503,134 @@ def remove_urls(text: str) -> str:
     return cleaned
 
 
+# Clear history command
+from nonebot import on_command
+clear_cmd = on_command("clear", aliases={"重置", "清空"}, priority=5, block=True)
+
+@clear_cmd.handle()
+async def handle_clear(bot: Bot, event: Event):
+    """Clear conversation history for current user"""
+    conv_key = get_conversation_key(bot, event)
+    clear_history(conv_key)
+    await clear_cmd.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
+
+
 # Create chat handler with custom rule
 ai_chat = on_message(rule=should_handle, priority=99, block=True)
 
 
-async def call_tool_function(tool_name: str, arguments: Dict) -> str:
+def get_conversation_key(bot: Bot, event: Event) -> Tuple[str, str]:
+    """
+    Get conversation key for history storage
+    获取对话历史的唯一键
+    
+    Returns:
+        (platform, user_id): tuple for identifying unique conversation
+    """
+    platform, user_id = extract_platform_info(bot, event)
+    return (platform, user_id)
+
+
+def get_history(key: Tuple[str, str]) -> List[Dict]:
+    """
+    Get conversation history for a user
+    获取用户的对话历史
+    """
+    return conversation_history.get(key, [])
+
+
+def add_to_history(key: Tuple[str, str], user_message: str, assistant_message: str):
+    """
+    Add a conversation round to history
+    添加一轮对话到历史记录
+    
+    Args:
+        key: Conversation identifier
+        user_message: User's message
+        assistant_message: Assistant's response
+    """
+    history = conversation_history[key]
+    
+    # Add new messages
+    history.append({"role": "user", "content": user_message})
+    history.append({"role": "assistant", "content": assistant_message})
+    
+    # Keep only last N messages
+    if len(history) > MAX_HISTORY_MESSAGES:
+        conversation_history[key] = history[-MAX_HISTORY_MESSAGES:]
+    
+    logger.debug(f"History for {key}: {len(conversation_history[key])} messages")
+
+
+def clear_history(key: Tuple[str, str]):
+    """
+    Clear conversation history for a user
+    清空用户的对话历史
+    """
+    if key in conversation_history:
+        del conversation_history[key]
+        logger.info(f"Cleared history for {key}")
+
+
+def extract_platform_info(bot: Bot, event: Event) -> tuple[str, str]:
+    """
+    Extract platform type and user ID from event
+    提取平台类型和用户ID
+    
+    Returns:
+        (platform, platform_id): tuple of platform name and user ID
+    """
+    try:
+        from nonebot.adapters.telegram import Bot as TelegramBot
+        from nonebot.adapters.qq import Bot as QQBot
+    except ImportError:
+        TelegramBot = None
+        QQBot = None
+    
+    # Detect platform by bot type
+    if TelegramBot and isinstance(bot, TelegramBot):
+        # Telegram platform
+        from_ = getattr(event, 'from_', None)
+        if from_:
+            user_id = str(getattr(from_, 'id', ''))
+        else:
+            user_id = ''
+        return ("telegram", user_id)
+    elif QQBot and isinstance(bot, QQBot):
+        # QQ platform
+        author = getattr(event, 'author', None)
+        if author:
+            user_id = str(getattr(author, 'id', ''))
+        else:
+            # Fallback: try user_id field directly
+            user_id = str(getattr(event, 'user_id', ''))
+        return ("qq", user_id)
+    else:
+        # Unknown platform, return generic values
+        logger.warning(f"Unknown platform: {bot.__class__.__name__}")
+        return ("unknown", "")
+
+
+async def call_tool_function(
+    tool_name: str,
+    arguments: Dict,
+    bot: Optional[Bot] = None,
+    event: Optional[Event] = None
+) -> str:
     """Call a tool function and return result as JSON string"""
     tool_func = skills_manager.get_tool_function(tool_name)
     if not tool_func:
         return json.dumps({"error": f"Tool {tool_name} not found"}, ensure_ascii=False)
     
     try:
+        # Auto-inject platform and platform_id for tools that need them
+        if tool_name in ['keytao_create_phrase', 'keytao_batch_create_phrases', 'keytao_submit_batch']:
+            if bot and event:
+                platform, platform_id = extract_platform_info(bot, event)
+                arguments['platform'] = platform
+                arguments['platform_id'] = platform_id
+                logger.info(f"Auto-injected platform info: {platform}, {platform_id}")
+        
         result = await tool_func(**arguments)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -284,12 +638,21 @@ async def call_tool_function(tool_name: str, arguments: Dict) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-async def get_openai_response(message: str, max_iterations: int = 6) -> Optional[str]:
+async def get_openai_response(
+    message: str,
+    bot: Bot,
+    event: Event,
+    history: Optional[List[Dict]] = None,
+    max_iterations: int = 6
+) -> Optional[str]:
     """
     Call DashScope (Qwen) API to get response with function calling support
     
     Args:
         message: User message
+        bot: Bot instance for context
+        event: Event instance for context
+        history: Previous conversation history
         max_iterations: Maximum number of function calling iterations (default 6)
     """
     if not DASHSCOPE_API_KEY:
@@ -305,11 +668,16 @@ async def get_openai_response(message: str, max_iterations: int = 6) -> Optional
             timeout=30.0
         )
         
-        # Build initial messages
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": message}
-        ]
+        # Build initial messages with history
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        
+        # Add conversation history if available
+        if history:
+            messages.extend(history)
+            logger.debug(f"Using {len(history)} history messages")
+        
+        # Add current user message
+        messages.append({"role": "user", "content": message})
         
         # Get available tools
         tools = skills_manager.get_tools() if skills_manager.has_tools() else None
@@ -370,8 +738,8 @@ async def get_openai_response(message: str, max_iterations: int = 6) -> Optional
                     
                     logger.info(f"Calling tool: {function_name} with args: {function_args}")
                     
-                    # Call the tool
-                    function_result = await call_tool_function(function_name, function_args)
+                    # Call the tool with context
+                    function_result = await call_tool_function(function_name, function_args, bot, event)
                     
                     # Add tool result to messages
                     messages.append({
@@ -426,13 +794,22 @@ async def handle_ai_chat(bot: Bot, event: Event):
         await ai_chat.finish("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
         return
     
-    # Get AI response (wait for completion before sending)
-    response = await get_openai_response(message_text)
+    # Get conversation key
+    conv_key = get_conversation_key(bot, event)
+    
+    # Get conversation history
+    history = get_history(conv_key)
+    
+    # Get AI response with context and history (wait for completion before sending)
+    response = await get_openai_response(message_text, bot, event, history)
     
     # Handle error response
     if not response:
         await ai_chat.finish("呜呜，处理请求时出错了 qwq 要不再试一次？")
         return
+    
+    # Save to conversation history
+    add_to_history(conv_key, message_text, response)
     
     # Platform-specific reply handling
     try:
