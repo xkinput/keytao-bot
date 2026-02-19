@@ -1,12 +1,11 @@
 """
-DashScope (Qwen) Chat plugin
-使用阿里云通义千问 API 进行智能对话
+Doubao (豆包) Chat plugin
+使用火山引擎豆包 API 进行智能对话
 通过 Skills 系统动态加载工具
 """
 import json
 import re
 from typing import Optional, List, Dict, Tuple
-from collections import defaultdict
 
 from nonebot import on_message, get_driver
 from nonebot.adapters import Bot, Event
@@ -21,25 +20,25 @@ except ImportError:
     logger.warning("openai package not installed, OpenAI chat plugin will not work")
 
 from ..skills import SkillsManager
+from ..utils.history_store import get_history_store
 
 # Get configuration
 driver = get_driver()
 config = driver.config
-DASHSCOPE_API_KEY = getattr(config, "dashscope_api_key", None)
-DASHSCOPE_BASE_URL = getattr(config, "dashscope_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-DASHSCOPE_MODEL = getattr(config, "dashscope_model", "qwen-plus")
-DASHSCOPE_MAX_TOKENS = getattr(config, "dashscope_max_tokens", 1000)
-DASHSCOPE_TEMPERATURE = getattr(config, "dashscope_temperature", 0.0)
+ARK_API_KEY = getattr(config, "ark_api_key", None)
+ARK_BASE_URL = getattr(config, "ark_base_url", "https://ark.cn-beijing.volces.com/api/v3")
+ARK_MODEL = getattr(config, "ark_model", "doubao-seed-1-6-251015")
+ARK_MAX_TOKENS = getattr(config, "ark_max_tokens", 1000)
+ARK_TEMPERATURE = getattr(config, "ark_temperature", 0.7)
 
 # Initialize skills manager and load all skills
 skills_manager = SkillsManager()
 skills_manager.load_all_skills()
 logger.info(f"Loaded {len(skills_manager.get_tools())} tools from skills")
 
-# Conversation history storage
-# key: (platform, user_id), value: list of messages
-conversation_history: Dict[Tuple[str, str], List[Dict]] = defaultdict(list)
-MAX_HISTORY_MESSAGES = 10  # Keep last 10 messages (5 rounds of conversation)
+# Initialize history store (SQLite)
+history_store = get_history_store()
+MAX_HISTORY_MESSAGES = 30  # Keep last 30 messages (15 rounds) for batch operations
 
 # System prompt with compliance requirements  
 SYSTEM_PROMPT = """⚠️⚠️⚠️ 执行前必读 ⚠️⚠️⚠️
@@ -184,7 +183,7 @@ AI → 根据文档解释
 
 ⚠️ 当用户表达以下意图时，调用创建词条工具而非查询工具：
 
-触发关键词和格式（必须调用 keytao_create_phrase 或 keytao_batch_create_phrases）：
+触发关键词和格式（必须调用 keytao_create_phrase）：
 • "加词 [词] [编码]" → 创建操作
 • "添加 [词] [编码]" → 创建操作
 • "改词 [旧词] [新词] [编码]" → 修改操作
@@ -192,6 +191,89 @@ AI → 根据文档解释
 • "删除 [词]" → 删除操作（注意：需要先查询编码）
 • "删词 [词]" → 删除操作
 • "移除 [词]" → 删除操作
+
+⚠️⚠️⚠️ 草稿批次自动管理 - 工作机制 ⚠️⚠️⚠️
+
+**核心机制**：每次操作自动追加到草稿批次，用户立即看到结果（冲突/警告）
+
+**工作流程**：
+
+1️⃣ **单次操作**：
+   用户："加词 测试1 test1"
+   - AI立即调用 keytao_create_phrase(word="测试1", code="test1")
+   - 工具自动查找或创建草稿批次
+   - 操作追加到该草稿批次
+   - 返回结果：成功/冲突/警告
+   - AI显示结果并询问："是否继续添加或提交审核？"
+
+2️⃣ **继续操作**：
+   用户："删除 测试2"
+   - AI先查询测试2获取编码
+   - AI调用 keytao_create_phrase(action="Delete", word="测试2", code="查到的编码")
+   - 工具自动追加到同一个草稿批次
+   - 返回结果
+   - AI显示结果并询问
+
+3️⃣ **提交审核**：
+   用户："提交"或"是"
+   - AI调用 keytao_submit_batch()
+   - 工具自动查找并提交草稿批次
+   - 提交后该批次状态变为Pending（待审核）
+   - 下次操作会创建新的草稿批次
+
+**关键点说明**：
+- ✅ 每次操作立即调用工具（不是只记录）
+- ✅ 草稿批次自动管理：工具自动查找或创建Draft状态的批次
+- ✅ 立即反馈：用户每次操作后立即看到结果
+- ✅ 支持所有操作：Create/Change/Delete都可以混合在一个批次
+- ✅ 冲突检测：API会立即检测并返回冲突/警告
+- ✅ 无需手动管理状态：批次ID由API自动管理
+
+**完整示例**：
+
+```
+用户："加词 测试1 test1"
+AI → keytao_create_phrase(word="测试1", code="test1")
+     （工具自动创建草稿批次）
+返回 → {success: true, ...}
+AI → "✅ 成功添加到草稿批次！
+      是否继续添加还是提交审核？"
+
+用户："删除 如果"
+AI → keytao_lookup_by_word(word="如果")
+返回 → 编码: ri
+AI → keytao_create_phrase(action="Delete", word="如果", code="ri")
+     （工具自动追加到同一草稿批次）
+返回 → {success: true, ...}
+AI → "✅ 成功添加删除操作！
+      当前草稿批次已包含多个操作
+      继续还是提交审核？"
+
+用户："提交"
+AI → keytao_submit_batch()
+     （工具自动查找并提交草稿批次）
+返回 → {success: true, ...}
+AI → "🎉 批次已提交审核！管理员通过后即可生效～"
+```
+
+**警告处理示例**：
+
+```
+用户："加词 测试 test1"
+AI → keytao_create_phrase(word="测试", code="test1")
+返回 → {success: false, warnings: [{warningType: "duplicate_code", ...}]}
+AI → "⚠️ 重码警告！
+      编码 test1 已被词条【旧测试】占用
+      你要添加的【测试】将成为重码
+      
+      是否确认添加？"
+
+用户："确认"
+AI → keytao_create_phrase(word="测试", code="test1", confirmed=true)
+返回 → {success: true, ...}
+AI → "✅ 已确认添加重码到草稿批次！
+      继续还是提交审核？"
+```
 
 ⚠️⚠️⚠️ 关键判断规则 - 必须仔细识别 ⚠️⚠️⚠️
 
@@ -376,92 +458,81 @@ AI 回复：
 成功创建后的流程：
 ⚠️⚠️⚠️ 极其重要！创建成功后的标准流程 ⚠️⚠️⚠️
 
-当 keytao_create_phrase 或 keytao_batch_create_phrases 返回 success=true 时：
-
-📌 关键第一步：**必须记住并显示 batchId**
-• 工具返回的 response.batchId 是提交审核的唯一凭证
-• 你**必须**在回复中明确显示它，格式：「批次ID: 实际的batchId」
-• 这样下次用户说"提交"时，你能从对话历史中找到这个ID
+当 keytao_create_phrase 返回 success=true 时：
 
 标准流程：
-1. **告知用户创建成功**（词条已保存为草稿）
-2. **显示批次ID**：「批次ID: [实际batchId]」
-3. **显示批次链接**（仅Telegram）：
-   - 如果当前平台是 Telegram，显示链接：`https://keytao.vercel.app/batch/{实际batchId}`
+1. **告知用户操作成功**（已添加到草稿批次）
+2. **显示批次链接**（仅Telegram）：
+   - 如果当前平台是 Telegram，显示链接：`https://keytao.vercel.app/batch`
    - 如果当前平台是 QQ，**不显示链接**
-4. **询问是否提交审核**：
+3. **询问是否提交审核**：
    - "是否立即提交审核？"
    - "回复'提交'或'是'即可提交审核哦～"
-5. **等待用户回复**
-6. 如果用户回复"提交"、"是"、"确认"等肯定意图：
+   - "也可以继续添加/修改/删除词条"
+4. **等待用户回复**
+5. 如果用户回复"提交"、"是"、"确认"等肯定意图：
    ⚠️⚠️⚠️ 重要：必须调用工具，不要只回复文本！
    
-   A. **优先检查引用消息**：
-      • 如果用户使用了reply（你会收到【用户正在回复你的消息】提示）：
-        - 从被引用的消息内容中查找「批次ID: xxx」
-        - 提取冒号后面的完整ID值（格式如：7e204eda-7452-456d-aa06-eef3f3112189）
-        - **立即调用工具** keytao_submit_batch(batch_id="提取到的ID")
-      
-      • 如果用户回复的是其他人的消息：
-        - 不要执行操作，提示用户需要回复bot的消息
+   **判断用户意图**：
    
-   B. **备选：从对话历史查找**：
-      • 如果用户没有使用reply，则从对话历史中查找你上一条消息
-      • 在你的上一条消息里查找「批次ID: xxx」
-      • 提取并调用工具
+   A. **提交审核** - 将草稿批次提交审核：
+      • 直接调用 keytao_submit_batch()
+      • 工具会自动查找并提交草稿批次
+      • ⚠️ 不要再调用keytao_create_phrase
+   
+   B. **确认警告** - 创建时遇到重码警告：
+      • 特征：对话历史中有「⚠️ 重码警告」
+      • 使用相同参数再次调用keytao_create_phrase，添加confirmed=true
    
    - 等待工具返回结果
-   - 根据返回的success和message告知用户提交状态
-   ⚠️ 禁止行为：不要猜测结果，不要在未调用工具的情况下直接回复"已提交"
-   - 等待工具返回结果
-   - 根据返回的success和message告知用户提交状态
-   ⚠️ 禁止行为：不要猜测结果，不要在未调用工具的情况下直接回复"已提交"
-7. 如果找不到批次ID：
-   - 告诉用户需要重新创建词条
+   - 根据返回的success和message告知用户
+   ⚠️ 禁止行为：
+   • 不要猜测结果
+   • 不要在未调用工具时直接回复"已提交"
+6. 如果用户继续添加词条：
+   - 直接调用keytao_create_phrase添加新操作
+   - 工具会自动追加到同一草稿批次
 
 示例流程（Telegram）：
 用户："加词 测试 ushi"
-AI → 调用 keytao_create_phrase
-返回：{"success": true, "batchId": "cm3abc123", "pullRequestCount": 1}
+AI → keytao_create_phrase(word="测试", code="ushi")
+返回：{"success": true, ...}
 AI 回复：
-"✅ 成功创建词条！
+"✅ 成功添加到草稿批次！
 • 词：测试
 • 编码：ushi
 
 词条已保存为草稿 📝
-批次ID: cm3abc123
-🔗 https://keytao.vercel.app/batch/cm3abc123
+🔗 https://keytao.vercel.app/batch
 
-是否立即提交审核？回复'提交'或'是'即可～"
+是否立即提交审核？回复'提交'或'是'即可～
+也可以继续添加/修改/删除词条哦"
 
 示例流程（QQ）：
 用户："加词 测试 ushi"
-AI → 调用 keytao_create_phrase
-返回：{"success": true, "batchId": "cm3abc123", "pullRequestCount": 1}
+AI → keytao_create_phrase(word="测试", code="ushi")
+返回：{"success": true, ...}
 AI 回复：
-"✅ 成功创建词条！
+"✅ 成功添加到草稿批次！
 • 词：测试
 • 编码：ushi
 
 词条已保存为草稿 📝
-批次ID: cm3abc123
 
-是否立即提交审核？回复'提交'或'是'即可～"
+是否立即提交审核？回复'提交'或'是'即可～
+也可以继续添加/修改/删除词条哦"
 
 用户："提交"
-AI → 在对话历史中搜索"批次ID:"，找到 cm3abc123
-AI → 调用 keytao_submit_batch(batch_id="cm3abc123")
+AI → keytao_submit_batch()
 返回：{"success": true, "message": "批次已提交审核"}
 AI 回复：
 "🎉 太棒啦！批次已提交审核～
 管理员审核通过后，词条就会生效啦 owo"
 
 ⚠️ 重要注意事项：
-- 创建成功后**必须**显示「批次ID: xxx」
-- 显示格式必须是：批次ID: [实际ID]（冒号后有空格）
-- 提交时**必须**从对话历史中提取这个ID
-- 不要凭记忆或猜测 batch_id，必须使用实际返回的值
-- 如果找不到批次ID，让用户重新创建
+- 草稿批次由API自动管理，无需在回复中显示批次ID
+- 提交时直接调用 keytao_submit_batch()，工具会自动找到草稿批次
+- 用户可以连续多次操作，都会追加到同一个草稿批次
 
 ---
 
@@ -688,8 +759,15 @@ def get_history(key: Tuple[str, str]) -> List[Dict]:
     """
     Get conversation history for a user
     获取用户的对话历史
+    
+    Args:
+        key: (platform, user_id) tuple
+    
+    Returns:
+        List of message dicts with {role, content}
     """
-    return conversation_history.get(key, [])
+    platform, user_id = key
+    return history_store.get_history(platform, user_id, limit=MAX_HISTORY_MESSAGES)
 
 
 def add_to_history(key: Tuple[str, str], user_message: str, assistant_message: str):
@@ -698,31 +776,26 @@ def add_to_history(key: Tuple[str, str], user_message: str, assistant_message: s
     添加一轮对话到历史记录
     
     Args:
-        key: Conversation identifier
+        key: (platform, user_id) tuple
         user_message: User's message
         assistant_message: Assistant's response
     """
-    history = conversation_history[key]
-    
-    # Add new messages
-    history.append({"role": "user", "content": user_message})
-    history.append({"role": "assistant", "content": assistant_message})
-    
-    # Keep only last N messages
-    if len(history) > MAX_HISTORY_MESSAGES:
-        conversation_history[key] = history[-MAX_HISTORY_MESSAGES:]
-    
-    logger.debug(f"History for {key}: {len(conversation_history[key])} messages")
+    platform, user_id = key
+    history_store.add_conversation_round(platform, user_id, user_message, assistant_message)
+    logger.debug(f"Added conversation round for {platform}:{user_id}")
 
 
 def clear_history(key: Tuple[str, str]):
     """
     Clear conversation history for a user
     清空用户的对话历史
+    
+    Args:
+        key: (platform, user_id) tuple
     """
-    if key in conversation_history:
-        del conversation_history[key]
-        logger.info(f"Cleared history for {key}")
+    platform, user_id = key
+    deleted = history_store.clear_history(platform, user_id)
+    logger.info(f"Cleared {deleted} messages for {platform}:{user_id}")
 
 
 def extract_platform_info(bot: Bot, event: Event) -> tuple[str, str]:
@@ -776,8 +849,8 @@ async def call_tool_function(
         return json.dumps({"error": f"Tool {tool_name} not found"}, ensure_ascii=False)
     
     try:
-        # Auto-inject platform and platform_id for tools that need them
-        if tool_name in ['keytao_create_phrase', 'keytao_batch_create_phrases', 'keytao_submit_batch']:
+        # Auto-inject platform and platform_id for keytao tools
+        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch']:
             if bot and event:
                 platform, platform_id = extract_platform_info(bot, event)
                 arguments['platform'] = platform
@@ -785,6 +858,7 @@ async def call_tool_function(
                 logger.info(f"Auto-injected platform info: {platform}, {platform_id}")
         
         result = await tool_func(**arguments)
+        
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Tool {tool_name} execution error: {e}")
@@ -799,7 +873,7 @@ async def get_openai_response(
     max_iterations: int = 6
 ) -> Optional[str]:
     """
-    Call DashScope (Qwen) API to get response with function calling support
+    Call Doubao (豆包) API to get response with function calling support
     
     Args:
         message: User message
@@ -808,16 +882,16 @@ async def get_openai_response(
         history: Previous conversation history
         max_iterations: Maximum number of function calling iterations (default 6)
     """
-    if not DASHSCOPE_API_KEY:
-        return "❌ DashScope API Key 未配置，请联系管理员"
+    if not ARK_API_KEY:
+        return "❌ Doubao API Key 未配置，请联系管理员"
     
     if not AsyncOpenAI:
         return "❌ OpenAI 兼容库未安装，请联系管理员"
     
     try:
         client = AsyncOpenAI(
-            api_key=DASHSCOPE_API_KEY,
-            base_url=DASHSCOPE_BASE_URL,
+            api_key=ARK_API_KEY,
+            base_url=ARK_BASE_URL,
             timeout=30.0
         )
         
@@ -876,10 +950,10 @@ async def get_openai_response(
         for iteration in range(max_iterations):
             # Call AI API
             call_kwargs = {
-                "model": DASHSCOPE_MODEL,
+                "model": ARK_MODEL,
                 "messages": messages,
-                "max_tokens": DASHSCOPE_MAX_TOKENS,
-                "temperature": DASHSCOPE_TEMPERATURE,
+                "max_tokens": ARK_MAX_TOKENS,
+                "temperature": ARK_TEMPERATURE,
             }
             
             # Add tools if available
@@ -949,7 +1023,7 @@ async def get_openai_response(
         return "呜呜，处理太久了 qwq 要不再试一次？"
             
     except Exception as e:
-        logger.error(f"DashScope API error: {e}")
+        logger.error(f"Doubao API error: {e}")
         return "呜呜，AI 服务暂时不可用 qwq 等等再来找我吧 ～"
 
 

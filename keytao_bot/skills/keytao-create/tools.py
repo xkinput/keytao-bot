@@ -30,6 +30,49 @@ def get_bot_token() -> Optional[str]:
         return None
 
 
+async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[str]:
+    """
+    Get or create the latest draft batch for the user
+    获取或创建用户的最新草稿批次
+    
+    Args:
+        platform: Platform type ('qq' or 'telegram')
+        platform_id: User's platform ID
+        
+    Returns:
+        str: Batch ID if successful, None if failed
+    """
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+    
+    if not BOT_API_TOKEN:
+        logger.error("[get_latest_draft_batch] Missing BOT_API_TOKEN")
+        return None
+    
+    url = f"{KEYTAO_API_BASE}/api/bot/batches/latest-draft"
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                url,
+                headers={"X-Bot-Token": BOT_API_TOKEN},
+                params={"platform": platform, "platformId": platform_id}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                batch_id = data.get("batchId")
+                logger.info(f"[get_latest_draft_batch] Got batch ID: {batch_id}")
+                return batch_id
+            else:
+                logger.error(f"[get_latest_draft_batch] API error ({response.status_code}): {response.text}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"[get_latest_draft_batch] Error: {e}")
+        return None
+
+
 async def keytao_create_phrase(
     platform: str,
     platform_id: str,
@@ -44,6 +87,9 @@ async def keytao_create_phrase(
     """
     Create, modify or delete a phrase entry via bot API
     通过 bot API 创建、修改或删除词条
+    
+    Automatically gets or creates a draft batch for the user.
+    自动获取或创建用户的草稿批次。
     
     Args:
         platform: Platform type ('qq' or 'telegram')
@@ -68,6 +114,14 @@ async def keytao_create_phrase(
             "message": "Bot配置错误：缺少API token"
         }
     
+    # Get or create draft batch
+    batch_id = await get_latest_draft_batch(platform, platform_id)
+    if not batch_id:
+        return {
+            "success": False,
+            "message": "无法获取草稿批次，请稍后重试"
+        }
+    
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch"
     
     request_data = {
@@ -81,8 +135,10 @@ async def keytao_create_phrase(
             "type": type,
             "remark": remark
         }],
-        "confirmed": confirmed
+        "confirmed": confirmed,
+        "batchId": batch_id  # Always use the draft batch
     }
+    
     logger.info(f"[keytao_create_phrase] Sending request: {json.dumps(request_data, ensure_ascii=False)}")
     
     try:
@@ -131,105 +187,20 @@ async def keytao_create_phrase(
         }
 
 
-async def keytao_batch_create_phrases(
-    platform: str,
-    platform_id: str,
-    items: List[Dict],
-    confirmed: bool = False
-) -> Dict:
-    """
-    Create multiple phrase entries in batch via bot API
-    批量创建多个词条
-    
-    Args:
-        platform: Platform type ('qq' or 'telegram')
-        platform_id: User's platform ID
-        items: List of items to create, each with {word, code, type?, remark?}
-        confirmed: Whether warnings are confirmed
-        
-    Returns:
-        dict: API response with success status and details
-    """
-    KEYTAO_API_BASE = get_keytao_url()
-    BOT_API_TOKEN = get_bot_token()
-    
-    if not BOT_API_TOKEN:
-        return {
-            "success": False,
-            "message": "Bot配置错误：缺少API token"
-        }
-    
-    url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch"
-    
-    # Convert items to API format
-    api_items = []
-    for item in items:
-        api_items.append({
-            "action": "Create",
-            "word": item.get("word"),
-            "code": item.get("code"),
-            "type": item.get("type", "Phrase"),
-            "remark": item.get("remark")
-        })
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                headers={
-                    "X-Bot-Token": BOT_API_TOKEN,
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "platform": platform,
-                    "platformId": platform_id,
-                    "items": api_items,
-                    "confirmed": confirmed
-                }
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 404:
-                return {
-                    "success": False,
-                    "message": "未找到绑定账号，请使用 /bind 命令绑定你的账号"
-                }
-            elif response.status_code == 400:
-                # Conflicts or warnings
-                return response.json()
-            else:
-                return {
-                    "success": False,
-                    "message": f"创建失败: HTTP {response.status_code}"
-                }
-                
-    except httpx.TimeoutException:
-        return {
-            "success": False,
-            "message": "请求超时，请稍后重试"
-        }
-    except Exception as e:
-        logger.error(f"Batch create error: {e}")
-        return {
-            "success": False,
-            "message": f"批量创建失败: {str(e)}"
-        }
-
-
 async def keytao_submit_batch(
     platform: str,
-    platform_id: str,
-    batch_id: str
+    platform_id: str
 ) -> Dict:
     """
-    Submit a batch for review
-    提交批次进行审核
+    Submit current draft batch for review
+    提交当前草稿批次进行审核
+    
+    Automatically finds and submits the user's latest draft batch.
+    自动查找并提交用户的最新草稿批次。
     
     Args:
         platform: Platform type ('qq' or 'telegram')
         platform_id: User's platform ID
-        batch_id: Batch ID to submit
         
     Returns:
         dict: API response with success status
@@ -241,6 +212,14 @@ async def keytao_submit_batch(
         return {
             "success": False,
             "message": "Bot配置错误：缺少API token"
+        }
+    
+    # Get draft batch ID
+    batch_id = await get_latest_draft_batch(platform, platform_id)
+    if not batch_id:
+        return {
+            "success": False,
+            "message": "没有找到待提交的草稿批次"
         }
     
     url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/submit"
@@ -299,7 +278,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_create_phrase",
-            "description": "创建、修改或删除键道词条。用于用户希望添加、修改或删除词条时。支持检测冲突和警告，如有重码警告可确认后创建。",
+            "description": "创建、修改或删除键道词条。用于用户希望添加、修改或删除词条时。支持检测冲突和警告，如有重码警告可确认后创建。自动追加到草稿批次。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -341,60 +320,12 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "keytao_batch_create_phrases",
-            "description": "批量创建多个键道词条。用于用户一次性添加多个词条时。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "description": "要创建的词条列表",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "word": {
-                                    "type": "string",
-                                    "description": "词条内容"
-                                },
-                                "code": {
-                                    "type": "string",
-                                    "description": "键道编码"
-                                },
-                                "type": {
-                                    "type": "string",
-                                    "description": "词条类型（可选）"
-                                },
-                                "remark": {
-                                    "type": "string",
-                                    "description": "备注（可选）"
-                                }
-                            },
-                            "required": ["word", "code"]
-                        }
-                    },
-                    "confirmed": {
-                        "type": "boolean",
-                        "description": "是否已确认重码警告"
-                    }
-                },
-                "required": ["items"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "keytao_submit_batch",
-            "description": "提交批次进行审核。用于用户确认提交词条修改后。",
+            "description": "提交当前草稿批次进行审核。用于用户确认提交词条修改后。会自动查找并提交用户的草稿批次。",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "batch_id": {
-                        "type": "string",
-                        "description": "要提交的批次ID"
-                    }
-                },
-                "required": ["batch_id"]
+                "properties": {},
+                "required": []
             }
         }
     }
@@ -404,6 +335,5 @@ TOOLS = [
 # Tool registry for dynamic calling
 TOOL_FUNCTIONS = {
     "keytao_create_phrase": keytao_create_phrase,
-    "keytao_batch_create_phrases": keytao_batch_create_phrases,
     "keytao_submit_batch": keytao_submit_batch
 }

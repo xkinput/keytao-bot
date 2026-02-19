@@ -4,6 +4,7 @@ Keytao Lookup Skill Tools
 """
 import httpx
 from typing import Dict, List, Optional
+from nonebot.log import logger
 
 
 def get_keytao_url() -> str:
@@ -58,6 +59,10 @@ async def keytao_lookup_by_code(code: str) -> Dict:
             # Sort by weight and limit to 10 results
             sorted_phrases = sorted(exact_matches, key=lambda x: x.get("weight", 0))
             
+            # Debug log
+            logger.info(f"[keytao_lookup_by_code] code={code}, found {len(sorted_phrases)} phrases")
+            logger.info(f"[keytao_lookup_by_code] phrases: {[(p.get('word'), p.get('weight')) for p in sorted_phrases]}")
+            
             # Type mapping to Chinese labels
             type_labels = {
                 "Single": "单字",
@@ -70,17 +75,6 @@ async def keytao_lookup_by_code(code: str) -> Dict:
                 "English": "英文"
             }
             
-            # Analyze duplicate positions
-            weights = [p.get("weight", 0) for p in sorted_phrases]
-            min_weight = min(weights)
-            base_weight = (min_weight // 10) * 10
-            
-            # Infer base weight
-            if min_weight % 10 == 1:
-                base_weight = min_weight
-            elif min_weight % 10 == 0:
-                base_weight = min_weight
-            
             # Position labels (default word has no label)
             position_labels = {
                 0: "",
@@ -91,16 +85,15 @@ async def keytao_lookup_by_code(code: str) -> Dict:
                 5: "六重"
             }
             
-            # Build result with labels
+            # Build result with labels based on array index
             result_phrases = []
-            for p in sorted_phrases:
+            for idx, p in enumerate(sorted_phrases):
                 p_weight = p.get("weight", 0)
-                p_pos = p_weight - base_weight
                 phrase_type = p.get("type", "")
                 
-                # Only show label if there are multiple phrases AND position > 0
-                if len(sorted_phrases) > 1 and p_pos > 0:
-                    label = position_labels.get(p_pos, f"{p_pos + 1}重")
+                # Label based on array index (position in sorted array)
+                if len(sorted_phrases) > 1 and idx > 0:
+                    label = position_labels.get(idx, f"{idx + 1}重")
                 else:
                     label = ""
                 
@@ -110,7 +103,7 @@ async def keytao_lookup_by_code(code: str) -> Dict:
                     "weight": p_weight,
                     "type": phrase_type,
                     "type_label": type_labels.get(phrase_type, phrase_type),
-                    "position": p_pos,
+                    "position": idx,  # Use array index as position
                     "position_label": label
                 })
             
@@ -237,27 +230,29 @@ async def analyze_duplicates(code: str, target_word: str, target_weight: int) ->
         if len(all_phrases) <= 1:
             return None  # No duplicates
         
-        # Sort by weight
+        # Sort by weight (ascending)
         sorted_phrases = sorted(all_phrases, key=lambda x: x.get("weight", 0))
         
-        # Infer base weight (might start from 100 or 101)
-        weights = [p.get("weight", 0) for p in sorted_phrases]
-        min_weight = min(weights)
-        base_weight = (min_weight // 10) * 10  # Get tens place
+        # Debug log
+        logger.info(f"[analyze_duplicates] code={code}, target_word={target_word}, target_weight={target_weight}")
+        logger.info(f"[analyze_duplicates] sorted_phrases: {[(p.get('word'), p.get('weight')) for p in sorted_phrases]}")
         
-        # If min_weight ends with 1 (e.g., 101), base is likely min_weight
-        # If min_weight ends with 0 (e.g., 100), base is min_weight
-        if min_weight % 10 == 1:
-            base_weight = min_weight
-        elif min_weight % 10 == 0:
-            base_weight = min_weight
+        # Find position by actual index in sorted array (NOT by weight difference!)
+        position = -1
+        for idx, p in enumerate(sorted_phrases):
+            if p.get("word") == target_word and p.get("weight") == target_weight:
+                position = idx
+                break
         
-        # Calculate position for target word
-        position = target_weight - base_weight
+        if position == -1:
+            logger.warning(f"[analyze_duplicates] Target word '{target_word}' not found in sorted list")
+            return None
+        
+        logger.info(f"[analyze_duplicates] Found position={position} (0-based index)")
         
         # Position labels
         position_labels = {
-            0: "",  # Default, no label
+            0: "",  # First, no label
             1: "二重",
             2: "三重",
             3: "四重",
@@ -267,28 +262,26 @@ async def analyze_duplicates(code: str, target_word: str, target_weight: int) ->
         
         # Build word list with positions
         word_list = []
-        for p in sorted_phrases:
-            p_weight = p.get("weight", 0)
-            p_pos = p_weight - base_weight
+        for idx, p in enumerate(sorted_phrases):
             p_word = p.get("word", "")
+            p_weight = p.get("weight", 0)
             
-            # Only show label for position > 0
-            if p_pos > 0:
-                label = position_labels.get(p_pos, f"{p_pos + 1}重")
+            # Label based on array index
+            if idx > 0:
+                label = position_labels.get(idx, f"{idx + 1}重")
             else:
                 label = ""
             
             word_list.append({
                 "word": p_word,
                 "weight": p_weight,
-                "position": p_pos,
+                "position": idx,
                 "label": label
             })
         
         return {
             "position": position,
-            "position_label": position_labels.get(position, f"{position}重") if position > 0 else "",
-            "base_weight": base_weight,
+            "position_label": position_labels.get(position, f"{position + 1}重") if position > 0 else "",
             "all_words": word_list
         }
         

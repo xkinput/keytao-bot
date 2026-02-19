@@ -87,30 +87,30 @@ KEYTAO_API_BASE="https://keytao.vercel.app"
 
 如果你部署了自己的 Keytao Next 实例，可以修改此 URL。
 
-#### 配置 DashScope API（AI 聊天功能）
+#### 配置 Doubao API（AI 聊天功能）
 
-1. 访问 [阿里云百炼平台](https://bailian.console.aliyun.com/) 获取 API Key
+1. 访问 [火山引擎控制台](https://console.volcengine.com/ark) 获取 API Key
 2. 在 `.env.dev` 或 `.env.prod` 中配置：
 
 ```bash
-# DashScope API Key（必填）
-DASHSCOPE_API_KEY="sk-your-api-key-here"
+# Doubao ARK API Key（必填）
+ARK_API_KEY="your-ark-api-key-here"
 
 # 可选配置
-DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"  # API 地址
-DASHSCOPE_MODEL="qwen-plus"                 # 使用的模型
-DASHSCOPE_MAX_TOKENS=1000                  # 最大回复长度
-DASHSCOPE_TEMPERATURE=0.7                  # 创造性 (0.0-2.0)
+ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"  # API 地址
+ARK_MODEL="doubao-seed-1-6-251015"                      # 使用的模型
+ARK_MAX_TOKENS=1000                                      # 最大回复长度
+ARK_TEMPERATURE=0.7                                      # 创造性 (0.0-2.0)
 ```
 
 **模型选择建议**：
-- `qwen-plus` - 推荐，性价比高，适合日常对话
-- `qwen-turbo` - 更快，价格更低
-- `qwen-max` - 最强能力，价格较高
-- 更多模型：[模型列表](https://help.aliyun.com/model-studio/getting-started/models)
+- `doubao-seed-1-6-251015` - 推荐，性价比高
+- `doubao-pro-4k` - 更强能力
+- `doubao-lite-4k` - 更快，价格更低
+- 更多模型：[模型列表](https://www.volcengine.com/docs/82379/1099455)
 
 **兼容性说明**：
-- DashScope 兼容 OpenAI 的 API 格式
+- Doubao ARK 兼容 OpenAI 的 API 格式
 - 可无缝切换到其他兼容 OpenAI 的服务商
 
 #### 安装额外驱动（Telegram 需要）
@@ -254,7 +254,7 @@ ENVIRONMENT=dev nb run
 ## 📚 技术栈
 
 - **NoneBot2**：机器人框架
-- **DashScope (通义千问)**：阿里云大模型 API，提供 AI 对话能力（兼容 OpenAI 格式）
+- **Doubao (豆包)**：火山引擎大模型 API，提供 AI 对话能力（兼容 OpenAI 格式）
 - **adapter-qq**：QQ 官方接口适配器
 - **adapter-telegram**：Telegram 适配器
 - **FastAPI**：Web 框架（驱动器）
@@ -292,32 +292,32 @@ ai_chat = on_message(priority=99, block=True)
 
 ⚠️ **注意**：这会让机器人响应所有消息，可能造成刷屏和大量 API 调用费用。
 
-### DashScope API 调用失败
+### Doubao API 调用失败
 
 **错误提示**：`❌ AI 服务暂时不可用，请稍后重试`
 
 **解决方法**：
-1. 检查 `DASHSCOPE_API_KEY` 是否配置正确
+1. 检查 `ARK_API_KEY` 是否配置正确
 2. 运行测试脚本：`python test_openai.py`
 3. 查看详细日志：`LOG_LEVEL=DEBUG nb run`
-4. 检查账户余额：[账户管理](https://bailian.console.aliyun.com/)
+4. 检查账户余额：[火山引擎控制台](https://console.volcengine.com/ark)
 
 ### 如何切换模型
 
 在 `.env` 中修改：
 
 ```bash
-# 使用 qwen-max（更强大但更贵）
-DASHSCOPE_MODEL="qwen-max"
+# 使用 doubao-pro-4k（更强能力）
+ARK_MODEL="doubao-pro-4k"
 
-# 使用 qwen-turbo（更快更便宜）
-DASHSCOPE_MODEL="qwen-turbo"
+# 使用 doubao-lite-4k（更快更便宜）
+ARK_MODEL="doubao-lite-4k"
 
-# 使用 qwen-plus（推荐，均衡）
-DASHSCOPE_MODEL="qwen-plus"
+# 使用 doubao-seed-1-6-251015（推荐，均衡）
+ARK_MODEL="doubao-seed-1-6-251015"
 ```
 
-完整模型列表：[阿里云百炼模型](https://help.aliyun.com/model-studio/getting-started/models)
+完整模型列表：[豆包模型](https://www.volcengine.com/docs/82379/1099455)
 
 ## 📖 参考文档
 
@@ -328,12 +328,12 @@ DASHSCOPE_MODEL="qwen-plus"
 - [adapter-qq 文档](https://github.com/nonebot/adapter-qq)
 - [adapter-telegram 使用指南](https://github.com/nonebot/adapter-telegram/blob/beta/MANUAL.md)
 
-### DashScope (阿里云通义千问)
-- [阿里云百炼平台](https://bailian.console.aliyun.com/)
-- [DashScope API 文档](https://help.aliyun.com/model-studio/developer-reference/api-details)
-- [模型列表](https://help.aliyun.com/model-studio/getting-started/models)
-- [错误代码](https://help.aliyun.com/model-studio/developer-reference/error-code)
-- [定价说明](https://help.aliyun.com/model-studio/product-overview/billing)
+### Doubao (豆包)
+- [火山引擎控制台](https://console.volcengine.com/ark)
+- [豆包 API 文档](https://www.volcengine.com/docs/82379/1263279)
+- [模型列表](https://www.volcengine.com/docs/82379/1099455)
+- [错误代码](https://www.volcengine.com/docs/82379/1263279)
+- [定价说明](https://www.volcengine.com/docs/82379/1151134)
 
 ### 项目文档
 - [AI 聊天功能详细指南](docs/openai_chat_guide.md)
