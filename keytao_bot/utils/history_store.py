@@ -68,12 +68,12 @@ class HistoryStore:
             limit: Maximum number of messages to return
         
         Returns:
-            List of message dicts with {role, content}
+            List of message dicts with {role, content, timestamp}
         """
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT role, content 
+                SELECT role, content, timestamp
                 FROM conversations 
                 WHERE platform = ? AND user_id = ?
                 ORDER BY timestamp DESC
@@ -82,7 +82,14 @@ class HistoryStore:
             
             # Reverse to get chronological order
             rows = cursor.fetchall()
-            messages = [{"role": row[0], "content": row[1]} for row in reversed(rows)]
+            messages = [
+                {
+                    "role": row[0], 
+                    "content": row[1],
+                    "timestamp": row[2]
+                } 
+                for row in reversed(rows)
+            ]
             
             logger.debug(f"Retrieved {len(messages)} history messages for {platform}:{user_id}")
             return messages

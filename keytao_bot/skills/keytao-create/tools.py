@@ -310,7 +310,7 @@ TOOLS = [
                     },
                     "confirmed": {
                         "type": "boolean",
-                        "description": "是否已确认重码警告（仅在首次返回警告后使用）"
+                        "description": "⚠️ 重要：当工具首次返回警告（requiresConfirmation=true）后，用户确认时必须设置为true！不设置此参数会导致无限循环警告。默认false"
                     }
                 },
                 "required": ["word", "code"]
