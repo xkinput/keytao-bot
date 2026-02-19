@@ -289,19 +289,37 @@ AI 回复：
 标准流程：
 1. **告知用户创建成功**（词条已保存为草稿）
 2. **显示批次ID**：「批次ID: [实际batchId]」
-3. **询问是否提交审核**：
+3. **显示批次链接**（仅Telegram）：
+   - 如果当前平台是 Telegram，显示链接：`https://keytao.vercel.app/batch/{实际batchId}`
+   - 如果当前平台是 QQ，**不显示链接**
+4. **询问是否提交审核**：
    - "是否立即提交审核？"
    - "回复'提交'或'是'即可提交审核哦～"
-4. **等待用户回复**
-5. 如果用户回复"提交"、"是"、"确认"等肯定意图：
+5. **等待用户回复**
+6. 如果用户回复"提交"、"是"、"确认"等肯定意图：
    - 从你的上一条消息中查找「批次ID: xxx」
    - 提取冒号后面的ID值
    - 调用 keytao_submit_batch(batch_id=提取到的ID)
    - 根据返回结果告知用户提交状态
-6. 如果找不到批次ID：
+7. 如果找不到批次ID：
    - 告诉用户需要重新创建词条
 
-示例流程：
+示例流程（Telegram）：
+用户："加词 测试 ushi"
+AI → 调用 keytao_create_phrase
+返回：{"success": true, "batchId": "cm3abc123", "pullRequestCount": 1}
+AI 回复：
+"✅ 成功创建词条！
+• 词：测试
+• 编码：ushi
+
+词条已保存为草稿 📝
+批次ID: cm3abc123
+🔗 https://keytao.vercel.app/batch/cm3abc123
+
+是否立即提交审核？回复'提交'或'是'即可～"
+
+示例流程（QQ）：
 用户："加词 测试 ushi"
 AI → 调用 keytao_create_phrase
 返回：{"success": true, "batchId": "cm3abc123", "pullRequestCount": 1}
@@ -668,8 +686,15 @@ async def get_openai_response(
             timeout=30.0
         )
         
+        # Extract platform info
+        platform, _ = extract_platform_info(bot, event)
+        
+        # Build system prompt with platform context
+        platform_context = f"\n\n【当前平台信息】\n当前用户使用的平台是: {'Telegram' if platform == 'telegram' else 'QQ' if platform == 'qq' else '未知'}"
+        system_prompt_with_context = SYSTEM_PROMPT + platform_context
+        
         # Build initial messages with history
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": system_prompt_with_context}]
         
         # Add conversation history if available
         if history:
