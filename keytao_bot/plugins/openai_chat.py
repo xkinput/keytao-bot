@@ -524,9 +524,6 @@ AI 回复：
 • 词：测试
 • 编码：ushi
 
-词条已保存为草稿 📝
-🔗 https://keytao.vercel.app/batch
-
 是否立即提交审核？回复'提交'或'是'即可～
 也可以继续添加/修改/删除词条哦"
 
@@ -1132,46 +1129,54 @@ async def handle_ai_chat(bot: Bot, event: Event):
     add_to_history(conv_key, message_text, response)
     
     # Platform-specific reply handling
-    try:
-        # Detect platform by bot class name (more reliable)
-        bot_class_name = bot.__class__.__name__
-        bot_module_name = bot.__class__.__module__
-        
-        logger.debug(f"Bot type: {bot_class_name}, Module: {bot_module_name}")
-        
-        # Telegram: keep URLs (supports links)
-        if 'telegram' in bot_module_name.lower():
-            if TGGroupMessageEvent and isinstance(event, TGGroupMessageEvent):
-                message_id = event.message_id
+    # Detect platform by bot class name (more reliable)
+    bot_class_name = bot.__class__.__name__
+    bot_module_name = bot.__class__.__module__
+    
+    logger.debug(f"Bot type: {bot_class_name}, Module: {bot_module_name}")
+    
+    # Telegram: keep URLs (supports links), reply to user message
+    if 'telegram' in bot_module_name.lower():
+        message_id = getattr(event, 'message_id', None)
+        logger.info(f"Telegram message_id: {message_id}")
+        if message_id:
+            try:
+                logger.info(f"Attempting Telegram reply to message_id: {message_id}")
                 await bot.send(
                     event=event,
                     message=response,
                     reply_to_message_id=message_id
                 )
-            else:
+                logger.info("Telegram reply sent successfully")
+                return  # Successfully sent with reply, exit handler
+            except Exception as e:
+                logger.error(f"Failed to send Telegram reply: {e}", exc_info=True)
+                # Fallback to normal send
                 await ai_chat.finish(response)
-            raise FinishedException
-        
-        # QQ: remove URLs (API restriction)
-        elif 'qq' in bot_module_name.lower() or bot_class_name == 'Bot':
-            filtered_response = remove_urls(response)
-            logger.info(f"QQ platform detected, filtering URLs. Original: {len(response)} chars, Filtered: {len(filtered_response)} chars")
-            await ai_chat.finish(filtered_response)
-        
-        # Other platforms: send normally
         else:
-            logger.warning(f"Unknown platform, sending without filtering: {bot_class_name}")
+            logger.warning("Telegram message_id not found, using finish")
             await ai_chat.finish(response)
-            
-    except FinishedException:
-        raise
-    except Exception as e:
-        logger.error(f"Error sending reply: {e}")
-        # Fallback: try with URL filtering for safety
-        try:
-            filtered_response = remove_urls(response)
-            await ai_chat.finish(filtered_response)
-        except:
-            await ai_chat.finish(response)
+    
+    # QQ: remove URLs (API restriction), try to reply to user message
+    elif 'qq' in bot_module_name.lower() or bot_class_name == 'Bot':
+        filtered_response = remove_urls(response)
+        logger.info(f"QQ platform detected, filtering URLs. Original: {len(response)} chars, Filtered: {len(filtered_response)} chars")
+        
+        # For QQ, check if event has reply method (some QQ adapters support this)
+        if hasattr(event, 'reply') and callable(getattr(event, 'reply', None)):
+            try:
+                reply_func = getattr(event, 'reply')
+                await reply_func(filtered_response)
+                return  # Successfully sent with reply, exit handler
+            except Exception as e:
+                logger.warning(f"Failed to use QQ event.reply: {e}, falling back to finish")
+        
+        # Fallback: normal send without reference
+        await ai_chat.finish(filtered_response)
+    
+    # Other platforms: send normally
+    else:
+        logger.warning(f"Unknown platform, sending without filtering: {bot_class_name}")
+        await ai_chat.finish(response)
 
 
