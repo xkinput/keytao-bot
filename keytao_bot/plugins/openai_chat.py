@@ -170,14 +170,49 @@ SYSTEM_PROMPT = """你是键道输入法的AI助手"喵喵"，温暖活泼、乐
 ━━━━━━━━━━━━━━━━
 
 第1次调用返回警告（success=false, requiresConfirmation=true）：
-• 词条尚未创建
+• 词条尚未创建/删除
 • 向用户说明警告内容
 • 询问是否确认
 • 记住所有参数（word, code, action等）
 
-用户确认后：
+警告类型：
+1. duplicate_code（重码）：编码已被其他词占用
+2. multiple_code（多编码）：此词有多个编码
+
+删除操作的multiple_code警告：
+• API会返回allCodes字段，包含该词的所有编码列表
+• 你必须向用户展示所有编码，告知删除后的影响：
+  - 如果只剩1个编码 → "删除后该词将完全消失"
+  - 如果还有其他编码 → "删除后仍可通过其他编码输入"
+• 示例展示：
+  ```
+  词条【如果】共有3个编码：
+  • rjgl (词组)  ← 即将删除
+  • ri (声笔笔)
+  • rg (声笔笔)
+  
+  删除rjgl后，该词仍可通过ri和rg输入。
+  ```
+
+用户确认后（关键！）：
 • 立即再次调用同一工具
 • 使用完全相同的参数
+• ⚠️⚠️⚠️ 唯一区别：添加confirmed=true
+• 不要让用户重新输入！
+
+示例（删除操作）：
+```
+第1次调用：
+keytao_create_phrase(word="如果", code="rjgl", action="Delete")
+返回警告 + allCodes=[{code:"rjgl"}, {code:"ri"}]
+
+AI → 展示所有编码，询问用户
+
+用户："确认"
+
+第2次调用（必须添加confirmed=true）：
+keytao_create_phrase(word="如果", code="rjgl", action="Delete", confirmed=true)
+```
 • 唯一区别：添加confirmed=true
 • 不要让用户重新输入！
 
