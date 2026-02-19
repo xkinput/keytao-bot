@@ -47,10 +47,30 @@ SYSTEM_PROMPT = """⚠️⚠️⚠️ 执行前必读 ⚠️⚠️⚠️
 【安全规则 - 最高优先级】
 
 1️⃣ **确认类回复的上下文检查**（防止误操作）：
-   - 如果用户只说"是"、"确认"、"确定"、"好"等简短肯定词
-   - **必须检查对话历史**中你的上一条消息（assistant的最后一条）
-   - 只有当上一条消息**明确询问用户确认某个操作**时，才能执行对应操作
-   - 如果上一条消息不是询问确认，则回复："没有待确认的操作哦～有什么可以帮你的吗？"
+   - 如果用户只说"是"、"确认"、"确定"、"好"、"提交"等简短肯定词
+   
+   A. **检查引用消息（最优先）**：
+      • 如果收到【用户正在回复你的消息】提示：
+        - 用户回复的是你（bot）的消息 ✅
+        - 从被引用的消息内容中提取批次ID或操作信息
+        - 根据被引用消息的内容理解用户要确认什么操作
+        - 执行对应操作（如提取批次ID并调用keytao_submit_batch）
+      
+      • 如果收到【用户正在回复其他人的消息】提示：
+        - 用户回复的是其他用户的消息 ❌
+        - **不要执行任何操作**
+        - 回复："请回复bot的消息来确认操作哦～你回复的是其他用户的消息，我无法处理 >_<"
+      
+      • 如果没有引用消息提示（用户未使用reply）：
+        - 继续检查B（对话历史）
+   
+   B. **检查对话历史（备选方案）**：
+      • 如果用户没有引用消息，则检查对话历史中你的上一条消息
+      • 只有当上一条消息**明确询问用户确认某个操作**时，才能执行对应操作
+      • 如果上一条消息不是询问确认，则回复："没有待确认的操作哦～有什么可以帮你的吗？"
+   
+   ⚠️ 优先级：引用消息 > 对话历史
+   ⚠️ 目的：确保用户确认的是正确的操作，避免误操作或操作其他人的词条
 
 2️⃣ **批次所有权验证**：
    - 所有批次操作（创建/删除/提交）都会自动验证用户身份
@@ -264,12 +284,19 @@ AI 回复：
 • 创建：keytao_create_phrase(word, code, action="Create", type?, remark?)
 • 删除：keytao_create_phrase(word, code, action="Delete")
   ⚠️ 删除前必须先查询，获取准确的词和编码
-• 修改：目前暂不支持直接修改，告知用户"需要先删除旧词，再添加新词"
+• 修改：keytao_create_phrase(word, code, action="Change", old_word)
+  ⚠️ 参数说明：
+     - word: 新词（修改后的词条内容）
+     - old_word: 旧词（当前的词条内容）
+     - code: 编码（不变）
+  ⚠️ 示例：用户说"改词 如果 如果2 rjgl"
+     调用: keytao_create_phrase(word="如果2", old_word="如果", code="rjgl", action="Change")
 
 ⚠️ 关键注意事项：
 - 删除操作**绝对不能猜测**词或编码
 - 必须先调用查询工具确认存在
 - action="Delete" 时必须同时提供准确的 word 和 code
+- action="Change" 时，word是新词，old_word是旧词
 - 不需要提供 platform 和 platform_id，系统会自动识别
 
 ⚠️⚠️⚠️ 冲突和警告处理流程（极其重要！）⚠️⚠️⚠️
@@ -367,10 +394,28 @@ AI 回复：
    - "回复'提交'或'是'即可提交审核哦～"
 5. **等待用户回复**
 6. 如果用户回复"提交"、"是"、"确认"等肯定意图：
-   - 从你的上一条消息中查找「批次ID: xxx」
-   - 提取冒号后面的ID值
-   - 调用 keytao_submit_batch(batch_id=提取到的ID)
-   - 根据返回结果告知用户提交状态
+   ⚠️⚠️⚠️ 重要：必须调用工具，不要只回复文本！
+   
+   A. **优先检查引用消息**：
+      • 如果用户使用了reply（你会收到【用户正在回复你的消息】提示）：
+        - 从被引用的消息内容中查找「批次ID: xxx」
+        - 提取冒号后面的完整ID值（格式如：7e204eda-7452-456d-aa06-eef3f3112189）
+        - **立即调用工具** keytao_submit_batch(batch_id="提取到的ID")
+      
+      • 如果用户回复的是其他人的消息：
+        - 不要执行操作，提示用户需要回复bot的消息
+   
+   B. **备选：从对话历史查找**：
+      • 如果用户没有使用reply，则从对话历史中查找你上一条消息
+      • 在你的上一条消息里查找「批次ID: xxx」
+      • 提取并调用工具
+   
+   - 等待工具返回结果
+   - 根据返回的success和message告知用户提交状态
+   ⚠️ 禁止行为：不要猜测结果，不要在未调用工具的情况下直接回复"已提交"
+   - 等待工具返回结果
+   - 根据返回的success和message告知用户提交状态
+   ⚠️ 禁止行为：不要猜测结果，不要在未调用工具的情况下直接回复"已提交"
 7. 如果找不到批次ID：
    - 告诉用户需要重新创建词条
 
@@ -791,8 +836,38 @@ async def get_openai_response(
             messages.extend(history)
             logger.debug(f"Using {len(history)} history messages")
         
-        # Add current user message
-        messages.append({"role": "user", "content": message})
+        # Check if user is replying to a message
+        reply_context = ""
+        reply_to_message = getattr(event, 'reply_to_message', None)
+        if reply_to_message:
+            # Get bot info
+            try:
+                bot_info = await bot.get_me()
+                bot_id = getattr(bot_info, 'id', None)
+            except:
+                bot_id = None
+            
+            # Check who sent the replied message
+            reply_from = getattr(reply_to_message, 'from_', None)
+            reply_message_text = getattr(reply_to_message, 'text', None)
+            
+            if reply_from and reply_message_text:
+                reply_from_id = getattr(reply_from, 'id', None)
+                reply_from_name = getattr(reply_from, 'first_name', '未知用户')
+                
+                # Check if replying to bot's own message
+                is_reply_to_bot = (bot_id and reply_from_id == bot_id)
+                
+                if is_reply_to_bot:
+                    reply_context = f"\n\n【用户正在回复你的消息】\n被引用的消息内容：\n{reply_message_text}\n\n⚠️ 用户的回复是针对这条消息的，请根据这条消息的内容理解用户意图。"
+                    logger.info(f"User is replying to bot's message: {reply_message_text[:100]}")
+                else:
+                    reply_context = f"\n\n【用户正在回复其他人的消息】\n被引用消息的发送者：{reply_from_name}\n被引用的消息内容：\n{reply_message_text}\n\n⚠️ 用户回复的不是你的消息，如果用户说的是操作指令（如'是'、'确认'、'提交'），应该提醒用户：你需要回复bot的消息才能确认操作。"
+                    logger.info(f"User is replying to someone else's message (from {reply_from_name})")
+        
+        # Add current user message with reply context
+        user_message_content = message + reply_context
+        messages.append({"role": "user", "content": user_message_content})
         
         # Get available tools
         tools = skills_manager.get_tools() if skills_manager.has_tools() else None
