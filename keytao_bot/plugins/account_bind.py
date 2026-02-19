@@ -6,6 +6,7 @@ from nonebot import on_command, get_driver
 from nonebot.adapters import Bot, Event
 from nonebot.exception import FinishedException
 from nonebot.log import logger
+from nonebot.rule import Rule
 import httpx
 
 # Get configuration from NoneBot
@@ -18,8 +19,69 @@ BOT_API_TOKEN = getattr(config, "bot_api_token", None)
 logger.info(f"[account_bind] KEYTAO_API_BASE: {KEYTAO_API_BASE}")
 logger.info(f"[account_bind] BOT_API_TOKEN loaded: {bool(BOT_API_TOKEN)}")
 
-# Bind command
-bind_cmd = on_command("bind", priority=5, block=True)
+
+# Custom rule for handling /bind only in appropriate contexts
+async def should_handle_bind(bot: Bot, event: Event) -> bool:
+    """
+    Rule to handle /bind command:
+    - Private messages: always
+    - Group messages: only when bot is mentioned or replied to
+    """
+    try:
+        from nonebot.adapters.telegram import Bot as TelegramBot
+        from nonebot.adapters.telegram.event import PrivateMessageEvent, GroupMessageEvent
+        from nonebot.adapters.qq import Bot as QQBot
+        
+        if isinstance(bot, TelegramBot):
+            # Telegram: always in private
+            if isinstance(event, PrivateMessageEvent):
+                return True
+            # Telegram: in group, check for mention or reply
+            elif isinstance(event, GroupMessageEvent):
+                # Check if message is a reply to bot
+                reply_to_message = getattr(event, 'reply_to_message', None)
+                if reply_to_message:
+                    bot_info = await bot.get_me()
+                    # Check if the replied message is from the bot
+                    reply_from = getattr(reply_to_message, 'from_', None)
+                    if reply_from and reply_from.id == bot_info.id:
+                        logger.info("[account_bind] Message is a reply to bot, will handle")
+                        return True
+                
+                # Check for @mention
+                bot_info = await bot.get_me()
+                bot_username = bot_info.username
+                message_to_check = getattr(event, 'original_message', event.message)
+                
+                for segment in message_to_check:
+                    if segment.type == 'mention':
+                        mention_text = segment.data.get('text', '')
+                        if mention_text == f"@{bot_username}":
+                            logger.info(f"[account_bind] Bot mentioned in group, will handle")
+                            return True
+                
+                logger.debug("[account_bind] Bot not mentioned/replied in group, will not handle")
+                return False
+            return False
+        
+        elif isinstance(bot, QQBot):
+            # QQ: use default to_me() behavior
+            from nonebot.rule import to_me
+            return await to_me()(bot, event, {})
+        
+        else:
+            # Other platforms: use to_me()
+            from nonebot.rule import to_me
+            return await to_me()(bot, event, {})
+            
+    except Exception as e:
+        logger.error(f"[account_bind] Error in should_handle_bind rule: {e}")
+        # Fallback: allow in all cases to avoid breaking the command
+        return True
+
+
+# Bind command with custom rule
+bind_cmd = on_command("bind", rule=Rule(should_handle_bind), priority=5, block=True)
 
 
 @bind_cmd.handle()

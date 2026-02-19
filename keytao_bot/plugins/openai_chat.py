@@ -508,8 +508,18 @@ async def should_handle(bot: Bot, event: Event) -> bool:
             if isinstance(event, PrivateMessageEvent):
                 logger.debug("Telegram private message, will handle")
                 return True
-            # Telegram: in groups, check for mentions
+            # Telegram: in groups, check for mentions or replies
             elif isinstance(event, GroupMessageEvent):
+                # Check if message is a reply to bot
+                reply_to_message = getattr(event, 'reply_to_message', None)
+                if reply_to_message:
+                    bot_info = await bot.get_me()
+                    # Check if the replied message is from the bot
+                    reply_from = getattr(reply_to_message, 'from_', None)
+                    if reply_from and reply_from.id == bot_info.id:
+                        logger.info("Message is a reply to bot, will handle")
+                        return True
+                
                 # Get message text
                 message_text = event.get_plaintext().strip()
                 logger.debug(f"Telegram group message: '{message_text}'")
@@ -535,7 +545,7 @@ async def should_handle(bot: Bot, event: Event) -> bool:
                 except Exception as segment_err:
                     logger.debug(f"Error checking message segments: {segment_err}")
                 
-                logger.debug("Bot not mentioned in group, will not handle")
+                logger.debug("Bot not mentioned/replied in group, will not handle")
                 return False
             return False
         
@@ -564,7 +574,8 @@ def remove_urls(text: str) -> str:
 
 # Clear history command
 from nonebot import on_command
-clear_cmd = on_command("clear", aliases={"重置", "清空"}, priority=5, block=True)
+from nonebot.rule import Rule
+clear_cmd = on_command("clear", aliases={"重置", "清空"}, rule=Rule(should_handle), priority=5, block=True)
 
 @clear_cmd.handle()
 async def handle_clear(bot: Bot, event: Event):
