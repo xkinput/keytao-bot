@@ -13,6 +13,18 @@ DOCS_MAPPING = {
         "guide/learn-xkjd/phonetics-rules.md",  # 音码规则
         "guide/learn-xkjd/stroke-rules.md",      # 形码规则
     ],
+    "音码": [
+        "guide/learn-xkjd/phonetics-rules.md",
+    ],
+    "零声母": [
+        "guide/learn-xkjd/phonetics-rules.md",
+    ],
+    "声母": [
+        "guide/learn-xkjd/phonetics-rules.md",
+    ],
+    "韵母": [
+        "guide/learn-xkjd/phonetics-rules.md",
+    ],
     "学习": [
         "guide/learn-xkjd/index.md",             # 研习键道概述
         "guide/start-xkjd/index.md",             # 入门键道
@@ -26,10 +38,16 @@ DOCS_MAPPING = {
         "guide/learn-xkjd/stroke-rules.md",
         "guide/learn-xkjd/layouts.md",
     ],
+    "形码": [
+        "guide/learn-xkjd/stroke-rules.md",
+    ],
     "单字": [
         "guide/start-xkjd/characters.md",
     ],
     "词组": [
+        "guide/start-xkjd/phrases.md",
+    ],
+    "词语": [
         "guide/start-xkjd/phrases.md",
     ],
     "顶功": [
@@ -37,6 +55,13 @@ DOCS_MAPPING = {
     ],
     "简码": [
         "guide/advance-in-xkjd/shorthand.md",
+    ],
+    "入门": [
+        "guide/start-xkjd/index.md",
+    ],
+    "教程": [
+        "guide/start-xkjd/index.md",
+        "guide/learn-xkjd/index.md",
     ],
 }
 
@@ -166,13 +191,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_fetch_docs",
-            "description": "从键道输入法官方文档网站获取相关内容。用于回答关于键道的学习方法、编码规则、教程、概念解释等问题",
+            "description": "从键道输入法官方文档获取内容。用于回答：1) 如何使用键道（零声母、顶功、简码等输入规则）; 2) 学习方法和教程; 3) 安装配置指南; 4) 输入法概念解释。注意：查询具体词条编码请用lookup工具，不要用本工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "要查询的问题或关键词，如 '学习方法', '编码规则', '字根', '安装教程'等"
+                        "description": "要查询的问题或关键词，如 '零声母', '顶功', '学习方法', '字根规则', '安装教程'等"
                     }
                 },
                 "required": ["query"]
