@@ -304,7 +304,7 @@ async def call_tool_function(
     
     try:
         # Auto-inject platform and platform_id for keytao tools
-        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch']:
+        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch', 'keytao_list_draft_items', 'keytao_remove_draft_item']:
             if bot and event:
                 platform, platform_id = extract_platform_info(bot, event)
                 arguments['platform'] = platform
@@ -566,7 +566,7 @@ async def get_openai_response(
                     function_result = await call_tool_function(function_name, function_args, bot, event)
                     
                     # If tool requires confirmation, save pending state so next user message can bypass AI
-                    if function_name == "keytao_create_phrase" and bot and event:
+                    if function_name in ("keytao_create_phrase", "keytao_submit_batch") and bot and event:
                         try:
                             result_data = json.loads(function_result)
                             if result_data.get("requiresConfirmation"):

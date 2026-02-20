@@ -204,7 +204,8 @@ async def keytao_create_phrase(
 
 async def keytao_submit_batch(
     platform: str,
-    platform_id: str
+    platform_id: str,
+    confirmed: bool = False
 ) -> Dict:
     """
     Submit current draft batch for review
@@ -216,6 +217,7 @@ async def keytao_submit_batch(
     Args:
         platform: Platform type ('qq' or 'telegram')
         platform_id: User's platform ID
+        confirmed: Whether to confirm duplicate code / multiple code warnings
         
     Returns:
         dict: API response with success status
@@ -249,7 +251,8 @@ async def keytao_submit_batch(
                 },
                 json={
                     "platform": platform,
-                    "platformId": platform_id
+                    "platformId": platform_id,
+                    "confirmed": confirmed
                 }
             )
             
@@ -285,6 +288,92 @@ async def keytao_submit_batch(
             "success": False,
             "message": f"提交失败: {str(e)}"
         }
+
+
+async def keytao_list_draft_items(
+    platform: str,
+    platform_id: str,
+) -> Dict:
+    """
+    List all PR items in the user's latest draft batch
+    列出用户最新草稿批次中的所有条目
+    """
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+
+    if not BOT_API_TOKEN:
+        return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    url = f"{KEYTAO_API_BASE}/api/bot/batches/latest-draft/items"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                url,
+                headers={"X-Bot-Token": BOT_API_TOKEN},
+                params={"platform": platform, "platformId": platform_id}
+            )
+
+            try:
+                data = response.json()
+            except Exception:
+                logger.error(f"[keytao_list_draft_items] Non-JSON response ({response.status_code}): {response.text[:200]}")
+                return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+
+            logger.info(f"[keytao_list_draft_items] status={response.status_code} count={data.get('count', 0)}")
+            return data
+
+    except httpx.TimeoutException:
+        return {"success": False, "message": "请求超时，请稍后重试"}
+    except Exception as e:
+        logger.error(f"List draft items error: {e}")
+        return {"success": False, "message": f"获取失败: {str(e)}"}
+
+
+async def keytao_remove_draft_item(
+    platform: str,
+    platform_id: str,
+    pr_id: int,
+) -> Dict:
+    """
+    Remove a specific PR item from the user's draft batch
+    从用户草稿批次中删除指定的词条条目
+
+    Args:
+        platform: Platform type ('qq' or 'telegram')
+        platform_id: User's platform ID
+        pr_id: The numeric ID of the PR to delete (obtainable from keytao_list_draft_items)
+    """
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+
+    if not BOT_API_TOKEN:
+        return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/{pr_id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.delete(
+                url,
+                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                json={"platform": platform, "platformId": platform_id}
+            )
+
+            try:
+                data = response.json()
+            except Exception:
+                logger.error(f"[keytao_remove_draft_item] Non-JSON response ({response.status_code}): {response.text[:200]}")
+                return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+
+            logger.info(f"[keytao_remove_draft_item] PR#{pr_id} status={response.status_code}")
+            return data
+
+    except httpx.TimeoutException:
+        return {"success": False, "message": "请求超时，请稍后重试"}
+    except Exception as e:
+        logger.error(f"Remove draft item error: {e}")
+        return {"success": False, "message": f"删除失败: {str(e)}"}
 
 
 # Tool definitions for OpenAI Function Calling
@@ -339,8 +428,42 @@ TOOLS = [
             "description": "提交当前草稿批次进行审核。用于用户确认提交词条修改后。会自动查找并提交用户的草稿批次。",
             "parameters": {
                 "type": "object",
+                "properties": {
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "⚠️ 重要：当提交返回重码警告（requiresConfirmation=true）后，用户确认时必须设置为true。默认false"
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_list_draft_items",
+            "description": "查看当前草稿批次中所有待审词条。用于用户询问草稿内容、想确认已添加了哪些词条时调用。返回条目列表包含 id、词条、编码、操作类型。",
+            "parameters": {
+                "type": "object",
                 "properties": {},
                 "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_remove_draft_item",
+            "description": "从草稿批次中删除指定词条。用于用户要撤销、取消或删除某个已添加的词条时调用。需要先用 keytao_list_draft_items 获取条目 ID。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pr_id": {
+                        "type": "integer",
+                        "description": "要删除的条目 ID（从 keytao_list_draft_items 返回的 items[].id 获取）"
+                    }
+                },
+                "required": ["pr_id"]
             }
         }
     }
@@ -350,5 +473,7 @@ TOOLS = [
 # Tool registry for dynamic calling
 TOOL_FUNCTIONS = {
     "keytao_create_phrase": keytao_create_phrase,
-    "keytao_submit_batch": keytao_submit_batch
+    "keytao_submit_batch": keytao_submit_batch,
+    "keytao_list_draft_items": keytao_list_draft_items,
+    "keytao_remove_draft_item": keytao_remove_draft_item,
 }
