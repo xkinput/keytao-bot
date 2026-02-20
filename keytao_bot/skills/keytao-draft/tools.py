@@ -325,9 +325,12 @@ async def keytao_list_draft_items(
 
     except httpx.TimeoutException:
         return {"success": False, "message": "请求超时，请稍后重试"}
+    except httpx.TransportError as e:
+        logger.error(f"List draft items network error: {type(e).__name__}: {e!r}")
+        return {"success": False, "message": f"网络错误: {type(e).__name__}"}
     except Exception as e:
-        logger.error(f"List draft items error: {e}")
-        return {"success": False, "message": f"获取失败: {str(e)}"}
+        logger.error(f"List draft items error: {type(e).__name__}: {e!r}")
+        return {"success": False, "message": f"获取失败: {type(e).__name__}: {e}"}
 
 
 async def keytao_remove_draft_item(
@@ -354,10 +357,11 @@ async def keytao_remove_draft_item(
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.delete(
+            response = await client.request(
+                "DELETE",
                 url,
                 headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
-                json={"platform": platform, "platformId": platform_id}
+                content=json.dumps({"platform": platform, "platformId": platform_id})
             )
 
             try:
