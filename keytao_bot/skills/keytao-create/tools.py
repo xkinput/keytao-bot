@@ -122,6 +122,21 @@ async def keytao_create_phrase(
             "message": "无法获取草稿批次，请稍后重试"
         }
     
+    # Auto-detect type when not explicitly specified, mirrors detectPhraseType in keytao-next
+    if type == "Phrase":
+        import re, unicodedata
+        is_symbol_word = word and all(
+            unicodedata.category(c).startswith(('P', 'S')) for c in word if not c.isspace()
+        )
+        if (code and code.startswith(';')) or is_symbol_word:
+            type = "Symbol"
+        elif re.search(r'https?://|www\.', word, re.IGNORECASE):
+            type = "Link"
+        elif re.search(r'[a-zA-Z]', word):
+            type = "English"
+        elif len(word) == 1 and re.match(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', word):
+            type = "Single"
+
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch"
     
     request_data = {
