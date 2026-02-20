@@ -3,6 +3,7 @@ Skills loader for AI chat
 加载和管理 AI skills
 """
 import os
+import re
 import importlib.util
 from pathlib import Path
 from typing import Dict, List, Callable, Optional
@@ -22,6 +23,7 @@ class SkillsManager:
         
         self.tools: List[Dict] = []
         self.tool_functions: Dict[str, Callable] = {}
+        self.skill_docs: Dict[str, str] = {}
         
     def load_all_skills(self):
         """Load all skills from skills directory"""
@@ -33,8 +35,34 @@ class SkillsManager:
             if skill_path.is_dir() and not skill_path.name.startswith('.'):
                 self.load_skill(skill_path)
     
+    def _parse_skill_md(self, content: str, skill_name: str) -> str:
+        """Extract skill instructions from SKILL.md"""
+        # Remove frontmatter (YAML between --- ---)
+        content = re.sub(r'^---\n.*?\n---\n', '', content, flags=re.DOTALL)
+        
+        # Clean up excessive whitespace
+        content = re.sub(r'\n{3,}', '\n\n', content)
+        content = content.strip()
+        
+        return f"## SKILL: {skill_name}\n\n{content}"
+    
     def load_skill(self, skill_path: Path):
-        """Load a single skill"""
+        """Load a single skill (tools + documentation)"""
+        skill_name = skill_path.name
+        
+        # Load SKILL.md first
+        skill_md = skill_path / "SKILL.md"
+        if skill_md.exists():
+            try:
+                with open(skill_md, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    parsed_doc = self._parse_skill_md(content, skill_name)
+                    self.skill_docs[skill_name] = parsed_doc
+                    logger.info(f"📚 Loaded documentation for skill: {skill_name}")
+            except Exception as e:
+                logger.error(f"Failed to load SKILL.md for {skill_name}: {e}")
+        
+        # Load tools.py
         tools_file = skill_path / "tools.py"
         
         if not tools_file.exists():
@@ -57,11 +85,11 @@ class SkillsManager:
             # Get tools and functions
             if hasattr(module, 'TOOLS'):
                 self.tools.extend(module.TOOLS)
-                logger.info(f"Loaded {len(module.TOOLS)} tools from skill: {skill_path.name}")
+                logger.info(f"🔧 Loaded {len(module.TOOLS)} tools from skill: {skill_name}")
             
             if hasattr(module, 'TOOL_FUNCTIONS'):
                 self.tool_functions.update(module.TOOL_FUNCTIONS)
-                logger.info(f"Registered {len(module.TOOL_FUNCTIONS)} functions from skill: {skill_path.name}")
+                logger.info(f"⚙️  Registered {len(module.TOOL_FUNCTIONS)} functions from skill: {skill_name}")
                 
         except Exception as e:
             logger.error(f"Failed to load skill {skill_path.name}: {e}")
@@ -77,3 +105,12 @@ class SkillsManager:
     def has_tools(self) -> bool:
         """Check if any tools are loaded"""
         return len(self.tools) > 0
+    
+    def get_skill_instructions(self) -> str:
+        """Get combined instructions from all skills"""
+        if not self.skill_docs:
+            return ""
+        
+        instructions = "\n\n━━━━━━━━━━━━━━━━━━━━\n📚 功能说明文档\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        instructions += "\n\n".join(self.skill_docs.values())
+        return instructions
