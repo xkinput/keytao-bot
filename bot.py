@@ -4,7 +4,7 @@
 keytao-bot entry point
 """
 import nonebot
-from nonebot.adapters.qq import Adapter as QQAdapter
+from nonebot.adapters.onebot.v11 import Adapter as OneBotAdapter
 from nonebot.adapters.telegram import Adapter as TelegramAdapter
 
 # Initialize NoneBot
@@ -14,7 +14,7 @@ nonebot.init()
 driver = nonebot.get_driver()
 
 # Register adapters
-driver.register_adapter(QQAdapter)
+driver.register_adapter(OneBotAdapter)
 driver.register_adapter(TelegramAdapter)
 
 # Load plugins

@@ -1,0 +1,32 @@
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    environment:
+      - NAPCAT_UID=${NAPCAT_UID:-1000}
+      - NAPCAT_GID=${NAPCAT_GID:-1000}
+      - ACCOUNT=3785773770
+    ports:
+      - "6099:6099"   # WebUI: http://localhost:6099/webui
+    volumes:
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/qq:/app/.config/QQ
+    networks:
+      - bot-net
+
+  bot:
+    build: .
+    container_name: keytao-bot
+    restart: always
+    env_file: .env
+    volumes:
+      - .:/app
+    networks:
+      - bot-net
+    depends_on:
+      - napcat
+
+networks:
+  bot-net:
+    driver: bridge

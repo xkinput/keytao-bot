@@ -30,9 +30,9 @@ def remove_urls_for_qq(text: str) -> str:
 
 
 def is_qq_bot(bot: Bot) -> bool:
-    """Check if current bot is QQ platform"""
+    """Check if current bot is QQ platform (OneBot v11 via NapCat)"""
     try:
-        from nonebot.adapters.qq import Bot as QQBot
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
         return isinstance(bot, QQBot)
     except:
         return False
@@ -48,7 +48,7 @@ async def should_handle_bind(bot: Bot, event: Event) -> bool:
     try:
         from nonebot.adapters.telegram import Bot as TelegramBot
         from nonebot.adapters.telegram.event import PrivateMessageEvent, GroupMessageEvent
-        from nonebot.adapters.qq import Bot as QQBot
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
         
         if isinstance(bot, TelegramBot):
             # Telegram: always in private
@@ -113,7 +113,7 @@ async def handle_bind(bot: Bot, event: Event):
     
     # Get platform info
     try:
-        from nonebot.adapters.qq import Bot as QQBot
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
         from nonebot.adapters.telegram import Bot as TelegramBot
         
         if isinstance(bot, QQBot):

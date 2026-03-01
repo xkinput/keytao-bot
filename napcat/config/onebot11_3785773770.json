@@ -1,0 +1,26 @@
+{
+  "network": {
+    "httpServers": [],
+    "httpSseServers": [],
+    "httpClients": [],
+    "websocketServers": [],
+    "websocketClients": [
+      {
+        "name": "keytao-bot",
+        "enable": true,
+        "url": "ws://bot:8080/onebot/v11/ws",
+        "reconnectInterval": 3000,
+        "heartInterval": 30000,
+        "token": "",
+        "messagePostFormat": "array",
+        "reportSelfMessage": false,
+        "debug": false
+      }
+    ],
+    "plugins": []
+  },
+  "musicSignUrl": "",
+  "enableLocalFile2Url": false,
+  "parseMultMsg": false,
+  "imageDownloadProxy": ""
+}

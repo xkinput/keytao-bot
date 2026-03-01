@@ -109,7 +109,7 @@ async def should_handle(bot: Bot, event: Event) -> bool:
         # Import platform-specific types
         from nonebot.adapters.telegram import Bot as TelegramBot
         from nonebot.adapters.telegram.event import PrivateMessageEvent, GroupMessageEvent
-        from nonebot.adapters.qq import Bot as QQBot
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
         
         if isinstance(bot, TelegramBot):
             # Telegram: always respond in private chats
@@ -262,7 +262,7 @@ def extract_platform_info(bot: Bot, event: Event) -> tuple[str, str]:
     """
     try:
         from nonebot.adapters.telegram import Bot as TelegramBot
-        from nonebot.adapters.qq import Bot as QQBot
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
     except ImportError:
         TelegramBot = None
         QQBot = None
@@ -277,13 +277,8 @@ def extract_platform_info(bot: Bot, event: Event) -> tuple[str, str]:
             user_id = ''
         return ("telegram", user_id)
     elif QQBot and isinstance(bot, QQBot):
-        # QQ platform
-        author = getattr(event, 'author', None)
-        if author:
-            user_id = str(getattr(author, 'id', ''))
-        else:
-            # Fallback: try user_id field directly
-            user_id = str(getattr(event, 'user_id', ''))
+        # QQ platform (OneBot v11 via NapCat)
+        user_id = str(getattr(event, 'user_id', ''))
         return ("qq", user_id)
     else:
         # Unknown platform, return generic values
@@ -616,14 +611,11 @@ async def handle_ai_chat(bot: Bot, event: Event):
         TGGroupMessageEvent = None
     
     try:
-        from nonebot.adapters.qq import Bot as QQBot
-        from nonebot.adapters.qq import MessageSegment as QQMessageSegment
-        from nonebot.adapters.qq.event import GroupAtMessageCreateEvent, C2CMessageCreateEvent
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
+        from nonebot.adapters.onebot.v11 import MessageSegment as QQMessageSegment
     except ImportError:
         QQBot = None
         QQMessageSegment = None
-        GroupAtMessageCreateEvent = None
-        C2CMessageCreateEvent = None
     
     # Get message text
     message_text = event.get_plaintext().strip()
@@ -707,37 +699,25 @@ async def handle_ai_chat(bot: Bot, event: Event):
             await ai_chat.finish(response)
     
     # QQ: remove URLs (API restriction), try to reply to user message
-    elif 'qq' in bot_module_name.lower() or bot_class_name == 'Bot':
+    elif 'onebot' in bot_module_name.lower() or bot_class_name == 'Bot':
         filtered_response = remove_urls(response)
         logger.info(f"QQ platform detected, filtering URLs. Original: {len(response)} chars, Filtered: {len(filtered_response)} chars")
         
         # Try to get QQ message id for reply
-        qq_msg_id = getattr(event, 'id', None) or getattr(event, 'message_id', None)
-        logger.info(f"QQ message id: {qq_msg_id}")
+        qq_msg_id = getattr(event, 'message_id', None)
+        logger.info(f"QQ message_id: {qq_msg_id}")
         
-        if qq_msg_id:
-            # Method 1: Try using bot.send with msg_id parameter
+        if qq_msg_id and QQMessageSegment:
             try:
-                logger.info(f"Attempting QQ reply to message id: {qq_msg_id}")
+                logger.info(f"Attempting OneBot v11 reply to message_id: {qq_msg_id}")
                 await bot.send(
                     event=event,
-                    message=filtered_response,
-                    msg_id=qq_msg_id
+                    message=QQMessageSegment.reply(qq_msg_id) + filtered_response,
                 )
-                logger.info("QQ reply sent successfully with msg_id")
+                logger.info("OneBot v11 reply sent successfully")
                 return
             except Exception as e:
-                logger.warning(f"Failed to send QQ reply with msg_id: {e}")
-            
-            # Method 2: Try using event.reply() method
-            if hasattr(event, 'reply') and callable(getattr(event, 'reply', None)):
-                try:
-                    reply_func = getattr(event, 'reply')
-                    await reply_func(filtered_response)
-                    logger.info("QQ reply sent successfully with event.reply")
-                    return
-                except Exception as e:
-                    logger.warning(f"Failed to use QQ event.reply: {e}")
+                logger.warning(f"Failed to send OneBot v11 reply: {e}")
         
         # Fallback: normal send without reference
         logger.info("QQ falling back to normal send without reply")

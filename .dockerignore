@@ -1,0 +1,11 @@
+.venv/
+.git/
+.env
+.env.*
+napcat/qq/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/

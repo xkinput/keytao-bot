@@ -44,6 +44,11 @@ env/
 data/
 logs/
 
+# NapCat - QQ session data (sensitive, auto-generated)
+napcat/qq/
+# NapCat WebUI token config (sensitive)
+napcat/config/webui.json
+
 # uv
 .uv/
 
