@@ -8,7 +8,6 @@ from nonebot.exception import FinishedException
 from nonebot.log import logger
 from nonebot.rule import Rule
 import httpx
-import re
 
 # Get configuration from NoneBot
 driver = get_driver()
@@ -20,22 +19,6 @@ BOT_API_TOKEN = getattr(config, "bot_api_token", None)
 logger.info(f"[account_bind] KEYTAO_API_BASE: {KEYTAO_API_BASE}")
 logger.info(f"[account_bind] BOT_API_TOKEN loaded: {bool(BOT_API_TOKEN)}")
 
-
-def remove_urls_for_qq(text: str) -> str:
-    """Remove URLs from text for QQ platform compatibility"""
-    # Match URLs
-    url_pattern = r'(https?://\S+|ftp://\S+|www\.\S+)'
-    cleaned = re.sub(url_pattern, '[链接]', text, flags=re.IGNORECASE)
-    return cleaned
-
-
-def is_qq_bot(bot: Bot) -> bool:
-    """Check if current bot is QQ platform (OneBot v11 via NapCat)"""
-    try:
-        from nonebot.adapters.onebot.v11 import Bot as QQBot
-        return isinstance(bot, QQBot)
-    except:
-        return False
 
 
 # Custom rule for handling /bind only in appropriate contexts
@@ -139,16 +122,13 @@ async def handle_bind(bot: Bot, event: Event):
             "📝 如何绑定机器人账号：\n\n"
             "1. 登录键道网站：https://keytao.vercel.app\n"
             "2. 点击网站右上角的用户名，进入【我的资料】页面\n"
-            "   （或直接访问：https://keytao.vercel.app/profile）\n"
+            "   （ 或直接访问：https://keytao.vercel.app/profile ）\n"
             "3. 在【机器人账号绑定】区域点击【生成绑定码】\n"
             "4. 复制生成的绑定码\n"
             "5. 在这里发送：/bind [你的绑定码]\n\n"
             "示例：/bind AB12CD\n\n"
             "💡 提示：如果在群聊中，需要 @我 或回复我的消息"
         )
-        # Filter URLs for QQ platform
-        if is_qq_bot(bot):
-            help_text = remove_urls_for_qq(help_text)
         await bind_cmd.finish(help_text)
         return
     
