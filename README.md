@@ -26,7 +26,7 @@ keytao-bot/
     ├── __init__.py
     ├── plugins/          # 插件目录
     │   ├── __init__.py
-    │   └── openai_chat.py    # DashScope (通义千问) AI 聊天插件
+    │   └── openai_chat.py    # OpenAI 兼容 AI 聊天插件
     └── skills/           # AI Skills (Function Calling)
         ├── __init__.py       # Skills Manager
         ├── README.md         # Skills 开发文档
@@ -87,27 +87,28 @@ KEYTAO_API_BASE="https://keytao.vercel.app"
 
 如果你部署了自己的 Keytao Next 实例，可以修改此 URL。
 
-#### 配置 Doubao API（AI 聊天功能）
+#### 配置 OpenAI 兼容 API（AI 聊天功能）
 
-1. 访问 [火山引擎控制台](https://console.volcengine.com/ark) 获取 API Key
+1. 准备一个 OpenAI 兼容服务的 API Key
+2. 例如使用 Gemini 时，可访问 [Google AI Studio](https://aistudio.google.com/app/apikey) 获取 API Key
 2. 在 `.env.dev` 或 `.env.prod` 中配置：
 
 ```bash
-# Doubao ARK API Key（必填）
-ARK_API_KEY="your-ark-api-key-here"
+# OpenAI-compatible API Key（必填）
+OPENAI_API_KEY="your-api-key-here"
 
-# 可选配置
-ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"  # API 地址
-ARK_MODEL="doubao-seed-1-6-251015"                      # 使用的模型
-ARK_MAX_TOKENS=1000                                      # 最大回复长度
-ARK_TEMPERATURE=0.7                                      # 创造性 (0.0-2.0)
+# 可选配置（这里以 Gemini 为例）
+OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"  # API 地址
+OPENAI_MODEL="gemini-2.0-flash"                                         # 使用的模型
+OPENAI_MAX_TOKENS=1000                                                     # 最大回复长度
+OPENAI_TEMPERATURE=0.7                                                     # 创造性 (0.0-2.0)
 ```
 
 **模型选择建议**：
-- `doubao-seed-1-6-251015` - 推荐，性价比高
-- `doubao-pro-4k` - 更强能力
-- `doubao-lite-4k` - 更快，价格更低
-- 更多模型：[模型列表](https://www.volcengine.com/docs/82379/1099455)
+- `gemini-2.0-flash` - 默认，速度和成本均衡
+- `gemini-2.0-flash-lite` - 更便宜更快
+- `gemini-2.5-pro` - 更强能力
+- 也可以替换成其他 OpenAI 兼容服务的 `OPENAI_BASE_URL` 和 `OPENAI_MODEL`
 
 **兼容性说明**：
 - Doubao ARK 兼容 OpenAI 的 API 格式
@@ -292,32 +293,32 @@ ai_chat = on_message(priority=99, block=True)
 
 ⚠️ **注意**：这会让机器人响应所有消息，可能造成刷屏和大量 API 调用费用。
 
-### Doubao API 调用失败
+### OpenAI 兼容 API 调用失败
 
 **错误提示**：`❌ AI 服务暂时不可用，请稍后重试`
 
 **解决方法**：
-1. 检查 `ARK_API_KEY` 是否配置正确
+1. 检查 `OPENAI_API_KEY` 是否配置正确
 2. 运行测试脚本：`python test_openai.py`
 3. 查看详细日志：`LOG_LEVEL=DEBUG nb run`
-4. 检查账户余额：[火山引擎控制台](https://console.volcengine.com/ark)
+4. 检查你当前服务商的账户状态、配额和模型权限
 
 ### 如何切换模型
 
 在 `.env` 中修改：
 
 ```bash
-# 使用 doubao-pro-4k（更强能力）
-ARK_MODEL="doubao-pro-4k"
+# 使用 gemini-2.5-pro（更强能力）
+OPENAI_MODEL="gemini-2.5-pro"
 
-# 使用 doubao-lite-4k（更快更便宜）
-ARK_MODEL="doubao-lite-4k"
+# 使用 gemini-2.0-flash-lite（更快更便宜）
+OPENAI_MODEL="gemini-2.0-flash-lite"
 
-# 使用 doubao-seed-1-6-251015（推荐，均衡）
-ARK_MODEL="doubao-seed-1-6-251015"
+# 使用 gemini-2.0-flash（推荐，均衡）
+OPENAI_MODEL="gemini-2.0-flash"
 ```
 
-完整模型列表：[豆包模型](https://www.volcengine.com/docs/82379/1099455)
+完整模型列表请查看你当前服务商的模型文档。
 
 ## 📖 参考文档
 
@@ -328,12 +329,8 @@ ARK_MODEL="doubao-seed-1-6-251015"
 - [adapter-qq 文档](https://github.com/nonebot/adapter-qq)
 - [adapter-telegram 使用指南](https://github.com/nonebot/adapter-telegram/blob/beta/MANUAL.md)
 
-### Doubao (豆包)
-- [火山引擎控制台](https://console.volcengine.com/ark)
-- [豆包 API 文档](https://www.volcengine.com/docs/82379/1263279)
-- [模型列表](https://www.volcengine.com/docs/82379/1099455)
-- [错误代码](https://www.volcengine.com/docs/82379/1263279)
-- [定价说明](https://www.volcengine.com/docs/82379/1151134)
+### OpenAI 兼容服务
+- 使用你所接入服务商的控制台、模型列表、错误码和定价文档
 
 ### 项目文档
 - [AI 聊天功能详细指南](docs/openai_chat_guide.md)

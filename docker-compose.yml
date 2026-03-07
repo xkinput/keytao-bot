@@ -6,7 +6,9 @@ services:
     environment:
       - NAPCAT_UID=${NAPCAT_UID:-1000}
       - NAPCAT_GID=${NAPCAT_GID:-1000}
-      - ACCOUNT=3785773770
+      - ACCOUNT=${ACCOUNT}
+      - NAPCAT_QUICK_PASSWORD=${NAPCAT_QUICK_PASSWORD:-}
+      - NAPCAT_QUICK_PASSWORD_MD5=${NAPCAT_QUICK_PASSWORD_MD5:-}
     ports:
       - "6099:6099"   # WebUI: http://localhost:6099/webui
     volumes:
