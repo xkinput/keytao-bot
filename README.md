@@ -8,6 +8,7 @@
 - 🧠 **AI 智能对话**：基于阿里云通义千问的智能聊天功能
 - 🎯 **Skills 系统**：AI 自动识别需求并调用工具（Function Calling）
 - 📖 **键道查词**：通过 skill 实现智能查词，AI 自动调用
+- 🌐 **网络搜索**：通过 skill 检索外部网页、文档和实时信息
 - 🔧 **易于扩展**：基于插件和 skills 系统，方便添加新功能
 - 🚀 **现代化架构**：使用 uv 管理依赖，FastAPI 驱动
 - 🛡️ **合规设计**：内置中国法律法规和人道主义价值观约束
@@ -184,11 +185,21 @@ AI 会根据对话内容自动识别需求并调用相应工具（Function Calli
       "你好" 的键道编码是 nau
 ```
 
+**示例 - 网络搜索**：
+```
+你: @bot 帮我搜一下 nonebot2 function calling 文档
+机器人: [自动调用 web_search]
+    我帮你查到这些来源：
+    1. NoneBot2 官方文档 ...
+    2. OpenAI Function Calling 文档 ...
+```
+
 **特点**：
 - 🎯 自动识别用户意图，无需输入固定命令
 - 🔧 通过 Skills Manager 动态加载工具
 - 📦 易于扩展，添加新 skill 无需修改 AI 代码
 - 🔄 支持多轮对话和工具链式调用
+- 🌍 支持从外部网络检索补充最新信息
 
 **查看 Skills 开发文档**：[keytao_bot/skills/README.md](keytao_bot/skills/README.md)
 

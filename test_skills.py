@@ -63,6 +63,21 @@ async def test_skills_loading():
             print(f"     ❌ Error: {result.get('error')}")
     else:
         print("   ❌ Function not found")
+
+    # Test web search
+    print("\n4️⃣ Testing web_search...")
+    search_func = manager.get_tool_function("web_search")
+
+    if search_func:
+        result = await search_func(query="NoneBot2 官网", max_results=3)
+        print("   Query result for 'NoneBot2 官网':")
+        if result.get("success"):
+            for item in result.get("results", [])[:3]:
+                print(f"     • {item['title']} -> {item['url']}")
+        else:
+            print(f"     ❌ Error: {result.get('error')}")
+    else:
+        print("   ❌ Function not found")
     
     print("\n" + "=" * 60)
     print("✅ Skills system test completed")
