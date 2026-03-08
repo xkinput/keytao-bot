@@ -358,7 +358,7 @@ async def get_openai_response(
     bot: Bot,
     event: Event,
     history: Optional[List[Dict]] = None,
-    max_iterations: int = 6
+    max_iterations: int = 20
 ) -> Optional[str]:
     """
     Call OpenAI-compatible API to get response with function calling support
@@ -368,7 +368,7 @@ async def get_openai_response(
         bot: Bot instance for context
         event: Event instance for context
         history: Previous conversation history
-        max_iterations: Maximum number of function calling iterations (default 6)
+        max_iterations: Maximum number of function calling iterations (default 20)
     """
     if not OPENAI_API_KEY:
         return "❌ OpenAI 兼容 API Key 未配置，请联系管理员"
