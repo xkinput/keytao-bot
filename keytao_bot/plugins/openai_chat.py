@@ -495,6 +495,8 @@ async def get_openai_response(
             if tools:
                 call_kwargs["tools"] = tools
                 call_kwargs["tool_choice"] = "auto"
+
+            logger.info(f"Calling model: {OPENAI_MODEL} (iteration {iteration + 1}/{max_iterations})")
             
             response = await client.chat.completions.create(**call_kwargs)
             
