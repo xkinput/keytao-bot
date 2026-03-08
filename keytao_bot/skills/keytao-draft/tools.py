@@ -8,6 +8,34 @@ from typing import Dict, List, Optional
 from nonebot.log import logger
 
 
+ACTION_LABELS = {
+    "Create": "新增",
+    "Change": "修改",
+    "Delete": "删除",
+}
+
+TYPE_LABELS = {
+    "Single": "单字",
+    "Phrase": "词组",
+    "Supplement": "补充词条",
+    "Symbol": "符号",
+    "Link": "链接",
+    "CSS": "声笔笔",
+    "CSSSingle": "声笔笔单字",
+    "English": "英文",
+}
+
+
+def enrich_pr_item_labels(item: Dict) -> Dict:
+    """Add Chinese labels for action/type fields."""
+    enriched_item = dict(item)
+    action = enriched_item.get("action")
+    phrase_type = enriched_item.get("type")
+    enriched_item["action_label"] = ACTION_LABELS.get(action, action or "未知")
+    enriched_item["type_label"] = TYPE_LABELS.get(phrase_type, phrase_type or "未知")
+    return enriched_item
+
+
 def get_keytao_url() -> str:
     """Get Keytao API base URL from config"""
     try:
@@ -321,6 +349,8 @@ async def keytao_list_draft_items(
                 return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
 
             logger.info(f"[keytao_list_draft_items] status={response.status_code} count={data.get('count', 0)}")
+            if data.get("success") and isinstance(data.get("items"), list):
+                data["items"] = [enrich_pr_item_labels(item) for item in data["items"]]
             return data
 
     except httpx.TimeoutException:
