@@ -291,6 +291,153 @@ def clear_history(key: Tuple[str, str]):
     logger.info(f"Cleared {deleted} messages for {platform}:{user_id}")
 
 
+def extract_onebot_reply_id(event: Event) -> Optional[str]:
+    """
+    Extract replied message id from OneBot v11 message segments
+    从 OneBot v11 消息段中提取被回复的消息 ID
+    """
+    try:
+        message_to_check = getattr(event, 'original_message', None) or getattr(event, 'message', None)
+        if not message_to_check:
+            return None
+
+        for segment in message_to_check:
+            segment_type = getattr(segment, 'type', None)
+            segment_data = getattr(segment, 'data', {})
+
+            if segment_type == 'reply':
+                reply_id = segment_data.get('id') or segment_data.get('message_id')
+                if reply_id is not None:
+                    return str(reply_id)
+    except Exception as error:
+        logger.debug(f"Failed to extract OneBot reply id: {error}")
+
+    return None
+
+
+def extract_onebot_plaintext(message: object) -> str:
+    """
+    Extract plain text from OneBot message payload
+    从 OneBot 消息内容中提取纯文本
+    """
+    if message is None:
+        return ""
+
+    if isinstance(message, str):
+        return message.strip()
+
+    extract_plain_text = getattr(message, 'extract_plain_text', None)
+    if callable(extract_plain_text):
+        try:
+            plain_text = extract_plain_text()
+            return str(plain_text).strip()
+        except Exception:
+            pass
+
+    parts: List[str] = []
+
+    try:
+        for segment in message:  # type: ignore
+            if isinstance(segment, dict):
+                segment_type = segment.get('type')
+                segment_data = segment.get('data', {})
+            else:
+                segment_type = getattr(segment, 'type', None)
+                segment_data = getattr(segment, 'data', {})
+
+            if segment_type == 'text':
+                text = segment_data.get('text', '')
+                if text:
+                    parts.append(str(text))
+    except Exception:
+        pass
+
+    return ''.join(parts).strip()
+
+
+async def build_reply_context(bot: Bot, event: Event) -> str:
+    """
+    Build reply context for Telegram and OneBot v11
+    为 Telegram 和 OneBot v11 构建回复上下文
+    """
+    try:
+        from nonebot.adapters.telegram import Bot as TelegramBot
+    except ImportError:
+        TelegramBot = None
+
+    try:
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
+    except ImportError:
+        QQBot = None
+
+    if TelegramBot and isinstance(bot, TelegramBot):
+        reply_to_message = getattr(event, 'reply_to_message', None)
+        if not reply_to_message:
+            return ""
+
+        try:
+            bot_info = await bot.get_me()
+            bot_id = getattr(bot_info, 'id', None)
+        except Exception:
+            bot_id = None
+
+        reply_from = getattr(reply_to_message, 'from_', None)
+        reply_message_text = getattr(reply_to_message, 'text', None)
+
+        if reply_from and reply_message_text:
+            reply_from_id = getattr(reply_from, 'id', None)
+            reply_from_name = getattr(reply_from, 'first_name', '未知用户')
+            is_reply_to_bot = bool(bot_id and reply_from_id == bot_id)
+
+            if is_reply_to_bot:
+                logger.info(f"User is replying to bot's message: {reply_message_text[:100]}")
+                return f"\n\n【用户正在回复你的消息】\n被引用的消息内容：\n{reply_message_text}\n\n⚠️ 用户的回复是针对这条消息的，请根据这条消息的内容理解用户意图。"
+
+            logger.info(f"User is replying to someone else's message (from {reply_from_name})")
+            return f"\n\n【用户正在回复其他人的消息】\n被引用消息的发送者：{reply_from_name}\n被引用的消息内容：\n{reply_message_text}\n\n⚠️ 用户回复的不是你的消息，如果用户说的是操作指令（如'是'、'确认'、'提交'），应该提醒用户：你需要回复bot的消息才能确认操作。"
+
+        return ""
+
+    if QQBot and isinstance(bot, QQBot):
+        reply_message_id = extract_onebot_reply_id(event)
+        if not reply_message_id:
+            return ""
+
+        logger.info(f"Detected OneBot reply segment, reply message_id: {reply_message_id}")
+
+        try:
+            reply_payload = await bot.get_msg(message_id=int(reply_message_id))
+        except Exception as error:
+            logger.warning(f"Failed to fetch replied OneBot message {reply_message_id}: {error}")
+            return ""
+
+        sender = reply_payload.get('sender', {}) if isinstance(reply_payload, dict) else {}
+        reply_from_id = str(sender.get('user_id') or reply_payload.get('user_id', ''))
+        reply_from_name = sender.get('card') or sender.get('nickname') or reply_from_id or '未知用户'
+        reply_message_text = extract_onebot_plaintext(
+            reply_payload.get('message') if isinstance(reply_payload, dict) else None
+        )
+
+        if not reply_message_text and isinstance(reply_payload, dict):
+            reply_message_text = str(reply_payload.get('raw_message', '')).strip()
+
+        if not reply_message_text:
+            logger.info(f"Replied OneBot message {reply_message_id} has no plain text content")
+            return ""
+
+        bot_id = str(getattr(bot, 'self_id', ''))
+        is_reply_to_bot = bool(bot_id and reply_from_id == bot_id)
+
+        if is_reply_to_bot:
+            logger.info(f"User is replying to bot's QQ message: {reply_message_text[:100]}")
+            return f"\n\n【用户正在回复你的消息】\n被引用的消息内容：\n{reply_message_text}\n\n⚠️ 用户的回复是针对这条消息的，请根据这条消息的内容理解用户意图。"
+
+        logger.info(f"User is replying to someone else's QQ message (from {reply_from_name})")
+        return f"\n\n【用户正在回复其他人的消息】\n被引用消息的发送者：{reply_from_name}\n被引用的消息内容：\n{reply_message_text}\n\n⚠️ 用户回复的不是你的消息，如果用户说的是操作指令（如'是'、'确认'、'提交'），应该提醒用户：你需要回复bot的消息才能确认操作。"
+
+    return ""
+
+
 def extract_platform_info(bot: Bot, event: Event) -> tuple[str, str]:
     """
     Extract platform type and user ID from event
@@ -439,39 +586,7 @@ async def get_openai_response(
                     break  # Only check the most recent assistant message
         
         # Check if user is replying to a message
-        reply_context = ""
-        
-        # Telegram: check for reply_to_message attribute
-        reply_to_message = getattr(event, 'reply_to_message', None)
-        
-        # Note: QQ official API does not provide reply/reference information
-        # Even when users quote messages in QQ groups, the bot API doesn't expose it
-        
-        if reply_to_message:
-            # Get bot info
-            try:
-                bot_info = await bot.get_me()
-                bot_id = getattr(bot_info, 'id', None)
-            except:
-                bot_id = None
-            
-            # Check who sent the replied message
-            reply_from = getattr(reply_to_message, 'from_', None)
-            reply_message_text = getattr(reply_to_message, 'text', None)
-            
-            if reply_from and reply_message_text:
-                reply_from_id = getattr(reply_from, 'id', None)
-                reply_from_name = getattr(reply_from, 'first_name', '未知用户')
-                
-                # Check if replying to bot's own message
-                is_reply_to_bot = (bot_id and reply_from_id == bot_id)
-                
-                if is_reply_to_bot:
-                    reply_context = f"\n\n【用户正在回复你的消息】\n被引用的消息内容：\n{reply_message_text}\n\n⚠️ 用户的回复是针对这条消息的，请根据这条消息的内容理解用户意图。"
-                    logger.info(f"User is replying to bot's message: {reply_message_text[:100]}")
-                else:
-                    reply_context = f"\n\n【用户正在回复其他人的消息】\n被引用消息的发送者：{reply_from_name}\n被引用的消息内容：\n{reply_message_text}\n\n⚠️ 用户回复的不是你的消息，如果用户说的是操作指令（如'是'、'确认'、'提交'），应该提醒用户：你需要回复bot的消息才能确认操作。"
-                    logger.info(f"User is replying to someone else's message (from {reply_from_name})")
+        reply_context = await build_reply_context(bot, event)
         
         # Add current user message with reply context and optional confirmation hint
         # Mark current message clearly so AI only processes this one
