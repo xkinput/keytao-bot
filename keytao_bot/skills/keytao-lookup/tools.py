@@ -7,6 +7,27 @@ from typing import Dict, List, Optional
 from nonebot.log import logger
 
 
+TYPE_LABELS = {
+    "Single": "单字",
+    "Phrase": "词组",
+    "Supplement": "补充词条",
+    "Symbol": "符号",
+    "Link": "链接",
+    "CSS": "声笔笔",
+    "CSSSingle": "声笔笔单字",
+    "English": "英文"
+}
+
+POSITION_LABELS = {
+    0: "",
+    1: "二重",
+    2: "三重",
+    3: "四重",
+    4: "五重",
+    5: "六重"
+}
+
+
 def get_keytao_url() -> str:
     """Get Keytao API base URL from config"""
     try:
@@ -17,6 +38,304 @@ def get_keytao_url() -> str:
     except:
         # Fallback to default if NoneBot not initialized
         return "https://keytao.vercel.app"
+
+
+def get_bot_token() -> Optional[str]:
+    """Get Bot API token from config"""
+    try:
+        from nonebot import get_driver
+        driver = get_driver()
+        config = driver.config
+        return getattr(config, "bot_api_token", None)
+    except:
+        return None
+
+
+def _position_label(index: int) -> str:
+    return POSITION_LABELS.get(index, f"{index + 1}重") if index > 0 else ""
+
+
+def _chunk_items(items: List[str], chunk_size: int) -> List[List[str]]:
+    return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+async def _call_bot_lookup_api(path: str, payload: Dict) -> Dict:
+    keytao_api_base = get_keytao_url()
+    bot_api_token = get_bot_token()
+
+    if not bot_api_token:
+        return {
+            "success": False,
+            "message": "Bot配置错误：缺少API token"
+        }
+
+    url = f"{keytao_api_base}{path}"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "X-Bot-Token": bot_api_token,
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+            )
+            data = response.json()
+
+            if response.is_success:
+                return data
+
+            return {
+                "success": False,
+                "message": data.get("message") or data.get("error") or f"API error: {response.status_code}"
+            }
+    except Exception as error:
+        return {
+            "success": False,
+            "message": str(error)
+        }
+
+
+def _format_code_lookup_result(code: str, phrases: List[Dict]) -> Dict:
+    if not phrases:
+        return {
+            "success": True,
+            "code": code,
+            "phrases": []
+        }
+
+    sorted_phrases = sorted(
+        phrases,
+        key=lambda item: (item.get("weight", 0), item.get("word", ""))
+    )
+
+    result_phrases = []
+    for index, phrase in enumerate(sorted_phrases):
+        phrase_type = phrase.get("type", "")
+        result_phrases.append({
+            "word": phrase.get("word", ""),
+            "code": phrase.get("code", code),
+            "weight": phrase.get("weight", 0),
+            "type": phrase_type,
+            "type_label": TYPE_LABELS.get(phrase_type, phrase_type),
+            "position": index,
+            "position_label": _position_label(index)
+        })
+
+    logger.info(f"[keytao_lookup_by_code] code={code}, found {len(result_phrases)} phrases")
+    logger.info(f"[keytao_lookup_by_code] phrases: {[(p.get('word'), p.get('weight')) for p in result_phrases]}")
+
+    return {
+        "success": True,
+        "code": code,
+        "phrases": result_phrases
+    }
+
+
+def _build_duplicate_info(target_word: str, target_phrase: Dict, phrases_for_code: List[Dict]) -> Optional[Dict]:
+    if len(phrases_for_code) <= 1:
+        return None
+
+    sorted_phrases = sorted(
+        phrases_for_code,
+        key=lambda item: (item.get("weight", 0), item.get("word", ""))
+    )
+
+    position = -1
+    for index, phrase in enumerate(sorted_phrases):
+        if (
+            phrase.get("word") == target_word
+            and phrase.get("weight") == target_phrase.get("weight", 0)
+            and phrase.get("type") == target_phrase.get("type")
+        ):
+            position = index
+            break
+
+    if position == -1:
+        return None
+
+    return {
+        "position": position,
+        "position_label": _position_label(position),
+        "all_words": [
+            {
+                "word": phrase.get("word", ""),
+                "weight": phrase.get("weight", 0),
+                "position": index,
+                "label": _position_label(index)
+            }
+            for index, phrase in enumerate(sorted_phrases)
+        ]
+    }
+
+
+def _format_word_lookup_result(word: str, phrases: List[Dict], code_phrase_map: Dict[str, List[Dict]]) -> Dict:
+    enhanced_phrases = []
+
+    for phrase in phrases:
+        phrase_type = phrase.get("type", "")
+        phrase_info = {
+            "word": phrase.get("word", word),
+            "code": phrase.get("code", ""),
+            "weight": phrase.get("weight", 0),
+            "type": phrase_type,
+            "type_label": TYPE_LABELS.get(phrase_type, phrase_type)
+        }
+
+        duplicate_info = _build_duplicate_info(
+            word,
+            phrase,
+            code_phrase_map.get(phrase.get("code", ""), [])
+        )
+        if duplicate_info:
+            phrase_info["duplicate_info"] = duplicate_info
+
+        enhanced_phrases.append(phrase_info)
+
+    enhanced_phrases.sort(key=lambda item: (len(item.get("code", "")), item.get("code", ""), item.get("weight", 0)))
+
+    return {
+        "success": True,
+        "word": word,
+        "phrases": enhanced_phrases
+    }
+
+
+async def keytao_lookup_by_codes_batch(codes: List[str]) -> Dict:
+    """
+    Query phrases by codes in batch
+    批量按编码查询词条
+
+    Args:
+        codes: List of Keytao codes, max 100 items
+
+    Returns:
+        dict: Batch query result
+    """
+    normalized_codes = [code.strip() for code in codes if isinstance(code, str) and code.strip()]
+
+    if not normalized_codes:
+        return {
+            "success": False,
+            "message": "至少要提供一个编码",
+            "count": 0,
+            "results": []
+        }
+
+    if len(normalized_codes) > 100:
+        return {
+            "success": False,
+            "message": "一次最多查询100个编码",
+            "count": 0,
+            "results": []
+        }
+
+    data = await _call_bot_lookup_api(
+        "/api/bot/phrases/by-code/batch",
+        {"codes": normalized_codes}
+    )
+
+    if not data.get("success"):
+        return {
+            "success": False,
+            "message": data.get("message", "查询失败"),
+            "count": 0,
+            "results": []
+        }
+
+    results = [
+        _format_code_lookup_result(item.get("code", ""), item.get("phrases", []))
+        for item in data.get("results", [])
+    ]
+
+    return {
+        "success": True,
+        "count": len(results),
+        "results": results
+    }
+
+
+async def keytao_lookup_by_words_batch(words: List[str]) -> Dict:
+    """
+    Query codes by words in batch
+    批量按词条查询编码
+
+    Args:
+        words: List of words, max 100 items
+
+    Returns:
+        dict: Batch query result
+    """
+    normalized_words = [word.strip() for word in words if isinstance(word, str) and word.strip()]
+
+    if not normalized_words:
+        return {
+            "success": False,
+            "message": "至少要提供一个词",
+            "count": 0,
+            "results": []
+        }
+
+    if len(normalized_words) > 100:
+        return {
+            "success": False,
+            "message": "一次最多查询100个词",
+            "count": 0,
+            "results": []
+        }
+
+    word_data = await _call_bot_lookup_api(
+        "/api/bot/phrases/by-word/batch",
+        {"words": normalized_words}
+    )
+
+    if not word_data.get("success"):
+        return {
+            "success": False,
+            "message": word_data.get("message", "查询失败"),
+            "count": 0,
+            "results": []
+        }
+
+    code_set = []
+    seen_codes = set()
+    for item in word_data.get("results", []):
+        for phrase in item.get("phrases", []):
+            code = phrase.get("code", "")
+            if code and code not in seen_codes:
+                seen_codes.add(code)
+                code_set.append(code)
+
+    code_phrase_map = {}
+    if code_set:
+        for code_chunk in _chunk_items(code_set, 100):
+            code_data = await _call_bot_lookup_api(
+                "/api/bot/phrases/by-code/batch",
+                {"codes": code_chunk}
+            )
+
+            if not code_data.get("success"):
+                return {
+                    "success": False,
+                    "message": code_data.get("message", "查询失败"),
+                    "count": 0,
+                    "results": []
+                }
+
+            for item in code_data.get("results", []):
+                code_phrase_map[item.get("code", "")] = item.get("phrases", [])
+
+    results = [
+        _format_word_lookup_result(item.get("word", ""), item.get("phrases", []), code_phrase_map)
+        for item in word_data.get("results", [])
+    ]
+
+    return {
+        "success": True,
+        "count": len(results),
+        "results": results
+    }
 
 
 async def keytao_lookup_by_code(code: str) -> Dict:
@@ -30,95 +349,20 @@ async def keytao_lookup_by_code(code: str) -> Dict:
     Returns:
         dict: Query result with phrases list and duplicate labels
     """
-    KEYTAO_API_BASE = get_keytao_url()
-    url = f"{KEYTAO_API_BASE}/api/phrases/by-code"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, params={"code": code, "page": "1"})
-            response.raise_for_status()
-            data = response.json()
-            phrases = data.get("phrases", [])
-            
-            if not phrases:
-                return {
-                    "success": True,
-                    "code": code,
-                    "phrases": []
-                }
-            
-            # Filter to ensure exact code match (API might return similar codes)
-            exact_matches = [p for p in phrases if p.get("code", "") == code]
-            
-            if not exact_matches:
-                return {
-                    "success": True,
-                    "code": code,
-                    "phrases": []
-                }
-            
-            # Sort by weight and limit to 10 results
-            sorted_phrases = sorted(exact_matches, key=lambda x: x.get("weight", 0))
-            
-            # Debug log
-            logger.info(f"[keytao_lookup_by_code] code={code}, found {len(sorted_phrases)} phrases")
-            logger.info(f"[keytao_lookup_by_code] phrases: {[(p.get('word'), p.get('weight')) for p in sorted_phrases]}")
-            
-            # Type mapping to Chinese labels
-            type_labels = {
-                "Single": "单字",
-                "Phrase": "词组",
-                "Supplement": "补充词条",
-                "Symbol": "符号",
-                "Link": "链接",
-                "CSS": "声笔笔",
-                "CSSSingle": "声笔笔单字",
-                "English": "英文"
-            }
-            
-            # Position labels (default word has no label)
-            position_labels = {
-                0: "",
-                1: "二重",
-                2: "三重",
-                3: "四重",
-                4: "五重",
-                5: "六重"
-            }
-            
-            # Build result with labels based on array index
-            result_phrases = []
-            for idx, p in enumerate(sorted_phrases):
-                p_weight = p.get("weight", 0)
-                phrase_type = p.get("type", "")
-                
-                # Label based on array index (position in sorted array)
-                if len(sorted_phrases) > 1 and idx > 0:
-                    label = position_labels.get(idx, f"{idx + 1}重")
-                else:
-                    label = ""
-                
-                result_phrases.append({
-                    "word": p.get("word", ""),
-                    "code": p.get("code", ""),
-                    "weight": p_weight,
-                    "type": phrase_type,
-                    "type_label": type_labels.get(phrase_type, phrase_type),
-                    "position": idx,  # Use array index as position
-                    "position_label": label
-                })
-            
-            return {
-                "success": True,
-                "code": code,
-                "phrases": result_phrases
-            }
-    except Exception as e:
+    result = await keytao_lookup_by_codes_batch([code])
+    if not result.get("success"):
         return {
             "success": False,
             "code": code,
-            "error": str(e),
+            "error": result.get("message", "查询失败"),
             "phrases": []
         }
+
+    return result.get("results", [{
+        "success": True,
+        "code": code,
+        "phrases": []
+    }])[0]
 
 
 
@@ -133,165 +377,65 @@ async def keytao_lookup_by_word(word: str) -> Dict:
     Returns:
         dict: Query result with phrases list and duplicate analysis
     """
-    KEYTAO_API_BASE = get_keytao_url()
-    url = f"{KEYTAO_API_BASE}/api/phrases/by-word"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # First request to get total pages
-            response = await client.get(url, params={"word": word, "page": "1"})
-            response.raise_for_status()
-            data = response.json()
-            
-            all_phrases = data.get("phrases", [])
-            pagination = data.get("pagination", {})
-            total_pages = pagination.get("totalPages", 1)
-            
-            # If there are more pages, fetch them
-            if total_pages > 1:
-                for page in range(2, total_pages + 1):
-                    page_response = await client.get(url, params={"word": word, "page": str(page)})
-                    page_response.raise_for_status()
-                    page_data = page_response.json()
-                    all_phrases.extend(page_data.get("phrases", []))
-            
-            # Type mapping to Chinese labels
-            type_labels = {
-                "Single": "单字",
-                "Phrase": "词组",
-                "Supplement": "补充词条",
-                "Symbol": "符号",
-                "Link": "链接",
-                "CSS": "声笔笔",
-                "CSSSingle": "声笔笔单字",
-                "English": "英文"
-            }
-            
-            # Enhance each phrase with duplicate analysis
-            enhanced_phrases = []
-            for p in all_phrases:
-                phrase_code = p.get("code", "")
-                phrase_weight = p.get("weight", 0)
-                phrase_type = p.get("type", "")
-                
-                phrase_info = {
-                    "word": p.get("word", ""),
-                    "code": phrase_code,
-                    "weight": phrase_weight,
-                    "type": phrase_type,
-                    "type_label": type_labels.get(phrase_type, phrase_type)  # Chinese label
-                }
-                
-                # Check if weight suggests duplicates (last digit not 0)
-                if phrase_weight % 10 != 0:
-                    # Query all phrases with this code to analyze duplicates
-                    dup_analysis = await analyze_duplicates(phrase_code, word, phrase_weight)
-                    if dup_analysis:
-                        phrase_info["duplicate_info"] = dup_analysis
-                
-                enhanced_phrases.append(phrase_info)
-            
-            # Sort by code length (shorter codes first)
-            enhanced_phrases.sort(key=lambda x: len(x.get("code", "")))
-            
-            return {
-                "success": True,
-                "word": word,
-                "phrases": enhanced_phrases
-            }
-    except Exception as e:
+    result = await keytao_lookup_by_words_batch([word])
+    if not result.get("success"):
         return {
             "success": False,
             "word": word,
-            "error": str(e),
+            "error": result.get("message", "查询失败"),
             "phrases": []
         }
 
-
-async def analyze_duplicates(code: str, target_word: str, target_weight: int) -> Optional[Dict]:
-    """
-    Analyze duplicate information for a code
-    分析编码的重码情况
-    
-    Args:
-        code: The code to analyze
-        target_word: The word we're querying for
-        target_weight: The weight of the target word
-        
-    Returns:
-        dict: Duplicate analysis with position and all words
-    """
-    try:
-        # Query all phrases with this code
-        result = await keytao_lookup_by_code(code)
-        if not result.get("success") or not result.get("phrases"):
-            return None
-        
-        all_phrases = result["phrases"]
-        if len(all_phrases) <= 1:
-            return None  # No duplicates
-        
-        # Sort by weight (ascending)
-        sorted_phrases = sorted(all_phrases, key=lambda x: x.get("weight", 0))
-        
-        # Debug log
-        logger.info(f"[analyze_duplicates] code={code}, target_word={target_word}, target_weight={target_weight}")
-        logger.info(f"[analyze_duplicates] sorted_phrases: {[(p.get('word'), p.get('weight')) for p in sorted_phrases]}")
-        
-        # Find position by actual index in sorted array (NOT by weight difference!)
-        position = -1
-        for idx, p in enumerate(sorted_phrases):
-            if p.get("word") == target_word and p.get("weight") == target_weight:
-                position = idx
-                break
-        
-        if position == -1:
-            logger.warning(f"[analyze_duplicates] Target word '{target_word}' not found in sorted list")
-            return None
-        
-        logger.info(f"[analyze_duplicates] Found position={position} (0-based index)")
-        
-        # Position labels
-        position_labels = {
-            0: "",  # First, no label
-            1: "二重",
-            2: "三重",
-            3: "四重",
-            4: "五重",
-            5: "六重"
-        }
-        
-        # Build word list with positions
-        word_list = []
-        for idx, p in enumerate(sorted_phrases):
-            p_word = p.get("word", "")
-            p_weight = p.get("weight", 0)
-            
-            # Label based on array index
-            if idx > 0:
-                label = position_labels.get(idx, f"{idx + 1}重")
-            else:
-                label = ""
-            
-            word_list.append({
-                "word": p_word,
-                "weight": p_weight,
-                "position": idx,
-                "label": label
-            })
-        
-        return {
-            "position": position,
-            "position_label": position_labels.get(position, f"{position + 1}重") if position > 0 else "",
-            "all_words": word_list
-        }
-        
-    except Exception as e:
-        return None
+    return result.get("results", [{
+        "success": True,
+        "word": word,
+        "phrases": []
+    }])[0]
 
 
 
 # Tool definitions for OpenAI Function Calling
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_lookup_by_codes_batch",
+            "description": "批量查询多个键道输入法编码对应的词条。适合用户一次给出多个编码时使用，一次最多100个编码",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codes": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "要查询的编码列表，一次最多100个，如 ['abc', 'nau']"
+                    }
+                },
+                "required": ["codes"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_lookup_by_words_batch",
+            "description": "批量查询多个中文词条对应的键道输入法编码。适合用户一次给出多个词时使用，一次最多100个词",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "words": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "description": "要查询的中文词列表，一次最多100个，如 ['你好', '世界']"
+                    }
+                },
+                "required": ["words"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -331,6 +475,8 @@ TOOLS = [
 
 # Tool registry for dynamic calling
 TOOL_FUNCTIONS = {
+    "keytao_lookup_by_codes_batch": keytao_lookup_by_codes_batch,
+    "keytao_lookup_by_words_batch": keytao_lookup_by_words_batch,
     "keytao_lookup_by_code": keytao_lookup_by_code,
     "keytao_lookup_by_word": keytao_lookup_by_word
 }

@@ -1,6 +1,6 @@
 ---
 name: keytao-lookup
-description: 键道输入法查词工具。当用户询问词的编码或编码对应的词时必须调用。关键规则：用户问任何词的编码→立即调用keytao_lookup_by_word；用户问任何编码的词→立即调用keytao_lookup_by_code。绝不凭记忆猜测，必须调用工具获取实时数据。词语提取：从用户问题中提取关键词。⚠️展示时必须严格按照下方【展示格式规范】的格式，不要自己发挥！
+description: 键道输入法查词工具。当用户询问词的编码或编码对应的词时必须调用。关键规则：用户问任何词的编码→立即调用keytao_lookup_by_word；用户问任何编码的词→立即调用keytao_lookup_by_code；用户一次问多个词的编码→优先调用keytao_lookup_by_words_batch；用户一次问多个编码对应的词→优先调用keytao_lookup_by_codes_batch。绝不凭记忆猜测，必须调用工具获取实时数据。词语提取：从用户问题中提取关键词。⚠️展示时必须严格按照下方【展示格式规范】的格式，不要自己发挥！
 ---
 # 展示格式规范
 
@@ -241,6 +241,13 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 ## 工具定义
 
+### 0. 批量查询规则
+
+- 一次查询多个词的编码时，优先调用 `keytao_lookup_by_words_batch`
+- 一次查询多个编码对应的词时，优先调用 `keytao_lookup_by_codes_batch`
+- 单个词或单个编码时，调用对应的单查工具
+- 批量工具一次最多接收 100 个词或编码
+
 ### 1. keytao_lookup_by_code
 
 按编码查询词条。
@@ -288,6 +295,22 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
   ]
 }
 ```
+
+### 3. keytao_lookup_by_codes_batch
+
+批量按编码查询词条。
+
+**参数：**
+
+- `codes` (string[], required): 要查询的编码数组，一次最多 100 个
+
+### 4. keytao_lookup_by_words_batch
+
+批量按词条查询编码。
+
+**参数：**
+
+- `words` (string[], required): 要查询的词条数组，一次最多 100 个
 
 ## 回复建议
 
