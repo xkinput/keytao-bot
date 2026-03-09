@@ -19,6 +19,8 @@ BOT_API_TOKEN = getattr(config, "bot_api_token", None)
 logger.info(f"[account_bind] KEYTAO_API_BASE: {KEYTAO_API_BASE}")
 logger.info(f"[account_bind] BOT_API_TOKEN loaded: {bool(BOT_API_TOKEN)}")
 
+GROUP_TRIGGER_KEYWORDS = ("键道", "喵喵")
+
 
 
 # Custom rule for handling /bind only in appropriate contexts
@@ -32,6 +34,7 @@ async def should_handle_bind(bot: Bot, event: Event) -> bool:
         from nonebot.adapters.telegram import Bot as TelegramBot
         from nonebot.adapters.telegram.event import PrivateMessageEvent, GroupMessageEvent
         from nonebot.adapters.onebot.v11 import Bot as QQBot
+        from nonebot.adapters.onebot.v11.event import PrivateMessageEvent as QQPrivateMessageEvent, GroupMessageEvent as QQGroupMessageEvent
         
         if isinstance(bot, TelegramBot):
             # Telegram: always in private
@@ -53,6 +56,7 @@ async def should_handle_bind(bot: Bot, event: Event) -> bool:
                 bot_info = await bot.get_me()
                 bot_username = bot_info.username
                 message_to_check = getattr(event, 'original_message', event.message)
+                message_text = event.get_plaintext().strip()
                 
                 for segment in message_to_check:
                     if segment.type == 'mention':
@@ -60,13 +64,32 @@ async def should_handle_bind(bot: Bot, event: Event) -> bool:
                         if mention_text == f"@{bot_username}":
                             logger.info(f"[account_bind] Bot mentioned in group, will handle")
                             return True
+
+                if any(keyword in message_text for keyword in GROUP_TRIGGER_KEYWORDS):
+                    logger.info("[account_bind] Group message contains trigger keyword, will handle")
+                    return True
                 
                 logger.debug("[account_bind] Bot not mentioned/replied in group, will not handle")
                 return False
             return False
         
         elif isinstance(bot, QQBot):
-            # QQ: use default to_me() behavior
+            if isinstance(event, QQPrivateMessageEvent):
+                return True
+            if isinstance(event, QQGroupMessageEvent):
+                from nonebot.rule import to_me
+
+                if await to_me()(bot, event, {}):
+                    return True
+
+                message_text = event.get_plaintext().strip()
+                if any(keyword in message_text for keyword in GROUP_TRIGGER_KEYWORDS):
+                    logger.info("[account_bind] QQ group message contains trigger keyword, will handle")
+                    return True
+
+                return False
+
+            # QQ: fallback to default to_me() behavior for other event types
             from nonebot.rule import to_me
             return await to_me()(bot, event, {})
         

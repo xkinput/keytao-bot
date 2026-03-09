@@ -41,6 +41,8 @@ if OPENAI_TEMPERATURE is None:
 if OPENAI_TEMPERATURE is None:
     OPENAI_TEMPERATURE = 0.7
 
+GROUP_TRIGGER_KEYWORDS = ("键道", "喵喵")
+
 # Initialize skills manager and load all skills
 skills_manager = SkillsManager()
 skills_manager.load_all_skills()
@@ -158,6 +160,7 @@ async def should_handle(bot: Bot, event: Event) -> bool:
         from nonebot.adapters.telegram import Bot as TelegramBot
         from nonebot.adapters.telegram.event import PrivateMessageEvent, GroupMessageEvent
         from nonebot.adapters.onebot.v11 import Bot as QQBot
+        from nonebot.adapters.onebot.v11.event import PrivateMessageEvent as QQPrivateMessageEvent, GroupMessageEvent as QQGroupMessageEvent
         
         if isinstance(bot, TelegramBot):
             # Telegram: always respond in private chats
@@ -200,13 +203,32 @@ async def should_handle(bot: Bot, event: Event) -> bool:
                                 return True
                 except Exception as segment_err:
                     logger.debug(f"Error checking message segments: {segment_err}")
+
+                if any(keyword in message_text for keyword in GROUP_TRIGGER_KEYWORDS):
+                    logger.info("Group message contains trigger keyword, will handle")
+                    return True
                 
                 logger.debug("Bot not mentioned/replied in group, will not handle")
                 return False
             return False
         
         elif isinstance(bot, QQBot):
-            # QQ: use default to_me() behavior
+            if isinstance(event, QQPrivateMessageEvent):
+                return True
+            if isinstance(event, QQGroupMessageEvent):
+                from nonebot.rule import to_me
+
+                if await to_me()(bot, event, {}):
+                    return True
+
+                message_text = event.get_plaintext().strip()
+                if any(keyword in message_text for keyword in GROUP_TRIGGER_KEYWORDS):
+                    logger.info("QQ group message contains trigger keyword, will handle")
+                    return True
+
+                return False
+
+            # QQ: fallback to default to_me() behavior for other event types
             from nonebot.rule import to_me
             return await to_me()(bot, event, {})
         
