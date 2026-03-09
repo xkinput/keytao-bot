@@ -201,9 +201,15 @@ async def keytao_create_phrase(
                 return data
             elif response.status_code == 404:
                 logger.warning(f"[keytao_create_phrase] API response (404): {response.text}")
+                try:
+                    data = response.json()
+                    if data.get("message"):
+                        return data
+                except Exception:
+                    pass
                 return {
                     "success": False,
-                    "message": "未找到绑定账号，请使用 /bind 命令绑定你的账号"
+                    "message": "未找到绑定账号，请先使用 /bind 命令绑定你的键道平台账号到 https://keytao.vercel.app"
                 }
             elif response.status_code == 400:
                 # Conflict or warning

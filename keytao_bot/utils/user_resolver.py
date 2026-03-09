@@ -64,8 +64,8 @@ def get_not_bound_message() -> str:
     """Get not bound prompt message"""
     return (
         "❌ 未找到你在键道平台的账号 qwq\n\n"
-        "使用机器人创建词条需要先绑定账号：\n"
-        "1. 访问 keytao.vercel.app 注册账号\n"
+        "使用机器人创建词条需要先绑定键道平台账号：\n"
+        "1. 访问 https://keytao.vercel.app 注册或登录账号\n"
         "2. 登录后进入【我的资料】页面\n"
         "3. 在【机器人账号绑定】部分生成绑定码\n"
         "4. 在这里发送：/bind [绑定码]\n\n"
