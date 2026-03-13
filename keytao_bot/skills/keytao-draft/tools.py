@@ -47,6 +47,19 @@ def get_keytao_url() -> str:
         return "https://keytao.vercel.app"
 
 
+def make_batch_url(batch_id: str) -> str:
+    """Build a web URL for a draft batch."""
+    return f"{get_keytao_url()}/batch/{batch_id}"
+
+
+def _inject_batch_url(data: Dict) -> Dict:
+    """Inject batchUrl into any response dict that contains a batchId."""
+    batch_id = data.get("batchId")
+    if batch_id:
+        data["batchUrl"] = make_batch_url(batch_id)
+    return data
+
+
 def get_bot_token() -> Optional[str]:
     """Get Bot API token from config"""
     try:
@@ -99,6 +112,20 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
     except Exception as e:
         logger.error(f"[get_latest_draft_batch] Error: {e}")
         return None
+
+
+async def _fetch_draft_snapshot(platform: str, platform_id: str) -> Optional[Dict]:
+    """Fetch current draft items and return as snapshot dict (best-effort, never raises)."""
+    try:
+        result = await keytao_list_draft_items(platform, platform_id)
+        if result.get("success"):
+            return {
+                "count": result.get("count", 0),
+                "items": result.get("items", [])
+            }
+    except Exception as e:
+        logger.warning(f"[draft_snapshot] Failed to fetch: {e}")
+    return None
 
 
 async def keytao_create_phrase(
@@ -198,6 +225,10 @@ async def keytao_create_phrase(
             if response.status_code == 200:
                 data = response.json()
                 logger.info(f"[keytao_create_phrase] API response (200): {json.dumps(data, ensure_ascii=False)}")
+                snapshot = await _fetch_draft_snapshot(platform, platform_id)
+                if snapshot is not None:
+                    data["draft_snapshot"] = snapshot
+                _inject_batch_url(data)
                 return data
             elif response.status_code == 404:
                 logger.warning(f"[keytao_create_phrase] API response (404): {response.text}")
@@ -215,6 +246,12 @@ async def keytao_create_phrase(
                 # Conflict or warning
                 data = response.json()
                 logger.info(f"[keytao_create_phrase] API response (400): {json.dumps(data, ensure_ascii=False)}")
+                # Attach draft snapshot so AI can report current state even when this item has a warning
+                if data.get("requiresConfirmation"):
+                    snapshot = await _fetch_draft_snapshot(platform, platform_id)
+                    if snapshot is not None:
+                        data["draft_snapshot"] = snapshot
+                    _inject_batch_url(data)
                 return data
             else:
                 logger.error(f"[keytao_create_phrase] API response ({response.status_code}): {response.text}")
@@ -291,7 +328,9 @@ async def keytao_submit_batch(
             )
             
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                _inject_batch_url(data)
+                return data
             elif response.status_code == 404:
                 return {
                     "success": False,
@@ -357,6 +396,7 @@ async def keytao_list_draft_items(
             logger.info(f"[keytao_list_draft_items] status={response.status_code} count={data.get('count', 0)}")
             if data.get("success") and isinstance(data.get("items"), list):
                 data["items"] = [enrich_pr_item_labels(item) for item in data["items"]]
+            _inject_batch_url(data)
             return data
 
     except httpx.TimeoutException:
@@ -407,6 +447,11 @@ async def keytao_remove_draft_item(
                 return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
 
             logger.info(f"[keytao_remove_draft_item] PR#{pr_id} status={response.status_code}")
+            if data.get("success"):
+                snapshot = await _fetch_draft_snapshot(platform, platform_id)
+                if snapshot is not None:
+                    data["draft_snapshot"] = snapshot
+            _inject_batch_url(data)
             return data
 
     except httpx.TimeoutException:
@@ -510,10 +555,187 @@ TOOLS = [
 ]
 
 
+async def keytao_batch_add_to_draft(
+    platform: str,
+    platform_id: str,
+    items: List[Dict],
+    batch_id: Optional[str] = None,
+) -> Dict:
+    """
+    Batch add word entries to draft (tolerant mode).
+    Hard conflicts are skipped and reported; duplicate-code warnings are auto-confirmed.
+
+    Args:
+        platform: Platform type ('qq' or 'telegram')
+        platform_id: User's platform ID
+        items: List of dicts with keys: word, code, action (optional), type (optional), remark (optional)
+        batch_id: Optional existing draft batch ID
+
+    Returns:
+        dict with successCount, failedCount, skippedCount, failed[], skipped[], draftItems[], draftTotal
+    """
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+
+    if not BOT_API_TOKEN:
+        return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    if not batch_id:
+        batch_id = await get_latest_draft_batch(platform, platform_id)
+        if not batch_id:
+            return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
+
+    url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch-draft"
+    request_data = {
+        "platform": platform,
+        "platformId": platform_id,
+        "batchId": batch_id,
+        "items": items,
+    }
+
+    logger.info(f"[keytao_batch_add_to_draft] Sending {len(items)} items to batch-draft")
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url,
+                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                json=request_data,
+            )
+            try:
+                data = response.json()
+            except Exception:
+                return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+
+            logger.info(
+                f"[keytao_batch_add_to_draft] status={response.status_code} "
+                f"success={data.get('successCount',0)} failed={data.get('failedCount',0)}"
+            )
+            # Enrich draft item labels
+            if isinstance(data.get("draftItems"), list):
+                data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
+            _inject_batch_url(data)
+            return data
+
+    except httpx.TimeoutException:
+        return {"success": False, "message": "请求超时，请稍后重试"}
+    except Exception as e:
+        logger.error(f"[keytao_batch_add_to_draft] Error: {e}")
+        return {"success": False, "message": f"批量添加失败: {str(e)}"}
+
+
+async def keytao_batch_remove_draft_items(
+    platform: str,
+    platform_id: str,
+    ids: list[int],
+) -> Dict:
+    """Batch delete draft items by their PR IDs."""
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+
+    if not BOT_API_TOKEN:
+        return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch-draft"
+    payload = {"platform": platform, "platformId": platform_id, "ids": ids}
+    logger.info(f"[keytao_batch_remove_draft_items] Deleting ids={ids}")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(
+                "DELETE", url,
+                json=payload,
+                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+            )
+            try:
+                data: Dict = response.json()
+            except Exception:
+                return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+            logger.info(
+                f"[keytao_batch_remove_draft_items] status={response.status_code} "
+                f"success={data.get('success')} deleted={data.get('successCount')}"
+            )
+            if isinstance(data.get("draftItems"), list):
+                data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
+            _inject_batch_url(data)
+            return data
+    except httpx.TimeoutException:
+        return {"success": False, "message": "请求超时，请稍后重试"}
+    except Exception as e:
+        logger.error(f"[keytao_batch_remove_draft_items] Error: {e}")
+        return {"success": False, "message": f"批量删除失败: {str(e)}"}
+
+
+TOOLS += [
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_batch_add_to_draft",
+            "description": (
+                "批量将词条加入草稿。适合用户一次提交大量词条时使用。"
+                "遇到冲突的条目会跳过并在 failed 列表中说明原因，重码（同编码不同词）会自动确认写入。"
+                "操作完成后返回成功数、失败数及当前草稿快照。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "要添加的词条列表",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "word": {"type": "string", "description": "词条内容"},
+                                "code": {"type": "string", "description": "键道编码（纯字母）"},
+                                "action": {
+                                    "type": "string",
+                                    "enum": ["Create", "Change", "Delete"],
+                                    "description": "操作类型，默认 Create",
+                                },
+                                "type": {
+                                    "type": "string",
+                                    "description": "词条类型，不传则自动推断",
+                                },
+                                "remark": {"type": "string", "description": "备注（可选）"},
+                            },
+                            "required": ["word", "code"],
+                        },
+                    }
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_batch_remove_draft_items",
+            "description": (
+                "批量从草稿中删除词条，通过条目 ID 列表指定要删除的内容。"
+                "只能删除属于当前用户且处于草稿状态的条目。"
+                "操作完成后返回成功数、失败信息及当前草稿快照。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "description": "要删除的草稿条目 ID 列表（整数）",
+                        "items": {"type": "integer"},
+                    }
+                },
+                "required": ["ids"],
+            },
+        },
+    },
+]
+
+
 # Tool registry for dynamic calling
 TOOL_FUNCTIONS = {
     "keytao_create_phrase": keytao_create_phrase,
     "keytao_submit_batch": keytao_submit_batch,
     "keytao_list_draft_items": keytao_list_draft_items,
     "keytao_remove_draft_item": keytao_remove_draft_item,
+    "keytao_batch_add_to_draft": keytao_batch_add_to_draft,
+    "keytao_batch_remove_draft_items": keytao_batch_remove_draft_items,
 }

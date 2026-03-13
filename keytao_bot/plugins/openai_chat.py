@@ -79,6 +79,16 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
    用户确认 → 立即再次调用 + confirmed=true（相同参数）
    ⚠️ 如果不传confirmed=true会无限循环！
 
+   Delete 操作不会阻塞，写入草稿后成功响应中包含 notes（被删除的词条信息），必须告知用户。
+   
+3. 多步操作原则
+   用户要求连续多个步骤（删A→删B→加C→加D）时：
+   • 按顺序连续调用工具，不要在步骤之间停下来等用户确认
+   • Delete 步骤永远不停，直接继续
+   • 只有 Create/Change 返回 requiresConfirmation 时才暂停询问
+   • 每次工具返回后，用 draft_snapshot 展示当前草稿状态
+   • 全部完成后一次性汇报结果 + 最终草稿状态
+
 3. 否定词识别（避免误操作）
    否定词：不、别、不要、不用、取消、算了
    • 有否定词 → 取消当前操作
@@ -244,7 +254,7 @@ async def should_handle(bot: Bot, event: Event) -> bool:
 # Clear history command
 from nonebot import on_command
 from nonebot.rule import Rule
-clear_cmd = on_command("clear", aliases={"重置", "清空"}, rule=Rule(should_handle), priority=5, block=True)
+clear_cmd = on_command("clear", aliases={"清空对话", "清空历史"}, rule=Rule(should_handle), priority=5, block=True)
 
 @clear_cmd.handle()
 async def handle_clear(bot: Bot, event: Event):
@@ -507,7 +517,7 @@ async def call_tool_function(
     
     try:
         # Auto-inject platform and platform_id for keytao tools
-        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch', 'keytao_list_draft_items', 'keytao_remove_draft_item']:
+        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch', 'keytao_list_draft_items', 'keytao_remove_draft_item', 'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items']:
             if bot and event:
                 platform, platform_id = extract_platform_info(bot, event)
                 arguments['platform'] = platform
