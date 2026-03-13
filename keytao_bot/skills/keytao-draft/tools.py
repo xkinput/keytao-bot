@@ -382,6 +382,46 @@ async def keytao_submit_batch(
         }
 
 
+async def keytao_recall_batch(
+    platform: str,
+    platform_id: str,
+) -> Dict:
+    """
+    Recall (un-submit) the latest submitted batch, reverting it back to Draft.
+    撤回最近一次提审，将批次状态恢复为草稿。
+    """
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+
+    if not BOT_API_TOKEN:
+        return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    url = f"{KEYTAO_API_BASE}/api/bot/batches/recall"
+    logger.info(f"[keytao_recall_batch] platform={platform} platformId={platform_id}")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                url,
+                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                json={"platform": platform, "platformId": platform_id},
+            )
+            try:
+                data = response.json()
+            except Exception:
+                return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+
+            logger.info(f"[keytao_recall_batch] status={response.status_code} success={data.get('success')}")
+            _inject_batch_url(data)
+            return data
+
+    except httpx.TimeoutException:
+        return {"success": False, "message": "请求超时，请稍后重试"}
+    except Exception as e:
+        logger.error(f"[keytao_recall_batch] Error: {e}")
+        return {"success": False, "message": f"撤回失败: {str(e)}"}
+
+
 async def keytao_list_draft_items(
     platform: str,
     platform_id: str,
@@ -529,7 +569,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_submit_batch",
-            "description": "提交当前草稿批次进行审核。用于用户确认提交词条修改后。会自动查找并提交用户的草稿批次。",
+            "description": "提交当前草稿批次进行审核。仅当用户明确说"提交"、"提审"、"发起审核"、"submit"时才调用，不得因"确认"、"好"、"是"等模糊词而触发。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -746,6 +786,21 @@ TOOLS += [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_recall_batch",
+            "description": (
+                "撤回最近一次提审，将批次从\"审核中\"状态恢复为草稿。"
+                "⚠️ 仅当用户明确说\"撤回\"、\"撤销提交\"、\"取消提审\"时调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -757,4 +812,5 @@ TOOL_FUNCTIONS = {
     "keytao_remove_draft_item": keytao_remove_draft_item,
     "keytao_batch_add_to_draft": keytao_batch_add_to_draft,
     "keytao_batch_remove_draft_items": keytao_batch_remove_draft_items,
+    "keytao_recall_batch": keytao_recall_batch,
 }

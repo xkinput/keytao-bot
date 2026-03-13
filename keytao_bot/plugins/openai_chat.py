@@ -72,6 +72,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
    • 标有 [历史] 的消息是已经处理完的历史记录，绝对不要重复处理！
    • 用户说操作词（添加/删除/修改）→ 立即调用工具
    • 用户说"确认/是" + 最近有警告 → 立即调用confirmed=true
+   • ⚠️ "确认/好/是/可以"不是提交指令！提交草稿必须用户明确说"提交"/"提审"/"发起审核"
    • 不要多余查询！不要反复询问！
 
 2. 确认流程（防止无限循环）
@@ -517,7 +518,7 @@ async def call_tool_function(
     
     try:
         # Auto-inject platform and platform_id for keytao tools
-        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch', 'keytao_list_draft_items', 'keytao_remove_draft_item', 'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items']:
+        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch', 'keytao_list_draft_items', 'keytao_remove_draft_item', 'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items', 'keytao_recall_batch']:
             if bot and event:
                 platform, platform_id = extract_platform_info(bot, event)
                 arguments['platform'] = platform
