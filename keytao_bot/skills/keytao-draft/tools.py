@@ -27,12 +27,31 @@ TYPE_LABELS = {
 
 
 def enrich_pr_item_labels(item: Dict) -> Dict:
-    """Add Chinese labels for action/type fields."""
+    """Add Chinese labels and display_label for action/type fields."""
     enriched_item = dict(item)
     action = enriched_item.get("action")
     phrase_type = enriched_item.get("type")
+    word = enriched_item.get("word") or ""
+    old_word = enriched_item.get("oldWord")
+    code = enriched_item.get("code") or ""
+    weight = enriched_item.get("weight")
+    conflict_reason = enriched_item.get("conflictReason")
+
     enriched_item["action_label"] = ACTION_LABELS.get(action, action or "未知")
     enriched_item["type_label"] = TYPE_LABELS.get(phrase_type, phrase_type or "未知")
+
+    weight_str = f"（权重: {weight}）" if weight is not None else ""
+    if action == "Change" and old_word:
+        display = f"{old_word} → {word} @ {code}{weight_str}"
+    elif action == "Delete":
+        display = f"{word} @ {code}{weight_str}"
+    else:
+        display = f"{word} → {code}{weight_str}"
+    enriched_item["display_label"] = display
+
+    if conflict_reason:
+        enriched_item["warning"] = conflict_reason
+
     return enriched_item
 
 
