@@ -524,12 +524,16 @@ async def call_tool_function(
                 arguments['platform'] = platform
                 arguments['platform_id'] = platform_id
                 logger.info(f"Auto-injected platform info: {platform}, {platform_id}")
-        
+            else:
+                logger.error(f"[call_tool_function] bot={bot!r} event={event!r} — cannot inject platform info for {tool_name}!")
+                return json.dumps({"error": f"内部错误：无法获取用户平台信息（bot={bot!r}）"}, ensure_ascii=False)
+
         result = await tool_func(**arguments)
-        
-        return json.dumps(result, ensure_ascii=False)
+        result_json = json.dumps(result, ensure_ascii=False)
+        logger.info(f"Tool {tool_name} result: {result_json[:300]}")
+        return result_json
     except Exception as e:
-        logger.error(f"Tool {tool_name} execution error: {e}")
+        logger.error(f"Tool {tool_name} execution error: {type(e).__name__}: {e}")
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 

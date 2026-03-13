@@ -569,7 +569,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_submit_batch",
-            "description": "提交当前草稿批次进行审核。仅当用户明确说"提交"、"提审"、"发起审核"、"submit"时才调用，不得因"确认"、"好"、"是"等模糊词而触发。",
+            "description": '提交当前草稿批次进行审核。仅当用户明确说"提交"、"提审"、"发起审核"、"submit"时才调用，不得因"确认"、"好"、"是"等模糊词而触发。',
             "parameters": {
                 "type": "object",
                 "properties": {
