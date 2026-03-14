@@ -348,6 +348,7 @@ async def keytao_submit_batch(
             
             if response.status_code == 200:
                 data = response.json()
+                data["batchId"] = batch_id  # inject so _inject_batch_url can build batchUrl
                 _inject_batch_url(data)
                 return data
             elif response.status_code == 404:
