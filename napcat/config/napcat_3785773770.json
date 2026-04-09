@@ -3,11 +3,11 @@
   "consoleLog": true,
   "fileLogLevel": "debug",
   "consoleLogLevel": "info",
-  "packetBackend": "auto",
+  "packetBackend": "nt",
   "packetServer": "",
   "o3HookMode": 1,
   "bypass": {
-    "hook": false,
+    "hook": true,
     "window": false,
     "module": false,
     "process": false,

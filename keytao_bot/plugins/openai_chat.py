@@ -41,7 +41,8 @@ if OPENAI_TEMPERATURE is None:
 if OPENAI_TEMPERATURE is None:
     OPENAI_TEMPERATURE = 0.7
 
-GROUP_TRIGGER_KEYWORDS = ("键道", "喵喵")
+GROUP_TRIGGER_KEYWORD_START = "键道"   # must appear at the start of the message
+GROUP_TRIGGER_KEYWORD_ANY = "喵喵"    # can appear anywhere in the message
 
 # Initialize skills manager and load all skills
 skills_manager = SkillsManager()
@@ -50,7 +51,7 @@ logger.info(f"Loaded {len(skills_manager.get_tools())} tools from skills")
 
 # Initialize history store (SQLite)
 history_store = get_history_store()
-MAX_HISTORY_MESSAGES = 30  # Keep last 30 messages (15 rounds) for batch operations
+MAX_HISTORY_MESSAGES = 16  # Keep last 16 messages (8 rounds)
 
 # Pending confirmation state: stores tool args waiting for user to confirm a warning
 # Key: (platform, user_id), Value: {"function": str, "args": dict}
@@ -76,9 +77,13 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
    • 不要多余查询！不要反复询问！
 
 2. 确认流程（防止无限循环）
-   第1次调用 → 返回警告 → 告知用户 → 询问确认
-   用户确认 → 立即再次调用 + confirmed=true（相同参数）
+   第1次调用 → 返回警告（requiresConfirmation: true）→ 告知用户 → 询问确认
+   用户确认 → 立即用【同一个工具】+ confirmed=true 重新调用
    ⚠️ 如果不传confirmed=true会无限循环！
+   ⚠️ 必须重调【同一个工具】，绝不跨工具处理确认：
+      • 上一步是 keytao_submit_batch → 确认时调 keytao_submit_batch(confirmed=True)
+      • 上一步是 keytao_create_phrase → 确认时调 keytao_create_phrase(confirmed=True, 相同词条参数)
+      绝对禁止：提交确认时调用 create_phrase / batch_add_to_draft 等其他工具！
 
    Delete 操作不会阻塞，写入草稿后成功响应中包含 notes（被删除的词条信息），必须告知用户。
    
@@ -215,14 +220,14 @@ async def should_handle(bot: Bot, event: Event) -> bool:
                 except Exception as segment_err:
                     logger.debug(f"Error checking message segments: {segment_err}")
 
-                if any(keyword in message_text for keyword in GROUP_TRIGGER_KEYWORDS):
+                if GROUP_TRIGGER_KEYWORD_ANY in message_text or message_text.startswith(GROUP_TRIGGER_KEYWORD_START):
                     logger.info("Group message contains trigger keyword, will handle")
                     return True
-                
+
                 logger.debug("Bot not mentioned/replied in group, will not handle")
                 return False
             return False
-        
+
         elif isinstance(bot, QQBot):
             if isinstance(event, QQPrivateMessageEvent):
                 return True
@@ -233,7 +238,7 @@ async def should_handle(bot: Bot, event: Event) -> bool:
                     return True
 
                 message_text = event.get_plaintext().strip()
-                if any(keyword in message_text for keyword in GROUP_TRIGGER_KEYWORDS):
+                if GROUP_TRIGGER_KEYWORD_ANY in message_text or message_text.startswith(GROUP_TRIGGER_KEYWORD_START):
                     logger.info("QQ group message contains trigger keyword, will handle")
                     return True
 
