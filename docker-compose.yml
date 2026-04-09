@@ -29,6 +29,17 @@ services:
     depends_on:
       - napcat
 
+  napcat-watchdog:
+    image: alpine:latest
+    container_name: napcat-watchdog
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: >
+      sh -c "apk add --no-cache docker-cli &&
+             echo '0 3 * * * docker restart napcat' | crontab - &&
+             crond -f -l 8"
+
 networks:
   bot-net:
     driver: bridge
