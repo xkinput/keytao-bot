@@ -3,6 +3,7 @@ Keytao Create Skill Tools
 键道创建词条工具实现
 """
 import json
+import difflib
 import httpx
 from typing import Dict, List, Optional
 from nonebot.log import logger
@@ -32,6 +33,36 @@ def compute_draft_summary(items: List[Dict]) -> Dict:
     modified = sum(1 for i in items if i.get("action") == "Change")
     deleted = sum(1 for i in items if i.get("action") == "Delete")
     return {"added": added, "modified": modified, "deleted": deleted}
+
+
+def _format_preview_text(preview: Dict) -> str:
+    """Convert preview API response into a unified-diff text block."""
+    changes = preview.get("changes", [])
+    if not changes:
+        return ""
+
+    def phrase_line(p: Dict) -> str:
+        word = p.get("word", "")
+        code = p.get("code", "")
+        weight = p.get("weight", 0)
+        return f"{word:<8} {code:<12} {weight}"
+
+    parts: List[str] = []
+    for group in changes:
+        phrase_type = group.get("phraseType", "")
+        codes = group.get("codes", [])
+        before = [phrase_line(p) for p in group.get("before", [])]
+        after = [phrase_line(p) for p in group.get("after", [])]
+
+        unified = list(difflib.unified_diff(before, after, n=3, lineterm=""))
+        if len(unified) <= 2:
+            continue
+
+        parts.append(f"diff {phrase_type}  {', '.join(codes)}")
+        parts.extend(unified[2:])  # skip --- / +++ header lines
+        parts.append("")
+
+    return "\n".join(parts).strip()
 
 
 def enrich_pr_item_labels(item: Dict) -> Dict:
@@ -391,6 +422,58 @@ async def keytao_submit_batch(
             "success": False,
             "message": f"提交失败: {str(e)}"
         }
+
+
+async def keytao_get_batch_preview(
+    platform: str,
+    platform_id: str,
+) -> Dict:
+    """
+    Fetch the diff preview of the user's current draft batch.
+    Returns summary stats and a formatted unified-diff text block.
+    """
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+
+    if not BOT_API_TOKEN:
+        return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    batch_id = await get_latest_draft_batch(platform, platform_id)
+    if not batch_id:
+        return {"success": False, "message": "没有找到草稿批次"}
+
+    url = f"{KEYTAO_API_BASE}/api/batches/{batch_id}/preview"
+    logger.info(f"[keytao_get_batch_preview] batchId={batch_id}")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url)
+
+        try:
+            data = response.json()
+        except Exception:
+            return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+
+        if response.status_code != 200:
+            return {"success": False, "message": f"获取预览失败: HTTP {response.status_code}"}
+
+        preview = data.get("preview", {})
+        summary = preview.get("summary", {})
+        diff_text = _format_preview_text(preview)
+
+        return {
+            "success": True,
+            "batchId": batch_id,
+            "batchUrl": make_batch_url(batch_id),
+            "summary": summary,
+            "diff_text": diff_text,
+        }
+
+    except httpx.TimeoutException:
+        return {"success": False, "message": "请求超时，请稍后重试"}
+    except Exception as e:
+        logger.error(f"[keytao_get_batch_preview] Error: {e}")
+        return {"success": False, "message": f"获取预览失败: {str(e)}"}
 
 
 async def keytao_recall_batch(
@@ -813,6 +896,23 @@ TOOLS += [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_get_batch_preview",
+            "description": (
+                "获取当前草稿批次的 diff 预览。"
+                "返回 summary（新增/修改/删除数量）和 diff_text（文字版 unified diff，含上下文行）。"
+                "用户查看草稿时，优先调用此工具（而非 keytao_list_draft_items），以便展示完整 diff 效果。"
+                "若需要条目 ID 进行删除操作，再补充调用 keytao_list_draft_items。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -825,4 +925,5 @@ TOOL_FUNCTIONS = {
     "keytao_batch_add_to_draft": keytao_batch_add_to_draft,
     "keytao_batch_remove_draft_items": keytao_batch_remove_draft_items,
     "keytao_recall_batch": keytao_recall_batch,
+    "keytao_get_batch_preview": keytao_get_batch_preview,
 }
