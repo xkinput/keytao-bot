@@ -893,7 +893,14 @@ async def handle_ai_chat(bot: Bot, event: Event):
         try:
             result = json.loads(result_json)
             if result.get("success"):
-                response = f"✅ 已确认添加到草稿批次！\n\n• 词：{func_args.get('word', '')}\n• 编码：{func_args.get('code', '')}\n\n是否立即提交审核？回复'提交'或'是'即可～\n也可以继续添加/修改/删除词条哦 owo"
+                if func_name == "keytao_submit_batch":
+                    batch_url = result.get("batchUrl", "")
+                    pr_url = result.get("prUrl", "")
+                    url_part = f"\n\n草稿地址：{batch_url}" if batch_url else ""
+                    pr_part = f"\nPR：{pr_url}" if pr_url else ""
+                    response = f"✅ 草稿已成功提交审核！{url_part}{pr_part}"
+                else:
+                    response = f"✅ 已确认添加到草稿批次！\n\n• 词：{func_args.get('word', '')}\n• 编码：{func_args.get('code', '')}\n\n是否立即提交审核？回复'提交'或'是'即可～\n也可以继续添加/修改/删除词条哦 owo"
             else:
                 response = f"操作失败：{result.get('message', '未知错误')} qwq"
         except Exception:
