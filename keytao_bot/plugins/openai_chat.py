@@ -4,6 +4,7 @@ OpenAI-compatible chat plugin
 通过 Skills 系统动态加载工具
 """
 import json
+import re
 from typing import Optional, List, Dict, Tuple
 
 from nonebot import on_message, get_driver
@@ -20,6 +21,56 @@ except ImportError:
 
 from ..skills import SkillsManager
 from ..utils.history_store import get_history_store
+
+
+# ---------------------------------------------------------------------------
+# Message formatting helpers
+# ---------------------------------------------------------------------------
+
+def _strip_markdown(text: str) -> str:
+    """Remove markdown syntax for plain-text platforms (QQ)."""
+    # Code blocks: keep content, drop fences
+    text = re.sub(r'```[\w]*\n?(.*?)```', lambda m: m.group(1).strip(), text, flags=re.DOTALL)
+    # Inline code: keep content
+    text = re.sub(r'`([^`\n]+)`', r'\1', text)
+    # Bold / italic
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'__(.*?)__', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'_((?!\s).*?(?<!\s))_', r'\1', text)
+    # ATX headers
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Horizontal rules
+    text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+    # Collapse excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+_MV2_RE = re.compile(r'([\\_%*\[\]()~`>#+\-=|{}.!])')
+
+def _escape_mv2_segment(text: str) -> str:
+    """Escape special characters for Telegram MarkdownV2 in a plain-text segment."""
+    return _MV2_RE.sub(r'\\\1', text)
+
+
+def _to_markdownv2(text: str) -> str:
+    """
+    Convert an AI response (common markdown) to Telegram MarkdownV2.
+    Code blocks (``` ... ```) and inline code (` ... `) are kept verbatim;
+    everything else has special characters escaped.
+    """
+    result: list[str] = []
+    last = 0
+    for m in re.finditer(r'```[\w]*\n?.*?```|`[^`\n]+`', text, re.DOTALL):
+        result.append(_escape_mv2_segment(text[last:m.start()]))
+        result.append(m.group())  # code span / block: no escaping needed
+        last = m.end()
+    result.append(_escape_mv2_segment(text[last:]))
+    return ''.join(result)
+
+
+# ---------------------------------------------------------------------------
 
 # Get configuration
 driver = get_driver()
@@ -874,8 +925,9 @@ async def handle_ai_chat(bot: Bot, event: Event):
     
     logger.debug(f"Bot type: {bot_class_name}, Module: {bot_module_name}")
     
-    # Telegram: keep URLs (supports links), reply to user message
+    # Telegram: render MarkdownV2 (code blocks + escaped text)
     if 'telegram' in bot_module_name.lower():
+        tg_text = _to_markdownv2(response)
         message_id = getattr(event, 'message_id', None)
         logger.info(f"Telegram message_id: {message_id}")
         if message_id:
@@ -883,40 +935,50 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 logger.info(f"Attempting Telegram reply to message_id: {message_id}")
                 await bot.send(
                     event=event,
-                    message=response,
-                    reply_to_message_id=message_id
+                    message=tg_text,
+                    reply_to_message_id=message_id,
+                    parse_mode="MarkdownV2",
                 )
                 logger.info("Telegram reply sent successfully")
-                return  # Successfully sent with reply, exit handler
+                return
             except Exception as e:
-                logger.error(f"Failed to send Telegram reply: {e}", exc_info=True)
-                # Fallback to normal send
-                await ai_chat.finish(response)
+                logger.error(f"Telegram MarkdownV2 send failed, falling back to plain text: {e}")
+                try:
+                    await bot.send(
+                        event=event,
+                        message=response,
+                        reply_to_message_id=message_id,
+                    )
+                    return
+                except Exception:
+                    await ai_chat.finish(response)
         else:
             logger.warning("Telegram message_id not found, using finish")
-            await ai_chat.finish(response)
+            try:
+                await ai_chat.finish(tg_text, parse_mode="MarkdownV2")
+            except Exception:
+                await ai_chat.finish(response)
     
     # QQ: reply to user message
     elif 'onebot' in bot_module_name.lower() or bot_class_name == 'Bot':
-        # Try to get QQ message id for reply
+        qq_text = _strip_markdown(response)
         qq_msg_id = getattr(event, 'message_id', None)
         logger.info(f"QQ message_id: {qq_msg_id}")
-        
+
         if qq_msg_id and QQMessageSegment:
             try:
                 logger.info(f"Attempting OneBot v11 reply to message_id: {qq_msg_id}")
                 await bot.send(
                     event=event,
-                    message=QQMessageSegment.reply(qq_msg_id) + response,
+                    message=QQMessageSegment.reply(qq_msg_id) + qq_text,
                 )
                 logger.info("OneBot v11 reply sent successfully")
                 return
             except Exception as e:
                 logger.warning(f"Failed to send OneBot v11 reply: {e}")
-        
-        # Fallback: normal send without reference
+
         logger.info("QQ falling back to normal send without reply")
-        await ai_chat.finish(response)
+        await ai_chat.finish(qq_text)
     
     # Other platforms: send normally
     else:
