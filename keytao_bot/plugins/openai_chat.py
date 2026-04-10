@@ -523,7 +523,7 @@ async def call_tool_function(
     
     try:
         # Auto-inject platform and platform_id for keytao tools
-        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch', 'keytao_list_draft_items', 'keytao_remove_draft_item', 'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items', 'keytao_recall_batch']:
+        if tool_name in ['keytao_create_phrase', 'keytao_submit_batch', 'keytao_list_draft_items', 'keytao_remove_draft_item', 'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items', 'keytao_recall_batch', 'keytao_get_batch_preview']:
             if bot and event:
                 platform, platform_id = extract_platform_info(bot, event)
                 arguments['platform'] = platform
