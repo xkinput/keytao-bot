@@ -5,6 +5,7 @@ OpenAI-compatible chat plugin
 """
 import json
 import re
+from datetime import datetime
 from typing import Optional, List, Dict, Tuple
 
 from nonebot import on_message, get_driver
@@ -121,7 +122,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 
 1. 立即执行原则
    • ⚠️ 只处理标有 [当前请求] 的消息！
-   • 标有 [历史] 的消息是已经处理完的历史记录，绝对不要重复处理！
+   • 带有 [Xm ago] / [Xh ago] 等时间标签的消息是已经处理完的历史记录，绝对不要重复处理！
    • 用户说删除/修改操作词 → 立即调用工具
    • 用户说"确认/是" + 最近有警告 → 立即调用confirmed=true
    • ⚠️ "确认/好/是/可以"不是提交指令！提交草稿必须用户明确说"提交"/"提审"/"发起审核"
@@ -172,11 +173,26 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
    • 不允许凭记忆回答！
 
    ⚠️ 查词的完整流程（不得只调一个工具就结束！）：
-   当用户查询一个词/字时，必须同时（或连续）调用以下两个工具，再汇总回复：
-     • keytao_lookup_by_word(word)   — 查词库中是否已有该词条及其编码位置
-     • keytao_encode(word)           — 按规则计算拆分和推荐编码（不依赖词库）
-   无论词库中是否存在该词，都必须展示 keytao_encode 的拆分结果。
-   ⚠️ 禁止只调 lookup 说"没找到"就结束，必须同时给出拆分信息！
+
+   【第一步】同时调用：
+     • keytao_lookup_by_word(word)   — 查词库是否已有该词及其编码位置
+     • keytao_encode(word)           — 按规则计算拆分和候选编码
+
+   【第二步】根据第一步结果判断：
+     A) 词库中已有该词 → 展示词库位置 + 拆分，流程结束
+     B) 词库中没有该词 → 必须继续执行第三步！
+
+   【第三步】词不在词库时，查各候选编码的占用情况：
+     取 keytao_encode 返回的 codes（推荐编码）和 altCodes（进阶/备用编码），
+     对每个候选编码调用 keytao_lookup_by_code(code)，
+     查清楚该码位现有几个词、是否有空位。
+
+   【第四步】汇总回复，告诉用户：
+     • 该词的拆分是什么
+     • 推荐用哪个编码加入（优先选有空位的首选码，其次二重，说清楚会排在第几重）
+     • 如果主码已满，给出备用码建议
+     • 最后询问用户是否要加入草稿
+   ⚠️ 禁止只说"未收录"就结束，必须给出可操作的加词建议！
 
 5. 聊天与查词的边界
         • 你不仅是工具助手，也要会正常聊天、接话、解释、陪聊、开玩笑
@@ -657,19 +673,38 @@ async def get_openai_response(
         # Build initial messages with history
         messages = [{"role": "system", "content": system_prompt_full}]
         
-        # Add conversation history, marking past user messages as [历史] so AI won't re-execute them
+        # Add conversation history with relative timestamps on user messages
         if history:
+            now = datetime.now()
             processed_history = []
             for msg in history:
                 role = msg.get("role")
                 content = msg.get("content", "")
+                timestamp_str = msg.get("timestamp", "")
+                ago = ""
+                if timestamp_str:
+                    try:
+                        msg_time = datetime.fromisoformat(timestamp_str)
+                        diff = now - msg_time
+                        total_seconds = int(diff.total_seconds())
+                        if total_seconds < 60:
+                            ago = f"{total_seconds}s ago"
+                        elif total_seconds < 3600:
+                            ago = f"{total_seconds // 60}m ago"
+                        elif total_seconds < 86400:
+                            ago = f"{total_seconds // 3600}h ago"
+                        else:
+                            ago = f"{total_seconds // 86400}d ago"
+                    except Exception:
+                        pass
                 if role == "user":
-                    processed_history.append({"role": role, "content": f"[历史] {content}"})
+                    prefix = f"[{ago}]" if ago else ""
+                    processed_history.append({"role": role, "content": f"{prefix} {content}" if prefix else content})
                 else:
                     processed_history.append({"role": role, "content": content})
-            
+
             messages.extend(processed_history)
-            logger.info(f"Using {len(history)} history messages (marked as [历史])")
+            logger.info(f"Using {len(history)} history messages")
         
         # Detect: user is confirming a pending warning
         # If current message is a short confirmation AND recent history has a warning, inject explicit instruction
