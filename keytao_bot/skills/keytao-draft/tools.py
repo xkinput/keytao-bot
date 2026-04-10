@@ -26,6 +26,14 @@ TYPE_LABELS = {
 }
 
 
+def compute_draft_summary(items: List[Dict]) -> Dict:
+    """Compute added/modified/deleted counts from a list of PR items."""
+    added = sum(1 for i in items if i.get("action") == "Create")
+    modified = sum(1 for i in items if i.get("action") == "Change")
+    deleted = sum(1 for i in items if i.get("action") == "Delete")
+    return {"added": added, "modified": modified, "deleted": deleted}
+
+
 def enrich_pr_item_labels(item: Dict) -> Dict:
     """Add Chinese labels and display_label for action/type fields."""
     enriched_item = dict(item)
@@ -138,9 +146,11 @@ async def _fetch_draft_snapshot(platform: str, platform_id: str) -> Optional[Dic
     try:
         result = await keytao_list_draft_items(platform, platform_id)
         if result.get("success"):
+            items = result.get("items", [])
             return {
                 "count": result.get("count", 0),
-                "items": result.get("items", [])
+                "items": items,
+                "summary": compute_draft_summary(items),
             }
     except Exception as e:
         logger.warning(f"[draft_snapshot] Failed to fetch: {e}")
@@ -456,6 +466,7 @@ async def keytao_list_draft_items(
             logger.info(f"[keytao_list_draft_items] status={response.status_code} count={data.get('count', 0)}")
             if data.get("success") and isinstance(data.get("items"), list):
                 data["items"] = [enrich_pr_item_labels(item) for item in data["items"]]
+                data["summary"] = compute_draft_summary(data["items"])
             _inject_batch_url(data)
             return data
 

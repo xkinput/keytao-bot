@@ -370,10 +370,10 @@ async def keytao_lookup_by_word(word: str) -> Dict:
     """
     Query code by word with duplicate analysis
     按词条查询编码，并分析重码情况
-    
+
     Args:
         word: Chinese word/phrase to query
-        
+
     Returns:
         dict: Query result with phrases list and duplicate analysis
     """
@@ -392,6 +392,36 @@ async def keytao_lookup_by_word(word: str) -> Dict:
         "phrases": []
     }])[0]
 
+
+async def keytao_encode(word: str) -> Dict:
+    """
+    Calculate keytao encoding and char split for a word (rule-based, not DB query)
+    计算词条的键道编码及字根拆分（按规则计算，非数据库查询）
+
+    Args:
+        word: Chinese word or character to encode
+
+    Returns:
+        dict: Encoding result with codes, altCodes, and per-char split data
+    """
+    keytao_api_base = get_keytao_url()
+    url = f"{keytao_api_base}/api/phrases/encode"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, params={"word": word})
+            if response.is_success:
+                return response.json()
+            return {
+                "success": False,
+                "message": f"编码服务返回错误: {response.status_code}"
+            }
+    except Exception as error:
+        logger.error(f"[keytao_encode] error: {error}")
+        return {
+            "success": False,
+            "message": "编码服务暂时不可用，请稍后再试"
+        }
 
 
 # Tool definitions for OpenAI Function Calling
@@ -469,6 +499,23 @@ TOOLS = [
                 "required": ["word"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_encode",
+            "description": "按键道规则计算词条的编码和字根拆分。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "word": {
+                        "type": "string",
+                        "description": "要编码的中文词条或单字，如 '你好', '若'"
+                    }
+                },
+                "required": ["word"]
+            }
+        }
     }
 ]
 
@@ -478,5 +525,6 @@ TOOL_FUNCTIONS = {
     "keytao_lookup_by_codes_batch": keytao_lookup_by_codes_batch,
     "keytao_lookup_by_words_batch": keytao_lookup_by_words_batch,
     "keytao_lookup_by_code": keytao_lookup_by_code,
-    "keytao_lookup_by_word": keytao_lookup_by_word
+    "keytao_lookup_by_word": keytao_lookup_by_word,
+    "keytao_encode": keytao_encode
 }
