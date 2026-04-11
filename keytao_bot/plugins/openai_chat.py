@@ -149,12 +149,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      × 用户说的是模糊的感叹/评论（"这个不错""原来如此"）——不是加词确认
      × 上一条是 AI 回复（不是用户当前消息）——不能自己给自己确认
 
-   编码顺序调整的触发条件（必须同时满足）：
-     ① 用户当前消息明确说了要将某词加到某个具体编码（如"我要加到 pzty"、"让跑通用 pzty"）
-     ② 该编码已被其他词占用（需查询确认）
-     满足以上两点 → 执行 SKILL 里的「编码顺序调整协议」（一次 batch 调用，Delete 在前）
-     仅满足①但编码为空 → 按普通加词流程写入
-     仅说"调整顺序/优先级"但未指明编码 → 询问"想调整到哪个编码位？"，不写入
+   编码顺序调整：只有当用户当前消息同时给出了【目标词+目标编码】且编码已被占用，才执行 SKILL 里的「编码顺序调整协议」。缺少任一条件一律先询问，不写入。
 
 2. 确认流程（防止无限循环）
    第1次调用 → 返回警告（requiresConfirmation: true）→ 告知用户 → 询问确认
@@ -751,8 +746,19 @@ async def get_openai_response(
         # Check if user is replying to a message
         reply_context = await build_reply_context(bot, event)
         
+        # Insert a hard boundary between history and current request
+        messages.append({
+            "role": "system",
+            "content": (
+                "━━━ 当前请求边界 ━━━\n"
+                "以上是历史记录（只读，用于理解上下文）。\n"
+                "以下是用户刚发出的新消息，这是本轮唯一需要处理的请求。\n"
+                "⚠️ 任何草稿写入操作（加词/删词/修改编码顺序）只能由下面这条消息中用户的明确指令触发，"
+                "不得根据历史记录推断执行。"
+            )
+        })
+
         # Add current user message with reply context and optional confirmation hint
-        # Mark current message clearly so AI only processes this one
         user_message_content = f"[当前请求] {message}" + reply_context + pending_confirm_hint
         messages.append({"role": "user", "content": user_message_content})
         
