@@ -747,7 +747,7 @@ async def get_openai_response(
                 elif msg.get("role") == "assistant":
                     content = msg.get("content", "")
                     # Detect "以编码 CODE 将「WORD」加入草稿" pattern — user is confirming a word-add
-                    add_match = re.search(r'以编码\s*([a-z]+)\s*将[「"'](.+?)[」"']加入草稿', content)
+                    add_match = re.search(r'以编码\s*([a-z]+)\s*将「(.+?)」加入草稿', content)
                     if add_match:
                         target_code = add_match.group(1)
                         target_word = add_match.group(2)
