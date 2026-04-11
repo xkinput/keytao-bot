@@ -123,6 +123,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 1. 立即执行原则
    • ⚠️ 只处理标有 [当前请求] 的消息！
    • 带有 [Xm ago] / [Xh ago] 等时间标签的消息是已经处理完的历史记录，绝对不要重复处理！
+   • 用户消息中出现 [系统检测：...] 提示时，必须严格按提示内容执行，不得用其他规则覆盖！
    • 用户说删除/修改操作词 → 立即调用工具
    • 用户说"确认/是" + 最近有警告 → 立即调用confirmed=true
    • ⚠️ 执行「编码顺序调整协议」时，所有 Delete + Create 必须合并为一次 batch 调用（Delete 在前），不得分两次调用！
@@ -732,8 +733,71 @@ async def get_openai_response(
         is_short_confirm = user_msg_lower in confirmation_words or (len(message.strip()) <= 4 and any(w in user_msg_lower for w in confirmation_words))
         
         pending_confirm_hint = ""
-        if is_short_confirm and messages:
-            # Check recent messages for a pending warning or a pending word-add confirmation
+        msg_stripped = message.strip()
+        is_numeric_choice = msg_stripped.isdigit()
+
+        # Build reply context early so it's available for numeric detection
+        reply_context = await build_reply_context(bot, event)
+
+        # Extract the quoted message text from reply_context (if user quoted a bot message)
+        quoted_content = ""
+        quoted_match = re.search(r'被引用的消息内容：\n(.+?)(?:\n\n⚠️|$)', reply_context, re.DOTALL)
+        if quoted_match:
+            quoted_content = quoted_match.group(1).strip()
+
+        def _extract_numeric_hint(choice_num: int, content: str) -> Optional[str]:
+            """Try to extract a pending_confirm_hint for a numeric choice from a content string."""
+            # Match numbered code list: "N. code — description" (supports em dash, en dash, hyphen)
+            list_entries = re.findall(r'\d+\.\s*([a-z]+)\s*[-—–]\s*(.+)', content)
+            if not list_entries or not (1 <= choice_num <= len(list_entries)):
+                return None
+            target_code, description = list_entries[choice_num - 1]
+            # Extract target word from confirmation sentence
+            word_match = re.search(r'以编码\s*[a-z]+\s*将「(.+?)」加入草稿', content)
+            target_word = word_match.group(1) if word_match else None
+            if not target_word:
+                return None
+            is_occupied = '已有' in description
+            if is_occupied:
+                occupying_match = re.search(r'已有「(.+?)」', description)
+                occupying_word = occupying_match.group(1) if occupying_match else '原有词'
+                logger.info(f"🎯 Numeric→occupied: {choice_num}→{target_code}, will displace {occupying_word}")
+                return (
+                    f"\n\n[系统检测：用户选择了第{choice_num}个编码 {target_code}，"
+                    f"该位置已有「{occupying_word}」。"
+                    f"请执行编码顺序调整协议：先调用 keytao_list_draft_items 检查草稿，"
+                    f"清理冲突条目后，一次性提交 [Delete {occupying_word}@{target_code}, "
+                    f"Create {target_word}@{target_code}, Create {occupying_word}@下一空位]，"
+                    f"不要询问用户是否确认！]"
+                )
+            else:
+                logger.info(f"🎯 Numeric→empty: {choice_num}→{target_code}")
+                return (
+                    f"\n\n[系统检测：用户选择了第{choice_num}个编码 {target_code}（空位）。"
+                    f"请立即调用 keytao_create_phrase(word='{target_word}', code='{target_code}')，"
+                    f"不得使用其他编码，不得执行顺序调整！]"
+                )
+
+        # --- Case 1: numeric reply (e.g. "1", "2", "3") — map to code from the list in previous message ---
+        if is_numeric_choice and messages:
+            choice_num = int(msg_stripped)
+            # Try last assistant message first, then quoted content as fallback
+            contents_to_search = []
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant":
+                    contents_to_search.append(msg.get("content", ""))
+                    break
+            if quoted_content:
+                contents_to_search.append(quoted_content)
+
+            for content in contents_to_search:
+                hint = _extract_numeric_hint(choice_num, content)
+                if hint:
+                    pending_confirm_hint = hint
+                    break
+
+        # --- Case 2: short confirmation words ---
+        elif is_short_confirm and messages:
             for msg in reversed(messages):
                 if msg.get("role") == "tool":
                     try:
@@ -746,7 +810,7 @@ async def get_openai_response(
                         pass
                 elif msg.get("role") == "assistant":
                     content = msg.get("content", "")
-                    # Detect "以编码 CODE 将「WORD」加入草稿" pattern — user is confirming a word-add
+                    # "以编码 CODE 将「WORD」加入草稿" — user confirming default recommended code
                     add_match = re.search(r'以编码\s*([a-z]+)\s*将「(.+?)」加入草稿', content)
                     if add_match:
                         target_code = add_match.group(1)
@@ -756,16 +820,13 @@ async def get_openai_response(
                             f"请立即调用 keytao_create_phrase(word='{target_word}', code='{target_code}')，"
                             f"不得调用任何查询工具，不得执行编码顺序调整！]"
                         )
-                        logger.info(f"🎯 Detected word-add confirmation: {target_word}@{target_code}, injecting hint")
+                        logger.info(f"🎯 Detected word-add confirmation: {target_word}@{target_code}")
                         break
                     if any(kw in content for kw in ["警告", "重码", "多编码", "是否确认", "requiresConfirmation"]):
                         pending_confirm_hint = "\n\n[系统检测：用户在确认上一条警告！请立即用相同参数再次调用keytao_create_phrase，但添加confirmed=true，不要询问用户！]"
                         logger.info("🎯 Detected confirmation of pending warning (from assistant msg), injecting hint")
                         break
-                    break  # Only check the most recent assistant message
-        
-        # Check if user is replying to a message
-        reply_context = await build_reply_context(bot, event)
+                    break
         
         # Insert a hard boundary between history and current request
         messages.append({
