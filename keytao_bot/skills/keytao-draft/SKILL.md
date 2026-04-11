@@ -341,6 +341,91 @@ summary 格式规则：
 
 ---
 
+## 编码顺序调整协议
+
+**触发条件（同时满足以下两点）：**
+- 用户明确指定某词要用某个**具体编码**（如"我要将跑通加到 pzty"、"让跑通排在炮筒前面"）
+- 该编码已被另一个词占用（非空码位）
+
+**与「通用编码自动分配协议」的区别：**
+- 自动分配协议：找第一个**空位**放新词（新词往后顺延）
+- 本协议：用户**指定了目标位置**，被挤走的原词才往后顺延
+
+**典型触发表达：**
+- "我要将XX加到 abc"（abc 已有词）
+- "让XX用 abc 编码"
+- "把XX的优先级调到最前"
+- "我要XX排在第一"
+- 加词确认展示后，用户回复"我要加到 abc"（而非默认推荐位）
+
+---
+
+### Step 1：查清现状
+
+并行调用：
+- `keytao_encode(new_word)` → 获取编码链 `chain = [code, altCode0, altCode1, ...]`
+- `keytao_lookup_by_code(target_code)` → 查目标位现有词条列表
+
+同时，若 `new_word` 已在词库中，调用 `keytao_lookup_by_word(new_word)` 确认其当前编码 `old_code`。
+
+**验证：** 若 `target_code` 不在 `new_word` 的编码链中，告知用户"该编码不是「词」的有效编码位，无法调整到此位置"，终止协议。
+
+### Step 2：确定受影响范围
+
+**找出从 `target_code` 到 `new_word` 原编码（`old_code`）之间的所有连续占位词：**
+
+```
+chain 中 target_code 的 index = i
+若 new_word 已在词库（有 old_code），则 old_code 在 chain 中的 index = j（j > i）
+需移动的槽位范围：chain[i], chain[i+1], ..., chain[j-1]
+```
+
+若 `new_word` 不在词库，则等效 j = i（无 old_code），只检查从 `target_code` 开始连续被占的槽位：
+```
+从 chain[i] 开始，依次查 chain[i], chain[i+1], ... 直到遇到空位或 old_code（已释放）
+收集所有途中被占的词 → 这些词都需要往后推一格
+```
+
+对上述范围中尚未查过的编码，批量调用 `keytao_lookup_by_codes_batch([...])` 查清占用情况。
+
+### Step 3：构建操作列表（顺序严格）
+
+操作顺序：先全部 Delete，再全部 Create。
+
+**Delete 操作（逆序构建，从最后一个受影响词开始，避免循环依赖）：**
+1. 若 `new_word` 已在词库：`Delete(word=new_word, code=old_code)`
+2. 对每个被推移的词（从 chain[i] 到 chain[j-1] 的占位词）：`Delete(word=占位词, code=chain[k])`
+
+**Create 操作：**
+1. `Create(word=new_word, code=target_code)`
+2. 对每个被推移的词：`Create(word=占位词, code=chain[k+1])`（往后推一格）
+
+将所有 Delete 合并为一次 `keytao_batch_add_to_draft` 调用，所有 Create 合并为另一次调用。
+
+> ⚠️ 必须先提交所有 Delete，再提交所有 Create，防止编码冲突报错。
+
+### Step 4：回复格式
+
+```
+✅ 编码顺序已调整，影响 N 个词条：
+
+📌 顺序变更：
+• 跑通 → pzty（原主码位，取代「炮筒」）
+• 炮筒 → pztyo（顺延至下一位）
+
+当前草稿（共 N 条）：
+...
+
+草稿地址：https://...
+
+发送「提交」以提交该草稿
+```
+
+- 每条格式：`词 → 新编码（说明，如"顺延至下一位"或"取代「原词」"）`
+- 若只影响 1 个词（目标位为空），按正常加词流程处理，无需展示"顺序变更"段落
+
+---
+
 ## 典型场景
 
 ### 添加词条
@@ -396,6 +481,49 @@ summary 格式规则：
 用户：撤回一下
 → 调用 keytao_recall_batch()
 → 批次恢复为草稿状态
+```
+
+### 编码顺序调整（用户指定目标编码）
+
+**场景 A：新词抢占已有词的编码（新词不在词库）**
+
+```
+[查词流程结束后，AI 展示推荐编码 pztyo，用户说：我要加到 pzty]
+
+→ target_code=pzty, new_word=跑通（不在词库）
+→ 调用 keytao_lookup_by_codes_batch(["pzty", "pztyo", "pztyoa"]) 查占用情况
+   结果：pzty 有「炮筒」，pztyo 为空
+→ 受影响词：炮筒（在 pzty，需移至 pztyo）
+→ 第一次 batch_add_to_draft：Delete 炮筒@pzty
+→ 第二次 batch_add_to_draft：Create 跑通@pzty，Create 炮筒@pztyo
+→ 汇报：跑通→pzty（取代炮筒），炮筒→pztyo（顺延）
+```
+
+**场景 B：词库中已有两词，用户要调换顺序**
+
+```
+词库：炮筒@pzty，跑通@pztyo
+用户：我要将跑通调到炮筒前面（或：让跑通用 pzty）
+
+→ target_code=pzty, new_word=跑通, old_code=pztyo
+→ 受影响范围：chain[pzty] → chain[pztyo]，即炮筒在 pzty 需被推至 pztyo
+   （pztyo 因跑通移出而释放，炮筒恰好可去 pztyo）
+→ 第一次 batch_add_to_draft：Delete 跑通@pztyo，Delete 炮筒@pzty
+→ 第二次 batch_add_to_draft：Create 跑通@pzty，Create 炮筒@pztyo
+→ 汇报：跑通→pzty，炮筒→pztyo（交换顺序）
+```
+
+**场景 C：级联推移（多词连续被影响）**
+
+```
+词库：词A@pzty，词B@pztyo，pztyoa 为空
+用户：我要将跑通加到 pzty
+
+→ 从 pzty 开始连续检查：pzty 有词A，pztyo 有词B，pztyoa 空
+→ 受影响词：词A（pzty→pztyo），词B（pztyo→pztyoa）
+→ Delete 词A@pzty，Delete 词B@pztyo
+→ Create 跑通@pzty，Create 词A@pztyo，Create 词B@pztyoa
+→ 汇报：跑通→pzty（取代词A），词A→pztyo（顺延），词B→pztyoa（顺延）
 ```
 
 ### 编码冲突处理
