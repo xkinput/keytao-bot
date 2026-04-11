@@ -362,15 +362,24 @@ summary 格式规则：
 
 ---
 
-### Step 1：查清现状
+### Step 1：查清现状（含草稿冲突清理）
 
 并行调用：
 - `keytao_encode(new_word)` → 获取编码链 `chain = [code, altCode0, altCode1, ...]`
 - `keytao_lookup_by_code(target_code)` → 查目标位现有词条列表
+- `keytao_list_draft_items()` → 获取当前草稿所有条目
 
 同时，若 `new_word` 已在词库中，调用 `keytao_lookup_by_word(new_word)` 确认其当前编码 `old_code`。
 
 **验证：** 若 `target_code` 不在 `new_word` 的编码链中，告知用户"该编码不是「词」的有效编码位，无法调整到此位置"，终止协议。
+
+**草稿冲突清理（执行 Step 3 前必须先做）：**
+
+检查草稿中是否存在与本次操作冲突的条目——即涉及 `new_word` 或本次受影响编码链（target_code 到最终落点）的任何条目：
+- 若草稿里有 `new_word` 的 Create/Delete 条目 → 用 `keytao_batch_remove_draft_items` 删除
+- 若草稿里有受影响编码（如 target_code、顺延目标编码）上与本次操作重复的条目 → 一并删除
+
+> 目的：避免草稿中出现重复条目（如 `跑通@pztyo` 已在草稿，顺序调整又要创建 `炮筒@pztyo`，两者都会冲突）。
 
 ### Step 2：确定受影响范围
 
@@ -407,8 +416,12 @@ Create 部分：
 1. `{action: Create, word: new_word, code: target_code}`
 2. 对每个被推移的词：`{action: Create, word: 占位词, code: chain[k+1]}`（往后推一格）
 
-**示例：**
-```json
+**示例（草稿已有「跑通@pztyo」时）：**
+```
+// 第一步：删除草稿中的冲突条目
+keytao_batch_remove_draft_items(ids=[已有的跑通@pztyo草稿条目ID])
+
+// 第二步：一次性提交所有调整
 keytao_batch_add_to_draft(items=[
   {"action": "Delete", "word": "炮筒", "code": "pzty", "type": "Phrase"},
   {"action": "Create", "word": "跑通", "code": "pzty",  "type": "Phrase"},
