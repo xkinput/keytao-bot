@@ -150,13 +150,11 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 
    判断逻辑（按优先级）：
    1. 用户说"是/好/确定/加/确认"（未指定编号/编码）
-      → 从本轮历史中找到你上一条消息里的推荐编码（✅那个），直接 Create(word, 推荐编码)
-   2. 用户回复数字 N
-      → 找到上一条消息中第 N 个编码
-      → 若为空位：直接 Create(word, 该编码)
-      → 若已占用：询问"该编码已有「X」，是否将「新词」排前，「X」顺延到下一位？"等确认后执行顺序调整协议
-   3. 用户说"加到 abc"且 abc 为空位：直接 Create(word, abc)
-   4. 用户说"加到 abc"且 abc 已占用：询问顺延确认
+      → 从上一条消息里的推荐编码（✅那个），直接 Create(word, 推荐编码)
+   2. 用户回复数字 N，或说"加到 abc"
+      → 找到对应编码，直接 Create(word, 该编码)
+      → 若返回 requiresConfirmation（重码警告）→ 按正常重码确认流程处理，让用户决定要不要保留重码
+      → 不要主动询问"是否顺延"，顺序调整只在用户明确说"让XX排前面"时才触发
 
    ⚠️ 不得进入阶段二的情况：
      × 用户只说了"查词 XX"——纯查询，停在阶段一
@@ -735,7 +733,7 @@ async def get_openai_response(
         
         pending_confirm_hint = ""
         if is_short_confirm and messages:
-            # Check recent messages for a pending warning
+            # Check recent messages for a pending warning or a pending word-add confirmation
             for msg in reversed(messages):
                 if msg.get("role") == "tool":
                     try:
@@ -748,6 +746,18 @@ async def get_openai_response(
                         pass
                 elif msg.get("role") == "assistant":
                     content = msg.get("content", "")
+                    # Detect "以编码 CODE 将「WORD」加入草稿" pattern — user is confirming a word-add
+                    add_match = re.search(r'以编码\s*([a-z]+)\s*将[「"'](.+?)[」"']加入草稿', content)
+                    if add_match:
+                        target_code = add_match.group(1)
+                        target_word = add_match.group(2)
+                        pending_confirm_hint = (
+                            f"\n\n[系统检测：用户确认将「{target_word}」以编码 {target_code} 加入草稿。"
+                            f"请立即调用 keytao_create_phrase(word='{target_word}', code='{target_code}')，"
+                            f"不得调用任何查询工具，不得执行编码顺序调整！]"
+                        )
+                        logger.info(f"🎯 Detected word-add confirmation: {target_word}@{target_code}, injecting hint")
+                        break
                     if any(kw in content for kw in ["警告", "重码", "多编码", "是否确认", "requiresConfirmation"]):
                         pending_confirm_hint = "\n\n[系统检测：用户在确认上一条警告！请立即用相同参数再次调用keytao_create_phrase，但添加confirmed=true，不要询问用户！]"
                         logger.info("🎯 Detected confirmation of pending warning (from assistant msg), injecting hint")
