@@ -404,6 +404,10 @@ chain 中 target_code 的 index = i
 
 > ⚠️ 必须先提交所有 Delete，再提交所有 Create，防止编码冲突报错。
 
+> ⚠️ **Create 批次返回 `warnedCount > 0` 时，不得触发「通用编码自动分配协议」！**
+> 本协议的 Create 批次中存在"编码已被占用"警告是**预期行为**：被占用的编码已在上一步 Delete 批次中删除，同一草稿批次内 API 会自行解析（`hasConflict: false`）。
+> 此时应直接跳过自动分配协议，进入 Step 4 汇报结果。
+
 ### Step 4：回复格式
 
 ```
