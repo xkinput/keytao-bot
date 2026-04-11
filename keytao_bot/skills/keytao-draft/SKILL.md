@@ -388,25 +388,33 @@ chain 中 target_code 的 index = i
 
 对上述范围中尚未查过的编码，批量调用 `keytao_lookup_by_codes_batch([...])` 查清占用情况。
 
-### Step 3：构建操作列表（顺序严格）
+### Step 3：构建操作列表并一次性提交
 
-操作顺序：先全部 Delete，再全部 Create。
+> ⚠️ **所有 Delete 和 Create 必须合并为一次 `keytao_batch_add_to_draft` 调用！**
+>
+> 原因：API 的批内冲突解析（`checkBatchConflictsWithWeight`）只在**同一次调用**的 items 里查找 Delete 来消解 Create 的重码警告。
+> 如果分两次调用，第二次 Create 看不到第一次已写入的 Delete，永远会触发 `warnedCount > 0`，进而错误地启动「通用编码自动分配协议」。
 
-**Delete 操作（逆序构建，从最后一个受影响词开始，避免循环依赖）：**
-1. 若 `new_word` 已在词库：`Delete(word=new_word, code=old_code)`
-2. 对每个被推移的词（从 chain[i] 到 chain[j-1] 的占位词）：`Delete(word=占位词, code=chain[k])`
+**构建顺序（Delete 在前，Create 在后）：**
 
-**Create 操作：**
-1. `Create(word=new_word, code=target_code)`
-2. 对每个被推移的词：`Create(word=占位词, code=chain[k+1])`（往后推一格）
+Delete 部分：
+1. 若 `new_word` 已在词库：`{action: Delete, word: new_word, code: old_code}`
+2. 对每个被推移的词（从 chain[i] 到 chain[j-1] 的占位词）：`{action: Delete, word: 占位词, code: chain[k]}`
 
-将所有 Delete 合并为一次 `keytao_batch_add_to_draft` 调用，所有 Create 合并为另一次调用。
+Create 部分：
+1. `{action: Create, word: new_word, code: target_code}`
+2. 对每个被推移的词：`{action: Create, word: 占位词, code: chain[k+1]}`（往后推一格）
 
-> ⚠️ 必须先提交所有 Delete，再提交所有 Create，防止编码冲突报错。
+**示例：**
+```json
+keytao_batch_add_to_draft(items=[
+  {"action": "Delete", "word": "炮筒", "code": "pzty", "type": "Phrase"},
+  {"action": "Create", "word": "跑通", "code": "pzty",  "type": "Phrase"},
+  {"action": "Create", "word": "炮筒", "code": "pztyo", "type": "Phrase"}
+])
+```
 
-> ⚠️ **Create 批次返回 `warnedCount > 0` 时，不得触发「通用编码自动分配协议」！**
-> 本协议的 Create 批次中存在"编码已被占用"警告是**预期行为**：被占用的编码已在上一步 Delete 批次中删除，同一草稿批次内 API 会自行解析（`hasConflict: false`）。
-> 此时应直接跳过自动分配协议，进入 Step 4 汇报结果。
+这样 API 会在同一批次内发现 Delete 炮筒@pzty 解析了 Create 跑通@pzty 的冲突，返回 `warnedCount: 0`，直接进入 Step 4。
 
 ### Step 4：回复格式
 
@@ -498,8 +506,8 @@ chain 中 target_code 的 index = i
 → 调用 keytao_lookup_by_codes_batch(["pzty", "pztyo", "pztyoa"]) 查占用情况
    结果：pzty 有「炮筒」，pztyo 为空
 → 受影响词：炮筒（在 pzty，需移至 pztyo）
-→ 第一次 batch_add_to_draft：Delete 炮筒@pzty
-→ 第二次 batch_add_to_draft：Create 跑通@pzty，Create 炮筒@pztyo
+→ 一次 batch_add_to_draft，items 顺序：
+   [Delete 炮筒@pzty, Create 跑通@pzty, Create 炮筒@pztyo]
 → 汇报：跑通→pzty（取代炮筒），炮筒→pztyo（顺延）
 ```
 
@@ -512,8 +520,8 @@ chain 中 target_code 的 index = i
 → target_code=pzty, new_word=跑通, old_code=pztyo
 → 受影响范围：chain[pzty] → chain[pztyo]，即炮筒在 pzty 需被推至 pztyo
    （pztyo 因跑通移出而释放，炮筒恰好可去 pztyo）
-→ 第一次 batch_add_to_draft：Delete 跑通@pztyo，Delete 炮筒@pzty
-→ 第二次 batch_add_to_draft：Create 跑通@pzty，Create 炮筒@pztyo
+→ 一次 batch_add_to_draft，items 顺序：
+   [Delete 跑通@pztyo, Delete 炮筒@pzty, Create 跑通@pzty, Create 炮筒@pztyo]
 → 汇报：跑通→pzty，炮筒→pztyo（交换顺序）
 ```
 
@@ -525,8 +533,8 @@ chain 中 target_code 的 index = i
 
 → 从 pzty 开始连续检查：pzty 有词A，pztyo 有词B，pztyoa 空
 → 受影响词：词A（pzty→pztyo），词B（pztyo→pztyoa）
-→ Delete 词A@pzty，Delete 词B@pztyo
-→ Create 跑通@pzty，Create 词A@pztyo，Create 词B@pztyoa
+→ 一次 batch_add_to_draft，items 顺序：
+   [Delete 词A@pzty, Delete 词B@pztyo, Create 跑通@pzty, Create 词A@pztyo, Create 词B@pztyoa]
 → 汇报：跑通→pzty（取代词A），词A→pztyo（顺延），词B→pztyoa（顺延）
 ```
 
