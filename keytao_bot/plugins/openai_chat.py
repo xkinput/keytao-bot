@@ -456,8 +456,8 @@ _INJECT_PLATFORM_TOOLS = frozenset({
 async def call_tool_function(
     tool_name: str,
     arguments: Dict,
-    bot: Optional[Bot] = None,
-    event: Optional[Event] = None,
+    platform: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> str:
     """Call a tool function and return result as JSON string."""
     tool_func = skills_manager.get_tool_function(tool_name)
@@ -466,10 +466,9 @@ async def call_tool_function(
 
     try:
         if tool_name in _INJECT_PLATFORM_TOOLS:
-            if bot and event:
-                platform, platform_id = extract_platform_info(bot, event)
+            if platform and user_id:
                 arguments['platform'] = platform
-                arguments['platform_id'] = platform_id
+                arguments['platform_id'] = user_id
             else:
                 return json.dumps(
                     {"error": "内部错误：无法获取用户平台信息"}, ensure_ascii=False
@@ -489,16 +488,16 @@ async def call_tool_function(
 # ---------------------------------------------------------------------------
 
 async def _execute_add_to_draft(
-    word: str, code: str, bot: Bot, event: Event,
+    word: str, code: str, platform: str, user_id: str,
 ) -> str:
     """Directly add a word to draft and return formatted response."""
     result_json = await call_tool_function(
-        "keytao_create_phrase", {"word": word, "code": code}, bot, event,
+        "keytao_create_phrase", {"word": word, "code": code}, platform, user_id,
     )
     data = json.loads(result_json)
 
     if data.get("requiresConfirmation"):
-        conv_key = get_conversation_key(bot, event)
+        conv_key = (platform, user_id)
         conversation_states[conv_key] = PendingToolConfirm(
             function_name="keytao_create_phrase",
             args={"word": word, "code": code},
@@ -514,15 +513,15 @@ async def _execute_add_to_draft(
         return f"添加失败：{data.get('message', '未知错误')} qwq"
 
     header = f"✅ 已将「{word}」以编码 {code} 加入草稿\n"
-    return header + await _format_draft_response(data, bot, event)
+    return header + await _format_draft_response(data, platform, user_id)
 
 
 async def _execute_confirmed_tool(
-    state: PendingToolConfirm, bot: Bot, event: Event,
+    state: PendingToolConfirm, platform: str, user_id: str,
 ) -> str:
     """Re-call a tool with confirmed=True and return formatted response."""
     args = {**state.args, "confirmed": True}
-    result_json = await call_tool_function(state.function_name, args, bot, event)
+    result_json = await call_tool_function(state.function_name, args, platform, user_id)
     data = json.loads(result_json)
 
     if state.function_name == "keytao_submit_batch":
@@ -539,18 +538,18 @@ async def _execute_confirmed_tool(
 
     if data.get("success"):
         header = "✅ 已确认添加到草稿\n"
-        return header + await _format_draft_response(data, bot, event)
+        return header + await _format_draft_response(data, platform, user_id)
     return f"操作失败：{data.get('message', '未知错误')} qwq"
 
 
-async def _format_draft_response(data: Dict, bot: Bot, event: Event) -> str:
+async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str:
     """Format draft state (summary + diff + items + URL) after an operation."""
-    preview_json = await call_tool_function("keytao_get_batch_preview", {}, bot, event)
+    preview_json = await call_tool_function("keytao_get_batch_preview", {}, platform, user_id)
     preview = json.loads(preview_json)
 
     snapshot = data.get("draft_snapshot")
     if not snapshot:
-        list_json = await call_tool_function("keytao_list_draft_items", {}, bot, event)
+        list_json = await call_tool_function("keytao_list_draft_items", {}, platform, user_id)
         list_data = json.loads(list_json)
         if list_data.get("success"):
             snapshot = {
@@ -611,9 +610,9 @@ async def _format_draft_response(data: Dict, bot: Bot, event: Event) -> str:
 async def _handle_pending_add_word(
     state: PendingAddWord,
     message: str,
-    bot: Bot,
-    event: Event,
-    conv_key: Tuple[str, str],
+    platform: str,
+    user_id: str,
+    history: List[Dict],
 ) -> Optional[str]:
     """Handle user response to a pending add-word prompt.
 
@@ -631,6 +630,7 @@ async def _handle_pending_add_word(
         if 0 <= idx < len(state.candidates):
             target_code, is_occupied = state.candidates[idx]
         else:
+            conv_key = (platform, user_id)
             conversation_states[conv_key] = state  # re-save so user can retry
             return f"请选择 1-{len(state.candidates)} 之间的编号 owo"
 
@@ -647,7 +647,7 @@ async def _handle_pending_add_word(
 
     # Empty slot -> direct execution (no AI needed)
     if not is_occupied:
-        return await _execute_add_to_draft(state.word, target_code, bot, event)
+        return await _execute_add_to_draft(state.word, target_code, platform, user_id)
 
     # Occupied slot -> pass to AI with instruction for 编码顺序调整协议
     injection = (
@@ -655,8 +655,7 @@ async def _handle_pending_add_word(
         f"请执行编码顺序调整协议：先查清该编码现有词条和「{state.word}」的编码链，"
         f"然后构建 Delete+Create 操作列表并一次性提交到草稿。]"
     )
-    history = get_history(conv_key)
-    return await get_openai_response(message + injection, bot, event, history)
+    return await get_ai_response_core(message + injection, platform, user_id, history)
 
 
 # ---------------------------------------------------------------------------
@@ -745,17 +744,21 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 
 
 # ---------------------------------------------------------------------------
-# AI response function
+# Core AI response function (platform-agnostic)
 # ---------------------------------------------------------------------------
 
-async def get_openai_response(
+async def get_ai_response_core(
     message: str,
-    bot: Bot,
-    event: Event,
+    platform: str,
+    user_id: str,
     history: Optional[List[Dict]] = None,
+    reply_context: str = "",
     max_iterations: int = 20,
 ) -> Optional[str]:
-    """Call OpenAI-compatible API with function calling support."""
+    """Call OpenAI-compatible API with function calling support.
+
+    Platform-agnostic: works for QQ, Telegram, and web API calls.
+    """
     if not OPENAI_API_KEY or not AsyncOpenAI:
         return "❌ AI 服务未配置，请联系管理员"
 
@@ -766,8 +769,7 @@ async def get_openai_response(
             timeout=30.0,
         )
 
-        platform, _ = extract_platform_info(bot, event)
-        platform_label = {'telegram': 'Telegram', 'qq': 'QQ'}.get(platform, '未知')
+        platform_label = {'telegram': 'Telegram', 'qq': 'QQ', 'web': 'Web'}.get(platform, '未知')
         platform_ctx = f"\n\n【当前平台】{platform_label}"
         skill_instructions = skills_manager.get_skill_instructions()
         system_prompt = SYSTEM_PROMPT_CORE + platform_ctx + skill_instructions
@@ -813,15 +815,13 @@ async def get_openai_response(
             ),
         })
 
-        # Build reply context and compose current user message
-        reply_context = await build_reply_context(bot, event)
         messages.append({
             "role": "user",
             "content": f"[当前请求] {message}{reply_context}",
         })
 
         tools = skills_manager.get_tools() if skills_manager.has_tools() else None
-        conv_key = get_conversation_key(bot, event)
+        conv_key = (platform, user_id)
 
         # Tool calling loop
         for iteration in range(max_iterations):
@@ -871,7 +871,7 @@ async def get_openai_response(
                     fn_args = json.loads(tc.function.arguments)
                     logger.info(f"Tool call: {fn_name}({fn_args})")
 
-                    result_str = await call_tool_function(fn_name, fn_args, bot, event)
+                    result_str = await call_tool_function(fn_name, fn_args, platform, user_id)
 
                     # Save pending state if tool requires confirmation
                     if fn_name in ("keytao_create_phrase", "keytao_submit_batch"):
@@ -905,6 +905,21 @@ async def get_openai_response(
     except Exception as e:
         logger.error(f"API error: {e}")
         return "呜呜，AI 服务暂时不可用 qwq 等等再来找我吧～"
+
+
+async def get_openai_response(
+    message: str,
+    bot: Bot,
+    event: Event,
+    history: Optional[List[Dict]] = None,
+    max_iterations: int = 20,
+) -> Optional[str]:
+    """NoneBot wrapper: extract platform context then call get_ai_response_core."""
+    platform, user_id = extract_platform_info(bot, event)
+    reply_context = await build_reply_context(bot, event)
+    return await get_ai_response_core(
+        message, platform, user_id, history, reply_context, max_iterations,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -941,7 +956,8 @@ async def handle_ai_chat(bot: Bot, event: Event):
         await ai_chat.finish("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
         return
 
-    conv_key = get_conversation_key(bot, event)
+    platform, user_id = extract_platform_info(bot, event)
+    conv_key = (platform, user_id)
     response: Optional[str] = None
 
     # ===== Phase 1: Check pending state =====
@@ -952,8 +968,9 @@ async def handle_ai_chat(bot: Bot, event: Event):
             response = "好的，已取消 owo"
 
         elif isinstance(state, PendingAddWord):
+            history = get_history(conv_key)
             response = await _handle_pending_add_word(
-                state, message_text, bot, event, conv_key,
+                state, message_text, platform, user_id, history,
             )
             # response is None → unrecognized input, fall through to Phase 2
 
@@ -964,13 +981,16 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 and message_text.strip() in {"提交", "提审"}
             )
             if _is_confirm(message_text) or is_submit_reconfirm:
-                response = await _execute_confirmed_tool(state, bot, event)
+                response = await _execute_confirmed_tool(state, platform, user_id)
             # else: response stays None, fall through to AI as new request
 
     # ===== Phase 2: AI response (if not handled directly) =====
     if response is None:
         history = get_history(conv_key)
-        response = await get_openai_response(message_text, bot, event, history)
+        reply_context = await build_reply_context(bot, event)
+        response = await get_ai_response_core(
+            message_text, platform, user_id, history, reply_context,
+        )
 
     if not response:
         await ai_chat.finish("呜呜，处理请求时出错了 qwq 要不再试一次？")
