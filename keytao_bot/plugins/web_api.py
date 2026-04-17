@@ -42,29 +42,24 @@ def _check_auth(authorization: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-@driver.on_startup
-async def _setup_web_api() -> None:
-    try:
-        from nonebot import get_app
-        app = get_app()
-    except Exception as e:
-        logger.error(f"web_api: failed to get FastAPI app: {e}")
-        return
+# Middleware and routes must be registered at import time, before the app starts.
+try:
+    from nonebot import get_app
+    _app = get_app()
 
-    app.add_middleware(
+    _app.add_middleware(
         CORSMiddleware,
         allow_origins=WEB_CORS_ORIGINS,
-        allow_origin_regex=r"https?://.*",  # allow all origins in dev
+        allow_origin_regex=r"https?://.*",
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
-    @app.post("/api/chat")
+    @_app.post("/api/chat")
     async def chat(
         request: ChatRequest,
         authorization: Optional[str] = None,
     ) -> dict:
-        from fastapi import Request as FastAPIRequest
         _check_auth(authorization)
 
         store = get_history_store()
@@ -82,7 +77,7 @@ async def _setup_web_api() -> None:
 
         return {"reply": reply or "抱歉，AI 暂时无法响应，请稍后再试"}
 
-    @app.delete("/api/chat/history")
+    @_app.delete("/api/chat/history")
     async def clear_history(
         request: HistoryClearRequest,
         authorization: Optional[str] = None,
@@ -99,3 +94,6 @@ async def _setup_web_api() -> None:
         f"web_api: routes registered  POST /api/chat  DELETE /api/chat/history  "
         f"(auth={'enabled' if WEB_API_KEY else 'disabled'})"
     )
+
+except Exception as e:
+    logger.error(f"web_api: failed to register routes: {e}")
