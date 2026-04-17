@@ -10,7 +10,7 @@ Auth: Bearer token via WEB_API_KEY env var (skip check if not set).
 import os
 from typing import Optional
 
-from fastapi import HTTPException
+from fastapi import Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from nonebot import get_driver
@@ -58,7 +58,7 @@ try:
     @_app.post("/api/chat")
     async def chat(
         request: ChatRequest,
-        authorization: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
     ) -> dict:
         _check_auth(authorization)
 
@@ -80,7 +80,7 @@ try:
     @_app.delete("/api/chat/history")
     async def clear_history(
         request: HistoryClearRequest,
-        authorization: Optional[str] = None,
+        authorization: Optional[str] = Header(None),
     ) -> dict:
         _check_auth(authorization)
 
