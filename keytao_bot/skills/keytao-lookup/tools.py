@@ -123,8 +123,7 @@ def _format_code_lookup_result(code: str, phrases: List[Dict]) -> Dict:
             "position_label": _position_label(index)
         })
 
-    logger.info(f"[keytao_lookup_by_code] code={code}, found {len(result_phrases)} phrases")
-    logger.info(f"[keytao_lookup_by_code] phrases: {[(p.get('word'), p.get('weight')) for p in result_phrases]}")
+    logger.info(f"[keytao_lookup_by_code] code={code} found={len(result_phrases)} {[(p.get('word'), p.get('weight')) for p in result_phrases]}")
 
     return {
         "success": True,

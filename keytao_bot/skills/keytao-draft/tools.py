@@ -744,7 +744,11 @@ async def keytao_batch_add_to_draft(
         "platform": platform,
         "platformId": platform_id,
         "batchId": batch_id,
-        "items": items,
+        "items": [
+            {**{k: v for k, v in item.items() if k != "old_word"},
+             **({"oldWord": item["old_word"]} if "old_word" in item else {})}
+            for item in items
+        ],
     }
 
     logger.info(f"[keytao_batch_add_to_draft] Sending {len(items)} items to batch-draft")

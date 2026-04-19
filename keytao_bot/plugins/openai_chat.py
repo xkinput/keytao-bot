@@ -970,12 +970,24 @@ async def get_ai_response_core(
                             logger.error(f"Tool call {fn_name} duplicated {dup_count} times, aborting")
                             return "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～"
                         logger.warning(f"Duplicate tool call ({dup_count}): {fn_name}, injecting forcing hint")
+                        _write_tools = frozenset({
+                            "keytao_batch_add_to_draft", "keytao_create_phrase",
+                            "keytao_submit_batch", "keytao_batch_remove_draft_items",
+                            "keytao_remove_draft_item", "keytao_recall_batch",
+                        })
+                        if fn_name in _write_tools:
+                            dup_hint = (
+                                f"工具 {fn_name} 已执行过，数据已写入。"
+                                "禁止重复调用。请直接根据上方执行结果回复用户。"
+                            )
+                        else:
+                            dup_hint = (
+                                f"工具 {fn_name} 已调用过，结果已在上方消息中。"
+                                "禁止再次调用此工具。请直接使用上方已有数据继续下一步操作。"
+                            )
                         result_str = json.dumps({
                             "error": "重复调用，已忽略",
-                            "message": (
-                                f"工具 {fn_name} 已调用过，结果已在上方消息中。"
-                                "禁止再次调用此工具。请立即根据已有数据调用 keytao_batch_add_to_draft 完成操作。"
-                            ),
+                            "message": dup_hint,
                         })
                         _seen_tool_calls[call_fingerprint] = dup_count + 1
                     else:
