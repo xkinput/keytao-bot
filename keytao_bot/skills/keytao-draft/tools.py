@@ -640,7 +640,7 @@ TOOLS = [
                     },
                     "old_word": {
                         "type": "string",
-                        "description": "旧词条内容（仅 Change 操作需要）"
+                        "description": "【Change 操作必填，不传会被后端拒绝】修改前的原词条内容。必须先调用 keytao_lookup_by_codes_batch 查出该编码当前的词，再将查询结果填入此字段。例如：lookup 返回 fpnm 当前词为"防粘"，则 old_word=\"防粘\"，word=\"防黏\"。"
                     },
                     "type": {
                         "type": "string",

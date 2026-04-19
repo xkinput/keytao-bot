@@ -861,6 +861,24 @@ async def get_ai_response_core(
 
             # Process tool calls
             if choice.message.tool_calls:
+                # Validate all tool call arguments before committing to messages
+                parsed_tool_calls = []
+                truncated = False
+                for tc in choice.message.tool_calls:
+                    try:
+                        parsed_tool_calls.append((tc, json.loads(tc.function.arguments)))
+                    except json.JSONDecodeError:
+                        truncated = True
+                        break
+
+                if truncated:
+                    if current_max_tokens < _MAX_TOKENS_CAP:
+                        current_max_tokens = min(current_max_tokens * 2, _MAX_TOKENS_CAP)
+                        logger.warning(f"Tool args truncated, retrying with max_tokens={current_max_tokens}")
+                        continue
+                    logger.error("Tool args truncated even at max cap")
+                    return "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～"
+
                 assistant_msg: Dict = {
                     "role": "assistant",
                     "content": choice.message.content,
@@ -878,13 +896,8 @@ async def get_ai_response_core(
                 ]
                 messages.append(assistant_msg)
 
-                for tc in choice.message.tool_calls:
+                for tc, fn_args in parsed_tool_calls:
                     fn_name = tc.function.name
-                    try:
-                        fn_args = json.loads(tc.function.arguments)
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Failed to parse tool arguments for {fn_name}: {e}")
-                        return "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～"
                     logger.info(f"Tool call: {fn_name}({fn_args})")
 
                     result_str = await call_tool_function(fn_name, fn_args, platform, user_id)
