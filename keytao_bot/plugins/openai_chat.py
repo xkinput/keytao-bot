@@ -744,6 +744,60 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 
 
 # ---------------------------------------------------------------------------
+# Structural message preprocessor (bypasses AI for well-defined batch ops)
+# ---------------------------------------------------------------------------
+
+_RE_REPLACE_CHAR = re.compile(
+    r'将[这些]*词[条中]*[的]*["\u201c\u300c]?(.)["\u201d\u300d]?改[为成]["\u201c\u300c]?(.)["\u201d\u300d]?[：:，,\s]'
+)
+_RE_WORD_CODE_LINE = re.compile(r'^(\S+)\s+([a-z]+)\s*$')
+
+
+async def _try_handle_replace_char(
+    message: str, platform: str, user_id: str
+) -> Optional[str]:
+    """Detect '将X改成Y + word-code list' pattern and handle directly in Python."""
+    m = _RE_REPLACE_CHAR.search(message)
+    if not m:
+        return None
+
+    old_char, new_char = m.group(1), m.group(2)
+    items = []
+    for line in message.splitlines():
+        lm = _RE_WORD_CODE_LINE.match(line.strip())
+        if not lm:
+            continue
+        old_word, code = lm.group(1), lm.group(2)
+        if old_char not in old_word:
+            continue
+        new_word = old_word.replace(old_char, new_char)
+        items.append({"action": "Change", "old_word": old_word, "word": new_word, "code": code})
+
+    if not items:
+        return None
+
+    logger.info(f"[replace_char] Detected pattern '{old_char}'→'{new_char}', {len(items)} items, bypassing AI")
+    result_str = await call_tool_function("keytao_batch_add_to_draft", {"items": items}, platform, user_id)
+    try:
+        data = json.loads(result_str)
+    except Exception:
+        return "呜呜，批量修改失败 qwq"
+
+    success = data.get("successCount", 0)
+    failed = data.get("failedCount", 0)
+    skipped = data.get("skippedCount", 0)
+
+    parts = [f"✅ 已将 {len(items)} 个词中的「{old_char}」替换为「{new_char}」"]
+    parts.append(f"成功 {success} 条" + (f"，跳过 {skipped} 条" if skipped else "") + (f"，失败 {failed} 条" if failed else ""))
+
+    if data.get("failed"):
+        failed_lines = [f"  • {f['word']}（{f['code']}）：{f['reason']}" for f in data["failed"][:5]]
+        parts.append("❌ 未写入：\n" + "\n".join(failed_lines))
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Core AI response function (platform-agnostic)
 # ---------------------------------------------------------------------------
 
@@ -761,6 +815,10 @@ async def get_ai_response_core(
     """
     if not OPENAI_API_KEY or not AsyncOpenAI:
         return "❌ AI 服务未配置，请联系管理员"
+
+    preprocessed = await _try_handle_replace_char(message, platform, user_id)
+    if preprocessed is not None:
+        return preprocessed
 
     try:
         client = AsyncOpenAI(
