@@ -31,10 +31,12 @@ WEB_CORS_ORIGINS: list[str] = (
 class ChatRequest(BaseModel):
     message: str
     session_id: str  # UUID stored in browser localStorage
+    user_id: Optional[str] = None  # keytao-next user ID, injected server-side after JWT verification
 
 
 class HistoryClearRequest(BaseModel):
     session_id: str
+    user_id: Optional[str] = None
 
 
 def _check_auth(authorization: Optional[str]) -> None:
@@ -62,18 +64,26 @@ try:
     ) -> dict:
         _check_auth(authorization)
 
+        # Logged-in users identified by keytao user ID; anonymous by session UUID
+        if request.user_id:
+            platform = "web"
+            user_key = request.user_id
+        else:
+            platform = "web-anon"
+            user_key = request.session_id
+
         store = get_history_store()
-        history = store.get_history("web", request.session_id, limit=MAX_HISTORY_MESSAGES)
+        history = store.get_history(platform, user_key, limit=MAX_HISTORY_MESSAGES)
 
         reply = await get_ai_response_core(
             message=request.message,
-            platform="web",
-            user_id=request.session_id,
+            platform=platform,
+            user_id=user_key,
             history=history,
         )
 
         if reply:
-            store.add_conversation_round("web", request.session_id, request.message, reply)
+            store.add_conversation_round(platform, user_key, request.message, reply)
 
         return {"reply": reply or "抱歉，AI 暂时无法响应，请稍后再试"}
 
@@ -84,10 +94,13 @@ try:
     ) -> dict:
         _check_auth(authorization)
 
+        platform = "web" if request.user_id else "web-anon"
+        user_key = request.user_id if request.user_id else request.session_id
+
         store = get_history_store()
-        deleted = store.clear_history("web", request.session_id)
-        conversation_states.pop(("web", request.session_id), None)
-        logger.info(f"web_api: cleared {deleted} messages for session {request.session_id[:8]}…")
+        deleted = store.clear_history(platform, user_key)
+        conversation_states.pop((platform, user_key), None)
+        logger.info(f"web_api: cleared {deleted} messages for {platform}/{user_key[:8]}…")
         return {"success": True, "deleted": deleted}
 
     logger.info(

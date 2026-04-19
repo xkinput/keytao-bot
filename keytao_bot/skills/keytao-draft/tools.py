@@ -94,6 +94,16 @@ def enrich_pr_item_labels(item: Dict) -> Dict:
     return enriched_item
 
 
+class UserNotFoundError(Exception):
+    pass
+
+
+def _not_bound_message(platform: str) -> str:
+    if platform in ("web", "web-anon"):
+        return "请先登录 KeyTao 后再进行加词操作"
+    return "未找到绑定账号，请先使用 /bind 命令绑定你的键道平台账号"
+
+
 def get_keytao_url() -> str:
     """Get Keytao API base URL from config"""
     try:
@@ -163,6 +173,8 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
                 batch_id = data.get("batchId")
                 logger.info(f"[get_latest_draft_batch] Got batch ID: {batch_id}")
                 return batch_id
+            elif response.status_code == 404:
+                raise UserNotFoundError()
             else:
                 logger.error(f"[get_latest_draft_batch] API error ({response.status_code}): {response.text}")
                 return None
@@ -230,13 +242,13 @@ async def keytao_create_phrase(
         }
     
     # Get or create draft batch
-    batch_id = await get_latest_draft_batch(platform, platform_id)
+    try:
+        batch_id = await get_latest_draft_batch(platform, platform_id)
+    except UserNotFoundError:
+        return {"success": False, "message": _not_bound_message(platform)}
     if not batch_id:
-        return {
-            "success": False,
-            "message": "无法获取草稿批次，请稍后重试"
-        }
-    
+        return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
+
     # Auto-detect type when not explicitly specified, mirrors detectPhraseType in keytao-next
     if type == "Phrase":
         import re, unicodedata
@@ -292,16 +304,7 @@ async def keytao_create_phrase(
                 return data
             elif response.status_code == 404:
                 logger.warning(f"[keytao_create_phrase] API response (404): {response.text}")
-                try:
-                    data = response.json()
-                    if data.get("message"):
-                        return data
-                except Exception:
-                    pass
-                return {
-                    "success": False,
-                    "message": "未找到绑定账号，请先使用 /bind 命令绑定你的键道平台账号到 https://keytao.vercel.app"
-                }
+                return {"success": False, "message": _not_bound_message(platform)}
             elif response.status_code == 400:
                 # Conflict or warning
                 data = response.json()
@@ -363,12 +366,12 @@ async def keytao_submit_batch(
         }
     
     # Get draft batch ID
-    batch_id = await get_latest_draft_batch(platform, platform_id)
+    try:
+        batch_id = await get_latest_draft_batch(platform, platform_id)
+    except UserNotFoundError:
+        return {"success": False, "message": _not_bound_message(platform)}
     if not batch_id:
-        return {
-            "success": False,
-            "message": "没有找到待提交的草稿批次"
-        }
+        return {"success": False, "message": "没有找到待提交的草稿批次"}
     
     url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/submit"
     
@@ -438,7 +441,10 @@ async def keytao_get_batch_preview(
     if not BOT_API_TOKEN:
         return {"success": False, "message": "Bot配置错误：缺少API token"}
 
-    batch_id = await get_latest_draft_batch(platform, platform_id)
+    try:
+        batch_id = await get_latest_draft_batch(platform, platform_id)
+    except UserNotFoundError:
+        return {"success": False, "message": _not_bound_message(platform)}
     if not batch_id:
         return {"success": False, "message": "没有找到草稿批次"}
 
@@ -735,7 +741,10 @@ async def keytao_batch_add_to_draft(
         return {"success": False, "message": "Bot配置错误：缺少API token"}
 
     if not batch_id:
-        batch_id = await get_latest_draft_batch(platform, platform_id)
+        try:
+            batch_id = await get_latest_draft_batch(platform, platform_id)
+        except UserNotFoundError:
+            return {"success": False, "message": _not_bound_message(platform)}
         if not batch_id:
             return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
 
