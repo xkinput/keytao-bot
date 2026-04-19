@@ -826,7 +826,7 @@ async def get_ai_response_core(
         _MAX_TOKENS_CAP = 8000
         line_count = message.count("\n") + 1
         current_max_tokens = max(OPENAI_MAX_TOKENS, min(line_count * 200 + 500, _MAX_TOKENS_CAP))
-        _seen_tool_calls: set = set()
+        _seen_tool_calls: Dict[tuple, int] = {}  # fingerprint → call count
 
         # Tool calling loop
         for iteration in range(max_iterations):
@@ -902,14 +902,22 @@ async def get_ai_response_core(
                     logger.info(f"Tool call: {fn_name}({fn_args})")
 
                     call_fingerprint = (fn_name, json.dumps(fn_args, sort_keys=True, ensure_ascii=False))
-                    if call_fingerprint in _seen_tool_calls:
-                        logger.warning(f"Duplicate tool call detected: {fn_name}, injecting forcing hint")
+                    dup_count = _seen_tool_calls.get(call_fingerprint, 0)
+                    if dup_count > 0:
+                        if dup_count >= 2:
+                            logger.error(f"Tool call {fn_name} duplicated {dup_count} times, aborting")
+                            return "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～"
+                        logger.warning(f"Duplicate tool call ({dup_count}): {fn_name}, injecting forcing hint")
                         result_str = json.dumps({
-                            "error": "重复调用检测",
-                            "message": "你已经获得过这个查询的结果，请勿再次查询。直接使用已有数据完成下一步操作。",
+                            "error": "重复调用，已忽略",
+                            "message": (
+                                f"工具 {fn_name} 已调用过，结果已在上方消息中。"
+                                "禁止再次调用此工具。请立即根据已有数据调用 keytao_batch_add_to_draft 完成操作。"
+                            ),
                         })
+                        _seen_tool_calls[call_fingerprint] = dup_count + 1
                     else:
-                        _seen_tool_calls.add(call_fingerprint)
+                        _seen_tool_calls[call_fingerprint] = 1
                         result_str = await call_tool_function(fn_name, fn_args, platform, user_id)
 
                     # Save pending state if tool requires confirmation
