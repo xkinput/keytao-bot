@@ -816,10 +816,6 @@ async def get_ai_response_core(
     if not OPENAI_API_KEY or not AsyncOpenAI:
         return "❌ AI 服务未配置，请联系管理员"
 
-    preprocessed = await _try_handle_replace_char(message, platform, user_id)
-    if preprocessed is not None:
-        return preprocessed
-
     try:
         client = AsyncOpenAI(
             api_key=OPENAI_API_KEY,
@@ -914,6 +910,10 @@ async def get_ai_response_core(
                 if current_max_tokens < _MAX_TOKENS_CAP:
                     current_max_tokens = min(current_max_tokens * 2, _MAX_TOKENS_CAP)
                     logger.warning(f"Response truncated, retrying with max_tokens={current_max_tokens}")
+                    messages.append({
+                        "role": "user",
+                        "content": "[系统] 你上一次的输出因过长被截断，以上查询结果已完整获取。请勿重新查询，直接根据已有数据继续调用下一步工具完成任务。",
+                    })
                     continue
                 logger.warning("Response truncated even at max cap")
                 return "呜呜，回复太长被截断了 qwq 请把任务拆小一点再试试～"
@@ -934,6 +934,10 @@ async def get_ai_response_core(
                     if current_max_tokens < _MAX_TOKENS_CAP:
                         current_max_tokens = min(current_max_tokens * 2, _MAX_TOKENS_CAP)
                         logger.warning(f"Tool args truncated, retrying with max_tokens={current_max_tokens}")
+                        messages.append({
+                            "role": "user",
+                            "content": "[系统] 你上一次生成的工具调用参数因过长被截断。请勿重新查询，直接根据已有数据重新生成完整的工具调用。",
+                        })
                         continue
                     logger.error("Tool args truncated even at max cap")
                     return "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～"
