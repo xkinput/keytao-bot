@@ -158,8 +158,11 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
         logger.error("[get_latest_draft_batch] Missing BOT_API_TOKEN")
         return None
     
+    if platform == "web-anon":
+        raise UserNotFoundError()
+
     url = f"{KEYTAO_API_BASE}/api/bot/batches/latest-draft"
-    
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
@@ -167,7 +170,7 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
                 headers={"X-Bot-Token": BOT_API_TOKEN},
                 params={"platform": platform, "platformId": platform_id}
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
                 batch_id = data.get("batchId")
@@ -535,6 +538,9 @@ async def keytao_list_draft_items(
 
     if not BOT_API_TOKEN:
         return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    if platform == "web-anon":
+        return {"success": False, "message": _not_bound_message(platform)}
 
     url = f"{KEYTAO_API_BASE}/api/bot/batches/latest-draft/items"
 
