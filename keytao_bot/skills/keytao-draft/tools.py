@@ -849,6 +849,10 @@ TOOLS += [
                                     "enum": ["Create", "Change", "Delete"],
                                     "description": "操作类型，默认 Create",
                                 },
+                                "old_word": {
+                                    "type": "string",
+                                    "description": "【Change 操作必填】修改前的原词条内容，不传后端会拒绝",
+                                },
                                 "type": {
                                     "type": "string",
                                     "description": "词条类型，不传则自动推断",

@@ -99,7 +99,7 @@ keytao_batch_add_to_draft(items=[
 - `word` (str): 词条内容
 - `code` (str): 键道编码（纯字母 a-z）
 - `action` (str, optional): `Create`（默认）/ `Change` / `Delete`
-- `old_word` (str, **Change 操作时必填**): 旧词条内容，必须先调 `keytao_lookup_by_code(code)` 查出当前词再填入，不传后端会拒绝
+- `old_word` (str, **Change 操作时必填**): 旧词条内容，不传后端会拒绝。若用户已提供旧词直接填入；若未提供则先调 `keytao_lookup_by_code(code)` 查出当前词
 - `type` (str, optional): 词条类型，**不传则自动推断**：
   - 1 个汉字 → `Single`；英文字母 → `English`；链接 → `Link`；符号 → `Symbol`；其余 → `Phrase`
 - `remark` (str, optional): 备注
