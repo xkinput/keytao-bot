@@ -823,12 +823,16 @@ async def get_ai_response_core(
         tools = skills_manager.get_tools() if skills_manager.has_tools() else None
         conv_key = (platform, user_id)
 
+        _MAX_TOKENS_CAP = 8000
+        line_count = message.count("\n") + 1
+        current_max_tokens = max(OPENAI_MAX_TOKENS, min(line_count * 200 + 500, _MAX_TOKENS_CAP))
+
         # Tool calling loop
         for iteration in range(max_iterations):
             call_kwargs: Dict = {
                 "model": OPENAI_MODEL,
                 "messages": messages,
-                "max_tokens": OPENAI_MAX_TOKENS,
+                "max_tokens": current_max_tokens,
                 "temperature": OPENAI_TEMPERATURE,
             }
             if tools:
@@ -846,6 +850,14 @@ async def get_ai_response_core(
             # No tool calls → return text response
             if choice.finish_reason == "stop" or not choice.message.tool_calls:
                 return choice.message.content
+
+            if choice.finish_reason == "length":
+                if current_max_tokens < _MAX_TOKENS_CAP:
+                    current_max_tokens = min(current_max_tokens * 2, _MAX_TOKENS_CAP)
+                    logger.warning(f"Response truncated, retrying with max_tokens={current_max_tokens}")
+                    continue
+                logger.warning("Response truncated even at max cap")
+                return "呜呜，回复太长被截断了 qwq 请把任务拆小一点再试试～"
 
             # Process tool calls
             if choice.message.tool_calls:
@@ -868,7 +880,11 @@ async def get_ai_response_core(
 
                 for tc in choice.message.tool_calls:
                     fn_name = tc.function.name
-                    fn_args = json.loads(tc.function.arguments)
+                    try:
+                        fn_args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Failed to parse tool arguments for {fn_name}: {e}")
+                        return "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～"
                     logger.info(f"Tool call: {fn_name}({fn_args})")
 
                     result_str = await call_tool_function(fn_name, fn_args, platform, user_id)
