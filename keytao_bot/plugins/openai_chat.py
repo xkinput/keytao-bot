@@ -766,7 +766,7 @@ async def get_ai_response_core(
         client = AsyncOpenAI(
             api_key=OPENAI_API_KEY,
             base_url=OPENAI_BASE_URL,
-            timeout=30.0,
+            timeout=60.0,
         )
 
         platform_label = {'telegram': 'Telegram', 'qq': 'QQ', 'web': 'Web'}.get(platform, '未知')
