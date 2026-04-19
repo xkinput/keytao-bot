@@ -904,7 +904,7 @@ async def get_ai_response_core(
                     call_fingerprint = (fn_name, json.dumps(fn_args, sort_keys=True, ensure_ascii=False))
                     dup_count = _seen_tool_calls.get(call_fingerprint, 0)
                     if dup_count > 0:
-                        if dup_count >= 2:
+                        if dup_count >= 4:
                             logger.error(f"Tool call {fn_name} duplicated {dup_count} times, aborting")
                             return "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～"
                         logger.warning(f"Duplicate tool call ({dup_count}): {fn_name}, injecting forcing hint")
