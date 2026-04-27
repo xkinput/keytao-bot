@@ -952,6 +952,10 @@ async def get_ai_response_core(
                     "role": "assistant",
                     "content": choice.message.content,
                 }
+                # DeepSeek thinking mode: reasoning_content must be echoed back
+                reasoning_content = getattr(choice.message, 'reasoning_content', None)
+                if reasoning_content:
+                    assistant_msg["reasoning_content"] = reasoning_content
                 assistant_msg["tool_calls"] = [
                     {
                         "id": tc.id,
