@@ -897,6 +897,12 @@ async def get_ai_response_core(
             logger.info(f"Calling {OPENAI_MODEL} (iter {iteration + 1}/{max_iterations})")
             response = await client.chat.completions.create(**call_kwargs)
 
+            if response.usage:
+                cache_hit = getattr(response.usage, 'prompt_cache_hit_tokens', 0) or 0
+                cache_miss = getattr(response.usage, 'prompt_cache_miss_tokens', 0) or 0
+                if cache_hit or cache_miss:
+                    logger.info(f"Cache: hit={cache_hit} miss={cache_miss} tokens")
+
             if not response.choices:
                 return "呜呜，AI 好像没有回复 qwq 要不再试一次？"
 
