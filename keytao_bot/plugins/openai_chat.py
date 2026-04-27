@@ -67,6 +67,19 @@ def _to_markdownv2(text: str) -> str:
 # Configuration
 # ---------------------------------------------------------------------------
 
+_BIND_HELP_TEXT = (
+    "你还没有绑定键道账号哦～\n\n"
+    "📝 绑定步骤：\n\n"
+    "1. 登录键道网站：https://keytao.vercel.app\n"
+    "2. 点击右上角用户名，进入【我的资料】\n"
+    "   （或直接访问：https://keytao.vercel.app/profile ）\n"
+    "3. 在【机器人账号绑定】区域点击【生成绑定码】\n"
+    "4. 复制绑定码\n"
+    "5. 在这里发送：/bind [你的绑定码]\n\n"
+    "示例：/bind AB12CD\n\n"
+    "💡 群聊中需要 @我 或回复我的消息才能触发绑定"
+)
+
 driver = get_driver()
 config = driver.config
 OPENAI_API_KEY = (
@@ -495,6 +508,9 @@ async def _execute_add_to_draft(
         "keytao_create_phrase", {"word": word, "code": code}, platform, user_id,
     )
     data = json.loads(result_json)
+
+    if data.get("not_bound"):
+        return _BIND_HELP_TEXT
 
     if data.get("requiresConfirmation"):
         conv_key = (platform, user_id)
@@ -1003,6 +1019,14 @@ async def get_ai_response_core(
                     else:
                         _seen_tool_calls[call_fingerprint] = 1
                         result_str = await call_tool_function(fn_name, fn_args, platform, user_id)
+
+                    # Short-circuit: user not bound → return bind instructions directly
+                    try:
+                        _rd = json.loads(result_str)
+                        if _rd.get("not_bound"):
+                            return _BIND_HELP_TEXT
+                    except Exception:
+                        pass
 
                     # Save pending state if tool requires confirmation
                     if fn_name in ("keytao_create_phrase", "keytao_submit_batch"):

@@ -248,7 +248,7 @@ async def keytao_create_phrase(
     try:
         batch_id = await get_latest_draft_batch(platform, platform_id)
     except UserNotFoundError:
-        return {"success": False, "message": _not_bound_message(platform)}
+        return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
     if not batch_id:
         return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
 
@@ -307,7 +307,7 @@ async def keytao_create_phrase(
                 return data
             elif response.status_code == 404:
                 logger.warning(f"[keytao_create_phrase] API response (404): {response.text}")
-                return {"success": False, "message": _not_bound_message(platform)}
+                return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
             elif response.status_code == 400:
                 # Conflict or warning
                 data = response.json()
@@ -372,7 +372,7 @@ async def keytao_submit_batch(
     try:
         batch_id = await get_latest_draft_batch(platform, platform_id)
     except UserNotFoundError:
-        return {"success": False, "message": _not_bound_message(platform)}
+        return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
     if not batch_id:
         return {"success": False, "message": "没有找到待提交的草稿批次"}
     
@@ -447,7 +447,7 @@ async def keytao_get_batch_preview(
     try:
         batch_id = await get_latest_draft_batch(platform, platform_id)
     except UserNotFoundError:
-        return {"success": False, "message": _not_bound_message(platform)}
+        return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
     if not batch_id:
         return {"success": False, "message": "没有找到草稿批次"}
 
@@ -540,7 +540,7 @@ async def keytao_list_draft_items(
         return {"success": False, "message": "Bot配置错误：缺少API token"}
 
     if platform == "web-anon":
-        return {"success": False, "message": _not_bound_message(platform)}
+        return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
 
     url = f"{KEYTAO_API_BASE}/api/bot/batches/latest-draft/items"
 
@@ -750,7 +750,7 @@ async def keytao_batch_add_to_draft(
         try:
             batch_id = await get_latest_draft_batch(platform, platform_id)
         except UserNotFoundError:
-            return {"success": False, "message": _not_bound_message(platform)}
+            return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
         if not batch_id:
             return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
 
