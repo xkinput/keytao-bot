@@ -1,178 +1,123 @@
 """
 Keytao Docs Skill Tools
-键道文档查询工具实现 - 从 GitHub 获取真实文档内容
+键道文档查询工具实现 - 通过 GitHub Code Search API 搜索文档内容
 """
+import os
 import httpx
 from typing import Dict, List
 from nonebot.log import logger
 
 
-# 文档文件映射 (关键词 -> GitHub 文档路径)
-DOCS_MAPPING = {
-    "规则": [
-        "guide/learn-xkjd/phonetics-rules.md",  # 音码规则
-        "guide/learn-xkjd/stroke-rules.md",      # 形码规则
-    ],
-    "音码": [
-        "guide/learn-xkjd/phonetics-rules.md",
-    ],
-    "零声母": [
-        "guide/learn-xkjd/phonetics-rules.md",
-    ],
-    "声母": [
-        "guide/learn-xkjd/phonetics-rules.md",
-    ],
-    "韵母": [
-        "guide/learn-xkjd/phonetics-rules.md",
-    ],
-    "学习": [
-        "guide/learn-xkjd/index.md",             # 研习键道概述
-        "guide/start-xkjd/index.md",             # 入门键道
-        "guide/learn-xkjd/layouts.md",           # 键道图谱
-    ],
-    "安装": [
-        "guide/get-xkjd/download-and-install.md",
-        "guide/get-xkjd/index.md",
-    ],
-    "字根": [
-        "guide/learn-xkjd/stroke-rules.md",
-        "guide/learn-xkjd/layouts.md",
-    ],
-    "形码": [
-        "guide/learn-xkjd/stroke-rules.md",
-    ],
-    "单字": [
-        "guide/start-xkjd/characters.md",
-    ],
-    "词组": [
-        "guide/start-xkjd/phrases.md",
-    ],
-    "词语": [
-        "guide/start-xkjd/phrases.md",
-    ],
-    "顶功": [
-        "guide/advance-in-xkjd/top-up.md",
-    ],
-    "简码": [
-        "guide/advance-in-xkjd/shorthand.md",
-    ],
-    "入门": [
-        "guide/start-xkjd/index.md",
-    ],
-    "教程": [
-        "guide/start-xkjd/index.md",
-        "guide/learn-xkjd/index.md",
-    ],
-}
-
-# GitHub raw 文件 URL 前缀
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_RAW_PREFIX = "https://raw.githubusercontent.com/xkinput/keytao-docs/main/"
+DOCS_SITE_URL = "https://keytao-docs.vercel.app"
+DOCS_REPO = "xkinput/keytao-docs"
+
+
+def _gh_headers() -> dict:
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return headers
 
 
 def clean_markdown(content: str) -> str:
-    """清理 markdown 内容，移除 frontmatter"""
     lines = content.split('\n')
-    
-    # 移除 frontmatter (--- 之间的内容)
     if lines and lines[0].strip() == '---':
         try:
             end_idx = lines[1:].index('---') + 1
             lines = lines[end_idx + 1:]
         except ValueError:
             pass
-    
-    # 重新组合，限制长度
     cleaned = '\n'.join(lines).strip()
-    
-    # 限制总长度
     if len(cleaned) > 2000:
         cleaned = cleaned[:2000] + "\n\n..."
-    
     return cleaned
 
 
-async def fetch_doc_from_github(doc_path: str) -> str:
-    """从 GitHub 获取文档内容"""
-    url = GITHUB_RAW_PREFIX + doc_path
-    
+def _path_to_url(path: str) -> str:
+    return f"{DOCS_SITE_URL}/{path.replace('.md', '')}"
+
+
+async def _search_docs(query: str) -> List[str]:
+    """Search keytao-docs repo via GitHub Code Search, return list of file paths."""
+    url = "https://api.github.com/search/code"
+    params = {"q": f"{query} repo:{DOCS_REPO} extension:md", "per_page": 5}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params, headers=_gh_headers())
+            resp.raise_for_status()
+            data = resp.json()
+            return [item["path"] for item in data.get("items", [])]
+    except Exception as e:
+        logger.warning(f"GitHub search failed: {e}")
+        return []
+
+
+async def _fetch_raw(path: str) -> str:
+    url = GITHUB_RAW_PREFIX + path
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.text
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.text
     except Exception as e:
-        logger.warning(f"Failed to fetch {doc_path}: {e}")
+        logger.warning(f"Failed to fetch {path}: {e}")
         return ""
 
 
 async def keytao_fetch_docs(query: str) -> Dict:
     """
-    从键道文档 GitHub 仓库获取相关内容
-    
+    通过 GitHub Code Search 在键道文档仓库中搜索相关内容
+
     Args:
         query: 要查询的问题或关键词
-        
+
     Returns:
         dict: 查询结果
     """
     try:
-        query_lower = query.lower()
-        
-        # 匹配关键词到文档文件
-        docs_to_fetch: List[str] = []
-        matched_keywords = []
-        
-        for keyword, doc_paths in DOCS_MAPPING.items():
-            if keyword in query_lower or keyword in query:
-                docs_to_fetch.extend(doc_paths)
-                matched_keywords.append(keyword)
-        
-        # 如果没有匹配到，使用默认文档
-        if not docs_to_fetch:
-            docs_to_fetch = ["guide/index.md"]
-            matched_keywords = ["概述"]
-        
-        # 去重
-        docs_to_fetch = list(dict.fromkeys(docs_to_fetch))[:3]  # 最多3个文档
-        
-        # 获取文档内容
-        content_parts = []
-        sources = []
-        
-        for doc_path in docs_to_fetch:
-            doc_content = await fetch_doc_from_github(doc_path)
-            if doc_content:
-                cleaned = clean_markdown(doc_content)
-                if cleaned:
-                    # 提取文档标题（第一个 # 标题）
-                    title = doc_path.split('/')[-1].replace('.md', '')
-                    for line in cleaned.split('\n'):
-                        if line.startswith('# '):
-                            title = line.replace('# ', '').strip()
-                            break
-                    
-                    content_parts.append(f"【{title}】\n\n{cleaned}")
-                    sources.append(f"https://keytao-docs.vercel.app/{doc_path.replace('.md', '.html')}")
-        
+        paths = await _search_docs(query)
+
+        if not paths:
+            paths = ["guide/index.md"]
+
+        paths = paths[:3]
+
+        content_parts: List[str] = []
+        sources: List[str] = []
+
+        for path in paths:
+            raw = await _fetch_raw(path)
+            if not raw:
+                continue
+            cleaned = clean_markdown(raw)
+            if not cleaned:
+                continue
+            title = path.split('/')[-1].replace('.md', '')
+            for line in cleaned.split('\n'):
+                if line.startswith('# '):
+                    title = line.lstrip('#').strip()
+                    break
+            content_parts.append(f"【{title}】\n\n{cleaned}")
+            sources.append(_path_to_url(path))
+
         if content_parts:
-            combined = "\n\n---\n\n".join(content_parts)
             return {
                 "success": True,
                 "query": query,
-                "content": combined,
+                "content": "\n\n---\n\n".join(content_parts),
                 "sources": sources,
-                "matched_keywords": matched_keywords,
-                "hint": "更多详细信息请访问: https://keytao-docs.vercel.app"
+                "hint": f"更多详细信息请访问: {DOCS_SITE_URL}",
             }
-        else:
-            return {
-                "success": False,
-                "query": query,
-                "content": "",
-                "error": "未能获取文档内容",
-                "hint": f"建议访问官方文档了解更多：https://keytao-docs.vercel.app"
-            }
-            
+        return {
+            "success": False,
+            "query": query,
+            "content": "",
+            "error": "未能获取文档内容",
+            "hint": f"建议访问官方文档了解更多：{DOCS_SITE_URL}",
+        }
+
     except Exception as e:
         logger.error(f"Error fetching docs: {e}")
         return {
@@ -181,7 +126,7 @@ async def keytao_fetch_docs(query: str) -> Dict:
             "error": str(e),
             "content": "",
             "sources": [],
-            "hint": "访问文档: https://keytao-docs.vercel.app"
+            "hint": f"访问文档: {DOCS_SITE_URL}",
         }
 
 
@@ -197,7 +142,7 @@ TOOLS = [
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "要查询的问题或关键词，如 '零声母', '顶功', '学习方法', '字根规则', '安装教程'等"
+                        "description": "要查询的问题或关键词，如 '零声母', '顶功', 'Lua功能', '时间日期', '简码提示', '字根规则', '安装教程'等"
                     }
                 },
                 "required": ["query"]
