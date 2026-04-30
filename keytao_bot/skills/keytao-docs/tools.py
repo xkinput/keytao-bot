@@ -39,8 +39,37 @@ def _path_to_url(path: str) -> str:
     return f"{DOCS_SITE_URL}/{path.replace('.md', '')}"
 
 
+async def _list_all_md_paths() -> List[str]:
+    """Recursively list all .md files via GitHub Contents API (no auth needed for public repos)."""
+    result: List[str] = []
+    dirs_to_visit = [""]  # start at repo root
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        while dirs_to_visit:
+            dir_path = dirs_to_visit.pop()
+            url = f"https://api.github.com/repos/{DOCS_REPO}/contents/{dir_path}".rstrip("/")
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                for item in resp.json():
+                    if item["type"] == "file" and item["name"].endswith(".md"):
+                        result.append(item["path"])
+                    elif item["type"] == "dir":
+                        dirs_to_visit.append(item["path"])
+            except Exception as e:
+                logger.warning(f"Contents API failed for {dir_path}: {e}")
+    return result
+
+
+def _score_path(path: str, query: str) -> int:
+    """Simple relevance score: count query words found in path segments."""
+    q_words = query.lower().split()
+    path_lower = path.lower()
+    return sum(1 for w in q_words if w in path_lower)
+
+
 async def _search_docs(query: str) -> List[str]:
-    """Search keytao-docs repo via GitHub Code Search, return list of file paths."""
+    """Search via GitHub Code Search; fall back to tree-based filename matching."""
     url = "https://api.github.com/search/code"
     params = {"q": f"{query} repo:{DOCS_REPO} extension:md", "per_page": 5}
     try:
@@ -48,10 +77,17 @@ async def _search_docs(query: str) -> List[str]:
             resp = await client.get(url, params=params, headers=_gh_headers())
             resp.raise_for_status()
             data = resp.json()
-            return [item["path"] for item in data.get("items", [])]
+            paths = [item["path"] for item in data.get("items", [])]
+            if paths:
+                return paths
     except Exception as e:
         logger.warning(f"GitHub search failed: {e}")
-        return []
+
+    # Fallback: match query words against file paths in the repo tree
+    all_paths = await _list_all_md_paths()
+    scored = [(p, _score_path(p, query)) for p in all_paths if _score_path(p, query) > 0]
+    scored.sort(key=lambda x: -x[1])
+    return [p for p, _ in scored[:5]]
 
 
 async def _fetch_raw(path: str) -> str:
