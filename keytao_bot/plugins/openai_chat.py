@@ -146,6 +146,25 @@ OPENAI_TEMPERATURE: float = _as_float(openai_temperature_value, 0.7)
 
 GROUP_TRIGGER_KEYWORD_START = "键道"
 GROUP_TRIGGER_KEYWORD_ANY = "喵喵"
+_LEADING_COMMAND_PREFIX_RE = re.compile(
+    r"^(?:@\S+|键道|喵喵)[\s:：，,]*",
+    re.IGNORECASE,
+)
+_CLEAR_COMMAND_RE = re.compile(r"^/?(?:clear|清空对话|清空历史)\s*$", re.IGNORECASE)
+
+
+def _strip_command_message_prefixes(message_text: str) -> str:
+    text = message_text.strip()
+    while text:
+        stripped = _LEADING_COMMAND_PREFIX_RE.sub("", text, count=1).strip()
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
+def _is_clear_command_text(message_text: str) -> bool:
+    return bool(_CLEAR_COMMAND_RE.match(_strip_command_message_prefixes(message_text)))
 
 
 # ---------------------------------------------------------------------------
@@ -899,12 +918,34 @@ clear_cmd = on_command(
 )
 
 
+async def should_handle_clear_message(bot: Bot, event: Event) -> bool:
+    if not _is_clear_command_text(event.get_plaintext()):
+        return False
+    return await should_handle(bot, event)
+
+
+clear_message = on_message(
+    rule=Rule(should_handle_clear_message),
+    priority=4,
+    block=True,
+)
+
+
 @clear_cmd.handle()
 async def handle_clear(bot: Bot, event: Event):
+    await _handle_clear(bot, event, clear_cmd)
+
+
+@clear_message.handle()
+async def handle_clear_message(bot: Bot, event: Event):
+    await _handle_clear(bot, event, clear_message)
+
+
+async def _handle_clear(bot: Bot, event: Event, matcher):
     conv_key = get_conversation_key(bot, event)
     clear_history(conv_key)
     conversation_state_store.delete(conv_key)
-    await clear_cmd.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
+    await matcher.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
 
 
 ai_chat = on_message(rule=should_handle, priority=99, block=True)

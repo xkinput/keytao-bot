@@ -2,7 +2,10 @@
 Account binding plugin
 Handles /bind command for platform account binding
 """
-from nonebot import on_command, get_driver
+import re
+from typing import Optional
+
+from nonebot import on_command, on_message, get_driver
 from nonebot.adapters import Bot, Event
 from nonebot.exception import FinishedException
 from nonebot.log import logger
@@ -20,6 +23,34 @@ logger.info(f"[account_bind] KEYTAO_API_BASE: {KEYTAO_API_BASE}")
 logger.info(f"[account_bind] BOT_API_TOKEN loaded: {bool(BOT_API_TOKEN)}")
 
 GROUP_TRIGGER_KEYWORDS = ("键道", "喵喵")
+
+_BIND_COMMAND_RE = re.compile(r"^/?bind(?:\s+(\S+))?\s*$", re.IGNORECASE)
+_LEADING_BIND_PREFIX_RE = re.compile(
+    r"^(?:@\S+|键道|喵喵)[\s:：，,]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_bind_message_prefixes(message_text: str) -> str:
+    text = message_text.strip()
+    while text:
+        stripped = _LEADING_BIND_PREFIX_RE.sub("", text, count=1).strip()
+        if stripped == text:
+            break
+        text = stripped
+    return text
+
+
+def _extract_bind_key(message_text: str) -> Optional[str]:
+    match = _BIND_COMMAND_RE.match(_strip_bind_message_prefixes(message_text))
+    if not match:
+        return None
+    key = match.group(1)
+    return key.upper() if key else ""
+
+
+def _is_bind_command_text(message_text: str) -> bool:
+    return _extract_bind_key(message_text) is not None
 
 
 
@@ -104,12 +135,29 @@ async def should_handle_bind(bot: Bot, event: Event) -> bool:
         return True
 
 
+async def should_handle_bind_message(bot: Bot, event: Event) -> bool:
+    message_text = event.get_plaintext().strip()
+    if not _is_bind_command_text(message_text):
+        return False
+    return await should_handle_bind(bot, event)
+
+
 # Bind command with custom rule
 bind_cmd = on_command("bind", rule=Rule(should_handle_bind), priority=5, block=True)
+bind_message = on_message(rule=Rule(should_handle_bind_message), priority=4, block=True)
 
 
 @bind_cmd.handle()
 async def handle_bind(bot: Bot, event: Event):
+    await _handle_bind(bot, event, bind_cmd)
+
+
+@bind_message.handle()
+async def handle_bind_message(bot: Bot, event: Event):
+    await _handle_bind(bot, event, bind_message)
+
+
+async def _handle_bind(bot: Bot, event: Event, matcher):
     """
     Handle bind command
     Usage: /bind AB12CD
@@ -129,18 +177,18 @@ async def handle_bind(bot: Bot, event: Event):
             platform = "telegram"
             platform_id = event.get_user_id()
         else:
-            await bind_cmd.finish("不支持的平台")
+            await matcher.finish("不支持的平台")
             return
     except Exception as e:
         logger.error(f"Get platform info error: {e}")
-        await bind_cmd.finish("获取平台信息失败")
+        await matcher.finish("获取平台信息失败")
         return
 
     # Get bind key from message
     message_text = event.get_plaintext().strip()
-    parts = message_text.split()
+    key = _extract_bind_key(message_text)
     
-    if len(parts) < 2:
+    if key is None or not key:
         help_text = (
             "📝 如何绑定机器人账号：\n\n"
             "1. 登录键道网站：https://keytao.vercel.app\n"
@@ -152,15 +200,13 @@ async def handle_bind(bot: Bot, event: Event):
             "示例：/bind AB12CD\n\n"
             "💡 提示：如果在群聊中，需要 @我 或回复我的消息"
         )
-        await bind_cmd.finish(help_text)
+        await matcher.finish(help_text)
         return
-    
-    key = parts[1].upper()
 
     # Check if BOT_API_TOKEN is configured
     if not BOT_API_TOKEN:
         logger.error("BOT_API_TOKEN not configured")
-        await bind_cmd.finish("❌ 机器人配置错误，请联系管理员")
+        await matcher.finish("❌ 机器人配置错误，请联系管理员")
         return
 
     # Call verify API
@@ -185,25 +231,25 @@ async def handle_bind(bot: Bot, event: Event):
                 if data.get("success"):
                     user_name = data.get("userName", "")
                     nickname = data.get("userNickname") or user_name
-                    await bind_cmd.finish(
+                    await matcher.finish(
                         f"✅ 绑定成功！\n\n"
                         f"账号：{nickname}\n"
                         f"现在你可以使用机器人创建词条了～ >w<"
                     )
                 else:
-                    await bind_cmd.finish(f"❌ {data.get('message', '绑定失败')}")
+                    await matcher.finish(f"❌ {data.get('message', '绑定失败')}")
             else:
                 try:
                     error_data = response.json()
                     message = error_data.get("message", "绑定失败")
                 except:
                     message = "绑定失败"
-                await bind_cmd.finish(f"❌ {message}")
+                await matcher.finish(f"❌ {message}")
 
     except httpx.TimeoutException:
-        await bind_cmd.finish("❌ 请求超时，请稍后重试")
+        await matcher.finish("❌ 请求超时，请稍后重试")
     except FinishedException:
         raise  # Let NoneBot handle this, don't catch it
     except Exception as e:
         logger.error(f"Bind error: {e}")
-        await bind_cmd.finish("❌ 绑定失败，请稍后重试")
+        await matcher.finish("❌ 绑定失败，请稍后重试")

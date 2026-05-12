@@ -63,7 +63,11 @@ class _FakeLogger:
 _fake_log.logger = _FakeLogger()
 sys.modules["nonebot.log"] = _fake_log
 
-sys.modules["nonebot.exception"] = types.ModuleType("nonebot.exception")
+_fake_exception = types.ModuleType("nonebot.exception")
+class FinishedException(Exception):
+    pass
+_fake_exception.FinishedException = FinishedException
+sys.modules["nonebot.exception"] = _fake_exception
 
 # OpenAI
 _fake_openai = types.ModuleType("openai")
@@ -80,10 +84,15 @@ from keytao_bot.plugins.openai_chat import (
     _parse_pending_add_word,
     _strip_markdown,
     _to_markdownv2,
+    _is_clear_command_text,
     PendingAddWord,
     PendingToolConfirm,
     CONFIRM_WORDS,
     CANCEL_WORDS,
+)
+from keytao_bot.plugins.account_bind import (
+    _extract_bind_key,
+    _is_bind_command_text,
 )
 from keytao_bot.harness.state import MemoryConversationStateStore
 from keytao_bot.harness.tools import ToolContext, ToolExecutor
@@ -465,6 +474,34 @@ def test_confirm_cancel_word_sets():
     # No overlap
     overlap = CONFIRM_WORDS & CANCEL_WORDS
     check("no overlap between confirm and cancel", len(overlap) == 0)
+
+
+def test_bind_command_text_detection():
+    """Verify bind commands still route when prefixed by mentions or trigger words."""
+    print("\n🧪 bind command text detection")
+
+    check("plain slash command detected", _is_bind_command_text("/bind 26PZWH"))
+    check("plain no-slash command detected", _is_bind_command_text("bind 26PZWH"))
+    check("QQ mention prefix detected", _is_bind_command_text("@喵喵 /bind 26PZWH"))
+    check("trigger word prefix detected", _is_bind_command_text("喵喵 /bind 26PZWH"))
+    check("multiple prefixes detected", _is_bind_command_text("@喵喵 键道 /bind 26PZWH"))
+    check("bind key uppercased", _extract_bind_key("@喵喵 /bind 26pzwh") == "26PZWH")
+    check("missing key returns empty string", _extract_bind_key("@喵喵 /bind") == "")
+    check("natural language not detected", not _is_bind_command_text("喵喵 绑定怎么弄"))
+    check("trailing words not detected", not _is_bind_command_text("/bind 26PZWH extra"))
+
+
+def test_clear_command_text_detection():
+    """Verify clear commands still route when prefixed by mentions or trigger words."""
+    print("\n🧪 clear command text detection")
+
+    check("plain slash clear detected", _is_clear_command_text("/clear"))
+    check("plain clear detected", _is_clear_command_text("clear"))
+    check("Chinese alias detected", _is_clear_command_text("清空历史"))
+    check("mention prefix detected", _is_clear_command_text("@喵喵 /clear"))
+    check("trigger word prefix detected", _is_clear_command_text("喵喵 清空对话"))
+    check("natural language not detected", not _is_clear_command_text("喵喵 怎么清空历史"))
+    check("trailing words not detected", not _is_clear_command_text("/clear now"))
 
 
 def test_memory_conversation_state_store():
@@ -863,6 +900,8 @@ if __name__ == "__main__":
     test_edge_case_numeric_out_of_range()
     test_edge_case_zero_choice()
     test_confirm_cancel_word_sets()
+    test_bind_command_text_detection()
+    test_clear_command_text_detection()
     test_memory_conversation_state_store()
     test_tool_executor_context_injection()
     test_tool_executor_draft_policy_guards()
