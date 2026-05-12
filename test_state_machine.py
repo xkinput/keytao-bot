@@ -7,6 +7,7 @@ import sys
 import os
 import asyncio
 import importlib.util
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -100,6 +101,18 @@ _lookup_tools = importlib.util.module_from_spec(_lookup_spec)
 _lookup_spec.loader.exec_module(_lookup_tools)
 _normalize_encode_response = _lookup_tools._normalize_encode_response
 _apply_candidate_occupancy = _lookup_tools._apply_candidate_occupancy
+
+_draft_tools_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "keytao_bot",
+    "skills",
+    "keytao-draft",
+    "tools.py",
+)
+_draft_spec = importlib.util.spec_from_file_location("keytao_draft_tools_for_test", _draft_tools_path)
+_draft_tools = importlib.util.module_from_spec(_draft_spec)
+_draft_spec.loader.exec_module(_draft_tools)
+_build_code_shift_plan = _draft_tools._build_code_shift_plan
 
 
 passed = 0
@@ -517,6 +530,74 @@ def test_tool_executor_context_injection():
     asyncio.run(_run_tool_executor_checks())
 
 
+async def _run_tool_executor_policy_checks():
+    calls = []
+
+    async def fake_tool(**kwargs):
+        calls.append(kwargs)
+        return {"success": True, "args": kwargs}
+
+    executor = ToolExecutor(
+        lambda name: fake_tool if name in {
+            "keytao_batch_add_to_draft",
+            "keytao_batch_remove_draft_items",
+        } else None,
+        frozenset({"keytao_batch_add_to_draft", "keytao_batch_remove_draft_items"}),
+    )
+
+    bad_move = await executor.call(
+        "keytao_batch_add_to_draft",
+        {"items": [
+            {"action": "Delete", "word": "会员费", "code": "hyfa"},
+            {"action": "Delete", "word": "换言之", "code": "hyfio"},
+            {"action": "Create", "word": "会员费", "code": "hyfio"},
+            {"action": "Create", "word": "换言之", "code": "hyfioa"},
+        ]},
+        ToolContext(platform="qq", user_id="123", current_message="还是会员费改hyfio吧 换衣服别动了"),
+    )
+    bad_data = json.loads(bad_move)
+    check("unmentioned word reassignment is blocked", bad_data.get("policyBlocked") is True)
+    check("blocked reassignment names 换言之", "换言之" in bad_data.get("blockedReassignments", [""])[0])
+    check("blocked call did not execute", len(calls) == 0)
+
+    protected_move = await executor.call(
+        "keytao_batch_add_to_draft",
+        {"items": [
+            {"action": "Delete", "word": "换言之", "code": "hyfio"},
+            {"action": "Create", "word": "换言之", "code": "hyfioa"},
+        ]},
+        ToolContext(platform="qq", user_id="123", current_message="会员费改hyfio，换言之别动"),
+    )
+    protected_data = json.loads(protected_move)
+    check("protected word reassignment is blocked", protected_data.get("policyBlocked") is True)
+
+    allowed_move = await executor.call(
+        "keytao_batch_add_to_draft",
+        {"items": [
+            {"action": "Delete", "word": "会员费", "code": "hyfa"},
+            {"action": "Create", "word": "会员费", "code": "hyfio"},
+        ]},
+        ToolContext(platform="qq", user_id="123", current_message="还是会员费改hyfio吧 换衣服别动了"),
+    )
+    allowed_data = json.loads(allowed_move)
+    check("mentioned word reassignment is allowed", allowed_data.get("success") is True)
+    check("allowed call executed once", len(calls) == 1)
+
+    broad_delete = await executor.call(
+        "keytao_batch_remove_draft_items",
+        {"ids": [1110, 1111, 1112, 1113, 1114, 1115]},
+        ToolContext(platform="qq", user_id="123", current_message="还是会员费改hyfio吧 换衣服别动了"),
+    )
+    broad_delete_data = json.loads(broad_delete)
+    check("broad draft delete without delete intent is blocked", broad_delete_data.get("policyBlocked") is True)
+
+
+def test_tool_executor_draft_policy_guards():
+    """Verify draft tools cannot move unrelated words while satisfying a code edit."""
+    print("\n🧪 ToolExecutor draft policy guards")
+    asyncio.run(_run_tool_executor_policy_checks())
+
+
 class _FakeAIMessage:
     def __init__(self, content=None, tool_calls=None):
         self.content = content
@@ -679,6 +760,83 @@ def test_apply_candidate_occupancy_updates_recommendation():
     check("recommendedCode moves to first available", result["recommendedCode"] == "hyfio")
 
 
+def test_build_code_shift_plan_uses_occupant_encode_chain():
+    """Verify displaced words move by their own encode candidates, not the inserted word's chain."""
+    print("\n🧪 code shift plan uses occupant encode chain")
+
+    result = _build_code_shift_plan(
+        word="会员费",
+        target_code="hyfio",
+        target_candidate_codes=["hyf", "hyfi", "hyfio", "hyfioa"],
+        current_phrase={"word": "会员费", "code": "hyfa", "type": "Phrase"},
+        code_phrase_map={
+            "hyfio": [{"word": "换言之", "code": "hyfio", "type": "Phrase", "weight": 100}],
+            "hyfioo": [],
+        },
+        word_candidate_code_map={
+            "会员费": ["hyf", "hyfi", "hyfio", "hyfioa"],
+            "换言之": ["hyf", "hyfi", "hyfio", "hyfioo"],
+        },
+    )
+
+    check("shift plan succeeds", result["success"] is True)
+    check("one word shifted", len(result["shifted"]) == 1)
+    check("换言之 shifts to its own next code", result["shifted"][0]["toCode"] == "hyfioo")
+    check("换言之 does not use 会员费 next code", result["shifted"][0]["toCode"] != "hyfioa")
+    check("delete target old code first", result["items"][0] == {"action": "Delete", "word": "会员费", "code": "hyfa", "type": "Phrase"})
+    check("create shifted word at hyfioo", {"action": "Create", "word": "换言之", "code": "hyfioo", "type": "Phrase"} in result["items"])
+
+
+def test_build_code_shift_plan_cascades_until_empty():
+    """Verify occupied destination codes continue shifting by each occupant's encode chain."""
+    print("\n🧪 code shift plan cascades until empty")
+
+    result = _build_code_shift_plan(
+        word="会员费",
+        target_code="hyfio",
+        target_candidate_codes=["hyf", "hyfi", "hyfio", "hyfioa"],
+        current_phrase={"word": "会员费", "code": "hyfa", "type": "Phrase"},
+        code_phrase_map={
+            "hyfio": [{"word": "换言之", "code": "hyfio", "type": "Phrase", "weight": 100}],
+            "hyfioo": [{"word": "候选词", "code": "hyfioo", "type": "Phrase", "weight": 100}],
+            "hxci": [],
+        },
+        word_candidate_code_map={
+            "会员费": ["hyf", "hyfi", "hyfio", "hyfioa"],
+            "换言之": ["hyf", "hyfi", "hyfio", "hyfioo"],
+            "候选词": ["hx", "hxc", "hyfioo", "hxci"],
+        },
+    )
+
+    check("cascade plan succeeds", result["success"] is True)
+    check("two words shifted", len(result["shifted"]) == 2)
+    check("first shifted word", result["shifted"][0]["word"] == "换言之")
+    check("second shifted word", result["shifted"][1]["word"] == "候选词")
+    check("second word shifts by own chain", result["shifted"][1]["toCode"] == "hxci")
+
+
+def test_build_code_shift_plan_rejects_invalid_occupant_code():
+    """Verify the shift stops if an occupant's current code is not in its encode chain."""
+    print("\n🧪 code shift plan rejects invalid occupant code")
+
+    result = _build_code_shift_plan(
+        word="会员费",
+        target_code="hyfio",
+        target_candidate_codes=["hyf", "hyfi", "hyfio", "hyfioa"],
+        current_phrase={"word": "会员费", "code": "hyfa", "type": "Phrase"},
+        code_phrase_map={
+            "hyfio": [{"word": "换言之", "code": "hyfio", "type": "Phrase", "weight": 100}],
+        },
+        word_candidate_code_map={
+            "会员费": ["hyf", "hyfi", "hyfio", "hyfioa"],
+            "换言之": ["hyf", "hyfi", "hyfioo"],
+        },
+    )
+
+    check("invalid occupant code rejected", result["success"] is False)
+    check("error mentions occupant", "换言之" in result["message"])
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("State Machine & Core Logic Tests")
@@ -703,10 +861,14 @@ if __name__ == "__main__":
     test_confirm_cancel_word_sets()
     test_memory_conversation_state_store()
     test_tool_executor_context_injection()
+    test_tool_executor_draft_policy_guards()
     test_orchestrator_empty_response_retry()
     test_normalize_encode_response_codes_first()
     test_normalize_encode_response_infer_fallback()
     test_apply_candidate_occupancy_updates_recommendation()
+    test_build_code_shift_plan_uses_occupant_encode_chain()
+    test_build_code_shift_plan_cascades_until_empty()
+    test_build_code_shift_plan_rejects_invalid_occupant_code()
 
     print("\n" + "=" * 60)
     total = passed + failed

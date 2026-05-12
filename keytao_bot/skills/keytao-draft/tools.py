@@ -35,6 +35,105 @@ def compute_draft_summary(items: List[Dict]) -> Dict:
     return {"added": added, "modified": modified, "deleted": deleted}
 
 
+def _clean_code_list(codes: object) -> List[str]:
+    if not isinstance(codes, list):
+        return []
+    result: List[str] = []
+    seen = set()
+    for code in codes:
+        if not isinstance(code, str):
+            continue
+        normalized = code.strip().lower()
+        if normalized and "?" not in normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _select_current_phrase(word: str, phrases: List[Dict]) -> Optional[Dict]:
+    matching = [phrase for phrase in phrases if phrase.get("word") == word and phrase.get("code")]
+    if not matching:
+        return None
+    return sorted(matching, key=lambda item: (len(item.get("code", "")), item.get("code", "")))[0]
+
+
+def _select_code_occupant(phrases: List[Dict], ignored_word: str) -> Optional[Dict]:
+    candidates = [phrase for phrase in phrases if phrase.get("word") and phrase.get("word") != ignored_word]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: (item.get("weight", 0), item.get("word", "")))[0]
+
+
+def _build_code_shift_plan(
+    word: str,
+    target_code: str,
+    target_candidate_codes: List[str],
+    current_phrase: Optional[Dict],
+    code_phrase_map: Dict[str, List[Dict]],
+    word_candidate_code_map: Dict[str, List[str]],
+) -> Dict:
+    if target_code not in target_candidate_codes:
+        return {
+            "success": False,
+            "message": f"{target_code} 不是「{word}」的有效候选编码",
+        }
+
+    current_code = current_phrase.get("code") if current_phrase else None
+    current_type = current_phrase.get("type", "Phrase") if current_phrase else "Phrase"
+    deletes: List[Dict] = []
+    creates: List[Dict] = [{"action": "Create", "word": word, "code": target_code, "type": current_type or "Phrase"}]
+    shifted: List[Dict] = []
+    vacated_codes = {current_code} if current_code and current_code != target_code else set()
+    visited_codes = set()
+    probe_code = target_code
+
+    if current_code and current_code != target_code:
+        deletes.append({"action": "Delete", "word": word, "code": current_code, "type": current_type or "Phrase"})
+
+    while probe_code not in vacated_codes:
+        if probe_code in visited_codes:
+            return {"success": False, "message": f"顺延计算出现循环：{probe_code}"}
+        visited_codes.add(probe_code)
+
+        occupant = _select_code_occupant(code_phrase_map.get(probe_code, []), word)
+        if not occupant:
+            break
+
+        occupant_word = occupant.get("word", "")
+        occupant_codes = word_candidate_code_map.get(occupant_word, [])
+        if probe_code not in occupant_codes:
+            return {
+                "success": False,
+                "message": f"无法顺延「{occupant_word}」：当前编码 {probe_code} 不在它自己的候选编码中",
+            }
+
+        code_index = occupant_codes.index(probe_code)
+        if code_index + 1 >= len(occupant_codes):
+            return {
+                "success": False,
+                "message": f"无法顺延「{occupant_word}」：{probe_code} 之后没有可用候选编码",
+            }
+
+        next_code = occupant_codes[code_index + 1]
+        occupant_type = occupant.get("type", "Phrase") or "Phrase"
+        deletes.append({"action": "Delete", "word": occupant_word, "code": probe_code, "type": occupant_type})
+        creates.append({"action": "Create", "word": occupant_word, "code": next_code, "type": occupant_type})
+        shifted.append({
+            "word": occupant_word,
+            "fromCode": probe_code,
+            "toCode": next_code,
+            "candidateCodes": occupant_codes,
+        })
+        vacated_codes.add(probe_code)
+        probe_code = next_code
+
+    return {
+        "success": True,
+        "items": deletes + creates,
+        "shifted": shifted,
+    }
+
+
 def _format_preview_text(preview: Dict) -> str:
     """Convert preview API response into a unified-diff text block."""
     changes = preview.get("changes", [])
@@ -201,6 +300,79 @@ async def _fetch_draft_snapshot(platform: str, platform_id: str) -> Optional[Dic
     except Exception as e:
         logger.warning(f"[draft_snapshot] Failed to fetch: {e}")
     return None
+
+
+async def _fetch_encode_candidates(word: str) -> Dict:
+    keytao_api_base = get_keytao_url()
+    encode_url = f"{keytao_api_base}/api/phrases/encode"
+    infer_url = f"{keytao_api_base}/api/phrases/infer"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(encode_url, params={"word": word})
+            encode_data = response.json() if response.is_success else {}
+            codes = _clean_code_list(encode_data.get("codes"))
+            alt_codes = _clean_code_list(encode_data.get("altCodes"))
+            if not codes:
+                infer_response = await client.get(infer_url, params={"word": word})
+                infer_data = infer_response.json() if infer_response.is_success else {}
+                codes = _clean_code_list(infer_data.get("codes"))
+                alt_codes = _clean_code_list(infer_data.get("altCodes"))
+            candidate_codes = _clean_code_list([*codes, *alt_codes])
+            if not candidate_codes:
+                return {"success": False, "message": f"无法计算「{word}」的候选编码"}
+            return {"success": True, "word": word, "candidateCodes": candidate_codes}
+    except httpx.TimeoutException:
+        return {"success": False, "message": f"计算「{word}」编码超时"}
+    except Exception as e:
+        logger.error(f"[shift_encode] Error for {word}: {e}")
+        return {"success": False, "message": f"计算「{word}」编码失败: {str(e)}"}
+
+
+async def _lookup_words_raw(words: List[str]) -> Dict:
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+    if not BOT_API_TOKEN:
+        return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{KEYTAO_API_BASE}/api/bot/phrases/by-word/batch",
+                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                json={"words": words},
+            )
+            data = response.json()
+            if not data.get("success"):
+                return {"success": False, "message": data.get("message", "按词查询失败")}
+            return {"success": True, "results": data.get("results", [])}
+    except httpx.TimeoutException:
+        return {"success": False, "message": "按词查询超时"}
+    except Exception as e:
+        return {"success": False, "message": f"按词查询失败: {str(e)}"}
+
+
+async def _lookup_codes_raw(codes: List[str]) -> Dict:
+    KEYTAO_API_BASE = get_keytao_url()
+    BOT_API_TOKEN = get_bot_token()
+    if not BOT_API_TOKEN:
+        return {"success": False, "message": "Bot配置错误：缺少API token"}
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{KEYTAO_API_BASE}/api/bot/phrases/by-code/batch",
+                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                json={"codes": codes},
+            )
+            data = response.json()
+            if not data.get("success"):
+                return {"success": False, "message": data.get("message", "按编码查询失败")}
+            return {"success": True, "results": data.get("results", [])}
+    except httpx.TimeoutException:
+        return {"success": False, "message": "按编码查询超时"}
+    except Exception as e:
+        return {"success": False, "message": f"按编码查询失败: {str(e)}"}
 
 
 async def keytao_create_phrase(
@@ -838,6 +1010,121 @@ async def keytao_batch_remove_draft_items(
         return {"success": False, "message": f"批量删除失败: {str(e)}"}
 
 
+async def keytao_shift_phrase_code(
+    platform: str,
+    platform_id: str,
+    word: str,
+    target_code: str,
+) -> Dict:
+    """Move a word to a target code and shift occupants using each occupant's own encode chain."""
+    word = word.strip()
+    target_code = target_code.strip().lower()
+    if not word or not target_code:
+        return {"success": False, "message": "必须提供词条和目标编码"}
+
+    target_encode = await _fetch_encode_candidates(word)
+    if not target_encode.get("success"):
+        return target_encode
+    target_candidate_codes = target_encode.get("candidateCodes", [])
+    if target_code not in target_candidate_codes:
+        return {
+            "success": False,
+            "message": f"{target_code} 不是「{word}」的有效候选编码，可选：{', '.join(target_candidate_codes)}",
+            "candidateCodes": target_candidate_codes,
+        }
+
+    word_lookup = await _lookup_words_raw([word])
+    if not word_lookup.get("success"):
+        return word_lookup
+    word_result = next((item for item in word_lookup.get("results", []) if item.get("word") == word), {})
+    current_phrase = _select_current_phrase(word, word_result.get("phrases", []))
+
+    code_phrase_map: Dict[str, List[Dict]] = {}
+    word_candidate_code_map: Dict[str, List[str]] = {word: target_candidate_codes}
+    probe_code = target_code
+    vacated_code = current_phrase.get("code") if current_phrase else None
+    visited_codes = set()
+
+    while probe_code != vacated_code:
+        if probe_code in visited_codes:
+            return {"success": False, "message": f"顺延计算出现循环：{probe_code}"}
+        visited_codes.add(probe_code)
+
+        if probe_code not in code_phrase_map:
+            code_lookup = await _lookup_codes_raw([probe_code])
+            if not code_lookup.get("success"):
+                return code_lookup
+            for item in code_lookup.get("results", []):
+                code_phrase_map[item.get("code", "")] = item.get("phrases", [])
+
+        occupant = _select_code_occupant(code_phrase_map.get(probe_code, []), word)
+        if not occupant:
+            break
+
+        occupant_word = occupant.get("word", "")
+        occupant_encode = await _fetch_encode_candidates(occupant_word)
+        if not occupant_encode.get("success"):
+            return occupant_encode
+        occupant_codes = occupant_encode.get("candidateCodes", [])
+        word_candidate_code_map[occupant_word] = occupant_codes
+        if probe_code not in occupant_codes:
+            return {
+                "success": False,
+                "message": f"无法顺延「{occupant_word}」：当前编码 {probe_code} 不在它自己的候选编码中",
+                "word": occupant_word,
+                "candidateCodes": occupant_codes,
+            }
+        code_index = occupant_codes.index(probe_code)
+        if code_index + 1 >= len(occupant_codes):
+            return {
+                "success": False,
+                "message": f"无法顺延「{occupant_word}」：{probe_code} 之后没有可用候选编码",
+                "word": occupant_word,
+                "candidateCodes": occupant_codes,
+            }
+        probe_code = occupant_codes[code_index + 1]
+
+    plan = _build_code_shift_plan(
+        word,
+        target_code,
+        target_candidate_codes,
+        current_phrase,
+        code_phrase_map,
+        word_candidate_code_map,
+    )
+    if not plan.get("success"):
+        return plan
+
+    planned_words = {item.get("word") for item in plan.get("items", []) if item.get("word")}
+    existing_draft = await keytao_list_draft_items(platform, platform_id)
+    removed_draft_ids: List[int] = []
+    if existing_draft.get("success"):
+        for item in existing_draft.get("items", []):
+            if item.get("word") in planned_words and isinstance(item.get("id"), int):
+                removed_draft_ids.append(item["id"])
+    if removed_draft_ids:
+        remove_result = await keytao_batch_remove_draft_items(platform, platform_id, removed_draft_ids)
+        if not remove_result.get("success"):
+            return remove_result
+
+    write_result = await keytao_batch_add_to_draft(platform, platform_id, plan.get("items", []))
+    write_result["shiftPlan"] = {
+        "word": word,
+        "targetCode": target_code,
+        "candidateCodes": target_candidate_codes,
+        "items": plan.get("items", []),
+        "shifted": plan.get("shifted", []),
+        "removedDraftIds": removed_draft_ids,
+    }
+    if plan.get("shifted"):
+        shifted_text = "；".join(
+            f"{item['word']} {item['fromCode']}→{item['toCode']}"
+            for item in plan.get("shifted", [])
+        )
+        write_result["message"] = f"{write_result.get('message', '已写入草稿')}；顺延：{shifted_text}"
+    return write_result
+
+
 TOOLS += [
     {
         "type": "function",
@@ -846,6 +1133,7 @@ TOOLS += [
             "description": (
                 "批量将词条加入草稿。适合用户一次提交大量词条时使用。"
                 "遇到冲突的条目会跳过并在 failed 列表中说明原因，重码（同编码不同词）会自动确认写入。"
+                "如需把词插入已占用编码并顺延后续词，必须先使用 keytao_shift_phrase_code，不要手工计算顺延。"
                 "操作完成后返回成功数、失败数及当前草稿快照。"
             ),
             "parameters": {
@@ -885,10 +1173,31 @@ TOOLS += [
     {
         "type": "function",
         "function": {
+            "name": "keytao_shift_phrase_code",
+            "description": (
+                "将一个词改到指定编码，并按每个被挤走词自己的 keytao_encode 候选编码链逐个顺延。"
+                "会检查目标编码是否是目标词的有效编码、每个顺延目标是否可继续挪动或为空，"
+                "自动清理相关草稿条目后一次性写入 Delete+Create，并返回 shiftPlan.shifted 说明顺延了哪些词。"
+                "用户要求插入到已占用编码、抢占某码位、把某词改到某个已占用编码时优先使用此工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "word": {"type": "string", "description": "要移动/插入的目标词"},
+                    "target_code": {"type": "string", "description": "目标编码，如 hyfio"},
+                },
+                "required": ["word", "target_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "keytao_batch_remove_draft_items",
             "description": (
                 "批量从草稿中删除词条，通过条目 ID 列表指定要删除的内容。"
                 "只能删除属于当前用户且处于草稿状态的条目。"
+                "禁止在普通改码请求中批量删除大量草稿条目；只有用户明确要求删除/清空/撤销时才可批量删除。"
                 "操作完成后返回成功数、失败信息及当前草稿快照。"
             ),
             "parameters": {
@@ -947,6 +1256,7 @@ TOOL_FUNCTIONS = {
     "keytao_remove_draft_item": keytao_remove_draft_item,
     "keytao_batch_add_to_draft": keytao_batch_add_to_draft,
     "keytao_batch_remove_draft_items": keytao_batch_remove_draft_items,
+    "keytao_shift_phrase_code": keytao_shift_phrase_code,
     "keytao_recall_batch": keytao_recall_batch,
     "keytao_get_batch_preview": keytao_get_batch_preview,
 }

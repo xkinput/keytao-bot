@@ -366,113 +366,58 @@ summary 格式规则：
 
 ---
 
-## 编码顺序调整协议
+## 指定占用编码处理协议
 
-**触发条件（必须同时满足，缺一不可）：**
-1. 用户当前消息明确指定了**目标词**和**目标编码**（如"我要把跑通加到 pzty"、"让跑通用 pzty"）
-2. 该目标编码已被另一个词占用
+**核心规则：允许顺延，但顺延必须由 `keytao_shift_phrase_code` 计算。**
 
-**与「通用编码自动分配协议」的区别：**
-- 自动分配协议：找第一个**空位**放新词（新词往后顺延）
-- 本协议：用户**指定了已占用的目标位置**，被挤走的原词才往后顺延
+用户说“把 A 改到 xxx”或“让 A 用 xxx”时，如果 `xxx` 已被 B 占用，可以把 B 顺延走；但 B 的新编码必须通过 `keytao_encode(B)` 得到 B 自己的候选编码链，再从 B 当前编码之后取下一位。不能把 A 的候选编码链套到 B 身上。
 
-⚠️ 以下情况**不触发**本协议：
-- 用户选择了空位编码 → 直接普通加词，无需本协议
-- 用户只说了词名，没有指定目标编码 → 先展示候选编码列表
-- 用户说"调整顺序/优先级"但没说具体编码 → 先询问目标编码
+### 必须使用的工具
 
-⚠️ **系统注入指令优先**：如果用户消息中出现 `[系统检测：...]` 提示，必须严格按照提示内容执行，不得自行判断触发条件。
+调用：
 
----
-
-### Step 1：查清现状（含草稿冲突清理）
-
-并行调用：
-- `keytao_encode(new_word)` → 获取编码链 `chain = [code, altCode0, altCode1, ...]`
-- `keytao_lookup_by_code(target_code)` → 查目标位现有词条列表
-- `keytao_list_draft_items()` → 获取当前草稿所有条目
-
-同时，若 `new_word` 已在词库中，调用 `keytao_lookup_by_word(new_word)` 确认其当前编码 `old_code`。
-
-**验证：** 若 `target_code` 不在 `new_word` 的编码链中，告知用户"该编码不是「词」的有效编码位，无法调整到此位置"，终止协议。
-
-**草稿冲突清理（执行 Step 3 前必须先做）：**
-
-检查草稿中是否存在与本次操作冲突的条目——即涉及 `new_word` 或本次受影响编码链（target_code 到最终落点）的任何条目：
-- 若草稿里有 `new_word` 的 Create/Delete 条目 → 用 `keytao_batch_remove_draft_items` 删除
-- 若草稿里有受影响编码（如 target_code、顺延目标编码）上与本次操作重复的条目 → 一并删除
-
-> 目的：避免草稿中出现重复条目（如 `跑通@pztyo` 已在草稿，顺序调整又要创建 `炮筒@pztyo`，两者都会冲突）。
-
-### Step 2：确定受影响范围
-
-**找出从 `target_code` 到 `new_word` 原编码（`old_code`）之间的所有连续占位词：**
-
-```
-chain 中 target_code 的 index = i
-若 new_word 已在词库（有 old_code），则 old_code 在 chain 中的 index = j（j > i）
-需移动的槽位范围：chain[i], chain[i+1], ..., chain[j-1]
+```python
+keytao_shift_phrase_code(word="会员费", target_code="hyfio")
 ```
 
-若 `new_word` 不在词库，则等效 j = i（无 old_code），只检查从 `target_code` 开始连续被占的槽位：
-```
-从 chain[i] 开始，依次查 chain[i], chain[i+1], ... 直到遇到空位或 old_code（已释放）
-收集所有途中被占的词 → 这些词都需要往后推一格
-```
+该工具会自动：
+- 检查 `target_code` 是否是目标词 A 的有效候选编码
+- 查询 A 当前旧编码
+- 查询目标编码占用词 B
+- 对 B 调 `keytao_encode(B)`，从 B 自己的候选链里找下一码
+- 如果下一码也被 C 占用，继续对 C 调 `keytao_encode(C)` 并顺延
+- 每一步都检查能否继续顺延，直到遇到空码或被 A 旧编码释放的位置
+- 清理相关旧草稿条目
+- 一次性写入 Delete+Create
+- 返回 `shiftPlan.shifted`，说明顺延计算了哪些词
 
-对上述范围中尚未查过的编码，批量调用 `keytao_lookup_by_codes_batch([...])` 查清占用情况。
+### 禁止的操作
 
-### Step 3：构建操作列表并一次性提交
+- 禁止手工构造顺延 Delete+Create；必须调用 `keytao_shift_phrase_code`
+- 禁止用目标词 A 的编码链给被挤词 B 选新码
+- 禁止没检查目标码是否空就写入顺延结果
+- 禁止顺延后不告诉用户移动了哪些词
+- 禁止先批量删除草稿中的大量条目，再按模型规划重建
 
-> ⚠️ **所有 Delete 和 Create 必须合并为一次 `keytao_batch_add_to_draft` 调用！**
->
-> 原因：API 的批内冲突解析（`checkBatchConflictsWithWeight`）只在**同一次调用**的 items 里查找 Delete 来消解 Create 的重码警告。
-> 如果分两次调用，第二次 Create 看不到第一次已写入的 Delete，永远会触发 `warnedCount > 0`，进而错误地启动「通用编码自动分配协议」。
-
-**构建顺序（Delete 在前，Create 在后）：**
-
-Delete 部分：
-1. 若 `new_word` 已在词库：`{action: Delete, word: new_word, code: old_code}`
-2. 对每个被推移的词（从 chain[i] 到 chain[j-1] 的占位词）：`{action: Delete, word: 占位词, code: chain[k]}`
-
-Create 部分：
-1. `{action: Create, word: new_word, code: target_code}`
-2. 对每个被推移的词：`{action: Create, word: 占位词, code: chain[k+1]}`（往后推一格）
-
-**示例（草稿已有「跑通@pztyo」时）：**
-```
-// 第一步：删除草稿中的冲突条目
-keytao_batch_remove_draft_items(ids=[已有的跑通@pztyo草稿条目ID])
-
-// 第二步：一次性提交所有调整
-keytao_batch_add_to_draft(items=[
-  {"action": "Delete", "word": "炮筒", "code": "pzty", "type": "Phrase"},
-  {"action": "Create", "word": "跑通", "code": "pzty",  "type": "Phrase"},
-  {"action": "Create", "word": "炮筒", "code": "pztyo", "type": "Phrase"}
-])
-```
-
-这样 API 会在同一批次内发现 Delete 炮筒@pzty 解析了 Create 跑通@pzty 的冲突，返回 `warnedCount: 0`，直接进入 Step 4。
-
-### Step 4：回复格式
+### 示例
 
 ```
-✅ 编码顺序已调整，影响 N 个词条：
+词库：会员费@hyfa，换言之@hyfio，换衣服@hyfi
+用户：还是会员费改 hyfio 吧，换衣服别动了
 
-📌 顺序变更：
-• 跑通 → pzty（原主码位，取代「炮筒」）
-• 炮筒 → pztyo（顺延至下一位）
+→ 调用 keytao_shift_phrase_code(word="会员费", target_code="hyfio")
+→ 工具计算：
+  1. 会员费可用候选：hyf, hyfi, hyfio, hyfioa；目标 hyfio 有效
+  2. hyfio 当前已有「换言之」
+  3. 对「换言之」调用 encode，候选为 hyf, hyfi, hyfio, hyfioo
+  4. 换言之当前位置是 hyfio，下一位是 hyfioo
+  5. hyfioo 为空，可以顺延
 
-当前草稿（共 N 条）：
-...
+工具写入：
+  [Delete 会员费@hyfa, Delete 换言之@hyfio, Create 会员费@hyfio, Create 换言之@hyfioo]
 
-草稿地址：https://...
-
-发送「提交」以提交该草稿
+回复：会员费已改到 hyfio；顺延计算：换言之 hyfio→hyfioo。换衣服保持 hyfi 不动。
 ```
-
-- 每条格式：`词 → 新编码（说明，如"顺延至下一位"或"取代「原词」"）`
-- 若只影响 1 个词（目标位为空），按正常加词流程处理，无需展示"顺序变更"段落
 
 ---
 
@@ -533,47 +478,15 @@ keytao_batch_add_to_draft(items=[
 → 批次恢复为草稿状态
 ```
 
-### 编码顺序调整（用户指定目标编码）
-
-**场景 A：新词抢占已有词的编码（新词不在词库）**
+### 用户指定已占用编码
 
 ```
-[查词流程结束后，AI 展示推荐编码 pztyo，用户说：我要加到 pzty]
+词库：会员费@hyfa，换言之@hyfio，换衣服@hyfi
+用户：还是会员费改 hyfio 吧，换衣服别动了
 
-→ target_code=pzty, new_word=跑通（不在词库）
-→ 调用 keytao_lookup_by_codes_batch(["pzty", "pztyo", "pztyoa"]) 查占用情况
-   结果：pzty 有「炮筒」，pztyo 为空
-→ 受影响词：炮筒（在 pzty，需移至 pztyo）
-→ 一次 batch_add_to_draft，items 顺序：
-   [Delete 炮筒@pzty, Create 跑通@pzty, Create 炮筒@pztyo]
-→ 汇报：跑通→pzty（取代炮筒），炮筒→pztyo（顺延）
-```
-
-**场景 B：词库中已有两词，用户要调换顺序**
-
-```
-词库：炮筒@pzty，跑通@pztyo
-用户：我要将跑通调到炮筒前面（或：让跑通用 pzty）
-
-→ target_code=pzty, new_word=跑通, old_code=pztyo
-→ 受影响范围：chain[pzty] → chain[pztyo]，即炮筒在 pzty 需被推至 pztyo
-   （pztyo 因跑通移出而释放，炮筒恰好可去 pztyo）
-→ 一次 batch_add_to_draft，items 顺序：
-   [Delete 跑通@pztyo, Delete 炮筒@pzty, Create 跑通@pzty, Create 炮筒@pztyo]
-→ 汇报：跑通→pzty，炮筒→pztyo（交换顺序）
-```
-
-**场景 C：级联推移（多词连续被影响）**
-
-```
-词库：词A@pzty，词B@pztyo，pztyoa 为空
-用户：我要将跑通加到 pzty
-
-→ 从 pzty 开始连续检查：pzty 有词A，pztyo 有词B，pztyoa 空
-→ 受影响词：词A（pzty→pztyo），词B（pztyo→pztyoa）
-→ 一次 batch_add_to_draft，items 顺序：
-   [Delete 词A@pzty, Delete 词B@pztyo, Create 跑通@pzty, Create 词A@pztyo, Create 词B@pztyoa]
-→ 汇报：跑通→pzty（取代词A），词A→pztyo（顺延），词B→pztyoa（顺延）
+→ 调用 keytao_shift_phrase_code(word="会员费", target_code="hyfio")
+→ 工具按各自 encode 链计算顺延
+→ 汇报：会员费已改到 hyfio；顺延计算：换言之 hyfio→hyfioo；换衣服保持 hyfi 不动
 ```
 
 ### 编码冲突处理

@@ -477,7 +477,7 @@ _INJECT_PLATFORM_TOOLS = frozenset({
     'keytao_create_phrase', 'keytao_submit_batch',
     'keytao_list_draft_items', 'keytao_remove_draft_item',
     'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items',
-    'keytao_recall_batch', 'keytao_get_batch_preview',
+    'keytao_shift_phrase_code', 'keytao_recall_batch', 'keytao_get_batch_preview',
 })
 tool_executor = ToolExecutor(skills_manager.get_tool_function, _INJECT_PLATFORM_TOOLS)
 
@@ -661,13 +661,7 @@ async def _handle_pending_add_word(
     if not is_occupied:
         return await _execute_add_to_draft(state.word, target_code, platform, user_id)
 
-    # Occupied slot -> pass to AI with instruction for 编码顺序调整协议
-    injection = (
-        f"\n\n[系统提示: 用户选择了编码 {target_code}（已被占用）用于「{state.word}」。"
-        f"请执行编码顺序调整协议：先查清该编码现有词条和「{state.word}」的编码链，"
-        f"然后构建 Delete+Create 操作列表并一次性提交到草稿。]"
-    )
-    return await get_ai_response_core(message + injection, platform, user_id, history)
+    return await _execute_add_to_draft(state.word, target_code, platform, user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +684,14 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
    • 查词/编码 → 调用查询工具
    • 文档/规则 → 调用文档工具
    • 增删改词条 → 调用草稿工具
+
+2.1 草稿编辑安全红线
+    • 用户说"把 A 改到 xxx"且 xxx 已被占用时，可以顺延插入位置及后续词
+    • 顺延必须调用 keytao_shift_phrase_code(word=A, target_code=xxx)，禁止手工计算
+    • 被挤走的 B 必须用 B 自己的 keytao_encode 候选编码链找下一位，不能沿用 A 的编码链
+    • 每次顺延都必须确认目标码为空，或继续顺延该目标码上的词；无法继续时停止并告知用户
+    • 回复必须说明顺延计算了哪些词，例如：换言之 hyfio→hyfioo
+    • 禁止先批量删除大量草稿条目再按模型规划重建，除非用户明确要求清空/批量删除
 
 3. 查词完整流程（严格遵循，不得省略！）
    触发：用户查词、问怎么打、想加词

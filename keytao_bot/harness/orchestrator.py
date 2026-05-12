@@ -3,7 +3,7 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from nonebot.log import logger
 
@@ -37,9 +37,9 @@ class AgentOrchestrator:
 
     def __init__(
         self,
-        client_factory: Callable[[], object],
+        client_factory: Callable[[], Any],
         runtime: AgentRuntimeConfig,
-        skills_manager: object,
+        skills_manager: Any,
         tool_executor: ToolExecutor,
         state_store: MemoryConversationStateStore,
         bind_help_text: str,
@@ -185,7 +185,7 @@ class AgentOrchestrator:
                     result_str = await self._call_tool_once(
                         fn_name,
                         fn_args,
-                        ToolContext(context.platform, context.user_id),
+                        ToolContext(context.platform, context.user_id, message),
                         seen_tool_calls,
                     )
                 except DuplicateToolCallAbort:
@@ -243,7 +243,7 @@ class AgentOrchestrator:
         line_count = message.count("\n") + 1
         return max(self._runtime.max_tokens, min(line_count * 200 + 500, self._runtime.max_tokens_cap))
 
-    def _log_usage(self, response: object) -> None:
+    def _log_usage(self, response: Any) -> None:
         usage = getattr(response, "usage", None)
         if not usage:
             return
@@ -252,7 +252,7 @@ class AgentOrchestrator:
         if cache_hit or cache_miss:
             logger.info(f"Cache: hit={cache_hit} miss={cache_miss} tokens")
 
-    def _parse_tool_calls(self, tool_calls: List[object]) -> Optional[List[tuple]]:
+    def _parse_tool_calls(self, tool_calls: List[Any]) -> Optional[List[tuple]]:
         parsed_tool_calls = []
         for tool_call in tool_calls:
             try:
