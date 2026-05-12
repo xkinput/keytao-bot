@@ -382,6 +382,7 @@ keytao_shift_phrase_code(word="会员费", target_code="hyfio")
 
 该工具会自动：
 - 检查 `target_code` 是否是目标词 A 的有效候选编码
+- 若用户指定的是飞键/编码系列，使用 `requestedCodeAnalysis` 判断是否属于固定飞键规则，并返回同系列支持的候选码
 - 查询 A 当前旧编码
 - 查询目标编码占用词 B
 - 对 B 调 `keytao_encode(B)`，从 B 自己的候选链里找下一码

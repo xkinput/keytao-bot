@@ -302,26 +302,35 @@ async def _fetch_draft_snapshot(platform: str, platform_id: str) -> Optional[Dic
     return None
 
 
-async def _fetch_encode_candidates(word: str) -> Dict:
+async def _fetch_encode_candidates(word: str, requested_code: Optional[str] = None) -> Dict:
     keytao_api_base = get_keytao_url()
     encode_url = f"{keytao_api_base}/api/phrases/encode"
     infer_url = f"{keytao_api_base}/api/phrases/infer"
+    params = {"word": word}
+    if requested_code:
+        params["code"] = requested_code
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(encode_url, params={"word": word})
+            response = await client.get(encode_url, params=params)
             encode_data = response.json() if response.is_success else {}
             codes = _clean_code_list(encode_data.get("codes"))
             alt_codes = _clean_code_list(encode_data.get("altCodes"))
             if not codes:
-                infer_response = await client.get(infer_url, params={"word": word})
+                infer_response = await client.get(infer_url, params=params)
                 infer_data = infer_response.json() if infer_response.is_success else {}
                 codes = _clean_code_list(infer_data.get("codes"))
                 alt_codes = _clean_code_list(infer_data.get("altCodes"))
+                requested_analysis = infer_data.get("requestedCodeAnalysis")
+            else:
+                requested_analysis = encode_data.get("requestedCodeAnalysis")
             candidate_codes = _clean_code_list([*codes, *alt_codes])
             if not candidate_codes:
                 return {"success": False, "message": f"无法计算「{word}」的候选编码"}
-            return {"success": True, "word": word, "candidateCodes": candidate_codes}
+            result = {"success": True, "word": word, "candidateCodes": candidate_codes}
+            if requested_analysis:
+                result["requestedCodeAnalysis"] = requested_analysis
+            return result
     except httpx.TimeoutException:
         return {"success": False, "message": f"计算「{word}」编码超时"}
     except Exception as e:
@@ -1022,15 +1031,17 @@ async def keytao_shift_phrase_code(
     if not word or not target_code:
         return {"success": False, "message": "必须提供词条和目标编码"}
 
-    target_encode = await _fetch_encode_candidates(word)
+    target_encode = await _fetch_encode_candidates(word, target_code)
     if not target_encode.get("success"):
         return target_encode
     target_candidate_codes = target_encode.get("candidateCodes", [])
     if target_code not in target_candidate_codes:
+        requested_analysis = target_encode.get("requestedCodeAnalysis")
         return {
             "success": False,
             "message": f"{target_code} 不是「{word}」的有效候选编码，可选：{', '.join(target_candidate_codes)}",
             "candidateCodes": target_candidate_codes,
+            "requestedCodeAnalysis": requested_analysis,
         }
 
     word_lookup = await _lookup_words_raw([word])

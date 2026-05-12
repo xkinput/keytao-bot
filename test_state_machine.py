@@ -693,12 +693,16 @@ def test_normalize_encode_response_codes_first():
             }
         ],
         "codes": ["hyf", "hyfi", "hyfio", "hyfioo"],
-        "altCodes": [],
+        "altCodes": ["ffb", "ffbo"],
+        "flyKeyVariants": [{"baseCode": "ffb", "codes": ["ffb", "ffbo"], "changes": []}],
+        "requestedCodeAnalysis": {"code": "ffb", "supported": True, "matchType": "flyKey"},
     })
 
     check("success true", result["success"] is True)
     check("recommendedCode is codes[0]", result["recommendedCode"] == "hyf")
-    check("candidateCodes preserve progressive codes", result["candidateCodes"] == ["hyf", "hyfi", "hyfio", "hyfioo"])
+    check("candidateCodes include fly key codes", result["candidateCodes"] == ["hyf", "hyfi", "hyfio", "hyfioo", "ffb", "ffbo"])
+    check("flyKeyVariants preserved", result["flyKeyVariants"][0]["baseCode"] == "ffb")
+    check("requestedCodeAnalysis preserved", result["requestedCodeAnalysis"]["matchType"] == "flyKey")
     check("chars are display-only without fullCode", "fullCode" not in result["chars"][0])
 
 

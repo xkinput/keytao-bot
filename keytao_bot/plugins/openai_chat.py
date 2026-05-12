@@ -698,6 +698,8 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 
    【第一步】同时调用：
      keytao_encode(word) + keytao_lookup_by_word(word)
+         如果用户指定了目标编码/编码系列（例如“放到 ffb 系列”“用 ff=zh,zh”），
+         必须调用 keytao_encode(word, requested_code=目标编码或系列前缀)，用 requestedCodeAnalysis 判断是否支持。
 
    【第二步】判断：
      A) 词库已有 → 展示词库位置 + 拆分，流程结束
@@ -707,6 +709,8 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
          优先使用 keytao_encode 返回的 candidateStatuses（已查占用）。
          如果 occupancyChecked=false 或没有 candidateStatuses，才取 candidateCodes/codes + altCodes，
          调用 keytao_lookup_by_codes_batch 查每个码位。
+         飞键候选必须以工具返回的 altCodes / flyKeyVariants / candidateStatuses 为准；
+         支持固定规则组合候选，如 zh 的 q/f 双键位组合，禁止自己泛化到规则外键位。
          ⚠️ 禁止向用户展示“待查占用”；回复前必须得到“已有「...」”或“空位”。
 
    【第四步】展示拆分 + 候选编码列表，格式：

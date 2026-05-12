@@ -268,6 +268,8 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 - `codes[0]`：最短规则编码
 - `codes[1..]`：逐步加一位形码的选重码
 - `altCodes`：飞键备用编码（zh/ch/uang 双键位产生）
+- `flyKeyVariants`：按固定飞键规则生成的分组候选系列；同音 zh/ch 多字可以组合生成，例如 `qqb` 同时允许 `fqb`、`qfb`、`ffb` 系列时，以此字段为准
+- `requestedCodeAnalysis`：当调用时传入 `requested_code`，返回用户指定编码是否属于标准候选、固定飞键候选、同系列但不支持，或完全不支持；用户强制指定编码/编码系列时必须展示这里的结论
 - `c1` / `c2`：字根拆分（每个字符是一个字根）
 - `shapeCode`：c1+c2 各字根对应的形码字母串
 - `phoneticCode`：音码（2字母）
@@ -294,6 +296,8 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 ```
 飞键备用：fhz · ...
 ```
+
+用户指定编码时，调用 `keytao_encode(word="词", requested_code="ffb")`。若 `requestedCodeAnalysis.supported=false`，必须说明工具给出的原因，并列出 `seriesCodes` 或 `alternatives`，不要自行推断规则外编码。
 
 若某字无拆分数据，形码显示「—」，音码仍正常展示。
 

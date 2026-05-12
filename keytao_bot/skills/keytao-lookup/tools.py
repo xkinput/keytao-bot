@@ -139,13 +139,16 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         "candidateCodes": candidate_codes,
         "codes": codes,
         "altCodes": alt_codes,
+        "flyKeyVariants": encode_data.get("flyKeyVariants") or infer_data.get("flyKeyVariants") or [],
         "codeSource": code_source,
         "chars": _clean_encode_chars(encode_data.get("chars")),
     }
 
-    for key in ("suggestion", "suggestionIndex", "isBaseConflict", "wordExists"):
+    for key in ("suggestion", "suggestionIndex", "isBaseConflict", "wordExists", "requestedCodeAnalysis"):
         if key in infer_data:
             result[key] = infer_data[key]
+        elif key in encode_data:
+            result[key] = encode_data[key]
 
     if not result["success"]:
         result["message"] = "编码服务未能返回有效候选编码，请让用户手动指定编码"
@@ -535,13 +538,14 @@ async def keytao_lookup_by_word(word: str) -> Dict:
     }])[0]
 
 
-async def keytao_encode(word: str) -> Dict:
+async def keytao_encode(word: str, requested_code: Optional[str] = None) -> Dict:
     """
     Calculate keytao encoding and char split for a word (rule-based, not DB query)
     计算词条的键道编码及字根拆分（按规则计算，非数据库查询）
 
     Args:
         word: Chinese word or character to encode
+        requested_code: Optional user-specified code to analyze against fixed fly-key rules
 
     Returns:
         dict: Encoding result with codes, altCodes, and per-char split data
@@ -552,7 +556,10 @@ async def keytao_encode(word: str) -> Dict:
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(encode_url, params={"word": word})
+            params = {"word": word}
+            if requested_code:
+                params["code"] = requested_code
+            response = await client.get(encode_url, params=params)
             if response.is_success:
                 encode_data = response.json()
                 codes = _clean_code_list(encode_data.get("codes"))
@@ -561,7 +568,7 @@ async def keytao_encode(word: str) -> Dict:
                     lookup_result = await keytao_lookup_by_codes_batch(encoding.get("candidateCodes", []))
                     return _apply_candidate_occupancy(encoding, lookup_result)
 
-                infer_response = await client.get(infer_url, params={"word": word})
+                infer_response = await client.get(infer_url, params=params)
                 infer_data = infer_response.json() if infer_response.is_success else {}
                 encoding = _normalize_encode_response(word, encode_data, infer_data)
                 lookup_result = await keytao_lookup_by_codes_batch(encoding.get("candidateCodes", []))
@@ -665,6 +672,10 @@ TOOLS = [
                     "word": {
                         "type": "string",
                         "description": "要编码的中文词条或单字，如 '你好', '若'"
+                    },
+                    "requested_code": {
+                        "type": "string",
+                        "description": "可选。用户强制指定或询问的编码，如 'ffb'。提供后会返回 requestedCodeAnalysis，说明该编码是否属于标准候选或固定飞键候选，并列出支持的同系列编码"
                     }
                 },
                 "required": ["word"]
