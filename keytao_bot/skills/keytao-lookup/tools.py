@@ -59,6 +59,97 @@ def _chunk_items(items: List[str], chunk_size: int) -> List[List[str]]:
     return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
 
 
+def _clean_code_list(codes: object) -> List[str]:
+    if not isinstance(codes, list):
+        return []
+
+    result: List[str] = []
+    seen = set()
+    for code in codes:
+        if not isinstance(code, str):
+            continue
+        normalized = code.strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _has_valid_codes(codes: List[str]) -> bool:
+    return bool(codes) and all("?" not in code for code in codes)
+
+
+def _clean_encode_chars(chars: object) -> List[Dict]:
+    if not isinstance(chars, list):
+        return []
+
+    cleaned = []
+    for item in chars:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append({
+            "char": item.get("char", ""),
+            "pinyin": item.get("pinyin", ""),
+            "pinyins": item.get("pinyins", []),
+            "phoneticCode": item.get("phoneticCode", ""),
+            "c1": item.get("c1"),
+            "c2": item.get("c2"),
+            "shapeCode": item.get("shapeCode"),
+        })
+    return cleaned
+
+
+def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optional[Dict] = None) -> Dict:
+    """Return phrase candidate codes before display-only char split data."""
+    infer_data = infer_data or {}
+    encode_codes = _clean_code_list(encode_data.get("codes"))
+    encode_alt_codes = _clean_code_list(encode_data.get("altCodes"))
+    infer_codes = _clean_code_list(infer_data.get("codes"))
+    infer_alt_codes = _clean_code_list(infer_data.get("altCodes"))
+
+    if _has_valid_codes(encode_codes):
+        codes = encode_codes
+        alt_codes = encode_alt_codes
+        code_source = "encode"
+    elif _has_valid_codes(infer_codes):
+        codes = infer_codes
+        alt_codes = infer_alt_codes
+        code_source = "infer-fallback"
+    else:
+        codes = encode_codes or infer_codes
+        alt_codes = encode_alt_codes or infer_alt_codes
+        code_source = "invalid"
+
+    candidate_codes = _clean_code_list([*codes, *alt_codes])
+    suggestion = infer_data.get("suggestion")
+    recommended_code = suggestion if isinstance(suggestion, str) and "?" not in suggestion else None
+    if not recommended_code and codes and "?" not in codes[0]:
+        recommended_code = codes[0]
+    if not recommended_code and candidate_codes:
+        recommended_code = candidate_codes[0]
+
+    result = {
+        "success": _has_valid_codes(codes),
+        "input": encode_data.get("input") or infer_data.get("word") or word,
+        "word": word,
+        "type": encode_data.get("type") or infer_data.get("type", ""),
+        "recommendedCode": recommended_code,
+        "candidateCodes": candidate_codes,
+        "codes": codes,
+        "altCodes": alt_codes,
+        "codeSource": code_source,
+        "chars": _clean_encode_chars(encode_data.get("chars")),
+    }
+
+    for key in ("suggestion", "suggestionIndex", "isBaseConflict", "wordExists"):
+        if key in infer_data:
+            result[key] = infer_data[key]
+
+    if not result["success"]:
+        result["message"] = "编码服务未能返回有效候选编码，请让用户手动指定编码"
+    return result
+
+
 async def _call_bot_lookup_api(path: str, payload: Dict) -> Dict:
     keytao_api_base = get_keytao_url()
     bot_api_token = get_bot_token()
@@ -404,13 +495,21 @@ async def keytao_encode(word: str) -> Dict:
         dict: Encoding result with codes, altCodes, and per-char split data
     """
     keytao_api_base = get_keytao_url()
-    url = f"{keytao_api_base}/api/phrases/encode"
+    encode_url = f"{keytao_api_base}/api/phrases/encode"
+    infer_url = f"{keytao_api_base}/api/phrases/infer"
 
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, params={"word": word})
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(encode_url, params={"word": word})
             if response.is_success:
-                return response.json()
+                encode_data = response.json()
+                codes = _clean_code_list(encode_data.get("codes"))
+                if _has_valid_codes(codes):
+                    return _normalize_encode_response(word, encode_data)
+
+                infer_response = await client.get(infer_url, params={"word": word})
+                infer_data = infer_response.json() if infer_response.is_success else {}
+                return _normalize_encode_response(word, encode_data, infer_data)
             return {
                 "success": False,
                 "message": f"编码服务返回错误: {response.status_code}"
@@ -503,7 +602,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_encode",
-            "description": "按键道规则计算词条的编码和字根拆分。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
+            "description": "按键道规则计算词条的编码和字根拆分。返回的 candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
             "parameters": {
                 "type": "object",
                 "properties": {

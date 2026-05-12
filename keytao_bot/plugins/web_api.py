@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from nonebot import get_driver
 from nonebot.log import logger
 
-from .openai_chat import get_ai_response_core, conversation_states, MAX_HISTORY_MESSAGES
+from .openai_chat import get_ai_response_core, conversation_state_store, MAX_HISTORY_MESSAGES
 from ..utils.history_store import get_history_store
 
 driver = get_driver()
@@ -99,7 +99,7 @@ try:
 
         store = get_history_store()
         deleted = store.clear_history(platform, user_key)
-        conversation_states.pop((platform, user_key), None)
+        conversation_state_store.delete((platform, user_key))
         logger.info(f"web_api: cleared {deleted} messages for {platform}/{user_key[:8]}…")
         return {"success": True, "deleted": deleted}
 

@@ -5,6 +5,8 @@ Does NOT require NoneBot runtime — only tests pure functions.
 """
 import sys
 import os
+import asyncio
+import importlib.util
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -82,6 +84,20 @@ from keytao_bot.plugins.openai_chat import (
     CONFIRM_WORDS,
     CANCEL_WORDS,
 )
+from keytao_bot.harness.state import MemoryConversationStateStore
+from keytao_bot.harness.tools import ToolContext, ToolExecutor
+
+_lookup_tools_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "keytao_bot",
+    "skills",
+    "keytao-lookup",
+    "tools.py",
+)
+_lookup_spec = importlib.util.spec_from_file_location("keytao_lookup_tools_for_test", _lookup_tools_path)
+_lookup_tools = importlib.util.module_from_spec(_lookup_spec)
+_lookup_spec.loader.exec_module(_lookup_tools)
+_normalize_encode_response = _lookup_tools._normalize_encode_response
 
 
 passed = 0
@@ -436,6 +452,124 @@ def test_confirm_cancel_word_sets():
     check("no overlap between confirm and cancel", len(overlap) == 0)
 
 
+def test_memory_conversation_state_store():
+    """Verify the explicit state-store seam preserves pending state behavior."""
+    print("\n🧪 MemoryConversationStateStore")
+
+    store = MemoryConversationStateStore()
+    key = ("qq", "123")
+    state = PendingToolConfirm(
+        function_name="keytao_create_phrase",
+        args={"word": "测试", "code": "cek"},
+    )
+
+    check("initially empty", not store.contains(key))
+    store.set(key, state)
+    check("contains after set", store.contains(key))
+    check("get returns same state", store.get(key) == state)
+    check("pop returns same state", store.pop(key) == state)
+    check("empty after pop", not store.contains(key))
+    store.set(key, state)
+    store.delete(key)
+    check("empty after delete", not store.contains(key))
+
+
+async def _run_tool_executor_checks():
+    calls = []
+
+    async def fake_tool(**kwargs):
+        calls.append(kwargs)
+        return {"success": True, "args": kwargs}
+
+    executor = ToolExecutor(
+        lambda name: fake_tool if name == "context_tool" else None,
+        frozenset({"context_tool"}),
+    )
+
+    result = await executor.call(
+        "context_tool",
+        {"word": "测试"},
+        ToolContext(platform="qq", user_id="123"),
+    )
+    check("tool executor returns JSON success", '"success": true' in result)
+    check("platform injected", calls[0]["platform"] == "qq")
+    check("platform_id injected", calls[0]["platform_id"] == "123")
+
+    missing_context = await executor.call(
+        "context_tool",
+        {"word": "测试"},
+        ToolContext(),
+    )
+    check("missing context is rejected", "无法获取用户平台信息" in missing_context)
+    missing_tool = await executor.call(
+        "missing_tool",
+        {},
+        ToolContext(platform="qq", user_id="123"),
+    )
+    check("missing tool is reported", "Tool missing_tool not found" in missing_tool)
+
+
+def test_tool_executor_context_injection():
+    """Verify contextual tools still receive platform identifiers."""
+    print("\n🧪 ToolExecutor context injection")
+    asyncio.run(_run_tool_executor_checks())
+
+
+def test_normalize_encode_response_codes_first():
+    """Verify keytao_encode exposes phrase candidate codes as first-class data."""
+    print("\n🧪 keytao_encode normalization (valid codes)")
+
+    result = _normalize_encode_response("换言之", {
+        "input": "换言之",
+        "type": "三字词",
+        "chars": [
+            {
+                "char": "换",
+                "pinyin": "huàn",
+                "phoneticCode": "ht",
+                "shapeCode": "iuua",
+                "fullCode": "htiuua",
+            }
+        ],
+        "codes": ["hyf", "hyfi", "hyfio", "hyfioo"],
+        "altCodes": [],
+    })
+
+    check("success true", result["success"] is True)
+    check("recommendedCode is codes[0]", result["recommendedCode"] == "hyf")
+    check("candidateCodes preserve progressive codes", result["candidateCodes"] == ["hyf", "hyfi", "hyfio", "hyfioo"])
+    check("chars are display-only without fullCode", "fullCode" not in result["chars"][0])
+
+
+def test_normalize_encode_response_infer_fallback():
+    """Verify invalid x? codes can be replaced by infer fallback candidates."""
+    print("\n🧪 keytao_encode normalization (infer fallback)")
+
+    result = _normalize_encode_response(
+        "换言之",
+        {
+            "input": "换言之",
+            "type": "三字词",
+            "chars": [{"char": "换", "pinyin": "", "phoneticCode": "x?", "shapeCode": "iuua"}],
+            "codes": ["x?x", "x?xi"],
+            "altCodes": [],
+        },
+        {
+            "word": "换言之",
+            "type": "三字词",
+            "codes": ["hyf", "hyfi", "hyfio", "hyfioo"],
+            "altCodes": [],
+            "suggestion": "hyfioo",
+            "suggestionIndex": 3,
+        },
+    )
+
+    check("success true after fallback", result["success"] is True)
+    check("codeSource is infer-fallback", result["codeSource"] == "infer-fallback")
+    check("recommendedCode uses infer suggestion", result["recommendedCode"] == "hyfioo")
+    check("candidateCodes use fallback codes", result["candidateCodes"] == ["hyf", "hyfi", "hyfio", "hyfioo"])
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("State Machine & Core Logic Tests")
@@ -458,6 +592,10 @@ if __name__ == "__main__":
     test_edge_case_numeric_out_of_range()
     test_edge_case_zero_choice()
     test_confirm_cancel_word_sets()
+    test_memory_conversation_state_store()
+    test_tool_executor_context_injection()
+    test_normalize_encode_response_codes_first()
+    test_normalize_encode_response_infer_fallback()
 
     print("\n" + "=" * 60)
     total = passed + failed

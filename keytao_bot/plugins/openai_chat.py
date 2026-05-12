@@ -6,9 +6,7 @@ Python handles: confirmation routing, direct execution of simple confirms.
 """
 import json
 import re
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Optional, List, Dict, Tuple, Union
+from typing import Any, Optional, List, Dict, Tuple
 
 from nonebot import on_message, on_command, get_driver
 from nonebot.adapters import Bot, Event
@@ -22,6 +20,14 @@ except ImportError:
     logger.warning("openai package not installed, OpenAI chat plugin will not work")
 
 from ..skills import SkillsManager
+from ..harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
+from ..harness.state import (
+    MemoryConversationStateStore,
+    PendingAddWord,
+    PendingState,
+    PendingToolConfirm,
+)
+from ..harness.tools import ToolContext, ToolExecutor
 from ..utils.history_store import get_history_store
 
 
@@ -82,6 +88,22 @@ _BIND_HELP_TEXT = (
 
 driver = get_driver()
 config = driver.config
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 OPENAI_API_KEY = (
     getattr(config, "openai_api_key", None)
     or getattr(config, "gemini_api_key", None)
@@ -99,26 +121,28 @@ OPENAI_MODEL = (
     or getattr(config, "ark_model", None)
     or "gemini-2.0-flash"
 )
-OPENAI_MAX_TOKENS = (
+OPENAI_MAX_TOKENS: int = _as_int((
     getattr(config, "openai_max_tokens", None)
     or getattr(config, "gemini_max_tokens", None)
     or getattr(config, "ark_max_tokens", None)
     or 1000
-)
-OPENAI_TIMEOUT = getattr(config, "openai_timeout", None)
-if OPENAI_TIMEOUT is None:
-    OPENAI_TIMEOUT = getattr(config, "gemini_timeout", None)
-if OPENAI_TIMEOUT is None:
-    OPENAI_TIMEOUT = getattr(config, "ark_timeout", None)
-if OPENAI_TIMEOUT is None:
-    OPENAI_TIMEOUT = 180.0
-OPENAI_TEMPERATURE = getattr(config, "openai_temperature", None)
-if OPENAI_TEMPERATURE is None:
-    OPENAI_TEMPERATURE = getattr(config, "gemini_temperature", None)
-if OPENAI_TEMPERATURE is None:
-    OPENAI_TEMPERATURE = getattr(config, "ark_temperature", None)
-if OPENAI_TEMPERATURE is None:
-    OPENAI_TEMPERATURE = 0.7
+), 1000)
+openai_timeout_value = getattr(config, "openai_timeout", None)
+if openai_timeout_value is None:
+    openai_timeout_value = getattr(config, "gemini_timeout", None)
+if openai_timeout_value is None:
+    openai_timeout_value = getattr(config, "ark_timeout", None)
+if openai_timeout_value is None:
+    openai_timeout_value = 180.0
+OPENAI_TIMEOUT: float = _as_float(openai_timeout_value, 180.0)
+openai_temperature_value = getattr(config, "openai_temperature", None)
+if openai_temperature_value is None:
+    openai_temperature_value = getattr(config, "gemini_temperature", None)
+if openai_temperature_value is None:
+    openai_temperature_value = getattr(config, "ark_temperature", None)
+if openai_temperature_value is None:
+    openai_temperature_value = 0.7
+OPENAI_TEMPERATURE: float = _as_float(openai_temperature_value, 0.7)
 
 GROUP_TRIGGER_KEYWORD_START = "键道"
 GROUP_TRIGGER_KEYWORD_ANY = "喵喵"
@@ -140,25 +164,9 @@ MAX_HISTORY_MESSAGES = 16
 # Conversation State Machine
 # ---------------------------------------------------------------------------
 
-@dataclass
-class PendingAddWord:
-    """User has been shown candidate codes, waiting for choice."""
-    word: str
-    recommended_code: str
-    candidates: List[Tuple[str, bool]]  # [(code, is_occupied), ...]
-
-
-@dataclass
-class PendingToolConfirm:
-    """A tool returned requiresConfirmation, waiting for user to confirm."""
-    function_name: str
-    args: Dict
-
-
-PendingState = Union[PendingAddWord, PendingToolConfirm, None]
-
 # Per-conversation state: (platform, user_id) -> state
-conversation_states: Dict[Tuple[str, str], PendingState] = {}
+conversation_state_store = MemoryConversationStateStore()
+conversation_states: Dict[Tuple[str, str], PendingState] = conversation_state_store.states
 
 CONFIRM_WORDS = frozenset({
     "确认", "是", "好", "可以", "同意", "yes", "ok", "确定", "嗯", "行", "y",
@@ -471,6 +479,7 @@ _INJECT_PLATFORM_TOOLS = frozenset({
     'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items',
     'keytao_recall_batch', 'keytao_get_batch_preview',
 })
+tool_executor = ToolExecutor(skills_manager.get_tool_function, _INJECT_PLATFORM_TOOLS)
 
 
 async def call_tool_function(
@@ -480,27 +489,7 @@ async def call_tool_function(
     user_id: Optional[str] = None,
 ) -> str:
     """Call a tool function and return result as JSON string."""
-    tool_func = skills_manager.get_tool_function(tool_name)
-    if not tool_func:
-        return json.dumps({"error": f"Tool {tool_name} not found"}, ensure_ascii=False)
-
-    try:
-        if tool_name in _INJECT_PLATFORM_TOOLS:
-            if platform and user_id:
-                arguments['platform'] = platform
-                arguments['platform_id'] = user_id
-            else:
-                return json.dumps(
-                    {"error": "内部错误：无法获取用户平台信息"}, ensure_ascii=False
-                )
-
-        result = await tool_func(**arguments)
-        result_json = json.dumps(result, ensure_ascii=False)
-        logger.info(f"Tool {tool_name} result: {result_json[:300]}")
-        return result_json
-    except Exception as e:
-        logger.error(f"Tool {tool_name} error: {type(e).__name__}: {e}")
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+    return await tool_executor.call(tool_name, arguments, ToolContext(platform, user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -521,10 +510,10 @@ async def _execute_add_to_draft(
 
     if data.get("requiresConfirmation"):
         conv_key = (platform, user_id)
-        conversation_states[conv_key] = PendingToolConfirm(
+        conversation_state_store.set(conv_key, PendingToolConfirm(
             function_name="keytao_create_phrase",
             args={"word": word, "code": code},
-        )
+        ))
         warnings = data.get("warnings", [])
         warn_text = "\n".join(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
@@ -654,7 +643,7 @@ async def _handle_pending_add_word(
             target_code, is_occupied = state.candidates[idx]
         else:
             conv_key = (platform, user_id)
-            conversation_states[conv_key] = state  # re-save so user can retry
+            conversation_state_store.set(conv_key, state)
             return f"请选择 1-{len(state.candidates)} 之间的编号 owo"
 
     # Simple confirmation -> use recommended code
@@ -840,230 +829,36 @@ async def get_ai_response_core(
         return "❌ AI 服务未配置，请联系管理员"
 
     try:
-        client = AsyncOpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url=OPENAI_BASE_URL,
+        client_cls = AsyncOpenAI
+        runtime = AgentRuntimeConfig(
+            model=OPENAI_MODEL,
+            max_tokens=OPENAI_MAX_TOKENS,
+            temperature=OPENAI_TEMPERATURE,
             timeout=OPENAI_TIMEOUT,
         )
-
-        platform_label = {'telegram': 'Telegram', 'qq': 'QQ', 'web': 'Web'}.get(platform, '未知')
-        platform_ctx = f"\n\n【当前平台】{platform_label}"
-        skill_instructions = skills_manager.get_skill_instructions()
-        system_prompt = SYSTEM_PROMPT_CORE + platform_ctx + skill_instructions
-
-        logger.info(f"📋 System prompt length: {len(system_prompt)} chars")
-        logger.info(f"OpenAI timeout configured: {OPENAI_TIMEOUT}s")
-
-        messages: List[Dict] = [{"role": "system", "content": system_prompt}]
-
-        # Add history with relative timestamps
-        if history:
-            now = datetime.now()
-            for msg in history:
-                role = msg.get("role")
-                content = msg.get("content", "")
-                ts = msg.get("timestamp", "")
-                ago = ""
-                if ts:
-                    try:
-                        diff = now - datetime.fromisoformat(ts)
-                        secs = int(diff.total_seconds())
-                        if secs < 60:
-                            ago = f"{secs}s ago"
-                        elif secs < 3600:
-                            ago = f"{secs // 60}m ago"
-                        elif secs < 86400:
-                            ago = f"{secs // 3600}h ago"
-                        else:
-                            ago = f"{secs // 86400}d ago"
-                    except Exception:
-                        pass
-                if role == "user" and ago:
-                    messages.append({"role": role, "content": f"[{ago}] {content}"})
-                else:
-                    messages.append({"role": role, "content": content})
-
-        # Hard boundary between history and current request
-        messages.append({
-            "role": "system",
-            "content": (
-                "━━━ 当前请求边界 ━━━\n"
-                "以上为历史记录（用于理解上下文）。\n"
-                "以下是用户刚发的新消息，是本轮唯一需要处理的请求。"
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client_cls(
+                api_key=OPENAI_API_KEY,
+                base_url=OPENAI_BASE_URL,
+                timeout=OPENAI_TIMEOUT,
             ),
-        })
-
-        messages.append({
-            "role": "user",
-            "content": f"[当前请求] {message}{reply_context}",
-        })
-
-        tools = skills_manager.get_tools() if skills_manager.has_tools() else None
-        conv_key = (platform, user_id)
-
-        _MAX_TOKENS_CAP = 8000
-        line_count = message.count("\n") + 1
-        current_max_tokens = max(OPENAI_MAX_TOKENS, min(line_count * 200 + 500, _MAX_TOKENS_CAP))
-        _seen_tool_calls: Dict[tuple, int] = {}  # fingerprint → call count
-
-        # Tool calling loop
-        for iteration in range(max_iterations):
-            call_kwargs: Dict = {
-                "model": OPENAI_MODEL,
-                "messages": messages,
-                "max_tokens": current_max_tokens,
-                "temperature": OPENAI_TEMPERATURE,
-            }
-            if tools:
-                call_kwargs["tools"] = tools
-                call_kwargs["tool_choice"] = "auto"
-
-            logger.info(f"Calling {OPENAI_MODEL} (iter {iteration + 1}/{max_iterations})")
-            response = await client.chat.completions.create(**call_kwargs)
-
-            if response.usage:
-                cache_hit = getattr(response.usage, 'prompt_cache_hit_tokens', 0) or 0
-                cache_miss = getattr(response.usage, 'prompt_cache_miss_tokens', 0) or 0
-                if cache_hit or cache_miss:
-                    logger.info(f"Cache: hit={cache_hit} miss={cache_miss} tokens")
-
-            if not response.choices:
-                return "呜呜，AI 好像没有回复 qwq 要不再试一次？"
-
-            choice = response.choices[0]
-
-            # No tool calls → return text response
-            if choice.finish_reason == "stop" or not choice.message.tool_calls:
-                return choice.message.content
-
-            if choice.finish_reason == "length":
-                if current_max_tokens < _MAX_TOKENS_CAP:
-                    current_max_tokens = min(current_max_tokens * 2, _MAX_TOKENS_CAP)
-                    logger.warning(f"Response truncated, retrying with max_tokens={current_max_tokens}")
-                    messages.append({
-                        "role": "user",
-                        "content": "[系统] 你上一次的输出因过长被截断，以上查询结果已完整获取。请勿重新查询，直接根据已有数据继续调用下一步工具完成任务。",
-                    })
-                    continue
-                logger.warning("Response truncated even at max cap")
-                return "呜呜，回复太长被截断了 qwq 请把任务拆小一点再试试～"
-
-            # Process tool calls
-            if choice.message.tool_calls:
-                # Validate all tool call arguments before committing to messages
-                parsed_tool_calls = []
-                truncated = False
-                for tc in choice.message.tool_calls:
-                    try:
-                        parsed_tool_calls.append((tc, json.loads(tc.function.arguments)))
-                    except json.JSONDecodeError:
-                        truncated = True
-                        break
-
-                if truncated:
-                    if current_max_tokens < _MAX_TOKENS_CAP:
-                        current_max_tokens = min(current_max_tokens * 2, _MAX_TOKENS_CAP)
-                        logger.warning(f"Tool args truncated, retrying with max_tokens={current_max_tokens}")
-                        messages.append({
-                            "role": "user",
-                            "content": "[系统] 你上一次生成的工具调用参数因过长被截断。请勿重新查询，直接根据已有数据重新生成完整的工具调用。",
-                        })
-                        continue
-                    logger.error("Tool args truncated even at max cap")
-                    return "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～"
-
-                assistant_msg: Dict = {
-                    "role": "assistant",
-                    "content": choice.message.content,
-                }
-                # DeepSeek thinking mode: reasoning_content must be echoed back
-                reasoning_content = getattr(choice.message, 'reasoning_content', None)
-                if reasoning_content:
-                    assistant_msg["reasoning_content"] = reasoning_content
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in choice.message.tool_calls
-                ]
-                messages.append(assistant_msg)
-
-                for tc, fn_args in parsed_tool_calls:
-                    fn_name = tc.function.name
-                    logger.info(f"Tool call: {fn_name}({fn_args})")
-
-                    call_fingerprint = (fn_name, json.dumps(fn_args, sort_keys=True, ensure_ascii=False))
-                    dup_count = _seen_tool_calls.get(call_fingerprint, 0)
-                    if dup_count > 0:
-                        if dup_count >= 4:
-                            logger.error(f"Tool call {fn_name} duplicated {dup_count} times, aborting")
-                            return "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～"
-                        logger.warning(f"Duplicate tool call ({dup_count}): {fn_name}, injecting forcing hint")
-                        _write_tools = frozenset({
-                            "keytao_batch_add_to_draft", "keytao_create_phrase",
-                            "keytao_submit_batch", "keytao_batch_remove_draft_items",
-                            "keytao_remove_draft_item", "keytao_recall_batch",
-                        })
-                        if fn_name in _write_tools:
-                            dup_hint = (
-                                f"工具 {fn_name} 已执行过，数据已写入。"
-                                "禁止重复调用。请直接根据上方执行结果回复用户。"
-                            )
-                        else:
-                            dup_hint = (
-                                f"工具 {fn_name} 已调用过，结果已在上方消息中。"
-                                "禁止再次调用此工具。请直接使用上方已有数据继续下一步操作。"
-                            )
-                        result_str = json.dumps({
-                            "error": "重复调用，已忽略",
-                            "message": dup_hint,
-                        })
-                        _seen_tool_calls[call_fingerprint] = dup_count + 1
-                    else:
-                        _seen_tool_calls[call_fingerprint] = 1
-                        result_str = await call_tool_function(fn_name, fn_args, platform, user_id)
-
-                    # Short-circuit: user not bound → return bind instructions directly
-                    try:
-                        _rd = json.loads(result_str)
-                        if _rd.get("not_bound"):
-                            return _BIND_HELP_TEXT
-                    except Exception:
-                        pass
-
-                    # Save pending state if tool requires confirmation
-                    if fn_name in ("keytao_create_phrase", "keytao_submit_batch"):
-                        try:
-                            rd = json.loads(result_str)
-                            if rd.get("requiresConfirmation"):
-                                saved = {
-                                    k: v for k, v in fn_args.items()
-                                    if k not in ("confirmed", "platform", "platform_id")
-                                }
-                                conversation_states[conv_key] = PendingToolConfirm(
-                                    function_name=fn_name, args=saved,
-                                )
-                                logger.info(f"💾 Saved PendingToolConfirm: {fn_name}({saved})")
-                        except Exception:
-                            pass
-
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": fn_name,
-                        "content": result_str,
-                    })
-
-                continue  # next iteration to get AI's response
-
-            return choice.message.content or "呜呜，AI 没有回复 qwq"
-
-        return "呜呜，处理太久了 qwq 要不再试一次？"
+            runtime=runtime,
+            skills_manager=skills_manager,
+            tool_executor=tool_executor,
+            state_store=conversation_state_store,
+            bind_help_text=_BIND_HELP_TEXT,
+            system_prompt_core=SYSTEM_PROMPT_CORE,
+        )
+        return await orchestrator.run(
+            message=message,
+            context=AgentRequestContext(
+                platform=platform,
+                user_id=user_id,
+                history=history,
+                reply_context=reply_context,
+            ),
+            max_iterations=max_iterations,
+        )
 
     except Exception as e:
         logger.error(f"API error: {e}")
@@ -1099,7 +894,7 @@ clear_cmd = on_command(
 async def handle_clear(bot: Bot, event: Event):
     conv_key = get_conversation_key(bot, event)
     clear_history(conv_key)
-    conversation_states.pop(conv_key, None)
+    conversation_state_store.delete(conv_key)
     await clear_cmd.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
 
 
@@ -1124,7 +919,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
     response: Optional[str] = None
 
     # ===== Phase 1: Check pending state =====
-    state = conversation_states.pop(conv_key, None)
+    state = conversation_state_store.pop(conv_key)
 
     if state is not None:
         if _has_cancel(message_text):
@@ -1160,10 +955,10 @@ async def handle_ai_chat(bot: Bot, event: Event):
         return
 
     # ===== Phase 3: Detect new pending state from AI response =====
-    if conv_key not in conversation_states:
+    if not conversation_state_store.contains(conv_key):
         pending = _parse_pending_add_word(response)
         if pending:
-            conversation_states[conv_key] = pending
+            conversation_state_store.set(conv_key, pending)
             logger.info(
                 f"📌 Saved PendingAddWord: {pending.word}@{pending.recommended_code} "
                 f"({len(pending.candidates)} candidates)"

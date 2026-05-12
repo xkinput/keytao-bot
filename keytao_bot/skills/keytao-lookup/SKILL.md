@@ -260,12 +260,16 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 ```
 
 字段说明：
-- `codes[0]`：推荐的最短可用编码
+- `candidateCodes`：所有可选词条编码（`codes + altCodes` 去重），展示候选和查占用时优先使用此字段
+- `recommendedCode`：推荐编码；没有占用信息时通常等于 `codes[0]`
+- `codes[0]`：最短规则编码
 - `codes[1..]`：逐步加一位形码的选重码
 - `altCodes`：飞键备用编码（zh/ch/uang 双键位产生）
 - `c1` / `c2`：字根拆分（每个字符是一个字根）
 - `shapeCode`：c1+c2 各字根对应的形码字母串
 - `phoneticCode`：音码（2字母）
+
+⚠️ 关键规则：词条候选编码只能取 `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
 
 ## 展示格式（查询编码/拆分时）
 
@@ -294,7 +298,7 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 ### 第一步：调用 keytao_encode
 
-调用 `keytao_encode(word="你好")`，取 `codes[0]` 作为推荐编码。
+调用 `keytao_encode(word="你好")`，取 `recommendedCode` 作为推荐编码；展示和查占用使用 `candidateCodes`。
 
 ### 第二步：发送确认消息
 
