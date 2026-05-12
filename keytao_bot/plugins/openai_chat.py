@@ -105,6 +105,13 @@ OPENAI_MAX_TOKENS = (
     or getattr(config, "ark_max_tokens", None)
     or 1000
 )
+OPENAI_TIMEOUT = getattr(config, "openai_timeout", None)
+if OPENAI_TIMEOUT is None:
+    OPENAI_TIMEOUT = getattr(config, "gemini_timeout", None)
+if OPENAI_TIMEOUT is None:
+    OPENAI_TIMEOUT = getattr(config, "ark_timeout", None)
+if OPENAI_TIMEOUT is None:
+    OPENAI_TIMEOUT = 180.0
 OPENAI_TEMPERATURE = getattr(config, "openai_temperature", None)
 if OPENAI_TEMPERATURE is None:
     OPENAI_TEMPERATURE = getattr(config, "gemini_temperature", None)
@@ -836,7 +843,7 @@ async def get_ai_response_core(
         client = AsyncOpenAI(
             api_key=OPENAI_API_KEY,
             base_url=OPENAI_BASE_URL,
-            timeout=60.0,
+            timeout=OPENAI_TIMEOUT,
         )
 
         platform_label = {'telegram': 'Telegram', 'qq': 'QQ', 'web': 'Web'}.get(platform, '未知')
@@ -845,6 +852,7 @@ async def get_ai_response_core(
         system_prompt = SYSTEM_PROMPT_CORE + platform_ctx + skill_instructions
 
         logger.info(f"📋 System prompt length: {len(system_prompt)} chars")
+        logger.info(f"OpenAI timeout configured: {OPENAI_TIMEOUT}s")
 
         messages: List[Dict] = [{"role": "system", "content": system_prompt}]
 

@@ -102,6 +102,7 @@ OPENAI_API_KEY="your-api-key-here"
 OPENAI_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai/"  # API 地址
 OPENAI_MODEL="gemini-2.0-flash"                                         # 使用的模型
 OPENAI_MAX_TOKENS=1000                                                     # 最大回复长度
+OPENAI_TIMEOUT=180                                                         # 请求超时秒数
 OPENAI_TEMPERATURE=0.7                                                     # 创造性 (0.0-2.0)
 ```
 
