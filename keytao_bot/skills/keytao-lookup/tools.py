@@ -121,6 +121,7 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         code_source = "invalid"
 
     candidate_codes = _clean_code_list([*codes, *alt_codes])
+    base_code = codes[0] if codes else None
     suggestion = infer_data.get("suggestion")
     recommended_code = suggestion if isinstance(suggestion, str) and "?" not in suggestion else None
     if not recommended_code and codes and "?" not in codes[0]:
@@ -133,6 +134,7 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         "input": encode_data.get("input") or infer_data.get("word") or word,
         "word": word,
         "type": encode_data.get("type") or infer_data.get("type", ""),
+        "baseCode": base_code,
         "recommendedCode": recommended_code,
         "candidateCodes": candidate_codes,
         "codes": codes,
@@ -148,6 +150,56 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
     if not result["success"]:
         result["message"] = "编码服务未能返回有效候选编码，请让用户手动指定编码"
     return result
+
+
+def _format_candidate_status(code: str, phrases: List[Dict]) -> Dict:
+    words = [phrase.get("word", "") for phrase in phrases if phrase.get("word")]
+    occupied = bool(phrases)
+    if occupied:
+        label = "已有「" + "、".join(words[:3]) + "」"
+        if len(words) > 3:
+            label += f"等 {len(words)} 个词"
+    else:
+        label = "空位"
+
+    return {
+        "code": code,
+        "occupied": occupied,
+        "label": label,
+        "phrases": phrases,
+    }
+
+
+def _apply_candidate_occupancy(encoding: Dict, lookup_result: Dict) -> Dict:
+    candidate_codes = encoding.get("candidateCodes", [])
+    if not isinstance(candidate_codes, list) or not candidate_codes:
+        encoding["occupancyChecked"] = False
+        encoding["candidateStatuses"] = []
+        return encoding
+
+    if not lookup_result.get("success"):
+        encoding["occupancyChecked"] = False
+        encoding["candidateStatuses"] = []
+        encoding["occupancyError"] = lookup_result.get("message", "候选编码占用查询失败")
+        return encoding
+
+    result_map = {
+        item.get("code", ""): item.get("phrases", [])
+        for item in lookup_result.get("results", [])
+        if isinstance(item, dict)
+    }
+    statuses = [
+        _format_candidate_status(code, result_map.get(code, []))
+        for code in candidate_codes
+    ]
+    first_available = next((item["code"] for item in statuses if not item["occupied"]), None)
+
+    encoding["occupancyChecked"] = True
+    encoding["candidateStatuses"] = statuses
+    encoding["firstAvailableCode"] = first_available
+    if first_available:
+        encoding["recommendedCode"] = first_available
+    return encoding
 
 
 async def _call_bot_lookup_api(path: str, payload: Dict) -> Dict:
@@ -505,11 +557,15 @@ async def keytao_encode(word: str) -> Dict:
                 encode_data = response.json()
                 codes = _clean_code_list(encode_data.get("codes"))
                 if _has_valid_codes(codes):
-                    return _normalize_encode_response(word, encode_data)
+                    encoding = _normalize_encode_response(word, encode_data)
+                    lookup_result = await keytao_lookup_by_codes_batch(encoding.get("candidateCodes", []))
+                    return _apply_candidate_occupancy(encoding, lookup_result)
 
                 infer_response = await client.get(infer_url, params={"word": word})
                 infer_data = infer_response.json() if infer_response.is_success else {}
-                return _normalize_encode_response(word, encode_data, infer_data)
+                encoding = _normalize_encode_response(word, encode_data, infer_data)
+                lookup_result = await keytao_lookup_by_codes_batch(encoding.get("candidateCodes", []))
+                return _apply_candidate_occupancy(encoding, lookup_result)
             return {
                 "success": False,
                 "message": f"编码服务返回错误: {response.status_code}"
@@ -602,7 +658,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_encode",
-            "description": "按键道规则计算词条的编码和字根拆分。返回的 candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
+            "description": "按键道规则计算词条的编码、候选码占用情况和字根拆分。返回的 candidateStatuses 是已经查过占用的候选列表，禁止回复'待查占用'；candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
             "parameters": {
                 "type": "object",
                 "properties": {

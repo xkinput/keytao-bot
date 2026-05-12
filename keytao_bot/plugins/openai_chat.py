@@ -702,8 +702,10 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      B) 词库没有 → 必须继续第三步
 
    【第三步】查候选编码占用情况：
-     取 keytao_encode 返回的 codes + altCodes，
-     调用 keytao_lookup_by_codes_batch 查每个码位
+         优先使用 keytao_encode 返回的 candidateStatuses（已查占用）。
+         如果 occupancyChecked=false 或没有 candidateStatuses，才取 candidateCodes/codes + altCodes，
+         调用 keytao_lookup_by_codes_batch 查每个码位。
+         ⚠️ 禁止向用户展示“待查占用”；回复前必须得到“已有「...」”或“空位”。
 
    【第四步】展示拆分 + 候选编码列表，格式：
 
@@ -717,9 +719,10 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      2. abcde — ✅ 推荐（空位）
      3. abcdea — 空位
 
-     是否以编码 abcde 将「词」加入草稿？也可回复编号选其他编码。
+         是否以编码 abcde 将「词」加入草稿？也可回复编号选其他编码。
 
    ⚠️ 确认句格式必须固定：「是否以编码 XXX 将「YYY」加入草稿」——系统靠此提取上下文
+     ⚠️ 推荐编码使用 keytao_encode.recommendedCode；若 candidateStatuses 中有 ✅ 推荐，以该空位为准
    ⚠️ 禁止只说"未收录"就结束，必须给出可操作的加词建议
    ⚠️ 这一步只展示不写入！用户确认后由系统自动处理
 

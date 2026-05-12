@@ -98,6 +98,7 @@ _lookup_spec = importlib.util.spec_from_file_location("keytao_lookup_tools_for_t
 _lookup_tools = importlib.util.module_from_spec(_lookup_spec)
 _lookup_spec.loader.exec_module(_lookup_tools)
 _normalize_encode_response = _lookup_tools._normalize_encode_response
+_apply_candidate_occupancy = _lookup_tools._apply_candidate_occupancy
 
 
 passed = 0
@@ -570,6 +571,35 @@ def test_normalize_encode_response_infer_fallback():
     check("candidateCodes use fallback codes", result["candidateCodes"] == ["hyf", "hyfi", "hyfio", "hyfioo"])
 
 
+def test_apply_candidate_occupancy_updates_recommendation():
+    """Verify encoded candidates include checked occupancy labels before AI sees them."""
+    print("\n🧪 keytao_encode candidate occupancy")
+
+    encoding = _normalize_encode_response("会员费", {
+        "input": "会员费",
+        "type": "三字词",
+        "chars": [],
+        "codes": ["hyf", "hyfi", "hyfio", "hyfioa"],
+        "altCodes": [],
+    })
+    result = _apply_candidate_occupancy(encoding, {
+        "success": True,
+        "results": [
+            {"code": "hyf", "phrases": [{"word": "换衣服", "code": "hyf", "type_label": "词组"}]},
+            {"code": "hyfi", "phrases": [{"word": "会员费", "code": "hyfi", "type_label": "词组"}]},
+            {"code": "hyfio", "phrases": []},
+            {"code": "hyfioa", "phrases": []},
+        ],
+    })
+
+    check("occupancyChecked true", result["occupancyChecked"] is True)
+    check("candidateStatuses length", len(result["candidateStatuses"]) == 4)
+    check("occupied label is explicit", result["candidateStatuses"][0]["label"] == "已有「换衣服」")
+    check("empty label is explicit", result["candidateStatuses"][2]["label"] == "空位")
+    check("firstAvailableCode set", result["firstAvailableCode"] == "hyfio")
+    check("recommendedCode moves to first available", result["recommendedCode"] == "hyfio")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("State Machine & Core Logic Tests")
@@ -596,6 +626,7 @@ if __name__ == "__main__":
     test_tool_executor_context_injection()
     test_normalize_encode_response_codes_first()
     test_normalize_encode_response_infer_fallback()
+    test_apply_candidate_occupancy_updates_recommendation()
 
     print("\n" + "=" * 60)
     total = passed + failed

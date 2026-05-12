@@ -261,7 +261,10 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 字段说明：
 - `candidateCodes`：所有可选词条编码（`codes + altCodes` 去重），展示候选和查占用时优先使用此字段
-- `recommendedCode`：推荐编码；没有占用信息时通常等于 `codes[0]`
+- `candidateStatuses`：已经批量查过占用的候选列表，展示候选编码必须使用此字段的 `label`
+- `occupancyChecked`：是否已经完成候选编码占用查询；为 `true` 时禁止再显示"待查占用"
+- `firstAvailableCode`：首个空位候选码
+- `recommendedCode`：推荐编码；查占用后通常等于 `firstAvailableCode`，否则等于 `codes[0]`
 - `codes[0]`：最短规则编码
 - `codes[1..]`：逐步加一位形码的选重码
 - `altCodes`：飞键备用编码（zh/ch/uang 双键位产生）
@@ -269,7 +272,9 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 - `shapeCode`：c1+c2 各字根对应的形码字母串
 - `phoneticCode`：音码（2字母）
 
-⚠️ 关键规则：词条候选编码只能取 `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
+⚠️ 关键规则：词条候选编码只能取 `candidateStatuses` / `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
+
+⚠️ 展示候选编码时：如果 `occupancyChecked=true`，必须使用 `candidateStatuses`，例如 `1. hyfi — 已有「会员费」`、`2. hyfio — 空位`。禁止输出"待查占用"。
 
 ## 展示格式（查询编码/拆分时）
 
@@ -298,7 +303,7 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 ### 第一步：调用 keytao_encode
 
-调用 `keytao_encode(word="你好")`，取 `recommendedCode` 作为推荐编码；展示和查占用使用 `candidateCodes`。
+调用 `keytao_encode(word="你好")`，取 `recommendedCode` 作为推荐编码；展示候选和占用状态使用 `candidateStatuses`。
 
 ### 第二步：发送确认消息
 
