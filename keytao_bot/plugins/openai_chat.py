@@ -150,7 +150,7 @@ _LEADING_COMMAND_PREFIX_RE = re.compile(
     r"^(?:@\S+|键道|喵喵)[\s:：，,]*",
     re.IGNORECASE,
 )
-_CLEAR_COMMAND_RE = re.compile(r"^/?(?:clear|清空对话|清空历史)\s*$", re.IGNORECASE)
+_CLEAR_COMMAND_RE = re.compile(r"^/?(?:clear|清空对话|清空历史)$", re.IGNORECASE)
 
 
 def _strip_command_message_prefixes(message_text: str) -> str:
@@ -164,7 +164,8 @@ def _strip_command_message_prefixes(message_text: str) -> str:
 
 
 def _is_clear_command_text(message_text: str) -> bool:
-    return bool(_CLEAR_COMMAND_RE.match(_strip_command_message_prefixes(message_text)))
+    command_text = _strip_command_message_prefixes(message_text)
+    return any(_CLEAR_COMMAND_RE.fullmatch(token) for token in command_text.split())
 
 
 # ---------------------------------------------------------------------------

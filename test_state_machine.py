@@ -483,12 +483,17 @@ def test_bind_command_text_detection():
     check("plain slash command detected", _is_bind_command_text("/bind 26PZWH"))
     check("plain no-slash command detected", _is_bind_command_text("bind 26PZWH"))
     check("QQ mention prefix detected", _is_bind_command_text("@喵喵 /bind 26PZWH"))
+    check("QQ mention display name prefix detected", _is_bind_command_text("@喵喵 jacobpang /bind NW7UWX"))
+    check("bind command inside sentence detected", _is_bind_command_text("@喵喵 jacobpang 请 /bind NW7UWX 绑定一下"))
     check("trigger word prefix detected", _is_bind_command_text("喵喵 /bind 26PZWH"))
     check("multiple prefixes detected", _is_bind_command_text("@喵喵 键道 /bind 26PZWH"))
     check("bind key uppercased", _extract_bind_key("@喵喵 /bind 26pzwh") == "26PZWH")
+    check("bind key extracted after display name", _extract_bind_key("@喵喵 jacobpang /bind NW7UWX") == "NW7UWX")
+    check("bind key extracted inside sentence", _extract_bind_key("@喵喵 jacobpang 请 /bind NW7UWX 绑定一下") == "NW7UWX")
     check("missing key returns empty string", _extract_bind_key("@喵喵 /bind") == "")
     check("natural language not detected", not _is_bind_command_text("喵喵 绑定怎么弄"))
-    check("trailing words not detected", not _is_bind_command_text("/bind 26PZWH extra"))
+    check("mentioned bind discussion not detected", not _is_bind_command_text("@喵喵 关于 /bind 绑定"))
+    check("valid bind with trailing words detected", _is_bind_command_text("/bind 26PZWH extra"))
 
 
 def test_clear_command_text_detection():
@@ -499,9 +504,12 @@ def test_clear_command_text_detection():
     check("plain clear detected", _is_clear_command_text("clear"))
     check("Chinese alias detected", _is_clear_command_text("清空历史"))
     check("mention prefix detected", _is_clear_command_text("@喵喵 /clear"))
+    check("mention display name prefix detected", _is_clear_command_text("@喵喵 jacobpang /clear"))
+    check("clear command inside sentence detected", _is_clear_command_text("@喵喵 jacobpang 请 /clear 一下"))
     check("trigger word prefix detected", _is_clear_command_text("喵喵 清空对话"))
     check("natural language not detected", not _is_clear_command_text("喵喵 怎么清空历史"))
-    check("trailing words not detected", not _is_clear_command_text("/clear now"))
+    check("mentioned clear token detected", _is_clear_command_text("@喵喵 关于 /clear"))
+    check("clear with trailing words detected", _is_clear_command_text("/clear now"))
 
 
 def test_memory_conversation_state_store():

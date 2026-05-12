@@ -24,7 +24,8 @@ logger.info(f"[account_bind] BOT_API_TOKEN loaded: {bool(BOT_API_TOKEN)}")
 
 GROUP_TRIGGER_KEYWORDS = ("键道", "喵喵")
 
-_BIND_COMMAND_RE = re.compile(r"^/?bind(?:\s+(\S+))?\s*$", re.IGNORECASE)
+_BIND_COMMAND_RE = re.compile(r"(?<!\S)/?bind(?!\S)", re.IGNORECASE)
+_BIND_KEY_RE = re.compile(r"^[A-Za-z0-9]{6}$")
 _LEADING_BIND_PREFIX_RE = re.compile(
     r"^(?:@\S+|键道|喵喵)[\s:：，,]*",
     re.IGNORECASE,
@@ -42,11 +43,18 @@ def _strip_bind_message_prefixes(message_text: str) -> str:
 
 
 def _extract_bind_key(message_text: str) -> Optional[str]:
-    match = _BIND_COMMAND_RE.match(_strip_bind_message_prefixes(message_text))
-    if not match:
+    command_text = _strip_bind_message_prefixes(message_text)
+    tokens = command_text.split()
+    for index, token in enumerate(tokens):
+        if not _BIND_COMMAND_RE.fullmatch(token):
+            continue
+        if index + 1 >= len(tokens):
+            return ""
+        key = tokens[index + 1]
+        if _BIND_KEY_RE.fullmatch(key):
+            return key.upper()
         return None
-    key = match.group(1)
-    return key.upper() if key else ""
+    return None
 
 
 def _is_bind_command_text(message_text: str) -> bool:
