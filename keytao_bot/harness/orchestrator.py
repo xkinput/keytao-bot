@@ -1,5 +1,6 @@
 """OpenAI-compatible agent/tool orchestration loop."""
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
@@ -88,6 +89,7 @@ class AgentOrchestrator:
         conv_key = (context.platform, context.user_id)
         current_max_tokens = self._initial_max_tokens(message)
         seen_tool_calls: Dict[tuple, int] = {}
+        empty_response_retries = 0
 
         for iteration in range(max_iterations):
             call_kwargs: Dict = {
@@ -101,15 +103,21 @@ class AgentOrchestrator:
                 call_kwargs["tool_choice"] = "auto"
 
             logger.info(f"Calling {self._runtime.model} (iter {iteration + 1}/{max_iterations})")
+            started_at = time.monotonic()
             response = await client.chat.completions.create(**call_kwargs)
+            elapsed = time.monotonic() - started_at
             self._log_usage(response)
 
             if not response.choices:
                 return "呜呜，AI 好像没有回复 qwq 要不再试一次？"
 
             choice = response.choices[0]
-            if choice.finish_reason == "stop" or not choice.message.tool_calls:
-                return choice.message.content
+            tool_call_count = len(choice.message.tool_calls or [])
+            content = choice.message.content or ""
+            logger.info(
+                f"Model response: finish_reason={choice.finish_reason} "
+                f"tool_calls={tool_call_count} content_len={len(content)} elapsed={elapsed:.1f}s"
+            )
 
             if choice.finish_reason == "length":
                 if current_max_tokens < self._runtime.max_tokens_cap:
@@ -122,6 +130,20 @@ class AgentOrchestrator:
                     continue
                 logger.warning("Response truncated even at max cap")
                 return "呜呜，回复太长被截断了 qwq 请把任务拆小一点再试试～"
+
+            if not choice.message.tool_calls:
+                if content.strip():
+                    return content
+                if empty_response_retries < 1:
+                    empty_response_retries += 1
+                    logger.warning("Model returned empty final content, retrying once")
+                    messages.append({
+                        "role": "user",
+                        "content": "[系统] 你上一次没有生成任何可见回复。请不要重新查询，直接根据已有工具结果回复用户；如需继续操作，请调用下一步工具。",
+                    })
+                    continue
+                logger.error("Model returned empty final content twice")
+                return "呜呜，AI 返回了空回复 qwq 请再说一次要我怎么处理。"
 
             parsed_tool_calls = self._parse_tool_calls(choice.message.tool_calls)
             if parsed_tool_calls is None:

@@ -86,6 +86,7 @@ from keytao_bot.plugins.openai_chat import (
 )
 from keytao_bot.harness.state import MemoryConversationStateStore
 from keytao_bot.harness.tools import ToolContext, ToolExecutor
+from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
 
 _lookup_tools_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -516,6 +517,84 @@ def test_tool_executor_context_injection():
     asyncio.run(_run_tool_executor_checks())
 
 
+class _FakeAIMessage:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _FakeChoice:
+    def __init__(self, finish_reason, content=None, tool_calls=None):
+        self.finish_reason = finish_reason
+        self.message = _FakeAIMessage(content, tool_calls)
+
+
+class _FakeAIResponse:
+    def __init__(self, finish_reason, content=None, tool_calls=None):
+        self.choices = [_FakeChoice(finish_reason, content, tool_calls)]
+        self.usage = None
+
+
+class _FakeCompletions:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        completions = _FakeCompletions(responses)
+        self.chat = types.SimpleNamespace(completions=completions)
+        self.completions = completions
+
+
+class _FakeSkillsManager:
+    def get_skill_instructions(self):
+        return ""
+
+    def has_tools(self):
+        return False
+
+
+async def _run_orchestrator_empty_response_retry_checks():
+    client = _FakeClient([
+        _FakeAIResponse("stop", None),
+        _FakeAIResponse("stop", "已根据已有结果继续处理"),
+    ])
+    orchestrator = AgentOrchestrator(
+        client_factory=lambda: client,
+        runtime=AgentRuntimeConfig(
+            model="fake-model",
+            max_tokens=1000,
+            temperature=0.7,
+            timeout=180.0,
+        ),
+        skills_manager=_FakeSkillsManager(),
+        tool_executor=ToolExecutor(lambda name: None, frozenset()),
+        state_store=MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+
+    result = await orchestrator.run(
+        "还是会员费改hyfio吧",
+        AgentRequestContext(platform="qq", user_id="123"),
+    )
+
+    check("empty final content retries once", len(client.completions.calls) == 2)
+    check("retry returns visible reply", result == "已根据已有结果继续处理")
+
+
+def test_orchestrator_empty_response_retry():
+    """Verify empty final model content does not become a generic request failure."""
+    print("\n🧪 AgentOrchestrator empty response retry")
+    asyncio.run(_run_orchestrator_empty_response_retry_checks())
+
+
 def test_normalize_encode_response_codes_first():
     """Verify keytao_encode exposes phrase candidate codes as first-class data."""
     print("\n🧪 keytao_encode normalization (valid codes)")
@@ -624,6 +703,7 @@ if __name__ == "__main__":
     test_confirm_cancel_word_sets()
     test_memory_conversation_state_store()
     test_tool_executor_context_injection()
+    test_orchestrator_empty_response_retry()
     test_normalize_encode_response_codes_first()
     test_normalize_encode_response_infer_fallback()
     test_apply_candidate_occupancy_updates_recommendation()
