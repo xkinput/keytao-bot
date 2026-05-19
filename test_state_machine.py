@@ -81,6 +81,9 @@ sys.modules["duckduckgo_search"] = types.ModuleType("duckduckgo_search")
 
 # Now import the pure functions we want to test
 from keytao_bot.plugins.openai_chat import (
+    _augment_simple_word_query_response,
+    _build_existing_word_priority_note,
+    _extract_pure_chinese_words,
     _is_confirm,
     _has_cancel,
     _handle_pending_add_word,
@@ -315,6 +318,99 @@ def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_input
     check("prompt mentions meaning explanation", "每个词都先用 1-2 句解释它的大致含义" in SYSTEM_PROMPT_CORE)
     check("prompt mentions batch lookup preference", "多个词时优先使用批量查询工具" in SYSTEM_PROMPT_CORE)
     check("prompt mentions duplicate order", "主动说明该词在同码词里的排序位置" in SYSTEM_PROMPT_CORE)
+
+
+def test_extract_pure_chinese_words():
+    """Verify simple Chinese-word-only messages can be detected for enrichment."""
+    print("\n🧪 extract pure Chinese words")
+
+    check("single word extracted", _extract_pure_chinese_words("寿司郎") == ["寿司郎"])
+    check("multiple words extracted", _extract_pure_chinese_words("寿司郎 卧龙凤雏") == ["寿司郎", "卧龙凤雏"])
+    check("non-word sentence not extracted", _extract_pure_chinese_words("寿司郎是什么") == [])
+
+
+def test_build_existing_word_priority_note():
+    """Verify existing-word note explains earlier occupied candidates and duplicate order."""
+    print("\n🧪 build existing-word priority note")
+
+    lookup_entry = {
+        "word": "寿司郎",
+        "phrases": [
+            {
+                "word": "寿司郎",
+                "code": "eslv",
+                "type_label": "词组",
+                "duplicate_info": {
+                    "position_label": "二重",
+                    "all_words": [
+                        {"word": "寿司狼", "label": ""},
+                        {"word": "寿司郎", "label": "二重"},
+                    ],
+                },
+            }
+        ],
+    }
+    encode_data = {
+        "candidateStatuses": [
+            {"code": "esl", "occupied": True, "label": "已有「厄斯兰」"},
+            {"code": "eslv", "occupied": True, "label": "已有「寿司狼、寿司郎」"},
+            {"code": "eslva", "occupied": False, "label": "空位"},
+        ]
+    }
+
+    note = _build_existing_word_priority_note("寿司郎", lookup_entry, encode_data)
+    check("note mentions prior occupied code", "esl 已有" in note)
+    check("note mentions duplicate position", "排在二重" in note)
+    check("note mentions peer words", "寿司狼" in note and "寿司郎" in note)
+
+
+def test_augment_simple_word_query_response_appends_priority_note():
+    """Verify simple existing-word replies get deterministic priority enrichment."""
+    print("\n🧪 augment simple word query response")
+
+    async def _run():
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            if tool_name == "keytao_lookup_by_words_batch":
+                return json.dumps({
+                    "success": True,
+                    "results": [{
+                        "word": "寿司郎",
+                        "phrases": [{
+                            "word": "寿司郎",
+                            "code": "eslv",
+                            "duplicate_info": {
+                                "position_label": "二重",
+                                "all_words": [
+                                    {"word": "寿司狼", "label": ""},
+                                    {"word": "寿司郎", "label": "二重"},
+                                ],
+                            },
+                        }],
+                    }],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_encode":
+                return json.dumps({
+                    "success": True,
+                    "candidateStatuses": [
+                        {"code": "esl", "occupied": True, "label": "已有「厄斯兰」"},
+                        {"code": "eslv", "occupied": True, "label": "已有「寿司狼、寿司郎」"},
+                    ],
+                }, ensure_ascii=False)
+            raise AssertionError(tool_name)
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _augment_simple_word_query_response(
+                "寿司郎",
+                "词库已有：\n\n词: 寿司郎\n编码: eslv（三字词）【词组】",
+                "qq",
+                "123",
+            )
+
+        check("result contains priority appendix", "补充说明：" in result)
+        check("result explains prior occupied code", "esl 已有" in result)
+        check("result explains duplicate order", "排在二重" in result)
+
+    asyncio.run(_run())
 
 
 def test_pending_add_word_numeric_choice():
@@ -1182,6 +1278,9 @@ if __name__ == "__main__":
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
+    test_extract_pure_chinese_words()
+    test_build_existing_word_priority_note()
+    test_augment_simple_word_query_response_appends_priority_note()
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()
     test_occupied_numeric_choice_means_duplicate_confirm()

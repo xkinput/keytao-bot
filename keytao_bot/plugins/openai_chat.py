@@ -151,6 +151,8 @@ _LEADING_COMMAND_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 _CLEAR_COMMAND_RE = re.compile(r"^/?(?:clear|清空对话|清空历史)$", re.IGNORECASE)
+_PURE_CHINESE_WORDS_RE = re.compile(r'^[\u4e00-\u9fff]+(?:[\s、，,；;]+[\u4e00-\u9fff]+)*$')
+_WORD_QUERY_STOPWORDS = ("什么", "怎么", "为何", "为啥", "意思", "含义", "吗", "呢", "呀", "啊", "吧", "嘛")
 
 
 def _strip_command_message_prefixes(message_text: str) -> str:
@@ -166,6 +168,16 @@ def _strip_command_message_prefixes(message_text: str) -> str:
 def _is_clear_command_text(message_text: str) -> bool:
     command_text = _strip_command_message_prefixes(message_text)
     return any(_CLEAR_COMMAND_RE.fullmatch(token) for token in command_text.split())
+
+
+def _extract_pure_chinese_words(message_text: str) -> List[str]:
+    """Extract standalone Chinese words from a simple word-only message."""
+    text = message_text.strip()
+    if not text or not _PURE_CHINESE_WORDS_RE.fullmatch(text):
+        return []
+    if any(stopword in text for stopword in _WORD_QUERY_STOPWORDS):
+        return []
+    return [token for token in re.split(r'[\s、，,；;]+', text) if token]
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +321,104 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
         return response
     logger.info("🧭 Appending occupied-choice guidance via parsed pending-add matcher")
     return response.rstrip() + f"\n{guidance}"
+
+
+def _build_existing_word_priority_note(word: str, lookup_entry: Dict, encode_data: Dict) -> Optional[str]:
+    """Explain why an existing word uses its current code and where it ranks there."""
+    phrases = lookup_entry.get("phrases", [])
+    if not phrases:
+        return None
+
+    candidate_statuses = encode_data.get("candidateStatuses", [])
+    candidate_index = {
+        item.get("code", ""): idx
+        for idx, item in enumerate(candidate_statuses)
+        if isinstance(item, dict) and item.get("code")
+    }
+
+    notes: List[str] = []
+    for phrase in phrases:
+        code = phrase.get("code", "")
+        if not code:
+            continue
+
+        idx = candidate_index.get(code)
+        if idx is not None and idx > 0:
+            prior_statuses = [
+                item for item in candidate_statuses[:idx]
+                if isinstance(item, dict) and item.get("occupied")
+            ]
+            if prior_statuses:
+                prior_text = "；".join(
+                    f"{item.get('code', '')} {item.get('label', '')}"
+                    for item in prior_statuses[:3]
+                )
+                notes.append(f"{word} 当前用 {code}，因为更前面的候选码位已被占用：{prior_text}。")
+
+        dup = phrase.get("duplicate_info")
+        if isinstance(dup, dict) and len(dup.get("all_words", [])) > 1:
+            position_label = dup.get("position_label") or "首位"
+            all_words = dup.get("all_words", [])
+            dup_text = "、".join(
+                f"{item.get('word', '')}{f'（{item.get('label')}）' if item.get('label') else ''}"
+                for item in all_words[:5]
+                if item.get("word")
+            )
+            notes.append(f"{code} 这个码位里，{word} 排在{position_label}；同码词有：{dup_text}。")
+
+    if not notes:
+        return None
+    return "\n".join(f"• {note}" for note in notes)
+
+
+async def _augment_simple_word_query_response(
+    message_text: str,
+    response: str,
+    platform: str,
+    user_id: str,
+) -> str:
+    """Append deterministic code-priority notes for simple word-only queries."""
+    words = _extract_pure_chinese_words(message_text)
+    if not words:
+        return response
+    if "前面的候选码位" in response or "同码词有：" in response:
+        return response
+
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_words_batch", {"words": words}, platform, user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        return response
+    if not lookup_data.get("success"):
+        return response
+
+    lookup_map = {
+        item.get("word", ""): item
+        for item in lookup_data.get("results", [])
+        if isinstance(item, dict) and item.get("word")
+    }
+
+    note_blocks: List[str] = []
+    for word in words:
+        lookup_entry = lookup_map.get(word, {})
+        if not lookup_entry.get("phrases"):
+            continue
+        encode_json = await call_tool_function(
+            "keytao_encode", {"word": word}, platform, user_id,
+        )
+        try:
+            encode_data = json.loads(encode_json)
+        except Exception:
+            continue
+        note = _build_existing_word_priority_note(word, lookup_entry, encode_data)
+        if note:
+            note_blocks.append(f"{word} 的编码位置说明：\n{note}")
+
+    if not note_blocks:
+        return response
+    return response.rstrip() + "\n\n补充说明：\n" + "\n\n".join(note_blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1279,9 @@ async def handle_ai_chat(bot: Bot, event: Event):
         return
 
     response = _ensure_pending_add_word_guidance(response)
+    response = await _augment_simple_word_query_response(
+        normalized_message_text, response, platform, user_id,
+    )
 
     # ===== Phase 3: Detect new pending state from AI response =====
     if not conversation_state_store.contains(conv_key):
