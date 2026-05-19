@@ -292,6 +292,20 @@ def test_pending_add_word_guidance_appended_for_occupied_candidates():
     check("guidance mentions recode reply", "编号 重新编码" in guided)
 
 
+def test_pending_add_word_guidance_fallback_matcher():
+    """Verify fallback string matcher still appends guidance when response shape varies."""
+    print("\n🧪 pending add-word guidance fallback matcher")
+
+    response = """候选编码：
+1. zrxx - 已有「增翔」
+2. zrxxv - 推荐（空位）
+
+是否以编码 zrxxv 将「增香」加入草稿？也可回复编号选其他编码。"""
+
+    guided = _ensure_pending_add_word_guidance(response)
+    check("fallback appends guidance", "原词 重新编码" in guided)
+
+
 def test_pending_add_word_numeric_choice():
     """Test the state machine logic for numeric choice."""
     print("\n🧪 PendingAddWord numeric choice logic")
@@ -1081,6 +1095,7 @@ if __name__ == "__main__":
     test_parse_pending_add_word_no_match()
     test_parse_pending_add_word_no_candidate_list()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
+    test_pending_add_word_guidance_fallback_matcher()
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()
     test_occupied_numeric_choice_means_duplicate_confirm()

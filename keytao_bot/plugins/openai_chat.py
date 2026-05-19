@@ -294,14 +294,22 @@ def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> Pendin
 
 def _ensure_pending_add_word_guidance(response: str) -> str:
     """Append deterministic guidance for occupied candidate choices."""
+    guidance = "若所选编号显示“已有…”，直接回复该编号表示添加重码；回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
+    if "重新编码" in response and "添加重码" in response:
+        return response
+
+    # Robust fallback: if the visible reply already contains numbered-choice wording
+    # and at least one occupied slot, append guidance even when regex parsing misses.
+    if "也可回复编号选其他编码" in response and "已有「" in response:
+        logger.info("🧭 Appending occupied-choice guidance via fallback matcher")
+        return response.rstrip() + f"\n{guidance}"
+
     pending = _parse_pending_add_word(response)
     if pending is None:
         return response
     if not any(occupied for _, occupied in pending.candidates):
         return response
-    if "重新编码" in response and "添加重码" in response:
-        return response
-    guidance = "若所选编号显示“已有…”，直接回复该编号表示添加重码；回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
+    logger.info("🧭 Appending occupied-choice guidance via parsed pending-add matcher")
     return response.rstrip() + f"\n{guidance}"
 
 
