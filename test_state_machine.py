@@ -96,6 +96,7 @@ from keytao_bot.plugins.openai_chat import (
     PendingToolConfirm,
     CONFIRM_WORDS,
     CANCEL_WORDS,
+    SYSTEM_PROMPT_CORE,
 )
 from keytao_bot.plugins.account_bind import (
     _extract_bind_key,
@@ -304,6 +305,16 @@ def test_pending_add_word_guidance_fallback_matcher():
 
     guided = _ensure_pending_add_word_guidance(response)
     check("fallback appends guidance", "原词 重新编码" in guided)
+
+
+def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs():
+    """Verify word-only inputs default to meaning + keytao lookup behavior for one or many words."""
+    print("\n🧪 system prompt includes single/multi-word lookup rule")
+
+    check("prompt mentions one or many Chinese words", "如果用户只发了一个或多个中文词/短词" in SYSTEM_PROMPT_CORE)
+    check("prompt mentions meaning explanation", "每个词都先用 1-2 句解释它的大致含义" in SYSTEM_PROMPT_CORE)
+    check("prompt mentions batch lookup preference", "多个词时优先使用批量查询工具" in SYSTEM_PROMPT_CORE)
+    check("prompt mentions duplicate order", "主动说明该词在同码词里的排序位置" in SYSTEM_PROMPT_CORE)
 
 
 def test_pending_add_word_numeric_choice():
@@ -1170,6 +1181,7 @@ if __name__ == "__main__":
     test_parse_pending_add_word_no_candidate_list()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
+    test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()
     test_occupied_numeric_choice_means_duplicate_confirm()
