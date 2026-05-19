@@ -1009,6 +1009,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
     if not message_text:
         await ai_chat.finish("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
         return
+    normalized_message_text = _strip_command_message_prefixes(message_text) or message_text
 
     platform, user_id = extract_platform_info(bot, event)
     conv_key = (platform, user_id)
@@ -1027,14 +1028,14 @@ async def handle_ai_chat(bot: Bot, event: Event):
             )
 
     if state is not None:
-        if _has_cancel(message_text):
+        if _has_cancel(normalized_message_text):
             response = "好的，已取消 owo"
 
         elif isinstance(state, PendingAddWord):
             if history is None:
                 history = get_history(conv_key)
             response = await _handle_pending_add_word(
-                state, message_text, platform, user_id, history,
+                state, normalized_message_text, platform, user_id, history,
             )
             # response is None → unrecognized input, fall through to Phase 2
 
@@ -1042,9 +1043,9 @@ async def handle_ai_chat(bot: Bot, event: Event):
             # "提交" when pending state is submit_batch also counts as confirm
             is_submit_reconfirm = (
                 state.function_name == "keytao_submit_batch"
-                and message_text.strip() in {"提交", "提审"}
+                and normalized_message_text.strip() in {"提交", "提审"}
             )
-            if _is_confirm(message_text) or is_submit_reconfirm:
+            if _is_confirm(normalized_message_text) or is_submit_reconfirm:
                 response = await _execute_confirmed_tool(state, platform, user_id)
             # else: response stays None, fall through to AI as new request
 
@@ -1054,7 +1055,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
             history = get_history(conv_key)
         reply_context = await build_reply_context(bot, event)
         response = await get_ai_response_core(
-            message_text, platform, user_id, history, reply_context,
+            normalized_message_text, platform, user_id, history, reply_context,
         )
 
     if not response:
@@ -1072,7 +1073,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
             )
 
     # Save conversation history
-    add_to_history(conv_key, message_text, response)
+    add_to_history(conv_key, normalized_message_text, response)
 
     # ===== Phase 4: Platform-specific reply =====
     bot_module = bot.__class__.__module__

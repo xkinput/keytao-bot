@@ -84,6 +84,7 @@ from keytao_bot.plugins.openai_chat import (
     _has_cancel,
     _parse_pending_add_word,
     _recover_pending_state_from_history,
+    _strip_command_message_prefixes,
     _strip_markdown,
     _to_markdownv2,
     _is_clear_command_text,
@@ -303,6 +304,35 @@ def test_pending_add_word_numeric_choice():
     check("choice '3' → not occupied", not occupied)
 
 
+def test_numeric_reply_means_exact_candidate_selection():
+    """Verify numbered replies select the exact candidate, not a generic confirm action."""
+    print("\n🧪 numeric reply means exact candidate selection")
+
+    state = PendingAddWord(
+        word="增香",
+        recommended_code="zrxxv",
+        candidates=[
+            ("zrxx", True),
+            ("zrxxv", False),
+            ("zrxxvu", False),
+        ],
+    )
+
+    msg1 = _strip_command_message_prefixes("喵喵 1")
+    check("'1' is not confirm", not _is_confirm(msg1))
+    idx1 = int(msg1) - 1
+    check("'1' selects zrxx", state.candidates[idx1][0] == "zrxx")
+
+    msg3 = _strip_command_message_prefixes("喵喵 3")
+    check("'3' is not confirm", not _is_confirm(msg3))
+    idx3 = int(msg3) - 1
+    check("'3' selects zrxxvu", state.candidates[idx3][0] == "zrxxvu")
+
+    confirm_msg = _strip_command_message_prefixes("喵喵 是")
+    check("'是' remains confirm", _is_confirm(confirm_msg))
+    check("'是' maps to recommended code", state.recommended_code == "zrxxv")
+
+
 def test_pending_add_word_confirm_uses_recommended():
     """Test that '是' maps to recommended code."""
     print("\n🧪 PendingAddWord confirm → recommended code")
@@ -513,6 +543,17 @@ def test_clear_command_text_detection():
     check("natural language not detected", not _is_clear_command_text("喵喵 怎么清空历史"))
     check("mentioned clear token detected", _is_clear_command_text("@喵喵 关于 /clear"))
     check("clear with trailing words detected", _is_clear_command_text("/clear now"))
+
+
+def test_pending_reply_prefix_stripping():
+    """Verify pending-state replies still work when prefixed by trigger words or mentions."""
+    print("\n🧪 pending reply prefix stripping")
+
+    check("喵喵 1 -> 1", _strip_command_message_prefixes("喵喵 1") == "1")
+    check("键道 是 -> 是", _strip_command_message_prefixes("键道 是") == "是")
+    check("@喵喵 确认 -> 确认", _strip_command_message_prefixes("@喵喵 确认") == "确认")
+    check("prefixed digit stays digit", _strip_command_message_prefixes("喵喵 1").isdigit())
+    check("prefixed confirm still confirms", _is_confirm(_strip_command_message_prefixes("喵喵 是")))
 
 
 def test_memory_conversation_state_store():
@@ -961,6 +1002,7 @@ if __name__ == "__main__":
     test_parse_pending_add_word_no_match()
     test_parse_pending_add_word_no_candidate_list()
     test_pending_add_word_numeric_choice()
+    test_numeric_reply_means_exact_candidate_selection()
     test_pending_add_word_confirm_uses_recommended()
     test_pending_tool_confirm_data()
     test_strip_markdown()
@@ -972,6 +1014,7 @@ if __name__ == "__main__":
     test_confirm_cancel_word_sets()
     test_bind_command_text_detection()
     test_clear_command_text_detection()
+    test_pending_reply_prefix_stripping()
     test_memory_conversation_state_store()
     test_recover_pending_add_word_from_history()
     test_recover_pending_submit_confirm_from_history()
