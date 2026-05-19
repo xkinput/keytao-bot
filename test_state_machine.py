@@ -83,6 +83,7 @@ sys.modules["duckduckgo_search"] = types.ModuleType("duckduckgo_search")
 from keytao_bot.plugins.openai_chat import (
     _augment_simple_word_query_response,
     _build_existing_word_priority_note,
+    _extract_prior_occupied_candidates,
     _extract_pure_chinese_words,
     _is_confirm,
     _has_cancel,
@@ -364,6 +365,21 @@ def test_build_existing_word_priority_note():
     check("note mentions peer words", "寿司狼" in note and "寿司郎" in note)
 
 
+def test_extract_prior_occupied_candidates():
+    """Verify prior occupied candidate slots can be extracted before current code."""
+    print("\n🧪 extract prior occupied candidates")
+
+    prior = _extract_prior_occupied_candidates("eslv", {
+        "candidateStatuses": [
+            {"code": "esl", "occupied": True, "label": "已有「神速力」"},
+            {"code": "eslv", "occupied": True, "label": "已有「寿司郎」"},
+            {"code": "eslva", "occupied": False, "label": "空位"},
+        ]
+    })
+    check("one prior occupied candidate found", len(prior) == 1)
+    check("prior candidate code is esl", prior[0]["code"] == "esl")
+
+
 def test_augment_simple_word_query_response_appends_priority_note():
     """Verify simple existing-word replies get deterministic priority enrichment."""
     print("\n🧪 augment simple word query response")
@@ -399,16 +415,76 @@ def test_augment_simple_word_query_response_appends_priority_note():
             raise AssertionError(tool_name)
 
         with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-            result = await _augment_simple_word_query_response(
-                "寿司郎",
-                "词库已有：\n\n词: 寿司郎\n编码: eslv（三字词）【词组】",
-                "qq",
-                "123",
-            )
+            with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(return_value="从日常语感看，寿司郎更偏品牌名，神速力更像作品设定词；不过当前码位排序仍以现有词库占位为准。")):
+                result = await _augment_simple_word_query_response(
+                    "寿司郎",
+                    "词库已有：\n\n词: 寿司郎\n编码: eslv（三字词）【词组】",
+                    "qq",
+                    "123",
+                )
 
         check("result contains priority appendix", "补充说明：" in result)
         check("result explains prior occupied code", "esl 已有" in result)
         check("result explains duplicate order", "排在二重" in result)
+        check("result includes usage comparison", "常用度对比：" in result)
+
+    asyncio.run(_run())
+
+
+def test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority():
+    """Verify usage comparison is still appended even if base reply already mentions prior code occupancy."""
+    print("\n🧪 augment simple word query response preserves usage comparison")
+
+    async def _run():
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            if tool_name == "keytao_lookup_by_words_batch":
+                return json.dumps({
+                    "success": True,
+                    "results": [{
+                        "word": "寿司郎",
+                        "phrases": [{
+                            "word": "寿司郎",
+                            "code": "eslv",
+                            "duplicate_info": {
+                                "position_label": "首位",
+                                "all_words": [
+                                    {"word": "寿司郎", "label": "首位"},
+                                ],
+                            },
+                        }],
+                    }],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_encode":
+                return json.dumps({
+                    "success": True,
+                    "candidateStatuses": [
+                        {"code": "esl", "occupied": True, "label": "已有「神速力」"},
+                        {"code": "eslv", "occupied": True, "label": "已有「寿司郎」"},
+                    ],
+                }, ensure_ascii=False)
+            raise AssertionError(tool_name)
+
+        base_response = (
+            "词库已有「寿司郎」！\n\n"
+            "词: 寿司郎\n"
+            "编码: eslv【词组】\n\n"
+            "补充说明：\n"
+            "寿司郎 的编码位置说明：\n"
+            "• 寿司郎 当前用 eslv，因为更前面的候选码位已被占用：esl 已有「神速力」。"
+        )
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(return_value="从日常语感看，神速力更像固定作品词，寿司郎更偏现实里的品牌名；不过当前码位顺序仍以现有词库占位为准。")):
+                result = await _augment_simple_word_query_response(
+                    "寿司郎",
+                    base_response,
+                    "qq",
+                    "123",
+                )
+
+        check("keeps existing response text", "更前面的候选码位已被占用" in result)
+        check("still appends usage comparison", "常用度对比：" in result)
+        check("comparison mentions occupant word", "神速力" in result)
 
     asyncio.run(_run())
 
@@ -1280,6 +1356,7 @@ if __name__ == "__main__":
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
     test_extract_pure_chinese_words()
     test_build_existing_word_priority_note()
+    test_extract_prior_occupied_candidates()
     test_augment_simple_word_query_response_appends_priority_note()
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()

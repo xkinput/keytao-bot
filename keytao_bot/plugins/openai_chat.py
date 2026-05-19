@@ -371,6 +371,98 @@ def _build_existing_word_priority_note(word: str, lookup_entry: Dict, encode_dat
     return "\n".join(f"• {note}" for note in notes)
 
 
+def _extract_prior_occupied_candidates(current_code: str, encode_data: Dict) -> List[Dict]:
+    """Return occupied candidate slots before the current code."""
+    candidate_statuses = encode_data.get("candidateStatuses", [])
+    if not isinstance(candidate_statuses, list):
+        return []
+    current_index = next(
+        (idx for idx, item in enumerate(candidate_statuses) if isinstance(item, dict) and item.get("code") == current_code),
+        None,
+    )
+    if current_index is None or current_index <= 0:
+        return []
+    result = []
+    for item in candidate_statuses[:current_index]:
+        if not isinstance(item, dict) or not item.get("occupied"):
+            continue
+        result.append({
+            "code": item.get("code", ""),
+            "label": item.get("label", ""),
+        })
+    return result
+
+
+def _extract_words_from_candidate_label(label: str) -> List[str]:
+    """Extract occupied words from candidate label like 已有「甲、乙」."""
+    if not label:
+        return []
+    match = re.search(r'已有「(.+?)」', label)
+    if not match:
+        return []
+    return [part.strip() for part in match.group(1).split('、') if part.strip()]
+
+
+async def _generate_usage_comparison_note(
+    word: str,
+    current_code: str,
+    prior_occupied: List[Dict],
+) -> Optional[str]:
+    """Ask the model for a concise common-usage comparison note."""
+    if not prior_occupied or not OPENAI_API_KEY or not AsyncOpenAI:
+        return None
+
+    occupied_text = "；".join(
+        f"{item.get('code', '')} {item.get('label', '')}"
+        for item in prior_occupied
+        if item.get("code")
+    )
+    occupied_words = []
+    for item in prior_occupied:
+        occupied_words.extend(_extract_words_from_candidate_label(str(item.get("label", ""))))
+    if not occupied_text:
+        return None
+
+    try:
+        client = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            timeout=min(OPENAI_TIMEOUT, 30.0),
+        )
+        response = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            temperature=0.3,
+            max_tokens=180,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是中文输入法助手。请用1到2句简短中文，比较当前词和前面占位词在日常使用中的常见场景/常用度差异。"
+                        "语气克制，不要绝对化，不要使用项目符号。"
+                        "优先直接点名占位词，并明确这只是日常语感层面的比较，不等于实际码序规则。"
+                        "最后顺带点明：当前码位顺序仍以现有词库占位为准。"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"当前词：{word}\n"
+                        f"当前编码：{current_code}\n"
+                        f"更前面被占用的候选码位：{occupied_text}\n"
+                        f"前面占位词：{'、'.join(occupied_words) if occupied_words else '未知'}"
+                    ),
+                },
+            ],
+        )
+        if not response.choices:
+            return None
+        content = (response.choices[0].message.content or "").strip()
+        return content or None
+    except Exception as error:
+        logger.warning(f"Failed to generate usage comparison note for {word}: {error}")
+        return None
+
+
 async def _augment_simple_word_query_response(
     message_text: str,
     response: str,
@@ -380,8 +472,6 @@ async def _augment_simple_word_query_response(
     """Append deterministic code-priority notes for simple word-only queries."""
     words = _extract_pure_chinese_words(message_text)
     if not words:
-        return response
-    if "前面的候选码位" in response or "同码词有：" in response:
         return response
 
     lookup_json = await call_tool_function(
@@ -413,8 +503,29 @@ async def _augment_simple_word_query_response(
         except Exception:
             continue
         note = _build_existing_word_priority_note(word, lookup_entry, encode_data)
+        note_lines = []
         if note:
-            note_blocks.append(f"{word} 的编码位置说明：\n{note}")
+            note_lines = [
+                line for line in note.splitlines()
+                if line.strip() and line.strip() not in response
+            ]
+        comparison_notes: List[str] = []
+        for phrase in lookup_entry.get("phrases", []):
+            code = phrase.get("code", "")
+            if not code:
+                continue
+            prior_occupied = _extract_prior_occupied_candidates(code, encode_data)
+            comparison = await _generate_usage_comparison_note(word, code, prior_occupied)
+            comparison_line = f"• 常用度对比：{comparison}" if comparison else ""
+            if comparison_line and comparison_line not in response:
+                comparison_notes.append(f"• 常用度对比：{comparison}")
+        if note_lines or comparison_notes:
+            block_parts = [f"{word} 的编码位置说明："]
+            if note_lines:
+                block_parts.extend(note_lines)
+            if comparison_notes:
+                block_parts.extend(comparison_notes)
+            note_blocks.append("\n".join(block_parts))
 
     if not note_blocks:
         return response
