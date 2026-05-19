@@ -1062,6 +1062,7 @@ async def keytao_shift_phrase_code(
     ignored_words = {word}
     code_phrase_map: Dict[str, List[Dict]] = {}
     word_candidate_code_map: Dict[str, List[str]] = {word: target_candidate_codes}
+    pending_occupants_by_code: Dict[str, List[Dict]] = {}
 
     async def ensure_code_lookup(code: str) -> Dict:
         if code in code_phrase_map:
@@ -1071,8 +1072,11 @@ async def keytao_shift_phrase_code(
             return code_lookup
         for item in code_lookup.get("results", []):
             item_code = item.get("code", "")
-            code_phrase_map[item_code] = _ordered_code_occupants(item.get("phrases", []), ignored_words)
+            occupants = _ordered_code_occupants(item.get("phrases", []), ignored_words)
+            code_phrase_map[item_code] = list(occupants)
+            pending_occupants_by_code[item_code] = list(occupants)
         code_phrase_map.setdefault(code, [])
+        pending_occupants_by_code.setdefault(code, [])
         return {"success": True}
 
     lookup_result = await ensure_code_lookup(target_code)
@@ -1080,8 +1084,8 @@ async def keytao_shift_phrase_code(
         return lookup_result
 
     reserved_codes = {target_code}
-    queue: List[Dict] = list(code_phrase_map.get(target_code, []))
-    code_phrase_map[target_code] = []
+    queue: List[Dict] = list(pending_occupants_by_code.get(target_code, []))
+    pending_occupants_by_code[target_code] = []
 
     while queue:
         occupant = queue.pop(0)
@@ -1111,10 +1115,10 @@ async def keytao_shift_phrase_code(
             if not lookup_result.get("success"):
                 return lookup_result
             reserved_codes.add(candidate_code)
-            evicted = list(code_phrase_map.get(candidate_code, []))
+            evicted = list(pending_occupants_by_code.get(candidate_code, []))
             if evicted:
                 queue.extend(evicted)
-                code_phrase_map[candidate_code] = []
+                pending_occupants_by_code[candidate_code] = []
             found_next = True
             break
 

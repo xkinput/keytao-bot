@@ -715,6 +715,29 @@ def test_recover_pending_submit_confirm_from_history():
     check("submit args empty", state.args == {})
 
 
+def test_recover_pending_state_scans_back_to_recent_matching_assistant_message():
+    """Verify recovery can skip a newer unrelated assistant message."""
+    print("\n🧪 recover pending state scans recent assistant messages")
+
+    history = [
+        {"role": "user", "content": "喵喵 增香"},
+        {
+            "role": "assistant",
+            "content": """候选编码：
+1. zrxx — 已有「增翔」
+2. zrxxv — ✅ 推荐（空位）
+
+是否以编码 zrxxv 将「增香」加入草稿？也可回复编号选其他编码。""",
+        },
+        {"role": "user", "content": "谢谢"},
+        {"role": "assistant", "content": "不客气喵～"},
+    ]
+
+    state = _recover_pending_state_from_history(history)
+    check("state recovered from earlier assistant prompt", isinstance(state, PendingAddWord))
+    check("recovered word is 增香", state.word == "增香")
+
+
 def test_history_store_keeps_user_and_assistant_same_second():
     """Verify a conversation round keeps both messages instead of dropping one."""
     print("\n🧪 HistoryStore stores both sides of a round")
@@ -1082,6 +1105,57 @@ def test_build_code_shift_plan_rejects_invalid_occupant_code():
     check("error mentions occupant", "换言之" in result["message"])
 
 
+def test_shift_phrase_code_plans_real_occupant_move():
+    """Verify keytao_shift_phrase_code keeps occupant moves in the final write plan."""
+    print("\n🧪 keytao_shift_phrase_code keeps occupant move")
+
+    async def _run():
+        async def fake_fetch(word, requested_code=None):
+            mapping = {
+                "增香": {"success": True, "word": "增香", "candidateCodes": ["zrxx", "zrxxv", "zrxxvu"]},
+                "增翔": {"success": True, "word": "增翔", "candidateCodes": ["zrxx", "zrxxv", "zrxxvo"]},
+            }
+            return mapping[word]
+
+        async def fake_lookup_words(words):
+            return {"success": True, "results": [{"word": "增香", "phrases": []}]}
+
+        async def fake_lookup_codes(codes):
+            result_map = {
+                "zrxx": [{"word": "增翔", "code": "zrxx", "type": "Phrase", "weight": 100}],
+                "zrxxv": [],
+            }
+            return {
+                "success": True,
+                "results": [{"code": code, "phrases": result_map.get(code, [])} for code in codes],
+            }
+
+        async def fake_list(platform, platform_id):
+            return {"success": True, "items": []}
+
+        async def fake_remove(platform, platform_id, ids):
+            return {"success": True}
+
+        async def fake_add(platform, platform_id, items):
+            return {"success": True, "items": items}
+
+        with patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_fetch):
+            with patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_lookup_words):
+                with patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_lookup_codes):
+                    with patch.object(_draft_tools, "keytao_list_draft_items", side_effect=fake_list):
+                        with patch.object(_draft_tools, "keytao_batch_remove_draft_items", side_effect=fake_remove):
+                            with patch.object(_draft_tools, "keytao_batch_add_to_draft", side_effect=fake_add):
+                                result = await _draft_tools.keytao_shift_phrase_code("qq", "123", "增香", "zrxx")
+
+        check("shift tool succeeds", result["success"] is True)
+        items = result["shiftPlan"]["items"]
+        check("plan deletes occupant old code", {"action": "Delete", "word": "增翔", "code": "zrxx", "type": "Phrase"} in items)
+        check("plan recreates occupant at next code", {"action": "Create", "word": "增翔", "code": "zrxxv", "type": "Phrase"} in items)
+        check("plan creates target word at requested code", {"action": "Create", "word": "增香", "code": "zrxx", "type": "Phrase"} in items)
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("State Machine & Core Logic Tests")
@@ -1115,6 +1189,7 @@ if __name__ == "__main__":
     test_memory_conversation_state_store()
     test_recover_pending_add_word_from_history()
     test_recover_pending_submit_confirm_from_history()
+    test_recover_pending_state_scans_back_to_recent_matching_assistant_message()
     test_history_store_keeps_user_and_assistant_same_second()
     test_tool_executor_context_injection()
     test_tool_executor_draft_policy_guards()
@@ -1125,6 +1200,7 @@ if __name__ == "__main__":
     test_build_code_shift_plan_uses_occupant_encode_chain()
     test_build_code_shift_plan_cascades_until_empty()
     test_build_code_shift_plan_rejects_invalid_occupant_code()
+    test_shift_phrase_code_plans_real_occupant_move()
 
     print("\n" + "=" * 60)
     total = passed + failed

@@ -247,14 +247,15 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     )
 
 
-def _get_last_assistant_message(history: Optional[List[Dict]]) -> str:
-    """Return the most recent assistant message from history."""
+def _get_recent_assistant_messages(history: Optional[List[Dict]]) -> List[str]:
+    """Return assistant messages from newest to oldest."""
     if not history:
-        return ""
+        return []
+    result: List[str] = []
     for msg in reversed(history):
         if msg.get("role") == "assistant":
-            return str(msg.get("content", "") or "")
-    return ""
+            result.append(str(msg.get("content", "") or ""))
+    return result
 
 
 def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
@@ -278,16 +279,13 @@ def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
 
 def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> PendingState:
     """Best-effort recovery when in-memory pending state was lost."""
-    assistant_message = _get_last_assistant_message(history)
-    if not assistant_message:
-        return None
+    for assistant_message in _get_recent_assistant_messages(history):
+        pending_add = _parse_pending_add_word(assistant_message)
+        if pending_add is not None:
+            return pending_add
 
-    pending_add = _parse_pending_add_word(assistant_message)
-    if pending_add is not None:
-        return pending_add
-
-    if _looks_like_submit_reconfirm_prompt(assistant_message):
-        return PendingToolConfirm(function_name="keytao_submit_batch", args={})
+        if _looks_like_submit_reconfirm_prompt(assistant_message):
+            return PendingToolConfirm(function_name="keytao_submit_batch", args={})
 
     return None
 
