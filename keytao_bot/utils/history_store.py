@@ -36,7 +36,39 @@ class HistoryStore:
         """Initialize database schema"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            
+
+            # Older schema used UNIQUE(platform, user_id, timestamp), which
+            # drops one side of a user/assistant round when both inserts land
+            # in the same second. Migrate it away in place.
+            cursor.execute("""
+                SELECT sql FROM sqlite_master
+                WHERE type = 'table' AND name = 'conversations'
+            """)
+            row = cursor.fetchone()
+            schema_sql = row[0] if row and row[0] else ""
+            if "UNIQUE(platform, user_id, timestamp)" in schema_sql:
+                try:
+                    cursor.execute("""
+                        CREATE TABLE conversations_new (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            platform TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            role TEXT NOT NULL,
+                            content TEXT NOT NULL,
+                            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    cursor.execute("""
+                        INSERT INTO conversations_new (id, platform, user_id, role, content, timestamp)
+                        SELECT id, platform, user_id, role, content, timestamp
+                        FROM conversations
+                        ORDER BY id
+                    """)
+                    cursor.execute("DROP TABLE conversations")
+                    cursor.execute("ALTER TABLE conversations_new RENAME TO conversations")
+                except sqlite3.OperationalError as error:
+                    logger.warning(f"Skip history schema migration for readonly DB {self.db_path}: {error}")
+
             # Create conversations table
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS conversations (
@@ -45,11 +77,10 @@ class HistoryStore:
                     user_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(platform, user_id, timestamp)
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
+
             # Create index for faster queries
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_platform_user 
@@ -76,7 +107,7 @@ class HistoryStore:
                 SELECT role, content, timestamp
                 FROM conversations 
                 WHERE platform = ? AND user_id = ?
-                ORDER BY timestamp DESC
+                ORDER BY timestamp DESC, id DESC
                 LIMIT ?
             """, (platform, user_id, limit))
             
@@ -113,9 +144,10 @@ class HistoryStore:
                 """, (platform, user_id, role, content))
                 conn.commit()
                 logger.debug(f"Added {role} message for {platform}:{user_id}")
-            except sqlite3.IntegrityError:
-                # Duplicate message (same timestamp), ignore
-                logger.warning(f"Duplicate message detected for {platform}:{user_id}")
+            except sqlite3.IntegrityError as error:
+                logger.warning(
+                    f"Failed to add {role} message for {platform}:{user_id}: {error}"
+                )
     
     def add_conversation_round(self, platform: str, user_id: str, user_message: str, assistant_message: str):
         """

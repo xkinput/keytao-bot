@@ -8,6 +8,7 @@ import os
 import asyncio
 import importlib.util
 import json
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -82,6 +83,7 @@ from keytao_bot.plugins.openai_chat import (
     _is_confirm,
     _has_cancel,
     _parse_pending_add_word,
+    _recover_pending_state_from_history,
     _strip_markdown,
     _to_markdownv2,
     _is_clear_command_text,
@@ -97,6 +99,7 @@ from keytao_bot.plugins.account_bind import (
 from keytao_bot.harness.state import MemoryConversationStateStore
 from keytao_bot.harness.tools import ToolContext, ToolExecutor
 from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
+from keytao_bot.utils.history_store import HistoryStore
 
 _lookup_tools_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -534,6 +537,65 @@ def test_memory_conversation_state_store():
     check("empty after delete", not store.contains(key))
 
 
+def test_recover_pending_add_word_from_history():
+    """Verify confirm flows can be recovered from the last assistant message."""
+    print("\n🧪 recover PendingAddWord from history")
+
+    history = [
+        {"role": "user", "content": "喵喵 卧龙凤雏"},
+        {
+            "role": "assistant",
+            "content": """「卧龙凤雏」目前不在词库中，但编码计算没问题！
+
+候选编码：
+1. wlfj — ✅ 推荐（空位）
+2. wlfjv — 空位
+
+是否以编码 wlfj 将「卧龙凤雏」加入草稿？也可回复编号选其他编码。""",
+        },
+    ]
+
+    state = _recover_pending_state_from_history(history)
+    check("recovered state exists", state is not None)
+    check("recovered PendingAddWord", isinstance(state, PendingAddWord))
+    check("word recovered correctly", state.word == "卧龙凤雏")
+    check("recommended code recovered", state.recommended_code == "wlfj")
+
+
+def test_recover_pending_submit_confirm_from_history():
+    """Verify submit reconfirm can be recovered when in-memory state is gone."""
+    print("\n🧪 recover PendingToolConfirm from history")
+
+    history = [
+        {"role": "user", "content": "提交吧"},
+        {
+            "role": "assistant",
+            "content": "⚠️ 检测到批次中存在重码，是否继续提交？回复「确认」继续提交，回复「取消」放弃。",
+        },
+    ]
+
+    state = _recover_pending_state_from_history(history)
+    check("recovered submit confirm exists", state is not None)
+    check("recovered PendingToolConfirm", isinstance(state, PendingToolConfirm))
+    check("submit tool recovered", state.function_name == "keytao_submit_batch")
+    check("submit args empty", state.args == {})
+
+
+def test_history_store_keeps_user_and_assistant_same_second():
+    """Verify a conversation round keeps both messages instead of dropping one."""
+    print("\n🧪 HistoryStore stores both sides of a round")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "history.db")
+        store = HistoryStore(db_path)
+        store.add_conversation_round("qq", "123", "喵喵 卧龙凤雏", "是否以编码 wlfj 将「卧龙凤雏」加入草稿？")
+        history = store.get_history("qq", "123", limit=10)
+
+    check("history keeps 2 messages", len(history) == 2)
+    check("first row is user", history[0]["role"] == "user")
+    check("second row is assistant", history[1]["role"] == "assistant")
+
+
 async def _run_tool_executor_checks():
     calls = []
 
@@ -911,6 +973,9 @@ if __name__ == "__main__":
     test_bind_command_text_detection()
     test_clear_command_text_detection()
     test_memory_conversation_state_store()
+    test_recover_pending_add_word_from_history()
+    test_recover_pending_submit_confirm_from_history()
+    test_history_store_keeps_user_and_assistant_same_second()
     test_tool_executor_context_injection()
     test_tool_executor_draft_policy_guards()
     test_orchestrator_empty_response_retry()

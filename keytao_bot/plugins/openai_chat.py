@@ -238,6 +238,51 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     )
 
 
+def _get_last_assistant_message(history: Optional[List[Dict]]) -> str:
+    """Return the most recent assistant message from history."""
+    if not history:
+        return ""
+    for msg in reversed(history):
+        if msg.get("role") == "assistant":
+            return str(msg.get("content", "") or "")
+    return ""
+
+
+def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
+    """Detect a prior assistant message asking the user to reconfirm submission."""
+    text = (response or "").strip()
+    if not text or "提交" not in text or "加入草稿" in text:
+        return False
+
+    hints = (
+        "是否继续提交",
+        "确认提交",
+        "继续提交吗",
+        "继续提审",
+        "确认后继续提交",
+        "回复「确认」继续提交",
+        "回复“确认”继续提交",
+        "确认继续提交",
+    )
+    return any(hint in text for hint in hints)
+
+
+def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> PendingState:
+    """Best-effort recovery when in-memory pending state was lost."""
+    assistant_message = _get_last_assistant_message(history)
+    if not assistant_message:
+        return None
+
+    pending_add = _parse_pending_add_word(assistant_message)
+    if pending_add is not None:
+        return pending_add
+
+    if _looks_like_submit_reconfirm_prompt(assistant_message):
+        return PendingToolConfirm(function_name="keytao_submit_batch", args={})
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Platform detection & OneBot helpers
 # ---------------------------------------------------------------------------
@@ -968,16 +1013,26 @@ async def handle_ai_chat(bot: Bot, event: Event):
     platform, user_id = extract_platform_info(bot, event)
     conv_key = (platform, user_id)
     response: Optional[str] = None
+    history: Optional[List[Dict]] = None
 
     # ===== Phase 1: Check pending state =====
     state = conversation_state_store.pop(conv_key)
+    if state is None:
+        history = get_history(conv_key)
+        state = _recover_pending_state_from_history(history)
+        if state is not None:
+            logger.info(
+                "♻️ Recovered pending state from history: "
+                f"{state.__class__.__name__} for {platform}:{user_id}"
+            )
 
     if state is not None:
         if _has_cancel(message_text):
             response = "好的，已取消 owo"
 
         elif isinstance(state, PendingAddWord):
-            history = get_history(conv_key)
+            if history is None:
+                history = get_history(conv_key)
             response = await _handle_pending_add_word(
                 state, message_text, platform, user_id, history,
             )
@@ -995,7 +1050,8 @@ async def handle_ai_chat(bot: Bot, event: Event):
 
     # ===== Phase 2: AI response (if not handled directly) =====
     if response is None:
-        history = get_history(conv_key)
+        if history is None:
+            history = get_history(conv_key)
         reply_context = await build_reply_context(bot, event)
         response = await get_ai_response_core(
             message_text, platform, user_id, history, reply_context,
