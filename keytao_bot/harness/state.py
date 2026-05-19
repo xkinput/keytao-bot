@@ -1,5 +1,5 @@
 """Conversation state primitives for the agent harness."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Union
 
 
@@ -12,6 +12,7 @@ class PendingAddWord:
     word: str
     recommended_code: str
     candidates: List[Tuple[str, bool]]
+    occupied_words: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass

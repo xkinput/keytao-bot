@@ -9,6 +9,7 @@ import asyncio
 import importlib.util
 import json
 import tempfile
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -82,8 +83,11 @@ sys.modules["duckduckgo_search"] = types.ModuleType("duckduckgo_search")
 from keytao_bot.plugins.openai_chat import (
     _is_confirm,
     _has_cancel,
+    _handle_pending_add_word,
+    _ensure_pending_add_word_guidance,
     _parse_pending_add_word,
     _recover_pending_state_from_history,
+    _resolve_shift_target_code,
     _strip_command_message_prefixes,
     _strip_markdown,
     _to_markdownv2,
@@ -101,6 +105,7 @@ from keytao_bot.harness.state import MemoryConversationStateStore
 from keytao_bot.harness.tools import ToolContext, ToolExecutor
 from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
 from keytao_bot.utils.history_store import HistoryStore
+import keytao_bot.plugins.openai_chat as openai_chat_module
 
 _lookup_tools_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -205,6 +210,7 @@ def test_parse_pending_add_word_standard():
     check("candidate[0] == ('jfxm', True)", result.candidates[0] == ("jfxm", True))
     check("candidate[1] == ('jfxmo', False)", result.candidates[1] == ("jfxmo", False))
     check("candidate[2] == ('jfxmoa', False)", result.candidates[2] == ("jfxmoa", False))
+    check("occupied words extracted", result.occupied_words["jfxm"] == ["馋涎"])
 
 
 def test_parse_pending_add_word_em_dash():
@@ -271,6 +277,21 @@ def test_parse_pending_add_word_no_candidate_list():
           result.candidates[0] == ("abc", False))
 
 
+def test_pending_add_word_guidance_appended_for_occupied_candidates():
+    """Verify occupied candidate lists automatically get reply guidance appended."""
+    print("\n🧪 pending add-word guidance appended")
+
+    response = """候选编码：
+1. zrxx — 已有「增翔」
+2. zrxxv — ✅ 推荐（空位）
+
+是否以编码 zrxxv 将「增香」加入草稿？也可回复编号选其他编码。"""
+
+    guided = _ensure_pending_add_word_guidance(response)
+    check("guidance mentions duplicate reply", "直接回复该编号表示添加重码" in guided)
+    check("guidance mentions recode reply", "编号 重新编码" in guided)
+
+
 def test_pending_add_word_numeric_choice():
     """Test the state machine logic for numeric choice."""
     print("\n🧪 PendingAddWord numeric choice logic")
@@ -331,6 +352,64 @@ def test_numeric_reply_means_exact_candidate_selection():
     confirm_msg = _strip_command_message_prefixes("喵喵 是")
     check("'是' remains confirm", _is_confirm(confirm_msg))
     check("'是' maps to recommended code", state.recommended_code == "zrxxv")
+
+
+def test_occupied_numeric_choice_means_duplicate_confirm():
+    """Verify selecting an occupied candidate directly means duplicate-code insertion."""
+    print("\n🧪 occupied numeric choice means duplicate confirm")
+
+    state = PendingAddWord(
+        word="增香",
+        recommended_code="zrxxv",
+        candidates=[
+            ("zrxx", True),
+            ("zrxxv", False),
+            ("zrxxvu", False),
+        ],
+        occupied_words={"zrxx": ["增翔"]},
+    )
+
+    async def _run():
+        with patch.object(openai_chat_module, "_execute_confirmed_tool", AsyncMock(return_value="duplicate")) as duplicate_mock:
+            with patch.object(openai_chat_module, "_execute_shift_to_code", AsyncMock(return_value="shifted")) as shift_mock:
+                result = await _handle_pending_add_word(
+                    state, "1", "qq", "123", [],
+                )
+        check("occupied choice returns duplicate result", result == "duplicate")
+        check("duplicate helper called once", duplicate_mock.await_count == 1)
+        check("shift helper not called", shift_mock.await_count == 0)
+
+    asyncio.run(_run())
+
+
+def test_shift_request_can_target_by_number_or_word():
+    """Verify users can request shift directly by number or by occupant word."""
+    print("\n🧪 shift request can target by number or word")
+
+    state = PendingAddWord(
+        word="增香",
+        recommended_code="zrxxv",
+        candidates=[
+            ("zrxx", True),
+            ("zrxxv", False),
+            ("zrxxvu", False),
+        ],
+        occupied_words={"zrxx": ["增翔"]},
+    )
+
+    check("'1 重新编码' -> zrxx", _resolve_shift_target_code(state, "1 重新编码") == "zrxx")
+    check("'增翔重新编码' -> zrxx", _resolve_shift_target_code(state, "增翔重新编码") == "zrxx")
+    check("'重新编码' with one occupied choice -> zrxx", _resolve_shift_target_code(state, "重新编码") == "zrxx")
+
+    async def _run():
+        with patch.object(openai_chat_module, "_execute_shift_to_code", AsyncMock(return_value="shifted")) as shift_mock:
+            result = await _handle_pending_add_word(
+                state, "1 重新编码", "qq", "123", [],
+            )
+        check("shift request returns shift result", result == "shifted")
+        check("shift helper called once", shift_mock.await_count == 1)
+
+    asyncio.run(_run())
 
 
 def test_pending_add_word_confirm_uses_recommended():
@@ -1001,8 +1080,11 @@ if __name__ == "__main__":
     test_parse_pending_add_word_all_empty()
     test_parse_pending_add_word_no_match()
     test_parse_pending_add_word_no_candidate_list()
+    test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()
+    test_occupied_numeric_choice_means_duplicate_confirm()
+    test_shift_request_can_target_by_number_or_word()
     test_pending_add_word_confirm_uses_recommended()
     test_pending_tool_confirm_data()
     test_strip_markdown()

@@ -223,10 +223,18 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     word = confirm_match.group(2)
 
     candidates: List[Tuple[str, bool]] = []
+    occupied_words: Dict[str, List[str]] = {}
     for m in re.finditer(r'\d+\.\s*([a-z]+)\s*[-—–]\s*(.+)', response):
         code = m.group(1)
         desc = m.group(2)
         candidates.append((code, '已有' in desc))
+        occupied_match = re.search(r'已有「(.+?)」', desc)
+        if occupied_match:
+            occupied_words[code] = [
+                part.strip()
+                for part in occupied_match.group(1).split('、')
+                if part.strip()
+            ]
 
     if not candidates:
         candidates = [(recommended_code, False)]
@@ -235,6 +243,7 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
         word=word,
         recommended_code=recommended_code,
         candidates=candidates,
+        occupied_words=occupied_words,
     )
 
 
@@ -281,6 +290,19 @@ def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> Pendin
         return PendingToolConfirm(function_name="keytao_submit_batch", args={})
 
     return None
+
+
+def _ensure_pending_add_word_guidance(response: str) -> str:
+    """Append deterministic guidance for occupied candidate choices."""
+    pending = _parse_pending_add_word(response)
+    if pending is None:
+        return response
+    if not any(occupied for _, occupied in pending.candidates):
+        return response
+    if "重新编码" in response and "添加重码" in response:
+        return response
+    guidance = "若所选编号显示“已有…”，直接回复该编号表示添加重码；回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
+    return response.rstrip() + f"\n{guidance}"
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +615,55 @@ async def _execute_add_to_draft(
     return header + await _format_draft_response(data, platform, user_id)
 
 
+async def _execute_shift_to_code(
+    word: str, target_code: str, platform: str, user_id: str,
+) -> str:
+    """Insert/move a word into an occupied code and shift occupants forward."""
+    result_json = await call_tool_function(
+        "keytao_shift_phrase_code", {"word": word, "target_code": target_code}, platform, user_id,
+    )
+    data = json.loads(result_json)
+
+    if data.get("not_bound"):
+        return _BIND_HELP_TEXT
+
+    if not data.get("success"):
+        return f"调整编码失败：{data.get('message', '未知错误')} qwq"
+
+    shifted = data.get("shiftPlan", {}).get("shifted", [])
+    if shifted:
+        header = f"✅ 已将「{word}」插入编码 {target_code}，并顺延 {len(shifted)} 条\n"
+    else:
+        header = f"✅ 已将「{word}」调整到编码 {target_code}\n"
+    return header + await _format_draft_response(data, platform, user_id)
+
+
+def _resolve_shift_target_code(state: PendingAddWord, msg: str) -> Optional[str]:
+    """Resolve which occupied candidate the user wants to shift for."""
+    if "重新编码" not in msg:
+        return None
+
+    digit_match = re.search(r'(\d+)', msg)
+    if digit_match:
+        idx = int(digit_match.group(1)) - 1
+        if 0 <= idx < len(state.candidates):
+            code, occupied = state.candidates[idx]
+            if occupied:
+                return code
+
+    for code, occupied in state.candidates:
+        if not occupied:
+            continue
+        for occupant_word in state.occupied_words.get(code, []):
+            if occupant_word and occupant_word in msg:
+                return code
+
+    occupied_codes = [code for code, occupied in state.candidates if occupied]
+    if len(occupied_codes) == 1:
+        return occupied_codes[0]
+    return None
+
+
 async def _execute_confirmed_tool(
     state: PendingToolConfirm, platform: str, user_id: str,
 ) -> str:
@@ -696,7 +767,9 @@ async def _handle_pending_add_word(
     Returns a response string if handled directly, None to fall through to AI.
     """
     msg = message.strip()
-    msg_lower = msg.lower()
+    shift_target_code = _resolve_shift_target_code(state, msg)
+    if shift_target_code is not None:
+        return await _execute_shift_to_code(state.word, shift_target_code, platform, user_id)
 
     target_code: Optional[str] = None
     is_occupied = False
@@ -726,7 +799,14 @@ async def _handle_pending_add_word(
     if not is_occupied:
         return await _execute_add_to_draft(state.word, target_code, platform, user_id)
 
-    return await _execute_add_to_draft(state.word, target_code, platform, user_id)
+    return await _execute_confirmed_tool(
+        PendingToolConfirm(
+            function_name="keytao_create_phrase",
+            args={"word": state.word, "code": target_code},
+        ),
+        platform,
+        user_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +871,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      3. abcdea — 空位
 
          是否以编码 abcde 将「词」加入草稿？也可回复编号选其他编码。
+         若所选编号显示“已有…”，直接回复该编号表示添加重码；回复“编号 重新编码”或“原词 重新编码”则挪开原词。
 
    ⚠️ 确认句格式必须固定：「是否以编码 XXX 将「YYY」加入草稿」——系统靠此提取上下文
      ⚠️ 推荐编码使用 keytao_encode.recommendedCode；若 candidateStatuses 中有 ✅ 推荐，以该空位为准
@@ -1061,6 +1142,8 @@ async def handle_ai_chat(bot: Bot, event: Event):
     if not response:
         await ai_chat.finish("呜呜，处理请求时出错了 qwq 要不再试一次？")
         return
+
+    response = _ensure_pending_add_word_guidance(response)
 
     # ===== Phase 3: Detect new pending state from AI response =====
     if not conversation_state_store.contains(conv_key):

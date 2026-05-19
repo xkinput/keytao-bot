@@ -57,11 +57,13 @@ def _select_current_phrase(word: str, phrases: List[Dict]) -> Optional[Dict]:
     return sorted(matching, key=lambda item: (len(item.get("code", "")), item.get("code", "")))[0]
 
 
-def _select_code_occupant(phrases: List[Dict], ignored_word: str) -> Optional[Dict]:
-    candidates = [phrase for phrase in phrases if phrase.get("word") and phrase.get("word") != ignored_word]
-    if not candidates:
-        return None
-    return sorted(candidates, key=lambda item: (item.get("weight", 0), item.get("word", "")))[0]
+def _ordered_code_occupants(phrases: List[Dict], ignored_words: Optional[set[str]] = None) -> List[Dict]:
+    ignored_words = ignored_words or set()
+    candidates = [
+        phrase for phrase in phrases
+        if phrase.get("word") and phrase.get("word") not in ignored_words
+    ]
+    return sorted(candidates, key=lambda item: (item.get("weight", 0), item.get("word", "")))
 
 
 def _build_code_shift_plan(
@@ -83,23 +85,22 @@ def _build_code_shift_plan(
     deletes: List[Dict] = []
     creates: List[Dict] = [{"action": "Create", "word": word, "code": target_code, "type": current_type or "Phrase"}]
     shifted: List[Dict] = []
-    vacated_codes = {current_code} if current_code and current_code != target_code else set()
-    visited_codes = set()
-    probe_code = target_code
+    ignored_words = {word}
+    reserved_codes = {target_code}
+    occupants_by_code: Dict[str, List[Dict]] = {
+        code: _ordered_code_occupants(phrases, ignored_words)
+        for code, phrases in code_phrase_map.items()
+    }
+    queue: List[Dict] = list(occupants_by_code.get(target_code, []))
+    occupants_by_code[target_code] = []
 
     if current_code and current_code != target_code:
         deletes.append({"action": "Delete", "word": word, "code": current_code, "type": current_type or "Phrase"})
 
-    while probe_code not in vacated_codes:
-        if probe_code in visited_codes:
-            return {"success": False, "message": f"顺延计算出现循环：{probe_code}"}
-        visited_codes.add(probe_code)
-
-        occupant = _select_code_occupant(code_phrase_map.get(probe_code, []), word)
-        if not occupant:
-            break
-
+    while queue:
+        occupant = queue.pop(0)
         occupant_word = occupant.get("word", "")
+        probe_code = occupant.get("code", "")
         occupant_codes = word_candidate_code_map.get(occupant_word, [])
         if probe_code not in occupant_codes:
             return {
@@ -108,13 +109,18 @@ def _build_code_shift_plan(
             }
 
         code_index = occupant_codes.index(probe_code)
-        if code_index + 1 >= len(occupant_codes):
+        next_code: Optional[str] = None
+        for candidate_code in occupant_codes[code_index + 1:]:
+            if candidate_code in reserved_codes:
+                continue
+            next_code = candidate_code
+            break
+        if not next_code:
             return {
                 "success": False,
                 "message": f"无法顺延「{occupant_word}」：{probe_code} 之后没有可用候选编码",
             }
 
-        next_code = occupant_codes[code_index + 1]
         occupant_type = occupant.get("type", "Phrase") or "Phrase"
         deletes.append({"action": "Delete", "word": occupant_word, "code": probe_code, "type": occupant_type})
         creates.append({"action": "Create", "word": occupant_word, "code": next_code, "type": occupant_type})
@@ -124,8 +130,11 @@ def _build_code_shift_plan(
             "toCode": next_code,
             "candidateCodes": occupant_codes,
         })
-        vacated_codes.add(probe_code)
-        probe_code = next_code
+        reserved_codes.add(next_code)
+        evicted = list(occupants_by_code.get(next_code, []))
+        if evicted:
+            queue.extend(evicted)
+            occupants_by_code[next_code] = []
 
     return {
         "success": True,
@@ -1050,34 +1059,41 @@ async def keytao_shift_phrase_code(
     word_result = next((item for item in word_lookup.get("results", []) if item.get("word") == word), {})
     current_phrase = _select_current_phrase(word, word_result.get("phrases", []))
 
+    ignored_words = {word}
     code_phrase_map: Dict[str, List[Dict]] = {}
     word_candidate_code_map: Dict[str, List[str]] = {word: target_candidate_codes}
-    probe_code = target_code
-    vacated_code = current_phrase.get("code") if current_phrase else None
-    visited_codes = set()
 
-    while probe_code != vacated_code:
-        if probe_code in visited_codes:
-            return {"success": False, "message": f"顺延计算出现循环：{probe_code}"}
-        visited_codes.add(probe_code)
+    async def ensure_code_lookup(code: str) -> Dict:
+        if code in code_phrase_map:
+            return {"success": True}
+        code_lookup = await _lookup_codes_raw([code])
+        if not code_lookup.get("success"):
+            return code_lookup
+        for item in code_lookup.get("results", []):
+            item_code = item.get("code", "")
+            code_phrase_map[item_code] = _ordered_code_occupants(item.get("phrases", []), ignored_words)
+        code_phrase_map.setdefault(code, [])
+        return {"success": True}
 
-        if probe_code not in code_phrase_map:
-            code_lookup = await _lookup_codes_raw([probe_code])
-            if not code_lookup.get("success"):
-                return code_lookup
-            for item in code_lookup.get("results", []):
-                code_phrase_map[item.get("code", "")] = item.get("phrases", [])
+    lookup_result = await ensure_code_lookup(target_code)
+    if not lookup_result.get("success"):
+        return lookup_result
 
-        occupant = _select_code_occupant(code_phrase_map.get(probe_code, []), word)
-        if not occupant:
-            break
+    reserved_codes = {target_code}
+    queue: List[Dict] = list(code_phrase_map.get(target_code, []))
+    code_phrase_map[target_code] = []
 
+    while queue:
+        occupant = queue.pop(0)
         occupant_word = occupant.get("word", "")
-        occupant_encode = await _fetch_encode_candidates(occupant_word)
-        if not occupant_encode.get("success"):
-            return occupant_encode
-        occupant_codes = occupant_encode.get("candidateCodes", [])
-        word_candidate_code_map[occupant_word] = occupant_codes
+        probe_code = occupant.get("code", "")
+        occupant_codes = word_candidate_code_map.get(occupant_word)
+        if not occupant_codes:
+            occupant_encode = await _fetch_encode_candidates(occupant_word)
+            if not occupant_encode.get("success"):
+                return occupant_encode
+            occupant_codes = occupant_encode.get("candidateCodes", [])
+            word_candidate_code_map[occupant_word] = occupant_codes
         if probe_code not in occupant_codes:
             return {
                 "success": False,
@@ -1086,14 +1102,29 @@ async def keytao_shift_phrase_code(
                 "candidateCodes": occupant_codes,
             }
         code_index = occupant_codes.index(probe_code)
-        if code_index + 1 >= len(occupant_codes):
+
+        found_next = False
+        for candidate_code in occupant_codes[code_index + 1:]:
+            if candidate_code in reserved_codes:
+                continue
+            lookup_result = await ensure_code_lookup(candidate_code)
+            if not lookup_result.get("success"):
+                return lookup_result
+            reserved_codes.add(candidate_code)
+            evicted = list(code_phrase_map.get(candidate_code, []))
+            if evicted:
+                queue.extend(evicted)
+                code_phrase_map[candidate_code] = []
+            found_next = True
+            break
+
+        if not found_next:
             return {
                 "success": False,
                 "message": f"无法顺延「{occupant_word}」：{probe_code} 之后没有可用候选编码",
                 "word": occupant_word,
                 "candidateCodes": occupant_codes,
             }
-        probe_code = occupant_codes[code_index + 1]
 
     plan = _build_code_shift_plan(
         word,
