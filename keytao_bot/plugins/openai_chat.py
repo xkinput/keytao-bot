@@ -201,25 +201,41 @@ conversation_state_store = MemoryConversationStateStore()
 conversation_states: Dict[Tuple[str, str], PendingState] = conversation_state_store.states
 
 CONFIRM_WORDS = frozenset({
-    "确认", "是", "好", "可以", "同意", "yes", "ok", "确定", "嗯", "行", "y",
+    "确认", "是", "好", "好的", "可以", "同意", "yes", "ok", "确定", "嗯", "行", "y",
 })
+_CONFIRM_MESSAGE_RE = re.compile(
+    r"^(?:"
+    r"确认|是|好|好的|可以|同意|yes|ok|确定|嗯|行|y"
+    r")(?:[\s,，。.!！~吧啦喔哦呀哈呗]*)$",
+    re.IGNORECASE,
+)
 CANCEL_WORDS = frozenset({
-    "不", "别", "不要", "不用", "取消", "算了", "不行", "不对", "no", "n",
+    "别", "不要", "不要了", "不用", "不用了", "取消", "算了", "不行", "先不", "先不了", "no", "n",
 })
+_CANCEL_MESSAGE_RE = re.compile(
+    r"^(?:"
+    r"取消|算了|别|不行|"
+    r"不要(?:了|加了)?|"
+    r"不用(?:了)?|"
+    r"先不(?:了)?|"
+    r"no|n"
+    r")(?:[\s,，。.!！~吧啦喔哦呀哈呗]*)$",
+    re.IGNORECASE,
+)
 
 
 def _is_confirm(msg: str) -> bool:
     """Check if message is a short confirmation."""
     msg = msg.strip().lower()
-    if any(w in msg for w in CANCEL_WORDS):
+    if _has_cancel(msg):
         return False
-    return msg in CONFIRM_WORDS or (len(msg) <= 4 and any(w in msg for w in CONFIRM_WORDS))
+    return bool(_CONFIRM_MESSAGE_RE.fullmatch(msg))
 
 
 def _has_cancel(msg: str) -> bool:
-    """Check if message contains cancellation words."""
+    """Check if message is an explicit cancellation reply."""
     msg = msg.strip().lower()
-    return any(w in msg for w in CANCEL_WORDS)
+    return bool(_CANCEL_MESSAGE_RE.fullmatch(msg))
 
 
 def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
@@ -283,15 +299,14 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     )
 
 
-def _get_recent_assistant_messages(history: Optional[List[Dict]]) -> List[str]:
-    """Return assistant messages from newest to oldest."""
+def _get_latest_assistant_message(history: Optional[List[Dict]]) -> str:
+    """Return the most recent assistant message, if any."""
     if not history:
-        return []
-    result: List[str] = []
+        return ""
     for msg in reversed(history):
         if msg.get("role") == "assistant":
-            result.append(str(msg.get("content", "") or ""))
-    return result
+            return str(msg.get("content", "") or "")
+    return ""
 
 
 def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
@@ -315,13 +330,16 @@ def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
 
 def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> PendingState:
     """Best-effort recovery when in-memory pending state was lost."""
-    for assistant_message in _get_recent_assistant_messages(history):
-        pending_add = _parse_pending_add_word(assistant_message)
-        if pending_add is not None:
-            return pending_add
+    assistant_message = _get_latest_assistant_message(history)
+    if not assistant_message:
+        return None
 
-        if _looks_like_submit_reconfirm_prompt(assistant_message):
-            return PendingToolConfirm(function_name="keytao_submit_batch", args={})
+    pending_add = _parse_pending_add_word(assistant_message)
+    if pending_add is not None:
+        return pending_add
+
+    if _looks_like_submit_reconfirm_prompt(assistant_message):
+        return PendingToolConfirm(function_name="keytao_submit_batch", args={})
 
     return None
 

@@ -177,10 +177,11 @@ def test_is_confirm():
 def test_has_cancel():
     print("\n🧪 _has_cancel")
 
-    check("'不' → True", _has_cancel("不"))
     check("'取消' → True", _has_cancel("取消"))
+    check("'取消吧' → True", _has_cancel("取消吧"))
     check("'算了' → True", _has_cancel("算了"))
     check("'不要了' → True", _has_cancel("不要了"))
+    check("'不要加了' → True", _has_cancel("不要加了"))
     check("'不行' → True", _has_cancel("不行"))
     check("'no' → True", _has_cancel("no"))
     check("'NO' → True (case insensitive)", _has_cancel("NO"))
@@ -188,6 +189,8 @@ def test_has_cancel():
     check("'是' → False", not _has_cancel("是"))
     check("'好的' → False", not _has_cancel("好的"))
     check("'查词' → False", not _has_cancel("查词"))
+    check("'不是，我想查编码规则' → False", not _has_cancel("不是，我想查编码规则"))
+    check("'不对，我是想改码' → False", not _has_cancel("不对，我是想改码"))
 
 
 def test_parse_pending_add_word_standard():
@@ -842,19 +845,13 @@ def test_real_world_scenario():
           target_code != "chxi")
 
 
-def test_edge_case_mixed_cancel_confirm():
-    """Edge case: message with both confirm and cancel words."""
-    print("\n🧪 Edge case: mixed cancel + confirm")
+def test_edge_case_correction_should_not_cancel():
+    """Messages correcting the bot should not be mistaken for cancel."""
+    print("\n🧪 Edge case: correction should not cancel")
 
-    # "不是" contains "不" (cancel) — should cancel, not confirm
-    check("'不是' has cancel", _has_cancel("不是"))
-    # In the handler, _has_cancel is checked first, so this is correct
-
-    # "不好" also has cancel
-    check("'不好' has cancel", _has_cancel("不好"))
-
-    # "好不好" — has cancel word
-    check("'好不好' has cancel", _has_cancel("好不好"))
+    check("'不是' is not cancel", not _has_cancel("不是"))
+    check("'不好' is not cancel", not _has_cancel("不好"))
+    check("'好不好' is not cancel", not _has_cancel("好不好"))
 
 
 def test_edge_case_numeric_out_of_range():
@@ -893,8 +890,8 @@ def test_confirm_cancel_word_sets():
     check("'是' in CONFIRM_WORDS", "是" in CONFIRM_WORDS)
     check("'确认' in CONFIRM_WORDS", "确认" in CONFIRM_WORDS)
     check("'yes' in CONFIRM_WORDS", "yes" in CONFIRM_WORDS)
-    check("'不' in CANCEL_WORDS", "不" in CANCEL_WORDS)
     check("'取消' in CANCEL_WORDS", "取消" in CANCEL_WORDS)
+    check("'不要了' in CANCEL_WORDS", "不要了" in CANCEL_WORDS)
     check("'no' in CANCEL_WORDS", "no" in CANCEL_WORDS)
 
     # No overlap
@@ -1015,9 +1012,9 @@ def test_recover_pending_submit_confirm_from_history():
     check("submit args empty", state.args == {})
 
 
-def test_recover_pending_state_scans_back_to_recent_matching_assistant_message():
-    """Verify recovery can skip a newer unrelated assistant message."""
-    print("\n🧪 recover pending state scans recent assistant messages")
+def test_recover_pending_state_ignores_stale_assistant_prompt():
+    """Verify recovery does not resurrect an older prompt after a later reply."""
+    print("\n🧪 recover pending state ignores stale prompt")
 
     history = [
         {"role": "user", "content": "喵喵 增香"},
@@ -1034,8 +1031,29 @@ def test_recover_pending_state_scans_back_to_recent_matching_assistant_message()
     ]
 
     state = _recover_pending_state_from_history(history)
-    check("state recovered from earlier assistant prompt", isinstance(state, PendingAddWord))
-    check("recovered word is 增香", state.word == "增香")
+    check("stale prompt is not recovered", state is None)
+
+
+def test_recover_pending_state_ignores_cancelled_prompt():
+    """Verify recovery stops after the bot has already acknowledged cancellation."""
+    print("\n🧪 recover pending state ignores cancelled prompt")
+
+    history = [
+        {"role": "user", "content": "喵喵 增香"},
+        {
+            "role": "assistant",
+            "content": """候选编码：
+1. zrxx — 已有「增翔」
+2. zrxxv — ✅ 推荐（空位）
+
+是否以编码 zrxxv 将「增香」加入草稿？也可回复编号选其他编码。""",
+        },
+        {"role": "user", "content": "取消"},
+        {"role": "assistant", "content": "好的，已取消 owo"},
+    ]
+
+    state = _recover_pending_state_from_history(history)
+    check("cancelled prompt is not recovered", state is None)
 
 
 def test_history_store_keeps_user_and_assistant_same_second():
@@ -1486,7 +1504,7 @@ if __name__ == "__main__":
     test_strip_markdown()
     test_markdownv2_escape()
     test_real_world_scenario()
-    test_edge_case_mixed_cancel_confirm()
+    test_edge_case_correction_should_not_cancel()
     test_edge_case_numeric_out_of_range()
     test_edge_case_zero_choice()
     test_confirm_cancel_word_sets()
@@ -1496,7 +1514,8 @@ if __name__ == "__main__":
     test_memory_conversation_state_store()
     test_recover_pending_add_word_from_history()
     test_recover_pending_submit_confirm_from_history()
-    test_recover_pending_state_scans_back_to_recent_matching_assistant_message()
+    test_recover_pending_state_ignores_stale_assistant_prompt()
+    test_recover_pending_state_ignores_cancelled_prompt()
     test_history_store_keeps_user_and_assistant_same_second()
     test_tool_executor_context_injection()
     test_tool_executor_draft_policy_guards()
