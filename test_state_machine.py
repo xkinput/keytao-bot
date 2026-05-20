@@ -489,6 +489,123 @@ def test_augment_simple_word_query_response_keeps_usage_comparison_when_response
     asyncio.run(_run())
 
 
+def test_augment_simple_word_query_response_handles_multiple_words():
+    """Verify multiple plain Chinese words are enriched one by one via batch lookup."""
+    print("\n🧪 augment simple word query response handles multiple words")
+
+    async def _run():
+        tool_calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_lookup_by_words_batch":
+                return json.dumps({
+                    "success": True,
+                    "results": [
+                        {
+                            "word": "寿司郎",
+                            "phrases": [{
+                                "word": "寿司郎",
+                                "code": "eslv",
+                            }],
+                        },
+                        {
+                            "word": "卧龙凤雏",
+                            "phrases": [{
+                                "word": "卧龙凤雏",
+                                "code": "wlfj",
+                                "duplicate_info": {
+                                    "position_label": "二重",
+                                    "all_words": [
+                                        {"word": "我来封键", "label": ""},
+                                        {"word": "卧龙凤雏", "label": "二重"},
+                                    ],
+                                },
+                            }],
+                        },
+                    ],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_encode" and arguments == {"word": "寿司郎"}:
+                return json.dumps({
+                    "success": True,
+                    "candidateStatuses": [
+                        {"code": "esl", "occupied": True, "label": "已有「神速力」"},
+                        {"code": "eslv", "occupied": True, "label": "已有「寿司郎」"},
+                    ],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_encode" and arguments == {"word": "卧龙凤雏"}:
+                return json.dumps({
+                    "success": True,
+                    "candidateStatuses": [
+                        {"code": "wlfj", "occupied": True, "label": "已有「我来封键、卧龙凤雏」"},
+                        {"code": "wlfjv", "occupied": False, "label": "空位"},
+                    ],
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        async def fake_comparison(word, current_code, prior_occupied):
+            if word == "寿司郎":
+                return "从日常语感看，神速力更像固定作品词，寿司郎更偏现实里的品牌名；不过当前码位顺序仍以现有词库占位为准。"
+            return None
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(side_effect=fake_comparison)):
+                result = await _augment_simple_word_query_response(
+                    "寿司郎 卧龙凤雏",
+                    "先看两个词的编码情况：",
+                    "qq",
+                    "123",
+                )
+
+        check("batch lookup called once", sum(1 for name, _ in tool_calls if name == "keytao_lookup_by_words_batch") == 1)
+        check("encode called for each existing word", sum(1 for name, _ in tool_calls if name == "keytao_encode") == 2)
+        check("first word block included", "寿司郎 的编码位置说明：" in result)
+        check("second word block included", "卧龙凤雏 的编码位置说明：" in result)
+        check("multiple word result keeps order", result.index("寿司郎 的编码位置说明：") < result.index("卧龙凤雏 的编码位置说明："))
+        check("first word comparison included", "常用度对比：" in result)
+        check("second word duplicate order included", "卧龙凤雏 排在二重" in result)
+
+    asyncio.run(_run())
+
+
+def test_augment_simple_word_query_response_skips_confirm_and_draft_reply():
+    """Verify confirmation messages do not trigger word-query augmentation."""
+    print("\n🧪 augment simple word query response skips confirm/draft reply")
+
+    async def _run():
+        base_response = """✅ 已将「磁条」以编码 cktcv 加入草稿
++1 新增  ~0 修改  -0 删除
+
+diff Phrase  cktcv
+@@ -1,6 +1,7 @@
+ 辞退       cktb         100
+ 词条       cktc         100
+ 此条       cktci        100
++磁条       cktcv        100
+ 磁铁       cktd         100
+ 磁头       cktdv        100
+ 磁贴       cktdva       100
+
+当前草稿（共 1 条）：
+• 新增 磁条 → cktcv（权重: 100）
+
+草稿地址：https://keytao.vercel.app/batch/77fcefe5-e608-4502-af34-681179e8308a
+
+发送「提交」以提交该草稿"""
+
+        with patch.object(openai_chat_module, "call_tool_function", AsyncMock(side_effect=AssertionError("should not query tools"))):
+            result = await _augment_simple_word_query_response(
+                "是",
+                base_response,
+                "qq",
+                "123",
+            )
+
+        check("confirm reply remains unchanged", result == base_response)
+
+    asyncio.run(_run())
+
+
 def test_pending_add_word_numeric_choice():
     """Test the state machine logic for numeric choice."""
     print("\n🧪 PendingAddWord numeric choice logic")
@@ -1358,6 +1475,8 @@ if __name__ == "__main__":
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
     test_augment_simple_word_query_response_appends_priority_note()
+    test_augment_simple_word_query_response_handles_multiple_words()
+    test_augment_simple_word_query_response_skips_confirm_and_draft_reply()
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()
     test_occupied_numeric_choice_means_duplicate_confirm()

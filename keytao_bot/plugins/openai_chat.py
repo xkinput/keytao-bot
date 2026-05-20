@@ -222,6 +222,30 @@ def _has_cancel(msg: str) -> bool:
     return any(w in msg for w in CANCEL_WORDS)
 
 
+def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
+    """Skip query augmentation for confirmations and action-result replies."""
+    text = message_text.strip()
+    if not text:
+        return False
+    if _is_confirm(text) or _has_cancel(text):
+        return False
+
+    response_text = response.strip()
+    action_markers = (
+        "加入草稿",
+        "当前草稿",
+        "发送「提交」",
+        "发送“提交”",
+        "diff Phrase",
+        "草稿地址：",
+        "✅ 已将",
+        "✅ 已写入草稿",
+        "插入编码",
+        "调整到编码",
+    )
+    return not any(marker in response_text for marker in action_markers)
+
+
 def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     """Parse AI response for the candidate code confirmation pattern.
 
@@ -470,6 +494,9 @@ async def _augment_simple_word_query_response(
     user_id: str,
 ) -> str:
     """Append deterministic code-priority notes for simple word-only queries."""
+    if not _should_augment_simple_word_query(message_text, response):
+        return response
+
     words = _extract_pure_chinese_words(message_text)
     if not words:
         return response
