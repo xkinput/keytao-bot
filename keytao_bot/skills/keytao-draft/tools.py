@@ -847,7 +847,7 @@ TOOLS = [
                     "type": {
                         "type": "string",
                         "enum": ["Single", "Phrase", "Supplement", "Symbol", "Link", "CSS", "CSSSingle", "English"],
-                        "description": "词条类型，默认为 Phrase（词组）"
+                        "description": "词条类型。用户明确指定类型时必须传：声笔笔=CSS，声笔笔单字=CSSSingle，词组=Phrase，单字=Single，补充=Supplement，符号=Symbol，链接=Link，英文=English。Change/Delete 若不传会默认词组，可能改错词库。"
                     },
                     "remark": {
                         "type": "string",
@@ -1204,7 +1204,7 @@ TOOLS += [
                                 },
                                 "type": {
                                     "type": "string",
-                                    "description": "词条类型，不传则自动推断",
+                                    "description": "词条类型。用户明确指定类型时必须传：声笔笔=CSS，声笔笔单字=CSSSingle，词组=Phrase，单字=Single，补充=Supplement，符号=Symbol，链接=Link，英文=English。Change/Delete 若不传会默认词组，可能改错词库。",
                                 },
                                 "remark": {"type": "string", "description": "备注（可选）"},
                             },

@@ -95,6 +95,7 @@ from keytao_bot.plugins.openai_chat import (
     _strip_command_message_prefixes,
     _strip_markdown,
     _to_markdownv2,
+    _try_handle_replace_char,
     _is_clear_command_text,
     PendingAddWord,
     PendingToolConfirm,
@@ -1105,6 +1106,18 @@ async def _run_tool_executor_checks():
     )
     check("missing tool is reported", "Tool missing_tool not found" in missing_tool)
 
+    calls.clear()
+    draft_executor = ToolExecutor(
+        lambda name: fake_tool if name == "keytao_batch_add_to_draft" else None,
+        frozenset({"keytao_batch_add_to_draft"}),
+    )
+    await draft_executor.call(
+        "keytao_batch_add_to_draft",
+        {"items": [{"action": "Change", "old_word": "旧词", "word": "新词", "code": "sbb"}]},
+        ToolContext(platform="qq", user_id="123", current_message="把声笔笔 sbb 的旧词改成新词"),
+    )
+    check("explicit message type injected into draft item", calls[0]["items"][0]["type"] == "CSS")
+
 
 def test_tool_executor_context_injection():
     """Verify contextual tools still receive platform identifiers."""
@@ -1474,6 +1487,34 @@ def test_shift_phrase_code_plans_real_occupant_move():
     asyncio.run(_run())
 
 
+def test_replace_char_preserves_explicit_css_type():
+    print("\n🧪 replace-char preprocessor preserves explicit CSS type")
+
+    async def _run():
+        message = "将这些声笔笔词条中的粘改为黏：\n防粘 fpnm\n胶粘 jcnm"
+
+        async def fake_call_tool_function(tool_name, arguments, platform, user_id):
+            check("replace-char uses batch draft tool", tool_name == "keytao_batch_add_to_draft")
+            check("replace-char preserves platform", platform == "qq")
+            check("replace-char preserves user", user_id == "42")
+            items = arguments.get("items", [])
+            check("replace-char generated two items", len(items) == 2)
+            check("replace-char marks CSS type", all(item.get("type") == "CSS" for item in items))
+            return json.dumps({
+                "success": True,
+                "successCount": 2,
+                "failedCount": 0,
+                "skippedCount": 0,
+            }, ensure_ascii=False)
+
+        with patch.object(openai_chat_module, "call_tool_function", fake_call_tool_function):
+            response = await _try_handle_replace_char(message, "qq", "42")
+
+        check("replace-char handled message", response is not None and "成功 2 条" in response)
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("State Machine & Core Logic Tests")
@@ -1527,6 +1568,7 @@ if __name__ == "__main__":
     test_build_code_shift_plan_cascades_until_empty()
     test_build_code_shift_plan_rejects_invalid_occupant_code()
     test_shift_phrase_code_plans_real_occupant_move()
+    test_replace_char_preserves_explicit_css_type()
 
     print("\n" + "=" * 60)
     total = passed + failed

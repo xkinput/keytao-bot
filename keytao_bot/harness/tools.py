@@ -16,6 +16,27 @@ class ToolContext:
 
 _DELETE_INTENT_RE = re.compile(r"删除|删掉|移除|撤销|清空|清理|全部删|都删")
 _PROTECTED_WORD_RE = r"(?:别动|不要动|别改|不要改|不动|保持)"
+_TYPE_HINTS = [
+    ("声笔笔单字", "CSSSingle"),
+    ("CSSSingle", "CSSSingle"),
+    ("css-single", "CSSSingle"),
+    ("声笔笔", "CSS"),
+    ("CSS", "CSS"),
+    ("词组", "Phrase"),
+    ("词语", "Phrase"),
+    ("单字", "Single"),
+    ("补充", "Supplement"),
+    ("符号", "Symbol"),
+    ("链接", "Link"),
+    ("英文", "English"),
+]
+
+
+def _extract_explicit_phrase_type(message: str) -> Optional[str]:
+    for hint, phrase_type in _TYPE_HINTS:
+        if hint in message:
+            return phrase_type
+    return None
 
 
 def _is_word_protected(message: str, word: str) -> bool:
@@ -71,7 +92,7 @@ class ToolExecutor:
         if not tool_func:
             return json.dumps({"error": f"Tool {tool_name} not found"}, ensure_ascii=False)
 
-        call_args = dict(arguments)
+        call_args = self._with_explicit_phrase_type(tool_name, arguments, context)
         try:
             if tool_name in self._context_tools:
                 if not context.platform or not context.user_id:
@@ -88,6 +109,25 @@ class ToolExecutor:
         except Exception as error:
             logger.error(f"Tool {tool_name} error: {type(error).__name__}: {error}")
             return json.dumps({"error": str(error)}, ensure_ascii=False)
+
+    def _with_explicit_phrase_type(self, tool_name: str, arguments: Dict, context: ToolContext) -> Dict:
+        call_args = dict(arguments)
+        phrase_type = _extract_explicit_phrase_type(context.current_message or "")
+        if not phrase_type:
+            return call_args
+
+        if tool_name == "keytao_create_phrase":
+            call_args.setdefault("type", phrase_type)
+            return call_args
+
+        if tool_name == "keytao_batch_add_to_draft" and isinstance(call_args.get("items"), list):
+            call_args["items"] = [
+                {**item, "type": item.get("type") or phrase_type}
+                if isinstance(item, dict) else item
+                for item in call_args["items"]
+            ]
+
+        return call_args
 
     def _validate_policy(self, tool_name: str, arguments: Dict, context: ToolContext) -> Optional[Dict]:
         message = context.current_message or ""

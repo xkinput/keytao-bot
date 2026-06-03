@@ -1206,9 +1206,31 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 # ---------------------------------------------------------------------------
 
 _RE_REPLACE_CHAR = re.compile(
-    r'将[这些]*词[条中]*[的]*["\u201c\u300c]?(.)["\u201d\u300d]?改[为成]["\u201c\u300c]?(.)["\u201d\u300d]?[：:，,\s]'
+    r'将(?:这些|这批|以下|下列)?(?:\S{0,12}?)(?:词条|词|字)?(?:中|中的|里|里的|的)?'
+    r'["\u201c\u300c]?(.)["\u201d\u300d]?改[为成]["\u201c\u300c]?(.)["\u201d\u300d]?[：:，,\s]'
 )
 _RE_WORD_CODE_LINE = re.compile(r'^(\S+)\s+([a-z]+)\s*$')
+_TYPE_HINTS = [
+    ("声笔笔单字", "CSSSingle"),
+    ("CSSSingle", "CSSSingle"),
+    ("css-single", "CSSSingle"),
+    ("声笔笔", "CSS"),
+    ("CSS", "CSS"),
+    ("词组", "Phrase"),
+    ("词语", "Phrase"),
+    ("单字", "Single"),
+    ("补充", "Supplement"),
+    ("符号", "Symbol"),
+    ("链接", "Link"),
+    ("英文", "English"),
+]
+
+
+def _extract_explicit_phrase_type(message: str) -> Optional[str]:
+    for hint, phrase_type in _TYPE_HINTS:
+        if hint in message:
+            return phrase_type
+    return None
 
 
 async def _try_handle_replace_char(
@@ -1220,6 +1242,7 @@ async def _try_handle_replace_char(
         return None
 
     old_char, new_char = m.group(1), m.group(2)
+    phrase_type = _extract_explicit_phrase_type(message)
     items = []
     for line in message.splitlines():
         lm = _RE_WORD_CODE_LINE.match(line.strip())
@@ -1229,7 +1252,10 @@ async def _try_handle_replace_char(
         if old_char not in old_word:
             continue
         new_word = old_word.replace(old_char, new_char)
-        items.append({"action": "Change", "old_word": old_word, "word": new_word, "code": code})
+        item = {"action": "Change", "old_word": old_word, "word": new_word, "code": code}
+        if phrase_type:
+            item["type"] = phrase_type
+        items.append(item)
 
     if not items:
         return None
