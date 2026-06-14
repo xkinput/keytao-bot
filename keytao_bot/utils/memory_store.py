@@ -1,14 +1,24 @@
 """Scoped compressed memory store for chat context."""
+import inspect
 import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 from nonebot.log import logger
 
 
 GLOBAL_SCOPE_ID = "global"
+DEFAULT_RECENT_LIMITS = {
+    "global": 4,
+    "group": 6,
+    "user": 10,
+}
+COMPACTION_THRESHOLD = 90
+COMPACTION_KEEP_RECENT = 30
+
+MemorySummarizer = Callable[[str, str, str, List[Dict]], Awaitable[str] | str]
 
 
 @dataclass(frozen=True)
@@ -77,13 +87,16 @@ class ScopedMemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_memory_entries_scope
                 ON memory_entries(scope, scope_id, id DESC)
             """)
+            cursor.execute("PRAGMA table_info(memory_entries)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "importance" not in columns:
+                cursor.execute("""
+                    ALTER TABLE memory_entries
+                    ADD COLUMN importance TEXT NOT NULL DEFAULT 'medium'
+                """)
             conn.commit()
 
-    def get_context_block(
-        self,
-        memory_context: ChatMemoryContext,
-        recent_limit: int = 6,
-    ) -> str:
+    def get_context_block(self, memory_context: ChatMemoryContext) -> str:
         """Build a compact prompt block from global, group and personal memory."""
         sections: List[str] = []
         scopes = [
@@ -93,7 +106,7 @@ class ScopedMemoryStore:
         ]
         for scope, scope_id, label in scopes:
             summary = self._get_summary(scope, scope_id)
-            recent = self._get_recent_entries(scope, scope_id, recent_limit)
+            recent = self._get_recent_entries(scope, scope_id, DEFAULT_RECENT_LIMITS[scope])
             if not summary and not recent:
                 continue
             lines = [f"[{label}]"]
@@ -103,7 +116,8 @@ class ScopedMemoryStore:
                 speaker = item["speaker_name"] or item["speaker_id"]
                 target = item["target_name"] or item["target_id"]
                 arrow = f"{speaker} -> {target}" if target else speaker
-                lines.append(f"- {item['role']} {arrow}: {item['content']}")
+                importance = item.get("importance") or "medium"
+                lines.append(f"- {importance} {item['role']} {arrow}: {item['content']}")
             sections.append("\n".join(lines))
 
         if not sections:
@@ -138,14 +152,15 @@ class ScopedMemoryStore:
             for scope, scope_id in scope_ids:
                 for role, content, speaker_name, target_name in entries:
                     compact = self._compress_content(content, role)
+                    importance = _classify_importance(scope, role, compact)
                     if not compact:
                         continue
                     cursor.execute("""
                         INSERT INTO memory_entries (
                             scope, scope_id, role, speaker_id, speaker_name,
-                            target_id, target_name, content
+                            target_id, target_name, content, importance
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         scope,
                         scope_id,
@@ -155,11 +170,23 @@ class ScopedMemoryStore:
                         memory_context.target_user_id if role == "user" else memory_context.user_id,
                         target_name or "",
                         compact,
+                        importance,
                     ))
             conn.commit()
 
+    async def compact_due_scopes(
+        self,
+        memory_context: ChatMemoryContext,
+        summarizer: Optional[MemorySummarizer] = None,
+    ) -> None:
+        """Compact scopes that crossed the threshold, using LLM when available."""
+        scope_ids = [
+            ("global", GLOBAL_SCOPE_ID),
+            ("group", memory_context.space_scope_id),
+            ("user", memory_context.user_scope_id),
+        ]
         for scope, scope_id in scope_ids:
-            self._compact_scope(scope, scope_id)
+            await self._compact_scope(scope, scope_id, summarizer)
 
     def clear_user_memory(self, memory_context: ChatMemoryContext) -> None:
         """Clear the current user's personal memory."""
@@ -189,10 +216,17 @@ class ScopedMemoryStore:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT role, speaker_id, speaker_name, target_id, target_name, content
+                SELECT role, speaker_id, speaker_name, target_id, target_name, content, importance
                 FROM memory_entries
                 WHERE scope = ? AND scope_id = ?
-                ORDER BY id DESC
+                  AND importance != 'low'
+                ORDER BY
+                    CASE importance
+                        WHEN 'high' THEN 0
+                        WHEN 'medium' THEN 1
+                        ELSE 2
+                    END,
+                    id DESC
                 LIMIT ?
             """, (scope, scope_id, limit))
             rows = cursor.fetchall()
@@ -204,11 +238,19 @@ class ScopedMemoryStore:
                 "target_id": row[3],
                 "target_name": row[4],
                 "content": row[5],
+                "importance": row[6],
             }
             for row in reversed(rows)
         ]
 
-    def _compact_scope(self, scope: str, scope_id: str, keep_recent: int = 30, threshold: int = 90) -> None:
+    async def _compact_scope(
+        self,
+        scope: str,
+        scope_id: str,
+        summarizer: Optional[MemorySummarizer] = None,
+        keep_recent: int = COMPACTION_KEEP_RECENT,
+        threshold: int = COMPACTION_THRESHOLD,
+    ) -> None:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
@@ -221,7 +263,7 @@ class ScopedMemoryStore:
 
             overflow = count - keep_recent
             cursor.execute("""
-                SELECT id, role, speaker_name, target_name, content
+                SELECT id, role, speaker_id, speaker_name, target_id, target_name, content, importance
                 FROM memory_entries
                 WHERE scope = ? AND scope_id = ?
                 ORDER BY id ASC
@@ -232,27 +274,62 @@ class ScopedMemoryStore:
                 return
 
             old_summary = self._get_summary(scope, scope_id)
-            new_summary = self._merge_summary(old_summary, rows)
-            cursor.execute("""
-                INSERT INTO memory_summaries(scope, scope_id, content, updated_at)
-                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(scope, scope_id) DO UPDATE SET
-                    content = excluded.content,
-                    updated_at = CURRENT_TIMESTAMP
-            """, (scope, scope_id, new_summary))
+            entries = [_row_to_entry(row) for row in rows]
+
+        new_summary = await self._summarize_scope(scope, scope_id, old_summary, entries, summarizer)
+
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            if new_summary:
+                cursor.execute("""
+                    INSERT INTO memory_summaries(scope, scope_id, content, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(scope, scope_id) DO UPDATE SET
+                        content = excluded.content,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (scope, scope_id, new_summary))
             cursor.execute(
-                f"DELETE FROM memory_entries WHERE id IN ({','.join('?' for _ in rows)})",
-                [row[0] for row in rows],
+                f"DELETE FROM memory_entries WHERE id IN ({','.join('?' for _ in entries)})",
+                [entry["id"] for entry in entries],
             )
             conn.commit()
+            logger.info(
+                f"Compacted memory scope={scope} scope_id={scope_id} entries={len(entries)}"
+            )
 
-    def _merge_summary(self, old_summary: str, rows: List[tuple]) -> str:
+    async def _summarize_scope(
+        self,
+        scope: str,
+        scope_id: str,
+        old_summary: str,
+        entries: List[Dict],
+        summarizer: Optional[MemorySummarizer],
+    ) -> str:
+        if summarizer is not None:
+            try:
+                result = summarizer(scope, scope_id, old_summary, entries)
+                if inspect.isawaitable(result):
+                    result = await result
+                summary = _sanitize_summary(str(result or ""))
+                if summary:
+                    return summary
+            except Exception as error:
+                logger.warning(
+                    f"LLM memory compaction failed for {scope}:{scope_id}: {error}"
+                )
+        return self._merge_summary(old_summary, entries)
+
+    def _merge_summary(self, old_summary: str, entries: List[Dict]) -> str:
         lines = [line.strip("- ").strip() for line in old_summary.splitlines() if line.strip()]
-        for _, role, speaker_name, target_name, content in rows:
-            speaker = speaker_name or "未知用户"
-            target = target_name or ""
-            label = f"{role} {speaker}" + (f" -> {target}" if target else "")
-            lines.append(f"{label}: {content}")
+        for entry in entries:
+            if entry.get("importance") == "low":
+                continue
+            speaker = entry.get("speaker_name") or entry.get("speaker_id") or "未知用户"
+            target = entry.get("target_name") or entry.get("target_id") or ""
+            label = f"{entry.get('importance', 'medium')} {entry['role']} {speaker}"
+            if target:
+                label += f" -> {target}"
+            lines.append(f"{label}: {entry['content']}")
 
         deduped: List[str] = []
         seen = set()
@@ -307,6 +384,66 @@ def _assistant_action_summary(text: str) -> str:
         summary = re.search(r"\+\d+\s+新增\s+~\d+\s+修改\s+-\d+\s+删除", text)
         return f"展示了当前草稿：{summary.group(0)}。" if summary else "展示了当前草稿。"
     return ""
+
+
+def _row_to_entry(row: tuple) -> Dict:
+    return {
+        "id": row[0],
+        "role": row[1],
+        "speaker_id": row[2],
+        "speaker_name": row[3],
+        "target_id": row[4],
+        "target_name": row[5],
+        "content": row[6],
+        "importance": row[7],
+    }
+
+
+def _classify_importance(scope: str, role: str, content: str) -> str:
+    text = (content or "").strip()
+    if not text:
+        return "low"
+
+    if _is_low_value_memory(text):
+        return "low"
+
+    high_markers = (
+        "偏好", "习惯", "记住", "以后", "称呼", "不要", "别再",
+        "已处理加词草稿", "已提交当前用户草稿审核", "已确认添加到草稿",
+    )
+    if scope == "user" and any(marker in text for marker in high_markers):
+        return "high"
+
+    if scope == "group":
+        group_markers = ("约定", "正在讨论", "主题", "回复", "上下文", "谁")
+        if any(marker in text for marker in group_markers):
+            return "medium"
+        return "low" if role == "assistant" and len(text) < 20 else "medium"
+
+    if scope == "global":
+        global_markers = ("规则", "公共", "全局", "稳定", "安全")
+        return "medium" if any(marker in text for marker in global_markers) else "low"
+
+    return "medium"
+
+
+def _is_low_value_memory(text: str) -> bool:
+    normalized = text.strip().lower()
+    if len(normalized) <= 2:
+        return True
+    low_value_exact = {
+        "确认", "好的", "好", "是", "ok", "yes", "取消", "算了",
+        "谢谢", "感谢", "哈哈", "收到", "嗯", "行",
+    }
+    return normalized in low_value_exact
+
+
+def _sanitize_summary(summary: str) -> str:
+    text = _strip_markdown(summary)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > 2200:
+        text = text[:2200].rstrip()
+    return text
 
 
 _memory_store: Optional[ScopedMemoryStore] = None

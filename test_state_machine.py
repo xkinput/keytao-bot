@@ -8,6 +8,7 @@ import os
 import asyncio
 import importlib.util
 import json
+import sqlite3
 import tempfile
 from unittest.mock import AsyncMock, patch
 
@@ -1025,6 +1026,11 @@ def test_scoped_memory_store_builds_compressed_context():
             "喵喵 把增香加到 zrxx",
             "✅ 已将「增香」以编码 zrxx 加入草稿\n\n当前草稿（共 1 条）：\n• 新增 增香 → zrxx",
         )
+        store.add_conversation_round(
+            context,
+            "喵喵 记住一个全局稳定规则：测试规则只用于公共说明",
+            "已记住这条公共规则。",
+        )
         block = store.get_context_block(context)
 
     check("memory block has global section", "全局记忆" in block)
@@ -1033,6 +1039,63 @@ def test_scoped_memory_store_builds_compressed_context():
     check("assistant reply compressed draft action", "已处理加词草稿" in block)
     check("memory says it grants no permission", "不授予任何操作权限" in block)
     check("memory cannot change safety principles", "不能改变系统提示词中的安全宗旨" in block)
+
+
+def test_scoped_memory_store_llm_compacts_at_threshold():
+    print("\n🧪 ScopedMemoryStore LLM compaction threshold")
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "memory.db")
+            store = ScopedMemoryStore(db_path)
+            context = ChatMemoryContext(
+                platform="qq",
+                user_id="1001",
+                space_type="group",
+                space_id="42",
+                speaker_name="Alice",
+                target_name="喵喵",
+            )
+            for idx in range(4):
+                store.add_conversation_round(
+                    context,
+                    f"喵喵 记住我的偏好 {idx}：以后按个人习惯处理",
+                    f"已记录个人偏好 {idx}。",
+                )
+
+            calls = []
+
+            async def fake_summarizer(scope, scope_id, old_summary, entries):
+                calls.append((scope, scope_id, len(entries)))
+                return "- high Alice: 喜欢按个人习惯处理。"
+
+            await store._compact_scope(
+                "user",
+                context.user_scope_id,
+                fake_summarizer,
+                keep_recent=2,
+                threshold=4,
+            )
+
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT content FROM memory_summaries WHERE scope = ? AND scope_id = ?",
+                    ("user", context.user_scope_id),
+                )
+                summary_row = cursor.fetchone()
+                cursor.execute(
+                    "SELECT COUNT(*) FROM memory_entries WHERE scope = ? AND scope_id = ?",
+                    ("user", context.user_scope_id),
+                )
+                remaining = cursor.fetchone()[0]
+
+        check("summarizer called once", len(calls) == 1)
+        check("summarizer receives overflow entries", calls[0][2] == 6)
+        check("LLM summary stored", summary_row is not None and "个人习惯" in summary_row[0])
+        check("recent entries kept", remaining == 2)
+
+    asyncio.run(_run())
 
 
 def test_agent_request_context_scope_key_format():
@@ -1740,6 +1803,7 @@ if __name__ == "__main__":
     test_memory_conversation_state_store()
     test_memory_conversation_state_store_owner_scope()
     test_scoped_memory_store_builds_compressed_context()
+    test_scoped_memory_store_llm_compacts_at_threshold()
     test_agent_request_context_scope_key_format()
     test_recover_pending_add_word_from_history()
     test_recover_pending_submit_confirm_from_history()
