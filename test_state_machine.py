@@ -85,6 +85,7 @@ from keytao_bot.plugins.openai_chat import (
     _build_existing_word_priority_note,
     _extract_prior_occupied_candidates,
     _extract_pure_chinese_words,
+    _extract_requested_code_from_pending_reply,
     _is_confirm,
     _has_cancel,
     _handle_pending_add_word,
@@ -92,6 +93,7 @@ from keytao_bot.plugins.openai_chat import (
     _parse_pending_add_word,
     _recover_pending_state_from_history,
     _resolve_shift_target_code,
+    _select_requested_code_candidate,
     _strip_command_message_prefixes,
     _strip_markdown,
     _to_markdownv2,
@@ -1359,6 +1361,106 @@ def test_apply_candidate_occupancy_updates_recommendation():
     check("recommendedCode moves to first available", result["recommendedCode"] == "hyfio")
 
 
+def test_normalize_encode_response_includes_alternate_pronunciation_candidates():
+    """Verify single-char polyphones expose all pinyin routes as candidate codes."""
+    print("\n🧪 keytao_encode alternate pronunciation candidates")
+
+    result = _normalize_encode_response("噌", {
+        "input": "噌",
+        "type": "单字",
+        "chars": [{
+            "char": "噌",
+            "pinyin": "cēng",
+            "pinyins": ["cēng", "chēng"],
+            "phoneticCode": "cr",
+            "shapeCode": "ooui",
+        }],
+        "codes": ["cr", "cro", "croo", "croou", "crooui"],
+        "altCodes": [],
+        "requestedCodeAnalysis": {"code": "jr", "supported": False},
+    })
+
+    check("alternate pronunciation variants present", len(result["alternatePronunciationCodes"]) == 2)
+    cheng_variant = next(
+        item for item in result["alternatePronunciationCodes"]
+        if item["pinyin"] == "chēng"
+    )
+    check("cheng phonetic code is jr", cheng_variant["phoneticCode"] == "jr")
+    check("cheng code chain includes shape", cheng_variant["codes"] == ["jr", "jro", "jroo", "jroou", "jrooui"])
+    check("requestedCandidateCodes uses jr series first", result["requestedCandidateCodes"] == ["jr", "jro", "jroo", "jroou", "jrooui"])
+    check("candidateCodes starts with requested series", result["candidateCodes"][:5] == ["jr", "jro", "jroo", "jroou", "jrooui"])
+
+    occupied = _apply_candidate_occupancy(result, {
+        "success": True,
+        "results": [
+            {"code": "jr", "phrases": [{"word": "成", "code": "jr"}]},
+            {"code": "jro", "phrases": [{"word": "呈", "code": "jro"}]},
+            {"code": "jroo", "phrases": [{"word": "宬", "code": "jroo"}]},
+            {"code": "jroou", "phrases": []},
+            {"code": "jrooui", "phrases": []},
+            {"code": "cr", "phrases": [{"word": "曾", "code": "cr"}]},
+            {"code": "cro", "phrases": [{"word": "蹭", "code": "cro"}]},
+            {"code": "croo", "phrases": [{"word": "噌", "code": "croo"}]},
+            {"code": "croou", "phrases": []},
+            {"code": "crooui", "phrases": [{"word": "噌", "code": "crooui"}]},
+        ],
+    })
+    check("requested series first empty selected", occupied["firstRequestedAvailableCode"] == "jroou")
+    check("recommended follows requested pronunciation", occupied["recommendedCode"] == "jroou")
+
+
+def test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate():
+    """Verify 'confirm add with jr' is treated as a phonetic route, not bare code jr."""
+    print("\n🧪 pending add-word explicit phonetic prefix")
+
+    state = PendingAddWord(
+        word="噌",
+        recommended_code="croou",
+        candidates=[
+            ("cr", True),
+            ("cro", True),
+            ("croo", True),
+            ("croou", False),
+        ],
+        occupied_words={"cr": ["曾"], "cro": ["蹭"], "croo": ["噌"]},
+    )
+    encoding = {
+        "success": True,
+        "word": "噌",
+        "candidateCodes": ["jr", "jro", "jroo", "jroou", "jrooui", "cr", "cro", "croo", "croou", "crooui"],
+        "requestedCandidateCodes": ["jr", "jro", "jroo", "jroou", "jrooui"],
+        "candidateStatuses": [
+            {"code": "jr", "occupied": True, "label": "已有「成」"},
+            {"code": "jro", "occupied": True, "label": "已有「呈」"},
+            {"code": "jroo", "occupied": True, "label": "已有「宬」"},
+            {"code": "jroou", "occupied": False, "label": "空位"},
+            {"code": "jrooui", "occupied": False, "label": "空位"},
+        ],
+    }
+
+    check("extracts explicit requested code", _extract_requested_code_from_pending_reply("确认，加，以 jr") == "jr")
+    check("does not treat split pinyin as code", _extract_requested_code_from_pending_reply("重新编码，ch eng，不应该是 wr") is None)
+    check("selects first empty shape candidate", _select_requested_code_candidate("噌", "jr", encoding) == ("jroou", False))
+
+    async def _run():
+        async def fake_call_tool_function(tool_name, arguments, platform, user_id):
+            check("re-encodes current word", tool_name == "keytao_encode")
+            check("passes requested code prefix", arguments == {"word": "噌", "requested_code": "jr"})
+            return json.dumps(encoding, ensure_ascii=False)
+
+        with patch.object(openai_chat_module, "call_tool_function", fake_call_tool_function):
+            with patch.object(openai_chat_module, "_execute_add_to_draft", AsyncMock(return_value="added")) as add_mock:
+                result = await _handle_pending_add_word(
+                    state, "确认，加，以 jr", "qq", "123", [],
+                )
+
+        check("pending handler adds resolved candidate", result == "added")
+        check("add helper called once", add_mock.await_count == 1)
+        check("add helper uses jroou", add_mock.await_args.args[:2] == ("噌", "jroou"))
+
+    asyncio.run(_run())
+
+
 def test_build_code_shift_plan_uses_occupant_encode_chain():
     """Verify displaced words move by their own encode candidates, not the inserted word's chain."""
     print("\n🧪 code shift plan uses occupant encode chain")
@@ -1564,6 +1666,8 @@ if __name__ == "__main__":
     test_normalize_encode_response_codes_first()
     test_normalize_encode_response_infer_fallback()
     test_apply_candidate_occupancy_updates_recommendation()
+    test_normalize_encode_response_includes_alternate_pronunciation_candidates()
+    test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate()
     test_build_code_shift_plan_uses_occupant_encode_chain()
     test_build_code_shift_plan_cascades_until_empty()
     test_build_code_shift_plan_rejects_invalid_occupant_code()

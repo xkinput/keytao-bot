@@ -936,6 +936,105 @@ def _resolve_shift_target_code(state: PendingAddWord, msg: str) -> Optional[str]
     return None
 
 
+def _extract_requested_code_from_pending_reply(msg: str) -> Optional[str]:
+    """Extract an explicit code or code prefix from a pending add-word reply."""
+    text = msg.strip().lower()
+    if not text:
+        return None
+
+    patterns = (
+        r'(?:以|用|走|按|放到|改到|到)\s*([a-z]{2,6})',
+        r'([a-z]{2,6})\s*(?:编码|音码|码|系列)',
+    )
+    matches: List[str] = []
+    for pattern in patterns:
+        matches.extend(re.findall(pattern, text))
+    if not matches:
+        return None
+    return matches[-1]
+
+
+def _lookup_status_occupied(encoding: Dict, code: str) -> bool:
+    for status in encoding.get("candidateStatuses", []):
+        if isinstance(status, dict) and status.get("code") == code:
+            return bool(status.get("occupied"))
+    return False
+
+
+def _select_requested_code_candidate(word: str, requested_code: str, encoding: Dict) -> Optional[Tuple[str, bool]]:
+    """Choose the actual candidate when the user supplied a code or phonetic prefix."""
+    statuses = [
+        status for status in encoding.get("candidateStatuses", [])
+        if isinstance(status, dict) and isinstance(status.get("code"), str)
+    ]
+    status_codes = [status["code"] for status in statuses]
+    candidate_codes = [
+        code for code in encoding.get("candidateCodes", [])
+        if isinstance(code, str)
+    ]
+
+    requested_series = [
+        code for code in encoding.get("requestedCandidateCodes", [])
+        if isinstance(code, str)
+    ]
+    if not requested_series:
+        requested_series = [
+            code for code in status_codes or candidate_codes
+            if code.startswith(requested_code)
+        ]
+
+    if requested_series:
+        # For a single character, a two-letter request is usually just the
+        # phonetic route; continue along that route to the first empty slot.
+        if len(word) == 1 and len(requested_code) == 2 and len(requested_series) > 1:
+            for code in requested_series:
+                if not _lookup_status_occupied(encoding, code):
+                    return code, False
+            fallback = requested_series[0]
+            return fallback, _lookup_status_occupied(encoding, fallback)
+
+        if requested_code in requested_series:
+            return requested_code, _lookup_status_occupied(encoding, requested_code)
+
+        for code in requested_series:
+            if not _lookup_status_occupied(encoding, code):
+                return code, False
+        fallback = requested_series[0]
+        return fallback, _lookup_status_occupied(encoding, fallback)
+
+    if requested_code in status_codes or requested_code in candidate_codes:
+        return requested_code, _lookup_status_occupied(encoding, requested_code)
+
+    return None
+
+
+async def _resolve_requested_code_for_pending_add(
+    state: PendingAddWord,
+    msg: str,
+    platform: str,
+    user_id: str,
+) -> Optional[Tuple[str, bool]]:
+    requested_code = _extract_requested_code_from_pending_reply(msg)
+    if not requested_code:
+        return None
+
+    result_json = await call_tool_function(
+        "keytao_encode",
+        {"word": state.word, "requested_code": requested_code},
+        platform,
+        user_id,
+    )
+    try:
+        encoding = json.loads(result_json)
+    except json.JSONDecodeError:
+        return None
+
+    if not encoding.get("success"):
+        return None
+
+    return _select_requested_code_candidate(state.word, requested_code, encoding)
+
+
 async def _execute_confirmed_tool(
     state: PendingToolConfirm, platform: str, user_id: str,
 ) -> str:
@@ -1043,6 +1142,20 @@ async def _handle_pending_add_word(
     if shift_target_code is not None:
         return await _execute_shift_to_code(state.word, shift_target_code, platform, user_id)
 
+    requested_target = await _resolve_requested_code_for_pending_add(state, msg, platform, user_id)
+    if requested_target is not None:
+        target_code, is_occupied = requested_target
+        if not is_occupied:
+            return await _execute_add_to_draft(state.word, target_code, platform, user_id)
+        return await _execute_confirmed_tool(
+            PendingToolConfirm(
+                function_name="keytao_create_phrase",
+                args={"word": state.word, "code": target_code},
+            ),
+            platform,
+            user_id,
+        )
+
     target_code: Optional[str] = None
     is_occupied = False
 
@@ -1124,6 +1237,9 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      keytao_encode(word) + keytao_lookup_by_word(word)
          如果用户指定了目标编码/编码系列（例如“放到 ffb 系列”“用 ff=zh,zh”），
          必须调用 keytao_encode(word, requested_code=目标编码或系列前缀)，用 requestedCodeAnalysis 判断是否支持。
+         如果用户是在纠正单字读音/双拼音码（例如“ch eng 应该是 jr”“以 jr 的编码加”），
+         jr 这类两码通常只是“声母+韵母”的音码前缀，不等于完整单字编码；必须结合 keytao_encode 返回的
+         alternatePronunciationCodes / requestedCandidateCodes / candidateStatuses，沿该读音的形码链选择空位。
 
    【第二步】判断：
      A) 词库已有 → 展示词库位置 + 拆分，流程结束
@@ -1134,6 +1250,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
          如果 occupancyChecked=false 或没有 candidateStatuses，才取 candidateCodes/codes + altCodes，
          调用 keytao_lookup_by_codes_batch 查每个码位。
          飞键候选必须以工具返回的 altCodes / flyKeyVariants / candidateStatuses 为准；
+         多音单字候选必须以工具返回的 alternatePronunciationCodes / requestedCandidateCodes 为准；
          支持固定规则组合候选，如 zh 的 q/f 双键位组合，禁止自己泛化到规则外键位。
          ⚠️ 禁止向用户展示“待查占用”；回复前必须得到“已有「...」”或“空位”。
 

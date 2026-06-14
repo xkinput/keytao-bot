@@ -2,6 +2,9 @@
 Keytao Lookup Skill Tools
 键道查词工具实现
 """
+import re
+import unicodedata
+
 import httpx
 from typing import Dict, List, Optional
 from nonebot.log import logger
@@ -79,6 +82,240 @@ def _has_valid_codes(codes: List[str]) -> bool:
     return bool(codes) and all("?" not in code for code in codes)
 
 
+_FINAL_CODE_MAP = {
+    "iu": "q",
+    "ua": "q",
+    "ei": "w",
+    "un": "w",
+    "vn": "w",
+    "e": "e",
+    "eng": "r",
+    "ueng": "r",
+    "ng": "r",
+    "uan": "t",
+    "van": "t",
+    "iong": "y",
+    "ong": "y",
+    "ang": "p",
+    "a": "s",
+    "ia": "s",
+    "ie": "d",
+    "ou": "d",
+    "an": "f",
+    "ing": "g",
+    "uai": "g",
+    "ai": "h",
+    "ue": "h",
+    "ve": "h",
+    "er": "j",
+    "u": "j",
+    "i": "k",
+    "o": "l",
+    "uo": "l",
+    "v": "l",
+    "ao": "z",
+    "iang": "x",
+    "uang": "x",
+    "iao": "c",
+    "in": "b",
+    "ui": "b",
+    "en": "n",
+    "ian": "m",
+}
+
+_ZERO_INITIAL_CODES = {
+    "a": "xs",
+    "ai": "xh",
+    "an": "xf",
+    "ang": "xp",
+    "ao": "xz",
+    "e": "xe",
+    "ei": "xw",
+    "en": "xn",
+    "eng": "xr",
+    "er": "xj",
+    "o": "xl",
+    "ou": "xd",
+}
+
+_CH_INITIAL_BY_FINAL = {
+    "ai": "j",
+    "an": "j",
+    "ang": "j",
+    "en": "j",
+    "eng": "j",
+    "u": "j",
+    "un": "j",
+    "ao": "j",
+    "e": "j",
+    "a": "w",
+    "i": "w",
+    "ong": "w",
+    "ou": "w",
+    "ua": "w",
+    "uai": "w",
+    "uan": "w",
+    "uang": "w",
+    "ui": "w",
+    "uo": "w",
+}
+
+_ZH_INITIAL_BY_FINAL = {
+    "an": "q",
+    "ang": "q",
+    "ei": "q",
+    "en": "q",
+    "eng": "q",
+    "u": "q",
+    "un": "q",
+    "ai": "q",
+    "ao": "q",
+    "e": "q",
+    "a": "f",
+    "i": "f",
+    "ong": "f",
+    "ou": "f",
+    "ua": "f",
+    "uai": "f",
+    "uan": "f",
+    "uang": "f",
+    "ui": "f",
+    "uo": "f",
+}
+
+_INITIALS = (
+    "zh", "ch", "sh",
+    "b", "p", "m", "f", "d", "t", "n", "l",
+    "g", "k", "h", "j", "q", "x", "r", "z", "c", "s", "y", "w",
+)
+
+
+def _strip_pinyin_tone(pinyin: str) -> str:
+    normalized = unicodedata.normalize("NFD", pinyin.strip().lower())
+    without_marks = "".join(
+        char for char in normalized
+        if unicodedata.category(char) != "Mn"
+    )
+    return (
+        without_marks
+        .replace("ü", "v")
+        .replace("u:", "v")
+        .replace("ê", "e")
+    )
+
+
+def _split_pinyin(pinyin: str) -> Optional[tuple[str, str]]:
+    plain = _strip_pinyin_tone(pinyin)
+    plain = re.sub(r"[^a-zv]", "", plain)
+    if not plain:
+        return None
+
+    if plain in _ZERO_INITIAL_CODES:
+        return "", plain
+
+    for initial in _INITIALS:
+        if plain.startswith(initial) and len(plain) > len(initial):
+            return initial, plain[len(initial):]
+    return "", plain
+
+
+def _normalize_final(initial: str, final: str) -> str:
+    if final == "iong":
+        return "iong"
+    if initial in {"j", "q", "x", "y"}:
+        if final == "u":
+            return "v"
+        if final.startswith("u"):
+            possible_v_final = "v" + final[1:]
+            if possible_v_final in _FINAL_CODE_MAP:
+                return possible_v_final
+    return final
+
+
+def _pinyin_to_phonetic_code(pinyin: str) -> Optional[str]:
+    split = _split_pinyin(pinyin)
+    if not split:
+        return None
+    initial, raw_final = split
+
+    if not initial:
+        normalized_final = _normalize_final(initial, raw_final)
+        return _ZERO_INITIAL_CODES.get(normalized_final)
+
+    final = _normalize_final(initial, raw_final)
+    final_code = _FINAL_CODE_MAP.get(final)
+    if not final_code:
+        return None
+
+    if initial == "ch":
+        initial_code = _CH_INITIAL_BY_FINAL.get(final)
+    elif initial == "zh":
+        initial_code = _ZH_INITIAL_BY_FINAL.get(final)
+    elif initial == "sh":
+        initial_code = "e"
+    else:
+        initial_code = initial
+
+    if not initial_code:
+        return None
+    return f"{initial_code}{final_code}"
+
+
+def _build_single_char_code_chain(phonetic_code: str, shape_code: object) -> List[str]:
+    if not phonetic_code or not isinstance(shape_code, str):
+        return []
+    return _clean_code_list(
+        [
+            phonetic_code + shape_code[:index]
+            for index in range(0, len(shape_code) + 1)
+        ]
+    )
+
+
+def _build_alternate_pronunciation_codes(chars: List[Dict]) -> List[Dict]:
+    if len(chars) != 1:
+        return []
+
+    char_info = chars[0]
+    pinyins = char_info.get("pinyins", [])
+    if not isinstance(pinyins, list):
+        return []
+
+    default_pinyin = char_info.get("pinyin", "")
+    default_phonetic = char_info.get("phoneticCode", "")
+    shape_code = char_info.get("shapeCode")
+
+    variants: List[Dict] = []
+    seen_codes = set()
+    for pinyin in pinyins:
+        if not isinstance(pinyin, str) or not pinyin.strip():
+            continue
+        phonetic_code = _pinyin_to_phonetic_code(pinyin)
+        if not phonetic_code or phonetic_code in seen_codes:
+            continue
+        code_chain = _build_single_char_code_chain(phonetic_code, shape_code)
+        if not code_chain:
+            continue
+        seen_codes.add(phonetic_code)
+        variants.append({
+            "pinyin": pinyin,
+            "phoneticCode": phonetic_code,
+            "codes": code_chain,
+            "isDefault": phonetic_code == default_phonetic or pinyin == default_pinyin,
+        })
+    return variants
+
+
+def _requested_code_from_analysis(*sources: Dict) -> Optional[str]:
+    for source in sources:
+        analysis = source.get("requestedCodeAnalysis")
+        if isinstance(analysis, dict):
+            code = analysis.get("code")
+            if isinstance(code, str) and code.strip():
+                return code.strip().lower()
+    return None
+
+
 def _clean_encode_chars(chars: object) -> List[Dict]:
     if not isinstance(chars, list):
         return []
@@ -120,7 +357,30 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         alt_codes = encode_alt_codes or infer_alt_codes
         code_source = "invalid"
 
-    candidate_codes = _clean_code_list([*codes, *alt_codes])
+    chars = _clean_encode_chars(encode_data.get("chars"))
+    alternate_pronunciation_codes = _build_alternate_pronunciation_codes(chars)
+    alternate_codes = _clean_code_list(
+        [
+            code
+            for variant in alternate_pronunciation_codes
+            for code in variant.get("codes", [])
+            if isinstance(variant, dict)
+        ]
+    )
+    requested_code = _requested_code_from_analysis(encode_data, infer_data)
+    requested_candidate_codes = _clean_code_list(
+        [
+            code for code in alternate_codes
+            if requested_code and code.startswith(requested_code)
+        ]
+    )
+
+    candidate_codes = _clean_code_list([
+        *requested_candidate_codes,
+        *codes,
+        *alt_codes,
+        *alternate_codes,
+    ])
     base_code = codes[0] if codes else None
     suggestion = infer_data.get("suggestion")
     recommended_code = suggestion if isinstance(suggestion, str) and "?" not in suggestion else None
@@ -139,9 +399,11 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         "candidateCodes": candidate_codes,
         "codes": codes,
         "altCodes": alt_codes,
+        "alternatePronunciationCodes": alternate_pronunciation_codes,
+        "requestedCandidateCodes": requested_candidate_codes,
         "flyKeyVariants": encode_data.get("flyKeyVariants") or infer_data.get("flyKeyVariants") or [],
         "codeSource": code_source,
-        "chars": _clean_encode_chars(encode_data.get("chars")),
+        "chars": chars,
     }
 
     for key in ("suggestion", "suggestionIndex", "isBaseConflict", "wordExists", "requestedCodeAnalysis"):
@@ -195,12 +457,27 @@ def _apply_candidate_occupancy(encoding: Dict, lookup_result: Dict) -> Dict:
         _format_candidate_status(code, result_map.get(code, []))
         for code in candidate_codes
     ]
+    requested_candidate_codes = encoding.get("requestedCandidateCodes", [])
+    requested_code_set = {
+        code for code in requested_candidate_codes
+        if isinstance(code, str)
+    }
+    first_requested_available = next(
+        (
+            item["code"] for item in statuses
+            if item["code"] in requested_code_set and not item["occupied"]
+        ),
+        None,
+    )
     first_available = next((item["code"] for item in statuses if not item["occupied"]), None)
 
     encoding["occupancyChecked"] = True
     encoding["candidateStatuses"] = statuses
     encoding["firstAvailableCode"] = first_available
-    if first_available:
+    if first_requested_available:
+        encoding["firstRequestedAvailableCode"] = first_requested_available
+        encoding["recommendedCode"] = first_requested_available
+    elif first_available:
         encoding["recommendedCode"] = first_available
     return encoding
 
@@ -665,7 +942,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_encode",
-            "description": "按键道规则计算词条的编码、候选码占用情况和字根拆分。返回的 candidateStatuses 是已经查过占用的候选列表，禁止回复'待查占用'；candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
+            "description": "按键道规则计算词条的编码、候选码占用情况和字根拆分。返回的 candidateStatuses 是已经查过占用的候选列表，禁止回复'待查占用'；candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。单字多音字会额外返回 alternatePronunciationCodes，并把其它读音的合法候选并入 candidateCodes；用户纠正读音或给出音码前缀时，应传 requested_code 并优先使用 requestedCandidateCodes/firstRequestedAvailableCode。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
             "parameters": {
                 "type": "object",
                 "properties": {
