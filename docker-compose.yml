@@ -3,6 +3,9 @@ services:
     image: mlikiowa/napcat-docker:latest
     container_name: napcat
     restart: always
+    depends_on:
+      bot:
+        condition: service_healthy
     environment:
       - NAPCAT_UID=${NAPCAT_UID:-1000}
       - NAPCAT_GID=${NAPCAT_GID:-1000}
@@ -28,8 +31,12 @@ services:
       - .:/app
     networks:
       - bot-net
-    depends_on:
-      - napcat
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 8080))\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
 
   napcat-watchdog:
     image: alpine:latest
