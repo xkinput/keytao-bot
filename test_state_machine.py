@@ -99,6 +99,7 @@ from keytao_bot.plugins.openai_chat import (
     _to_markdownv2,
     _try_handle_replace_char,
     _is_clear_command_text,
+    _is_sensitive_pending_control_text,
     PendingAddWord,
     PendingToolConfirm,
     CONFIRM_WORDS,
@@ -113,6 +114,7 @@ from keytao_bot.harness.state import MemoryConversationStateStore
 from keytao_bot.harness.tools import ToolContext, ToolExecutor
 from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
 from keytao_bot.utils.history_store import HistoryStore
+from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 import keytao_bot.plugins.openai_chat as openai_chat_module
 
 _lookup_tools_path = os.path.join(
@@ -949,6 +951,16 @@ def test_pending_reply_prefix_stripping():
     check("prefixed confirm still confirms", _is_confirm(_strip_command_message_prefixes("喵喵 是")))
 
 
+def test_sensitive_pending_control_text():
+    print("\n🧪 sensitive pending control text")
+
+    check("确认 is sensitive", _is_sensitive_pending_control_text("确认"))
+    check("prefixed confirm is sensitive", _is_sensitive_pending_control_text("喵喵 确认"))
+    check("cancel is sensitive", _is_sensitive_pending_control_text("取消"))
+    check("submit confirm is sensitive", _is_sensitive_pending_control_text("确认提交"))
+    check("normal lookup is not sensitive", not _is_sensitive_pending_control_text("查词 增香"))
+
+
 def test_memory_conversation_state_store():
     """Verify the explicit state-store seam preserves pending state behavior."""
     print("\n🧪 MemoryConversationStateStore")
@@ -969,6 +981,71 @@ def test_memory_conversation_state_store():
     store.set(key, state)
     store.delete(key)
     check("empty after delete", not store.contains(key))
+
+
+def test_memory_conversation_state_store_owner_scope():
+    print("\n🧪 MemoryConversationStateStore owner scope")
+
+    store = MemoryConversationStateStore()
+    owner_key = ("qq", "1001")
+    other_key = ("qq", "2002")
+    same_group = ("qq", "qq:group:42")
+    other_group = ("qq", "qq:group:43")
+    state = PendingToolConfirm(
+        function_name="keytao_submit_batch",
+        args={},
+    )
+
+    store.set(owner_key, state, space_key=same_group)
+    check("owner state is present", store.contains(owner_key))
+    check("same owner is not other", store.find_pending_for_other_owner(same_group, owner_key) is None)
+    check("other user in same group is detected", store.find_pending_for_other_owner(same_group, other_key) is not None)
+    check("other group is ignored", store.find_pending_for_other_owner(other_group, other_key) is None)
+
+
+def test_scoped_memory_store_builds_compressed_context():
+    print("\n🧪 ScopedMemoryStore compressed context")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = ScopedMemoryStore(os.path.join(tmpdir, "memory.db"))
+        context = ChatMemoryContext(
+            platform="qq",
+            user_id="1001",
+            space_type="group",
+            space_id="42",
+            speaker_name="Alice",
+            target_name="喵喵",
+        )
+        store.add_conversation_round(
+            context,
+            "喵喵 把增香加到 zrxx",
+            "✅ 已将「增香」以编码 zrxx 加入草稿\n\n当前草稿（共 1 条）：\n• 新增 增香 → zrxx",
+        )
+        block = store.get_context_block(context)
+
+    check("memory block has global section", "全局记忆" in block)
+    check("memory block has group section", "本对话空间记忆" in block)
+    check("memory block has user section", "当前用户个人记忆" in block)
+    check("assistant reply compressed draft action", "已处理加词草稿" in block)
+    check("memory says it grants no permission", "不授予任何操作权限" in block)
+
+
+def test_agent_request_context_scope_key_format():
+    print("\n🧪 AgentRequestContext scope key format")
+
+    group_context = AgentRequestContext(
+        platform="qq",
+        user_id="1001",
+        space_type="group",
+        space_id="42",
+    )
+    private_context = AgentRequestContext(
+        platform="telegram",
+        user_id="2002",
+    )
+
+    check("group space key includes platform namespace", group_context.space_key == ("qq", "qq:group:42"))
+    check("private space key includes platform namespace", private_context.space_key == ("telegram", "telegram:private:2002"))
 
 
 def test_recover_pending_add_word_from_history():
@@ -1654,7 +1731,11 @@ if __name__ == "__main__":
     test_bind_command_text_detection()
     test_clear_command_text_detection()
     test_pending_reply_prefix_stripping()
+    test_sensitive_pending_control_text()
     test_memory_conversation_state_store()
+    test_memory_conversation_state_store_owner_scope()
+    test_scoped_memory_store_builds_compressed_context()
+    test_agent_request_context_scope_key_format()
     test_recover_pending_add_word_from_history()
     test_recover_pending_submit_confirm_from_history()
     test_recover_pending_state_ignores_stale_assistant_prompt()

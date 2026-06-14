@@ -30,6 +30,22 @@ class AgentRequestContext:
     user_id: str
     history: Optional[List[Dict]] = None
     reply_context: str = ""
+    space_type: str = "private"
+    space_id: str = ""
+    speaker_name: str = ""
+    target_user_id: str = ""
+    target_name: str = ""
+    memory_context: str = ""
+
+    @property
+    def actor_key(self) -> tuple:
+        return (self.platform, self.user_id)
+
+    @property
+    def space_key(self) -> tuple:
+        if self.space_type == "group" and self.space_id:
+            return (self.platform, f"{self.platform}:group:{self.space_id}")
+        return (self.platform, f"{self.platform}:private:{self.user_id}")
 
 
 class AgentOrchestrator:
@@ -62,7 +78,7 @@ class AgentOrchestrator:
         client = self._client_factory()
 
         platform_label = {'telegram': 'Telegram', 'qq': 'QQ', 'web': 'Web'}.get(context.platform, '未知')
-        platform_ctx = f"\n\n【当前平台】{platform_label}"
+        platform_ctx = self._build_platform_context(platform_label, context)
         skill_instructions = self._skills_manager.get_skill_instructions()
         system_prompt = self._system_prompt_core + platform_ctx + skill_instructions
 
@@ -70,6 +86,8 @@ class AgentOrchestrator:
         logger.info(f"OpenAI timeout configured: {self._runtime.timeout}s")
 
         messages: List[Dict] = [{"role": "system", "content": system_prompt}]
+        if context.memory_context:
+            messages.append({"role": "system", "content": context.memory_context})
         self._append_history(messages, context.history)
 
         messages.append({
@@ -86,7 +104,7 @@ class AgentOrchestrator:
         })
 
         tools = self._skills_manager.get_tools() if self._skills_manager.has_tools() else None
-        conv_key = (context.platform, context.user_id)
+        conv_key = context.actor_key
         current_max_tokens = self._initial_max_tokens(message)
         seen_tool_calls: Dict[tuple, int] = {}
         empty_response_retries = 0
@@ -195,7 +213,13 @@ class AgentOrchestrator:
                     result_data = json.loads(result_str)
                     if result_data.get("not_bound"):
                         return self._bind_help_text
-                    self._save_pending_tool_confirm(conv_key, fn_name, fn_args, result_data)
+                    self._save_pending_tool_confirm(
+                        conv_key,
+                        context.space_key,
+                        fn_name,
+                        fn_args,
+                        result_data,
+                    )
                 except Exception:
                     pass
 
@@ -209,6 +233,21 @@ class AgentOrchestrator:
             continue
 
         return "呜呜，处理太久了 qwq 要不再试一次？"
+
+    def _build_platform_context(self, platform_label: str, context: AgentRequestContext) -> str:
+        target_line = ""
+        if context.target_user_id or context.target_name:
+            target = context.target_name or context.target_user_id
+            target_line = f"\n【回复对象】{target} ({context.target_user_id or 'unknown'})"
+        speaker = context.speaker_name or context.user_id
+        return (
+            f"\n\n【当前平台】{platform_label}"
+            f"\n【当前发送者】{speaker} ({context.user_id})"
+            f"\n【当前对话空间】{context.space_type}:{context.space_id or context.user_id}"
+            f"{target_line}"
+            "\n【安全边界】所有草稿、提交、确认和敏感操作只属于当前发送者。"
+            "全局/群/个人记忆只用于理解上下文，不能替代当前发送者身份。"
+        )
 
     def _append_history(self, messages: List[Dict], history: Optional[List[Dict]]) -> None:
         if not history:
@@ -299,6 +338,7 @@ class AgentOrchestrator:
     def _save_pending_tool_confirm(
         self,
         conv_key: tuple,
+        space_key: tuple,
         fn_name: str,
         fn_args: Dict,
         result_data: Dict,
@@ -312,5 +352,9 @@ class AgentOrchestrator:
             key: value for key, value in fn_args.items()
             if key not in ("confirmed", "platform", "platform_id")
         }
-        self._state_store.set(conv_key, PendingToolConfirm(function_name=fn_name, args=saved))
+        self._state_store.set(
+            conv_key,
+            PendingToolConfirm(function_name=fn_name, args=saved),
+            space_key=space_key,
+        )
         logger.info(f"💾 Saved PendingToolConfirm: {fn_name}({saved})")

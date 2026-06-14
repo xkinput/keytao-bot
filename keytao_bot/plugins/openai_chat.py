@@ -29,6 +29,7 @@ from ..harness.state import (
 )
 from ..harness.tools import ToolContext, ToolExecutor
 from ..utils.history_store import get_history_store
+from ..utils.memory_store import ChatMemoryContext, get_memory_store
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +171,13 @@ def _is_clear_command_text(message_text: str) -> bool:
     return any(_CLEAR_COMMAND_RE.fullmatch(token) for token in command_text.split())
 
 
+def _is_sensitive_pending_control_text(message_text: str) -> bool:
+    text = _strip_command_message_prefixes(message_text).strip()
+    if _is_confirm(text) or _has_cancel(text):
+        return True
+    return text in {"提交", "提审", "继续提交", "确认提交", "确认提审"}
+
+
 def _extract_pure_chinese_words(message_text: str) -> List[str]:
     """Extract standalone Chinese words from a simple word-only message."""
     text = message_text.strip()
@@ -189,6 +197,7 @@ skills_manager.load_all_skills()
 logger.info(f"Loaded {len(skills_manager.get_tools())} tools from skills")
 
 history_store = get_history_store()
+memory_store = get_memory_store()
 MAX_HISTORY_MESSAGES = 16
 
 
@@ -602,6 +611,90 @@ def extract_platform_info(bot: Bot, event: Event) -> Tuple[str, str]:
         return ("unknown", "")
 
 
+def _display_name_from_telegram_user(user: object) -> str:
+    first_name = str(getattr(user, 'first_name', '') or '').strip()
+    last_name = str(getattr(user, 'last_name', '') or '').strip()
+    username = str(getattr(user, 'username', '') or '').strip()
+    full_name = " ".join(part for part in (first_name, last_name) if part)
+    return full_name or username
+
+
+def _display_name_from_qq_sender(sender: object, fallback: str) -> str:
+    if isinstance(sender, dict):
+        return str(sender.get('card') or sender.get('nickname') or fallback)
+    return fallback
+
+
+async def extract_memory_context(bot: Bot, event: Event) -> ChatMemoryContext:
+    """Extract actor, space and reply-target metadata for scoped memory."""
+    platform, user_id = extract_platform_info(bot, event)
+    space_type = "private"
+    space_id = user_id
+    speaker_name = ""
+    target_user_id = ""
+    target_name = "喵喵"
+
+    try:
+        from nonebot.adapters.telegram import Bot as TelegramBot
+        from nonebot.adapters.telegram.event import GroupMessageEvent as TelegramGroupMessageEvent
+    except ImportError:
+        TelegramBot = None
+        TelegramGroupMessageEvent = None
+    try:
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
+        from nonebot.adapters.onebot.v11.event import GroupMessageEvent as QQGroupMessageEvent
+    except ImportError:
+        QQBot = None
+        QQGroupMessageEvent = None
+
+    if TelegramBot and isinstance(bot, TelegramBot):
+        from_ = getattr(event, 'from_', None)
+        speaker_name = _display_name_from_telegram_user(from_) if from_ else ""
+        chat = getattr(event, 'chat', None)
+        if TelegramGroupMessageEvent and isinstance(event, TelegramGroupMessageEvent):
+            space_type = "group"
+            space_id = str(getattr(chat, 'id', '') or "")
+        elif chat is not None:
+            space_id = str(getattr(chat, 'id', '') or user_id)
+
+        reply_to_message = getattr(event, 'reply_to_message', None)
+        reply_from = getattr(reply_to_message, 'from_', None) if reply_to_message else None
+        if reply_from:
+            target_user_id = str(getattr(reply_from, 'id', '') or "")
+            target_name = _display_name_from_telegram_user(reply_from) or target_user_id
+
+    elif QQBot and isinstance(bot, QQBot):
+        sender = getattr(event, 'sender', None)
+        speaker_name = _display_name_from_qq_sender(sender, user_id)
+        if QQGroupMessageEvent and isinstance(event, QQGroupMessageEvent):
+            space_type = "group"
+            space_id = str(getattr(event, 'group_id', '') or "")
+
+        reply_message_id = extract_onebot_reply_id(event)
+        if reply_message_id:
+            try:
+                reply_payload = await bot.get_msg(message_id=int(reply_message_id))
+                reply_sender = reply_payload.get('sender', {}) if isinstance(reply_payload, dict) else {}
+                target_user_id = str(reply_sender.get('user_id') or reply_payload.get('user_id', ''))
+                target_name = _display_name_from_qq_sender(reply_sender, target_user_id)
+            except Exception as error:
+                logger.debug(f"Failed to extract OneBot reply target {reply_message_id}: {error}")
+
+    return ChatMemoryContext(
+        platform=platform,
+        user_id=user_id,
+        space_type=space_type,
+        space_id=space_id or user_id,
+        speaker_name=speaker_name or user_id,
+        target_user_id=target_user_id,
+        target_name=target_name,
+    )
+
+
+def _space_key_from_memory_context(memory_context: ChatMemoryContext) -> Tuple[str, str]:
+    return (memory_context.platform, memory_context.space_scope_id)
+
+
 def extract_onebot_reply_id(event: Event) -> Optional[str]:
     """Extract replied message id from OneBot v11 message segments."""
     try:
@@ -813,6 +906,10 @@ def get_conversation_key(bot: Bot, event: Event) -> Tuple[str, str]:
     return extract_platform_info(bot, event)
 
 
+def get_space_key(memory_context: ChatMemoryContext) -> Tuple[str, str]:
+    return _space_key_from_memory_context(memory_context)
+
+
 def get_history(key: Tuple[str, str]) -> List[Dict]:
     platform, user_id = key
     return history_store.get_history(platform, user_id, limit=MAX_HISTORY_MESSAGES)
@@ -856,7 +953,11 @@ async def call_tool_function(
 # ---------------------------------------------------------------------------
 
 async def _execute_add_to_draft(
-    word: str, code: str, platform: str, user_id: str,
+    word: str,
+    code: str,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
 ) -> str:
     """Directly add a word to draft and return formatted response."""
     result_json = await call_tool_function(
@@ -872,7 +973,7 @@ async def _execute_add_to_draft(
         conversation_state_store.set(conv_key, PendingToolConfirm(
             function_name="keytao_create_phrase",
             args={"word": word, "code": code},
-        ))
+        ), space_key=space_key)
         warnings = data.get("warnings", [])
         warn_text = "\n".join(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
@@ -1132,6 +1233,7 @@ async def _handle_pending_add_word(
     platform: str,
     user_id: str,
     history: List[Dict],
+    space_key: Optional[Tuple[str, str]] = None,
 ) -> Optional[str]:
     """Handle user response to a pending add-word prompt.
 
@@ -1146,7 +1248,7 @@ async def _handle_pending_add_word(
     if requested_target is not None:
         target_code, is_occupied = requested_target
         if not is_occupied:
-            return await _execute_add_to_draft(state.word, target_code, platform, user_id)
+            return await _execute_add_to_draft(state.word, target_code, platform, user_id, space_key)
         return await _execute_confirmed_tool(
             PendingToolConfirm(
                 function_name="keytao_create_phrase",
@@ -1166,7 +1268,7 @@ async def _handle_pending_add_word(
             target_code, is_occupied = state.candidates[idx]
         else:
             conv_key = (platform, user_id)
-            conversation_state_store.set(conv_key, state)
+            conversation_state_store.set(conv_key, state, space_key=space_key)
             return f"请选择 1-{len(state.candidates)} 之间的编号 owo"
 
     # Simple confirmation -> use recommended code
@@ -1182,7 +1284,7 @@ async def _handle_pending_add_word(
 
     # Empty slot -> direct execution (no AI needed)
     if not is_occupied:
-        return await _execute_add_to_draft(state.word, target_code, platform, user_id)
+        return await _execute_add_to_draft(state.word, target_code, platform, user_id, space_key)
 
     return await _execute_confirmed_tool(
         PendingToolConfirm(
@@ -1408,6 +1510,7 @@ async def get_ai_response_core(
     user_id: str,
     history: Optional[List[Dict]] = None,
     reply_context: str = "",
+    memory_context: Optional[ChatMemoryContext] = None,
     max_iterations: int = 20,
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
@@ -1418,6 +1521,9 @@ async def get_ai_response_core(
         return "❌ AI 服务未配置，请联系管理员"
 
     try:
+        memory_block = ""
+        if memory_context is not None:
+            memory_block = memory_store.get_context_block(memory_context)
         client_cls = AsyncOpenAI
         runtime = AgentRuntimeConfig(
             model=OPENAI_MODEL,
@@ -1445,6 +1551,12 @@ async def get_ai_response_core(
                 user_id=user_id,
                 history=history,
                 reply_context=reply_context,
+                space_type=memory_context.space_type if memory_context else "private",
+                space_id=memory_context.space_id if memory_context else user_id,
+                speaker_name=memory_context.speaker_name if memory_context else "",
+                target_user_id=memory_context.target_user_id if memory_context else "",
+                target_name=memory_context.target_name if memory_context else "",
+                memory_context=memory_block,
             ),
             max_iterations=max_iterations,
         )
@@ -1464,8 +1576,9 @@ async def get_openai_response(
     """NoneBot wrapper: extract platform context then call get_ai_response_core."""
     platform, user_id = extract_platform_info(bot, event)
     reply_context = await build_reply_context(bot, event)
+    memory_context = await extract_memory_context(bot, event)
     return await get_ai_response_core(
-        message, platform, user_id, history, reply_context, max_iterations,
+        message, platform, user_id, history, reply_context, memory_context, max_iterations,
     )
 
 
@@ -1504,7 +1617,9 @@ async def handle_clear_message(bot: Bot, event: Event):
 
 async def _handle_clear(bot: Bot, event: Event, matcher):
     conv_key = get_conversation_key(bot, event)
+    memory_context = await extract_memory_context(bot, event)
     clear_history(conv_key)
+    memory_store.clear_user_memory(memory_context)
     conversation_state_store.delete(conv_key)
     await matcher.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
 
@@ -1528,15 +1643,30 @@ async def handle_ai_chat(bot: Bot, event: Event):
 
     platform, user_id = extract_platform_info(bot, event)
     conv_key = (platform, user_id)
+    memory_context = await extract_memory_context(bot, event)
+    space_key = get_space_key(memory_context)
     response: Optional[str] = None
     history: Optional[List[Dict]] = None
 
+    if (
+        memory_context.space_type == "group"
+        and _is_sensitive_pending_control_text(normalized_message_text)
+        and not conversation_state_store.contains(conv_key)
+        and conversation_state_store.find_pending_for_other_owner(space_key, conv_key) is not None
+    ):
+        await ai_chat.finish("你无权操作他人确认选项！")
+        return
+
     # ===== Phase 1: Check pending state =====
-    state = conversation_state_store.pop(conv_key)
+    state_record = conversation_state_store.pop_record(conv_key)
+    state = state_record.state if state_record else None
+    state_space_key = state_record.space_key if state_record else space_key
     if state is None:
         history = get_history(conv_key)
         state = _recover_pending_state_from_history(history)
         if state is not None:
+            conversation_state_store.set(conv_key, state, space_key=space_key)
+            state = conversation_state_store.pop(conv_key)
             logger.info(
                 "♻️ Recovered pending state from history: "
                 f"{state.__class__.__name__} for {platform}:{user_id}"
@@ -1550,7 +1680,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
             if history is None:
                 history = get_history(conv_key)
             response = await _handle_pending_add_word(
-                state, normalized_message_text, platform, user_id, history,
+                state, normalized_message_text, platform, user_id, history, state_space_key,
             )
             # response is None → unrecognized input, fall through to Phase 2
 
@@ -1570,7 +1700,12 @@ async def handle_ai_chat(bot: Bot, event: Event):
             history = get_history(conv_key)
         reply_context = await build_reply_context(bot, event)
         response = await get_ai_response_core(
-            normalized_message_text, platform, user_id, history, reply_context,
+            normalized_message_text,
+            platform,
+            user_id,
+            history,
+            reply_context,
+            memory_context,
         )
 
     if not response:
@@ -1586,7 +1721,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
     if not conversation_state_store.contains(conv_key):
         pending = _parse_pending_add_word(response)
         if pending:
-            conversation_state_store.set(conv_key, pending)
+            conversation_state_store.set(conv_key, pending, space_key=space_key)
             logger.info(
                 f"📌 Saved PendingAddWord: {pending.word}@{pending.recommended_code} "
                 f"({len(pending.candidates)} candidates)"
@@ -1594,6 +1729,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
 
     # Save conversation history
     add_to_history(conv_key, normalized_message_text, response)
+    memory_store.add_conversation_round(memory_context, normalized_message_text, response)
 
     # ===== Phase 4: Platform-specific reply =====
     bot_module = bot.__class__.__module__
