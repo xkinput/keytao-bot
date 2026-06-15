@@ -227,6 +227,41 @@ class ScopedMemoryStore:
             )
             conn.commit()
 
+    def get_recent_operations(
+        self,
+        memory_context: ChatMemoryContext,
+        include_current_user_only: bool = False,
+        limit: int = 8,
+    ) -> List[Dict]:
+        """Return recent structured dictionary-operation memories."""
+        scope_id = memory_context.user_scope_id if include_current_user_only else memory_context.space_scope_id
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT speaker_id, speaker_name, content, timestamp
+                FROM memory_entries
+                WHERE scope = ?
+                  AND scope_id = ?
+                  AND role = 'memory'
+                  AND target_name = '词库操作'
+                ORDER BY id DESC
+                LIMIT ?
+            """, (
+                "user" if include_current_user_only else "group",
+                scope_id,
+                limit,
+            ))
+            rows = cursor.fetchall()
+        return [
+            {
+                "speaker_id": row[0],
+                "speaker_name": row[1],
+                "content": row[2],
+                "timestamp": row[3],
+            }
+            for row in rows
+        ]
+
     def _get_summary(self, scope: str, scope_id: str) -> str:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -431,7 +466,7 @@ def _extract_operation_memories(
 
     return [
         (
-            f"词库操作：{actor}({memory_context.user_id}) {status}"
+            f"词库操作：{actor} {status}"
             f"「{word_code['word']}」 @ {word_code['code']}；"
             f"用户原话：{user_intent}"
         )

@@ -1444,6 +1444,17 @@ _RE_REPLACE_CHAR = re.compile(
     r'["\u201c\u300c]?(.)["\u201d\u300d]?改[为成]["\u201c\u300c]?(.)["\u201d\u300d]?[：:，,\s]'
 )
 _RE_WORD_CODE_LINE = re.compile(r'^(\S+)\s+([a-z]+)\s*$')
+_OPERATION_RECALL_RE = re.compile(
+    r"(?:你|喵喵|bot|机器人).{0,8}(?:前面|刚刚|最近|之前).{0,10}(?:加了|加过|提交|经手|做过).{0,8}(?:词|词条)"
+    r"|(?:所有人|群友|大家).{0,10}(?:加了|加过|提交|经手|做过).{0,8}(?:词|词条)"
+    r"|(?:前面|刚刚|最近|之前).{0,12}(?:谁|哪位|哪些人|有人).{0,8}(?:加了|加过|提交|经手|做过).{0,8}(?:词|词条)"
+)
+_SELF_OPERATION_RECALL_RE = re.compile(
+    r"(?:我|俺|本人|自己).{0,8}(?:前面|刚刚|最近|之前).{0,10}(?:加了|加过|提交|经手|做过).{0,8}(?:词|词条)"
+)
+_OPERATION_MEMORY_PREFIX_RE = re.compile(
+    r"^词库操作：(?P<actor>.+?)(?:[（(][^)）]+[）)])?\s+(?P<rest>(?:已提交审核|已加入草稿).*)$"
+)
 _TYPE_HINTS = [
     ("声笔笔单字", "CSSSingle"),
     ("CSSSingle", "CSSSingle"),
@@ -1513,6 +1524,53 @@ async def _try_handle_replace_char(
         parts.append("❌ 未写入：\n" + "\n".join(failed_lines))
 
     return "\n".join(parts)
+
+
+def _try_handle_operation_recall(
+    message: str,
+    memory_context: ChatMemoryContext,
+) -> Optional[str]:
+    """Answer recent bot-mediated dictionary operation recall from memory."""
+    text = message.strip()
+    if not text:
+        return None
+
+    current_user_only = bool(_SELF_OPERATION_RECALL_RE.search(text))
+    if not current_user_only and not _OPERATION_RECALL_RE.search(text):
+        return None
+
+    operations = memory_store.get_recent_operations(
+        memory_context,
+        include_current_user_only=current_user_only,
+        limit=8,
+    )
+    if not operations:
+        scope_text = "你自己" if current_user_only else "这个群里"
+        return f"我这里还没有记到{scope_text}最近通过喵喵经手的加词/提交记录。"
+
+    lines = [
+        "最近通过喵喵经手的词库操作："
+        if not current_user_only else
+        "你最近通过喵喵经手的词库操作："
+    ]
+    for item in operations:
+        lines.append(f"• {_format_operation_memory_for_reply(item)}")
+    lines.append("\n这里只统计通过喵喵处理过的记录；网页端或其他方式直接操作的草稿，我不会假装知道。")
+    return "\n".join(lines)
+
+
+def _format_operation_memory_for_reply(item: Dict) -> str:
+    content = str(item.get("content") or "").strip()
+    speaker_name = str(item.get("speaker_name") or "").strip()
+    match = _OPERATION_MEMORY_PREFIX_RE.match(content)
+    if not match:
+        return re.sub(r"([^\s（(]+)[（(]\d{4,}[）)]", r"\1", content)
+
+    actor = speaker_name or match.group("actor").strip()
+    rest = match.group("rest").strip()
+    if not rest:
+        return actor
+    return f"{actor} {rest}"
 
 
 # ---------------------------------------------------------------------------
@@ -1756,42 +1814,48 @@ async def handle_ai_chat(bot: Bot, event: Event):
         await ai_chat.finish("你无权操作他人确认选项！")
         return
 
+    response = _try_handle_operation_recall(normalized_message_text, memory_context)
+
     # ===== Phase 1: Check pending state =====
-    state_record = conversation_state_store.pop_record(conv_key)
-    state = state_record.state if state_record else None
-    state_space_key = state_record.space_key if state_record else space_key
-    if state is None:
-        history = get_history(conv_key)
-        state = _recover_pending_state_from_history(history)
+    if response is None:
+        state_record = conversation_state_store.pop_record(conv_key)
+        state = state_record.state if state_record else None
+        state_space_key = state_record.space_key if state_record else space_key
+        if state is None:
+            history = get_history(conv_key)
+            state = _recover_pending_state_from_history(history)
+            if state is not None:
+                conversation_state_store.set(conv_key, state, space_key=space_key)
+                state = conversation_state_store.pop(conv_key)
+                logger.info(
+                    "♻️ Recovered pending state from history: "
+                    f"{state.__class__.__name__} for {platform}:{user_id}"
+                )
+
         if state is not None:
-            conversation_state_store.set(conv_key, state, space_key=space_key)
-            state = conversation_state_store.pop(conv_key)
-            logger.info(
-                "♻️ Recovered pending state from history: "
-                f"{state.__class__.__name__} for {platform}:{user_id}"
-            )
+            if _has_cancel(normalized_message_text):
+                response = "好的，已取消 owo"
 
-    if state is not None:
-        if _has_cancel(normalized_message_text):
-            response = "好的，已取消 owo"
+            elif isinstance(state, PendingAddWord):
+                if history is None:
+                    history = get_history(conv_key)
+                response = await _handle_pending_add_word(
+                    state, normalized_message_text, platform, user_id, history, state_space_key,
+                )
+                # response is None → unrecognized input, fall through to Phase 2
 
-        elif isinstance(state, PendingAddWord):
-            if history is None:
-                history = get_history(conv_key)
-            response = await _handle_pending_add_word(
-                state, normalized_message_text, platform, user_id, history, state_space_key,
-            )
-            # response is None → unrecognized input, fall through to Phase 2
+            elif isinstance(state, PendingToolConfirm):
+                # "提交" when pending state is submit_batch also counts as confirm
+                is_submit_reconfirm = (
+                    state.function_name == "keytao_submit_batch"
+                    and normalized_message_text.strip() in {"提交", "提审"}
+                )
+                if _is_confirm(normalized_message_text) or is_submit_reconfirm:
+                    response = await _execute_confirmed_tool(state, platform, user_id)
+                # else: response stays None, fall through to AI as new request
 
-        elif isinstance(state, PendingToolConfirm):
-            # "提交" when pending state is submit_batch also counts as confirm
-            is_submit_reconfirm = (
-                state.function_name == "keytao_submit_batch"
-                and normalized_message_text.strip() in {"提交", "提审"}
-            )
-            if _is_confirm(normalized_message_text) or is_submit_reconfirm:
-                response = await _execute_confirmed_tool(state, platform, user_id)
-            # else: response stays None, fall through to AI as new request
+            if response is None and state is not None:
+                conversation_state_store.set(conv_key, state, space_key=state_space_key)
 
     # ===== Phase 2: AI response (if not handled directly) =====
     if response is None:

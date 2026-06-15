@@ -247,6 +247,66 @@ def get_bot_token() -> Optional[str]:
         return None
 
 
+def _parse_json_mapping(value: object) -> Dict[str, str]:
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items() if v}
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        data = json.loads(value)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if v}
+
+
+def get_user_api_key(platform: str, platform_id: str) -> Optional[str]:
+    """Get a KeyTao user API key matching the bound platform account."""
+    try:
+        from nonebot import get_driver
+        driver = get_driver()
+        config = driver.config
+        mapping = _parse_json_mapping(
+            getattr(config, "keytao_user_api_keys", None)
+            or getattr(config, "bot_user_api_keys", None)
+        )
+        for key in (
+            f"{platform}:{platform_id}",
+            platform_id,
+            f"{platform}:default",
+            "default",
+        ):
+            if mapping.get(key):
+                return mapping[key]
+        return (
+            getattr(config, "keytao_api_key", None)
+            or getattr(config, "bot_user_api_key", None)
+        )
+    except Exception:
+        return None
+
+
+def get_bot_headers(
+    platform: Optional[str] = None,
+    platform_id: Optional[str] = None,
+    content_type: bool = False,
+) -> Dict[str, str]:
+    token = get_bot_token()
+    headers: Dict[str, str] = {}
+    if token:
+        headers["X-Bot-Token"] = token
+    if content_type:
+        headers["Content-Type"] = "application/json"
+
+    if platform and platform_id:
+        user_api_key = get_user_api_key(platform, platform_id)
+        if user_api_key:
+            headers["X-API-Key"] = user_api_key
+
+    return headers
+
+
 async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[str]:
     """
     Get or create the latest draft batch for the user
@@ -275,7 +335,7 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 url,
-                headers={"X-Bot-Token": BOT_API_TOKEN},
+                headers=get_bot_headers(platform, platform_id),
                 params={"platform": platform, "platformId": platform_id}
             )
 
@@ -480,10 +540,7 @@ async def keytao_create_phrase(
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 url,
-                headers={
-                    "X-Bot-Token": BOT_API_TOKEN,
-                    "Content-Type": "application/json"
-                },
+                headers=get_bot_headers(platform, platform_id, content_type=True),
                 json=request_data
             )
             
@@ -572,10 +629,7 @@ async def keytao_submit_batch(
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 url,
-                headers={
-                    "X-Bot-Token": BOT_API_TOKEN,
-                    "Content-Type": "application/json"
-                },
+                headers=get_bot_headers(platform, platform_id, content_type=True),
                 json={
                     "platform": platform,
                     "platformId": platform_id,
@@ -696,7 +750,7 @@ async def keytao_recall_batch(
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.post(
                 url,
-                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                headers=get_bot_headers(platform, platform_id, content_type=True),
                 json={"platform": platform, "platformId": platform_id},
             )
             try:
@@ -738,7 +792,7 @@ async def keytao_list_draft_items(
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 url,
-                headers={"X-Bot-Token": BOT_API_TOKEN},
+                headers=get_bot_headers(platform, platform_id),
                 params={"platform": platform, "platformId": platform_id}
             )
 
@@ -792,7 +846,7 @@ async def keytao_remove_draft_item(
             response = await client.request(
                 "DELETE",
                 url,
-                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                headers=get_bot_headers(platform, platform_id, content_type=True),
                 content=json.dumps({"platform": platform, "platformId": platform_id})
             )
 
@@ -962,7 +1016,7 @@ async def keytao_batch_add_to_draft(
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 url,
-                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                headers=get_bot_headers(platform, platform_id, content_type=True),
                 json=request_data,
             )
             try:
@@ -1007,7 +1061,7 @@ async def keytao_batch_remove_draft_items(
             response = await client.request(
                 "DELETE", url,
                 json=payload,
-                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                headers=get_bot_headers(platform, platform_id, content_type=True),
             )
             try:
                 data: Dict = response.json()

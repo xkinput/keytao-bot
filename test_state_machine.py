@@ -99,6 +99,7 @@ from keytao_bot.plugins.openai_chat import (
     _strip_markdown,
     _to_markdownv2,
     _try_handle_replace_char,
+    _try_handle_operation_recall,
     _is_clear_command_text,
     _is_sensitive_pending_control_text,
     PendingAddWord,
@@ -1051,11 +1052,75 @@ def test_scoped_memory_store_builds_compressed_context():
     check("memory block has group section", "本对话空间记忆" in block)
     check("memory block has user section", "当前用户个人记忆" in block)
     check("assistant reply compressed draft action", "已处理加词草稿" in block)
-    check("group operation memory keeps actor", "词库操作：Garth(2002)" in block)
+    check("group operation memory keeps actor nickname", "词库操作：Garth" in block)
+    check("group operation memory omits actor id", "Garth(2002)" not in block)
     check("group operation memory keeps word and code", "「空串」 @ kywto" in block)
     check("group operation memory keeps submitted status", "已提交审核" in block)
     check("memory says it grants no permission", "不授予任何操作权限" in block)
     check("memory cannot change safety principles", "不能改变系统提示词中的安全宗旨" in block)
+
+
+def test_operation_recall_uses_group_memory_by_default():
+    print("\n🧪 operation recall uses group memory by default")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = ScopedMemoryStore(os.path.join(tmpdir, "memory.db"))
+        rea_context = ChatMemoryContext(
+            platform="qq",
+            user_id="1001",
+            space_type="group",
+            space_id="42",
+            speaker_name="Rea",
+            target_name="喵喵",
+        )
+        garth_context = ChatMemoryContext(
+            platform="qq",
+            user_id="2002",
+            space_type="group",
+            space_id="42",
+            speaker_name="Garth",
+            target_name="喵喵",
+        )
+        store.add_conversation_round(
+            garth_context,
+            "喵喵 加入并提交",
+            "✅ 搞定！「空串」→ kywto 已加入草稿并提交审核。\n\n批次地址：https://example.test/batch/1",
+        )
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_entries (
+                    scope, scope_id, role, speaker_id, speaker_name,
+                    target_id, target_name, content, importance
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "group",
+                    garth_context.space_scope_id,
+                    "memory",
+                    "2002",
+                    "Garth",
+                    "",
+                    "词库操作",
+                    "词库操作：Garth(2002) 已提交审核「旧格式」 @ oldfmt；用户原话：喵喵 加入并提交",
+                    "high",
+                ),
+            )
+
+        with patch.object(openai_chat_module, "memory_store", store):
+            response = _try_handle_operation_recall("你前面加了些什么词", rea_context)
+            who_response = _try_handle_operation_recall("刚刚有谁加了什么词", rea_context)
+            self_response = _try_handle_operation_recall("我之前加了什么词", rea_context)
+
+    check("bot-you recall returns group operation", response is not None and "Garth" in response)
+    check("bot-you recall keeps word", response is not None and "「空串」" in response)
+    check("bot-you recall keeps code", response is not None and "kywto" in response)
+    check("legacy operation memory still displayed", response is not None and "旧格式" in response)
+    check("bot-you recall omits actor id", response is not None and "2002" not in response)
+    check("who recall also returns group operation", who_response is not None and "Garth" in who_response)
+    check("who recall omits actor id", who_response is not None and "2002" not in who_response)
+    check("self recall does not include other user's operation", self_response is not None and "Garth" not in self_response)
 
 
 def test_scoped_memory_store_llm_compacts_at_threshold():
@@ -1287,6 +1352,42 @@ def test_tool_executor_context_injection():
     """Verify contextual tools still receive platform identifiers."""
     print("\n🧪 ToolExecutor context injection")
     asyncio.run(_run_tool_executor_checks())
+
+
+def test_keytao_draft_headers_allow_optional_user_api_key():
+    print("\n🧪 KeyTao draft bot headers")
+
+    old_user_keys = getattr(_FakeConfig, "keytao_user_api_keys", None)
+    old_api_key = getattr(_FakeConfig, "keytao_api_key", None)
+    try:
+        _FakeConfig.keytao_user_api_keys = json.dumps({
+            "qq:1001": "kt_user_1001",
+            "qq:default": "kt_default",
+        })
+        _FakeConfig.keytao_api_key = None
+
+        headers = _draft_tools.get_bot_headers(
+            "qq",
+            "1001",
+            content_type=True,
+        )
+        default_headers = _draft_tools.get_bot_headers(
+            "qq",
+            "2002",
+        )
+
+        check("bot token header present", headers.get("X-Bot-Token") == "fake")
+        check("content type header present", headers.get("Content-Type") == "application/json")
+        check("optional matched user API key header present", headers.get("X-API-Key") == "kt_user_1001")
+        check("platform default API key supported", default_headers.get("X-API-Key") == "kt_default")
+
+        _FakeConfig.keytao_user_api_keys = "{}"
+        bot_only_headers = _draft_tools.get_bot_headers("qq", "3003")
+        check("missing user API key still allows bot token", bot_only_headers.get("X-Bot-Token") == "fake")
+        check("missing user API key omits X-API-Key", "X-API-Key" not in bot_only_headers)
+    finally:
+        _FakeConfig.keytao_user_api_keys = old_user_keys
+        _FakeConfig.keytao_api_key = old_api_key
 
 
 async def _run_tool_executor_policy_checks():
@@ -1820,6 +1921,7 @@ if __name__ == "__main__":
     test_memory_conversation_state_store()
     test_memory_conversation_state_store_owner_scope()
     test_scoped_memory_store_builds_compressed_context()
+    test_operation_recall_uses_group_memory_by_default()
     test_scoped_memory_store_llm_compacts_at_threshold()
     test_agent_request_context_scope_key_format()
     test_recover_pending_add_word_from_history()
@@ -1828,6 +1930,7 @@ if __name__ == "__main__":
     test_recover_pending_state_ignores_cancelled_prompt()
     test_history_store_keeps_user_and_assistant_same_second()
     test_tool_executor_context_injection()
+    test_keytao_draft_headers_allow_optional_user_api_key()
     test_tool_executor_draft_policy_guards()
     test_orchestrator_empty_response_retry()
     test_normalize_encode_response_codes_first()
