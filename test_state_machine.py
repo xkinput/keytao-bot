@@ -1010,6 +1010,12 @@ def test_memory_conversation_state_store_owner_scope():
     check("other user in same group is detected", store.find_pending_for_other_owner(same_group, other_key) is not None)
     check("other group is ignored", store.find_pending_for_other_owner(other_group, other_key) is None)
 
+    legacy_store = MemoryConversationStateStore({owner_key: state})
+    check(
+        "legacy pending without space is conservatively detected",
+        legacy_store.find_pending_for_other_owner(same_group, other_key) is not None,
+    )
+
 
 def test_scoped_memory_store_builds_compressed_context():
     print("\n🧪 ScopedMemoryStore compressed context")
@@ -1120,7 +1126,82 @@ def test_operation_recall_uses_group_memory_by_default():
     check("bot-you recall omits actor id", response is not None and "2002" not in response)
     check("who recall also returns group operation", who_response is not None and "Garth" in who_response)
     check("who recall omits actor id", who_response is not None and "2002" not in who_response)
-    check("self recall does not include other user's operation", self_response is not None and "Garth" not in self_response)
+    check("self recall falls back without other user's operation", self_response is None)
+
+
+def test_operation_recall_falls_back_when_structured_memory_empty():
+    print("\n🧪 operation recall falls back when structured memory is empty")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = ScopedMemoryStore(os.path.join(tmpdir, "memory.db"))
+        context = ChatMemoryContext(
+            platform="qq",
+            user_id="1001",
+            space_type="group",
+            space_id="42",
+            speaker_name="Rea",
+            target_name="喵喵",
+        )
+
+        with patch.object(openai_chat_module, "memory_store", store):
+            response = _try_handle_operation_recall("你前面加了些什么词", context)
+
+    check("empty structured operation memory falls through to LLM", response is None)
+
+
+def test_operation_recall_recovers_legacy_assistant_memory():
+    print("\n🧪 operation recall recovers legacy assistant memory")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = ScopedMemoryStore(os.path.join(tmpdir, "memory.db"))
+        rea_context = ChatMemoryContext(
+            platform="qq",
+            user_id="1001",
+            space_type="group",
+            space_id="42",
+            speaker_name="Rea",
+            target_name="喵喵",
+        )
+        garth_context = ChatMemoryContext(
+            platform="qq",
+            user_id="2002",
+            space_type="group",
+            space_id="42",
+            speaker_name="Garth",
+            target_name="喵喵",
+        )
+        with sqlite3.connect(store.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_entries (
+                    scope, scope_id, role, speaker_id, speaker_name,
+                    target_id, target_name, content, importance
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "group",
+                    garth_context.space_scope_id,
+                    "assistant",
+                    "bot",
+                    "喵喵",
+                    "2002",
+                    "Garth",
+                    "已处理加词草稿：空串 @ kywto，已加入草稿并提交审核。",
+                    "high",
+                ),
+            )
+
+        with patch.object(openai_chat_module, "memory_store", store):
+            response = _try_handle_operation_recall("你前面加了些什么词", rea_context)
+            self_response = _try_handle_operation_recall("我之前加了什么词", rea_context)
+
+    check("legacy assistant memory is recovered", response is not None and "Garth" in response)
+    check("legacy assistant memory keeps word", response is not None and "「空串」" in response)
+    check("legacy assistant memory keeps code", response is not None and "kywto" in response)
+    check("legacy assistant memory keeps submitted status", response is not None and "已提交审核" in response)
+    check("legacy assistant memory hides platform id", response is not None and "2002" not in response)
+    check("self recall ignores other user's legacy memory", self_response is None)
 
 
 def test_scoped_memory_store_llm_compacts_at_threshold():
@@ -1922,6 +2003,8 @@ if __name__ == "__main__":
     test_memory_conversation_state_store_owner_scope()
     test_scoped_memory_store_builds_compressed_context()
     test_operation_recall_uses_group_memory_by_default()
+    test_operation_recall_falls_back_when_structured_memory_empty()
+    test_operation_recall_recovers_legacy_assistant_memory()
     test_scoped_memory_store_llm_compacts_at_threshold()
     test_agent_request_context_scope_key_format()
     test_recover_pending_add_word_from_history()

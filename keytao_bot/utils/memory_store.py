@@ -262,6 +262,71 @@ class ScopedMemoryStore:
             for row in rows
         ]
 
+    def get_recent_operation_candidates(
+        self,
+        memory_context: ChatMemoryContext,
+        include_current_user_only: bool = False,
+        limit: int = 8,
+    ) -> List[Dict]:
+        """Return bot-mediated dictionary operations from structured and legacy memories."""
+        operations = self.get_recent_operations(
+            memory_context,
+            include_current_user_only=include_current_user_only,
+            limit=limit,
+        )
+        if len(operations) >= limit:
+            return operations[:limit]
+
+        legacy_operations = self._get_recent_legacy_operations(
+            memory_context,
+            include_current_user_only=include_current_user_only,
+            limit=limit - len(operations),
+        )
+        return _dedupe_operations(operations + legacy_operations)[:limit]
+
+    def _get_recent_legacy_operations(
+        self,
+        memory_context: ChatMemoryContext,
+        include_current_user_only: bool,
+        limit: int,
+    ) -> List[Dict]:
+        if limit <= 0:
+            return []
+
+        scope = "user" if include_current_user_only else "group"
+        scope_id = memory_context.user_scope_id if include_current_user_only else memory_context.space_scope_id
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT role, speaker_id, speaker_name, target_id, target_name, content, timestamp
+                FROM memory_entries
+                WHERE scope = ?
+                  AND scope_id = ?
+                  AND role != 'memory'
+                  AND importance != 'low'
+                ORDER BY id DESC
+                LIMIT 80
+            """, (scope, scope_id))
+            rows = cursor.fetchall()
+
+        operations: List[Dict] = []
+        for role, speaker_id, speaker_name, target_id, target_name, content, timestamp in rows:
+            operation = _legacy_operation_from_entry({
+                "role": role,
+                "speaker_id": speaker_id,
+                "speaker_name": speaker_name,
+                "target_id": target_id,
+                "target_name": target_name,
+                "content": content,
+                "timestamp": timestamp,
+            })
+            if operation is None:
+                continue
+            operations.append(operation)
+            if len(operations) >= limit:
+                break
+        return operations
+
     def _get_summary(self, scope: str, scope_id: str) -> str:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
@@ -476,9 +541,11 @@ def _extract_operation_memories(
 def _extract_word_code_from_text(text: str) -> Optional[Dict[str, str]]:
     patterns = (
         r"「(?P<word>.+?)」\s*[→\-]\s*(?P<code>[a-z;]{2,12})",
+        r"「(?P<word>.+?)」\s*@\s*(?P<code>[a-z;]{2,12})",
         r"「(?P<word>.+?)」以编码\s*(?P<code>[a-z;]{2,12})",
         r"以编码\s*(?P<code>[a-z;]{2,12})\s*将「(?P<word>.+?)」加入草稿",
         r"新增\s+(?P<word>\S+)\s*[→\-]\s*(?P<code>[a-z;]{2,12})",
+        r"已处理加词草稿：(?P<word>[^@\s，。]+)\s*@\s*(?P<code>[a-z;]{2,12})",
     )
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -492,6 +559,69 @@ def _extract_word_code_from_text(text: str) -> Optional[Dict[str, str]]:
 
 def _looks_submitted(text: str) -> bool:
     return any(marker in text for marker in ("提交审核", "已提交", "提审成功", "提交成功"))
+
+
+def _legacy_operation_from_entry(entry: Dict) -> Optional[Dict]:
+    """Recover dictionary-operation memories written before structured op rows existed."""
+    content = str(entry.get("content") or "")
+    if not _looks_like_operation_text(content):
+        return None
+
+    word_code = _extract_word_code_from_text(content)
+    if not word_code:
+        return None
+
+    role = str(entry.get("role") or "")
+    if role == "assistant":
+        actor = str(entry.get("target_name") or entry.get("target_id") or "").strip()
+        actor_id = str(entry.get("target_id") or "").strip()
+    else:
+        actor = str(entry.get("speaker_name") or entry.get("speaker_id") or "").strip()
+        actor_id = str(entry.get("speaker_id") or "").strip()
+    actor = re.sub(r"([^\s（(]+)[（(]\d{4,}[）)]", r"\1", actor) or "未知用户"
+
+    status = "已提交审核" if _looks_submitted(content) else "已加入草稿"
+    return {
+        "speaker_id": actor_id,
+        "speaker_name": actor,
+        "content": f"词库操作：{actor} {status}「{word_code['word']}」 @ {word_code['code']}",
+        "timestamp": entry.get("timestamp") or "",
+    }
+
+
+def _looks_like_operation_text(text: str) -> bool:
+    if not text:
+        return False
+    operation_markers = (
+        "已处理加词草稿",
+        "已确认添加到草稿",
+        "已加入草稿",
+        "加入草稿并提交审核",
+        "提交审核",
+        "提审成功",
+        "新增",
+    )
+    return any(marker in text for marker in operation_markers)
+
+
+def _dedupe_operations(operations: List[Dict]) -> List[Dict]:
+    deduped: List[Dict] = []
+    seen = set()
+    for operation in operations:
+        content = str(operation.get("content") or "")
+        speaker_name = str(operation.get("speaker_name") or "")
+        word_code = _extract_word_code_from_text(content) or {}
+        key = (
+            speaker_name,
+            word_code.get("word", ""),
+            word_code.get("code", ""),
+            "submitted" if _looks_submitted(content) else "draft",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(operation)
+    return deduped
 
 
 def _row_to_entry(row: tuple) -> Dict:

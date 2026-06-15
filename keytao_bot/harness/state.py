@@ -105,4 +105,21 @@ class MemoryConversationStateStore:
         for record in self._records.values():
             if record.space_key == space_key and record.owner_key != owner_key:
                 return record
+            if (
+                record.space_key is None
+                and record.owner_key != owner_key
+                and record.owner_key[0] == space_key[0]
+            ):
+                return record
+        for key, state in self._states.items():
+            if key == owner_key or state is None or key in self._records:
+                continue
+            platform, user_id = key
+            legacy_space_key = (platform, f"{platform}:private:{user_id}")
+            if legacy_space_key == space_key:
+                return PendingStateRecord(
+                    state=state,
+                    owner_key=key,
+                    space_key=legacy_space_key,
+                )
         return None

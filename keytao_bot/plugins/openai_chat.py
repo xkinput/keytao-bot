@@ -1539,14 +1539,15 @@ def _try_handle_operation_recall(
     if not current_user_only and not _OPERATION_RECALL_RE.search(text):
         return None
 
-    operations = memory_store.get_recent_operations(
+    operations = memory_store.get_recent_operation_candidates(
         memory_context,
         include_current_user_only=current_user_only,
         limit=8,
     )
     if not operations:
-        scope_text = "你自己" if current_user_only else "这个群里"
-        return f"我这里还没有记到{scope_text}最近通过喵喵经手的加词/提交记录。"
+        # Fall back to the normal LLM path so broader context/history can still
+        # be used when no deterministic operation memory is available.
+        return None
 
     lines = [
         "最近通过喵喵经手的词库操作："
