@@ -172,6 +172,31 @@ class ScopedMemoryStore:
                         compact,
                         importance,
                     ))
+
+                for operation in _extract_operation_memories(
+                    memory_context,
+                    user_message,
+                    assistant_message,
+                ):
+                    if scope == "global":
+                        continue
+                    cursor.execute("""
+                        INSERT INTO memory_entries (
+                            scope, scope_id, role, speaker_id, speaker_name,
+                            target_id, target_name, content, importance
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        scope,
+                        scope_id,
+                        "memory",
+                        memory_context.user_id,
+                        memory_context.speaker_name or memory_context.user_id,
+                        "",
+                        "词库操作",
+                        operation,
+                        "high",
+                    ))
             conn.commit()
 
     async def compact_due_scopes(
@@ -373,17 +398,65 @@ def _strip_markdown(text: str) -> str:
 
 
 def _assistant_action_summary(text: str) -> str:
+    if "已确认添加到草稿" in text or "加入草稿" in text:
+        m = _extract_word_code_from_text(text)
+        if m:
+            status = "已加入草稿并提交审核" if _looks_submitted(text) else "已加入草稿"
+            return f"已处理加词草稿：{m['word']} @ {m['code']}，{status}。"
+        return "已处理加词草稿。"
     if "草稿已成功提交审核" in text:
         return "已提交当前用户草稿审核。"
-    if "已确认添加到草稿" in text or "加入草稿" in text:
-        m = re.search(r"「(.+?)」.*?(?:编码|以编码)\s*([a-z;]+)", text)
-        if m:
-            return f"已处理加词草稿：{m.group(1)} @ {m.group(2)}。"
-        return "已处理加词草稿。"
     if "当前草稿" in text:
         summary = re.search(r"\+\d+\s+新增\s+~\d+\s+修改\s+-\d+\s+删除", text)
         return f"展示了当前草稿：{summary.group(0)}。" if summary else "展示了当前草稿。"
     return ""
+
+
+def _extract_operation_memories(
+    memory_context: ChatMemoryContext,
+    user_message: str,
+    assistant_message: str,
+) -> List[str]:
+    """Extract durable structured memories for bot-mediated dictionary ops."""
+    text = _strip_markdown(assistant_message or "")
+    word_code = _extract_word_code_from_text(text)
+    if not word_code:
+        return []
+
+    actor = memory_context.speaker_name or memory_context.user_id
+    status = "已提交审核" if _looks_submitted(text) else "已加入草稿"
+    user_intent = _strip_markdown(user_message or "")
+    if len(user_intent) > 80:
+        user_intent = user_intent[:80].rstrip() + "..."
+
+    return [
+        (
+            f"词库操作：{actor}({memory_context.user_id}) {status}"
+            f"「{word_code['word']}」 @ {word_code['code']}；"
+            f"用户原话：{user_intent}"
+        )
+    ]
+
+
+def _extract_word_code_from_text(text: str) -> Optional[Dict[str, str]]:
+    patterns = (
+        r"「(?P<word>.+?)」\s*[→\-]\s*(?P<code>[a-z;]{2,12})",
+        r"「(?P<word>.+?)」以编码\s*(?P<code>[a-z;]{2,12})",
+        r"以编码\s*(?P<code>[a-z;]{2,12})\s*将「(?P<word>.+?)」加入草稿",
+        r"新增\s+(?P<word>\S+)\s*[→\-]\s*(?P<code>[a-z;]{2,12})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return {
+                "word": match.group("word").strip(),
+                "code": match.group("code").strip(),
+            }
+    return None
+
+
+def _looks_submitted(text: str) -> bool:
+    return any(marker in text for marker in ("提交审核", "已提交", "提审成功", "提交成功"))
 
 
 def _row_to_entry(row: tuple) -> Dict:
@@ -409,7 +482,7 @@ def _classify_importance(scope: str, role: str, content: str) -> str:
 
     high_markers = (
         "偏好", "习惯", "记住", "以后", "称呼", "不要", "别再",
-        "已处理加词草稿", "已提交当前用户草稿审核", "已确认添加到草稿",
+        "词库操作", "已处理加词草稿", "已提交当前用户草稿审核", "已确认添加到草稿",
     )
     if scope == "user" and any(marker in text for marker in high_markers):
         return "high"
