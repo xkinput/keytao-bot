@@ -90,10 +90,12 @@ from keytao_bot.plugins.openai_chat import (
     _is_confirm,
     _has_cancel,
     _handle_pending_add_word,
+    _handle_referenced_pending_from_other_user,
     _ensure_pending_add_word_guidance,
     _is_pending_tool_confirm_message,
     _parse_pending_batch_add,
     _parse_pending_add_word,
+    _parse_pending_state_from_response,
     _recover_pending_state_from_history,
     _resolve_shift_target_code,
     _select_requested_code_candidate,
@@ -361,6 +363,102 @@ def test_parse_pending_batch_add_two_words():
     check("second item parsed", result.args["items"][1] == {"word": "野钓", "code": "yedci", "action": "Create"})
     check("'加入' confirms batch add", _is_pending_tool_confirm_message(result, "加入"))
     check("'加入' is not global confirm", not _is_confirm("加入"))
+
+
+def test_parse_pending_state_from_referenced_message():
+    """Verify quoted bot pending messages can be parsed before using local history."""
+    print("\n🧪 _parse_pending_state_from_response")
+
+    add_response = """候选编码：
+1. jfxm — 已有「馋涎」
+2. jfxmo — ✅ 推荐（空位）
+
+是否以编码 jfxmo 将「产线」加入草稿？也可回复编号选其他编码。"""
+    add_state = _parse_pending_state_from_response(add_response)
+    check("quoted add pending parsed", isinstance(add_state, PendingAddWord))
+    check("quoted add word parsed", add_state.word == "产线")
+
+    submit_response = "⚠️ 检测到批次中存在重码，是否继续提交？回复「确认」继续提交，回复「取消」放弃。"
+    submit_state = _parse_pending_state_from_response(submit_response)
+    check("quoted submit pending parsed", isinstance(submit_state, PendingToolConfirm))
+    check("quoted submit tool parsed", submit_state.function_name == "keytao_submit_batch")
+
+
+def test_referenced_other_owner_pending_prompts_copy():
+    """Replying to another user's bot pending prompt should not use the current user's old pending."""
+    print("\n🧪 referenced other-owner pending")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        owner_key = ("qq", "1001")
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        other_pending = PendingAddWord(
+            word="产线",
+            recommended_code="jfxmo",
+            candidates=[("jfxm", True), ("jfxmo", False)],
+            occupied_words={"jfxm": ["馋涎"]},
+        )
+        own_pending = PendingAddWord(
+            word="增香",
+            recommended_code="zrxx",
+            candidates=[("zrxx", False)],
+        )
+        store.set(owner_key, other_pending, space_key=space_key, owner_label="EVO")
+        store.set(current_key, own_pending, space_key=space_key, owner_label="音樂盒")
+
+        other_record = store.find_matching_pending_for_other_owner(space_key, current_key, other_pending)
+        response = _handle_referenced_pending_from_other_user(
+            other_pending,
+            store.get_record(current_key),
+            other_record,
+            current_key,
+            space_key,
+            "音樂盒",
+        )
+
+        current_record = store.get_record(current_key)
+        check("other owner matched", other_record is not None)
+        check("response names owner", response is not None and "EVO" in response)
+        check("response blocks acting for owner", response is not None and "不能替 EVO 确认" in response)
+        check("current pending becomes referenced copy", current_record.state.word == "产线")
+        check("current pending keeps current owner label", current_record.owner_label == "音樂盒")
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
+def test_referenced_other_owner_submit_does_not_copy():
+    """Someone else's submit confirmation should not become the current user's submit confirm."""
+    print("\n🧪 referenced other-owner submit pending")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        owner_key = ("qq", "1001")
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        submit_pending = PendingToolConfirm("keytao_submit_batch", {})
+        store.set(owner_key, submit_pending, space_key=space_key, owner_label="EVO")
+
+        other_record = store.find_matching_pending_for_other_owner(space_key, current_key, submit_pending)
+        response = _handle_referenced_pending_from_other_user(
+            submit_pending,
+            store.get_record(current_key),
+            other_record,
+            current_key,
+            space_key,
+            "音樂盒",
+        )
+
+        check("submit owner matched", other_record is not None)
+        check("submit response names owner", response is not None and "EVO" in response)
+        check("submit response points to own command", response is not None and "提交" in response)
+        check("submit pending not copied", store.get_record(current_key) is None)
+    finally:
+        openai_chat_module.conversation_state_store = old_store
 
 
 def test_pending_add_word_guidance_appended_for_occupied_candidates():
@@ -1096,10 +1194,23 @@ def test_memory_conversation_state_store_owner_scope():
         args={},
     )
 
-    store.set(owner_key, state, space_key=same_group)
+    store.set(owner_key, state, space_key=same_group, owner_label="EVO")
     check("owner state is present", store.contains(owner_key))
+    check("owner label is stored", store.get_record(owner_key).owner_label == "EVO")
     check("same owner is not other", store.find_pending_for_other_owner(same_group, owner_key) is None)
     check("other user in same group is detected", store.find_pending_for_other_owner(same_group, other_key) is not None)
+    check(
+        "matching pending for other user is detected",
+        store.find_matching_pending_for_other_owner(same_group, other_key, state) is not None,
+    )
+    check(
+        "non-matching pending for other user is ignored",
+        store.find_matching_pending_for_other_owner(
+            same_group,
+            other_key,
+            PendingToolConfirm(function_name="keytao_create_phrase", args={"word": "别的", "code": "bd"}),
+        ) is None,
+    )
     check("other group is ignored", store.find_pending_for_other_owner(other_group, other_key) is None)
 
     legacy_store = MemoryConversationStateStore({owner_key: state})
@@ -2201,6 +2312,9 @@ if __name__ == "__main__":
     test_parse_pending_add_word_no_candidate_list()
     test_parse_pending_add_word_multitone_template()
     test_parse_pending_batch_add_two_words()
+    test_parse_pending_state_from_referenced_message()
+    test_referenced_other_owner_pending_prompts_copy()
+    test_referenced_other_owner_submit_does_not_copy()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()

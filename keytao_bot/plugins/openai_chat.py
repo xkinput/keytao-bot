@@ -5,8 +5,10 @@ AI handles: chat, queries, tool calling, formatting.
 Python handles: confirmation routing, direct execution of simple confirms.
 """
 import asyncio
+import copy
 import json
 import re
+from dataclasses import dataclass
 from typing import Any, Optional, List, Dict, Tuple
 
 from nonebot import on_message, on_command, get_driver
@@ -26,6 +28,7 @@ from ..harness.state import (
     MemoryConversationStateStore,
     PendingAddWord,
     PendingState,
+    PendingStateRecord,
     PendingToolConfirm,
 )
 from ..harness.tools import ToolContext, ToolExecutor
@@ -87,6 +90,16 @@ _BIND_HELP_TEXT = (
     "示例：/bind AB12CD\n\n"
     "💡 群聊中需要 @我 或回复我的消息才能触发绑定"
 )
+
+
+@dataclass(frozen=True)
+class ReplyReferenceInfo:
+    is_reply: bool = False
+    is_to_bot: bool = False
+    sender_id: str = ""
+    sender_name: str = ""
+    text: str = ""
+
 
 driver = get_driver()
 config = driver.config
@@ -418,20 +431,151 @@ def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
     return any(hint in text for hint in hints)
 
 
+def _parse_pending_state_from_response(response: str) -> PendingState:
+    """Parse any pending operation represented by an assistant response."""
+    batch_pending = _parse_pending_batch_add(response)
+    if batch_pending is not None:
+        return batch_pending
+
+    pending_add = _parse_pending_add_word(response)
+    if pending_add is not None:
+        return pending_add
+
+    if _looks_like_submit_reconfirm_prompt(response):
+        return PendingToolConfirm(function_name="keytao_submit_batch", args={})
+
+    return None
+
+
 def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> PendingState:
     """Best-effort recovery when in-memory pending state was lost."""
     assistant_message = _get_latest_assistant_message(history)
     if not assistant_message:
         return None
 
-    pending_add = _parse_pending_add_word(assistant_message)
-    if pending_add is not None:
-        return pending_add
+    return _parse_pending_state_from_response(assistant_message)
 
-    if _looks_like_submit_reconfirm_prompt(assistant_message):
-        return PendingToolConfirm(function_name="keytao_submit_batch", args={})
 
-    return None
+def _clone_pending_state(state: PendingState) -> PendingState:
+    return copy.deepcopy(state)
+
+
+def _pending_owner_label(record: PendingStateRecord) -> str:
+    return record.owner_label or record.owner_key[1] or "这位用户"
+
+
+def _describe_pending_state(state: PendingState) -> str:
+    if isinstance(state, PendingAddWord):
+        return f"加词「{state.word}」→ {state.recommended_code}"
+
+    if isinstance(state, PendingToolConfirm):
+        if state.function_name == "keytao_batch_add_to_draft":
+            items = state.args.get("items", [])
+            words = [
+                f"「{item.get('word')}」→ {item.get('code')}"
+                for item in items
+                if isinstance(item, dict) and item.get("word") and item.get("code")
+            ]
+            preview = "、".join(words[:3])
+            if len(words) > 3:
+                preview += f" 等 {len(words)} 条"
+            return f"批量加词：{preview}" if preview else "批量加词"
+
+        if state.function_name == "keytao_create_phrase":
+            word = state.args.get("word", "")
+            code = state.args.get("code", "")
+            action = state.args.get("action", "Create")
+            action_label = {
+                "Create": "加词",
+                "Change": "修改",
+                "Delete": "删除",
+            }.get(action, action)
+            if word and code:
+                return f"{action_label}「{word}」→ {code}"
+            return action_label
+
+        if state.function_name == "keytao_submit_batch":
+            return "提交草稿"
+
+    return "待确认操作"
+
+
+def _pending_state_can_be_copied_to_current_user(state: PendingState) -> bool:
+    if isinstance(state, PendingAddWord):
+        return True
+    if isinstance(state, PendingToolConfirm):
+        return state.function_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"}
+    return False
+
+
+def _format_other_owner_pending_message(
+    owner_label: str,
+    state: PendingState,
+    copied: bool,
+) -> str:
+    description = _describe_pending_state(state)
+    if not copied:
+        return (
+            f"这条是 {owner_label} 的待确认操作：{description}。\n"
+            f"你不能替 {owner_label} 确认。\n\n"
+            "如果要操作你自己的草稿，请直接发送完整指令，例如「提交」或「加词 词语 编码」。"
+        )
+
+    return (
+        f"这条是 {owner_label} 的待确认操作：{description}。\n"
+        f"你不能替 {owner_label} 确认，我也不会把你的回复套到你前面的其他操作上。\n\n"
+        "如果你也想把同样操作放进自己的草稿，我已经为你单独准备好了。"
+        "请再回复「确认」继续，或回复「取消」放弃。"
+    )
+
+
+def _handle_referenced_pending_from_other_user(
+    referenced_state: PendingState,
+    current_record: Optional[PendingStateRecord],
+    other_record: Optional[PendingStateRecord],
+    conv_key: Tuple[str, str],
+    space_key: Tuple[str, str],
+    owner_label: str,
+) -> Optional[str]:
+    """Handle a user replying to a bot pending prompt that is not their own."""
+    if referenced_state is None:
+        return None
+    if current_record and conversation_state_store.states_equivalent(current_record.state, referenced_state):
+        return None
+
+    if other_record is not None:
+        copied = False
+        if _pending_state_can_be_copied_to_current_user(referenced_state):
+            conversation_state_store.set(
+                conv_key,
+                _clone_pending_state(referenced_state),
+                space_key=space_key,
+                owner_label=owner_label,
+            )
+            copied = True
+        return _format_other_owner_pending_message(
+            _pending_owner_label(other_record),
+            referenced_state,
+            copied,
+        )
+
+    if _pending_state_can_be_copied_to_current_user(referenced_state):
+        conversation_state_store.set(
+            conv_key,
+            _clone_pending_state(referenced_state),
+            space_key=space_key,
+            owner_label=owner_label,
+        )
+        return (
+            f"你引用的是一条待确认操作：{_describe_pending_state(referenced_state)}。\n"
+            "我没找到它当前的归属记录，所以不会直接执行。\n\n"
+            "如果这是你也想加入自己草稿的操作，请再回复「确认」继续，或回复「取消」放弃。"
+        )
+
+    return (
+        f"你引用的是一条待确认操作：{_describe_pending_state(referenced_state)}。\n"
+        "我没找到它当前的归属记录，所以不会直接执行。"
+    )
 
 
 def _ensure_pending_add_word_guidance(response: str) -> str:
@@ -826,8 +970,8 @@ def extract_onebot_plaintext(message: object) -> str:
     return ''.join(parts).strip()
 
 
-async def build_reply_context(bot: Bot, event: Event) -> str:
-    """Build reply context for Telegram and OneBot v11."""
+async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReferenceInfo:
+    """Extract replied-message metadata for Telegram and OneBot v11."""
     try:
         from nonebot.adapters.telegram import Bot as TelegramBot
     except ImportError:
@@ -837,46 +981,44 @@ async def build_reply_context(bot: Bot, event: Event) -> str:
     except ImportError:
         QQBot = None
 
-    # --- Telegram ---
     if TelegramBot and isinstance(bot, TelegramBot):
         reply_to_message = getattr(event, 'reply_to_message', None)
         if not reply_to_message:
-            return ""
+            return ReplyReferenceInfo()
         try:
             bot_info = await bot.get_me()
-            bot_id = getattr(bot_info, 'id', None)
+            bot_id = str(getattr(bot_info, 'id', '') or '')
         except Exception:
-            bot_id = None
+            bot_id = ""
 
         reply_from = getattr(reply_to_message, 'from_', None)
-        reply_text = getattr(reply_to_message, 'text', None)
-        if reply_from and reply_text:
-            reply_from_id = getattr(reply_from, 'id', None)
-            reply_from_name = getattr(reply_from, 'first_name', '未知用户')
-            if bot_id and reply_from_id == bot_id:
-                return (
-                    f"\n\n【用户正在回复你的消息】\n被引用的消息内容：\n{reply_text}\n\n"
-                    "⚠️ 用户的回复是针对这条消息的，请根据这条消息的内容理解用户意图。"
-                )
-            return (
-                f"\n\n【用户正在回复其他人的消息】\n被引用消息的发送者：{reply_from_name}\n"
-                f"被引用的消息内容：\n{reply_text}\n\n"
-                "⚠️ 用户回复的不是你的消息，如果用户说的是操作指令（如'是'、'确认'、'提交'），"
-                "应该提醒用户：你需要回复bot的消息才能确认操作。"
-            )
-        return ""
+        reply_text = (
+            getattr(reply_to_message, 'text', None)
+            or getattr(reply_to_message, 'caption', None)
+            or ""
+        )
+        if not reply_from:
+            return ReplyReferenceInfo(is_reply=True, text=str(reply_text or "").strip())
+        reply_from_id = str(getattr(reply_from, 'id', '') or '')
+        reply_from_name = _display_name_from_telegram_user(reply_from) or reply_from_id or "未知用户"
+        return ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=bool(bot_id and reply_from_id == bot_id),
+            sender_id=reply_from_id,
+            sender_name=reply_from_name,
+            text=str(reply_text or "").strip(),
+        )
 
-    # --- OneBot v11 (QQ) ---
     if QQBot and isinstance(bot, QQBot):
         reply_message_id = extract_onebot_reply_id(event)
         if not reply_message_id:
-            return ""
+            return ReplyReferenceInfo()
         logger.info(f"Detected OneBot reply segment, reply message_id: {reply_message_id}")
         try:
             reply_payload = await bot.get_msg(message_id=int(reply_message_id))
         except Exception as error:
             logger.warning(f"Failed to fetch replied OneBot message {reply_message_id}: {error}")
-            return ""
+            return ReplyReferenceInfo(is_reply=True)
 
         sender = reply_payload.get('sender', {}) if isinstance(reply_payload, dict) else {}
         reply_from_id = str(sender.get('user_id') or reply_payload.get('user_id', ''))
@@ -886,23 +1028,41 @@ async def build_reply_context(bot: Bot, event: Event) -> str:
         )
         if not reply_text and isinstance(reply_payload, dict):
             reply_text = str(reply_payload.get('raw_message', '')).strip()
-        if not reply_text:
-            return ""
 
         bot_id = str(getattr(bot, 'self_id', ''))
-        if bot_id and reply_from_id == bot_id:
-            return (
-                f"\n\n【用户正在回复你的消息】\n被引用的消息内容：\n{reply_text}\n\n"
-                "⚠️ 用户的回复是针对这条消息的，请根据这条消息的内容理解用户意图。"
-            )
-        return (
-            f"\n\n【用户正在回复其他人的消息】\n被引用消息的发送者：{reply_from_name}\n"
-            f"被引用的消息内容：\n{reply_text}\n\n"
-            "⚠️ 用户回复的不是你的消息，如果用户说的是操作指令（如'是'、'确认'、'提交'），"
-            "应该提醒用户：你需要回复bot的消息才能确认操作。"
+        return ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=bool(bot_id and reply_from_id == bot_id),
+            sender_id=reply_from_id,
+            sender_name=reply_from_name,
+            text=reply_text,
         )
 
-    return ""
+    return ReplyReferenceInfo()
+
+
+async def build_reply_context(
+    bot: Bot,
+    event: Event,
+    reply_info: Optional[ReplyReferenceInfo] = None,
+) -> str:
+    """Build reply context for Telegram and OneBot v11."""
+    info = reply_info or await extract_reply_reference_info(bot, event)
+    if not info.is_reply or not info.text:
+        return ""
+
+    if info.is_to_bot:
+        return (
+            f"\n\n【用户正在回复你的消息】\n被引用的消息内容：\n{info.text}\n\n"
+            "⚠️ 用户的回复是针对这条消息的，请根据这条消息的内容理解用户意图。"
+        )
+
+    return (
+        f"\n\n【用户正在回复其他人的消息】\n被引用消息的发送者：{info.sender_name or '未知用户'}\n"
+        f"被引用的消息内容：\n{info.text}\n\n"
+        "⚠️ 用户回复的不是你的消息，如果用户说的是操作指令（如'是'、'确认'、'提交'），"
+        "应该提醒用户：你需要回复bot的消息才能确认操作。"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1039,6 +1199,7 @@ async def _execute_add_to_draft(
     platform: str,
     user_id: str,
     space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
 ) -> str:
     """Directly add a word to draft and return formatted response."""
     result_json = await call_tool_function(
@@ -1054,7 +1215,7 @@ async def _execute_add_to_draft(
         conversation_state_store.set(conv_key, PendingToolConfirm(
             function_name="keytao_create_phrase",
             args={"word": word, "code": code},
-        ), space_key=space_key)
+        ), space_key=space_key, owner_label=owner_label)
         warnings = data.get("warnings", [])
         warn_text = "\n".join(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
@@ -1339,6 +1500,7 @@ async def _handle_pending_add_word(
     user_id: str,
     history: List[Dict],
     space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
 ) -> Optional[str]:
     """Handle user response to a pending add-word prompt.
 
@@ -1353,7 +1515,9 @@ async def _handle_pending_add_word(
     if requested_target is not None:
         target_code, is_occupied = requested_target
         if not is_occupied:
-            return await _execute_add_to_draft(state.word, target_code, platform, user_id, space_key)
+            return await _execute_add_to_draft(
+                state.word, target_code, platform, user_id, space_key, owner_label,
+            )
         return await _execute_confirmed_tool(
             PendingToolConfirm(
                 function_name="keytao_create_phrase",
@@ -1373,7 +1537,7 @@ async def _handle_pending_add_word(
             target_code, is_occupied = state.candidates[idx]
         else:
             conv_key = (platform, user_id)
-            conversation_state_store.set(conv_key, state, space_key=space_key)
+            conversation_state_store.set(conv_key, state, space_key=space_key, owner_label=owner_label)
             return f"请选择 1-{len(state.candidates)} 之间的编号 owo"
 
     # Simple confirmation -> use recommended code
@@ -1389,7 +1553,9 @@ async def _handle_pending_add_word(
 
     # Empty slot -> direct execution (no AI needed)
     if not is_occupied:
-        return await _execute_add_to_draft(state.word, target_code, platform, user_id, space_key)
+        return await _execute_add_to_draft(
+            state.word, target_code, platform, user_id, space_key, owner_label,
+        )
 
     return await _execute_confirmed_tool(
         PendingToolConfirm(
@@ -1923,16 +2089,52 @@ async def handle_ai_chat(bot: Bot, event: Event):
     conv_key = (platform, user_id)
     memory_context = await extract_memory_context(bot, event)
     space_key = get_space_key(memory_context)
+    owner_label = memory_context.speaker_name or user_id
+    reply_reference = await extract_reply_reference_info(bot, event)
     response: Optional[str] = None
     history: Optional[List[Dict]] = None
 
+    referenced_pending = (
+        _parse_pending_state_from_response(reply_reference.text)
+        if reply_reference.is_to_bot and reply_reference.text
+        else None
+    )
+    if referenced_pending is not None and memory_context.space_type == "group":
+        current_record = conversation_state_store.get_record(conv_key)
+        other_record = conversation_state_store.find_matching_pending_for_other_owner(
+            space_key,
+            conv_key,
+            referenced_pending,
+        )
+        response = _handle_referenced_pending_from_other_user(
+            referenced_pending,
+            current_record,
+            other_record,
+            conv_key,
+            space_key,
+            owner_label,
+        )
+        if response is not None:
+            add_to_history(conv_key, normalized_message_text, response)
+            memory_store.add_conversation_round(memory_context, normalized_message_text, response)
+            await ai_chat.finish(response)
+            return
+
+    other_pending_record = conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
     if (
         memory_context.space_type == "group"
         and _is_sensitive_pending_control_text(normalized_message_text)
         and not conversation_state_store.contains(conv_key)
-        and conversation_state_store.find_pending_for_other_owner(space_key, conv_key) is not None
+        and other_pending_record is not None
     ):
-        await ai_chat.finish("你无权操作他人确认选项！")
+        response = _format_other_owner_pending_message(
+            _pending_owner_label(other_pending_record),
+            other_pending_record.state,
+            copied=False,
+        )
+        add_to_history(conv_key, normalized_message_text, response)
+        memory_store.add_conversation_round(memory_context, normalized_message_text, response)
+        await ai_chat.finish(response)
         return
 
     response = _try_handle_operation_recall(normalized_message_text, memory_context)
@@ -1946,7 +2148,12 @@ async def handle_ai_chat(bot: Bot, event: Event):
             history = get_history(conv_key)
             state = _recover_pending_state_from_history(history)
             if state is not None:
-                conversation_state_store.set(conv_key, state, space_key=space_key)
+                conversation_state_store.set(
+                    conv_key,
+                    state,
+                    space_key=space_key,
+                    owner_label=owner_label,
+                )
                 state = conversation_state_store.pop(conv_key)
                 logger.info(
                     "♻️ Recovered pending state from history: "
@@ -1961,7 +2168,13 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 if history is None:
                     history = get_history(conv_key)
                 response = await _handle_pending_add_word(
-                    state, normalized_message_text, platform, user_id, history, state_space_key,
+                    state,
+                    normalized_message_text,
+                    platform,
+                    user_id,
+                    history,
+                    state_space_key,
+                    owner_label,
                 )
                 # response is None → unrecognized input, fall through to Phase 2
 
@@ -1971,13 +2184,19 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 # else: response stays None, fall through to AI as new request
 
             if response is None and state is not None:
-                conversation_state_store.set(conv_key, state, space_key=state_space_key)
+                state_owner_label = state_record.owner_label if state_record else owner_label
+                conversation_state_store.set(
+                    conv_key,
+                    state,
+                    space_key=state_space_key,
+                    owner_label=state_owner_label,
+                )
 
     # ===== Phase 2: AI response (if not handled directly) =====
     if response is None:
         if history is None:
             history = get_history(conv_key)
-        reply_context = await build_reply_context(bot, event)
+        reply_context = await build_reply_context(bot, event, reply_reference)
         response = await get_ai_response_core(
             normalized_message_text,
             platform,
@@ -2000,7 +2219,12 @@ async def handle_ai_chat(bot: Bot, event: Event):
     if not conversation_state_store.contains(conv_key):
         batch_pending = _parse_pending_batch_add(response)
         if batch_pending:
-            conversation_state_store.set(conv_key, batch_pending, space_key=space_key)
+            conversation_state_store.set(
+                conv_key,
+                batch_pending,
+                space_key=space_key,
+                owner_label=owner_label,
+            )
             logger.info(
                 "📌 Saved PendingToolConfirm: "
                 f"{batch_pending.function_name} ({len(batch_pending.args.get('items', []))} items)"
@@ -2009,7 +2233,12 @@ async def handle_ai_chat(bot: Bot, event: Event):
         else:
             pending = _parse_pending_add_word(response)
         if pending:
-            conversation_state_store.set(conv_key, pending, space_key=space_key)
+            conversation_state_store.set(
+                conv_key,
+                pending,
+                space_key=space_key,
+                owner_label=owner_label,
+            )
             logger.info(
                 f"📌 Saved PendingAddWord: {pending.word}@{pending.recommended_code} "
                 f"({len(pending.candidates)} candidates)"

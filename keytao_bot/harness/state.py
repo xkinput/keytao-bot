@@ -32,6 +32,7 @@ class PendingStateRecord:
     state: PendingState
     owner_key: ConversationKey
     space_key: Optional[SpaceKey] = None
+    owner_label: str = ""
 
 
 class MemoryConversationStateStore:
@@ -63,6 +64,7 @@ class MemoryConversationStateStore:
         key: ConversationKey,
         state: PendingState,
         space_key: Optional[SpaceKey] = None,
+        owner_label: str = "",
     ) -> None:
         if state is None:
             self.delete(key)
@@ -72,6 +74,7 @@ class MemoryConversationStateStore:
             state=state,
             owner_key=key,
             space_key=space_key,
+            owner_label=owner_label,
         )
 
     def pop(self, key: ConversationKey) -> PendingState:
@@ -86,6 +89,23 @@ class MemoryConversationStateStore:
         if state is not None:
             return PendingStateRecord(state=state, owner_key=key)
         return None
+
+    @staticmethod
+    def states_equivalent(left: PendingState, right: PendingState) -> bool:
+        """Compare pending states by the operation they represent."""
+        if left is None or right is None or type(left) is not type(right):
+            return False
+        if isinstance(left, PendingAddWord) and isinstance(right, PendingAddWord):
+            return (
+                left.word == right.word
+                and left.recommended_code == right.recommended_code
+            )
+        if isinstance(left, PendingToolConfirm) and isinstance(right, PendingToolConfirm):
+            return (
+                left.function_name == right.function_name
+                and left.args == right.args
+            )
+        return left == right
 
     def delete(self, key: ConversationKey) -> None:
         self._states.pop(key, None)
@@ -119,6 +139,41 @@ class MemoryConversationStateStore:
             if legacy_space_key == space_key:
                 return PendingStateRecord(
                     state=state,
+                    owner_key=key,
+                    space_key=legacy_space_key,
+                )
+        return None
+
+    def find_matching_pending_for_other_owner(
+        self,
+        space_key: Optional[SpaceKey],
+        owner_key: ConversationKey,
+        state: PendingState,
+    ) -> Optional[PendingStateRecord]:
+        """Return another user's pending state in the same space that matches state."""
+        if state is None:
+            return None
+        for record in self._records.values():
+            if record.owner_key == owner_key:
+                continue
+            same_space = (
+                record.space_key == space_key
+                or (
+                    record.space_key is None
+                    and space_key is not None
+                    and record.owner_key[0] == space_key[0]
+                )
+            )
+            if same_space and self.states_equivalent(record.state, state):
+                return record
+        for key, candidate in self._states.items():
+            if key == owner_key or candidate is None or key in self._records:
+                continue
+            platform, user_id = key
+            legacy_space_key = (platform, f"{platform}:private:{user_id}")
+            if legacy_space_key == space_key and self.states_equivalent(candidate, state):
+                return PendingStateRecord(
+                    state=candidate,
                     owner_key=key,
                     space_key=legacy_space_key,
                 )

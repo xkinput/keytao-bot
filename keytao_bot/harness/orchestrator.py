@@ -216,6 +216,7 @@ class AgentOrchestrator:
                     self._save_pending_tool_confirm(
                         conv_key,
                         context.space_key,
+                        context.speaker_name,
                         fn_name,
                         fn_args,
                         result_data,
@@ -340,6 +341,7 @@ class AgentOrchestrator:
         self,
         conv_key: tuple,
         space_key: tuple,
+        owner_label: str,
         fn_name: str,
         fn_args: Dict,
         result_data: Dict,
@@ -357,5 +359,6 @@ class AgentOrchestrator:
             conv_key,
             PendingToolConfirm(function_name=fn_name, args=saved),
             space_key=space_key,
+            owner_label=owner_label,
         )
         logger.info(f"💾 Saved PendingToolConfirm: {fn_name}({saved})")
