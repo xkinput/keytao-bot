@@ -142,7 +142,12 @@ _draft_tools_path = os.path.join(
 _draft_spec = importlib.util.spec_from_file_location("keytao_draft_tools_for_test", _draft_tools_path)
 _draft_tools = importlib.util.module_from_spec(_draft_spec)
 _draft_spec.loader.exec_module(_draft_tools)
+_build_encode_candidate_result = _draft_tools._build_encode_candidate_result
 _build_code_shift_plan = _draft_tools._build_code_shift_plan
+_infer_phrase_type = _draft_tools._infer_phrase_type
+_normalize_draft_item_for_request = _draft_tools._normalize_draft_item_for_request
+_split_items_by_code_validation = _draft_tools._split_items_by_code_validation
+_validate_draft_item_code = _draft_tools._validate_draft_item_code
 
 
 passed = 0
@@ -1471,6 +1476,91 @@ def test_keytao_draft_headers_allow_optional_user_api_key():
         _FakeConfig.keytao_api_key = old_api_key
 
 
+async def _run_draft_code_validation_checks():
+    async def fake_fetch_encode_candidates(word, requested_code=None):
+        check("validation passes requested code to encoder", requested_code in {"xiehmp", "xemev"})
+        return {
+            "success": True,
+            "word": word,
+            "candidateCodes": ["xeme", "xemev", "xemevi"],
+        }
+
+    with patch.object(_draft_tools, "_fetch_encode_candidates", fake_fetch_encode_candidates):
+        invalid = await _validate_draft_item_code({
+            "action": "Create",
+            "word": "喜上眉梢",
+            "code": "xiehmp",
+            "type": "Phrase",
+        })
+        valid = await _validate_draft_item_code({
+            "action": "Create",
+            "word": "喜上眉梢",
+            "code": "xemev",
+            "type": "Phrase",
+        })
+        valid_items, failed_items = await _split_items_by_code_validation([
+            {"action": "Create", "word": "喜上眉梢", "code": "xiehmp", "type": "Phrase"},
+            {"action": "Create", "word": "喜上眉梢", "code": "XEMEV", "type": "Phrase"},
+            {"action": "Delete", "word": "旧词", "code": "abc", "type": "Phrase"},
+        ])
+
+    check("invalid code is rejected", invalid.get("success") is False)
+    check("invalid reason names code", "xiehmp" in invalid.get("reason", ""))
+    check("valid code is accepted", valid.get("success") is True)
+    check("batch validation keeps valid and non-create items", len(valid_items) == 2)
+    check("batch validation normalizes valid code", valid_items[0]["code"] == "xemev")
+    check("batch validation reports one failed item", len(failed_items) == 1)
+    check("failed item keeps original index", failed_items[0]["index"] == 0)
+
+
+def test_keytao_draft_code_validation_guards_create_codes():
+    """Verify draft writes reject Create codes outside the word's encode chain."""
+    print("\n🧪 KeyTao draft code validation")
+
+    check("single CJK infers Single", _infer_phrase_type("喜", "xk", "Phrase") == "Single")
+    check("phrase remains Phrase", _infer_phrase_type("喜上眉梢", "xemev", "Phrase") == "Phrase")
+    check("English skips Phrase validation via type inference", _infer_phrase_type("hello", "hello", "Phrase") == "English")
+    normalized = _normalize_draft_item_for_request({"word": " 喜 ", "code": " XK "})
+    check("draft item word is trimmed", normalized["word"] == "喜")
+    check("draft item code is normalized", normalized["code"] == "xk")
+    check("draft item type is inferred", normalized["type"] == "Single")
+    asyncio.run(_run_draft_code_validation_checks())
+
+
+def test_draft_encode_candidates_include_alternate_pronunciations():
+    """Verify draft validation accepts alternate single-char pronunciation chains."""
+    print("\n🧪 KeyTao draft alternate pronunciation candidates")
+
+    result = _build_encode_candidate_result(
+        "噌",
+        {
+            "input": "噌",
+            "type": "单字",
+            "chars": [{
+                "char": "噌",
+                "pinyin": "cēng",
+                "pinyins": ["cēng", "chēng"],
+                "phoneticCode": "cr",
+                "shapeCode": "ooui",
+            }],
+            "codes": ["cr", "cro", "croo", "croou", "crooui"],
+            "altCodes": [],
+            "requestedCodeAnalysis": {
+                "code": "jroou",
+                "supported": False,
+                "matchType": "unsupported",
+            },
+        },
+        requested_code="jroou",
+    )
+
+    check("candidate build succeeds", result["success"] is True)
+    check("requested alternate code is accepted", "jroou" in result["candidateCodes"])
+    check("requested alternate series comes first", result["candidateCodes"][0] == "jroou")
+    check("default pronunciation codes still present", "croou" in result["candidateCodes"])
+    check("alternate pronunciation variants preserved", len(result["alternatePronunciationCodes"]) == 2)
+
+
 async def _run_tool_executor_policy_checks():
     calls = []
 
@@ -2014,6 +2104,8 @@ if __name__ == "__main__":
     test_history_store_keeps_user_and_assistant_same_second()
     test_tool_executor_context_injection()
     test_keytao_draft_headers_allow_optional_user_api_key()
+    test_keytao_draft_code_validation_guards_create_codes()
+    test_draft_encode_candidates_include_alternate_pronunciations()
     test_tool_executor_draft_policy_guards()
     test_orchestrator_empty_response_retry()
     test_normalize_encode_response_codes_first()

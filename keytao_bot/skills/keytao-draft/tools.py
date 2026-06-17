@@ -2,11 +2,16 @@
 Keytao Create Skill Tools
 键道创建词条工具实现
 """
-import json
+import asyncio
 import difflib
+import json
+import re
+import unicodedata
 import httpx
 from typing import Dict, List, Optional
 from nonebot.log import logger
+
+from keytao_bot.utils.keytao_encoding import build_alternate_pronunciation_codes
 
 
 ACTION_LABELS = {
@@ -47,6 +52,110 @@ def _clean_code_list(codes: object) -> List[str]:
         if normalized and "?" not in normalized and normalized not in seen:
             seen.add(normalized)
             result.append(normalized)
+    return result
+
+
+def _contains_cjk_text(word: str) -> bool:
+    return bool(re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', word or ""))
+
+
+def _infer_phrase_type(word: str, code: str, phrase_type: str = "Phrase") -> str:
+    """Mirror keytao-next phrase type inference for bot-side guardrails."""
+    if phrase_type and phrase_type != "Phrase":
+        return phrase_type
+
+    is_symbol_word = bool(word) and all(
+        unicodedata.category(c).startswith(('P', 'S')) for c in word if not c.isspace()
+    )
+    if (code and code.startswith(';')) or is_symbol_word:
+        return "Symbol"
+    if re.search(r'https?://|www\.', word or "", re.IGNORECASE):
+        return "Link"
+    if re.search(r'[a-zA-Z]', word or ""):
+        return "English"
+    if len(word or "") == 1 and _contains_cjk_text(word):
+        return "Single"
+    return phrase_type or "Phrase"
+
+
+def _should_validate_create_code(item: Dict) -> bool:
+    action = item.get("action", "Create")
+    if action != "Create":
+        return False
+
+    word = str(item.get("word") or "").strip()
+    code = str(item.get("code") or "").strip().lower()
+    if not word or not code or not re.fullmatch(r"[a-z]+", code):
+        return False
+
+    phrase_type = _infer_phrase_type(word, code, item.get("type") or "Phrase")
+    return phrase_type in {"Phrase", "Single"} and _contains_cjk_text(word)
+
+
+def _normalize_draft_item_for_request(item: Dict) -> Dict:
+    normalized = dict(item)
+    word = normalized.get("word")
+    code = normalized.get("code")
+    if isinstance(word, str):
+        normalized["word"] = word.strip()
+    if isinstance(code, str):
+        normalized["code"] = code.strip().lower()
+
+    if not normalized.get("type") and isinstance(normalized.get("word"), str) and isinstance(normalized.get("code"), str):
+        normalized["type"] = _infer_phrase_type(
+            normalized["word"],
+            normalized["code"],
+            "Phrase",
+        )
+    return normalized
+
+
+def _build_encode_candidate_result(
+    word: str,
+    encode_data: Dict,
+    infer_data: Optional[Dict] = None,
+    requested_code: Optional[str] = None,
+) -> Dict:
+    infer_data = infer_data or {}
+    codes = _clean_code_list(encode_data.get("codes")) or _clean_code_list(infer_data.get("codes"))
+    alt_codes = _clean_code_list(encode_data.get("altCodes")) or _clean_code_list(infer_data.get("altCodes"))
+    alternate_pronunciation_codes = build_alternate_pronunciation_codes(encode_data.get("chars"))
+    alternate_codes = _clean_code_list(
+        [
+            code
+            for variant in alternate_pronunciation_codes
+            for code in variant.get("codes", [])
+            if isinstance(variant, dict)
+        ]
+    )
+    requested_prefix = requested_code.strip().lower() if isinstance(requested_code, str) else ""
+    requested_candidate_codes = _clean_code_list(
+        [
+            code for code in alternate_codes
+            if requested_prefix and code.startswith(requested_prefix)
+        ]
+    )
+    candidate_codes = _clean_code_list([
+        *requested_candidate_codes,
+        *codes,
+        *alt_codes,
+        *alternate_codes,
+    ])
+    requested_analysis = (
+        infer_data.get("requestedCodeAnalysis")
+        or encode_data.get("requestedCodeAnalysis")
+    )
+
+    if not candidate_codes:
+        return {"success": False, "message": f"无法计算「{word}」的候选编码"}
+
+    result = {"success": True, "word": word, "candidateCodes": candidate_codes}
+    if requested_analysis:
+        result["requestedCodeAnalysis"] = requested_analysis
+    if alternate_pronunciation_codes:
+        result["alternatePronunciationCodes"] = alternate_pronunciation_codes
+    if requested_candidate_codes:
+        result["requestedCandidateCodes"] = requested_candidate_codes
     return result
 
 
@@ -321,6 +430,8 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
     """
     KEYTAO_API_BASE = get_keytao_url()
     BOT_API_TOKEN = get_bot_token()
+    word = word.strip()
+    code = code.strip().lower()
     
     if not BOT_API_TOKEN:
         logger.error("[get_latest_draft_batch] Missing BOT_API_TOKEN")
@@ -388,23 +499,99 @@ async def _fetch_encode_candidates(word: str, requested_code: Optional[str] = No
             if not codes:
                 infer_response = await client.get(infer_url, params=params)
                 infer_data = infer_response.json() if infer_response.is_success else {}
-                codes = _clean_code_list(infer_data.get("codes"))
-                alt_codes = _clean_code_list(infer_data.get("altCodes"))
-                requested_analysis = infer_data.get("requestedCodeAnalysis")
+                return _build_encode_candidate_result(
+                    word,
+                    encode_data,
+                    infer_data,
+                    requested_code,
+                )
             else:
-                requested_analysis = encode_data.get("requestedCodeAnalysis")
-            candidate_codes = _clean_code_list([*codes, *alt_codes])
-            if not candidate_codes:
-                return {"success": False, "message": f"无法计算「{word}」的候选编码"}
-            result = {"success": True, "word": word, "candidateCodes": candidate_codes}
-            if requested_analysis:
-                result["requestedCodeAnalysis"] = requested_analysis
-            return result
+                return _build_encode_candidate_result(
+                    word,
+                    {**encode_data, "codes": codes, "altCodes": alt_codes},
+                    requested_code=requested_code,
+                )
     except httpx.TimeoutException:
         return {"success": False, "message": f"计算「{word}」编码超时"}
     except Exception as e:
         logger.error(f"[shift_encode] Error for {word}: {e}")
         return {"success": False, "message": f"计算「{word}」编码失败: {str(e)}"}
+
+
+async def _validate_draft_item_code(item: Dict) -> Dict:
+    """Ensure a Create item's code belongs to that word's encode candidate chain."""
+    if not _should_validate_create_code(item):
+        return {"success": True, "skipped": True}
+
+    word = str(item.get("word") or "").strip()
+    code = str(item.get("code") or "").strip().lower()
+    encoding = await _fetch_encode_candidates(word, code)
+    if not encoding.get("success"):
+        return {
+            "success": False,
+            "word": word,
+            "code": code,
+            "reason": encoding.get("message", "编码校验失败"),
+            "candidateCodes": encoding.get("candidateCodes", []),
+        }
+
+    candidate_codes = encoding.get("candidateCodes", [])
+    if code in candidate_codes:
+        return {"success": True, "candidateCodes": candidate_codes}
+
+    return {
+        "success": False,
+        "word": word,
+        "code": code,
+        "reason": f"编码 {code} 不是「{word}」的有效候选编码",
+        "candidateCodes": candidate_codes,
+        "requestedCodeAnalysis": encoding.get("requestedCodeAnalysis"),
+    }
+
+
+def _format_code_validation_failure(validation: Dict, index: int = 0) -> Dict:
+    candidate_codes = validation.get("candidateCodes") or []
+    reason = validation.get("reason", "编码校验失败")
+    if candidate_codes:
+        reason += f"；可选：{', '.join(candidate_codes[:8])}"
+        if len(candidate_codes) > 8:
+            reason += f" 等 {len(candidate_codes)} 个"
+    failed = {
+        "index": index,
+        "word": validation.get("word", ""),
+        "code": validation.get("code", ""),
+        "reason": reason,
+        "validationError": True,
+    }
+    if validation.get("requestedCodeAnalysis") is not None:
+        failed["requestedCodeAnalysis"] = validation.get("requestedCodeAnalysis")
+    return failed
+
+
+async def _split_items_by_code_validation(items: List[Dict]) -> tuple[List[Dict], List[Dict]]:
+    """Return (valid_items, failed_items) after deterministic code validation."""
+    if not items:
+        return [], []
+
+    semaphore = asyncio.Semaphore(8)
+    normalized_items = [_normalize_draft_item_for_request(item) for item in items]
+
+    async def validate(index: int, item: Dict) -> tuple[int, Dict, Dict]:
+        async with semaphore:
+            return index, item, await _validate_draft_item_code(item)
+
+    checked = await asyncio.gather(
+        *(validate(index, item) for index, item in enumerate(normalized_items))
+    )
+
+    valid_items: List[Dict] = []
+    failed_items: List[Dict] = []
+    for index, item, validation in checked:
+        if validation.get("success"):
+            valid_items.append(item)
+        else:
+            failed_items.append(_format_code_validation_failure(validation, index))
+    return valid_items, failed_items
 
 
 async def _lookup_words_raw(words: List[str]) -> Dict:
@@ -503,19 +690,23 @@ async def keytao_create_phrase(
         return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
 
     # Auto-detect type when not explicitly specified, mirrors detectPhraseType in keytao-next
-    if type == "Phrase":
-        import re, unicodedata
-        is_symbol_word = word and all(
-            unicodedata.category(c).startswith(('P', 'S')) for c in word if not c.isspace()
-        )
-        if (code and code.startswith(';')) or is_symbol_word:
-            type = "Symbol"
-        elif re.search(r'https?://|www\.', word, re.IGNORECASE):
-            type = "Link"
-        elif re.search(r'[a-zA-Z]', word):
-            type = "English"
-        elif len(word) == 1 and re.match(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', word):
-            type = "Single"
+    type = _infer_phrase_type(word, code, type)
+    validation = await _validate_draft_item_code({
+        "action": action,
+        "word": word,
+        "code": code,
+        "type": type,
+    })
+    if not validation.get("success"):
+        failed = _format_code_validation_failure(validation)
+        return {
+            "success": False,
+            "message": failed["reason"],
+            "failed": [failed],
+            "failedCount": 1,
+            "batchId": batch_id,
+            "batchUrl": make_batch_url(batch_id),
+        }
 
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch"
     
@@ -998,6 +1189,28 @@ async def keytao_batch_add_to_draft(
         if not batch_id:
             return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
 
+    valid_items, validation_failed = await _split_items_by_code_validation(items)
+    if validation_failed and not valid_items:
+        result = {
+            "success": False,
+            "message": f"{len(validation_failed)} 条编码校验失败，未写入草稿",
+            "batchId": batch_id,
+            "batchUrl": make_batch_url(batch_id),
+            "successCount": 0,
+            "failedCount": len(validation_failed),
+            "skippedCount": 0,
+            "failed": validation_failed,
+            "skipped": [],
+            "draftItems": [],
+            "draftTotal": 0,
+        }
+        snapshot = await _fetch_draft_snapshot(platform, platform_id)
+        if snapshot is not None:
+            result["draft_snapshot"] = snapshot
+            result["draftItems"] = snapshot.get("items", [])
+            result["draftTotal"] = snapshot.get("count", 0)
+        return result
+
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch-draft"
     request_data = {
         "platform": platform,
@@ -1006,11 +1219,14 @@ async def keytao_batch_add_to_draft(
         "items": [
             {**{k: v for k, v in item.items() if k != "old_word"},
              **({"oldWord": item["old_word"]} if "old_word" in item else {})}
-            for item in items
+            for item in valid_items
         ],
     }
 
-    logger.info(f"[keytao_batch_add_to_draft] Sending {len(items)} items to batch-draft")
+    logger.info(
+        f"[keytao_batch_add_to_draft] Sending {len(valid_items)} items to batch-draft "
+        f"({len(validation_failed)} validation failures)"
+    )
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1031,6 +1247,13 @@ async def keytao_batch_add_to_draft(
             # Enrich draft item labels
             if isinstance(data.get("draftItems"), list):
                 data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
+            if validation_failed:
+                data["failed"] = [*data.get("failed", []), *validation_failed]
+                data["failedCount"] = data.get("failedCount", 0) + len(validation_failed)
+                data["message"] = (
+                    f"{data.get('message', '已处理草稿')}；"
+                    f"{len(validation_failed)} 条编码校验失败未写入"
+                )
             _inject_batch_url(data)
             return data
 
