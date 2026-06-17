@@ -159,6 +159,20 @@ _LEADING_COMMAND_PREFIX_RE = re.compile(
 _CLEAR_COMMAND_RE = re.compile(r"^/?(?:clear|清空对话|清空历史)$", re.IGNORECASE)
 _PURE_CHINESE_WORDS_RE = re.compile(r'^[\u4e00-\u9fff]+(?:[\s、，,；;]+[\u4e00-\u9fff]+)*$')
 _WORD_QUERY_STOPWORDS = ("什么", "怎么", "为何", "为啥", "意思", "含义", "吗", "呢", "呀", "啊", "吧", "嘛")
+_PENDING_BATCH_ADD_CONTROL_WORDS = frozenset({
+    "加入", "添加", "加", "一起加入", "写入", "加进去",
+    "重新编码", "直接加", "强制加", "加重码", "添加重码", "确认重码",
+    "重码也行", "就用这个编码",
+})
+_PENDING_SUBMIT_CONFIRM_WORDS = frozenset({"继续提交", "确认提交", "确认提审"})
+_NON_PENDING_SHORT_COMMANDS = frozenset({
+    "草稿", "提交", "提审", "发起审核", "撤回", "撤销提交", "取消提审",
+    "清空历史", "清空对话", "clear", "/clear", "绑定", "bind", "/bind",
+})
+_PENDING_NUMERIC_CHOICE_RE = re.compile(r"(?:第)?\d+(?:个|号)?")
+_PENDING_RECODE_CHOICE_RE = re.compile(r"(?:\d+|[\u4e00-\u9fffA-Za-z0-9]{1,20})\s*重新编码")
+_PENDING_CODE_DIRECTIVE_RE = re.compile(r"(?:改码|换码|用|走|按|放到|改到|到)\s*[a-z]{2,12}", re.IGNORECASE)
+_PENDING_CODE_CHOICE_RE = re.compile(r"[a-z]{2,12}", re.IGNORECASE)
 
 
 def _strip_command_message_prefixes(message_text: str) -> str:
@@ -178,9 +192,21 @@ def _is_clear_command_text(message_text: str) -> bool:
 
 def _is_sensitive_pending_control_text(message_text: str) -> bool:
     text = _strip_command_message_prefixes(message_text).strip()
+    if text in _NON_PENDING_SHORT_COMMANDS:
+        return False
     if _is_confirm(text) or _has_cancel(text):
         return True
-    return text in {"继续提交", "确认提交", "确认提审"}
+    if text in _PENDING_SUBMIT_CONFIRM_WORDS or text in _PENDING_BATCH_ADD_CONTROL_WORDS:
+        return True
+    if _PENDING_NUMERIC_CHOICE_RE.fullmatch(text):
+        return True
+    if _PENDING_RECODE_CHOICE_RE.fullmatch(text):
+        return True
+    if _PENDING_CODE_DIRECTIVE_RE.fullmatch(text):
+        return True
+    if _PENDING_CODE_CHOICE_RE.fullmatch(text):
+        return True
+    return False
 
 
 def _extract_pure_chinese_words(message_text: str) -> List[str]:
