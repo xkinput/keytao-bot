@@ -290,15 +290,31 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
 
     candidates: List[Tuple[str, bool]] = []
     occupied_words: Dict[str, List[str]] = {}
-    for m in re.finditer(r'\d+\.\s*([a-z]+)\s*[-—–]\s*(.+)', response):
+    seen_codes = set()
+    for m in re.finditer(r'(?m)^\s*(?:\d+\.\s*)?([a-z]+)\s*[-—–]\s*(.+?)\s*$', response):
         code = m.group(1)
         desc = m.group(2)
-        candidates.append((code, '已有' in desc))
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+
+        desc_text = desc.strip()
+        is_available = desc_text.startswith("✅") or "空位" in desc_text
+        candidates.append((code, not is_available))
         occupied_match = re.search(r'已有「(.+?)」', desc)
         if occupied_match:
             occupied_words[code] = [
                 part.strip()
                 for part in occupied_match.group(1).split('、')
+                if part.strip()
+            ]
+        elif not is_available:
+            cleaned_desc = re.sub(r'已有\s*', '', desc_text)
+            cleaned_desc = cleaned_desc.replace("✔️", "")
+            cleaned_desc = re.sub(r'[（(].*?[）)]', '', cleaned_desc)
+            occupied_words[code] = [
+                part.strip()
+                for part in re.split(r'[、,，]\s*', cleaned_desc)
                 if part.strip()
             ]
 
@@ -310,6 +326,40 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
         recommended_code=recommended_code,
         candidates=candidates,
         occupied_words=occupied_words,
+    )
+
+
+def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
+    """Parse AI response for a multi-word add confirmation prompt."""
+    if "一起加入草稿" not in response:
+        return None
+
+    confirm_line = next(
+        (
+            line.strip()
+            for line in response.splitlines()
+            if "一起加入草稿" in line and "将「" in line
+        ),
+        "",
+    )
+    if not confirm_line:
+        return None
+
+    items = []
+    seen = set()
+    for code, word in re.findall(r'(?:以编码\s*)?([a-z]+)\s*将「(.+?)」', confirm_line):
+        key = (word, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({"word": word, "code": code, "action": "Create"})
+
+    if len(items) < 2:
+        return None
+
+    return PendingToolConfirm(
+        function_name="keytao_batch_add_to_draft",
+        args={"items": items},
     )
 
 
@@ -1047,6 +1097,10 @@ def _extract_requested_code_from_pending_reply(msg: str) -> Optional[str]:
     text = msg.strip().lower()
     if not text:
         return None
+    if _is_confirm(text) or _has_cancel(text):
+        return None
+    if re.fullmatch(r'[a-z]{2,12}', text):
+        return text
 
     patterns = (
         r'(?:以|用|走|按|放到|改到|到)\s*([a-z]{2,6})',
@@ -1145,7 +1199,10 @@ async def _execute_confirmed_tool(
     state: PendingToolConfirm, platform: str, user_id: str,
 ) -> str:
     """Re-call a tool with confirmed=True and return formatted response."""
-    args = {**state.args, "confirmed": True}
+    if state.function_name == "keytao_batch_add_to_draft":
+        args = dict(state.args)
+    else:
+        args = {**state.args, "confirmed": True}
     result_json = await call_tool_function(state.function_name, args, platform, user_id)
     data = json.loads(result_json)
 
@@ -1161,10 +1218,27 @@ async def _execute_confirmed_tool(
             return "\n".join(parts)
         return f"提交失败：{data.get('message', '未知错误')} qwq"
 
+    if state.function_name == "keytao_batch_add_to_draft":
+        if data.get("not_bound"):
+            return _BIND_HELP_TEXT
+        if data.get("success") or data.get("successCount", 0) > 0:
+            header = "✅ 已加入草稿\n"
+            return header + await _format_draft_response(data, platform, user_id)
+        return f"添加失败：{data.get('message', '未知错误')} qwq"
+
     if data.get("success"):
         header = "✅ 已确认添加到草稿\n"
         return header + await _format_draft_response(data, platform, user_id)
     return f"操作失败：{data.get('message', '未知错误')} qwq"
+
+
+def _is_pending_tool_confirm_message(state: PendingToolConfirm, message: str) -> bool:
+    text = message.strip()
+    if state.function_name == "keytao_submit_batch":
+        return _is_confirm(text) or text in {"提交", "提审"}
+    if state.function_name == "keytao_batch_add_to_draft":
+        return _is_confirm(text) or text in {"加入", "添加", "加", "一起加入", "写入", "加进去"}
+    return _is_confirm(text)
 
 
 async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str:
@@ -1369,6 +1443,26 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
          ⚠️ 禁止向用户展示“待查占用”；回复前必须得到“已有「...」”或“空位”。
 
    【第四步】展示拆分 + 候选编码列表，格式：
+
+     如果 keytao_encode 返回 candidateDisplayGroups（多音单字），必须使用多音单字模板，不要使用普通编号候选模板：
+
+     「词」的键道编码（单字）
+
+     逐字拆分：字根串　形码 XXXX
+
+     📌 pinyinLabel — 音码 XX
+
+       code   — displayLabel
+       code   — displayLabel
+
+     多音单字展示规则：
+     • 按 candidateDisplayGroups 顺序分组；标题使用 pinyinLabel 和 phoneticCode
+     • 每个候选项使用 items[].displayLabel 原样展示
+     • 自己已占用的码显示“已有 词 ✔️”；别人占用只显示词名；空位显示“✅”
+     • 每个读音组里最短可用码显示“✅ （推荐）”
+     • 多音单字不显示“待查占用”，不自己拼候选码
+     • 若需要引导加词，仍必须在末尾保留固定确认句：「是否以编码 XXX 将「YYY」加入草稿」
+       其中 XXX 使用整体 recommendedCode；也可以补一句“也可直接回复其他可选编码”。
 
      「词」（N字词）的拆分和候选编码：
 
@@ -1846,12 +1940,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 # response is None → unrecognized input, fall through to Phase 2
 
             elif isinstance(state, PendingToolConfirm):
-                # "提交" when pending state is submit_batch also counts as confirm
-                is_submit_reconfirm = (
-                    state.function_name == "keytao_submit_batch"
-                    and normalized_message_text.strip() in {"提交", "提审"}
-                )
-                if _is_confirm(normalized_message_text) or is_submit_reconfirm:
+                if _is_pending_tool_confirm_message(state, normalized_message_text):
                     response = await _execute_confirmed_tool(state, platform, user_id)
                 # else: response stays None, fall through to AI as new request
 
@@ -1883,7 +1972,16 @@ async def handle_ai_chat(bot: Bot, event: Event):
 
     # ===== Phase 3: Detect new pending state from AI response =====
     if not conversation_state_store.contains(conv_key):
-        pending = _parse_pending_add_word(response)
+        batch_pending = _parse_pending_batch_add(response)
+        if batch_pending:
+            conversation_state_store.set(conv_key, batch_pending, space_key=space_key)
+            logger.info(
+                "📌 Saved PendingToolConfirm: "
+                f"{batch_pending.function_name} ({len(batch_pending.args.get('items', []))} items)"
+            )
+            pending = None
+        else:
+            pending = _parse_pending_add_word(response)
         if pending:
             conversation_state_store.set(conv_key, pending, space_key=space_key)
             logger.info(

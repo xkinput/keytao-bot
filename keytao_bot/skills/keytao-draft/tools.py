@@ -430,8 +430,6 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
     """
     KEYTAO_API_BASE = get_keytao_url()
     BOT_API_TOKEN = get_bot_token()
-    word = word.strip()
-    code = code.strip().lower()
     
     if not BOT_API_TOKEN:
         logger.error("[get_latest_draft_batch] Missing BOT_API_TOKEN")

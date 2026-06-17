@@ -265,6 +265,7 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 - `occupancyChecked`：是否已经完成候选编码占用查询；为 `true` 时禁止再显示"待查占用"
 - `firstAvailableCode`：首个空位候选码
 - `recommendedCode`：推荐编码；查占用后通常等于 `firstAvailableCode`，否则等于 `codes[0]`
+- `candidateDisplayGroups`：多音单字专用展示分组。每组含 `pinyinLabel`、`phoneticCode`、`recommendedCode` 和 `items[].displayLabel`，展示时必须直接使用这些字段
 - `codes[0]`：最短规则编码
 - `codes[1..]`：逐步加一位形码的选重码
 - `altCodes`：飞键备用编码（zh/ch/uang 双键位产生）
@@ -277,6 +278,8 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 ⚠️ 关键规则：词条候选编码只能取 `candidateStatuses` / `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
 
 ⚠️ 展示候选编码时：如果 `occupancyChecked=true`，必须使用 `candidateStatuses`，例如 `1. hyfi — 已有「会员费」`、`2. hyfio — 空位`。禁止输出"待查占用"。
+
+⚠️ 多音单字展示时：如果返回 `candidateDisplayGroups`，必须按读音分组展示，不使用普通编号候选模板。`displayLabel` 已经区分“已有 当前字 ✔️”、其他占用词和空位。
 
 ## 展示格式（查询编码/拆分时）
 
@@ -296,6 +299,35 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 ```
 飞键备用：fhz · ...
 ```
+
+多音单字使用此格式：
+```
+「噌」的键道编码（单字）
+
+逐字拆分：口｜丶丿丨　形码 ooui
+
+📌 cēng（默认音）— 音码 cr
+
+  cr     — 曾
+  cro    — 蹭
+  croo   — 已有 噌 ✔️
+  croou  — ✅ （推荐）
+  crooui — 已有 噌 ✔️
+
+📌 chēng — 音码 jr
+
+  jr     — 成
+  jro    — 呈
+  jroo   — 宬
+  jroou  — ✅ （推荐）
+  jrooui — ✅
+```
+
+多音单字规则：
+- 每个读音组内，最短空码显示 `✅ （推荐）`
+- 其他空码显示 `✅`
+- 当前查询字自己已占用的码显示 `已有 字 ✔️`
+- 其他词占用只显示词名
 
 用户指定编码时，调用 `keytao_encode(word="词", requested_code="ffb")`。若 `requestedCodeAnalysis.supported=false`，必须说明工具给出的原因，并列出 `seriesCodes` 或 `alternatives`，不要自行推断规则外编码。
 

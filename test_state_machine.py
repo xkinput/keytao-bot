@@ -91,6 +91,8 @@ from keytao_bot.plugins.openai_chat import (
     _has_cancel,
     _handle_pending_add_word,
     _ensure_pending_add_word_guidance,
+    _is_pending_tool_confirm_message,
+    _parse_pending_batch_add,
     _parse_pending_add_word,
     _recover_pending_state_from_history,
     _resolve_shift_target_code,
@@ -295,6 +297,70 @@ def test_parse_pending_add_word_no_candidate_list():
     check("fallback to 1 candidate", len(result.candidates) == 1)
     check("fallback candidate is recommended code",
           result.candidates[0] == ("abc", False))
+
+
+def test_parse_pending_add_word_multitone_template():
+    """Test parsing unnumbered multi-pronunciation encode template."""
+    print("\n🧪 _parse_pending_add_word (multitone template)")
+
+    response = """「噌」的键道编码（单字）
+
+逐字拆分：口｜丶丿丨　形码 ooui
+
+📌 cēng（默认音）— 音码 cr
+
+  cr     — 曾
+  cro    — 蹭
+  croo   — 已有 噌 ✔️
+  croou  — ✅ （推荐）
+  crooui — 已有 噌 ✔️
+
+📌 chēng — 音码 jr
+
+  jr     — 成
+  jro    — 呈
+  jroo   — 宬
+  jroou  — ✅ （推荐）
+  jrooui — ✅
+
+是否以编码 croou 将「噌」加入草稿？也可直接回复其他可选编码。"""
+
+    result = _parse_pending_add_word(response)
+    check("result is not None", result is not None)
+    check("word == '噌'", result.word == "噌")
+    check("recommended_code == 'croou'", result.recommended_code == "croou")
+    check("10 candidates parsed", len(result.candidates) == 10)
+    check("own occupied candidate parsed", ("croo", True) in result.candidates)
+    check("empty recommended candidate parsed", ("jroou", False) in result.candidates)
+    check("other occupant parsed", result.occupied_words["cr"] == ["曾"])
+    check("own occupant parsed", result.occupied_words["croo"] == ["噌"])
+
+
+def test_parse_pending_batch_add_two_words():
+    """Test parsing a two-word batch add confirmation prompt."""
+    print("\n🧪 _parse_pending_batch_add")
+
+    response = """夜钓 — 夜间钓鱼
+
+候选编码：
+1. yedc — ✅ 推荐（空位）
+
+野钓 — 自然水域作钓
+
+候选编码：
+1. yedc — 空位
+2. yedci — ✅ 推荐（空位）
+
+是否以编码 yedc 将「夜钓」、yedci 将「野钓」一起加入草稿？也可分别指定编码～"""
+
+    result = _parse_pending_batch_add(response)
+    check("batch pending parsed", isinstance(result, PendingToolConfirm))
+    check("batch tool selected", result.function_name == "keytao_batch_add_to_draft")
+    check("two items parsed", len(result.args["items"]) == 2)
+    check("first item parsed", result.args["items"][0] == {"word": "夜钓", "code": "yedc", "action": "Create"})
+    check("second item parsed", result.args["items"][1] == {"word": "野钓", "code": "yedci", "action": "Create"})
+    check("'加入' confirms batch add", _is_pending_tool_confirm_message(result, "加入"))
+    check("'加入' is not global confirm", not _is_confirm("加入"))
 
 
 def test_pending_add_word_guidance_appended_for_occupied_candidates():
@@ -1476,6 +1542,44 @@ def test_keytao_draft_headers_allow_optional_user_api_key():
         _FakeConfig.keytao_api_key = old_api_key
 
 
+def test_get_latest_draft_batch_does_not_touch_word_code_locals():
+    """Regression: get_latest_draft_batch must not reference phrase-specific locals."""
+    print("\n🧪 get_latest_draft_batch")
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"batchId": "batch-123"}
+
+    class FakeAsyncClient:
+        last_request = {}
+
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, headers=None, params=None):
+            FakeAsyncClient.last_request = {
+                "url": url,
+                "headers": headers or {},
+                "params": params or {},
+            }
+            return FakeResponse()
+
+    with patch.object(_draft_tools.httpx, "AsyncClient", FakeAsyncClient, create=True):
+        batch_id = asyncio.run(_draft_tools.get_latest_draft_batch("qq", "12345"))
+
+    check("returns batch id", batch_id == "batch-123")
+    check("passes platform param", FakeAsyncClient.last_request["params"].get("platform") == "qq")
+    check("passes platformId param", FakeAsyncClient.last_request["params"].get("platformId") == "12345")
+
+
 async def _run_draft_code_validation_checks():
     async def fake_fetch_encode_candidates(word, requested_code=None):
         check("validation passes requested code to encoder", requested_code in {"xiehmp", "xemev"})
@@ -1841,6 +1945,15 @@ def test_normalize_encode_response_includes_alternate_pronunciation_candidates()
     })
     check("requested series first empty selected", occupied["firstRequestedAvailableCode"] == "jroou")
     check("recommended follows requested pronunciation", occupied["recommendedCode"] == "jroou")
+    groups = occupied["candidateDisplayGroups"]
+    check("display groups include both pronunciations", len(groups) == 2)
+    default_group = next(item for item in groups if item["isDefault"])
+    cheng_group = next(item for item in groups if item["pinyin"] == "chēng")
+    check("default group label marks default", default_group["pinyinLabel"] == "cēng（默认音）")
+    check("own occupied label is explicit", default_group["items"][2]["displayLabel"] == "已有 噌 ✔️")
+    check("other occupied label is bare word", cheng_group["items"][0]["displayLabel"] == "成")
+    check("shortest empty label is recommended", cheng_group["items"][3]["displayLabel"] == "✅ （推荐）")
+    check("later empty label is selectable", cheng_group["items"][4]["displayLabel"] == "✅")
 
 
 def test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate():
@@ -1873,6 +1986,8 @@ def test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate():
     }
 
     check("extracts explicit requested code", _extract_requested_code_from_pending_reply("确认，加，以 jr") == "jr")
+    check("extracts bare requested code", _extract_requested_code_from_pending_reply("jroou") == "jroou")
+    check("does not treat ok as a code", _extract_requested_code_from_pending_reply("ok") is None)
     check("does not treat split pinyin as code", _extract_requested_code_from_pending_reply("重新编码，ch eng，不应该是 wr") is None)
     check("selects first empty shape candidate", _select_requested_code_candidate("噌", "jr", encoding) == ("jroou", False))
 
@@ -2063,6 +2178,8 @@ if __name__ == "__main__":
     test_parse_pending_add_word_all_empty()
     test_parse_pending_add_word_no_match()
     test_parse_pending_add_word_no_candidate_list()
+    test_parse_pending_add_word_multitone_template()
+    test_parse_pending_batch_add_two_words()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
@@ -2104,6 +2221,7 @@ if __name__ == "__main__":
     test_history_store_keeps_user_and_assistant_same_second()
     test_tool_executor_context_injection()
     test_keytao_draft_headers_allow_optional_user_api_key()
+    test_get_latest_draft_batch_does_not_touch_word_code_locals()
     test_keytao_draft_code_validation_guards_create_codes()
     test_draft_encode_candidates_include_alternate_pronunciations()
     test_tool_executor_draft_policy_guards()

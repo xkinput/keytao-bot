@@ -214,6 +214,93 @@ def _format_candidate_status(code: str, phrases: List[Dict]) -> Dict:
     }
 
 
+def _format_candidate_display_label(target_word: str, status: Dict, recommended: bool) -> Dict:
+    phrases = status.get("phrases", [])
+    words = [
+        phrase.get("word", "")
+        for phrase in phrases
+        if isinstance(phrase, dict) and phrase.get("word")
+    ]
+    own_words = [word for word in words if word == target_word]
+    other_words = [word for word in words if word != target_word]
+
+    if not status.get("occupied"):
+        display_label = "✅ （推荐）" if recommended else "✅"
+        state = "available"
+    elif own_words:
+        display_parts = [f"已有 {target_word} ✔️"]
+        display_parts.extend(other_words[:3])
+        display_label = "、".join(display_parts)
+        state = "occupied_self"
+    else:
+        display_label = "、".join(other_words[:3]) if other_words else status.get("label", "")
+        state = "occupied_other"
+
+    return {
+        "code": status.get("code", ""),
+        "displayLabel": display_label,
+        "state": state,
+        "recommended": recommended,
+        "occupied": bool(status.get("occupied")),
+        "words": words,
+    }
+
+
+def _build_candidate_display_groups(encoding: Dict, statuses: List[Dict]) -> List[Dict]:
+    variants = [
+        variant for variant in encoding.get("alternatePronunciationCodes", [])
+        if isinstance(variant, dict)
+    ]
+    if len(variants) <= 1:
+        return []
+
+    status_map = {
+        status.get("code", ""): status
+        for status in statuses
+        if isinstance(status, dict) and status.get("code")
+    }
+    target_word = encoding.get("word", "")
+    groups: List[Dict] = []
+
+    for variant in variants:
+        codes = [
+            code for code in variant.get("codes", [])
+            if isinstance(code, str) and code in status_map
+        ]
+        if not codes:
+            continue
+
+        recommended_code = next(
+            (
+                code for code in codes
+                if not status_map.get(code, {}).get("occupied")
+            ),
+            None,
+        )
+        pinyin = variant.get("pinyin", "")
+        phonetic_code = variant.get("phoneticCode", "")
+        is_default = bool(variant.get("isDefault"))
+        pinyin_label = f"{pinyin}（默认音）" if is_default else pinyin
+
+        groups.append({
+            "pinyin": pinyin,
+            "pinyinLabel": pinyin_label,
+            "phoneticCode": phonetic_code,
+            "isDefault": is_default,
+            "recommendedCode": recommended_code,
+            "items": [
+                _format_candidate_display_label(
+                    target_word,
+                    status_map[code],
+                    recommended=code == recommended_code,
+                )
+                for code in codes
+            ],
+        })
+
+    return groups
+
+
 def _apply_candidate_occupancy(encoding: Dict, lookup_result: Dict) -> Dict:
     candidate_codes = encoding.get("candidateCodes", [])
     if not isinstance(candidate_codes, list) or not candidate_codes:
@@ -258,6 +345,9 @@ def _apply_candidate_occupancy(encoding: Dict, lookup_result: Dict) -> Dict:
         encoding["recommendedCode"] = first_requested_available
     elif first_available:
         encoding["recommendedCode"] = first_available
+    display_groups = _build_candidate_display_groups(encoding, statuses)
+    if display_groups:
+        encoding["candidateDisplayGroups"] = display_groups
     return encoding
 
 
