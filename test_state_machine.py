@@ -1037,6 +1037,8 @@ def test_sensitive_pending_control_text():
     check("prefixed confirm is sensitive", _is_sensitive_pending_control_text("喵喵 确认"))
     check("cancel is sensitive", _is_sensitive_pending_control_text("取消"))
     check("submit confirm is sensitive", _is_sensitive_pending_control_text("确认提交"))
+    check("plain submit is a fresh command", not _is_sensitive_pending_control_text("提交"))
+    check("plain review submit is a fresh command", not _is_sensitive_pending_control_text("提审"))
     check("normal lookup is not sensitive", not _is_sensitive_pending_control_text("查词 增香"))
 
 

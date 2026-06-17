@@ -180,7 +180,7 @@ def _is_sensitive_pending_control_text(message_text: str) -> bool:
     text = _strip_command_message_prefixes(message_text).strip()
     if _is_confirm(text) or _has_cancel(text):
         return True
-    return text in {"提交", "提审", "继续提交", "确认提交", "确认提审"}
+    return text in {"继续提交", "确认提交", "确认提审"}
 
 
 def _extract_pure_chinese_words(message_text: str) -> List[str]:
