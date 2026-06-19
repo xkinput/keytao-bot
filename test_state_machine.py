@@ -10,6 +10,7 @@ import importlib.util
 import json
 import sqlite3
 import tempfile
+from typing import Dict
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -457,6 +458,38 @@ def test_referenced_other_owner_submit_does_not_copy():
         check("submit response names owner", response is not None and "EVO" in response)
         check("submit response points to own command", response is not None and "提交" in response)
         check("submit pending not copied", store.get_record(current_key) is None)
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
+def test_referenced_unknown_pending_recode_falls_through():
+    """A referenced add prompt plus recode text should be handled as a fresh request."""
+    print("\n🧪 referenced unknown pending recode falls through")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        referenced_pending = PendingAddWord(
+            word="室内乐",
+            recommended_code="enyhu",
+            candidates=[("enyhu", False)],
+        )
+
+        response = _handle_referenced_pending_from_other_user(
+            referenced_pending,
+            store.get_record(current_key),
+            None,
+            current_key,
+            space_key,
+            "Rea",
+            "室内乐 是音乐的乐 不是快乐的乐 重新编码",
+        )
+
+        check("recode reply falls through to AI flow", response is None)
+        check("stale referenced pending is not copied", store.get_record(current_key) is None)
     finally:
         openai_chat_module.conversation_state_store = old_store
 
@@ -1797,6 +1830,70 @@ def test_draft_encode_candidates_include_alternate_pronunciations():
     check("alternate pronunciation variants preserved", len(result["alternatePronunciationCodes"]) == 2)
 
 
+def _indoor_music_encode_data() -> Dict:
+    return {
+        "input": "室内乐",
+        "type": "三字词",
+        "chars": [
+            {
+                "char": "室",
+                "pinyin": "shì",
+                "pinyins": ["shì"],
+                "phoneticCode": "ek",
+                "shapeCode": "oova",
+            },
+            {
+                "char": "内",
+                "pinyin": "nèi",
+                "pinyins": ["nèi", "nà"],
+                "phoneticCode": "nw",
+                "shapeCode": "iauo",
+            },
+            {
+                "char": "乐",
+                "pinyin": "lè",
+                "pinyins": ["lè", "yuè", "yào", "lào"],
+                "phoneticCode": "le",
+                "shapeCode": "uaiu",
+            },
+        ],
+        "codes": ["enl", "enlo", "enloi", "enloiu"],
+        "altCodes": [],
+        "requestedCodeAnalysis": {
+            "code": "enyhu",
+            "supported": False,
+            "matchType": "unsupported",
+        },
+    }
+
+
+def test_draft_encode_candidates_include_phrase_polyphone_candidates():
+    """Verify draft validation accepts deterministic phrase-internal polyphone chains."""
+    print("\n🧪 KeyTao draft phrase polyphone candidates")
+
+    result = _build_encode_candidate_result(
+        "室内乐",
+        _indoor_music_encode_data(),
+        requested_code="enyhu",
+    )
+    yh_result = _build_encode_candidate_result(
+        "室内乐",
+        _indoor_music_encode_data(),
+        requested_code="yh",
+    )
+
+    phrase_variants = result["alternatePhrasePronunciationCodes"]
+    yue_variant = next(item for item in phrase_variants if item["pinyin"] == "yuè")
+    check("phrase polyphone variants present", len(phrase_variants) >= 3)
+    check("yue variant points at 乐", yue_variant["char"] == "乐" and yue_variant["charIndex"] == 2)
+    check("standard yue phrase chain is present", "enyoiu" in yue_variant["standardCodes"])
+    check("stale full-phonetic yue chain is accepted narrowly", "enyhu" in yue_variant["focusedCodes"])
+    check("candidate build accepts enyhu", "enyhu" in result["candidateCodes"])
+    check("requested enyhu series comes first", result["requestedCandidateCodes"][0] == "enyhu")
+    check("requested yh maps to yue phrase chain", yh_result["requestedCandidateCodes"][0] == "eny")
+    check("default le focused chain is not invented", "enle" not in result["candidateCodes"])
+
+
 async def _run_tool_executor_policy_checks():
     calls = []
 
@@ -2088,6 +2185,36 @@ def test_normalize_encode_response_includes_alternate_pronunciation_candidates()
     check("later empty label is selectable", cheng_group["items"][4]["displayLabel"] == "✅")
 
 
+def test_normalize_encode_response_includes_phrase_polyphone_candidates():
+    """Verify phrase-internal polyphone routes are exposed without single-char grouping."""
+    print("\n🧪 keytao_encode phrase polyphone candidates")
+
+    result = _normalize_encode_response("室内乐", _indoor_music_encode_data())
+    requested_data = _indoor_music_encode_data()
+    requested_data["requestedCodeAnalysis"] = {"code": "yh", "supported": False}
+    requested = _normalize_encode_response(
+        "室内乐",
+        requested_data,
+    )
+    occupied = _apply_candidate_occupancy(result, {
+        "success": True,
+        "results": [
+            {"code": code, "phrases": []}
+            for code in result["candidateCodes"]
+        ],
+    })
+
+    yue_variant = next(
+        item for item in result["alternatePhrasePronunciationCodes"]
+        if item["pinyin"] == "yuè"
+    )
+    check("lookup candidateCodes include standard yue chain", "enyoiu" in result["candidateCodes"])
+    check("lookup candidateCodes include stale focused yue code", "enyhu" in result["candidateCodes"])
+    check("lookup yue variant is tied to third char", yue_variant["charIndex"] == 2)
+    check("requested yh exposes yue route", requested["requestedCandidateCodes"][0] == "eny")
+    check("phrase polyphones do not create single-char display groups", "candidateDisplayGroups" not in occupied)
+
+
 def test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate():
     """Verify 'confirm add with jr' is treated as a phonetic route, not bare code jr."""
     print("\n🧪 pending add-word explicit phonetic prefix")
@@ -2315,6 +2442,7 @@ if __name__ == "__main__":
     test_parse_pending_state_from_referenced_message()
     test_referenced_other_owner_pending_prompts_copy()
     test_referenced_other_owner_submit_does_not_copy()
+    test_referenced_unknown_pending_recode_falls_through()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
@@ -2359,12 +2487,14 @@ if __name__ == "__main__":
     test_get_latest_draft_batch_does_not_touch_word_code_locals()
     test_keytao_draft_code_validation_guards_create_codes()
     test_draft_encode_candidates_include_alternate_pronunciations()
+    test_draft_encode_candidates_include_phrase_polyphone_candidates()
     test_tool_executor_draft_policy_guards()
     test_orchestrator_empty_response_retry()
     test_normalize_encode_response_codes_first()
     test_normalize_encode_response_infer_fallback()
     test_apply_candidate_occupancy_updates_recommendation()
     test_normalize_encode_response_includes_alternate_pronunciation_candidates()
+    test_normalize_encode_response_includes_phrase_polyphone_candidates()
     test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate()
     test_build_code_shift_plan_uses_occupant_encode_chain()
     test_build_code_shift_plan_cascades_until_empty()

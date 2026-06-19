@@ -266,6 +266,8 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 - `firstAvailableCode`：首个空位候选码
 - `recommendedCode`：推荐编码；查占用后通常等于 `firstAvailableCode`，否则等于 `codes[0]`
 - `candidateDisplayGroups`：多音单字专用展示分组。每组含 `pinyinLabel`、`phoneticCode`、`recommendedCode` 和 `items[].displayLabel`，展示时必须直接使用这些字段
+- `alternatePronunciationCodes`：多音单字候选。每组含 `pinyin`、`phoneticCode`、`codes`
+- `alternatePhrasePronunciationCodes`：词组中多音字候选。每组含 `char`、`charIndex`、`pinyin`、`phoneticCode`、`codes`
 - `codes[0]`：最短规则编码
 - `codes[1..]`：逐步加一位形码的选重码
 - `altCodes`：飞键备用编码（zh/ch/uang 双键位产生）
@@ -280,6 +282,8 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 ⚠️ 展示候选编码时：如果 `occupancyChecked=true`，必须使用 `candidateStatuses`，例如 `1. hyfi — 已有「会员费」`、`2. hyfio — 空位`。禁止输出"待查占用"。
 
 ⚠️ 多音单字展示时：如果返回 `candidateDisplayGroups`，必须按读音分组展示，不使用普通编号候选模板。`displayLabel` 已经区分“已有 当前字 ✔️”、其他占用词和空位。
+
+⚠️ 用户纠正词组中某个多音字读音时（如“室内乐 是音乐的乐”），只能从 `alternatePhrasePronunciationCodes` / `requestedCandidateCodes` / `candidateStatuses` 选择候选，禁止根据 `chars` 自己拼编码。
 
 ## 展示格式（查询编码/拆分时）
 

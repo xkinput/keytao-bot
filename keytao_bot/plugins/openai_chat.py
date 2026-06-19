@@ -508,6 +508,18 @@ def _pending_state_can_be_copied_to_current_user(state: PendingState) -> bool:
     return False
 
 
+def _requests_recode_or_pronunciation_change(message: str) -> bool:
+    text = (message or "").strip().lower()
+    return any(marker in text for marker in (
+        "重新编码",
+        "重编",
+        "改码",
+        "读音",
+        "音码",
+        "不是",
+    ))
+
+
 def _format_other_owner_pending_message(
     owner_label: str,
     state: PendingState,
@@ -536,6 +548,7 @@ def _handle_referenced_pending_from_other_user(
     conv_key: Tuple[str, str],
     space_key: Tuple[str, str],
     owner_label: str,
+    message: str = "",
 ) -> Optional[str]:
     """Handle a user replying to a bot pending prompt that is not their own."""
     if referenced_state is None:
@@ -543,9 +556,10 @@ def _handle_referenced_pending_from_other_user(
     if current_record and conversation_state_store.states_equivalent(current_record.state, referenced_state):
         return None
 
+    recode_requested = _requests_recode_or_pronunciation_change(message)
     if other_record is not None:
         copied = False
-        if _pending_state_can_be_copied_to_current_user(referenced_state):
+        if not recode_requested and _pending_state_can_be_copied_to_current_user(referenced_state):
             conversation_state_store.set(
                 conv_key,
                 _clone_pending_state(referenced_state),
@@ -558,6 +572,9 @@ def _handle_referenced_pending_from_other_user(
             referenced_state,
             copied,
         )
+
+    if recode_requested:
+        return None
 
     if _pending_state_can_be_copied_to_current_user(referenced_state):
         conversation_state_store.set(
@@ -1620,6 +1637,9 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
          如果用户是在纠正单字读音/双拼音码（例如“ch eng 应该是 jr”“以 jr 的编码加”），
          jr 这类两码通常只是“声母+韵母”的音码前缀，不等于完整单字编码；必须结合 keytao_encode 返回的
          alternatePronunciationCodes / requestedCandidateCodes / candidateStatuses，沿该读音的形码链选择空位。
+         如果用户纠正的是词组里的多音字（例如“室内乐 是音乐的乐 不是快乐的乐”），
+         必须使用 keytao_encode 返回的 alternatePhrasePronunciationCodes / requestedCandidateCodes / candidateStatuses，
+         按对应 charIndex/pinyin/phoneticCode 的候选链选码，禁止根据 chars 自己拼词组码。
 
    【第二步】判断：
      A) 词库已有 → 展示词库位置 + 拆分，流程结束
@@ -1631,6 +1651,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
          调用 keytao_lookup_by_codes_batch 查每个码位。
          飞键候选必须以工具返回的 altCodes / flyKeyVariants / candidateStatuses 为准；
          多音单字候选必须以工具返回的 alternatePronunciationCodes / requestedCandidateCodes 为准；
+         词组中多音字候选必须以工具返回的 alternatePhrasePronunciationCodes / requestedCandidateCodes 为准；
          支持固定规则组合候选，如 zh 的 q/f 双键位组合，禁止自己泛化到规则外键位。
          ⚠️ 禁止向用户展示“待查占用”；回复前必须得到“已有「...」”或“空位”。
 
@@ -2113,6 +2134,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
             conv_key,
             space_key,
             owner_label,
+            normalized_message_text,
         )
         if response is not None:
             add_to_history(conv_key, normalized_message_text, response)

@@ -10,6 +10,7 @@ from nonebot.log import logger
 
 from keytao_bot.utils.keytao_encoding import (
     build_alternate_pronunciation_codes as _build_alternate_pronunciation_codes,
+    build_phrase_pronunciation_codes as _build_phrase_pronunciation_codes,
 )
 
 
@@ -138,19 +139,37 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
 
     chars = _clean_encode_chars(encode_data.get("chars"))
     alternate_pronunciation_codes = _build_alternate_pronunciation_codes(chars)
+    phrase_pronunciation_codes = _build_phrase_pronunciation_codes(chars)
+    pronunciation_variants = [*alternate_pronunciation_codes, *phrase_pronunciation_codes]
     alternate_codes = _clean_code_list(
         [
             code
-            for variant in alternate_pronunciation_codes
+            for variant in pronunciation_variants
             for code in variant.get("codes", [])
             if isinstance(variant, dict)
         ]
     )
     requested_code = _requested_code_from_analysis(encode_data, infer_data)
+    requested_variants = [
+        variant
+        for variant in pronunciation_variants
+        if requested_code
+        and isinstance(variant, dict)
+        and variant.get("phoneticCode") == requested_code
+    ]
+    requested_variant_codes = _clean_code_list([
+        code
+        for variant in requested_variants
+        for code in variant.get("codes", [])
+        if isinstance(code, str)
+    ])
     requested_candidate_codes = _clean_code_list(
         [
-            code for code in alternate_codes
-            if requested_code and code.startswith(requested_code)
+            code for code in [
+                *requested_variant_codes,
+                *alternate_codes,
+            ]
+            if (requested_code and code.startswith(requested_code)) or code in requested_variant_codes
         ]
     )
 
@@ -179,6 +198,7 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         "codes": codes,
         "altCodes": alt_codes,
         "alternatePronunciationCodes": alternate_pronunciation_codes,
+        "alternatePhrasePronunciationCodes": phrase_pronunciation_codes,
         "requestedCandidateCodes": requested_candidate_codes,
         "flyKeyVariants": encode_data.get("flyKeyVariants") or infer_data.get("flyKeyVariants") or [],
         "codeSource": code_source,
@@ -811,7 +831,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_encode",
-            "description": "按键道规则计算词条的编码、候选码占用情况和字根拆分。返回的 candidateStatuses 是已经查过占用的候选列表，禁止回复'待查占用'；candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。单字多音字会额外返回 alternatePronunciationCodes，并把其它读音的合法候选并入 candidateCodes；用户纠正读音或给出音码前缀时，应传 requested_code 并优先使用 requestedCandidateCodes/firstRequestedAvailableCode。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
+            "description": "按键道规则计算词条的编码、候选码占用情况和字根拆分。返回的 candidateStatuses 是已经查过占用的候选列表，禁止回复'待查占用'；candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。单字多音字会额外返回 alternatePronunciationCodes；词组中多音字会额外返回 alternatePhrasePronunciationCodes；这些合法候选会并入 candidateCodes。用户纠正读音或给出音码前缀时，应传 requested_code 并优先使用 requestedCandidateCodes/firstRequestedAvailableCode。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
             "parameters": {
                 "type": "object",
                 "properties": {

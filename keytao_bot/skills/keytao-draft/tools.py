@@ -11,7 +11,10 @@ import httpx
 from typing import Dict, List, Optional
 from nonebot.log import logger
 
-from keytao_bot.utils.keytao_encoding import build_alternate_pronunciation_codes
+from keytao_bot.utils.keytao_encoding import (
+    build_alternate_pronunciation_codes,
+    build_phrase_pronunciation_codes,
+)
 
 
 ACTION_LABELS = {
@@ -119,20 +122,40 @@ def _build_encode_candidate_result(
     infer_data = infer_data or {}
     codes = _clean_code_list(encode_data.get("codes")) or _clean_code_list(infer_data.get("codes"))
     alt_codes = _clean_code_list(encode_data.get("altCodes")) or _clean_code_list(infer_data.get("altCodes"))
-    alternate_pronunciation_codes = build_alternate_pronunciation_codes(encode_data.get("chars"))
+    chars = encode_data.get("chars")
+    alternate_pronunciation_codes = build_alternate_pronunciation_codes(chars)
+    phrase_pronunciation_codes = build_phrase_pronunciation_codes(chars)
+    pronunciation_variants = [*alternate_pronunciation_codes, *phrase_pronunciation_codes]
     alternate_codes = _clean_code_list(
         [
             code
-            for variant in alternate_pronunciation_codes
+            for variant in pronunciation_variants
             for code in variant.get("codes", [])
             if isinstance(variant, dict)
         ]
     )
     requested_prefix = requested_code.strip().lower() if isinstance(requested_code, str) else ""
+    requested_variants = [
+        variant
+        for variant in pronunciation_variants
+        if requested_prefix
+        and isinstance(variant, dict)
+        and variant.get("phoneticCode") == requested_prefix
+    ]
+    requested_variant_codes = _clean_code_list([
+        code
+        for variant in requested_variants
+        for code in variant.get("codes", [])
+        if isinstance(code, str)
+    ])
     requested_candidate_codes = _clean_code_list(
         [
-            code for code in alternate_codes
-            if requested_prefix and code.startswith(requested_prefix)
+            code
+            for code in [
+                *requested_variant_codes,
+                *alternate_codes,
+            ]
+            if requested_prefix and (code.startswith(requested_prefix) or code in requested_variant_codes)
         ]
     )
     candidate_codes = _clean_code_list([
@@ -154,6 +177,8 @@ def _build_encode_candidate_result(
         result["requestedCodeAnalysis"] = requested_analysis
     if alternate_pronunciation_codes:
         result["alternatePronunciationCodes"] = alternate_pronunciation_codes
+    if phrase_pronunciation_codes:
+        result["alternatePhrasePronunciationCodes"] = phrase_pronunciation_codes
     if requested_candidate_codes:
         result["requestedCandidateCodes"] = requested_candidate_codes
     return result

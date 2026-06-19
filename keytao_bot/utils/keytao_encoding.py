@@ -210,14 +210,103 @@ def build_single_char_code_chain(phonetic_code: str, shape_code: object) -> List
     )
 
 
+def _clean_char_infos(chars: object) -> List[Dict]:
+    if not isinstance(chars, list):
+        return []
+
+    cleaned: List[Dict] = []
+    for item in chars:
+        if not isinstance(item, dict):
+            continue
+        cleaned.append(item)
+    return cleaned
+
+
+def _shape_first_key(char_info: Dict) -> str:
+    shape_code = char_info.get("shapeCode")
+    return shape_code[:1] if isinstance(shape_code, str) else ""
+
+
+def _build_progressive_codes(base: str, shape_steps: List[str]) -> List[str]:
+    if not base:
+        return []
+
+    codes = [base]
+    current = base
+    for step in shape_steps:
+        if not step:
+            break
+        current += step
+        codes.append(current)
+    return _clean_code_list(codes)
+
+
+def _phrase_code_positions(length: int) -> List[int]:
+    if length <= 0:
+        return []
+    if length <= 3:
+        return list(range(length))
+    return [0, 1, 2, length - 1]
+
+
+def build_phrase_code_chain(chars: object, phonetic_codes: Optional[List[str]] = None) -> List[str]:
+    """Build the standard KeyTao phrase candidate chain for encoded chars."""
+    char_infos = _clean_char_infos(chars)
+    if not char_infos:
+        return []
+
+    if phonetic_codes is None:
+        phonetic_codes = [
+            code if isinstance(code, str) else ""
+            for code in (item.get("phoneticCode") for item in char_infos)
+        ]
+    if len(phonetic_codes) != len(char_infos) or any(not code for code in phonetic_codes):
+        return []
+
+    length = len(char_infos)
+    if length == 1:
+        return build_single_char_code_chain(phonetic_codes[0], char_infos[0].get("shapeCode"))
+
+    if length == 2:
+        base = "".join(phonetic_codes)
+        shape_steps = [_shape_first_key(item) for item in char_infos]
+    elif length == 3:
+        base = "".join(code[:1] for code in phonetic_codes)
+        shape_steps = [_shape_first_key(item) for item in char_infos]
+    else:
+        positions = _phrase_code_positions(length)
+        base = "".join(phonetic_codes[index][:1] for index in positions)
+        shape_steps = [_shape_first_key(char_infos[0]), _shape_first_key(char_infos[1])]
+
+    return _build_progressive_codes(base, shape_steps)
+
+
+def _build_focused_phrase_pronunciation_chain(
+    chars: List[Dict],
+    phonetic_codes: List[str],
+    char_index: int,
+    phonetic_code: str,
+) -> List[str]:
+    """Build a narrow chain for stale prompts that used a full final-char sound code."""
+    length = len(chars)
+    if length <= 2:
+        return []
+
+    positions = _phrase_code_positions(length)
+    if not positions or char_index != positions[-1]:
+        return []
+
+    prefix = "".join(phonetic_codes[index][:1] for index in positions[:-1])
+    suffix_codes = build_single_char_code_chain(phonetic_code, chars[char_index].get("shapeCode"))
+    return _clean_code_list([prefix + code for code in suffix_codes])
+
+
 def build_alternate_pronunciation_codes(chars: object) -> List[Dict]:
-    if not isinstance(chars, list) or len(chars) != 1:
+    char_infos = _clean_char_infos(chars)
+    if len(char_infos) != 1:
         return []
 
-    char_info = chars[0]
-    if not isinstance(char_info, dict):
-        return []
-
+    char_info = char_infos[0]
     pinyins = char_info.get("pinyins", [])
     if not isinstance(pinyins, list):
         return []
@@ -244,4 +333,68 @@ def build_alternate_pronunciation_codes(chars: object) -> List[Dict]:
             "codes": code_chain,
             "isDefault": phonetic_code == default_phonetic or pinyin == default_pinyin,
         })
+    return variants
+
+
+def build_phrase_pronunciation_codes(chars: object) -> List[Dict]:
+    """Build bounded pronunciation variants for polyphonic chars inside a phrase."""
+    char_infos = _clean_char_infos(chars)
+    if len(char_infos) <= 1:
+        return []
+
+    default_phonetic_codes = [
+        code if isinstance(code, str) else ""
+        for code in (item.get("phoneticCode") for item in char_infos)
+    ]
+    if any(not code for code in default_phonetic_codes):
+        return []
+
+    variants: List[Dict] = []
+    seen_keys = set()
+    for index, char_info in enumerate(char_infos):
+        pinyins = char_info.get("pinyins", [])
+        if not isinstance(pinyins, list) or len(pinyins) <= 1:
+            continue
+
+        default_pinyin = char_info.get("pinyin", "")
+        default_phonetic = default_phonetic_codes[index]
+        seen_phonetics = set()
+        for pinyin in pinyins:
+            if not isinstance(pinyin, str) or not pinyin.strip():
+                continue
+            phonetic_code = pinyin_to_phonetic_code(pinyin)
+            if not phonetic_code or phonetic_code in seen_phonetics:
+                continue
+            seen_phonetics.add(phonetic_code)
+            is_default = phonetic_code == default_phonetic or pinyin == default_pinyin
+            if is_default:
+                continue
+
+            phonetic_codes = list(default_phonetic_codes)
+            phonetic_codes[index] = phonetic_code
+            standard_codes = build_phrase_code_chain(char_infos, phonetic_codes)
+            focused_codes = _build_focused_phrase_pronunciation_chain(
+                char_infos,
+                default_phonetic_codes,
+                index,
+                phonetic_code,
+            )
+            codes = _clean_code_list([*standard_codes, *focused_codes])
+            if not codes:
+                continue
+
+            key = (index, phonetic_code, tuple(codes))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            variants.append({
+                "char": char_info.get("char", ""),
+                "charIndex": index,
+                "pinyin": pinyin,
+                "phoneticCode": phonetic_code,
+                "codes": codes,
+                "standardCodes": standard_codes,
+                "focusedCodes": focused_codes,
+                "isDefault": False,
+            })
     return variants
