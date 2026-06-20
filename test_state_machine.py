@@ -102,6 +102,7 @@ from keytao_bot.plugins.openai_chat import (
     _pending_owner_label,
     _recover_pending_state_from_history,
     _resolve_shift_target_code,
+    _restore_current_pending_from_history_for_sensitive_control,
     _select_requested_code_candidate,
     _strip_command_message_prefixes,
     _strip_markdown,
@@ -519,6 +520,63 @@ def test_referenced_pending_prefers_current_user_history():
         check("current pending restored", current_record is not None)
         check("current owner label is nickname", current_record.owner_label == "Garth")
         check("same referenced prompt falls through to current pending", response is None)
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
+def test_sensitive_control_restores_current_history_before_other_owner_guard():
+    """Unquoted sensitive controls should recover the sender before blocking on others."""
+    print("\n🧪 sensitive control restores current history before other owner guard")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        other_key = ("qq", "1001")
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        same_pending = PendingAddWord(
+            word="室内乐",
+            recommended_code="enyo",
+            candidates=[("eny", True), ("enyo", False), ("enyoi", False)],
+            occupied_words={"eny": ["是那样"]},
+        )
+        store.set(other_key, same_pending, space_key=space_key, owner_label="Rea")
+        history = [
+            {"role": "user", "content": "喵喵 清空草稿，重新编码"},
+            {
+                "role": "assistant",
+                "content": """🗑️ 草稿已清空！「室内乐」重新编码如下：
+
+候选编码：
+1. eny — 已有「是那样」
+2. enyo — ✅ 推荐（空位）
+3. enyoi — ✅ 空位
+
+是否以编码 enyo 将「室内乐」加入草稿？也可回复编号指定其他编码～""",
+            },
+        ]
+
+        restored_record = _restore_current_pending_from_history_for_sensitive_control(
+            "加入并提交",
+            current_key,
+            space_key,
+            "Garth",
+            history,
+        )
+        other_record = store.find_pending_for_other_owner(space_key, current_key)
+
+        would_block_as_other_owner = (
+            _is_sensitive_pending_control_text("加入并提交")
+            and not store.contains(current_key)
+            and other_record is not None
+        )
+
+        check("current pending restored", restored_record is not None)
+        check("current pending word restored", restored_record.state.word == "室内乐")
+        check("current owner label restored", restored_record.owner_label == "Garth")
+        check("other pending still exists", other_record is not None)
+        check("guard no longer blocks as other owner", not would_block_as_other_owner)
     finally:
         openai_chat_module.conversation_state_store = old_store
 
@@ -1068,6 +1126,58 @@ def test_pending_add_word_confirm_uses_recommended():
             break
 
 
+def test_pending_add_word_add_and_submit_uses_recommended():
+    """Verify '加入并提交' adds the recommended code and submits the batch."""
+    print("\n🧪 PendingAddWord add and submit → recommended code")
+
+    state = PendingAddWord(
+        word="室内乐",
+        recommended_code="enyo",
+        candidates=[
+            ("eny", True),
+            ("enyo", False),
+            ("enyoi", False),
+        ],
+        occupied_words={"eny": ["是那样"]},
+    )
+
+    async def _run():
+        calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, arguments, platform, user_id))
+            if tool_name == "keytao_create_phrase":
+                return json.dumps({
+                    "success": True,
+                    "batchUrl": "https://keytao.test/batch/current",
+                }, ensure_ascii=False)
+            if tool_name == "keytao_submit_batch":
+                return json.dumps({
+                    "success": True,
+                    "batchUrl": "https://keytao.test/batch/current",
+                }, ensure_ascii=False)
+            raise AssertionError(tool_name)
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _handle_pending_add_word(
+                state,
+                "加入并提交",
+                "qq",
+                "2002",
+                [],
+                ("qq", "qq:group:42"),
+                "Garth",
+            )
+
+        check("add called first", calls[0][0] == "keytao_create_phrase")
+        check("recommended code used", calls[0][1] == {"word": "室内乐", "code": "enyo"})
+        check("submit called second", calls[1][0] == "keytao_submit_batch")
+        check("submit uses current user", calls[1][2:] == ("qq", "2002"))
+        check("response says submitted", "已加入草稿并提交审核" in result)
+
+    asyncio.run(_run())
+
+
 def test_pending_tool_confirm_data():
     """Test PendingToolConfirm dataclass."""
     print("\n🧪 PendingToolConfirm")
@@ -1272,6 +1382,8 @@ def test_sensitive_pending_control_text():
     check("plain submit is a fresh command", not _is_sensitive_pending_control_text("提交"))
     check("plain review submit is a fresh command", not _is_sensitive_pending_control_text("提审"))
     check("batch join is sensitive", _is_sensitive_pending_control_text("加入"))
+    check("add and submit is sensitive", _is_sensitive_pending_control_text("加入并提交"))
+    check("prefixed add and submit is sensitive", _is_sensitive_pending_control_text("喵喵 加入并提交"))
     check("batch write is sensitive", _is_sensitive_pending_control_text("写入"))
     check("plain recode is sensitive", _is_sensitive_pending_control_text("重新编码"))
     check("duplicate add is sensitive", _is_sensitive_pending_control_text("加重码"))
@@ -2545,6 +2657,7 @@ if __name__ == "__main__":
     test_referenced_other_owner_pending_prompts_copy()
     test_referenced_other_owner_submit_does_not_copy()
     test_referenced_pending_prefers_current_user_history()
+    test_sensitive_control_restores_current_history_before_other_owner_guard()
     test_pending_owner_label_hides_raw_id()
     test_qq_sender_display_name_supports_onebot_sender_object()
     test_referenced_unknown_pending_recode_falls_through()
@@ -2562,6 +2675,7 @@ if __name__ == "__main__":
     test_occupied_numeric_choice_means_duplicate_confirm()
     test_shift_request_can_target_by_number_or_word()
     test_pending_add_word_confirm_uses_recommended()
+    test_pending_add_word_add_and_submit_uses_recommended()
     test_pending_tool_confirm_data()
     test_strip_markdown()
     test_markdownv2_escape()

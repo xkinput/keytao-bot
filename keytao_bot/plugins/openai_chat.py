@@ -207,6 +207,8 @@ def _is_sensitive_pending_control_text(message_text: str) -> bool:
     text = _strip_command_message_prefixes(message_text).strip()
     if text in _NON_PENDING_SHORT_COMMANDS:
         return False
+    if _is_add_and_submit_message(text):
+        return True
     if _is_confirm(text) or _has_cancel(text):
         return True
     if text in _PENDING_SUBMIT_CONFIRM_WORDS or text in _PENDING_BATCH_ADD_CONTROL_WORDS:
@@ -220,6 +222,16 @@ def _is_sensitive_pending_control_text(message_text: str) -> bool:
     if _PENDING_CODE_CHOICE_RE.fullmatch(text):
         return True
     return False
+
+
+def _is_add_and_submit_message(message_text: str) -> bool:
+    text = re.sub(r"\s+", "", _strip_command_message_prefixes(message_text).strip())
+    return bool(re.fullmatch(
+        r"(?:加入草稿|添加草稿|加入|添加|加|写入|加进去)"
+        r"(?:并|后)?"
+        r"(?:提交审核|提交|提审)",
+        text,
+    ))
 
 
 def _extract_pure_chinese_words(message_text: str) -> List[str]:
@@ -474,6 +486,33 @@ def _ensure_current_pending_matches_reference(
     recovered_state = _recover_pending_state_from_history(history)
     if not conversation_state_store.states_equivalent(recovered_state, referenced_state):
         return current_record
+
+    conversation_state_store.set(
+        conv_key,
+        recovered_state,
+        space_key=space_key,
+        owner_label=owner_label,
+    )
+    return conversation_state_store.get_record(conv_key)
+
+
+def _restore_current_pending_from_history_for_sensitive_control(
+    message_text: str,
+    conv_key: Tuple[str, str],
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+    history: Optional[List[Dict]],
+) -> Optional[PendingStateRecord]:
+    """Restore the current user's pending state before considering other owners."""
+    current_record = conversation_state_store.get_record(conv_key)
+    if current_record is not None:
+        return current_record
+    if not _is_sensitive_pending_control_text(message_text):
+        return None
+
+    recovered_state = _recover_pending_state_from_history(history)
+    if recovered_state is None:
+        return None
 
     conversation_state_store.set(
         conv_key,
@@ -1095,7 +1134,7 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
 
         sender = reply_payload.get('sender', {}) if isinstance(reply_payload, dict) else {}
         reply_from_id = str(sender.get('user_id') or reply_payload.get('user_id', ''))
-        reply_from_name = sender.get('card') or sender.get('nickname') or reply_from_id or '未知用户'
+        reply_from_name = _display_name_from_qq_sender(sender, reply_from_id or '未知用户')
         reply_text = extract_onebot_plaintext(
             reply_payload.get('message') if isinstance(reply_payload, dict) else None
         )
@@ -1301,6 +1340,80 @@ async def _execute_add_to_draft(
 
     header = f"✅ 已将「{word}」以编码 {code} 加入草稿\n"
     return header + await _format_draft_response(data, platform, user_id)
+
+
+async def _execute_add_to_draft_and_submit(
+    word: str,
+    code: str,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> str:
+    """Add a word to the draft, then submit the resulting batch."""
+    create_json = await call_tool_function(
+        "keytao_create_phrase", {"word": word, "code": code}, platform, user_id,
+    )
+    create_data = json.loads(create_json)
+
+    if create_data.get("not_bound"):
+        return _BIND_HELP_TEXT
+
+    if create_data.get("requiresConfirmation"):
+        conv_key = (platform, user_id)
+        conversation_state_store.set(conv_key, PendingToolConfirm(
+            function_name="keytao_create_phrase",
+            args={"word": word, "code": code},
+        ), space_key=space_key, owner_label=owner_label)
+        warnings = create_data.get("warnings", [])
+        warn_text = "\n".join(
+            f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
+            for w in warnings
+        ) if warnings else create_data.get("message", "存在重码警告")
+        return f"{warn_text}\n\n确认添加吗？回复「确认」继续，「取消」放弃。"
+
+    if not create_data.get("success"):
+        return f"添加失败：{create_data.get('message', '未知错误')} qwq"
+
+    submit_json = await call_tool_function("keytao_submit_batch", {}, platform, user_id)
+    submit_data = json.loads(submit_json)
+
+    if submit_data.get("not_bound"):
+        return _BIND_HELP_TEXT
+
+    if submit_data.get("requiresConfirmation"):
+        conv_key = (platform, user_id)
+        conversation_state_store.set(
+            conv_key,
+            PendingToolConfirm(function_name="keytao_submit_batch", args={}),
+            space_key=space_key,
+            owner_label=owner_label,
+        )
+        warnings = submit_data.get("warnings", [])
+        warn_text = "\n".join(
+            f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
+            for w in warnings
+        ) if warnings else submit_data.get("message", "提交前需要确认")
+        return (
+            f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
+            f"{warn_text}\n\n"
+            "是否继续提交？回复「确认」继续提交，回复「取消」放弃。"
+        )
+
+    if not submit_data.get("success"):
+        return (
+            f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
+            f"提交失败：{submit_data.get('message', '未知错误')} qwq"
+        )
+
+    batch_url = submit_data.get("batchUrl") or create_data.get("batchUrl", "")
+    pr_url = submit_data.get("prUrl", "")
+    parts = [f"✅ 搞定！「{word}」→ {code} 已加入草稿并提交审核。"]
+    if batch_url:
+        parts.append(f"批次地址：{batch_url}")
+    if pr_url:
+        parts.append(f"PR：{pr_url}")
+    return "\n\n".join(parts)
 
 
 async def _execute_shift_to_code(
@@ -1580,6 +1693,7 @@ async def _handle_pending_add_word(
     Returns a response string if handled directly, None to fall through to AI.
     """
     msg = message.strip()
+    submit_after_add = _is_add_and_submit_message(msg)
     shift_target_code = _resolve_shift_target_code(state, msg)
     if shift_target_code is not None:
         return await _execute_shift_to_code(state.word, shift_target_code, platform, user_id)
@@ -1614,7 +1728,7 @@ async def _handle_pending_add_word(
             return f"请选择 1-{len(state.candidates)} 之间的编号 owo"
 
     # Simple confirmation -> use recommended code
-    elif _is_confirm(msg):
+    elif _is_confirm(msg) or submit_after_add:
         target_code = state.recommended_code
         for c, occ in state.candidates:
             if c == target_code:
@@ -1626,6 +1740,10 @@ async def _handle_pending_add_word(
 
     # Empty slot -> direct execution (no AI needed)
     if not is_occupied:
+        if submit_after_add:
+            return await _execute_add_to_draft_and_submit(
+                state.word, target_code, platform, user_id, space_key, owner_label,
+            )
         return await _execute_add_to_draft(
             state.word, target_code, platform, user_id, space_key, owner_label,
         )
@@ -2210,6 +2328,26 @@ async def handle_ai_chat(bot: Bot, event: Event):
             memory_store.add_conversation_round(memory_context, normalized_message_text, response)
             await ai_chat.finish(response)
             return
+
+    if (
+        memory_context.space_type == "group"
+        and not conversation_state_store.contains(conv_key)
+        and _is_sensitive_pending_control_text(normalized_message_text)
+    ):
+        if history is None:
+            history = get_history(conv_key)
+        restored_record = _restore_current_pending_from_history_for_sensitive_control(
+            normalized_message_text,
+            conv_key,
+            space_key,
+            owner_label,
+            history,
+        )
+        if restored_record is not None:
+            logger.info(
+                "♻️ Restored current pending before other-owner guard: "
+                f"{restored_record.state.__class__.__name__} for {platform}:{user_id}"
+            )
 
     other_pending_record = conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
     if (
