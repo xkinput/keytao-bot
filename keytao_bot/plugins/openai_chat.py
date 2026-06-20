@@ -456,12 +456,44 @@ def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> Pendin
     return _parse_pending_state_from_response(assistant_message)
 
 
+def _ensure_current_pending_matches_reference(
+    referenced_state: PendingState,
+    conv_key: Tuple[str, str],
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+    history: Optional[List[Dict]],
+) -> Optional[PendingStateRecord]:
+    """Restore current user's matching pending before checking other owners."""
+    current_record = conversation_state_store.get_record(conv_key)
+    if (
+        current_record is not None
+        and conversation_state_store.states_equivalent(current_record.state, referenced_state)
+    ):
+        return current_record
+
+    recovered_state = _recover_pending_state_from_history(history)
+    if not conversation_state_store.states_equivalent(recovered_state, referenced_state):
+        return current_record
+
+    conversation_state_store.set(
+        conv_key,
+        recovered_state,
+        space_key=space_key,
+        owner_label=owner_label,
+    )
+    return conversation_state_store.get_record(conv_key)
+
+
 def _clone_pending_state(state: PendingState) -> PendingState:
     return copy.deepcopy(state)
 
 
 def _pending_owner_label(record: PendingStateRecord) -> str:
-    return record.owner_label or record.owner_key[1] or "这位用户"
+    owner_id = str(record.owner_key[1] or "").strip()
+    owner_label = str(record.owner_label or "").strip()
+    if owner_label and owner_label != owner_id:
+        return owner_label
+    return "这位用户"
 
 
 def _describe_pending_state(state: PendingState) -> str:
@@ -862,9 +894,33 @@ def _display_name_from_telegram_user(user: object) -> str:
 
 
 def _display_name_from_qq_sender(sender: object, fallback: str) -> str:
+    for field in ("card", "nickname"):
+        value = None
+        if isinstance(sender, dict):
+            value = sender.get(field)
+        else:
+            value = getattr(sender, field, None)
+        text = str(value or "").strip()
+        if text:
+            return text
+    for dump_method in ("model_dump", "dict"):
+        dump = getattr(sender, dump_method, None)
+        if not callable(dump):
+            continue
+        try:
+            data = dump()
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            for field in ("card", "nickname"):
+                text = str(data.get(field) or "").strip()
+                if text:
+                    return text
     if isinstance(sender, dict):
-        return str(sender.get('card') or sender.get('nickname') or fallback)
-    return fallback
+        text = str(sender.get('user_id') or "").strip()
+        if text and text != str(fallback):
+            return text
+    return str(fallback or "").strip()
 
 
 async def extract_memory_context(bot: Bot, event: Event) -> ChatMemoryContext:
@@ -2121,12 +2177,25 @@ async def handle_ai_chat(bot: Bot, event: Event):
         else None
     )
     if referenced_pending is not None and memory_context.space_type == "group":
-        current_record = conversation_state_store.get_record(conv_key)
-        other_record = conversation_state_store.find_matching_pending_for_other_owner(
-            space_key,
-            conv_key,
+        if history is None:
+            history = get_history(conv_key)
+        current_record = _ensure_current_pending_matches_reference(
             referenced_pending,
+            conv_key,
+            space_key,
+            owner_label,
+            history,
         )
+        other_record = None
+        if not (
+            current_record is not None
+            and conversation_state_store.states_equivalent(current_record.state, referenced_pending)
+        ):
+            other_record = conversation_state_store.find_matching_pending_for_other_owner(
+                space_key,
+                conv_key,
+                referenced_pending,
+            )
         response = _handle_referenced_pending_from_other_user(
             referenced_pending,
             current_record,

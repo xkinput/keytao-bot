@@ -88,6 +88,8 @@ from keytao_bot.plugins.openai_chat import (
     _extract_prior_occupied_candidates,
     _extract_pure_chinese_words,
     _extract_requested_code_from_pending_reply,
+    _display_name_from_qq_sender,
+    _ensure_current_pending_matches_reference,
     _is_confirm,
     _has_cancel,
     _handle_pending_add_word,
@@ -97,6 +99,7 @@ from keytao_bot.plugins.openai_chat import (
     _parse_pending_batch_add,
     _parse_pending_add_word,
     _parse_pending_state_from_response,
+    _pending_owner_label,
     _recover_pending_state_from_history,
     _resolve_shift_target_code,
     _select_requested_code_candidate,
@@ -117,7 +120,7 @@ from keytao_bot.plugins.account_bind import (
     _extract_bind_key,
     _is_bind_command_text,
 )
-from keytao_bot.harness.state import MemoryConversationStateStore
+from keytao_bot.harness.state import MemoryConversationStateStore, PendingStateRecord
 from keytao_bot.harness.tools import ToolContext, ToolExecutor
 from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
 from keytao_bot.utils.history_store import HistoryStore
@@ -460,6 +463,104 @@ def test_referenced_other_owner_submit_does_not_copy():
         check("submit pending not copied", store.get_record(current_key) is None)
     finally:
         openai_chat_module.conversation_state_store = old_store
+
+
+def test_referenced_pending_prefers_current_user_history():
+    """Replying to your own bot prompt should not be stolen by another same pending."""
+    print("\n🧪 referenced pending prefers current user history")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        other_key = ("qq", "1001")
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        referenced_pending = PendingAddWord(
+            word="室内乐",
+            recommended_code="enyo",
+            candidates=[("eny", True), ("enyo", False)],
+            occupied_words={"eny": ["是那样"]},
+        )
+        store.set(other_key, referenced_pending, space_key=space_key, owner_label="Rea")
+        history = [
+            {"role": "user", "content": "喵喵 室内乐 这个词的正确编码是什么"},
+            {
+                "role": "assistant",
+                "content": """候选编码：
+1. eny — 已有「是那样」
+2. enyo — ✅ 推荐（空位）
+
+是否以编码 enyo 将「室内乐」加入草稿？也可回复编号选其他编码。""",
+            },
+        ]
+
+        current_record = _ensure_current_pending_matches_reference(
+            referenced_pending,
+            current_key,
+            space_key,
+            "Garth",
+            history,
+        )
+        other_record = store.find_matching_pending_for_other_owner(
+            space_key,
+            current_key,
+            referenced_pending,
+        )
+        response = _handle_referenced_pending_from_other_user(
+            referenced_pending,
+            current_record,
+            other_record,
+            current_key,
+            space_key,
+            "Garth",
+        )
+
+        check("current pending restored", current_record is not None)
+        check("current owner label is nickname", current_record.owner_label == "Garth")
+        check("same referenced prompt falls through to current pending", response is None)
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
+def test_pending_owner_label_hides_raw_id():
+    print("\n🧪 pending owner label hides raw id")
+
+    state = PendingToolConfirm("keytao_submit_batch", {})
+    raw_record = PendingStateRecord(
+        state=state,
+        owner_key=("qq", "739497722"),
+        owner_label="739497722",
+    )
+    named_record = PendingStateRecord(
+        state=state,
+        owner_key=("qq", "739497722"),
+        owner_label="Garth",
+    )
+
+    check("raw id fallback is hidden", _pending_owner_label(raw_record) == "这位用户")
+    check("nickname label is preserved", _pending_owner_label(named_record) == "Garth")
+
+
+def test_qq_sender_display_name_supports_onebot_sender_object():
+    print("\n🧪 QQ sender display name")
+
+    class SenderWithCard:
+        card = "𝄞arth"
+        nickname = "Garth"
+
+    class SenderWithNickname:
+        card = ""
+        nickname = "Garth"
+
+    class SenderWithDump:
+        def model_dump(self):
+            return {"card": "", "nickname": "DumpName"}
+
+    check("object card wins", _display_name_from_qq_sender(SenderWithCard(), "739497722") == "𝄞arth")
+    check("object nickname fallback", _display_name_from_qq_sender(SenderWithNickname(), "739497722") == "Garth")
+    check("model dump nickname fallback", _display_name_from_qq_sender(SenderWithDump(), "739497722") == "DumpName")
+    check("dict card still works", _display_name_from_qq_sender({"card": "群名片", "nickname": "昵称"}, "123") == "群名片")
 
 
 def test_referenced_unknown_pending_recode_falls_through():
@@ -1860,7 +1961,7 @@ def _indoor_music_encode_data() -> Dict:
         "codes": ["enl", "enlo", "enloi", "enloiu"],
         "altCodes": [],
         "requestedCodeAnalysis": {
-            "code": "enyhu",
+            "code": "yh",
             "supported": False,
             "matchType": "unsupported",
         },
@@ -1874,12 +1975,12 @@ def test_draft_encode_candidates_include_phrase_polyphone_candidates():
     result = _build_encode_candidate_result(
         "室内乐",
         _indoor_music_encode_data(),
-        requested_code="enyhu",
+        requested_code="yh",
     )
-    yh_result = _build_encode_candidate_result(
+    stale_result = _build_encode_candidate_result(
         "室内乐",
         _indoor_music_encode_data(),
-        requested_code="yh",
+        requested_code="enyhu",
     )
 
     phrase_variants = result["alternatePhrasePronunciationCodes"]
@@ -1887,11 +1988,11 @@ def test_draft_encode_candidates_include_phrase_polyphone_candidates():
     check("phrase polyphone variants present", len(phrase_variants) >= 3)
     check("yue variant points at 乐", yue_variant["char"] == "乐" and yue_variant["charIndex"] == 2)
     check("standard yue phrase chain is present", "enyoiu" in yue_variant["standardCodes"])
-    check("stale full-phonetic yue chain is accepted narrowly", "enyhu" in yue_variant["focusedCodes"])
-    check("candidate build accepts enyhu", "enyhu" in result["candidateCodes"])
-    check("requested enyhu series comes first", result["requestedCandidateCodes"][0] == "enyhu")
-    check("requested yh maps to yue phrase chain", yh_result["requestedCandidateCodes"][0] == "eny")
-    check("default le focused chain is not invented", "enle" not in result["candidateCodes"])
+    check("candidate build rejects enyh", "enyh" not in result["candidateCodes"])
+    check("candidate build rejects enyhu", "enyhu" not in result["candidateCodes"])
+    check("requested yh maps to yue phrase chain", result["requestedCandidateCodes"][0] == "eny")
+    check("stale enyhu request does not become requested series", "requestedCandidateCodes" not in stale_result)
+    check("default le full-phonetic chain is not invented", "enle" not in result["candidateCodes"])
 
 
 async def _run_tool_executor_policy_checks():
@@ -2209,7 +2310,8 @@ def test_normalize_encode_response_includes_phrase_polyphone_candidates():
         if item["pinyin"] == "yuè"
     )
     check("lookup candidateCodes include standard yue chain", "enyoiu" in result["candidateCodes"])
-    check("lookup candidateCodes include stale focused yue code", "enyhu" in result["candidateCodes"])
+    check("lookup candidateCodes reject enyh", "enyh" not in result["candidateCodes"])
+    check("lookup candidateCodes reject enyhu", "enyhu" not in result["candidateCodes"])
     check("lookup yue variant is tied to third char", yue_variant["charIndex"] == 2)
     check("requested yh exposes yue route", requested["requestedCandidateCodes"][0] == "eny")
     check("phrase polyphones do not create single-char display groups", "candidateDisplayGroups" not in occupied)
@@ -2442,6 +2544,9 @@ if __name__ == "__main__":
     test_parse_pending_state_from_referenced_message()
     test_referenced_other_owner_pending_prompts_copy()
     test_referenced_other_owner_submit_does_not_copy()
+    test_referenced_pending_prefers_current_user_history()
+    test_pending_owner_label_hides_raw_id()
+    test_qq_sender_display_name_supports_onebot_sender_object()
     test_referenced_unknown_pending_recode_falls_through()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()

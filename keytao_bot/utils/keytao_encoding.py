@@ -281,26 +281,6 @@ def build_phrase_code_chain(chars: object, phonetic_codes: Optional[List[str]] =
     return _build_progressive_codes(base, shape_steps)
 
 
-def _build_focused_phrase_pronunciation_chain(
-    chars: List[Dict],
-    phonetic_codes: List[str],
-    char_index: int,
-    phonetic_code: str,
-) -> List[str]:
-    """Build a narrow chain for stale prompts that used a full final-char sound code."""
-    length = len(chars)
-    if length <= 2:
-        return []
-
-    positions = _phrase_code_positions(length)
-    if not positions or char_index != positions[-1]:
-        return []
-
-    prefix = "".join(phonetic_codes[index][:1] for index in positions[:-1])
-    suffix_codes = build_single_char_code_chain(phonetic_code, chars[char_index].get("shapeCode"))
-    return _clean_code_list([prefix + code for code in suffix_codes])
-
-
 def build_alternate_pronunciation_codes(chars: object) -> List[Dict]:
     char_infos = _clean_char_infos(chars)
     if len(char_infos) != 1:
@@ -373,13 +353,7 @@ def build_phrase_pronunciation_codes(chars: object) -> List[Dict]:
             phonetic_codes = list(default_phonetic_codes)
             phonetic_codes[index] = phonetic_code
             standard_codes = build_phrase_code_chain(char_infos, phonetic_codes)
-            focused_codes = _build_focused_phrase_pronunciation_chain(
-                char_infos,
-                default_phonetic_codes,
-                index,
-                phonetic_code,
-            )
-            codes = _clean_code_list([*standard_codes, *focused_codes])
+            codes = _clean_code_list(standard_codes)
             if not codes:
                 continue
 
@@ -394,7 +368,6 @@ def build_phrase_pronunciation_codes(chars: object) -> List[Dict]:
                 "phoneticCode": phonetic_code,
                 "codes": codes,
                 "standardCodes": standard_codes,
-                "focusedCodes": focused_codes,
                 "isDefault": False,
             })
     return variants
