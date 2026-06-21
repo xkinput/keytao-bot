@@ -981,6 +981,143 @@ async def _augment_simple_word_query_response(
     return response.rstrip() + "\n\n补充说明：\n" + "\n\n".join(note_blocks)
 
 
+def _format_encode_char_split(chars: object) -> List[str]:
+    if not isinstance(chars, list):
+        return []
+
+    lines: List[str] = []
+    for item in chars:
+        if not isinstance(item, dict):
+            continue
+        char = str(item.get("char") or "").strip()
+        pinyin = str(item.get("pinyin") or "").strip()
+        phonetic_code = str(item.get("phoneticCode") or "").strip()
+        shape_code = str(item.get("shapeCode") or "").strip()
+        root_parts = [
+            str(item.get(key) or "").strip()
+            for key in ("c1", "c2")
+            if str(item.get(key) or "").strip()
+        ]
+
+        display_char = f"{char}（{pinyin}）" if pinyin else char
+        pieces = [f"• {display_char}"]
+        if phonetic_code:
+            pieces.append(f"音码 {phonetic_code}")
+        if root_parts:
+            pieces.append(f"字根 {'｜'.join(root_parts)}")
+        if shape_code:
+            pieces.append(f"形码 {shape_code}")
+        if len(pieces) > 1:
+            lines.append("　".join(pieces))
+
+    return lines
+
+
+def _candidate_statuses_from_encoding(encoding: Dict) -> List[Dict]:
+    statuses = [
+        status for status in encoding.get("candidateStatuses", [])
+        if isinstance(status, dict) and isinstance(status.get("code"), str) and status.get("code")
+    ]
+    if statuses:
+        return statuses
+
+    return [
+        {"code": code, "occupied": False, "label": "空位"}
+        for code in encoding.get("candidateCodes", [])
+        if isinstance(code, str) and code
+    ]
+
+
+def _format_candidate_status_line(index: int, status: Dict, recommended_code: str) -> str:
+    code = str(status.get("code") or "").strip()
+    occupied = bool(status.get("occupied"))
+    if occupied:
+        label = str(status.get("label") or "已有占用").strip()
+    elif code == recommended_code:
+        label = "✅ 推荐（空位）"
+    else:
+        label = "空位"
+    return f"{index}. {code} — {label}"
+
+
+def _format_tool_encoded_add_prompt(word: str, encoding: Dict) -> Optional[str]:
+    statuses = _candidate_statuses_from_encoding(encoding)
+    if not statuses:
+        return None
+
+    status_codes = [status.get("code", "") for status in statuses]
+    recommended_code = str(encoding.get("recommendedCode") or "").strip()
+    if not recommended_code or recommended_code not in status_codes:
+        first_available = next(
+            (str(status.get("code")) for status in statuses if not status.get("occupied")),
+            "",
+        )
+        recommended_code = first_available or str(statuses[0].get("code") or "").strip()
+    if not recommended_code:
+        return None
+
+    word_type = str(encoding.get("type") or "").strip()
+    type_label = word_type or f"{len(word)}字词"
+    lines = [
+        f"词库暂无收录「{word}」，按工具规则计算如下：",
+        "",
+        f"「{word}」的键道编码（{type_label}）",
+        "",
+    ]
+
+    split_lines = _format_encode_char_split(encoding.get("chars"))
+    if split_lines:
+        lines.extend(["逐字拆分:", *split_lines, ""])
+
+    lines.append("候选编码:")
+    lines.extend(
+        _format_candidate_status_line(index, status, recommended_code)
+        for index, status in enumerate(statuses[:6], start=1)
+    )
+    lines.extend([
+        "",
+        f"是否以编码 {recommended_code} 将「{word}」加入草稿？也可回复编号选其他编码。",
+    ])
+    return "\n".join(lines)
+
+
+async def _try_handle_simple_single_word_query(
+    message_text: str,
+    platform: str,
+    user_id: str,
+) -> Optional[str]:
+    """Handle a single bare Chinese word via tools before the model can invent codes."""
+    words = _extract_pure_chinese_words(message_text)
+    if len(words) != 1:
+        return None
+
+    word = words[0]
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_word", {"word": word}, platform, user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+
+    if lookup_data.get("success") and lookup_data.get("phrases"):
+        return None
+
+    encode_json = await call_tool_function(
+        "keytao_encode", {"word": word}, platform, user_id,
+    )
+    try:
+        encoding = json.loads(encode_json)
+    except Exception:
+        return "编码工具返回了无法解析的结果，先不生成候选，免得把错误编码写进草稿 qwq"
+
+    if not encoding.get("success"):
+        message = encoding.get("message") or "编码工具暂时没有返回有效候选"
+        return f"{message}，先不生成候选，免得把错误编码写进草稿 qwq"
+
+    return _format_tool_encoded_add_prompt(word, encoding)
+
+
 # ---------------------------------------------------------------------------
 # Platform detection & OneBot helpers
 # ---------------------------------------------------------------------------
@@ -1213,7 +1350,7 @@ def _build_qq_reply_message(
     """Build a QQ reply, optionally mentioning the target user first."""
     message = qq_message_segment.reply(reply_message_id)
     if mention_target and target_user_id:
-        message = message + qq_message_segment.at(target_user_id) + "\n"
+        message = message + qq_message_segment.at(target_user_id) + " "
     return message + text
 
 
@@ -2582,6 +2719,13 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 )
 
     # ===== Phase 2: AI response (if not handled directly) =====
+    if response is None:
+        response = await _try_handle_simple_single_word_query(
+            normalized_message_text,
+            platform,
+            user_id,
+        )
+
     if response is None:
         if history is None:
             history = get_history(conv_key)

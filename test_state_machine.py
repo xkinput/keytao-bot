@@ -111,6 +111,7 @@ from keytao_bot.plugins.openai_chat import (
     _strip_command_message_prefixes,
     _strip_markdown,
     _to_markdownv2,
+    _try_handle_simple_single_word_query,
     _try_handle_replace_char,
     _try_handle_operation_recall,
     extract_onebot_mentioned_user_ids,
@@ -808,7 +809,7 @@ def test_onebot_at_segments_bind_referenced_owner():
     check("at segment id extracted", extract_onebot_mentioned_user_ids(message) == ("2002",))
     check("raw CQ at id extracted", extract_onebot_mentioned_user_ids("[CQ:at,qq=2002] 文本") == ("2002",))
     check("plaintext keeps owner mention", extract_onebot_plaintext(message).startswith("@2002"))
-    check("reply message mentions target", str(built_message).startswith("[reply:123][@:2002]\n"))
+    check("reply message mentions target", str(built_message).startswith("[reply:123][@:2002] "))
 
 
 def test_referenced_unknown_pending_recode_falls_through():
@@ -945,6 +946,75 @@ def test_extract_prior_occupied_candidates():
     })
     check("one prior occupied candidate found", len(prior) == 1)
     check("prior candidate code is esl", prior[0]["code"] == "esl")
+
+
+def test_simple_single_word_query_uses_encode_tool_before_ai():
+    """Verify bare word queries cannot invent phrase codes before encoding."""
+    print("\n🧪 simple single word query uses encode tool")
+
+    async def _run():
+        tool_calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({"success": True, "word": "洛阳纸贵", "phrases": []}, ensure_ascii=False)
+            if tool_name == "keytao_encode":
+                return json.dumps({
+                    "success": True,
+                    "word": "洛阳纸贵",
+                    "type": "四字词",
+                    "recommendedCode": "lyfg",
+                    "candidateCodes": ["lyfg", "lyfga", "lyfgaa"],
+                    "candidateStatuses": [
+                        {"code": "lyfg", "occupied": False, "label": "空位"},
+                        {"code": "lyfga", "occupied": False, "label": "空位"},
+                        {"code": "lyfgaa", "occupied": False, "label": "空位"},
+                    ],
+                    "chars": [
+                        {"char": "洛", "pinyin": "luò", "phoneticCode": "ll", "shapeCode": "duao"},
+                        {"char": "阳", "pinyin": "yáng", "phoneticCode": "yp", "shapeCode": "ea"},
+                        {"char": "纸", "pinyin": "zhǐ", "phoneticCode": "fk", "shapeCode": "iea"},
+                        {"char": "贵", "pinyin": "guì", "phoneticCode": "gb", "shapeCode": "ob"},
+                    ],
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _try_handle_simple_single_word_query("洛阳纸贵", "qq", "123")
+
+        pending = _parse_pending_add_word(result or "")
+
+        check("lookup called first", tool_calls[0] == ("keytao_lookup_by_word", {"word": "洛阳纸贵"}))
+        check("encode called second", tool_calls[1] == ("keytao_encode", {"word": "洛阳纸贵"}))
+        check("valid code shown", result is not None and "lyfg" in result)
+        check("invalid hallucinated code absent", result is not None and "loyfg" not in result)
+        check("pending parsed from tool response", isinstance(pending, PendingAddWord))
+        check("pending recommended uses tool code", pending.recommended_code == "lyfg")
+
+    asyncio.run(_run())
+
+
+def test_simple_single_word_query_existing_word_falls_through():
+    """Verify existing words still use the richer normal lookup response path."""
+    print("\n🧪 simple single word query existing word falls through")
+
+    async def _run():
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({
+                    "success": True,
+                    "word": "寿司郎",
+                    "phrases": [{"word": "寿司郎", "code": "eslv"}],
+                }, ensure_ascii=False)
+            raise AssertionError("existing word should not encode in this bypass")
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _try_handle_simple_single_word_query("寿司郎", "qq", "123")
+
+        check("existing word falls through", result is None)
+
+    asyncio.run(_run())
 
 
 def test_augment_simple_word_query_response_appends_priority_note():
@@ -2861,7 +2931,10 @@ if __name__ == "__main__":
     test_extract_pure_chinese_words()
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
+    test_simple_single_word_query_uses_encode_tool_before_ai()
+    test_simple_single_word_query_existing_word_falls_through()
     test_augment_simple_word_query_response_appends_priority_note()
+    test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority()
     test_augment_simple_word_query_response_handles_multiple_words()
     test_augment_simple_word_query_response_skips_confirm_and_draft_reply()
     test_pending_add_word_numeric_choice()
