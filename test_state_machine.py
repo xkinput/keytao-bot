@@ -89,7 +89,9 @@ from keytao_bot.plugins.openai_chat import (
     _extract_pure_chinese_words,
     _extract_requested_code_from_pending_reply,
     _display_name_from_qq_sender,
+    _build_qq_reply_message,
     _ensure_current_pending_matches_reference,
+    _ensure_current_pending_from_referenced_owner,
     _is_confirm,
     _has_cancel,
     _handle_pending_add_word,
@@ -100,7 +102,9 @@ from keytao_bot.plugins.openai_chat import (
     _parse_pending_add_word,
     _parse_pending_state_from_response,
     _pending_owner_label,
+    _record_from_referenced_owner,
     _recover_pending_state_from_history,
+    _referenced_owner_key_from_reply_reference,
     _resolve_shift_target_code,
     _restore_current_pending_from_history_for_sensitive_control,
     _select_requested_code_candidate,
@@ -109,10 +113,13 @@ from keytao_bot.plugins.openai_chat import (
     _to_markdownv2,
     _try_handle_replace_char,
     _try_handle_operation_recall,
+    extract_onebot_mentioned_user_ids,
+    extract_onebot_plaintext,
     _is_clear_command_text,
     _is_sensitive_pending_control_text,
     PendingAddWord,
     PendingToolConfirm,
+    ReplyReferenceInfo,
     CONFIRM_WORDS,
     CANCEL_WORDS,
     SYSTEM_PROMPT_CORE,
@@ -524,6 +531,154 @@ def test_referenced_pending_prefers_current_user_history():
         openai_chat_module.conversation_state_store = old_store
 
 
+def test_referenced_pending_scans_current_user_history():
+    """Quoted own pending prompts should recover even after later assistant replies."""
+    print("\n🧪 referenced pending scans current user history")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        pending_prompt = """词库暂未收录「接片」。
+
+候选编码：
+1. jdpm — ✅ 推荐（空位）
+2. jdpmi — 空位
+3. jdpmiu — 空位
+
+是否以编码 jdpm 将「接片」加入草稿？也可回复编号选其他编码～"""
+        referenced_pending = _parse_pending_state_from_response(pending_prompt)
+        history = [
+            {"role": "user", "content": "喵喵 接片"},
+            {"role": "assistant", "content": pending_prompt},
+            {"role": "user", "content": "？"},
+            {"role": "assistant", "content": "我还在等你确认刚才的候选哦～"},
+        ]
+
+        current_record = _ensure_current_pending_matches_reference(
+            referenced_pending,
+            current_key,
+            space_key,
+            "Garth",
+            history,
+        )
+        response = _handle_referenced_pending_from_other_user(
+            referenced_pending,
+            current_record,
+            None,
+            current_key,
+            space_key,
+            "Garth",
+            "加入并提交",
+        )
+
+        check("referenced pending parsed", referenced_pending is not None)
+        check("current pending restored from older history", current_record is not None)
+        check("current pending word restored", current_record.state.word == "接片")
+        check("own referenced prompt falls through", response is None)
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
+def test_referenced_pending_uses_bot_mention_as_owner():
+    """A quoted bot prompt with @current-user should bind directly to that user."""
+    print("\n🧪 referenced pending uses bot mention as owner")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        pending_prompt = """@2002
+候选编码：
+1. jdpm — ✅ 推荐（空位）
+
+是否以编码 jdpm 将「接片」加入草稿？也可回复编号选其他编码～"""
+        referenced_pending = _parse_pending_state_from_response(pending_prompt)
+        reply_reference = ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=True,
+            text=pending_prompt,
+            mentioned_user_ids=("2002",),
+        )
+
+        referenced_owner_key = _referenced_owner_key_from_reply_reference(reply_reference, "qq")
+        current_record = _ensure_current_pending_from_referenced_owner(
+            referenced_pending,
+            referenced_owner_key,
+            current_key,
+            space_key,
+            "Garth",
+        )
+        response = _handle_referenced_pending_from_other_user(
+            referenced_pending,
+            current_record,
+            None,
+            current_key,
+            space_key,
+            "Garth",
+            "加入并提交",
+        )
+
+        check("referenced owner key is current user", referenced_owner_key == current_key)
+        check("current pending restored from mention", current_record is not None)
+        check("mention-restored word", current_record.state.word == "接片")
+        check("own mentioned prompt falls through", response is None)
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
+def test_referenced_pending_mention_blocks_other_user_direct_action():
+    """A quoted bot prompt with @other-user should not execute as the current user."""
+    print("\n🧪 referenced pending mention blocks other user direct action")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        pending_prompt = """@1001
+候选编码：
+1. jdpm — ✅ 推荐（空位）
+
+是否以编码 jdpm 将「接片」加入草稿？也可回复编号选其他编码～"""
+        referenced_pending = _parse_pending_state_from_response(pending_prompt)
+        reply_reference = ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=True,
+            text=pending_prompt,
+            mentioned_user_ids=("1001",),
+        )
+
+        referenced_owner_key = _referenced_owner_key_from_reply_reference(reply_reference, "qq")
+        other_record = _record_from_referenced_owner(
+            referenced_pending,
+            referenced_owner_key,
+            current_key,
+            space_key,
+        )
+        response = _handle_referenced_pending_from_other_user(
+            referenced_pending,
+            None,
+            other_record,
+            current_key,
+            space_key,
+            "Garth",
+            "加入并提交",
+        )
+
+        check("referenced owner key is other user", referenced_owner_key == ("qq", "1001"))
+        check("other owner record built from mention", other_record is not None)
+        check("other mentioned prompt is blocked", response is not None and "不能替" in response)
+        check("safe copy requires another confirm", response is not None and "请再回复「确认」" in response)
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
 def test_sensitive_control_restores_current_history_before_other_owner_guard():
     """Unquoted sensitive controls should recover the sender before blocking on others."""
     print("\n🧪 sensitive control restores current history before other owner guard")
@@ -619,6 +774,41 @@ def test_qq_sender_display_name_supports_onebot_sender_object():
     check("object nickname fallback", _display_name_from_qq_sender(SenderWithNickname(), "739497722") == "Garth")
     check("model dump nickname fallback", _display_name_from_qq_sender(SenderWithDump(), "739497722") == "DumpName")
     check("dict card still works", _display_name_from_qq_sender({"card": "群名片", "nickname": "昵称"}, "123") == "群名片")
+
+
+def test_onebot_at_segments_bind_referenced_owner():
+    print("\n🧪 OneBot at segments bind referenced owner")
+
+    message = [
+        {"type": "at", "data": {"qq": "2002"}},
+        {"type": "text", "data": {"text": "\n是否以编码 jdpm 将「接片」加入草稿？"}},
+    ]
+
+    class FakeQQMessage(str):
+        def __add__(self, other):
+            return FakeQQMessage(str(self) + str(other))
+
+    class FakeQQMessageSegment:
+        @staticmethod
+        def reply(message_id):
+            return FakeQQMessage(f"[reply:{message_id}]")
+
+        @staticmethod
+        def at(user_id):
+            return FakeQQMessage(f"[@:{user_id}]")
+
+    built_message = _build_qq_reply_message(
+        FakeQQMessageSegment,
+        123,
+        "2002",
+        "是否以编码 jdpm 将「接片」加入草稿？",
+        True,
+    )
+
+    check("at segment id extracted", extract_onebot_mentioned_user_ids(message) == ("2002",))
+    check("raw CQ at id extracted", extract_onebot_mentioned_user_ids("[CQ:at,qq=2002] 文本") == ("2002",))
+    check("plaintext keeps owner mention", extract_onebot_plaintext(message).startswith("@2002"))
+    check("reply message mentions target", str(built_message).startswith("[reply:123][@:2002]\n"))
 
 
 def test_referenced_unknown_pending_recode_falls_through():
@@ -2657,9 +2847,13 @@ if __name__ == "__main__":
     test_referenced_other_owner_pending_prompts_copy()
     test_referenced_other_owner_submit_does_not_copy()
     test_referenced_pending_prefers_current_user_history()
+    test_referenced_pending_scans_current_user_history()
+    test_referenced_pending_uses_bot_mention_as_owner()
+    test_referenced_pending_mention_blocks_other_user_direct_action()
     test_sensitive_control_restores_current_history_before_other_owner_guard()
     test_pending_owner_label_hides_raw_id()
     test_qq_sender_display_name_supports_onebot_sender_object()
+    test_onebot_at_segments_bind_referenced_owner()
     test_referenced_unknown_pending_recode_falls_through()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()

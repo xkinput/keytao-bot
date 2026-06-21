@@ -99,6 +99,7 @@ class ReplyReferenceInfo:
     sender_id: str = ""
     sender_name: str = ""
     text: str = ""
+    mentioned_user_ids: Tuple[str, ...] = ()
 
 
 driver = get_driver()
@@ -468,6 +469,87 @@ def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> Pendin
     return _parse_pending_state_from_response(assistant_message)
 
 
+def _recover_matching_pending_state_from_history(
+    referenced_state: PendingState,
+    history: Optional[List[Dict]],
+) -> PendingState:
+    """Recover a quoted pending state from this user's own history."""
+    if referenced_state is None or not history:
+        return None
+
+    for msg in reversed(history):
+        if msg.get("role") != "assistant":
+            continue
+        candidate = _parse_pending_state_from_response(str(msg.get("content", "") or ""))
+        if conversation_state_store.states_equivalent(candidate, referenced_state):
+            return candidate
+    return None
+
+
+def _referenced_owner_key_from_reply_reference(
+    reply_reference: ReplyReferenceInfo,
+    platform: str,
+) -> Optional[Tuple[str, str]]:
+    """Return the user explicitly mentioned by a quoted bot prompt."""
+    for mentioned_user_id in reply_reference.mentioned_user_ids:
+        owner_id = str(mentioned_user_id or "").strip()
+        if owner_id and owner_id.lower() != "all":
+            return (platform, owner_id)
+    return None
+
+
+def _ensure_current_pending_from_referenced_owner(
+    referenced_state: PendingState,
+    referenced_owner_key: Optional[Tuple[str, str]],
+    conv_key: Tuple[str, str],
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[PendingStateRecord]:
+    """Trust an explicit @owner on the quoted bot prompt for current-user ownership."""
+    if referenced_state is None or referenced_owner_key != conv_key:
+        return None
+
+    current_record = conversation_state_store.get_record(conv_key)
+    if (
+        current_record is not None
+        and conversation_state_store.states_equivalent(current_record.state, referenced_state)
+    ):
+        return current_record
+
+    conversation_state_store.set(
+        conv_key,
+        _clone_pending_state(referenced_state),
+        space_key=space_key,
+        owner_label=owner_label,
+    )
+    return conversation_state_store.get_record(conv_key)
+
+
+def _record_from_referenced_owner(
+    referenced_state: PendingState,
+    referenced_owner_key: Optional[Tuple[str, str]],
+    conv_key: Tuple[str, str],
+    space_key: Optional[Tuple[str, str]],
+) -> Optional[PendingStateRecord]:
+    """Build an owner record from an explicit @owner on a quoted bot prompt."""
+    if referenced_state is None or referenced_owner_key is None or referenced_owner_key == conv_key:
+        return None
+
+    owner_record = conversation_state_store.get_record(referenced_owner_key)
+    if (
+        owner_record is not None
+        and conversation_state_store.states_equivalent(owner_record.state, referenced_state)
+    ):
+        return owner_record
+
+    return PendingStateRecord(
+        state=referenced_state,
+        owner_key=referenced_owner_key,
+        space_key=space_key,
+        owner_label="被 @ 的那位用户",
+    )
+
+
 def _ensure_current_pending_matches_reference(
     referenced_state: PendingState,
     conv_key: Tuple[str, str],
@@ -483,8 +565,8 @@ def _ensure_current_pending_matches_reference(
     ):
         return current_record
 
-    recovered_state = _recover_pending_state_from_history(history)
-    if not conversation_state_store.states_equivalent(recovered_state, referenced_state):
+    recovered_state = _recover_matching_pending_state_from_history(referenced_state, history)
+    if recovered_state is None:
         return current_record
 
     conversation_state_store.set(
@@ -1050,6 +1132,41 @@ def extract_onebot_reply_id(event: Event) -> Optional[str]:
     return None
 
 
+def extract_onebot_mentioned_user_ids(message: object) -> Tuple[str, ...]:
+    """Extract explicit @ user ids from a OneBot message payload."""
+    mentioned_user_ids: List[str] = []
+
+    if isinstance(message, str):
+        for match in re.finditer(r"\[CQ:at,qq=([^,\]]+)", message):
+            qq = match.group(1).strip()
+            if qq and qq.lower() != "all":
+                mentioned_user_ids.append(qq)
+        return tuple(mentioned_user_ids)
+
+    try:
+        for segment in message:  # type: ignore
+            if isinstance(segment, dict):
+                seg_type = segment.get('type')
+                seg_data = segment.get('data', {})
+            else:
+                seg_type = getattr(segment, 'type', None)
+                seg_data = getattr(segment, 'data', {})
+            if seg_type != 'at':
+                continue
+            qq = str(
+                seg_data.get('qq')
+                or seg_data.get('user_id')
+                or seg_data.get('id')
+                or ""
+            ).strip()
+            if qq and qq.lower() != "all":
+                mentioned_user_ids.append(qq)
+    except Exception:
+        pass
+
+    return tuple(mentioned_user_ids)
+
+
 def extract_onebot_plaintext(message: object) -> str:
     """Extract plain text from OneBot message payload."""
     if message is None:
@@ -1077,9 +1194,27 @@ def extract_onebot_plaintext(message: object) -> str:
                 text = seg_data.get('text', '')
                 if text:
                     parts.append(str(text))
+            elif seg_type == 'at':
+                qq = str(seg_data.get('qq') or seg_data.get('user_id') or "").strip()
+                if qq and qq.lower() != "all":
+                    parts.append(f"@{qq} ")
     except Exception:
         pass
     return ''.join(parts).strip()
+
+
+def _build_qq_reply_message(
+    qq_message_segment: object,
+    reply_message_id: object,
+    target_user_id: str,
+    text: str,
+    mention_target: bool,
+) -> object:
+    """Build a QQ reply, optionally mentioning the target user first."""
+    message = qq_message_segment.reply(reply_message_id)
+    if mention_target and target_user_id:
+        message = message + qq_message_segment.at(target_user_id) + "\n"
+    return message + text
 
 
 async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReferenceInfo:
@@ -1135,11 +1270,15 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
         sender = reply_payload.get('sender', {}) if isinstance(reply_payload, dict) else {}
         reply_from_id = str(sender.get('user_id') or reply_payload.get('user_id', ''))
         reply_from_name = _display_name_from_qq_sender(sender, reply_from_id or '未知用户')
-        reply_text = extract_onebot_plaintext(
-            reply_payload.get('message') if isinstance(reply_payload, dict) else None
-        )
+        reply_message = reply_payload.get('message') if isinstance(reply_payload, dict) else None
+        reply_text = extract_onebot_plaintext(reply_message)
+        mentioned_user_ids = extract_onebot_mentioned_user_ids(reply_message)
         if not reply_text and isinstance(reply_payload, dict):
             reply_text = str(reply_payload.get('raw_message', '')).strip()
+        if not mentioned_user_ids and isinstance(reply_payload, dict):
+            mentioned_user_ids = extract_onebot_mentioned_user_ids(
+                str(reply_payload.get('raw_message', '') or "")
+            )
 
         bot_id = str(getattr(bot, 'self_id', ''))
         return ReplyReferenceInfo(
@@ -1148,6 +1287,7 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
             sender_id=reply_from_id,
             sender_name=reply_from_name,
             text=reply_text,
+            mentioned_user_ids=mentioned_user_ids,
         )
 
     return ReplyReferenceInfo()
@@ -2295,19 +2435,39 @@ async def handle_ai_chat(bot: Bot, event: Event):
         else None
     )
     if referenced_pending is not None and memory_context.space_type == "group":
-        if history is None:
-            history = get_history(conv_key)
-        current_record = _ensure_current_pending_matches_reference(
+        referenced_owner_key = _referenced_owner_key_from_reply_reference(
+            reply_reference,
+            platform,
+        )
+        current_record = _ensure_current_pending_from_referenced_owner(
             referenced_pending,
+            referenced_owner_key,
             conv_key,
             space_key,
             owner_label,
-            history,
         )
-        other_record = None
-        if not (
-            current_record is not None
-            and conversation_state_store.states_equivalent(current_record.state, referenced_pending)
+        if current_record is None and referenced_owner_key is None:
+            if history is None:
+                history = get_history(conv_key)
+            current_record = _ensure_current_pending_matches_reference(
+                referenced_pending,
+                conv_key,
+                space_key,
+                owner_label,
+                history,
+            )
+        other_record = _record_from_referenced_owner(
+            referenced_pending,
+            referenced_owner_key,
+            conv_key,
+            space_key,
+        )
+        if (
+            other_record is None
+            and not (
+                current_record is not None
+                and conversation_state_store.states_equivalent(current_record.state, referenced_pending)
+            )
         ):
             other_record = conversation_state_store.find_matching_pending_for_other_owner(
                 space_key,
@@ -2517,7 +2677,13 @@ async def handle_ai_chat(bot: Bot, event: Event):
             try:
                 await bot.send(
                     event=event,
-                    message=QQMessageSegment.reply(qq_msg_id) + qq_text,
+                    message=_build_qq_reply_message(
+                        QQMessageSegment,
+                        qq_msg_id,
+                        user_id,
+                        qq_text,
+                        memory_context.space_type == "group",
+                    ),
                 )
                 return
             except Exception:
