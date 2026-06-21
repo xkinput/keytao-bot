@@ -814,13 +814,20 @@ def _handle_referenced_pending_from_other_user(
     """Handle a user replying to a bot pending prompt that is not their own."""
     if referenced_state is None:
         return None
+    if not _is_sensitive_pending_control_text(message):
+        return None
     if current_record and conversation_state_store.states_equivalent(current_record.state, referenced_state):
         return None
 
     recode_requested = _requests_recode_or_pronunciation_change(message)
+    can_copy_to_current_user = (
+        not recode_requested
+        and not _has_cancel(message)
+        and _pending_state_can_be_copied_to_current_user(referenced_state)
+    )
     if other_record is not None:
         copied = False
-        if not recode_requested and _pending_state_can_be_copied_to_current_user(referenced_state):
+        if can_copy_to_current_user:
             conversation_state_store.set(
                 conv_key,
                 _clone_pending_state(referenced_state),
@@ -837,7 +844,7 @@ def _handle_referenced_pending_from_other_user(
     if recode_requested:
         return None
 
-    if _pending_state_can_be_copied_to_current_user(referenced_state):
+    if can_copy_to_current_user:
         conversation_state_store.set(
             conv_key,
             _clone_pending_state(referenced_state),

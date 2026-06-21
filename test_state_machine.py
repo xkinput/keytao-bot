@@ -434,6 +434,7 @@ def test_referenced_other_owner_pending_prompts_copy():
             current_key,
             space_key,
             "音樂盒",
+            "确认",
         )
 
         current_record = store.get_record(current_key)
@@ -442,6 +443,78 @@ def test_referenced_other_owner_pending_prompts_copy():
         check("response blocks acting for owner", response is not None and "不能替 EVO 确认" in response)
         check("current pending becomes referenced copy", current_record.state.word == "产线")
         check("current pending keeps current owner label", current_record.owner_label == "音樂盒")
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
+def test_referenced_other_owner_pending_question_falls_through():
+    """Non-control replies to another user's pending prompt should stay conversational."""
+    print("\n🧪 referenced other-owner pending question falls through")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        owner_key = ("qq", "1001")
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        other_pending = PendingAddWord(
+            word="电鸡",
+            recommended_code="dmjkia",
+            candidates=[("dmjk", True), ("dmjki", True), ("dmjkia", False)],
+            occupied_words={"dmjk": ["点击"], "dmjki": ["电机"]},
+        )
+        store.set(owner_key, other_pending, space_key=space_key, owner_label="Garth")
+
+        other_record = store.find_matching_pending_for_other_owner(space_key, current_key, other_pending)
+        response = _handle_referenced_pending_from_other_user(
+            other_pending,
+            store.get_record(current_key),
+            other_record,
+            current_key,
+            space_key,
+            "Rea",
+            "这词什么意思",
+        )
+
+        check("other owner matched for question", other_record is not None)
+        check("meaning question falls through", response is None)
+        check("meaning question does not copy pending", store.get_record(current_key) is None)
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+
+def test_referenced_other_owner_cancel_does_not_copy():
+    """Cancelling another user's pending prompt should not create a copied pending state."""
+    print("\n🧪 referenced other-owner cancel does not copy")
+
+    old_store = openai_chat_module.conversation_state_store
+    store = MemoryConversationStateStore()
+    try:
+        openai_chat_module.conversation_state_store = store
+        owner_key = ("qq", "1001")
+        current_key = ("qq", "2002")
+        space_key = ("qq", "qq:group:42")
+        other_pending = PendingAddWord(
+            word="电鸡",
+            recommended_code="dmjkia",
+            candidates=[("dmjkia", False)],
+        )
+        store.set(owner_key, other_pending, space_key=space_key, owner_label="Garth")
+
+        other_record = store.find_matching_pending_for_other_owner(space_key, current_key, other_pending)
+        response = _handle_referenced_pending_from_other_user(
+            other_pending,
+            store.get_record(current_key),
+            other_record,
+            current_key,
+            space_key,
+            "Rea",
+            "取消",
+        )
+
+        check("cancel response blocks other owner operation", response is not None and "不能替 Garth 确认" in response)
+        check("cancel does not copy pending", store.get_record(current_key) is None)
     finally:
         openai_chat_module.conversation_state_store = old_store
 
@@ -468,6 +541,7 @@ def test_referenced_other_owner_submit_does_not_copy():
             current_key,
             space_key,
             "音樂盒",
+            "确认提交",
         )
 
         check("submit owner matched", other_record is not None)
@@ -1877,6 +1951,8 @@ def test_sensitive_pending_control_text():
     check("bind is a fresh command", not _is_sensitive_pending_control_text("/bind 26PZWH"))
     check("add word command is fresh", not _is_sensitive_pending_control_text("添加 喜上眉梢 xemev"))
     check("normal lookup is not sensitive", not _is_sensitive_pending_control_text("查词 增香"))
+    check("meaning question is not sensitive", not _is_sensitive_pending_control_text("这词什么意思"))
+    check("usage comparison is not sensitive", not _is_sensitive_pending_control_text("这个和电机哪个常用"))
 
 
 def test_memory_conversation_state_store():
@@ -3129,6 +3205,8 @@ if __name__ == "__main__":
     test_parse_pending_batch_add_two_words()
     test_parse_pending_state_from_referenced_message()
     test_referenced_other_owner_pending_prompts_copy()
+    test_referenced_other_owner_pending_question_falls_through()
+    test_referenced_other_owner_cancel_does_not_copy()
     test_referenced_other_owner_submit_does_not_copy()
     test_referenced_pending_prefers_current_user_history()
     test_referenced_pending_scans_current_user_history()
