@@ -97,7 +97,10 @@ from keytao_bot.plugins.openai_chat import (
     _handle_pending_add_word,
     _handle_referenced_pending_from_other_user,
     _ensure_pending_add_word_guidance,
+    _is_draft_view_command,
     _is_pending_tool_confirm_message,
+    _looks_like_draft_action_command,
+    _parse_keep_only_draft_command,
     _parse_pending_batch_add,
     _parse_pending_add_word,
     _parse_pending_state_from_response,
@@ -111,6 +114,7 @@ from keytao_bot.plugins.openai_chat import (
     _strip_command_message_prefixes,
     _strip_markdown,
     _to_markdownv2,
+    _try_handle_draft_management_command,
     _try_handle_simple_single_word_query,
     _try_handle_replace_char,
     _try_handle_operation_recall,
@@ -896,6 +900,23 @@ def test_extract_pure_chinese_words():
     check("single word extracted", _extract_pure_chinese_words("寿司郎") == ["寿司郎"])
     check("multiple words extracted", _extract_pure_chinese_words("寿司郎 卧龙凤雏") == ["寿司郎", "卧龙凤雏"])
     check("non-word sentence not extracted", _extract_pure_chinese_words("寿司郎是什么") == [])
+    check("draft view command not extracted", _extract_pure_chinese_words("查看草稿") == [])
+    check("draft keep-only command not extracted", _extract_pure_chinese_words("除了大盘鸡其他都去掉再提交") == [])
+
+
+def test_draft_management_command_detection():
+    """Verify draft commands are recognized before word lookup fallback."""
+    print("\n🧪 draft management command detection")
+
+    submit_command = _parse_keep_only_draft_command("除了大盘鸡其他都去掉再提交")
+    recall_command = _parse_keep_only_draft_command("不是，撤销草稿里的除了大盘鸡")
+
+    check("draft view detected", _is_draft_view_command("查看草稿"))
+    check("keep-only submit parsed", submit_command is not None and submit_command.keep_words == ("大盘鸡",))
+    check("keep-only submit flag", submit_command is not None and submit_command.submit_after is True)
+    check("keep-only recall parsed", recall_command is not None and recall_command.keep_words == ("大盘鸡",))
+    check("keep-only recall no submit", recall_command is not None and recall_command.submit_after is False)
+    check("draft action command detected", _looks_like_draft_action_command("不是，撤销草稿里的除了大盘鸡"))
 
 
 def test_build_existing_word_priority_note():
@@ -1013,6 +1034,179 @@ def test_simple_single_word_query_existing_word_falls_through():
             result = await _try_handle_simple_single_word_query("寿司郎", "qq", "123")
 
         check("existing word falls through", result is None)
+
+    asyncio.run(_run())
+
+
+def test_simple_single_word_query_skips_draft_commands():
+    """Verify draft commands do not trigger the encode-before-AI shortcut."""
+    print("\n🧪 simple single word query skips draft commands")
+
+    async def _run():
+        with patch.object(openai_chat_module, "call_tool_function", AsyncMock(side_effect=AssertionError("should not query word tools"))):
+            view_result = await _try_handle_simple_single_word_query("查看草稿", "qq", "123")
+            keep_result = await _try_handle_simple_single_word_query("除了大盘鸡其他都去掉再提交", "qq", "123")
+
+        check("draft view falls through", view_result is None)
+        check("draft keep-only falls through", keep_result is None)
+
+    asyncio.run(_run())
+
+
+def test_draft_view_command_uses_draft_tools():
+    """Verify 查看草稿 calls draft tools instead of word lookup."""
+    print("\n🧪 draft view command uses draft tools")
+
+    async def _run():
+        tool_calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_list_draft_items":
+                return json.dumps({
+                    "success": True,
+                    "count": 1,
+                    "items": [
+                        {"id": 2, "word": "大盘鸡", "code": "dpjv", "action": "Create", "action_label": "新增", "display_label": "大盘鸡 → dpjv"},
+                    ],
+                    "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    "batchUrl": "https://keytao.vercel.app/batch/draft-1",
+                }, ensure_ascii=False)
+            if tool_name == "keytao_get_batch_preview":
+                return json.dumps({
+                    "success": True,
+                    "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    "diff_text": "",
+                    "batchUrl": "https://keytao.vercel.app/batch/draft-1",
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _try_handle_draft_management_command("查看草稿", "qq", "123")
+
+        check("draft view handled", result is not None)
+        check("draft list called", tool_calls[0] == ("keytao_list_draft_items", {}))
+        check("draft preview called", tool_calls[1] == ("keytao_get_batch_preview", {}))
+        check("draft item shown", result is not None and "大盘鸡 → dpjv" in result)
+        check("word lookup not called", all(name != "keytao_lookup_by_word" for name, _ in tool_calls))
+
+    asyncio.run(_run())
+
+
+def test_keep_only_draft_command_removes_others_and_submits():
+    """Verify 只保留某词再提交 deletes other draft items by fresh IDs."""
+    print("\n🧪 keep-only draft command removes others and submits")
+
+    async def _run():
+        tool_calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_list_draft_items":
+                return json.dumps({
+                    "success": True,
+                    "count": 3,
+                    "items": [
+                        {"id": 1, "word": "大落", "code": "dsll", "action": "Change"},
+                        {"id": 2, "word": "大盘鸡", "code": "dpjv", "action": "Create"},
+                        {"id": 3, "word": "打落", "code": "dslli", "action": "Change"},
+                    ],
+                    "summary": {"added": 1, "modified": 2, "deleted": 0},
+                }, ensure_ascii=False)
+            if tool_name == "keytao_batch_remove_draft_items":
+                return json.dumps({"success": True, "successCount": 2}, ensure_ascii=False)
+            if tool_name == "keytao_submit_batch":
+                return json.dumps({
+                    "success": True,
+                    "batchUrl": "https://keytao.vercel.app/batch/submitted-1",
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _try_handle_draft_management_command(
+                "除了大盘鸡其他都去掉再提交",
+                "qq",
+                "123",
+            )
+
+        remove_call = next((arguments for name, arguments in tool_calls if name == "keytao_batch_remove_draft_items"), {})
+
+        check("keep-only handled", result is not None)
+        check("remove excludes kept item", remove_call.get("ids") == [1, 3])
+        check("submit called", any(name == "keytao_submit_batch" for name, _ in tool_calls))
+        check("submit response shown", result is not None and "批次已提交审核" in result)
+        check("kept word shown", result is not None and "大盘鸡" in result)
+
+    asyncio.run(_run())
+
+
+def test_keep_only_draft_command_recalls_then_removes_without_refresh_prompt():
+    """Verify empty draft is recalled, listed again, then pruned without asking user for IDs."""
+    print("\n🧪 keep-only draft command recalls then removes")
+
+    async def _run():
+        tool_calls = []
+        list_count = 0
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            nonlocal list_count
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_list_draft_items":
+                list_count += 1
+                if list_count == 1:
+                    return json.dumps({
+                        "success": True,
+                        "count": 0,
+                        "items": [],
+                        "summary": {"added": 0, "modified": 0, "deleted": 0},
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": True,
+                    "count": 3,
+                    "items": [
+                        {"id": 1, "word": "大落", "code": "dsll", "action": "Change"},
+                        {"id": 2, "word": "大盘鸡", "code": "dpjv", "action": "Create"},
+                        {"id": 3, "word": "打落", "code": "dslli", "action": "Change"},
+                    ],
+                    "summary": {"added": 1, "modified": 2, "deleted": 0},
+                }, ensure_ascii=False)
+            if tool_name == "keytao_recall_batch":
+                return json.dumps({"success": True, "batchUrl": "https://keytao.vercel.app/batch/recalled"}, ensure_ascii=False)
+            if tool_name == "keytao_batch_remove_draft_items":
+                return json.dumps({
+                    "success": True,
+                    "successCount": 2,
+                    "draft_snapshot": {
+                        "count": 1,
+                        "items": [
+                            {"id": 2, "word": "大盘鸡", "code": "dpjv", "action": "Create", "action_label": "新增", "display_label": "大盘鸡 → dpjv"},
+                        ],
+                        "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    },
+                }, ensure_ascii=False)
+            if tool_name == "keytao_get_batch_preview":
+                return json.dumps({
+                    "success": True,
+                    "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    "diff_text": "",
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _try_handle_draft_management_command(
+                "不是，撤销草稿里的除了大盘鸡",
+                "qq",
+                "123",
+            )
+
+        remove_call = next((arguments for name, arguments in tool_calls if name == "keytao_batch_remove_draft_items"), {})
+
+        check("recall called after empty draft", any(name == "keytao_recall_batch" for name, _ in tool_calls))
+        check("draft listed twice", sum(1 for name, _ in tool_calls if name == "keytao_list_draft_items") == 2)
+        check("remove uses refreshed IDs", remove_call.get("ids") == [1, 3])
+        check("no submit without submit phrase", all(name != "keytao_submit_batch" for name, _ in tool_calls))
+        check("refresh prompt absent", result is not None and "刷新" not in result and "条目 ID" not in result)
+        check("remaining draft shown", result is not None and "大盘鸡 → dpjv" in result)
 
     asyncio.run(_run())
 
@@ -1239,6 +1433,26 @@ diff Phrase  cktcv
             )
 
         check("confirm reply remains unchanged", result == base_response)
+
+    asyncio.run(_run())
+
+
+def test_augment_simple_word_query_response_skips_draft_action_message():
+    """Verify draft action messages do not enrich a correction prefix as a word."""
+    print("\n🧪 augment simple word query response skips draft action message")
+
+    async def _run():
+        base_response = "撤回成功！草稿已恢复 10 条，已从草稿删除 9 条。"
+
+        with patch.object(openai_chat_module, "call_tool_function", AsyncMock(side_effect=AssertionError("should not query tools"))):
+            result = await _augment_simple_word_query_response(
+                "不是，撤销草稿里的除了大盘鸡",
+                base_response,
+                "qq",
+                "123",
+            )
+
+        check("draft action reply remains unchanged", result == base_response)
 
     asyncio.run(_run())
 
@@ -2929,14 +3143,20 @@ if __name__ == "__main__":
     test_pending_add_word_guidance_fallback_matcher()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
     test_extract_pure_chinese_words()
+    test_draft_management_command_detection()
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
     test_simple_single_word_query_uses_encode_tool_before_ai()
     test_simple_single_word_query_existing_word_falls_through()
+    test_simple_single_word_query_skips_draft_commands()
+    test_draft_view_command_uses_draft_tools()
+    test_keep_only_draft_command_removes_others_and_submits()
+    test_keep_only_draft_command_recalls_then_removes_without_refresh_prompt()
     test_augment_simple_word_query_response_appends_priority_note()
     test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority()
     test_augment_simple_word_query_response_handles_multiple_words()
     test_augment_simple_word_query_response_skips_confirm_and_draft_reply()
+    test_augment_simple_word_query_response_skips_draft_action_message()
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()
     test_occupied_numeric_choice_means_duplicate_confirm()

@@ -173,6 +173,19 @@ _LEADING_COMMAND_PREFIX_RE = re.compile(
 _CLEAR_COMMAND_RE = re.compile(r"^/?(?:clear|清空对话|清空历史)$", re.IGNORECASE)
 _PURE_CHINESE_WORDS_RE = re.compile(r'^[\u4e00-\u9fff]+(?:[\s、，,；;]+[\u4e00-\u9fff]+)*$')
 _WORD_QUERY_STOPWORDS = ("什么", "怎么", "为何", "为啥", "意思", "含义", "吗", "呢", "呀", "啊", "吧", "嘛")
+_DRAFT_VIEW_COMMAND_RE = re.compile(
+    r"^(?:"
+    r"草稿|"
+    r"(?:查看|看|看看|查|查一下|列出|显示)(?:当前|我的)?草稿(?:列表|内容|条目|批次)?|"
+    r"(?:当前|我的)草稿(?:列表|内容|条目|批次)?"
+    r")$"
+)
+_DRAFT_ACTION_KEYWORDS = (
+    "草稿", "提交", "提审", "发起审核", "撤回", "撤销提交", "取消提审",
+    "删掉", "删除", "去掉", "移除", "清掉", "清空", "只保留", "只留",
+)
+_DRAFT_KEEP_ONLY_REMOVE_VERBS = r"(?:去掉|删掉|删除|撤销|移除|清掉|清空)"
+_DRAFT_KEEP_ONLY_PREFIX_REMOVE_VERBS = r"(?:去掉|删掉|删除|撤销|移除|清掉|清空)"
 _PENDING_BATCH_ADD_CONTROL_WORDS = frozenset({
     "加入", "添加", "加", "一起加入", "写入", "加进去",
     "重新编码", "直接加", "强制加", "加重码", "添加重码", "确认重码",
@@ -199,9 +212,90 @@ def _strip_command_message_prefixes(message_text: str) -> str:
     return text
 
 
+def _compact_command_text(message_text: str) -> str:
+    text = _strip_command_message_prefixes(message_text)
+    text = re.sub(r"\s+", "", text)
+    return text.strip(" \t\r\n。.!！?？~")
+
+
+def _strip_command_correction_prefix(message_text: str) -> str:
+    text = _compact_command_text(message_text)
+    return re.sub(r"^(?:不是|不对|错了)[，,、。.!！?？]*", "", text)
+
+
 def _is_clear_command_text(message_text: str) -> bool:
     command_text = _strip_command_message_prefixes(message_text)
     return any(_CLEAR_COMMAND_RE.fullmatch(token) for token in command_text.split())
+
+
+def _is_draft_view_command(message_text: str) -> bool:
+    return bool(_DRAFT_VIEW_COMMAND_RE.fullmatch(_strip_command_correction_prefix(message_text)))
+
+
+@dataclass(frozen=True)
+class KeepOnlyDraftCommand:
+    keep_words: Tuple[str, ...]
+    submit_after: bool
+
+
+def _split_keep_words(raw_text: str) -> Tuple[str, ...]:
+    text = raw_text.strip(" \t\r\n。.!！?？~的")
+    text = re.sub(r"^(?:这(?:个|条)?|词条)", "", text)
+    words = [
+        part.strip(" \t\r\n。.!！?？~的")
+        for part in re.split(r"[、,，；;\s]+|(?:和|及|与)", text)
+        if part.strip(" \t\r\n。.!！?？~的")
+    ]
+    return tuple(dict.fromkeys(words))
+
+
+def _parse_keep_only_draft_command(message_text: str) -> Optional[KeepOnlyDraftCommand]:
+    text = _strip_command_correction_prefix(message_text)
+    if not text:
+        return None
+
+    patterns = (
+        rf"^(?:请|帮我|麻烦)?(?:把)?(?:草稿(?:里的|里|中的|中)?)?"
+        rf"(?:除了|除)(?P<keep>.+?)(?:之外|以外|外|其他|其它|其余)"
+        rf"(?:的)?(?:都|全|全部)?{_DRAFT_KEEP_ONLY_REMOVE_VERBS}(?P<tail>.*)$",
+        rf"^(?:请|帮我|麻烦)?(?:把)?{_DRAFT_KEEP_ONLY_PREFIX_REMOVE_VERBS}"
+        rf"(?:草稿(?:里的|里|中的|中)?)?(?:除了|除)(?P<keep>.+?)"
+        rf"(?:之外|以外|外)(?:的)?(?P<tail>.*)$",
+        rf"^(?:请|帮我|麻烦)?(?:把)?{_DRAFT_KEEP_ONLY_PREFIX_REMOVE_VERBS}"
+        rf"(?:草稿(?:里的|里|中的|中)?)?(?:除了|除)(?P<keep>.+?)"
+        rf"(?P<tail>(?:再提交|并提交|提交审核|提审)?)$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, text)
+        if not match:
+            continue
+        keep_words = _split_keep_words(match.group("keep"))
+        if not keep_words:
+            return None
+        tail = match.group("tail") or ""
+        submit_after = any(marker in tail or marker in text for marker in ("再提交", "并提交", "提交审核", "提审"))
+        return KeepOnlyDraftCommand(keep_words=keep_words, submit_after=submit_after)
+
+    return None
+
+
+def _looks_like_draft_action_command(message_text: str) -> bool:
+    text = _strip_command_correction_prefix(message_text)
+    if not text:
+        return False
+    if _is_draft_view_command(text):
+        return True
+    if _parse_keep_only_draft_command(text) is not None:
+        return True
+    if text in _NON_PENDING_SHORT_COMMANDS:
+        return True
+    if "草稿" in text and any(keyword in text for keyword in _DRAFT_ACTION_KEYWORDS):
+        return True
+    if any(keyword in text for keyword in ("提交", "提审", "发起审核")) and any(
+        keyword in text for keyword in ("除了", "除", "其他", "其余", "其它")
+    ):
+        return True
+    return False
 
 
 def _is_sensitive_pending_control_text(message_text: str) -> bool:
@@ -239,6 +333,8 @@ def _extract_pure_chinese_words(message_text: str) -> List[str]:
     """Extract standalone Chinese words from a simple word-only message."""
     text = message_text.strip()
     if not text or not _PURE_CHINESE_WORDS_RE.fullmatch(text):
+        return []
+    if _looks_like_draft_action_command(text):
         return []
     if any(stopword in text for stopword in _WORD_QUERY_STOPWORDS):
         return []
@@ -309,6 +405,8 @@ def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
     text = message_text.strip()
     if not text:
         return False
+    if _looks_like_draft_action_command(text):
+        return False
     if _is_confirm(text) or _has_cancel(text):
         return False
 
@@ -318,10 +416,20 @@ def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
         "当前草稿",
         "发送「提交」",
         "发送“提交”",
+        "批次已提交审核",
+        "草稿已成功提交审核",
+        "已提交审核",
+        "撤回成功",
+        "草稿已恢复",
+        "已从草稿删除",
+        "删除成功",
         "diff Phrase",
         "草稿地址：",
+        "批次地址：",
         "✅ 已将",
         "✅ 已写入草稿",
+        "✅ 已只保留",
+        "✅ 草稿里已经只保留",
         "插入编码",
         "调整到编码",
     )
@@ -1956,6 +2064,230 @@ async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str
     return "\n".join(parts)
 
 
+async def _submit_current_draft(
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> str:
+    submit_json = await call_tool_function("keytao_submit_batch", {}, platform, user_id)
+    submit_data = json.loads(submit_json)
+
+    if submit_data.get("not_bound"):
+        return _BIND_HELP_TEXT
+
+    if submit_data.get("requiresConfirmation"):
+        conv_key = (platform, user_id)
+        conversation_state_store.set(
+            conv_key,
+            PendingToolConfirm(function_name="keytao_submit_batch", args={}),
+            space_key=space_key,
+            owner_label=owner_label,
+        )
+        warnings = submit_data.get("warnings", [])
+        warn_text = "\n".join(
+            f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
+            for w in warnings
+        ) if warnings else submit_data.get("message", "提交前需要确认")
+        return f"{warn_text}\n\n是否继续提交？回复「确认」继续提交，回复「取消」放弃。"
+
+    if not submit_data.get("success"):
+        return f"提交失败：{submit_data.get('message', '未知错误')} qwq"
+
+    batch_url = submit_data.get("batchUrl", "")
+    pr_url = submit_data.get("prUrl", "")
+    parts = ["✅ 批次已提交审核！"]
+    if batch_url:
+        parts.append(f"批次地址：{batch_url}")
+    if pr_url:
+        parts.append(f"PR：{pr_url}")
+    return "\n".join(parts)
+
+
+async def _fetch_current_draft_items(platform: str, user_id: str) -> Dict:
+    list_json = await call_tool_function("keytao_list_draft_items", {}, platform, user_id)
+    try:
+        return json.loads(list_json)
+    except Exception:
+        return {"success": False, "message": "草稿工具返回了无法解析的结果"}
+
+
+def _draft_snapshot_from_list_data(list_data: Dict) -> Dict:
+    items = list_data.get("items", [])
+    return {
+        "count": list_data.get("count", len(items) if isinstance(items, list) else 0),
+        "items": items if isinstance(items, list) else [],
+        "summary": list_data.get("summary", {}),
+    }
+
+
+async def _try_handle_draft_view_command(
+    message_text: str,
+    platform: str,
+    user_id: str,
+) -> Optional[str]:
+    if not _is_draft_view_command(message_text):
+        return None
+
+    list_data = await _fetch_current_draft_items(platform, user_id)
+    if list_data.get("not_bound"):
+        return _BIND_HELP_TEXT
+    if not list_data.get("success"):
+        return f"查看草稿失败：{list_data.get('message', '未知错误')} qwq"
+
+    data = {
+        "draft_snapshot": _draft_snapshot_from_list_data(list_data),
+        "batchUrl": list_data.get("batchUrl", ""),
+    }
+    return await _format_draft_response(data, platform, user_id)
+
+
+def _draft_item_word(item: Dict) -> str:
+    return str(item.get("word") or item.get("text") or "").strip()
+
+
+def _draft_item_id(item: Dict) -> Optional[int]:
+    for key in ("id", "pr_id", "prId"):
+        value = item.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+async def _list_draft_items_after_optional_recall(
+    command: KeepOnlyDraftCommand,
+    platform: str,
+    user_id: str,
+) -> Tuple[Dict, Optional[str]]:
+    list_data = await _fetch_current_draft_items(platform, user_id)
+    if list_data.get("not_bound"):
+        return list_data, None
+    if not list_data.get("success"):
+        return list_data, None
+
+    items = list_data.get("items")
+    has_items = isinstance(items, list) and len(items) > 0
+    if has_items:
+        return list_data, None
+
+    recall_json = await call_tool_function("keytao_recall_batch", {}, platform, user_id)
+    try:
+        recall_data = json.loads(recall_json)
+    except Exception:
+        recall_data = {"success": False, "message": "撤回工具返回了无法解析的结果"}
+
+    if recall_data.get("not_bound"):
+        return recall_data, None
+    if not recall_data.get("success"):
+        return list_data, f"没找到可处理的草稿，也没能撤回最近提交的批次：{recall_data.get('message', '未知错误')}"
+
+    refreshed = await _fetch_current_draft_items(platform, user_id)
+    return refreshed, "已先撤回最近提交的批次并恢复为草稿。"
+
+
+async def _try_handle_keep_only_draft_items_command(
+    message_text: str,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    command = _parse_keep_only_draft_command(message_text)
+    if command is None:
+        return None
+
+    list_data, recall_note = await _list_draft_items_after_optional_recall(command, platform, user_id)
+    if list_data.get("not_bound"):
+        return _BIND_HELP_TEXT
+    if not list_data.get("success"):
+        if recall_note:
+            return recall_note
+        return f"获取草稿失败：{list_data.get('message', '未知错误')} qwq"
+
+    items = list_data.get("items", [])
+    if not isinstance(items, list) or not items:
+        if recall_note:
+            return recall_note
+        return "当前没有可处理的草稿条目。"
+
+    keep_set = set(command.keep_words)
+    kept_items = [item for item in items if isinstance(item, dict) and _draft_item_word(item) in keep_set]
+    if not kept_items:
+        keep_label = "、".join(command.keep_words)
+        return f"草稿里没找到「{keep_label}」，我不会删除其他条目。"
+
+    delete_items = [
+        item for item in items
+        if isinstance(item, dict) and _draft_item_word(item) not in keep_set
+    ]
+    delete_ids = [
+        item_id for item_id in (_draft_item_id(item) for item in delete_items)
+        if item_id is not None
+    ]
+    missing_id_count = len(delete_items) - len(delete_ids)
+    if missing_id_count > 0:
+        return "草稿列表里有条目缺少内部 ID，我先不批量删除，避免误删。"
+
+    keep_label = "、".join(command.keep_words)
+    if delete_ids:
+        remove_json = await call_tool_function(
+            "keytao_batch_remove_draft_items",
+            {"ids": delete_ids},
+            platform,
+            user_id,
+        )
+        try:
+            remove_data = json.loads(remove_json)
+        except Exception:
+            remove_data = {"success": False, "message": "删除工具返回了无法解析的结果"}
+        if not remove_data.get("success"):
+            return f"删除失败：{remove_data.get('message', '未知错误')} qwq"
+    else:
+        remove_data = {
+            "success": True,
+            "successCount": 0,
+            "draft_snapshot": _draft_snapshot_from_list_data(list_data),
+            "batchUrl": list_data.get("batchUrl", ""),
+        }
+
+    deleted_count = int(remove_data.get("successCount") or len(delete_ids))
+    prefix_parts = []
+    if recall_note:
+        prefix_parts.append(recall_note)
+    if deleted_count > 0:
+        prefix_parts.append(f"✅ 已只保留「{keep_label}」，从草稿删除 {deleted_count} 条。")
+    else:
+        prefix_parts.append(f"✅ 草稿里已经只保留「{keep_label}」。")
+
+    if command.submit_after:
+        submit_response = await _submit_current_draft(platform, user_id, space_key, owner_label)
+        return "\n".join([*prefix_parts, submit_response])
+
+    return "\n".join(prefix_parts) + "\n" + await _format_draft_response(remove_data, platform, user_id)
+
+
+async def _try_handle_draft_management_command(
+    message_text: str,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    response = await _try_handle_keep_only_draft_items_command(
+        message_text,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
+
+    return await _try_handle_draft_view_command(message_text, platform, user_id)
+
+
 async def _handle_pending_add_word(
     state: PendingAddWord,
     message: str,
@@ -2719,6 +3051,15 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 )
 
     # ===== Phase 2: AI response (if not handled directly) =====
+    if response is None:
+        response = await _try_handle_draft_management_command(
+            normalized_message_text,
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+        )
+
     if response is None:
         response = await _try_handle_simple_single_word_query(
             normalized_message_text,
