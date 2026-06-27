@@ -87,22 +87,21 @@ from keytao_bot.plugins.openai_chat import (
     _build_existing_word_priority_note,
     _extract_prior_occupied_candidates,
     _extract_pure_chinese_words,
-    _extract_requested_code_from_pending_reply,
+    _get_simple_word_query_words,
     _display_name_from_qq_sender,
     _build_qq_reply_message,
     _ensure_current_pending_matches_reference,
     _ensure_current_pending_from_referenced_owner,
-    _is_confirm,
-    _has_cancel,
     _handle_pending_add_word,
     _handle_referenced_pending_from_other_user,
     _ensure_pending_add_word_guidance,
-    _is_draft_view_command,
     _is_pending_tool_confirm_message,
-    _looks_like_draft_action_command,
-    _parse_keep_only_draft_command,
+    _is_sensitive_pending_control_intent,
+    _keep_only_command_from_intent,
     _parse_pending_batch_add,
     _parse_pending_add_word,
+    _parse_message_command_intent_payload,
+    _parse_simple_word_query_intent_payload,
     _parse_pending_state_from_response,
     _pending_owner_label,
     _record_from_referenced_owner,
@@ -120,13 +119,11 @@ from keytao_bot.plugins.openai_chat import (
     _try_handle_operation_recall,
     extract_onebot_mentioned_user_ids,
     extract_onebot_plaintext,
-    _is_clear_command_text,
-    _is_sensitive_pending_control_text,
+    MessageCommandIntent,
     PendingAddWord,
     PendingToolConfirm,
     ReplyReferenceInfo,
-    CONFIRM_WORDS,
-    CANCEL_WORDS,
+    SimpleWordQueryIntent,
     SYSTEM_PROMPT_CORE,
 )
 from keytao_bot.plugins.account_bind import (
@@ -185,45 +182,67 @@ def check(name: str, result: bool):
         print(f"  ❌ {name}")
 
 
-def test_is_confirm():
-    print("\n🧪 _is_confirm")
+def test_message_command_intent_payload():
+    """Verify command intent JSON replaces fixed command phrase lists."""
+    print("\n🧪 message command intent payload")
 
-    check("'是' → True", _is_confirm("是"))
-    check("'好' → True", _is_confirm("好"))
-    check("'yes' → True", _is_confirm("yes"))
-    check("'ok' → True", _is_confirm("ok"))
-    check("'OK' → True (case insensitive)", _is_confirm("OK"))
-    check("'确认' → True", _is_confirm("确认"))
-    check("'确定' → True", _is_confirm("确定"))
-    check("'嗯' → True", _is_confirm("嗯"))
-    check("'行' → True", _is_confirm("行"))
-    check("'y' → True", _is_confirm("y"))
-    check("' 是 ' → True (whitespace)", _is_confirm(" 是 "))
+    confirm = _parse_message_command_intent_payload({
+        "intent": "pending_confirm",
+        "confidence": 0.97,
+    })
+    cancel = _parse_message_command_intent_payload({
+        "intent": "pending_cancel",
+        "confidence": 0.95,
+    })
+    choice = _parse_message_command_intent_payload({
+        "intent": "pending_choice",
+        "choice_index": "2",
+        "confidence": 0.93,
+    })
+    code_request = _parse_message_command_intent_payload({
+        "intent": "pending_code_request",
+        "requested_code": "JROOU",
+        "confidence": 0.9,
+    })
+    recode = _parse_message_command_intent_payload({
+        "intent": "pending_recode",
+        "choice_index": 1,
+        "target_word": "增翔",
+        "confidence": 0.91,
+    })
+    keep_only = _parse_message_command_intent_payload({
+        "intent": "draft_keep_only",
+        "keep_words": ["大盘鸡"],
+        "submit_after": "true",
+        "confidence": 0.94,
+    })
+    recall = _parse_message_command_intent_payload({
+        "intent": "operation_recall",
+        "current_user_only": "true",
+        "confidence": 0.94,
+    })
+    replace_char = _parse_message_command_intent_payload({
+        "intent": "batch_replace_char",
+        "old_char": "粘",
+        "new_char": "黏",
+        "confidence": 0.94,
+    })
+    ordinary = _parse_message_command_intent_payload({
+        "intent": "none",
+        "confidence": 0.99,
+    })
 
-    check("'查词 你好' → False", not _is_confirm("查词 你好"))
-    check("'不是' → False", not _is_confirm("不是"))
-    check("'帮我加个词' → False", not _is_confirm("帮我加个词"))
-    check("'提交' → False", not _is_confirm("提交"))
-    check("'' → False (empty)", not _is_confirm(""))
-
-
-def test_has_cancel():
-    print("\n🧪 _has_cancel")
-
-    check("'取消' → True", _has_cancel("取消"))
-    check("'取消吧' → True", _has_cancel("取消吧"))
-    check("'算了' → True", _has_cancel("算了"))
-    check("'不要了' → True", _has_cancel("不要了"))
-    check("'不要加了' → True", _has_cancel("不要加了"))
-    check("'不行' → True", _has_cancel("不行"))
-    check("'no' → True", _has_cancel("no"))
-    check("'NO' → True (case insensitive)", _has_cancel("NO"))
-
-    check("'是' → False", not _has_cancel("是"))
-    check("'好的' → False", not _has_cancel("好的"))
-    check("'查词' → False", not _has_cancel("查词"))
-    check("'不是，我想查编码规则' → False", not _has_cancel("不是，我想查编码规则"))
-    check("'不对，我是想改码' → False", not _has_cancel("不对，我是想改码"))
+    check("pending confirm is sensitive", _is_sensitive_pending_control_intent(confirm))
+    check("pending cancel is sensitive", _is_sensitive_pending_control_intent(cancel))
+    check("choice index parsed", choice.choice_index == 2)
+    check("code request normalized", code_request.requested_code == "jroou")
+    check("recode target parsed", recode.choice_index == 1 and recode.target_word == "增翔")
+    command = _keep_only_command_from_intent(keep_only)
+    check("keep-only parsed from intent", command is not None and command.keep_words == ("大盘鸡",))
+    check("keep-only submit flag from intent", command is not None and command.submit_after)
+    check("operation recall scope parsed", recall.intent == "operation_recall" and recall.current_user_only)
+    check("replace-char payload parsed", replace_char.old_char == "粘" and replace_char.new_char == "黏")
+    check("ordinary text is not sensitive", not _is_sensitive_pending_control_intent(ordinary))
 
 
 def test_parse_pending_add_word_standard():
@@ -378,8 +397,10 @@ def test_parse_pending_batch_add_two_words():
     check("two items parsed", len(result.args["items"]) == 2)
     check("first item parsed", result.args["items"][0] == {"word": "夜钓", "code": "yedc", "action": "Create"})
     check("second item parsed", result.args["items"][1] == {"word": "野钓", "code": "yedci", "action": "Create"})
-    check("'加入' confirms batch add", _is_pending_tool_confirm_message(result, "加入"))
-    check("'加入' is not global confirm", not _is_confirm("加入"))
+    confirm_intent = MessageCommandIntent(intent="pending_confirm", confidence=0.9)
+    ordinary_intent = MessageCommandIntent(intent="none", confidence=0.9)
+    check("semantic confirm confirms batch add", _is_pending_tool_confirm_message(result, confirm_intent))
+    check("ordinary intent does not confirm batch add", not _is_pending_tool_confirm_message(result, ordinary_intent))
 
 
 def test_parse_pending_state_from_referenced_message():
@@ -434,7 +455,7 @@ def test_referenced_other_owner_pending_prompts_copy():
             current_key,
             space_key,
             "音樂盒",
-            "确认",
+            MessageCommandIntent(intent="pending_confirm", confidence=0.96),
         )
 
         current_record = store.get_record(current_key)
@@ -474,7 +495,7 @@ def test_referenced_other_owner_pending_question_falls_through():
             current_key,
             space_key,
             "Rea",
-            "这词什么意思",
+            MessageCommandIntent(intent="none", confidence=0.96),
         )
 
         check("other owner matched for question", other_record is not None)
@@ -510,7 +531,7 @@ def test_referenced_other_owner_cancel_does_not_copy():
             current_key,
             space_key,
             "Rea",
-            "取消",
+            MessageCommandIntent(intent="pending_cancel", confidence=0.96),
         )
 
         check("cancel response blocks other owner operation", response is not None and "不能替 Garth 确认" in response)
@@ -541,7 +562,7 @@ def test_referenced_other_owner_submit_does_not_copy():
             current_key,
             space_key,
             "音樂盒",
-            "确认提交",
+            MessageCommandIntent(intent="pending_confirm", confidence=0.96),
         )
 
         check("submit owner matched", other_record is not None)
@@ -601,6 +622,7 @@ def test_referenced_pending_prefers_current_user_history():
             current_key,
             space_key,
             "Garth",
+            MessageCommandIntent(intent="pending_add_and_submit", confidence=0.96),
         )
 
         check("current pending restored", current_record is not None)
@@ -650,7 +672,7 @@ def test_referenced_pending_scans_current_user_history():
             current_key,
             space_key,
             "Garth",
-            "加入并提交",
+            MessageCommandIntent(intent="pending_add_and_submit", confidence=0.96),
         )
 
         check("referenced pending parsed", referenced_pending is not None)
@@ -699,7 +721,7 @@ def test_referenced_pending_uses_bot_mention_as_owner():
             current_key,
             space_key,
             "Garth",
-            "加入并提交",
+            MessageCommandIntent(intent="pending_add_and_submit", confidence=0.96),
         )
 
         check("referenced owner key is current user", referenced_owner_key == current_key)
@@ -747,7 +769,7 @@ def test_referenced_pending_mention_blocks_other_user_direct_action():
             current_key,
             space_key,
             "Garth",
-            "加入并提交",
+            MessageCommandIntent(intent="pending_add_and_submit", confidence=0.96),
         )
 
         check("referenced owner key is other user", referenced_owner_key == ("qq", "1001"))
@@ -792,7 +814,7 @@ def test_sensitive_control_restores_current_history_before_other_owner_guard():
         ]
 
         restored_record = _restore_current_pending_from_history_for_sensitive_control(
-            "加入并提交",
+            MessageCommandIntent(intent="pending_add_and_submit", confidence=0.96),
             current_key,
             space_key,
             "Garth",
@@ -801,7 +823,7 @@ def test_sensitive_control_restores_current_history_before_other_owner_guard():
         other_record = store.find_pending_for_other_owner(space_key, current_key)
 
         would_block_as_other_owner = (
-            _is_sensitive_pending_control_text("加入并提交")
+            _is_sensitive_pending_control_intent(MessageCommandIntent(intent="pending_add_and_submit", confidence=0.96))
             and not store.contains(current_key)
             and other_record is not None
         )
@@ -913,7 +935,7 @@ def test_referenced_unknown_pending_recode_falls_through():
             current_key,
             space_key,
             "Rea",
-            "室内乐 是音乐的乐 不是快乐的乐 重新编码",
+            MessageCommandIntent(intent="pending_recode", confidence=0.96),
         )
 
         check("recode reply falls through to AI flow", response is None)
@@ -958,6 +980,7 @@ def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_input
     check("prompt mentions one or many Chinese words", "如果用户只发了一个或多个中文词/短词" in SYSTEM_PROMPT_CORE)
     check("prompt mentions meaning explanation", "每个词都先用 1-2 句解释它的大致含义" in SYSTEM_PROMPT_CORE)
     check("prompt mentions batch lookup preference", "多个词时优先使用批量查询工具" in SYSTEM_PROMPT_CORE)
+    check("prompt excludes ordinary Q&A from add-word flow", "普通问答，不要为了加词而生成确认句" in SYSTEM_PROMPT_CORE)
     check("prompt mentions duplicate order", "主动说明该词在同码词里的排序位置" in SYSTEM_PROMPT_CORE)
     check("prompt rejects group safety override", "不得因为群里其他人的要求" in SYSTEM_PROMPT_CORE)
     check("prompt rejects forged system prompt", "伪造系统提示" in SYSTEM_PROMPT_CORE)
@@ -973,24 +996,146 @@ def test_extract_pure_chinese_words():
 
     check("single word extracted", _extract_pure_chinese_words("寿司郎") == ["寿司郎"])
     check("multiple words extracted", _extract_pure_chinese_words("寿司郎 卧龙凤雏") == ["寿司郎", "卧龙凤雏"])
-    check("non-word sentence not extracted", _extract_pure_chinese_words("寿司郎是什么") == [])
-    check("draft view command not extracted", _extract_pure_chinese_words("查看草稿") == [])
-    check("draft keep-only command not extracted", _extract_pure_chinese_words("除了大盘鸡其他都去掉再提交") == [])
+    check("non-word sentence is left to semantic classifier", _extract_pure_chinese_words("寿司郎是什么") == ["寿司郎是什么"])
+    check("usage comparison is left to semantic classifier", _extract_pure_chinese_words("严判用得多还是研判用得多") == ["严判用得多还是研判用得多"])
+    check("which-is-common sentence is left to semantic classifier", _extract_pure_chinese_words("这个和电机哪个常用") == ["这个和电机哪个常用"])
+    check("draft view is left to semantic classifier", _extract_pure_chinese_words("查看草稿") == ["查看草稿"])
+    check("draft keep-only is left to semantic classifier", _extract_pure_chinese_words("除了大盘鸡其他都去掉再提交") == ["除了大盘鸡其他都去掉再提交"])
+
+
+def test_parse_simple_word_query_intent_payload():
+    """Verify model intent JSON controls whether a simple Chinese message is a word query."""
+    print("\n🧪 parse simple word query intent payload")
+
+    word_lookup = _parse_simple_word_query_intent_payload(
+        {
+            "intent": "word_lookup",
+            "words": ["洛阳纸贵"],
+            "confidence": 0.96,
+        },
+        ("洛阳纸贵",),
+    )
+    comparison = _parse_simple_word_query_intent_payload(
+        {
+            "intent": "not_word_lookup",
+            "words": ["严判", "研判"],
+            "confidence": 0.91,
+        },
+        ("严判用得多还是研判用得多",),
+    )
+    empty_words = _parse_simple_word_query_intent_payload(
+        {
+            "intent": "word_lookup",
+            "words": [],
+            "confidence": 0.8,
+        },
+        ("寿司郎",),
+    )
+
+    check("word lookup is allowed", word_lookup.should_handle)
+    check("word lookup keeps model words", word_lookup.words == ("洛阳纸贵",))
+    check("ordinary comparison is rejected", not comparison.should_handle)
+    check("rejected intent clears words", comparison.words == ())
+    check("empty model words fall back to structural token", empty_words.words == ("寿司郎",))
+
+
+def test_get_simple_word_query_words_uses_semantic_classifier():
+    """Verify structural Chinese messages are routed by the model intent gate."""
+    print("\n🧪 simple word query words use semantic classifier")
+
+    async def _run():
+        async def fake_classifier(message_text, structural_words):
+            if message_text == "洛阳纸贵":
+                return SimpleWordQueryIntent(
+                    should_handle=True,
+                    words=("洛阳纸贵",),
+                    intent="word_lookup",
+                    confidence=0.98,
+                )
+            return SimpleWordQueryIntent(
+                should_handle=False,
+                words=(),
+                intent="not_word_lookup",
+                confidence=0.93,
+            )
+
+        with patch.object(openai_chat_module, "_classify_simple_word_query_intent", side_effect=fake_classifier):
+            bare_words = await _get_simple_word_query_words("洛阳纸贵")
+            comparison_words = await _get_simple_word_query_words("严判用得多还是研判用得多")
+
+        check("bare word accepted by classifier", bare_words == ("洛阳纸贵",))
+        check("comparison rejected by classifier", comparison_words == ())
+
+    asyncio.run(_run())
+
+
+def test_classify_simple_word_query_intent_calls_model():
+    """Verify the intent classifier calls the configured model and parses JSON output."""
+    print("\n🧪 classify simple word query intent calls model")
+
+    async def _run():
+        create_mock = AsyncMock(return_value=types.SimpleNamespace(
+            choices=[
+                types.SimpleNamespace(
+                    message=types.SimpleNamespace(
+                        content='{"intent":"word_lookup","words":["洛阳纸贵"],"confidence":0.97}'
+                    )
+                )
+            ]
+        ))
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.chat = types.SimpleNamespace(
+                    completions=types.SimpleNamespace(create=create_mock)
+                )
+
+        with patch.object(openai_chat_module, "AsyncOpenAI", FakeClient):
+            with patch.object(openai_chat_module, "OPENAI_API_KEY", "fake-key"):
+                result = await openai_chat_module._classify_simple_word_query_intent(
+                    "洛阳纸贵",
+                    ("洛阳纸贵",),
+                )
+
+        call_kwargs = create_mock.call_args.kwargs
+        check("classifier accepts word lookup", result.should_handle)
+        check("classifier parses words", result.words == ("洛阳纸贵",))
+        check("classifier uses configured model", call_kwargs.get("model") == openai_chat_module.WORD_QUERY_INTENT_MODEL)
+        check("classifier asks for deterministic output", call_kwargs.get("temperature") == 0.0)
+
+    asyncio.run(_run())
 
 
 def test_draft_management_command_detection():
-    """Verify draft commands are recognized before word lookup fallback."""
+    """Verify draft-management intents are recognized before word lookup fallback."""
     print("\n🧪 draft management command detection")
 
-    submit_command = _parse_keep_only_draft_command("除了大盘鸡其他都去掉再提交")
-    recall_command = _parse_keep_only_draft_command("不是，撤销草稿里的除了大盘鸡")
+    view_intent = _parse_message_command_intent_payload({
+        "intent": "draft_view",
+        "confidence": 0.96,
+    })
+    submit_intent = _parse_message_command_intent_payload({
+        "intent": "draft_keep_only",
+        "keep_words": ["大盘鸡"],
+        "submit_after": True,
+        "confidence": 0.96,
+    })
+    recall_intent = _parse_message_command_intent_payload({
+        "intent": "draft_keep_only",
+        "keep_words": ["大盘鸡"],
+        "submit_after": False,
+        "confidence": 0.96,
+    })
+    submit_command = _keep_only_command_from_intent(submit_intent)
+    recall_command = _keep_only_command_from_intent(recall_intent)
 
-    check("draft view detected", _is_draft_view_command("查看草稿"))
+    check("draft view detected", view_intent.intent == "draft_view")
     check("keep-only submit parsed", submit_command is not None and submit_command.keep_words == ("大盘鸡",))
     check("keep-only submit flag", submit_command is not None and submit_command.submit_after is True)
     check("keep-only recall parsed", recall_command is not None and recall_command.keep_words == ("大盘鸡",))
     check("keep-only recall no submit", recall_command is not None and recall_command.submit_after is False)
-    check("draft action command detected", _looks_like_draft_action_command("不是，撤销草稿里的除了大盘鸡"))
+    check("ordinary intent is not draft action", _keep_only_command_from_intent(MessageCommandIntent()) is None)
 
 
 def test_build_existing_word_priority_note():
@@ -1075,8 +1220,9 @@ def test_simple_single_word_query_uses_encode_tool_before_ai():
                 }, ensure_ascii=False)
             raise AssertionError((tool_name, arguments))
 
-        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-            result = await _try_handle_simple_single_word_query("洛阳纸贵", "qq", "123")
+        with patch.object(openai_chat_module, "_classify_simple_word_query_intent", AsyncMock(return_value=SimpleWordQueryIntent(True, ("洛阳纸贵",), "word_lookup", 0.98))):
+            with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+                result = await _try_handle_simple_single_word_query("洛阳纸贵", "qq", "123")
 
         pending = _parse_pending_add_word(result or "")
 
@@ -1104,8 +1250,9 @@ def test_simple_single_word_query_existing_word_falls_through():
                 }, ensure_ascii=False)
             raise AssertionError("existing word should not encode in this bypass")
 
-        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-            result = await _try_handle_simple_single_word_query("寿司郎", "qq", "123")
+        with patch.object(openai_chat_module, "_classify_simple_word_query_intent", AsyncMock(return_value=SimpleWordQueryIntent(True, ("寿司郎",), "word_lookup", 0.98))):
+            with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+                result = await _try_handle_simple_single_word_query("寿司郎", "qq", "123")
 
         check("existing word falls through", result is None)
 
@@ -1123,6 +1270,23 @@ def test_simple_single_word_query_skips_draft_commands():
 
         check("draft view falls through", view_result is None)
         check("draft keep-only falls through", keep_result is None)
+
+    asyncio.run(_run())
+
+
+def test_simple_single_word_query_skips_chat_comparison_questions():
+    """Verify chat-style common-usage questions do not become add-word prompts."""
+    print("\n🧪 simple single word query skips chat comparison questions")
+
+    async def _run():
+        semantic_reject = SimpleWordQueryIntent(False, (), "not_word_lookup", 0.96)
+        with patch.object(openai_chat_module, "_classify_simple_word_query_intent", AsyncMock(return_value=semantic_reject)):
+            with patch.object(openai_chat_module, "call_tool_function", AsyncMock(side_effect=AssertionError("should not query word tools"))):
+                usage_result = await _try_handle_simple_single_word_query("严判用得多还是研判用得多", "qq", "123")
+                common_result = await _try_handle_simple_single_word_query("这个和电机哪个常用", "qq", "123")
+
+        check("usage comparison falls through", usage_result is None)
+        check("which-is-common question falls through", common_result is None)
 
     asyncio.run(_run())
 
@@ -1156,7 +1320,12 @@ def test_draft_view_command_uses_draft_tools():
             raise AssertionError((tool_name, arguments))
 
         with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-            result = await _try_handle_draft_management_command("查看草稿", "qq", "123")
+            result = await _try_handle_draft_management_command(
+                "查看草稿",
+                "qq",
+                "123",
+                command_intent=MessageCommandIntent(intent="draft_view", confidence=0.96),
+            )
 
         check("draft view handled", result is not None)
         check("draft list called", tool_calls[0] == ("keytao_list_draft_items", {}))
@@ -1201,6 +1370,12 @@ def test_keep_only_draft_command_removes_others_and_submits():
                 "除了大盘鸡其他都去掉再提交",
                 "qq",
                 "123",
+                command_intent=MessageCommandIntent(
+                    intent="draft_keep_only",
+                    keep_words=("大盘鸡",),
+                    submit_after=True,
+                    confidence=0.96,
+                ),
             )
 
         remove_call = next((arguments for name, arguments in tool_calls if name == "keytao_batch_remove_draft_items"), {})
@@ -1271,6 +1446,12 @@ def test_keep_only_draft_command_recalls_then_removes_without_refresh_prompt():
                 "不是，撤销草稿里的除了大盘鸡",
                 "qq",
                 "123",
+                command_intent=MessageCommandIntent(
+                    intent="draft_keep_only",
+                    keep_words=("大盘鸡",),
+                    submit_after=False,
+                    confidence=0.96,
+                ),
             )
 
         remove_call = next((arguments for name, arguments in tool_calls if name == "keytao_batch_remove_draft_items"), {})
@@ -1319,14 +1500,15 @@ def test_augment_simple_word_query_response_appends_priority_note():
                 }, ensure_ascii=False)
             raise AssertionError(tool_name)
 
-        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-            with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(return_value="从日常语感看，寿司郎更偏品牌名，神速力更像作品设定词；不过当前码位排序仍以现有词库占位为准。")):
-                result = await _augment_simple_word_query_response(
-                    "寿司郎",
-                    "词库已有：\n\n词: 寿司郎\n编码: eslv（三字词）【词组】",
-                    "qq",
-                    "123",
-                )
+        with patch.object(openai_chat_module, "_classify_simple_word_query_intent", AsyncMock(return_value=SimpleWordQueryIntent(True, ("寿司郎",), "word_lookup", 0.98))):
+            with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+                with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(return_value="从日常语感看，寿司郎更偏品牌名，神速力更像作品设定词；不过当前码位排序仍以现有词库占位为准。")):
+                    result = await _augment_simple_word_query_response(
+                        "寿司郎",
+                        "词库已有：\n\n词: 寿司郎\n编码: eslv（三字词）【词组】",
+                        "qq",
+                        "123",
+                    )
 
         check("result contains priority appendix", "补充说明：" in result)
         check("result explains prior occupied code", "esl 已有" in result)
@@ -1378,14 +1560,15 @@ def test_augment_simple_word_query_response_keeps_usage_comparison_when_response
             "• 寿司郎 当前用 eslv，因为更前面的候选码位已被占用：esl 已有「神速力」。"
         )
 
-        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-            with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(return_value="从日常语感看，神速力更像固定作品词，寿司郎更偏现实里的品牌名；不过当前码位顺序仍以现有词库占位为准。")):
-                result = await _augment_simple_word_query_response(
-                    "寿司郎",
-                    base_response,
-                    "qq",
-                    "123",
-                )
+        with patch.object(openai_chat_module, "_classify_simple_word_query_intent", AsyncMock(return_value=SimpleWordQueryIntent(True, ("寿司郎",), "word_lookup", 0.98))):
+            with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+                with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(return_value="从日常语感看，神速力更像固定作品词，寿司郎更偏现实里的品牌名；不过当前码位顺序仍以现有词库占位为准。")):
+                    result = await _augment_simple_word_query_response(
+                        "寿司郎",
+                        base_response,
+                        "qq",
+                        "123",
+                    )
 
         check("keeps existing response text", "更前面的候选码位已被占用" in result)
         check("still appends usage comparison", "常用度对比：" in result)
@@ -1453,14 +1636,15 @@ def test_augment_simple_word_query_response_handles_multiple_words():
                 return "从日常语感看，神速力更像固定作品词，寿司郎更偏现实里的品牌名；不过当前码位顺序仍以现有词库占位为准。"
             return None
 
-        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-            with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(side_effect=fake_comparison)):
-                result = await _augment_simple_word_query_response(
-                    "寿司郎 卧龙凤雏",
-                    "先看两个词的编码情况：",
-                    "qq",
-                    "123",
-                )
+        with patch.object(openai_chat_module, "_classify_simple_word_query_intent", AsyncMock(return_value=SimpleWordQueryIntent(True, ("寿司郎", "卧龙凤雏"), "word_lookup", 0.98))):
+            with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+                with patch.object(openai_chat_module, "_generate_usage_comparison_note", AsyncMock(side_effect=fake_comparison)):
+                    result = await _augment_simple_word_query_response(
+                        "寿司郎 卧龙凤雏",
+                        "先看两个词的编码情况：",
+                        "qq",
+                        "123",
+                    )
 
         check("batch lookup called once", sum(1 for name, _ in tool_calls if name == "keytao_lookup_by_words_batch") == 1)
         check("encode called for each existing word", sum(1 for name, _ in tool_calls if name == "keytao_encode") == 2)
@@ -1578,18 +1762,18 @@ def test_numeric_reply_means_exact_candidate_selection():
         ],
     )
 
-    msg1 = _strip_command_message_prefixes("喵喵 1")
-    check("'1' is not confirm", not _is_confirm(msg1))
-    idx1 = int(msg1) - 1
+    choice_one = MessageCommandIntent(intent="pending_choice", choice_index=1, confidence=0.96)
+    check("'1' routes as choice", choice_one.intent == "pending_choice")
+    idx1 = choice_one.choice_index - 1
     check("'1' selects zrxx", state.candidates[idx1][0] == "zrxx")
 
-    msg3 = _strip_command_message_prefixes("喵喵 3")
-    check("'3' is not confirm", not _is_confirm(msg3))
-    idx3 = int(msg3) - 1
+    choice_three = MessageCommandIntent(intent="pending_choice", choice_index=3, confidence=0.96)
+    check("'3' routes as choice", choice_three.intent == "pending_choice")
+    idx3 = choice_three.choice_index - 1
     check("'3' selects zrxxvu", state.candidates[idx3][0] == "zrxxvu")
 
-    confirm_msg = _strip_command_message_prefixes("喵喵 是")
-    check("'是' remains confirm", _is_confirm(confirm_msg))
+    confirm_intent = MessageCommandIntent(intent="pending_confirm", confidence=0.96)
+    check("semantic confirm remains confirm", confirm_intent.intent == "pending_confirm")
     check("'是' maps to recommended code", state.recommended_code == "zrxxv")
 
 
@@ -1613,6 +1797,7 @@ def test_occupied_numeric_choice_means_duplicate_confirm():
             with patch.object(openai_chat_module, "_execute_shift_to_code", AsyncMock(return_value="shifted")) as shift_mock:
                 result = await _handle_pending_add_word(
                     state, "1", "qq", "123", [],
+                    command_intent=MessageCommandIntent(intent="pending_choice", choice_index=1, confidence=0.96),
                 )
         check("occupied choice returns duplicate result", result == "duplicate")
         check("duplicate helper called once", duplicate_mock.await_count == 1)
@@ -1636,14 +1821,24 @@ def test_shift_request_can_target_by_number_or_word():
         occupied_words={"zrxx": ["增翔"]},
     )
 
-    check("'1 重新编码' -> zrxx", _resolve_shift_target_code(state, "1 重新编码") == "zrxx")
-    check("'增翔重新编码' -> zrxx", _resolve_shift_target_code(state, "增翔重新编码") == "zrxx")
-    check("'重新编码' with one occupied choice -> zrxx", _resolve_shift_target_code(state, "重新编码") == "zrxx")
+    check("choice recode -> zrxx", _resolve_shift_target_code(
+        state,
+        MessageCommandIntent(intent="pending_recode", choice_index=1, confidence=0.96),
+    ) == "zrxx")
+    check("target-word recode -> zrxx", _resolve_shift_target_code(
+        state,
+        MessageCommandIntent(intent="pending_recode", target_word="增翔", confidence=0.96),
+    ) == "zrxx")
+    check("single occupied recode -> zrxx", _resolve_shift_target_code(
+        state,
+        MessageCommandIntent(intent="pending_recode", confidence=0.96),
+    ) == "zrxx")
 
     async def _run():
         with patch.object(openai_chat_module, "_execute_shift_to_code", AsyncMock(return_value="shifted")) as shift_mock:
             result = await _handle_pending_add_word(
                 state, "1 重新编码", "qq", "123", [],
+                command_intent=MessageCommandIntent(intent="pending_recode", choice_index=1, confidence=0.96),
             )
         check("shift request returns shift result", result == "shifted")
         check("shift helper called once", shift_mock.await_count == 1)
@@ -1664,8 +1859,8 @@ def test_pending_add_word_confirm_uses_recommended():
         ],
     )
 
-    check("'是' is confirm", _is_confirm("是"))
-    # Logic: on confirm, use recommended_code
+    confirm_intent = MessageCommandIntent(intent="pending_confirm", confidence=0.96)
+    check("semantic confirm is sensitive", _is_sensitive_pending_control_intent(confirm_intent))
     check("recommended_code == 'cek'", state.recommended_code == "cek")
     # Find occupation status for recommended
     for code, occ in state.candidates:
@@ -1715,6 +1910,7 @@ def test_pending_add_word_add_and_submit_uses_recommended():
                 [],
                 ("qq", "qq:group:42"),
                 "Garth",
+                MessageCommandIntent(intent="pending_add_and_submit", confidence=0.96),
             )
 
         check("add called first", calls[0][0] == "keytao_create_phrase")
@@ -1799,10 +1995,10 @@ def test_real_world_scenario():
     check("word = '产线'", state.word == "产线")
     check("recommended = 'jfxmo'", state.recommended_code == "jfxmo")
 
-    # Step 3: User says "是"
-    user_msg = "是"
-    check("'是' is confirm", _is_confirm(user_msg))
-    check("'是' is not cancel", not _has_cancel(user_msg))
+    # Step 3: semantic intent classifier marks the user reply as confirm
+    user_intent = MessageCommandIntent(intent="pending_confirm", confidence=0.96)
+    check("user reply is semantic confirm", user_intent.intent == "pending_confirm")
+    check("user reply is not cancel", user_intent.intent != "pending_cancel")
 
     # Step 4: Python directly uses saved state
     # (In real code this calls _execute_add_to_draft with exact code)
@@ -1823,9 +2019,10 @@ def test_edge_case_correction_should_not_cancel():
     """Messages correcting the bot should not be mistaken for cancel."""
     print("\n🧪 Edge case: correction should not cancel")
 
-    check("'不是' is not cancel", not _has_cancel("不是"))
-    check("'不好' is not cancel", not _has_cancel("不好"))
-    check("'好不好' is not cancel", not _has_cancel("好不好"))
+    correction = MessageCommandIntent(intent="none", confidence=0.96)
+    recode = MessageCommandIntent(intent="pending_recode", confidence=0.96)
+    check("ordinary correction is not cancel", correction.intent != "pending_cancel")
+    check("recode correction is not cancel", recode.intent != "pending_cancel")
 
 
 def test_edge_case_numeric_out_of_range():
@@ -1857,20 +2054,18 @@ def test_edge_case_zero_choice():
     check("idx -1 is out of range", not (0 <= idx < len(state.candidates)))
 
 
-def test_confirm_cancel_word_sets():
-    """Verify the frozen sets contain expected words."""
-    print("\n🧪 CONFIRM_WORDS and CANCEL_WORDS sets")
+def test_command_intents_are_distinct():
+    """Verify semantic command intents keep sensitive actions distinct."""
+    print("\n🧪 command intents are distinct")
 
-    check("'是' in CONFIRM_WORDS", "是" in CONFIRM_WORDS)
-    check("'确认' in CONFIRM_WORDS", "确认" in CONFIRM_WORDS)
-    check("'yes' in CONFIRM_WORDS", "yes" in CONFIRM_WORDS)
-    check("'取消' in CANCEL_WORDS", "取消" in CANCEL_WORDS)
-    check("'不要了' in CANCEL_WORDS", "不要了" in CANCEL_WORDS)
-    check("'no' in CANCEL_WORDS", "no" in CANCEL_WORDS)
+    confirm = MessageCommandIntent(intent="pending_confirm", confidence=0.96)
+    cancel = MessageCommandIntent(intent="pending_cancel", confidence=0.96)
+    clear = MessageCommandIntent(intent="clear_history", confidence=0.96)
 
-    # No overlap
-    overlap = CONFIRM_WORDS & CANCEL_WORDS
-    check("no overlap between confirm and cancel", len(overlap) == 0)
+    check("confirm intent is sensitive", _is_sensitive_pending_control_intent(confirm))
+    check("cancel intent is sensitive", _is_sensitive_pending_control_intent(cancel))
+    check("clear intent is not pending-sensitive", not _is_sensitive_pending_control_intent(clear))
+    check("confirm and cancel are distinct", confirm.intent != cancel.intent)
 
 
 def test_bind_command_text_detection():
@@ -1893,20 +2088,22 @@ def test_bind_command_text_detection():
     check("valid bind with trailing words detected", _is_bind_command_text("/bind 26PZWH extra"))
 
 
-def test_clear_command_text_detection():
-    """Verify clear commands still route when prefixed by mentions or trigger words."""
-    print("\n🧪 clear command text detection")
+def test_clear_command_intent_detection():
+    """Verify clear-history routing is represented by semantic intent."""
+    print("\n🧪 clear command intent detection")
 
-    check("plain slash clear detected", _is_clear_command_text("/clear"))
-    check("plain clear detected", _is_clear_command_text("clear"))
-    check("Chinese alias detected", _is_clear_command_text("清空历史"))
-    check("mention prefix detected", _is_clear_command_text("@喵喵 /clear"))
-    check("mention display name prefix detected", _is_clear_command_text("@喵喵 jacobpang /clear"))
-    check("clear command inside sentence detected", _is_clear_command_text("@喵喵 jacobpang 请 /clear 一下"))
-    check("trigger word prefix detected", _is_clear_command_text("喵喵 清空对话"))
-    check("natural language not detected", not _is_clear_command_text("喵喵 怎么清空历史"))
-    check("mentioned clear token detected", _is_clear_command_text("@喵喵 关于 /clear"))
-    check("clear with trailing words detected", _is_clear_command_text("/clear now"))
+    clear_intent = _parse_message_command_intent_payload({
+        "intent": "clear_history",
+        "confidence": 0.96,
+    })
+    discussion_intent = _parse_message_command_intent_payload({
+        "intent": "none",
+        "confidence": 0.96,
+    })
+
+    check("clear history intent detected", clear_intent.intent == "clear_history")
+    check("clear history is not pending-sensitive", not _is_sensitive_pending_control_intent(clear_intent))
+    check("discussion stays non-command", discussion_intent.intent == "none")
 
 
 def test_pending_reply_prefix_stripping():
@@ -1917,42 +2114,35 @@ def test_pending_reply_prefix_stripping():
     check("键道 是 -> 是", _strip_command_message_prefixes("键道 是") == "是")
     check("@喵喵 确认 -> 确认", _strip_command_message_prefixes("@喵喵 确认") == "确认")
     check("prefixed digit stays digit", _strip_command_message_prefixes("喵喵 1").isdigit())
-    check("prefixed confirm still confirms", _is_confirm(_strip_command_message_prefixes("喵喵 是")))
+    check("prefixed text is left for semantic intent", _strip_command_message_prefixes("喵喵 是") == "是")
 
 
-def test_sensitive_pending_control_text():
-    print("\n🧪 sensitive pending control text")
+def test_sensitive_pending_control_intents():
+    print("\n🧪 sensitive pending control intents")
 
-    check("确认 is sensitive", _is_sensitive_pending_control_text("确认"))
-    check("prefixed confirm is sensitive", _is_sensitive_pending_control_text("喵喵 确认"))
-    check("cancel is sensitive", _is_sensitive_pending_control_text("取消"))
-    check("submit confirm is sensitive", _is_sensitive_pending_control_text("确认提交"))
-    check("plain submit is a fresh command", not _is_sensitive_pending_control_text("提交"))
-    check("plain review submit is a fresh command", not _is_sensitive_pending_control_text("提审"))
-    check("batch join is sensitive", _is_sensitive_pending_control_text("加入"))
-    check("add and submit is sensitive", _is_sensitive_pending_control_text("加入并提交"))
-    check("prefixed add and submit is sensitive", _is_sensitive_pending_control_text("喵喵 加入并提交"))
-    check("batch write is sensitive", _is_sensitive_pending_control_text("写入"))
-    check("plain recode is sensitive", _is_sensitive_pending_control_text("重新编码"))
-    check("duplicate add is sensitive", _is_sensitive_pending_control_text("加重码"))
-    check("direct add is sensitive", _is_sensitive_pending_control_text("直接加"))
-    check("numeric candidate choice is sensitive", _is_sensitive_pending_control_text("2"))
-    check("ordinal candidate choice is sensitive", _is_sensitive_pending_control_text("第2个"))
-    check("numeric recode choice is sensitive", _is_sensitive_pending_control_text("1 重新编码"))
-    check("word recode choice is sensitive", _is_sensitive_pending_control_text("会员费 重新编码"))
-    check("code directive is sensitive", _is_sensitive_pending_control_text("改码 xemev"))
-    check("compact code directive is sensitive", _is_sensitive_pending_control_text("用jroou"))
-    check("bare code choice is sensitive", _is_sensitive_pending_control_text("xemev"))
-    check("uppercase bare code choice is sensitive", _is_sensitive_pending_control_text("JROOU"))
-    check("draft view is a fresh command", not _is_sensitive_pending_control_text("草稿"))
-    check("recall is a fresh command", not _is_sensitive_pending_control_text("撤回"))
-    check("delete is a fresh command", not _is_sensitive_pending_control_text("删除 1"))
-    check("clear is a fresh command", not _is_sensitive_pending_control_text("clear"))
-    check("bind is a fresh command", not _is_sensitive_pending_control_text("/bind 26PZWH"))
-    check("add word command is fresh", not _is_sensitive_pending_control_text("添加 喜上眉梢 xemev"))
-    check("normal lookup is not sensitive", not _is_sensitive_pending_control_text("查词 增香"))
-    check("meaning question is not sensitive", not _is_sensitive_pending_control_text("这词什么意思"))
-    check("usage comparison is not sensitive", not _is_sensitive_pending_control_text("这个和电机哪个常用"))
+    sensitive_intents = [
+        "pending_confirm",
+        "pending_cancel",
+        "pending_add_and_submit",
+        "pending_recode",
+        "pending_code_request",
+        "pending_choice",
+    ]
+    non_sensitive_intents = [
+        "none",
+        "clear_history",
+        "draft_view",
+        "draft_keep_only",
+    ]
+
+    check("all pending intents are sensitive", all(
+        _is_sensitive_pending_control_intent(MessageCommandIntent(intent=intent, confidence=0.96))
+        for intent in sensitive_intents
+    ))
+    check("fresh-command intents are not pending-sensitive", all(
+        not _is_sensitive_pending_control_intent(MessageCommandIntent(intent=intent, confidence=0.96))
+        for intent in non_sensitive_intents
+    ))
 
 
 def test_memory_conversation_state_store():
@@ -2114,9 +2304,21 @@ def test_operation_recall_uses_group_memory_by_default():
             )
 
         with patch.object(openai_chat_module, "memory_store", store):
-            response = _try_handle_operation_recall("你前面加了些什么词", rea_context)
-            who_response = _try_handle_operation_recall("刚刚有谁加了什么词", rea_context)
-            self_response = _try_handle_operation_recall("我之前加了什么词", rea_context)
+            response = _try_handle_operation_recall(
+                "你前面加了些什么词",
+                rea_context,
+                MessageCommandIntent(intent="operation_recall", confidence=0.96),
+            )
+            who_response = _try_handle_operation_recall(
+                "刚刚有谁加了什么词",
+                rea_context,
+                MessageCommandIntent(intent="operation_recall", confidence=0.96),
+            )
+            self_response = _try_handle_operation_recall(
+                "我之前加了什么词",
+                rea_context,
+                MessageCommandIntent(intent="operation_recall", current_user_only=True, confidence=0.96),
+            )
 
     check("bot-you recall returns group operation", response is not None and "Garth" in response)
     check("bot-you recall keeps word", response is not None and "「空串」" in response)
@@ -2143,7 +2345,11 @@ def test_operation_recall_falls_back_when_structured_memory_empty():
         )
 
         with patch.object(openai_chat_module, "memory_store", store):
-            response = _try_handle_operation_recall("你前面加了些什么词", context)
+            response = _try_handle_operation_recall(
+                "你前面加了些什么词",
+                context,
+                MessageCommandIntent(intent="operation_recall", confidence=0.96),
+            )
 
     check("empty structured operation memory falls through to LLM", response is None)
 
@@ -2192,8 +2398,16 @@ def test_operation_recall_recovers_legacy_assistant_memory():
             )
 
         with patch.object(openai_chat_module, "memory_store", store):
-            response = _try_handle_operation_recall("你前面加了些什么词", rea_context)
-            self_response = _try_handle_operation_recall("我之前加了什么词", rea_context)
+            response = _try_handle_operation_recall(
+                "你前面加了些什么词",
+                rea_context,
+                MessageCommandIntent(intent="operation_recall", confidence=0.96),
+            )
+            self_response = _try_handle_operation_recall(
+                "我之前加了什么词",
+                rea_context,
+                MessageCommandIntent(intent="operation_recall", current_user_only=True, confidence=0.96),
+            )
 
     check("legacy assistant memory is recovered", response is not None and "Garth" in response)
     check("legacy assistant memory keeps word", response is not None and "「空串」" in response)
@@ -3008,10 +3222,12 @@ def test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate():
         ],
     }
 
-    check("extracts explicit requested code", _extract_requested_code_from_pending_reply("确认，加，以 jr") == "jr")
-    check("extracts bare requested code", _extract_requested_code_from_pending_reply("jroou") == "jroou")
-    check("does not treat ok as a code", _extract_requested_code_from_pending_reply("ok") is None)
-    check("does not treat split pinyin as code", _extract_requested_code_from_pending_reply("重新编码，ch eng，不应该是 wr") is None)
+    requested_intent = MessageCommandIntent(
+        intent="pending_code_request",
+        requested_code="jr",
+        confidence=0.96,
+    )
+    check("requested code comes from semantic intent", requested_intent.requested_code == "jr")
     check("selects first empty shape candidate", _select_requested_code_candidate("噌", "jr", encoding) == ("jroou", False))
 
     async def _run():
@@ -3024,6 +3240,11 @@ def test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate():
             with patch.object(openai_chat_module, "_execute_add_to_draft", AsyncMock(return_value="added")) as add_mock:
                 result = await _handle_pending_add_word(
                     state, "确认，加，以 jr", "qq", "123", [],
+                    command_intent=MessageCommandIntent(
+                        intent="pending_code_request",
+                        requested_code="jr",
+                        confidence=0.96,
+                    ),
                 )
 
         check("pending handler adds resolved candidate", result == "added")
@@ -3182,7 +3403,17 @@ def test_replace_char_preserves_explicit_css_type():
             }, ensure_ascii=False)
 
         with patch.object(openai_chat_module, "call_tool_function", fake_call_tool_function):
-            response = await _try_handle_replace_char(message, "qq", "42")
+            response = await _try_handle_replace_char(
+                message,
+                "qq",
+                "42",
+                MessageCommandIntent(
+                    intent="batch_replace_char",
+                    old_char="粘",
+                    new_char="黏",
+                    confidence=0.96,
+                ),
+            )
 
         check("replace-char handled message", response is not None and "成功 2 条" in response)
 
@@ -3194,8 +3425,7 @@ if __name__ == "__main__":
     print("State Machine & Core Logic Tests")
     print("=" * 60)
 
-    test_is_confirm()
-    test_has_cancel()
+    test_message_command_intent_payload()
     test_parse_pending_add_word_standard()
     test_parse_pending_add_word_em_dash()
     test_parse_pending_add_word_all_empty()
@@ -3221,12 +3451,16 @@ if __name__ == "__main__":
     test_pending_add_word_guidance_fallback_matcher()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
     test_extract_pure_chinese_words()
+    test_parse_simple_word_query_intent_payload()
+    test_get_simple_word_query_words_uses_semantic_classifier()
+    test_classify_simple_word_query_intent_calls_model()
     test_draft_management_command_detection()
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
     test_simple_single_word_query_uses_encode_tool_before_ai()
     test_simple_single_word_query_existing_word_falls_through()
     test_simple_single_word_query_skips_draft_commands()
+    test_simple_single_word_query_skips_chat_comparison_questions()
     test_draft_view_command_uses_draft_tools()
     test_keep_only_draft_command_removes_others_and_submits()
     test_keep_only_draft_command_recalls_then_removes_without_refresh_prompt()
@@ -3248,11 +3482,11 @@ if __name__ == "__main__":
     test_edge_case_correction_should_not_cancel()
     test_edge_case_numeric_out_of_range()
     test_edge_case_zero_choice()
-    test_confirm_cancel_word_sets()
+    test_command_intents_are_distinct()
     test_bind_command_text_detection()
-    test_clear_command_text_detection()
+    test_clear_command_intent_detection()
     test_pending_reply_prefix_stripping()
-    test_sensitive_pending_control_text()
+    test_sensitive_pending_control_intents()
     test_memory_conversation_state_store()
     test_memory_conversation_state_store_owner_scope()
     test_scoped_memory_store_builds_compressed_context()

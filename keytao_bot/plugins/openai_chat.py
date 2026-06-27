@@ -170,36 +170,38 @@ _LEADING_COMMAND_PREFIX_RE = re.compile(
     r"^(?:@\S+|键道|喵喵)[\s:：，,]*",
     re.IGNORECASE,
 )
-_CLEAR_COMMAND_RE = re.compile(r"^/?(?:clear|清空对话|清空历史)$", re.IGNORECASE)
 _PURE_CHINESE_WORDS_RE = re.compile(r'^[\u4e00-\u9fff]+(?:[\s、，,；;]+[\u4e00-\u9fff]+)*$')
-_WORD_QUERY_STOPWORDS = ("什么", "怎么", "为何", "为啥", "意思", "含义", "吗", "呢", "呀", "啊", "吧", "嘛")
-_DRAFT_VIEW_COMMAND_RE = re.compile(
-    r"^(?:"
-    r"草稿|"
-    r"(?:查看|看|看看|查|查一下|列出|显示)(?:当前|我的)?草稿(?:列表|内容|条目|批次)?|"
-    r"(?:当前|我的)草稿(?:列表|内容|条目|批次)?"
-    r")$"
+_PURE_CHINESE_TOKEN_RE = re.compile(r'^[\u4e00-\u9fff]{1,30}$')
+_CODE_TOKEN_RE = re.compile(r"^[a-z]{2,12}$", re.IGNORECASE)
+
+WORD_QUERY_INTENT_MODEL = (
+    getattr(config, "word_query_intent_model", None)
+    or getattr(config, "openai_intent_model", None)
+    or getattr(config, "gemini_intent_model", None)
+    or OPENAI_MODEL
 )
-_DRAFT_ACTION_KEYWORDS = (
-    "草稿", "提交", "提审", "发起审核", "撤回", "撤销提交", "取消提审",
-    "删掉", "删除", "去掉", "移除", "清掉", "清空", "只保留", "只留",
-)
-_DRAFT_KEEP_ONLY_REMOVE_VERBS = r"(?:去掉|删掉|删除|撤销|移除|清掉|清空)"
-_DRAFT_KEEP_ONLY_PREFIX_REMOVE_VERBS = r"(?:去掉|删掉|删除|撤销|移除|清掉|清空)"
-_PENDING_BATCH_ADD_CONTROL_WORDS = frozenset({
-    "加入", "添加", "加", "一起加入", "写入", "加进去",
-    "重新编码", "直接加", "强制加", "加重码", "添加重码", "确认重码",
-    "重码也行", "就用这个编码",
-})
-_PENDING_SUBMIT_CONFIRM_WORDS = frozenset({"继续提交", "确认提交", "确认提审"})
-_NON_PENDING_SHORT_COMMANDS = frozenset({
-    "草稿", "提交", "提审", "发起审核", "撤回", "撤销提交", "取消提审",
-    "清空历史", "清空对话", "clear", "/clear", "绑定", "bind", "/bind",
-})
-_PENDING_NUMERIC_CHOICE_RE = re.compile(r"(?:第)?\d+(?:个|号)?")
-_PENDING_RECODE_CHOICE_RE = re.compile(r"(?:\d+|[\u4e00-\u9fffA-Za-z0-9]{1,20})\s*重新编码")
-_PENDING_CODE_DIRECTIVE_RE = re.compile(r"(?:改码|换码|用|走|按|放到|改到|到)\s*[a-z]{2,12}", re.IGNORECASE)
-_PENDING_CODE_CHOICE_RE = re.compile(r"[a-z]{2,12}", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class SimpleWordQueryIntent:
+    should_handle: bool
+    words: Tuple[str, ...] = ()
+    intent: str = "not_word_lookup"
+    confidence: float = 0.0
+
+
+@dataclass(frozen=True)
+class MessageCommandIntent:
+    intent: str = "none"
+    confidence: float = 0.0
+    keep_words: Tuple[str, ...] = ()
+    submit_after: bool = False
+    current_user_only: bool = False
+    choice_index: Optional[int] = None
+    requested_code: str = ""
+    target_word: str = ""
+    old_char: str = ""
+    new_char: str = ""
 
 
 def _strip_command_message_prefixes(message_text: str) -> str:
@@ -212,133 +214,341 @@ def _strip_command_message_prefixes(message_text: str) -> str:
     return text
 
 
-def _compact_command_text(message_text: str) -> str:
-    text = _strip_command_message_prefixes(message_text)
-    text = re.sub(r"\s+", "", text)
-    return text.strip(" \t\r\n。.!！?？~")
-
-
-def _strip_command_correction_prefix(message_text: str) -> str:
-    text = _compact_command_text(message_text)
-    return re.sub(r"^(?:不是|不对|错了)[，,、。.!！?？]*", "", text)
-
-
-def _is_clear_command_text(message_text: str) -> bool:
-    command_text = _strip_command_message_prefixes(message_text)
-    return any(_CLEAR_COMMAND_RE.fullmatch(token) for token in command_text.split())
-
-
-def _is_draft_view_command(message_text: str) -> bool:
-    return bool(_DRAFT_VIEW_COMMAND_RE.fullmatch(_strip_command_correction_prefix(message_text)))
-
-
 @dataclass(frozen=True)
 class KeepOnlyDraftCommand:
     keep_words: Tuple[str, ...]
     submit_after: bool
 
 
-def _split_keep_words(raw_text: str) -> Tuple[str, ...]:
-    text = raw_text.strip(" \t\r\n。.!！?？~的")
-    text = re.sub(r"^(?:这(?:个|条)?|词条)", "", text)
-    words = [
-        part.strip(" \t\r\n。.!！?？~的")
-        for part in re.split(r"[、,，；;\s]+|(?:和|及|与)", text)
-        if part.strip(" \t\r\n。.!！?？~的")
-    ]
-    return tuple(dict.fromkeys(words))
-
-
-def _parse_keep_only_draft_command(message_text: str) -> Optional[KeepOnlyDraftCommand]:
-    text = _strip_command_correction_prefix(message_text)
-    if not text:
+def _keep_only_command_from_intent(command_intent: MessageCommandIntent) -> Optional[KeepOnlyDraftCommand]:
+    if command_intent.intent != "draft_keep_only" or not command_intent.keep_words:
         return None
-
-    patterns = (
-        rf"^(?:请|帮我|麻烦)?(?:把)?(?:草稿(?:里的|里|中的|中)?)?"
-        rf"(?:除了|除)(?P<keep>.+?)(?:之外|以外|外|其他|其它|其余)"
-        rf"(?:的)?(?:都|全|全部)?{_DRAFT_KEEP_ONLY_REMOVE_VERBS}(?P<tail>.*)$",
-        rf"^(?:请|帮我|麻烦)?(?:把)?{_DRAFT_KEEP_ONLY_PREFIX_REMOVE_VERBS}"
-        rf"(?:草稿(?:里的|里|中的|中)?)?(?:除了|除)(?P<keep>.+?)"
-        rf"(?:之外|以外|外)(?:的)?(?P<tail>.*)$",
-        rf"^(?:请|帮我|麻烦)?(?:把)?{_DRAFT_KEEP_ONLY_PREFIX_REMOVE_VERBS}"
-        rf"(?:草稿(?:里的|里|中的|中)?)?(?:除了|除)(?P<keep>.+?)"
-        rf"(?P<tail>(?:再提交|并提交|提交审核|提审)?)$",
+    return KeepOnlyDraftCommand(
+        keep_words=command_intent.keep_words,
+        submit_after=command_intent.submit_after,
     )
-    for pattern in patterns:
-        match = re.fullmatch(pattern, text)
-        if not match:
-            continue
-        keep_words = _split_keep_words(match.group("keep"))
-        if not keep_words:
-            return None
-        tail = match.group("tail") or ""
-        submit_after = any(marker in tail or marker in text for marker in ("再提交", "并提交", "提交审核", "提审"))
-        return KeepOnlyDraftCommand(keep_words=keep_words, submit_after=submit_after)
-
-    return None
 
 
-def _looks_like_draft_action_command(message_text: str) -> bool:
-    text = _strip_command_correction_prefix(message_text)
-    if not text:
-        return False
-    if _is_draft_view_command(text):
-        return True
-    if _parse_keep_only_draft_command(text) is not None:
-        return True
-    if text in _NON_PENDING_SHORT_COMMANDS:
-        return True
-    if "草稿" in text and any(keyword in text for keyword in _DRAFT_ACTION_KEYWORDS):
-        return True
-    if any(keyword in text for keyword in ("提交", "提审", "发起审核")) and any(
-        keyword in text for keyword in ("除了", "除", "其他", "其余", "其它")
-    ):
-        return True
-    return False
-
-
-def _is_sensitive_pending_control_text(message_text: str) -> bool:
-    text = _strip_command_message_prefixes(message_text).strip()
-    if text in _NON_PENDING_SHORT_COMMANDS:
-        return False
-    if _is_add_and_submit_message(text):
-        return True
-    if _is_confirm(text) or _has_cancel(text):
-        return True
-    if text in _PENDING_SUBMIT_CONFIRM_WORDS or text in _PENDING_BATCH_ADD_CONTROL_WORDS:
-        return True
-    if _PENDING_NUMERIC_CHOICE_RE.fullmatch(text):
-        return True
-    if _PENDING_RECODE_CHOICE_RE.fullmatch(text):
-        return True
-    if _PENDING_CODE_DIRECTIVE_RE.fullmatch(text):
-        return True
-    if _PENDING_CODE_CHOICE_RE.fullmatch(text):
-        return True
-    return False
-
-
-def _is_add_and_submit_message(message_text: str) -> bool:
-    text = re.sub(r"\s+", "", _strip_command_message_prefixes(message_text).strip())
-    return bool(re.fullmatch(
-        r"(?:加入草稿|添加草稿|加入|添加|加|写入|加进去)"
-        r"(?:并|后)?"
-        r"(?:提交审核|提交|提审)",
-        text,
-    ))
+def _is_sensitive_pending_control_intent(command_intent: MessageCommandIntent) -> bool:
+    return command_intent.intent in {
+        "pending_confirm",
+        "pending_cancel",
+        "pending_add_and_submit",
+        "pending_recode",
+        "pending_code_request",
+        "pending_choice",
+    }
 
 
 def _extract_pure_chinese_words(message_text: str) -> List[str]:
-    """Extract standalone Chinese words from a simple word-only message."""
+    """Extract structurally simple Chinese tokens without deciding intent."""
     text = message_text.strip()
     if not text or not _PURE_CHINESE_WORDS_RE.fullmatch(text):
         return []
-    if _looks_like_draft_action_command(text):
-        return []
-    if any(stopword in text for stopword in _WORD_QUERY_STOPWORDS):
-        return []
     return [token for token in re.split(r'[\s、，,；;]+', text) if token]
+
+
+def _load_json_object_from_model_text(content: str) -> Dict:
+    """Parse the first JSON object from a model response."""
+    text = (content or "").strip()
+    if not text:
+        return {}
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        value = json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            value = json.loads(match.group(0))
+        except Exception:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _sanitize_simple_word_intent_words(words: object, fallback_words: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Keep only clean Chinese tokens returned by the intent classifier."""
+    if not isinstance(words, list):
+        words = []
+    sanitized = []
+    for word in words:
+        token = str(word or "").strip()
+        if token and _PURE_CHINESE_TOKEN_RE.fullmatch(token):
+            sanitized.append(token)
+    if sanitized:
+        return tuple(dict.fromkeys(sanitized))
+    return fallback_words
+
+
+def _parse_simple_word_query_intent_payload(
+    payload: Dict,
+    fallback_words: Tuple[str, ...],
+) -> SimpleWordQueryIntent:
+    """Normalize model JSON into a simple word-query intent decision."""
+    intent = str(payload.get("intent") or "").strip().lower()
+    should_handle = intent == "word_lookup" or payload.get("should_handle") is True
+    try:
+        confidence = float(payload.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    words = _sanitize_simple_word_intent_words(payload.get("words"), fallback_words)
+    if not should_handle:
+        return SimpleWordQueryIntent(
+            should_handle=False,
+            words=(),
+            intent=intent or "not_word_lookup",
+            confidence=confidence,
+        )
+    return SimpleWordQueryIntent(
+        should_handle=True,
+        words=words,
+        intent=intent or "word_lookup",
+        confidence=confidence,
+    )
+
+
+def _sanitize_optional_code(value: object) -> str:
+    code = str(value or "").strip().lower()
+    return code if _CODE_TOKEN_RE.fullmatch(code) else ""
+
+
+def _sanitize_optional_positive_int(value: object) -> Optional[int]:
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = str(value or "").strip()
+    if not text.isdigit():
+        return None
+    number = int(text)
+    return number if number > 0 else None
+
+
+def _sanitize_optional_single_char(value: object) -> str:
+    text = str(value or "").strip()
+    return text if len(text) == 1 and not text.isspace() else ""
+
+
+def _sanitize_optional_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"true", "yes", "1"}:
+        return True
+    if text in {"false", "no", "0", ""}:
+        return False
+    return False
+
+
+def _sanitize_command_words(words: object) -> Tuple[str, ...]:
+    if not isinstance(words, list):
+        return ()
+    result = []
+    for word in words:
+        token = str(word or "").strip()
+        if token and _PURE_CHINESE_TOKEN_RE.fullmatch(token):
+            result.append(token)
+    return tuple(dict.fromkeys(result))
+
+
+def _parse_message_command_intent_payload(payload: Dict) -> MessageCommandIntent:
+    """Normalize model JSON into command-routing metadata."""
+    allowed_intents = {
+        "none",
+        "clear_history",
+        "draft_view",
+        "draft_keep_only",
+        "operation_recall",
+        "batch_replace_char",
+        "pending_confirm",
+        "pending_cancel",
+        "pending_add_and_submit",
+        "pending_recode",
+        "pending_code_request",
+        "pending_choice",
+    }
+    intent = str(payload.get("intent") or "none").strip().lower()
+    if intent not in allowed_intents:
+        intent = "none"
+    try:
+        confidence = float(payload.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return MessageCommandIntent(
+        intent=intent,
+        confidence=confidence,
+        keep_words=_sanitize_command_words(payload.get("keep_words")),
+        submit_after=_sanitize_optional_bool(payload.get("submit_after")),
+        current_user_only=_sanitize_optional_bool(payload.get("current_user_only")),
+        choice_index=_sanitize_optional_positive_int(payload.get("choice_index")),
+        requested_code=_sanitize_optional_code(payload.get("requested_code")),
+        target_word=str(payload.get("target_word") or "").strip(),
+        old_char=_sanitize_optional_single_char(payload.get("old_char")),
+        new_char=_sanitize_optional_single_char(payload.get("new_char")),
+    )
+
+
+def _pending_context_for_command_intent(state: Optional[PendingState]) -> str:
+    if isinstance(state, PendingAddWord):
+        candidates = [
+            {
+                "index": index,
+                "code": code,
+                "occupied": occupied,
+                "occupied_words": state.occupied_words.get(code, []),
+            }
+            for index, (code, occupied) in enumerate(state.candidates, start=1)
+        ]
+        return json.dumps(
+            {
+                "type": "pending_add_word",
+                "word": state.word,
+                "recommended_code": state.recommended_code,
+                "candidates": candidates,
+            },
+            ensure_ascii=False,
+        )
+    if isinstance(state, PendingToolConfirm):
+        return json.dumps(
+            {
+                "type": "pending_tool_confirm",
+                "function_name": state.function_name,
+                "args": state.args,
+            },
+            ensure_ascii=False,
+        )
+    return "none"
+
+
+async def _classify_message_command_intent(
+    message_text: str,
+    pending_state: Optional[PendingState] = None,
+) -> MessageCommandIntent:
+    """Use the configured flash/intent model for command and pending-control semantics."""
+    if not message_text.strip():
+        return MessageCommandIntent()
+    if not OPENAI_API_KEY or not AsyncOpenAI:
+        logger.warning("Command intent model unavailable; falling through to main AI flow")
+        return MessageCommandIntent()
+
+    pending_context = _pending_context_for_command_intent(pending_state)
+    system_prompt = (
+        "你是键道机器人喵喵的轻量语义路由器。"
+        "只判断当前消息是否应由程序快捷处理；不要执行操作，不要回答用户。\n"
+        "输出必须是 JSON 对象，不要解释。\n"
+        "intent 只能是：none, clear_history, draft_view, draft_keep_only, "
+        "operation_recall, batch_replace_char, "
+        "pending_confirm, pending_cancel, pending_add_and_submit, pending_recode, "
+        "pending_code_request, pending_choice。\n"
+        "clear_history：用户明确要求清空/重置本轮聊天历史。\n"
+        "draft_view：用户要查看自己当前草稿。\n"
+        "draft_keep_only：用户要在自己草稿里只保留指定词，keep_words 必须列出保留词；"
+        "如果语义还要求随后提交，则 submit_after=true。\n"
+        "operation_recall：用户询问最近通过喵喵经手的词库操作；"
+        "如果只问自己，则 current_user_only=true。\n"
+        "batch_replace_char：用户要求把下方词码列表里的某个字符批量替换成另一个字符；"
+        "old_char/new_char 必须是单个字符。\n"
+        "pending_* 只在 pending_context 不是 none，且用户在回应该待确认操作时使用。"
+        "普通提问、词义/常用度比较、泛泛讨论、如何使用功能、以及新的复杂操作都返回 none，交给主模型。"
+    )
+    user_prompt = (
+        f"当前消息：{message_text}\n"
+        f"pending_context：{pending_context}\n"
+        "请只返回 JSON，字段包括：intent, confidence, keep_words, submit_after, "
+        "current_user_only, choice_index, requested_code, target_word, old_char, new_char。"
+    )
+
+    try:
+        client = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            timeout=min(OPENAI_TIMEOUT, 20.0),
+        )
+        response = await client.chat.completions.create(
+            model=WORD_QUERY_INTENT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=260,
+            temperature=0.0,
+        )
+        if not response.choices:
+            return MessageCommandIntent()
+        payload = _load_json_object_from_model_text(response.choices[0].message.content or "")
+        return _parse_message_command_intent_payload(payload)
+    except Exception as error:
+        logger.warning(f"Failed to classify command intent: {error}")
+        return MessageCommandIntent()
+
+
+async def _classify_simple_word_query_intent(
+    message_text: str,
+    structural_words: Tuple[str, ...],
+) -> SimpleWordQueryIntent:
+    """Use the configured flash/intent model to decide whether this is a bare word lookup."""
+    if not structural_words:
+        return SimpleWordQueryIntent(False)
+    if not OPENAI_API_KEY or not AsyncOpenAI:
+        logger.warning("Word-query intent model unavailable; falling through to main AI flow")
+        return SimpleWordQueryIntent(False)
+
+    system_prompt = (
+        "你是键道机器人喵喵的轻量语义路由器。"
+        "只判断当前消息是否应该进入“裸词查词/编码”快捷流程。\n"
+        "输出必须是 JSON 对象，不要解释。\n"
+        "字段：intent 为 word_lookup 或 not_word_lookup；"
+        "words 为应查询的词语数组；confidence 为 0 到 1。\n"
+        "word_lookup 仅表示用户只给出一个或多个独立中文词、短语、成语或专名，"
+        "希望了解词义、键道编码、词库位置或候选顺序。\n"
+        "not_word_lookup 表示自然句、问答、比较、解释、闲聊、命令、草稿操作、确认操作、"
+        "或任何需要由主对话模型理解后再决定工具调用的请求。"
+    )
+    user_prompt = (
+        f"当前消息：{message_text}\n"
+        f"结构切分候选：{json.dumps(list(structural_words), ensure_ascii=False)}\n"
+        "请只返回 JSON，例如："
+        '{"intent":"word_lookup","words":["示例词"],"confidence":0.9}'
+    )
+
+    try:
+        client = AsyncOpenAI(
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            timeout=min(OPENAI_TIMEOUT, 20.0),
+        )
+        response = await client.chat.completions.create(
+            model=WORD_QUERY_INTENT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=180,
+            temperature=0.0,
+        )
+        if not response.choices:
+            return SimpleWordQueryIntent(False)
+        content = response.choices[0].message.content or ""
+        payload = _load_json_object_from_model_text(content)
+        return _parse_simple_word_query_intent_payload(payload, structural_words)
+    except Exception as error:
+        logger.warning(f"Failed to classify simple word-query intent: {error}")
+        return SimpleWordQueryIntent(False)
+
+
+async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
+    """Return model-approved word-query targets, or empty when the main AI should handle it."""
+    structural_words = tuple(_extract_pure_chinese_words(message_text))
+    if not structural_words:
+        return ()
+    intent = await _classify_simple_word_query_intent(message_text, structural_words)
+    if not intent.should_handle:
+        logger.info(
+            "Simple Chinese message fell through to main AI: "
+            f"intent={intent.intent} confidence={intent.confidence:.2f}"
+        )
+        return ()
+    return intent.words
 
 
 # ---------------------------------------------------------------------------
@@ -362,52 +572,10 @@ MAX_HISTORY_MESSAGES = 24
 conversation_state_store = MemoryConversationStateStore()
 conversation_states: Dict[Tuple[str, str], PendingState] = conversation_state_store.states
 
-CONFIRM_WORDS = frozenset({
-    "确认", "是", "好", "好的", "可以", "同意", "yes", "ok", "确定", "嗯", "行", "y",
-})
-_CONFIRM_MESSAGE_RE = re.compile(
-    r"^(?:"
-    r"确认|是|好|好的|可以|同意|yes|ok|确定|嗯|行|y"
-    r")(?:[\s,，。.!！~吧啦喔哦呀哈呗]*)$",
-    re.IGNORECASE,
-)
-CANCEL_WORDS = frozenset({
-    "别", "不要", "不要了", "不用", "不用了", "取消", "算了", "不行", "先不", "先不了", "no", "n",
-})
-_CANCEL_MESSAGE_RE = re.compile(
-    r"^(?:"
-    r"取消|算了|别|不行|"
-    r"不要(?:了|加了)?|"
-    r"不用(?:了)?|"
-    r"先不(?:了)?|"
-    r"no|n"
-    r")(?:[\s,，。.!！~吧啦喔哦呀哈呗]*)$",
-    re.IGNORECASE,
-)
-
-
-def _is_confirm(msg: str) -> bool:
-    """Check if message is a short confirmation."""
-    msg = msg.strip().lower()
-    if _has_cancel(msg):
-        return False
-    return bool(_CONFIRM_MESSAGE_RE.fullmatch(msg))
-
-
-def _has_cancel(msg: str) -> bool:
-    """Check if message is an explicit cancellation reply."""
-    msg = msg.strip().lower()
-    return bool(_CANCEL_MESSAGE_RE.fullmatch(msg))
-
-
 def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
     """Skip query augmentation for confirmations and action-result replies."""
     text = message_text.strip()
     if not text:
-        return False
-    if _looks_like_draft_action_command(text):
-        return False
-    if _is_confirm(text) or _has_cancel(text):
         return False
 
     response_text = response.strip()
@@ -687,7 +855,7 @@ def _ensure_current_pending_matches_reference(
 
 
 def _restore_current_pending_from_history_for_sensitive_control(
-    message_text: str,
+    command_intent: MessageCommandIntent,
     conv_key: Tuple[str, str],
     space_key: Optional[Tuple[str, str]],
     owner_label: str,
@@ -697,7 +865,7 @@ def _restore_current_pending_from_history_for_sensitive_control(
     current_record = conversation_state_store.get_record(conv_key)
     if current_record is not None:
         return current_record
-    if not _is_sensitive_pending_control_text(message_text):
+    if not _is_sensitive_pending_control_intent(command_intent):
         return None
 
     recovered_state = _recover_pending_state_from_history(history)
@@ -769,18 +937,6 @@ def _pending_state_can_be_copied_to_current_user(state: PendingState) -> bool:
     return False
 
 
-def _requests_recode_or_pronunciation_change(message: str) -> bool:
-    text = (message or "").strip().lower()
-    return any(marker in text for marker in (
-        "重新编码",
-        "重编",
-        "改码",
-        "读音",
-        "音码",
-        "不是",
-    ))
-
-
 def _format_other_owner_pending_message(
     owner_label: str,
     state: PendingState,
@@ -809,20 +965,20 @@ def _handle_referenced_pending_from_other_user(
     conv_key: Tuple[str, str],
     space_key: Tuple[str, str],
     owner_label: str,
-    message: str = "",
+    command_intent: MessageCommandIntent,
 ) -> Optional[str]:
     """Handle a user replying to a bot pending prompt that is not their own."""
     if referenced_state is None:
         return None
-    if not _is_sensitive_pending_control_text(message):
+    if not _is_sensitive_pending_control_intent(command_intent):
         return None
     if current_record and conversation_state_store.states_equivalent(current_record.state, referenced_state):
         return None
 
-    recode_requested = _requests_recode_or_pronunciation_change(message)
+    recode_requested = command_intent.intent == "pending_recode"
     can_copy_to_current_user = (
         not recode_requested
-        and not _has_cancel(message)
+        and command_intent.intent != "pending_cancel"
         and _pending_state_can_be_copied_to_current_user(referenced_state)
     )
     if other_record is not None:
@@ -1034,7 +1190,7 @@ async def _augment_simple_word_query_response(
     if not _should_augment_simple_word_query(message_text, response):
         return response
 
-    words = _extract_pure_chinese_words(message_text)
+    words = await _get_simple_word_query_words(message_text)
     if not words:
         return response
 
@@ -1202,7 +1358,7 @@ async def _try_handle_simple_single_word_query(
     user_id: str,
 ) -> Optional[str]:
     """Handle a single bare Chinese word via tools before the model can invent codes."""
-    words = _extract_pure_chinese_words(message_text)
+    words = await _get_simple_word_query_words(message_text)
     if len(words) != 1:
         return None
 
@@ -1831,14 +1987,16 @@ async def _execute_shift_to_code(
     return header + await _format_draft_response(data, platform, user_id)
 
 
-def _resolve_shift_target_code(state: PendingAddWord, msg: str) -> Optional[str]:
+def _resolve_shift_target_code(
+    state: PendingAddWord,
+    command_intent: MessageCommandIntent,
+) -> Optional[str]:
     """Resolve which occupied candidate the user wants to shift for."""
-    if "重新编码" not in msg:
+    if command_intent.intent != "pending_recode":
         return None
 
-    digit_match = re.search(r'(\d+)', msg)
-    if digit_match:
-        idx = int(digit_match.group(1)) - 1
+    if command_intent.choice_index is not None:
+        idx = command_intent.choice_index - 1
         if 0 <= idx < len(state.candidates):
             code, occupied = state.candidates[idx]
             if occupied:
@@ -1848,35 +2006,13 @@ def _resolve_shift_target_code(state: PendingAddWord, msg: str) -> Optional[str]
         if not occupied:
             continue
         for occupant_word in state.occupied_words.get(code, []):
-            if occupant_word and occupant_word in msg:
+            if occupant_word and occupant_word == command_intent.target_word:
                 return code
 
     occupied_codes = [code for code, occupied in state.candidates if occupied]
     if len(occupied_codes) == 1:
         return occupied_codes[0]
     return None
-
-
-def _extract_requested_code_from_pending_reply(msg: str) -> Optional[str]:
-    """Extract an explicit code or code prefix from a pending add-word reply."""
-    text = msg.strip().lower()
-    if not text:
-        return None
-    if _is_confirm(text) or _has_cancel(text):
-        return None
-    if re.fullmatch(r'[a-z]{2,12}', text):
-        return text
-
-    patterns = (
-        r'(?:以|用|走|按|放到|改到|到)\s*([a-z]{2,6})',
-        r'([a-z]{2,6})\s*(?:编码|音码|码|系列)',
-    )
-    matches: List[str] = []
-    for pattern in patterns:
-        matches.extend(re.findall(pattern, text))
-    if not matches:
-        return None
-    return matches[-1]
 
 
 def _lookup_status_occupied(encoding: Dict, code: str) -> bool:
@@ -1935,11 +2071,10 @@ def _select_requested_code_candidate(word: str, requested_code: str, encoding: D
 
 async def _resolve_requested_code_for_pending_add(
     state: PendingAddWord,
-    msg: str,
+    requested_code: str,
     platform: str,
     user_id: str,
 ) -> Optional[Tuple[str, bool]]:
-    requested_code = _extract_requested_code_from_pending_reply(msg)
     if not requested_code:
         return None
 
@@ -1997,13 +2132,15 @@ async def _execute_confirmed_tool(
     return f"操作失败：{data.get('message', '未知错误')} qwq"
 
 
-def _is_pending_tool_confirm_message(state: PendingToolConfirm, message: str) -> bool:
-    text = message.strip()
+def _is_pending_tool_confirm_message(
+    state: PendingToolConfirm,
+    command_intent: MessageCommandIntent,
+) -> bool:
     if state.function_name == "keytao_submit_batch":
-        return _is_confirm(text) or text in {"提交", "提审"}
+        return command_intent.intent == "pending_confirm"
     if state.function_name == "keytao_batch_add_to_draft":
-        return _is_confirm(text) or text in {"加入", "添加", "加", "一起加入", "写入", "加进去"}
-    return _is_confirm(text)
+        return command_intent.intent in {"pending_confirm", "pending_add_and_submit"}
+    return command_intent.intent == "pending_confirm"
 
 
 async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str:
@@ -2129,11 +2266,11 @@ def _draft_snapshot_from_list_data(list_data: Dict) -> Dict:
 
 
 async def _try_handle_draft_view_command(
-    message_text: str,
+    command_intent: MessageCommandIntent,
     platform: str,
     user_id: str,
 ) -> Optional[str]:
-    if not _is_draft_view_command(message_text):
+    if command_intent.intent != "draft_view":
         return None
 
     list_data = await _fetch_current_draft_items(platform, user_id)
@@ -2195,13 +2332,13 @@ async def _list_draft_items_after_optional_recall(
 
 
 async def _try_handle_keep_only_draft_items_command(
-    message_text: str,
+    command_intent: MessageCommandIntent,
     platform: str,
     user_id: str,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
 ) -> Optional[str]:
-    command = _parse_keep_only_draft_command(message_text)
+    command = _keep_only_command_from_intent(command_intent)
     if command is None:
         return None
 
@@ -2281,9 +2418,13 @@ async def _try_handle_draft_management_command(
     user_id: str,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    command_intent: Optional[MessageCommandIntent] = None,
 ) -> Optional[str]:
+    if command_intent is None:
+        command_intent = await _classify_message_command_intent(message_text)
+
     response = await _try_handle_keep_only_draft_items_command(
-        message_text,
+        command_intent,
         platform,
         user_id,
         space_key,
@@ -2292,7 +2433,7 @@ async def _try_handle_draft_management_command(
     if response is not None:
         return response
 
-    return await _try_handle_draft_view_command(message_text, platform, user_id)
+    return await _try_handle_draft_view_command(command_intent, platform, user_id)
 
 
 async def _handle_pending_add_word(
@@ -2303,18 +2444,27 @@ async def _handle_pending_add_word(
     history: List[Dict],
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    command_intent: Optional[MessageCommandIntent] = None,
 ) -> Optional[str]:
     """Handle user response to a pending add-word prompt.
 
     Returns a response string if handled directly, None to fall through to AI.
     """
     msg = message.strip()
-    submit_after_add = _is_add_and_submit_message(msg)
-    shift_target_code = _resolve_shift_target_code(state, msg)
+    if command_intent is None:
+        command_intent = await _classify_message_command_intent(msg, state)
+
+    submit_after_add = command_intent.intent == "pending_add_and_submit"
+    shift_target_code = _resolve_shift_target_code(state, command_intent)
     if shift_target_code is not None:
         return await _execute_shift_to_code(state.word, shift_target_code, platform, user_id)
 
-    requested_target = await _resolve_requested_code_for_pending_add(state, msg, platform, user_id)
+    requested_target = await _resolve_requested_code_for_pending_add(
+        state,
+        command_intent.requested_code if command_intent.intent == "pending_code_request" else "",
+        platform,
+        user_id,
+    )
     if requested_target is not None:
         target_code, is_occupied = requested_target
         if not is_occupied:
@@ -2333,9 +2483,8 @@ async def _handle_pending_add_word(
     target_code: Optional[str] = None
     is_occupied = False
 
-    # Numeric choice (e.g. "1", "2", "3")
-    if msg.isdigit():
-        idx = int(msg) - 1
+    if command_intent.intent == "pending_choice" and command_intent.choice_index is not None:
+        idx = command_intent.choice_index - 1
         if 0 <= idx < len(state.candidates):
             target_code, is_occupied = state.candidates[idx]
         else:
@@ -2343,8 +2492,7 @@ async def _handle_pending_add_word(
             conversation_state_store.set(conv_key, state, space_key=space_key, owner_label=owner_label)
             return f"请选择 1-{len(state.candidates)} 之间的编号 owo"
 
-    # Simple confirmation -> use recommended code
-    elif _is_confirm(msg) or submit_after_add:
+    elif command_intent.intent == "pending_confirm" or submit_after_add:
         target_code = state.recommended_code
         for c, occ in state.candidates:
             if c == target_code:
@@ -2419,6 +2567,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      词义解释可以直接用你的语言能力简短说明，不必额外查外部资料；
      但编码、候选码、重码顺序必须来自工具结果，不能凭空编造。
      多个词时优先使用批量查询工具，并按词逐个整理结果。
+     如果语义是常用度、词义、使用场景等普通问答，不要为了加词而生成确认句。
 
    【第一步】同时调用：
      keytao_encode(word) + keytao_lookup_by_word(word)
@@ -2536,19 +2685,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 # Structural message preprocessor (bypasses AI for well-defined batch ops)
 # ---------------------------------------------------------------------------
 
-_RE_REPLACE_CHAR = re.compile(
-    r'将(?:这些|这批|以下|下列)?(?:\S{0,12}?)(?:词条|词|字)?(?:中|中的|里|里的|的)?'
-    r'["\u201c\u300c]?(.)["\u201d\u300d]?改[为成]["\u201c\u300c]?(.)["\u201d\u300d]?[：:，,\s]'
-)
 _RE_WORD_CODE_LINE = re.compile(r'^(\S+)\s+([a-z]+)\s*$')
-_OPERATION_RECALL_RE = re.compile(
-    r"(?:你|喵喵|bot|机器人).{0,8}(?:前面|刚刚|最近|之前).{0,10}(?:加了|加过|提交|经手|做过).{0,8}(?:词|词条)"
-    r"|(?:所有人|群友|大家).{0,10}(?:加了|加过|提交|经手|做过).{0,8}(?:词|词条)"
-    r"|(?:前面|刚刚|最近|之前).{0,12}(?:谁|哪位|哪些人|有人).{0,8}(?:加了|加过|提交|经手|做过).{0,8}(?:词|词条)"
-)
-_SELF_OPERATION_RECALL_RE = re.compile(
-    r"(?:我|俺|本人|自己).{0,8}(?:前面|刚刚|最近|之前).{0,10}(?:加了|加过|提交|经手|做过).{0,8}(?:词|词条)"
-)
 _OPERATION_MEMORY_PREFIX_RE = re.compile(
     r"^词库操作：(?P<actor>.+?)(?:[（(][^)）]+[）)])?\s+(?P<rest>(?:已提交审核|已加入草稿).*)$"
 )
@@ -2576,14 +2713,18 @@ def _extract_explicit_phrase_type(message: str) -> Optional[str]:
 
 
 async def _try_handle_replace_char(
-    message: str, platform: str, user_id: str
+    message: str,
+    platform: str,
+    user_id: str,
+    command_intent: MessageCommandIntent,
 ) -> Optional[str]:
-    """Detect '将X改成Y + word-code list' pattern and handle directly in Python."""
-    m = _RE_REPLACE_CHAR.search(message)
-    if not m:
+    """Handle model-classified single-character replacement over word-code lines."""
+    if command_intent.intent != "batch_replace_char":
+        return None
+    old_char, new_char = command_intent.old_char, command_intent.new_char
+    if not old_char or not new_char or old_char == new_char:
         return None
 
-    old_char, new_char = m.group(1), m.group(2)
     phrase_type = _extract_explicit_phrase_type(message)
     items = []
     for line in message.splitlines():
@@ -2626,16 +2767,14 @@ async def _try_handle_replace_char(
 def _try_handle_operation_recall(
     message: str,
     memory_context: ChatMemoryContext,
+    command_intent: MessageCommandIntent,
 ) -> Optional[str]:
     """Answer recent bot-mediated dictionary operation recall from memory."""
     text = message.strip()
-    if not text:
+    if not text or command_intent.intent != "operation_recall":
         return None
 
-    current_user_only = bool(_SELF_OPERATION_RECALL_RE.search(text))
-    if not current_user_only and not _OPERATION_RECALL_RE.search(text):
-        return None
-
+    current_user_only = command_intent.current_user_only
     operations = memory_store.get_recent_operation_candidates(
         memory_context,
         include_current_user_only=current_user_only,
@@ -2842,32 +2981,14 @@ async def get_openai_response(
 # ---------------------------------------------------------------------------
 
 clear_cmd = on_command(
-    "clear", aliases={"清空对话", "清空历史"},
+    "clear",
     rule=Rule(should_handle), priority=5, block=True,
-)
-
-
-async def should_handle_clear_message(bot: Bot, event: Event) -> bool:
-    if not _is_clear_command_text(event.get_plaintext()):
-        return False
-    return await should_handle(bot, event)
-
-
-clear_message = on_message(
-    rule=Rule(should_handle_clear_message),
-    priority=4,
-    block=True,
 )
 
 
 @clear_cmd.handle()
 async def handle_clear(bot: Bot, event: Event):
     await _handle_clear(bot, event, clear_cmd)
-
-
-@clear_message.handle()
-async def handle_clear_message(bot: Bot, event: Event):
-    await _handle_clear(bot, event, clear_message)
 
 
 async def _handle_clear(bot: Bot, event: Event, matcher):
@@ -2904,6 +3025,27 @@ async def handle_ai_chat(bot: Bot, event: Event):
     reply_reference = await extract_reply_reference_info(bot, event)
     response: Optional[str] = None
     history: Optional[List[Dict]] = None
+    command_intent_cache: Dict[Tuple[str, str], MessageCommandIntent] = {}
+
+    async def command_intent_for(pending_state: Optional[PendingState] = None) -> MessageCommandIntent:
+        cache_key = (
+            pending_state.__class__.__name__ if pending_state is not None else "none",
+            _describe_pending_state(pending_state) if pending_state is not None else "",
+        )
+        if cache_key not in command_intent_cache:
+            command_intent_cache[cache_key] = await _classify_message_command_intent(
+                normalized_message_text,
+                pending_state,
+            )
+        return command_intent_cache[cache_key]
+
+    generic_command_intent = await command_intent_for()
+    if generic_command_intent.intent == "clear_history":
+        clear_history(conv_key)
+        memory_store.clear_user_memory(memory_context)
+        conversation_state_store.delete(conv_key)
+        await ai_chat.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
+        return
 
     referenced_pending = (
         _parse_pending_state_from_response(reply_reference.text)
@@ -2950,6 +3092,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 conv_key,
                 referenced_pending,
             )
+        referenced_command_intent = await command_intent_for(referenced_pending)
         response = _handle_referenced_pending_from_other_user(
             referenced_pending,
             current_record,
@@ -2957,7 +3100,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
             conv_key,
             space_key,
             owner_label,
-            normalized_message_text,
+            referenced_command_intent,
         )
         if response is not None:
             add_to_history(conv_key, normalized_message_text, response)
@@ -2965,15 +3108,13 @@ async def handle_ai_chat(bot: Bot, event: Event):
             await ai_chat.finish(response)
             return
 
-    if (
-        memory_context.space_type == "group"
-        and not conversation_state_store.contains(conv_key)
-        and _is_sensitive_pending_control_text(normalized_message_text)
-    ):
+    if memory_context.space_type == "group" and not conversation_state_store.contains(conv_key):
         if history is None:
             history = get_history(conv_key)
+        recovered_state = _recover_pending_state_from_history(history)
+        recovered_command_intent = await command_intent_for(recovered_state) if recovered_state else generic_command_intent
         restored_record = _restore_current_pending_from_history_for_sensitive_control(
-            normalized_message_text,
+            recovered_command_intent,
             conv_key,
             space_key,
             owner_label,
@@ -2986,9 +3127,14 @@ async def handle_ai_chat(bot: Bot, event: Event):
             )
 
     other_pending_record = conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
+    other_pending_command_intent = (
+        await command_intent_for(other_pending_record.state)
+        if other_pending_record is not None
+        else generic_command_intent
+    )
     if (
         memory_context.space_type == "group"
-        and _is_sensitive_pending_control_text(normalized_message_text)
+        and _is_sensitive_pending_control_intent(other_pending_command_intent)
         and not conversation_state_store.contains(conv_key)
         and other_pending_record is not None
     ):
@@ -3002,7 +3148,11 @@ async def handle_ai_chat(bot: Bot, event: Event):
         await ai_chat.finish(response)
         return
 
-    response = _try_handle_operation_recall(normalized_message_text, memory_context)
+    response = _try_handle_operation_recall(
+        normalized_message_text,
+        memory_context,
+        generic_command_intent,
+    )
 
     # ===== Phase 1: Check pending state =====
     if response is None:
@@ -3026,7 +3176,8 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 )
 
         if state is not None:
-            if _has_cancel(normalized_message_text):
+            pending_command_intent = await command_intent_for(state)
+            if pending_command_intent.intent == "pending_cancel":
                 response = "好的，已取消 owo"
 
             elif isinstance(state, PendingAddWord):
@@ -3040,11 +3191,12 @@ async def handle_ai_chat(bot: Bot, event: Event):
                     history,
                     state_space_key,
                     owner_label,
+                    pending_command_intent,
                 )
                 # response is None → unrecognized input, fall through to Phase 2
 
             elif isinstance(state, PendingToolConfirm):
-                if _is_pending_tool_confirm_message(state, normalized_message_text):
+                if _is_pending_tool_confirm_message(state, pending_command_intent):
                     response = await _execute_confirmed_tool(state, platform, user_id)
                 # else: response stays None, fall through to AI as new request
 
@@ -3065,6 +3217,15 @@ async def handle_ai_chat(bot: Bot, event: Event):
             user_id,
             space_key,
             owner_label,
+            generic_command_intent,
+        )
+
+    if response is None:
+        response = await _try_handle_replace_char(
+            normalized_message_text,
+            platform,
+            user_id,
+            generic_command_intent,
         )
 
     if response is None:
