@@ -173,6 +173,17 @@ _LEADING_COMMAND_PREFIX_RE = re.compile(
 _PURE_CHINESE_WORDS_RE = re.compile(r'^[\u4e00-\u9fff]+(?:[\s、，,；;]+[\u4e00-\u9fff]+)*$')
 _PURE_CHINESE_TOKEN_RE = re.compile(r'^[\u4e00-\u9fff]{1,30}$')
 _CODE_TOKEN_RE = re.compile(r"^[a-z]{2,12}$", re.IGNORECASE)
+_DRAFT_SUBMIT_COMMANDS = {
+    "提交",
+    "提审",
+    "送审",
+    "提交草稿",
+    "提交批次",
+    "提交审核",
+    "提交当前草稿",
+    "提交这个草稿",
+    "发起审核",
+}
 
 WORD_QUERY_INTENT_MODEL = (
     getattr(config, "word_query_intent_model", None)
@@ -214,6 +225,22 @@ def _strip_command_message_prefixes(message_text: str) -> str:
     return text
 
 
+def _is_plain_draft_submit_request(message_text: str) -> bool:
+    text = _strip_command_message_prefixes(message_text)
+    text = re.sub(r"[\s，,。.!！?？~～]+", "", text)
+    if text.startswith("请"):
+        text = text[1:]
+    changed = True
+    while changed:
+        changed = False
+        for suffix in ("一下", "吧", "啦", "了"):
+            if text.endswith(suffix):
+                text = text[:-len(suffix)]
+                changed = True
+                break
+    return text in _DRAFT_SUBMIT_COMMANDS
+
+
 @dataclass(frozen=True)
 class KeepOnlyDraftCommand:
     keep_words: Tuple[str, ...]
@@ -238,6 +265,38 @@ def _is_sensitive_pending_control_intent(command_intent: MessageCommandIntent) -
         "pending_code_request",
         "pending_choice",
     }
+
+
+def _is_fresh_current_user_command_intent(
+    command_intent: MessageCommandIntent,
+    message_text: str = "",
+) -> bool:
+    if command_intent.intent == "draft_submit":
+        return _is_plain_draft_submit_request(message_text)
+    return command_intent.intent in {
+        "clear_history",
+        "draft_view",
+        "draft_keep_only",
+        "operation_recall",
+        "batch_replace_char",
+    }
+
+
+def _should_block_for_other_owner_pending(
+    space_type: str,
+    has_current_pending: bool,
+    other_pending_record: Optional[PendingStateRecord],
+    generic_command_intent: MessageCommandIntent,
+    other_pending_command_intent: MessageCommandIntent,
+    message_text: str = "",
+) -> bool:
+    return (
+        space_type == "group"
+        and other_pending_record is not None
+        and not has_current_pending
+        and not _is_fresh_current_user_command_intent(generic_command_intent, message_text)
+        and _is_sensitive_pending_control_intent(other_pending_command_intent)
+    )
 
 
 def _extract_pure_chinese_words(message_text: str) -> List[str]:
@@ -356,6 +415,7 @@ def _parse_message_command_intent_payload(payload: Dict) -> MessageCommandIntent
     allowed_intents = {
         "none",
         "clear_history",
+        "draft_submit",
         "draft_view",
         "draft_keep_only",
         "operation_recall",
@@ -427,6 +487,8 @@ async def _classify_message_command_intent(
     """Use the configured flash/intent model for command and pending-control semantics."""
     if not message_text.strip():
         return MessageCommandIntent()
+    if pending_state is None and _is_plain_draft_submit_request(message_text):
+        return MessageCommandIntent(intent="draft_submit", confidence=1.0)
     if not OPENAI_API_KEY or not AsyncOpenAI:
         logger.warning("Command intent model unavailable; falling through to main AI flow")
         return MessageCommandIntent()
@@ -436,11 +498,12 @@ async def _classify_message_command_intent(
         "你是键道机器人喵喵的轻量语义路由器。"
         "只判断当前消息是否应由程序快捷处理；不要执行操作，不要回答用户。\n"
         "输出必须是 JSON 对象，不要解释。\n"
-        "intent 只能是：none, clear_history, draft_view, draft_keep_only, "
+        "intent 只能是：none, clear_history, draft_submit, draft_view, draft_keep_only, "
         "operation_recall, batch_replace_char, "
         "pending_confirm, pending_cancel, pending_add_and_submit, pending_recode, "
         "pending_code_request, pending_choice。\n"
         "clear_history：用户明确要求清空/重置本轮聊天历史。\n"
+        "draft_submit：用户明确要求提交/提审自己的当前草稿。\n"
         "draft_view：用户要查看自己当前草稿。\n"
         "draft_keep_only：用户要在自己草稿里只保留指定词，keep_words 必须列出保留词；"
         "如果语义还要求随后提交，则 submit_after=true。\n"
@@ -2286,6 +2349,19 @@ async def _try_handle_draft_view_command(
     return await _format_draft_response(data, platform, user_id)
 
 
+async def _try_handle_draft_submit_command(
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    if command_intent.intent != "draft_submit":
+        return None
+
+    return await _submit_current_draft(platform, user_id, space_key, owner_label)
+
+
 def _draft_item_word(item: Dict) -> str:
     return str(item.get("word") or item.get("text") or "").strip()
 
@@ -2422,6 +2498,16 @@ async def _try_handle_draft_management_command(
 ) -> Optional[str]:
     if command_intent is None:
         command_intent = await _classify_message_command_intent(message_text)
+
+    response = await _try_handle_draft_submit_command(
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
 
     response = await _try_handle_keep_only_draft_items_command(
         command_intent,
@@ -3046,6 +3132,10 @@ async def handle_ai_chat(bot: Bot, event: Event):
         conversation_state_store.delete(conv_key)
         await ai_chat.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
         return
+    generic_intent_is_fresh_command = _is_fresh_current_user_command_intent(
+        generic_command_intent,
+        normalized_message_text,
+    )
 
     referenced_pending = (
         _parse_pending_state_from_response(reply_reference.text)
@@ -3108,7 +3198,11 @@ async def handle_ai_chat(bot: Bot, event: Event):
             await ai_chat.finish(response)
             return
 
-    if memory_context.space_type == "group" and not conversation_state_store.contains(conv_key):
+    if (
+        memory_context.space_type == "group"
+        and not conversation_state_store.contains(conv_key)
+        and not generic_intent_is_fresh_command
+    ):
         if history is None:
             history = get_history(conv_key)
         recovered_state = _recover_pending_state_from_history(history)
@@ -3129,14 +3223,16 @@ async def handle_ai_chat(bot: Bot, event: Event):
     other_pending_record = conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
     other_pending_command_intent = (
         await command_intent_for(other_pending_record.state)
-        if other_pending_record is not None
+        if other_pending_record is not None and not generic_intent_is_fresh_command
         else generic_command_intent
     )
-    if (
-        memory_context.space_type == "group"
-        and _is_sensitive_pending_control_intent(other_pending_command_intent)
-        and not conversation_state_store.contains(conv_key)
-        and other_pending_record is not None
+    if _should_block_for_other_owner_pending(
+        memory_context.space_type,
+        conversation_state_store.contains(conv_key),
+        other_pending_record,
+        generic_command_intent,
+        other_pending_command_intent,
+        normalized_message_text,
     ):
         response = _format_other_owner_pending_message(
             _pending_owner_label(other_pending_record),
@@ -3155,7 +3251,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
     )
 
     # ===== Phase 1: Check pending state =====
-    if response is None:
+    if response is None and not generic_intent_is_fresh_command:
         state_record = conversation_state_store.pop_record(conv_key)
         state = state_record.state if state_record else None
         state_space_key = state_record.space_key if state_record else space_key

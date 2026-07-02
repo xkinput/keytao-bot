@@ -87,9 +87,11 @@ from keytao_bot.plugins.openai_chat import (
     _build_existing_word_priority_note,
     _extract_prior_occupied_candidates,
     _extract_pure_chinese_words,
+    _classify_message_command_intent,
     _get_simple_word_query_words,
     _display_name_from_qq_sender,
     _build_qq_reply_message,
+    _is_fresh_current_user_command_intent,
     _ensure_current_pending_matches_reference,
     _ensure_current_pending_from_referenced_owner,
     _handle_pending_add_word,
@@ -110,6 +112,7 @@ from keytao_bot.plugins.openai_chat import (
     _resolve_shift_target_code,
     _restore_current_pending_from_history_for_sensitive_control,
     _select_requested_code_candidate,
+    _should_block_for_other_owner_pending,
     _strip_command_message_prefixes,
     _strip_markdown,
     _to_markdownv2,
@@ -227,6 +230,10 @@ def test_message_command_intent_payload():
         "new_char": "黏",
         "confidence": 0.94,
     })
+    submit = _parse_message_command_intent_payload({
+        "intent": "draft_submit",
+        "confidence": 0.98,
+    })
     ordinary = _parse_message_command_intent_payload({
         "intent": "none",
         "confidence": 0.99,
@@ -242,6 +249,8 @@ def test_message_command_intent_payload():
     check("keep-only submit flag from intent", command is not None and command.submit_after)
     check("operation recall scope parsed", recall.intent == "operation_recall" and recall.current_user_only)
     check("replace-char payload parsed", replace_char.old_char == "粘" and replace_char.new_char == "黏")
+    check("draft submit parsed", submit.intent == "draft_submit")
+    check("draft submit is not pending-sensitive", not _is_sensitive_pending_control_intent(submit))
     check("ordinary text is not sensitive", not _is_sensitive_pending_control_intent(ordinary))
 
 
@@ -571,6 +580,57 @@ def test_referenced_other_owner_submit_does_not_copy():
         check("submit pending not copied", store.get_record(current_key) is None)
     finally:
         openai_chat_module.conversation_state_store = old_store
+
+
+def test_unquoted_draft_submit_bypasses_other_owner_pending_guard():
+    """Unquoted submit is a fresh current-user draft command, not another user's confirm."""
+    print("\n🧪 unquoted draft submit bypasses other-owner pending guard")
+
+    other_record = PendingStateRecord(
+        state=PendingToolConfirm(
+            function_name="keytao_create_phrase",
+            args={"word": "反佣", "code": "ffyyui"},
+        ),
+        owner_key=("qq", "1001"),
+        space_key=("qq", "qq:group:42"),
+        owner_label="Rea",
+    )
+
+    submit_intent = MessageCommandIntent(intent="draft_submit", confidence=1.0)
+    confirm_intent = MessageCommandIntent(intent="pending_confirm", confidence=0.96)
+    check(
+        "draft submit is not blocked by other owner pending",
+        not _should_block_for_other_owner_pending(
+            "group",
+            False,
+            other_record,
+            submit_intent,
+            confirm_intent,
+            "提交",
+        ),
+    )
+    check(
+        "bare confirm is still blocked by other owner pending",
+        _should_block_for_other_owner_pending(
+            "group",
+            False,
+            other_record,
+            MessageCommandIntent(intent="none", confidence=0.96),
+            confirm_intent,
+            "是",
+        ),
+    )
+    check(
+        "confirm-submit wording is still blocked by other owner pending",
+        _should_block_for_other_owner_pending(
+            "group",
+            False,
+            other_record,
+            submit_intent,
+            confirm_intent,
+            "确认提交",
+        ),
+    )
 
 
 def test_referenced_pending_prefers_current_user_history():
@@ -1336,6 +1396,39 @@ def test_draft_view_command_uses_draft_tools():
     asyncio.run(_run())
 
 
+def test_draft_submit_command_uses_current_user_tools():
+    """Verify 提交 calls the current sender's draft submit tool directly."""
+    print("\n🧪 draft submit command uses current user tools")
+
+    async def _run():
+        tool_calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments, platform, user_id))
+            if tool_name == "keytao_submit_batch":
+                return json.dumps({
+                    "success": True,
+                    "batchUrl": "https://keytao.vercel.app/batch/current-user",
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _try_handle_draft_management_command(
+                "提交",
+                "qq",
+                "2002",
+                ("qq", "qq:group:42"),
+                "别打脸",
+                command_intent=MessageCommandIntent(intent="draft_submit", confidence=1.0),
+            )
+
+        check("draft submit handled", result is not None and "批次已提交审核" in result)
+        check("submit tool called once", len(tool_calls) == 1)
+        check("submit uses current sender", tool_calls[0] == ("keytao_submit_batch", {}, "qq", "2002"))
+
+    asyncio.run(_run())
+
+
 def test_keep_only_draft_command_removes_others_and_submits():
     """Verify 只保留某词再提交 deletes other draft items by fresh IDs."""
     print("\n🧪 keep-only draft command removes others and submits")
@@ -2061,10 +2154,12 @@ def test_command_intents_are_distinct():
     confirm = MessageCommandIntent(intent="pending_confirm", confidence=0.96)
     cancel = MessageCommandIntent(intent="pending_cancel", confidence=0.96)
     clear = MessageCommandIntent(intent="clear_history", confidence=0.96)
+    submit = MessageCommandIntent(intent="draft_submit", confidence=0.96)
 
     check("confirm intent is sensitive", _is_sensitive_pending_control_intent(confirm))
     check("cancel intent is sensitive", _is_sensitive_pending_control_intent(cancel))
     check("clear intent is not pending-sensitive", not _is_sensitive_pending_control_intent(clear))
+    check("draft submit is not pending-sensitive", not _is_sensitive_pending_control_intent(submit))
     check("confirm and cancel are distinct", confirm.intent != cancel.intent)
 
 
@@ -2106,6 +2201,62 @@ def test_clear_command_intent_detection():
     check("discussion stays non-command", discussion_intent.intent == "none")
 
 
+def test_fresh_current_user_command_detection():
+    """Verify fresh commands can bypass stale pending state without weakening confirms."""
+    print("\n🧪 fresh current-user command detection")
+
+    check(
+        "plain submit is fresh",
+        _is_fresh_current_user_command_intent(
+            MessageCommandIntent(intent="draft_submit", confidence=1.0),
+            "喵喵，提交一下吧",
+        ),
+    )
+    check(
+        "confirm submit is not plain fresh submit",
+        not _is_fresh_current_user_command_intent(
+            MessageCommandIntent(intent="draft_submit", confidence=0.96),
+            "确认提交",
+        ),
+    )
+    check(
+        "draft view is fresh",
+        _is_fresh_current_user_command_intent(
+            MessageCommandIntent(intent="draft_view", confidence=0.96),
+            "查看草稿",
+        ),
+    )
+    check(
+        "pending confirm is not fresh",
+        not _is_fresh_current_user_command_intent(
+            MessageCommandIntent(intent="pending_confirm", confidence=0.96),
+            "是",
+        ),
+    )
+
+
+def test_local_draft_submit_intent_detection():
+    """Verify plain submit commands route locally before any model call."""
+    print("\n🧪 local draft submit intent detection")
+
+    async def _run():
+        intent = await _classify_message_command_intent("喵喵，提交一下吧")
+        pending_intent = await _classify_message_command_intent(
+            "喵喵，提交一下吧",
+            PendingAddWord(
+                word="偷奸耍滑",
+                recommended_code="tjeh",
+                candidates=[("tjeh", False)],
+            ),
+        )
+
+        check("plain submit routes to draft_submit", intent.intent == "draft_submit")
+        check("plain submit confidence is deterministic", intent.confidence == 1.0)
+        check("pending context does not use local draft-submit shortcut", pending_intent.intent == "none")
+
+    asyncio.run(_run())
+
+
 def test_pending_reply_prefix_stripping():
     """Verify pending-state replies still work when prefixed by trigger words or mentions."""
     print("\n🧪 pending reply prefix stripping")
@@ -2131,6 +2282,7 @@ def test_sensitive_pending_control_intents():
     non_sensitive_intents = [
         "none",
         "clear_history",
+        "draft_submit",
         "draft_view",
         "draft_keep_only",
     ]
@@ -3438,6 +3590,7 @@ if __name__ == "__main__":
     test_referenced_other_owner_pending_question_falls_through()
     test_referenced_other_owner_cancel_does_not_copy()
     test_referenced_other_owner_submit_does_not_copy()
+    test_unquoted_draft_submit_bypasses_other_owner_pending_guard()
     test_referenced_pending_prefers_current_user_history()
     test_referenced_pending_scans_current_user_history()
     test_referenced_pending_uses_bot_mention_as_owner()
@@ -3462,6 +3615,7 @@ if __name__ == "__main__":
     test_simple_single_word_query_skips_draft_commands()
     test_simple_single_word_query_skips_chat_comparison_questions()
     test_draft_view_command_uses_draft_tools()
+    test_draft_submit_command_uses_current_user_tools()
     test_keep_only_draft_command_removes_others_and_submits()
     test_keep_only_draft_command_recalls_then_removes_without_refresh_prompt()
     test_augment_simple_word_query_response_appends_priority_note()
@@ -3485,6 +3639,8 @@ if __name__ == "__main__":
     test_command_intents_are_distinct()
     test_bind_command_text_detection()
     test_clear_command_intent_detection()
+    test_fresh_current_user_command_detection()
+    test_local_draft_submit_intent_detection()
     test_pending_reply_prefix_stripping()
     test_sensitive_pending_control_intents()
     test_memory_conversation_state_store()
