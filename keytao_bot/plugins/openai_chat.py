@@ -465,6 +465,8 @@ def _pending_context_for_command_intent(state: Optional[PendingState]) -> str:
                 "word": state.word,
                 "recommended_code": state.recommended_code,
                 "candidates": candidates,
+                "pronunciation_codes": state.pronunciation_codes,
+                "pronunciation_recommended_codes": state.pronunciation_recommended_codes,
             },
             ensure_ascii=False,
         )
@@ -681,6 +683,9 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
 
     candidates: List[Tuple[str, bool]] = []
     occupied_words: Dict[str, List[str]] = {}
+    code_remarks: Dict[str, str] = {}
+    pronunciation_codes: Dict[str, str] = {}
+    pronunciation_recommended_codes: List[str] = []
     seen_codes = set()
     for m in re.finditer(r'(?m)^\s*(?:\d+\.\s*)?([a-z]+)\s*[-—–]\s*(.+?)\s*$', response):
         code = m.group(1)
@@ -692,6 +697,13 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
         desc_text = desc.strip()
         is_available = desc_text.startswith("✅") or "空位" in desc_text
         candidates.append((code, not is_available))
+        if "读音" in desc_text or "来源" in desc_text:
+            code_remarks[code] = "Bot审词：" + desc_text
+        pinyin_match = re.search(r'读音\s*([A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ\s]+)', desc_text)
+        if pinyin_match:
+            pronunciation_codes[code] = re.sub(r"\s+", " ", pinyin_match.group(1)).strip()
+        if "该读音推荐" in desc_text or "推荐" in desc_text:
+            pronunciation_recommended_codes.append(code)
         occupied_match = re.search(r'已有「(.+?)」', desc)
         if occupied_match:
             occupied_words[code] = [
@@ -717,6 +729,9 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
         recommended_code=recommended_code,
         candidates=candidates,
         occupied_words=occupied_words,
+        code_remarks=code_remarks,
+        pronunciation_codes=pronunciation_codes,
+        pronunciation_recommended_codes=pronunciation_recommended_codes,
     )
 
 
@@ -1415,6 +1430,83 @@ def _format_tool_encoded_add_prompt(word: str, encoding: Dict) -> Optional[str]:
     return "\n".join(lines)
 
 
+def _review_source_label(source: Dict) -> str:
+    label = str(source.get("source") or "").strip()
+    url = str(source.get("url") or "").strip()
+    if label and url:
+        return f"{label} {url}"
+    return label or url
+
+
+def _format_review_candidate_line(index: int, status: Dict, recommended_code: str, pinyin: str, sources: List[Dict]) -> str:
+    code = str(status.get("code") or "").strip()
+    occupied = bool(status.get("occupied"))
+    if occupied:
+        label = str(status.get("label") or "已有占用").strip()
+    elif code == recommended_code:
+        label = "✅ 该读音推荐（空位）"
+    else:
+        label = "空位"
+    source_names = "、".join(
+        str(source.get("source") or "").strip()
+        for source in sources[:3]
+        if str(source.get("source") or "").strip()
+    )
+    source_text = f"；来源 {source_names}" if source_names else "；来源 待补充"
+    return f"{index}. {code} — {label}；读音 {pinyin}{source_text}"
+
+
+def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
+    if not review.get("success"):
+        return None
+    word = str(review.get("word") or "").strip()
+    recommended_code = str(review.get("recommendedCode") or "").strip()
+    pronunciations = [
+        item for item in review.get("pronunciations", [])
+        if isinstance(item, dict) and item.get("candidateStatuses")
+    ]
+    if not word or not recommended_code or not pronunciations:
+        return None
+
+    lines = [
+        f"词库暂无收录「{word}」，先按权威来源审读音：",
+        "",
+    ]
+    candidate_index = 1
+    for index, pronunciation in enumerate(pronunciations, start=1):
+        pinyin = str(pronunciation.get("pinyin") or "").strip()
+        sources = [
+            source for source in pronunciation.get("sources", [])
+            if isinstance(source, dict)
+        ]
+        lines.append(f"读音 {index}. {pinyin}")
+        if sources:
+            source_line = "；".join(
+                label for label in (_review_source_label(source) for source in sources[:3])
+                if label
+            )
+            lines.append(f"来源：{source_line}")
+        else:
+            lines.append("来源：未找到权威来源，仅作候选展示，不能自动通过")
+        lines.append("候选编码:")
+        for status in pronunciation.get("candidateStatuses", [])[:6]:
+            lines.append(
+                _format_review_candidate_line(
+                    candidate_index,
+                    status,
+                    str(pronunciation.get("recommendedCode") or ""),
+                    pinyin,
+                    sources,
+                )
+            )
+            candidate_index += 1
+        lines.append("")
+
+    lines.append(f"是否以编码 {recommended_code} 将「{word}」加入草稿？也可回复编号、编码，或回复「都加」添加每个读音的推荐编码。")
+    lines.append("证据一致时提交后可由 Bot 自动审核；证据不足、纯删除或歧义修改会等待管理员。")
+    return "\n".join(lines).strip()
+
+
 async def _try_handle_simple_single_word_query(
     message_text: str,
     platform: str,
@@ -1437,13 +1529,25 @@ async def _try_handle_simple_single_word_query(
     if lookup_data.get("success") and lookup_data.get("phrases"):
         return None
 
+    review_json = await call_tool_function(
+        "keytao_prepare_reviewed_add", {"word": word}, platform, user_id,
+    )
+    try:
+        review = json.loads(review_json)
+    except Exception:
+        review = {}
+
+    reviewed_prompt = _format_reviewed_add_prompt(review)
+    if reviewed_prompt:
+        return reviewed_prompt
+
     encode_json = await call_tool_function(
         "keytao_encode", {"word": word}, platform, user_id,
     )
     try:
         encoding = json.loads(encode_json)
     except Exception:
-        return "编码工具返回了无法解析的结果，先不生成候选，免得把错误编码写进草稿 qwq"
+        return "审词/编码工具返回了无法解析的结果，先不生成候选，免得把错误编码写进草稿 qwq"
 
     if not encoding.get("success"):
         message = encoding.get("message") or "编码工具暂时没有返回有效候选"
@@ -1923,10 +2027,14 @@ async def _execute_add_to_draft(
     user_id: str,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    remark: str = "",
 ) -> str:
     """Directly add a word to draft and return formatted response."""
+    args = {"word": word, "code": code}
+    if remark:
+        args["remark"] = remark
     result_json = await call_tool_function(
-        "keytao_create_phrase", {"word": word, "code": code}, platform, user_id,
+        "keytao_create_phrase", args, platform, user_id,
     )
     data = json.loads(result_json)
 
@@ -1937,7 +2045,7 @@ async def _execute_add_to_draft(
         conv_key = (platform, user_id)
         conversation_state_store.set(conv_key, PendingToolConfirm(
             function_name="keytao_create_phrase",
-            args={"word": word, "code": code},
+            args=args,
         ), space_key=space_key, owner_label=owner_label)
         warnings = data.get("warnings", [])
         warn_text = "\n".join(
@@ -1960,10 +2068,14 @@ async def _execute_add_to_draft_and_submit(
     user_id: str,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    remark: str = "",
 ) -> str:
     """Add a word to the draft, then submit the resulting batch."""
+    args = {"word": word, "code": code}
+    if remark:
+        args["remark"] = remark
     create_json = await call_tool_function(
-        "keytao_create_phrase", {"word": word, "code": code}, platform, user_id,
+        "keytao_create_phrase", args, platform, user_id,
     )
     create_data = json.loads(create_json)
 
@@ -1974,7 +2086,7 @@ async def _execute_add_to_draft_and_submit(
         conv_key = (platform, user_id)
         conversation_state_store.set(conv_key, PendingToolConfirm(
             function_name="keytao_create_phrase",
-            args={"word": word, "code": code},
+            args=args,
         ), space_key=space_key, owner_label=owner_label)
         warnings = create_data.get("warnings", [])
         warn_text = "\n".join(
@@ -2005,10 +2117,14 @@ async def _execute_add_to_draft_and_submit(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
             for w in warnings
         ) if warnings else submit_data.get("message", "提交前需要确认")
+        review_parts: List[str] = []
+        _append_submit_review_lines(review_parts, submit_data)
+        review_text = ("\n\n" + "\n".join(review_parts)) if review_parts else ""
         return (
             f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
             f"{warn_text}\n\n"
             "是否继续提交？回复「确认」继续提交，回复「取消」放弃。"
+            f"{review_text}"
         )
 
     if not submit_data.get("success"):
@@ -2020,10 +2136,13 @@ async def _execute_add_to_draft_and_submit(
     batch_url = submit_data.get("batchUrl") or create_data.get("batchUrl", "")
     pr_url = submit_data.get("prUrl", "")
     parts = [f"✅ 搞定！「{word}」→ {code} 已加入草稿并提交审核。"]
+    if submit_data.get("autoApproved"):
+        parts = [f"✅ 搞定！「{word}」→ {code} 已自动审核通过，已加入词库。"]
     if batch_url:
         parts.append(f"批次地址：{batch_url}")
     if pr_url:
         parts.append(f"PR：{pr_url}")
+    _append_submit_review_lines(parts, submit_data)
     return "\n\n".join(parts)
 
 
@@ -2132,6 +2251,67 @@ def _select_requested_code_candidate(word: str, requested_code: str, encoding: D
     return None
 
 
+def _requested_codes_from_pending_message(message: str, state: PendingAddWord) -> List[str]:
+    candidate_codes = [code for code, _ in state.candidates]
+    candidate_set = set(candidate_codes)
+    requested = [
+        token.lower()
+        for token in re.findall(r"\b[a-z]{2,12}\b", message.lower())
+        if token.lower() in candidate_set
+    ]
+    if requested:
+        result: List[str] = []
+        seen = set()
+        for code in requested:
+            if code not in seen:
+                seen.add(code)
+                result.append(code)
+        return result
+
+    normalized = message.strip()
+    if (
+        state.pronunciation_recommended_codes
+        and any(marker in normalized for marker in ("都加", "全加", "全部", "都可以", "都要"))
+    ):
+        return [
+            code for code in state.pronunciation_recommended_codes
+            if code in candidate_set
+        ]
+
+    return []
+
+
+async def _execute_add_multiple_codes_to_draft(
+    state: PendingAddWord,
+    codes: List[str],
+    platform: str,
+    user_id: str,
+) -> str:
+    items = []
+    for code in codes:
+        item = {"word": state.word, "code": code, "action": "Create"}
+        remark = state.code_remarks.get(code)
+        if remark:
+            item["remark"] = remark
+        items.append(item)
+    if not items:
+        return "没有找到可添加的编码 qwq"
+
+    result_json = await call_tool_function(
+        "keytao_batch_add_to_draft",
+        {"items": items},
+        platform,
+        user_id,
+    )
+    data = json.loads(result_json)
+    if data.get("not_bound"):
+        return _BIND_HELP_TEXT
+    if data.get("success") or data.get("successCount", 0) > 0:
+        header = f"✅ 已将「{state.word}」的 {len(items)} 个读音编码加入草稿\n"
+        return header + await _format_draft_response(data, platform, user_id)
+    return f"添加失败：{data.get('message', '未知错误')} qwq"
+
+
 async def _resolve_requested_code_for_pending_add(
     state: PendingAddWord,
     requested_code: str,
@@ -2174,10 +2354,13 @@ async def _execute_confirmed_tool(
             batch_url = data.get("batchUrl", "")
             pr_url = data.get("prUrl", "")
             parts = ["✅ 草稿已成功提交审核！"]
+            if data.get("autoApproved"):
+                parts = ["✅ 草稿已自动审核通过，已加入词库！"]
             if batch_url:
                 parts.append(f"\n草稿地址：{batch_url}")
             if pr_url:
                 parts.append(f"PR：{pr_url}")
+            _append_submit_review_lines(parts, data)
             return "\n".join(parts)
         return f"提交失败：{data.get('message', '未知错误')} qwq"
 
@@ -2271,6 +2454,29 @@ async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str
     return "\n".join(parts)
 
 
+def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
+    auto_review = submit_data.get("autoReview") if isinstance(submit_data, dict) else None
+    if submit_data.get("autoApproved"):
+        parts.append("✅ Bot 已完成自动审词，证据一致，批次已加入词库。")
+        approve_result = submit_data.get("autoApproveResult") or {}
+        message = approve_result.get("message")
+        if message:
+            parts.append(str(message))
+        return
+
+    if isinstance(auto_review, dict):
+        summary = auto_review.get("summary")
+        if summary:
+            parts.append(f"自动审词：{summary}")
+        issues = auto_review.get("issues") or []
+        if issues:
+            issue_lines = "\n".join(f"• {issue}" for issue in issues[:5])
+            parts.append("等待管理员审核原因：\n" + issue_lines)
+    approve_result = submit_data.get("autoApproveResult") or {}
+    if approve_result and not approve_result.get("success"):
+        parts.append(f"自动批准未执行：{approve_result.get('message', '未知原因')}")
+
+
 async def _submit_current_draft(
     platform: str,
     user_id: str,
@@ -2296,7 +2502,10 @@ async def _submit_current_draft(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
             for w in warnings
         ) if warnings else submit_data.get("message", "提交前需要确认")
-        return f"{warn_text}\n\n是否继续提交？回复「确认」继续提交，回复「取消」放弃。"
+        review_parts: List[str] = []
+        _append_submit_review_lines(review_parts, submit_data)
+        review_text = ("\n\n" + "\n".join(review_parts)) if review_parts else ""
+        return f"{warn_text}\n\n是否继续提交？回复「确认」继续提交，回复「取消」放弃。{review_text}"
 
     if not submit_data.get("success"):
         return f"提交失败：{submit_data.get('message', '未知错误')} qwq"
@@ -2304,10 +2513,13 @@ async def _submit_current_draft(
     batch_url = submit_data.get("batchUrl", "")
     pr_url = submit_data.get("prUrl", "")
     parts = ["✅ 批次已提交审核！"]
+    if submit_data.get("autoApproved"):
+        parts = ["✅ 批次已自动审核通过，已加入词库！"]
     if batch_url:
         parts.append(f"批次地址：{batch_url}")
     if pr_url:
         parts.append(f"PR：{pr_url}")
+    _append_submit_review_lines(parts, submit_data)
     return "\n".join(parts)
 
 
@@ -2540,10 +2752,47 @@ async def _handle_pending_add_word(
     if command_intent is None:
         command_intent = await _classify_message_command_intent(msg, state)
 
+    requested_codes = _requested_codes_from_pending_message(msg, state)
+    if len(requested_codes) > 1:
+        return await _execute_add_multiple_codes_to_draft(
+            state,
+            requested_codes,
+            platform,
+            user_id,
+        )
+
     submit_after_add = command_intent.intent == "pending_add_and_submit"
     shift_target_code = _resolve_shift_target_code(state, command_intent)
     if shift_target_code is not None:
         return await _execute_shift_to_code(state.word, shift_target_code, platform, user_id)
+
+    if len(requested_codes) == 1:
+        direct_code = requested_codes[0]
+        for code, occupied in state.candidates:
+            if code != direct_code:
+                continue
+            if not occupied:
+                return await _execute_add_to_draft(
+                    state.word,
+                    direct_code,
+                    platform,
+                    user_id,
+                    space_key,
+                    owner_label,
+                    state.code_remarks.get(direct_code, ""),
+                )
+            return await _execute_confirmed_tool(
+                PendingToolConfirm(
+                    function_name="keytao_create_phrase",
+                    args={
+                        "word": state.word,
+                        "code": direct_code,
+                        **({"remark": state.code_remarks.get(direct_code)} if state.code_remarks.get(direct_code) else {}),
+                    },
+                ),
+                platform,
+                user_id,
+            )
 
     requested_target = await _resolve_requested_code_for_pending_add(
         state,
@@ -2555,7 +2804,13 @@ async def _handle_pending_add_word(
         target_code, is_occupied = requested_target
         if not is_occupied:
             return await _execute_add_to_draft(
-                state.word, target_code, platform, user_id, space_key, owner_label,
+                state.word,
+                target_code,
+                platform,
+                user_id,
+                space_key,
+                owner_label,
+                state.code_remarks.get(target_code, ""),
             )
         return await _execute_confirmed_tool(
             PendingToolConfirm(
@@ -2592,10 +2847,22 @@ async def _handle_pending_add_word(
     if not is_occupied:
         if submit_after_add:
             return await _execute_add_to_draft_and_submit(
-                state.word, target_code, platform, user_id, space_key, owner_label,
+                state.word,
+                target_code,
+                platform,
+                user_id,
+                space_key,
+                owner_label,
+                state.code_remarks.get(target_code, ""),
             )
         return await _execute_add_to_draft(
-            state.word, target_code, platform, user_id, space_key, owner_label,
+            state.word,
+            target_code,
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+            state.code_remarks.get(target_code, ""),
         )
 
     return await _execute_confirmed_tool(

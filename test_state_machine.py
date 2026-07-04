@@ -138,6 +138,8 @@ from keytao_bot.harness.tools import ToolContext, ToolExecutor
 from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
+from keytao_bot.utils import keytao_review as keytao_review_module
+from keytao_bot.utils.keytao_review import ReviewHttpConfig, audit_draft_items
 import keytao_bot.plugins.openai_chat as openai_chat_module
 
 _lookup_tools_path = os.path.join(
@@ -1248,9 +1250,9 @@ def test_extract_prior_occupied_candidates():
     check("prior candidate code is esl", prior[0]["code"] == "esl")
 
 
-def test_simple_single_word_query_uses_encode_tool_before_ai():
-    """Verify bare word queries cannot invent phrase codes before encoding."""
-    print("\n🧪 simple single word query uses encode tool")
+def test_simple_single_word_query_uses_review_tool_before_ai():
+    """Verify bare word queries use pronunciation review before AI fallback."""
+    print("\n🧪 simple single word query uses review tool")
 
     async def _run():
         tool_calls = []
@@ -1259,6 +1261,27 @@ def test_simple_single_word_query_uses_encode_tool_before_ai():
             tool_calls.append((tool_name, arguments))
             if tool_name == "keytao_lookup_by_word":
                 return json.dumps({"success": True, "word": "洛阳纸贵", "phrases": []}, ensure_ascii=False)
+            if tool_name == "keytao_prepare_reviewed_add":
+                return json.dumps({
+                    "success": True,
+                    "word": "洛阳纸贵",
+                    "recommendedCode": "lyfg",
+                    "autoReviewable": True,
+                    "pronunciations": [
+                        {
+                            "pinyin": "luo yang zhi gui",
+                            "normalized": ["luo", "yang", "zhi", "gui"],
+                            "recommendedCode": "lyfg",
+                            "sources": [
+                                {"source": "汉典", "url": "https://www.zdic.net/hans/洛阳纸贵"},
+                            ],
+                            "candidateStatuses": [
+                                {"code": "lyfg", "occupied": False, "label": "空位"},
+                                {"code": "lyfga", "occupied": False, "label": "空位"},
+                            ],
+                        },
+                    ],
+                }, ensure_ascii=False)
             if tool_name == "keytao_encode":
                 return json.dumps({
                     "success": True,
@@ -1287,11 +1310,14 @@ def test_simple_single_word_query_uses_encode_tool_before_ai():
         pending = _parse_pending_add_word(result or "")
 
         check("lookup called first", tool_calls[0] == ("keytao_lookup_by_word", {"word": "洛阳纸贵"}))
-        check("encode called second", tool_calls[1] == ("keytao_encode", {"word": "洛阳纸贵"}))
+        check("review called second", tool_calls[1] == ("keytao_prepare_reviewed_add", {"word": "洛阳纸贵"}))
+        check("encode not needed on reviewed success", all(name != "keytao_encode" for name, _ in tool_calls))
+        check("source shown", result is not None and "汉典" in result)
         check("valid code shown", result is not None and "lyfg" in result)
         check("invalid hallucinated code absent", result is not None and "loyfg" not in result)
         check("pending parsed from tool response", isinstance(pending, PendingAddWord))
         check("pending recommended uses tool code", pending.recommended_code == "lyfg")
+        check("pending keeps review remark", "lyfg" in pending.code_remarks)
 
     asyncio.run(_run())
 
@@ -2011,6 +2037,64 @@ def test_pending_add_word_add_and_submit_uses_recommended():
         check("submit called second", calls[1][0] == "keytao_submit_batch")
         check("submit uses current user", calls[1][2:] == ("qq", "2002"))
         check("response says submitted", "已加入草稿并提交审核" in result)
+
+    asyncio.run(_run())
+
+
+def test_pending_add_word_adds_multiple_reviewed_codes():
+    """Verify reviewed multi-pronunciation prompts can add more than one code."""
+    print("\n🧪 PendingAddWord multi-code reviewed add")
+
+    async def _run():
+        calls = []
+        state = PendingAddWord(
+            word="测试词",
+            recommended_code="ceek",
+            candidates=[("ceek", False), ("ceekv", False), ("ceeo", False)],
+            code_remarks={
+                "ceek": "Bot审词：读音 ce shi；来源 汉典",
+                "ceeo": "Bot审词：读音 ce ci；来源 百度百科",
+            },
+            pronunciation_recommended_codes=["ceek", "ceeo"],
+        )
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, arguments, platform, user_id))
+            if tool_name == "keytao_batch_add_to_draft":
+                return json.dumps({
+                    "success": True,
+                    "successCount": 2,
+                    "draft_snapshot": {
+                        "count": 2,
+                        "summary": {"added": 2, "modified": 0, "deleted": 0},
+                        "items": [
+                            {"word": "测试词", "code": "ceek", "action": "Create"},
+                            {"word": "测试词", "code": "ceeo", "action": "Create"},
+                        ],
+                    },
+                }, ensure_ascii=False)
+            if tool_name == "keytao_get_batch_preview":
+                return json.dumps({"success": True, "diff_text": "", "summary": {"added": 2, "modified": 0, "deleted": 0}}, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _handle_pending_add_word(
+                state,
+                "都加",
+                "qq",
+                "2002",
+                [],
+                ("qq", "qq:group:42"),
+                "Rea",
+                MessageCommandIntent(intent="pending_confirm", confidence=0.95),
+            )
+
+        add_call = calls[0]
+        items = add_call[1]["items"]
+        check("batch add called", add_call[0] == "keytao_batch_add_to_draft")
+        check("two reviewed codes added", [item["code"] for item in items] == ["ceek", "ceeo"])
+        check("review remarks preserved", all(item.get("remark") for item in items))
+        check("multi-code response shown", result is not None and "2 个读音编码" in result)
 
     asyncio.run(_run())
 
@@ -2925,6 +3009,79 @@ def test_keytao_draft_code_validation_guards_create_codes():
     asyncio.run(_run_draft_code_validation_checks())
 
 
+def test_review_audit_blocks_bare_delete_and_allows_code_move():
+    """Verify auto review blocks pure delete but allows delete+create code moves."""
+    print("\n🧪 review audit delete and code move policy")
+
+    async def _run():
+        async def fake_prepare_reviewed_word(config, word):
+            return {
+                "success": True,
+                "word": word,
+                "autoReviewable": True,
+                "pronunciations": [
+                    {
+                        "pinyin": "ce shi",
+                        "sources": [{"source": "汉典", "url": "https://example.test"}],
+                        "codes": ["ceek", "ceeko", "cya", "cyb", "cyc"],
+                    }
+                ],
+            }
+
+        async def fake_commonness_pass(front_word, behind_word):
+            return {
+                "success": True,
+                "verdict": "front_more_common",
+                "frontWord": front_word,
+                "behindWord": behind_word,
+                "summary": f"常用度证据支持「{front_word}」排在「{behind_word}」前",
+            }
+
+        async def fake_commonness_unclear(front_word, behind_word):
+            return {
+                "success": True,
+                "verdict": "not_enough_evidence",
+                "frontWord": front_word,
+                "behindWord": behind_word,
+                "summary": "可比较的常用度信号不足",
+            }
+
+        config = ReviewHttpConfig(api_base="https://fake", bot_token="fake")
+        with patch.object(keytao_review_module, "prepare_reviewed_word", side_effect=fake_prepare_reviewed_word):
+            bare_delete = await audit_draft_items(config, [
+                {"action": "Delete", "word": "测试", "code": "ceek"},
+            ])
+            code_move = await audit_draft_items(config, [
+                {"action": "Delete", "word": "测试", "code": "ceek"},
+                {"action": "Create", "word": "测试", "code": "ceeko"},
+            ])
+            with patch.object(keytao_review_module, "compare_word_commonness", side_effect=fake_commonness_pass):
+                priority_move = await audit_draft_items(config, [
+                    {"action": "Delete", "word": "常用词", "code": "cya"},
+                    {"action": "Delete", "word": "低频词", "code": "cyb"},
+                    {"action": "Create", "word": "常用词", "code": "cyb"},
+                    {"action": "Create", "word": "低频词", "code": "cyc"},
+                ])
+            with patch.object(keytao_review_module, "compare_word_commonness", side_effect=fake_commonness_unclear):
+                unclear_priority_move = await audit_draft_items(config, [
+                    {"action": "Delete", "word": "常用词", "code": "cya"},
+                    {"action": "Delete", "word": "低频词", "code": "cyb"},
+                    {"action": "Create", "word": "常用词", "code": "cyb"},
+                    {"action": "Create", "word": "低频词", "code": "cyc"},
+                ])
+
+        check("bare delete needs admin", bare_delete["autoApprove"] is False)
+        check("bare delete issue explains policy", "纯删除" in bare_delete["issues"][0])
+        check("code move auto approves", code_move["autoApprove"] is True)
+        check("code move records original delete", any("调码删除原位" in item for item in code_move["approvedItems"]))
+        check("priority move auto approves with commonness evidence", priority_move["autoApprove"] is True)
+        check("priority move records commonness comparison", bool(priority_move.get("commonnessComparisons")))
+        check("unclear priority move needs admin", unclear_priority_move["autoApprove"] is False)
+        check("unclear priority issue explains commonness", any("常用度证据不足" in item for item in unclear_priority_move["issues"]))
+
+    asyncio.run(_run())
+
+
 def test_draft_encode_candidates_include_alternate_pronunciations():
     """Verify draft validation accepts alternate single-char pronunciation chains."""
     print("\n🧪 KeyTao draft alternate pronunciation candidates")
@@ -3610,7 +3767,7 @@ if __name__ == "__main__":
     test_draft_management_command_detection()
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
-    test_simple_single_word_query_uses_encode_tool_before_ai()
+    test_simple_single_word_query_uses_review_tool_before_ai()
     test_simple_single_word_query_existing_word_falls_through()
     test_simple_single_word_query_skips_draft_commands()
     test_simple_single_word_query_skips_chat_comparison_questions()
@@ -3629,6 +3786,7 @@ if __name__ == "__main__":
     test_shift_request_can_target_by_number_or_word()
     test_pending_add_word_confirm_uses_recommended()
     test_pending_add_word_add_and_submit_uses_recommended()
+    test_pending_add_word_adds_multiple_reviewed_codes()
     test_pending_tool_confirm_data()
     test_strip_markdown()
     test_markdownv2_escape()
@@ -3660,6 +3818,7 @@ if __name__ == "__main__":
     test_keytao_draft_headers_allow_optional_user_api_key()
     test_get_latest_draft_batch_does_not_touch_word_code_locals()
     test_keytao_draft_code_validation_guards_create_codes()
+    test_review_audit_blocks_bare_delete_and_allows_code_move()
     test_draft_encode_candidates_include_alternate_pronunciations()
     test_draft_encode_candidates_include_phrase_polyphone_candidates()
     test_tool_executor_draft_policy_guards()

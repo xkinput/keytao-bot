@@ -15,6 +15,11 @@ from keytao_bot.utils.keytao_encoding import (
     build_alternate_pronunciation_codes,
     build_phrase_pronunciation_codes,
 )
+from keytao_bot.utils.keytao_review import (
+    ReviewHttpConfig,
+    audit_draft_items,
+    build_review_note,
+)
 
 
 ACTION_LABELS = {
@@ -800,6 +805,71 @@ async def keytao_create_phrase(
         }
 
 
+def _review_config() -> ReviewHttpConfig:
+    return ReviewHttpConfig(api_base=get_keytao_url(), bot_token=get_bot_token() or "")
+
+
+async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str) -> Dict:
+    try:
+        list_result = await keytao_list_draft_items(platform, platform_id)
+        if not list_result.get("success"):
+            return {
+                "success": False,
+                "verdict": "needs_admin",
+                "autoApprove": False,
+                "summary": list_result.get("message", "无法读取草稿，提交后等待管理员审核"),
+                "issues": [list_result.get("message", "无法读取草稿")],
+            }
+        return await audit_draft_items(_review_config(), list_result.get("items", []))
+    except Exception as error:
+        logger.warning(f"[auto_review] audit failed: {error}")
+        return {
+            "success": False,
+            "verdict": "needs_admin",
+            "autoApprove": False,
+            "summary": "自动审核异常，提交后等待管理员审核",
+            "issues": [str(error)],
+        }
+
+
+async def _auto_approve_submitted_batch(
+    platform: str,
+    platform_id: str,
+    batch_id: str,
+    auto_review: Dict,
+) -> Dict:
+    KEYTAO_API_BASE = get_keytao_url()
+    review_note = build_review_note(auto_review)
+    url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/auto-approve"
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url,
+                headers=get_bot_headers(platform, platform_id, content_type=True),
+                json={
+                    "platform": platform,
+                    "platformId": platform_id,
+                    "reviewNote": review_note,
+                },
+            )
+        try:
+            data = response.json()
+        except Exception:
+            return {"success": False, "message": f"自动批准接口返回异常（HTTP {response.status_code}）"}
+        if response.is_success:
+            return data
+        return {
+            "success": False,
+            "message": data.get("message") or data.get("error") or f"自动批准失败: HTTP {response.status_code}",
+            "details": data,
+        }
+    except httpx.TimeoutException:
+        return {"success": False, "message": "自动批准请求超时，批次已提交等待管理员审核"}
+    except Exception as error:
+        logger.warning(f"[auto_review] approve failed: {error}")
+        return {"success": False, "message": f"自动批准失败：{str(error)}"}
+
+
 async def keytao_submit_batch(
     platform: str,
     platform_id: str,
@@ -836,6 +906,8 @@ async def keytao_submit_batch(
         return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
     if not batch_id:
         return {"success": False, "message": "没有找到待提交的草稿批次"}
+
+    auto_review = await _audit_current_draft_for_auto_approval(platform, platform_id)
     
     url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/submit"
     
@@ -855,6 +927,16 @@ async def keytao_submit_batch(
                 data = response.json()
                 data["batchId"] = batch_id  # inject so _inject_batch_url can build batchUrl
                 _inject_batch_url(data)
+                data["autoReview"] = auto_review
+                if auto_review.get("autoApprove"):
+                    approve_result = await _auto_approve_submitted_batch(
+                        platform,
+                        platform_id,
+                        batch_id,
+                        auto_review,
+                    )
+                    data["autoApproveResult"] = approve_result
+                    data["autoApproved"] = bool(approve_result.get("success"))
                 return data
             elif response.status_code == 404:
                 return {
@@ -868,6 +950,7 @@ async def keytao_submit_batch(
                 }
             elif response.status_code == 400:
                 data = response.json()
+                data["autoReview"] = auto_review
                 return data
             else:
                 return {

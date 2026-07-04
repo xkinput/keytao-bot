@@ -14,6 +14,9 @@ class PendingAddWord:
     recommended_code: str
     candidates: List[Tuple[str, bool]]
     occupied_words: Dict[str, List[str]] = field(default_factory=dict)
+    code_remarks: Dict[str, str] = field(default_factory=dict)
+    pronunciation_codes: Dict[str, str] = field(default_factory=dict)
+    pronunciation_recommended_codes: List[str] = field(default_factory=list)
 
 
 @dataclass
