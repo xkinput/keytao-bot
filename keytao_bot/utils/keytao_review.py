@@ -338,7 +338,7 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
 
 async def _call_keytao_api(config: ReviewHttpConfig, path: str, payload: Optional[Dict] = None, method: str = "POST") -> Dict:
     if not config.bot_token:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
     url = f"{config.api_base}{path}"
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -838,7 +838,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         "success": True,
         "verdict": "pass" if auto_approve else "needs_admin",
         "autoApprove": auto_approve,
-        "summary": "证据一致，允许 Bot 自动通过" if auto_approve else "存在不确定项，提交后等待管理员审核",
+        "summary": "证据一致，允许本喵自动通过" if auto_approve else "存在不确定项，提交后等待管理员审核",
         "issues": issues,
         "approvedItems": approved_items,
         "reviewedWords": reviewed_words,
@@ -855,7 +855,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
 
 
 def build_review_note(audit: Dict) -> str:
-    lines = ["Bot 自动审词报告"]
+    lines = ["喵喵自动审词报告"]
     lines.append(f"结论：{audit.get('summary', '')}")
     if audit.get("approvedItems"):
         lines.append("通过项：")

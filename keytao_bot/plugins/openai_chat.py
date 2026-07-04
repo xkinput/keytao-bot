@@ -698,7 +698,7 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
         is_available = desc_text.startswith("✅") or "空位" in desc_text
         candidates.append((code, not is_available))
         if "读音" in desc_text or "来源" in desc_text:
-            code_remarks[code] = "Bot审词：" + desc_text
+            code_remarks[code] = "喵喵审词：" + desc_text
         pinyin_match = re.search(r'读音\s*([A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ\s]+)', desc_text)
         if pinyin_match:
             pronunciation_codes[code] = re.sub(r"\s+", " ", pinyin_match.group(1)).strip()
@@ -1503,7 +1503,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         lines.append("")
 
     lines.append(f"是否以编码 {recommended_code} 将「{word}」加入草稿？也可回复编号、编码，或回复「都加」添加每个读音的推荐编码。")
-    lines.append("证据一致时提交后可由 Bot 自动审核；证据不足、纯删除或歧义修改会等待管理员。")
+    lines.append("证据一致时提交后可由本喵自动审核；证据不足、纯删除或歧义修改会等待管理员。")
     return "\n".join(lines).strip()
 
 
@@ -2457,7 +2457,7 @@ async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str
 def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
     auto_review = submit_data.get("autoReview") if isinstance(submit_data, dict) else None
     if submit_data.get("autoApproved"):
-        parts.append("✅ Bot 已完成自动审词，证据一致，批次已加入词库。")
+        parts.append("✅ 本喵已完成自动审词，证据一致，批次已加入词库。")
         approve_result = submit_data.get("autoApproveResult") or {}
         message = approve_result.get("message")
         if message:

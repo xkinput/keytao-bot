@@ -626,7 +626,7 @@ async def _lookup_words_raw(words: List[str]) -> Dict:
     KEYTAO_API_BASE = get_keytao_url()
     BOT_API_TOKEN = get_bot_token()
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -649,7 +649,7 @@ async def _lookup_codes_raw(codes: List[str]) -> Dict:
     KEYTAO_API_BASE = get_keytao_url()
     BOT_API_TOKEN = get_bot_token()
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -706,7 +706,7 @@ async def keytao_create_phrase(
     if not BOT_API_TOKEN:
         return {
             "success": False,
-            "message": "Bot配置错误：缺少API token"
+            "message": "喵喵配置错误：缺少API token"
         }
     
     # Get or create draft batch
@@ -896,7 +896,7 @@ async def keytao_submit_batch(
     if not BOT_API_TOKEN:
         return {
             "success": False,
-            "message": "Bot配置错误：缺少API token"
+            "message": "喵喵配置错误：缺少API token"
         }
     
     # Get draft batch ID
@@ -983,7 +983,7 @@ async def keytao_get_batch_preview(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
     try:
         batch_id = await get_latest_draft_batch(platform, platform_id)
@@ -1038,7 +1038,7 @@ async def keytao_recall_batch(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
     url = f"{KEYTAO_API_BASE}/api/bot/batches/recall"
     logger.info(f"[keytao_recall_batch] platform={platform} platformId={platform_id}")
@@ -1078,7 +1078,7 @@ async def keytao_list_draft_items(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
     if platform == "web-anon":
         return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
@@ -1134,7 +1134,7 @@ async def keytao_remove_draft_item(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/{pr_id}"
 
@@ -1285,7 +1285,7 @@ async def keytao_batch_add_to_draft(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
     if not batch_id:
         try:
@@ -1380,7 +1380,7 @@ async def keytao_batch_remove_draft_items(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "Bot配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch-draft"
     payload = {"platform": platform, "platformId": platform_id, "ids": ids}

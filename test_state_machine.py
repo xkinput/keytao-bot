@@ -2052,8 +2052,8 @@ def test_pending_add_word_adds_multiple_reviewed_codes():
             recommended_code="ceek",
             candidates=[("ceek", False), ("ceekv", False), ("ceeo", False)],
             code_remarks={
-                "ceek": "Bot审词：读音 ce shi；来源 汉典",
-                "ceeo": "Bot审词：读音 ce ci；来源 百度百科",
+                "ceek": "喵喵审词：读音 ce shi；来源 汉典",
+                "ceeo": "喵喵审词：读音 ce ci；来源 百度百科",
             },
             pronunciation_recommended_codes=["ceek", "ceeo"],
         )

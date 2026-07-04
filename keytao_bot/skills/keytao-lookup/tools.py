@@ -378,7 +378,7 @@ async def _call_bot_lookup_api(path: str, payload: Dict) -> Dict:
     if not bot_api_token:
         return {
             "success": False,
-            "message": "Bot配置错误：缺少API token"
+            "message": "喵喵配置错误：缺少API token"
         }
 
     url = f"{keytao_api_base}{path}"
