@@ -346,7 +346,7 @@ class AgentOrchestrator:
         fn_args: Dict,
         result_data: Dict,
     ) -> None:
-        if fn_name not in ("keytao_create_phrase", "keytao_submit_batch"):
+        if fn_name not in ("keytao_create_phrase", "keytao_submit_batch", "keytao_batch_add_to_draft"):
             return
         if not result_data.get("requiresConfirmation"):
             return

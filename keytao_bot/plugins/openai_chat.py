@@ -2342,10 +2342,7 @@ async def _execute_confirmed_tool(
     state: PendingToolConfirm, platform: str, user_id: str,
 ) -> str:
     """Re-call a tool with confirmed=True and return formatted response."""
-    if state.function_name == "keytao_batch_add_to_draft":
-        args = dict(state.args)
-    else:
-        args = {**state.args, "confirmed": True}
+    args = {**state.args, "confirmed": True}
     result_json = await call_tool_function(state.function_name, args, platform, user_id)
     data = json.loads(result_json)
 

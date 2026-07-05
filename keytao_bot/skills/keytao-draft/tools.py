@@ -820,7 +820,11 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
                 "summary": list_result.get("message", "无法读取草稿，提交后等待管理员审核"),
                 "issues": [list_result.get("message", "无法读取草稿")],
             }
-        return await audit_draft_items(_review_config(), list_result.get("items", []))
+        deterministic_audit = await audit_draft_items(_review_config(), list_result.get("items", []))
+        if deterministic_audit.get("autoApprove") or not _can_llm_override_audit_issues(deterministic_audit):
+            return deterministic_audit
+        llm_audit = await _try_llm_auto_review_for_draft(list_result, deterministic_audit)
+        return llm_audit or deterministic_audit
     except Exception as error:
         logger.warning(f"[auto_review] audit failed: {error}")
         return {
@@ -830,6 +834,94 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
             "summary": "自动审核异常，提交后等待管理员审核",
             "issues": [str(error)],
         }
+
+
+def _can_llm_override_audit_issues(audit: Dict) -> bool:
+    issues = audit.get("issues") or []
+    if not issues:
+        return False
+    allowed_fragments = (
+        "没有权威读音来源",
+        "常用词信号不足",
+    )
+    blocked_fragments = (
+        "纯删除",
+        "不在读音候选链",
+        "不在权威读音候选链",
+        "改词",
+        "歧义",
+        "常用度证据不足",
+        "审词失败",
+        "词或编码为空",
+    )
+    return all(
+        any(fragment in issue for fragment in allowed_fragments)
+        and not any(fragment in issue for fragment in blocked_fragments)
+        for issue in issues
+    )
+
+
+async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit: Dict) -> Optional[Dict]:
+    try:
+        from keytao_bot.utils.keytao_batch_review import review_keytao_batch_with_llm
+
+        items = list_result.get("items", [])
+        batch = {
+            "id": list_result.get("batchId") or list_result.get("batch_id") or "current-draft",
+            "status": "Draft",
+            "description": "键道助手草稿批次",
+            "pullRequests": items,
+        }
+        review_result = await review_keytao_batch_with_llm(batch)
+        if not review_result.get("success"):
+            logger.warning(f"[auto_review] LLM fallback failed: {review_result.get('message')}")
+            return None
+
+        ai_review = review_result.get("aiReview") or {}
+        review_items = ai_review.get("items") if isinstance(ai_review.get("items"), list) else []
+        non_pass_items = [
+            item for item in review_items
+            if isinstance(item, dict) and item.get("status") != "pass"
+        ]
+        if ai_review.get("verdict") == "pass" and not non_pass_items and review_items:
+            approved_items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                action = item.get("action") or "Create"
+                word = item.get("word") or ""
+                code = item.get("code") or ""
+                if word and code:
+                    approved_items.append(f"{action}：{word}@{code}，本喵 LLM 复审通过")
+            return {
+                **deterministic_audit,
+                "success": True,
+                "verdict": "pass",
+                "autoApprove": True,
+                "summary": ai_review.get("headline") or "本喵已结合语言常识完成复审，允许自动通过",
+                "issues": [],
+                "approvedItems": approved_items or deterministic_audit.get("approvedItems", []),
+                "llmReview": ai_review,
+                "llmFallback": True,
+            }
+
+        issues = []
+        for item in non_pass_items[:10]:
+            reasons = item.get("reasons") if isinstance(item.get("reasons"), list) else []
+            title = item.get("title") or f"PR#{item.get('prId')} 需要复核"
+            reason = reasons[0] if reasons else title
+            issues.append(str(reason))
+
+        return {
+            **deterministic_audit,
+            "summary": ai_review.get("headline") or deterministic_audit.get("summary", "存在不确定项，提交后等待管理员审核"),
+            "issues": issues or deterministic_audit.get("issues", []),
+            "llmReview": ai_review,
+            "llmFallback": True,
+        }
+    except Exception as error:
+        logger.warning(f"[auto_review] LLM fallback error: {error}")
+        return None
 
 
 async def _auto_approve_submitted_batch(
@@ -1267,6 +1359,7 @@ async def keytao_batch_add_to_draft(
     platform_id: str,
     items: List[Dict],
     batch_id: Optional[str] = None,
+    confirmed: bool = False,
 ) -> Dict:
     """
     Batch add word entries to draft (tolerant mode).
@@ -1277,6 +1370,7 @@ async def keytao_batch_add_to_draft(
         platform_id: User's platform ID
         items: List of dicts with keys: word, code, action (optional), type (optional), remark (optional)
         batch_id: Optional existing draft batch ID
+        confirmed: Whether to confirm warnings that must pause before writing
 
     Returns:
         dict with successCount, failedCount, skippedCount, failed[], skipped[], draftItems[], draftTotal
@@ -1322,6 +1416,7 @@ async def keytao_batch_add_to_draft(
         "platform": platform,
         "platformId": platform_id,
         "batchId": batch_id,
+        "confirmed": confirmed,
         "items": [
             {**{k: v for k, v in item.items() if k != "old_word"},
              **({"oldWord": item["old_word"]} if "old_word" in item else {})}
@@ -1561,7 +1656,8 @@ TOOLS += [
             "name": "keytao_batch_add_to_draft",
             "description": (
                 "批量将词条加入草稿。适合用户一次提交大量词条时使用。"
-                "遇到冲突的条目会跳过并在 failed 列表中说明原因，重码（同编码不同词）会自动确认写入。"
+                "遇到冲突的条目会跳过并在 failed 列表中说明原因，重码（同编码不同词）会自动确认写入；"
+                "跳过更短空位编码会返回 requiresConfirmation，用户确认后再传 confirmed=true 写入。"
                 "如需把词插入已占用编码并顺延后续词，必须先使用 keytao_shift_phrase_code，不要手工计算顺延。"
                 "操作完成后返回成功数、失败数及当前草稿快照。"
             ),
@@ -1593,7 +1689,11 @@ TOOLS += [
                             },
                             "required": ["word", "code"],
                         },
-                    }
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "当工具首次返回 requiresConfirmation=true 后，用户确认继续时必须设置为 true。默认 false",
+                    },
                 },
                 "required": ["items"],
             },

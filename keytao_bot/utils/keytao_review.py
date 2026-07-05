@@ -44,6 +44,8 @@ COMMONNESS_SEARCH_QUERIES = [
     ('"{word}" 词典 OR 辞典', "dictionary"),
     ('"{word}" 百度百科 OR 维基百科', "encyclopedia"),
 ]
+COMMON_KNOWN_MIN_SCORE = 0.55
+COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
 
 AUTHORITATIVE_SOURCES = [
     {
@@ -117,6 +119,7 @@ _PINYIN_LABEL_RE = re.compile(
 )
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+_CJK_WORD_RE = re.compile(r"^[\u3400-\u9fff]+$")
 
 
 @dataclass(frozen=True)
@@ -544,17 +547,39 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
     }
 
 
-def _candidate_codes_from_review(review: Dict) -> set[str]:
+def _candidate_codes_from_review(review: Dict, *, include_fallback: bool = False) -> set[str]:
     codes: set[str] = set()
     for pronunciation in review.get("pronunciations", []):
         if not isinstance(pronunciation, dict):
             continue
-        if not pronunciation.get("sources"):
+        if not include_fallback and not pronunciation.get("sources"):
             continue
         for code in pronunciation.get("codes", []):
             if isinstance(code, str):
                 codes.add(code)
     return codes
+
+
+def _is_common_known_word(word: str, commonness: Dict) -> bool:
+    if not word or not _CJK_WORD_RE.match(word):
+        return False
+    if len(word) < 2 or len(word) > 8:
+        return False
+    if not commonness.get("success"):
+        return False
+
+    signals = commonness.get("signals") or {}
+    score = float(commonness.get("score") or 0.0)
+    active_signals = sum(1 for value in signals.values() if float(value or 0.0) > 0.15)
+    has_language_signal = (
+        float(signals.get("corpus") or 0.0) > 0.15
+        or float(signals.get("dictionary") or 0.0) > 0.15
+    )
+    return (
+        score >= COMMON_KNOWN_MIN_SCORE
+        and active_signals >= COMMON_KNOWN_MIN_ACTIVE_SIGNALS
+        and has_language_signal
+    )
 
 
 def _bounded_log_score(value: float) -> float:
@@ -765,6 +790,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
 
     issues: List[str] = []
     approved_items: List[str] = []
+    common_known_items: List[Dict[str, Any]] = []
     reviewed_words: Dict[str, Dict] = {}
     move_pairs = _find_move_pairs(items)
     priority_comparisons = _find_priority_comparisons(items)
@@ -806,10 +832,43 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         if not review.get("success"):
             issues.append(f"「{word}」审词失败：{review.get('message', '未知错误')}")
             continue
+
+        candidate_codes = _candidate_codes_from_review(
+            review,
+            include_fallback=not bool(review.get("autoReviewable")),
+        )
         if not review.get("autoReviewable"):
-            issues.append(f"「{word}」没有权威读音来源，不能自动通过")
+            if code not in candidate_codes:
+                available = ", ".join(sorted(candidate_codes)[:8])
+                issues.append(f"「{word}」编码 {code} 不在读音候选链中，可选：{available or '无'}")
+                continue
+
+            commonness = await estimate_word_commonness(word)
+            if _is_common_known_word(word, commonness):
+                summary = (
+                    f"「{word}」未找到权威读音页，但属于常见现代汉语词语/熟语，"
+                    f"且编码 {code} 在读音候选链中"
+                )
+                review["commonKnownReview"] = {
+                    "accepted": True,
+                    "summary": summary,
+                    "commonness": commonness,
+                    "policy": {
+                        "minScore": COMMON_KNOWN_MIN_SCORE,
+                        "minActiveSignals": COMMON_KNOWN_MIN_ACTIVE_SIGNALS,
+                    },
+                }
+                common_known_items.append({
+                    "word": word,
+                    "code": code,
+                    "summary": summary,
+                    "commonness": commonness,
+                })
+                approved_items.append(f"{action}：{word}@{code}，本喵按常见词/熟语语言常识通过")
+                continue
+
+            issues.append(f"「{word}」没有权威读音来源，且常用词信号不足，不能自动通过")
             continue
-        candidate_codes = _candidate_codes_from_review(review)
         if code not in candidate_codes:
             available = ", ".join(sorted(candidate_codes)[:8])
             issues.append(f"「{word}」编码 {code} 不在权威读音候选链中，可选：{available or '无'}")
@@ -841,6 +900,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         "summary": "证据一致，允许本喵自动通过" if auto_approve else "存在不确定项，提交后等待管理员审核",
         "issues": issues,
         "approvedItems": approved_items,
+        "commonKnownItems": common_known_items,
         "reviewedWords": reviewed_words,
         "commonnessComparisons": commonness_results,
         "sourcePolicy": {
@@ -850,6 +910,11 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
             ],
             "reviewSignalWeights": REVIEW_SIGNAL_WEIGHTS,
             "commonnessSignalWeights": COMMONNESS_SIGNAL_WEIGHTS,
+            "commonKnownWordPolicy": {
+                "minScore": COMMON_KNOWN_MIN_SCORE,
+                "minActiveSignals": COMMON_KNOWN_MIN_ACTIVE_SIGNALS,
+                "requiresCandidateCodeMatch": True,
+            },
         },
     }
 
@@ -870,6 +935,14 @@ def build_review_note(audit: Dict) -> str:
             lines.append(
                 f"- {item.get('frontWord')} > {item.get('behindWord')} @ {item.get('code')}："
                 f"{result.get('summary', '未给出结论')}"
+            )
+    if audit.get("commonKnownItems"):
+        lines.append("常见词/熟语语言常识通过：")
+        for item in audit.get("commonKnownItems", [])[:10]:
+            commonness = item.get("commonness") or {}
+            lines.append(
+                f"- {item.get('word')}@{item.get('code')}：{item.get('summary')}；"
+                f"常用度分 {float(commonness.get('score') or 0):.2f}"
             )
     lines.append("权重：语料 0.45，搜索 0.25，词典 0.20，百科 0.10；自动通过要求读音、编码和调序常用度证据一致。")
     return "\n".join(lines)

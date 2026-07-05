@@ -307,7 +307,8 @@ summary 格式规则：
 
 **触发条件（任一满足即触发）：**
 - `keytao_create_phrase` 返回 `requiresConfirmation: true`（含 `warnings[]`，词条**尚未写入**）
-- `keytao_batch_add_to_draft` 返回 `warnedCount > 0`（含 `warned[]`，词条**已写入**但编码冲突）
+- `keytao_batch_add_to_draft` 返回 `requiresConfirmation: true`（含 `warnings[]`，本次需要确认的词条**尚未写入**，常见于跳过更短空位编码）
+- `keytao_batch_add_to_draft` 返回 `warnedCount > 0` 且无 `requiresConfirmation`（含 `warned[]`，词条**已写入**但存在重码提醒）
 
 ### ⚠️ 优先级判断：用户是否明确要求保留重码？
 
@@ -318,7 +319,7 @@ summary 格式规则：
 | **明确要求保留重码** | "就用这个编码"、"加重码"、"确认重码"、"重码也行"、"直接加"、"强制加" | **跳过本协议**，改用原编码 + `confirmed=True` 直接写入 |
 | **未表态（默认）** | 普通加词请求，未提及重码 | **执行本协议**，自动分配至第一个空位编码 |
 
-用户明确要求保留重码时，`keytao_create_phrase` 用原 `code` + `confirmed=True` 重新调用；`keytao_batch_add_to_draft` 的 warned 条目已写入，无需修正，直接按正常成功展示（告知用户该词与哪个词形成重码即可）。
+用户明确要求保留重码或确认跳过空位时，`keytao_create_phrase` 或 `keytao_batch_add_to_draft` 用原 `code` + `confirmed=True` 重新调用；若 `keytao_batch_add_to_draft` 只是返回已写入的 `warned[]`，无需修正，直接按正常成功展示（告知用户该词与哪个词形成重码即可）。
 
 ---
 
@@ -582,12 +583,12 @@ diff Phrase  wltbv, wltb
 - 回复末尾始终附草稿地址和提交提示：`发送「提交」以提交该草稿`
 - 若 `diff_text` 为空，跳过代码块，直接展示条目列表
 
-有警告时（`requiresConfirmation: true`），其他步骤已写入草稿，展示格式：
+有警告时（`requiresConfirmation: true`），该次需要确认的条目尚未写入草稿；展示当前草稿并询问用户是否继续：
 ```
 ✅ 已执行 X 步，当前草稿（共 N 条）：
 • ...
 
-⚠️ 第 Y 步有重码：编码 "xxx" 已被 "某词" 占用。
+⚠️ 第 Y 步需要确认：编码 "xxx" 已被 "某词" 占用，或跳过了更短空位编码。
 确认继续添加吗？
 ```
 
