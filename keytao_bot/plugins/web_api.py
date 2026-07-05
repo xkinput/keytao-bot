@@ -3,12 +3,13 @@ Web API plugin — exposes HTTP endpoints for the Live2D chat frontend.
 
 Routes:
   POST /api/chat          — send a message, get AI reply
+  POST /api/keytao/batches/review — run LLM-backed KeyTao batch review
   DELETE /api/chat/history — clear session history
 
 Auth: Bearer token via WEB_API_KEY env var (skip check if not set).
 """
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,7 @@ from nonebot import get_driver
 from nonebot.log import logger
 
 from .openai_chat import get_ai_response_core, conversation_state_store, MAX_HISTORY_MESSAGES
+from ..utils.keytao_batch_review import review_keytao_batch_with_llm
 from ..utils.history_store import get_history_store
 
 driver = get_driver()
@@ -37,6 +39,12 @@ class ChatRequest(BaseModel):
 class HistoryClearRequest(BaseModel):
     session_id: str
     user_id: Optional[str] = None
+
+
+class KeyTaoBatchReviewRequest(BaseModel):
+    batch: Dict[str, Any]
+    local_review: Optional[Dict[str, Any]] = None
+    focus_pr_id: Optional[int] = None
 
 
 def _check_auth(authorization: Optional[str]) -> None:
@@ -87,6 +95,21 @@ try:
 
         return {"reply": reply or "抱歉，AI 暂时无法响应，请稍后再试"}
 
+    @_app.post("/api/keytao/batches/review")
+    async def keytao_batch_review(
+        request: KeyTaoBatchReviewRequest,
+        authorization: Optional[str] = Header(None),
+    ) -> dict:
+        _check_auth(authorization)
+        result = await review_keytao_batch_with_llm(
+            batch=request.batch,
+            local_review=request.local_review,
+            focus_pr_id=request.focus_pr_id,
+        )
+        if not result.get("success"):
+            raise HTTPException(status_code=502, detail=result.get("message") or "喵喵复审失败")
+        return result
+
     @_app.delete("/api/chat/history")
     async def clear_history(
         request: HistoryClearRequest,
@@ -104,7 +127,7 @@ try:
         return {"success": True, "deleted": deleted}
 
     logger.info(
-        f"web_api: routes registered  POST /api/chat  DELETE /api/chat/history  "
+        f"web_api: routes registered  POST /api/chat  POST /api/keytao/batches/review  DELETE /api/chat/history  "
         f"(auth={'enabled' if WEB_API_KEY else 'disabled'})"
     )
 
