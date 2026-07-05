@@ -226,7 +226,9 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 # keytao_encode：计算编码与字根拆分
 
-此工具按键道规则**实时计算**，适用于所有词（包括词库中没有的词）。与数据库查询不同，它返回完整的逐字拆分信息。
+此工具按键道普通词组/单字规则**实时计算**，适用于 `Phrase` / `Single` / `Supplement` 这类按读音与形码生成候选链的词条（包括词库中没有的词）。与数据库查询不同，它返回完整的逐字拆分信息。
+
+⚠️ `CSS` / `CSSSingle` 是键道声笔笔短码表，不等同于普通词组的“双拼 + 形码”候选链。遇到声笔笔条目时，不能用 `keytao_encode` 的普通 Phrase 结果判定 `fa`、`fao` 等码位“读音矛盾”；应通过 `keytao_lookup_by_word` / `keytao_lookup_by_code` 查看声笔笔词库事实，再按短码表位置、同码链优先级、词频和结构对齐审查。
 
 ## 触发场景
 
@@ -278,6 +280,8 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 - `phoneticCode`：音码（2字母）
 
 ⚠️ 关键规则：词条候选编码只能取 `candidateStatuses` / `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
+
+⚠️ 声笔笔/CSS 关键规则：`CSS` / `CSSSingle` 条目属于键道6扩展短码表。例如 `fa`、`fao` 在声笔笔表中是短码位置，不应按普通词组音码拆成 `f + ao` 去否定词条。审核这类条目时只按 CSS 表、同码链顺序和常用度判断。
 
 ⚠️ 展示候选编码时：如果 `occupancyChecked=true`，必须使用 `candidateStatuses`，例如 `1. hyfi — 已有「会员费」`、`2. hyfio — 空位`。禁止输出"待查占用"。
 

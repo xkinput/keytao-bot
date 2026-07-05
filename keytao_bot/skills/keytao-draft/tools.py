@@ -843,6 +843,10 @@ def _can_llm_override_audit_issues(audit: Dict) -> bool:
     allowed_fragments = (
         "没有权威读音来源",
         "常用词信号不足",
+        "常用度证据不足",
+        "可比较的常用度信号不足",
+        "声笔笔短码",
+        "声笔笔短码表",
     )
     blocked_fragments = (
         "纯删除",
@@ -850,7 +854,6 @@ def _can_llm_override_audit_issues(audit: Dict) -> bool:
         "不在权威读音候选链",
         "改词",
         "歧义",
-        "常用度证据不足",
         "审词失败",
         "词或编码为空",
     )

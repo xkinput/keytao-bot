@@ -16,7 +16,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
-from .keytao_review import ReviewHttpConfig, audit_draft_items
+from .keytao_review import ReviewHttpConfig, audit_draft_items, fetch_keytao_encode, lookup_codes
 
 
 ReviewItem = Dict[str, Any]
@@ -204,6 +204,173 @@ def _move_pairs(items: Sequence[ReviewItem]) -> set[Tuple[str, str]]:
     return pairs
 
 
+def _collect_code_strings(value: Any, result: Optional[List[str]] = None) -> List[str]:
+    result = result if result is not None else []
+    if isinstance(value, str):
+        code = value.strip().lower()
+        if code and re.fullmatch(r"[a-z]+", code) and code not in result:
+            result.append(code)
+        return result
+    if isinstance(value, list):
+        for item in value:
+            _collect_code_strings(item, result)
+        return result
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"code", "codes", "candidateCodes", "altCodes", "requestedCandidateCodes", "seriesCodes"}:
+                _collect_code_strings(item, result)
+            elif key in {"flyKeyVariants", "alternatePronunciationCodes", "alternatePhrasePronunciationCodes", "candidateStatuses", "items"}:
+                _collect_code_strings(item, result)
+        return result
+    return result
+
+
+def _encode_candidate_codes(encode_data: Dict[str, Any]) -> List[str]:
+    codes: List[str] = []
+    for key in ("candidateCodes", "codes", "altCodes", "requestedCandidateCodes"):
+        _collect_code_strings(encode_data.get(key), codes)
+    for key in ("flyKeyVariants", "alternatePronunciationCodes", "alternatePhrasePronunciationCodes", "candidateStatuses"):
+        _collect_code_strings(encode_data.get(key), codes)
+    return codes
+
+
+def _status_label(phrases: Sequence[Dict[str, Any]]) -> str:
+    words = [_string(item.get("word")) for item in phrases if isinstance(item, dict) and _string(item.get("word"))]
+    if not words:
+        return "空位"
+    label = "已有「" + "、".join(words[:3]) + "」"
+    if len(words) > 3:
+        label += f"等 {len(words)} 个词"
+    return label
+
+
+def _pinyin_from_encode_chars(encode_data: Dict[str, Any]) -> str:
+    chars = encode_data.get("chars")
+    if not isinstance(chars, list):
+        return ""
+    pinyins = [
+        _string(item.get("pinyin"))
+        for item in chars
+        if isinstance(item, dict) and _string(item.get("pinyin"))
+    ]
+    return " ".join(pinyins)
+
+
+async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[ReviewItem], reason: str) -> Dict[str, Any]:
+    move_pairs = _move_pairs(items)
+    words: List[str] = []
+    for item in items:
+        action = _string(item.get("action") or "Create") or "Create"
+        if action == "Delete":
+            continue
+        word = _string(item.get("word"))
+        if word and word not in words:
+            words.append(word)
+
+    encode_results = await asyncio.gather(
+        *(fetch_keytao_encode(config, word) for word in words),
+        return_exceptions=True,
+    )
+    encode_by_word: Dict[str, Dict[str, Any]] = {}
+    all_codes: List[str] = []
+    for word, result in zip(words, encode_results):
+        if isinstance(result, Exception):
+            encode_by_word[word] = {"success": False, "message": str(result)}
+            continue
+        encode_by_word[word] = result
+        for code in _encode_candidate_codes(result):
+            if code not in all_codes:
+                all_codes.append(code)
+
+    try:
+        code_map = await lookup_codes(config, all_codes)
+    except Exception:
+        code_map = {}
+
+    reviewed_words: Dict[str, Dict[str, Any]] = {}
+    for word, encode_data in encode_by_word.items():
+        candidate_codes = _encode_candidate_codes(encode_data)
+        statuses = [
+            {
+                "code": code,
+                "occupied": bool(code_map.get(code)),
+                "label": _status_label(code_map.get(code, [])),
+                "phrases": code_map.get(code, []),
+            }
+            for code in candidate_codes
+        ]
+        recommended = next((item["code"] for item in statuses if not item["occupied"]), candidate_codes[0] if candidate_codes else "")
+        reviewed_words[word] = {
+            "success": bool(candidate_codes),
+            "word": word,
+            "autoReviewable": False,
+            "autoReviewReason": "来源抓取超时，仅保留 keytao_encode 候选链供 LLM 复审",
+            "encodeOnly": True,
+            "keytaoEncode": {
+                "candidateCodes": candidate_codes,
+                "candidateStatuses": statuses[:12],
+                "recommendedCode": recommended,
+                "type": encode_data.get("type"),
+                "chars": encode_data.get("chars", [])[:8] if isinstance(encode_data.get("chars"), list) else [],
+            },
+            "pronunciations": [
+                {
+                    "pinyin": _pinyin_from_encode_chars(encode_data),
+                    "normalized": [],
+                    "codes": candidate_codes,
+                    "sources": [{"source": "keytao_encode", "url": config.api_base}],
+                    "score": 0,
+                    "fallback": True,
+                    "candidateStatuses": statuses[:12],
+                    "recommendedCode": recommended,
+                }
+            ] if candidate_codes else [],
+        }
+
+    issues: List[str] = []
+    approved_items: List[str] = []
+    for item in items:
+        action = _string(item.get("action") or "Create") or "Create"
+        word = _string(item.get("word"))
+        code = _string(item.get("code")).lower()
+        phrase_type = _string(item.get("type") or "Phrase") or "Phrase"
+        if not word or not code:
+            issues.append("存在词或编码为空的草稿条目")
+            continue
+        if action == "Delete" and (word, code) not in move_pairs:
+            issues.append(f"纯删除「{word}」@{code} 必须由管理员审核")
+            continue
+        if phrase_type in {"CSS", "CSSSingle"}:
+            approved_items.append(f"{action}：{word}@{code} 是声笔笔短码表条目，交由 LLM 按 CSS 优先级复审")
+            continue
+        candidate_codes = reviewed_words.get(word, {}).get("keytaoEncode", {}).get("candidateCodes") or []
+        if code in candidate_codes:
+            approved_items.append(f"{action}：{word}@{code}，keytao_encode 候选链包含目标编码")
+        else:
+            available = ", ".join(candidate_codes[:8])
+            issues.append(f"「{word}」编码 {code} 不在 keytao_encode 候选链中，可选：{available or '无'}")
+
+    return {
+        "success": True,
+        "verdict": "needs_admin",
+        "autoApprove": False,
+        "summary": "来源抓取超时，本喵已保留 keytao_encode 候选链供 LLM 复审",
+        "issues": issues or [reason],
+        "approvedItems": approved_items,
+        "commonKnownItems": [],
+        "reviewedWords": reviewed_words,
+        "commonnessComparisons": [],
+        "deterministicAuditTimedOut": True,
+        "deterministicAuditReason": reason,
+        "sourcePolicy": {
+            "note": (
+                "本次管理员复查未等完网页来源抓取；编码正确性必须以 keytao_encode 候选链、"
+                "CSS 短码表或 KeyTao 文档为准，禁止按通用双拼盲猜。"
+            ),
+        },
+    }
+
+
 def _fallback_audit_for_llm(items: Sequence[ReviewItem], reason: str) -> Dict[str, Any]:
     move_pairs = _move_pairs(items)
     issues: List[str] = []
@@ -271,6 +438,52 @@ def _summary_from_item(item: Dict[str, Any], reasons: Sequence[str]) -> str:
     return (reasons[0] if reasons else "本喵已完成复审")[:180]
 
 
+_GENERIC_ENCODING_GUESS_MARKERS = (
+    "通用双拼",
+    "常规双拼",
+    "普通双拼",
+    "零声母",
+    "多出v",
+    "多出 v",
+    "声韵编码不应",
+    "声母为",
+    "无法判定该编码由真实读音严格推出",
+    "键道具体编码方案未在",
+)
+
+
+def _contains_generic_encoding_guess(values: Sequence[str]) -> bool:
+    text = "\n".join(values)
+    return any(marker in text for marker in _GENERIC_ENCODING_GUESS_MARKERS)
+
+
+def _audit_supports_item_code(audit: Optional[Dict[str, Any]], word: str, code: str) -> bool:
+    if not isinstance(audit, dict) or not word or not code:
+        return False
+    review = (audit.get("reviewedWords") or {}).get(word)
+    if not isinstance(review, dict):
+        return False
+    candidate_sets: List[Any] = []
+    for pronunciation in review.get("pronunciations", []):
+        if isinstance(pronunciation, dict):
+            candidate_sets.append(pronunciation.get("codes"))
+            candidate_sets.append(pronunciation.get("candidateStatuses"))
+    keytao_encode = review.get("keytaoEncode") if isinstance(review.get("keytaoEncode"), dict) else {}
+    candidate_sets.extend([
+        review.get("candidateCodes"),
+        keytao_encode.get("candidateCodes"),
+        keytao_encode.get("candidateStatuses"),
+    ])
+    for candidate_set in candidate_sets:
+        if code in _collect_code_strings(candidate_set):
+            return True
+    return False
+
+
+def _is_css_item(pr: ReviewItem) -> bool:
+    return _string(pr.get("type") or "Phrase") in {"CSS", "CSSSingle"}
+
+
 def _fallback_review_from_llm_error(
     items: Sequence[ReviewItem],
     audit: Dict[str, Any],
@@ -333,13 +546,14 @@ def _fallback_review_from_llm_error(
         ],
         "items": raw_items,
         "codeChainRecommendations": [],
-    }, items, local_review)
+    }, items, local_review, audit)
 
 
 def _normalize_llm_review(
     raw: Dict[str, Any],
     items: Sequence[ReviewItem],
     local_review: Optional[Dict[str, Any]],
+    audit: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     raw_items = raw.get("items") if isinstance(raw.get("items"), list) else []
     raw_by_id: Dict[int, Dict[str, Any]] = {}
@@ -386,6 +600,35 @@ def _normalize_llm_review(
             evidence.insert(0, f"读音：{pronunciation}")
         if sources:
             evidence.append(f"来源：{'、'.join(sources)}")
+
+        combined_review_text = [*reasons, *suggestions, *evidence]
+        if _contains_generic_encoding_guess(combined_review_text):
+            has_hard_blocker = (
+                (pr.get("action") == "Delete" and (word, code) not in move_pairs)
+                or bool(pr.get("hasConflict"))
+                or (isinstance(pr.get("conflictInfo"), dict) and pr["conflictInfo"].get("hasConflict"))
+            )
+            if _audit_supports_item_code(audit, word, code):
+                if not has_hard_blocker:
+                    status = "pass"
+                reasons = [
+                    f"keytao_encode 候选链包含 {code}，编码按键道规则可推出；本喵已忽略脱离键道规则的错误推导。"
+                ]
+                suggestions = ["编码正确性以 keytao_encode/candidateStatuses 为准，继续核对词义、冲突和同码链顺序。"]
+                evidence = [
+                    f"编码依据：keytao_encode candidate chain includes {code}",
+                    *[line for line in evidence if not _contains_generic_encoding_guess([line])],
+                ]
+            elif _is_css_item(pr):
+                status = "attention" if status == "manual_review" else status
+                reasons = [
+                    "这是声笔笔/CSS 类型条目，不能按普通词组双拼+形码规则判定读音编码矛盾。"
+                ]
+                suggestions = ["请按声笔笔短码表、同码链常用度和结构对齐关系复核。"]
+                evidence = [
+                    "编码依据：CSS/CSSSingle 属于键道声笔笔短码表，不等同普通 Phrase 候选链。",
+                    *[line for line in evidence if not _contains_generic_encoding_guess([line])],
+                ]
 
         normalized_items.append({
             "prId": pr_id,
@@ -483,6 +726,12 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
         "你是键道输入法审词员喵喵。你必须根据给定证据做保守、专业的中文词语审核。"
         "重点检查：真实读音、编码是否由真实读音推出、同码链顺序是否合理、改词是否把正确词误改掉、"
         "纯删除是否必须人工确认、调码是否等价于删除原位并新增正确位置。"
+        "编码正确性只能依据 deterministicAudit.reviewedWords、keytao_encode 返回的 candidateCodes/"
+        "candidateStatuses/requestedCodeAnalysis、localReview 的编码链、以及 KeyTao/键道6 文档。"
+        "禁止使用通用双拼、普通拼音键位、零声母猜测或你自己的声韵推导来判定键道编码；"
+        "如果目标编码已经出现在 keytao_encode 候选链中，不得说“无法由读音推出”或“多出某个字母”。"
+        "CSS/CSSSingle 是键道声笔笔短码表，fa/fao 等码位不等同普通 Phrase 双拼+形码，"
+        "审核 CSS 时应检查短码表、同码链优先级、词频/结构对齐，不得以 zhi/fou 与 f/ao 不对应为理由判错。"
         "常见现代汉语词语、成语、熟语或大众明确知晓的固定表达，即使没有抓到权威读音页，"
         "只要你能明确给出读音和含义，且目标编码在 deterministicAudit 的读音候选链中，可以建议通过；"
         "此时 evidence 写“本喵语言常识：读音/含义大众通行”，sources 可以为空或写“语言常识”。"
@@ -586,11 +835,19 @@ async def review_keytao_batch_with_llm(
     except asyncio.TimeoutError:
         reason = f"确定性来源审查超过 {audit_timeout:.0f} 秒"
         logger.warning(f"KeyTao deterministic batch audit timed out before LLM review: {reason}")
-        audit = _fallback_audit_for_llm(items, reason)
+        try:
+            audit = await _fallback_audit_with_encode(_review_config(), items, reason)
+        except Exception as encode_error:
+            logger.warning(f"KeyTao encode-only fallback audit failed: {encode_error}")
+            audit = _fallback_audit_for_llm(items, reason)
     except Exception as error:
         reason = f"确定性来源审查失败：{error}"
         logger.warning(f"KeyTao deterministic batch audit failed before LLM review: {error}")
-        audit = _fallback_audit_for_llm(items, reason)
+        try:
+            audit = await _fallback_audit_with_encode(_review_config(), items, reason)
+        except Exception as encode_error:
+            logger.warning(f"KeyTao encode-only fallback audit failed: {encode_error}")
+            audit = _fallback_audit_for_llm(items, reason)
 
     try:
         raw_review = await _call_llm(batch, items, audit, local_review, focus_pr_id)
@@ -604,7 +861,7 @@ async def review_keytao_batch_with_llm(
             "warning": str(error),
         }
 
-    ai_review = _normalize_llm_review(raw_review, items, local_review)
+    ai_review = _normalize_llm_review(raw_review, items, local_review, audit)
     return {
         "success": True,
         "aiReview": ai_review,

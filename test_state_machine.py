@@ -140,6 +140,7 @@ from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 from keytao_bot.utils import keytao_review as keytao_review_module
 from keytao_bot.utils.keytao_review import ReviewHttpConfig, audit_draft_items
+from keytao_bot.utils.keytao_batch_review import _normalize_llm_review
 import keytao_bot.plugins.openai_chat as openai_chat_module
 
 _lookup_tools_path = os.path.join(
@@ -3123,6 +3124,91 @@ def test_review_audit_blocks_bare_delete_and_allows_code_move():
     asyncio.run(_run())
 
 
+def test_llm_review_prefers_keytao_encode_over_generic_double_pinyin_guess():
+    """Verify LLM review normalization strips generic double-pinyin guesses when encode supports the code."""
+    print("\n🧪 LLM review uses keytao_encode candidate chain")
+
+    raw = {
+        "items": [
+            {
+                "prId": 1,
+                "status": "manual_review",
+                "title": "编码无法判定",
+                "reasons": ["通用双拼映射偶取 x，组合似为 xjz，但 xjziv 多出 v，无法判定该编码由真实读音严格推出。"],
+                "suggestions": ["请管理员核对键道输入法三字词编码规则。"],
+                "pronunciation": "ou ji zi",
+                "evidence": ["编码 xjziv 与常规双拼假设不同。"],
+            }
+        ]
+    }
+    items = [
+        {
+            "id": 1,
+            "action": "Create",
+            "word": "偶极子",
+            "code": "xjziv",
+            "type": "Phrase",
+            "hasConflict": False,
+            "conflictInfo": None,
+        }
+    ]
+    audit = {
+        "reviewedWords": {
+            "偶极子": {
+                "pronunciations": [
+                    {"codes": ["xjz", "xjzi", "xjziv", "xjziva"]}
+                ],
+                "keytaoEncode": {"candidateCodes": ["xjz", "xjzi", "xjziv", "xjziva"]},
+            }
+        }
+    }
+
+    review = _normalize_llm_review(raw, items, {"codeChains": []}, audit)
+    item = review["items"][0]
+    joined = "\n".join(item["reasons"] + item["suggestions"] + item["reviewRecord"]["evidence"])
+    check("encode-supported code passes", item["status"] == "pass")
+    check("reason cites keytao_encode", "keytao_encode" in joined)
+    check("generic double pinyin removed", "通用双拼" not in joined and "零声母" not in joined)
+
+
+def test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries():
+    """Verify CSS entries are reviewed as short-code table entries, not ordinary phrase pinyin."""
+    print("\n🧪 CSS review ignores ordinary phrase pinyin mismatch")
+
+    raw = {
+        "items": [
+            {
+                "prId": 2,
+                "status": "manual_review",
+                "title": "读音与编码矛盾",
+                "reasons": ["否则读音 fou ze，声韵编码不应为 fao（f+ao）。"],
+                "suggestions": ["建议驳回。"],
+                "pronunciation": "fou ze",
+                "evidence": ["声母为 f，但第二字不是 ao。"],
+            }
+        ]
+    }
+    items = [
+        {
+            "id": 2,
+            "action": "Change",
+            "word": "否则",
+            "oldWord": "只能",
+            "code": "fao",
+            "type": "CSS",
+            "hasConflict": False,
+            "conflictInfo": None,
+        }
+    ]
+
+    review = _normalize_llm_review(raw, items, {"codeChains": []}, {"reviewedWords": {}})
+    item = review["items"][0]
+    joined = "\n".join(item["reasons"] + item["suggestions"] + item["reviewRecord"]["evidence"])
+    check("CSS item is not rejected by phrase pinyin", item["status"] == "attention")
+    check("CSS short-code policy cited", "声笔笔" in joined and "短码表" in joined)
+    check("ordinary pinyin mismatch removed", "声韵编码不应" not in joined)
+
+
 def test_draft_encode_candidates_include_alternate_pronunciations():
     """Verify draft validation accepts alternate single-char pronunciation chains."""
     print("\n🧪 KeyTao draft alternate pronunciation candidates")
@@ -3861,6 +3947,8 @@ if __name__ == "__main__":
     test_get_latest_draft_batch_does_not_touch_word_code_locals()
     test_keytao_draft_code_validation_guards_create_codes()
     test_review_audit_blocks_bare_delete_and_allows_code_move()
+    test_llm_review_prefers_keytao_encode_over_generic_double_pinyin_guess()
+    test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries()
     test_draft_encode_candidates_include_alternate_pronunciations()
     test_draft_encode_candidates_include_phrase_polyphone_candidates()
     test_tool_executor_draft_policy_guards()

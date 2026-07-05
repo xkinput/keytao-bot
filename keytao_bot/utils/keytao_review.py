@@ -17,6 +17,9 @@ from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code
 
 
 SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/"
+DUCKDUCKGO_LITE_ENDPOINT = "https://lite.duckduckgo.com/lite/"
+BING_ENDPOINT = "https://www.bing.com/search"
+SO360_ENDPOINT = "https://www.so.com/s"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -46,6 +49,8 @@ COMMONNESS_SEARCH_QUERIES = [
 ]
 COMMON_KNOWN_MIN_SCORE = 0.55
 COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
+COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
+CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
 
 AUTHORITATIVE_SOURCES = [
     {
@@ -211,16 +216,146 @@ def _extract_search_results(content: str, max_results: int) -> List[Dict[str, st
     return results
 
 
+def _dedupe_search_results(results: List[Dict[str, str]], max_results: int) -> List[Dict[str, str]]:
+    deduped: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for item in results:
+        url = _normalize_result_url(str(item.get("url") or "")).strip()
+        title = str(item.get("title") or "").strip()
+        if not url or not title:
+            continue
+        parsed = urlparse(url)
+        key = parsed._replace(fragment="", query=parsed.query[:160]).geturl()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({
+            "title": title[:180],
+            "url": url,
+            "snippet": str(item.get("snippet") or "").strip()[:360],
+            "provider": str(item.get("provider") or "").strip(),
+        })
+        if len(deduped) >= max_results:
+            break
+    return deduped
+
+
+def _extract_duckduckgo_lite_results(content: str, max_results: int) -> List[Dict[str, str]]:
+    matches = list(
+        re.finditer(
+            r"<a[^>]+class=['\"]result-link['\"][^>]+href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>",
+            content,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
+    snippets = list(
+        re.finditer(
+            r"<td[^>]+class=['\"]result-snippet['\"][^>]*>(.*?)</td>",
+            content,
+            re.IGNORECASE | re.DOTALL,
+        )
+    )
+    results: List[Dict[str, str]] = []
+    for index, match in enumerate(matches[:max_results]):
+        snippet = snippets[index].group(1) if index < len(snippets) else ""
+        results.append({
+            "title": _strip_tags(match.group(2)),
+            "url": _normalize_result_url(match.group(1)),
+            "snippet": _strip_tags(snippet),
+            "provider": "duckduckgo-lite",
+        })
+    return _dedupe_search_results(results, max_results)
+
+
+def _extract_bing_results(content: str, max_results: int) -> List[Dict[str, str]]:
+    matches = list(re.finditer(
+        r"<h2[^>]*>.*?<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?</h2>",
+        content,
+        re.IGNORECASE | re.DOTALL,
+    ))
+    results: List[Dict[str, str]] = []
+    for index, match in enumerate(matches[:max_results * 3]):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else min(len(content), start + 2600)
+        nearby_html = content[start:end]
+        snippet_match = re.search(r"<p[^>]*>(.*?)</p>", nearby_html, re.IGNORECASE | re.DOTALL)
+        results.append({
+            "title": _strip_tags(match.group(2)),
+            "url": _normalize_result_url(match.group(1)),
+            "snippet": _strip_tags(snippet_match.group(1) if snippet_match else ""),
+            "provider": "bing",
+        })
+        if len(results) >= max_results:
+            break
+    return _dedupe_search_results(results, max_results)
+
+
+def _extract_so360_results(content: str, max_results: int) -> List[Dict[str, str]]:
+    blocks = re.findall(
+        r'<li[^>]+class="res-list"[^>]*>(.*?)</li>',
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    results: List[Dict[str, str]] = []
+    for block in blocks[:max_results * 2]:
+        link_match = re.search(r"<h3[^>]*>.*?<a([^>]*)>(.*?)</a>.*?</h3>", block, re.IGNORECASE | re.DOTALL)
+        if not link_match:
+            continue
+        attrs = link_match.group(1)
+        href_match = re.search(r'href=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        mdurl_match = re.search(r'data-mdurl=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        snippet_match = re.search(
+            r'<p[^>]+class=["\']res-desc["\'][^>]*>(.*?)</p>|<span[^>]+class=["\']res-list-summary["\'][^>]*>(.*?)</span>',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
+        url = html.unescape(mdurl_match.group(1)) if mdurl_match else _normalize_result_url(href_match.group(1) if href_match else "")
+        results.append({
+            "title": _strip_tags(link_match.group(2)),
+            "url": url,
+            "snippet": _strip_tags((snippet_match.group(1) or snippet_match.group(2)) if snippet_match else ""),
+            "provider": "so360",
+        })
+        if len(results) >= max_results:
+            break
+    return _dedupe_search_results(results, max_results)
+
+
 async def _search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
+    query = query.strip()
+    if not query:
+        return []
+
+    providers = (
+        ("so360", SO360_ENDPOINT, {"q": query}, _extract_so360_results),
+        ("bing", BING_ENDPOINT, {"q": query, "setlang": "zh-CN"}, _extract_bing_results),
+        ("duckduckgo-html", SEARCH_ENDPOINT, {"q": query, "kl": "cn-zh"}, _extract_search_results),
+        ("duckduckgo-lite", DUCKDUCKGO_LITE_ENDPOINT, {"q": query, "kl": "cn-zh"}, _extract_duckduckgo_lite_results),
+    )
+    merged: List[Dict[str, str]] = []
+    failures: List[str] = []
     try:
         async with httpx.AsyncClient(
             timeout=12.0,
             headers={"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
             follow_redirects=True,
         ) as client:
-            response = await client.get(SEARCH_ENDPOINT, params={"q": query, "kl": "cn-zh"})
-            response.raise_for_status()
-        return _extract_search_results(response.text, max_results)
+            for provider, endpoint, params, extractor in providers:
+                try:
+                    response = await client.get(endpoint, params=params)
+                    response.raise_for_status()
+                    results = extractor(response.text, max_results)
+                    for result in results:
+                        result.setdefault("provider", provider)
+                    merged = _dedupe_search_results(merged + results, max_results)
+                    if len(merged) >= max_results:
+                        break
+                except Exception as error:
+                    failures.append(f"{provider}: {error}")
+                    logger.debug(f"Review search provider {provider} failed for {query}: {error}")
+        if not merged and failures:
+            logger.debug(f"Review search returned no results for {query}; provider failures: {'; '.join(failures)}")
+        return merged
     except Exception as error:
         logger.warning(f"Review search failed for {query}: {error}")
         return []
@@ -574,12 +709,79 @@ def _is_common_known_word(word: str, commonness: Dict) -> bool:
     has_language_signal = (
         float(signals.get("corpus") or 0.0) > 0.15
         or float(signals.get("dictionary") or 0.0) > 0.15
+        or float(signals.get("encyclopedia") or 0.0) > 0.15
     )
+    has_search_signal = float(signals.get("search") or 0.0) > 0.35
     return (
-        score >= COMMON_KNOWN_MIN_SCORE
-        and active_signals >= COMMON_KNOWN_MIN_ACTIVE_SIGNALS
-        and has_language_signal
+        (
+            score >= COMMON_KNOWN_MIN_SCORE
+            and active_signals >= COMMON_KNOWN_MIN_ACTIVE_SIGNALS
+            and (has_language_signal or has_search_signal)
+        )
+        or (
+            score >= COMMON_KNOWN_RELAXED_MIN_SCORE
+            and active_signals >= 1
+            and has_language_signal
+        )
     )
+
+
+def _is_css_review_type(phrase_type: str) -> bool:
+    return str(phrase_type or "").strip() in CSS_REVIEW_TYPES
+
+
+def _same_type_phrases(phrases: Sequence[Dict], phrase_type: str) -> List[Dict]:
+    return [
+        phrase for phrase in phrases
+        if isinstance(phrase, dict) and str(phrase.get("type") or "Phrase") == phrase_type
+    ]
+
+
+async def prepare_css_reviewed_item(config: ReviewHttpConfig, item: Dict) -> Dict:
+    """Review CSS/CSSSingle entries as curated short-code table edits, not phrase pinyin encodings."""
+    word = str(item.get("word") or "").strip()
+    code = str(item.get("code") or "").strip().lower()
+    old_word = str(item.get("oldWord") or item.get("old_word") or "").strip()
+    phrase_type = str(item.get("type") or "CSS").strip() or "CSS"
+    if not word or not code:
+        return {"success": False, "message": "词或编码为空"}
+
+    lookup_words_result, lookup_codes_result = await asyncio.gather(
+        lookup_words(config, [word] + ([old_word] if old_word else [])),
+        lookup_codes(config, [code]),
+    )
+    word_existing = _same_type_phrases(lookup_words_result.get(word, []), phrase_type)
+    code_existing = _same_type_phrases(lookup_codes_result.get(code, []), phrase_type)
+    exact_existing = [
+        phrase for phrase in word_existing
+        if str(phrase.get("code") or "").lower() == code
+    ]
+    commonness = await estimate_word_commonness(word)
+
+    return {
+        "success": True,
+        "word": word,
+        "code": code,
+        "type": phrase_type,
+        "oldWord": old_word or None,
+        "autoReviewable": bool(exact_existing) or _is_common_known_word(word, commonness),
+        "autoReviewReason": (
+            "同类型声笔笔词库已存在该词条"
+            if exact_existing else
+            "声笔笔按短码表和日常优先级审查，不能按普通词组音码判错"
+        ),
+        "cssShortCodeReview": {
+            "accepted": True,
+            "policy": (
+                "CSS/CSSSingle 是键道声笔笔短码表；编码体现声笔笔码位和词频/结构优先级，"
+                "不等同于普通 Phrase 的双拼+形码候选链。"
+            ),
+            "sameTypeExistingForWord": word_existing[:8],
+            "sameTypeExistingForCode": code_existing[:8],
+            "exactExisting": exact_existing[:8],
+            "commonness": commonness,
+        },
+    }
 
 
 def _bounded_log_score(value: float) -> float:
@@ -800,6 +1002,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         word = str(item.get("word") or "").strip()
         code = str(item.get("code") or "").strip().lower()
         old_word = str(item.get("oldWord") or item.get("old_word") or "").strip()
+        phrase_type = str(item.get("type") or "Phrase").strip() or "Phrase"
 
         if not word or not code:
             issues.append("存在词或编码为空的草稿条目")
@@ -810,6 +1013,38 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 approved_items.append(f"调码删除原位：{word}@{code}")
                 continue
             issues.append(f"纯删除「{word}」@{code} 必须由管理员审核")
+            continue
+
+        if _is_css_review_type(phrase_type):
+            css_review = await prepare_css_reviewed_item(config, item)
+            reviewed_words[word] = css_review
+            if not css_review.get("success"):
+                issues.append(f"「{word}」声笔笔审查失败：{css_review.get('message', '未知错误')}")
+                continue
+
+            css_info = css_review.get("cssShortCodeReview") or {}
+            exact_existing = css_info.get("exactExisting") or []
+            if action == "Change" and old_word:
+                comparison = await compare_word_commonness(word, old_word)
+                css_review["commonnessComparison"] = comparison
+                if exact_existing or comparison.get("verdict") == "front_more_common":
+                    approved_items.append(
+                        f"声笔笔改词：{old_word}→{word}@{code}，按 CSS 短码表/常用度优先级通过"
+                    )
+                    continue
+                issues.append(
+                    f"声笔笔短码替换「{old_word}→{word}」需要确认："
+                    f"{comparison.get('summary', '请按 CSS 短码表、词频和结构对齐复核')}"
+                )
+                continue
+
+            if css_review.get("autoReviewable"):
+                approved_items.append(f"{action}：{word}@{code}，按声笔笔短码表/常见词优先级通过")
+                continue
+            issues.append(
+                f"「{word}」@{code} 是声笔笔短码表条目，不能按普通词组音码判错；"
+                "但缺少同类型词库记录或足够常用度证据，需要管理员确认优先级"
+            )
             continue
 
         review_word = word
@@ -912,9 +1147,14 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
             "commonnessSignalWeights": COMMONNESS_SIGNAL_WEIGHTS,
             "commonKnownWordPolicy": {
                 "minScore": COMMON_KNOWN_MIN_SCORE,
+                "relaxedMinScore": COMMON_KNOWN_RELAXED_MIN_SCORE,
                 "minActiveSignals": COMMON_KNOWN_MIN_ACTIVE_SIGNALS,
                 "requiresCandidateCodeMatch": True,
             },
+            "cssShortCodePolicy": (
+                "CSS/CSSSingle 按键道声笔笔短码表和同码链优先级审查；"
+                "不得用普通 Phrase 双拼+形码规则判定 fa/fao 等码位的读音矛盾。"
+            ),
         },
     }
 
