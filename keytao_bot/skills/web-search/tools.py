@@ -17,6 +17,7 @@ from nonebot.log import logger
 DUCKDUCKGO_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
 DUCKDUCKGO_LITE_ENDPOINT = "https://lite.duckduckgo.com/lite/"
 BING_ENDPOINT = "https://www.bing.com/search"
+SO360_ENDPOINT = "https://www.so.com/s"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -66,6 +67,10 @@ def _normalize_result_url(raw_url: str) -> str:
 def _is_probably_url(value: str) -> bool:
     parsed = urlparse(value if "://" in value else f"https://{value}")
     return bool(parsed.netloc and "." in parsed.netloc)
+
+
+def _has_cjk(value: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", value))
 
 
 def _dedupe_results(results: List[Dict[str, str]], max_results: int) -> List[Dict[str, str]]:
@@ -169,6 +174,37 @@ def _extract_bing(content: str, max_results: int) -> List[Dict[str, str]]:
     return _dedupe_results(results, max_results)
 
 
+def _extract_so360(content: str, max_results: int) -> List[Dict[str, str]]:
+    blocks = re.findall(
+        r'<li[^>]+class="res-list"[^>]*>(.*?)</li>',
+        content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    results: List[Dict[str, str]] = []
+    for block in blocks[:max_results * 2]:
+        link_match = re.search(r"<h3[^>]*>.*?<a([^>]*)>(.*?)</a>.*?</h3>", block, re.IGNORECASE | re.DOTALL)
+        if not link_match:
+            continue
+        attrs = link_match.group(1)
+        href_match = re.search(r'href=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        mdurl_match = re.search(r'data-mdurl=["\']([^"\']+)["\']', attrs, re.IGNORECASE)
+        snippet_match = re.search(
+            r'<p[^>]+class=["\']res-desc["\'][^>]*>(.*?)</p>|<span[^>]+class=["\']res-list-summary["\'][^>]*>(.*?)</span>',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
+        url = html.unescape(mdurl_match.group(1)) if mdurl_match else _normalize_result_url(href_match.group(1) if href_match else "")
+        results.append({
+            "title": _strip_tags(link_match.group(2)),
+            "url": url,
+            "snippet": _strip_tags((snippet_match.group(1) or snippet_match.group(2)) if snippet_match else ""),
+            "provider": "so360",
+        })
+        if len(results) >= max_results:
+            break
+    return _dedupe_results(results, max_results)
+
+
 async def _get_text(client: httpx.AsyncClient, url: str, *, params: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
     response = await client.get(url, params=params)
     return response.status_code, response.text
@@ -190,6 +226,11 @@ async def _search_with_provider(client: httpx.AsyncClient, provider: str, query:
         if status >= 400:
             raise RuntimeError(f"HTTP {status}")
         return _extract_bing(text, max_results)
+    if provider == "so360":
+        status, text = await _get_text(client, SO360_ENDPOINT, params={"q": query})
+        if status >= 400:
+            raise RuntimeError(f"HTTP {status}")
+        return _extract_so360(text, max_results)
     return []
 
 
@@ -228,6 +269,62 @@ def _extract_main_text(content: str, max_chars: int) -> str:
     return stripped[:max_chars].strip()
 
 
+def _jina_reader_url(url: str) -> str:
+    return f"https://r.jina.ai/http://r.jina.ai/http://{url}"
+
+
+def _parse_jina_reader_text(content: str, max_chars: int) -> Dict[str, str]:
+    title = ""
+    source_url = ""
+    text = content
+    title_match = re.search(r"^Title:\s*(.+)$", content, re.MULTILINE)
+    source_match = re.search(r"^URL Source:\s*(.+)$", content, re.MULTILINE)
+    markdown_match = re.search(r"^Markdown Content:\s*([\s\S]*)$", content, re.MULTILINE)
+    if title_match:
+        title = title_match.group(1).strip()
+    if source_match:
+        source_url = source_match.group(1).strip()
+    if markdown_match:
+        text = markdown_match.group(1).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return {
+        "title": title,
+        "url": source_url,
+        "text": text[:max_chars].strip(),
+    }
+
+
+async def _web_fetch_via_jina(url: str, max_chars: int, reason: str) -> Dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(_jina_reader_url(url))
+            response.raise_for_status()
+        parsed = _parse_jina_reader_text(response.text, max_chars)
+        if not parsed.get("text"):
+            return {"success": False, "url": url, "error": reason or "网页抓取失败"}
+        return {
+            "success": True,
+            "url": parsed.get("url") or url,
+            "status": response.status_code,
+            "title": parsed.get("title", ""),
+            "description": "",
+            "contentType": response.headers.get("content-type", ""),
+            "text": parsed["text"],
+            "truncated": len(parsed["text"]) >= max_chars,
+            "provider": "jina-reader",
+        }
+    except Exception as exc:
+        logger.warning(f"Jina reader fetch failed for {url}: {exc}")
+        return {"success": False, "url": url, "error": reason or f"网页抓取失败: {exc}"}
+
+
 async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
     """Fetch a webpage and return readable text for synthesis."""
     normalized_url = url.strip()
@@ -259,12 +356,7 @@ async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
         text = raw_text if "text/plain" in content_type else _extract_main_text(raw_text, max_chars)
         text = _strip_tags(text)[:max_chars].strip()
         if not text:
-            return {
-                "success": False,
-                "url": str(response.url),
-                "status": response.status_code,
-                "error": "页面可访问，但没有提取到正文",
-            }
+            return await _web_fetch_via_jina(str(response.url), max_chars, "页面可访问，但没有提取到正文")
         return {
             "success": True,
             "url": str(response.url),
@@ -276,13 +368,13 @@ async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
             "truncated": len(text) >= max_chars,
         }
     except httpx.TimeoutException:
-        return {"success": False, "url": normalized_url, "error": "网页抓取超时"}
+        return await _web_fetch_via_jina(normalized_url, max_chars, "网页抓取超时")
     except httpx.HTTPError as exc:
         logger.warning(f"Web fetch HTTP error for {normalized_url}: {exc}")
-        return {"success": False, "url": normalized_url, "error": f"网页抓取失败: {exc}"}
+        return await _web_fetch_via_jina(normalized_url, max_chars, f"网页抓取失败: {exc}")
     except Exception as exc:
         logger.exception(f"Web fetch failed for {normalized_url}: {exc}")
-        return {"success": False, "url": normalized_url, "error": f"网页抓取失败: {exc}"}
+        return await _web_fetch_via_jina(normalized_url, max_chars, f"网页抓取失败: {exc}")
 
 
 async def web_search(query: str, max_results: int = 5, fetch_top_n: int = 0) -> Dict[str, Any]:
@@ -308,7 +400,11 @@ async def web_search(query: str, max_results: int = 5, fetch_top_n: int = 0) -> 
 
     max_results = max(1, min(max_results, 10))
     fetch_top_n = max(0, min(fetch_top_n, 3))
-    providers = ["duckduckgo-html", "duckduckgo-lite", "bing"]
+    providers = (
+        ["so360", "bing", "duckduckgo-html", "duckduckgo-lite"]
+        if _has_cjk(normalized_query)
+        else ["bing", "duckduckgo-html", "duckduckgo-lite", "so360"]
+    )
     provider_errors: Dict[str, str] = {}
     merged: List[Dict[str, str]] = []
 
