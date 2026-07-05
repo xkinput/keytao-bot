@@ -168,6 +168,22 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     raise ValueError("LLM did not return a JSON object")
 
 
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if text:
+                    parts.append(str(text))
+            elif item:
+                parts.append(str(item))
+        return "\n".join(parts).strip()
+    return str(content or "").strip()
+
+
 def _move_pairs(items: Sequence[ReviewItem]) -> set[Tuple[str, str]]:
     creates_by_word: Dict[str, List[ReviewItem]] = {}
     for item in items:
@@ -255,6 +271,71 @@ def _summary_from_item(item: Dict[str, Any], reasons: Sequence[str]) -> str:
     return (reasons[0] if reasons else "本喵已完成复审")[:180]
 
 
+def _fallback_review_from_llm_error(
+    items: Sequence[ReviewItem],
+    audit: Dict[str, Any],
+    local_review: Optional[Dict[str, Any]],
+    reason: str,
+) -> Dict[str, Any]:
+    move_pairs = _move_pairs(items)
+    audit_summary = _string(audit.get("summary"))
+    audit_issues = _list_of_strings(audit.get("issues"), limit=4)
+    raw_items: List[Dict[str, Any]] = []
+
+    for pr in items:
+        word = _string(pr.get("word"))
+        code = _string(pr.get("code")).lower()
+        action = _string(pr.get("action") or "Create") or "Create"
+        status = "attention"
+        title = "本喵建议人工复核"
+        reasons = [f"模型输出异常：{reason}"]
+        suggestions = ["请管理员按读音、编码、冲突和编码链顺序人工确认。"]
+
+        if audit_summary:
+            reasons.append(f"确定性审查：{audit_summary}")
+        if action == "Delete" and (word, code) not in move_pairs:
+            status = "manual_review"
+            title = "纯删除需要管理员确认"
+            suggestions.insert(0, "纯删除不能自动通过，请确认该词确实应删除。")
+        if pr.get("hasConflict") or (isinstance(pr.get("conflictInfo"), dict) and pr["conflictInfo"].get("hasConflict")):
+            status = "manual_review"
+            title = "冲突需要管理员确认"
+            conflict_reason = _string(pr.get("conflictReason") or pr.get("conflictInfo", {}).get("impact"))
+            if conflict_reason:
+                reasons.insert(0, conflict_reason)
+
+        raw_items.append({
+            "prId": pr.get("id"),
+            "status": status,
+            "title": title,
+            "reasons": reasons[:6],
+            "suggestions": suggestions[:6],
+            "sources": [],
+            "evidence": [
+                "本喵已调用模型复审，但模型没有返回可解析的完整 JSON。",
+                *audit_issues,
+            ][:8],
+            "source": "bot-llm-fallback",
+        })
+
+    return _normalize_llm_review({
+        "verdict": "manual_review" if any(item.get("status") == "manual_review" for item in raw_items) else "needs_attention",
+        "headline": "本喵模型输出异常，已保守标记为需复核。",
+        "suggestedReviewNote": (
+            "本喵模型输出异常，未能稳定生成完整 JSON；"
+            "已按确定性审查和本地冲突信息保守标记，请管理员人工确认。\n"
+            f"异常：{reason}"
+        ),
+        "checklist": [
+            "模型已被调用，但输出为空或 JSON 格式异常。",
+            "本次结果不自动通过，仅作为人工复核提示。",
+            "请重点核对读音、编码链、冲突和纯删除项。",
+        ],
+        "items": raw_items,
+        "codeChainRecommendations": [],
+    }, items, local_review)
+
+
 def _normalize_llm_review(
     raw: Dict[str, Any],
     items: Sequence[ReviewItem],
@@ -315,7 +396,7 @@ def _normalize_llm_review(
             "suggestions": list(dict.fromkeys(suggestions))[:6],
             "reviewRecord": {
                 "reviewedBy": "Miaomiao",
-                "source": "bot-llm",
+                "source": _string(raw_item.get("source")) or "bot-llm",
                 "summary": _summary_from_item(raw_item, reasons),
                 "pronunciation": pronunciation or None,
                 "sources": sources,
@@ -442,19 +523,49 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
         "localReview": local_review,
         "requiredJsonShape": schema_hint,
     }
-    response = await client.chat.completions.create(
-        model=config["model"],
-        temperature=min(config["temperature"], 0.3),
-        max_tokens=config["max_tokens"],
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": _compact_json(user_payload, max_chars=42000)},
-        ],
-    )
-    content = response.choices[0].message.content if response.choices else ""
-    if not content:
-        raise RuntimeError("喵喵 LLM 没有返回审查内容")
-    return _extract_json_object(content)
+    user_content = _compact_json(user_payload, max_chars=42000)
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, 3):
+        prompt = system_prompt
+        if attempt > 1:
+            prompt += (
+                "上一次响应为空或不是合法 JSON。现在必须重新生成一个完整 JSON 对象，"
+                "不要解释，不要省略字段，不要使用 Markdown 代码块。"
+            )
+        response = await client.chat.completions.create(
+            model=config["model"],
+            temperature=min(config["temperature"], 0.2),
+            max_tokens=config["max_tokens"],
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_content},
+            ],
+        )
+        choice = response.choices[0] if response.choices else None
+        finish_reason = _string(getattr(choice, "finish_reason", "")) if choice else "no_choices"
+        message = getattr(choice, "message", None) if choice else None
+        content = _message_content_to_text(getattr(message, "content", "") if message else "")
+        logger.info(
+            "KeyTao LLM batch review response "
+            f"attempt={attempt} finish_reason={finish_reason or 'unknown'} content_len={len(content)}"
+        )
+
+        if not content:
+            last_error = RuntimeError(f"喵喵 LLM 没有返回审查内容（finish_reason={finish_reason or 'unknown'}）")
+            continue
+
+        try:
+            return _extract_json_object(content)
+        except Exception as error:
+            preview = content[:600].replace("\n", "\\n")
+            logger.warning(
+                "KeyTao LLM batch review returned invalid JSON "
+                f"attempt={attempt}: {error}; preview={preview}"
+            )
+            last_error = error
+
+    raise RuntimeError(str(last_error or "喵喵 LLM 未返回可解析的审查 JSON"))
 
 
 async def review_keytao_batch_with_llm(
@@ -485,7 +596,13 @@ async def review_keytao_batch_with_llm(
         raw_review = await _call_llm(batch, items, audit, local_review, focus_pr_id)
     except Exception as error:
         logger.warning(f"KeyTao LLM batch review failed: {error}")
-        return {"success": False, "message": str(error)}
+        ai_review = _fallback_review_from_llm_error(items, audit, local_review, str(error))
+        return {
+            "success": True,
+            "aiReview": ai_review,
+            "reviewedAt": ai_review["generatedAt"],
+            "warning": str(error),
+        }
 
     ai_review = _normalize_llm_review(raw_review, items, local_review)
     return {
