@@ -1,6 +1,7 @@
 """LLM-backed KeyTao batch review helpers."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -79,6 +80,15 @@ def _llm_config() -> Dict[str, Any]:
         "timeout": _as_float(timeout_value, 180.0),
         "temperature": _as_float(temperature_value, 0.2),
     }
+
+
+def _deterministic_audit_timeout() -> float:
+    value = _config_value(
+        "keytao_batch_review_audit_timeout",
+        "KEYTAO_BATCH_REVIEW_AUDIT_TIMEOUT",
+        25,
+    )
+    return max(5.0, _as_float(value, 25.0))
 
 
 def _string(value: Any) -> str:
@@ -176,6 +186,41 @@ def _move_pairs(items: Sequence[ReviewItem]) -> set[Tuple[str, str]]:
                 pairs.add((word, code))
                 break
     return pairs
+
+
+def _fallback_audit_for_llm(items: Sequence[ReviewItem], reason: str) -> Dict[str, Any]:
+    move_pairs = _move_pairs(items)
+    issues: List[str] = []
+    approved_items: List[str] = []
+
+    for item in items:
+        action = _string(item.get("action") or "Create") or "Create"
+        word = _string(item.get("word"))
+        code = _string(item.get("code")).lower()
+        if not word or not code:
+            issues.append("存在词或编码为空的草稿条目")
+            continue
+        if action == "Delete" and (word, code) not in move_pairs:
+            issues.append(f"纯删除「{word}」@{code} 必须由管理员审核")
+            continue
+        approved_items.append(f"{action}：{word}@{code} 交由 LLM 结合语言常识、编码链和本地冲突继续复审")
+
+    return {
+        "success": True,
+        "verdict": "needs_admin",
+        "autoApprove": False,
+        "summary": "来源抓取超时，本喵已改用 LLM 继续复审",
+        "issues": issues or [reason],
+        "approvedItems": approved_items,
+        "commonKnownItems": [],
+        "reviewedWords": {},
+        "commonnessComparisons": [],
+        "deterministicAuditTimedOut": True,
+        "deterministicAuditReason": reason,
+        "sourcePolicy": {
+            "note": "本次管理员复查未等完网页来源抓取，LLM 仍需按读音、编码、冲突和编码链保守判断。",
+        },
+    }
 
 
 def _normalize_status(value: Any) -> str:
@@ -421,7 +466,21 @@ async def review_keytao_batch_with_llm(
     if not items:
         return {"success": False, "message": "批次没有可审查条目"}
 
-    audit = await audit_draft_items(_review_config(), items)
+    audit_timeout = _deterministic_audit_timeout()
+    try:
+        audit = await asyncio.wait_for(
+            audit_draft_items(_review_config(), items),
+            timeout=audit_timeout,
+        )
+    except asyncio.TimeoutError:
+        reason = f"确定性来源审查超过 {audit_timeout:.0f} 秒"
+        logger.warning(f"KeyTao deterministic batch audit timed out before LLM review: {reason}")
+        audit = _fallback_audit_for_llm(items, reason)
+    except Exception as error:
+        reason = f"确定性来源审查失败：{error}"
+        logger.warning(f"KeyTao deterministic batch audit failed before LLM review: {error}")
+        audit = _fallback_audit_for_llm(items, reason)
+
     try:
         raw_review = await _call_llm(batch, items, audit, local_review, focus_pr_id)
     except Exception as error:
