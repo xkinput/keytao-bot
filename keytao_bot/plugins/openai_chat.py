@@ -177,6 +177,21 @@ _LEADING_COMMAND_PREFIX_RE = re.compile(
 _PURE_CHINESE_WORDS_RE = re.compile(r'^[\u4e00-\u9fff]+(?:[\s、，,；;]+[\u4e00-\u9fff]+)*$')
 _PURE_CHINESE_TOKEN_RE = re.compile(r'^[\u4e00-\u9fff]{1,30}$')
 _CODE_TOKEN_RE = re.compile(r"^[a-z]{2,12}$", re.IGNORECASE)
+_REFERENCED_WORD_QUERY_HINTS = (
+    "这两个词",
+    "这俩词",
+    "这几个词",
+    "这些词",
+    "上面两个词",
+    "上面几个词",
+    "引用里",
+    "引用的",
+)
+_WORD_LIBRARY_QUERY_HINTS = (
+    "词库",
+    "收录",
+    "编码",
+)
 _DRAFT_SUBMIT_COMMANDS = {
     "提交",
     "提审",
@@ -1332,6 +1347,177 @@ async def _augment_simple_word_query_response(
     if not note_blocks:
         return response
     return response.rstrip() + "\n\n补充说明：\n" + "\n\n".join(note_blocks)
+
+
+def _is_referenced_word_presence_query(message_text: str) -> bool:
+    """Detect deictic quoted-message questions like "这两个词词库都有吗"."""
+    text = _strip_command_message_prefixes(message_text)
+    text = re.sub(r"\s+", "", text)
+    if not text:
+        return False
+    has_reference_hint = any(hint in text for hint in _REFERENCED_WORD_QUERY_HINTS)
+    has_library_hint = any(hint in text for hint in _WORD_LIBRARY_QUERY_HINTS)
+    return has_reference_hint and has_library_hint
+
+
+def _dedupe_words(words: List[str], limit: int) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for word in words:
+        token = str(word or "").strip()
+        if not token or not _PURE_CHINESE_TOKEN_RE.fullmatch(token):
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _split_reference_word_group(text: str) -> List[str]:
+    parts = re.split(r"[、,，/／和与及\s]+", text)
+    return [
+        part.strip()
+        for part in parts
+        if part.strip() and _PURE_CHINESE_TOKEN_RE.fullmatch(part.strip())
+    ]
+
+
+def _clean_reference_heading_line(line: str) -> str:
+    text = line.strip()
+    text = re.sub(r"^[\s#>*\-•·\d.、:：|]+", "", text)
+    text = re.sub(r"^[^\u4e00-\u9fff「」]+", "", text)
+    return text.strip()
+
+
+def _extract_referenced_word_targets(reference_text: str, expected_count: int = 2) -> List[str]:
+    """Extract the primary compared words from a quoted bot answer."""
+    limit = max(1, min(expected_count or 2, 8))
+    heading_words: List[str] = []
+
+    for raw_line in (reference_text or "").splitlines():
+        line = _clean_reference_heading_line(raw_line)
+        if not line or "|" in line:
+            continue
+
+        quoted_heading = re.fullmatch(r"「([\u4e00-\u9fff]{1,30})」", line)
+        plain_heading = re.fullmatch(r"([\u4e00-\u9fff]{1,30})", line)
+        if quoted_heading:
+            heading_words.extend(_split_reference_word_group(quoted_heading.group(1)))
+        elif plain_heading:
+            heading_words.append(plain_heading.group(1))
+
+    words = _dedupe_words(heading_words, limit)
+    if len(words) >= limit:
+        return words
+
+    comparison_words: List[str] = []
+    for match in re.finditer(r"([\u4e00-\u9fff]{1,12})\s*(?:≫|>|＞|更常用|优于|高于|大于)\s*([\u4e00-\u9fff]{1,12})", reference_text or ""):
+        comparison_words.extend([match.group(1), match.group(2)])
+
+    words = _dedupe_words(words + comparison_words, limit)
+    if len(words) >= limit:
+        return words
+
+    quoted_words: List[str] = []
+    for quoted in re.findall(r"「([^」]{1,40})」", reference_text or ""):
+        quoted_words.extend(_split_reference_word_group(quoted))
+    return _dedupe_words(words + quoted_words, limit)
+
+
+def _format_phrase_lookup_brief(phrase: Dict) -> str:
+    code = str(phrase.get("code") or "").strip()
+    type_label = str(phrase.get("type_label") or phrase.get("type") or "词条").strip()
+    weight = phrase.get("weight")
+    pieces = [code or "无编码", type_label]
+    if weight is not None:
+        pieces.append(f"权重 {weight}")
+
+    duplicate_info = phrase.get("duplicate_info")
+    if isinstance(duplicate_info, dict):
+        position_label = str(duplicate_info.get("position_label") or "").strip()
+        if position_label:
+            pieces.append(f"同码{position_label}")
+    return "（" + "，".join(pieces) + "）"
+
+
+def _format_referenced_word_presence_response(words: List[str], lookup_data: Dict) -> str:
+    results = {
+        str(item.get("word") or "").strip(): item
+        for item in lookup_data.get("results", [])
+        if isinstance(item, dict) and str(item.get("word") or "").strip()
+    }
+    lines = [f"查的是你引用那条消息里的：{'、'.join(f'「{word}」' for word in words)}。", ""]
+    all_found = True
+
+    for word in words:
+        phrases = results.get(word, {}).get("phrases", [])
+        if phrases:
+            briefs = "；".join(
+                _format_phrase_lookup_brief(phrase)
+                for phrase in phrases[:4]
+                if isinstance(phrase, dict)
+            )
+            lines.append(f"• 「{word}」：已收录 {briefs}")
+        else:
+            all_found = False
+            lines.append(f"• 「{word}」：当前词库未收录")
+
+    if all_found:
+        lines.append("")
+        lines.append("结论：这些词当前都在词库里。")
+    else:
+        lines.append("")
+        lines.append("结论：不是全部都在词库里，未收录的可以再让本喵按读音和编码候选走加词流程。")
+    return "\n".join(lines)
+
+
+async def _try_handle_referenced_word_presence_query(
+    message_text: str,
+    reply_reference: ReplyReferenceInfo,
+    platform: str,
+    user_id: str,
+) -> Optional[str]:
+    """Answer word-presence questions strictly from the quoted message text."""
+    if not _is_referenced_word_presence_query(message_text):
+        return None
+    if not reply_reference.is_reply:
+        return None
+    if not reply_reference.text:
+        return (
+            "本喵看见你是在回复一条消息，但平台没有把被引用的原文给到本喵。"
+            "可能是消息过期、权限不足，或适配器没返回引用内容。为了不乱猜，请直接把要查的两个词发出来。"
+        )
+
+    expected_count = 2 if re.search(r"(两个|俩)", message_text) else 6
+    words = _extract_referenced_word_targets(reply_reference.text, expected_count=expected_count)
+    if not words:
+        return (
+            "本喵拿到了被引用消息，但没能稳定识别出里面要查的词。"
+            "为了不把旧聊天记录里的词拿来误答，请直接发：词A 词B。"
+        )
+
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_words_batch",
+        {"words": words},
+        platform,
+        user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+
+    if not lookup_data.get("success"):
+        message = lookup_data.get("message") or lookup_data.get("error") or "词库查询暂时失败"
+        return (
+            f"本喵从引用消息里识别到：{'、'.join(f'「{word}」' for word in words)}，"
+            f"但查询词库时失败了：{message}。这次不会改用旧上下文，免得答错。"
+        )
+
+    return _format_referenced_word_presence_response(words, lookup_data)
 
 
 def _format_encode_char_split(chars: object) -> List[str]:
@@ -3565,6 +3751,17 @@ async def handle_ai_chat(bot: Bot, event: Event):
             other_pending_record.state,
             copied=False,
         )
+        remember_conversation(conv_key, memory_context, normalized_message_text, response)
+        await ai_chat.finish(response)
+        return
+
+    response = await _try_handle_referenced_word_presence_query(
+        normalized_message_text,
+        reply_reference,
+        platform,
+        user_id,
+    )
+    if response is not None:
         remember_conversation(conv_key, memory_context, normalized_message_text, response)
         await ai_chat.finish(response)
         return

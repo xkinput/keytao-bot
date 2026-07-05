@@ -87,6 +87,7 @@ from keytao_bot.plugins.openai_chat import (
     _build_existing_word_priority_note,
     _extract_prior_occupied_candidates,
     _extract_pure_chinese_words,
+    _extract_referenced_word_targets,
     _classify_message_command_intent,
     _get_simple_word_query_words,
     _display_name_from_qq_sender,
@@ -117,6 +118,7 @@ from keytao_bot.plugins.openai_chat import (
     _strip_markdown,
     _to_markdownv2,
     _try_handle_draft_management_command,
+    _try_handle_referenced_word_presence_query,
     _try_handle_simple_single_word_query,
     _try_handle_replace_char,
     _try_handle_operation_recall,
@@ -1773,6 +1775,118 @@ def test_augment_simple_word_query_response_handles_multiple_words():
         check("multiple word result keeps order", result.index("寿司郎 的编码位置说明：") < result.index("卧龙凤雏 的编码位置说明："))
         check("first word comparison included", "常用度对比：" in result)
         check("second word duplicate order included", "卧龙凤雏 排在二重" in result)
+
+    asyncio.run(_run())
+
+
+def test_referenced_word_presence_query_extracts_quoted_words():
+    """Verify quoted comparison text yields the words the user is pointing at."""
+    print("\n🧪 referenced word presence query extracts quoted words")
+
+    quoted_text = """
+🔗 直连
+
+直接连接（direct connection）。日常技术场景里的高频词。
+
+🔗 直链
+
+有两种含义，但使用场景都比「直连」窄。
+
+📊 结论：直连 ≫ 直链
+"""
+    words = _extract_referenced_word_targets(quoted_text, expected_count=2)
+
+    check("extracts first quoted heading word", words[:1] == ["直连"])
+    check("extracts second quoted heading word", words == ["直连", "直链"])
+
+
+def test_referenced_word_presence_query_uses_referenced_message_not_history():
+    """Verify "这两个词词库都有吗" queries the quoted message, not stale user history."""
+    print("\n🧪 referenced word presence query uses referenced message")
+
+    async def _run():
+        tool_calls = []
+        quoted_text = """
+@条子啊 搜索暂时罢工了，不过凭语言常识可以给你分析清楚：
+
+🔗 直连
+
+直接连接（direct connection）。日常技术场景里的高频词。
+
+🔗 直链
+
+有两种含义，但使用场景都比「直连」窄。
+
+📊 结论：直连 ≫ 直链
+"""
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_lookup_by_words_batch":
+                return json.dumps({
+                    "success": True,
+                    "results": [
+                        {
+                            "word": "直连",
+                            "phrases": [{
+                                "word": "直连",
+                                "code": "vglm",
+                                "weight": 100,
+                                "type_label": "词组",
+                            }],
+                        },
+                        {
+                            "word": "直链",
+                            "phrases": [{
+                                "word": "直链",
+                                "code": "vglj",
+                                "weight": 100,
+                                "type_label": "词组",
+                            }],
+                        },
+                    ],
+                }, ensure_ascii=False)
+            raise AssertionError(tool_name)
+
+        reply_reference = ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=True,
+            sender_id="bot",
+            sender_name="喵喵",
+            text=quoted_text,
+        )
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _try_handle_referenced_word_presence_query(
+                "@喵喵 这两个词现在词库都有吗",
+                reply_reference,
+                "qq",
+                "123",
+            )
+
+        called_words = tool_calls[0][1].get("words") if tool_calls else []
+        serialized_calls = json.dumps(tool_calls, ensure_ascii=False)
+        check("lookup uses words from quoted message", called_words == ["直连", "直链"])
+        check("lookup does not use stale history words", "质保金" not in serialized_calls and "直播间" not in serialized_calls)
+        check("response mentions 直连", result is not None and "「直连」：已收录" in result)
+        check("response mentions 直链", result is not None and "「直链」：已收录" in result)
+
+    asyncio.run(_run())
+
+
+def test_referenced_word_presence_query_explains_missing_quote_text():
+    """Verify missing quoted text is explained instead of falling back to stale context."""
+    print("\n🧪 referenced word presence query missing quote text")
+
+    async def _run():
+        result = await _try_handle_referenced_word_presence_query(
+            "这两个词现在词库都有吗",
+            ReplyReferenceInfo(is_reply=True, is_to_bot=True),
+            "qq",
+            "123",
+        )
+
+        check("missing quote text explained", result is not None and "没有把被引用的原文" in result)
+        check("asks user to send words directly", result is not None and "直接把要查的两个词发出来" in result)
 
     asyncio.run(_run())
 
@@ -3905,6 +4019,9 @@ if __name__ == "__main__":
     test_augment_simple_word_query_response_appends_priority_note()
     test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority()
     test_augment_simple_word_query_response_handles_multiple_words()
+    test_referenced_word_presence_query_extracts_quoted_words()
+    test_referenced_word_presence_query_uses_referenced_message_not_history()
+    test_referenced_word_presence_query_explains_missing_quote_text()
     test_augment_simple_word_query_response_skips_confirm_and_draft_reply()
     test_augment_simple_word_query_response_skips_draft_action_message()
     test_pending_add_word_numeric_choice()
