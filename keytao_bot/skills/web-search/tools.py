@@ -7,6 +7,7 @@ from __future__ import annotations
 import html
 import re
 from typing import Any, Dict, List, Optional, Tuple
+import base64
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
@@ -46,6 +47,18 @@ def _normalize_result_url(raw_url: str) -> str:
         uddg = query.get("uddg")
         if uddg:
             return unquote(uddg[0])
+
+    if parsed.netloc.endswith("bing.com") and parsed.path.startswith("/ck/"):
+        query = parse_qs(parsed.query)
+        encoded_target = (query.get("u") or [""])[0]
+        if encoded_target.startswith("a1"):
+            try:
+                padded = encoded_target[2:] + "=" * (-len(encoded_target[2:]) % 4)
+                target = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8", "ignore")
+                if target:
+                    return target
+            except Exception:
+                pass
 
     return decoded
 
@@ -134,20 +147,20 @@ def _extract_duckduckgo_lite(content: str, max_results: int) -> List[Dict[str, s
 
 
 def _extract_bing(content: str, max_results: int) -> List[Dict[str, str]]:
-    blocks = re.findall(
-        r'<li[^>]+class="b_algo"[^>]*>(.*?)</li>',
+    matches = list(re.finditer(
+        r"<h2[^>]*>.*?<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?</h2>",
         content,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+        re.IGNORECASE | re.DOTALL,
+    ))
     results: List[Dict[str, str]] = []
-    for block in blocks[:max_results * 2]:
-        link_match = re.search(r"<h2[^>]*>.*?<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?</h2>", block, re.IGNORECASE | re.DOTALL)
-        if not link_match:
-            continue
-        snippet_match = re.search(r"<p[^>]*>(.*?)</p>", block, re.IGNORECASE | re.DOTALL)
+    for index, match in enumerate(matches[:max_results * 3]):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else min(len(content), start + 2600)
+        nearby_html = content[start:end]
+        snippet_match = re.search(r"<p[^>]*>(.*?)</p>", nearby_html, re.IGNORECASE | re.DOTALL)
         results.append({
-            "title": _strip_tags(link_match.group(2)),
-            "url": _normalize_result_url(link_match.group(1)),
+            "title": _strip_tags(match.group(2)),
+            "url": _normalize_result_url(match.group(1)),
             "snippet": _strip_tags(snippet_match.group(1) if snippet_match else ""),
             "provider": "bing",
         })
