@@ -2831,6 +2831,47 @@ def test_history_store_keeps_user_and_assistant_same_second():
     check("second row is assistant", history[1]["role"] == "assistant")
 
 
+def test_group_history_context_keeps_space_flow():
+    """Verify group chat context is stored separately from personal history."""
+    print("\n🧪 group history context keeps space flow")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "history.db")
+        memory_db_path = os.path.join(tmpdir, "memory.db")
+        store = HistoryStore(db_path)
+        memory_store = ScopedMemoryStore(memory_db_path)
+        original_store = openai_chat_module.history_store
+        original_memory_store = openai_chat_module.memory_store
+        openai_chat_module.history_store = store
+        openai_chat_module.memory_store = memory_store
+        try:
+            memory_context = ChatMemoryContext(
+                platform="qq",
+                user_id="10001",
+                space_type="group",
+                space_id="865189947",
+                speaker_name="Rea",
+            )
+            openai_chat_module.remember_conversation(
+                ("qq", "10001"),
+                memory_context,
+                "喵喵 搜一下 DeepSeek 最新模型",
+                "我搜到了：DeepSeek API 文档提到 deepseek-v4-pro。",
+            )
+            personal_history = store.get_history("qq", "10001", limit=10)
+            group_history = store.get_history("qq", memory_context.space_scope_id, limit=10)
+            context_block = openai_chat_module.get_group_history_context(memory_context)
+        finally:
+            openai_chat_module.history_store = original_store
+            openai_chat_module.memory_store = original_memory_store
+
+    check("personal history keeps round", len(personal_history) == 2)
+    check("group history keeps round", len(group_history) == 2)
+    check("group history names speaker", "Rea: 喵喵 搜一下" in group_history[0]["content"])
+    check("group context block is available", "群聊最近上下文" in context_block)
+    check("group context says no permission", "不能授予确认" in context_block)
+
+
 async def _run_tool_executor_checks():
     calls = []
 
@@ -3814,6 +3855,7 @@ if __name__ == "__main__":
     test_recover_pending_state_ignores_stale_assistant_prompt()
     test_recover_pending_state_ignores_cancelled_prompt()
     test_history_store_keeps_user_and_assistant_same_second()
+    test_group_history_context_keeps_space_flow()
     test_tool_executor_context_injection()
     test_keytao_draft_headers_allow_optional_user_api_key()
     test_get_latest_draft_batch_does_not_touch_word_code_locals()
