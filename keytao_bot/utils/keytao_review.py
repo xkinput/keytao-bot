@@ -1166,9 +1166,18 @@ def _looks_like_entity_text(word: str, text: str, entity: Dict[str, Any]) -> boo
 def _entity_direct_source_urls(word: str, entity: Dict[str, Any]) -> List[Tuple[str, str]]:
     urls: List[Tuple[str, str]] = []
     seen = set()
-    for term in _entity_query_terms(word, entity)[:6]:
+    terms = _list_of_short_strings([
+        *(entity.get("canonicalNames") or []),
+        *(entity.get("aliases") or []),
+        word,
+    ], limit=6)
+    sources = list(AUTHORITATIVE_SOURCES)
+    entity_type = str(entity.get("entityType") or "unclear")
+    if entity_type not in {"common_word", "idiom", "technical_term"}:
+        sources.sort(key=lambda source: 0 if source.get("category") == "encyclopedia" else 1)
+    for term in terms:
         encoded = quote(term)
-        for source in AUTHORITATIVE_SOURCES:
+        for source in sources:
             if source.get("category") not in {"dictionary", "encyclopedia"}:
                 continue
             for template in source.get("direct_urls", []):
@@ -1177,25 +1186,42 @@ def _entity_direct_source_urls(word: str, entity: Dict[str, Any]) -> List[Tuple[
                     continue
                 seen.add(url)
                 urls.append((str(source.get("label") or ""), url))
-    return urls[:14]
+    return urls[:10]
 
 
 async def _fetch_entity_direct_hits(word: str, entity: Dict[str, Any]) -> List[Dict[str, str]]:
-    hits: List[Dict[str, str]] = []
-    for label, url in _entity_direct_source_urls(word, entity):
+    async def inspect_url(label: str, url: str) -> Optional[Dict[str, str]]:
         text = await _fetch_text(url)
         if not text:
-            continue
+            return None
         if not _looks_like_entity_text(word, text[:16000], entity):
-            continue
-        hits.append({
+            return None
+        return {
             "title": label or url,
             "url": url,
             "snippet": text[:240],
             "provider": "direct-source",
-        })
-        if len(hits) >= 3:
-            break
+        }
+
+    hits: List[Dict[str, str]] = []
+    tasks = [
+        asyncio.create_task(inspect_url(label, url))
+        for label, url in _entity_direct_source_urls(word, entity)
+    ]
+    if not tasks:
+        return hits
+    try:
+        for task in asyncio.as_completed(tasks):
+            hit = await task
+            if not hit:
+                continue
+            hits.append(hit)
+            if len(hits) >= 3:
+                break
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
     return hits
 
 
