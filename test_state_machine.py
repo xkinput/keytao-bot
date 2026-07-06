@@ -99,6 +99,7 @@ from keytao_bot.plugins.openai_chat import (
     _handle_referenced_pending_from_other_user,
     _ensure_pending_add_word_guidance,
     _is_pending_tool_confirm_message,
+    _is_contextual_reply_to_current_user_history,
     _is_sensitive_pending_control_intent,
     _keep_only_command_from_intent,
     _parse_pending_batch_add,
@@ -634,6 +635,59 @@ def test_unquoted_draft_submit_bypasses_other_owner_pending_guard():
             submit_intent,
             confirm_intent,
             "确认提交",
+        ),
+    )
+
+
+def test_contextual_short_reply_bypasses_other_owner_pending_guard():
+    """Short replies to the sender's own latest bot question must not target another user."""
+    print("\n🧪 contextual short reply bypasses other-owner pending guard")
+
+    other_record = PendingStateRecord(
+        state=PendingAddWord(
+            word="秦琼",
+            recommended_code="qbqyv",
+            candidates=[("qbqyv", False)],
+        ),
+        owner_key=("qq", "1001"),
+        space_key=("qq", "qq:group:42"),
+        owner_label="Rea",
+    )
+    history = [
+        {"role": "user", "content": "喵喵 瑶光 摇光那个是正确的"},
+        {
+            "role": "assistant",
+            "content": "要这样加吗？摇光→yzgm，瑶光→yzgmv？",
+        },
+    ]
+    cancel_intent = MessageCommandIntent(intent="pending_cancel", confidence=0.96)
+
+    check(
+        "decline is contextual to current user history",
+        _is_contextual_reply_to_current_user_history("不用", history),
+    )
+    check(
+        "contextual decline does not block as other owner pending",
+        not _should_block_for_other_owner_pending(
+            "group",
+            False,
+            other_record,
+            MessageCommandIntent(intent="none", confidence=0.96),
+            cancel_intent,
+            "不用",
+            current_contextual_reply=True,
+        ),
+    )
+    check(
+        "same decline still blocks without current-user context",
+        _should_block_for_other_owner_pending(
+            "group",
+            False,
+            other_record,
+            MessageCommandIntent(intent="none", confidence=0.96),
+            cancel_intent,
+            "不用",
+            current_contextual_reply=False,
         ),
     )
 
@@ -3989,6 +4043,7 @@ if __name__ == "__main__":
     test_referenced_other_owner_cancel_does_not_copy()
     test_referenced_other_owner_submit_does_not_copy()
     test_unquoted_draft_submit_bypasses_other_owner_pending_guard()
+    test_contextual_short_reply_bypasses_other_owner_pending_guard()
     test_referenced_pending_prefers_current_user_history()
     test_referenced_pending_scans_current_user_history()
     test_referenced_pending_uses_bot_mention_as_owner()

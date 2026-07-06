@@ -308,11 +308,13 @@ def _should_block_for_other_owner_pending(
     generic_command_intent: MessageCommandIntent,
     other_pending_command_intent: MessageCommandIntent,
     message_text: str = "",
+    current_contextual_reply: bool = False,
 ) -> bool:
     return (
         space_type == "group"
         and other_pending_record is not None
         and not has_current_pending
+        and not current_contextual_reply
         and not _is_fresh_current_user_command_intent(generic_command_intent, message_text)
         and _is_sensitive_pending_control_intent(other_pending_command_intent)
     )
@@ -831,6 +833,135 @@ def _parse_pending_state_from_response(response: str) -> PendingState:
         return PendingToolConfirm(function_name="keytao_submit_batch", args={})
 
     return None
+
+
+_CONTEXTUAL_SHORT_REPLIES = {
+    "不用",
+    "不用了",
+    "不要",
+    "不要了",
+    "不需要",
+    "不需要了",
+    "先不用",
+    "先不用了",
+    "暂时不用",
+    "暂时不用了",
+    "算了",
+    "不了",
+    "不",
+    "不加",
+    "不加了",
+    "不改",
+    "不改了",
+    "不用加",
+    "不用加了",
+    "不用改",
+    "不用改了",
+    "取消",
+    "撤销",
+    "要",
+    "要的",
+    "要加",
+    "加",
+    "加吧",
+    "好",
+    "好的",
+    "好呀",
+    "好啊",
+    "行",
+    "可以",
+    "可以的",
+    "可",
+    "嗯",
+    "嗯嗯",
+    "是",
+    "是的",
+    "对",
+    "对的",
+    "确认",
+    "同意",
+    "就这样",
+    "按这个",
+    "这样",
+    "这样加",
+    "这么加",
+    "都加",
+    "选这个",
+}
+_CONTEXTUAL_REPLY_SUFFIXES = ("一下", "吧", "啦", "了", "哦", "喔", "呀", "呢", "哈", "嘛")
+_CONTEXTUAL_ASSISTANT_REPLY_HINTS = (
+    "?",
+    "？",
+    "要这样",
+    "要不要",
+    "是否",
+    "还是",
+    "需要",
+    "可以",
+    "要加",
+    "要改",
+    "要哪个",
+    "选哪个",
+    "回复",
+    "确认",
+    "同意",
+    "要我",
+)
+
+
+def _normalize_contextual_short_reply(message_text: str) -> str:
+    """Normalize a short conversational reply without changing its meaning."""
+    text = _strip_command_message_prefixes(message_text)
+    text = re.sub(r"[\s，,。.!！?？~～…、;；:：\"'“”‘’（）()【】\[\]<>《》]+", "", text)
+    return text.strip()
+
+
+def _is_contextual_short_reply(message_text: str) -> bool:
+    """Detect short replies that depend on the current user's own latest context."""
+    text = _normalize_contextual_short_reply(message_text)
+    if not text:
+        return False
+    if text in _CONTEXTUAL_SHORT_REPLIES:
+        return True
+    if re.fullmatch(r"\d{1,2}", text):
+        return True
+    if re.fullmatch(r"第?[一二三四五六七八九十两]+个?", text):
+        return True
+
+    canonical = text
+    changed = True
+    while changed:
+        changed = False
+        for suffix in _CONTEXTUAL_REPLY_SUFFIXES:
+            if canonical.endswith(suffix) and len(canonical) > len(suffix):
+                canonical = canonical[:-len(suffix)]
+                changed = True
+                break
+    return canonical in _CONTEXTUAL_SHORT_REPLIES
+
+
+def _latest_assistant_message_invites_contextual_reply(history: Optional[List[Dict]]) -> bool:
+    """Return true when the latest assistant turn is an open conversational prompt."""
+    assistant_message = _get_latest_assistant_message(history)
+    if not assistant_message:
+        return False
+    if _parse_pending_state_from_response(assistant_message) is not None:
+        return False
+    compact = re.sub(r"\s+", "", assistant_message)
+    if not compact:
+        return False
+    return any(hint in compact for hint in _CONTEXTUAL_ASSISTANT_REPLY_HINTS)
+
+
+def _is_contextual_reply_to_current_user_history(
+    message_text: str,
+    history: Optional[List[Dict]],
+) -> bool:
+    """Protect the sender's own short replies from another user's pending state."""
+    return (
+        _is_contextual_short_reply(message_text)
+        and _latest_assistant_message_invites_contextual_reply(history)
+    )
 
 
 def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> PendingState:
@@ -3733,11 +3864,26 @@ async def handle_ai_chat(bot: Bot, event: Event):
             )
 
     other_pending_record = conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
-    other_pending_command_intent = (
-        await command_intent_for(other_pending_record.state)
-        if other_pending_record is not None and not generic_intent_is_fresh_command
-        else generic_command_intent
-    )
+    current_contextual_reply = False
+    if (
+        memory_context.space_type == "group"
+        and other_pending_record is not None
+        and not conversation_state_store.contains(conv_key)
+        and not generic_intent_is_fresh_command
+    ):
+        if history is None:
+            history = get_history(conv_key)
+        current_contextual_reply = _is_contextual_reply_to_current_user_history(
+            normalized_message_text,
+            history,
+        )
+    other_pending_command_intent = generic_command_intent
+    if (
+        other_pending_record is not None
+        and not generic_intent_is_fresh_command
+        and not current_contextual_reply
+    ):
+        other_pending_command_intent = await command_intent_for(other_pending_record.state)
     if _should_block_for_other_owner_pending(
         memory_context.space_type,
         conversation_state_store.contains(conv_key),
@@ -3745,6 +3891,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
         generic_command_intent,
         other_pending_command_intent,
         normalized_message_text,
+        current_contextual_reply,
     ):
         response = _format_other_owner_pending_message(
             _pending_owner_label(other_pending_record),
