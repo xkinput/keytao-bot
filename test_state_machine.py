@@ -93,6 +93,7 @@ from keytao_bot.plugins.openai_chat import (
     _display_name_from_qq_sender,
     _build_qq_reply_message,
     _is_fresh_current_user_command_intent,
+    _is_prefixed_fresh_word_query,
     _ensure_current_pending_matches_reference,
     _ensure_current_pending_from_referenced_owner,
     _handle_pending_add_word,
@@ -2677,6 +2678,36 @@ def test_pending_reply_prefix_stripping():
     check("prefixed text is left for semantic intent", _strip_command_message_prefixes("喵喵 是") == "是")
 
 
+def test_prefixed_word_lookup_bypasses_pending_state():
+    """Verify prefixed bare words are treated as fresh lookups, not stale pending confirms."""
+    print("\n🧪 prefixed word lookup bypasses pending state")
+
+    check(
+        "prefixed word is fresh lookup",
+        _is_prefixed_fresh_word_query("喵喵 敬德", _strip_command_message_prefixes("喵喵 敬德")),
+    )
+    check(
+        "prefixed brand is fresh lookup",
+        _is_prefixed_fresh_word_query("键道 百岁山", _strip_command_message_prefixes("键道 百岁山")),
+    )
+    check(
+        "prefixed mention word is fresh lookup",
+        _is_prefixed_fresh_word_query("@喵喵 敬德", _strip_command_message_prefixes("@喵喵 敬德")),
+    )
+    check(
+        "unprefixed word is not forced fresh",
+        not _is_prefixed_fresh_word_query("敬德", _strip_command_message_prefixes("敬德")),
+    )
+    check(
+        "prefixed confirm stays pending control",
+        not _is_prefixed_fresh_word_query("喵喵 确认", _strip_command_message_prefixes("喵喵 确认")),
+    )
+    check(
+        "prefixed add-submit stays pending control",
+        not _is_prefixed_fresh_word_query("喵喵 加入并提交", _strip_command_message_prefixes("喵喵 加入并提交")),
+    )
+
+
 def test_sensitive_pending_control_intents():
     print("\n🧪 sensitive pending control intents")
 
@@ -4538,6 +4569,7 @@ if __name__ == "__main__":
     test_fresh_current_user_command_detection()
     test_local_draft_submit_intent_detection()
     test_pending_reply_prefix_stripping()
+    test_prefixed_word_lookup_bypasses_pending_state()
     test_sensitive_pending_control_intents()
     test_memory_conversation_state_store()
     test_memory_conversation_state_store_owner_scope()

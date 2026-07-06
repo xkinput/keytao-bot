@@ -203,6 +203,29 @@ _DRAFT_SUBMIT_COMMANDS = {
     "提交这个草稿",
     "发起审核",
 }
+_PENDING_CONTROL_TEXTS = {
+    "确认",
+    "确定",
+    "好的",
+    "好",
+    "是",
+    "对",
+    "可以",
+    "行",
+    "加",
+    "加入",
+    "添加",
+    "都加",
+    "全部加",
+    "提交",
+    "加入并提交",
+    "加并提交",
+    "取消",
+    "不用",
+    "不要",
+    "不了",
+    "算了",
+}
 
 WORD_QUERY_INTENT_MODEL = (
     getattr(config, "word_query_intent_model", None)
@@ -299,6 +322,22 @@ def _is_fresh_current_user_command_intent(
         "operation_recall",
         "batch_replace_char",
     }
+
+
+def _is_prefixed_fresh_word_query(message_text: str, normalized_message_text: str) -> bool:
+    raw = message_text.strip()
+    normalized = normalized_message_text.strip()
+    if not raw or not normalized or raw == normalized:
+        return False
+    words = _extract_pure_chinese_words(normalized)
+    if not words:
+        return False
+    compact = "".join(words)
+    if normalized in _PENDING_CONTROL_TEXTS or compact in _PENDING_CONTROL_TEXTS:
+        return False
+    if normalized in _DRAFT_SUBMIT_COMMANDS or compact in _DRAFT_SUBMIT_COMMANDS:
+        return False
+    return True
 
 
 def _should_block_for_other_owner_pending(
@@ -3801,6 +3840,10 @@ async def handle_ai_chat(bot: Bot, event: Event):
         await ai_chat.finish("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
         return
     normalized_message_text = _strip_command_message_prefixes(message_text) or message_text
+    message_is_prefixed_fresh_word_query = _is_prefixed_fresh_word_query(
+        message_text,
+        normalized_message_text,
+    )
 
     platform, user_id = extract_platform_info(bot, event)
     conv_key = (platform, user_id)
@@ -3834,7 +3877,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
     generic_intent_is_fresh_command = _is_fresh_current_user_command_intent(
         generic_command_intent,
         normalized_message_text,
-    )
+    ) or message_is_prefixed_fresh_word_query
 
     referenced_pending = (
         _parse_pending_state_from_response(reply_reference.text)
