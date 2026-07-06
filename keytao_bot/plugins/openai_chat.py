@@ -1788,7 +1788,7 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
         if audit.get("llmFallback"):
             reason = summary or "已按提交时的 LLM 复审路径预判可通过"
         elif audit.get("commonKnownItems"):
-            reason = summary or "常见词/品牌/熟语信号和编码候选链一致"
+            reason = summary or "常见词/实体常识、搜索核验和编码候选链一致"
         else:
             reason = summary or "权威来源、编码和常用度证据一致"
         return (
@@ -1862,7 +1862,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         lines.append(pre_submit_preview)
     else:
         lines.append(
-            "提交后本喵会结合权威来源、常见词/品牌常识、搜索/词典/百科信号和编码候选链复审；"
+            "提交后本喵会结合权威来源、LLM 基础常识、常见词/明星/品牌/角色/作品/地名等实体信号、搜索/词典/百科信号和编码候选链复审；"
             "证据或常识信号足够可自动通过，证据不足、纯删除或歧义修改会等待管理员。"
         )
     return "\n".join(lines).strip()
@@ -2895,7 +2895,7 @@ def _format_auto_approved_review_line(auto_review: Optional[Dict]) -> str:
                 return f"✅ 本喵已完成自动复审：{summary}，批次已加入词库。"
             return "✅ 本喵已结合语言常识完成自动复审，批次已加入词库。"
         if auto_review.get("commonKnownItems"):
-            return "✅ 本喵已按常见词/品牌/熟语信号和编码候选链完成自动审词，批次已加入词库。"
+            return "✅ 本喵已按常见词/实体常识、搜索核验和编码候选链完成自动审词，批次已加入词库。"
         if summary and summary != "证据一致，允许本喵自动通过":
             return f"✅ 本喵已完成自动审词：{summary}，批次已加入词库。"
     return "✅ 本喵已完成自动审词，权威来源/编码/常用度证据一致，批次已加入词库。"

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import math
+import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -11,7 +13,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
+from nonebot import get_driver
 from nonebot.log import logger
+
+try:
+    from openai import AsyncOpenAI
+except Exception:  # pragma: no cover - optional dependency guard
+    AsyncOpenAI = None  # type: ignore
 
 from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code
 
@@ -47,6 +55,46 @@ COMMONNESS_SEARCH_QUERIES = [
     ('"{word}" 词典 OR 辞典', "dictionary"),
     ('"{word}" 百度百科 OR 维基百科', "encyclopedia"),
 ]
+PERSON_ALIAS_SEARCH_QUERIES = [
+    '"{word}" "字"',
+    '"{word}" "号"',
+    '"{word}" "别名"',
+    '"{word}" "又名"',
+    '"{word}" "名将"',
+    '"{word}" "历史人物"',
+]
+PERSON_ALIAS_HINTS = (
+    "字",
+    "号",
+    "别名",
+    "又名",
+    "又称",
+    "人称",
+    "名将",
+    "历史人物",
+    "人物",
+    "传",
+    "门神",
+    "隋末",
+    "唐初",
+)
+ENTITY_TYPE_HINTS = {
+    "common_word": ("词典", "现代汉语", "意思", "读音"),
+    "idiom": ("成语", "典故", "出处", "读音"),
+    "person": ("人物", "简介", "百度百科", "维基百科"),
+    "celebrity": ("明星", "演员", "歌手", "艺人", "百度百科"),
+    "historical_person": ("历史人物", "名将", "传", "百度百科"),
+    "courtesy_name": ("字", "号", "别名", "历史人物", "名将"),
+    "stage_name": ("艺名", "原名", "明星", "歌手", "演员"),
+    "fictional_character": ("角色", "人物", "作品", "动漫", "游戏"),
+    "brand": ("品牌", "官网", "公司", "百科"),
+    "product": ("产品", "品牌", "官网", "百科"),
+    "place": ("地名", "城市", "景点", "行政区", "百科"),
+    "organization": ("机构", "公司", "组织", "官网", "百科"),
+    "work": ("作品", "电影", "电视剧", "小说", "歌曲", "百科"),
+    "technical_term": ("术语", "百科", "定义", "读音"),
+}
+ENTITY_ACCEPTED_TYPES = set(ENTITY_TYPE_HINTS)
 COMMON_KNOWN_MIN_SCORE = 0.55
 COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
 COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
@@ -131,6 +179,60 @@ _CJK_WORD_RE = re.compile(r"^[\u3400-\u9fff]+$")
 class ReviewHttpConfig:
     api_base: str
     bot_token: str
+
+
+def _config_value(name: str, env_name: str, default: Any = None) -> Any:
+    try:
+        value = getattr(get_driver().config, name, None)
+        if value not in (None, ""):
+            return value
+    except Exception:
+        pass
+    return os.getenv(env_name, default)
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _load_json_object_from_model_text(content: str) -> Dict[str, Any]:
+    text = (content or "").strip()
+    if not text:
+        return {}
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+    try:
+        value = json.loads(text)
+    except Exception:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            value = json.loads(match.group(0))
+        except Exception:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _review_llm_config() -> Dict[str, Any]:
+    timeout_value = (
+        _config_value("openai_timeout", "OPENAI_TIMEOUT", None)
+        or _config_value("gemini_timeout", "GEMINI_TIMEOUT", None)
+        or _config_value("ark_timeout", "ARK_TIMEOUT", None)
+        or 20
+    )
+    return {
+        "api_key": str(_config_value("openai_api_key", "OPENAI_API_KEY", "") or ""),
+        "base_url": str(_config_value("openai_base_url", "OPENAI_BASE_URL", "https://api.deepseek.com") or ""),
+        "model": str(
+            _config_value("keytao_review_model", "KEYTAO_REVIEW_MODEL", "")
+            or _config_value("openai_model", "OPENAI_MODEL", "deepseek-chat")
+        ),
+        "timeout": min(_as_float(timeout_value, 20.0), 30.0),
+    }
 
 
 def normalize_pinyin_syllable(value: str) -> str:
@@ -702,6 +804,10 @@ def _is_common_known_word(word: str, commonness: Dict) -> bool:
         return False
     if not commonness.get("success"):
         return False
+    if (commonness.get("entityKnowledge") or {}).get("accepted"):
+        return True
+    if (commonness.get("personAlias") or {}).get("accepted"):
+        return True
 
     signals = commonness.get("signals") or {}
     score = float(commonness.get("score") or 0.0)
@@ -724,6 +830,24 @@ def _is_common_known_word(word: str, commonness: Dict) -> bool:
             and has_language_signal
         )
     )
+
+
+def _common_known_review_type(commonness: Dict) -> str:
+    entity = commonness.get("entityKnowledge") or {}
+    if entity.get("accepted"):
+        return str(entity.get("entityType") or "entity_knowledge")
+    if (commonness.get("personAlias") or {}).get("accepted"):
+        return "courtesy_name"
+    return "common_known_word"
+
+
+def _common_known_review_label(commonness: Dict) -> str:
+    entity = commonness.get("entityKnowledge") or {}
+    if entity.get("accepted"):
+        return str(entity.get("label") or _entity_type_label(str(entity.get("entityType") or "")))
+    if (commonness.get("personAlias") or {}).get("accepted"):
+        return "名人字号/别名"
+    return "常见词/熟语"
 
 
 def can_llm_override_audit_issues(audit: Dict) -> bool:
@@ -826,6 +950,296 @@ def _count_word_mentions(word: str, result: Dict[str, str]) -> int:
     return text.count(word)
 
 
+def _list_of_short_strings(value: Any, *, limit: int = 8, max_len: int = 60) -> List[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    result: List[str] = []
+    seen = set()
+    for item in value:
+        text = str(item or "").strip()
+        if not text or len(text) > max_len or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _normalize_entity_knowledge(word: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    entity_type = str(payload.get("entityType") or payload.get("type") or "unclear").strip()
+    confidence = 0.0
+    try:
+        confidence = float(payload.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    recognized = bool(payload.get("recognized")) and entity_type in ENTITY_ACCEPTED_TYPES and confidence >= 0.50
+    return {
+        "recognized": recognized,
+        "word": word,
+        "entityType": entity_type if entity_type in ENTITY_ACCEPTED_TYPES else "unclear",
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "canonicalNames": _list_of_short_strings(payload.get("canonicalNames"), limit=6),
+        "aliases": _list_of_short_strings(payload.get("aliases"), limit=8),
+        "description": str(payload.get("description") or "").strip()[:160],
+        "pinyin": str(payload.get("pinyin") or "").strip()[:80],
+        "searchQueries": _list_of_short_strings(payload.get("searchQueries"), limit=10, max_len=90),
+        "reviewHint": str(payload.get("reviewHint") or "").strip()[:180],
+    }
+
+
+async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
+    word = word.strip()
+    if not word or not _CJK_WORD_RE.match(word) or len(word) > 12:
+        return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
+
+    config = _review_llm_config()
+    if not config["api_key"] or AsyncOpenAI is None:
+        return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
+
+    system_prompt = (
+        "你是中文词语和中文实体常识识别器。给你一个短中文词，只判断它是否可能是大众熟知或稳定存在的词/实体。"
+        "可识别类型：common_word, idiom, person, celebrity, historical_person, courtesy_name, stage_name, "
+        "fictional_character, brand, product, place, organization, work, technical_term, unclear。"
+        "如果是明星、艺名、历史人物、人物字号/别名、角色名、品牌简称、作品名等，请给出全称/别名和适合搜索核验的中文查询。"
+        "不要为了通过审核而编造；陌生专名、临时网名、含义不明或你不确定时 recognized=false。"
+        "只返回 JSON 对象。"
+    )
+    user_prompt = {
+        "word": word,
+        "requiredJson": {
+            "recognized": True,
+            "entityType": "celebrity",
+            "confidence": 0.0,
+            "canonicalNames": ["全称或标准名"],
+            "aliases": ["别名/简称/艺名"],
+            "description": "一句话说明它是什么",
+            "pinyin": "可选拼音",
+            "searchQueries": [f'"{word}" 百度百科', f'"{word}" 是谁'],
+            "reviewHint": "为什么它可作为常识实体审查",
+        },
+    }
+
+    try:
+        client = AsyncOpenAI(
+            api_key=config["api_key"],
+            base_url=config["base_url"],
+            timeout=config["timeout"],
+        )
+        response = await client.chat.completions.create(
+            model=config["model"],
+            temperature=0.0,
+            max_tokens=700,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+            ],
+        )
+        if not response.choices:
+            return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
+        content = response.choices[0].message.content or ""
+        return _normalize_entity_knowledge(word, _load_json_object_from_model_text(content))
+    except Exception as error:
+        logger.debug(f"Entity knowledge inference failed for {word}: {error}")
+        return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
+
+
+def _looks_like_person_alias_result(word: str, result: Dict[str, str]) -> bool:
+    text = re.sub(r"\s+", "", f"{result.get('title', '')} {result.get('snippet', '')}")
+    if not word or word not in text:
+        return False
+    if re.search(rf"(?:字|号|别名|又名|又称|人称).{{0,10}}{re.escape(word)}", text):
+        return True
+    if re.search(rf"{re.escape(word)}.{{0,10}}(?:字|号|别名|又名|又称|人称)", text):
+        return True
+    return any(hint in text for hint in PERSON_ALIAS_HINTS)
+
+
+async def _estimate_person_alias_signal(word: str) -> Dict[str, Any]:
+    if not word or not _CJK_WORD_RE.match(word) or len(word) > 6:
+        return {"accepted": False, "word": word, "hits": [], "score": 0.0}
+
+    query_results = await asyncio.gather(*(
+        _search_web(query.format(word=word), max_results=4)
+        for query in PERSON_ALIAS_SEARCH_QUERIES
+    ))
+    hits: List[Dict[str, str]] = []
+    seen_urls = set()
+    for results in query_results:
+        for result in results:
+            url = str(result.get("url") or "")
+            key = url or f"{result.get('title', '')}:{result.get('snippet', '')}"
+            if key in seen_urls:
+                continue
+            if not _looks_like_person_alias_result(word, result):
+                continue
+            seen_urls.add(key)
+            hits.append(result)
+
+    exact_mentions = sum(_count_word_mentions(word, result) for result in hits)
+    score = _bounded_log_score(len(hits) + exact_mentions * 0.5)
+    accepted = len(hits) >= 2 or (
+        len(hits) >= 1
+        and any(
+            any(str(result.get(field) or "").find(strong_hint) >= 0 for field in ("title", "snippet"))
+            for result in hits
+            for strong_hint in ("名将", "历史人物", "人物", "字", "号", "别名", "又名", "门神")
+        )
+    )
+    return {
+        "accepted": accepted,
+        "word": word,
+        "score": score,
+        "hits": [
+            {
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "snippet": result.get("snippet", ""),
+            }
+            for result in hits[:5]
+        ],
+        "summary": (
+            f"搜索结果显示「{word}」有明确历史人物字号/别名信号"
+            if accepted else
+            "未取得足够的历史人物字号/别名信号"
+        ),
+    }
+
+
+def _entity_query_terms(word: str, entity: Dict[str, Any]) -> List[str]:
+    terms = [word]
+    terms.extend(entity.get("canonicalNames") or [])
+    terms.extend(entity.get("aliases") or [])
+    return _list_of_short_strings(terms, limit=8)
+
+
+def _entity_search_queries(word: str, entity: Dict[str, Any]) -> List[str]:
+    entity_type = str(entity.get("entityType") or "unclear")
+    terms = _entity_query_terms(word, entity)
+    queries: List[str] = []
+    queries.extend(entity.get("searchQueries") or [])
+    hints = ENTITY_TYPE_HINTS.get(entity_type, ())
+    for term in terms:
+        queries.append(f'"{term}"')
+        queries.append(f'"{term}" 百度百科 OR 维基百科')
+        for hint in hints[:4]:
+            queries.append(f'"{term}" "{hint}"')
+    if entity_type in {"person", "celebrity", "historical_person", "courtesy_name", "stage_name"}:
+        queries.append(f'"{word}" 是谁')
+    return _list_of_short_strings(queries, limit=12, max_len=100)
+
+
+def _looks_like_entity_result(word: str, result: Dict[str, str], entity: Dict[str, Any]) -> bool:
+    text = re.sub(r"\s+", "", f"{result.get('title', '')} {result.get('snippet', '')}")
+    terms = _entity_query_terms(word, entity)
+    if not any(term and term in text for term in terms):
+        return False
+    entity_type = str(entity.get("entityType") or "unclear")
+    hints = ENTITY_TYPE_HINTS.get(entity_type, ())
+    if any(hint in text for hint in hints):
+        return True
+    description = str(entity.get("description") or "")
+    if description and any(token and token in text for token in re.split(r"[\s，,。；;、/]+", description)[:5]):
+        return True
+    return entity_type in {"common_word", "idiom", "technical_term"} and word in text
+
+
+def _entity_type_label(entity_type: str) -> str:
+    return {
+        "common_word": "常见词",
+        "idiom": "成语/熟语",
+        "person": "公众人物",
+        "celebrity": "明星/公众人物",
+        "historical_person": "历史人物",
+        "courtesy_name": "名人字号/别名",
+        "stage_name": "艺名/别名",
+        "fictional_character": "角色名",
+        "brand": "品牌",
+        "product": "产品名",
+        "place": "地名",
+        "organization": "组织/机构名",
+        "work": "作品名",
+        "technical_term": "专业术语",
+    }.get(entity_type, "常识实体")
+
+
+async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
+    entity = await _infer_entity_knowledge(word)
+    if not entity.get("recognized"):
+        fallback = await _estimate_person_alias_signal(word)
+        if fallback.get("accepted"):
+            return {
+                "accepted": True,
+                "word": word,
+                "entityType": "courtesy_name",
+                "label": "名人字号/别名",
+                "confidence": 0.60,
+                "description": fallback.get("summary", ""),
+                "searchQueries": [query.format(word=word) for query in PERSON_ALIAS_SEARCH_QUERIES],
+                "hits": fallback.get("hits", []),
+                "score": fallback.get("score", 0.0),
+                "summary": fallback.get("summary", ""),
+                "source": "search_fallback",
+            }
+        return {
+            "accepted": False,
+            "word": word,
+            "entityType": "unclear",
+            "confidence": entity.get("confidence", 0.0),
+            "hits": [],
+            "score": 0.0,
+            "summary": "LLM 未能稳定识别为常见词或常识实体",
+            "source": "llm",
+        }
+
+    queries = _entity_search_queries(word, entity)
+    query_results = await asyncio.gather(*(
+        _search_web(query, max_results=4)
+        for query in queries
+    ))
+    hits: List[Dict[str, str]] = []
+    seen_urls = set()
+    for results in query_results:
+        for result in results:
+            url = str(result.get("url") or "")
+            key = url or f"{result.get('title', '')}:{result.get('snippet', '')}"
+            if key in seen_urls:
+                continue
+            if not _looks_like_entity_result(word, result, entity):
+                continue
+            seen_urls.add(key)
+            hits.append(result)
+
+    exact_mentions = sum(_count_word_mentions(word, result) for result in hits)
+    score = _bounded_log_score(len(hits) + exact_mentions * 0.5)
+    confidence = float(entity.get("confidence") or 0.0)
+    accepted = len(hits) >= 2 or (len(hits) >= 1 and confidence >= 0.70)
+    label = _entity_type_label(str(entity.get("entityType") or "unclear"))
+    return {
+        **entity,
+        "accepted": accepted,
+        "label": label,
+        "score": score,
+        "hits": [
+            {
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "snippet": result.get("snippet", ""),
+            }
+            for result in hits[:5]
+        ],
+        "searchQueries": queries,
+        "summary": (
+            f"本喵先识别为{label}，并取得搜索/百科信号"
+            if accepted else
+            f"本喵先识别为{label}，但搜索核验信号不足"
+        ),
+        "source": "llm_then_search",
+    }
+
+
 async def estimate_word_commonness(word: str) -> Dict:
     word = word.strip()
     if not word:
@@ -834,12 +1248,13 @@ async def estimate_word_commonness(word: str) -> Dict:
     signal_raw = {key: 0.0 for key in COMMONNESS_SIGNAL_WEIGHTS}
     evidence: Dict[str, List[str]] = {key: [] for key in COMMONNESS_SIGNAL_WEIGHTS}
 
-    evidence_data, query_results = await asyncio.gather(
+    evidence_data, query_results, entity_knowledge = await asyncio.gather(
         collect_pronunciation_evidence(word),
         asyncio.gather(*(
             _search_web(query.format(word=word), max_results=5)
             for query, _signal in COMMONNESS_SEARCH_QUERIES
         )),
+        _estimate_entity_knowledge_signal(word),
     )
 
     if evidence_data.get("success"):
@@ -867,6 +1282,16 @@ async def estimate_word_commonness(word: str) -> Dict:
                 if result.get("url")
             )
 
+    if entity_knowledge.get("accepted"):
+        signal_raw["encyclopedia"] += 6.0
+        signal_raw["corpus"] += 3.0
+        signal_raw["search"] += max(1.0, float(entity_knowledge.get("score") or 0.0))
+        evidence["encyclopedia"].extend(
+            hit.get("url", "")
+            for hit in entity_knowledge.get("hits", [])[:3]
+            if hit.get("url")
+        )
+
     signals = {
         key: _bounded_log_score(value)
         for key, value in signal_raw.items()
@@ -888,6 +1313,13 @@ async def estimate_word_commonness(word: str) -> Dict:
             if value
         },
         "weights": COMMONNESS_SIGNAL_WEIGHTS,
+        "entityKnowledge": entity_knowledge,
+        "personAlias": entity_knowledge if entity_knowledge.get("entityType") == "courtesy_name" else {
+            "accepted": False,
+            "word": word,
+            "hits": [],
+            "score": 0.0,
+        },
     }
 
 
@@ -1109,13 +1541,16 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
 
             commonness = await estimate_word_commonness(word)
             if _is_common_known_word(word, commonness):
+                common_known_label = _common_known_review_label(commonness)
+                common_known_type = _common_known_review_type(commonness)
                 summary = (
-                    f"「{word}」未找到权威读音页，但属于常见现代汉语词语/熟语，"
+                    f"「{word}」未找到权威读音页，但属于{common_known_label}，"
                     f"且编码 {code} 在读音候选链中"
                 )
                 review["commonKnownReview"] = {
                     "accepted": True,
                     "summary": summary,
+                    "type": common_known_type,
                     "commonness": commonness,
                     "policy": {
                         "minScore": COMMON_KNOWN_MIN_SCORE,
@@ -1126,9 +1561,10 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                     "word": word,
                     "code": code,
                     "summary": summary,
+                    "type": common_known_type,
                     "commonness": commonness,
                 })
-                approved_items.append(f"{action}：{word}@{code}，本喵按常见词/熟语语言常识通过")
+                approved_items.append(f"{action}：{word}@{code}，本喵按{common_known_label}语言常识通过")
                 continue
 
             issues.append(f"「{word}」没有权威读音来源，且常用词信号不足，不能自动通过")
@@ -1158,7 +1594,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
 
     auto_approve = not issues and bool(approved_items)
     if auto_approve and common_known_items:
-        summary = "读音编码可验证，常见词/品牌/熟语语言常识信号足够，允许本喵自动通过"
+        summary = "读音编码可验证，常见词/实体常识与搜索核验信号足够，允许本喵自动通过"
     elif auto_approve:
         summary = "权威来源、编码和常用度证据一致，允许本喵自动通过"
     else:
@@ -1212,7 +1648,7 @@ def build_review_note(audit: Dict) -> str:
                 f"{result.get('summary', '未给出结论')}"
             )
     if audit.get("commonKnownItems"):
-        lines.append("常见词/熟语语言常识通过：")
+        lines.append("常见词/熟语/名人字号语言常识通过：")
         for item in audit.get("commonKnownItems", [])[:10]:
             commonness = item.get("commonness") or {}
             lines.append(

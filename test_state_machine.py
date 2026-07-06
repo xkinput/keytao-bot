@@ -1417,7 +1417,7 @@ def test_reviewed_add_prompt_explains_fallback_review_policy():
     check("fallback prompt generated", bool(prompt))
     check("fallback prompt does not say cannot auto approve", "不能自动通过" not in (prompt or ""))
     check("fallback prompt mentions no authoritative page", "暂未找到权威读音页" in (prompt or ""))
-    check("fallback prompt mentions common knowledge review", "常见词/品牌常识" in (prompt or ""))
+    check("fallback prompt mentions common knowledge review", "LLM 基础常识" in (prompt or ""))
     check("fallback candidate line avoids vague pending source", "来源 暂无权威页" in (prompt or ""))
 
 
@@ -1434,7 +1434,7 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
             "success": True,
             "verdict": "pass",
             "autoApprove": True,
-            "summary": "读音编码可验证，常见词/品牌/熟语语言常识信号足够，允许本喵自动通过",
+            "summary": "读音编码可验证，常见词/实体常识与搜索核验信号足够，允许本喵自动通过",
             "commonKnownItems": [{"word": "百岁山", "code": "bsev"}],
             "issues": [],
         },
@@ -1454,7 +1454,7 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
     check("pre-submit preview mentions submission logic", "预审结论（同提交审核逻辑）" in (prompt or ""))
     check("pre-submit preview predicts auto approval", "预计可由本喵自动通过" in (prompt or ""))
     check("pre-submit preview explains batch caveat", "按整批重新审核" in (prompt or ""))
-    check("pre-submit preview keeps common-known reason", "常见词/品牌/熟语" in (prompt or ""))
+    check("pre-submit preview keeps common-known reason", "实体常识" in (prompt or ""))
 
 
 def test_prepare_reviewed_add_attaches_pre_submit_audit():
@@ -1489,7 +1489,7 @@ def test_prepare_reviewed_add_attaches_pre_submit_audit():
                 "success": True,
                 "verdict": "pass",
                 "autoApprove": True,
-                "summary": "读音编码可验证，常见词/品牌/熟语语言常识信号足够，允许本喵自动通过",
+                "summary": "读音编码可验证，常见词/实体常识与搜索核验信号足够，允许本喵自动通过",
                 "issues": [],
                 "approvedItems": ["Create：百岁山@bsev，本喵按常见词/熟语语言常识通过"],
             }
@@ -1514,7 +1514,7 @@ def test_auto_approved_review_lines_explain_pass_reason():
     _append_submit_review_lines(common_parts, {
         "autoApproved": True,
         "autoReview": {
-            "summary": "读音编码可验证，常见词/品牌/熟语语言常识信号足够，允许本喵自动通过",
+            "summary": "读音编码可验证，常见词/实体常识与搜索核验信号足够，允许本喵自动通过",
             "commonKnownItems": [{"word": "百岁山", "code": "bsev"}],
         },
     })
@@ -1529,7 +1529,7 @@ def test_auto_approved_review_lines_explain_pass_reason():
 
     common_text = "\n".join(common_parts)
     llm_text = "\n".join(llm_parts)
-    check("common-known auto approval mentions common signals", "常见词/品牌/熟语信号" in common_text)
+    check("common-known auto approval mentions common signals", "常见词/实体常识" in common_text)
     check("common-known auto approval avoids generic evidence-only wording", "证据一致" not in common_text)
     check("llm fallback auto approval mentions re-review", "自动复审" in llm_text)
     check("llm fallback auto approval keeps summary", "语言常识" in llm_text)
@@ -3448,6 +3448,155 @@ def test_review_audit_blocks_bare_delete_and_allows_code_move():
     asyncio.run(_run())
 
 
+def test_review_audit_allows_known_person_alias():
+    """Verify famous person courtesy names can pass without a standalone dictionary page."""
+    print("\n🧪 review audit allows known person alias")
+
+    async def _run():
+        async def fake_prepare_reviewed_word(config, word):
+            return {
+                "success": True,
+                "word": word,
+                "autoReviewable": False,
+                "pronunciations": [
+                    {
+                        "pinyin": "jing de",
+                        "sources": [],
+                        "codes": ["jgde", "jgdei", "jgdeiu"],
+                    }
+                ],
+            }
+
+        async def fake_estimate_word_commonness(word):
+            return {
+                "success": True,
+                "word": word,
+                "score": 0.0,
+                "signals": {"corpus": 0.0, "search": 0.0, "dictionary": 0.0, "encyclopedia": 0.0},
+                "personAlias": {
+                    "accepted": True,
+                    "summary": "搜索结果显示「敬德」有明确历史人物字号/别名信号",
+                    "hits": [
+                        {
+                            "title": "尉迟恭，字敬德",
+                            "url": "https://example.test/yuchigong",
+                            "snippet": "尉迟恭，字敬德，唐初名将。",
+                        }
+                    ],
+                },
+            }
+
+        config = ReviewHttpConfig(api_base="https://example.test", bot_token="bot")
+        with patch.object(keytao_review_module, "prepare_reviewed_word", side_effect=fake_prepare_reviewed_word):
+            with patch.object(keytao_review_module, "estimate_word_commonness", side_effect=fake_estimate_word_commonness):
+                audit = await audit_draft_items(config, [
+                    {"action": "Create", "word": "敬德", "code": "jgdei", "type": "Phrase"},
+                ])
+
+        check("person alias auto approves", audit.get("autoApprove") is True)
+        check("person alias summary mentions entity knowledge", "实体常识" in audit.get("summary", ""))
+        check("person alias common item recorded", audit.get("commonKnownItems", [{}])[0].get("type") == "courtesy_name")
+        check("person alias item summary keeps name alias", "名人字号" in audit.get("commonKnownItems", [{}])[0].get("summary", ""))
+        check("person alias approved item explains path", "名人字号/别名" in " ".join(audit.get("approvedItems", [])))
+
+    asyncio.run(_run())
+
+
+def test_entity_knowledge_signal_uses_llm_before_search():
+    """Verify entity lookup starts from LLM knowledge and then searches targeted queries."""
+    print("\n🧪 entity knowledge signal uses LLM before search")
+
+    async def _run():
+        queries = []
+
+        async def fake_infer_entity_knowledge(word):
+            return {
+                "recognized": True,
+                "word": word,
+                "entityType": "celebrity",
+                "confidence": 0.92,
+                "canonicalNames": ["周杰伦"],
+                "aliases": ["杰伦"],
+                "description": "华语流行乐男歌手、演员、导演",
+                "searchQueries": ['"杰伦" "周杰伦"', '"杰伦" 明星'],
+                "reviewHint": "大众熟知的明星简称",
+            }
+
+        async def fake_search_web(query, max_results=3):
+            queries.append(query)
+            if "周杰伦" not in query and "明星" not in query:
+                return []
+            return [
+                {
+                    "title": "周杰伦_百度百科",
+                    "url": "https://example.test/jay",
+                    "snippet": "周杰伦，华语流行乐男歌手、演员、导演，常被称为杰伦。",
+                }
+            ]
+
+        with patch.object(keytao_review_module, "_infer_entity_knowledge", side_effect=fake_infer_entity_knowledge):
+            with patch.object(keytao_review_module, "_search_web", side_effect=fake_search_web):
+                signal = await keytao_review_module._estimate_entity_knowledge_signal("杰伦")
+
+        check("entity signal accepted", signal.get("accepted") is True)
+        check("entity signal keeps celebrity type", signal.get("entityType") == "celebrity")
+        check("entity signal labels celebrity", signal.get("label") == "明星/公众人物")
+        check("entity search used llm canonical name", any("周杰伦" in query for query in queries))
+        check("entity signal includes hit", bool(signal.get("hits")))
+
+    asyncio.run(_run())
+
+
+def test_review_audit_allows_known_celebrity_alias():
+    """Verify celebrity aliases can pass through entity-knowledge review."""
+    print("\n🧪 review audit allows known celebrity alias")
+
+    async def _run():
+        async def fake_prepare_reviewed_word(config, word):
+            return {
+                "success": True,
+                "word": word,
+                "autoReviewable": False,
+                "pronunciations": [
+                    {
+                        "pinyin": "jie lun",
+                        "sources": [],
+                        "codes": ["jdlw", "jdlwo"],
+                    }
+                ],
+            }
+
+        async def fake_estimate_word_commonness(word):
+            return {
+                "success": True,
+                "word": word,
+                "score": 0.0,
+                "signals": {"corpus": 0.0, "search": 0.0, "dictionary": 0.0, "encyclopedia": 0.0},
+                "entityKnowledge": {
+                    "accepted": True,
+                    "entityType": "celebrity",
+                    "label": "明星/公众人物",
+                    "confidence": 0.92,
+                    "summary": "本喵先识别为明星/公众人物，并取得搜索/百科信号",
+                    "hits": [{"title": "周杰伦_百度百科", "url": "https://example.test/jay"}],
+                },
+            }
+
+        config = ReviewHttpConfig(api_base="https://example.test", bot_token="bot")
+        with patch.object(keytao_review_module, "prepare_reviewed_word", side_effect=fake_prepare_reviewed_word):
+            with patch.object(keytao_review_module, "estimate_word_commonness", side_effect=fake_estimate_word_commonness):
+                audit = await audit_draft_items(config, [
+                    {"action": "Create", "word": "杰伦", "code": "jdlwo", "type": "Phrase"},
+                ])
+
+        check("celebrity alias auto approves", audit.get("autoApprove") is True)
+        check("celebrity alias summary mentions entity knowledge", "实体常识" in audit.get("summary", ""))
+        check("celebrity alias item type recorded", audit.get("commonKnownItems", [{}])[0].get("type") == "celebrity")
+        check("celebrity alias approved item explains path", "明星/公众人物" in " ".join(audit.get("approvedItems", [])))
+
+    asyncio.run(_run())
+
+
 def test_llm_review_prefers_keytao_encode_over_generic_double_pinyin_guess():
     """Verify LLM review normalization strips generic double-pinyin guesses when encode supports the code."""
     print("\n🧪 LLM review uses keytao_encode candidate chain")
@@ -4279,6 +4428,9 @@ if __name__ == "__main__":
     test_get_latest_draft_batch_does_not_touch_word_code_locals()
     test_keytao_draft_code_validation_guards_create_codes()
     test_review_audit_blocks_bare_delete_and_allows_code_move()
+    test_review_audit_allows_known_person_alias()
+    test_entity_knowledge_signal_uses_llm_before_search()
+    test_review_audit_allows_known_celebrity_alias()
     test_llm_review_prefers_keytao_encode_over_generic_double_pinyin_guess()
     test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries()
     test_draft_encode_candidates_include_alternate_pronunciations()
