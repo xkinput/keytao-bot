@@ -1773,8 +1773,41 @@ def _format_review_candidate_line(index: int, status: Dict, recommended_code: st
         for source in sources[:3]
         if str(source.get("source") or "").strip()
     )
-    source_text = f"；来源 {source_names}" if source_names else "；来源 待补充"
+    source_text = f"；来源 {source_names}" if source_names else "；来源 暂无权威页"
     return f"{index}. {code} — {label}；读音 {pinyin}{source_text}"
+
+
+def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Optional[str]:
+    audit = review.get("preSubmitAudit") if isinstance(review, dict) else None
+    if not isinstance(audit, dict):
+        return None
+
+    summary = str(audit.get("summary") or "").strip()
+    suffix = "若提交时草稿还有其他条目，会按整批重新审核。"
+    if audit.get("autoApprove"):
+        if audit.get("llmFallback"):
+            reason = summary or "已按提交时的 LLM 复审路径预判可通过"
+        elif audit.get("commonKnownItems"):
+            reason = summary or "常见词/品牌/熟语信号和编码候选链一致"
+        else:
+            reason = summary or "权威来源、编码和常用度证据一致"
+        return (
+            f"预审结论（同提交审核逻辑）：若仅提交推荐编码 {recommended_code} 的这条新增，"
+            f"预计可由本喵自动通过。原因：{reason}。{suffix}"
+        )
+
+    issues = [
+        str(issue).strip()
+        for issue in (audit.get("issues") or [])
+        if str(issue).strip()
+    ]
+    reason = summary or (issues[0] if issues else "证据不足")
+    if issues and issues[0] not in reason:
+        reason = f"{reason}；{issues[0]}"
+    return (
+        f"预审结论（同提交审核逻辑）：若仅提交推荐编码 {recommended_code} 的这条新增，"
+        f"预计会等待管理员审核。原因：{reason}。{suffix}"
+    )
 
 
 def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
@@ -1790,7 +1823,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         return None
 
     lines = [
-        f"词库暂无收录「{word}」，先按权威来源审读音：",
+        f"词库暂无收录「{word}」，先审读音和编码候选：",
         "",
     ]
     candidate_index = 1
@@ -1808,7 +1841,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             )
             lines.append(f"来源：{source_line}")
         else:
-            lines.append("来源：未找到权威来源，仅作候选展示，不能自动通过")
+            lines.append("来源：暂未找到权威读音页，先按编码服务默认读音展示候选")
         lines.append("候选编码:")
         for status in pronunciation.get("candidateStatuses", [])[:6]:
             lines.append(
@@ -1824,7 +1857,14 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         lines.append("")
 
     lines.append(f"是否以编码 {recommended_code} 将「{word}」加入草稿？也可回复编号、编码，或回复「都加」添加每个读音的推荐编码。")
-    lines.append("证据一致时提交后可由本喵自动审核；证据不足、纯删除或歧义修改会等待管理员。")
+    pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)
+    if pre_submit_preview:
+        lines.append(pre_submit_preview)
+    else:
+        lines.append(
+            "提交后本喵会结合权威来源、常见词/品牌常识、搜索/词典/百科信号和编码候选链复审；"
+            "证据或常识信号足够可自动通过，证据不足、纯删除或歧义修改会等待管理员。"
+        )
     return "\n".join(lines).strip()
 
 
@@ -2826,7 +2866,7 @@ async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str
 def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
     auto_review = submit_data.get("autoReview") if isinstance(submit_data, dict) else None
     if submit_data.get("autoApproved"):
-        parts.append("✅ 本喵已完成自动审词，证据一致，批次已加入词库。")
+        parts.append(_format_auto_approved_review_line(auto_review))
         approve_result = submit_data.get("autoApproveResult") or {}
         message = approve_result.get("message")
         if message:
@@ -2844,6 +2884,21 @@ def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
     approve_result = submit_data.get("autoApproveResult") or {}
     if approve_result and not approve_result.get("success"):
         parts.append(f"自动批准未执行：{approve_result.get('message', '未知原因')}")
+
+
+def _format_auto_approved_review_line(auto_review: Optional[Dict]) -> str:
+    """Describe why an auto-approved batch passed without overstating source certainty."""
+    if isinstance(auto_review, dict):
+        summary = str(auto_review.get("summary") or "").strip()
+        if auto_review.get("llmFallback"):
+            if summary:
+                return f"✅ 本喵已完成自动复审：{summary}，批次已加入词库。"
+            return "✅ 本喵已结合语言常识完成自动复审，批次已加入词库。"
+        if auto_review.get("commonKnownItems"):
+            return "✅ 本喵已按常见词/品牌/熟语信号和编码候选链完成自动审词，批次已加入词库。"
+        if summary and summary != "证据一致，允许本喵自动通过":
+            return f"✅ 本喵已完成自动审词：{summary}，批次已加入词库。"
+    return "✅ 本喵已完成自动审词，权威来源/编码/常用度证据一致，批次已加入词库。"
 
 
 async def _submit_current_draft(

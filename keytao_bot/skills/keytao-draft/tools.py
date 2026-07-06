@@ -19,6 +19,7 @@ from keytao_bot.utils.keytao_review import (
     ReviewHttpConfig,
     audit_draft_items,
     build_review_note,
+    can_llm_override_audit_issues,
 )
 
 
@@ -821,7 +822,7 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
                 "issues": [list_result.get("message", "无法读取草稿")],
             }
         deterministic_audit = await audit_draft_items(_review_config(), list_result.get("items", []))
-        if deterministic_audit.get("autoApprove") or not _can_llm_override_audit_issues(deterministic_audit):
+        if deterministic_audit.get("autoApprove") or not can_llm_override_audit_issues(deterministic_audit):
             return deterministic_audit
         llm_audit = await _try_llm_auto_review_for_draft(list_result, deterministic_audit)
         return llm_audit or deterministic_audit
@@ -834,34 +835,6 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
             "summary": "自动审核异常，提交后等待管理员审核",
             "issues": [str(error)],
         }
-
-
-def _can_llm_override_audit_issues(audit: Dict) -> bool:
-    issues = audit.get("issues") or []
-    if not issues:
-        return False
-    allowed_fragments = (
-        "没有权威读音来源",
-        "常用词信号不足",
-        "常用度证据不足",
-        "可比较的常用度信号不足",
-        "声笔笔短码",
-        "声笔笔短码表",
-    )
-    blocked_fragments = (
-        "纯删除",
-        "不在读音候选链",
-        "不在权威读音候选链",
-        "改词",
-        "歧义",
-        "审词失败",
-        "词或编码为空",
-    )
-    return all(
-        any(fragment in issue for fragment in allowed_fragments)
-        and not any(fragment in issue for fragment in blocked_fragments)
-        for issue in issues
-    )
 
 
 async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit: Dict) -> Optional[Dict]:

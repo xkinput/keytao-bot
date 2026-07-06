@@ -10,7 +10,7 @@ import importlib.util
 import json
 import sqlite3
 import tempfile
-from typing import Dict
+from typing import Dict, List
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +98,8 @@ from keytao_bot.plugins.openai_chat import (
     _handle_pending_add_word,
     _handle_referenced_pending_from_other_user,
     _ensure_pending_add_word_guidance,
+    _append_submit_review_lines,
+    _format_reviewed_add_prompt,
     _is_pending_tool_confirm_message,
     _is_contextual_reply_to_current_user_history,
     _is_sensitive_pending_control_intent,
@@ -175,6 +177,17 @@ _infer_phrase_type = _draft_tools._infer_phrase_type
 _normalize_draft_item_for_request = _draft_tools._normalize_draft_item_for_request
 _split_items_by_code_validation = _draft_tools._split_items_by_code_validation
 _validate_draft_item_code = _draft_tools._validate_draft_item_code
+
+_review_tools_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "keytao_bot",
+    "skills",
+    "keytao-review",
+    "tools.py",
+)
+_review_spec = importlib.util.spec_from_file_location("keytao_review_tools_for_test", _review_tools_path)
+_review_tools = importlib.util.module_from_spec(_review_spec)
+_review_spec.loader.exec_module(_review_tools)
 
 
 passed = 0
@@ -1377,6 +1390,149 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
         check("pending keeps review remark", "lyfg" in pending.code_remarks)
 
     asyncio.run(_run())
+
+
+def test_reviewed_add_prompt_explains_fallback_review_policy():
+    """Fallback pronunciation prompts should not promise admin-only handling."""
+    print("\n🧪 reviewed add prompt explains fallback review policy")
+
+    prompt = _format_reviewed_add_prompt({
+        "success": True,
+        "word": "百岁山",
+        "recommendedCode": "bsev",
+        "autoReviewable": False,
+        "pronunciations": [
+            {
+                "pinyin": "bai sui shan",
+                "recommendedCode": "bsev",
+                "sources": [],
+                "candidateStatuses": [
+                    {"code": "bse", "occupied": True, "label": "已有「不算数」"},
+                    {"code": "bsev", "occupied": False, "label": "空位"},
+                ],
+            },
+        ],
+    })
+
+    check("fallback prompt generated", bool(prompt))
+    check("fallback prompt does not say cannot auto approve", "不能自动通过" not in (prompt or ""))
+    check("fallback prompt mentions no authoritative page", "暂未找到权威读音页" in (prompt or ""))
+    check("fallback prompt mentions common knowledge review", "常见词/品牌常识" in (prompt or ""))
+    check("fallback candidate line avoids vague pending source", "来源 暂无权威页" in (prompt or ""))
+
+
+def test_reviewed_add_prompt_shows_pre_submit_audit_result():
+    """Lookup prompts should show the same auto-review prediction as submission."""
+    print("\n🧪 reviewed add prompt shows pre-submit audit result")
+
+    prompt = _format_reviewed_add_prompt({
+        "success": True,
+        "word": "百岁山",
+        "recommendedCode": "bsev",
+        "autoReviewable": False,
+        "preSubmitAudit": {
+            "success": True,
+            "verdict": "pass",
+            "autoApprove": True,
+            "summary": "读音编码可验证，常见词/品牌/熟语语言常识信号足够，允许本喵自动通过",
+            "commonKnownItems": [{"word": "百岁山", "code": "bsev"}],
+            "issues": [],
+        },
+        "pronunciations": [
+            {
+                "pinyin": "bai sui shan",
+                "recommendedCode": "bsev",
+                "sources": [],
+                "candidateStatuses": [
+                    {"code": "bse", "occupied": True, "label": "已有「不算数」"},
+                    {"code": "bsev", "occupied": False, "label": "空位"},
+                ],
+            },
+        ],
+    })
+
+    check("pre-submit preview mentions submission logic", "预审结论（同提交审核逻辑）" in (prompt or ""))
+    check("pre-submit preview predicts auto approval", "预计可由本喵自动通过" in (prompt or ""))
+    check("pre-submit preview explains batch caveat", "按整批重新审核" in (prompt or ""))
+    check("pre-submit preview keeps common-known reason", "常见词/品牌/熟语" in (prompt or ""))
+
+
+def test_prepare_reviewed_add_attaches_pre_submit_audit():
+    """The review tool should run the proposed add through submit-time audit logic."""
+    print("\n🧪 prepare reviewed add attaches pre-submit audit")
+
+    async def _run():
+        audit_items = []
+
+        async def fake_prepare_reviewed_word(config, word):
+            return {
+                "success": True,
+                "word": word,
+                "recommendedCode": "bsev",
+                "autoReviewable": False,
+                "pronunciations": [
+                    {
+                        "pinyin": "bai sui shan",
+                        "sources": [],
+                        "codes": ["bse", "bsev"],
+                        "recommendedCode": "bsev",
+                        "candidateStatuses": [
+                            {"code": "bsev", "occupied": False, "label": "空位"},
+                        ],
+                    },
+                ],
+            }
+
+        async def fake_audit_draft_items(config, items):
+            audit_items.extend(items)
+            return {
+                "success": True,
+                "verdict": "pass",
+                "autoApprove": True,
+                "summary": "读音编码可验证，常见词/品牌/熟语语言常识信号足够，允许本喵自动通过",
+                "issues": [],
+                "approvedItems": ["Create：百岁山@bsev，本喵按常见词/熟语语言常识通过"],
+            }
+
+        with patch.object(_review_tools, "prepare_reviewed_word", side_effect=fake_prepare_reviewed_word):
+            with patch.object(_review_tools, "audit_draft_items", side_effect=fake_audit_draft_items):
+                result = await _review_tools.keytao_prepare_reviewed_add("百岁山")
+
+        check("pre-submit audit attached", result.get("preSubmitAudit", {}).get("autoApprove") is True)
+        check("audit uses recommended code", audit_items and audit_items[0].get("code") == "bsev")
+        check("audit uses create action", audit_items and audit_items[0].get("action") == "Create")
+        check("audit preview marked", result.get("preSubmitAudit", {}).get("previewOnly") is True)
+
+    asyncio.run(_run())
+
+
+def test_auto_approved_review_lines_explain_pass_reason():
+    """Auto-approved replies should describe the actual pass path."""
+    print("\n🧪 auto-approved review line explains pass reason")
+
+    common_parts: List[str] = []
+    _append_submit_review_lines(common_parts, {
+        "autoApproved": True,
+        "autoReview": {
+            "summary": "读音编码可验证，常见词/品牌/熟语语言常识信号足够，允许本喵自动通过",
+            "commonKnownItems": [{"word": "百岁山", "code": "bsev"}],
+        },
+    })
+    llm_parts: List[str] = []
+    _append_submit_review_lines(llm_parts, {
+        "autoApproved": True,
+        "autoReview": {
+            "summary": "本喵已结合语言常识完成复审，允许自动通过",
+            "llmFallback": True,
+        },
+    })
+
+    common_text = "\n".join(common_parts)
+    llm_text = "\n".join(llm_parts)
+    check("common-known auto approval mentions common signals", "常见词/品牌/熟语信号" in common_text)
+    check("common-known auto approval avoids generic evidence-only wording", "证据一致" not in common_text)
+    check("llm fallback auto approval mentions re-review", "自动复审" in llm_text)
+    check("llm fallback auto approval keeps summary", "语言常识" in llm_text)
 
 
 def test_simple_single_word_query_existing_word_falls_through():
@@ -4064,6 +4220,10 @@ if __name__ == "__main__":
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
     test_simple_single_word_query_uses_review_tool_before_ai()
+    test_reviewed_add_prompt_explains_fallback_review_policy()
+    test_reviewed_add_prompt_shows_pre_submit_audit_result()
+    test_prepare_reviewed_add_attaches_pre_submit_audit()
+    test_auto_approved_review_lines_explain_pass_reason()
     test_simple_single_word_query_existing_word_falls_through()
     test_simple_single_word_query_skips_draft_commands()
     test_simple_single_word_query_skips_chat_comparison_questions()

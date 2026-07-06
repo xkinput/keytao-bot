@@ -726,6 +726,35 @@ def _is_common_known_word(word: str, commonness: Dict) -> bool:
     )
 
 
+def can_llm_override_audit_issues(audit: Dict) -> bool:
+    """Return whether unresolved audit issues are safe to send through LLM review."""
+    issues = audit.get("issues") or []
+    if not issues:
+        return False
+    allowed_fragments = (
+        "没有权威读音来源",
+        "常用词信号不足",
+        "常用度证据不足",
+        "可比较的常用度信号不足",
+        "声笔笔短码",
+        "声笔笔短码表",
+    )
+    blocked_fragments = (
+        "纯删除",
+        "不在读音候选链",
+        "不在权威读音候选链",
+        "改词",
+        "歧义",
+        "审词失败",
+        "词或编码为空",
+    )
+    return all(
+        any(fragment in issue for fragment in allowed_fragments)
+        and not any(fragment in issue for fragment in blocked_fragments)
+        for issue in issues
+    )
+
+
 def _is_css_review_type(phrase_type: str) -> bool:
     return str(phrase_type or "").strip() in CSS_REVIEW_TYPES
 
@@ -1128,11 +1157,17 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         )
 
     auto_approve = not issues and bool(approved_items)
+    if auto_approve and common_known_items:
+        summary = "读音编码可验证，常见词/品牌/熟语语言常识信号足够，允许本喵自动通过"
+    elif auto_approve:
+        summary = "权威来源、编码和常用度证据一致，允许本喵自动通过"
+    else:
+        summary = "存在不确定项，提交后等待管理员审核"
     return {
         "success": True,
         "verdict": "pass" if auto_approve else "needs_admin",
         "autoApprove": auto_approve,
-        "summary": "证据一致，允许本喵自动通过" if auto_approve else "存在不确定项，提交后等待管理员审核",
+        "summary": summary,
         "issues": issues,
         "approvedItems": approved_items,
         "commonKnownItems": common_known_items,
