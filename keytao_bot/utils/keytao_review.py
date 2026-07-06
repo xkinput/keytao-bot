@@ -1741,7 +1741,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
 
     auto_approve = not issues and bool(approved_items)
     if auto_approve and common_known_items:
-        summary = "读音编码可验证，常见词/实体常识与搜索核验信号足够，允许本喵自动通过"
+        summary = "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过"
     elif auto_approve:
         summary = "权威来源、编码和常用度证据一致，允许本喵自动通过"
     else:

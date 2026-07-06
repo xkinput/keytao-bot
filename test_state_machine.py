@@ -1434,7 +1434,7 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
             "success": True,
             "verdict": "pass",
             "autoApprove": True,
-            "summary": "读音编码可验证，常见词/实体常识与搜索核验信号足够，允许本喵自动通过",
+            "summary": "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过",
             "commonKnownItems": [{"word": "百岁山", "code": "bsev"}],
             "issues": [],
         },
@@ -1489,7 +1489,7 @@ def test_prepare_reviewed_add_attaches_pre_submit_audit():
                 "success": True,
                 "verdict": "pass",
                 "autoApprove": True,
-                "summary": "读音编码可验证，常见词/实体常识与搜索核验信号足够，允许本喵自动通过",
+                "summary": "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过",
                 "issues": [],
                 "approvedItems": ["Create：百岁山@bsev，本喵按常见词/熟语语言常识通过"],
             }
@@ -1514,7 +1514,7 @@ def test_auto_approved_review_lines_explain_pass_reason():
     _append_submit_review_lines(common_parts, {
         "autoApproved": True,
         "autoReview": {
-            "summary": "读音编码可验证，常见词/实体常识与搜索核验信号足够，允许本喵自动通过",
+            "summary": "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过",
             "commonKnownItems": [{"word": "百岁山", "code": "bsev"}],
         },
     })
