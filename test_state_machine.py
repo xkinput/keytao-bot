@@ -3514,7 +3514,7 @@ def test_entity_knowledge_signal_uses_llm_before_search():
                 "recognized": True,
                 "word": word,
                 "entityType": "celebrity",
-                "confidence": 0.92,
+                "confidence": 0.75,
                 "canonicalNames": ["周杰伦"],
                 "aliases": ["杰伦"],
                 "description": "华语流行乐男歌手、演员、导演",
@@ -3534,9 +3534,13 @@ def test_entity_knowledge_signal_uses_llm_before_search():
                 }
             ]
 
+        async def fake_fetch_text(url):
+            return ""
+
         with patch.object(keytao_review_module, "_infer_entity_knowledge", side_effect=fake_infer_entity_knowledge):
-            with patch.object(keytao_review_module, "_search_web", side_effect=fake_search_web):
-                signal = await keytao_review_module._estimate_entity_knowledge_signal("杰伦")
+            with patch.object(keytao_review_module, "_fetch_text", side_effect=fake_fetch_text):
+                with patch.object(keytao_review_module, "_search_web", side_effect=fake_search_web):
+                    signal = await keytao_review_module._estimate_entity_knowledge_signal("杰伦")
 
         check("entity signal accepted", signal.get("accepted") is True)
         check("entity signal keeps celebrity type", signal.get("entityType") == "celebrity")
@@ -3594,6 +3598,8 @@ def test_entity_knowledge_signal_allows_high_confidence_llm_identity():
     print("\n🧪 entity knowledge signal allows high-confidence LLM identity")
 
     async def _run():
+        search_queries = []
+
         async def fake_infer_entity_knowledge(word):
             return {
                 "recognized": True,
@@ -3611,6 +3617,7 @@ def test_entity_knowledge_signal_allows_high_confidence_llm_identity():
             return ""
 
         async def fake_search_web(query, max_results=3):
+            search_queries.append(query)
             return []
 
         with patch.object(keytao_review_module, "_infer_entity_knowledge", side_effect=fake_infer_entity_knowledge):
@@ -3621,6 +3628,51 @@ def test_entity_knowledge_signal_allows_high_confidence_llm_identity():
         check("high-confidence llm identity accepted", signal.get("accepted") is True)
         check("high-confidence llm identity source recorded", signal.get("source") == "llm_high_confidence")
         check("high-confidence llm identity summary is explicit", "LLM 基础常识" in signal.get("summary", ""))
+        check("high-confidence llm identity skips search", not search_queries)
+
+    asyncio.run(_run())
+
+
+def test_word_commonness_short_circuits_accepted_entity():
+    """Verify accepted entity knowledge avoids slow commonness searches."""
+    print("\n🧪 word commonness short-circuits accepted entity")
+
+    async def _run():
+        calls = {"evidence": 0, "search": 0}
+
+        async def fake_entity_signal(word):
+            return {
+                "accepted": True,
+                "word": word,
+                "entityType": "historical_person",
+                "label": "历史人物",
+                "confidence": 0.95,
+                "description": "唐朝名将尉迟恭的字，民间尊为门神之一",
+                "canonicalNames": ["尉迟恭"],
+                "aliases": ["敬德"],
+                "hits": [],
+                "score": 0.0,
+                "summary": "本喵先识别为历史人物，LLM 基础常识给出明确标准名/别名和说明",
+                "source": "llm_high_confidence",
+            }
+
+        async def fake_collect_pronunciation_evidence(word):
+            calls["evidence"] += 1
+            return {"success": False, "groups": []}
+
+        async def fake_search_web(query, max_results=3):
+            calls["search"] += 1
+            return []
+
+        with patch.object(keytao_review_module, "_estimate_entity_knowledge_signal", side_effect=fake_entity_signal):
+            with patch.object(keytao_review_module, "collect_pronunciation_evidence", side_effect=fake_collect_pronunciation_evidence):
+                with patch.object(keytao_review_module, "_search_web", side_effect=fake_search_web):
+                    commonness = await keytao_review_module.estimate_word_commonness("敬德")
+
+        check("short-circuit commonness succeeds", commonness.get("success") is True)
+        check("short-circuit keeps entity knowledge", commonness.get("entityKnowledge", {}).get("source") == "llm_high_confidence")
+        check("short-circuit skips evidence lookup", calls["evidence"] == 0)
+        check("short-circuit skips commonness search", calls["search"] == 0)
 
     asyncio.run(_run())
 
@@ -4510,6 +4562,7 @@ if __name__ == "__main__":
     test_entity_knowledge_signal_uses_llm_before_search()
     test_entity_knowledge_signal_uses_direct_sources_before_search()
     test_entity_knowledge_signal_allows_high_confidence_llm_identity()
+    test_word_commonness_short_circuits_accepted_entity()
     test_review_audit_allows_known_celebrity_alias()
     test_llm_review_prefers_keytao_encode_over_generic_double_pinyin_guess()
     test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries()

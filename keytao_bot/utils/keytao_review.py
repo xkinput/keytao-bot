@@ -1273,10 +1273,18 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
             "source": "llm",
         }
 
+    confidence = float(entity.get("confidence") or 0.0)
+    entity_type = str(entity.get("entityType") or "unclear")
+    llm_high_confidence = (
+        confidence >= 0.90
+        and entity_type in ENTITY_ACCEPTED_TYPES
+        and bool(entity.get("description"))
+        and bool(entity.get("canonicalNames") or entity.get("aliases"))
+    )
     direct_hits = await _fetch_entity_direct_hits(word, entity)
     queries = _entity_search_queries(word, entity)
     query_results = []
-    if not direct_hits:
+    if not direct_hits and not llm_high_confidence:
         query_results = await asyncio.gather(*(
             _search_web(query, max_results=4)
             for query in queries
@@ -1303,14 +1311,6 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
 
     exact_mentions = sum(_count_word_mentions(word, result) for result in hits)
     score = _bounded_log_score(len(hits) + exact_mentions * 0.5)
-    confidence = float(entity.get("confidence") or 0.0)
-    entity_type = str(entity.get("entityType") or "unclear")
-    llm_high_confidence = (
-        confidence >= 0.90
-        and entity_type in ENTITY_ACCEPTED_TYPES
-        and bool(entity.get("description"))
-        and bool(entity.get("canonicalNames") or entity.get("aliases"))
-    )
     accepted = (
         len(hits) >= 2
         or (len(hits) >= 1 and confidence >= 0.70)
@@ -1355,13 +1355,54 @@ async def estimate_word_commonness(word: str) -> Dict:
     signal_raw = {key: 0.0 for key in COMMONNESS_SIGNAL_WEIGHTS}
     evidence: Dict[str, List[str]] = {key: [] for key in COMMONNESS_SIGNAL_WEIGHTS}
 
-    evidence_data, query_results, entity_knowledge = await asyncio.gather(
+    def build_result(entity_knowledge: Dict[str, Any]) -> Dict[str, Any]:
+        signals = {
+            key: _bounded_log_score(value)
+            for key, value in signal_raw.items()
+        }
+        weighted_score = sum(
+            signals[key] * COMMONNESS_SIGNAL_WEIGHTS[key]
+            for key in COMMONNESS_SIGNAL_WEIGHTS
+        )
+        return {
+            "success": True,
+            "word": word,
+            "score": weighted_score,
+            "signals": signals,
+            "rawSignals": signal_raw,
+            "evidence": {
+                key: list(dict.fromkeys(value))[:5]
+                for key, value in evidence.items()
+                if value
+            },
+            "weights": COMMONNESS_SIGNAL_WEIGHTS,
+            "entityKnowledge": entity_knowledge,
+            "personAlias": entity_knowledge if entity_knowledge.get("entityType") == "courtesy_name" else {
+                "accepted": False,
+                "word": word,
+                "hits": [],
+                "score": 0.0,
+            },
+        }
+
+    entity_knowledge = await _estimate_entity_knowledge_signal(word)
+    if entity_knowledge.get("accepted"):
+        signal_raw["encyclopedia"] += 6.0
+        signal_raw["corpus"] += 3.0
+        signal_raw["search"] += max(1.0, float(entity_knowledge.get("score") or 0.0))
+        evidence["encyclopedia"].extend(
+            hit.get("url", "")
+            for hit in entity_knowledge.get("hits", [])[:3]
+            if hit.get("url")
+        )
+        return build_result(entity_knowledge)
+
+    evidence_data, query_results = await asyncio.gather(
         collect_pronunciation_evidence(word),
         asyncio.gather(*(
             _search_web(query.format(word=word), max_results=5)
             for query, _signal in COMMONNESS_SEARCH_QUERIES
         )),
-        _estimate_entity_knowledge_signal(word),
     )
 
     if evidence_data.get("success"):
@@ -1399,35 +1440,7 @@ async def estimate_word_commonness(word: str) -> Dict:
             if hit.get("url")
         )
 
-    signals = {
-        key: _bounded_log_score(value)
-        for key, value in signal_raw.items()
-    }
-    weighted_score = sum(
-        signals[key] * COMMONNESS_SIGNAL_WEIGHTS[key]
-        for key in COMMONNESS_SIGNAL_WEIGHTS
-    )
-
-    return {
-        "success": True,
-        "word": word,
-        "score": weighted_score,
-        "signals": signals,
-        "rawSignals": signal_raw,
-        "evidence": {
-            key: list(dict.fromkeys(value))[:5]
-            for key, value in evidence.items()
-            if value
-        },
-        "weights": COMMONNESS_SIGNAL_WEIGHTS,
-        "entityKnowledge": entity_knowledge,
-        "personAlias": entity_knowledge if entity_knowledge.get("entityType") == "courtesy_name" else {
-            "accepted": False,
-            "word": word,
-            "hits": [],
-            "score": 0.0,
-        },
-    }
+    return build_result(entity_knowledge)
 
 
 def _commonness_signal_votes(front: Dict, behind: Dict) -> Dict[str, str]:
