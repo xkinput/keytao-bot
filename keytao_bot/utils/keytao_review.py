@@ -99,6 +99,8 @@ COMMON_KNOWN_MIN_SCORE = 0.55
 COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
 COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
 CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
+PRONUNCIATION_EVIDENCE_TIMEOUT = 8.0
+ENTITY_DIRECT_FETCH_TIMEOUT = 5.0
 
 AUTHORITATIVE_SOURCES = [
     {
@@ -576,6 +578,24 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
     }
 
 
+async def collect_pronunciation_evidence_limited(word: str) -> Dict[str, Any]:
+    try:
+        return await asyncio.wait_for(
+            collect_pronunciation_evidence(word),
+            timeout=PRONUNCIATION_EVIDENCE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.debug(f"Pronunciation evidence lookup timed out for {word}")
+        return {
+            "success": False,
+            "word": word,
+            "message": "权威读音搜索超时，已使用编码服务默认读音",
+            "groups": [],
+            "sources": [],
+            "timeout": True,
+        }
+
+
 async def _call_keytao_api(config: ReviewHttpConfig, path: str, payload: Optional[Dict] = None, method: str = "POST") -> Dict:
     if not config.bot_token:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
@@ -714,7 +734,7 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
         return {"success": False, "message": "词不能为空"}
 
     evidence, encode_data, existing_words = await asyncio.gather(
-        collect_pronunciation_evidence(word),
+        collect_pronunciation_evidence_limited(word),
         fetch_keytao_encode(config, word),
         lookup_words(config, [word]),
     )
@@ -1281,7 +1301,14 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
         and bool(entity.get("description"))
         and bool(entity.get("canonicalNames") or entity.get("aliases"))
     )
-    direct_hits = await _fetch_entity_direct_hits(word, entity)
+    try:
+        direct_hits = await asyncio.wait_for(
+            _fetch_entity_direct_hits(word, entity),
+            timeout=ENTITY_DIRECT_FETCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.debug(f"Entity direct-source lookup timed out for {word}")
+        direct_hits = []
     queries = _entity_search_queries(word, entity)
     query_results = []
     if not direct_hits and not llm_high_confidence:
@@ -1398,7 +1425,7 @@ async def estimate_word_commonness(word: str) -> Dict:
         return build_result(entity_knowledge)
 
     evidence_data, query_results = await asyncio.gather(
-        collect_pronunciation_evidence(word),
+        collect_pronunciation_evidence_limited(word),
         asyncio.gather(*(
             _search_web(query.format(word=word), max_results=5)
             for query, _signal in COMMONNESS_SEARCH_QUERIES
