@@ -1278,12 +1278,29 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
     exact_mentions = sum(_count_word_mentions(word, result) for result in hits)
     score = _bounded_log_score(len(hits) + exact_mentions * 0.5)
     confidence = float(entity.get("confidence") or 0.0)
+    entity_type = str(entity.get("entityType") or "unclear")
+    llm_high_confidence = (
+        confidence >= 0.90
+        and entity_type in ENTITY_ACCEPTED_TYPES
+        and bool(entity.get("description"))
+        and bool(entity.get("canonicalNames") or entity.get("aliases"))
+    )
     accepted = (
         len(hits) >= 2
         or (len(hits) >= 1 and confidence >= 0.70)
         or (bool(direct_hits) and confidence >= 0.60)
+        or llm_high_confidence
     )
-    label = _entity_type_label(str(entity.get("entityType") or "unclear"))
+    label = _entity_type_label(entity_type)
+    if accepted and hits:
+        summary = f"本喵先识别为{label}，并取得权威页面/搜索核验信号"
+        source = "llm_direct_source" if direct_hits else "llm_then_search"
+    elif accepted and llm_high_confidence:
+        summary = f"本喵先识别为{label}，LLM 基础常识给出明确标准名/别名和说明"
+        source = "llm_high_confidence"
+    else:
+        summary = f"本喵先识别为{label}，但搜索核验信号不足"
+        source = "llm_then_search"
     return {
         **entity,
         "accepted": accepted,
@@ -1299,12 +1316,8 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
             for result in hits[:5]
         ],
         "searchQueries": queries,
-        "summary": (
-            f"本喵先识别为{label}，并取得权威页面/搜索核验信号"
-            if accepted else
-            f"本喵先识别为{label}，但搜索核验信号不足"
-        ),
-        "source": "llm_direct_source" if direct_hits else "llm_then_search",
+        "summary": summary,
+        "source": source,
     }
 
 
