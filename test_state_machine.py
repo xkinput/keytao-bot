@@ -1458,6 +1458,62 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
     check("pre-submit preview keeps common-known reason", "实体常识" in (prompt or ""))
 
 
+def test_reviewed_add_prompt_explains_entity_common_knowledge():
+    """Lookup prompts should surface entity recognition when authority pages are missing."""
+    print("\n🧪 reviewed add prompt explains entity common knowledge")
+
+    prompt = _format_reviewed_add_prompt({
+        "success": True,
+        "word": "敬德",
+        "recommendedCode": "jgdei",
+        "autoReviewable": False,
+        "preSubmitAudit": {
+            "success": True,
+            "verdict": "pass",
+            "autoApprove": True,
+            "summary": "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过",
+            "commonKnownItems": [
+                {
+                    "word": "敬德",
+                    "code": "jgdei",
+                    "type": "historical_person",
+                    "summary": "「敬德」未找到权威读音页，但属于历史人物，且编码 jgdei 在读音候选链中",
+                    "commonness": {
+                        "entityKnowledge": {
+                            "accepted": True,
+                            "entityType": "historical_person",
+                            "label": "历史人物",
+                            "source": "llm_high_confidence",
+                            "canonicalNames": ["尉迟恭"],
+                            "aliases": ["敬德"],
+                            "summary": "本喵先识别为历史人物，LLM 基础常识给出明确标准名/别名和说明",
+                        },
+                    },
+                }
+            ],
+            "issues": [],
+        },
+        "pronunciations": [
+            {
+                "pinyin": "jing de",
+                "recommendedCode": "jgdei",
+                "sources": [],
+                "candidateStatuses": [
+                    {"code": "jgde", "occupied": True, "label": "已有「惊得」"},
+                    {"code": "jgdei", "occupied": False, "label": "空位"},
+                ],
+            },
+        ],
+    })
+
+    text = prompt or ""
+    check("entity prompt still states no authority page", "暂未找到权威读音页" in text)
+    check("entity prompt names inferred type", "本喵识别为历史人物" in text)
+    check("entity prompt names canonical identity", "尉迟恭" in text)
+    check("entity prompt says auto approval at source section", "提交预计可自动通过" in text)
+    check("entity audit reason includes llm knowledge", "LLM 基础常识" in text)
+
+
 def test_prepare_reviewed_add_attaches_pre_submit_audit():
     """The review tool should run the proposed add through submit-time audit logic."""
     print("\n🧪 prepare reviewed add attaches pre-submit audit")
@@ -4532,6 +4588,7 @@ if __name__ == "__main__":
     test_simple_single_word_query_uses_review_tool_before_ai()
     test_reviewed_add_prompt_explains_fallback_review_policy()
     test_reviewed_add_prompt_shows_pre_submit_audit_result()
+    test_reviewed_add_prompt_explains_entity_common_knowledge()
     test_prepare_reviewed_add_attaches_pre_submit_audit()
     test_auto_approved_review_lines_explain_pass_reason()
     test_simple_single_word_query_existing_word_falls_through()

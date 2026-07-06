@@ -1798,7 +1798,103 @@ def _review_source_label(source: Dict) -> str:
     return label or url
 
 
-def _format_review_candidate_line(index: int, status: Dict, recommended_code: str, pinyin: str, sources: List[Dict]) -> str:
+def _common_known_item_for_code(review: Dict, code: str) -> Optional[Dict]:
+    audit = review.get("preSubmitAudit") if isinstance(review, dict) else None
+    if not isinstance(audit, dict):
+        return None
+    word = str(review.get("word") or "").strip()
+    for item in audit.get("commonKnownItems") or []:
+        if not isinstance(item, dict):
+            continue
+        item_code = str(item.get("code") or "").strip()
+        item_word = str(item.get("word") or "").strip()
+        if item_code == code and (not word or not item_word or item_word == word):
+            return item
+    return None
+
+
+def _entity_identity_label(entity: Dict) -> str:
+    names: List[str] = []
+    for value in [*(entity.get("canonicalNames") or []), *(entity.get("aliases") or [])]:
+        text = str(value or "").strip()
+        if text and text not in names:
+            names.append(text)
+    return " / ".join(names[:3])
+
+
+def _common_known_item_label(item: Dict) -> str:
+    commonness = item.get("commonness") if isinstance(item.get("commonness"), dict) else {}
+    entity = commonness.get("entityKnowledge") if isinstance(commonness.get("entityKnowledge"), dict) else {}
+    label = str(entity.get("label") or "").strip()
+    if label:
+        return label
+    item_type = str(item.get("type") or "").strip()
+    return {
+        "historical_person": "历史人物",
+        "celebrity": "明星/公众人物",
+        "courtesy_name": "名人字号/别名",
+        "stage_name": "艺名/别名",
+        "brand": "品牌",
+        "product": "产品名",
+        "fictional_character": "角色名",
+        "place": "地名",
+        "organization": "组织/机构名",
+        "work": "作品名",
+        "technical_term": "专业术语",
+        "idiom": "成语/熟语",
+        "common_word": "常见词",
+    }.get(item_type, "常识实体")
+
+
+def _format_common_known_source_note(item: Optional[Dict]) -> str:
+    if not isinstance(item, dict):
+        return ""
+    commonness = item.get("commonness") if isinstance(item.get("commonness"), dict) else {}
+    entity = commonness.get("entityKnowledge") if isinstance(commonness.get("entityKnowledge"), dict) else {}
+    label = _common_known_item_label(item)
+    identity = _entity_identity_label(entity)
+    source = str(entity.get("source") or "").strip()
+    if identity:
+        return f"预审：本喵识别为{label}（{identity}），提交预计可自动通过"
+    if source:
+        return f"预审：本喵识别为{label}，提交预计可自动通过"
+    summary = str(item.get("summary") or "").strip()
+    return f"预审：{summary or f'属于{label}'}，提交预计可自动通过"
+
+
+def _format_common_known_audit_reason(item: Optional[Dict], fallback: str) -> str:
+    if not isinstance(item, dict):
+        return fallback
+    commonness = item.get("commonness") if isinstance(item.get("commonness"), dict) else {}
+    entity = commonness.get("entityKnowledge") if isinstance(commonness.get("entityKnowledge"), dict) else {}
+    label = _common_known_item_label(item)
+    identity = _entity_identity_label(entity)
+    entity_summary = str(entity.get("summary") or "").strip()
+    item_summary = str(item.get("summary") or "").strip()
+    if not item_summary and not entity_summary and not identity:
+        return fallback
+    parts = []
+    if item_summary:
+        parts.append(item_summary)
+    else:
+        parts.append(f"属于{label}，且编码在读音候选链中")
+    if identity:
+        parts.append(f"本喵识别为{label}（{identity}）")
+    elif label:
+        parts.append(f"本喵识别为{label}")
+    if entity_summary:
+        parts.append(entity_summary)
+    return "；".join(dict.fromkeys(part for part in parts if part))
+
+
+def _format_review_candidate_line(
+    index: int,
+    status: Dict,
+    recommended_code: str,
+    pinyin: str,
+    sources: List[Dict],
+    source_note: str = "",
+) -> str:
     code = str(status.get("code") or "").strip()
     occupied = bool(status.get("occupied"))
     if occupied:
@@ -1812,7 +1908,12 @@ def _format_review_candidate_line(index: int, status: Dict, recommended_code: st
         for source in sources[:3]
         if str(source.get("source") or "").strip()
     )
-    source_text = f"；来源 {source_names}" if source_names else "；来源 暂无权威页"
+    if source_names:
+        source_text = f"；来源 {source_names}"
+    elif source_note:
+        source_text = f"；来源 暂无权威页；{source_note}"
+    else:
+        source_text = "；来源 暂无权威页"
     return f"{index}. {code} — {label}；读音 {pinyin}{source_text}"
 
 
@@ -1827,7 +1928,11 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
         if audit.get("llmFallback"):
             reason = summary or "已按提交时的 LLM 复审路径预判可通过"
         elif audit.get("commonKnownItems"):
-            reason = summary or "常见词/实体常识信号和编码候选链一致"
+            common_item = _common_known_item_for_code(review, recommended_code)
+            reason = _format_common_known_audit_reason(
+                common_item,
+                summary or "常见词/实体常识信号和编码候选链一致",
+            )
         else:
             reason = summary or "权威来源、编码和常用度证据一致"
         return (
@@ -1866,6 +1971,8 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         "",
     ]
     candidate_index = 1
+    common_known_item = _common_known_item_for_code(review, recommended_code)
+    common_known_source_note = _format_common_known_source_note(common_known_item)
     for index, pronunciation in enumerate(pronunciations, start=1):
         pinyin = str(pronunciation.get("pinyin") or "").strip()
         sources = [
@@ -1879,6 +1986,8 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
                 if label
             )
             lines.append(f"来源：{source_line}")
+        elif common_known_source_note:
+            lines.append(f"来源：暂未找到权威读音页；{common_known_source_note}")
         else:
             lines.append("来源：暂未找到权威读音页，先按编码服务默认读音展示候选")
         lines.append("候选编码:")
@@ -1890,6 +1999,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
                     str(pronunciation.get("recommendedCode") or ""),
                     pinyin,
                     sources,
+                    common_known_source_note,
                 )
             )
             candidate_index += 1
