@@ -3547,6 +3547,48 @@ def test_entity_knowledge_signal_uses_llm_before_search():
     asyncio.run(_run())
 
 
+def test_entity_knowledge_signal_uses_direct_sources_before_search():
+    """Verify entity lookup can validate LLM knowledge through direct authoritative pages."""
+    print("\n🧪 entity knowledge signal uses direct sources before search")
+
+    async def _run():
+        search_queries = []
+
+        async def fake_infer_entity_knowledge(word):
+            return {
+                "recognized": True,
+                "word": word,
+                "entityType": "historical_person",
+                "confidence": 0.95,
+                "canonicalNames": ["尉迟恭"],
+                "aliases": ["敬德"],
+                "description": "唐朝名将尉迟恭的字，民间尊为门神之一",
+                "searchQueries": ['"敬德" 百度百科', '"尉迟恭" "敬德"'],
+                "reviewHint": "历史人物字号",
+            }
+
+        async def fake_fetch_text(url):
+            if "%E5%B0%89%E8%BF%9F%E6%81%AD" in url:
+                return "尉迟恭，字敬德，唐初名将，民间尊为门神。"
+            return ""
+
+        async def fake_search_web(query, max_results=3):
+            search_queries.append(query)
+            return []
+
+        with patch.object(keytao_review_module, "_infer_entity_knowledge", side_effect=fake_infer_entity_knowledge):
+            with patch.object(keytao_review_module, "_fetch_text", side_effect=fake_fetch_text):
+                with patch.object(keytao_review_module, "_search_web", side_effect=fake_search_web):
+                    signal = await keytao_review_module._estimate_entity_knowledge_signal("敬德")
+
+        check("direct-source entity signal accepted", signal.get("accepted") is True)
+        check("direct-source entity signal keeps type", signal.get("entityType") == "historical_person")
+        check("direct-source entity hit recorded", signal.get("hits", [{}])[0].get("provider") == "direct-source")
+        check("direct-source entity avoids slow search", not search_queries)
+
+    asyncio.run(_run())
+
+
 def test_review_audit_allows_known_celebrity_alias():
     """Verify celebrity aliases can pass through entity-knowledge review."""
     print("\n🧪 review audit allows known celebrity alias")
@@ -4430,6 +4472,7 @@ if __name__ == "__main__":
     test_review_audit_blocks_bare_delete_and_allows_code_move()
     test_review_audit_allows_known_person_alias()
     test_entity_knowledge_signal_uses_llm_before_search()
+    test_entity_knowledge_signal_uses_direct_sources_before_search()
     test_review_audit_allows_known_celebrity_alias()
     test_llm_review_prefers_keytao_encode_over_generic_double_pinyin_guess()
     test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries()

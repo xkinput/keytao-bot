@@ -1097,6 +1097,7 @@ async def _estimate_person_alias_signal(word: str) -> Dict[str, Any]:
                 "title": result.get("title", ""),
                 "url": result.get("url", ""),
                 "snippet": result.get("snippet", ""),
+                "provider": result.get("provider", ""),
             }
             for result in hits[:5]
         ],
@@ -1133,6 +1134,11 @@ def _entity_search_queries(word: str, entity: Dict[str, Any]) -> List[str]:
 
 def _looks_like_entity_result(word: str, result: Dict[str, str], entity: Dict[str, Any]) -> bool:
     text = re.sub(r"\s+", "", f"{result.get('title', '')} {result.get('snippet', '')}")
+    return _looks_like_entity_text(word, text, entity)
+
+
+def _looks_like_entity_text(word: str, text: str, entity: Dict[str, Any]) -> bool:
+    text = re.sub(r"\s+", "", text)
     terms = _entity_query_terms(word, entity)
     if not any(term and term in text for term in terms):
         return False
@@ -1140,10 +1146,57 @@ def _looks_like_entity_result(word: str, result: Dict[str, str], entity: Dict[st
     hints = ENTITY_TYPE_HINTS.get(entity_type, ())
     if any(hint in text for hint in hints):
         return True
+    canonical_names = [
+        name for name in entity.get("canonicalNames") or []
+        if name and name != word
+    ]
+    if word in text and any(name in text for name in canonical_names):
+        return True
+    if entity_type in {"person", "celebrity", "historical_person", "courtesy_name", "stage_name"}:
+        if re.search(rf"(?:字|号|别名|又名|又称|人称).{{0,12}}{re.escape(word)}", text):
+            return True
+        if re.search(rf"{re.escape(word)}.{{0,12}}(?:字|号|别名|又名|又称|人称)", text):
+            return True
     description = str(entity.get("description") or "")
     if description and any(token and token in text for token in re.split(r"[\s，,。；;、/]+", description)[:5]):
         return True
     return entity_type in {"common_word", "idiom", "technical_term"} and word in text
+
+
+def _entity_direct_source_urls(word: str, entity: Dict[str, Any]) -> List[Tuple[str, str]]:
+    urls: List[Tuple[str, str]] = []
+    seen = set()
+    for term in _entity_query_terms(word, entity)[:6]:
+        encoded = quote(term)
+        for source in AUTHORITATIVE_SOURCES:
+            if source.get("category") not in {"dictionary", "encyclopedia"}:
+                continue
+            for template in source.get("direct_urls", []):
+                url = template.format(word=encoded)
+                if url in seen:
+                    continue
+                seen.add(url)
+                urls.append((str(source.get("label") or ""), url))
+    return urls[:14]
+
+
+async def _fetch_entity_direct_hits(word: str, entity: Dict[str, Any]) -> List[Dict[str, str]]:
+    hits: List[Dict[str, str]] = []
+    for label, url in _entity_direct_source_urls(word, entity):
+        text = await _fetch_text(url)
+        if not text:
+            continue
+        if not _looks_like_entity_text(word, text[:16000], entity):
+            continue
+        hits.append({
+            "title": label or url,
+            "url": url,
+            "snippet": text[:240],
+            "provider": "direct-source",
+        })
+        if len(hits) >= 3:
+            break
+    return hits
 
 
 def _entity_type_label(entity_type: str) -> str:
@@ -1194,13 +1247,23 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
             "source": "llm",
         }
 
+    direct_hits = await _fetch_entity_direct_hits(word, entity)
     queries = _entity_search_queries(word, entity)
-    query_results = await asyncio.gather(*(
-        _search_web(query, max_results=4)
-        for query in queries
-    ))
+    query_results = []
+    if not direct_hits:
+        query_results = await asyncio.gather(*(
+            _search_web(query, max_results=4)
+            for query in queries
+        ))
     hits: List[Dict[str, str]] = []
     seen_urls = set()
+    for result in direct_hits:
+        url = str(result.get("url") or "")
+        key = url or f"{result.get('title', '')}:{result.get('snippet', '')}"
+        if key in seen_urls:
+            continue
+        seen_urls.add(key)
+        hits.append(result)
     for results in query_results:
         for result in results:
             url = str(result.get("url") or "")
@@ -1215,7 +1278,11 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
     exact_mentions = sum(_count_word_mentions(word, result) for result in hits)
     score = _bounded_log_score(len(hits) + exact_mentions * 0.5)
     confidence = float(entity.get("confidence") or 0.0)
-    accepted = len(hits) >= 2 or (len(hits) >= 1 and confidence >= 0.70)
+    accepted = (
+        len(hits) >= 2
+        or (len(hits) >= 1 and confidence >= 0.70)
+        or (bool(direct_hits) and confidence >= 0.60)
+    )
     label = _entity_type_label(str(entity.get("entityType") or "unclear"))
     return {
         **entity,
@@ -1227,16 +1294,17 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
                 "title": result.get("title", ""),
                 "url": result.get("url", ""),
                 "snippet": result.get("snippet", ""),
+                "provider": result.get("provider", ""),
             }
             for result in hits[:5]
         ],
         "searchQueries": queries,
         "summary": (
-            f"本喵先识别为{label}，并取得搜索/百科信号"
+            f"本喵先识别为{label}，并取得权威页面/搜索核验信号"
             if accepted else
             f"本喵先识别为{label}，但搜索核验信号不足"
         ),
-        "source": "llm_then_search",
+        "source": "llm_direct_source" if direct_hits else "llm_then_search",
     }
 
 
