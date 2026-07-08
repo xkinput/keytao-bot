@@ -3651,6 +3651,135 @@ def test_review_audit_blocks_bare_delete_and_allows_code_move():
     asyncio.run(_run())
 
 
+def test_review_audit_recommends_code_chain_priority_reorder():
+    """Verify review suggests concrete same-code-chain reorder when commonness is inverted."""
+    print("\n🧪 review audit recommends code-chain priority reorder")
+
+    async def _run():
+        async def fake_prepare_reviewed_word(config, word):
+            return {
+                "success": True,
+                "word": word,
+                "autoReviewable": True,
+                "pronunciations": [
+                    {
+                        "pinyin": "zhi bo jian",
+                        "sources": [{"source": "百度百科", "url": "https://example.test/zhibojian"}],
+                        "codes": ["fbjui", "fbjuio", "fbjuioa"],
+                        "candidateStatuses": [
+                            {
+                                "code": "fbjui",
+                                "occupied": True,
+                                "label": "已有「质保金」",
+                                "phrases": [{"word": "质保金", "code": "fbjui", "type": "Phrase"}],
+                            },
+                            {"code": "fbjuio", "occupied": False, "label": "空位", "phrases": []},
+                            {"code": "fbjuioa", "occupied": False, "label": "空位", "phrases": []},
+                        ],
+                    }
+                ],
+            }
+
+        async def fake_estimate_word_commonness(word):
+            scores = {"直播间": 0.92, "质保金": 0.35}
+            return {
+                "success": True,
+                "word": word,
+                "score": scores.get(word, 0.5),
+                "signals": {
+                    "corpus": scores.get(word, 0.5),
+                    "search": scores.get(word, 0.5),
+                    "dictionary": 0.25,
+                    "encyclopedia": 0.25,
+                },
+                "evidence": {"search": [f"https://example.test/{word}"]},
+                "entityKnowledge": {"accepted": False},
+            }
+
+        config = ReviewHttpConfig(api_base="https://example.test", bot_token="bot")
+        with patch.object(keytao_review_module, "prepare_reviewed_word", side_effect=fake_prepare_reviewed_word):
+            with patch.object(keytao_review_module, "estimate_word_commonness", side_effect=fake_estimate_word_commonness):
+                audit = await audit_draft_items(config, [
+                    {"action": "Create", "word": "直播间", "code": "fbjuio", "type": "Phrase"},
+                ])
+
+        chain_review = audit.get("codeChainPriorityReviews", [{}])[0]
+        moves = chain_review.get("recommendedMoves", [])
+        note = keytao_review_module.build_review_note(audit)
+
+        check("priority reorder blocks auto approval", audit.get("autoApprove") is False)
+        check("priority issue recorded", any("同编码链优先级" in issue for issue in audit.get("issues", [])))
+        check("chain recommendation recorded", chain_review.get("hasRecommendation") is True)
+        check("new common word moves to short code", any(move.get("word") == "直播间" and move.get("toCode") == "fbjui" for move in moves))
+        check("old occupant moves to longer code", any(move.get("word") == "质保金" and move.get("toCode") == "fbjuio" for move in moves))
+        check("review note includes purpose and chain sections", "词语用途判断：" in note and "同编码链优先级：" in note)
+
+    asyncio.run(_run())
+
+
+def test_review_audit_skips_code_chain_reorder_when_priority_ok():
+    """Verify review does not invent a reorder when same-code-chain priority is already sane."""
+    print("\n🧪 review audit skips code-chain reorder when priority is ok")
+
+    async def _run():
+        async def fake_prepare_reviewed_word(config, word):
+            return {
+                "success": True,
+                "word": word,
+                "autoReviewable": True,
+                "pronunciations": [
+                    {
+                        "pinyin": "zhi bao jin",
+                        "sources": [{"source": "汉典", "url": "https://example.test/zhibaojin"}],
+                        "codes": ["fbjui", "fbjuio", "fbjuioa"],
+                        "candidateStatuses": [
+                            {
+                                "code": "fbjui",
+                                "occupied": True,
+                                "label": "已有「直播间」",
+                                "phrases": [{"word": "直播间", "code": "fbjui", "type": "Phrase"}],
+                            },
+                            {"code": "fbjuio", "occupied": False, "label": "空位", "phrases": []},
+                            {"code": "fbjuioa", "occupied": False, "label": "空位", "phrases": []},
+                        ],
+                    }
+                ],
+            }
+
+        async def fake_estimate_word_commonness(word):
+            scores = {"直播间": 0.92, "质保金": 0.35}
+            return {
+                "success": True,
+                "word": word,
+                "score": scores.get(word, 0.5),
+                "signals": {
+                    "corpus": scores.get(word, 0.5),
+                    "search": scores.get(word, 0.5),
+                    "dictionary": 0.25,
+                    "encyclopedia": 0.25,
+                },
+                "evidence": {"search": [f"https://example.test/{word}"]},
+                "entityKnowledge": {"accepted": False},
+            }
+
+        config = ReviewHttpConfig(api_base="https://example.test", bot_token="bot")
+        with patch.object(keytao_review_module, "prepare_reviewed_word", side_effect=fake_prepare_reviewed_word):
+            with patch.object(keytao_review_module, "estimate_word_commonness", side_effect=fake_estimate_word_commonness):
+                audit = await audit_draft_items(config, [
+                    {"action": "Create", "word": "质保金", "code": "fbjuio", "type": "Phrase"},
+                ])
+
+        chain_review = audit.get("codeChainPriorityReviews", [{}])[0]
+
+        check("priority-ok add can auto approve", audit.get("autoApprove") is True)
+        check("chain review recorded", bool(audit.get("codeChainPriorityReviews")))
+        check("no reorder recommendation", chain_review.get("hasRecommendation") is False)
+        check("summary says no new order", "不建议新的排序" in chain_review.get("summary", ""))
+        check("purpose review recorded", audit.get("wordPurposeReviews", [{}])[0].get("word") == "质保金")
+
+    asyncio.run(_run())
+
+
 def test_review_audit_allows_known_person_alias():
     """Verify famous person courtesy names can pass without a standalone dictionary page."""
     print("\n🧪 review audit allows known person alias")
@@ -4766,6 +4895,8 @@ if __name__ == "__main__":
     test_get_latest_draft_batch_does_not_touch_word_code_locals()
     test_keytao_draft_code_validation_guards_create_codes()
     test_review_audit_blocks_bare_delete_and_allows_code_move()
+    test_review_audit_recommends_code_chain_priority_reorder()
+    test_review_audit_skips_code_chain_reorder_when_priority_ok()
     test_review_audit_allows_known_person_alias()
     test_entity_knowledge_signal_uses_llm_before_search()
     test_entity_knowledge_signal_uses_direct_sources_before_search()

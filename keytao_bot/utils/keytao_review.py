@@ -55,6 +55,9 @@ COMMONNESS_SEARCH_QUERIES = [
     ('"{word}" 词典 OR 辞典', "dictionary"),
     ('"{word}" 百度百科 OR 维基百科', "encyclopedia"),
 ]
+CODE_CHAIN_PRIORITY_WINDOW_AFTER = 2
+CODE_CHAIN_PRIORITY_MAX_OCCUPANTS = 8
+CODE_CHAIN_REORDER_SCORE_MARGIN = 0.20
 PERSON_ALIAS_SEARCH_QUERIES = [
     '"{word}" "字"',
     '"{word}" "号"',
@@ -1537,6 +1540,200 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
     }
 
 
+def _active_commonness_signals(commonness: Dict) -> int:
+    signals = commonness.get("signals") or {}
+    return sum(1 for value in signals.values() if float(value or 0) > 0.15)
+
+
+def _commonness_is_confident(commonness: Dict) -> bool:
+    if not commonness.get("success"):
+        return False
+    if (commonness.get("entityKnowledge") or {}).get("accepted"):
+        return True
+    if (commonness.get("personAlias") or {}).get("accepted"):
+        return True
+    return _active_commonness_signals(commonness) >= 2 or float(commonness.get("score") or 0) >= 0.65
+
+
+def _word_usage_summary(word: str, commonness: Dict) -> str:
+    entity = commonness.get("entityKnowledge") or {}
+    if entity.get("accepted"):
+        label = str(entity.get("label") or _entity_type_label(str(entity.get("entityType") or "")))
+        summary = str(entity.get("summary") or "").strip()
+        return f"{label}；{summary}" if summary else label
+    person_alias = commonness.get("personAlias") or {}
+    if person_alias.get("accepted"):
+        summary = str(person_alias.get("summary") or "").strip()
+        return f"名人字号/别名；{summary}" if summary else "名人字号/别名"
+
+    evidence = commonness.get("evidence") or {}
+    if evidence.get("dictionary") and evidence.get("encyclopedia"):
+        return "词典/百科均有信号的固定词语或实体名"
+    if evidence.get("dictionary"):
+        return "词典可查的常规汉语词语"
+    if evidence.get("encyclopedia"):
+        return "百科可查的实体、术语或专名"
+    if float(commonness.get("score") or 0) >= 0.65:
+        return "搜索/语料信号较多的日常表达或网络常用词"
+    if len(word) >= 4:
+        return "用途信号不足，暂按多字固定表达复核"
+    return "用途信号不足，需结合上下文人工判断"
+
+
+def _pronunciation_statuses_for_code(review: Dict, code: str) -> List[Dict]:
+    for pronunciation in review.get("pronunciations", []):
+        if not isinstance(pronunciation, dict):
+            continue
+        statuses = pronunciation.get("candidateStatuses")
+        if not isinstance(statuses, list):
+            continue
+        if any(isinstance(status, dict) and status.get("code") == code for status in statuses):
+            return [status for status in statuses if isinstance(status, dict)]
+    return []
+
+
+def _same_type_chain_phrases(status: Dict, phrase_type: str) -> List[Dict]:
+    phrases = status.get("phrases") if isinstance(status.get("phrases"), list) else []
+    return _same_type_phrases(phrases, phrase_type)
+
+
+async def _review_code_chain_priority(item: Dict, review: Dict) -> Dict:
+    word = str(item.get("word") or "").strip()
+    code = str(item.get("code") or "").strip().lower()
+    phrase_type = str(item.get("type") or "Phrase").strip() or "Phrase"
+    commonness = await estimate_word_commonness(word)
+    usage = _word_usage_summary(word, commonness)
+    base_result = {
+        "word": word,
+        "code": code,
+        "type": phrase_type,
+        "usage": usage,
+        "commonness": commonness,
+        "hasRecommendation": False,
+        "priorityOk": True,
+        "summary": "同编码链未发现需要调整的高置信优先级问题",
+        "currentOrder": [],
+        "recommendedOrder": [],
+        "recommendedMoves": [],
+    }
+
+    statuses = _pronunciation_statuses_for_code(review, code)
+    if not statuses:
+        base_result["summary"] = "未拿到可比较的候选编码链，暂不建议调序"
+        return base_result
+
+    current_index = next(
+        (index for index, status in enumerate(statuses) if status.get("code") == code),
+        -1,
+    )
+    if current_index < 0:
+        base_result["summary"] = "目标编码不在候选编码链中，暂不建议调序"
+        return base_result
+
+    end_index = min(len(statuses), current_index + CODE_CHAIN_PRIORITY_WINDOW_AFTER + 1)
+    entries: List[Dict[str, Any]] = []
+    seen_words: set[str] = set()
+    for index, status in enumerate(statuses[:end_index]):
+        status_code = str(status.get("code") or "").strip().lower()
+        for phrase in _same_type_chain_phrases(status, phrase_type)[:1]:
+            phrase_word = str(phrase.get("word") or "").strip()
+            if not phrase_word or phrase_word == word or phrase_word in seen_words:
+                continue
+            entries.append({
+                "word": phrase_word,
+                "code": status_code,
+                "position": index,
+                "current": False,
+            })
+            seen_words.add(phrase_word)
+            if len(entries) >= CODE_CHAIN_PRIORITY_MAX_OCCUPANTS:
+                break
+        if len(entries) >= CODE_CHAIN_PRIORITY_MAX_OCCUPANTS:
+            break
+
+    entries.append({
+        "word": word,
+        "code": code,
+        "position": current_index,
+        "current": True,
+    })
+    entries.sort(key=lambda entry: (int(entry["position"]), 0 if entry["current"] else 1))
+
+    words_to_score = [entry["word"] for entry in entries]
+    commonness_by_word: Dict[str, Dict] = {word: commonness}
+    missing_words = [entry_word for entry_word in words_to_score if entry_word not in commonness_by_word]
+    if missing_words:
+        estimates = await asyncio.gather(*(estimate_word_commonness(entry_word) for entry_word in missing_words))
+        commonness_by_word.update(dict(zip(missing_words, estimates)))
+
+    for entry in entries:
+        entry_commonness = commonness_by_word.get(entry["word"], {})
+        entry["score"] = float(entry_commonness.get("score") or 0)
+        entry["usage"] = _word_usage_summary(entry["word"], entry_commonness)
+        entry["confident"] = _commonness_is_confident(entry_commonness)
+
+    current_order = [
+        {
+            "word": entry["word"],
+            "code": entry["code"],
+            "score": entry["score"],
+            "usage": entry["usage"],
+            "current": entry["current"],
+        }
+        for entry in entries
+    ]
+    base_result["currentOrder"] = current_order
+
+    if len(entries) <= 1:
+        base_result["summary"] = "同编码链暂无其他同类型词可比较，暂不建议调序"
+        return base_result
+
+    if not all(entry["confident"] for entry in entries):
+        base_result["summary"] = "同编码链存在常用度信号不足的词，暂不自动建议调序"
+        return base_result
+
+    ordered_entries = sorted(
+        entries,
+        key=lambda entry: (-entry["score"], int(entry["position"]), entry["word"]),
+    )
+    original_words = [entry["word"] for entry in entries]
+    ordered_words = [entry["word"] for entry in ordered_entries]
+    top_delta = max(entry["score"] for entry in entries) - min(entry["score"] for entry in entries)
+    if ordered_words == original_words or top_delta < CODE_CHAIN_REORDER_SCORE_MARGIN:
+        base_result["summary"] = "同编码链常用度顺序基本合理，不建议新的排序"
+        return base_result
+
+    target_codes = [entry["code"] for entry in entries]
+    recommended_order = []
+    recommended_moves = []
+    original_code_by_word = {entry["word"]: entry["code"] for entry in entries}
+    for entry, target_code in zip(ordered_entries, target_codes):
+        recommended = {
+            "word": entry["word"],
+            "fromCode": original_code_by_word.get(entry["word"], ""),
+            "toCode": target_code,
+            "score": entry["score"],
+            "usage": entry["usage"],
+            "current": entry["current"],
+        }
+        recommended_order.append(recommended)
+        if recommended["fromCode"] != target_code:
+            recommended_moves.append(recommended)
+
+    if not recommended_moves:
+        base_result["summary"] = "同编码链常用度顺序基本合理，不建议新的排序"
+        return base_result
+
+    base_result.update({
+        "hasRecommendation": True,
+        "priorityOk": False,
+        "summary": "同编码链常用度显示当前排序可优化，建议按推荐顺序重排",
+        "recommendedOrder": recommended_order,
+        "recommendedMoves": recommended_moves,
+    })
+    return base_result
+
+
 def _find_move_pairs(items: Sequence[Dict]) -> Dict[Tuple[str, str], Dict]:
     creates_by_word: Dict[str, List[Dict]] = {}
     for item in items:
@@ -1587,6 +1784,31 @@ def _find_priority_comparisons(items: Sequence[Dict]) -> List[Dict[str, str]]:
     return comparisons
 
 
+def _purpose_review_from_commonness(word: str, code: str, phrase_type: str, commonness: Dict) -> Dict:
+    return {
+        "word": word,
+        "code": code,
+        "type": phrase_type,
+        "usage": _word_usage_summary(word, commonness),
+        "commonnessScore": float(commonness.get("score") or 0),
+        "activeSignals": _active_commonness_signals(commonness),
+        "confident": _commonness_is_confident(commonness),
+        "commonness": commonness,
+    }
+
+
+def _chain_recommendation_text(priority_review: Dict) -> str:
+    moves = priority_review.get("recommendedMoves") or []
+    if not moves:
+        return priority_review.get("summary", "建议复核同编码链顺序")
+    move_text = "、".join(
+        f"「{move.get('word')}」→{move.get('toCode')}"
+        for move in moves[:6]
+        if move.get("word") and move.get("toCode")
+    )
+    return f"{priority_review.get('summary', '建议重排')}：{move_text}"
+
+
 async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> Dict:
     if not items:
         return {
@@ -1601,6 +1823,8 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
     issues: List[str] = []
     approved_items: List[str] = []
     common_known_items: List[Dict[str, Any]] = []
+    word_purpose_reviews: List[Dict[str, Any]] = []
+    code_chain_priority_reviews: List[Dict[str, Any]] = []
     reviewed_words: Dict[str, Dict] = {}
     move_pairs = _find_move_pairs(items)
     priority_comparisons = _find_priority_comparisons(items)
@@ -1632,6 +1856,9 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
 
             css_info = css_review.get("cssShortCodeReview") or {}
             exact_existing = css_info.get("exactExisting") or []
+            css_commonness = css_info.get("commonness") if isinstance(css_info.get("commonness"), dict) else {}
+            if css_commonness:
+                word_purpose_reviews.append(_purpose_review_from_commonness(word, code, phrase_type, css_commonness))
             if action == "Change" and old_word:
                 comparison = await compare_word_commonness(word, old_word)
                 css_review["commonnessComparison"] = comparison
@@ -1687,7 +1914,13 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 continue
 
             commonness = await estimate_word_commonness(word)
+            word_purpose_reviews.append(_purpose_review_from_commonness(word, code, phrase_type, commonness))
             if _is_common_known_word(word, commonness):
+                priority_review = await _review_code_chain_priority(item, review)
+                code_chain_priority_reviews.append(priority_review)
+                if priority_review.get("hasRecommendation"):
+                    issues.append(f"「{word}」@{code} 同编码链优先级建议调整：{_chain_recommendation_text(priority_review)}")
+                    continue
                 common_known_label = _common_known_review_label(commonness)
                 common_known_type = _common_known_review_type(commonness)
                 summary = (
@@ -1719,6 +1952,17 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         if code not in candidate_codes:
             available = ", ".join(sorted(candidate_codes)[:8])
             issues.append(f"「{word}」编码 {code} 不在权威读音候选链中，可选：{available or '无'}")
+            continue
+        priority_review = await _review_code_chain_priority(item, review)
+        code_chain_priority_reviews.append(priority_review)
+        word_purpose_reviews.append(_purpose_review_from_commonness(
+            word,
+            code,
+            phrase_type,
+            priority_review.get("commonness") or {},
+        ))
+        if priority_review.get("hasRecommendation"):
+            issues.append(f"「{word}」@{code} 同编码链优先级建议调整：{_chain_recommendation_text(priority_review)}")
             continue
         approved_items.append(f"{action}：{word}@{code}")
 
@@ -1754,6 +1998,8 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         "issues": issues,
         "approvedItems": approved_items,
         "commonKnownItems": common_known_items,
+        "wordPurposeReviews": word_purpose_reviews,
+        "codeChainPriorityReviews": code_chain_priority_reviews,
         "reviewedWords": reviewed_words,
         "commonnessComparisons": commonness_results,
         "sourcePolicy": {
@@ -1794,6 +2040,20 @@ def build_review_note(audit: Dict) -> str:
                 f"- {item.get('frontWord')} > {item.get('behindWord')} @ {item.get('code')}："
                 f"{result.get('summary', '未给出结论')}"
             )
+    if audit.get("wordPurposeReviews"):
+        lines.append("词语用途判断：")
+        for item in audit.get("wordPurposeReviews", [])[:10]:
+            lines.append(
+                f"- 「{item.get('word')}」@{item.get('code')}：{item.get('usage', '用途未判定')}；"
+                f"常用度分 {float(item.get('commonnessScore') or 0):.2f}"
+            )
+    if audit.get("codeChainPriorityReviews"):
+        lines.append("同编码链优先级：")
+        for item in audit.get("codeChainPriorityReviews", [])[:10]:
+            if item.get("hasRecommendation"):
+                lines.append(f"- 「{item.get('word')}」@{item.get('code')}：{_chain_recommendation_text(item)}")
+            else:
+                lines.append(f"- 「{item.get('word')}」@{item.get('code')}：{item.get('summary', '不建议调序')}")
     if audit.get("commonKnownItems"):
         lines.append("常见词/熟语/名人字号语言常识通过：")
         for item in audit.get("commonKnownItems", [])[:10]:

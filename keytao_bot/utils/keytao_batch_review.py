@@ -669,6 +669,49 @@ def _normalize_llm_review(
             updated["recommendations"] = chain_by_key[key]
         code_chains.append(updated)
 
+    audit_chain_reviews = []
+    audit_word_purposes = []
+    if isinstance(audit, dict):
+        if isinstance(audit.get("codeChainPriorityReviews"), list):
+            audit_chain_reviews = [
+                item for item in audit.get("codeChainPriorityReviews", [])
+                if isinstance(item, dict)
+            ]
+        if isinstance(audit.get("wordPurposeReviews"), list):
+            audit_word_purposes = [
+                item for item in audit.get("wordPurposeReviews", [])
+                if isinstance(item, dict)
+            ]
+    existing_chain_keys = {
+        f"{_string(chain.get('type') or 'Phrase')}:{_string(chain.get('code')).lower()}"
+        for chain in code_chains
+        if isinstance(chain, dict)
+    }
+    for chain in audit_chain_reviews:
+        key = f"{_string(chain.get('type') or 'Phrase')}:{_string(chain.get('code')).lower()}"
+        if key in existing_chain_keys:
+            continue
+        moves = chain.get("recommendedMoves") if isinstance(chain.get("recommendedMoves"), list) else []
+        recommendations = []
+        if chain.get("hasRecommendation"):
+            move_text = "、".join(
+                f"「{move.get('word')}」→{move.get('toCode')}"
+                for move in moves[:6]
+                if isinstance(move, dict) and move.get("word") and move.get("toCode")
+            )
+            recommendations.append(
+                f"{chain.get('summary', '同编码链建议重排')}"
+                + (f"：{move_text}" if move_text else "")
+            )
+        code_chains.append({
+            "code": chain.get("code"),
+            "type": chain.get("type") or "Phrase",
+            "currentOrder": chain.get("currentOrder") or [],
+            "recommendedOrder": chain.get("recommendedOrder") or [],
+            "recommendations": recommendations,
+            "summary": chain.get("summary"),
+        })
+
     pass_count = sum(1 for item in normalized_items if item["status"] == "pass")
     attention_count = sum(1 for item in normalized_items if item["status"] == "attention")
     manual_count = sum(1 for item in normalized_items if item["status"] == "manual_review")
@@ -709,6 +752,8 @@ def _normalize_llm_review(
         ],
         "items": normalized_items,
         "codeChains": code_chains,
+        "wordPurposeReviews": audit_word_purposes,
+        "codeChainPriorityReviews": audit_chain_reviews,
     }
 
 
@@ -726,6 +771,10 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
         "你是键道输入法审词员喵喵。你必须根据给定证据做保守、专业的中文词语审核。"
         "重点检查：真实读音、编码是否由真实读音推出、同码链顺序是否合理、改词是否把正确词误改掉、"
         "纯删除是否必须人工确认、调码是否等价于删除原位并新增正确位置。"
+        "每个新增/修改词都必须判断这个词的用途/语境类别（如日常词、网络词、专业术语、品牌、人物别名等），"
+        "并和同编码候选链里已经占位的词比较常用度优先级。"
+        "如果现有顺序合理，明确不建议调序；只有新词或链上其他词明显更常用、应该占更短码时，才给出新的重排建议。"
+        "重排建议必须具体到“哪个词应到哪个编码”，不要泛泛说优化。"
         "编码正确性只能依据 deterministicAudit.reviewedWords、keytao_encode 返回的 candidateCodes/"
         "candidateStatuses/requestedCodeAnalysis、localReview 的编码链、以及 KeyTao/键道6 文档。"
         "禁止使用通用双拼、普通拼音键位、零声母猜测或你自己的声韵推导来判定键道编码；"
@@ -760,6 +809,11 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
             "code": "abc",
             "type": "Phrase",
             "recommendations": ["priority advice"],
+        }],
+        "wordPurposeReviews": [{
+            "word": "词",
+            "usage": "用途/语境类别",
+            "confidence": "high | medium | low",
         }],
     }
     user_payload = {
