@@ -1417,9 +1417,10 @@ def test_reviewed_add_prompt_explains_fallback_review_policy():
 
     check("fallback prompt generated", bool(prompt))
     check("fallback prompt does not say cannot auto approve", "不能自动通过" not in (prompt or ""))
-    check("fallback prompt mentions no authoritative page", "暂未找到权威读音页" in (prompt or ""))
-    check("fallback prompt mentions common knowledge review", "LLM 基础常识" in (prompt or ""))
-    check("fallback candidate line avoids vague pending source", "来源 暂无权威页" in (prompt or ""))
+    check("fallback prompt mentions no authoritative page", "来源 暂无权威页" in (prompt or ""))
+    check("fallback prompt keeps one concise review line", "审词：读音 bai sui shan" in (prompt or ""))
+    check("fallback prompt mentions later review", "提交后复审" in (prompt or ""))
+    check("fallback candidate line avoids repeated source", "1. bse — 已有「不算数」；来源" not in (prompt or ""))
 
 
 def test_reviewed_add_prompt_shows_pre_submit_audit_result():
@@ -1452,10 +1453,11 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
         ],
     })
 
-    check("pre-submit preview mentions submission logic", "预审结论（同提交审核逻辑）" in (prompt or ""))
-    check("pre-submit preview predicts auto approval", "预计可由本喵自动通过" in (prompt or ""))
-    check("pre-submit preview explains batch caveat", "按整批重新审核" in (prompt or ""))
+    check("pre-submit preview is concise", "预审结论（同提交审核逻辑）" not in (prompt or ""))
+    check("pre-submit preview predicts auto approval", "自动审核：预计可通过" in (prompt or ""))
+    check("pre-submit preview explains batch caveat", "提交整批时会重审" in (prompt or ""))
     check("pre-submit preview keeps common-known reason", "实体常识" in (prompt or ""))
+    check("pre-submit preview appears once", (prompt or "").count("自动审核：") == 1)
 
 
 def test_reviewed_add_prompt_explains_entity_common_knowledge():
@@ -1507,11 +1509,51 @@ def test_reviewed_add_prompt_explains_entity_common_knowledge():
     })
 
     text = prompt or ""
-    check("entity prompt still states no authority page", "暂未找到权威读音页" in text)
+    check("entity prompt still states no authority page", "来源 暂无权威页" in text)
     check("entity prompt names inferred type", "本喵识别为历史人物" in text)
     check("entity prompt names canonical identity", "尉迟恭" in text)
-    check("entity prompt says auto approval at source section", "提交预计可自动通过" in text)
-    check("entity audit reason includes llm knowledge", "LLM 基础常识" in text)
+    check("entity prompt says auto approval once", text.count("自动审核：预计可通过") == 1)
+    check("entity candidate lines stay compact", "1. jgde — 已有「惊得」；来源" not in text)
+
+
+def test_reviewed_add_prompt_keeps_waiting_review_concise():
+    """Uncertain reviewed add prompts should explain admin review once."""
+    print("\n🧪 reviewed add prompt keeps waiting review concise")
+
+    prompt = _format_reviewed_add_prompt({
+        "success": True,
+        "word": "黑哨比赛",
+        "recommendedCode": "hebsi",
+        "preSubmitAudit": {
+            "success": True,
+            "verdict": "needs_review",
+            "autoApprove": False,
+            "summary": "存在不确定项，提交后等待管理员审核",
+            "issues": [
+                "「黑哨比赛」没有权威读音来源，且常用词信号不足，不能自动通过",
+            ],
+        },
+        "pronunciations": [
+            {
+                "pinyin": "hei shao bi sai",
+                "recommendedCode": "hebsi",
+                "sources": [],
+                "candidateStatuses": [
+                    {"code": "hebs", "occupied": True, "label": "已有「喝吧」"},
+                    {"code": "hebsi", "occupied": False, "label": "空位"},
+                    {"code": "hebsio", "occupied": False, "label": "空位"},
+                ],
+            },
+        ],
+    })
+
+    text = prompt or ""
+    check("uncertain prompt generated", bool(prompt))
+    check("uncertain prompt uses one review line", text.count("自动审核：") == 1)
+    check("uncertain prompt predicts admin review", "自动审核：预计需管理员审核" in text)
+    check("uncertain prompt keeps concrete reason", "没有权威读音来源，且常用词信号不足" in text)
+    check("uncertain prompt omits old long preview", "预审结论（同提交审核逻辑）" not in text)
+    check("uncertain candidate lines omit repeated pronunciation", "1. hebs — 已有「喝吧」；读音" not in text)
 
 
 def test_prepare_reviewed_add_attaches_pre_submit_audit():
@@ -4589,6 +4631,7 @@ if __name__ == "__main__":
     test_reviewed_add_prompt_explains_fallback_review_policy()
     test_reviewed_add_prompt_shows_pre_submit_audit_result()
     test_reviewed_add_prompt_explains_entity_common_knowledge()
+    test_reviewed_add_prompt_keeps_waiting_review_concise()
     test_prepare_reviewed_add_attaches_pre_submit_audit()
     test_auto_approved_review_lines_explain_pass_reason()
     test_simple_single_word_query_existing_word_falls_through()

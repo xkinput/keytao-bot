@@ -784,6 +784,18 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     if not candidates:
         candidates = [(recommended_code, False)]
 
+    review_line_match = re.search(r'(?m)^\s*审词：(.+?)\s*$', response)
+    if review_line_match:
+        review_text = review_line_match.group(1).strip()
+        if review_text:
+            for code, _ in candidates:
+                code_remarks.setdefault(code, "喵喵审词：" + review_text)
+            pinyin_match = re.search(r'读音\s*([A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ\s]+)', review_text)
+            if pinyin_match:
+                pinyin = re.sub(r"\s+", " ", pinyin_match.group(1)).strip()
+                for code, _ in candidates:
+                    pronunciation_codes.setdefault(code, pinyin)
+
     return PendingAddWord(
         word=word,
         recommended_code=recommended_code,
@@ -1846,75 +1858,61 @@ def _common_known_item_label(item: Dict) -> str:
     }.get(item_type, "常识实体")
 
 
-def _format_common_known_source_note(item: Optional[Dict]) -> str:
+def _clean_review_audit_reason(reason: str) -> str:
+    text = str(reason or "").strip()
+    replacements = [
+        "存在不确定项，提交后等待管理员审核；",
+        "存在不确定项，提交后等待管理员审核",
+        "提交后等待管理员审核；",
+        "提交后等待管理员审核",
+        "允许本喵自动通过",
+        "可由本喵自动通过",
+        "不能自动通过",
+    ]
+    for old in replacements:
+        text = text.replace(old, "")
+    text = text.strip("；。 ，,")
+    return text
+
+
+def _format_source_summary(sources: List[Dict]) -> str:
+    labels = []
+    for source in sources[:3]:
+        label = _review_source_label(source)
+        if label:
+            labels.append(label)
+    return "；".join(labels) if labels else "暂无权威页"
+
+
+def _format_common_known_brief_reason(item: Optional[Dict], fallback: str) -> str:
     if not isinstance(item, dict):
-        return ""
+        return _clean_review_audit_reason(fallback)
     commonness = item.get("commonness") if isinstance(item.get("commonness"), dict) else {}
     entity = commonness.get("entityKnowledge") if isinstance(commonness.get("entityKnowledge"), dict) else {}
     label = _common_known_item_label(item)
     identity = _entity_identity_label(entity)
-    source = str(entity.get("source") or "").strip()
     if identity:
-        return f"预审：本喵识别为{label}（{identity}），提交预计可自动通过"
-    if source:
-        return f"预审：本喵识别为{label}，提交预计可自动通过"
-    summary = str(item.get("summary") or "").strip()
-    return f"预审：{summary or f'属于{label}'}，提交预计可自动通过"
-
-
-def _format_common_known_audit_reason(item: Optional[Dict], fallback: str) -> str:
-    if not isinstance(item, dict):
-        return fallback
-    commonness = item.get("commonness") if isinstance(item.get("commonness"), dict) else {}
-    entity = commonness.get("entityKnowledge") if isinstance(commonness.get("entityKnowledge"), dict) else {}
-    label = _common_known_item_label(item)
-    identity = _entity_identity_label(entity)
-    entity_summary = str(entity.get("summary") or "").strip()
-    item_summary = str(item.get("summary") or "").strip()
-    if not item_summary and not entity_summary and not identity:
-        return fallback
-    parts = []
-    if item_summary:
-        parts.append(item_summary)
-    else:
-        parts.append(f"属于{label}，且编码在读音候选链中")
-    if identity:
-        parts.append(f"本喵识别为{label}（{identity}）")
-    elif label:
-        parts.append(f"本喵识别为{label}")
-    if entity_summary:
-        parts.append(entity_summary)
-    return "；".join(dict.fromkeys(part for part in parts if part))
+        return f"本喵识别为{label}（{identity}），编码在候选链中"
+    summary = _clean_review_audit_reason(str(item.get("summary") or "").strip())
+    if summary:
+        return summary
+    return _clean_review_audit_reason(fallback) or f"本喵识别为{label}"
 
 
 def _format_review_candidate_line(
     index: int,
     status: Dict,
     recommended_code: str,
-    pinyin: str,
-    sources: List[Dict],
-    source_note: str = "",
 ) -> str:
     code = str(status.get("code") or "").strip()
     occupied = bool(status.get("occupied"))
     if occupied:
         label = str(status.get("label") or "已有占用").strip()
     elif code == recommended_code:
-        label = "✅ 该读音推荐（空位）"
+        label = "✅ 推荐（空位）"
     else:
         label = "空位"
-    source_names = "、".join(
-        str(source.get("source") or "").strip()
-        for source in sources[:3]
-        if str(source.get("source") or "").strip()
-    )
-    if source_names:
-        source_text = f"；来源 {source_names}"
-    elif source_note:
-        source_text = f"；来源 暂无权威页；{source_note}"
-    else:
-        source_text = "；来源 暂无权威页"
-    return f"{index}. {code} — {label}；读音 {pinyin}{source_text}"
+    return f"{index}. {code} — {label}"
 
 
 def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Optional[str]:
@@ -1923,35 +1921,28 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
         return None
 
     summary = str(audit.get("summary") or "").strip()
-    suffix = "若提交时草稿还有其他条目，会按整批重新审核。"
+    suffix = "；提交整批时会重审"
     if audit.get("autoApprove"):
         if audit.get("llmFallback"):
-            reason = summary or "已按提交时的 LLM 复审路径预判可通过"
+            reason = _clean_review_audit_reason(summary or "LLM 复审认为读音和编码一致")
         elif audit.get("commonKnownItems"):
             common_item = _common_known_item_for_code(review, recommended_code)
-            reason = _format_common_known_audit_reason(
+            reason = _format_common_known_brief_reason(
                 common_item,
                 summary or "常见词/实体常识信号和编码候选链一致",
             )
         else:
-            reason = summary or "权威来源、编码和常用度证据一致"
-        return (
-            f"预审结论（同提交审核逻辑）：若仅提交推荐编码 {recommended_code} 的这条新增，"
-            f"预计可由本喵自动通过。原因：{reason}。{suffix}"
-        )
+            reason = _clean_review_audit_reason(summary or "权威来源、编码和常用度证据一致")
+        return f"自动审核：预计可通过（{reason}{suffix}）"
 
     issues = [
         str(issue).strip()
         for issue in (audit.get("issues") or [])
         if str(issue).strip()
     ]
-    reason = summary or (issues[0] if issues else "证据不足")
-    if issues and issues[0] not in reason:
-        reason = f"{reason}；{issues[0]}"
-    return (
-        f"预审结论（同提交审核逻辑）：若仅提交推荐编码 {recommended_code} 的这条新增，"
-        f"预计会等待管理员审核。原因：{reason}。{suffix}"
-    )
+    reason = issues[0] if issues else summary or "证据不足"
+    reason = _clean_review_audit_reason(reason)
+    return f"自动审核：预计需管理员审核（{reason or '证据不足'}{suffix}）"
 
 
 def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
@@ -1971,25 +1962,23 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         "",
     ]
     candidate_index = 1
-    common_known_item = _common_known_item_for_code(review, recommended_code)
-    common_known_source_note = _format_common_known_source_note(common_known_item)
-    for index, pronunciation in enumerate(pronunciations, start=1):
+    pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)
+    if len(pronunciations) == 1:
+        pronunciation = pronunciations[0]
         pinyin = str(pronunciation.get("pinyin") or "").strip()
         sources = [
             source for source in pronunciation.get("sources", [])
             if isinstance(source, dict)
         ]
-        lines.append(f"读音 {index}. {pinyin}")
-        if sources:
-            source_line = "；".join(
-                label for label in (_review_source_label(source) for source in sources[:3])
-                if label
-            )
-            lines.append(f"来源：{source_line}")
-        elif common_known_source_note:
-            lines.append(f"来源：暂未找到权威读音页；{common_known_source_note}")
+        review_parts = [
+            f"读音 {pinyin}" if pinyin else "读音待确认",
+            f"来源 {_format_source_summary(sources)}",
+        ]
+        if pre_submit_preview:
+            review_parts.append(pre_submit_preview)
         else:
-            lines.append("来源：暂未找到权威读音页，先按编码服务默认读音展示候选")
+            review_parts.append("自动审核：提交后复审（会结合来源、常识、搜索和编码判断）")
+        lines.append("审词：" + "；".join(review_parts))
         lines.append("候选编码:")
         for status in pronunciation.get("candidateStatuses", [])[:6]:
             lines.append(
@@ -1997,23 +1986,45 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
                     candidate_index,
                     status,
                     str(pronunciation.get("recommendedCode") or ""),
-                    pinyin,
-                    sources,
-                    common_known_source_note,
                 )
             )
             candidate_index += 1
         lines.append("")
-
-    lines.append(f"是否以编码 {recommended_code} 将「{word}」加入草稿？也可回复编号、编码，或回复「都加」添加每个读音的推荐编码。")
-    pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)
-    if pre_submit_preview:
-        lines.append(pre_submit_preview)
     else:
-        lines.append(
-            "提交后本喵会结合权威来源、LLM 基础常识、常见词/明星/品牌/角色/作品/地名等实体信号、搜索/词典/百科信号和编码候选链复审；"
-            "证据或常识信号足够可自动通过，证据不足、纯删除或歧义修改会等待管理员。"
-        )
+        lines.append("读音与来源:")
+        for index, pronunciation in enumerate(pronunciations, start=1):
+            pinyin = str(pronunciation.get("pinyin") or "").strip()
+            sources = [
+                source for source in pronunciation.get("sources", [])
+                if isinstance(source, dict)
+            ]
+            lines.append(f"{index}. {pinyin or '待确认'}；来源 {_format_source_summary(sources)}")
+        if pre_submit_preview:
+            lines.append(pre_submit_preview)
+        else:
+            lines.append("自动审核：提交后复审（会结合来源、常识、搜索和编码判断）")
+        lines.append("")
+
+        for index, pronunciation in enumerate(pronunciations, start=1):
+            pinyin = str(pronunciation.get("pinyin") or "").strip()
+            sources = [
+                source for source in pronunciation.get("sources", [])
+                if isinstance(source, dict)
+            ]
+            lines.append(f"候选编码（读音 {index}）:")
+            for status in pronunciation.get("candidateStatuses", [])[:6]:
+                lines.append(
+                    _format_review_candidate_line(
+                        candidate_index,
+                        status,
+                        str(pronunciation.get("recommendedCode") or ""),
+                    )
+                )
+                candidate_index += 1
+            lines.append("")
+
+    lines.append(f"是否以编码 {recommended_code} 将「{word}」加入草稿？可回复编号、编码，或「都加」。")
+    lines.append("若选的是已有词编码，回复“编号 重新编码”可挪开原词。")
     return "\n".join(lines).strip()
 
 
