@@ -4,6 +4,7 @@ Scheduled KeyTao GitHub dictionary sync checks.
 import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from nonebot import get_bots, get_driver
@@ -16,6 +17,7 @@ config = driver.config
 DEFAULT_SYNC_THRESHOLD = 10
 DEFAULT_SYNC_HOUR = 10
 DEFAULT_SYNC_MINUTE = 0
+DEFAULT_SYNC_TIMEZONE = "Asia/Shanghai"
 DEFAULT_SYNC_WEEKDAYS = {2, 6}  # Wednesday, Sunday
 
 _scheduler_task: asyncio.Task | None = None
@@ -62,6 +64,18 @@ def _parse_group_ids(value: Any) -> list[str]:
     return [str(item).strip() for item in items if str(item).strip()]
 
 
+def _get_schedule_timezone() -> ZoneInfo:
+    timezone_name = str(_config_value("keytao_sync_timezone", DEFAULT_SYNC_TIMEZONE)).strip() or DEFAULT_SYNC_TIMEZONE
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            f"[github_sync_scheduler] invalid KEYTAO_SYNC_TIMEZONE={timezone_name}, "
+            f"fall back to {DEFAULT_SYNC_TIMEZONE}"
+        )
+        return ZoneInfo(DEFAULT_SYNC_TIMEZONE)
+
+
 def _seconds_until_next_run(now: datetime, hour: int, minute: int) -> float:
     target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     for offset in range(8):
@@ -102,8 +116,10 @@ async def _call_auto_sync_endpoint(threshold: int) -> dict[str, Any]:
         data = {"message": response.text}
 
     if response.status_code >= 400:
-        message = data.get("message") or data.get("error") or response.text
-        raise RuntimeError(f"GitHub auto sync API failed ({response.status_code}): {message}")
+        data.setdefault("success", False)
+        data.setdefault("triggered", False)
+        data["httpStatus"] = response.status_code
+        data["message"] = data.get("message") or data.get("error") or response.text
 
     return data
 
@@ -149,6 +165,25 @@ def _build_notification(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_failure_notification(data: dict[str, Any]) -> str:
+    pending_count = data.get("pendingSyncBatches")
+    released_count = data.get("releasedFailedBatches")
+    message = data.get("message") or data.get("error") or "未知错误"
+    http_status = data.get("httpStatus")
+    lines = [
+        "本喵尝试进行 GitHub 词库自动同步，但这次失败了。",
+        f"原因：{message}",
+    ]
+    if http_status:
+        lines.append(f"接口状态：{http_status}")
+    if pending_count is not None:
+        lines.append(f"当前待同步批次：{pending_count} 个。")
+    if released_count:
+        lines.append(f"已释放上次失败卡住的批次：{released_count} 个。")
+    lines.append("请管理员检查同步任务记录。")
+    return "\n".join(lines)
+
+
 async def run_github_sync_check_once() -> dict[str, Any] | None:
     async with _run_lock:
         threshold = _parse_int(
@@ -162,6 +197,12 @@ async def run_github_sync_check_once() -> dict[str, Any] | None:
 
         if data.get("triggered") and data.get("prUrl"):
             await _send_group_notification(_build_notification(data))
+        elif data.get("success") is False or data.get("httpStatus"):
+            logger.error(
+                "[github_sync_scheduler] sync check failed: "
+                f"status={data.get('httpStatus')}, message={data.get('message')}"
+            )
+            await _send_group_notification(_build_failure_notification(data))
         else:
             logger.info(
                 "[github_sync_scheduler] sync not triggered: "
@@ -174,10 +215,14 @@ async def run_github_sync_check_once() -> dict[str, Any] | None:
 async def _scheduler_loop() -> None:
     hour = _parse_int(_config_value("keytao_sync_check_hour"), DEFAULT_SYNC_HOUR, minimum=0, maximum=23)
     minute = _parse_int(_config_value("keytao_sync_check_minute"), DEFAULT_SYNC_MINUTE, minimum=0, maximum=59)
-    logger.info(f"[github_sync_scheduler] scheduler started, runs on Wednesday/Sunday {hour:02d}:{minute:02d}")
+    timezone = _get_schedule_timezone()
+    logger.info(
+        "[github_sync_scheduler] scheduler started, runs on "
+        f"Wednesday/Sunday {hour:02d}:{minute:02d} {timezone.key}"
+    )
 
     while True:
-        delay = _seconds_until_next_run(datetime.now(), hour, minute)
+        delay = _seconds_until_next_run(datetime.now(timezone), hour, minute)
         logger.info(f"[github_sync_scheduler] next check in {int(delay)} seconds")
         await asyncio.sleep(delay)
         try:
