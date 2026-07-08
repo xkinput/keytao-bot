@@ -20,6 +20,7 @@ from keytao_bot.utils.keytao_review import (
     audit_draft_items,
     build_review_note,
     can_llm_override_audit_issues,
+    fetch_keytao_encode,
 )
 
 
@@ -810,6 +811,61 @@ def _review_config() -> ReviewHttpConfig:
     return ReviewHttpConfig(api_base=get_keytao_url(), bot_token=get_bot_token() or "")
 
 
+def _draft_audit_timeout() -> float:
+    try:
+        from nonebot import get_driver
+        value = getattr(get_driver().config, "keytao_batch_review_audit_timeout", None)
+    except Exception:
+        value = None
+    try:
+        return max(5.0, float(value or 25))
+    except (TypeError, ValueError):
+        return 25.0
+
+
+async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> Dict:
+    approved_items: List[str] = []
+    issues: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "Create")
+        word = str(item.get("word") or "")
+        code = str(item.get("code") or "")
+        if action == "Delete":
+            issues.append(f"「{word}」是纯删除操作，需要管理员确认")
+            continue
+        if not word or not code:
+            issues.append(f"草稿条目缺少词或编码，需要管理员确认：{item}")
+            continue
+        try:
+            encoding = await fetch_keytao_encode(_review_config(), word)
+            candidate_codes = set(encoding.get("candidateCodes") or [])
+            candidate_codes.update(encoding.get("flyingCodes") or [])
+            if code in candidate_codes:
+                approved_items.append(f"{action}：{word}@{code}，编码在 keytao_encode 候选链中")
+            else:
+                available = "、".join(sorted(candidate_codes)[:8])
+                issues.append(f"「{word}」编码 {code} 不在候选链中；可选：{available or '无'}")
+        except Exception as error:
+            issues.append(f"「{word}」编码兜底检查失败：{error}")
+
+    auto_approve = bool(approved_items) and not issues
+    return {
+        "success": True,
+        "verdict": "pass" if auto_approve else "needs_admin",
+        "autoApprove": auto_approve,
+        "summary": (
+            "来源审查超时，已用 keytao_encode 兜底通过"
+            if auto_approve
+            else f"{reason}，提交后等待管理员审核"
+        ),
+        "issues": issues,
+        "approvedItems": approved_items,
+        "timeout": True,
+    }
+
+
 async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str) -> Dict:
     try:
         list_result = await keytao_list_draft_items(platform, platform_id)
@@ -821,7 +877,17 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
                 "summary": list_result.get("message", "无法读取草稿，提交后等待管理员审核"),
                 "issues": [list_result.get("message", "无法读取草稿")],
             }
-        deterministic_audit = await audit_draft_items(_review_config(), list_result.get("items", []))
+        items = list_result.get("items", [])
+        audit_timeout = _draft_audit_timeout()
+        try:
+            deterministic_audit = await asyncio.wait_for(
+                audit_draft_items(_review_config(), items),
+                timeout=audit_timeout,
+            )
+        except asyncio.TimeoutError:
+            reason = f"确定性来源审查超过 {audit_timeout:.0f} 秒"
+            logger.warning(f"[auto_review] deterministic audit timed out: {reason}")
+            deterministic_audit = await _fallback_draft_audit_with_encode(items, reason)
         if deterministic_audit.get("autoApprove") or not can_llm_override_audit_issues(deterministic_audit):
             return deterministic_audit
         llm_audit = await _try_llm_auto_review_for_draft(list_result, deterministic_audit)
@@ -848,7 +914,10 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
             "description": "键道助手草稿批次",
             "pullRequests": items,
         }
-        review_result = await review_keytao_batch_with_llm(batch)
+        review_result = await review_keytao_batch_with_llm(
+            batch,
+            precomputed_audit=deterministic_audit,
+        )
         if not review_result.get("success"):
             logger.warning(f"[auto_review] LLM fallback failed: {review_result.get('message')}")
             return None

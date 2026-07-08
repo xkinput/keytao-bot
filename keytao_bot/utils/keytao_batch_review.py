@@ -823,33 +823,37 @@ async def review_keytao_batch_with_llm(
     batch: Dict[str, Any],
     local_review: Optional[Dict[str, Any]] = None,
     focus_pr_id: Optional[int] = None,
+    precomputed_audit: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     items = _extract_items(batch)
     if not items:
         return {"success": False, "message": "批次没有可审查条目"}
 
-    audit_timeout = _deterministic_audit_timeout()
-    try:
-        audit = await asyncio.wait_for(
-            audit_draft_items(_review_config(), items),
-            timeout=audit_timeout,
-        )
-    except asyncio.TimeoutError:
-        reason = f"确定性来源审查超过 {audit_timeout:.0f} 秒"
-        logger.warning(f"KeyTao deterministic batch audit timed out before LLM review: {reason}")
+    if precomputed_audit is not None:
+        audit = precomputed_audit
+    else:
+        audit_timeout = _deterministic_audit_timeout()
         try:
-            audit = await _fallback_audit_with_encode(_review_config(), items, reason)
-        except Exception as encode_error:
-            logger.warning(f"KeyTao encode-only fallback audit failed: {encode_error}")
-            audit = _fallback_audit_for_llm(items, reason)
-    except Exception as error:
-        reason = f"确定性来源审查失败：{error}"
-        logger.warning(f"KeyTao deterministic batch audit failed before LLM review: {error}")
-        try:
-            audit = await _fallback_audit_with_encode(_review_config(), items, reason)
-        except Exception as encode_error:
-            logger.warning(f"KeyTao encode-only fallback audit failed: {encode_error}")
-            audit = _fallback_audit_for_llm(items, reason)
+            audit = await asyncio.wait_for(
+                audit_draft_items(_review_config(), items),
+                timeout=audit_timeout,
+            )
+        except asyncio.TimeoutError:
+            reason = f"确定性来源审查超过 {audit_timeout:.0f} 秒"
+            logger.warning(f"KeyTao deterministic batch audit timed out before LLM review: {reason}")
+            try:
+                audit = await _fallback_audit_with_encode(_review_config(), items, reason)
+            except Exception as encode_error:
+                logger.warning(f"KeyTao encode-only fallback audit failed: {encode_error}")
+                audit = _fallback_audit_for_llm(items, reason)
+        except Exception as error:
+            reason = f"确定性来源审查失败：{error}"
+            logger.warning(f"KeyTao deterministic batch audit failed before LLM review: {error}")
+            try:
+                audit = await _fallback_audit_with_encode(_review_config(), items, reason)
+            except Exception as encode_error:
+                logger.warning(f"KeyTao encode-only fallback audit failed: {encode_error}")
+                audit = _fallback_audit_for_llm(items, reason)
 
     try:
         raw_review = await _call_llm(batch, items, audit, local_review, focus_pr_id)

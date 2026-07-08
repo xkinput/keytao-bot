@@ -4032,6 +4032,36 @@ async def trace_sensitive_message(bot: Bot, event: Event):
     )
 
 
+async def _send_processing_notice(
+    bot: Bot,
+    event: Event,
+    user_id: str,
+    memory_context: ChatMemoryContext,
+    text: str,
+    qq_message_segment: object = None,
+) -> None:
+    try:
+        bot_module = bot.__class__.__module__
+        if (
+            ('onebot' in bot_module.lower() or bot.__class__.__name__ == 'Bot')
+            and qq_message_segment
+        ):
+            message_id = getattr(event, 'message_id', None)
+            if message_id:
+                message = _build_qq_reply_message(
+                    qq_message_segment,
+                    message_id,
+                    user_id,
+                    _strip_markdown(text),
+                    memory_context.space_type == "group",
+                )
+                await bot.send(event=event, message=message)
+                return
+        await bot.send(event=event, message=text)
+    except Exception as error:
+        logger.warning(f"Failed to send processing notice: {error}")
+
+
 ai_chat = on_message(rule=should_handle, priority=99, block=True)
 
 
@@ -4082,6 +4112,15 @@ async def handle_ai_chat(bot: Bot, event: Event):
         conversation_state_store.delete(conv_key)
         await ai_chat.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
         return
+    if generic_command_intent.intent == "draft_submit":
+        await _send_processing_notice(
+            bot,
+            event,
+            user_id,
+            memory_context,
+            "收到，正在提交草稿并自动审词；如果要查来源，可能需要几十秒，本喵会把最终结果发回来。",
+            QQMessageSegment,
+        )
     generic_intent_is_fresh_command = _is_fresh_current_user_command_intent(
         generic_command_intent,
         normalized_message_text,

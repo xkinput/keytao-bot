@@ -59,7 +59,10 @@ async def _try_llm_auto_review_for_preview(
             "description": "键道助手加词前预审",
             "pullRequests": [item],
         }
-        review_result = await review_keytao_batch_with_llm(batch)
+        review_result = await review_keytao_batch_with_llm(
+            batch,
+            precomputed_audit=deterministic_audit,
+        )
         if not review_result.get("success"):
             return None
 
