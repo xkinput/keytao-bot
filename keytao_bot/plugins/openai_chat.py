@@ -676,6 +676,26 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     return intent.words
 
 
+_EXPLICIT_REVIEWED_ADD_WORD_RE = re.compile(
+    r"^(?:请|麻烦)?\s*(?:帮我|帮忙|给我)?\s*"
+    r"(?:加词|添加词|新增词|加一个词|添加一个词)"
+    r"\s*[:：,，]?\s*(?P<word>[\u3400-\u9fff]{1,20})$"
+)
+
+
+def _extract_explicit_reviewed_add_word(message_text: str) -> Optional[str]:
+    """Return the target word for a structural `加词 X` request."""
+    text = _strip_command_message_prefixes(message_text)
+    text = re.sub(r"\s+", " ", text).strip()
+    match = _EXPLICIT_REVIEWED_ADD_WORD_RE.fullmatch(text)
+    if not match:
+        return None
+    word = match.group("word").strip()
+    if word in _PENDING_CONTROL_TEXTS or word in _DRAFT_SUBMIT_COMMANDS:
+        return None
+    return word
+
+
 # ---------------------------------------------------------------------------
 # Skills & History
 # ---------------------------------------------------------------------------
@@ -2033,8 +2053,9 @@ async def _try_handle_simple_single_word_query(
     platform: str,
     user_id: str,
 ) -> Optional[str]:
-    """Handle a single bare Chinese word via tools before the model can invent codes."""
-    words = await _get_simple_word_query_words(message_text)
+    """Handle a single Chinese word add/query via tools before the model can invent codes."""
+    explicit_add_word = _extract_explicit_reviewed_add_word(message_text)
+    words = (explicit_add_word,) if explicit_add_word else await _get_simple_word_query_words(message_text)
     if len(words) != 1:
         return None
 
@@ -3484,6 +3505,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 
 2. 必须调用工具（绝不凭记忆回答编码问题）
    • 查词/编码 → 调用查询工具
+   • 加词前审词/新增词候选 → 优先调用 keytao_prepare_reviewed_add
    • 文档/规则 → 调用文档工具
    • 增删改词条 → 调用草稿工具
    • 外部事实/实时信息/近期资讯/官网公告/用户明确要求搜索/你不确定答案 → 调用 web_search
@@ -3510,8 +3532,11 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      多个词时优先使用批量查询工具，并按词逐个整理结果。
      如果语义是常用度、词义、使用场景等普通问答，不要为了加词而生成确认句。
 
-   【第一步】同时调用：
-     keytao_encode(word) + keytao_lookup_by_word(word)
+   【第一步】调用工具：
+     • 如果用户明确想加词/新增词：优先调用 keytao_lookup_by_word(word) + keytao_prepare_reviewed_add(word)
+       keytao_prepare_reviewed_add 会返回真实读音来源、候选编码、当前占位和自动审核预判；禁止只用 keytao_encode 展示加词候选。
+       只有 keytao_prepare_reviewed_add 失败或没有返回候选时，才回退 keytao_encode(word)。
+     • 如果用户只是问拆分/编码/怎么打：调用 keytao_encode(word) + keytao_lookup_by_word(word)
          如果用户指定了目标编码/编码系列（例如“放到 ffb 系列”“用 ff=zh,zh”），
          必须调用 keytao_encode(word, requested_code=目标编码或系列前缀)，用 requestedCodeAnalysis 判断是否支持。
          如果用户是在纠正单字读音/双拼音码（例如“ch eng 应该是 jr”“以 jr 的编码加”），
@@ -3535,7 +3560,20 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
          支持固定规则组合候选，如 zh 的 q/f 双键位组合，禁止自己泛化到规则外键位。
          ⚠️ 禁止向用户展示“待查占用”；回复前必须得到“已有「...」”或“空位”。
 
-   【第四步】展示拆分 + 候选编码列表，格式：
+   【第四步】展示审词/拆分 + 候选编码列表，格式：
+
+     明确加词且 keytao_prepare_reviewed_add 成功时，使用简洁审词模板，不要展开旧的逐字拆分模板：
+
+     词库暂无收录「词」，先审读音和编码候选：
+
+     审词：读音 xxx；来源 汉典/百科/暂无权威页；自动审核：预计可通过/预计需管理员审核（简短原因）
+     候选编码:
+     1. abcd — 已有「旧词」
+     2. abcde — ✅ 推荐（空位）
+     3. abcdea — 空位
+
+     是否以编码 abcde 将「词」加入草稿？可回复编号、编码，或「都加」。
+     若选的是已有词编码，回复“编号 重新编码”可挪开原词。
 
      如果 keytao_encode 返回 candidateDisplayGroups（多音单字），必须使用多音单字模板，不要使用普通编号候选模板：
 
