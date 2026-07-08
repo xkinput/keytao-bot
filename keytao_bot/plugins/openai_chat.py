@@ -3983,6 +3983,55 @@ async def _handle_clear(bot: Bot, event: Event, matcher):
     await matcher.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
 
 
+message_trace = on_message(priority=1, block=False)
+
+
+@message_trace.handle()
+async def trace_sensitive_message(bot: Bot, event: Event):
+    try:
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
+        from nonebot.adapters.onebot.v11.event import GroupMessageEvent as QQGroupMessageEvent
+    except ImportError:
+        return
+
+    if not isinstance(bot, QQBot) or not isinstance(event, QQGroupMessageEvent):
+        return
+
+    message_text = event.get_plaintext().strip()
+    if not message_text:
+        return
+
+    compact_text = re.sub(r"[\s，,。.!！?？~～]+", "", message_text)
+    is_sensitive_short_command = (
+        _is_plain_draft_submit_request(message_text)
+        or compact_text in _PENDING_CONTROL_TEXTS
+        or compact_text in _DRAFT_SUBMIT_COMMANDS
+    )
+    contains_trigger = (
+        GROUP_TRIGGER_KEYWORD_ANY in message_text
+        or message_text.startswith(GROUP_TRIGGER_KEYWORD_START)
+    )
+    is_to_bot = False
+    try:
+        is_to_bot = await to_me()(bot, event, {})
+    except Exception as error:
+        logger.debug(f"[message_trace] failed to evaluate to_me: {error}")
+
+    if not (is_to_bot or contains_trigger or is_sensitive_short_command):
+        return
+
+    sender = getattr(event, "sender", None)
+    sender_name = _display_name_from_qq_sender(sender, event.get_user_id())
+    logger.info(
+        "[message_trace] seen QQ group message "
+        f"group={getattr(event, 'group_id', '')} "
+        f"user={event.get_user_id()} "
+        f"name={sender_name} "
+        f"to_me={is_to_bot} "
+        f"text={message_text[:120]!r}"
+    )
+
+
 ai_chat = on_message(rule=should_handle, priority=99, block=True)
 
 
