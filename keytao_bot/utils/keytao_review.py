@@ -21,7 +21,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
-from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code
+from .keytao_encoding import (
+    build_phrase_code_chain,
+    normalize_contextual_phrase_encoding,
+    pinyin_to_phonetic_code,
+)
 
 
 SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/"
@@ -630,7 +634,7 @@ async def fetch_keytao_encode(config: ReviewHttpConfig, word: str) -> Dict:
             if not response.is_success:
                 return {"success": False, "message": f"编码服务返回错误: {response.status_code}"}
             data = response.json()
-        return data
+        return normalize_contextual_phrase_encoding(word, data)
     except Exception as error:
         return {"success": False, "message": f"编码服务暂时不可用: {error}"}
 

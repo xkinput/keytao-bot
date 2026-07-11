@@ -14,6 +14,7 @@ from nonebot.log import logger
 from keytao_bot.utils.keytao_encoding import (
     build_alternate_pronunciation_codes,
     build_phrase_pronunciation_codes,
+    normalize_contextual_phrase_encoding,
 )
 from keytao_bot.utils.keytao_review import (
     ReviewHttpConfig,
@@ -525,12 +526,18 @@ async def _fetch_encode_candidates(word: str, requested_code: Optional[str] = No
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(encode_url, params=params)
-            encode_data = response.json() if response.is_success else {}
+            encode_data = normalize_contextual_phrase_encoding(
+                word,
+                response.json() if response.is_success else {},
+            )
             codes = _clean_code_list(encode_data.get("codes"))
             alt_codes = _clean_code_list(encode_data.get("altCodes"))
             if not codes:
                 infer_response = await client.get(infer_url, params=params)
-                infer_data = infer_response.json() if infer_response.is_success else {}
+                infer_data = normalize_contextual_phrase_encoding(
+                    word,
+                    infer_response.json() if infer_response.is_success else {},
+                )
                 return _build_encode_candidate_result(
                     word,
                     encode_data,

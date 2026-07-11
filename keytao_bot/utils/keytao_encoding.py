@@ -111,6 +111,19 @@ _INITIALS = (
     "g", "k", "h", "j", "q", "x", "r", "z", "c", "s", "y", "w",
 )
 
+_SHUAI_RATE_SUFFIXES = (
+    "表率",
+    "统率",
+    "相率",
+    "坦率",
+    "直率",
+    "轻率",
+    "草率",
+    "粗率",
+    "简率",
+    "真率",
+)
+
 
 def _clean_code_list(codes: object) -> List[str]:
     if not isinstance(codes, list):
@@ -129,15 +142,18 @@ def _clean_code_list(codes: object) -> List[str]:
 
 
 def _strip_pinyin_tone(pinyin: str) -> str:
-    normalized = unicodedata.normalize("NFD", pinyin.strip().lower())
+    normalized = unicodedata.normalize(
+        "NFD",
+        pinyin.strip().lower()
+        .replace("u:", "v")
+        .translate(str.maketrans("üǖǘǚǜ", "vvvvv")),
+    )
     without_marks = "".join(
         char for char in normalized
         if unicodedata.category(char) != "Mn"
     )
     return (
         without_marks
-        .replace("ü", "v")
-        .replace("u:", "v")
         .replace("ê", "e")
     )
 
@@ -279,6 +295,63 @@ def build_phrase_code_chain(chars: object, phonetic_codes: Optional[List[str]] =
         shape_steps = [_shape_first_key(char_infos[0]), _shape_first_key(char_infos[1])]
 
     return _build_progressive_codes(base, shape_steps)
+
+
+def normalize_contextual_phrase_encoding(word: str, encode_data: Dict) -> Dict:
+    """Keep productive -率 words on the contextual lǜ candidate chain."""
+    if not isinstance(encode_data, dict):
+        return {}
+
+    chars = _clean_char_infos(encode_data.get("chars"))
+    if (
+        len(chars) <= 1
+        or len(chars) != len(word)
+        or chars[-1].get("char") != "率"
+        or any(word.endswith(suffix) for suffix in _SHUAI_RATE_SUFFIXES)
+    ):
+        return encode_data
+
+    rate_pinyins = chars[-1].get("pinyins")
+    if not isinstance(rate_pinyins, list):
+        return encode_data
+    contextual_pinyin = next(
+        (
+            item for item in rate_pinyins
+            if isinstance(item, str) and _strip_pinyin_tone(item) == "lv"
+        ),
+        None,
+    )
+    if not contextual_pinyin:
+        return encode_data
+
+    contextual_phonetic = pinyin_to_phonetic_code(contextual_pinyin)
+    if not contextual_phonetic:
+        return encode_data
+
+    normalized_chars = [dict(item) for item in chars]
+    rate_info = normalized_chars[-1]
+    rate_info["pinyin"] = contextual_pinyin
+    rate_info["pinyins"] = [
+        contextual_pinyin,
+        *[
+            item for item in rate_pinyins
+            if isinstance(item, str) and item != contextual_pinyin
+        ],
+    ]
+    rate_info["phoneticCode"] = contextual_phonetic
+    shape_code = rate_info.get("shapeCode")
+    if isinstance(shape_code, str):
+        rate_info["fullCode"] = contextual_phonetic + shape_code
+
+    codes = build_phrase_code_chain(normalized_chars)
+    if not codes:
+        return encode_data
+
+    normalized = dict(encode_data)
+    normalized["chars"] = normalized_chars
+    normalized["codes"] = codes
+    normalized["contextPinyinCorrected"] = True
+    return normalized
 
 
 def build_alternate_pronunciation_codes(chars: object) -> List[Dict]:

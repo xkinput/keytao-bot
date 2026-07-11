@@ -11,6 +11,7 @@ from nonebot.log import logger
 from keytao_bot.utils.keytao_encoding import (
     build_alternate_pronunciation_codes as _build_alternate_pronunciation_codes,
     build_phrase_pronunciation_codes as _build_phrase_pronunciation_codes,
+    normalize_contextual_phrase_encoding,
 )
 
 
@@ -118,7 +119,8 @@ def _clean_encode_chars(chars: object) -> List[Dict]:
 
 def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optional[Dict] = None) -> Dict:
     """Return phrase candidate codes before display-only char split data."""
-    infer_data = infer_data or {}
+    encode_data = normalize_contextual_phrase_encoding(word, encode_data)
+    infer_data = normalize_contextual_phrase_encoding(word, infer_data or {})
     encode_codes = _clean_code_list(encode_data.get("codes"))
     encode_alt_codes = _clean_code_list(encode_data.get("altCodes"))
     infer_codes = _clean_code_list(infer_data.get("codes"))
