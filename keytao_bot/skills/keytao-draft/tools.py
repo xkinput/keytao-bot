@@ -814,13 +814,16 @@ def _review_config() -> ReviewHttpConfig:
 def _draft_audit_timeout() -> float:
     try:
         from nonebot import get_driver
-        value = getattr(get_driver().config, "keytao_batch_review_audit_timeout", None)
+        config = get_driver().config
+        value = getattr(config, "keytao_background_review_audit_timeout", None)
+        if value is None:
+            value = getattr(config, "keytao_batch_review_audit_timeout", None)
     except Exception:
         value = None
     try:
-        return max(5.0, float(value or 25))
+        return max(5.0, float(value or 90))
     except (TypeError, ValueError):
-        return 25.0
+        return 90.0
 
 
 async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> Dict:
@@ -840,8 +843,8 @@ async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> D
             continue
         try:
             encoding = await fetch_keytao_encode(_review_config(), word)
-            candidate_codes = set(encoding.get("candidateCodes") or [])
-            candidate_codes.update(encoding.get("flyingCodes") or [])
+            normalized_encoding = _build_encode_candidate_result(word, encoding)
+            candidate_codes = set(normalized_encoding.get("candidateCodes") or [])
             if code in candidate_codes:
                 approved_items.append(f"{action}：{word}@{code}，编码在 keytao_encode 候选链中")
             else:

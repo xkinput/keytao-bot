@@ -8,8 +8,9 @@ import asyncio
 import copy
 import json
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, Optional, List, Dict, Tuple
+from typing import Any, Awaitable, Callable, Optional, List, Dict, Tuple
 
 from nonebot import on_message, on_command, get_driver
 from nonebot.adapters import Bot, Event
@@ -25,6 +26,9 @@ except ImportError:
 from ..skills import SkillsManager
 from ..harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
 from ..harness.state import (
+    ActiveDraftOperation,
+    ConversationLockStore,
+    DraftOperationCoordinator,
     MemoryConversationStateStore,
     PendingAddWord,
     PendingState,
@@ -166,6 +170,13 @@ MEMORY_SUMMARY_MAX_TOKENS: int = _as_int(
 GROUP_CONTEXT_HISTORY_MESSAGES: int = _as_int(
     getattr(config, "group_context_history_messages", None) or 16,
     16,
+)
+KEYTAO_BACKGROUND_OPERATION_TIMEOUT: float = max(
+    30.0,
+    _as_float(
+        getattr(config, "keytao_background_operation_timeout", None) or 420,
+        420.0,
+    ),
 )
 
 GROUP_TRIGGER_KEYWORD_START = "键道"
@@ -716,6 +727,13 @@ MAX_HISTORY_MESSAGES = 24
 # Per-conversation state: (platform, user_id) -> state
 conversation_state_store = MemoryConversationStateStore()
 conversation_states: Dict[Tuple[str, str], PendingState] = conversation_state_store.states
+conversation_message_locks = ConversationLockStore()
+draft_operation_coordinator = DraftOperationCoordinator()
+background_draft_tasks: set[asyncio.Task[Any]] = set()
+current_draft_operation_id: ContextVar[Optional[str]] = ContextVar(
+    "current_draft_operation_id",
+    default=None,
+)
 
 def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
     """Skip query augmentation for confirmations and action-result replies."""
@@ -1226,6 +1244,24 @@ def _describe_pending_state(state: PendingState) -> str:
             return "提交草稿"
 
     return "待确认操作"
+
+
+def _format_active_draft_operation_message(
+    operation: ActiveDraftOperation,
+    pending_state: PendingState = None,
+) -> str:
+    """Explain why another mutation cannot start without consuming its pending state."""
+    phase = "正等待你的确认" if operation.status == "awaiting_confirmation" else "正在后台处理"
+    if isinstance(pending_state, PendingAddWord) and pending_state.word != operation.word:
+        return (
+            f"上一批 {operation.description} {phase}，为避免两个批次写进同一份草稿，"
+            f"本喵暂时不会操作「{pending_state.word}」。\n"
+            f"「{pending_state.word}」的候选仍为你保留；上一批结束后再回复「加入并提交」即可。"
+        )
+    return (
+        f"{operation.description} {phase}，不用重复发送。"
+        "本喵完成后会直接回复最终结果。"
+    )
 
 
 def _pending_state_can_be_copied_to_current_user(state: PendingState) -> bool:
@@ -2596,6 +2632,15 @@ _INJECT_PLATFORM_TOOLS = frozenset({
     'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items',
     'keytao_shift_phrase_code', 'keytao_recall_batch', 'keytao_get_batch_preview',
 })
+_DRAFT_MUTATION_TOOLS = frozenset({
+    "keytao_create_phrase",
+    "keytao_remove_draft_item",
+    "keytao_batch_add_to_draft",
+    "keytao_batch_remove_draft_items",
+    "keytao_shift_phrase_code",
+    "keytao_recall_batch",
+    "keytao_submit_batch",
+})
 tool_executor = ToolExecutor(skills_manager.get_tool_function, _INJECT_PLATFORM_TOOLS)
 
 
@@ -2606,12 +2651,36 @@ async def call_tool_function(
     user_id: Optional[str] = None,
 ) -> str:
     """Call a tool function and return result as JSON string."""
+    if platform and user_id and tool_name in _DRAFT_MUTATION_TOOLS:
+        operation = draft_operation_coordinator.get((platform, user_id))
+        if (
+            operation is not None
+            and current_draft_operation_id.get() != operation.operation_id
+        ):
+            logger.info(
+                "[draft_operation] blocked out-of-band mutation "
+                f"operation={operation.operation_id} owner={platform}:{user_id} tool={tool_name}"
+            )
+            return json.dumps({
+                "success": False,
+                "operationInProgress": True,
+                "message": _format_active_draft_operation_message(operation),
+            }, ensure_ascii=False)
     return await tool_executor.call(tool_name, arguments, ToolContext(platform, user_id))
 
 
 # ---------------------------------------------------------------------------
 # Direct execution helpers (bypasses AI for simple confirmations)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DraftActionResult:
+    """Structured result for a draft mutation or submission."""
+    text: str
+    success: bool = False
+    pending_state: Optional[PendingToolConfirm] = None
+
 
 async def _execute_add_to_draft(
     word: str,
@@ -2664,47 +2733,71 @@ async def _execute_add_to_draft_and_submit(
     remark: str = "",
 ) -> str:
     """Add a word to the draft, then submit the resulting batch."""
+    result = await _perform_add_to_draft_and_submit(
+        word,
+        code,
+        platform,
+        user_id,
+        remark=remark,
+    )
+    if result.pending_state is not None:
+        conversation_state_store.set(
+            (platform, user_id),
+            result.pending_state,
+            space_key=space_key,
+            owner_label=owner_label,
+        )
+    return result.text
+
+
+async def _perform_add_to_draft_and_submit(
+    word: str,
+    code: str,
+    platform: str,
+    user_id: str,
+    *,
+    remark: str = "",
+    confirmed_create: bool = False,
+) -> DraftActionResult:
+    """Run add-and-submit without mutating conversational pending state."""
     args = {"word": word, "code": code}
     if remark:
         args["remark"] = remark
+    create_args = {**args, **({"confirmed": True} if confirmed_create else {})}
     create_json = await call_tool_function(
-        "keytao_create_phrase", args, platform, user_id,
+        "keytao_create_phrase", create_args, platform, user_id,
     )
     create_data = json.loads(create_json)
 
     if create_data.get("not_bound"):
-        return _BIND_HELP_TEXT
+        return DraftActionResult(_BIND_HELP_TEXT)
 
     if create_data.get("requiresConfirmation"):
-        conv_key = (platform, user_id)
-        conversation_state_store.set(conv_key, PendingToolConfirm(
+        pending_state = PendingToolConfirm(
             function_name="keytao_create_phrase",
             args=args,
-        ), space_key=space_key, owner_label=owner_label)
+        )
         warnings = create_data.get("warnings", [])
         warn_text = "\n".join(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
             for w in warnings
         ) if warnings else create_data.get("message", "存在重码警告")
-        return f"{warn_text}\n\n确认添加吗？回复「确认」继续，「取消」放弃。"
+        return DraftActionResult(
+            f"{warn_text}\n\n确认添加吗？回复「确认」继续，「取消」放弃。",
+            pending_state=pending_state,
+        )
 
     if not create_data.get("success"):
-        return f"添加失败：{create_data.get('message', '未知错误')} qwq"
+        return DraftActionResult(f"添加失败：{create_data.get('message', '未知错误')} qwq")
 
     submit_json = await call_tool_function("keytao_submit_batch", {}, platform, user_id)
     submit_data = json.loads(submit_json)
 
     if submit_data.get("not_bound"):
-        return _BIND_HELP_TEXT
+        return DraftActionResult(_BIND_HELP_TEXT)
 
     if submit_data.get("requiresConfirmation"):
-        conv_key = (platform, user_id)
-        conversation_state_store.set(
-            conv_key,
-            PendingToolConfirm(function_name="keytao_submit_batch", args={}),
-            space_key=space_key,
-            owner_label=owner_label,
-        )
+        pending_state = PendingToolConfirm(function_name="keytao_submit_batch", args={})
         warnings = submit_data.get("warnings", [])
         warn_text = "\n".join(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
@@ -2713,17 +2806,22 @@ async def _execute_add_to_draft_and_submit(
         review_parts: List[str] = []
         _append_submit_review_lines(review_parts, submit_data)
         review_text = ("\n\n" + "\n".join(review_parts)) if review_parts else ""
-        return (
-            f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
-            f"{warn_text}\n\n"
-            "是否继续提交？回复「确认」继续提交，回复「取消」放弃。"
-            f"{review_text}"
+        return DraftActionResult(
+            (
+                f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
+                f"{warn_text}\n\n"
+                "是否继续提交？回复「确认」继续提交，回复「取消」放弃。"
+                f"{review_text}"
+            ),
+            pending_state=pending_state,
         )
 
     if not submit_data.get("success"):
-        return (
-            f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
-            f"提交失败：{submit_data.get('message', '未知错误')} qwq"
+        return DraftActionResult(
+            (
+                f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
+                f"提交失败：{submit_data.get('message', '未知错误')} qwq"
+            )
         )
 
     batch_url = submit_data.get("batchUrl") or create_data.get("batchUrl", "")
@@ -2736,7 +2834,7 @@ async def _execute_add_to_draft_and_submit(
     if pr_url:
         parts.append(f"PR：{pr_url}")
     _append_submit_review_lines(parts, submit_data)
-    return "\n\n".join(parts)
+    return DraftActionResult("\n\n".join(parts), success=True)
 
 
 async def _execute_shift_to_code(
@@ -3088,20 +3186,33 @@ async def _submit_current_draft(
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
 ) -> str:
-    submit_json = await call_tool_function("keytao_submit_batch", {}, platform, user_id)
-    submit_data = json.loads(submit_json)
-
-    if submit_data.get("not_bound"):
-        return _BIND_HELP_TEXT
-
-    if submit_data.get("requiresConfirmation"):
-        conv_key = (platform, user_id)
+    result = await _perform_submit_current_draft(platform, user_id)
+    if result.pending_state is not None:
         conversation_state_store.set(
-            conv_key,
-            PendingToolConfirm(function_name="keytao_submit_batch", args={}),
+            (platform, user_id),
+            result.pending_state,
             space_key=space_key,
             owner_label=owner_label,
         )
+    return result.text
+
+
+async def _perform_submit_current_draft(
+    platform: str,
+    user_id: str,
+    *,
+    confirmed: bool = False,
+) -> DraftActionResult:
+    """Submit a draft without writing follow-up state into the conversation slot."""
+    arguments = {"confirmed": True} if confirmed else {}
+    submit_json = await call_tool_function("keytao_submit_batch", arguments, platform, user_id)
+    submit_data = json.loads(submit_json)
+
+    if submit_data.get("not_bound"):
+        return DraftActionResult(_BIND_HELP_TEXT)
+
+    if submit_data.get("requiresConfirmation"):
+        pending_state = PendingToolConfirm(function_name="keytao_submit_batch", args={})
         warnings = submit_data.get("warnings", [])
         warn_text = "\n".join(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
@@ -3110,10 +3221,13 @@ async def _submit_current_draft(
         review_parts: List[str] = []
         _append_submit_review_lines(review_parts, submit_data)
         review_text = ("\n\n" + "\n".join(review_parts)) if review_parts else ""
-        return f"{warn_text}\n\n是否继续提交？回复「确认」继续提交，回复「取消」放弃。{review_text}"
+        return DraftActionResult(
+            f"{warn_text}\n\n是否继续提交？回复「确认」继续提交，回复「取消」放弃。{review_text}",
+            pending_state=pending_state,
+        )
 
     if not submit_data.get("success"):
-        return f"提交失败：{submit_data.get('message', '未知错误')} qwq"
+        return DraftActionResult(f"提交失败：{submit_data.get('message', '未知错误')} qwq")
 
     batch_url = submit_data.get("batchUrl", "")
     pr_url = submit_data.get("prUrl", "")
@@ -3125,7 +3239,52 @@ async def _submit_current_draft(
     if pr_url:
         parts.append(f"PR：{pr_url}")
     _append_submit_review_lines(parts, submit_data)
-    return "\n".join(parts)
+    return DraftActionResult("\n".join(parts), success=True)
+
+
+async def _perform_active_operation_confirmation(
+    operation: ActiveDraftOperation,
+    platform: str,
+    user_id: str,
+) -> DraftActionResult:
+    """Resume a background draft operation after its owner confirms."""
+    pending_state = operation.pending_state
+    if not isinstance(pending_state, PendingToolConfirm):
+        return DraftActionResult("这次后台操作没有可确认的步骤，请重新发起。")
+
+    if pending_state.function_name == "keytao_submit_batch":
+        return await _perform_submit_current_draft(platform, user_id, confirmed=True)
+
+    if pending_state.function_name == "keytao_create_phrase" and operation.kind == "add_and_submit":
+        args = pending_state.args
+        return await _perform_add_to_draft_and_submit(
+            str(args.get("word") or operation.word),
+            str(args.get("code") or operation.code),
+            platform,
+            user_id,
+            remark=str(args.get("remark") or operation.remark),
+            confirmed_create=True,
+        )
+
+    return DraftActionResult("这次后台操作无法继续，请重新发起。")
+
+
+def _active_operation_reply_matches(
+    operation: ActiveDraftOperation,
+    reply_reference: ReplyReferenceInfo,
+) -> bool:
+    """Return whether a quoted bot message belongs to an active operation prompt."""
+    if operation.status != "awaiting_confirmation" or not reply_reference.is_to_bot:
+        return False
+    referenced_state = _parse_pending_state_from_response(reply_reference.text)
+    if conversation_state_store.states_equivalent(referenced_state, operation.pending_state):
+        return True
+    referenced_text = reply_reference.text or ""
+    return bool(
+        operation.word
+        and operation.word in referenced_text
+        and ("确认添加吗" in referenced_text or "是否继续提交" in referenced_text)
+    )
 
 
 async def _fetch_current_draft_items(platform: str, user_id: str) -> Dict:
@@ -3357,6 +3516,7 @@ async def _handle_pending_add_word(
     if command_intent is None:
         command_intent = await _classify_message_command_intent(msg, state)
 
+    submit_after_add = command_intent.intent == "pending_add_and_submit"
     requested_codes = _requested_codes_from_pending_message(msg, state)
     if len(requested_codes) > 1:
         return await _execute_add_multiple_codes_to_draft(
@@ -3366,7 +3526,6 @@ async def _handle_pending_add_word(
             user_id,
         )
 
-    submit_after_add = command_intent.intent == "pending_add_and_submit"
     shift_target_code = _resolve_shift_target_code(state, command_intent)
     if shift_target_code is not None:
         return await _execute_shift_to_code(state.word, shift_target_code, platform, user_id)
@@ -3377,6 +3536,16 @@ async def _handle_pending_add_word(
             if code != direct_code:
                 continue
             if not occupied:
+                if submit_after_add:
+                    return await _execute_add_to_draft_and_submit(
+                        state.word,
+                        direct_code,
+                        platform,
+                        user_id,
+                        space_key,
+                        owner_label,
+                        state.code_remarks.get(direct_code, ""),
+                    )
                 return await _execute_add_to_draft(
                     state.word,
                     direct_code,
@@ -3408,6 +3577,16 @@ async def _handle_pending_add_word(
     if requested_target is not None:
         target_code, is_occupied = requested_target
         if not is_occupied:
+            if submit_after_add:
+                return await _execute_add_to_draft_and_submit(
+                    state.word,
+                    target_code,
+                    platform,
+                    user_id,
+                    space_key,
+                    owner_label,
+                    state.code_remarks.get(target_code, ""),
+                )
             return await _execute_add_to_draft(
                 state.word,
                 target_code,
@@ -3461,6 +3640,17 @@ async def _handle_pending_add_word(
                 state.code_remarks.get(target_code, ""),
             )
         return await _execute_add_to_draft(
+            state.word,
+            target_code,
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+            state.code_remarks.get(target_code, ""),
+        )
+
+    if submit_after_add:
+        return await _execute_add_to_draft_and_submit(
             state.word,
             target_code,
             platform,
@@ -3628,6 +3818,9 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 4. 提交草稿
    • 仅当用户明确说"提交/提审/发起审核"时调 keytao_submit_batch
    • "确认/好/是"不是提交指令
+   • 区分三种结论：编码/结构硬冲突会阻止提交；证据不足、歧义、纯删除可以提交但需管理员审核；证据一致才可能由本喵自动通过
+   • “需管理员审核”绝不表述成“不可提交”，应明确告诉用户可以提交、提交后等待管理员
+   • 遇到重码或跳过更短空位等警告，不得静默改成另一个编码；展示具体影响并等待当前用户确认
    • 提交成功后不再调用任何其他工具
 
 5. 查看草稿
@@ -4032,7 +4225,7 @@ async def trace_sensitive_message(bot: Bot, event: Event):
     )
 
 
-async def _send_processing_notice(
+async def _send_event_response(
     bot: Bot,
     event: Event,
     user_id: str,
@@ -4059,14 +4252,143 @@ async def _send_processing_notice(
                 return
         await bot.send(event=event, message=text)
     except Exception as error:
-        logger.warning(f"Failed to send processing notice: {error}")
+        logger.warning(f"Failed to send background response: {error}")
+
+
+async def _run_background_draft_operation(
+    operation: ActiveDraftOperation,
+    action_factory: Callable[[], Awaitable[DraftActionResult]],
+    bot: Bot,
+    event: Event,
+    user_id: str,
+    memory_context: ChatMemoryContext,
+    user_message: str,
+    qq_message_segment: object = None,
+) -> None:
+    """Run one draft mutation and send only its final or confirmation result."""
+    conv_key = operation.owner_key
+    operation_token = current_draft_operation_id.set(operation.operation_id)
+    try:
+        result = await asyncio.wait_for(
+            action_factory(),
+            timeout=KEYTAO_BACKGROUND_OPERATION_TIMEOUT,
+        )
+    except asyncio.CancelledError:
+        draft_operation_coordinator.finish(conv_key, operation.operation_id)
+        raise
+    except asyncio.TimeoutError:
+        draft_operation_coordinator.finish(conv_key, operation.operation_id)
+        logger.error(
+            "Background draft operation timed out: "
+            f"{operation.kind} {operation.operation_id} "
+            f"timeout={KEYTAO_BACKGROUND_OPERATION_TIMEOUT:.0f}s"
+        )
+        result = DraftActionResult(
+            "后台审词处理超时，当前操作已结束。请求可能已经到达服务器，"
+            "请先发送「查看草稿」确认实际状态，避免重复添加或提交。"
+        )
+    except Exception as error:
+        logger.error(
+            "Background draft operation failed: "
+            f"{operation.kind} {operation.operation_id}"
+        )
+        draft_operation_coordinator.finish(conv_key, operation.operation_id)
+        result = DraftActionResult(f"后台处理失败：{error} qwq")
+    else:
+        if result.pending_state is not None:
+            draft_operation_coordinator.mark_awaiting_confirmation(
+                conv_key,
+                operation.operation_id,
+                result.pending_state,
+                result.text,
+            )
+            logger.info(
+                "[draft_operation] awaiting confirmation "
+                f"operation={operation.operation_id} owner={conv_key[0]}:{conv_key[1]}"
+            )
+        else:
+            draft_operation_coordinator.finish(conv_key, operation.operation_id)
+            logger.info(
+                "[draft_operation] finished "
+                f"operation={operation.operation_id} owner={conv_key[0]}:{conv_key[1]} "
+                f"success={result.success}"
+            )
+    finally:
+        current_draft_operation_id.reset(operation_token)
+
+    remember_conversation(conv_key, memory_context, user_message, result.text)
+    schedule_memory_compaction(memory_context)
+    await _send_event_response(
+        bot,
+        event,
+        user_id,
+        memory_context,
+        result.text,
+        qq_message_segment,
+    )
+
+
+def _schedule_background_draft_operation(
+    operation: ActiveDraftOperation,
+    action_factory: Callable[[], Awaitable[DraftActionResult]],
+    bot: Bot,
+    event: Event,
+    user_id: str,
+    memory_context: ChatMemoryContext,
+    user_message: str,
+    qq_message_segment: object = None,
+) -> bool:
+    """Schedule a background draft operation without emitting a processing notice."""
+    try:
+        task = asyncio.create_task(
+            _run_background_draft_operation(
+                operation,
+                action_factory,
+                bot,
+                event,
+                user_id,
+                memory_context,
+                user_message,
+                qq_message_segment,
+            )
+        )
+    except RuntimeError:
+        draft_operation_coordinator.finish(operation.owner_key, operation.operation_id)
+        logger.warning("No running event loop; cannot schedule background draft operation")
+        return False
+
+    background_draft_tasks.add(task)
+    task.add_done_callback(background_draft_tasks.discard)
+    logger.info(
+        "[draft_operation] scheduled "
+        f"operation={operation.operation_id} owner={operation.owner_key[0]}:{operation.owner_key[1]} "
+        f"kind={operation.kind} target={operation.description}"
+    )
+    return True
+
+
+async def _shutdown_background_draft_tasks() -> None:
+    """Cancel in-memory work during a graceful Bot shutdown."""
+    tasks = list(background_draft_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+if hasattr(driver, "on_shutdown"):
+    driver.on_shutdown(_shutdown_background_draft_tasks)
 
 
 ai_chat = on_message(rule=should_handle, priority=99, block=True)
 
 
-@ai_chat.handle()
-async def handle_ai_chat(bot: Bot, event: Event):
+async def _handle_ai_chat_serialized(
+    bot: Bot,
+    event: Event,
+    platform: str,
+    user_id: str,
+) -> None:
     # Platform-specific imports (may not all be installed)
     try:
         from nonebot.adapters.onebot.v11 import MessageSegment as QQMessageSegment
@@ -4083,7 +4405,6 @@ async def handle_ai_chat(bot: Bot, event: Event):
         normalized_message_text,
     )
 
-    platform, user_id = extract_platform_info(bot, event)
     conv_key = (platform, user_id)
     memory_context = await extract_memory_context(bot, event)
     space_key = get_space_key(memory_context)
@@ -4112,15 +4433,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
         conversation_state_store.delete(conv_key)
         await ai_chat.finish("好哒～ 对话历史已清空！我们重新开始吧 owo")
         return
-    if generic_command_intent.intent == "draft_submit":
-        await _send_processing_notice(
-            bot,
-            event,
-            user_id,
-            memory_context,
-            "收到，正在提交草稿并自动审词；如果要查来源，可能需要几十秒，本喵会把最终结果发回来。",
-            QQMessageSegment,
-        )
+    active_operation = draft_operation_coordinator.get(conv_key)
     generic_intent_is_fresh_command = _is_fresh_current_user_command_intent(
         generic_command_intent,
         normalized_message_text,
@@ -4131,6 +4444,129 @@ async def handle_ai_chat(bot: Bot, event: Event):
         if reply_reference.is_to_bot and reply_reference.text
         else None
     )
+    if active_operation is not None:
+        current_pending_state = conversation_state_store.get(conv_key)
+        explicit_active_reply = _active_operation_reply_matches(
+            active_operation,
+            reply_reference,
+        )
+
+        if active_operation.status == "running" and generic_command_intent.intent in {
+            "draft_submit",
+            "pending_confirm",
+            "pending_cancel",
+            "pending_add_and_submit",
+        }:
+            current_pending_intent = (
+                await command_intent_for(current_pending_state)
+                if current_pending_state is not None
+                else MessageCommandIntent()
+            )
+            cancelling_current_pending = (
+                current_pending_state is not None
+                and current_pending_intent.intent == "pending_cancel"
+            )
+            if not cancelling_current_pending:
+                response = _format_active_draft_operation_message(
+                    active_operation,
+                    current_pending_state,
+                )
+                remember_conversation(conv_key, memory_context, normalized_message_text, response)
+                await ai_chat.finish(response)
+                return
+
+        if active_operation.status == "awaiting_confirmation":
+            active_command_intent = await command_intent_for(active_operation.pending_state)
+            active_control_requested = active_command_intent.intent in {
+                "pending_confirm",
+                "pending_cancel",
+            }
+            duplicate_submit_requested = generic_command_intent.intent in {
+                "draft_submit",
+                "pending_add_and_submit",
+            }
+
+            if duplicate_submit_requested and not active_control_requested:
+                response = _format_active_draft_operation_message(
+                    active_operation,
+                    current_pending_state,
+                )
+                remember_conversation(conv_key, memory_context, normalized_message_text, response)
+                await ai_chat.finish(response)
+                return
+
+            if active_control_requested:
+                current_pending_intent = (
+                    await command_intent_for(current_pending_state)
+                    if current_pending_state is not None
+                    else MessageCommandIntent()
+                )
+                if current_pending_state is not None and not explicit_active_reply:
+                    if current_pending_intent.intent == "pending_cancel":
+                        active_control_requested = False
+                    elif current_pending_intent.intent in {
+                        "pending_add_and_submit",
+                        "pending_recode",
+                        "pending_code_request",
+                        "pending_choice",
+                    }:
+                        response = _format_active_draft_operation_message(
+                            active_operation,
+                            current_pending_state,
+                        )
+                    else:
+                        response = (
+                            f"现在同时有 {active_operation.description} 的提交确认，"
+                            f"以及 {_describe_pending_state(current_pending_state)}。\n"
+                            "为避免确认错对象，请直接回复对应的那条消息。"
+                        )
+                    if active_control_requested:
+                        remember_conversation(conv_key, memory_context, normalized_message_text, response)
+                        await ai_chat.finish(response)
+                        return
+
+                if not active_control_requested:
+                    pass
+                elif active_command_intent.intent == "pending_cancel":
+                    pending_function = getattr(active_operation.pending_state, "function_name", "")
+                    draft_operation_coordinator.finish(conv_key, active_operation.operation_id)
+                    response = (
+                        "好的，已取消继续提交，草稿仍为你保留 owo"
+                        if pending_function == "keytao_submit_batch"
+                        else "好的，已取消这次添加 owo"
+                    )
+                    remember_conversation(conv_key, memory_context, normalized_message_text, response)
+                    await ai_chat.finish(response)
+                    return
+                else:
+                    draft_operation_coordinator.mark_running(conv_key, active_operation.operation_id)
+                    scheduled = _schedule_background_draft_operation(
+                        active_operation,
+                        lambda: _perform_active_operation_confirmation(
+                            active_operation,
+                            platform,
+                            user_id,
+                        ),
+                        bot,
+                        event,
+                        user_id,
+                        memory_context,
+                        normalized_message_text,
+                        QQMessageSegment,
+                    )
+                    if scheduled:
+                        return
+                    draft_operation_coordinator.mark_awaiting_confirmation(
+                        conv_key,
+                        active_operation.operation_id,
+                        active_operation.pending_state,
+                        active_operation.prompt_text,
+                    )
+                    response = "后台任务启动失败，请稍后再回复「确认」。"
+                    remember_conversation(conv_key, memory_context, normalized_message_text, response)
+                    await ai_chat.finish(response)
+                    return
+
     if referenced_pending is not None and memory_context.space_type == "group":
         referenced_owner_key = _referenced_owner_key_from_reply_reference(
             reply_reference,
@@ -4190,6 +4626,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
         memory_context.space_type == "group"
         and not conversation_state_store.contains(conv_key)
         and not generic_intent_is_fresh_command
+        and active_operation is None
     ):
         if history is None:
             history = get_history(conv_key)
@@ -4269,7 +4706,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
         state_record = conversation_state_store.pop_record(conv_key)
         state = state_record.state if state_record else None
         state_space_key = state_record.space_key if state_record else space_key
-        if state is None:
+        if state is None and active_operation is None:
             history = get_history(conv_key)
             state = _recover_pending_state_from_history(history)
             if state is not None:
@@ -4293,21 +4730,97 @@ async def handle_ai_chat(bot: Bot, event: Event):
             elif isinstance(state, PendingAddWord):
                 if history is None:
                     history = get_history(conv_key)
-                response = await _handle_pending_add_word(
-                    state,
-                    normalized_message_text,
-                    platform,
-                    user_id,
-                    history,
-                    state_space_key,
-                    owner_label,
-                    pending_command_intent,
-                )
+                current_operation = draft_operation_coordinator.get(conv_key)
+                pending_mutation_requested = pending_command_intent.intent in {
+                    "pending_confirm",
+                    "pending_add_and_submit",
+                    "pending_recode",
+                    "pending_code_request",
+                    "pending_choice",
+                }
+                if current_operation is not None and pending_mutation_requested:
+                    conversation_state_store.set(
+                        conv_key,
+                        state,
+                        space_key=state_space_key,
+                        owner_label=state_record.owner_label if state_record else owner_label,
+                    )
+                    response = _format_active_draft_operation_message(
+                        current_operation,
+                        state,
+                    )
+                elif pending_command_intent.intent == "pending_add_and_submit":
+                    target_code = state.recommended_code
+                    operation = draft_operation_coordinator.begin(
+                        conv_key,
+                        "add_and_submit",
+                        word=state.word,
+                        code=target_code,
+                        remark=state.code_remarks.get(target_code, ""),
+                    )
+                    if operation is None:
+                        conversation_state_store.set(
+                            conv_key,
+                            state,
+                            space_key=state_space_key,
+                            owner_label=state_record.owner_label if state_record else owner_label,
+                        )
+                        response = "当前草稿操作刚刚开始，请稍后再试。"
+                    else:
+                        scheduled = _schedule_background_draft_operation(
+                            operation,
+                            lambda: _perform_add_to_draft_and_submit(
+                                state.word,
+                                target_code,
+                                platform,
+                                user_id,
+                                remark=state.code_remarks.get(target_code, ""),
+                            ),
+                            bot,
+                            event,
+                            user_id,
+                            memory_context,
+                            normalized_message_text,
+                            QQMessageSegment,
+                        )
+                        if scheduled:
+                            return
+                        conversation_state_store.set(
+                            conv_key,
+                            state,
+                            space_key=state_space_key,
+                            owner_label=state_record.owner_label if state_record else owner_label,
+                        )
+                        response = "后台任务启动失败，候选仍为你保留，请稍后再试。"
+                else:
+                    response = await _handle_pending_add_word(
+                        state,
+                        normalized_message_text,
+                        platform,
+                        user_id,
+                        history,
+                        state_space_key,
+                        owner_label,
+                        pending_command_intent,
+                    )
                 # response is None → unrecognized input, fall through to Phase 2
 
             elif isinstance(state, PendingToolConfirm):
                 if _is_pending_tool_confirm_message(state, pending_command_intent):
-                    response = await _execute_confirmed_tool(state, platform, user_id)
+                    current_operation = draft_operation_coordinator.get(conv_key)
+                    if current_operation is not None:
+                        conversation_state_store.set(
+                            conv_key,
+                            state,
+                            space_key=state_space_key,
+                            owner_label=state_record.owner_label if state_record else owner_label,
+                        )
+                        response = _format_active_draft_operation_message(
+                            current_operation,
+                            state,
+                        )
+                    else:
+                        response = await _execute_confirmed_tool(state, platform, user_id)
                 # else: response stays None, fall through to AI as new request
 
             if response is None and state is not None:
@@ -4320,6 +4833,32 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 )
 
     # ===== Phase 2: AI response (if not handled directly) =====
+    if response is None and generic_command_intent.intent == "draft_submit":
+        current_operation = draft_operation_coordinator.get(conv_key)
+        if current_operation is not None:
+            response = _format_active_draft_operation_message(
+                current_operation,
+                conversation_state_store.get(conv_key),
+            )
+        else:
+            operation = draft_operation_coordinator.begin(conv_key, "submit")
+            if operation is None:
+                response = "当前草稿操作刚刚开始，请稍后再试。"
+            else:
+                scheduled = _schedule_background_draft_operation(
+                    operation,
+                    lambda: _perform_submit_current_draft(platform, user_id),
+                    bot,
+                    event,
+                    user_id,
+                    memory_context,
+                    normalized_message_text,
+                    QQMessageSegment,
+                )
+                if scheduled:
+                    return
+                response = "后台任务启动失败，请稍后重新发送「提交」。"
+
     if response is None:
         response = await _try_handle_draft_management_command(
             normalized_message_text,
@@ -4455,3 +4994,11 @@ async def handle_ai_chat(bot: Bot, event: Event):
     # --- Other ---
     else:
         await ai_chat.finish(response)
+
+
+@ai_chat.handle()
+async def handle_ai_chat(bot: Bot, event: Event):
+    """Serialize one actor's messages while long draft reviews run separately."""
+    platform, user_id = extract_platform_info(bot, event)
+    async with conversation_message_locks.lock((platform, user_id)):
+        await _handle_ai_chat_serialized(bot, event, platform, user_id)

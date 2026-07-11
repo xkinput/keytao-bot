@@ -95,7 +95,7 @@ keytao_batch_add_to_draft(items=[
 }
 ```
 
-**`warnedCount > 0` 时：执行「通用编码自动分配协议」**（见下方独立章节）。协议会删除草稿中用错误编码写入的条目，并以正确 targetCode 重新写入。`failed[]` 非空时，在回复中追加「❌ 冲突条目（未写入）」段落。
+**`warnedCount > 0` 时：执行「编码警告确认协议」**（见下方独立章节）。不得静默删除、改码或重写用户已经选择的词条；如条目已写入，展示重码事实即可。`failed[]` 非空时，在回复中追加「❌ 冲突条目（未写入）」段落。
 
 ### keytao_create_phrase
 
@@ -121,9 +121,10 @@ keytao_batch_add_to_draft(items=[
 {"success": false, "warnings": [...], "requiresConfirmation": true, "message": "存在警告"}
 ```
 
-**收到 `requiresConfirmation: true` 时，执行「通用编码自动分配协议」中的优先级判断：**
-- 用户明确要保留重码 → 用原 `code` + `confirmed=True` 重新调用本工具
-- 用户未表态（默认）→ 执行自动分配，找到空位编码后用 `targetCode` 重新调用本工具
+**收到 `requiresConfirmation: true` 时，执行「编码警告确认协议」：**
+- 向当前操作发起者展示重码、跳过短空位等具体警告，并等待本人确认。
+- 只有本人明确确认保留该编码后，才用原 `code` + `confirmed=True` 重新调用本工具。
+- 禁止在用户未表态时擅自换到其他编码；若用户明确要求“自动安排空位”，才可使用 `keytao_encode` 的候选链选择第一个空位。
 
 ### keytao_get_batch_preview（查看草稿时优先使用）
 
@@ -303,71 +304,40 @@ summary 格式规则：
 
 🚫 **提交成功后，严禁再调用任何其他工具**（包括 `keytao_list_draft_items`）。提交后批次已不再是草稿，调用其他工具会立即创建一个新的空草稿——这是错误行为。用户可能还需要撤回本次提交，直接回复提交成功格式即可。
 
-## 通用编码自动分配协议
+## 编码警告确认协议
 
 **触发条件（任一满足即触发）：**
 - `keytao_create_phrase` 返回 `requiresConfirmation: true`（含 `warnings[]`，词条**尚未写入**）
 - `keytao_batch_add_to_draft` 返回 `requiresConfirmation: true`（含 `warnings[]`，本次需要确认的词条**尚未写入**，常见于跳过更短空位编码）
 - `keytao_batch_add_to_draft` 返回 `warnedCount > 0` 且无 `requiresConfirmation`（含 `warned[]`，词条**已写入**但存在重码提醒）
 
-### ⚠️ 优先级判断：用户是否明确要求保留重码？
+### 用户意图与处理
 
 **在执行协议前，必须先判断用户意图：**
 
 | 用户意图 | 典型表达 | 处理方式 |
 |---|---|---|
-| **明确要求保留重码** | "就用这个编码"、"加重码"、"确认重码"、"重码也行"、"直接加"、"强制加" | **跳过本协议**，改用原编码 + `confirmed=True` 直接写入 |
-| **未表态（默认）** | 普通加词请求，未提及重码 | **执行本协议**，自动分配至第一个空位编码 |
+| **明确要求保留当前编码** | "就用这个编码"、"加重码"、"确认重码"、"重码也行" | 展示警告；本人确认后用原编码 + `confirmed=True` 写入 |
+| **明确要求自动安排空位** | "自动顺延"、"帮我找空位"、"放到第一个空位" | 只使用 `keytao_encode` 返回的候选链选择第一个空位，并说明最终编码 |
+| **未表态（默认）** | 普通加词请求，未说明如何处理警告 | 保持当前选择并询问确认，不写入、不换码 |
 
-用户明确要求保留重码或确认跳过空位时，`keytao_create_phrase` 或 `keytao_batch_add_to_draft` 用原 `code` + `confirmed=True` 重新调用；若 `keytao_batch_add_to_draft` 只是返回已写入的 `warned[]`，无需修正，直接按正常成功展示（告知用户该词与哪个词形成重码即可）。
-
----
-
-**协议目标（仅在用户未明确要求重码时执行）：** 为每个冲突词条找到第一个空位编码（primary → altCode[0] → altCode[1] → ...），直接用该编码入库，不询问用户。
+用户明确要求保留重码或确认跳过空位时，`keytao_create_phrase` 或 `keytao_batch_add_to_draft` 用原 `code` + `confirmed=True` 重新调用；若 `keytao_batch_add_to_draft` 只是返回已写入的 `warned[]`，无需修正，直接按正常成功展示并告知用户与哪个词形成重码。
 
 ---
 
-### Step 1：查询编码链
+**安全边界：** 用户给出的编码、候选编号和“重码/重新编码”选择都属于修改意图的一部分，模型不得静默替换。跳过更短空位时必须明确提示被跳过的编码；只有用户确认后才能继续。
 
-对每个冲突词条，并行调用：
+---
+
+### 自动安排空位（仅在用户明确要求时）
+
+1. 对每个目标词调用：
 - `keytao_encode(word)` → 获得 `{ code, altCodes: [altCode0, altCode1, ...] }`，组成有序编码链 `[code, altCode0, altCode1, ...]`
 - `keytao_lookup_by_codes_batch([code, altCode0, altCode1, ...])` → 查哪些编码在词库中已有词条
 
-（多个冲突词条的编码链合并去重后，一次调用 lookup 即可。）
-
-### Step 2：确定 targetCode
-
-在编码链中按顺序找第一个词库里 `phrases == []` 的编码 → 即 **targetCode**。
-
-### Step 3：修正草稿
-
-| 触发来源 | 词条状态 | 操作 |
-|---|---|---|
-| `keytao_create_phrase` | 尚未写入 | 直接用 targetCode 重新调用 `keytao_create_phrase(word, code=targetCode)` |
-| `keytao_batch_add_to_draft` | 已写入原冲突编码 | 从 `draftItems` 找到该词的条目 ID，`keytao_batch_remove_draft_items` 删除，再 `keytao_batch_add_to_draft` 以 targetCode 重新写入 |
-
-多个词条的删除/重写可合并为各一次调用。
-
-### Step 4：回复格式
-
-```
-✅ 已写入草稿，自动分配编码 2 条。
-
-📌 编码自动分配：
-• 左利手 → zlev（zle 已有「自来水」，顺延至下一空位）
-• 右利手 → ylev（yle 已有「原来是」，顺延至下一空位）
-
-当前草稿（共 N 条）：
-...
-
-草稿地址：https://...
-
-发送「提交」以提交该草稿
-```
-
-- 标题：有分配时写"自动分配编码 N 条"，无冲突时正常写"已写入草稿"
-- 每条分配说明：`词 → targetCode（原编码 已有「占位词」，顺延至下一空位）`
-- 若 targetCode 与 code 相同（原编码本身就空），不列入分配段落，按正常成功处理
+2. 按工具返回顺序找第一个空位作为 `targetCode`，不得自己拼码或沿用别的词的候选链。
+3. 在写入前说明 `词 → targetCode（前面的码位为何不可用）`；若这会改变用户此前明确选择，仍需再次确认。
+4. 已经写入草稿的条目不得为了“优化”自动删除重建，除非用户明确要求重新编码该条目。
 
 ---
 
@@ -499,8 +469,8 @@ keytao_shift_phrase_code(word="会员费", target_code="hyfio")
 
 **`keytao_create_phrase` 或 `keytao_batch_add_to_draft` 遇到重码：**
 → 先判断用户是否明确要求保留重码：
-- 是 → 用原编码 + `confirmed=True` 写入，告知用户该词与谁形成重码
-- 否（默认）→ 执行「通用编码自动分配协议」，自动找空位编码写入
+- 是 → 展示警告；本人确认后用原编码 + `confirmed=True` 写入，告知用户该词与谁形成重码
+- 否（默认）→ 保持待确认状态，询问是保留重码还是改用候选空位；禁止静默改码
 
 **`keytao_submit_batch` 返回 `requiresConfirmation: true` 时：**
 - 告知用户批次中存在重码，询问是否继续提交

@@ -1,6 +1,10 @@
-"""Conversation state primitives for the agent harness."""
+"""Conversation and operation state primitives for the agent harness."""
+import asyncio
+import time
+import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Union
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Union
 
 
 ConversationKey = Tuple[str, str]
@@ -27,6 +31,149 @@ class PendingToolConfirm:
 
 
 PendingState = Union[PendingAddWord, PendingToolConfirm, None]
+
+
+@dataclass
+class ActiveDraftOperation:
+    """One serialized draft mutation that may continue in the background."""
+    operation_id: str
+    owner_key: ConversationKey
+    kind: str
+    word: str = ""
+    code: str = ""
+    remark: str = ""
+    status: str = "running"
+    pending_state: PendingState = None
+    prompt_text: str = ""
+    started_at: float = field(default_factory=time.monotonic)
+    updated_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def description(self) -> str:
+        if self.word and self.code:
+            return f"「{self.word}」→ {self.code}"
+        if self.word:
+            return f"「{self.word}」"
+        return "当前草稿"
+
+
+class ConversationLockStore:
+    """Provide one message-order lock per actor without blocking other actors."""
+
+    def __init__(self) -> None:
+        self._locks: Dict[ConversationKey, asyncio.Lock] = {}
+        self._users: Dict[ConversationKey, int] = {}
+
+    def get(self, key: ConversationKey) -> asyncio.Lock:
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
+
+    @asynccontextmanager
+    async def lock(self, key: ConversationKey) -> AsyncIterator[None]:
+        """Serialize an actor and retire the lock after every queued user exits."""
+        lock = self.get(key)
+        self._users[key] = self._users.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            remaining = self._users.get(key, 1) - 1
+            if remaining > 0:
+                self._users[key] = remaining
+            else:
+                self._users.pop(key, None)
+                if self._locks.get(key) is lock:
+                    self._locks.pop(key, None)
+
+    def __len__(self) -> int:
+        return len(self._locks)
+
+
+class DraftOperationCoordinator:
+    """Track one draft mutation lifecycle per bound chat actor."""
+
+    def __init__(self, confirmation_ttl_seconds: float = 7200.0) -> None:
+        self._active: Dict[ConversationKey, ActiveDraftOperation] = {}
+        self._confirmation_ttl_seconds = max(1.0, confirmation_ttl_seconds)
+
+    def get(self, key: ConversationKey) -> Optional[ActiveDraftOperation]:
+        operation = self._active.get(key)
+        if (
+            operation is not None
+            and operation.status == "awaiting_confirmation"
+            and time.monotonic() - operation.updated_at > self._confirmation_ttl_seconds
+        ):
+            self._active.pop(key, None)
+            return None
+        return operation
+
+    def begin(
+        self,
+        key: ConversationKey,
+        kind: str,
+        *,
+        word: str = "",
+        code: str = "",
+        remark: str = "",
+    ) -> Optional[ActiveDraftOperation]:
+        if self.get(key) is not None:
+            return None
+        operation = ActiveDraftOperation(
+            operation_id=uuid.uuid4().hex,
+            owner_key=key,
+            kind=kind,
+            word=word,
+            code=code,
+            remark=remark,
+        )
+        self._active[key] = operation
+        return operation
+
+    def mark_running(self, key: ConversationKey, operation_id: str) -> bool:
+        operation = self._matching(key, operation_id)
+        if operation is None:
+            return False
+        operation.status = "running"
+        operation.updated_at = time.monotonic()
+        return True
+
+    def mark_awaiting_confirmation(
+        self,
+        key: ConversationKey,
+        operation_id: str,
+        pending_state: PendingState,
+        prompt_text: str,
+    ) -> bool:
+        operation = self._matching(key, operation_id)
+        if operation is None:
+            return False
+        operation.status = "awaiting_confirmation"
+        operation.pending_state = pending_state
+        operation.prompt_text = prompt_text
+        operation.updated_at = time.monotonic()
+        return True
+
+    def finish(self, key: ConversationKey, operation_id: str) -> bool:
+        if self._matching(key, operation_id) is None:
+            return False
+        self._active.pop(key, None)
+        return True
+
+    def clear(self, key: ConversationKey) -> None:
+        self._active.pop(key, None)
+
+    def _matching(
+        self,
+        key: ConversationKey,
+        operation_id: str,
+    ) -> Optional[ActiveDraftOperation]:
+        operation = self._active.get(key)
+        if operation is None or operation.operation_id != operation_id:
+            return None
+        return operation
 
 
 @dataclass
