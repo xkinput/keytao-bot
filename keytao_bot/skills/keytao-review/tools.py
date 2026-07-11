@@ -80,9 +80,9 @@ async def _try_llm_auto_review_for_preview(
                 "success": True,
                 "verdict": "pass",
                 "autoApprove": True,
-                "summary": ai_review.get("headline") or "本喵已结合语言常识完成复审，预计可自动通过",
+                "summary": ai_review.get("headline") or "语言常识、读音和编码检查一致",
                 "issues": [],
-                "approvedItems": [f"Create：{word}@{code}，本喵 LLM 复审通过"],
+                "approvedItems": [f"Create：{word}@{code}，本喵审核通过"],
                 "llmReview": ai_review,
                 "llmFallback": True,
                 "previewOnly": True,
@@ -95,7 +95,7 @@ async def _try_llm_auto_review_for_preview(
             issues.append(str(reasons[0] if reasons else title))
         return {
             **deterministic_audit,
-            "summary": ai_review.get("headline") or deterministic_audit.get("summary", "存在不确定项，提交后等待管理员审核"),
+            "summary": ai_review.get("headline") or deterministic_audit.get("summary", "存在不确定项，需要管理员审核"),
             "issues": issues or deterministic_audit.get("issues", []),
             "llmReview": ai_review,
             "llmFallback": True,

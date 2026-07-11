@@ -1505,7 +1505,8 @@ def test_reviewed_add_prompt_explains_fallback_review_policy():
     check("fallback prompt does not say cannot auto approve", "不能自动通过" not in (prompt or ""))
     check("fallback prompt mentions no authoritative page", "来源 暂无权威页" in (prompt or ""))
     check("fallback prompt keeps one concise review line", "审词：读音 bai sui shan" in (prompt or ""))
-    check("fallback prompt mentions later review", "提交后复审" in (prompt or ""))
+    check("fallback prompt states preaudit is incomplete", "该词暂未完成预审" in (prompt or ""))
+    check("fallback prompt hides internal submit review", "提交后复审" not in (prompt or ""))
     check("fallback candidate line avoids repeated source", "1. bse — 已有「不算数」；来源" not in (prompt or ""))
 
 
@@ -1522,7 +1523,7 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
             "success": True,
             "verdict": "pass",
             "autoApprove": True,
-            "summary": "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过",
+            "summary": "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过；提交整批时会重审",
             "commonKnownItems": [{"word": "百岁山", "code": "bsev"}],
             "issues": [],
         },
@@ -1540,8 +1541,8 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
     })
 
     check("pre-submit preview is concise", "预审结论（同提交审核逻辑）" not in (prompt or ""))
-    check("pre-submit preview predicts auto approval", "自动审核：预计可通过" in (prompt or ""))
-    check("pre-submit preview explains batch caveat", "提交整批时会重审" in (prompt or ""))
+    check("pre-submit preview confirms word auto approval", "自动审核：该词可自动通过" in (prompt or ""))
+    check("pre-submit preview hides internal batch re-review", "提交整批时会重审" not in (prompt or ""))
     check("pre-submit preview keeps common-known reason", "实体常识" in (prompt or ""))
     check("pre-submit preview appears once", (prompt or "").count("自动审核：") == 1)
 
@@ -1598,8 +1599,47 @@ def test_reviewed_add_prompt_explains_entity_common_knowledge():
     check("entity prompt still states no authority page", "来源 暂无权威页" in text)
     check("entity prompt names inferred type", "本喵识别为历史人物" in text)
     check("entity prompt names canonical identity", "尉迟恭" in text)
-    check("entity prompt says auto approval once", text.count("自动审核：预计可通过") == 1)
+    check("entity prompt says word auto approval once", text.count("自动审核：该词可自动通过") == 1)
     check("entity candidate lines stay compact", "1. jgde — 已有「惊得」；来源" not in text)
+
+
+def test_reviewed_add_prompt_confirms_idiom_auto_approval():
+    """Known idioms should receive a decisive word-level auto-approval label."""
+    print("\n🧪 reviewed add prompt confirms idiom auto approval")
+
+    prompt = _format_reviewed_add_prompt({
+        "success": True,
+        "word": "和睦共处",
+        "recommendedCode": "hmgju",
+        "preSubmitAudit": {
+            "success": True,
+            "verdict": "pass",
+            "autoApprove": True,
+            "summary": "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过",
+            "commonKnownItems": [{
+                "word": "和睦共处",
+                "code": "hmgju",
+                "type": "idiom",
+                "summary": "「和睦共处」未找到权威读音页，但属于成语/熟语，且编码 hmgju 在读音候选链中",
+            }],
+            "issues": [],
+        },
+        "pronunciations": [{
+            "pinyin": "he mu gong chu",
+            "recommendedCode": "hmgju",
+            "sources": [],
+            "candidateStatuses": [
+                {"code": "hmgj", "occupied": True, "label": "已有「皇姑」"},
+                {"code": "hmgju", "occupied": False, "label": "空位"},
+            ],
+        }],
+    })
+
+    text = prompt or ""
+    check("idiom prompt confirms auto approval", "自动审核：该词可自动通过" in text)
+    check("idiom prompt names idiom evidence", "属于成语/熟语" in text)
+    check("idiom prompt avoids prediction wording", "预计" not in text)
+    check("idiom prompt hides internal re-review", "重审" not in text and "复审" not in text)
 
 
 def test_reviewed_add_prompt_keeps_waiting_review_concise():
@@ -1636,7 +1676,7 @@ def test_reviewed_add_prompt_keeps_waiting_review_concise():
     text = prompt or ""
     check("uncertain prompt generated", bool(prompt))
     check("uncertain prompt uses one review line", text.count("自动审核：") == 1)
-    check("uncertain prompt predicts admin review", "自动审核：预计需管理员审核" in text)
+    check("uncertain prompt confirms word needs admin review", "自动审核：该词需管理员审核" in text)
     check("uncertain prompt keeps concrete reason", "没有权威读音来源，且常用词信号不足" in text)
     check("uncertain prompt omits old long preview", "预审结论（同提交审核逻辑）" not in text)
     check("uncertain candidate lines omit repeated pronunciation", "1. hebs — 已有「喝吧」；读音" not in text)
@@ -1716,8 +1756,40 @@ def test_auto_approved_review_lines_explain_pass_reason():
     llm_text = "\n".join(llm_parts)
     check("common-known auto approval mentions common signals", "常见词/实体常识" in common_text)
     check("common-known auto approval avoids generic evidence-only wording", "证据一致" not in common_text)
-    check("llm fallback auto approval mentions re-review", "自动复审" in llm_text)
+    check("auto-approved lines use human review label", common_text.startswith("本喵审核：") and llm_text.startswith("本喵审核："))
+    check("llm fallback avoids internal re-review wording", "自动复审" not in llm_text and "复审" not in llm_text)
     check("llm fallback auto approval keeps summary", "语言常识" in llm_text)
+
+
+def test_submit_review_copy_is_decisive_and_non_redundant():
+    """Submit replies should expose one clear review result without backend process chatter."""
+    print("\n🧪 submit review copy is decisive and non-redundant")
+
+    approved_parts: List[str] = []
+    _append_submit_review_lines(approved_parts, {
+        "autoApproved": True,
+        "autoReview": {
+            "summary": "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过",
+            "commonKnownItems": [{"word": "和睦共处", "code": "hmgju"}],
+        },
+        "autoApproveResult": {"success": True, "message": "批次已由本喵自动审核通过"},
+    })
+    manual_parts: List[str] = []
+    _append_submit_review_lines(manual_parts, {
+        "autoApproved": False,
+        "autoReview": {
+            "summary": "存在不确定项，提交后等待管理员审核",
+            "issues": ["「测试词」证据不足，不能自动通过"],
+        },
+    })
+
+    approved_text = "\n".join(approved_parts)
+    manual_text = "\n".join(manual_parts)
+    check("approved reply contains one review line", len(approved_parts) == 1)
+    check("approved reply omits backend approval echo", "已由本喵自动审核通过" not in approved_text)
+    check("manual reply states batch status", "本喵审核：该批次需管理员审核" in manual_text)
+    check("manual reply removes temporal process wording", "提交后" not in manual_text and "等待管理员审核原因" not in manual_text)
+    check("manual issue uses positive status wording", "不能自动通过" not in manual_text and "需管理员审核" in manual_text)
 
 
 def test_simple_single_word_query_existing_word_falls_through():
@@ -5308,9 +5380,11 @@ if __name__ == "__main__":
     test_reviewed_add_prompt_explains_fallback_review_policy()
     test_reviewed_add_prompt_shows_pre_submit_audit_result()
     test_reviewed_add_prompt_explains_entity_common_knowledge()
+    test_reviewed_add_prompt_confirms_idiom_auto_approval()
     test_reviewed_add_prompt_keeps_waiting_review_concise()
     test_prepare_reviewed_add_attaches_pre_submit_audit()
     test_auto_approved_review_lines_explain_pass_reason()
+    test_submit_review_copy_is_decisive_and_non_redundant()
     test_simple_single_word_query_existing_word_falls_through()
     test_simple_single_word_query_skips_draft_commands()
     test_simple_single_word_query_skips_chat_comparison_questions()

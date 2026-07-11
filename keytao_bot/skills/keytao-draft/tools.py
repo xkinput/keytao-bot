@@ -861,7 +861,7 @@ async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> D
         "summary": (
             "来源审查超时，已用 keytao_encode 兜底通过"
             if auto_approve
-            else f"{reason}，提交后等待管理员审核"
+            else f"{reason}，需要管理员审核"
         ),
         "issues": issues,
         "approvedItems": approved_items,
@@ -877,7 +877,7 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
                 "success": False,
                 "verdict": "needs_admin",
                 "autoApprove": False,
-                "summary": list_result.get("message", "无法读取草稿，提交后等待管理员审核"),
+                "summary": list_result.get("message", "无法读取草稿，需要管理员审核"),
                 "issues": [list_result.get("message", "无法读取草稿")],
             }
         items = list_result.get("items", [])
@@ -901,7 +901,7 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
             "success": False,
             "verdict": "needs_admin",
             "autoApprove": False,
-            "summary": "自动审核异常，提交后等待管理员审核",
+            "summary": "自动审核异常，需要管理员审核",
             "issues": [str(error)],
         }
 
@@ -940,13 +940,13 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
                 word = item.get("word") or ""
                 code = item.get("code") or ""
                 if word and code:
-                    approved_items.append(f"{action}：{word}@{code}，本喵 LLM 复审通过")
+                    approved_items.append(f"{action}：{word}@{code}，本喵审核通过")
             return {
                 **deterministic_audit,
                 "success": True,
                 "verdict": "pass",
                 "autoApprove": True,
-                "summary": ai_review.get("headline") or "本喵已结合语言常识完成复审，允许自动通过",
+                "summary": ai_review.get("headline") or "语言常识、读音和编码检查一致",
                 "issues": [],
                 "approvedItems": approved_items or deterministic_audit.get("approvedItems", []),
                 "llmReview": ai_review,
@@ -962,7 +962,7 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
 
         return {
             **deterministic_audit,
-            "summary": ai_review.get("headline") or deterministic_audit.get("summary", "存在不确定项，提交后等待管理员审核"),
+            "summary": ai_review.get("headline") or deterministic_audit.get("summary", "存在不确定项，需要管理员审核"),
             "issues": issues or deterministic_audit.get("issues", []),
             "llmReview": ai_review,
             "llmFallback": True,
@@ -1004,7 +1004,7 @@ async def _auto_approve_submitted_batch(
             "details": data,
         }
     except httpx.TimeoutException:
-        return {"success": False, "message": "自动批准请求超时，批次已提交等待管理员审核"}
+        return {"success": False, "message": "批次已提交，自动批准超时，转交管理员审核"}
     except Exception as error:
         logger.warning(f"[auto_review] approve failed: {error}")
         return {"success": False, "message": f"自动批准失败：{str(error)}"}

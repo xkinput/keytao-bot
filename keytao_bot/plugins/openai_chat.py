@@ -1917,12 +1917,26 @@ def _common_known_item_label(item: Dict) -> str:
 def _clean_review_audit_reason(reason: str) -> str:
     text = str(reason or "").strip()
     replacements = [
+        "提交整批时会重新审核；",
+        "提交整批时会重新审核",
+        "提交整批时会重审；",
+        "提交整批时会重审",
+        "提交整批时会复审；",
+        "提交整批时会复审",
+        "提交时会重新审核；",
+        "提交时会重新审核",
+        "提交后将等待管理员审核；",
+        "提交后将等待管理员审核",
+        "提交后需管理员审核；",
+        "提交后需管理员审核",
         "存在不确定项，提交后等待管理员审核；",
         "存在不确定项，提交后等待管理员审核",
         "提交后等待管理员审核；",
         "提交后等待管理员审核",
         "允许本喵自动通过",
         "可由本喵自动通过",
+        "允许自动通过",
+        "预计可自动通过",
         "不能自动通过",
     ]
     for old in replacements:
@@ -1977,10 +1991,9 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
         return None
 
     summary = str(audit.get("summary") or "").strip()
-    suffix = "；提交整批时会重审"
     if audit.get("autoApprove"):
         if audit.get("llmFallback"):
-            reason = _clean_review_audit_reason(summary or "LLM 复审认为读音和编码一致")
+            reason = "语言常识、读音、编码和同码链检查一致"
         elif audit.get("commonKnownItems"):
             common_item = _common_known_item_for_code(review, recommended_code)
             reason = _format_common_known_brief_reason(
@@ -1989,7 +2002,7 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
             )
         else:
             reason = _clean_review_audit_reason(summary or "权威来源、编码和常用度证据一致")
-        return f"自动审核：预计可通过（{reason}{suffix}）"
+        return f"自动审核：该词可自动通过（{reason}）"
 
     issues = [
         str(issue).strip()
@@ -1998,7 +2011,7 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
     ]
     reason = issues[0] if issues else summary or "证据不足"
     reason = _clean_review_audit_reason(reason)
-    return f"自动审核：预计需管理员审核（{reason or '证据不足'}{suffix}）"
+    return f"自动审核：该词需管理员审核（{reason or '证据不足'}）"
 
 
 def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
@@ -2033,7 +2046,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         if pre_submit_preview:
             review_parts.append(pre_submit_preview)
         else:
-            review_parts.append("自动审核：提交后复审（会结合来源、常识、搜索和编码判断）")
+            review_parts.append("自动审核：该词暂未完成预审（当前仅确认读音与候选编码）")
         lines.append("审词：" + "；".join(review_parts))
         lines.append("候选编码:")
         for status in pronunciation.get("candidateStatuses", [])[:6]:
@@ -2058,7 +2071,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         if pre_submit_preview:
             lines.append(pre_submit_preview)
         else:
-            lines.append("自动审核：提交后复审（会结合来源、常识、搜索和编码判断）")
+            lines.append("自动审核：该词暂未完成预审（当前仅确认读音与候选编码）")
         lines.append("")
 
         for index, pronunciation in enumerate(pronunciations, start=1):
@@ -2828,7 +2841,7 @@ async def _perform_add_to_draft_and_submit(
     pr_url = submit_data.get("prUrl", "")
     parts = [f"✅ 搞定！「{word}」→ {code} 已加入草稿并提交审核。"]
     if submit_data.get("autoApproved"):
-        parts = [f"✅ 搞定！「{word}」→ {code} 已自动审核通过，已加入词库。"]
+        parts = [f"✅ 搞定！「{word}」→ {code} 已加入词库。"]
     if batch_url:
         parts.append(f"批次地址：{batch_url}")
     if pr_url:
@@ -3043,7 +3056,7 @@ async def _execute_confirmed_tool(
             pr_url = data.get("prUrl", "")
             parts = ["✅ 草稿已成功提交审核！"]
             if data.get("autoApproved"):
-                parts = ["✅ 草稿已自动审核通过，已加入词库！"]
+                parts = ["✅ 草稿已加入词库！"]
             if batch_url:
                 parts.append(f"\n草稿地址：{batch_url}")
             if pr_url:
@@ -3146,20 +3159,21 @@ def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
     auto_review = submit_data.get("autoReview") if isinstance(submit_data, dict) else None
     if submit_data.get("autoApproved"):
         parts.append(_format_auto_approved_review_line(auto_review))
-        approve_result = submit_data.get("autoApproveResult") or {}
-        message = approve_result.get("message")
-        if message:
-            parts.append(str(message))
         return
 
     if isinstance(auto_review, dict):
-        summary = auto_review.get("summary")
-        if summary:
-            parts.append(f"自动审词：{summary}")
+        summary = _clean_review_audit_reason(str(auto_review.get("summary") or ""))
+        if summary and "管理员审核" not in summary and "管理员确认" not in summary:
+            parts.append(f"本喵审核：该批次需管理员审核（{summary}）")
+        else:
+            parts.append("本喵审核：该批次需管理员审核。")
         issues = auto_review.get("issues") or []
         if issues:
-            issue_lines = "\n".join(f"• {issue}" for issue in issues[:5])
-            parts.append("等待管理员审核原因：\n" + issue_lines)
+            issue_lines = "\n".join(
+                f"• {str(issue).replace('不能自动通过', '需管理员审核').replace('提交后等待管理员审核', '需管理员审核')}"
+                for issue in issues[:5]
+            )
+            parts.append("需管理员审核：\n" + issue_lines)
     approve_result = submit_data.get("autoApproveResult") or {}
     if approve_result and not approve_result.get("success"):
         parts.append(f"自动批准未执行：{approve_result.get('message', '未知原因')}")
@@ -3168,16 +3182,14 @@ def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
 def _format_auto_approved_review_line(auto_review: Optional[Dict]) -> str:
     """Describe why an auto-approved batch passed without overstating source certainty."""
     if isinstance(auto_review, dict):
-        summary = str(auto_review.get("summary") or "").strip()
+        summary = _clean_review_audit_reason(str(auto_review.get("summary") or ""))
         if auto_review.get("llmFallback"):
-            if summary:
-                return f"✅ 本喵已完成自动复审：{summary}，批次已加入词库。"
-            return "✅ 本喵已结合语言常识完成自动复审，批次已加入词库。"
+            return "本喵审核：语言常识、读音、编码和同码链检查通过。"
         if auto_review.get("commonKnownItems"):
-            return "✅ 本喵已按常见词/实体常识信号和编码候选链完成自动审词，批次已加入词库。"
-        if summary and summary != "证据一致，允许本喵自动通过":
-            return f"✅ 本喵已完成自动审词：{summary}，批次已加入词库。"
-    return "✅ 本喵已完成自动审词，权威来源/编码/常用度证据一致，批次已加入词库。"
+            return "本喵审核：常见词/实体常识、编码候选链和同码链检查通过。"
+        if summary and summary != "证据一致":
+            return f"本喵审核：{summary}。"
+    return "本喵审核：权威来源、编码和常用度证据一致。"
 
 
 async def _submit_current_draft(
@@ -3233,7 +3245,7 @@ async def _perform_submit_current_draft(
     pr_url = submit_data.get("prUrl", "")
     parts = ["✅ 批次已提交审核！"]
     if submit_data.get("autoApproved"):
-        parts = ["✅ 批次已自动审核通过，已加入词库！"]
+        parts = ["✅ 批次已加入词库！"]
     if batch_url:
         parts.append(f"批次地址：{batch_url}")
     if pr_url:
@@ -3756,7 +3768,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 
      词库暂无收录「词」，先审读音和编码候选：
 
-     审词：读音 xxx；来源 汉典/百科/暂无权威页；自动审核：预计可通过/预计需管理员审核（简短原因）
+     审词：读音 xxx；来源 汉典/百科/暂无权威页；自动审核：该词可自动通过/该词需管理员审核（简短原因）
      候选编码:
      1. abcd — 已有「旧词」
      2. abcde — ✅ 推荐（空位）
@@ -3819,7 +3831,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
    • 仅当用户明确说"提交/提审/发起审核"时调 keytao_submit_batch
    • "确认/好/是"不是提交指令
    • 区分三种结论：编码/结构硬冲突会阻止提交；证据不足、歧义、纯删除可以提交但需管理员审核；证据一致才可能由本喵自动通过
-   • “需管理员审核”绝不表述成“不可提交”，应明确告诉用户可以提交、提交后等待管理员
+   • “需管理员审核”绝不表述成“不可提交”，应明确告诉用户“可提交，但需管理员审核”，不要描述“提交后等待”等过程
    • 遇到重码或跳过更短空位等警告，不得静默改成另一个编码；展示具体影响并等待当前用户确认
    • 提交成功后不再调用任何其他工具
 

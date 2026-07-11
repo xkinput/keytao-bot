@@ -1947,7 +1947,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 approved_items.append(f"{action}：{word}@{code}，本喵按{common_known_label}语言常识通过")
                 continue
 
-            issues.append(f"「{word}」没有权威读音来源，且常用词信号不足，不能自动通过")
+            issues.append(f"「{word}」没有权威读音来源，且常用词信号不足，需要管理员审核")
             continue
         if code not in candidate_codes:
             available = ", ".join(sorted(candidate_codes)[:8])
@@ -1989,7 +1989,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
     elif auto_approve:
         summary = "权威来源、编码和常用度证据一致，允许本喵自动通过"
     else:
-        summary = "存在不确定项，提交后等待管理员审核"
+        summary = "存在不确定项，需要管理员审核"
     return {
         "success": True,
         "verdict": "pass" if auto_approve else "needs_admin",

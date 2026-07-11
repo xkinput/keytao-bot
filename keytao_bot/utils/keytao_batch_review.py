@@ -509,7 +509,7 @@ def _fallback_review_from_llm_error(
         if action == "Delete" and (word, code) not in move_pairs:
             status = "manual_review"
             title = "纯删除需要管理员确认"
-            suggestions.insert(0, "纯删除不能自动通过，请确认该词确实应删除。")
+            suggestions.insert(0, "纯删除需要管理员确认，请核实该词确实应删除。")
         if pr.get("hasConflict") or (isinstance(pr.get("conflictInfo"), dict) and pr["conflictInfo"].get("hasConflict")):
             status = "manual_review"
             title = "冲突需要管理员确认"
