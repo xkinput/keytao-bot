@@ -104,6 +104,8 @@ COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
 CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
 PRONUNCIATION_EVIDENCE_TIMEOUT = 4.0
 ENTITY_DIRECT_FETCH_TIMEOUT = 3.0
+ENTITY_PRONUNCIATION_MIN_CONFIDENCE = 0.75
+CONTEXT_ENTITY_SOURCE_DOMAINS = ("baike.baidu.com", "zh.wikipedia.org")
 
 AUTHORITATIVE_SOURCES = [
     {
@@ -695,6 +697,133 @@ def _encode_default_pinyin_sequence(encode_data: Dict) -> Tuple[str, ...]:
     return tuple(result)
 
 
+def _entity_pronunciation_group(
+    word: str,
+    entity: Dict[str, Any],
+    default_sequence: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    """Build a context-aware pronunciation only from high-confidence entity knowledge."""
+    if not entity.get("recognized"):
+        return None
+    if float(entity.get("confidence") or 0.0) < ENTITY_PRONUNCIATION_MIN_CONFIDENCE:
+        return None
+
+    sequence = normalize_pinyin_sequence(str(entity.get("pinyin") or ""))
+    if len(sequence) != len(word):
+        return None
+    if any(not pinyin_to_phonetic_code(syllable) for syllable in sequence):
+        return None
+
+    entity_type = str(entity.get("entityType") or "unclear")
+    label = _entity_type_label(entity_type)
+    normalized_default = tuple(default_sequence)
+    corrected = bool(normalized_default and sequence != normalized_default)
+    return {
+        "pinyin": pinyin_sequence_label(sequence),
+        "normalized": list(sequence),
+        "sources": [],
+        "sourceIds": [],
+        "score": 0,
+        "fallback": True,
+        "semanticPronunciation": True,
+        "sourceSummary": f"本喵实体语境判断（{label}，暂无权威页）",
+        "contextPronunciation": {
+            "entityType": entity_type,
+            "label": label,
+            "confidence": float(entity.get("confidence") or 0.0),
+            "description": str(entity.get("description") or "").strip(),
+            "correctedDefault": corrected,
+            "defaultPinyin": pinyin_sequence_label(normalized_default),
+        },
+    }
+
+
+def _context_entity_name(word: str, result: Dict[str, str]) -> str:
+    parsed = urlparse(str(result.get("url") or ""))
+    if not any(domain in parsed.netloc for domain in CONTEXT_ENTITY_SOURCE_DOMAINS):
+        return ""
+
+    title_head = re.split(r"[（(_|｜-]", str(result.get("title") or ""), maxsplit=1)[0]
+    normalized = re.sub(r"\s+", "", title_head)
+    match = re.search(r"[\u3400-\u9fff]+", normalized)
+    candidate = match.group(0) if match else ""
+    if not candidate.startswith(word) or len(candidate) <= len(word) or len(candidate) > len(word) + 8:
+        return ""
+    return candidate
+
+
+async def _contextual_pronunciation_group(
+    config: ReviewHttpConfig,
+    word: str,
+    entity: Dict[str, Any],
+    default_sequence: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    candidates: List[Tuple[str, str]] = []
+    seen: set[str] = set()
+
+    if (
+        entity.get("recognized")
+        and float(entity.get("confidence") or 0.0) >= ENTITY_PRONUNCIATION_MIN_CONFIDENCE
+    ):
+        for name in [*(entity.get("canonicalNames") or []), *(entity.get("aliases") or [])]:
+            candidate = str(name or "").strip()
+            if candidate.startswith(word) and len(candidate) > len(word) and candidate not in seen:
+                seen.add(candidate)
+                candidates.append((candidate, "本喵实体识别"))
+
+    search_results = await _search_web(f'"{word}" 百度百科 OR 维基百科', max_results=5)
+    for result in search_results:
+        candidate = _context_entity_name(word, result)
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        candidates.append((candidate, str(result.get("url") or "百科搜索结果")))
+
+    if not candidates:
+        return None
+
+    encoded = await asyncio.gather(*(
+        fetch_keytao_encode(config, candidate)
+        for candidate, _source in candidates[:4]
+    ))
+    sequence_sources: Dict[Tuple[str, ...], List[Tuple[str, str]]] = {}
+    for (candidate, source), encode_data in zip(candidates[:4], encoded):
+        sequence = _encode_default_pinyin_sequence(encode_data)[:len(word)]
+        if len(sequence) != len(word):
+            continue
+        if any(not pinyin_to_phonetic_code(syllable) for syllable in sequence):
+            continue
+        sequence_sources.setdefault(sequence, []).append((candidate, source))
+
+    if len(sequence_sources) != 1:
+        return None
+
+    sequence, supporting_names = next(iter(sequence_sources.items()))
+    canonical_name, source = supporting_names[0]
+    normalized_default = tuple(default_sequence)
+    return {
+        "pinyin": pinyin_sequence_label(sequence),
+        "normalized": list(sequence),
+        "sources": [],
+        "sourceIds": [],
+        "score": 0,
+        "fallback": True,
+        "semanticPronunciation": True,
+        "sourceSummary": f"百科实体全称语境（{canonical_name}，暂无独立读音页）",
+        "contextPronunciation": {
+            "entityType": str(entity.get("entityType") or "unclear"),
+            "label": _entity_type_label(str(entity.get("entityType") or "unclear")),
+            "confidence": float(entity.get("confidence") or 0.0),
+            "description": str(entity.get("description") or "").strip(),
+            "correctedDefault": bool(normalized_default and sequence != normalized_default),
+            "defaultPinyin": pinyin_sequence_label(normalized_default),
+            "canonicalName": canonical_name,
+            "source": source,
+            "method": "entity_full_name_context",
+        },
+    }
+
+
 def _codes_for_pinyin_sequence(encode_data: Dict, sequence: Sequence[str]) -> List[str]:
     chars = encode_data.get("chars")
     if not isinstance(chars, list) or len(chars) != len(sequence):
@@ -736,10 +865,11 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
     if not word:
         return {"success": False, "message": "词不能为空"}
 
-    evidence, encode_data, existing_words = await asyncio.gather(
+    evidence, encode_data, existing_words, entity_knowledge = await asyncio.gather(
         collect_pronunciation_evidence_limited(word),
         fetch_keytao_encode(config, word),
         lookup_words(config, [word]),
+        _infer_entity_knowledge(word),
     )
     if not encode_data.get("success", True) and not encode_data.get("codes"):
         return {"success": False, "message": encode_data.get("message", "编码服务未返回有效结果")}
@@ -747,7 +877,17 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
     groups = evidence.get("groups", []) if evidence.get("success") else []
     if not groups:
         default_sequence = _encode_default_pinyin_sequence(encode_data)
-        if default_sequence:
+        entity_group = _entity_pronunciation_group(word, entity_knowledge, default_sequence)
+        if not entity_group and default_sequence:
+            entity_group = await _contextual_pronunciation_group(
+                config,
+                word,
+                entity_knowledge,
+                default_sequence,
+            )
+        if entity_group:
+            groups = [entity_group]
+        elif default_sequence:
             groups = [{
                 "pinyin": pinyin_sequence_label(default_sequence),
                 "normalized": list(default_sequence),
@@ -774,6 +914,9 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
             "sources": group.get("sources", []),
             "score": group.get("score", 0),
             "fallback": bool(group.get("fallback")),
+            "semanticPronunciation": bool(group.get("semanticPronunciation")),
+            "sourceSummary": str(group.get("sourceSummary") or "").strip(),
+            "contextPronunciation": group.get("contextPronunciation"),
         })
 
     if not pronunciations:
@@ -789,14 +932,23 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
         if not global_recommended and recommended:
             global_recommended = recommended
 
+    has_authority = any(pron.get("sources") for pron in pronunciations)
+    has_semantic_pronunciation = any(pron.get("semanticPronunciation") for pron in pronunciations)
     return {
         "success": True,
         "word": word,
         "existing": existing_words.get(word, []),
         "pronunciations": pronunciations,
         "recommendedCode": global_recommended,
-        "autoReviewable": any(pron.get("sources") for pron in pronunciations),
-        "autoReviewReason": "至少一个权威来源给出读音" if any(pron.get("sources") for pron in pronunciations) else "未找到权威来源，仅使用编码服务默认读音",
+        "autoReviewable": has_authority,
+        "autoReviewReason": (
+            "至少一个权威来源给出读音"
+            if has_authority else
+            "本喵已按明确实体语境纠正读音，仍需结合常用词/实体信号完成预审"
+            if has_semantic_pronunciation else
+            "未找到权威来源，仅使用编码服务默认读音"
+        ),
+        "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
         "sourcePolicy": {
             "acceptedSources": [
                 {key: source[key] for key in ("id", "label", "domain", "category", "trust")}
@@ -871,6 +1023,41 @@ def _common_known_review_label(commonness: Dict) -> str:
     if (commonness.get("personAlias") or {}).get("accepted"):
         return "名人字号/别名"
     return "常见词/熟语"
+
+
+_MANUAL_PREAUDIT_MARKERS = (
+    "自动审核：该词需管理员审核",
+    "自动审核:该词需管理员审核",
+    "自动审核：该词需要管理员审核",
+    "自动审核:该词需要管理员审核",
+    "自动审核：预计需管理员审核",
+    "自动审核:预计需管理员审核",
+    "自动审核：预计需要管理员审核",
+    "自动审核:预计需要管理员审核",
+    "自动审核：需管理员审核",
+    "自动审核:需管理员审核",
+    "自动审核：该词暂未完成预审",
+    "自动审核:该词暂未完成预审",
+)
+
+
+def manual_preaudit_issue_for_item(item: Dict) -> str:
+    """Return a conservative batch blocker recorded during add-stage review."""
+    remark = str(item.get("remark") or "").strip()
+    if not remark:
+        return ""
+
+    marker = next((value for value in _MANUAL_PREAUDIT_MARKERS if value in remark), "")
+    if not marker:
+        return ""
+
+    word = str(item.get("word") or "").strip() or "该词"
+    tail = remark.split(marker, 1)[1]
+    reason_match = re.match(r"\s*[（(]([^）)]+)[）)]", tail)
+    reason = reason_match.group(1).strip() if reason_match else ""
+    if reason:
+        return f"「{word}」加词预审已标记为需管理员审核：{reason}"
+    return f"「{word}」加词预审已标记为需管理员审核"
 
 
 def can_llm_override_audit_issues(audit: Dict) -> bool:
@@ -1027,6 +1214,8 @@ async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
         "可识别类型：common_word, idiom, person, celebrity, historical_person, courtesy_name, stage_name, "
         "fictional_character, brand, product, place, organization, work, technical_term, unclear。"
         "如果是明星、艺名、历史人物、人物字号/别名、角色名、品牌简称、作品名等，请给出全称/别名和适合搜索核验的中文查询。"
+        "pinyin 必须按完整词语的真实语境给出逐字拼音，特别检查地名、人名、术语里的多音字；不能沿用脱离语境的逐字默认音。"
+        "如果不能确定完整读音，pinyin 留空，不要猜测。"
         "不要为了通过审核而编造；陌生专名、临时网名、含义不明或你不确定时 recognized=false。"
         "只返回 JSON 对象。"
     )
@@ -1845,6 +2034,11 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 approved_items.append(f"调码删除原位：{word}@{code}")
                 continue
             issues.append(f"纯删除「{word}」@{code} 必须由管理员审核")
+            continue
+
+        preaudit_issue = manual_preaudit_issue_for_item(item)
+        if preaudit_issue:
+            issues.append(preaudit_issue)
             continue
 
         if _is_css_review_type(phrase_type):

@@ -21,6 +21,7 @@ from keytao_bot.utils.keytao_review import (
     build_review_note,
     can_llm_override_audit_issues,
     fetch_keytao_encode,
+    manual_preaudit_issue_for_item,
 )
 
 
@@ -841,6 +842,9 @@ async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> D
         if not word or not code:
             issues.append(f"草稿条目缺少词或编码，需要管理员确认：{item}")
             continue
+        preaudit_issue = manual_preaudit_issue_for_item(item)
+        if preaudit_issue:
+            issues.append(preaudit_issue)
         try:
             encoding = await fetch_keytao_encode(_review_config(), word)
             normalized_encoding = _build_encode_candidate_result(word, encoding)
@@ -853,19 +857,17 @@ async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> D
         except Exception as error:
             issues.append(f"「{word}」编码兜底检查失败：{error}")
 
-    auto_approve = bool(approved_items) and not issues
+    if not issues:
+        issues.append(f"{reason}；仅完成编码候选链校验，缺少完整的读音、词义和常用度审查")
     return {
         "success": True,
-        "verdict": "pass" if auto_approve else "needs_admin",
-        "autoApprove": auto_approve,
-        "summary": (
-            "来源审查超时，已用 keytao_encode 兜底通过"
-            if auto_approve
-            else f"{reason}，需要管理员审核"
-        ),
+        "verdict": "needs_admin",
+        "autoApprove": False,
+        "summary": f"{reason}，该批次需要管理员审核",
         "issues": issues,
         "approvedItems": approved_items,
         "timeout": True,
+        "encodeOnly": True,
     }
 
 
@@ -951,6 +953,7 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
                 "approvedItems": approved_items or deterministic_audit.get("approvedItems", []),
                 "llmReview": ai_review,
                 "llmFallback": True,
+                "encodeOnly": False,
             }
 
         issues = []
@@ -972,12 +975,29 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
         return None
 
 
+def _audit_allows_batch_auto_approve(auto_review: Dict) -> bool:
+    """Require an internally consistent all-pass result before calling approval."""
+    return bool(
+        isinstance(auto_review, dict)
+        and auto_review.get("autoApprove") is True
+        and auto_review.get("verdict") == "pass"
+        and not (auto_review.get("issues") or [])
+        and bool(auto_review.get("approvedItems") or [])
+        and not auto_review.get("encodeOnly")
+    )
+
+
 async def _auto_approve_submitted_batch(
     platform: str,
     platform_id: str,
     batch_id: str,
     auto_review: Dict,
 ) -> Dict:
+    if not _audit_allows_batch_auto_approve(auto_review):
+        return {
+            "success": False,
+            "message": "整批审核未达到逐项通过条件，已保留给管理员审核",
+        }
     KEYTAO_API_BASE = get_keytao_url()
     review_note = build_review_note(auto_review)
     url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/auto-approve"
@@ -1068,7 +1088,7 @@ async def keytao_submit_batch(
                 data["batchId"] = batch_id  # inject so _inject_batch_url can build batchUrl
                 _inject_batch_url(data)
                 data["autoReview"] = auto_review
-                if auto_review.get("autoApprove"):
+                if _audit_allows_batch_auto_approve(auto_review):
                     approve_result = await _auto_approve_submitted_batch(
                         platform,
                         platform_id,
@@ -1733,7 +1753,13 @@ TOOLS += [
                                     "type": "string",
                                     "description": "词条类型。用户明确指定类型时必须传：声笔笔=CSS，声笔笔单字=CSSSingle，词组=Phrase，单字=Single，补充=Supplement，符号=Symbol，链接=Link，英文=English。Change/Delete 若不传会默认词组，可能改错词库。",
                                 },
-                                "remark": {"type": "string", "description": "备注（可选）"},
+                                "remark": {
+                                    "type": "string",
+                                    "description": (
+                                        "审词备注。若本轮调用过 keytao_prepare_reviewed_add，必须完整传入该词的读音、"
+                                        "来源和自动审核结论；批次会按任一需管理员项锁定整批人工审核。"
+                                    ),
+                                },
                             },
                             "required": ["word", "code"],
                         },

@@ -237,6 +237,10 @@ _PENDING_CONTROL_TEXTS = {
     "不了",
     "算了",
 }
+_PENDING_ADD_AND_SUBMIT_COMMANDS = {
+    "加入并提交",
+    "加并提交",
+}
 
 WORD_QUERY_INTENT_MODEL = (
     getattr(config, "word_query_intent_model", None)
@@ -560,6 +564,20 @@ async def _classify_message_command_intent(
     """Use the configured flash/intent model for command and pending-control semantics."""
     if not message_text.strip():
         return MessageCommandIntent()
+    compact_message = re.sub(
+        r"[\s，,。.!！?？~～]+",
+        "",
+        _strip_command_message_prefixes(message_text),
+    )
+    pending_accepts_add_submit = (
+        isinstance(pending_state, PendingAddWord)
+        or (
+            isinstance(pending_state, PendingToolConfirm)
+            and pending_state.function_name == "keytao_batch_add_to_draft"
+        )
+    )
+    if pending_accepts_add_submit and compact_message in _PENDING_ADD_AND_SUBMIT_COMMANDS:
+        return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
     if pending_state is None and _is_plain_draft_submit_request(message_text):
         return MessageCommandIntent(intent="draft_submit", confidence=1.0)
     if not OPENAI_API_KEY or not AsyncOpenAI:
@@ -584,6 +602,8 @@ async def _classify_message_command_intent(
         "如果只问自己，则 current_user_only=true。\n"
         "batch_replace_char：用户要求把下方词码列表里的某个字符批量替换成另一个字符；"
         "old_char/new_char 必须是单个字符。\n"
+        "pending_add_and_submit：当前待确认的是加词或批量加词，且用户要求先加入再立即提交；"
+        "例如“加入并提交”。这种情况绝不能归类为 draft_submit。\n"
         "pending_* 只在 pending_context 不是 none，且用户在回应该待确认操作时使用。"
         "普通提问、词义/常用度比较、泛泛讨论、如何使用功能、以及新的复杂操作都返回 none，交给主模型。"
     )
@@ -845,30 +865,83 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     )
 
 
+def _normalize_generated_review_copy(response: str) -> str:
+    """Normalize model-generated review status text to the deterministic UI wording."""
+    text = str(response or "")
+    replacements = (
+        ("自动审核：预计需管理员审核", "自动审核：该词需管理员审核"),
+        ("自动审核:预计需管理员审核", "自动审核：该词需管理员审核"),
+        ("自动审核：预计需要管理员审核", "自动审核：该词需管理员审核"),
+        ("自动审核:预计需要管理员审核", "自动审核：该词需管理员审核"),
+        ("自动审核：预计可通过", "自动审核：该词可自动通过"),
+        ("自动审核:预计可通过", "自动审核：该词可自动通过"),
+    )
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return re.sub(
+        r"[；;]\s*提交整批时会(?:重新审核|重审|复审)",
+        "",
+        text,
+    )
+
+
+def _batch_review_remark(response: str, word: str) -> str:
+    """Extract the reviewed-add line belonging to one word section."""
+    header = re.search(rf"(?m)^「{re.escape(word)}」[^\n]*$", response)
+    if not header:
+        return ""
+    block_start = header.end()
+    next_header = re.search(r"(?m)^「[^」]+」[^\n]*$", response[block_start:])
+    block_end = block_start + next_header.start() if next_header else len(response)
+    block = response[block_start:block_end]
+    review_match = re.search(r"(?m)^\s*审词：(.+?)\s*$", block)
+    if not review_match:
+        return ""
+    review_text = _normalize_generated_review_copy(review_match.group(1).strip())
+    return f"喵喵审词：{review_text}" if review_text else ""
+
+
 def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
     """Parse AI response for a multi-word add confirmation prompt."""
-    if "一起加入草稿" not in response:
+    normalized_response = _normalize_generated_review_copy(response)
+    if "一起加入草稿" not in normalized_response:
         return None
 
     confirm_line = next(
         (
             line.strip()
-            for line in response.splitlines()
+            for line in normalized_response.splitlines()
             if "一起加入草稿" in line and "将「" in line
         ),
         "",
     )
-    if not confirm_line:
-        return None
 
     items = []
     seen = set()
-    for code, word in re.findall(r'(?:以编码\s*)?([a-z]+)\s*将「(.+?)」', confirm_line):
+    inline_pairs = re.findall(
+        r'(?:以编码\s*)?([a-z]{2,12})\s*将「(.+?)」',
+        confirm_line,
+        re.IGNORECASE,
+    ) if confirm_line else []
+    arrow_pairs = [
+        (match.group(2), match.group(1))
+        for match in re.finditer(
+            r'(?m)^\s*[-•]\s*「([^」]+)」\s*(?:→|->)\s*([a-z]{2,12})\s*$',
+            normalized_response,
+            re.IGNORECASE,
+        )
+    ]
+    for code, word in [*inline_pairs, *arrow_pairs]:
+        code = code.lower()
         key = (word, code)
         if key in seen:
             continue
         seen.add(key)
-        items.append({"word": word, "code": code, "action": "Create"})
+        item = {"word": word, "code": code, "action": "Create"}
+        remark = _batch_review_remark(normalized_response, word)
+        if remark:
+            item["remark"] = remark
+        items.append(item)
 
     if len(items) < 2:
         return None
@@ -1954,6 +2027,16 @@ def _format_source_summary(sources: List[Dict]) -> str:
     return "；".join(labels) if labels else "暂无权威页"
 
 
+def _format_pronunciation_source(pronunciation: Dict) -> str:
+    sources = [
+        source for source in pronunciation.get("sources", [])
+        if isinstance(source, dict)
+    ]
+    if sources:
+        return _format_source_summary(sources)
+    return str(pronunciation.get("sourceSummary") or "").strip() or "暂无权威页"
+
+
 def _format_common_known_brief_reason(item: Optional[Dict], fallback: str) -> str:
     if not isinstance(item, dict):
         return _clean_review_audit_reason(fallback)
@@ -2035,13 +2118,9 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
     if len(pronunciations) == 1:
         pronunciation = pronunciations[0]
         pinyin = str(pronunciation.get("pinyin") or "").strip()
-        sources = [
-            source for source in pronunciation.get("sources", [])
-            if isinstance(source, dict)
-        ]
         review_parts = [
             f"读音 {pinyin}" if pinyin else "读音待确认",
-            f"来源 {_format_source_summary(sources)}",
+            f"来源 {_format_pronunciation_source(pronunciation)}",
         ]
         if pre_submit_preview:
             review_parts.append(pre_submit_preview)
@@ -2063,11 +2142,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         lines.append("读音与来源:")
         for index, pronunciation in enumerate(pronunciations, start=1):
             pinyin = str(pronunciation.get("pinyin") or "").strip()
-            sources = [
-                source for source in pronunciation.get("sources", [])
-                if isinstance(source, dict)
-            ]
-            lines.append(f"{index}. {pinyin or '待确认'}；来源 {_format_source_summary(sources)}")
+            lines.append(f"{index}. {pinyin or '待确认'}；来源 {_format_pronunciation_source(pronunciation)}")
         if pre_submit_preview:
             lines.append(pre_submit_preview)
         else:
@@ -2076,10 +2151,6 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
 
         for index, pronunciation in enumerate(pronunciations, start=1):
             pinyin = str(pronunciation.get("pinyin") or "").strip()
-            sources = [
-                source for source in pronunciation.get("sources", [])
-                if isinstance(source, dict)
-            ]
             lines.append(f"候选编码（读音 {index}）:")
             for status in pronunciation.get("candidateStatuses", [])[:6]:
                 lines.append(
@@ -2848,6 +2919,68 @@ async def _perform_add_to_draft_and_submit(
         parts.append(f"PR：{pr_url}")
     _append_submit_review_lines(parts, submit_data)
     return DraftActionResult("\n\n".join(parts), success=True)
+
+
+async def _perform_batch_add_to_draft_and_submit(
+    items: List[Dict],
+    platform: str,
+    user_id: str,
+) -> DraftActionResult:
+    """Add every confirmed reviewed item, then submit exactly that batch."""
+    requested_items = [dict(item) for item in items if isinstance(item, dict)]
+    if not requested_items:
+        return DraftActionResult("没有找到可添加的词条 qwq")
+
+    add_json = await call_tool_function(
+        "keytao_batch_add_to_draft",
+        {"items": requested_items, "confirmed": True},
+        platform,
+        user_id,
+    )
+    add_data = json.loads(add_json)
+    if add_data.get("not_bound"):
+        return DraftActionResult(_BIND_HELP_TEXT)
+
+    if add_data.get("requiresConfirmation"):
+        pending_state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={"items": requested_items},
+        )
+        warnings = add_data.get("warnings", [])
+        warning_text = "\n".join(
+            f"⚠️ {warning.get('message', warning) if isinstance(warning, dict) else warning}"
+            for warning in warnings
+        ) if warnings else add_data.get("message", "批量添加前需要确认")
+        return DraftActionResult(
+            f"{warning_text}\n\n确认继续添加吗？回复「确认」继续，回复「取消」放弃。",
+            pending_state=pending_state,
+        )
+
+    success_count = int(add_data.get("successCount") or 0)
+    failed_count = int(add_data.get("failedCount") or 0)
+    if success_count <= 0:
+        return DraftActionResult(f"添加失败：{add_data.get('message', '未知错误')} qwq")
+
+    if failed_count > 0 or success_count < len(requested_items):
+        draft_text = await _format_draft_response(add_data, platform, user_id)
+        return DraftActionResult(
+            f"仅成功加入 {success_count}/{len(requested_items)} 条，已停止提交，避免生成不完整批次。\n\n{draft_text}"
+        )
+
+    submit_result = await _perform_submit_current_draft(platform, user_id)
+    item_lines = "\n".join(
+        f"- 「{str(item.get('word') or '').strip()}」→ {str(item.get('code') or '').strip()}"
+        for item in requested_items
+        if item.get("word") and item.get("code")
+    )
+    text = submit_result.text
+    if item_lines:
+        text = f"{text}\n\n{item_lines}"
+    return DraftActionResult(
+        text,
+        pending_state=submit_result.pending_state,
+        success=submit_result.success,
+    )
 
 
 async def _execute_shift_to_code(
@@ -3825,6 +3958,12 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
        1. 给出简短词义
        2. 再给拆分、候选编码和加词引导
      • 多个词时按词分段回答，避免把多个词混在一段里
+     • 多个待加词必须逐词调用 keytao_prepare_reviewed_add，并在末尾使用固定确认格式：
+       “这些词是否一起加入草稿并提交？”后逐行列出“- 「词」→ code”
+     • 用户明确确认前不得调用批量写入工具；确认后调用 keytao_batch_add_to_draft 时，
+       每个 item.remark 必须完整携带该词对应的“喵喵审词：读音...；来源...；自动审核...”记录
+     • 任一词的 preSubmitAudit.autoApprove=false 时，整批都只能提交给管理员审核；
+       其他词通过不能覆盖这一项，也不能把整批描述成已自动通过
      • 不要把“相关词”发散成大段百科，只需围绕当前词和工具查到的同码词/占位词简洁说明
 
 4. 提交草稿
@@ -4126,7 +4265,7 @@ async def get_ai_response_core(
             bind_help_text=_BIND_HELP_TEXT,
             system_prompt_core=SYSTEM_PROMPT_CORE,
         )
-        return await orchestrator.run(
+        result = await orchestrator.run(
             message=message,
             context=AgentRequestContext(
                 platform=platform,
@@ -4142,6 +4281,7 @@ async def get_ai_response_core(
             ),
             max_iterations=max_iterations,
         )
+        return _normalize_generated_review_copy(result) if result else result
 
     except Exception as e:
         logger.error(f"API error: {e}")
@@ -4831,6 +4971,53 @@ async def _handle_ai_chat_serialized(
                             current_operation,
                             state,
                         )
+                    elif (
+                        state.function_name == "keytao_batch_add_to_draft"
+                        and pending_command_intent.intent == "pending_add_and_submit"
+                    ):
+                        items = state.args.get("items", [])
+                        words = [
+                            str(item.get("word") or "").strip()
+                            for item in items
+                            if isinstance(item, dict) and item.get("word")
+                        ]
+                        operation = draft_operation_coordinator.begin(
+                            conv_key,
+                            "batch_add_and_submit",
+                            word="、".join(words),
+                        )
+                        if operation is None:
+                            conversation_state_store.set(
+                                conv_key,
+                                state,
+                                space_key=state_space_key,
+                                owner_label=state_record.owner_label if state_record else owner_label,
+                            )
+                            response = "当前草稿操作刚刚开始，请稍后再试。"
+                        else:
+                            scheduled = _schedule_background_draft_operation(
+                                operation,
+                                lambda: _perform_batch_add_to_draft_and_submit(
+                                    items,
+                                    platform,
+                                    user_id,
+                                ),
+                                bot,
+                                event,
+                                user_id,
+                                memory_context,
+                                normalized_message_text,
+                                QQMessageSegment,
+                            )
+                            if scheduled:
+                                return
+                            conversation_state_store.set(
+                                conv_key,
+                                state,
+                                space_key=state_space_key,
+                                owner_label=state_record.owner_label if state_record else owner_label,
+                            )
+                            response = "后台任务启动失败，批量候选仍为你保留，请稍后再试。"
                     else:
                         response = await _execute_confirmed_tool(state, platform, user_id)
                 # else: response stays None, fall through to AI as new request
@@ -4913,6 +5100,7 @@ async def _handle_ai_chat_serialized(
         await ai_chat.finish("呜呜，处理请求时出错了 qwq 要不再试一次？")
         return
 
+    response = _normalize_generated_review_copy(response)
     response = _ensure_pending_add_word_guidance(response)
     response = await _augment_simple_word_query_response(
         normalized_message_text, response, platform, user_id,
