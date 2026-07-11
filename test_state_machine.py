@@ -158,6 +158,7 @@ from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestConte
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 from keytao_bot.utils import keytao_review as keytao_review_module
+from keytao_bot.utils import keytao_batch_review as keytao_batch_review_module
 from keytao_bot.utils.keytao_review import ReviewHttpConfig, audit_draft_items
 from keytao_bot.utils.keytao_batch_review import _normalize_llm_review
 import keytao_bot.plugins.openai_chat as openai_chat_module
@@ -3305,35 +3306,45 @@ def test_active_add_confirmation_continues_to_submit():
     asyncio.run(_run())
 
 
-def test_draft_timeout_fallback_never_approves_from_encode_only():
-    """Encode-only timeout fallback may validate codes but must keep the batch manual."""
-    print("\n🧪 draft timeout fallback remains manual")
+def test_draft_timeout_fallback_uses_contextual_pronunciation():
+    """Timeout fallback must preserve context-corrected pronunciation without self-approving."""
+    print("\n🧪 draft timeout fallback uses contextual pronunciation")
 
     async def _run():
-        raw_encode = {
+        reviewed_word = {
             "success": True,
-            "codes": ["fbsj", "fbsju", "fbsjuv"],
-            "altCodes": [],
-            "chars": [],
+            "word": "雅鲁藏布",
+            "autoReviewable": False,
+            "pronunciations": [{
+                "pinyin": "ya lu zang bu",
+                "codes": ["ylzb", "ylzbv", "ylzbvu"],
+                "candidateStatuses": [
+                    {"code": "ylzb", "occupied": False, "label": "空位"},
+                ],
+                "contextPronunciation": {
+                    "correctedDefault": True,
+                    "defaultPinyin": "ya lu cang bu",
+                    "canonicalName": "雅鲁藏布江",
+                },
+            }],
         }
-        with patch.object(_draft_tools, "fetch_keytao_encode", AsyncMock(return_value=raw_encode)):
+        with patch.object(_draft_tools, "prepare_reviewed_word", AsyncMock(return_value=reviewed_word)):
             result = await _fallback_draft_audit_with_encode(
                 [{
                     "action": "Create",
-                    "word": "追速",
-                    "code": "fbsjuv",
+                    "word": "雅鲁藏布",
+                    "code": "ylzb",
                     "type": "Phrase",
-                    "remark": "喵喵审词：自动审核：该词需管理员审核（常用词信号不足）",
                 }],
                 "确定性来源审查超时",
             )
 
-        check("encode-only fallback cannot auto approve", result.get("autoApprove") is False)
-        check("encode-only fallback needs admin", result.get("verdict") == "needs_admin")
-        check("manual preaudit survives timeout", any("追速" in issue and "需管理员审核" in issue for issue in result.get("issues", [])))
-        check("approved item cites encode chain", "keytao_encode 候选链" in result.get("approvedItems", [""])[0])
-        check("fallback labels encode-only evidence", result.get("encodeOnly") is True)
-        check("approval guard rejects encode-only result", not _draft_tools._audit_allows_batch_auto_approve(result))
+        check("contextual fallback cannot auto approve alone", result.get("autoApprove") is False)
+        check("contextual fallback needs further review", result.get("verdict") == "needs_admin")
+        check("corrected code is accepted", any("雅鲁藏布@ylzb" in item for item in result.get("approvedItems", [])))
+        check("fallback cites corrected pronunciation chain", "读音优先级纠正后的候选链" in result.get("approvedItems", [""])[0])
+        check("fallback no longer labels result encode-only", result.get("encodeOnly") is False)
+        check("approval guard rejects incomplete fallback", not _draft_tools._audit_allows_batch_auto_approve(result))
         check("approval guard accepts a complete all-pass result", _draft_tools._audit_allows_batch_auto_approve({
             "autoApprove": True,
             "verdict": "pass",
@@ -5023,8 +5034,205 @@ def test_llm_review_prefers_keytao_encode_over_generic_double_pinyin_guess():
     item = review["items"][0]
     joined = "\n".join(item["reasons"] + item["suggestions"] + item["reviewRecord"]["evidence"])
     check("encode-supported code passes", item["status"] == "pass")
-    check("reason cites keytao_encode", "keytao_encode" in joined)
+    check("reason cites deterministic candidate chain", "确定性审词候选链" in joined)
     check("generic double pinyin removed", "通用双拼" not in joined and "零声母" not in joined)
+
+
+def test_llm_review_cannot_restore_context_free_polyphone_default():
+    """Normalization must preserve the deterministic context correction over an LLM default-tone mistake."""
+    print("\n🧪 LLM review preserves contextual polyphone correction")
+
+    raw = {
+        "items": [{
+            "prId": 2831,
+            "status": "manual_review",
+            "title": "默认读音与编码不一致",
+            "reasons": ["雅鲁藏布编码 ylzb 不在默认读音 cáng 的候选链中。"],
+            "suggestions": ["请管理员理解这是人工纠正。"],
+            "pronunciation": "ya lu cang bu",
+            "evidence": ["编码服务默认音为 cáng。"],
+        }],
+    }
+    items = [{
+        "id": 2831,
+        "action": "Create",
+        "word": "雅鲁藏布",
+        "code": "ylzb",
+        "type": "Phrase",
+        "hasConflict": False,
+        "conflictInfo": None,
+    }]
+    audit = {
+        "reviewedWords": {
+            "雅鲁藏布": {
+                "pronunciations": [{
+                    "pinyin": "ya lu zang bu",
+                    "codes": ["ylzb", "ylzbv", "ylzbvu"],
+                    "sourceSummary": "百科实体全称语境（雅鲁藏布江，暂无独立读音页）",
+                    "contextPronunciation": {
+                        "correctedDefault": True,
+                        "defaultPinyin": "ya lu cang bu",
+                        "canonicalName": "雅鲁藏布江",
+                    },
+                }],
+            },
+        },
+    }
+
+    review = _normalize_llm_review(raw, items, {"codeChains": []}, audit)
+    item = review["items"][0]
+    joined = "\n".join(item["reasons"] + item["suggestions"] + item["reviewRecord"]["evidence"])
+    check("context-corrected code is not rejected", item["status"] == "pass")
+    check("review record restores zang pronunciation", item["reviewRecord"]["pronunciation"] == "ya lu zang bu")
+    check("review cites entity-context priority", "实体语境" in joined and "雅鲁藏布江" in joined)
+    check("wrong default-tone objection is removed", "cáng" not in joined and "默认音" not in joined)
+
+
+def test_batch_review_timeout_fallback_uses_contextual_pronunciation():
+    """The web/admin fallback must use the same pronunciation priority as chat review."""
+    print("\n🧪 batch review fallback uses contextual pronunciation")
+
+    async def _run():
+        reviewed_word = {
+            "success": True,
+            "word": "雅鲁藏布",
+            "autoReviewable": False,
+            "pronunciations": [{
+                "pinyin": "ya lu zang bu",
+                "codes": ["ylzb", "ylzbv", "ylzbvu"],
+                "candidateStatuses": [{"code": "ylzb", "occupied": False, "label": "空位"}],
+                "contextPronunciation": {
+                    "correctedDefault": True,
+                    "defaultPinyin": "ya lu cang bu",
+                    "canonicalName": "雅鲁藏布江",
+                },
+            }],
+        }
+        items = [{
+            "id": 1,
+            "action": "Create",
+            "word": "雅鲁藏布",
+            "code": "ylzb",
+            "type": "Phrase",
+        }]
+        with patch.object(keytao_batch_review_module, "prepare_reviewed_word", AsyncMock(return_value=reviewed_word)):
+            audit = await keytao_batch_review_module._fallback_audit_with_encode(
+                ReviewHttpConfig("https://fake", "token"),
+                items,
+                "确定性来源审查超过 25 秒",
+            )
+
+        check("admin fallback accepts corrected code", any("雅鲁藏布@ylzb" in item for item in audit.get("approvedItems", [])))
+        check("admin fallback cites pronunciation priority", "读音优先级纠正后的候选链" in audit.get("approvedItems", [""])[0])
+        check("admin fallback keeps corrected reviewed word", audit.get("reviewedWords", {}).get("雅鲁藏布") == reviewed_word)
+        check("admin fallback does not report old default mismatch", not any("不在" in issue for issue in audit.get("issues", [])))
+
+    asyncio.run(_run())
+
+
+def test_batch_review_chunks_large_batches_and_isolates_failures():
+    """Large reviews should be split while same-word moves stay together and one bad chunk stays local."""
+    print("\n🧪 batch review chunks large batches")
+
+    async def _run():
+        items = [
+            {"id": 1, "action": "Delete", "word": "移动词", "code": "aaa", "type": "Phrase"},
+            {"id": 2, "action": "Create", "word": "移动词", "code": "aab", "type": "Phrase"},
+            *[
+                {
+                    "id": index,
+                    "action": "Create",
+                    "word": "雅鲁藏布" if index == 7 else "鱼嘴" if index == 8 else f"测试词{index}",
+                    "code": "ylzb" if index == 7 else "ylzbu" if index == 8 else f"ab{chr(96 + index)}",
+                    "type": "Phrase",
+                }
+                for index in range(3, 9)
+            ],
+        ]
+        calls = []
+
+        async def fake_call(_batch, chunk, _audit, _local_review, _focus):
+            ids = [item["id"] for item in chunk]
+            calls.append(ids)
+            if 6 in ids:
+                raise RuntimeError("finish_reason=length")
+            return {
+                "items": [{
+                    "prId": item["id"],
+                    "status": "pass",
+                    "title": "本喵建议通过",
+                    "reasons": ["读音和编码一致"],
+                    "suggestions": ["无需调整"],
+                } for item in chunk],
+            }
+
+        with patch.object(keytao_batch_review_module, "_review_chunk_size", return_value=3):
+            with patch.object(keytao_batch_review_module, "_review_chunk_concurrency", return_value=2):
+                with patch.object(keytao_batch_review_module, "_call_llm", side_effect=fake_call):
+                    raw, warnings = await keytao_batch_review_module._call_llm_chunked(
+                        {"id": "large-batch"},
+                        items,
+                        {"reviewedWords": {}},
+                        None,
+                        None,
+                    )
+
+        move_chunk = next(ids for ids in calls if 1 in ids or 2 in ids)
+        code_chain_chunk = next(ids for ids in calls if 7 in ids or 8 in ids)
+        raw_by_id = {item.get("prId"): item for item in raw.get("items", [])}
+        check("large batch is split into multiple calls", len(calls) >= 3)
+        check("delete and create for same word stay together", 1 in move_chunk and 2 in move_chunk)
+        check("same code-chain priority items stay together", 7 in code_chain_chunk and 8 in code_chain_chunk)
+        check("all items remain represented after merge", set(raw_by_id) == set(range(1, 9)))
+        check("failed chunk becomes local attention only", raw_by_id[6].get("status") == "attention")
+        check("successful chunks remain pass", raw_by_id[3].get("status") == "pass")
+        check("partial failure returns a warning", len(warnings) == 1 and "第" in warnings[0])
+
+    asyncio.run(_run())
+
+
+def test_batch_review_retries_length_with_more_output_tokens():
+    """An empty length-limited response should retry with a larger completion budget."""
+    print("\n🧪 batch review length retry raises output budget")
+
+    async def _run():
+        client = _FakeClient([
+            _FakeAIResponse("length", None),
+            _FakeAIResponse("stop", json.dumps({
+                "items": [{
+                    "prId": 1,
+                    "status": "pass",
+                    "title": "本喵建议通过",
+                    "reasons": ["读音和编码一致"],
+                    "suggestions": ["无需调整"],
+                }],
+            }, ensure_ascii=False)),
+        ])
+        config = {
+            "api_key": "test",
+            "base_url": "https://example.test",
+            "model": "test-model",
+            "max_tokens": 2500,
+            "max_tokens_cap": 12000,
+            "timeout": 30.0,
+            "temperature": 0.2,
+        }
+        with patch.object(keytao_batch_review_module, "AsyncOpenAI", return_value=client):
+            with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
+                raw = await keytao_batch_review_module._call_llm(
+                    {"id": "retry-batch"},
+                    [{"id": 1, "action": "Create", "word": "雅鲁藏布", "code": "ylzb", "type": "Phrase"}],
+                    {"reviewedWords": {}},
+                    None,
+                    None,
+                )
+
+        budgets = [call.get("max_tokens") for call in client.completions.calls]
+        check("length response is retried", len(budgets) == 2)
+        check("retry doubles output budget", budgets == [2500, 5000])
+        check("retry returns parsed review", raw.get("items", [{}])[0].get("prId") == 1)
+
+    asyncio.run(_run())
 
 
 def test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries():
@@ -5798,7 +6006,7 @@ if __name__ == "__main__":
     test_review_prompt_and_skills_share_submission_semantics()
     test_draft_tool_guard_blocks_out_of_band_mutations()
     test_active_add_confirmation_continues_to_submit()
-    test_draft_timeout_fallback_never_approves_from_encode_only()
+    test_draft_timeout_fallback_uses_contextual_pronunciation()
     test_mixed_batch_add_and_submit_stays_in_admin_review()
     test_pending_add_word_adds_multiple_reviewed_codes()
     test_pending_tool_confirm_data()
@@ -5845,6 +6053,10 @@ if __name__ == "__main__":
     test_word_commonness_short_circuits_accepted_entity()
     test_review_audit_allows_known_celebrity_alias()
     test_llm_review_prefers_keytao_encode_over_generic_double_pinyin_guess()
+    test_llm_review_cannot_restore_context_free_polyphone_default()
+    test_batch_review_timeout_fallback_uses_contextual_pronunciation()
+    test_batch_review_chunks_large_batches_and_isolates_failures()
+    test_batch_review_retries_length_with_more_output_tokens()
     test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries()
     test_draft_encode_candidates_include_alternate_pronunciations()
     test_draft_encode_candidates_include_phrase_polyphone_candidates()

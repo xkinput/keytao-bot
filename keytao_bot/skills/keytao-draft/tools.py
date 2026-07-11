@@ -22,6 +22,7 @@ from keytao_bot.utils.keytao_review import (
     can_llm_override_audit_issues,
     fetch_keytao_encode,
     manual_preaudit_issue_for_item,
+    prepare_reviewed_word,
 )
 
 
@@ -830,6 +831,30 @@ def _draft_audit_timeout() -> float:
 async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> Dict:
     approved_items: List[str] = []
     issues: List[str] = []
+    words = list(dict.fromkeys(
+        str(item.get("word") or "").strip()
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("action") or "Create") != "Delete"
+        and str(item.get("word") or "").strip()
+    ))
+    review_results = await asyncio.gather(*(
+        prepare_reviewed_word(_review_config(), word)
+        for word in words
+    ), return_exceptions=True)
+    reviewed_words = dict(zip(words, review_results))
+
+    def candidate_codes(review: Dict) -> set[str]:
+        result: set[str] = set()
+        for pronunciation in review.get("pronunciations", []):
+            if not isinstance(pronunciation, dict):
+                continue
+            result.update(_clean_code_list(pronunciation.get("codes")))
+            for status in pronunciation.get("candidateStatuses", []):
+                if isinstance(status, dict):
+                    result.update(_clean_code_list([status.get("code")]))
+        return result
+
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -846,28 +871,46 @@ async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> D
         if preaudit_issue:
             issues.append(preaudit_issue)
         try:
-            encoding = await fetch_keytao_encode(_review_config(), word)
-            normalized_encoding = _build_encode_candidate_result(word, encoding)
-            candidate_codes = set(normalized_encoding.get("candidateCodes") or [])
-            if code in candidate_codes:
-                approved_items.append(f"{action}：{word}@{code}，编码在 keytao_encode 候选链中")
+            review = reviewed_words.get(word)
+            if isinstance(review, Exception) or not isinstance(review, dict) or not review.get("success"):
+                encoding = await fetch_keytao_encode(_review_config(), word)
+                normalized_encoding = _build_encode_candidate_result(word, encoding)
+                codes = set(normalized_encoding.get("candidateCodes") or [])
+                basis = "keytao_encode 默认候选链"
             else:
-                available = "、".join(sorted(candidate_codes)[:8])
+                codes = candidate_codes(review)
+                corrected = any(
+                    isinstance(pronunciation, dict)
+                    and isinstance(pronunciation.get("contextPronunciation"), dict)
+                    and pronunciation["contextPronunciation"].get("correctedDefault")
+                    for pronunciation in review.get("pronunciations", [])
+                )
+                basis = "读音优先级纠正后的候选链" if corrected else "审词候选链"
+            if code in codes:
+                approved_items.append(f"{action}：{word}@{code}，编码在{basis}中")
+            else:
+                available = "、".join(sorted(codes)[:8])
                 issues.append(f"「{word}」编码 {code} 不在候选链中；可选：{available or '无'}")
         except Exception as error:
             issues.append(f"「{word}」编码兜底检查失败：{error}")
 
     if not issues:
-        issues.append(f"{reason}；仅完成编码候选链校验，缺少完整的读音、词义和常用度审查")
+        issues.append(f"{reason}；可比较的常用度信号不足，需要本喵继续复审")
     return {
         "success": True,
         "verdict": "needs_admin",
         "autoApprove": False,
-        "summary": f"{reason}，该批次需要管理员审核",
+        "summary": f"{reason}，已并行按读音优先级重建候选链，需要本喵继续复审",
         "issues": issues,
         "approvedItems": approved_items,
         "timeout": True,
-        "encodeOnly": True,
+        "encodeOnly": False,
+        "contextualPronunciationFallback": True,
+        "reviewedWords": {
+            word: review
+            for word, review in reviewed_words.items()
+            if isinstance(review, dict)
+        },
     }
 
 
