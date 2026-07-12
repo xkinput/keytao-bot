@@ -11,6 +11,8 @@ from nonebot import get_bots, get_driver
 from nonebot.adapters.onebot.v11 import Bot as QQBot
 from nonebot.log import logger
 
+from keytao_bot.utils.github_sync_notification import build_github_sync_notification
+
 driver = get_driver()
 config = driver.config
 
@@ -145,24 +147,7 @@ async def _send_group_notification(text: str) -> None:
 
 
 def _build_notification(data: dict[str, Any]) -> str:
-    pr_url = data.get("prUrl") or data.get("pr_url")
-    release_url = data.get("releaseUrl") or data.get("release_url")
-    release_tag = data.get("releaseTag") or data.get("release_tag")
-    pending_count = data.get("pendingSyncBatches")
-    lines = [
-        "本喵已完成 GitHub 词库同步并发布。",
-        f"同步 PR：{pr_url}",
-    ]
-    if release_tag or release_url:
-        lines.append(f"Release：{release_tag or '已发布'}")
-    if release_url:
-        lines.append(f"发布地址：{release_url}")
-    lines.append(
-        "请大家检查与更新。",
-    )
-    if pending_count is not None:
-        lines.append(f"本次触发时待同步批次：{pending_count} 个。")
-    return "\n".join(lines)
+    return build_github_sync_notification(data)
 
 
 def _build_failure_notification(data: dict[str, Any]) -> str:
