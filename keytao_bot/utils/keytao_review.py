@@ -247,8 +247,11 @@ def _review_llm_config() -> Dict[str, Any]:
 
 
 def normalize_pinyin_syllable(value: str) -> str:
-    text = value.strip().lower()
-    text = text.replace("u:", "v").replace("ü", "v")
+    text = (
+        value.strip().lower()
+        .replace("u:", "v")
+        .translate(str.maketrans("üǖǘǚǜ", "vvvvv"))
+    )
     text = re.sub(r"[1-5]$", "", text)
     normalized = unicodedata.normalize("NFD", text)
     return "".join(
@@ -832,7 +835,26 @@ def _codes_for_pinyin_sequence(encode_data: Dict, sequence: Sequence[str]) -> Li
     chars = encode_data.get("chars")
     if not isinstance(chars, list) or len(chars) != len(sequence):
         return []
-    phonetic_codes = [pinyin_to_phonetic_code(item) or "" for item in sequence]
+
+    normalized_sequence = tuple(normalize_pinyin_syllable(str(item)) for item in sequence)
+    default_sequence = _encode_default_pinyin_sequence(encode_data)
+    if normalized_sequence == default_sequence:
+        service_codes: List[str] = []
+        for code in [*(encode_data.get("codes") or []), *(encode_data.get("altCodes") or [])]:
+            normalized_code = str(code or "").strip().lower()
+            if normalized_code and normalized_code not in service_codes:
+                service_codes.append(normalized_code)
+        if service_codes:
+            return service_codes
+
+    phonetic_codes: List[str] = []
+    for index, syllable in enumerate(normalized_sequence):
+        char_info = chars[index] if isinstance(chars[index], dict) else {}
+        service_phonetic = str(char_info.get("phoneticCode") or "").strip().lower()
+        if index < len(default_sequence) and syllable == default_sequence[index] and service_phonetic:
+            phonetic_codes.append(service_phonetic)
+        else:
+            phonetic_codes.append(pinyin_to_phonetic_code(syllable) or "")
     if any(not code for code in phonetic_codes):
         return []
     return build_phrase_code_chain(chars, phonetic_codes)

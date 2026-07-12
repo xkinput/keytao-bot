@@ -1907,6 +1907,64 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
     asyncio.run(_run())
 
 
+def test_reviewed_word_preserves_encode_service_candidate_chains():
+    """Pronunciation evidence must not replace official KeyTao codes with local guesses."""
+    print("\n🧪 reviewed word preserves encode service candidate chains")
+
+    async def _run():
+        encode_data = {
+            "success": True,
+            "codes": ["yzgm", "yzgmi", "yzgmii"],
+            "altCodes": ["yzgx", "yzgxi", "yzgxii"],
+            "chars": [
+                {
+                    "char": "摇",
+                    "pinyin": "yáo",
+                    "phoneticCode": "yz",
+                    "shapeCode": "iuuo",
+                },
+                {
+                    "char": "光",
+                    "pinyin": "guāng",
+                    "phoneticCode": "gm",
+                    "shapeCode": "ioua",
+                },
+            ],
+        }
+        evidence = {
+            "success": True,
+            "groups": [{
+                "pinyin": "yao guang",
+                "normalized": ["yao", "guang"],
+                "sources": [{"source": "汉典", "url": "https://example.test"}],
+                "score": 1,
+                "fallback": False,
+            }],
+            "sources": [],
+        }
+
+        with patch.object(
+            keytao_review_module,
+            "collect_pronunciation_evidence_limited",
+            AsyncMock(return_value=evidence),
+        ):
+            with patch.object(keytao_review_module, "fetch_keytao_encode", AsyncMock(return_value=encode_data)):
+                with patch.object(keytao_review_module, "lookup_words", AsyncMock(return_value={})):
+                    with patch.object(keytao_review_module, "lookup_codes", AsyncMock(return_value={})):
+                        with patch.object(keytao_review_module, "_infer_entity_knowledge", AsyncMock(return_value={})):
+                            review = await keytao_review_module.prepare_reviewed_word(
+                                ReviewHttpConfig("https://fake", "token"),
+                                "摇光",
+                            )
+
+        codes = review.get("pronunciations", [{}])[0].get("codes", [])
+        check("service standard chain is preserved", codes[:3] == ["yzgm", "yzgmi", "yzgmii"])
+        check("service fly-key chain remains valid", codes[3:] == ["yzgx", "yzgxi", "yzgxii"])
+        check("official short code is accepted", "yzgm" in codes)
+
+    asyncio.run(_run())
+
+
 def test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable():
     """A trusted entity title should preserve contextual pronunciation when the LLM is down."""
     print("\n🧪 reviewed word uses encyclopedia full-name context")
@@ -6027,6 +6085,7 @@ if __name__ == "__main__":
     test_reviewed_add_prompt_keeps_waiting_review_concise()
     test_prepare_reviewed_add_attaches_pre_submit_audit()
     test_reviewed_word_corrects_polyphone_from_entity_context()
+    test_reviewed_word_preserves_encode_service_candidate_chains()
     test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable()
     test_auto_approved_review_lines_explain_pass_reason()
     test_submit_review_copy_is_decisive_and_non_redundant()
