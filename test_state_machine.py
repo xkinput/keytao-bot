@@ -101,6 +101,7 @@ from keytao_bot.plugins.openai_chat import (
     _handle_referenced_pending_from_other_user,
     _ensure_pending_add_word_guidance,
     _append_submit_review_lines,
+    _can_use_unrelated_group_pending,
     _format_reviewed_add_prompt,
     _format_active_draft_operation_message,
     _is_pending_tool_confirm_message,
@@ -486,6 +487,60 @@ def test_parse_pending_batch_add_preserves_each_review_result():
     check("manual item keeps its own review", "该词需管理员审核" in items[0].get("remark", ""))
     check("passing item keeps its own review", "该词可自动通过" in items[1].get("remark", ""))
     check("generated old prediction wording normalized", "预计需管理员审核" not in normalized)
+
+
+def test_parse_pending_batch_add_inline_priority_recommendation():
+    """Replay the 摇光/瑶光 prompt whose inline arrows previously lost ownership."""
+    print("\n🧪 _parse_pending_batch_add inline priority replay")
+
+    response = """两个词都正确，但含义和用法不同：
+
+「摇光」（yáo guāng）
+候选编码：
+1. yzgm — ✅ 推荐（空位）
+2. yzgmi — 空位
+
+「瑶光」（yáo guāng）
+候选编码：
+1. yzgm — ✅ 推荐（空位）
+2. yzgmv — 空位
+
+按常用度建议：摇光 → yzgm，瑶光 → yzgmv。
+
+要一起加这两个词吗？"""
+
+    result = _parse_pending_batch_add(response)
+    items = result.args["items"] if isinstance(result, PendingToolConfirm) else []
+
+    check("inline batch pending parsed", isinstance(result, PendingToolConfirm))
+    check("inline arrows yield two items", len(items) == 2)
+    check(
+        "inline recommendation keeps exact mapping",
+        [(item.get("word"), item.get("code")) for item in items]
+        == [("摇光", "yzgm"), ("瑶光", "yzgmv")],
+    )
+
+
+def test_quoted_bot_reply_never_uses_unrelated_group_pending():
+    """A malformed quoted prompt must not fall through to another user's state."""
+    print("\n🧪 quoted bot reply ignores unrelated group pending")
+
+    quoted_bot_reply = ReplyReferenceInfo(
+        is_reply=True,
+        is_to_bot=True,
+        sender_id="3785773770",
+        text="要一起加这两个词吗？",
+    )
+    unquoted_message = ReplyReferenceInfo()
+
+    check(
+        "quoted bot reply disables unrelated pending fallback",
+        not _can_use_unrelated_group_pending(quoted_bot_reply),
+    )
+    check(
+        "unquoted group command keeps ownership guard",
+        _can_use_unrelated_group_pending(unquoted_message),
+    )
 
 
 def test_parse_pending_state_from_referenced_message():
@@ -5934,6 +5989,8 @@ if __name__ == "__main__":
     test_parse_pending_add_word_multitone_template()
     test_parse_pending_batch_add_two_words()
     test_parse_pending_batch_add_preserves_each_review_result()
+    test_parse_pending_batch_add_inline_priority_recommendation()
+    test_quoted_bot_reply_never_uses_unrelated_group_pending()
     test_parse_pending_state_from_referenced_message()
     test_referenced_other_owner_pending_prompts_copy()
     test_referenced_other_owner_pending_question_falls_through()

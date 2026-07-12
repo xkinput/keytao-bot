@@ -904,7 +904,13 @@ def _batch_review_remark(response: str, word: str) -> str:
 def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
     """Parse AI response for a multi-word add confirmation prompt."""
     normalized_response = _normalize_generated_review_copy(response)
-    if "一起加入草稿" not in normalized_response:
+    batch_prompt_markers = (
+        "一起加入草稿",
+        "一起加这两个词",
+        "两个词是否一起加",
+        "两词是否一起加",
+    )
+    if not any(marker in normalized_response for marker in batch_prompt_markers):
         return None
 
     confirm_line = next(
@@ -931,8 +937,17 @@ def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
             re.IGNORECASE,
         )
     ]
-    for code, word in [*inline_pairs, *arrow_pairs]:
+    inline_arrow_pairs = [
+        (match.group(3), match.group(1) or match.group(2))
+        for match in re.finditer(
+            r'(?:「([^」]+)」|([\u4e00-\u9fff]{1,12}))\s*(?:→|->)\s*([a-z]{2,12})',
+            normalized_response,
+            re.IGNORECASE,
+        )
+    ]
+    for code, word in [*inline_pairs, *arrow_pairs, *inline_arrow_pairs]:
         code = code.lower()
+        word = word.strip()
         key = (word, code)
         if key in seen:
             continue
@@ -950,6 +965,11 @@ def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
         function_name="keytao_batch_add_to_draft",
         args={"items": items},
     )
+
+
+def _can_use_unrelated_group_pending(reply_reference: ReplyReferenceInfo) -> bool:
+    """Never bind a quoted bot reply to an unrelated user's group pending state."""
+    return not reply_reference.is_to_bot
 
 
 def _get_latest_assistant_message(history: Optional[List[Dict]]) -> str:
@@ -4596,6 +4616,13 @@ async def _handle_ai_chat_serialized(
         if reply_reference.is_to_bot and reply_reference.text
         else None
     )
+    if reply_reference.is_reply:
+        logger.info(
+            "[reply_trace] "
+            f"to_bot={reply_reference.is_to_bot} sender={reply_reference.sender_id or '-'} "
+            f"mentions={list(reply_reference.mentioned_user_ids)} "
+            f"pending={referenced_pending.__class__.__name__ if referenced_pending else 'none'}"
+        )
     if active_operation is not None:
         current_pending_state = conversation_state_store.get(conv_key)
         explicit_active_reply = _active_operation_reply_matches(
@@ -4797,7 +4824,11 @@ async def _handle_ai_chat_serialized(
                 f"{restored_record.state.__class__.__name__} for {platform}:{user_id}"
             )
 
-    other_pending_record = conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
+    other_pending_record = (
+        conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
+        if _can_use_unrelated_group_pending(reply_reference)
+        else None
+    )
     current_contextual_reply = False
     if (
         memory_context.space_type == "group"
