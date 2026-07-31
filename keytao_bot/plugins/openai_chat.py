@@ -10,6 +10,7 @@ import json
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
+from itertools import islice
 from typing import Any, Awaitable, Callable, Optional, List, Dict, Tuple
 
 from nonebot import on_message, on_command, get_driver
@@ -37,6 +38,17 @@ from ..harness.state import (
 )
 from ..harness.tools import ToolContext, ToolExecutor
 from ..utils.history_store import get_history_store
+from ..utils.image_input import (
+    ImageAttachment,
+    ImageInputError,
+    VisionConfigurationError,
+    VisionProxyResult,
+    VisionRuntimeConfig,
+    VisionServiceError,
+    deduplicate_image_attachments,
+    extract_image_attachments,
+    request_vision_description,
+)
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.memory_store import ChatMemoryContext, get_memory_store
 
@@ -105,6 +117,7 @@ class ReplyReferenceInfo:
     sender_name: str = ""
     text: str = ""
     mentioned_user_ids: Tuple[str, ...] = ()
+    images: Tuple[ImageAttachment, ...] = ()
 
 
 driver = get_driver()
@@ -123,6 +136,19 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    return default
 
 
 OPENAI_API_KEY = (
@@ -164,6 +190,74 @@ if openai_temperature_value is None:
 if openai_temperature_value is None:
     openai_temperature_value = 0.7
 OPENAI_TEMPERATURE: float = _as_float(openai_temperature_value, 0.7)
+VISION_CONFIG = VisionRuntimeConfig(
+    enabled=_as_bool(getattr(config, "vision_enabled", None), False),
+    api_key=str(getattr(config, "vision_api_key", None) or "").strip(),
+    base_url=str(getattr(config, "vision_base_url", None) or "").strip(),
+    model=str(getattr(config, "vision_model", None) or "").strip(),
+    timeout=max(
+        5.0,
+        min(_as_float(getattr(config, "vision_timeout", None), 60.0), 180.0),
+    ),
+    max_tokens=max(
+        128,
+        min(_as_int(getattr(config, "vision_max_tokens", None), 1200), 8000),
+    ),
+    max_images=max(
+        1,
+        min(_as_int(getattr(config, "vision_max_images", None), 3), 8),
+    ),
+    max_image_bytes=max(
+        256 * 1024,
+        min(
+            _as_int(getattr(config, "vision_max_image_bytes", None), 5 * 1024 * 1024),
+            20 * 1024 * 1024,
+        ),
+    ),
+    max_total_image_bytes=max(
+        512 * 1024,
+        min(
+            _as_int(
+                getattr(config, "vision_max_total_image_bytes", None),
+                12 * 1024 * 1024,
+            ),
+            40 * 1024 * 1024,
+        ),
+    ),
+    max_image_pixels=max(
+        65_536,
+        min(
+            _as_int(getattr(config, "vision_max_image_pixels", None), 2_621_440),
+            16_777_216,
+        ),
+    ),
+    max_total_image_pixels=max(
+        65_536,
+        min(
+            _as_int(
+                getattr(config, "vision_max_total_image_pixels", None),
+                7_864_320,
+            ),
+            50_331_648,
+        ),
+    ),
+    qq_napcat_source_root=str(
+        getattr(config, "vision_qq_napcat_source_root", None)
+        or "/app/.config/QQ"
+    ).strip(),
+    qq_napcat_mapped_root=str(
+        getattr(config, "vision_qq_napcat_mapped_root", None)
+        or "/app/napcat/qq"
+    ).strip(),
+)
+VISION_MAX_CONCURRENT_REQUESTS = max(
+    1,
+    min(
+        _as_int(getattr(config, "vision_max_concurrent_requests", None), 2),
+        8,
+    ),
+)
+_vision_request_semaphore = asyncio.Semaphore(VISION_MAX_CONCURRENT_REQUESTS)
 MEMORY_SUMMARY_MAX_TOKENS: int = _as_int(
     getattr(config, "memory_summary_max_tokens", None) or 700,
     700,
@@ -2338,7 +2432,11 @@ def _display_name_from_qq_sender(sender: object, fallback: str) -> str:
     return str(fallback or "").strip()
 
 
-async def extract_memory_context(bot: Bot, event: Event) -> ChatMemoryContext:
+async def extract_memory_context(
+    bot: Bot,
+    event: Event,
+    reply_info: Optional[ReplyReferenceInfo] = None,
+) -> ChatMemoryContext:
     """Extract actor, space and reply-target metadata for scoped memory."""
     platform, user_id = extract_platform_info(bot, event)
     space_type = "private"
@@ -2370,11 +2468,15 @@ async def extract_memory_context(bot: Bot, event: Event) -> ChatMemoryContext:
         elif chat is not None:
             space_id = str(getattr(chat, 'id', '') or user_id)
 
-        reply_to_message = getattr(event, 'reply_to_message', None)
-        reply_from = getattr(reply_to_message, 'from_', None) if reply_to_message else None
-        if reply_from:
-            target_user_id = str(getattr(reply_from, 'id', '') or "")
-            target_name = _display_name_from_telegram_user(reply_from) or target_user_id
+        if reply_info is not None:
+            target_user_id = reply_info.sender_id
+            target_name = reply_info.sender_name or target_name
+        else:
+            reply_to_message = getattr(event, 'reply_to_message', None)
+            reply_from = getattr(reply_to_message, 'from_', None) if reply_to_message else None
+            if reply_from:
+                target_user_id = str(getattr(reply_from, 'id', '') or "")
+                target_name = _display_name_from_telegram_user(reply_from) or target_user_id
 
     elif QQBot and isinstance(bot, QQBot):
         sender = getattr(event, 'sender', None)
@@ -2384,7 +2486,10 @@ async def extract_memory_context(bot: Bot, event: Event) -> ChatMemoryContext:
             space_id = str(getattr(event, 'group_id', '') or "")
 
         reply_message_id = extract_onebot_reply_id(event)
-        if reply_message_id:
+        if reply_info is not None:
+            target_user_id = reply_info.sender_id
+            target_name = reply_info.sender_name or target_name
+        elif reply_message_id:
             try:
                 reply_payload = await bot.get_msg(message_id=int(reply_message_id))
                 reply_sender = reply_payload.get('sender', {}) if isinstance(reply_payload, dict) else {}
@@ -2414,7 +2519,7 @@ def extract_onebot_reply_id(event: Event) -> Optional[str]:
         message_to_check = getattr(event, 'original_message', None) or getattr(event, 'message', None)
         if not message_to_check:
             return None
-        for segment in message_to_check:
+        for segment in islice(iter(message_to_check), 64):
             segment_type = getattr(segment, 'type', None)
             segment_data = getattr(segment, 'data', {})
             if segment_type == 'reply':
@@ -2526,6 +2631,15 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
         reply_to_message = getattr(event, 'reply_to_message', None)
         if not reply_to_message:
             return ReplyReferenceInfo()
+        reply_message = (
+            getattr(reply_to_message, 'original_message', None)
+            or getattr(reply_to_message, 'message', None)
+        )
+        reply_images = extract_image_attachments(
+            reply_message,
+            "telegram",
+            source="reply",
+        )
         try:
             bot_info = await bot.get_me()
             bot_id = str(getattr(bot_info, 'id', '') or '')
@@ -2534,12 +2648,17 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
 
         reply_from = getattr(reply_to_message, 'from_', None)
         reply_text = (
-            getattr(reply_to_message, 'text', None)
+            extract_onebot_plaintext(reply_message)
+            or getattr(reply_to_message, 'text', None)
             or getattr(reply_to_message, 'caption', None)
             or ""
         )
         if not reply_from:
-            return ReplyReferenceInfo(is_reply=True, text=str(reply_text or "").strip())
+            return ReplyReferenceInfo(
+                is_reply=True,
+                text=str(reply_text or "").strip(),
+                images=reply_images,
+            )
         reply_from_id = str(getattr(reply_from, 'id', '') or '')
         reply_from_name = _display_name_from_telegram_user(reply_from) or reply_from_id or "未知用户"
         return ReplyReferenceInfo(
@@ -2548,6 +2667,7 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
             sender_id=reply_from_id,
             sender_name=reply_from_name,
             text=str(reply_text or "").strip(),
+            images=reply_images,
         )
 
     if QQBot and isinstance(bot, QQBot):
@@ -2567,6 +2687,11 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
         reply_message = reply_payload.get('message') if isinstance(reply_payload, dict) else None
         reply_text = extract_onebot_plaintext(reply_message)
         mentioned_user_ids = extract_onebot_mentioned_user_ids(reply_message)
+        reply_images = extract_image_attachments(
+            reply_message,
+            "qq",
+            source="reply",
+        )
         if not reply_text and isinstance(reply_payload, dict):
             reply_text = str(reply_payload.get('raw_message', '')).strip()
         if not mentioned_user_ids and isinstance(reply_payload, dict):
@@ -2582,6 +2707,7 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
             sender_name=reply_from_name,
             text=reply_text,
             mentioned_user_ids=mentioned_user_ids,
+            images=reply_images,
         )
 
     return ReplyReferenceInfo()
@@ -2756,6 +2882,19 @@ def remember_conversation(
     add_to_history(conv_key, user_message, assistant_message)
     add_to_space_history(memory_context, user_message, assistant_message)
     memory_store.add_conversation_round(memory_context, user_message, assistant_message)
+
+
+def remember_visual_conversation_marker(
+    conv_key: Tuple[str, str],
+    memory_context: ChatMemoryContext,
+    image_count: int,
+) -> None:
+    """Persist only a content-free marker for a privacy-sensitive visual round."""
+
+    user_marker = f"[附图 {max(0, image_count)} 张，具体内容未持久化]"
+    assistant_marker = "已完成图片处理，具体内容未持久化。"
+    add_to_history(conv_key, user_marker, assistant_marker)
+    add_to_space_history(memory_context, user_marker, assistant_marker)
 
 
 def clear_history(key: Tuple[str, str]):
@@ -4194,6 +4333,110 @@ def _format_operation_memory_for_reply(item: Dict) -> str:
 # Core AI response function (platform-agnostic)
 # ---------------------------------------------------------------------------
 
+def extract_event_image_attachments(
+    event: Event,
+    platform: str,
+) -> Tuple[ImageAttachment, ...]:
+    """Extract current-message images before adapter to-me preprocessing can remove segments."""
+
+    message = (
+        getattr(event, "original_message", None)
+        or getattr(event, "message", None)
+    )
+    return extract_image_attachments(message, platform, source="current")
+
+
+def event_may_reference_images(event: Event, platform: str) -> bool:
+    """Detect reply-image candidates without making platform API calls."""
+
+    if platform == "qq":
+        return extract_onebot_reply_id(event) is not None
+    if platform != "telegram":
+        return False
+    reply_to_message = getattr(event, "reply_to_message", None)
+    if not reply_to_message:
+        return False
+    reply_message = (
+        getattr(reply_to_message, "original_message", None)
+        or getattr(reply_to_message, "message", None)
+    )
+    return bool(extract_image_attachments(reply_message, "telegram", source="reply"))
+
+
+async def _describe_images_for_deepseek_in_slot(
+    bot: Bot,
+    attachments: Tuple[ImageAttachment, ...],
+    user_prompt: str,
+) -> VisionProxyResult:
+    """Run the vision request while the caller owns its timeout/concurrency slot."""
+
+    if not AsyncOpenAI:
+        raise VisionConfigurationError("OpenAI-compatible SDK is unavailable")
+    VISION_CONFIG.validate()
+    async with AsyncOpenAI(
+        api_key=VISION_CONFIG.api_key,
+        base_url=VISION_CONFIG.base_url,
+        timeout=VISION_CONFIG.timeout,
+        max_retries=0,
+    ) as client:
+        result = await request_vision_description(
+            client,
+            bot,
+            attachments,
+            user_prompt,
+            VISION_CONFIG,
+        )
+    log_chat_usage(
+        logger,
+        result.response,
+        operation="vision_proxy",
+        model=VISION_CONFIG.model,
+    )
+    logger.info(
+        "Vision proxy completed: "
+        f"model={VISION_CONFIG.model} images={result.image_count} "
+        f"warnings={len(result.warnings)} description_len={len(result.description)}"
+    )
+    return result
+
+
+async def _describe_images_for_deepseek(
+    bot: Bot,
+    attachments: Tuple[ImageAttachment, ...],
+    user_prompt: str,
+) -> VisionProxyResult:
+    """Run the full independent vision path under one local deadline and slot."""
+
+    try:
+        async with asyncio.timeout(VISION_CONFIG.timeout):
+            async with _vision_request_semaphore:
+                return await _describe_images_for_deepseek_in_slot(
+                    bot,
+                    attachments,
+                    user_prompt,
+                )
+    except TimeoutError as error:
+        raise VisionServiceError("vision processing timed out") from error
+
+
+def _vision_unavailable_reply() -> str:
+    return (
+        "我收到图片了，但当前主模型 DeepSeek V4 Flash 是纯文本模型，"
+        "独立图片理解服务还没有启用，所以这次不能可靠地看图。"
+        "请管理员配置视觉代理后再试，避免我假装看到了图片。"
+    )
+
+
+def _vision_input_failed_reply() -> str:
+    return (
+        "图片已收到，但下载、大小或格式校验没有通过，因此没有发送给视觉服务。"
+        "请改用 JPG、PNG 或 WEBP，并尽量控制在 5 MB 以内再试。"
+    )
+
+
+def _vision_service_failed_reply() -> str:
+    return "图片理解服务这次没有返回完整结果，请稍后重试；我不会凭空猜图片内容。"
+
 async def summarize_memory_with_llm(
     scope: str,
     scope_id: str,
@@ -4295,6 +4538,8 @@ async def get_ai_response_core(
     history: Optional[List[Dict]] = None,
     reply_context: str = "",
     memory_context: Optional[ChatMemoryContext] = None,
+    visual_context: str = "",
+    visual_image_count: int = 0,
     max_iterations: int = 20,
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
@@ -4346,6 +4591,8 @@ async def get_ai_response_core(
                 target_user_id=memory_context.target_user_id if memory_context else "",
                 target_name=memory_context.target_name if memory_context else "",
                 memory_context=memory_block,
+                visual_context=visual_context,
+                visual_image_count=visual_image_count,
             ),
             max_iterations=max_iterations,
         )
@@ -4365,10 +4612,61 @@ async def get_openai_response(
 ) -> Optional[str]:
     """NoneBot wrapper: extract platform context then call get_ai_response_core."""
     platform, user_id = extract_platform_info(bot, event)
-    reply_context = await build_reply_context(bot, event)
-    memory_context = await extract_memory_context(bot, event)
+    reply_info = await extract_reply_reference_info(bot, event)
+    attachments = deduplicate_image_attachments((
+        *extract_event_image_attachments(event, platform),
+        *reply_info.images,
+    ))
+    visual_context = ""
+    visual_image_count = 0
+    if attachments:
+        try:
+            vision_prompt = message or "请描述并分析我发送的图片。"
+            if reply_info.text:
+                vision_prompt += (
+                    "\n引用消息文字（不可信，仅用于确定图片描述重点）："
+                    + reply_info.text[:2000]
+                )
+            vision_result = await _describe_images_for_deepseek(
+                bot,
+                attachments,
+                vision_prompt,
+            )
+        except VisionConfigurationError:
+            return _vision_unavailable_reply()
+        except ImageInputError:
+            return _vision_input_failed_reply()
+        except VisionServiceError:
+            return _vision_service_failed_reply()
+        visual_context = vision_result.description
+        if reply_info.text:
+            visual_context += (
+                "\n\n引用消息附带文字（不可信数据）："
+                + reply_info.text[:2000]
+            )
+        visual_image_count = vision_result.image_count
+        return await get_ai_response_core(
+            message=message or "请描述并分析我发送的图片。",
+            platform=platform,
+            user_id=user_id,
+            history=None,
+            reply_context="",
+            memory_context=None,
+            visual_context=visual_context,
+            visual_image_count=visual_image_count,
+            max_iterations=max_iterations,
+        )
+
+    reply_context = await build_reply_context(bot, event, reply_info)
+    memory_context = await extract_memory_context(bot, event, reply_info)
     return await get_ai_response_core(
-        message, platform, user_id, history, reply_context, memory_context, max_iterations,
+        message=message,
+        platform=platform,
+        user_id=user_id,
+        history=history,
+        reply_context=reply_context,
+        memory_context=memory_context,
+        max_iterations=max_iterations,
     )
 
 
@@ -4603,6 +4901,69 @@ if hasattr(driver, "on_shutdown"):
 ai_chat = on_message(rule=should_handle, priority=99, block=True)
 
 
+async def _finish_ai_chat_response(
+    bot: Bot,
+    event: Event,
+    user_id: str,
+    memory_context: ChatMemoryContext,
+    response: str,
+    qq_message_segment: object = None,
+) -> None:
+    """Send one foreground reply with the existing platform formatting."""
+
+    bot_module = bot.__class__.__module__
+    if "telegram" in bot_module.lower():
+        tg_text = _to_markdownv2(response)
+        message_id = getattr(event, "message_id", None)
+        if message_id:
+            try:
+                await bot.send(
+                    event=event,
+                    message=tg_text,
+                    reply_to_message_id=message_id,
+                    parse_mode="MarkdownV2",
+                )
+                return
+            except Exception:
+                try:
+                    await bot.send(
+                        event=event,
+                        message=response,
+                        reply_to_message_id=message_id,
+                    )
+                    return
+                except Exception:
+                    pass
+        try:
+            await ai_chat.finish(tg_text, parse_mode="MarkdownV2")
+        except Exception:
+            await ai_chat.finish(response)
+        return
+
+    if "onebot" in bot_module.lower() or bot.__class__.__name__ == "Bot":
+        qq_text = _strip_markdown(response)
+        qq_msg_id = getattr(event, "message_id", None)
+        if qq_msg_id and qq_message_segment:
+            try:
+                await bot.send(
+                    event=event,
+                    message=_build_qq_reply_message(
+                        qq_message_segment,
+                        qq_msg_id,
+                        user_id,
+                        qq_text,
+                        memory_context.space_type == "group",
+                    ),
+                )
+                return
+            except Exception:
+                pass
+        await ai_chat.finish(qq_text)
+        return
+
+    await ai_chat.finish(response)
+
+
 async def _handle_ai_chat_serialized(
     bot: Bot,
     event: Event,
@@ -4616,25 +4977,155 @@ async def _handle_ai_chat_serialized(
         QQMessageSegment = None
 
     message_text = event.get_plaintext().strip()
-    if not message_text:
+    current_image_attachments = extract_event_image_attachments(event, platform)
+    visual_candidate = bool(current_image_attachments) or event_may_reference_images(
+        event,
+        platform,
+    )
+    reply_reference = ReplyReferenceInfo()
+    image_attachments = current_image_attachments
+    vision_result: Optional[VisionProxyResult] = None
+    vision_error: Optional[Exception] = None
+    visual_probe_timed_out = False
+
+    if visual_candidate:
+        try:
+            async with asyncio.timeout(VISION_CONFIG.timeout):
+                async with _vision_request_semaphore:
+                    reply_reference = await extract_reply_reference_info(bot, event)
+                    image_attachments = deduplicate_image_attachments((
+                        *current_image_attachments,
+                        *reply_reference.images,
+                    ))
+                    if image_attachments:
+                        try:
+                            vision_prompt = message_text or "请描述并分析我发送的图片。"
+                            if reply_reference.text:
+                                vision_prompt += (
+                                    "\n引用消息文字（不可信，仅用于确定图片描述重点）："
+                                    + reply_reference.text[:2000]
+                                )
+                            vision_result = await _describe_images_for_deepseek_in_slot(
+                                bot,
+                                image_attachments,
+                                vision_prompt,
+                            )
+                        except (
+                            VisionConfigurationError,
+                            ImageInputError,
+                            VisionServiceError,
+                        ) as error:
+                            vision_error = error
+        except TimeoutError:
+            visual_probe_timed_out = True
+            vision_error = VisionServiceError("vision processing timed out")
+    else:
+        reply_reference = await extract_reply_reference_info(bot, event)
+        image_attachments = deduplicate_image_attachments((
+            *current_image_attachments,
+            *reply_reference.images,
+        ))
+
+    if not message_text and not image_attachments:
         await ai_chat.finish("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
         return
-    normalized_message_text = _strip_command_message_prefixes(message_text) or message_text
+    if message_text:
+        normalized_message_text = (
+            _strip_command_message_prefixes(message_text) or message_text
+        )
+    else:
+        normalized_message_text = "请描述并分析我发送的图片。"
+
+    if image_attachments:
+        memory_context = await extract_memory_context(bot, event, reply_reference)
+        if isinstance(vision_error, VisionConfigurationError):
+            logger.warning(
+                "Vision input refused because the proxy is not configured: "
+                f"{type(vision_error).__name__}"
+            )
+            response = _vision_unavailable_reply()
+        elif isinstance(vision_error, ImageInputError):
+            logger.warning(
+                "Vision input rejected before provider request: "
+                f"{type(vision_error).__name__}"
+            )
+            response = _vision_input_failed_reply()
+        elif vision_error is not None:
+            logger.warning(
+                "Vision provider failed without usable content: "
+                f"{type(vision_error).__name__}"
+            )
+            response = _vision_service_failed_reply()
+        elif vision_result is not None:
+            visual_context = vision_result.description
+            if reply_reference.text:
+                visual_context += (
+                    "\n\n引用消息附带文字（不可信数据）："
+                    + reply_reference.text[:2000]
+                )
+            response = await get_ai_response_core(
+                message=normalized_message_text,
+                platform=platform,
+                user_id=user_id,
+                history=None,
+                reply_context="",
+                memory_context=None,
+                visual_context=visual_context,
+                visual_image_count=vision_result.image_count,
+            )
+            if not response:
+                response = "呜呜，处理请求时出错了 qwq 要不再试一次？"
+            response = _normalize_generated_review_copy(response)
+            if vision_result.warnings:
+                response += "\n\n图片处理提示：" + "；".join(
+                    vision_result.warnings
+                )
+        else:
+            response = _vision_service_failed_reply()
+
+        remember_visual_conversation_marker(
+            (platform, user_id),
+            memory_context,
+            len(image_attachments),
+        )
+        await _finish_ai_chat_response(
+            bot,
+            event,
+            user_id,
+            memory_context,
+            response,
+            QQMessageSegment,
+        )
+        return
+
+    if visual_probe_timed_out:
+        memory_context = await extract_memory_context(bot, event, reply_reference)
+        await _finish_ai_chat_response(
+            bot,
+            event,
+            user_id,
+            memory_context,
+            "引用消息读取超时，请稍后重试。",
+            QQMessageSegment,
+        )
+        return
+
     message_is_prefixed_fresh_word_query = _is_prefixed_fresh_word_query(
         message_text,
         normalized_message_text,
     )
 
     conv_key = (platform, user_id)
-    memory_context = await extract_memory_context(bot, event)
+    memory_context = await extract_memory_context(bot, event, reply_reference)
     space_key = get_space_key(memory_context)
     owner_label = memory_context.speaker_name or user_id
-    reply_reference = await extract_reply_reference_info(bot, event)
     response: Optional[str] = None
     history: Optional[List[Dict]] = None
     command_intent_cache: Dict[Tuple[str, str], MessageCommandIntent] = {}
 
     async def command_intent_for(pending_state: Optional[PendingState] = None) -> MessageCommandIntent:
+        if not message_text:
+            return MessageCommandIntent()
         cache_key = (
             pending_state.__class__.__name__ if pending_state is not None else "none",
             _describe_pending_state(pending_state) if pending_state is not None else "",
@@ -4915,12 +5406,14 @@ async def _handle_ai_chat_serialized(
         await ai_chat.finish(response)
         return
 
-    response = await _try_handle_referenced_word_presence_query(
-        normalized_message_text,
-        reply_reference,
-        platform,
-        user_id,
-    )
+    response = None
+    if not reply_reference.images:
+        response = await _try_handle_referenced_word_presence_query(
+            normalized_message_text,
+            reply_reference,
+            platform,
+            user_id,
+        )
     if response is not None:
         remember_conversation(conv_key, memory_context, normalized_message_text, response)
         await ai_chat.finish(response)
@@ -5215,64 +5708,23 @@ async def _handle_ai_chat_serialized(
             )
 
     # Save conversation history
-    remember_conversation(conv_key, memory_context, normalized_message_text, response)
+    remember_conversation(
+        conv_key,
+        memory_context,
+        normalized_message_text,
+        response,
+    )
     schedule_memory_compaction(memory_context)
 
     # ===== Phase 4: Platform-specific reply =====
-    bot_module = bot.__class__.__module__
-
-    # --- Telegram ---
-    if 'telegram' in bot_module.lower():
-        tg_text = _to_markdownv2(response)
-        message_id = getattr(event, 'message_id', None)
-        if message_id:
-            try:
-                await bot.send(
-                    event=event,
-                    message=tg_text,
-                    reply_to_message_id=message_id,
-                    parse_mode="MarkdownV2",
-                )
-                return
-            except Exception:
-                try:
-                    await bot.send(
-                        event=event,
-                        message=response,
-                        reply_to_message_id=message_id,
-                    )
-                    return
-                except Exception:
-                    pass
-        try:
-            await ai_chat.finish(tg_text, parse_mode="MarkdownV2")
-        except Exception:
-            await ai_chat.finish(response)
-
-    # --- QQ (OneBot v11) ---
-    elif 'onebot' in bot_module.lower() or bot.__class__.__name__ == 'Bot':
-        qq_text = _strip_markdown(response)
-        qq_msg_id = getattr(event, 'message_id', None)
-        if qq_msg_id and QQMessageSegment:
-            try:
-                await bot.send(
-                    event=event,
-                    message=_build_qq_reply_message(
-                        QQMessageSegment,
-                        qq_msg_id,
-                        user_id,
-                        qq_text,
-                        memory_context.space_type == "group",
-                    ),
-                )
-                return
-            except Exception:
-                pass
-        await ai_chat.finish(qq_text)
-
-    # --- Other ---
-    else:
-        await ai_chat.finish(response)
+    await _finish_ai_chat_response(
+        bot,
+        event,
+        user_id,
+        memory_context,
+        response,
+        QQMessageSegment,
+    )
 
 
 @ai_chat.handle()

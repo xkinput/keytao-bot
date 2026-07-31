@@ -116,6 +116,29 @@ OPENAI_TEMPERATURE=0.7                                                     # 创
 - Doubao ARK 兼容 OpenAI 的 API 格式
 - 可无缝切换到其他兼容 OpenAI 的服务商
 
+#### 配置图片理解（可选）
+
+DeepSeek V4 Flash 本身只接受文本。机器人通过独立的 OpenAI 兼容视觉模型先生成图片观察结果，再交给 DeepSeek 生成文本回答。视觉服务与主模型使用完全独立的密钥；未显式启用时，机器人不会向第三方发送图片。
+
+```bash
+VISION_ENABLED=true
+VISION_API_KEY="your-vision-api-key"
+VISION_BASE_URL="https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+VISION_MODEL="qwen3.7-flash"
+VISION_TIMEOUT=60
+VISION_MAX_TOKENS=1200
+VISION_MAX_IMAGES=3
+VISION_MAX_IMAGE_BYTES=5242880
+VISION_MAX_TOTAL_IMAGE_BYTES=12582912
+VISION_MAX_IMAGE_PIXELS=2621440
+VISION_MAX_TOTAL_IMAGE_PIXELS=7864320
+VISION_MAX_CONCURRENT_REQUESTS=2
+VISION_QQ_NAPCAT_SOURCE_ROOT="/app/.config/QQ"
+VISION_QQ_NAPCAT_MAPPED_ROOT="/app/napcat/qq"
+```
+
+QQ 与 Telegram 图片会先在机器人侧做来源、格式、完整解码、像素和大小校验，再以 Base64 Data URL 发送给视觉模型。QQ 图片缺少临时 URL 时，只允许把 NapCat 返回的 `/app/.config/QQ` 内文件映射到 bot 的只读共享路径 `/app/napcat/qq` 后读取，不会读取其他本地路径。阿里云当前推荐的 Flash 视觉模型是 `qwen3.7-flash`，该链路会显式关闭其思考模式，并固定单图像素上限，以控制响应时间和费用。图片、视觉描述、临时下载地址、Telegram Token 和 Base64 内容不会写入持久记忆或日志；历史仅保留不含内容的图片处理标记。图片中的文字只能作为引用数据，带图轮次不会向主模型暴露任何工具，也不能产生待确认操作。
+
 #### 安装额外驱动（Telegram 需要）
 
 Telegram 适配器需要 httpx 驱动器：
@@ -355,4 +378,3 @@ MIT License
 ## 🤝 贡献
 
 欢迎提交 Issue 和 Pull Request！
-

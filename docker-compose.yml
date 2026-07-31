@@ -29,6 +29,8 @@ services:
       - "8080:8080"   # HTTP API for Live2D web frontend
     volumes:
       - .:/app
+      # The bot may read NapCat image cache entries, but must never mutate them.
+      - ./napcat/qq:/app/napcat/qq:ro
     networks:
       - bot-net
     healthcheck:

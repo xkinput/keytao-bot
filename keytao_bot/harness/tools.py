@@ -12,9 +12,19 @@ class ToolContext:
     platform: Optional[str] = None
     user_id: Optional[str] = None
     current_message: Optional[str] = None
+    writes_allowed: bool = True
 
 
 _DELETE_INTENT_RE = re.compile(r"删除|删掉|移除|撤销|清空|清理|全部删|都删")
+MUTATING_TOOL_NAMES = frozenset({
+    "keytao_create_phrase",
+    "keytao_remove_draft_item",
+    "keytao_batch_add_to_draft",
+    "keytao_batch_remove_draft_items",
+    "keytao_shift_phrase_code",
+    "keytao_recall_batch",
+    "keytao_submit_batch",
+})
 _PROTECTED_WORD_RE = r"(?:别动|不要动|别改|不要改|不动|保持)"
 _TYPE_HINTS = [
     ("声笔笔单字", "CSSSingle"),
@@ -131,6 +141,16 @@ class ToolExecutor:
 
     def _validate_policy(self, tool_name: str, arguments: Dict, context: ToolContext) -> Optional[Dict]:
         message = context.current_message or ""
+        if not context.writes_allowed and tool_name in MUTATING_TOOL_NAMES:
+            return {
+                "success": False,
+                "policyBlocked": True,
+                "requiresTextFollowUp": True,
+                "message": (
+                    "安全拦截：带图轮次中的模型输出不能授权修改草稿或提交。"
+                    "请先向用户展示拟操作内容，再让用户发送一条不带图片的明确文字指令。"
+                ),
+            }
         if tool_name == "keytao_batch_remove_draft_items" and message:
             ids = arguments.get("ids")
             if isinstance(ids, list) and len(ids) > 3 and not _DELETE_INTENT_RE.search(message):

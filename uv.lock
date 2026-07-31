@@ -851,6 +851,7 @@ dependencies = [
     { name = "nonebot-plugin-status" },
     { name = "nonebot2", extra = ["fastapi", "httpx", "websockets"] },
     { name = "openai" },
+    { name = "pillow" },
     { name = "python-socks" },
 ]
 
@@ -864,6 +865,7 @@ requires-dist = [
     { name = "nonebot-plugin-status", specifier = ">=0.9.0" },
     { name = "nonebot2", extras = ["fastapi", "httpx", "websockets"], specifier = ">=2.4.4" },
     { name = "openai", specifier = ">=2.21.0,<3" },
+    { name = "pillow", specifier = ">=12.1.1,<13" },
     { name = "python-socks", specifier = ">=2.8.1" },
 ]
 
