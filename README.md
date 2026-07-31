@@ -122,9 +122,9 @@ DeepSeek V4 Flash 本身只接受文本。机器人通过独立的 OpenAI 兼容
 
 ```bash
 VISION_ENABLED=true
-VISION_API_KEY="your-vision-api-key"
-VISION_BASE_URL="https://YOUR_WORKSPACE_ID.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
-VISION_MODEL="qwen3.7-flash"
+VISION_API_KEY="your-mimo-api-key"
+VISION_BASE_URL="https://api.xiaomimimo.com/v1"
+VISION_MODEL="mimo-v2.5"
 VISION_TIMEOUT=60
 VISION_MAX_TOKENS=1200
 VISION_MAX_IMAGES=3
@@ -137,7 +137,7 @@ VISION_QQ_NAPCAT_SOURCE_ROOT="/app/.config/QQ"
 VISION_QQ_NAPCAT_MAPPED_ROOT="/app/napcat/qq"
 ```
 
-QQ 与 Telegram 图片会先在机器人侧做来源、格式、完整解码、像素和大小校验，再以 Base64 Data URL 发送给视觉模型。QQ 图片缺少临时 URL 时，只允许把 NapCat 返回的 `/app/.config/QQ` 内文件映射到 bot 的只读共享路径 `/app/napcat/qq` 后读取，不会读取其他本地路径。阿里云当前推荐的 Flash 视觉模型是 `qwen3.7-flash`，该链路会显式关闭其思考模式，并固定单图像素上限，以控制响应时间和费用。图片、视觉描述、临时下载地址、Telegram Token 和 Base64 内容不会写入持久记忆或日志；历史仅保留不含内容的图片处理标记。图片中的文字只能作为引用数据，带图轮次不会向主模型暴露任何工具，也不能产生待确认操作。
+QQ 与 Telegram 图片会先在机器人侧做来源、格式、完整解码、像素和大小校验，再以 Base64 Data URL 发送给视觉模型。QQ 图片缺少临时 URL 时，只允许把 NapCat 返回的 `/app/.config/QQ` 内文件映射到 bot 的只读共享路径 `/app/napcat/qq` 后读取，不会读取其他本地路径。[小米官方图片理解文档](https://mimo.mi.com/docs/zh-CN/quick-start/usage-guide/multimodal-understanding/image-understanding)当前仅开放 `mimo-v2.5`；该链路按官方 Chat Completions 格式使用 `max_completion_tokens`，并显式关闭深度思考，以控制响应时间和费用。机器人采用的单图 5 MB、约 262 万像素限制比官方上限更保守，且只发送 Base64，不把 QQ 或 Telegram 临时地址交给模型服务。图片、视觉描述、临时下载地址、Telegram Token 和 Base64 内容不会写入持久记忆或日志；历史仅保留不含内容的图片处理标记。图片中的文字只能作为引用数据，带图轮次不会向主模型暴露任何工具，也不能产生待确认操作。
 
 #### 安装额外驱动（Telegram 需要）
 

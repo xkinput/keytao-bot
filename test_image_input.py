@@ -136,6 +136,33 @@ class VisionConfigurationTests(unittest.TestCase):
     def test_valid_provider_configuration_passes(self):
         _config().validate()
 
+    def test_xiaomi_endpoint_requires_current_image_model(self):
+        _config(
+            base_url="https://api.xiaomimimo.com/v1",
+            model="mimo-v2.5",
+        ).validate()
+        for model in ("mimo-v2-omni", "mimo-v2-flash", "qwen3.7-flash"):
+            with self.subTest(model=model):
+                with self.assertRaises(VisionConfigurationError):
+                    _config(
+                        base_url="https://api.xiaomimimo.com/v1",
+                        model=model,
+                    ).validate()
+
+    def test_mimo_model_requires_exact_official_endpoint(self):
+        for base_url in (
+            "https://vision.example/v1",
+            "https://proxy.xiaomimimo.com/v1",
+            "https://api.xiaomimimo.com/v1/chat/completions",
+            "https://api.xiaomimimo.com/v1?target=other",
+        ):
+            with self.subTest(base_url=base_url):
+                with self.assertRaises(VisionConfigurationError):
+                    _config(
+                        base_url=base_url,
+                        model="mimo-v2.5",
+                    ).validate()
+
     def test_requires_https_provider_endpoint(self):
         with self.assertRaises(VisionConfigurationError):
             _config(base_url="http://vision.example/v1").validate()
@@ -569,6 +596,62 @@ class VisionProxyRequestTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("not-forwarded", json.dumps(captured))
         self.assertEqual(result.description, "图 1 是一个测试界面。")
         self.assertEqual(result.image_count, 1)
+
+    async def test_mimo_sdk_serializes_official_image_request_fields(self):
+        captured = {}
+
+        async def handle_request(request):
+            captured.update(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json={
+                "id": "mimo-vision-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "mimo-v2.5",
+                "choices": [{
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": "图 1 是一个测试界面。",
+                    },
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 8,
+                    "total_tokens": 18,
+                },
+            })
+
+        encoded = base64.b64encode(_PNG_BYTES).decode("ascii")
+        attachment = ImageAttachment("qq", f"base64://{encoded}")
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle_request),
+        ) as http_client:
+            async with AsyncOpenAI(
+                api_key="vision-test-key",
+                base_url="https://api.xiaomimimo.com/v1",
+                http_client=http_client,
+                max_retries=0,
+            ) as client:
+                result = await request_vision_description(
+                    client,
+                    SimpleNamespace(),
+                    (attachment,),
+                    "这张图是什么？",
+                    _config(
+                        base_url="https://api.xiaomimimo.com/v1",
+                        model="mimo-v2.5",
+                    ),
+                )
+
+        content = captured["messages"][0]["content"]
+        self.assertEqual(content[0]["type"], "image_url")
+        self.assertEqual(content[1]["type"], "text")
+        self.assertNotIn("max_pixels", content[0])
+        self.assertEqual(captured["max_completion_tokens"], 500)
+        self.assertNotIn("max_tokens", captured)
+        self.assertEqual(captured["thinking"], {"type": "disabled"})
+        self.assertEqual(result.description, "图 1 是一个测试界面。")
 
     async def test_incomplete_vision_response_is_rejected(self):
         encoded = base64.b64encode(_PNG_BYTES).decode("ascii")

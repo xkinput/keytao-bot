@@ -29,6 +29,8 @@ _QQ_IMAGE_HOST_SUFFIXES = (
 _MAX_EXTRACTED_IMAGES = 8
 _MAX_SCANNED_SEGMENTS = 64
 _REDIRECT_STATUS_CODES = frozenset({301, 302, 303, 307, 308})
+_XIAOMI_MIMO_HOSTNAME = "api.xiaomimimo.com"
+_XIAOMI_MIMO_MODEL = "mimo-v2.5"
 _SUPPORTED_IMAGE_SIGNATURES: Tuple[Tuple[str, Callable[[bytes], bool]], ...] = (
     ("image/jpeg", lambda data: data.startswith(b"\xff\xd8\xff")),
     ("image/png", lambda data: data.startswith(b"\x89PNG\r\n\x1a\n")),
@@ -43,6 +45,18 @@ _SUPPORTED_IMAGE_SIGNATURES: Tuple[Tuple[str, Callable[[bytes], bool]], ...] = (
 # HTTPX logs full request URLs at INFO. Telegram file URLs contain the bot token.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def _is_official_xiaomi_mimo_base_url(base_url: str) -> bool:
+    parsed = urlparse(base_url)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.lower() == _XIAOMI_MIMO_HOSTNAME
+        and parsed.path.rstrip("/") == "/v1"
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 class ImageInputError(ValueError):
@@ -119,6 +133,19 @@ class VisionRuntimeConfig:
         ):
             raise VisionConfigurationError(
                 "DeepSeek V4 is text-only and cannot be used as the vision proxy"
+            )
+        is_xiaomi_domain = (
+            hostname == "xiaomimimo.com"
+            or hostname.endswith(".xiaomimimo.com")
+        )
+        is_mimo_model = self.model.lower() == _XIAOMI_MIMO_MODEL
+        if is_xiaomi_domain and not is_mimo_model:
+            raise VisionConfigurationError(
+                f"Xiaomi MiMo image understanding currently requires {_XIAOMI_MIMO_MODEL}"
+            )
+        if is_mimo_model and not _is_official_xiaomi_mimo_base_url(self.base_url):
+            raise VisionConfigurationError(
+                "mimo-v2.5 must use the official https://api.xiaomimimo.com/v1 endpoint"
             )
         if self.max_images < 1:
             raise VisionConfigurationError("vision max_images must be positive")
@@ -337,6 +364,13 @@ def _uses_aliyun_qwen(config: VisionRuntimeConfig) -> bool:
     return (
         config.model.lower().startswith("qwen")
         and _hostname_matches_suffixes(hostname, ("aliyuncs.com",))
+    )
+
+
+def _uses_xiaomi_mimo(config: VisionRuntimeConfig) -> bool:
+    return (
+        config.model.lower() == _XIAOMI_MIMO_MODEL
+        and _is_official_xiaomi_mimo_base_url(config.base_url)
     )
 
 
@@ -902,7 +936,8 @@ async def _request_vision_description(
         for index, image in enumerate(batch.images, start=1)
     )
     prompt += f"\n图片顺序与来源：{source_order}"
-    content = [{"type": "text", "text": prompt}]
+    text_item = {"type": "text", "text": prompt}
+    image_items = []
     for image in batch.images:
         image_item = {
             "type": "image_url",
@@ -910,18 +945,31 @@ async def _request_vision_description(
         }
         if _uses_aliyun_qwen(config):
             image_item["max_pixels"] = config.max_image_pixels
-        content.append(image_item)
+        image_items.append(image_item)
+
+    # Follow MiMo's documented image-first layout. Other compatible providers retain
+    # the existing text-first layout to avoid changing their request behavior.
+    if _uses_xiaomi_mimo(config):
+        content = [*image_items, text_item]
+    else:
+        content = [text_item, *image_items]
 
     try:
-        request_options = {}
+        request_options = {
+            "model": config.model,
+            "messages": [{"role": "user", "content": content}],
+        }
         if _uses_aliyun_qwen(config):
+            request_options["max_tokens"] = config.max_tokens
             request_options["extra_body"] = {"enable_thinking": False}
-        response = await client.chat.completions.create(
-            model=config.model,
-            messages=[{"role": "user", "content": content}],
-            max_tokens=config.max_tokens,
-            **request_options,
-        )
+        elif _uses_xiaomi_mimo(config):
+            request_options["max_completion_tokens"] = config.max_tokens
+            request_options["extra_body"] = {
+                "thinking": {"type": "disabled"},
+            }
+        else:
+            request_options["max_tokens"] = config.max_tokens
+        response = await client.chat.completions.create(**request_options)
     except Exception as error:
         raise VisionServiceError("vision proxy request failed") from error
 
