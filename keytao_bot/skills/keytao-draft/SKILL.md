@@ -56,7 +56,7 @@ description: 键道输入法草稿批次管理工具。添加词条、查看草�
 - `word` = 对旧词做替换后的新词（如 `防黏`）
 - `code` = 消息中的编码（如 `fpnm`）
 
-⛔ **严禁**在此情况下调用 `keytao_lookup_by_codes_batch`、`keytao_lookup_by_word`、`keytao_encode` 等任何查询/编码工具。用户已提供所有信息，**立即**构建并调用 `keytao_batch_add_to_draft`，一步完成：
+⛔ **严禁**在此情况下调用 `keytao_lookup_by_codes_batch`、`keytao_lookup_by_word`、`keytao_encode` 等任何查询/编码工具。用户已提供所有信息，直接构建并调用 `keytao_batch_add_to_draft` 获取完整只读预览：
 ```python
 keytao_batch_add_to_draft(items=[
   {"action": "Change", "old_word": "防粘", "word": "防黏", "code": "fpnm"},
@@ -71,7 +71,8 @@ keytao_batch_add_to_draft(items=[
 
 **特性：**
 - 遇到硬冲突（词条+编码完全重复、要删除的词不存在等）→ 跳过，记入 `failed`
-- 遇到重码警告 → **自动确认写入**，记入 `warned`，**必须触发后续智能分配流程**
+- 首次调用（包括没有警告时）只返回完整预览，不写入；所有条目与风险必须由用户确认票据
+- 确认写入必须绑定服务端返回的 `batchId`、`contentVersion` 和 `warningDigest`；快照变化时拒绝执行
 - 草稿中已存在的相同操作 → 跳过，记入 `skipped`
 - 最终返回 `successCount`、`failedCount`、`skippedCount`、`warnedCount`、`failed[]`、`skipped[]`、`warned[]`、`draftItems[]`
 
@@ -107,12 +108,12 @@ keytao_batch_add_to_draft(items=[
 - `type` (str, optional): 词条类型；用户明确指定类型时必须传。声笔笔=`CSS`，声笔笔单字=`CSSSingle`，词组=`Phrase`，单字=`Single`，补充=`Supplement`，符号=`Symbol`，链接=`Link`，英文=`English`。不传则自动推断：
   - 1 个汉字 → `Single`；英文字母 → `English`；链接 → `Link`；符号 → `Symbol`；其余 → `Phrase`
 - `remark` (str, optional): 备注
-- `confirmed` (bool, optional): 用户明确要求保留重码时传 `True`，让词条以原编码写入
+- `confirmed` (bool, reserved): 仅供程序使用保存的精确服务端票据执行；模型不得传入
 
 **返回值示例：**
 ```json
-// 成功
-{"success": true, "batchId": "uuid", "pullRequestCount": 1, "message": "..."}
+// 首次完整预览（尚未写入）
+{"success": false, "requiresConfirmation": true, "batchId": "uuid", "contentVersion": 3, "warningDigest": "...", "message": "..."}
 
 // 冲突（不可绕过）
 {"success": false, "conflicts": [...], "message": "存在冲突"}
@@ -123,7 +124,7 @@ keytao_batch_add_to_draft(items=[
 
 **收到 `requiresConfirmation: true` 时，执行「编码警告确认协议」：**
 - 向当前操作发起者展示重码、跳过短空位等具体警告，并等待本人确认。
-- 只有本人明确确认保留该编码后，才用原 `code` + `confirmed=True` 重新调用本工具。
+- 只有本人发送当前精确确认票据后，程序才会按原样回放预览参数；模型不得自行重新调用本工具。
 - 禁止在用户未表态时擅自换到其他编码；若用户明确要求“自动安排空位”，才可使用 `keytao_encode` 的候选链选择第一个空位。
 
 ### keytao_get_batch_preview（查看草稿时优先使用）
@@ -282,7 +283,7 @@ summary 格式规则：
 
 ### keytao_recall_batch
 
-撤回最近一次提审，将批次从"审核中"状态恢复为草稿。**AI 无需传递任何参数。**
+撤回最近一次提审，将批次从"审核中"状态恢复为草稿。首次调用无需参数，只获取精确批次和版本的只读票据；确认阶段由程序回放该票据。
 
 ⚠️ **仅当用户明确说"撤回"、"撤销提交"、"取消提审" 时才调用。**
 
@@ -296,20 +297,19 @@ summary 格式规则：
 
 ⚠️ **仅当用户明确说"提交"、"提审"、"发起审核"、"submit" 时才调用（初次调用 `confirmed` 不传或 false）。**
 
-当 `keytao_submit_batch` 返回 `requiresConfirmation: true` 时，告知用户警告并询问是否继续。  
-用户确认后（说"确认"、"好"、"是"等）→ **立即重新调用 `keytao_submit_batch(confirmed=True)`**，不要改调其他工具。
+`keytao_submit_batch` 首次调用始终返回完整只读快照。程序会保存其中的 `batchId`、`contentVersion`、`snapshotDigest`、`warningDigest` 和 `auditDigest`，并给用户一张精确确认票据。模型不得自行构造 `confirmed=True` 或摘要字段。
 
-⛔ **提交确认的铁律：上一步调的是 submit_batch，确认时只能再调 submit_batch(confirmed=True)。**  
-绝对禁止在提交确认时调用 `keytao_create_phrase`、`keytao_batch_add_to_draft` 或任何其他工具——那会把用户带入错误的加词流程。
+⛔ **提交确认的铁律：用户确认时由程序回放保存的 submit_batch 精确票据。**
+模型绝对禁止自行调用 `keytao_submit_batch(confirmed=True)`、`keytao_create_phrase`、`keytao_batch_add_to_draft` 或任何其他写工具。
 
 🚫 **提交成功后，严禁再调用任何其他工具**（包括 `keytao_list_draft_items`）。提交后批次已不再是草稿，调用其他工具会立即创建一个新的空草稿——这是错误行为。用户可能还需要撤回本次提交，直接回复提交成功格式即可。
 
 ## 编码警告确认协议
 
 **触发条件（任一满足即触发）：**
-- `keytao_create_phrase` 返回 `requiresConfirmation: true`（含 `warnings[]`，词条**尚未写入**）
-- `keytao_batch_add_to_draft` 返回 `requiresConfirmation: true`（含 `warnings[]`，本次需要确认的词条**尚未写入**，常见于跳过更短空位编码）
-- `keytao_batch_add_to_draft` 返回 `warnedCount > 0` 且无 `requiresConfirmation`（含 `warned[]`，词条**已写入**但存在重码提醒）
+- `keytao_create_phrase` 或 `keytao_batch_add_to_draft` 首次返回完整预览（无论是否有警告，均**尚未写入**）
+- `keytao_submit_batch` 首次返回提交快照（批次仍为草稿）
+- `keytao_recall_batch` 首次返回待撤回批次快照（批次仍未撤回）
 
 ### 用户意图与处理
 
@@ -317,11 +317,11 @@ summary 格式规则：
 
 | 用户意图 | 典型表达 | 处理方式 |
 |---|---|---|
-| **明确要求保留当前编码** | "就用这个编码"、"加重码"、"确认重码"、"重码也行" | 展示警告；本人确认后用原编码 + `confirmed=True` 写入 |
+| **明确要求保留当前编码** | "就用这个编码"、"加重码"、"确认重码"、"重码也行" | 展示完整预览；本人发送当前精确票据后由程序写入 |
 | **明确要求自动安排空位** | "自动顺延"、"帮我找空位"、"放到第一个空位" | 只使用 `keytao_encode` 返回的候选链选择第一个空位，并说明最终编码 |
 | **未表态（默认）** | 普通加词请求，未说明如何处理警告 | 保持当前选择并询问确认，不写入、不换码 |
 
-用户明确要求保留重码或确认跳过空位时，`keytao_create_phrase` 或 `keytao_batch_add_to_draft` 用原 `code` + `confirmed=True` 重新调用；若 `keytao_batch_add_to_draft` 只是返回已写入的 `warned[]`，无需修正，直接按正常成功展示并告知用户与哪个词形成重码。
+用户明确要求保留重码或确认跳过空位时，仍先展示服务端完整预览；确认阶段只能由保存的精确票据执行，模型不得自行重调工具或改动参数。
 
 ---
 
@@ -364,7 +364,7 @@ keytao_shift_phrase_code(word="会员费", target_code="hyfio")
 - 如果下一码也被 C 占用，继续对 C 调 `keytao_encode(C)` 并顺延
 - 每一步都检查能否继续顺延，直到遇到空码或被 A 旧编码释放的位置
 - 清理相关旧草稿条目
-- 一次性写入 Delete+Create
+- 先返回完整顺延计划和摘要；用户确认后才在同一事务写入 Delete+Create
 - 返回 `shiftPlan.shifted`，说明顺延计算了哪些词
 
 ### 禁止的操作
@@ -442,7 +442,7 @@ keytao_shift_phrase_code(word="会员费", target_code="hyfio")
 → 回复警告内容，询问是否继续提交
 
 用户：确认
-→ 调用 keytao_submit_batch(confirmed=True)   // 注意：不调其他工具！
+→ 程序消费当前精确票据并回放 batchId、版本和三个摘要；模型不调用工具
 → 成功后回复「批次已提交审核」+ batchUrl，结束
 ```
 
@@ -469,14 +469,14 @@ keytao_shift_phrase_code(word="会员费", target_code="hyfio")
 
 **`keytao_create_phrase` 或 `keytao_batch_add_to_draft` 遇到重码：**
 → 先判断用户是否明确要求保留重码：
-- 是 → 展示警告；本人确认后用原编码 + `confirmed=True` 写入，告知用户该词与谁形成重码
+- 是 → 展示完整预览；本人发送当前精确票据后由程序按原编码写入，并告知与谁形成重码
 - 否（默认）→ 保持待确认状态，询问是保留重码还是改用候选空位；禁止静默改码
 
 **`keytao_submit_batch` 返回 `requiresConfirmation: true` 时：**
-- 告知用户批次中存在重码，询问是否继续提交
-- 用户确认后，**立即重新调用 `keytao_submit_batch(confirmed=True)`**，**绝不改调其他工具**
+- 展示完整批次快照、审核结论和警告，询问是否继续提交
+- 用户只能用当前精确确认票据继续；程序按原样回放批次、版本和三个摘要，模型不得重新调用或换工具
 
-**Delete 操作无需确认，会直接写入草稿，但成功响应中包含 `notes` 字段**，记录了被删除的词条信息：
+**Delete 操作同样必须先展示精确目标、批次版本和目标摘要，用户确认后才会写入。成功响应中的 `notes` 字段**记录被删除的词条信息：
 ```json
 {
   "success": true,

@@ -174,7 +174,10 @@ TOOLS = [
                     "items": {
                         "type": "array",
                         "description": "草稿条目列表",
-                        "items": {"type": "object"},
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
                     },
                 },
                 "required": ["items"],

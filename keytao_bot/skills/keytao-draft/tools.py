@@ -4,8 +4,12 @@ Keytao Create Skill Tools
 """
 import asyncio
 import difflib
+import hashlib
+import hmac
 import json
 import re
+import secrets
+import time
 import unicodedata
 import httpx
 from typing import Dict, List, Optional
@@ -43,6 +47,7 @@ TYPE_LABELS = {
     "CSSSingle": "声笔笔单字",
     "English": "英文",
 }
+VALID_PHRASE_TYPES = frozenset(TYPE_LABELS)
 
 
 def compute_draft_summary(items: List[Dict]) -> Dict:
@@ -74,7 +79,7 @@ def _contains_cjk_text(word: str) -> bool:
 
 def _infer_phrase_type(word: str, code: str, phrase_type: str = "Phrase") -> str:
     """Mirror keytao-next phrase type inference for bot-side guardrails."""
-    if phrase_type and phrase_type != "Phrase":
+    if phrase_type in VALID_PHRASE_TYPES and phrase_type != "Phrase":
         return phrase_type
 
     is_symbol_word = bool(word) and all(
@@ -114,11 +119,21 @@ def _normalize_draft_item_for_request(item: Dict) -> Dict:
     if isinstance(code, str):
         normalized["code"] = code.strip().lower()
 
-    if not normalized.get("type") and isinstance(normalized.get("word"), str) and isinstance(normalized.get("code"), str):
+    if (
+        normalized.get("type") not in VALID_PHRASE_TYPES
+        and isinstance(normalized.get("word"), str)
+        and isinstance(normalized.get("code"), str)
+    ):
         normalized["type"] = _infer_phrase_type(
             normalized["word"],
             normalized["code"],
             "Phrase",
+        )
+    if "needs_manual_review" in normalized:
+        normalized["needsManualReview"] = bool(normalized.pop("needs_manual_review"))
+    if "needsManualReview" not in normalized:
+        normalized["needsManualReview"] = bool(
+            manual_preaudit_issue_for_item(normalized)
         )
     return normalized
 
@@ -391,6 +406,25 @@ def get_bot_token() -> Optional[str]:
         return None
 
 
+def get_bot_identity_secret() -> Optional[str]:
+    """Get the dedicated cross-service identity HMAC secret."""
+    try:
+        from nonebot import get_driver
+        config = get_driver().config
+        return getattr(config, "bot_identity_secret", None)
+    except Exception:
+        return None
+
+
+def _json_request_body(payload: Dict) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _parse_json_mapping(value: object) -> Dict[str, str]:
     if isinstance(value, dict):
         return {str(k): str(v) for k, v in value.items() if v}
@@ -435,6 +469,9 @@ def get_bot_headers(
     platform: Optional[str] = None,
     platform_id: Optional[str] = None,
     content_type: bool = False,
+    method: str = "",
+    path: str = "",
+    raw_body: bytes = b"",
 ) -> Dict[str, str]:
     token = get_bot_token()
     headers: Dict[str, str] = {}
@@ -447,6 +484,30 @@ def get_bot_headers(
         user_api_key = get_user_api_key(platform, platform_id)
         if user_api_key:
             headers["X-API-Key"] = user_api_key
+
+    if platform == "web" and platform_id and method and path:
+        identity_secret = get_bot_identity_secret()
+        if not identity_secret:
+            raise RuntimeError("BOT_IDENTITY_SECRET is not configured")
+        timestamp = str(int(time.time()))
+        nonce = secrets.token_hex(16)
+        body_digest = hashlib.sha256(raw_body).hexdigest()
+        canonical = "\n".join((
+            method.upper(),
+            path,
+            platform,
+            platform_id,
+            timestamp,
+            nonce,
+            body_digest,
+        )).encode("utf-8")
+        headers["X-Bot-User-Ts"] = timestamp
+        headers["X-Bot-User-Nonce"] = nonce
+        headers["X-Bot-User-Sig"] = hmac.new(
+            identity_secret.encode("utf-8"),
+            canonical,
+            hashlib.sha256,
+        ).hexdigest()
 
     return headers
 
@@ -479,7 +540,12 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 url,
-                headers=get_bot_headers(platform, platform_id),
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    method="GET",
+                    path="/api/bot/batches/latest-draft",
+                ),
                 params={"platform": platform, "platformId": platform_id}
             )
 
@@ -559,6 +625,14 @@ async def _fetch_encode_candidates(word: str, requested_code: Optional[str] = No
 
 async def _validate_draft_item_code(item: Dict) -> Dict:
     """Ensure a Create item's code belongs to that word's encode candidate chain."""
+    phrase_type = str(item.get("type") or "").strip()
+    if phrase_type not in VALID_PHRASE_TYPES:
+        return {
+            "success": False,
+            "word": str(item.get("word") or "").strip(),
+            "code": str(item.get("code") or "").strip(),
+            "reason": f"不支持的词库类型：{phrase_type or '(empty)'}",
+        }
     if not _should_validate_create_code(item):
         return {"success": True, "skipped": True}
 
@@ -688,7 +762,12 @@ async def keytao_create_phrase(
     old_word: Optional[str] = None,
     type: str = "Phrase",
     remark: Optional[str] = None,
-    confirmed: bool = False
+    confirmed: bool = False,
+    needs_manual_review: Optional[bool] = None,
+    batch_id: Optional[str] = None,
+    expected_content_version: Optional[int] = None,
+    expected_warning_digest: str = "",
+    preview_only: bool = False,
 ) -> Dict:
     """
     Create, modify or delete a phrase entry via bot API
@@ -721,15 +800,30 @@ async def keytao_create_phrase(
         }
     
     # Get or create draft batch
-    try:
-        batch_id = await get_latest_draft_batch(platform, platform_id)
-    except UserNotFoundError:
-        return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
+    if not batch_id:
+        try:
+            batch_id = await get_latest_draft_batch(platform, platform_id)
+        except UserNotFoundError:
+            return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
     if not batch_id:
         return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
+    if confirmed and (
+        not isinstance(expected_content_version, int)
+        or isinstance(expected_content_version, bool)
+        or expected_content_version < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_warning_digest)
+    ):
+        return {"success": False, "message": "添加确认缺少有效的服务端风险快照"}
 
     # Auto-detect type when not explicitly specified, mirrors detectPhraseType in keytao-next
     type = _infer_phrase_type(word, code, type)
+    if type not in VALID_PHRASE_TYPES:
+        return {"success": False, "message": f"不支持的词库类型：{type}"}
+    if needs_manual_review is None:
+        needs_manual_review = bool(manual_preaudit_issue_for_item({
+            "word": word,
+            "remark": remark,
+        }))
     validation = await _validate_draft_item_code({
         "action": action,
         "word": word,
@@ -758,24 +852,50 @@ async def keytao_create_phrase(
             "oldWord": old_word,
             "code": code,
             "type": type,
-            "remark": remark
+            "remark": remark,
+            "needsManualReview": bool(needs_manual_review),
         }],
         "confirmed": confirmed,
-        "batchId": batch_id  # Always use the draft batch
+        "previewOnly": preview_only,
+        "batchId": batch_id,
+        **(
+            {
+                "expectedContentVersion": expected_content_version,
+                "expectedWarningDigest": expected_warning_digest,
+            }
+            if confirmed
+            else {}
+        ),
     }
     
     logger.info(f"[keytao_create_phrase] Sending request: {json.dumps(request_data, ensure_ascii=False)}")
+    request_body = _json_request_body(request_data)
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 url,
-                headers=get_bot_headers(platform, platform_id, content_type=True),
-                json=request_data
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    content_type=True,
+                    method="POST",
+                    path="/api/bot/pull-requests/batch",
+                    raw_body=request_body,
+                ),
+                content=request_body,
             )
             
             if response.status_code == 200:
                 data = response.json()
+                data.setdefault("batchId", batch_id)
+                if preview_only and not data.get("requiresConfirmation"):
+                    return {
+                        "success": False,
+                        "uncertain": True,
+                        "message": "服务端未返回可确认的添加快照，已停止后续操作",
+                        "batchId": batch_id,
+                    }
                 logger.info(f"[keytao_create_phrase] API response (200): {json.dumps(data, ensure_ascii=False)}")
                 snapshot = await _fetch_draft_snapshot(platform, platform_id)
                 if snapshot is not None:
@@ -788,6 +908,7 @@ async def keytao_create_phrase(
             elif response.status_code == 400:
                 # Conflict or warning
                 data = response.json()
+                data.setdefault("batchId", batch_id)
                 logger.info(f"[keytao_create_phrase] API response (400): {json.dumps(data, ensure_ascii=False)}")
                 # Attach draft snapshot so AI can report current state even when this item has a warning
                 if data.get("requiresConfirmation"):
@@ -921,9 +1042,17 @@ async def _fallback_draft_audit_with_encode(items: List[Dict], reason: str) -> D
     }
 
 
-async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str) -> Dict:
+async def _audit_current_draft_for_auto_approval(
+    platform: str,
+    platform_id: str,
+    batch_id: str,
+) -> Dict:
     try:
-        list_result = await keytao_list_draft_items(platform, platform_id)
+        list_result = await keytao_list_draft_items(
+            platform,
+            platform_id,
+            batch_id=batch_id,
+        )
         if not list_result.get("success"):
             return {
                 "success": False,
@@ -932,7 +1061,73 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
                 "summary": list_result.get("message", "无法读取草稿，需要管理员审核"),
                 "issues": [list_result.get("message", "无法读取草稿")],
             }
+        listed_batch_id = str(list_result.get("batchId") or "")
+        content_version = list_result.get("contentVersion")
+        if (
+            listed_batch_id != batch_id
+            or not isinstance(content_version, int)
+            or isinstance(content_version, bool)
+            or content_version < 0
+        ):
+            return {
+                "success": False,
+                "verdict": "needs_admin",
+                "autoApprove": False,
+                "summary": "草稿快照缺少可验证版本，已停止提交",
+                "issues": ["草稿批次或内容版本不匹配"],
+            }
+
+        def bind_snapshot(review: Dict) -> Dict:
+            snapshot_items = [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "id", "action", "word", "oldWord", "code", "type",
+                        "weight", "remark", "needsManualReview",
+                    )
+                }
+                for item in list_result.get("items", [])
+                if isinstance(item, dict)
+            ]
+            snapshot_digest = hashlib.sha256(json.dumps(
+                {
+                    "batchId": batch_id,
+                    "contentVersion": content_version,
+                    "items": snapshot_items,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            return {
+                **review,
+                "batchId": batch_id,
+                "contentVersion": content_version,
+                "snapshotItems": snapshot_items,
+                "snapshotDigest": snapshot_digest,
+            }
+
         items = list_result.get("items", [])
+        locked_items = [
+            item for item in items
+            if isinstance(item, dict) and item.get("needsManualReview") is True
+        ]
+        if locked_items:
+            labels = [
+                str(item.get("word") or f"PR#{item.get('id')}")
+                for item in locked_items[:10]
+            ]
+            return bind_snapshot({
+                "success": True,
+                "verdict": "needs_admin",
+                "autoApprove": False,
+                "summary": "加词预审已锁定整批管理员审核",
+                "issues": [
+                    "结构化预审锁：" + "、".join(labels)
+                ],
+                "approvedItems": [],
+                "manualReviewLocked": True,
+            })
         audit_timeout = _draft_audit_timeout()
         try:
             deterministic_audit = await asyncio.wait_for(
@@ -944,9 +1139,9 @@ async def _audit_current_draft_for_auto_approval(platform: str, platform_id: str
             logger.warning(f"[auto_review] deterministic audit timed out: {reason}")
             deterministic_audit = await _fallback_draft_audit_with_encode(items, reason)
         if deterministic_audit.get("autoApprove") or not can_llm_override_audit_issues(deterministic_audit):
-            return deterministic_audit
+            return bind_snapshot(deterministic_audit)
         llm_audit = await _try_llm_auto_review_for_draft(list_result, deterministic_audit)
-        return llm_audit or deterministic_audit
+        return bind_snapshot(llm_audit or deterministic_audit)
     except Exception as error:
         logger.warning(f"[auto_review] audit failed: {error}")
         return {
@@ -1037,11 +1232,39 @@ def _audit_allows_batch_auto_approve(auto_review: Dict) -> bool:
     )
 
 
+def _auto_review_confirmation_digest(auto_review: Dict) -> str:
+    """Bind confirmation to the safety-relevant outcome of the bot-side audit."""
+    payload = {
+        "batchId": auto_review.get("batchId"),
+        "contentVersion": auto_review.get("contentVersion"),
+        "snapshotDigest": auto_review.get("snapshotDigest"),
+        "success": auto_review.get("success"),
+        "verdict": auto_review.get("verdict"),
+        "autoApprove": auto_review.get("autoApprove"),
+        "summary": auto_review.get("summary"),
+        "issues": auto_review.get("issues") or [],
+        "approvedItems": auto_review.get("approvedItems") or [],
+        "manualReviewLocked": bool(auto_review.get("manualReviewLocked")),
+        "llmFallback": bool(auto_review.get("llmFallback")),
+        "encodeOnly": bool(auto_review.get("encodeOnly")),
+        "timeout": bool(auto_review.get("timeout")),
+        "evidence": auto_review.get("evidence") or [],
+    }
+    return hashlib.sha256(json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")).hexdigest()
+
+
 async def _auto_approve_submitted_batch(
     platform: str,
     platform_id: str,
     batch_id: str,
     auto_review: Dict,
+    expected_content_version: int,
 ) -> Dict:
     if not _audit_allows_batch_auto_approve(auto_review):
         return {
@@ -1051,16 +1274,26 @@ async def _auto_approve_submitted_batch(
     KEYTAO_API_BASE = get_keytao_url()
     review_note = build_review_note(auto_review)
     url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/auto-approve"
+    request_data = {
+        "platform": platform,
+        "platformId": platform_id,
+        "reviewNote": review_note,
+        "expectedContentVersion": expected_content_version,
+    }
+    request_body = _json_request_body(request_data)
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 url,
-                headers=get_bot_headers(platform, platform_id, content_type=True),
-                json={
-                    "platform": platform,
-                    "platformId": platform_id,
-                    "reviewNote": review_note,
-                },
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    content_type=True,
+                    method="POST",
+                    path=f"/api/bot/batches/{batch_id}/auto-approve",
+                    raw_body=request_body,
+                ),
+                content=request_body,
             )
         try:
             data = response.json()
@@ -1083,7 +1316,13 @@ async def _auto_approve_submitted_batch(
 async def keytao_submit_batch(
     platform: str,
     platform_id: str,
-    confirmed: bool = False
+    confirmed: bool = False,
+    batch_id: Optional[str] = None,
+    expected_content_version: Optional[int] = None,
+    expected_server_snapshot_digest: str = "",
+    expected_warning_digest: str = "",
+    expected_audit_digest: str = "",
+    preview_only: bool = False,
 ) -> Dict:
     """
     Submit current draft batch for review
@@ -1095,7 +1334,7 @@ async def keytao_submit_batch(
     Args:
         platform: Platform type ('qq' or 'telegram')
         platform_id: User's platform ID
-        confirmed: Whether to confirm duplicate code / multiple code warnings
+        confirmed: Whether the exact server preview ticket is being confirmed
         
     Returns:
         dict: API response with success status
@@ -1109,41 +1348,116 @@ async def keytao_submit_batch(
             "message": "喵喵配置错误：缺少API token"
         }
     
-    # Get draft batch ID
-    try:
-        batch_id = await get_latest_draft_batch(platform, platform_id)
-    except UserNotFoundError:
-        return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
+    if confirmed and (
+        not batch_id
+        or not isinstance(expected_content_version, int)
+        or isinstance(expected_content_version, bool)
+        or expected_content_version < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_server_snapshot_digest)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_warning_digest)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_audit_digest)
+    ):
+        return {
+            "success": False,
+            "message": "提交确认缺少有效的批次版本，请重新获取最新提交检查结果",
+        }
+
+    # The first request may resolve the latest draft. A confirmation must use
+    # the exact batch/version returned by that first server warning.
+    if not batch_id:
+        try:
+            batch_id = await get_latest_draft_batch(platform, platform_id)
+        except UserNotFoundError:
+            return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
     if not batch_id:
         return {"success": False, "message": "没有找到待提交的草稿批次"}
 
-    auto_review = await _audit_current_draft_for_auto_approval(platform, platform_id)
+    auto_review = await _audit_current_draft_for_auto_approval(
+        platform,
+        platform_id,
+        batch_id,
+    )
+    audited_content_version = auto_review.get("contentVersion")
+    audited_digest = _auto_review_confirmation_digest(auto_review)
+    if (
+        not isinstance(audited_content_version, int)
+        or isinstance(audited_content_version, bool)
+        or audited_content_version < 0
+    ):
+        return {
+            "success": False,
+            "message": auto_review.get("summary") or "草稿快照缺少可验证版本，已停止提交",
+            "autoReview": auto_review,
+        }
+    if confirmed and expected_content_version != audited_content_version:
+        return {
+            "success": False,
+            "staleConfirmation": True,
+            "message": "草稿内容已变化，旧确认票据已作废，请重新提交",
+            "batchId": batch_id,
+            "contentVersion": audited_content_version,
+            "autoReview": auto_review,
+        }
+    if confirmed and expected_audit_digest != audited_digest:
+        return {
+            "success": False,
+            "staleConfirmation": True,
+            "message": "本喵复审结论已变化，旧确认票据已作废，请重新提交",
+            "batchId": batch_id,
+            "contentVersion": audited_content_version,
+            "auditDigest": audited_digest,
+            "autoReview": auto_review,
+        }
+    submission_content_version = audited_content_version
     
     url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/submit"
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
+            request_data = {
+                "platform": platform,
+                "platformId": platform_id,
+                "confirmed": confirmed,
+                "previewOnly": preview_only,
+            }
+            request_data["expectedContentVersion"] = submission_content_version
+            if confirmed:
+                request_data["expectedSnapshotDigest"] = expected_server_snapshot_digest
+                request_data["expectedWarningDigest"] = expected_warning_digest
+            request_body = _json_request_body(request_data)
             response = await client.post(
                 url,
-                headers=get_bot_headers(platform, platform_id, content_type=True),
-                json={
-                    "platform": platform,
-                    "platformId": platform_id,
-                    "confirmed": confirmed
-                }
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    content_type=True,
+                    method="POST",
+                    path=f"/api/bot/batches/{batch_id}/submit",
+                    raw_body=request_body,
+                ),
+                content=request_body,
             )
             
             if response.status_code == 200:
                 data = response.json()
                 data["batchId"] = batch_id  # inject so _inject_batch_url can build batchUrl
+                data.setdefault("contentVersion", submission_content_version)
                 _inject_batch_url(data)
                 data["autoReview"] = auto_review
+                data["auditDigest"] = audited_digest
+                data.setdefault("snapshotItems", auto_review.get("snapshotItems", []))
+                data["auditSnapshotDigest"] = auto_review.get("snapshotDigest", "")
+                if preview_only:
+                    data["success"] = False
+                    data["requiresConfirmation"] = True
+                    return data
                 if _audit_allows_batch_auto_approve(auto_review):
                     approve_result = await _auto_approve_submitted_batch(
                         platform,
                         platform_id,
                         batch_id,
                         auto_review,
+                        submission_content_version,
                     )
                     data["autoApproveResult"] = approve_result
                     data["autoApproved"] = bool(approve_result.get("success"))
@@ -1160,8 +1474,22 @@ async def keytao_submit_batch(
                 }
             elif response.status_code == 400:
                 data = response.json()
+                data.setdefault("batchId", batch_id)
+                data.setdefault("contentVersion", submission_content_version)
                 data["autoReview"] = auto_review
+                data["auditDigest"] = audited_digest
+                data.setdefault("snapshotItems", auto_review.get("snapshotItems", []))
+                data["auditSnapshotDigest"] = auto_review.get("snapshotDigest", "")
                 return data
+            elif response.status_code == 409:
+                data = response.json()
+                return {
+                    **data,
+                    "success": False,
+                    "staleConfirmation": True,
+                    "batchId": batch_id,
+                    "message": data.get("message") or "草稿内容已变化，请重新检查后提交",
+                }
             else:
                 return {
                     "success": False,
@@ -1239,6 +1567,8 @@ async def keytao_get_batch_preview(
 async def keytao_recall_batch(
     platform: str,
     platform_id: str,
+    batch_id: Optional[str] = None,
+    expected_content_version: Optional[int] = None,
 ) -> Dict:
     """
     Recall (un-submit) the latest submitted batch, reverting it back to Draft.
@@ -1255,10 +1585,67 @@ async def keytao_recall_batch(
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
+            if not batch_id:
+                response = await client.get(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        method="GET",
+                        path="/api/bot/batches/recall",
+                    ),
+                    params={"platform": platform, "platformId": platform_id},
+                )
+                try:
+                    data = response.json()
+                except Exception:
+                    return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+                if not response.is_success:
+                    return {
+                        **data,
+                        "success": False,
+                        "message": data.get("message") or f"获取待撤回批次失败（HTTP {response.status_code}）",
+                    }
+                preview_batch_id = str(data.get("batchId") or "")
+                preview_version = data.get("contentVersion")
+                if (
+                    not preview_batch_id
+                    or not isinstance(preview_version, int)
+                    or isinstance(preview_version, bool)
+                    or preview_version < 0
+                ):
+                    return {"success": False, "message": "待撤回批次缺少可验证版本"}
+                return {
+                    **data,
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "recallBatch",
+                    "message": "即将撤回这个已提交批次并恢复为草稿",
+                }
+            if (
+                not isinstance(expected_content_version, int)
+                or isinstance(expected_content_version, bool)
+                or expected_content_version < 0
+            ):
+                return {"success": False, "message": "撤回确认缺少有效的批次版本"}
+            request_data = {
+                "platform": platform,
+                "platformId": platform_id,
+                "batchId": batch_id,
+                "expectedContentVersion": expected_content_version,
+            }
+            request_body = _json_request_body(request_data)
             response = await client.post(
                 url,
-                headers=get_bot_headers(platform, platform_id, content_type=True),
-                json={"platform": platform, "platformId": platform_id},
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    content_type=True,
+                    method="POST",
+                    path="/api/bot/batches/recall",
+                    raw_body=request_body,
+                ),
+                content=request_body,
             )
             try:
                 data = response.json()
@@ -1266,6 +1653,13 @@ async def keytao_recall_batch(
                 return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
 
             logger.info(f"[keytao_recall_batch] status={response.status_code} success={data.get('success')}")
+            if response.status_code == 409:
+                return {
+                    **data,
+                    "success": False,
+                    "staleConfirmation": True,
+                    "message": data.get("message") or "待撤回批次已变化，旧票据已作废",
+                }
             _inject_batch_url(data)
             return data
 
@@ -1279,6 +1673,7 @@ async def keytao_recall_batch(
 async def keytao_list_draft_items(
     platform: str,
     platform_id: str,
+    batch_id: Optional[str] = None,
 ) -> Dict:
     """
     List all PR items in the user's latest draft batch
@@ -1299,8 +1694,17 @@ async def keytao_list_draft_items(
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(
                 url,
-                headers=get_bot_headers(platform, platform_id),
-                params={"platform": platform, "platformId": platform_id}
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    method="GET",
+                    path="/api/bot/batches/latest-draft/items",
+                ),
+                params={
+                    "platform": platform,
+                    "platformId": platform_id,
+                    **({"batchId": batch_id} if batch_id else {}),
+                },
             )
 
             try:
@@ -1326,10 +1730,83 @@ async def keytao_list_draft_items(
         return {"success": False, "message": f"获取失败: {type(e).__name__}: {e}"}
 
 
+def _canonical_delete_target(item: Dict) -> Dict:
+    return {
+        "id": int(item.get("id")),
+        "word": str(item.get("word") or ""),
+        "code": str(item.get("code") or ""),
+        "action": str(item.get("action") or ""),
+        "type": str(item.get("type") or ""),
+    }
+
+
+async def _prepare_delete_targets(
+    platform: str,
+    platform_id: str,
+    ids: List[int],
+    *,
+    batch_id: Optional[str] = None,
+) -> Dict:
+    snapshot = await keytao_list_draft_items(
+        platform,
+        platform_id,
+        batch_id=batch_id,
+    )
+    if not snapshot.get("success"):
+        return snapshot
+    current_batch_id = str(snapshot.get("batchId") or "")
+    content_version = snapshot.get("contentVersion")
+    if (
+        not current_batch_id
+        or not isinstance(content_version, int)
+        or isinstance(content_version, bool)
+        or content_version < 0
+    ):
+        return {"success": False, "message": "草稿快照缺少可验证版本"}
+    items_by_id = {
+        int(item["id"]): item
+        for item in snapshot.get("items", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), (int, str))
+        and str(item.get("id")).isdigit()
+    }
+    requested_ids = list(dict.fromkeys(int(item_id) for item_id in ids))
+    missing_ids = [item_id for item_id in requested_ids if item_id not in items_by_id]
+    if missing_ids:
+        return {
+            "success": False,
+            "staleConfirmation": True,
+            "message": f"草稿条目已变化，找不到 ID：{missing_ids}",
+        }
+    targets = [_canonical_delete_target(items_by_id[item_id]) for item_id in requested_ids]
+    digest_payload = {
+        "batchId": current_batch_id,
+        "contentVersion": content_version,
+        "targets": targets,
+    }
+    digest = hashlib.sha256(json.dumps(
+        digest_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return {
+        "success": True,
+        "batchId": current_batch_id,
+        "contentVersion": content_version,
+        "targets": targets,
+        "targetDigest": digest,
+    }
+
+
 async def keytao_remove_draft_item(
     platform: str,
     platform_id: str,
     pr_id: int,
+    batch_id: Optional[str] = None,
+    expected_content_version: Optional[int] = None,
+    expected_target_digest: str = "",
+    expected_targets: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     Remove a specific PR item from the user's draft batch
@@ -1346,15 +1823,58 @@ async def keytao_remove_draft_item(
     if not BOT_API_TOKEN:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
+    preview = await _prepare_delete_targets(
+        platform,
+        platform_id,
+        [pr_id],
+        batch_id=batch_id,
+    )
+    if not preview.get("success"):
+        return preview
+    if not expected_target_digest:
+        return {
+            **preview,
+            "success": False,
+            "requiresConfirmation": True,
+            "confirmationKind": "deleteTargets",
+            "message": "删除会永久移除以下草稿条目，请核对完整目标",
+        }
+    if (
+        batch_id != preview.get("batchId")
+        or expected_content_version != preview.get("contentVersion")
+        or expected_target_digest != preview.get("targetDigest")
+        or expected_targets != preview.get("targets")
+    ):
+        return {
+            "success": False,
+            "staleConfirmation": True,
+            "message": "删除目标或草稿版本已变化，旧确认票据已作废",
+        }
+
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/{pr_id}"
+    request_data = {
+        "platform": platform,
+        "platformId": platform_id,
+        "batchId": batch_id,
+        "expectedContentVersion": expected_content_version,
+        "expectedTargets": expected_targets,
+    }
+    request_body = _json_request_body(request_data)
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.request(
                 "DELETE",
                 url,
-                headers=get_bot_headers(platform, platform_id, content_type=True),
-                content=json.dumps({"platform": platform, "platformId": platform_id})
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    content_type=True,
+                    method="DELETE",
+                    path=f"/api/bot/pull-requests/{pr_id}",
+                    raw_body=request_body,
+                ),
+                content=request_body,
             )
 
             try:
@@ -1364,6 +1884,13 @@ async def keytao_remove_draft_item(
                 return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
 
             logger.info(f"[keytao_remove_draft_item] PR#{pr_id} status={response.status_code}")
+            if response.status_code == 409:
+                return {
+                    **data,
+                    "success": False,
+                    "staleConfirmation": True,
+                    "message": data.get("message") or "删除目标已变化，旧票据已作废",
+                }
             if data.get("success"):
                 snapshot = await _fetch_draft_snapshot(platform, platform_id)
                 if snapshot is not None:
@@ -1478,17 +2005,21 @@ async def keytao_batch_add_to_draft(
     items: List[Dict],
     batch_id: Optional[str] = None,
     confirmed: bool = False,
+    expected_content_version: Optional[int] = None,
+    expected_warning_digest: str = "",
+    preview_only: bool = False,
 ) -> Dict:
     """
     Batch add word entries to draft (tolerant mode).
-    Hard conflicts are skipped and reported; duplicate-code warnings are auto-confirmed.
+    The first call is a complete read-only preview. Any confirmed write must
+    carry the exact batch, content version, and warning digest from the server.
 
     Args:
         platform: Platform type ('qq' or 'telegram')
         platform_id: User's platform ID
         items: List of dicts with keys: word, code, action (optional), type (optional), remark (optional)
         batch_id: Optional existing draft batch ID
-        confirmed: Whether to confirm warnings that must pause before writing
+        confirmed: Whether the exact server preview ticket is being confirmed
 
     Returns:
         dict with successCount, failedCount, skippedCount, failed[], skipped[], draftItems[], draftTotal
@@ -1506,6 +2037,13 @@ async def keytao_batch_add_to_draft(
             return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
         if not batch_id:
             return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
+    if confirmed and (
+        not isinstance(expected_content_version, int)
+        or isinstance(expected_content_version, bool)
+        or expected_content_version < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_warning_digest)
+    ):
+        return {"success": False, "message": "批量添加确认缺少有效的服务端风险快照"}
 
     valid_items, validation_failed = await _split_items_by_code_validation(items)
     if validation_failed and not valid_items:
@@ -1535,6 +2073,15 @@ async def keytao_batch_add_to_draft(
         "platformId": platform_id,
         "batchId": batch_id,
         "confirmed": confirmed,
+        "previewOnly": preview_only,
+        **(
+            {
+                "expectedContentVersion": expected_content_version,
+                "expectedWarningDigest": expected_warning_digest,
+            }
+            if confirmed
+            else {}
+        ),
         "items": [
             {**{k: v for k, v in item.items() if k != "old_word"},
              **({"oldWord": item["old_word"]} if "old_word" in item else {})}
@@ -1546,13 +2093,21 @@ async def keytao_batch_add_to_draft(
         f"[keytao_batch_add_to_draft] Sending {len(valid_items)} items to batch-draft "
         f"({len(validation_failed)} validation failures)"
     )
+    request_body = _json_request_body(request_data)
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 url,
-                headers=get_bot_headers(platform, platform_id, content_type=True),
-                json=request_data,
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    content_type=True,
+                    method="POST",
+                    path="/api/bot/pull-requests/batch-draft",
+                    raw_body=request_body,
+                ),
+                content=request_body,
             )
             try:
                 data = response.json()
@@ -1566,6 +2121,14 @@ async def keytao_batch_add_to_draft(
             # Enrich draft item labels
             if isinstance(data.get("draftItems"), list):
                 data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
+            data.setdefault("batchId", batch_id)
+            if preview_only and not data.get("requiresConfirmation"):
+                return {
+                    "success": False,
+                    "uncertain": True,
+                    "message": "服务端未返回可确认的批量添加快照，已停止后续操作",
+                    "batchId": batch_id,
+                }
             if validation_failed:
                 data["failed"] = [*data.get("failed", []), *validation_failed]
                 data["failedCount"] = data.get("failedCount", 0) + len(validation_failed)
@@ -1587,6 +2150,10 @@ async def keytao_batch_remove_draft_items(
     platform: str,
     platform_id: str,
     ids: list[int],
+    batch_id: Optional[str] = None,
+    expected_content_version: Optional[int] = None,
+    expected_target_digest: str = "",
+    expected_targets: Optional[List[Dict]] = None,
 ) -> Dict:
     """Batch delete draft items by their PR IDs."""
     KEYTAO_API_BASE = get_keytao_url()
@@ -1595,15 +2162,58 @@ async def keytao_batch_remove_draft_items(
     if not BOT_API_TOKEN:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
+    preview = await _prepare_delete_targets(
+        platform,
+        platform_id,
+        ids,
+        batch_id=batch_id,
+    )
+    if not preview.get("success"):
+        return preview
+    if not expected_target_digest:
+        return {
+            **preview,
+            "success": False,
+            "requiresConfirmation": True,
+            "confirmationKind": "deleteTargets",
+            "message": "批量删除会永久移除以下草稿条目，请核对完整目标",
+        }
+    if (
+        batch_id != preview.get("batchId")
+        or expected_content_version != preview.get("contentVersion")
+        or expected_target_digest != preview.get("targetDigest")
+        or expected_targets != preview.get("targets")
+    ):
+        return {
+            "success": False,
+            "staleConfirmation": True,
+            "message": "批量删除目标或草稿版本已变化，旧确认票据已作废",
+        }
+
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch-draft"
-    payload = {"platform": platform, "platformId": platform_id, "ids": ids}
+    payload = {
+        "platform": platform,
+        "platformId": platform_id,
+        "ids": ids,
+        "batchId": batch_id,
+        "expectedContentVersion": expected_content_version,
+        "expectedTargets": expected_targets,
+    }
     logger.info(f"[keytao_batch_remove_draft_items] Deleting ids={ids}")
+    request_body = _json_request_body(payload)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.request(
                 "DELETE", url,
-                json=payload,
-                headers=get_bot_headers(platform, platform_id, content_type=True),
+                content=request_body,
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    content_type=True,
+                    method="DELETE",
+                    path="/api/bot/pull-requests/batch-draft",
+                    raw_body=request_body,
+                ),
             )
             try:
                 data: Dict = response.json()
@@ -1613,6 +2223,13 @@ async def keytao_batch_remove_draft_items(
                 f"[keytao_batch_remove_draft_items] status={response.status_code} "
                 f"success={data.get('success')} deleted={data.get('successCount')}"
             )
+            if response.status_code == 409:
+                return {
+                    **data,
+                    "success": False,
+                    "staleConfirmation": True,
+                    "message": data.get("message") or "批量删除目标已变化，旧票据已作废",
+                }
             if isinstance(data.get("draftItems"), list):
                 data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
             _inject_batch_url(data)
@@ -1624,13 +2241,130 @@ async def keytao_batch_remove_draft_items(
         return {"success": False, "message": f"批量删除失败: {str(e)}"}
 
 
+async def _keytao_strict_batch_add_to_draft(
+    platform: str,
+    platform_id: str,
+    items: List[Dict],
+    *,
+    batch_id: Optional[str] = None,
+    expected_content_version: Optional[int] = None,
+    confirmed: bool = False,
+    expected_warning_digest: str = "",
+) -> Dict:
+    """Write one all-or-nothing plan through the strict batch endpoint."""
+    bot_api_token = get_bot_token()
+    if not bot_api_token:
+        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+
+    if not batch_id:
+        try:
+            batch_id = await get_latest_draft_batch(platform, platform_id)
+        except UserNotFoundError:
+            return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
+    if not batch_id:
+        return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
+
+    valid_items, validation_failed = await _split_items_by_code_validation(items)
+    if validation_failed or len(valid_items) != len(items):
+        return {
+            "success": False,
+            "message": "顺延计划未通过整批编码预检，未写入任何草稿条目",
+            "failed": validation_failed,
+        }
+
+    request_items = [
+        {
+            **{key: value for key, value in item.items() if key != "old_word"},
+            **({"oldWord": item["old_word"]} if "old_word" in item else {}),
+        }
+        for item in valid_items
+    ]
+    url = f"{get_keytao_url()}/api/bot/pull-requests/batch"
+    request_data = {
+        "platform": platform,
+        "platformId": platform_id,
+        "items": request_items,
+        "confirmed": confirmed,
+        "batchId": batch_id,
+        **(
+            {
+                "expectedContentVersion": expected_content_version,
+                **(
+                    {"expectedWarningDigest": expected_warning_digest}
+                    if confirmed
+                    else {}
+                ),
+            }
+            if expected_content_version is not None
+            else {}
+        ),
+    }
+    request_body = _json_request_body(request_data)
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                url,
+                headers=get_bot_headers(
+                    platform,
+                    platform_id,
+                    content_type=True,
+                    method="POST",
+                    path="/api/bot/pull-requests/batch",
+                    raw_body=request_body,
+                ),
+                content=request_body,
+            )
+        try:
+            data = response.json()
+        except Exception:
+            return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+        if response.status_code == 409:
+            return {
+                **data,
+                "success": False,
+                "staleConfirmation": True,
+                "message": data.get("message") or "草稿内容已变化，顺延计划已作废",
+            }
+        if data.get("requiresConfirmation"):
+            return data
+        if not response.is_success or not data.get("success"):
+            return {
+                **data,
+                "success": False,
+                "message": data.get("message") or f"整批顺延写入失败（HTTP {response.status_code}）",
+            }
+        data["successCount"] = int(
+            data.get("successCount")
+            or data.get("pullRequestCount")
+            or len(request_items)
+        )
+        snapshot = await _fetch_draft_snapshot(platform, platform_id)
+        if snapshot is not None:
+            data["draft_snapshot"] = snapshot
+        _inject_batch_url(data)
+        return data
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "uncertain": True,
+            "message": "整批顺延请求超时；请先查看草稿确认状态，不要立即重试",
+        }
+    except Exception as error:
+        logger.error(f"[keytao_shift_phrase_code] strict batch error: {error}")
+        return {"success": False, "message": f"整批顺延写入失败: {str(error)}"}
+
+
 async def keytao_shift_phrase_code(
     platform: str,
     platform_id: str,
     word: str,
     target_code: str,
+    confirmed_plan_digest: str = "",
+    batch_id: Optional[str] = None,
+    expected_content_version: Optional[int] = None,
+    expected_warning_digest: str = "",
 ) -> Dict:
-    """Move a word to a target code and shift occupants using each occupant's own encode chain."""
+    """Preview, bind, then atomically write a complete code-shift plan."""
     word = word.strip()
     target_code = target_code.strip().lower()
     if not word or not target_code:
@@ -1738,26 +2472,108 @@ async def keytao_shift_phrase_code(
         return plan
 
     planned_words = {item.get("word") for item in plan.get("items", []) if item.get("word")}
-    existing_draft = await keytao_list_draft_items(platform, platform_id)
-    removed_draft_ids: List[int] = []
-    if existing_draft.get("success"):
-        for item in existing_draft.get("items", []):
-            if item.get("word") in planned_words and isinstance(item.get("id"), int):
-                removed_draft_ids.append(item["id"])
-    if removed_draft_ids:
-        remove_result = await keytao_batch_remove_draft_items(platform, platform_id, removed_draft_ids)
-        if not remove_result.get("success"):
-            return remove_result
+    existing_draft = await keytao_list_draft_items(
+        platform,
+        platform_id,
+        batch_id=batch_id,
+    )
+    if not existing_draft.get("success"):
+        return {
+            "success": False,
+            "message": existing_draft.get("message", "无法读取当前草稿，顺延未执行"),
+        }
+    related_draft_items = [
+        item for item in existing_draft.get("items", [])
+        if isinstance(item, dict) and item.get("word") in planned_words
+    ]
+    if related_draft_items:
+        return {
+            "success": False,
+            "policyBlocked": True,
+            "requiresDraftCleanup": True,
+            "message": (
+                "相关词条已存在于草稿中；为避免非原子地先删后写，"
+                "本次顺延未修改草稿。请先明确处理这些旧草稿条目，再重新发起顺延。"
+            ),
+            "relatedDraftItems": related_draft_items[:20],
+            "shiftPlan": {
+                "word": word,
+                "targetCode": target_code,
+                "candidateCodes": target_candidate_codes,
+                "items": plan.get("items", []),
+                "shifted": plan.get("shifted", []),
+                "removedDraftIds": [],
+            },
+        }
 
-    write_result = await keytao_batch_add_to_draft(platform, platform_id, plan.get("items", []))
-    write_result["shiftPlan"] = {
+    current_batch_id = str(existing_draft.get("batchId") or "")
+    current_content_version = existing_draft.get("contentVersion")
+    if (
+        not current_batch_id
+        or not isinstance(current_content_version, int)
+        or isinstance(current_content_version, bool)
+        or current_content_version < 0
+    ):
+        return {
+            "success": False,
+            "message": "当前草稿缺少可验证的内容版本，顺延未执行",
+        }
+
+    shift_plan = {
         "word": word,
         "targetCode": target_code,
         "candidateCodes": target_candidate_codes,
         "items": plan.get("items", []),
         "shifted": plan.get("shifted", []),
-        "removedDraftIds": removed_draft_ids,
+        "removedDraftIds": [],
     }
+    digest_payload = {
+        "batchId": current_batch_id,
+        "contentVersion": current_content_version,
+        "shiftPlan": shift_plan,
+    }
+    plan_digest = hashlib.sha256(json.dumps(
+        digest_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+    if not confirmed_plan_digest:
+        return {
+            "success": False,
+            "requiresConfirmation": True,
+            "confirmationKind": "shiftPlan",
+            "message": "顺延会移动当前编码链中的其他词条，请核对完整计划",
+            "batchId": current_batch_id,
+            "contentVersion": current_content_version,
+            "planDigest": plan_digest,
+            "shiftPlan": shift_plan,
+        }
+    if (
+        confirmed_plan_digest.strip().lower() != plan_digest
+        or batch_id != current_batch_id
+        or expected_content_version != current_content_version
+    ):
+        return {
+            "success": False,
+            "staleConfirmation": True,
+            "message": "顺延计划或草稿内容已变化，旧确认票据已作废，请重新发起",
+            "batchId": current_batch_id,
+            "contentVersion": current_content_version,
+        }
+
+    write_result = await _keytao_strict_batch_add_to_draft(
+        platform,
+        platform_id,
+        plan.get("items", []),
+        batch_id=current_batch_id,
+        expected_content_version=current_content_version,
+        confirmed=bool(expected_warning_digest),
+        expected_warning_digest=expected_warning_digest,
+    )
+    write_result["shiftPlan"] = shift_plan
+    write_result["planDigest"] = plan_digest
     if plan.get("shifted"):
         shifted_text = "；".join(
             f"{item['word']} {item['fromCode']}→{item['toCode']}"
@@ -1774,8 +2590,8 @@ TOOLS += [
             "name": "keytao_batch_add_to_draft",
             "description": (
                 "批量将词条加入草稿。适合用户一次提交大量词条时使用。"
-                "遇到冲突的条目会跳过并在 failed 列表中说明原因，重码（同编码不同词）会自动确认写入；"
-                "跳过更短空位编码会返回 requiresConfirmation，用户确认后再传 confirmed=true 写入。"
+                "首次调用只返回完整预览，不写入；所有条目和风险（包括重码、跳过更短空位）都必须由用户确认票据。"
+                "确认时必须原样携带服务端返回的 batchId、contentVersion 和 warningDigest，快照变化会拒绝写入。"
                 "如需把词插入已占用编码并顺延后续词，必须先使用 keytao_shift_phrase_code，不要手工计算顺延。"
                 "操作完成后返回成功数、失败数及当前草稿快照。"
             ),
@@ -1801,6 +2617,7 @@ TOOLS += [
                                 },
                                 "type": {
                                     "type": "string",
+                                    "enum": ["Single", "Phrase", "Supplement", "Symbol", "Link", "CSS", "CSSSingle", "English"],
                                     "description": "词条类型。用户明确指定类型时必须传：声笔笔=CSS，声笔笔单字=CSSSingle，词组=Phrase，单字=Single，补充=Supplement，符号=Symbol，链接=Link，英文=English。Change/Delete 若不传会默认词组，可能改错词库。",
                                 },
                                 "remark": {
@@ -1830,7 +2647,8 @@ TOOLS += [
             "description": (
                 "将一个词改到指定编码，并按每个被挤走词自己的 keytao_encode 候选编码链逐个顺延。"
                 "会检查目标编码是否是目标词的有效编码、每个顺延目标是否可继续挪动或为空，"
-                "自动清理相关草稿条目后一次性写入 Delete+Create，并返回 shiftPlan.shifted 说明顺延了哪些词。"
+                "仅在没有相关旧草稿条目时，通过严格事务一次性写入 Delete+Create；"
+                "如已有相关草稿则安全拒绝，不会先删后写。返回 shiftPlan.shifted 说明顺延了哪些词。"
                 "用户要求插入到已占用编码、抢占某码位、把某词改到某个已占用编码时优先使用此工具。"
             ),
             "parameters": {
