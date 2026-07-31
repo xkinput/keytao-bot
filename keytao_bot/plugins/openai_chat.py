@@ -37,6 +37,7 @@ from ..harness.state import (
 )
 from ..harness.tools import ToolContext, ToolExecutor
 from ..utils.history_store import get_history_store
+from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.memory_store import ChatMemoryContext, get_memory_store
 
 
@@ -611,7 +612,11 @@ async def _classify_message_command_intent(
         f"当前消息：{message_text}\n"
         f"pending_context：{pending_context}\n"
         "请只返回 JSON，字段包括：intent, confidence, keep_words, submit_after, "
-        "current_user_only, choice_index, requested_code, target_word, old_char, new_char。"
+        "current_user_only, choice_index, requested_code, target_word, old_char, new_char。\n"
+        "例如："
+        '{"intent":"none","confidence":0.9,"keep_words":[],"submit_after":false,'
+        '"current_user_only":false,"choice_index":null,"requested_code":"",'
+        '"target_word":"","old_char":"","new_char":""}'
     )
 
     try:
@@ -619,15 +624,26 @@ async def _classify_message_command_intent(
             api_key=OPENAI_API_KEY,
             base_url=OPENAI_BASE_URL,
             timeout=min(OPENAI_TIMEOUT, 20.0),
+            max_retries=1,
         )
-        response = await client.chat.completions.create(
+        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+            {
+                "model": WORD_QUERY_INTENT_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": 260,
+                "temperature": 0.0,
+            },
+            thinking=False,
+            json_output=True,
+        ))
+        log_chat_usage(
+            logger,
+            response,
+            operation="command_intent",
             model=WORD_QUERY_INTENT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=260,
-            temperature=0.0,
         )
         if not response.choices:
             return MessageCommandIntent()
@@ -672,15 +688,26 @@ async def _classify_simple_word_query_intent(
             api_key=OPENAI_API_KEY,
             base_url=OPENAI_BASE_URL,
             timeout=min(OPENAI_TIMEOUT, 20.0),
+            max_retries=1,
         )
-        response = await client.chat.completions.create(
+        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+            {
+                "model": WORD_QUERY_INTENT_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": 180,
+                "temperature": 0.0,
+            },
+            thinking=False,
+            json_output=True,
+        ))
+        log_chat_usage(
+            logger,
+            response,
+            operation="word_query_intent",
             model=WORD_QUERY_INTENT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=180,
-            temperature=0.0,
         )
         if not response.choices:
             return SimpleWordQueryIntent(False)
@@ -1573,31 +1600,41 @@ async def _generate_usage_comparison_note(
             api_key=OPENAI_API_KEY,
             base_url=OPENAI_BASE_URL,
             timeout=min(OPENAI_TIMEOUT, 30.0),
+            max_retries=1,
         )
-        response = await client.chat.completions.create(
+        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+            {
+                "model": OPENAI_MODEL,
+                "temperature": 0.3,
+                "max_tokens": 180,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "你是中文输入法助手。请用1到2句简短中文，比较当前词和前面占位词在日常使用中的常见场景/常用度差异。"
+                            "语气克制，不要绝对化，不要使用项目符号。"
+                            "优先直接点名占位词，并明确这只是日常语感层面的比较，不等于实际码序规则。"
+                            "最后顺带点明：当前码位顺序仍以现有词库占位为准。"
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"当前词：{word}\n"
+                            f"当前编码：{current_code}\n"
+                            f"更前面被占用的候选码位：{occupied_text}\n"
+                            f"前面占位词：{'、'.join(occupied_words) if occupied_words else '未知'}"
+                        ),
+                    },
+                ],
+            },
+            thinking=False,
+        ))
+        log_chat_usage(
+            logger,
+            response,
+            operation="usage_comparison",
             model=OPENAI_MODEL,
-            temperature=0.3,
-            max_tokens=180,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "你是中文输入法助手。请用1到2句简短中文，比较当前词和前面占位词在日常使用中的常见场景/常用度差异。"
-                        "语气克制，不要绝对化，不要使用项目符号。"
-                        "优先直接点名占位词，并明确这只是日常语感层面的比较，不等于实际码序规则。"
-                        "最后顺带点明：当前码位顺序仍以现有词库占位为准。"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"当前词：{word}\n"
-                        f"当前编码：{current_code}\n"
-                        f"更前面被占用的候选码位：{occupied_text}\n"
-                        f"前面占位词：{'、'.join(occupied_words) if occupied_words else '未知'}"
-                    ),
-                },
-            ],
         )
         if not response.choices:
             return None
@@ -4212,15 +4249,25 @@ async def summarize_memory_with_llm(
         api_key=OPENAI_API_KEY,
         base_url=OPENAI_BASE_URL,
         timeout=OPENAI_TIMEOUT,
+        max_retries=1,
     )
-    response = await client.chat.completions.create(
+    response = await client.chat.completions.create(**with_deepseek_chat_policy(
+        {
+            "model": OPENAI_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": MEMORY_SUMMARY_MAX_TOKENS,
+            "temperature": 0.2,
+        },
+        thinking=False,
+    ))
+    log_chat_usage(
+        logger,
+        response,
+        operation="memory_summary",
         model=OPENAI_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        max_tokens=MEMORY_SUMMARY_MAX_TOKENS,
-        temperature=0.2,
     )
     if not response.choices:
         return ""
@@ -4277,6 +4324,7 @@ async def get_ai_response_core(
                 api_key=OPENAI_API_KEY,
                 base_url=OPENAI_BASE_URL,
                 timeout=OPENAI_TIMEOUT,
+                max_retries=1,
             ),
             runtime=runtime,
             skills_manager=skills_manager,

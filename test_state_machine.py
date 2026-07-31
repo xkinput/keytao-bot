@@ -1348,18 +1348,129 @@ def test_classify_simple_word_query_intent_calls_model():
                     completions=types.SimpleNamespace(create=create_mock)
                 )
 
+        intent_model = "deepseek-v4-flash"
         with patch.object(openai_chat_module, "AsyncOpenAI", FakeClient):
             with patch.object(openai_chat_module, "OPENAI_API_KEY", "fake-key"):
-                result = await openai_chat_module._classify_simple_word_query_intent(
-                    "洛阳纸贵",
-                    ("洛阳纸贵",),
-                )
+                with patch.object(openai_chat_module, "WORD_QUERY_INTENT_MODEL", intent_model):
+                    result = await openai_chat_module._classify_simple_word_query_intent(
+                        "洛阳纸贵",
+                        ("洛阳纸贵",),
+                    )
 
         call_kwargs = create_mock.call_args.kwargs
         check("classifier accepts word lookup", result.should_handle)
         check("classifier parses words", result.words == ("洛阳纸贵",))
-        check("classifier uses configured model", call_kwargs.get("model") == openai_chat_module.WORD_QUERY_INTENT_MODEL)
+        check("classifier uses configured model", call_kwargs.get("model") == intent_model)
         check("classifier asks for deterministic output", call_kwargs.get("temperature") == 0.0)
+        check(
+            "classifier disables DeepSeek thinking",
+            call_kwargs.get("extra_body") == {"thinking": {"type": "disabled"}},
+        )
+        check(
+            "classifier requests JSON output",
+            call_kwargs.get("response_format") == {"type": "json_object"},
+        )
+
+    asyncio.run(_run())
+
+
+def test_remaining_llm_call_policies():
+    """Verify task-specific DeepSeek policies on the other direct LLM calls."""
+    print("\n🧪 remaining DeepSeek LLM call policies")
+
+    async def _run():
+        command_client = _FakeClient([_FakeAIResponse(
+            "stop",
+            '{"intent":"draft_view","confidence":0.98,"keep_words":[]}',
+        )])
+        with patch.object(openai_chat_module, "AsyncOpenAI", return_value=command_client):
+            with patch.object(openai_chat_module, "OPENAI_API_KEY", "fake-key"):
+                with patch.object(openai_chat_module, "WORD_QUERY_INTENT_MODEL", "deepseek-v4-flash"):
+                    await openai_chat_module._classify_message_command_intent("看看我现在的草稿")
+
+        usage_client = _FakeClient([_FakeAIResponse("stop", "日常语感接近，仍以词库码序为准。")])
+        with patch.object(openai_chat_module, "AsyncOpenAI", return_value=usage_client):
+            with patch.object(openai_chat_module, "OPENAI_API_KEY", "fake-key"):
+                with patch.object(openai_chat_module, "OPENAI_MODEL", "deepseek-v4-flash"):
+                    await openai_chat_module._generate_usage_comparison_note(
+                        "研判",
+                        "ypj",
+                        [{"code": "yp", "label": "严判"}],
+                    )
+
+        memory_client = _FakeClient([_FakeAIResponse("stop", "- 用户偏好简洁答复")])
+        with patch.object(openai_chat_module, "AsyncOpenAI", return_value=memory_client):
+            with patch.object(openai_chat_module, "OPENAI_API_KEY", "fake-key"):
+                with patch.object(openai_chat_module, "OPENAI_MODEL", "deepseek-v4-flash"):
+                    await openai_chat_module.summarize_memory_with_llm(
+                        "user",
+                        "123",
+                        "",
+                        [{
+                            "importance": "high",
+                            "role": "user",
+                            "speaker_id": "123",
+                            "content": "请简洁回答",
+                        }],
+                    )
+
+        entity_client = _FakeClient([_FakeAIResponse(
+            "stop",
+            json.dumps({
+                "recognized": True,
+                "entityType": "celebrity",
+                "confidence": 0.95,
+                "canonicalNames": ["周杰伦"],
+                "aliases": ["杰伦"],
+                "description": "歌手",
+                "pinyin": "jie lun",
+                "searchQueries": [],
+                "reviewHint": "大众熟知人物别名",
+            }, ensure_ascii=False),
+        )])
+        entity_config = {
+            "api_key": "fake-key",
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-v4-flash",
+            "timeout": 30.0,
+        }
+        with patch.object(keytao_review_module, "AsyncOpenAI", return_value=entity_client):
+            with patch.object(keytao_review_module, "_review_llm_config", return_value=entity_config):
+                await keytao_review_module._infer_entity_knowledge("杰伦")
+
+        command_call = command_client.completions.calls[0]
+        usage_call = usage_client.completions.calls[0]
+        memory_call = memory_client.completions.calls[0]
+        entity_call = entity_client.completions.calls[0]
+
+        check(
+            "command intent disables thinking",
+            command_call.get("extra_body") == {"thinking": {"type": "disabled"}},
+        )
+        check(
+            "command intent requests JSON output",
+            command_call.get("response_format") == {"type": "json_object"},
+        )
+        check(
+            "usage comparison disables thinking",
+            usage_call.get("extra_body") == {"thinking": {"type": "disabled"}},
+        )
+        check("usage comparison stays text output", "response_format" not in usage_call)
+        check(
+            "memory summary disables thinking",
+            memory_call.get("extra_body") == {"thinking": {"type": "disabled"}},
+        )
+        check("memory summary stays text output", "response_format" not in memory_call)
+        check(
+            "entity knowledge disables DeepSeek thinking",
+            entity_call.get("extra_body") == {"thinking": {"type": "disabled"}}
+            and "reasoning_effort" not in entity_call,
+        )
+        check(
+            "entity knowledge requests JSON output",
+            entity_call.get("response_format") == {"type": "json_object"},
+        )
+        check("entity knowledge keeps deterministic temperature", entity_call.get("temperature") == 0.0)
 
     asyncio.run(_run())
 
@@ -5310,7 +5421,16 @@ def test_batch_review_retries_length_with_more_output_tokens():
 
     async def _run():
         client = _FakeClient([
-            _FakeAIResponse("length", None),
+            _FakeAIResponse("length", json.dumps({
+                "items": [{
+                    "prId": 1,
+                    "status": "pass",
+                    "title": "本喵建议通过",
+                    "reasons": ["这段内容看似完整，但结束状态是 length"],
+                    "suggestions": ["不得接受截断响应"],
+                    "evidence": ["finish_reason=length"],
+                }],
+            }, ensure_ascii=False)),
             _FakeAIResponse("stop", json.dumps({
                 "items": [{
                     "prId": 1,
@@ -5318,13 +5438,14 @@ def test_batch_review_retries_length_with_more_output_tokens():
                     "title": "本喵建议通过",
                     "reasons": ["读音和编码一致"],
                     "suggestions": ["无需调整"],
+                    "evidence": ["确定性候选链包含目标编码"],
                 }],
             }, ensure_ascii=False)),
         ])
         config = {
             "api_key": "test",
             "base_url": "https://example.test",
-            "model": "test-model",
+            "model": "deepseek-v4-flash",
             "max_tokens": 2500,
             "max_tokens_cap": 12000,
             "timeout": 30.0,
@@ -5341,9 +5462,128 @@ def test_batch_review_retries_length_with_more_output_tokens():
                 )
 
         budgets = [call.get("max_tokens") for call in client.completions.calls]
-        check("length response is retried", len(budgets) == 2)
+        check("length response with parseable content is retried", len(budgets) == 2)
         check("retry doubles output budget", budgets == [2500, 5000])
         check("retry returns parsed review", raw.get("items", [{}])[0].get("prId") == 1)
+        check(
+            "all batch review attempts enable DeepSeek thinking",
+            all(
+                call.get("extra_body") == {"thinking": {"type": "enabled"}}
+                and call.get("reasoning_effort") == "high"
+                for call in client.completions.calls
+            ),
+        )
+        check(
+            "all batch review attempts request JSON output",
+            all(
+                call.get("response_format") == {"type": "json_object"}
+                for call in client.completions.calls
+            ),
+        )
+        check(
+            "all batch review attempts omit ignored temperature",
+            all("temperature" not in call for call in client.completions.calls),
+        )
+
+    asyncio.run(_run())
+
+
+def test_batch_review_retries_incomplete_json_schema():
+    """A syntactically valid but incomplete review must not be accepted."""
+    print("\n🧪 batch review retries incomplete JSON schema")
+
+    async def _run():
+        client = _FakeClient([
+            _FakeAIResponse("stop", json.dumps({
+                "items": [
+                    {"prId": 1, "status": "pass"},
+                    {"prId": 2, "status": "pass"},
+                ],
+            })),
+            _FakeAIResponse("stop", json.dumps({
+                "items": [
+                    {
+                        "prId": 1,
+                        "status": "pass",
+                        "title": "本喵建议通过",
+                        "reasons": ["读音和编码一致"],
+                        "suggestions": ["无需调整"],
+                        "evidence": ["确定性候选链包含目标编码"],
+                    },
+                    {
+                        "prId": 2,
+                        "status": "attention",
+                        "title": "本喵建议复核",
+                        "reasons": ["常用度证据有限"],
+                        "suggestions": ["请管理员确认"],
+                        "evidence": ["现有来源不足以确认常用度"],
+                    },
+                ],
+            }, ensure_ascii=False)),
+        ])
+        config = {
+            "api_key": "test",
+            "base_url": "https://example.test",
+            "model": "deepseek-v4-flash",
+            "max_tokens": 2500,
+            "max_tokens_cap": 12000,
+            "timeout": 30.0,
+            "temperature": 0.2,
+        }
+        items = [
+            {"id": 1, "action": "Create", "word": "甲词", "code": "abc", "type": "Phrase"},
+            {"id": 2, "action": "Create", "word": "乙词", "code": "abd", "type": "Phrase"},
+        ]
+        with patch.object(keytao_batch_review_module, "AsyncOpenAI", return_value=client):
+            with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
+                raw = await keytao_batch_review_module._call_llm(
+                    {"id": "schema-retry-batch"},
+                    items,
+                    {"reviewedWords": {}},
+                    None,
+                    None,
+                )
+
+        check("incomplete review JSON is retried", len(client.completions.calls) == 2)
+        check(
+            "accepted review covers every requested PR",
+            {item.get("prId") for item in raw.get("items", [])} == {1, 2},
+        )
+
+        sparse_payload = json.dumps({
+            "items": [
+                {"prId": 1, "status": "pass"},
+                {"prId": 2, "status": "pass"},
+            ],
+        })
+        sparse_client = _FakeClient([
+            _FakeAIResponse("stop", sparse_payload),
+            _FakeAIResponse("stop", sparse_payload),
+            _FakeAIResponse("stop", sparse_payload),
+        ])
+        with patch.object(keytao_batch_review_module, "AsyncOpenAI", return_value=sparse_client):
+            with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
+                fallback_raw, warnings = await keytao_batch_review_module._call_llm_chunked(
+                    {"id": "sparse-pass-batch"},
+                    items,
+                    {"reviewedWords": {}},
+                    None,
+                    None,
+                )
+
+        fallback_review = keytao_batch_review_module._normalize_llm_review(
+            fallback_raw,
+            items,
+            None,
+            {"reviewedWords": {}},
+        )
+        check("sparse pass exhausts the bounded three attempts", len(sparse_client.completions.calls) == 3)
+        check("sparse pass exhaustion emits a review warning", bool(warnings))
+        check("sparse pass exhaustion falls back to attention", fallback_review.get("verdict") == "needs_attention")
+        check(
+            "sparse pass exhaustion cannot preserve pass items",
+            all(item.get("status") == "attention" for item in fallback_review.get("items", [])),
+        )
 
     asyncio.run(_run())
 
@@ -5553,20 +5793,21 @@ def test_tool_executor_draft_policy_guards():
 
 
 class _FakeAIMessage:
-    def __init__(self, content=None, tool_calls=None):
+    def __init__(self, content=None, tool_calls=None, reasoning_content=None):
         self.content = content
         self.tool_calls = tool_calls
+        self.reasoning_content = reasoning_content
 
 
 class _FakeChoice:
-    def __init__(self, finish_reason, content=None, tool_calls=None):
+    def __init__(self, finish_reason, content=None, tool_calls=None, reasoning_content=None):
         self.finish_reason = finish_reason
-        self.message = _FakeAIMessage(content, tool_calls)
+        self.message = _FakeAIMessage(content, tool_calls, reasoning_content)
 
 
 class _FakeAIResponse:
-    def __init__(self, finish_reason, content=None, tool_calls=None):
-        self.choices = [_FakeChoice(finish_reason, content, tool_calls)]
+    def __init__(self, finish_reason, content=None, tool_calls=None, reasoning_content=None):
+        self.choices = [_FakeChoice(finish_reason, content, tool_calls, reasoning_content)]
         self.usage = None
 
 
@@ -5593,6 +5834,28 @@ class _FakeSkillsManager:
 
     def has_tools(self):
         return False
+
+
+class _FakeToolSkillsManager:
+    def get_skill_instructions(self):
+        return ""
+
+    def has_tools(self):
+        return True
+
+    def get_tools(self):
+        return [{
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "description": "Echo a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            },
+        }]
 
 
 async def _run_orchestrator_empty_response_retry_checks():
@@ -5622,6 +5885,220 @@ async def _run_orchestrator_empty_response_retry_checks():
 
     check("empty final content retries once", len(client.completions.calls) == 2)
     check("retry returns visible reply", result == "已根据已有结果继续处理")
+
+
+async def _run_orchestrator_deepseek_policy_checks():
+    client = _FakeClient([_FakeAIResponse("stop", "已完成")])
+    orchestrator = AgentOrchestrator(
+        client_factory=lambda: client,
+        runtime=AgentRuntimeConfig(
+            model="deepseek-v4-flash",
+            max_tokens=1000,
+            temperature=0.7,
+            timeout=180.0,
+        ),
+        skills_manager=_FakeSkillsManager(),
+        tool_executor=ToolExecutor(lambda name: None, frozenset()),
+        state_store=MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+
+    result = await orchestrator.run(
+        "帮我查一下",
+        AgentRequestContext(platform="qq", user_id="123"),
+    )
+
+    call = client.completions.calls[0]
+    check("DeepSeek orchestrator returns visible reply", result == "已完成")
+    check(
+        "DeepSeek orchestrator enables thinking",
+        call.get("extra_body") == {"thinking": {"type": "enabled"}}
+        and call.get("reasoning_effort") == "high",
+    )
+    check("DeepSeek orchestrator omits ignored temperature", "temperature" not in call)
+
+
+def test_orchestrator_deepseek_policy():
+    """Verify the main DeepSeek agent uses explicit high-effort thinking."""
+    print("\n🧪 AgentOrchestrator DeepSeek request policy")
+    asyncio.run(_run_orchestrator_deepseek_policy_checks())
+
+
+async def _run_orchestrator_reasoning_round_trip_checks():
+    tool_call = types.SimpleNamespace(
+        id="call_echo",
+        type="function",
+        function=types.SimpleNamespace(name="echo", arguments='{"value":"ok"}'),
+    )
+    client = _FakeClient([
+        _FakeAIResponse("tool_calls", "", [tool_call], reasoning_content=""),
+        _FakeAIResponse("stop", "工具完成"),
+    ])
+
+    async def echo(value):
+        return {"value": value}
+
+    orchestrator = AgentOrchestrator(
+        client_factory=lambda: client,
+        runtime=AgentRuntimeConfig(
+            model="deepseek-v4-flash",
+            max_tokens=1000,
+            temperature=0.7,
+            timeout=180.0,
+        ),
+        skills_manager=_FakeToolSkillsManager(),
+        tool_executor=ToolExecutor(lambda name: echo if name == "echo" else None, frozenset()),
+        state_store=MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+
+    result = await orchestrator.run(
+        "回显 ok",
+        AgentRequestContext(platform="qq", user_id="123"),
+    )
+
+    follow_up_messages = client.completions.calls[1]["messages"]
+    assistant_tool_message = next(
+        message for message in follow_up_messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    check("DeepSeek tool loop reaches final response", result == "工具完成")
+    check(
+        "all DeepSeek tool turns keep the thinking policy",
+        all(
+            call.get("extra_body") == {"thinking": {"type": "enabled"}}
+            and call.get("reasoning_effort") == "high"
+            and "temperature" not in call
+            for call in client.completions.calls
+        ),
+    )
+    check(
+        "DeepSeek tool loop preserves empty reasoning content",
+        "reasoning_content" in assistant_tool_message
+        and assistant_tool_message["reasoning_content"] == "",
+    )
+
+
+def test_orchestrator_reasoning_round_trip():
+    """DeepSeek tool turns must replay reasoning_content, including an empty value."""
+    print("\n🧪 AgentOrchestrator DeepSeek reasoning round trip")
+    asyncio.run(_run_orchestrator_reasoning_round_trip_checks())
+
+
+async def _run_orchestrator_tool_batch_validation_checks():
+    async def run_case(finish_reason, tool_calls):
+        executed = []
+
+        async def echo(value):
+            executed.append(value)
+            return {"value": value}
+
+        client = _FakeClient([_FakeAIResponse(finish_reason, "", tool_calls)])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="deepseek-v4-flash",
+                max_tokens=1000,
+                temperature=0.7,
+                timeout=180.0,
+                max_tokens_cap=1000,
+            ),
+            skills_manager=_FakeToolSkillsManager(),
+            tool_executor=ToolExecutor(lambda name: echo if name == "echo" else None, frozenset()),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        result = await orchestrator.run(
+            "回显",
+            AgentRequestContext(platform="qq", user_id="123"),
+        )
+        return result, executed
+
+    def tool_call(call_id, arguments, *, name="echo", call_type="function"):
+        return types.SimpleNamespace(
+            id=call_id,
+            type=call_type,
+            function=types.SimpleNamespace(name=name, arguments=arguments),
+        )
+
+    _, executed = await run_case("stop", [tool_call("call_stop", '{"value":"ok"}')])
+    check("tool calls with stop finish reason execute nothing", executed == [])
+
+    _, executed = await run_case("tool_calls", [
+        tool_call("call_valid", '{"value":"first"}'),
+        tool_call("call_invalid", '{"value":42}'),
+    ])
+    check("invalid tool argument makes the whole batch atomic", executed == [])
+
+    _, executed = await run_case("tool_calls", [
+        tool_call("call_duplicate", '{"value":"first"}'),
+        tool_call("call_duplicate", '{"value":"second"}'),
+    ])
+    check("duplicate tool ids execute nothing", executed == [])
+
+    _, executed = await run_case("tool_calls", [
+        tool_call(f"call_{index}", json.dumps({"value": str(index)}))
+        for index in range(9)
+    ])
+    check("oversized tool batches execute nothing", executed == [])
+
+    _, executed = await run_case("tool_calls", [
+        tool_call("call_known", '{"value":"first"}'),
+        tool_call("call_unknown", '{}', name="unknown"),
+    ])
+    check("unknown tool makes the whole batch atomic", executed == [])
+
+    executed = []
+
+    async def echo(value):
+        executed.append(value)
+        return {"value": value}
+
+    ordered_calls = [
+        tool_call("call_first", '{"value":"first"}'),
+        tool_call("call_second", '{"value":"second"}'),
+    ]
+    client = _FakeClient([
+        _FakeAIResponse("tool_calls", "", ordered_calls, reasoning_content="keep exactly"),
+        _FakeAIResponse("stop", "已完成"),
+    ])
+    orchestrator = AgentOrchestrator(
+        client_factory=lambda: client,
+        runtime=AgentRuntimeConfig(
+            model="deepseek-v4-flash",
+            max_tokens=1000,
+            temperature=0.7,
+            timeout=180.0,
+        ),
+        skills_manager=_FakeToolSkillsManager(),
+        tool_executor=ToolExecutor(lambda name: echo if name == "echo" else None, frozenset()),
+        state_store=MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+    result = await orchestrator.run(
+        "依次回显",
+        AgentRequestContext(platform="qq", user_id="123"),
+    )
+    follow_up = client.completions.calls[1]["messages"]
+    assistant_message = next(message for message in follow_up if message.get("role") == "assistant")
+    tool_messages = [message for message in follow_up if message.get("role") == "tool"]
+    check("valid tool batch executes sequentially", executed == ["first", "second"])
+    check("valid tool batch reaches final response", result == "已完成")
+    check(
+        "tool outputs retain call id order",
+        [message.get("tool_call_id") for message in tool_messages] == ["call_first", "call_second"],
+    )
+    check("tool batch replays reasoning exactly", assistant_message.get("reasoning_content") == "keep exactly")
+
+
+def test_orchestrator_tool_batch_validation():
+    """Invalid or incomplete tool-call batches must execute no tools."""
+    print("\n🧪 AgentOrchestrator tool-call batch validation")
+    asyncio.run(_run_orchestrator_tool_batch_validation_checks())
 
 
 def test_orchestrator_empty_response_retry():
@@ -6073,6 +6550,7 @@ if __name__ == "__main__":
     test_get_simple_word_query_words_uses_semantic_classifier()
     test_extract_explicit_reviewed_add_word()
     test_classify_simple_word_query_intent_calls_model()
+    test_remaining_llm_call_policies()
     test_draft_management_command_detection()
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
@@ -6173,11 +6651,15 @@ if __name__ == "__main__":
     test_batch_review_timeout_fallback_uses_contextual_pronunciation()
     test_batch_review_chunks_large_batches_and_isolates_failures()
     test_batch_review_retries_length_with_more_output_tokens()
+    test_batch_review_retries_incomplete_json_schema()
     test_llm_review_does_not_apply_phrase_pinyin_rules_to_css_entries()
     test_draft_encode_candidates_include_alternate_pronunciations()
     test_draft_encode_candidates_include_phrase_polyphone_candidates()
     test_tool_executor_draft_policy_guards()
     test_orchestrator_empty_response_retry()
+    test_orchestrator_deepseek_policy()
+    test_orchestrator_reasoning_round_trip()
+    test_orchestrator_tool_batch_validation()
     test_normalize_encode_response_codes_first()
     test_normalize_encode_response_infer_fallback()
     test_apply_candidate_occupancy_updates_recommendation()

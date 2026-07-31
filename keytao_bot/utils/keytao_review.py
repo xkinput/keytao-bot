@@ -26,6 +26,7 @@ from .keytao_encoding import (
     normalize_contextual_phrase_encoding,
     pinyin_to_phonetic_code,
 )
+from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 
 
 SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/"
@@ -1265,15 +1266,26 @@ async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
             api_key=config["api_key"],
             base_url=config["base_url"],
             timeout=config["timeout"],
+            max_retries=1,
         )
-        response = await client.chat.completions.create(
+        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+            {
+                "model": config["model"],
+                "temperature": 0.0,
+                "max_tokens": 700,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+                ],
+            },
+            thinking=False,
+            json_output=True,
+        ))
+        log_chat_usage(
+            logger,
+            response,
+            operation="entity_knowledge",
             model=config["model"],
-            temperature=0.0,
-            max_tokens=700,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
-            ],
         )
         if not response.choices:
             return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}

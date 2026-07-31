@@ -7,12 +7,30 @@ from typing import Any, Callable, Dict, List, Optional
 
 from nonebot.log import logger
 
+from keytao_bot.utils.llm_policy import (
+    is_deepseek_model,
+    log_chat_usage,
+    with_deepseek_chat_policy,
+)
+
 from .state import MemoryConversationStateStore, PendingToolConfirm
 from .tools import ToolContext, ToolExecutor
 
 
 class DuplicateToolCallAbort(Exception):
     pass
+
+
+class ToolCallValidationError(ValueError):
+    """Reject an incomplete or unsafe tool-call batch before any execution."""
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+_MAX_TOOL_CALLS_PER_RESPONSE = 8
+_MAX_TOOL_CALLS_PER_RUN = 40
 
 
 @dataclass(frozen=True)
@@ -104,18 +122,29 @@ class AgentOrchestrator:
         })
 
         tools = self._skills_manager.get_tools() if self._skills_manager.has_tools() else None
+        tool_schemas: Dict[str, Dict[str, Any]] = {}
+        for tool in tools or []:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if isinstance(function, dict):
+                tool_schemas[str(function.get("name") or "")] = function.get("parameters", {})
         conv_key = context.actor_key
         current_max_tokens = self._initial_max_tokens(message)
         seen_tool_calls: Dict[tuple, int] = {}
+        seen_tool_call_ids: set[str] = set()
+        total_tool_calls = 0
         empty_response_retries = 0
 
         for iteration in range(max_iterations):
-            call_kwargs: Dict = {
-                "model": self._runtime.model,
-                "messages": messages,
-                "max_tokens": current_max_tokens,
-                "temperature": self._runtime.temperature,
-            }
+            call_kwargs: Dict = with_deepseek_chat_policy(
+                {
+                    "model": self._runtime.model,
+                    "messages": messages,
+                    "max_tokens": current_max_tokens,
+                    "temperature": self._runtime.temperature,
+                },
+                thinking=True,
+                reasoning_effort="high",
+            )
             if tools:
                 call_kwargs["tools"] = tools
                 call_kwargs["tool_choice"] = "auto"
@@ -130,7 +159,8 @@ class AgentOrchestrator:
                 return "呜呜，AI 好像没有回复 qwq 要不再试一次？"
 
             choice = response.choices[0]
-            tool_call_count = len(choice.message.tool_calls or [])
+            response_tool_calls = choice.message.tool_calls or []
+            tool_call_count = len(response_tool_calls)
             content = choice.message.content or ""
             logger.info(
                 f"Model response: finish_reason={choice.finish_reason} "
@@ -149,7 +179,25 @@ class AgentOrchestrator:
                 logger.warning("Response truncated even at max cap")
                 return "呜呜，回复太长被截断了 qwq 请把任务拆小一点再试试～"
 
-            if not choice.message.tool_calls:
+            if choice.finish_reason not in {"stop", "tool_calls"}:
+                logger.error(
+                    "Refusing incomplete model response before tool execution: "
+                    f"finish_reason={choice.finish_reason}"
+                )
+                return "呜呜，AI 返回了未完成的结果 qwq 请稍后再试一次～"
+
+            if response_tool_calls and choice.finish_reason != "tool_calls":
+                logger.error(
+                    "Refusing tool calls with mismatched finish reason: "
+                    f"finish_reason={choice.finish_reason} tool_calls={tool_call_count}"
+                )
+                return "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～"
+
+            if choice.finish_reason == "tool_calls" and not response_tool_calls:
+                logger.error("Model returned finish_reason=tool_calls without any tool calls")
+                return "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～"
+
+            if not response_tool_calls:
                 if content.strip():
                     return content
                 if empty_response_retries < 1:
@@ -163,18 +211,37 @@ class AgentOrchestrator:
                 logger.error("Model returned empty final content twice")
                 return "呜呜，AI 返回了空回复 qwq 请再说一次要我怎么处理。"
 
-            parsed_tool_calls = self._parse_tool_calls(choice.message.tool_calls)
-            if parsed_tool_calls is None:
-                if current_max_tokens < self._runtime.max_tokens_cap:
+            try:
+                parsed_tool_calls = self._parse_tool_calls(
+                    response_tool_calls,
+                    tool_schemas,
+                    seen_tool_call_ids,
+                )
+            except ToolCallValidationError as error:
+                if error.retryable and current_max_tokens < self._runtime.max_tokens_cap:
                     current_max_tokens = min(current_max_tokens * 2, self._runtime.max_tokens_cap)
-                    logger.warning(f"Tool args truncated, retrying with max_tokens={current_max_tokens}")
+                    logger.warning(
+                        "Tool-call validation failed, retrying with "
+                        f"max_tokens={current_max_tokens}: {error}"
+                    )
                     messages.append({
                         "role": "user",
                         "content": "[系统] 你上一次生成的工具调用参数因过长被截断。请勿重新查询，直接根据已有数据重新生成完整的工具调用。",
                     })
                     continue
-                logger.error("Tool args truncated even at max cap")
+                logger.error(f"Refusing invalid tool-call batch: {error}")
                 return "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～"
+
+            if total_tool_calls + len(parsed_tool_calls) > _MAX_TOOL_CALLS_PER_RUN:
+                logger.error(
+                    "Refusing tool-call run over local limit: "
+                    f"current={total_tool_calls} requested={len(parsed_tool_calls)} "
+                    f"limit={_MAX_TOOL_CALLS_PER_RUN}"
+                )
+                return "呜呜，这次需要调用的工具太多了 qwq 请把任务拆小一点再试试～"
+
+            total_tool_calls += len(parsed_tool_calls)
+            seen_tool_call_ids.update(str(tc.id) for tc, _ in parsed_tool_calls)
 
             assistant_msg: Dict = {
                 "role": "assistant",
@@ -192,7 +259,9 @@ class AgentOrchestrator:
                 ],
             }
             reasoning_content = getattr(choice.message, 'reasoning_content', None)
-            if reasoning_content:
+            if is_deepseek_model(self._runtime.model):
+                assistant_msg["reasoning_content"] = reasoning_content or ""
+            elif reasoning_content is not None:
                 assistant_msg["reasoning_content"] = reasoning_content
             messages.append(assistant_msg)
 
@@ -285,22 +354,105 @@ class AgentOrchestrator:
         return max(self._runtime.max_tokens, min(line_count * 200 + 500, self._runtime.max_tokens_cap))
 
     def _log_usage(self, response: Any) -> None:
-        usage = getattr(response, "usage", None)
-        if not usage:
-            return
-        cache_hit = getattr(usage, 'prompt_cache_hit_tokens', 0) or 0
-        cache_miss = getattr(usage, 'prompt_cache_miss_tokens', 0) or 0
-        if cache_hit or cache_miss:
-            logger.info(f"Cache: hit={cache_hit} miss={cache_miss} tokens")
+        log_chat_usage(
+            logger,
+            response,
+            operation="main_agent",
+            model=self._runtime.model,
+        )
 
-    def _parse_tool_calls(self, tool_calls: List[Any]) -> Optional[List[tuple]]:
-        parsed_tool_calls = []
+    def _parse_tool_calls(
+        self,
+        tool_calls: List[Any],
+        tool_schemas: Dict[str, Dict[str, Any]],
+        seen_tool_call_ids: set[str],
+    ) -> List[tuple]:
+        if len(tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
+            raise ToolCallValidationError(
+                f"too many tool calls: {len(tool_calls)} > {_MAX_TOOL_CALLS_PER_RESPONSE}"
+            )
+
+        parsed_tool_calls: List[tuple] = []
+        batch_ids: set[str] = set()
         for tool_call in tool_calls:
+            if getattr(tool_call, "type", None) != "function":
+                raise ToolCallValidationError("tool call type must be function")
+
+            call_id = str(getattr(tool_call, "id", "") or "").strip()
+            if not call_id:
+                raise ToolCallValidationError("tool call id is missing")
+            if call_id in batch_ids or call_id in seen_tool_call_ids:
+                raise ToolCallValidationError(f"duplicate tool call id: {call_id}")
+
+            function = getattr(tool_call, "function", None)
+            fn_name = str(getattr(function, "name", "") or "").strip()
+            if not fn_name or fn_name not in tool_schemas:
+                raise ToolCallValidationError(f"unknown tool: {fn_name or '(missing)'}")
+
+            raw_arguments = getattr(function, "arguments", None)
+            if not isinstance(raw_arguments, str):
+                raise ToolCallValidationError("tool arguments must be a JSON object string")
             try:
-                parsed_tool_calls.append((tool_call, json.loads(tool_call.function.arguments)))
-            except json.JSONDecodeError:
-                return None
+                arguments = json.loads(raw_arguments)
+            except json.JSONDecodeError as error:
+                raise ToolCallValidationError(
+                    f"invalid JSON arguments for {fn_name}: {error}",
+                    retryable=True,
+                ) from error
+            if not isinstance(arguments, dict):
+                raise ToolCallValidationError(f"tool arguments for {fn_name} must be an object")
+
+            schema_error = self._validate_json_schema(arguments, tool_schemas[fn_name], "arguments")
+            if schema_error:
+                raise ToolCallValidationError(f"invalid arguments for {fn_name}: {schema_error}")
+
+            batch_ids.add(call_id)
+            parsed_tool_calls.append((tool_call, arguments))
         return parsed_tool_calls
+
+    @classmethod
+    def _validate_json_schema(cls, value: Any, schema: Any, path: str) -> Optional[str]:
+        """Validate the JSON-Schema subset used by the bot's function tools."""
+        if not isinstance(schema, dict):
+            return None
+
+        expected_type = schema.get("type")
+        type_matches = {
+            "object": isinstance(value, dict),
+            "array": isinstance(value, list),
+            "string": isinstance(value, str),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+            "boolean": isinstance(value, bool),
+        }
+        if expected_type in type_matches and not type_matches[expected_type]:
+            return f"{path} must be {expected_type}"
+
+        allowed_values = schema.get("enum")
+        if isinstance(allowed_values, list) and value not in allowed_values:
+            return f"{path} must be one of {allowed_values}"
+
+        if expected_type == "object" and isinstance(value, dict):
+            required = schema.get("required") if isinstance(schema.get("required"), list) else []
+            missing = [name for name in required if name not in value]
+            if missing:
+                return f"{path} is missing required fields: {', '.join(map(str, missing))}"
+            properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+            for name, child_value in value.items():
+                child_schema = properties.get(name)
+                if child_schema is None:
+                    continue
+                error = cls._validate_json_schema(child_value, child_schema, f"{path}.{name}")
+                if error:
+                    return error
+
+        if expected_type == "array" and isinstance(value, list) and isinstance(schema.get("items"), dict):
+            for index, child_value in enumerate(value):
+                error = cls._validate_json_schema(child_value, schema["items"], f"{path}[{index}]")
+                if error:
+                    return error
+
+        return None
 
     async def _call_tool_once(
         self,

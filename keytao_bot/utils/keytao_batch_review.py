@@ -23,6 +23,7 @@ from .keytao_review import (
     lookup_codes,
     prepare_reviewed_word,
 )
+from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 
 
 ReviewItem = Dict[str, Any]
@@ -1039,6 +1040,50 @@ def _merge_raw_chunk_reviews(reviews: Sequence[Dict[str, Any]]) -> Dict[str, Any
     return merged
 
 
+def _validate_llm_review_payload(
+    payload: Dict[str, Any],
+    items: Sequence[ReviewItem],
+) -> Dict[str, Any]:
+    """Require one valid review decision for every requested PR before accepting output."""
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        raise ValueError("review JSON must contain an items array")
+
+    expected_ids = {int(item["id"]) for item in items}
+    received_ids: set[int] = set()
+    allowed_statuses = {"pass", "attention", "manual_review"}
+    for index, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, dict):
+            raise ValueError(f"review items[{index}] must be an object")
+        raw_pr_id = raw_item.get("prId")
+        if not isinstance(raw_pr_id, int) or isinstance(raw_pr_id, bool):
+            raise ValueError(f"review items[{index}].prId must be an integer")
+        pr_id = raw_pr_id
+        if pr_id not in expected_ids:
+            raise ValueError(f"review contains unexpected PR id: {pr_id}")
+        if pr_id in received_ids:
+            raise ValueError(f"review contains duplicate PR id: {pr_id}")
+        status = _string(raw_item.get("status")).lower()
+        if status not in allowed_statuses:
+            raise ValueError(f"review item {pr_id} has invalid status: {status or '(missing)'}")
+        if not isinstance(raw_item.get("title"), str) or not raw_item["title"].strip():
+            raise ValueError(f"review item {pr_id} must have a non-empty title")
+        for field in ("reasons", "suggestions", "evidence"):
+            values = raw_item.get(field)
+            if (
+                not isinstance(values, list)
+                or not values
+                or any(not isinstance(value, str) or not value.strip() for value in values)
+            ):
+                raise ValueError(f"review item {pr_id} must have non-empty {field}")
+        received_ids.add(pr_id)
+
+    missing_ids = sorted(expected_ids - received_ids)
+    if missing_ids:
+        raise ValueError(f"review is missing PR ids: {missing_ids}")
+    return payload
+
+
 async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: Dict[str, Any], local_review: Optional[Dict[str, Any]], focus_pr_id: Optional[int]) -> Dict[str, Any]:
     config = _llm_config()
     if not config["api_key"] or AsyncOpenAI is None:
@@ -1048,6 +1093,7 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
         api_key=config["api_key"],
         base_url=config["base_url"],
         timeout=config["timeout"],
+        max_retries=0,
     )
     system_prompt = (
         "你是键道输入法审词员喵喵。你必须根据给定证据做保守、专业的中文词语审核。"
@@ -1132,14 +1178,25 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
                 "上一次响应为空或不是合法 JSON。现在必须重新生成一个完整 JSON 对象，"
                 "不要解释，不要省略 items；进一步压缩文字，每项只写最关键的一条理由和建议。"
             )
-        response = await client.chat.completions.create(
+        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+            {
+                "model": config["model"],
+                "temperature": min(config["temperature"], 0.2),
+                "max_tokens": current_max_tokens,
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": user_content},
+                ],
+            },
+            thinking=True,
+            reasoning_effort="high",
+            json_output=True,
+        ))
+        log_chat_usage(
+            logger,
+            response,
+            operation="batch_review",
             model=config["model"],
-            temperature=min(config["temperature"], 0.2),
-            max_tokens=current_max_tokens,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_content},
-            ],
         )
         choice = response.choices[0] if response.choices else None
         finish_reason = _string(getattr(choice, "finish_reason", "")) if choice else "no_choices"
@@ -1154,23 +1211,29 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
             f"content_len={len(content)} reasoning_len={len(reasoning_content)} max_tokens={current_max_tokens}"
         )
 
-        if not content:
-            last_error = RuntimeError(f"喵喵 LLM 没有返回审查内容（finish_reason={finish_reason or 'unknown'}）")
+        if finish_reason != "stop":
+            last_error = RuntimeError(
+                "喵喵 LLM 审查响应未完整结束"
+                f"（finish_reason={finish_reason or 'unknown'}）"
+            )
             if finish_reason == "length" and current_max_tokens < config["max_tokens_cap"]:
                 current_max_tokens = min(current_max_tokens * 2, config["max_tokens_cap"])
             continue
 
+        if not content:
+            last_error = RuntimeError(f"喵喵 LLM 没有返回审查内容（finish_reason={finish_reason or 'unknown'}）")
+            continue
+
         try:
-            return _extract_json_object(content)
+            parsed = _extract_json_object(content)
+            return _validate_llm_review_payload(parsed, items)
         except Exception as error:
             preview = content[:600].replace("\n", "\\n")
             logger.warning(
-                "KeyTao LLM batch review returned invalid JSON "
+                "KeyTao LLM batch review returned invalid JSON or schema "
                 f"attempt={attempt}: {error}; preview={preview}"
             )
             last_error = error
-            if finish_reason == "length" and current_max_tokens < config["max_tokens_cap"]:
-                current_max_tokens = min(current_max_tokens * 2, config["max_tokens_cap"])
 
     raise RuntimeError(str(last_error or "喵喵 LLM 未返回可解析的审查 JSON"))
 
