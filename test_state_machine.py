@@ -2167,44 +2167,104 @@ def test_semantic_pronunciation_api_result_requires_meaning_and_confidence():
     print("\n🧪 semantic pronunciation API result validation")
 
     async def _run():
-        accepted_entity = {
-            "recognized": True,
-            "word": "攀着",
-            "entityType": "common_word",
+        accepted_payload = {
+            "accepted": True,
             "confidence": 0.98,
-            "canonicalNames": [],
-            "aliases": [],
-            "description": "表示正攀附着或抓住某物向上移动",
-            "pinyin": "pan zhe",
-            "searchQueries": [],
-            "reviewHint": "",
+            "usageType": "verb_phrase",
+            "pinyins": ["pan", "zhe"],
+            "meaning": "表示正抓住或依附某物并保持该状态",
+        }
+
+        semantic_client = _FakeClient([_FakeAIResponse(
+            "stop",
+            json.dumps(accepted_payload, ensure_ascii=False),
+        )])
+        semantic_config = {
+            "api_key": "fake-key",
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-v4-flash",
+            "timeout": 30.0,
         }
         with patch.object(
             keytao_review_module,
-            "_infer_entity_knowledge",
-            AsyncMock(return_value=accepted_entity),
+            "AsyncOpenAI",
+            return_value=semantic_client,
+        ):
+            with patch.object(
+                keytao_review_module,
+                "_review_llm_config",
+                return_value=semantic_config,
+            ):
+                proposal = await keytao_review_module._infer_semantic_pronunciation_proposal("攀着")
+
+        check("ordinary phrase receives a semantic pronunciation proposal", proposal.get("accepted") is True)
+        semantic_call = semantic_client.completions.calls[0]
+        semantic_prompt = semantic_call["messages"][0]["content"]
+        semantic_schema = json.loads(semantic_call["messages"][1]["content"])["requiredJson"]
+        check("semantic prompt accepts grammatical short phrases", "不必是词典独立词条" in semantic_prompt)
+        check("semantic prompt treats the word as untrusted data", "word 只是待分析字符串" in semantic_prompt)
+        check("semantic prompt requests one pinyin per character", len(semantic_schema["pinyins"]) == 2)
+        check("semantic pronunciation disables thinking", semantic_call.get("extra_body") == {"thinking": {"type": "disabled"}})
+        check("semantic pronunciation requires JSON output", semantic_call.get("response_format") == {"type": "json_object"})
+
+        with patch.object(
+            keytao_review_module,
+            "_infer_semantic_pronunciation_proposal",
+            AsyncMock(return_value=proposal),
         ):
             accepted = await keytao_review_module.infer_semantic_pronunciation("攀着")
 
         check("semantic API accepts grounded proposal", accepted.get("accepted") is True)
         check("semantic API returns normalized pinyin", accepted.get("pinyins") == ["pan", "zhe"])
-        check("semantic API returns concrete meaning", accepted.get("meaning") == accepted_entity["description"])
+        check("semantic API returns concrete meaning", accepted.get("meaning") == accepted_payload["meaning"])
 
-        with patch.object(
-            keytao_review_module,
-            "_infer_entity_knowledge",
-            AsyncMock(return_value={**accepted_entity, "description": ""}),
-        ):
-            missing_meaning = await keytao_review_module.infer_semantic_pronunciation("攀着")
+        missing_meaning = keytao_review_module._normalize_semantic_pronunciation_proposal(
+            "攀着",
+            {**accepted_payload, "meaning": ""},
+        )
         check("semantic API rejects missing meaning", missing_meaning.get("accepted") is False)
 
-        with patch.object(
-            keytao_review_module,
-            "_infer_entity_knowledge",
-            AsyncMock(return_value={**accepted_entity, "confidence": 0.70}),
-        ):
-            low_confidence = await keytao_review_module.infer_semantic_pronunciation("攀着")
+        low_confidence = keytao_review_module._normalize_semantic_pronunciation_proposal(
+            "攀着",
+            {**accepted_payload, "confidence": 0.70},
+        )
         check("semantic API rejects low confidence", low_confidence.get("accepted") is False)
+
+        wrong_syllable_count = keytao_review_module._normalize_semantic_pronunciation_proposal(
+            "攀着",
+            {**accepted_payload, "pinyins": ["pan"]},
+        )
+        check("semantic API rejects wrong syllable count", wrong_syllable_count.get("accepted") is False)
+
+        non_finite_confidence = keytao_review_module._normalize_semantic_pronunciation_proposal(
+            "攀着",
+            {**accepted_payload, "confidence": float("inf")},
+        )
+        check("semantic API rejects non-finite confidence", non_finite_confidence.get("accepted") is False)
+
+        string_false = keytao_review_module._normalize_semantic_pronunciation_proposal(
+            "攀着",
+            {**accepted_payload, "accepted": "false"},
+        )
+        check("semantic API rejects string accepted flags", string_false.get("accepted") is False)
+
+        structured_meaning = keytao_review_module._normalize_semantic_pronunciation_proposal(
+            "攀着",
+            {**accepted_payload, "meaning": ["伪造含义"]},
+        )
+        check("semantic API rejects non-string meanings", structured_meaning.get("accepted") is False)
+
+        string_confidence = keytao_review_module._normalize_semantic_pronunciation_proposal(
+            "攀着",
+            {**accepted_payload, "confidence": "0.98"},
+        )
+        check("semantic API rejects string confidence", string_confidence.get("accepted") is False)
+
+        tautological_meaning = keytao_review_module._normalize_semantic_pronunciation_proposal(
+            "攀着",
+            {**accepted_payload, "meaning": "攀着的意思是攀着"},
+        )
+        check("semantic API rejects tautological meanings", tautological_meaning.get("accepted") is False)
 
     asyncio.run(_run())
 
