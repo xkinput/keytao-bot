@@ -5272,6 +5272,654 @@ def test_quoted_self_add_and_submit_requires_live_ticket():
     asyncio.run(_run())
 
 
+def test_bot_quoted_candidate_binds_short_add_submit_for_qq_and_telegram():
+    """A bot-authored quote supplies the exact word/code target for the current actor."""
+    print("\n🧪 bot quote binds short add-submit on QQ and Telegram")
+
+    prompt = """词库暂无收录「窨茶」，先审读音和编码候选：
+
+审词：读音 xun cha；来源 本喵整词语境判断；自动审核：该词需管理员审核
+候选编码:
+1. xwws — 已有「巡查」
+2. xwwso — ✅ 推荐（空位）
+3. xwwsoi — 空位
+
+是否以编码 xwwso 将「窨茶」加入草稿？可回复编号、编码，或「都加」。"""
+    referenced_state = _parse_pending_state_from_response(prompt)
+
+    class ReplyEvent:
+        original_message = []
+        message = original_message
+
+        @staticmethod
+        def get_plaintext():
+            return "添加并提交"
+
+    class HandlerBot:
+        pass
+
+    async def _run_case(platform, mentioned_user_ids):
+        user_id = f"{platform}-quoted-actor"
+        is_private = platform == "telegram"
+        memory_context = ChatMemoryContext(
+            platform=platform,
+            user_id=user_id,
+            space_type="private" if is_private else "group",
+            space_id="" if is_private else f"{platform}-quoted-group",
+            speaker_name="Rea",
+        )
+        reply_reference = ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=True,
+            sender_id="bot-id",
+            sender_name="喵喵",
+            text=prompt,
+            mentioned_user_ids=mentioned_user_ids,
+        )
+        store = MemoryConversationStateStore()
+        coordinator = DraftOperationCoordinator()
+        schedule = MagicMock(return_value=True)
+        main_model = AsyncMock(return_value="unexpected main-model fallback")
+        classifier = AsyncMock(return_value=MessageCommandIntent())
+        finish = AsyncMock(side_effect=FinishedException())
+        revalidate = AsyncMock(return_value=referenced_state)
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(openai_chat_module, "draft_operation_coordinator", coordinator),
+            patch.object(openai_chat_module.ai_chat, "finish", finish),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=reply_reference),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=memory_context),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_classify_message_command_intent",
+                classifier,
+            ),
+            patch.object(
+                openai_chat_module,
+                "_revalidate_referenced_add_pending",
+                revalidate,
+            ),
+            patch.object(
+                openai_chat_module,
+                "_schedule_background_draft_operation",
+                schedule,
+            ),
+            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(openai_chat_module, "get_ai_response_core", main_model),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+        ):
+            try:
+                await openai_chat_module._handle_ai_chat_serialized(
+                    HandlerBot(),
+                    ReplyEvent(),
+                    platform,
+                    user_id,
+                )
+            except FinishedException:
+                pass
+
+        operation = coordinator.get(memory_context.conversation_address)
+        check(f"{platform} bot quote is revalidated", revalidate.await_count == 1)
+        check(f"{platform} short quote schedules own add-submit", schedule.call_count == 1)
+        check(
+            f"{platform} quote keeps exact target",
+            operation is not None
+            and operation.word == "窨茶"
+            and operation.code == "xwwso",
+        )
+        check(f"{platform} quote bypasses main model", main_model.await_count == 0)
+        check(f"{platform} quote bypasses intent model", classifier.await_count == 0)
+
+    async def _run():
+        check("quoted candidate parsed", isinstance(referenced_state, PendingAddWord))
+        await _run_case("qq", ("qq-quoted-actor",))
+        await _run_case("telegram", ())
+
+    asyncio.run(_run())
+
+
+def test_queued_bot_quote_duplicate_is_idempotent():
+    """A duplicate quoted command must not rebuild a ticket while its write is queued."""
+    print("\n🧪 queued bot quote duplicate is idempotent")
+
+    prompt = """词库暂无收录「窨茶」，先审读音和编码候选：
+
+审词：读音 xun cha；来源 本喵整词语境判断；自动审核：该词需管理员审核
+候选编码:
+1. xwws — 已有「巡查」
+2. xwwso — ✅ 推荐（空位）
+3. xwwsoi — 空位
+
+是否以编码 xwwso 将「窨茶」加入草稿？可回复编号、编码，或「都加」。"""
+    referenced_state = _parse_pending_state_from_response(prompt)
+
+    class ReplyEvent:
+        original_message = []
+        message = original_message
+
+        @staticmethod
+        def get_plaintext():
+            return "添加并提交"
+
+    class HandlerBot:
+        pass
+
+    async def _run():
+        user_id = "queued-quoted-actor"
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id=user_id,
+            space_type="group",
+            space_id="queued-quoted-group",
+            speaker_name="Rea",
+        )
+        reply_reference = ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=True,
+            sender_id="bot-id",
+            sender_name="喵喵",
+            text=prompt,
+            mentioned_user_ids=(user_id,),
+        )
+        store = MemoryConversationStateStore()
+        coordinator = DraftOperationCoordinator()
+        schedule = MagicMock(return_value=True)
+        revalidate = AsyncMock(return_value=referenced_state)
+        finish = AsyncMock(side_effect=FinishedException())
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(openai_chat_module, "draft_operation_coordinator", coordinator),
+            patch.object(openai_chat_module.ai_chat, "finish", finish),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=reply_reference),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=memory_context),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_classify_message_command_intent",
+                AsyncMock(return_value=MessageCommandIntent()),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_revalidate_referenced_add_pending",
+                revalidate,
+            ),
+            patch.object(
+                openai_chat_module,
+                "_schedule_background_draft_operation",
+                schedule,
+            ),
+            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(
+                openai_chat_module,
+                "get_ai_response_core",
+                AsyncMock(return_value="unexpected main-model fallback"),
+            ),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+        ):
+            for _ in range(2):
+                try:
+                    await openai_chat_module._handle_ai_chat_serialized(
+                        HandlerBot(),
+                        ReplyEvent(),
+                        "qq",
+                        user_id,
+                    )
+                except FinishedException:
+                    pass
+
+        operation = coordinator.get(memory_context.conversation_address)
+        check("first quote is revalidated once", revalidate.await_count == 1)
+        check("duplicate quote schedules no second write", schedule.call_count == 1)
+        check(
+            "original operation remains queued",
+            operation is not None and operation.status == "queued",
+        )
+        check(
+            "duplicate quote leaves no replacement pending",
+            store.get_record(memory_context.conversation_address) is None,
+        )
+        check("duplicate quote gets one active-operation reply", finish.await_count == 1)
+
+    asyncio.run(_run())
+
+
+def test_unquoted_short_add_submit_requires_full_target_binding():
+    """Without a bot quote, a short mutation phrase cannot supply word/code authority."""
+    print("\n🧪 unquoted short add-submit requires full target")
+
+    async def _run():
+        state = PendingAddWord(
+            word="窨茶",
+            recommended_code="xwwso",
+            candidates=[("xwws", True), ("xwwso", False)],
+        )
+        conv_key = ConversationAddress.group("qq", "quoted-group", "quoted-actor")
+        space_key = ("qq", "qq:group:quoted-group")
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        openai_chat_module.conversation_state_store = store
+        store.set(conv_key, state, space_key=space_key, owner_label="Rea")
+        execute = AsyncMock(return_value="unexpected mutation")
+        try:
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_message_command_intent",
+                    AsyncMock(return_value=MessageCommandIntent(
+                        intent="pending_add_and_submit",
+                        confidence=1.0,
+                    )),
+                ),
+                patch.object(
+                    openai_chat_module,
+                    "_execute_add_to_draft_and_submit",
+                    execute,
+                ),
+            ):
+                result = await openai_chat_module.handle_pending_message_core(
+                    "添加并提交",
+                    "qq",
+                    "quoted-actor",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Rea",
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("unquoted short command executes no mutation", execute.await_count == 0)
+        check(
+            "unquoted short command requests complete target",
+            result is not None and "窨茶" in result and "xwwso" in result and "完整" in result,
+        )
+
+    asyncio.run(_run())
+
+
+def test_inline_unquoted_add_submit_requires_target_but_full_command_runs():
+    """The adapter handler must apply the same quote/target rule as the core helper."""
+    print("\n🧪 inline unquoted add-submit target binding")
+
+    class HandlerBot:
+        pass
+
+    class HandlerEvent:
+        original_message = []
+        message = original_message
+
+        def __init__(self, text):
+            self.text = text
+
+        def get_plaintext(self):
+            return self.text
+
+    async def _run_case(text, should_schedule):
+        user_id = "inline-target-actor"
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id=user_id,
+            space_type="group",
+            space_id="inline-target-group",
+            speaker_name="Rea",
+        )
+        state = PendingAddWord(
+            word="窨茶",
+            recommended_code="xwwso",
+            candidates=[("xwws", True), ("xwwso", False)],
+        )
+        store = MemoryConversationStateStore()
+        store.set(
+            memory_context.conversation_address,
+            state,
+            space_key=("qq", memory_context.space_scope_id),
+            owner_label="Rea",
+        )
+        coordinator = DraftOperationCoordinator()
+        schedule = MagicMock(return_value=True)
+        main_model = AsyncMock(return_value="unexpected main-model fallback")
+        finish = AsyncMock(side_effect=FinishedException())
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(openai_chat_module, "draft_operation_coordinator", coordinator),
+            patch.object(openai_chat_module.ai_chat, "finish", finish),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=ReplyReferenceInfo()),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=memory_context),
+            ),
+            patch.object(openai_chat_module, "OPENAI_API_KEY", ""),
+            patch.object(
+                openai_chat_module,
+                "_schedule_background_draft_operation",
+                schedule,
+            ),
+            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(openai_chat_module, "get_ai_response_core", main_model),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+        ):
+            try:
+                await openai_chat_module._handle_ai_chat_serialized(
+                    HandlerBot(),
+                    HandlerEvent(text),
+                    "qq",
+                    user_id,
+                )
+            except FinishedException:
+                pass
+
+        operation = coordinator.get(memory_context.conversation_address)
+        if should_schedule:
+            check("full target command schedules mutation", schedule.call_count == 1)
+            check(
+                "full target command keeps exact operation",
+                operation is not None
+                and operation.word == "窨茶"
+                and operation.code == "xwwso",
+            )
+        else:
+            response = str(finish.await_args.args[0]) if finish.await_args else ""
+            check("inline short command schedules no mutation", schedule.call_count == 0)
+            check(
+                "inline short command returns exact full example",
+                "添加 窨茶 xwwso 并提交" in response,
+            )
+            check(
+                "inline short command preserves pending target",
+                store.get(memory_context.conversation_address) is state,
+            )
+        check("inline target flow bypasses main model", main_model.await_count == 0)
+
+    async def _run():
+        await _run_case("添加并提交", False)
+        await _run_case("添加 窨茶 xwwso 并提交", True)
+
+    asyncio.run(_run())
+
+
+def test_target_bound_add_submit_rejects_questions_negation_and_substrings():
+    """Only the canonical exact word/code command can replace a native quote."""
+    print("\n🧪 target-bound add-submit negative syntax")
+    state = PendingAddWord(
+        word="窨茶",
+        recommended_code="xwwso",
+        candidates=[("xwwso", False)],
+    )
+    check(
+        "canonical full command is accepted",
+        openai_chat_module._is_target_bound_add_and_submit_request(
+            "添加 窨茶 xwwso 并提交",
+            state,
+        ),
+    )
+    check(
+        "plain short command is recognized but quoted prose is not",
+        openai_chat_module._is_short_add_and_submit_request("添加并提交")
+        and not openai_chat_module._is_short_add_and_submit_request("“添加并提交”"),
+    )
+    mixed_case_state = PendingAddWord(
+        word="DeepSeek",
+        recommended_code="dsko",
+        candidates=[("dsko", False)],
+    )
+    check(
+        "mixed-case word target is accepted exactly",
+        openai_chat_module._is_target_bound_add_and_submit_request(
+            "添加 DeepSeek DSKO 并提交",
+            mixed_case_state,
+        ),
+    )
+    rejected = (
+        "如何添加窨茶 xwwso 并提交",
+        "窨茶 xwwso 为什么不能添加，我不想提交",
+        "不要添加窨茶 xwwso 并提交",
+        "添加窨茶叶 xwwso 并提交",
+        "添加窨茶 xwwso 并提交吗",
+        "引用“添加窨茶 xwwso 并提交”",
+    )
+    check(
+        "questions negation quotes and word substrings are rejected",
+        all(
+            not openai_chat_module._is_target_bound_add_and_submit_request(text, state)
+            for text in rejected
+        ),
+    )
+
+
+def test_cross_user_bot_quote_creates_only_current_actor_operation():
+    """A bot quote is a target capability, never authority over the original actor."""
+    print("\n🧪 cross-user bot quote stays on current actor")
+
+    prompt = """词库暂无收录「窨茶」，先审读音和编码候选：
+
+审词：读音 xun cha；来源 本喵整词语境判断；自动审核：该词需管理员审核
+候选编码:
+1. xwws — 已有「巡查」
+2. xwwso — ✅ 推荐（空位）
+
+是否以编码 xwwso 将「窨茶」加入草稿？可回复编号、编码，或「都加」。"""
+    referenced_state = _parse_pending_state_from_response(prompt)
+
+    class ReplyEvent:
+        original_message = []
+        message = original_message
+
+        @staticmethod
+        def get_plaintext():
+            return "添加并提交"
+
+    class HandlerBot:
+        pass
+
+    async def _run():
+        source_user = "source-user"
+        current_user = "current-user"
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id=current_user,
+            space_type="group",
+            space_id="cross-quote-group",
+            speaker_name="Current",
+        )
+        source_key = ConversationAddress.group(
+            "qq",
+            "cross-quote-group",
+            source_user,
+        )
+        space_key = ("qq", memory_context.space_scope_id)
+        store = MemoryConversationStateStore()
+        store.set(source_key, referenced_state, space_key=space_key, owner_label="Source")
+        source_record = store.get_record(source_key)
+        coordinator = DraftOperationCoordinator()
+        schedule = MagicMock(return_value=True)
+        revalidate = AsyncMock(return_value=referenced_state)
+        perform = AsyncMock(return_value=DraftActionResult("done", success=True))
+        finish = AsyncMock(side_effect=FinishedException())
+        reply_reference = ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=True,
+            sender_id="bot-id",
+            sender_name="喵喵",
+            text=prompt,
+            mentioned_user_ids=(source_user,),
+        )
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(openai_chat_module, "draft_operation_coordinator", coordinator),
+            patch.object(openai_chat_module.ai_chat, "finish", finish),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=reply_reference),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=memory_context),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_classify_message_command_intent",
+                AsyncMock(return_value=MessageCommandIntent()),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_revalidate_referenced_add_pending",
+                revalidate,
+            ),
+            patch.object(
+                openai_chat_module,
+                "_perform_add_to_draft_and_submit",
+                perform,
+            ),
+            patch.object(
+                openai_chat_module,
+                "_schedule_background_draft_operation",
+                schedule,
+            ),
+            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(openai_chat_module, "get_ai_response_core", AsyncMock()),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+        ):
+            try:
+                await openai_chat_module._handle_ai_chat_serialized(
+                    HandlerBot(),
+                    ReplyEvent(),
+                    "qq",
+                    current_user,
+                )
+            except FinishedException:
+                pass
+            await schedule.call_args.args[1]()
+
+        current_operation = coordinator.get(memory_context.conversation_address)
+        check("cross-user quote schedules current actor only", schedule.call_count == 1)
+        check(
+            "cross-user quote operation owner is current actor",
+            current_operation is not None
+            and current_operation.owner_key.actor_id == current_user,
+        )
+        check(
+            "quote revalidation uses current actor",
+            revalidate.await_args.args[1:] == ("qq", current_user),
+        )
+        check(
+            "background write uses current actor",
+            perform.await_args.args[:4]
+            == ("窨茶", "xwwso", "qq", current_user),
+        )
+        check(
+            "source actor pending record remains untouched",
+            store.get_record(source_key) is source_record
+            and not source_record.execution_id,
+        )
+
+    asyncio.run(_run())
+
+
+def test_revalidated_quote_requires_current_semantic_snapshot():
+    """Semantic reading, recommendation, and occupancy must still match the quote."""
+    print("\n🧪 quoted semantic candidate revalidation")
+    state = PendingAddWord(
+        word="窨茶",
+        recommended_code="xwwso",
+        candidates=[("xwws", True), ("xwwso", False), ("xwwsoi", False)],
+        pronunciation_codes={
+            "xwws": "xun cha",
+            "xwwso": "xun cha",
+            "xwwsoi": "xun cha",
+        },
+    )
+    base_review = {
+        "success": True,
+        "word": "窨茶",
+        "recommendedCode": "xwwso",
+        "pronunciations": [{
+            "pinyin": "xun cha",
+            "sourceSummary": "本喵整词语境判断",
+            "recommendedCode": "xwwso",
+            "candidateStatuses": [
+                {"code": "xwws", "occupied": True, "words": ["巡查"]},
+                {"code": "xwwso", "occupied": False},
+                {"code": "xwwsoi", "occupied": False},
+            ],
+        }],
+        "preSubmitAudit": {
+            "success": True,
+            "autoApprove": False,
+            "issues": ["缺少权威整词读音来源"],
+        },
+    }
+
+    async def _revalidate(review):
+        with patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(review, ensure_ascii=False)),
+        ):
+            return await openai_chat_module._revalidate_referenced_add_pending(
+                state,
+                "telegram",
+                "semantic-actor",
+            )
+
+    async def _run():
+        current = await _revalidate(base_review)
+        check(
+            "current xun semantic snapshot is accepted",
+            isinstance(current, PendingAddWord)
+            and current.recommended_code == "xwwso",
+        )
+
+        unresolved = dict(base_review, pronunciationUnresolved=True)
+        check("unresolved pronunciation is rejected", await _revalidate(unresolved) is None)
+
+        changed_recommendation = json.loads(json.dumps(base_review, ensure_ascii=False))
+        changed_recommendation["recommendedCode"] = "xwwsoi"
+        changed_recommendation["pronunciations"][0]["recommendedCode"] = "xwwsoi"
+        check(
+            "changed recommendation is rejected",
+            await _revalidate(changed_recommendation) is None,
+        )
+
+        changed_reading = json.loads(json.dumps(base_review, ensure_ascii=False))
+        changed_reading["pronunciations"][0]["pinyin"] = "yin cha"
+        check(
+            "same code with a changed reading is rejected",
+            await _revalidate(changed_reading) is None,
+        )
+
+        occupied = json.loads(json.dumps(base_review, ensure_ascii=False))
+        occupied["pronunciations"][0]["candidateStatuses"][1]["occupied"] = True
+        check("changed occupancy is rejected", await _revalidate(occupied) is None)
+
+    asyncio.run(_run())
+
+
 def test_conversation_lock_serializes_same_actor_messages():
     """Verify one actor's messages cannot pop the same pending state concurrently."""
     print("\n🧪 conversation message lock serializes same actor")
@@ -5494,6 +6142,10 @@ def test_active_operation_message_preserves_second_word():
     check("message names second word", "小酥肉" in message)
     check("message says second candidate is preserved", "候选仍为你保留" in message)
     check("message explains draft collision guard", "同一份草稿" in message)
+    check(
+        "message gives an executable full follow-up command",
+        "添加 小酥肉 xsri 并提交" in message,
+    )
 
 
 def test_structured_add_submit_keeps_confirmation_out_of_chat_state():
@@ -10285,6 +10937,11 @@ def test_pending_pronunciation_correction_updates_live_ticket():
         encoding = {
             "success": True,
             "word": "窨茶",
+            "chars": [
+                {"char": "窨", "pinyin": "yìn"},
+                {"char": "茶", "pinyin": "chá"},
+            ],
+            "phrasePinyins": ["yin", "cha"],
             "candidateCodes": ["xwws", "xwwso", "xwwsoi"],
             "alternatePhrasePronunciationCodes": [{
                 "char": "窨",
@@ -10365,6 +11022,29 @@ def test_pending_pronunciation_correction_updates_live_ticket():
                 exception_record is not None and not exception_record.execution_id,
             )
 
+            incomplete_encoding = dict(encoding)
+            incomplete_encoding.pop("chars", None)
+            incomplete_encoding.pop("phrasePinyins", None)
+            with patch.object(
+                openai_chat_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps(incomplete_encoding, ensure_ascii=False)),
+            ):
+                incomplete_response = await _handle_pending_add_word(
+                    original,
+                    "窨字读作xun",
+                    "qq",
+                    "garth",
+                    [],
+                    space_key,
+                    "Garth",
+                    MessageCommandIntent(),
+                )
+            check(
+                "multi-character correction requires a full word reading",
+                "完整整词读音" in (incomplete_response or ""),
+            )
+
             with patch.object(openai_chat_module, "call_tool_function", fake_call):
                 corrected = await _handle_pending_add_word(
                     original,
@@ -10410,7 +11090,7 @@ def test_pending_pronunciation_correction_updates_live_ticket():
                 ) as execute_mock,
             ):
                 result = await openai_chat_module.handle_pending_message_core(
-                    "加入并提交",
+                    "添加 窨茶 xwwso 并提交",
                     "qq",
                     "garth",
                     conv_key,
@@ -10418,17 +11098,43 @@ def test_pending_pronunciation_correction_updates_live_ticket():
                     space_key=space_key,
                     owner_label="Garth",
                 )
-            check("add-and-submit executes without a nonce round trip", result == "added and submitted")
-            check("add-and-submit exposes no confirmation ticket", "确认票据" not in (result or ""))
-            check("add-and-submit uses corrected target", execute_mock.await_args.args[:2] == ("窨茶", "xwwso"))
+            check("full add-and-submit executes without a nonce round trip", result == "added and submitted")
+            check("full add-and-submit exposes no confirmation ticket", "确认票据" not in (result or ""))
+            check("full add-and-submit uses corrected target", execute_mock.await_args.args[:2] == ("窨茶", "xwwso"))
 
             store.delete(conv_key)
-            with patch.object(openai_chat_module, "call_tool_function", fake_call):
+            reviewed_add = {
+                "success": True,
+                "word": "窨茶",
+                "recommendedCode": "xwwso",
+                "pronunciations": [{
+                    "pinyin": "xun cha",
+                    "sourceSummary": "本喵整词语境判断",
+                    "recommendedCode": "xwwso",
+                    "candidateStatuses": encoding["candidateStatuses"],
+                }],
+                "preSubmitAudit": {
+                    "success": True,
+                    "autoApprove": False,
+                    "summary": "整词语境读音仍需管理员审核",
+                    "issues": ["缺少权威整词读音来源"],
+                },
+            }
+            with patch.object(
+                openai_chat_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps(reviewed_add, ensure_ascii=False)),
+            ) as review_call:
                 restored_after_restart = await openai_chat_module._revalidate_referenced_add_pending(
                     parsed_reply,
                     "qq",
                     "garth",
                 )
+            check(
+                "restart revalidation uses reviewed semantic pronunciation",
+                review_call.await_args.args[:2]
+                == ("keytao_prepare_reviewed_add", {"word": "窨茶"}),
+            )
             check(
                 "bot-authored quoted candidate can be revalidated after restart",
                 isinstance(restored_after_restart, PendingAddWord)
@@ -10462,7 +11168,7 @@ def test_pending_pronunciation_correction_updates_live_ticket():
                 ) as restored_execute,
             ):
                 restored_result = await openai_chat_module.handle_pending_message_core(
-                    "加入并提交",
+                    "添加 窨茶 xwwso 并提交",
                     "qq",
                     "garth",
                     conv_key,
@@ -10470,7 +11176,7 @@ def test_pending_pronunciation_correction_updates_live_ticket():
                     space_key=space_key,
                     owner_label="Garth",
                 )
-            check("revalidated quote executes without a ticket", restored_result == "restored and submitted")
+            check("revalidated full command executes without a ticket", restored_result == "restored and submitted")
             check("revalidated quote keeps xun target", restored_execute.await_args.args[:2] == ("窨茶", "xwwso"))
             restored_call = restored_execute.await_args
             restored_remark = (
@@ -10879,6 +11585,13 @@ if __name__ == "__main__":
     test_pending_add_word_confirm_uses_recommended()
     test_pending_add_word_add_and_submit_uses_recommended()
     test_quoted_self_add_and_submit_requires_live_ticket()
+    test_bot_quoted_candidate_binds_short_add_submit_for_qq_and_telegram()
+    test_queued_bot_quote_duplicate_is_idempotent()
+    test_unquoted_short_add_submit_requires_full_target_binding()
+    test_inline_unquoted_add_submit_requires_target_but_full_command_runs()
+    test_target_bound_add_submit_rejects_questions_negation_and_substrings()
+    test_cross_user_bot_quote_creates_only_current_actor_operation()
+    test_revalidated_quote_requires_current_semantic_snapshot()
     test_conversation_lock_serializes_same_actor_messages()
     test_draft_operation_coordinator_guards_lifecycle()
     test_draft_operation_confirmation_lease_expires()

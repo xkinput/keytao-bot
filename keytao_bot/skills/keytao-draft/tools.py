@@ -1701,7 +1701,10 @@ async def keytao_submit_batch(
                 "success": False,
                 "staleConfirmation": True,
                 "error": "submit_confirmation_missing",
-                "message": "提交检查已过期或不匹配，请重新发送「提交」或「加入并提交」获取最新快照",
+                "message": (
+                    "提交检查已过期或不匹配，请重新发送「提交」获取最新快照；"
+                    "若这是加词后提交，请重新发送包含词条和编码的完整指令"
+                ),
                 "batchId": batch_id,
             }, batch_id)
         confirmation_claimed = True

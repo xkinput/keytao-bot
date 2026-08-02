@@ -429,6 +429,8 @@ _PENDING_CONTROL_TEXTS = {
     "继续提交",
     "加入并提交",
     "加并提交",
+    "添加并提交",
+    "新增并提交",
     "取消",
     "不用",
     "不要",
@@ -438,6 +440,8 @@ _PENDING_CONTROL_TEXTS = {
 _PENDING_ADD_AND_SUBMIT_COMMANDS = {
     "加入并提交",
     "加并提交",
+    "添加并提交",
+    "新增并提交",
 }
 
 WORD_QUERY_INTENT_MODEL = (
@@ -546,6 +550,58 @@ def _compact_command_text(message_text: str) -> str:
         r"[\s，,。.!！?？~～…、;；:：\"'“”‘’（）()【】\[\]<>《》]+",
         "",
         _strip_command_message_prefixes(message_text),
+    )
+
+
+def _is_short_add_and_submit_request(message_text: str) -> bool:
+    """Recognize target-free add-and-submit controls."""
+    stripped = _strip_command_message_prefixes(message_text)
+    if (
+        re.search(r"[?？]", stripped)
+        or not message_authorizes_mutation(stripped)
+    ):
+        return False
+    return _compact_command_text(message_text) in _PENDING_ADD_AND_SUBMIT_COMMANDS
+
+
+def _is_target_bound_add_and_submit_request(
+    message_text: str,
+    state: PendingAddWord,
+) -> bool:
+    """Require an unquoted add-and-submit command to name its exact target."""
+    if not message_authorizes_mutation(_strip_command_message_prefixes(message_text)):
+        return False
+    compact = _compact_command_text(message_text)
+    word = str(state.word or "").strip()
+    code = str(state.recommended_code or "").strip().lower()
+    if not word or not code:
+        return False
+    request_prefix = r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我)*"
+    add_clause = r"(?:加词|添加|加入|新增)(?:词条)?"
+    code_clause = rf"(?:(?:用|以|按)?(?:编码)?(?:为|是)?)?{re.escape(code)}"
+    submit_clause = r"(?:并|并且|然后|再|同时|以及)?(?:提交|提审|送审)(?:审核|草稿|批次)?"
+    polite = r"(?:一下|吧|啦|了)?"
+    return bool(
+        re.fullmatch(
+            rf"{request_prefix}{add_clause}{re.escape(word)}{code_clause}{submit_clause}{polite}",
+            compact,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _format_full_add_and_submit_instruction(
+    state: Optional[PendingAddWord] = None,
+) -> str:
+    """Explain how to bind an add-and-submit command without a native quote."""
+    if isinstance(state, PendingAddWord):
+        example = f"添加 {state.word} {state.recommended_code} 并提交"
+    else:
+        example = "添加 词条 编码 并提交"
+    return (
+        "没有引用机器人给出的候选消息时，需要把词条和编码写完整，"
+        f"请发送「{example}」。\n"
+        "也可以直接引用那条候选消息回复「添加并提交」。"
     )
 
 
@@ -1147,6 +1203,11 @@ async def _classify_message_command_intent(
             and pending_state.function_name == "keytao_batch_add_to_draft"
         )
     )
+    if (
+        isinstance(pending_state, PendingAddWord)
+        and _is_target_bound_add_and_submit_request(message_text, pending_state)
+    ):
+        return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
     if pending_accepts_add_submit and compact_message in _PENDING_ADD_AND_SUBMIT_COMMANDS:
         return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
     if _is_explicit_draft_submit_request(message_text):
@@ -2058,6 +2119,12 @@ def _message_authorizes_pending_state_control(
     """Allow a generic short control or an exact target-bound local preview."""
     if re.search(r"[?？]", message_text):
         return False
+    if (
+        isinstance(state, PendingAddWord)
+        and command_intent.intent == "pending_add_and_submit"
+        and _is_target_bound_add_and_submit_request(message_text, state)
+    ):
+        return True
     if _message_authorizes_pending_control(message_text, command_intent):
         return True
     return bool(
@@ -2333,10 +2400,14 @@ def _format_active_draft_operation_message(
     """Explain why another mutation cannot start without consuming its pending state."""
     phase = "正等待你的确认" if operation.status == "awaiting_confirmation" else "正在后台处理"
     if isinstance(pending_state, PendingAddWord) and pending_state.word != operation.word:
+        full_command = (
+            f"添加 {pending_state.word} {pending_state.recommended_code} 并提交"
+        )
         return (
             f"上一批 {operation.description} {phase}，为避免两个批次写进同一份草稿，"
             f"本喵暂时不会操作「{pending_state.word}」。\n"
-            f"「{pending_state.word}」的候选仍为你保留；上一批结束后再回复「加入并提交」即可。"
+            f"「{pending_state.word}」的候选仍为你保留；上一批结束后请发送"
+            f"「{full_command}」，或引用候选消息回复「添加并提交」。"
         )
     message = (
         f"{operation.description} {phase}，不用重复发送。"
@@ -2484,62 +2555,127 @@ async def _revalidate_referenced_add_pending(
     platform: str,
     user_id: str,
 ) -> Optional[PendingAddWord]:
-    """Rebuild a bot-authored quoted candidate from current read-only data."""
-    encode_json = await call_tool_function(
-        "keytao_encode",
+    """Rebuild a bot-authored quoted candidate from the current reviewed reading."""
+    review_json = await call_tool_function(
+        "keytao_prepare_reviewed_add",
         {"word": referenced_state.word},
         platform,
         user_id,
     )
     try:
-        encoding = json.loads(encode_json)
+        review = json.loads(review_json)
     except Exception:
         return None
-    if not encoding.get("success"):
+    if (
+        not isinstance(review, dict)
+        or not review.get("success")
+        or review.get("pronunciationUnresolved")
+        or str(review.get("word") or "").strip() != referenced_state.word
+    ):
         return None
-    trusted_codes = {
-        str(code)
-        for code in encoding.get("candidateCodes") or []
-        if isinstance(code, str)
+
+    recommended_code = str(referenced_state.recommended_code or "").strip().lower()
+    referenced_occupancy = {
+        str(code).strip().lower(): bool(occupied)
+        for code, occupied in referenced_state.candidates
     }
-    status_map = {
-        str(status.get("code") or ""): status
-        for status in encoding.get("candidateStatuses") or []
-        if isinstance(status, dict) and status.get("code")
-    }
-    recommended_code = str(referenced_state.recommended_code or "")
-    if recommended_code not in trusted_codes or recommended_code not in status_map:
+    if not recommended_code or recommended_code not in referenced_occupancy:
         return None
+
+    matching_pronunciation: Optional[Dict] = None
+    status_map: Dict[str, Dict] = {}
+    for pronunciation in review.get("pronunciations") or []:
+        if not isinstance(pronunciation, dict):
+            continue
+        pronunciation_statuses = {
+            str(status.get("code") or "").strip().lower(): status
+            for status in pronunciation.get("candidateStatuses") or []
+            if isinstance(status, dict) and status.get("code")
+        }
+        if recommended_code in pronunciation_statuses:
+            matching_pronunciation = pronunciation
+            status_map = pronunciation_statuses
+            break
+
+    if matching_pronunciation is None:
+        return None
+    current_recommended = str(
+        matching_pronunciation.get("recommendedCode") or ""
+    ).strip().lower()
+    global_recommended = str(review.get("recommendedCode") or "").strip().lower()
+    if current_recommended != recommended_code or global_recommended != recommended_code:
+        return None
+    pinyin = str(matching_pronunciation.get("pinyin") or "").strip()
+    referenced_pinyin = str(
+        referenced_state.pronunciation_codes.get(recommended_code) or ""
+    ).strip()
+    normalized_pinyin = re.sub(r"\s+", " ", _plain_pinyin(pinyin)).strip()
+    normalized_referenced_pinyin = re.sub(
+        r"\s+",
+        " ",
+        _plain_pinyin(referenced_pinyin),
+    ).strip()
+    if (
+        not normalized_pinyin
+        or not normalized_referenced_pinyin
+        or normalized_pinyin != normalized_referenced_pinyin
+    ):
+        return None
+    if (
+        bool(status_map[recommended_code].get("occupied"))
+        != referenced_occupancy[recommended_code]
+    ):
+        return None
+
     candidates = [
-        (code, bool(status_map[code].get("occupied")))
-        for code, _ in referenced_state.candidates
-        if code in trusted_codes and code in status_map
+        (code, bool(status.get("occupied")))
+        for code, status in status_map.items()
     ]
-    if recommended_code not in {code for code, _ in candidates}:
-        candidates.insert(
-            0,
-            (recommended_code, bool(status_map[recommended_code].get("occupied"))),
-        )
     if not candidates:
         return None
-    conservative_remark = (
-        "喵喵审词：自动审核：该词需管理员审核"
-        "（机器人重启后仅重新校验了词语与编码，原审词证据需管理员复核）"
+
+    source = _format_pronunciation_source(matching_pronunciation)
+    audit_preview = _format_pre_submit_audit_preview(review, recommended_code)
+    if not audit_preview:
+        audit_preview = "自动审核：该词需管理员审核（当前审词证据不足）"
+    review_parts = [
+        f"读音 {pinyin}" if pinyin else "读音待确认",
+        f"来源 {source}",
+        audit_preview,
+    ]
+    reviewed_remark = "喵喵审词：" + "；".join(review_parts)
+
+    occupied_words: Dict[str, List[str]] = {}
+    for code, occupied in candidates:
+        if not occupied:
+            continue
+        status = status_map[code]
+        words = [
+            str(word or "").strip()
+            for word in status.get("words") or []
+            if str(word or "").strip()
+        ]
+        if not words:
+            words = [
+                str(phrase.get("word") or "").strip()
+                for phrase in status.get("phrases") or []
+                if isinstance(phrase, dict) and str(phrase.get("word") or "").strip()
+            ]
+        occupied_words[code] = words
+
+    pronunciation_codes = (
+        {code: pinyin for code, _occupied in candidates}
+        if pinyin
+        else {}
     )
     return PendingAddWord(
         word=referenced_state.word,
         recommended_code=recommended_code,
         candidates=candidates,
-        occupied_words={
-            code: [
-                str(phrase.get("word") or "")
-                for phrase in status_map[code].get("phrases") or []
-                if isinstance(phrase, dict) and phrase.get("word")
-            ]
-            for code, occupied in candidates
-            if occupied
-        },
-        code_remarks={code: conservative_remark for code, _ in candidates},
+        occupied_words=occupied_words,
+        code_remarks={code: reviewed_remark for code, _occupied in candidates},
+        pronunciation_codes=pronunciation_codes,
+        pronunciation_recommended_codes=[recommended_code],
     )
 
 
@@ -7001,8 +7137,45 @@ async def _try_update_pending_pronunciation(
         ),
         variant_codes[0],
     )
+    selected_variant = matching_variants[0]
+    selected_index = selected_variant.get("charIndex")
+    pronunciation_parts: List[str] = []
+    for key in ("contextPhrasePinyins", "phrasePinyins"):
+        values = encoding.get(key)
+        if isinstance(values, list) and len(values) == len(state.word):
+            normalized_values = [
+                _plain_pinyin(str(value or ""))
+                for value in values
+            ]
+            if all(normalized_values):
+                pronunciation_parts = normalized_values
+                break
+    if not pronunciation_parts and isinstance(chars, list) and len(chars) == len(state.word):
+        normalized_values = [
+            _plain_pinyin(str(item.get("pinyin") or ""))
+            if isinstance(item, dict)
+            else ""
+            for item in chars
+        ]
+        if all(normalized_values):
+            pronunciation_parts = normalized_values
+    if len(state.word) == 1:
+        reviewed_pinyin = corrected_pinyin
+    elif (
+        not isinstance(selected_index, int)
+        or isinstance(selected_index, bool)
+        or not 0 <= selected_index < len(state.word)
+        or len(pronunciation_parts) != len(state.word)
+    ):
+        return (
+            "读音纠正已收到，但编码服务没有返回可核验的完整整词读音；"
+            "旧候选没有执行，请重新发送词条。"
+        )
+    else:
+        pronunciation_parts[selected_index] = corrected_pinyin
+        reviewed_pinyin = " ".join(pronunciation_parts)
     review_line = (
-        f"读音 {corrected_pinyin}；来源 用户当前纠正 + 编码服务多音候选；"
+        f"读音 {reviewed_pinyin}；来源 用户当前纠正 + 编码服务多音候选；"
         "自动审核：该词需管理员审核（读音纠正需人工复核）"
     )
     lines = [
@@ -7068,7 +7241,11 @@ async def _handle_pending_add_word(
         command_intent = await _classify_message_command_intent(msg, state)
     if (
         _is_sensitive_pending_control_intent(command_intent)
-        and not _message_authorizes_pending_control(msg, command_intent)
+        and not _message_authorizes_pending_state_control(
+            state,
+            msg,
+            command_intent,
+        )
     ):
         command_intent = MessageCommandIntent()
 
@@ -7276,6 +7453,9 @@ async def handle_pending_message_core(
         if uncertain_action == "read":
             return None
         return uncertain_response
+
+    if isinstance(state, PendingAddWord) and _is_short_add_and_submit_request(message):
+        return _format_full_add_and_submit_instruction(state)
 
     preserve_after_response = False
 
@@ -8853,7 +9033,45 @@ async def _handle_ai_chat_serialized(
             command_intent_cache[cache_key] = classified
         return command_intent_cache[cache_key]
 
-    generic_command_intent = await command_intent_for()
+    referenced_pending = (
+        _parse_pending_state_from_response(reply_reference.text)
+        if reply_reference.is_to_bot and reply_reference.text
+        else None
+    )
+    quoted_add_and_submit_intent = MessageCommandIntent(
+        intent="pending_add_and_submit",
+        confidence=1.0,
+    )
+    quoted_short_add_and_submit = bool(
+        reply_reference.is_reply
+        and reply_reference.is_to_bot
+        and isinstance(referenced_pending, PendingAddWord)
+        and _is_short_add_and_submit_request(normalized_message_text)
+    )
+    if reply_reference.is_reply:
+        logger.info(
+            "[reply_trace] "
+            f"to_bot={reply_reference.is_to_bot} sender={reply_reference.sender_id or '-'} "
+            f"mentions={list(reply_reference.mentioned_user_ids)} "
+            f"pending={referenced_pending.__class__.__name__ if referenced_pending else 'none'}"
+        )
+    if quoted_short_add_and_submit:
+        generic_command_intent = quoted_add_and_submit_intent
+    elif _is_short_add_and_submit_request(normalized_message_text):
+        current_pending = conversation_state_store.get(conv_key)
+        response = _format_full_add_and_submit_instruction(
+            current_pending if isinstance(current_pending, PendingAddWord) else None
+        )
+        remember_conversation(
+            conv_key,
+            memory_context,
+            normalized_message_text,
+            response,
+        )
+        await ai_chat.finish(response)
+        return
+    else:
+        generic_command_intent = await command_intent_for()
     if _message_authorizes_clear_history(
         normalized_message_text,
         generic_command_intent,
@@ -8867,18 +9085,6 @@ async def _handle_ai_chat_serialized(
         normalized_message_text,
     ) or message_is_prefixed_fresh_word_query
 
-    referenced_pending = (
-        _parse_pending_state_from_response(reply_reference.text)
-        if reply_reference.is_to_bot and reply_reference.text
-        else None
-    )
-    if reply_reference.is_reply:
-        logger.info(
-            "[reply_trace] "
-            f"to_bot={reply_reference.is_to_bot} sender={reply_reference.sender_id or '-'} "
-            f"mentions={list(reply_reference.mentioned_user_ids)} "
-            f"pending={referenced_pending.__class__.__name__ if referenced_pending else 'none'}"
-        )
     if active_operation is not None:
         current_pending_state = conversation_state_store.get(conv_key)
         explicit_active_reply = _active_operation_reply_matches(
@@ -8886,7 +9092,7 @@ async def _handle_ai_chat_serialized(
             reply_reference,
         )
 
-        if active_operation.status == "running" and generic_command_intent.intent in {
+        if active_operation.status in {"queued", "running"} and generic_command_intent.intent in {
             "draft_submit",
             "pending_confirm",
             "pending_cancel",
@@ -9034,7 +9240,70 @@ async def _handle_ai_chat_serialized(
                     await ai_chat.finish(response)
                     return
 
-    if referenced_pending is not None and memory_context.space_type == "group":
+    quoted_pending_add_submit_authorized = False
+    if quoted_short_add_and_submit:
+        current_record = conversation_state_store.get_record(conv_key)
+        if current_record is not None and current_record.execution_id:
+            response = (
+                "当前还有一笔草稿操作结果待核验，暂不覆盖它。"
+                "请先查看当前草稿，确认状态后再重试。"
+            )
+            remember_conversation(
+                conv_key,
+                memory_context,
+                normalized_message_text,
+                response,
+            )
+            await ai_chat.finish(response)
+            return
+        restored_state = await _revalidate_referenced_add_pending(
+            referenced_pending,
+            platform,
+            user_id,
+        )
+        if restored_state is None:
+            response = (
+                "这条候选已不在当前可验证的审词快照中；没有执行添加。"
+                "请重新发送词条，我会生成最新候选。"
+            )
+            remember_conversation(
+                conv_key,
+                memory_context,
+                normalized_message_text,
+                response,
+            )
+            await ai_chat.finish(response)
+            return
+        stored = conversation_state_store.set(
+            conv_key,
+            restored_state,
+            space_key=space_key,
+            owner_label=owner_label,
+        )
+        if not stored:
+            response = "当前候选无法安全保存；没有执行添加，请重新发送词条。"
+            remember_conversation(
+                conv_key,
+                memory_context,
+                normalized_message_text,
+                response,
+            )
+            await ai_chat.finish(response)
+            return
+        current_record = conversation_state_store.get_record(conv_key)
+        if current_record is not None:
+            cache_key = (
+                current_record.state.__class__.__name__,
+                _describe_pending_state(current_record.state),
+            )
+            command_intent_cache[cache_key] = quoted_add_and_submit_intent
+            quoted_pending_add_submit_authorized = True
+
+    if (
+        not quoted_pending_add_submit_authorized
+        and referenced_pending is not None
+        and memory_context.space_type == "group"
+    ):
         referenced_owner_key = _referenced_owner_key_from_reply_reference(
             reply_reference,
             platform,

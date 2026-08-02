@@ -849,7 +849,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             reply = await chat_module.handle_pending_message_core(
-                "加入并提交",
+                "添加 阻抑 zjyka 并提交",
                 "qq",
                 "user-321",
                 conv_key,
@@ -1110,7 +1110,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             reply = await chat_module.handle_pending_message_core(
-                "加入并提交",
+                "添加 阻抑 zjyka 并提交",
                 "qq",
                 "user-321",
                 conv_key,
