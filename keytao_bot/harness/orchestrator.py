@@ -194,6 +194,7 @@ class AgentOrchestrator:
         trusted_draft_items_by_id: Dict[str, Dict[str, str]] = {}
         trusted_phrase_types_by_key: Dict[tuple[str, str], frozenset[str]] = {}
         trusted_reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
+        unresolved_pronunciation_words: set[str] = set()
         authoritative_result_links: Dict[str, str] = {}
         receipt_run_id = uuid.uuid4().hex
 
@@ -344,6 +345,12 @@ class AgentOrchestrator:
 
             total_tool_calls += len(parsed_tool_calls)
             seen_tool_call_ids.update(str(tc.id) for tc, _ in parsed_tool_calls)
+            reviewed_words_in_batch = {
+                str(fn_args.get("word") or "").strip()
+                for tc, fn_args in parsed_tool_calls
+                if tc.function.name == "keytao_prepare_reviewed_add"
+                and str(fn_args.get("word") or "").strip()
+            }
 
             assistant_msg: Dict = {
                 "role": "assistant",
@@ -390,12 +397,44 @@ class AgentOrchestrator:
                         fn_args,
                         tool_context,
                     )
-                    result_str = await self._call_tool_once(
-                        fn_name,
-                        canonical_fn_args,
-                        tool_context,
-                        seen_tool_calls,
+                    tool_word = str(canonical_fn_args.get("word") or "").strip()
+                    encode_blocked = bool(
+                        fn_name == "keytao_encode"
+                        and tool_word
+                        and (
+                            tool_word in unresolved_pronunciation_words
+                            or tool_word in reviewed_words_in_batch
+                        )
                     )
+                    if encode_blocked:
+                        logger.warning(
+                            "Blocked reviewed-add encode fallback: word=%s unresolved=%s",
+                            tool_word,
+                            tool_word in unresolved_pronunciation_words,
+                        )
+                        result_str = json.dumps({
+                            "success": False,
+                            "policyBlocked": True,
+                            "pronunciationUnresolved": (
+                                tool_word in unresolved_pronunciation_words
+                            ),
+                            "word": tool_word,
+                            "message": (
+                                "该词的审词结果尚未确定可靠读音；"
+                                "禁止回退逐字默认编码、展示候选或建立确认操作。"
+                                if tool_word in unresolved_pronunciation_words
+                                else
+                                "该词本轮已有专用审词请求；请只使用审词工具回执，"
+                                "不要并行回退逐字默认编码。"
+                            ),
+                        }, ensure_ascii=False)
+                    else:
+                        result_str = await self._call_tool_once(
+                            fn_name,
+                            canonical_fn_args,
+                            tool_context,
+                            seen_tool_calls,
+                        )
                 except DuplicateToolCallAbort:
                     return self._append_authoritative_result_links(
                         "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～",
@@ -414,6 +453,17 @@ class AgentOrchestrator:
 
                 try:
                     result_data = json.loads(result_str)
+                    if (
+                        fn_name == "keytao_prepare_reviewed_add"
+                        and result_data.get("pronunciationUnresolved") is True
+                    ):
+                        unresolved_word = str(
+                            result_data.get("word")
+                            or canonical_fn_args.get("word")
+                            or ""
+                        ).strip()
+                        if unresolved_word:
+                            unresolved_pronunciation_words.add(unresolved_word)
                     if result_data.get("not_bound"):
                         return self._append_authoritative_result_links(
                             self._bind_help_text,

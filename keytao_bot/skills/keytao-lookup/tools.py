@@ -205,6 +205,11 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         "flyKeyVariants": encode_data.get("flyKeyVariants") or infer_data.get("flyKeyVariants") or [],
         "codeSource": code_source,
         "pronunciationSource": encode_data.get("pronunciationSource") or infer_data.get("pronunciationSource") or "",
+        "standardPronunciationStatus": (
+            encode_data.get("standardPronunciationStatus")
+            or infer_data.get("standardPronunciationStatus")
+            or ""
+        ),
         "phrasePinyins": encode_data.get("phrasePinyins") or infer_data.get("phrasePinyins") or [],
         "contextPhrasePinyins": encode_data.get("contextPhrasePinyins") or infer_data.get("contextPhrasePinyins") or [],
         "semanticPronunciationNeeded": bool(
@@ -879,7 +884,7 @@ TOOLS = [
                     },
                     "semantic_pinyin": {
                         "type": "string",
-                        "description": "可选。仅当没有标准整词读音且你能根据明确语义判断时提供完整逐字拼音，如 'pan zhe'；必须和 semantic_meaning 同时提供"
+                        "description": "可选。仅当没有取得可信整词读音、词组语境与逐字默认音冲突，且你能根据明确语义判断时提供完整逐字拼音，如 'pan zhe'；必须和 semantic_meaning 同时提供"
                     },
                     "semantic_meaning": {
                         "type": "string",

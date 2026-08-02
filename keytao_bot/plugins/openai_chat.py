@@ -3235,6 +3235,12 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
     if not review.get("success"):
         return None
     word = str(review.get("word") or "").strip()
+    if word and review.get("pronunciationUnresolved"):
+        message = str(review.get("message") or "").strip()
+        return message or (
+            f"「{word}」存在多音字语境冲突，但暂时无法确定有明确含义支撑的整词读音。"
+            "本次不推荐编码，也不会创建待确认加词操作。"
+        )
     recommended_code = str(review.get("recommendedCode") or "").strip()
     pronunciations = [
         item for item in review.get("pronunciations", [])
@@ -3353,34 +3359,12 @@ async def _try_handle_simple_single_word_query(
             )
         return reviewed_prompt
 
-    encode_json = await call_tool_function(
-        "keytao_encode", {"word": word}, platform, user_id,
-    )
-    try:
-        encoding = json.loads(encode_json)
-    except Exception:
-        return "审词/编码工具返回了无法解析的结果，先不生成候选，免得把错误编码写进草稿 qwq"
-
-    if not encoding.get("success"):
-        message = encoding.get("message") or "编码工具暂时没有返回有效候选"
-        return f"{message}，先不生成候选，免得把错误编码写进草稿 qwq"
-
-    encoded_prompt = _format_tool_encoded_add_prompt(word, encoding)
-    if encoded_prompt:
-        pending = _parse_pending_add_word(encoded_prompt)
-        if pending is not None:
-            target_key = conv_key or (
-                current_memory_context.get().conversation_address
-                if current_memory_context.get() is not None
-                else ConversationAddress.private(platform, user_id)
-            )
-            conversation_state_store.set(
-                target_key,
-                pending,
-                space_key=space_key,
-                owner_label=owner_label,
-            )
-    return encoded_prompt
+    review_message = str(
+        review.get("message")
+        or review.get("error")
+        or "审词工具暂时没有返回可靠读音"
+    ).strip()
+    return f"{review_message}；本次不生成候选，也不会建立待确认加词操作。"
 
 
 # ---------------------------------------------------------------------------
@@ -3985,6 +3969,7 @@ def clear_history(key: ConversationKey) -> None:
 # ---------------------------------------------------------------------------
 
 _INJECT_PLATFORM_TOOLS = frozenset({
+    'keytao_prepare_reviewed_add',
     'keytao_create_phrase', 'keytao_submit_batch',
     'keytao_list_draft_items', 'keytao_remove_draft_item',
     'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items',
@@ -7480,14 +7465,16 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
    【第一步】调用工具：
      • 如果用户明确想加词/新增词：优先调用 keytao_lookup_by_word(word) + keytao_prepare_reviewed_add(word)
        keytao_prepare_reviewed_add 会返回真实读音来源、候选编码、当前占位和自动审核预判；禁止只用 keytao_encode 展示加词候选。
-       只有 keytao_prepare_reviewed_add 失败或没有返回候选时，才回退 keytao_encode(word)。
+       如果 keytao_prepare_reviewed_add 返回 pronunciationUnresolved=true，只能转述它的 message：禁止回退 keytao_encode、
+       禁止展示任何默认编码或候选、禁止建立待确认加词操作。审词工具失败且没有可靠结论时也只说明失败，不生成候选。
      • 如果用户只是问拆分/编码/怎么打：调用 keytao_encode(word) + keytao_lookup_by_word(word)
-         如果 keytao_encode.semanticPronunciationNeeded=true，表示权威整词页已确认缺失，且逐字默认音与词组语境音冲突。
+         如果 keytao_encode.semanticPronunciationNeeded=true，表示没有取得可信整词读音（整词页缺失或权威查询暂不可用），且逐字默认音与词组语境音冲突。
          只有当你能给出这个词明确、合理的含义或常见用法时，才把该语境读音和 recommendedCode 作为推荐；
          此时必须用 keytao_encode(word, semantic_pinyin=完整逐字拼音, semantic_meaning=具体含义) 再调用一次，
          只有返回 pronunciationSource=llm-semantic 且 semanticPronunciationAccepted=true 才能采用新编码。
          如果你不能说明含义，必须明确读音未定，只展示为待核对候选并请用户补充语境，禁止把逐字首音当成标准答案。
-         如果 pronunciationSource=zdic-unavailable，表示权威站暂时不可用；不得调用语义覆盖，也不得声称“没有标准读音”。
+         如果 standardPronunciationStatus=unavailable，仍不得声称“没有标准读音”；只有模型读音与词组语境音一致、
+         每字都属于工具返回的已知读音，且复算结果明确 accepted，才可作为需管理员复核的语义候选。
          如果用户指定了目标编码/编码系列（例如“放到 ffb 系列”“用 ff=zh,zh”），
          必须调用 keytao_encode(word, requested_code=目标编码或系列前缀)，用 requestedCodeAnalysis 判断是否支持。
          如果用户是在纠正单字读音/双拼音码（例如“ch eng 应该是 jr”“以 jr 的编码加”），
@@ -7576,6 +7563,8 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      • 多个词时按词分段回答，避免把多个词混在一段里
      • 多个待加词必须逐词调用 keytao_prepare_reviewed_add，并在末尾使用固定确认格式：
        “这些词是否一起加入草稿并提交？”后逐行列出“- 「词」→ code”
+     • 多词中任何 pronunciationUnresolved=true 的词只能单独说明工具 message，不得列入候选清单、批量确认或后续写入；
+       其余已可靠审词的词如需继续，必须与未决词明确分开。
      • 用户明确确认前不得调用批量写入工具；确认后调用 keytao_batch_add_to_draft 时，
        每个 item.remark 必须完整携带该词对应的“喵喵审词：读音...；来源...；自动审核...”记录
      • 任一词的 preSubmitAudit.autoApprove=false 时，整批都只能提交给管理员审核；

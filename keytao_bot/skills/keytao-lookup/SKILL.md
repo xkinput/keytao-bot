@@ -268,9 +268,10 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 - `firstAvailableCode`：首个空位候选码
 - `recommendedCode`：推荐编码；查占用后通常等于 `firstAvailableCode`，否则等于 `codes[0]`
 - `pronunciationSource`：实际用于编码的读音来源。`zdic-phrase` / `zdic-aabb` 为权威整词来源；`zdic-character-default` 为逐字汉典默认音；`pinyin-pro-context` 为词组语境音；`zdic-unavailable` 表示权威站暂不可用；`llm-semantic` 为已通过含义与逐字读音校验的模型语境音
+- `standardPronunciationStatus`：权威整词查询的独立状态。即使最终采用 `llm-semantic`，仍保留 `found` / `absent` / `unavailable`，不能把暂不可用说成没有标准读音
 - `phrasePinyins`：编码服务用于当前词组的逐字语境拼音
 - `contextPhrasePinyins`：pinyin-pro 给出的词组上下文候选音，可能因缺乏权威整词依据而未被采用
-- `semanticPronunciationNeeded`：只有权威整词页确定不存在且上下文音与逐字默认音冲突时才为 `true`
+- `semanticPronunciationNeeded`：没有取得可信整词读音（整词页缺失或权威查询暂不可用）且上下文音与逐字默认音冲突时为 `true`
 - `semanticPronunciationAccepted`：只有同时提供 `semantic_pinyin` 与具体的 `semantic_meaning`，并通过逐字合法读音校验后才为 `true`
 - `candidateDisplayGroups`：多音单字专用展示分组。每组含 `pinyinLabel`、`phoneticCode`、`recommendedCode` 和 `items[].displayLabel`，展示时必须直接使用这些字段
 - `alternatePronunciationCodes`：多音单字候选。每组含 `pinyin`、`phoneticCode`、`codes`
@@ -286,7 +287,7 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 ⚠️ 关键规则：词条候选编码只能取 `candidateStatuses` / `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
 
-⚠️ 语境读音规则：当首次调用返回 `semanticPronunciationNeeded=true` 时，只有模型能明确说明该词含义/常见用法，才可再次调用 `keytao_encode(word="词", semantic_pinyin="完整逐字拼音", semantic_meaning="具体含义")`。只有复算结果为 `pronunciationSource=llm-semantic` 且 `semanticPronunciationAccepted=true` 才可推荐；无法说明含义时必须把读音标为待核对。若 `pronunciationSource=zdic-unavailable`，权威查询只是暂时失败，禁止当成“无标准读音”并禁止语义覆盖。
+⚠️ 语境读音规则：当首次调用返回 `semanticPronunciationNeeded=true` 时，只有模型能明确说明该词含义/常见用法，才可再次调用 `keytao_encode(word="词", semantic_pinyin="完整逐字拼音", semantic_meaning="具体含义")`。只有模型读音与词组语境音逐字一致、每字属于已知读音，并且复算结果为 `pronunciationSource=llm-semantic`、`semanticPronunciationAccepted=true` 才可推荐；无法说明含义时必须把读音标为待核对。若 `standardPronunciationStatus=unavailable`，必须保留“权威查询暂不可用”的说明，候选需管理员复核，禁止声称“没有标准读音”。
 
 ⚠️ 声笔笔/CSS 关键规则：`CSS` / `CSSSingle` 条目属于键道6扩展短码表。例如 `fa`、`fao` 在声笔笔表中是短码位置，不应按普通词组音码拆成 `f + ao` 去否定词条。审核这类条目时只按 CSS 表、同码链顺序和常用度判断。
 

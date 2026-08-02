@@ -35,8 +35,10 @@ from .openai_chat import (
 )
 from ..harness.conversation import ConversationAddress
 from ..utils.keytao_batch_review import review_keytao_batch_with_llm
-from ..utils.keytao_review import infer_semantic_pronunciation
-from ..utils.llm_request_gate import RequestWindowGate
+from ..utils.keytao_review import (
+    SEMANTIC_PRONUNCIATION_GATE,
+    infer_semantic_pronunciation,
+)
 from ..utils.memory_store import ChatMemoryContext
 from ..utils.web_identity import (
     WebIdentityConfigError,
@@ -55,39 +57,6 @@ WEB_IDENTITY_KEY: str = (
 WEB_CORS_ORIGINS: list[str] = (
     getattr(config, "web_cors_origins", None)
     or ["http://localhost:3000", "http://localhost:3001"]
-)
-
-
-def _bounded_positive_env(name: str, default: int, maximum: int) -> int:
-    raw_value = getattr(config, name.lower(), None)
-    if raw_value is None:
-        raw_value = os.getenv(name, str(default))
-    try:
-        value = int(raw_value)
-    except (TypeError, ValueError):
-        return default
-    if value <= 0:
-        return default
-    return min(value, maximum)
-
-
-SEMANTIC_PRONUNCIATION_GATE = RequestWindowGate(
-    global_limit=_bounded_positive_env(
-        "SEMANTIC_PRONUNCIATION_GLOBAL_REQUESTS_PER_HOUR",
-        120,
-        10_000,
-    ),
-    requester_limit=_bounded_positive_env(
-        "SEMANTIC_PRONUNCIATION_USER_REQUESTS_PER_HOUR",
-        20,
-        1_000,
-    ),
-    window_seconds=60 * 60,
-    max_concurrent=_bounded_positive_env(
-        "SEMANTIC_PRONUNCIATION_MAX_CONCURRENT",
-        2,
-        32,
-    ),
 )
 
 

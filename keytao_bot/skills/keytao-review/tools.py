@@ -116,9 +116,32 @@ async def _build_pre_submit_audit(config: ReviewHttpConfig, word: str, code: str
     return llm_audit or deterministic_audit
 
 
-async def keytao_prepare_reviewed_add(word: str) -> Dict:
+def _semantic_requester_for_actor(
+    platform: Optional[str],
+    platform_id: Optional[str],
+) -> Optional[str]:
+    normalized_platform = str(platform or "").strip()
+    normalized_id = str(platform_id or "").strip()
+    if not normalized_platform or not normalized_id:
+        return None
+    return f"bot-review:actor:{normalized_platform}:{normalized_id}"
+
+
+async def keytao_prepare_reviewed_add(
+    word: str,
+    platform: Optional[str] = None,
+    platform_id: Optional[str] = None,
+) -> Dict:
     config = _review_config()
-    review = await prepare_reviewed_word(config, word)
+    semantic_requester = _semantic_requester_for_actor(platform, platform_id)
+    if semantic_requester:
+        review = await prepare_reviewed_word(
+            config,
+            word,
+            semantic_requester=semantic_requester,
+        )
+    else:
+        review = await prepare_reviewed_word(config, word)
     recommended_code = str(review.get("recommendedCode") or "").strip()
     reviewed_word = str(review.get("word") or word or "").strip()
     if review.get("success") and reviewed_word and recommended_code:

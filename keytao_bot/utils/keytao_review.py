@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -27,6 +28,7 @@ from .keytao_encoding import (
     pinyin_to_phonetic_code,
 )
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
+from .llm_request_gate import RequestWindowGate
 
 
 SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/"
@@ -245,6 +247,44 @@ def _review_llm_config() -> Dict[str, Any]:
         ),
         "timeout": min(_as_float(timeout_value, 20.0), 30.0),
     }
+
+
+def _bounded_positive_config(name: str, default: int, maximum: int) -> int:
+    raw_value = _config_value(name.lower(), name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return default
+    return min(value, maximum)
+
+
+SEMANTIC_PRONUNCIATION_GATE = RequestWindowGate(
+    global_limit=_bounded_positive_config(
+        "SEMANTIC_PRONUNCIATION_GLOBAL_REQUESTS_PER_HOUR",
+        120,
+        10_000,
+    ),
+    requester_limit=_bounded_positive_config(
+        "SEMANTIC_PRONUNCIATION_USER_REQUESTS_PER_HOUR",
+        20,
+        1_000,
+    ),
+    window_seconds=60 * 60,
+    max_concurrent=_bounded_positive_config(
+        "SEMANTIC_PRONUNCIATION_MAX_CONCURRENT",
+        2,
+        32,
+    ),
+)
+
+_SEMANTIC_ACCEPTED_CACHE_SECONDS = 6 * 60 * 60
+_SEMANTIC_REJECTED_CACHE_SECONDS = 10 * 60
+_SEMANTIC_CACHE_MAX_ENTRIES = 512
+_SEMANTIC_BACKGROUND_REQUESTER = "bot-review:background"
+_semantic_review_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_semantic_review_inflight: Dict[str, asyncio.Task] = {}
 
 
 def normalize_pinyin_syllable(value: str) -> str:
@@ -631,10 +671,32 @@ async def _call_keytao_api(config: ReviewHttpConfig, path: str, payload: Optiona
         return {"success": False, "message": str(error)}
 
 
-async def fetch_keytao_encode(config: ReviewHttpConfig, word: str) -> Dict:
+async def fetch_keytao_encode(
+    config: ReviewHttpConfig,
+    word: str,
+    *,
+    semantic_pinyin: str = "",
+    semantic_meaning: str = "",
+) -> Dict:
+    use_semantic = bool(semantic_pinyin.strip() and semantic_meaning.strip())
+    path = "/api/bot/phrases/encode" if use_semantic else "/api/phrases/encode"
+    params = {"word": word}
+    headers: Dict[str, str] = {}
+    if use_semantic:
+        if not config.bot_token:
+            return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        params.update({
+            "semantic_pinyin": semantic_pinyin.strip(),
+            "semantic_meaning": semantic_meaning.strip(),
+        })
+        headers["X-Bot-Token"] = config.bot_token
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(f"{config.api_base}/api/phrases/encode", params={"word": word})
+            response = await client.get(
+                f"{config.api_base}{path}",
+                params=params,
+                headers=headers,
+            )
             if not response.is_success:
                 return {"success": False, "message": f"编码服务返回错误: {response.status_code}"}
             data = response.json()
@@ -703,6 +765,99 @@ def _encode_default_pinyin_sequence(encode_data: Dict) -> Tuple[str, ...]:
             return ()
         result.append(normalized)
     return tuple(result)
+
+
+def _context_pinyin_sequence(encode_data: Dict) -> Tuple[str, ...]:
+    values = encode_data.get("contextPhrasePinyins")
+    if not isinstance(values, list):
+        return ()
+    result = tuple(
+        normalize_pinyin_syllable(str(value or ""))
+        for value in values
+    )
+    return result if all(result) else ()
+
+
+def _standard_pronunciation_status(encode_data: Dict) -> str:
+    explicit = str(encode_data.get("standardPronunciationStatus") or "").strip()
+    if explicit in {"found", "absent", "unavailable"}:
+        return explicit
+    source = str(encode_data.get("pronunciationSource") or "").strip()
+    if source in {"zdic-phrase", "zdic-aabb"}:
+        return "found"
+    if source == "zdic-unavailable":
+        return "unavailable"
+    return "absent"
+
+
+def _needs_semantic_pronunciation(encode_data: Dict, word: str) -> bool:
+    if len(word) <= 1:
+        return False
+    source = str(encode_data.get("pronunciationSource") or "").strip()
+    if source not in {"zdic-character-default", "zdic-unavailable"}:
+        return False
+    default_sequence = _encode_default_pinyin_sequence(encode_data)
+    context_sequence = _context_pinyin_sequence(encode_data)
+    has_context_conflict = bool(
+        len(default_sequence) == len(word)
+        and len(context_sequence) == len(word)
+        and default_sequence != context_sequence
+    )
+    return bool(encode_data.get("semanticPronunciationNeeded") or has_context_conflict)
+
+
+def _semantic_pronunciation_group(
+    word: str,
+    proposal: Dict[str, Any],
+    encode_data: Dict[str, Any],
+    default_sequence: Sequence[str] = (),
+) -> Optional[Dict[str, Any]]:
+    """Build a group only after the authenticated encoder revalidates the proposal."""
+    if proposal.get("accepted") is not True:
+        return None
+    if encode_data.get("semanticPronunciationAccepted") is not True:
+        return None
+    if str(encode_data.get("pronunciationSource") or "") != "llm-semantic":
+        return None
+
+    proposal_sequence = tuple(
+        normalize_pinyin_syllable(str(value or ""))
+        for value in (proposal.get("pinyins") or [])
+    )
+    encoded_sequence = _encode_default_pinyin_sequence(encode_data)
+    meaning = str(proposal.get("meaning") or "").strip()
+    if (
+        len(proposal_sequence) != len(word)
+        or not all(proposal_sequence)
+        or encoded_sequence != proposal_sequence
+        or not meaning
+    ):
+        return None
+
+    usage_type = str(proposal.get("usageType") or "common_word").strip()
+    label = _entity_type_label(usage_type)
+    standard_status = _standard_pronunciation_status(encode_data)
+    status_label = "权威整词页暂不可用" if standard_status == "unavailable" else "暂无权威整词页"
+    return {
+        "pinyin": pinyin_sequence_label(proposal_sequence),
+        "normalized": list(proposal_sequence),
+        "sources": [],
+        "sourceIds": [],
+        "score": 0,
+        "fallback": True,
+        "semanticPronunciation": True,
+        "requiresManualReview": True,
+        "sourceSummary": f"本喵整词语境判断（{label}，{status_label}）",
+        "contextPronunciation": {
+            "entityType": usage_type,
+            "label": label,
+            "confidence": float(proposal.get("confidence") or 0.0),
+            "description": meaning,
+            "correctedDefault": True,
+            "defaultPinyin": pinyin_sequence_label(default_sequence),
+            "method": "meaning_backed_semantic_pronunciation",
+        },
+    }
 
 
 def _entity_pronunciation_group(
@@ -909,29 +1064,107 @@ def _build_statuses_for_codes(codes: Sequence[str], code_map: Dict[str, List[Dic
     return statuses
 
 
-async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
+async def prepare_reviewed_word(
+    config: ReviewHttpConfig,
+    word: str,
+    *,
+    semantic_requester: Optional[str] = None,
+) -> Dict:
     word = word.strip()
     if not word:
         return {"success": False, "message": "词不能为空"}
 
-    evidence, encode_data, existing_words, entity_knowledge = await asyncio.gather(
+    evidence, encode_data, existing_words = await asyncio.gather(
         collect_pronunciation_evidence_limited(word),
         fetch_keytao_encode(config, word),
         lookup_words(config, [word]),
-        _infer_entity_knowledge(word),
     )
+    entity_knowledge: Dict[str, Any] = {
+        "recognized": False,
+        "word": word,
+        "entityType": "unclear",
+        "confidence": 0.0,
+    }
     if not encode_data.get("success", True) and not encode_data.get("codes"):
         return {"success": False, "message": encode_data.get("message", "编码服务未返回有效结果")}
 
     groups = evidence.get("groups", []) if evidence.get("success") else []
+    standard_status = _standard_pronunciation_status(encode_data)
     if not groups:
         default_sequence = _encode_default_pinyin_sequence(encode_data)
-        entity_group = _entity_pronunciation_group(
-            word,
-            entity_knowledge,
-            default_sequence,
-            encode_data,
-        )
+        entity_group = None
+        semantic_pronunciation_needed = _needs_semantic_pronunciation(encode_data, word)
+        if semantic_pronunciation_needed:
+            proposal = await _infer_semantic_pronunciation_for_review(
+                word,
+                requester=semantic_requester,
+            )
+            if proposal.get("accepted") is True:
+                semantic_encode = await fetch_keytao_encode(
+                    config,
+                    word,
+                    semantic_pinyin=" ".join(str(value) for value in proposal.get("pinyins", [])),
+                    semantic_meaning=str(proposal.get("meaning") or ""),
+                )
+                semantic_group = _semantic_pronunciation_group(
+                    word,
+                    proposal,
+                    semantic_encode,
+                    default_sequence,
+                )
+                if semantic_group:
+                    encode_data = semantic_encode
+                    standard_status = _standard_pronunciation_status(semantic_encode)
+                    groups = [semantic_group]
+
+            if not groups:
+                return {
+                    "success": True,
+                    "word": word,
+                    "existing": existing_words.get(word, []),
+                    "pronunciations": [],
+                    "recommendedCode": "",
+                    "autoReviewable": False,
+                    "pronunciationUnresolved": True,
+                    "requiresManualPronunciationReview": True,
+                    "standardPronunciationStatus": standard_status,
+                    "message": (
+                        f"「{word}」存在多音字语境冲突，但未取得可验证的整词含义和读音，"
+                        "暂不推荐编码"
+                    ),
+                    "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
+                }
+
+        if (
+            not groups
+            and not semantic_pronunciation_needed
+            and str(encode_data.get("pronunciationSource") or "") == "zdic-unavailable"
+        ):
+            return {
+                "success": True,
+                "word": word,
+                "existing": existing_words.get(word, []),
+                "pronunciations": [],
+                "recommendedCode": "",
+                "autoReviewable": False,
+                "pronunciationUnresolved": True,
+                "requiresManualPronunciationReview": True,
+                "standardPronunciationStatus": standard_status,
+                "message": (
+                    f"「{word}」的权威整词或逐字读音服务暂不可用，"
+                    "当前读音无法完成交叉验证，暂不推荐编码"
+                ),
+                "entityKnowledge": None,
+            }
+
+        if not groups:
+            entity_knowledge = await _infer_entity_knowledge(word)
+            entity_group = _entity_pronunciation_group(
+                word,
+                entity_knowledge,
+                default_sequence,
+                encode_data,
+            )
         if not entity_group and default_sequence:
             entity_group = await _contextual_pronunciation_group(
                 config,
@@ -939,9 +1172,9 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
                 entity_knowledge,
                 default_sequence,
             )
-        if entity_group:
+        if not groups and entity_group:
             groups = [entity_group]
-        elif default_sequence:
+        elif not groups and default_sequence:
             groups = [{
                 "pinyin": pinyin_sequence_label(default_sequence),
                 "normalized": list(default_sequence),
@@ -969,6 +1202,7 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
             "score": group.get("score", 0),
             "fallback": bool(group.get("fallback")),
             "semanticPronunciation": bool(group.get("semanticPronunciation")),
+            "requiresManualReview": bool(group.get("requiresManualReview")),
             "sourceSummary": str(group.get("sourceSummary") or "").strip(),
             "contextPronunciation": group.get("contextPronunciation"),
         })
@@ -988,6 +1222,10 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
 
     has_authority = any(pron.get("sources") for pron in pronunciations)
     has_semantic_pronunciation = any(pron.get("semanticPronunciation") for pron in pronunciations)
+    requires_manual_pronunciation_review = any(
+        bool(pron.get("requiresManualReview"))
+        for pron in pronunciations
+    )
     return {
         "success": True,
         "word": word,
@@ -995,6 +1233,8 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
         "pronunciations": pronunciations,
         "recommendedCode": global_recommended,
         "autoReviewable": has_authority,
+        "requiresManualPronunciationReview": requires_manual_pronunciation_review,
+        "standardPronunciationStatus": standard_status,
         "autoReviewReason": (
             "至少一个权威来源给出读音"
             if has_authority else
@@ -1470,6 +1710,93 @@ async def _infer_semantic_pronunciation_proposal(word: str) -> Dict[str, Any]:
     except Exception as error:
         logger.debug(f"Semantic pronunciation inference failed for {normalized_word}: {error}")
         return {"accepted": False, "word": normalized_word}
+
+
+def _cache_semantic_pronunciation_result(
+    word: str,
+    result: Dict[str, Any],
+) -> None:
+    if result.get("capacityLimited"):
+        return
+    ttl = (
+        _SEMANTIC_ACCEPTED_CACHE_SECONDS
+        if result.get("accepted") is True
+        else _SEMANTIC_REJECTED_CACHE_SECONDS
+    )
+    _semantic_review_cache[word] = (time.monotonic() + ttl, dict(result))
+    if len(_semantic_review_cache) > _SEMANTIC_CACHE_MAX_ENTRIES:
+        oldest_word = min(
+            _semantic_review_cache,
+            key=lambda value: _semantic_review_cache[value][0],
+        )
+        _semantic_review_cache.pop(oldest_word, None)
+
+
+def _finish_semantic_pronunciation_task(
+    word: str,
+    task: asyncio.Task,
+) -> None:
+    if _semantic_review_inflight.get(word) is task:
+        _semantic_review_inflight.pop(word, None)
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+async def _run_semantic_pronunciation_review(
+    word: str,
+    requester: str,
+) -> Dict[str, Any]:
+    decision = SEMANTIC_PRONUNCIATION_GATE.try_acquire(requester)
+    if not decision.allowed:
+        logger.warning(
+            "Semantic pronunciation review capacity exceeded: "
+            f"reason={decision.reason} retry_after={decision.retry_after_seconds}"
+        )
+        return {
+            "accepted": False,
+            "word": word,
+            "capacityLimited": True,
+            "capacityReason": decision.reason,
+        }
+    try:
+        result = await _infer_semantic_pronunciation_proposal(word)
+        _cache_semantic_pronunciation_result(word, result)
+        return result
+    finally:
+        SEMANTIC_PRONUNCIATION_GATE.release()
+
+
+async def _infer_semantic_pronunciation_for_review(
+    word: str,
+    *,
+    requester: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Share billed work by word while charging it to the trusted actor bucket."""
+    normalized_word = str(word or "").strip()
+    now = time.monotonic()
+    cached = _semantic_review_cache.get(normalized_word)
+    if cached and cached[0] > now:
+        return dict(cached[1])
+    if cached:
+        _semantic_review_cache.pop(normalized_word, None)
+
+    active = _semantic_review_inflight.get(normalized_word)
+    if active is not None:
+        return dict(await asyncio.shield(active))
+
+    requester_key = str(requester or "").strip() or _SEMANTIC_BACKGROUND_REQUESTER
+    task = asyncio.create_task(
+        _run_semantic_pronunciation_review(normalized_word, requester_key)
+    )
+    _semantic_review_inflight[normalized_word] = task
+    task.add_done_callback(
+        lambda completed, value=normalized_word: (
+            _finish_semantic_pronunciation_task(value, completed)
+        )
+    )
+    return dict(await asyncio.shield(task))
 
 
 async def infer_semantic_pronunciation(word: str) -> Dict[str, Any]:
@@ -2341,6 +2668,13 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
             if code not in candidate_codes:
                 available = ", ".join(sorted(candidate_codes)[:8])
                 issues.append(f"「{word}」编码 {code} 不在读音候选链中，可选：{available or '无'}")
+                continue
+
+            if review.get("requiresManualPronunciationReview"):
+                issues.append(
+                    f"「{word}」读音由有明确含义支撑的整词语境判定，"
+                    "但缺少权威整词读音来源，需要管理员审核"
+                )
                 continue
 
             commonness = await estimate_word_commonness(word)
