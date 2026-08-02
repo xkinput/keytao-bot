@@ -3,15 +3,18 @@ Keytao Create Skill Tools
 键道创建词条工具实现
 """
 import asyncio
+import copy
 import difflib
 import hashlib
 import hmac
 import json
 import re
 import secrets
+import threading
 import time
 import unicodedata
 import httpx
+from collections import OrderedDict
 from typing import Dict, List, Optional
 from nonebot.log import logger
 
@@ -48,6 +51,229 @@ TYPE_LABELS = {
     "English": "英文",
 }
 VALID_PHRASE_TYPES = frozenset(TYPE_LABELS)
+
+
+class _SubmitAuditTicketStore:
+    """Bounded single-use audit snapshots for exact submit confirmations."""
+
+    def __init__(
+        self,
+        *,
+        ttl_seconds: float = 7200.0,
+        max_entries: int = 4096,
+        max_entry_bytes: int = 1024 * 1024,
+        max_total_bytes: int = 32 * 1024 * 1024,
+    ) -> None:
+        self._ttl_seconds = max(1.0, float(ttl_seconds))
+        self._max_entries = max(1, int(max_entries))
+        self._max_entry_bytes = max(1024, int(max_entry_bytes))
+        self._max_total_bytes = max(
+            self._max_entry_bytes,
+            int(max_total_bytes),
+        )
+        self._entries: OrderedDict[
+            tuple[str, str, str, int, str],
+            tuple[float, Dict, int, str, str],
+        ] = OrderedDict()
+        self._total_bytes = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _key(
+        platform: str,
+        platform_id: str,
+        batch_id: str,
+        content_version: int,
+        audit_digest: str,
+    ) -> tuple[str, str, str, int, str]:
+        return (
+            str(platform),
+            str(platform_id),
+            str(batch_id),
+            int(content_version),
+            str(audit_digest).lower(),
+        )
+
+    def _purge_expired(self, now: float) -> None:
+        expired_keys = [
+            key
+            for key, (expires_at, _review, _size_bytes, _state, _generation)
+            in self._entries.items()
+            if expires_at <= now
+        ]
+        for key in expired_keys:
+            self._pop_key(key)
+
+    def _pop_key(
+        self,
+        key: tuple[str, str, str, int, str],
+    ) -> Optional[tuple[float, Dict, int, str, str]]:
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._total_bytes -= entry[2]
+        return entry
+
+    def put(
+        self,
+        platform: str,
+        platform_id: str,
+        batch_id: str,
+        content_version: int,
+        audit_digest: str,
+        auto_review: Dict,
+    ) -> bool:
+        try:
+            size_bytes = len(
+                json.dumps(
+                    auto_review,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        except (TypeError, ValueError):
+            return False
+        if size_bytes > self._max_entry_bytes:
+            return False
+        key = self._key(
+            platform,
+            platform_id,
+            batch_id,
+            content_version,
+            audit_digest,
+        )
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired(now)
+            existing = self._entries.get(key)
+            if existing is not None and existing[3] == "active":
+                return False
+            # A fresh server preview may replace a ready ticket or a request
+            # whose result was explicitly marked uncertain. It must never
+            # unlock a second confirmation while the first POST is in flight.
+            self._pop_key(key)
+            self._entries[key] = (
+                now + self._ttl_seconds,
+                copy.deepcopy(auto_review),
+                size_bytes,
+                "ready",
+                secrets.token_hex(16),
+            )
+            self._total_bytes += size_bytes
+            self._entries.move_to_end(key)
+            stored = True
+            while (
+                len(self._entries) > self._max_entries
+                or self._total_bytes > self._max_total_bytes
+            ):
+                evicted_key = next(
+                    (
+                        candidate_key
+                        for candidate_key, candidate in self._entries.items()
+                        if candidate[3] != "active"
+                    ),
+                    None,
+                )
+                if evicted_key is None:
+                    stored = False
+                    break
+                self._pop_key(evicted_key)
+                if evicted_key == key:
+                    stored = False
+                    break
+        return stored
+
+    def claim(
+        self,
+        platform: str,
+        platform_id: str,
+        batch_id: str,
+        content_version: int,
+        audit_digest: str,
+    ) -> tuple[str, Optional[Dict], Optional[str]]:
+        key = self._key(
+            platform,
+            platform_id,
+            batch_id,
+            content_version,
+            audit_digest,
+        )
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired(now)
+            entry = self._entries.get(key)
+            if entry is None:
+                return "missing", None, None
+            expires_at, auto_review, size_bytes, state, generation = entry
+            if state != "ready":
+                return "claimed", None, None
+            self._entries[key] = (
+                expires_at,
+                auto_review,
+                size_bytes,
+                "active",
+                generation,
+            )
+            return "ok", copy.deepcopy(auto_review), generation
+
+    def mark_uncertain(
+        self,
+        platform: str,
+        platform_id: str,
+        batch_id: str,
+        content_version: int,
+        audit_digest: str,
+        generation: str,
+    ) -> bool:
+        key = self._key(
+            platform,
+            platform_id,
+            batch_id,
+            content_version,
+            audit_digest,
+        )
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired(now)
+            entry = self._entries.get(key)
+            if entry is None or entry[3] != "active" or entry[4] != generation:
+                return False
+            expires_at, auto_review, size_bytes, _state, _generation = entry
+            self._entries[key] = (
+                expires_at,
+                auto_review,
+                size_bytes,
+                "uncertain",
+                generation,
+            )
+            return True
+
+    def consume(
+        self,
+        platform: str,
+        platform_id: str,
+        batch_id: str,
+        content_version: int,
+        audit_digest: str,
+        generation: str,
+    ) -> bool:
+        key = self._key(
+            platform,
+            platform_id,
+            batch_id,
+            content_version,
+            audit_digest,
+        )
+        with self._lock:
+            now = time.monotonic()
+            self._purge_expired(now)
+            entry = self._entries.get(key)
+            if entry is None or entry[4] != generation:
+                return False
+            self._pop_key(key)
+            return True
+
+
+_SUBMIT_AUDIT_TICKETS = _SubmitAuditTicketStore()
 
 
 def compute_draft_summary(items: List[Dict]) -> Dict:
@@ -1259,6 +1485,27 @@ def _auto_review_confirmation_digest(auto_review: Dict) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+def _is_exact_submit_preview(
+    data: object,
+    batch_id: str,
+    content_version: int,
+) -> bool:
+    """Accept only a complete, read-only server ticket for submission."""
+    return bool(
+        isinstance(data, dict)
+        and data.get("success") is False
+        and data.get("requiresConfirmation") is True
+        and data.get("batchId") == batch_id
+        and data.get("contentVersion") == content_version
+        and not isinstance(data.get("contentVersion"), bool)
+        and isinstance(data.get("warnings"), list)
+        and isinstance(data.get("warningDigest"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", data["warningDigest"])
+        and isinstance(data.get("snapshotDigest"), str)
+        and re.fullmatch(r"[0-9a-f]{64}", data["snapshotDigest"])
+    )
+
+
 async def _auto_approve_submitted_batch(
     platform: str,
     platform_id: str,
@@ -1372,11 +1619,64 @@ async def keytao_submit_batch(
     if not batch_id:
         return {"success": False, "message": "没有找到待提交的草稿批次"}
 
-    auto_review = await _audit_current_draft_for_auto_approval(
-        platform,
-        platform_id,
-        batch_id,
-    )
+    confirmation_claimed = False
+    confirmation_generation = ""
+
+    def consume_confirmation() -> None:
+        if not confirmation_claimed or not confirmation_generation:
+            return
+        _SUBMIT_AUDIT_TICKETS.consume(
+            platform,
+            platform_id,
+            batch_id,
+            expected_content_version,
+            expected_audit_digest,
+            confirmation_generation,
+        )
+
+    def mark_confirmation_uncertain() -> None:
+        if not confirmation_claimed or not confirmation_generation:
+            return
+        _SUBMIT_AUDIT_TICKETS.mark_uncertain(
+            platform,
+            platform_id,
+            batch_id,
+            expected_content_version,
+            expected_audit_digest,
+            confirmation_generation,
+        )
+
+    if confirmed:
+        claim_status, auto_review, confirmation_generation = _SUBMIT_AUDIT_TICKETS.claim(
+            platform,
+            platform_id,
+            batch_id,
+            expected_content_version,
+            expected_audit_digest,
+        )
+        if claim_status == "claimed":
+            return {
+                "success": False,
+                "uncertain": True,
+                "error": "submit_confirmation_already_claimed",
+                "message": "这次提交正在执行或结果尚不确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
+                "batchId": batch_id,
+            }
+        if claim_status != "ok" or auto_review is None:
+            return {
+                "success": False,
+                "staleConfirmation": True,
+                "error": "submit_confirmation_missing",
+                "message": "提交检查已过期或不匹配，请重新发送「提交」或「加入并提交」获取最新快照",
+                "batchId": batch_id,
+            }
+        confirmation_claimed = True
+    else:
+        auto_review = await _audit_current_draft_for_auto_approval(
+            platform,
+            platform_id,
+            batch_id,
+        )
     audited_content_version = auto_review.get("contentVersion")
     audited_digest = _auto_review_confirmation_digest(auto_review)
     if (
@@ -1384,31 +1684,75 @@ async def keytao_submit_batch(
         or isinstance(audited_content_version, bool)
         or audited_content_version < 0
     ):
+        consume_confirmation()
         return {
             "success": False,
+            "error": "invalid_audit_content_version",
             "message": auto_review.get("summary") or "草稿快照缺少可验证版本，已停止提交",
             "autoReview": auto_review,
         }
     if confirmed and expected_content_version != audited_content_version:
+        consume_confirmation()
         return {
             "success": False,
             "staleConfirmation": True,
-            "message": "草稿内容已变化，旧确认票据已作废，请重新提交",
+            "error": "submit_content_version_changed",
+            "message": "草稿内容已变化，本次确认已失效，请重新发送「提交」",
             "batchId": batch_id,
             "contentVersion": audited_content_version,
             "autoReview": auto_review,
         }
     if confirmed and expected_audit_digest != audited_digest:
+        consume_confirmation()
         return {
             "success": False,
             "staleConfirmation": True,
-            "message": "本喵复审结论已变化，旧确认票据已作废，请重新提交",
+            "error": "submit_audit_digest_changed",
+            "message": "提交检查与当前快照不匹配，本次确认已失效，请重新发送「提交」",
             "batchId": batch_id,
             "contentVersion": audited_content_version,
             "auditDigest": audited_digest,
             "autoReview": auto_review,
         }
     submission_content_version = audited_content_version
+
+    def prepare_submit_preview(data: object) -> Dict:
+        if not _is_exact_submit_preview(
+            data,
+            batch_id,
+            audited_content_version,
+        ):
+            return {
+                "success": False,
+                "uncertain": True,
+                "error": "invalid_submit_preview",
+                "message": "服务端未返回完整的只读提交快照；请先发送「查看草稿」核对状态",
+                "batchId": batch_id,
+                "contentVersion": audited_content_version,
+            }
+        preview_data = dict(data)
+        preview_data["autoReview"] = auto_review
+        preview_data["auditDigest"] = audited_digest
+        preview_data.setdefault("snapshotItems", auto_review.get("snapshotItems", []))
+        preview_data["auditSnapshotDigest"] = auto_review.get("snapshotDigest", "")
+        _inject_batch_url(preview_data)
+        stored = _SUBMIT_AUDIT_TICKETS.put(
+            platform,
+            platform_id,
+            batch_id,
+            audited_content_version,
+            audited_digest,
+            auto_review,
+        )
+        if not stored:
+            return {
+                "success": False,
+                "error": "audit_snapshot_not_stored",
+                "message": "提交检查无法安全保存（结果过大或容量不足）；请先发送「查看草稿」核对状态",
+                "batchId": batch_id,
+                "contentVersion": audited_content_version,
+            }
+        return preview_data
     
     url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/submit"
     
@@ -1440,6 +1784,8 @@ async def keytao_submit_batch(
             
             if response.status_code == 200:
                 data = response.json()
+                if not confirmed:
+                    return prepare_submit_preview(data)
                 data["batchId"] = batch_id  # inject so _inject_batch_url can build batchUrl
                 data.setdefault("contentVersion", submission_content_version)
                 _inject_batch_url(data)
@@ -1447,10 +1793,7 @@ async def keytao_submit_batch(
                 data["auditDigest"] = audited_digest
                 data.setdefault("snapshotItems", auto_review.get("snapshotItems", []))
                 data["auditSnapshotDigest"] = auto_review.get("snapshotDigest", "")
-                if preview_only:
-                    data["success"] = False
-                    data["requiresConfirmation"] = True
-                    return data
+                consume_confirmation()
                 if _audit_allows_batch_auto_approve(auto_review):
                     approve_result = await _auto_approve_submitted_batch(
                         platform,
@@ -1463,17 +1806,25 @@ async def keytao_submit_batch(
                     data["autoApproved"] = bool(approve_result.get("success"))
                 return data
             elif response.status_code == 404:
+                consume_confirmation()
                 return {
                     "success": False,
+                    "error": "batch_not_found",
                     "message": "批次不存在或已被删除"
                 }
             elif response.status_code == 403:
+                consume_confirmation()
                 return {
                     "success": False,
+                    "error": "batch_forbidden",
                     "message": "无权限操作此批次"
                 }
             elif response.status_code == 400:
                 data = response.json()
+                if not confirmed and data.get("requiresConfirmation") is True:
+                    return prepare_submit_preview(data)
+                consume_confirmation()
+                data.setdefault("error", "submit_rejected")
                 data.setdefault("batchId", batch_id)
                 data.setdefault("contentVersion", submission_content_version)
                 data["autoReview"] = auto_review
@@ -1483,28 +1834,63 @@ async def keytao_submit_batch(
                 return data
             elif response.status_code == 409:
                 data = response.json()
+                consume_confirmation()
                 return {
                     **data,
                     "success": False,
+                    "error": data.get("error") or "submit_snapshot_changed",
                     "staleConfirmation": True,
                     "batchId": batch_id,
                     "message": data.get("message") or "草稿内容已变化，请重新检查后提交",
                 }
             else:
+                if confirmed:
+                    mark_confirmation_uncertain()
+                    return {
+                        "success": False,
+                        "uncertain": True,
+                        "error": "submit_result_uncertain",
+                        "message": "提交结果暂时无法确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
+                        "batchId": batch_id,
+                    }
                 return {
                     "success": False,
+                    "error": "submit_http_error",
                     "message": f"提交失败: HTTP {response.status_code}"
                 }
                 
+    except asyncio.CancelledError:
+        mark_confirmation_uncertain()
+        raise
     except httpx.TimeoutException:
+        if confirmed:
+            mark_confirmation_uncertain()
+            return {
+                "success": False,
+                "uncertain": True,
+                "error": "submit_result_uncertain",
+                "message": "提交请求超时，结果可能已经生效；请先发送「查看草稿」核对状态，再重新发送「提交」",
+                "batchId": batch_id,
+            }
         return {
             "success": False,
+            "error": "submit_timeout",
             "message": "请求超时，请稍后重试"
         }
     except Exception as e:
         logger.error(f"Submit batch error: {e}")
+        if confirmed:
+            mark_confirmation_uncertain()
+            return {
+                "success": False,
+                "uncertain": True,
+                "error": "submit_result_uncertain",
+                "message": "提交结果无法确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
+                "batchId": batch_id,
+            }
         return {
             "success": False,
+            "error": "submit_failed",
             "message": f"提交失败: {str(e)}"
         }
 

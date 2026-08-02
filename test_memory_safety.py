@@ -694,6 +694,399 @@ class WebRequestLimitTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_candidate_prompt_hides_internal_confirmation_nonce(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "group-321", "user-321")
+        state_store.set(
+            conv_key,
+            PendingAddWord(
+                word="阻抑",
+                recommended_code="zjyka",
+                candidates=[("zjyka", False)],
+            ),
+        )
+        old_state_store = chat_module.conversation_state_store
+        try:
+            chat_module.conversation_state_store = state_store
+            prompt = chat_module._append_pending_ticket_challenge(
+                "回复「加入」只加入草稿，回复「加入并提交」则加入后提交。",
+                conv_key,
+            )
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+        self.assertNotIn("确认票据", prompt)
+        self.assertNotIn(state_store.get_record(conv_key).reconfirmation_code, prompt)
+
+    async def test_owner_add_and_submit_authorizes_exact_preview_chain(self) -> None:
+        """One explicit owner command authorizes the exact add and submit snapshots."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "group-321", "user-321")
+        calls = []
+        create_digest = "a" * 64
+        snapshot_digest = "b" * 64
+        submit_warning_digest = "c" * 64
+        audit_digest = "d" * 64
+
+        async def create_phrase(**kwargs):
+            calls.append(("keytao_create_phrase", kwargs))
+            if kwargs.get("preview_only"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "message": "请核对添加快照",
+                    "batchId": "batch-321",
+                    "contentVersion": 4,
+                    "warningDigest": create_digest,
+                    "warnings": [],
+                }
+            return {
+                "success": True,
+                "batchId": "batch-321",
+                "contentVersion": 5,
+            }
+
+        async def submit_batch(**kwargs):
+            calls.append(("keytao_submit_batch", kwargs))
+            if kwargs.get("preview_only"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "message": "请核对提交快照",
+                    "batchId": "batch-321",
+                    "contentVersion": 5,
+                    "snapshotDigest": snapshot_digest,
+                    "warningDigest": submit_warning_digest,
+                    "auditDigest": audit_digest,
+                    "snapshotItems": [
+                        {
+                            "action": "Create",
+                            "word": "阻抑",
+                            "code": "zjyka",
+                        },
+                    ],
+                }
+            return {
+                "success": True,
+                "batchId": "batch-321",
+                "contentVersion": 5,
+            }
+
+        old_state_store = chat_module.conversation_state_store
+        old_tool_executor = chat_module.tool_executor
+        try:
+            chat_module.conversation_state_store = state_store
+            chat_module.tool_executor = ToolExecutor(
+                lambda name: {
+                    "keytao_create_phrase": create_phrase,
+                    "keytao_submit_batch": submit_batch,
+                }.get(name),
+                frozenset({"keytao_create_phrase", "keytao_submit_batch"}),
+            )
+            state_store.set(
+                conv_key,
+                PendingAddWord(
+                    word="阻抑",
+                    recommended_code="zjyka",
+                    candidates=[
+                        ("zjyk", True),
+                        ("zjyka", False),
+                        ("zjykai", False),
+                    ],
+                ),
+            )
+
+            reply = await chat_module.handle_pending_message_core(
+                "加入并提交",
+                "qq",
+                "user-321",
+                conv_key,
+                history=[],
+                space_key=conv_key.space_key,
+                owner_label="321",
+            )
+
+            self.assertEqual(
+                [name for name, _arguments in calls],
+                [
+                    "keytao_create_phrase",
+                    "keytao_create_phrase",
+                    "keytao_submit_batch",
+                    "keytao_submit_batch",
+                ],
+            )
+            self.assertEqual(calls[0][1]["word"], "阻抑")
+            self.assertEqual(calls[0][1]["code"], "zjyka")
+            self.assertTrue(calls[0][1]["preview_only"])
+            self.assertTrue(calls[1][1]["confirmed"])
+            self.assertEqual(
+                calls[1][1]["expected_warning_digest"],
+                create_digest,
+            )
+            self.assertTrue(calls[3][1]["confirmed"])
+            self.assertEqual(
+                calls[3][1]["expected_server_snapshot_digest"],
+                snapshot_digest,
+            )
+            self.assertIn("已加入草稿并提交审核", reply)
+            self.assertNotIn("确认票据", reply)
+            self.assertNotIn("确认操作", reply)
+            self.assertIsNone(state_store.get_record(conv_key))
+        finally:
+            chat_module.tool_executor = old_tool_executor
+            chat_module.conversation_state_store = old_state_store
+
+    async def test_target_bound_local_preview_confirmation_reaches_server_check(self) -> None:
+        """An exact natural command must pass the generic mutation gate."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("web", "user-natural-confirm")
+        calls = []
+
+        async def create_phrase(**kwargs):
+            calls.append(kwargs)
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "message": "编码刚刚被占用",
+                "batchId": "batch-natural-confirm",
+                "contentVersion": 8,
+                "warningDigest": "e" * 64,
+                "warnings": [
+                    {
+                        "warningType": "duplicate_code",
+                        "message": "zjyka 现已有其他词条",
+                    },
+                ],
+            }
+
+        old_state_store = chat_module.conversation_state_store
+        old_tool_executor = chat_module.tool_executor
+        try:
+            chat_module.conversation_state_store = state_store
+            chat_module.tool_executor = ToolExecutor(
+                lambda name: create_phrase if name == "keytao_create_phrase" else None,
+                frozenset({"keytao_create_phrase"}),
+            )
+            state_store.set(
+                conv_key,
+                PendingToolConfirm(
+                    function_name="keytao_create_phrase",
+                    args={"word": "阻抑", "code": "zjyka"},
+                    confirmation_source="local_preview",
+                ),
+            )
+
+            reply = await chat_module.handle_pending_message_core(
+                "确认加入 阻抑 zjyka",
+                "web",
+                "user-natural-confirm",
+                conv_key,
+                history=[],
+                space_key=conv_key.space_key,
+                owner_label="321",
+            )
+
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0]["preview_only"])
+            saved = state_store.get(conv_key)
+            self.assertIsInstance(saved, PendingToolConfirm)
+            self.assertEqual(saved.confirmation_source, "server_warning")
+            self.assertIn("zjyka 现已有其他词条", reply)
+            self.assertIn("确认票据 ", reply)
+            self.assertNotIn("确认加入 阻抑 zjyka", reply)
+        finally:
+            chat_module.tool_executor = old_tool_executor
+            chat_module.conversation_state_store = old_state_store
+
+    async def test_question_marked_pending_controls_never_execute(self) -> None:
+        """Question-like short replies cannot authorize a live add ticket."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("web", "user-question")
+        pending = PendingAddWord(
+            word="阻抑",
+            recommended_code="zjyka",
+            candidates=[("zjyka", False)],
+        )
+        calls = []
+
+        async def create_phrase(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        old_state_store = chat_module.conversation_state_store
+        old_tool_executor = chat_module.tool_executor
+        try:
+            chat_module.conversation_state_store = state_store
+            chat_module.tool_executor = ToolExecutor(
+                lambda name: create_phrase if name == "keytao_create_phrase" else None,
+                frozenset({"keytao_create_phrase"}),
+            )
+            for command in ("加入并提交？", "确认？", "确认加入？", "1？"):
+                with self.subTest(command=command):
+                    calls.clear()
+                    state_store.set(conv_key, pending)
+                    before = state_store.get_record(conv_key)
+                    reply = await chat_module.handle_pending_message_core(
+                        command,
+                        "web",
+                        "user-question",
+                        conv_key,
+                        history=[],
+                        space_key=conv_key.space_key,
+                        owner_label="321",
+                    )
+                    after = state_store.get_record(conv_key)
+
+                    self.assertEqual(calls, [])
+                    self.assertIsNone(reply)
+                    self.assertIs(after.state, pending)
+                    self.assertEqual(
+                        after.reconfirmation_code,
+                        before.reconfirmation_code,
+                    )
+                    self.assertFalse(after.execution_id)
+        finally:
+            chat_module.tool_executor = old_tool_executor
+            chat_module.conversation_state_store = old_state_store
+
+    async def test_current_draft_submit_never_consumes_pending_add_word(self) -> None:
+        """Submit commands must submit the draft, not confirm an unrelated candidate."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("web", "user-321")
+        pending = PendingAddWord(
+            word="阻抑",
+            recommended_code="zjyka",
+            candidates=[("zjyka", False)],
+        )
+        calls = []
+
+        async def submit_batch(**kwargs):
+            calls.append(("keytao_submit_batch", kwargs))
+            if kwargs.get("preview_only"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "message": "请核对当前草稿",
+                    "batchId": "existing-draft",
+                    "contentVersion": 9,
+                    "snapshotDigest": "a" * 64,
+                    "warningDigest": "b" * 64,
+                    "auditDigest": "c" * 64,
+                    "snapshotItems": [
+                        {"action": "Create", "word": "已有草稿", "code": "yycg"},
+                    ],
+                }
+            return {"success": True, "batchId": "existing-draft"}
+
+        old_state_store = chat_module.conversation_state_store
+        old_tool_executor = chat_module.tool_executor
+        try:
+            chat_module.conversation_state_store = state_store
+            chat_module.tool_executor = ToolExecutor(
+                lambda name: submit_batch if name == "keytao_submit_batch" else None,
+                frozenset({"keytao_submit_batch"}),
+            )
+            for command in ("提交", "确认提交"):
+                with self.subTest(command=command):
+                    calls.clear()
+                    state_store.set(conv_key, pending)
+                    reply = await chat_module.handle_pending_message_core(
+                        command,
+                        "web",
+                        "user-321",
+                        conv_key,
+                        history=[],
+                        owner_label="user-321",
+                    )
+
+                    self.assertEqual(
+                        [name for name, _arguments in calls],
+                        ["keytao_submit_batch", "keytao_submit_batch"],
+                    )
+                    self.assertIn("已提交审核", reply)
+                    self.assertIs(state_store.get(conv_key), pending)
+        finally:
+            chat_module.tool_executor = old_tool_executor
+            chat_module.conversation_state_store = old_state_store
+
+    async def test_new_create_warning_pauses_on_snapshot_bound_ticket(self) -> None:
+        """A new risk needs one exact snapshot ticket instead of auto-confirmation."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "group-321", "user-321")
+        calls = []
+
+        async def create_phrase(**kwargs):
+            calls.append(("keytao_create_phrase", kwargs))
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "message": "编码刚刚被占用",
+                "batchId": "batch-risk",
+                "contentVersion": 6,
+                "warningDigest": "e" * 64,
+                "warnings": [
+                    {
+                        "warningType": "duplicate_code",
+                        "message": "zjyka 现已有其他词条",
+                    },
+                ],
+            }
+
+        old_state_store = chat_module.conversation_state_store
+        old_tool_executor = chat_module.tool_executor
+        try:
+            chat_module.conversation_state_store = state_store
+            chat_module.tool_executor = ToolExecutor(
+                lambda name: create_phrase if name == "keytao_create_phrase" else None,
+                frozenset({"keytao_create_phrase"}),
+            )
+            state_store.set(
+                conv_key,
+                PendingAddWord(
+                    word="阻抑",
+                    recommended_code="zjyka",
+                    candidates=[("zjyka", False)],
+                ),
+            )
+
+            reply = await chat_module.handle_pending_message_core(
+                "加入并提交",
+                "qq",
+                "user-321",
+                conv_key,
+                history=[],
+                space_key=conv_key.space_key,
+                owner_label="321",
+            )
+
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(calls[0][1]["preview_only"])
+            self.assertNotIn("confirmed", calls[0][1])
+            self.assertIn("zjyka 现已有其他词条", reply)
+            saved = state_store.get(conv_key)
+            self.assertIsInstance(saved, PendingToolConfirm)
+            self.assertEqual(saved.args["expected_warning_digest"], "e" * 64)
+            record = state_store.get_record(conv_key)
+            self.assertIn(f"确认票据 {record.reconfirmation_code}", reply)
+            self.assertEqual(reply.count("确认票据 "), 1)
+            self.assertNotIn("「确认加入」", reply)
+            self.assertNotIn("「确认提交」", reply)
+        finally:
+            chat_module.tool_executor = old_tool_executor
+            chat_module.conversation_state_store = old_state_store
+
     async def test_recode_ticket_preview_matches_canonical_candidate(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 

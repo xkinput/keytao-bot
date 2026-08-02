@@ -759,8 +759,8 @@ def test_unquoted_draft_submit_bypasses_other_owner_pending_guard():
         ),
     )
     check(
-        "confirm-submit wording is still blocked by other owner pending",
-        _should_block_for_other_owner_pending(
+        "confirm-submit wording is a fresh own-draft command",
+        not _should_block_for_other_owner_pending(
             "group",
             False,
             other_record,
@@ -2418,7 +2418,7 @@ def test_draft_submit_command_uses_current_user_tools():
         openai_chat_module.conversation_state_store = store
         try:
             with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-                preview = await _try_handle_draft_management_command(
+                submitted = await _try_handle_draft_management_command(
                     "提交",
                     "qq",
                     "2002",
@@ -2427,27 +2427,12 @@ def test_draft_submit_command_uses_current_user_tools():
                     command_intent=MessageCommandIntent(intent="draft_submit", confidence=1.0),
                 )
                 record = store.get_record(ConversationAddress.group("qq", "42", "2002"))
-                confirmed = await openai_chat_module._execute_confirmed_tool(
-                    record.state,
-                    "qq",
-                    "2002",
-                    ConversationAddress.group("qq", "42", "2002"),
-                    ("qq", "qq:group:42"),
-                    "别打脸",
-                )
         finally:
             openai_chat_module.conversation_state_store = old_store
 
-        check("draft submit preview handled", preview is not None and "是否继续提交" in preview)
+        check("draft submit handled", submitted is not None and "已提交审核" in submitted)
         check("submit preview is non-mutating", tool_calls[0][1] == {"preview_only": True})
         check("submit uses current sender", all(call[2:] == ("qq", "2002") for call in tool_calls))
-        check("submit ticket binds exact batch", record is not None and record.state.args.get("batch_id") == "draft-current-user")
-        check("submit ticket binds exact version", record is not None and record.state.args.get("expected_content_version") == 7)
-        check("submit ticket binds all digests", record is not None and {
-            record.state.args.get("expected_server_snapshot_digest"),
-            record.state.args.get("expected_warning_digest"),
-            record.state.args.get("expected_audit_digest"),
-        } == {digest_a, digest_b, digest_c})
         check("confirmed submit carries snapshot ticket", tool_calls[1][1] == {
             "batch_id": "draft-current-user",
             "expected_content_version": 7,
@@ -2456,9 +2441,651 @@ def test_draft_submit_command_uses_current_user_tools():
             "expected_audit_digest": digest_c,
             "confirmed": True,
         })
-        check("confirmed submit succeeds", "草稿已成功提交审核" in confirmed)
+        check("plain submit leaves no ticket", record is None)
+        check("plain submit shows no ticket code", "确认票据" not in submitted and "确认操作" not in submitted)
 
     asyncio.run(_run())
+
+
+def test_add_submit_extra_snapshot_shows_one_exact_confirmation():
+    """Extra old draft items must be shown before one nonce-bound confirmation."""
+    print("\n🧪 add-submit extra snapshot shows one exact confirmation")
+
+    async def _run():
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            if tool_name != "keytao_submit_batch":
+                raise AssertionError((tool_name, arguments))
+            return json.dumps({
+                "success": False,
+                "requiresConfirmation": True,
+                "message": "批次检查完成，请确认后提交",
+                "batchId": "draft-extra-items",
+                "contentVersion": 17,
+                "snapshotDigest": "1" * 64,
+                "warningDigest": "2" * 64,
+                "auditDigest": "3" * 64,
+                "warnings": [],
+                "snapshotItems": [
+                    {
+                        "id": 41,
+                        "action": "Create",
+                        "word": "阻抑",
+                        "code": "zjyka",
+                        "type": "Phrase",
+                    },
+                    {
+                        "id": 42,
+                        "action": "Delete",
+                        "word": "旧草稿词",
+                        "code": "jqk",
+                        "type": "Phrase",
+                    },
+                ],
+                "autoReview": {
+                    "summary": "存在额外旧草稿，需要人工确认",
+                    "issues": ["快照包含未由本次加词授权的删除项"],
+                },
+            }, ensure_ascii=False)
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await openai_chat_module._perform_submit_current_draft(
+                "qq",
+                "user-extra-items",
+                batch_id="draft-extra-items",
+                preview_only=True,
+                auto_confirm=True,
+                authorized_items=[
+                    {"action": "Create", "word": "阻抑", "code": "zjyka"},
+                ],
+            )
+
+        coordinator = DraftOperationCoordinator()
+        operation = coordinator.begin(
+            ("qq", "user-extra-items"),
+            "add_and_submit",
+            word="阻抑",
+            code="zjyka",
+        )
+        coordinator.mark_awaiting_confirmation(
+            ("qq", "user-extra-items"),
+            operation.operation_id,
+            result.pending_state,
+            result.text,
+        )
+
+        check("extra snapshot blocks automatic confirmation", result.pending_state is not None)
+        check("extra snapshot shows authorized create", "Create 阻抑 @ zjyka" in result.text)
+        check("extra snapshot shows old delete", "Delete 旧草稿词 @ jqk" in result.text)
+        check("extra snapshot shows exact digests", "SHA-256 " + "1" * 64 in result.text and "SHA-256 " + "2" * 64 in result.text)
+        check("risk prompt does not advertise unusable natural command", "「确认提交」" not in result.text and "「确认加入」" not in result.text)
+        check("risk prompt exposes one executable nonce", operation.prompt_text.count("确认操作 ") == 1)
+
+    asyncio.run(_run())
+
+
+def test_submit_confirmation_reuses_preview_audit_snapshot():
+    """A confirmation must reuse the preview audit instead of rerunning the LLM."""
+    print("\n🧪 submit confirmation reuses preview audit snapshot")
+
+    async def _run():
+        audit_calls = []
+        http_calls = []
+        first_audit = {
+            "success": True,
+            "verdict": "needs_admin",
+            "autoApprove": False,
+            "summary": "首次审计结论",
+            "issues": ["缺少权威来源"],
+            "approvedItems": [],
+            "batchId": "draft-audit",
+            "contentVersion": 7,
+            "snapshotDigest": "1" * 64,
+            "snapshotItems": [
+                {"action": "Create", "word": "阻抑", "code": "zjyka"},
+            ],
+        }
+        changed_wording = {
+            **first_audit,
+            "summary": "同一安全结论的不同措辞",
+        }
+        response_payloads = [
+            (400, {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "draft-audit",
+                "contentVersion": 7,
+                "snapshotDigest": "2" * 64,
+                "warningDigest": "3" * 64,
+                "warnings": [],
+            }),
+            (200, {
+                "success": True,
+                "contentVersion": 7,
+            }),
+        ]
+
+        async def fake_audit(platform, platform_id, batch_id):
+            audit_calls.append((platform, platform_id, batch_id))
+            return first_audit if len(audit_calls) == 1 else changed_wording
+
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return dict(self._payload)
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, **kwargs):
+                http_calls.append((url, kwargs))
+                return FakeResponse(*response_payloads[len(http_calls) - 1])
+
+        with (
+            patch.object(
+                _draft_tools,
+                "_audit_current_draft_for_auto_approval",
+                side_effect=fake_audit,
+            ),
+            patch.object(_draft_tools, "get_bot_token", return_value="token"),
+            patch.object(
+                _draft_tools,
+                "get_keytao_url",
+                return_value="https://keytao.test",
+            ),
+            patch.object(
+                _draft_tools,
+                "get_bot_headers",
+                return_value={"Authorization": "Bearer token"},
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
+            ),
+        ):
+            preview = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-321",
+                batch_id="draft-audit",
+                preview_only=True,
+            )
+            wrong_actor = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "other-user",
+                confirmed=True,
+                batch_id="draft-audit",
+                expected_content_version=7,
+                expected_server_snapshot_digest="2" * 64,
+                expected_warning_digest="3" * 64,
+                expected_audit_digest=preview["auditDigest"],
+            )
+            confirmed = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-321",
+                confirmed=True,
+                batch_id="draft-audit",
+                expected_content_version=7,
+                expected_server_snapshot_digest="2" * 64,
+                expected_warning_digest="3" * 64,
+                expected_audit_digest=preview["auditDigest"],
+            )
+            replayed = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-321",
+                confirmed=True,
+                batch_id="draft-audit",
+                expected_content_version=7,
+                expected_server_snapshot_digest="2" * 64,
+                expected_warning_digest="3" * 64,
+                expected_audit_digest=preview["auditDigest"],
+            )
+
+        check("preview creates exact submit ticket", preview.get("requiresConfirmation") is True)
+        check("audit ticket is actor-bound", wrong_actor.get("staleConfirmation") is True)
+        check("confirmation reuses one audit", len(audit_calls) == 1)
+        check("confirmation reaches server", len(http_calls) == 2)
+        check("confirmation succeeds despite wording drift", confirmed.get("success") is True)
+        check("audit ticket is single-use", replayed.get("staleConfirmation") is True and len(http_calls) == 2)
+
+    asyncio.run(_run())
+
+
+def test_submit_timeout_recovers_after_fresh_preview():
+    """An uncertain POST cannot replay, but a fresh server preview can recover."""
+    print("\n🧪 submit timeout recovers after fresh preview")
+
+    async def _run():
+        audit_calls = []
+        http_calls = []
+        audit = {
+            "success": True,
+            "verdict": "needs_admin",
+            "autoApprove": False,
+            "summary": "需要管理员审核",
+            "issues": ["缺少权威来源"],
+            "approvedItems": [],
+            "batchId": "draft-timeout",
+            "contentVersion": 11,
+            "snapshotDigest": "4" * 64,
+            "snapshotItems": [
+                {"action": "Create", "word": "阻抑", "code": "zjyka"},
+            ],
+        }
+
+        async def fake_audit(platform, platform_id, batch_id):
+            audit_calls.append((platform, platform_id, batch_id))
+            return dict(audit)
+
+        class FakeTimeout(Exception):
+            pass
+
+        class FakeResponse:
+            def __init__(self, payload, status_code=200):
+                self.payload = payload
+                self.status_code = status_code
+
+            def json(self):
+                return dict(self.payload)
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, **kwargs):
+                http_calls.append((url, kwargs))
+                if len(http_calls) in {1, 3}:
+                    return FakeResponse({
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "batchId": "draft-timeout",
+                        "contentVersion": 11,
+                        "snapshotDigest": "5" * 64,
+                        "warningDigest": "6" * 64,
+                        "warnings": [],
+                    }, status_code=400)
+                if len(http_calls) == 2:
+                    raise FakeTimeout()
+                return FakeResponse({
+                    "success": True,
+                    "contentVersion": 11,
+                    "message": "submitted",
+                })
+
+        with (
+            patch.object(
+                _draft_tools,
+                "_audit_current_draft_for_auto_approval",
+                side_effect=fake_audit,
+            ),
+            patch.object(_draft_tools, "get_bot_token", return_value="token"),
+            patch.object(
+                _draft_tools,
+                "get_keytao_url",
+                return_value="https://keytao.test",
+            ),
+            patch.object(
+                _draft_tools,
+                "get_bot_headers",
+                return_value={"Authorization": "Bearer token"},
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "TimeoutException",
+                FakeTimeout,
+                create=True,
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
+            ),
+        ):
+            preview = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-timeout",
+                batch_id="draft-timeout",
+                preview_only=True,
+            )
+            confirmation_args = {
+                "confirmed": True,
+                "batch_id": "draft-timeout",
+                "expected_content_version": 11,
+                "expected_server_snapshot_digest": "5" * 64,
+                "expected_warning_digest": "6" * 64,
+                "expected_audit_digest": preview["auditDigest"],
+            }
+            timed_out = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-timeout",
+                **confirmation_args,
+            )
+            replayed = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-timeout",
+                **confirmation_args,
+            )
+            calls_after_replay = len(http_calls)
+            audits_after_replay = len(audit_calls)
+            refreshed = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-timeout",
+                batch_id="draft-timeout",
+                preview_only=True,
+            )
+            refreshed_confirmation_args = {
+                **confirmation_args,
+                "expected_audit_digest": refreshed["auditDigest"],
+            }
+            recovered = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-timeout",
+                **refreshed_confirmation_args,
+            )
+
+        check("timeout is marked uncertain", timed_out.get("uncertain") is True)
+        check("timeout directs a read-only state check", "查看草稿" in timed_out.get("message", ""))
+        check("uncertain confirmation stays claimed", replayed.get("error") == "submit_confirmation_already_claimed")
+        check("uncertain confirmation cannot post twice", calls_after_replay == 2)
+        check("uncertain confirmation cannot rerun audit", audits_after_replay == 1)
+        check("fresh preview replaces the claimed ticket", refreshed.get("requiresConfirmation") is True)
+        check("fresh preview can recover submission", recovered.get("success") is True)
+        check("recovered confirmation reaches server once", len(http_calls) == 4)
+        check("fresh preview performs one new audit", len(audit_calls) == 2)
+
+        bounded = _draft_tools._SubmitAuditTicketStore(
+            max_entry_bytes=1024,
+            max_total_bytes=2048,
+        )
+        oversized = bounded.put(
+            "qq",
+            "user-timeout",
+            "oversized",
+            1,
+            "7" * 64,
+            {"snapshotItems": [{"remark": "x" * 2048}]},
+        )
+        check("oversized audit snapshot is refused", oversized is False)
+
+    asyncio.run(_run())
+
+
+def test_submit_cancellation_marks_ticket_uncertain():
+    """Cancellation must release an active claim for a later fresh preview."""
+    print("\n🧪 submit cancellation marks ticket uncertain")
+
+    async def _run():
+        audit_calls = []
+        http_calls = []
+        audit = {
+            "success": True,
+            "verdict": "needs_admin",
+            "autoApprove": False,
+            "summary": "需要管理员审核",
+            "issues": ["缺少权威来源"],
+            "approvedItems": [],
+            "batchId": "draft-cancelled",
+            "contentVersion": 13,
+            "snapshotDigest": "a" * 64,
+            "snapshotItems": [
+                {"action": "Create", "word": "阻抑", "code": "zjyka"},
+            ],
+        }
+
+        async def fake_audit(platform, platform_id, batch_id):
+            audit_calls.append((platform, platform_id, batch_id))
+            return dict(audit)
+
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self.payload = payload
+
+            def json(self):
+                return dict(self.payload)
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, **kwargs):
+                http_calls.append((url, kwargs))
+                if len(http_calls) in {1, 3}:
+                    return FakeResponse(400, {
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "batchId": "draft-cancelled",
+                        "contentVersion": 13,
+                        "snapshotDigest": "b" * 64,
+                        "warningDigest": "c" * 64,
+                        "warnings": [],
+                    })
+                if len(http_calls) == 2:
+                    raise asyncio.CancelledError()
+                return FakeResponse(200, {
+                    "success": True,
+                    "contentVersion": 13,
+                })
+
+        with (
+            patch.object(
+                _draft_tools,
+                "_audit_current_draft_for_auto_approval",
+                side_effect=fake_audit,
+            ),
+            patch.object(_draft_tools, "get_bot_token", return_value="token"),
+            patch.object(
+                _draft_tools,
+                "get_keytao_url",
+                return_value="https://keytao.test",
+            ),
+            patch.object(
+                _draft_tools,
+                "get_bot_headers",
+                return_value={"Authorization": "Bearer token"},
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
+            ),
+        ):
+            preview = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-cancelled",
+                batch_id="draft-cancelled",
+                preview_only=True,
+            )
+            confirmation_args = {
+                "confirmed": True,
+                "batch_id": "draft-cancelled",
+                "expected_content_version": 13,
+                "expected_server_snapshot_digest": "b" * 64,
+                "expected_warning_digest": "c" * 64,
+                "expected_audit_digest": preview["auditDigest"],
+            }
+            cancelled = False
+            try:
+                await _draft_tools.keytao_submit_batch(
+                    "qq",
+                    "user-cancelled",
+                    **confirmation_args,
+                )
+            except asyncio.CancelledError:
+                cancelled = True
+            refreshed = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-cancelled",
+                batch_id="draft-cancelled",
+                preview_only=True,
+            )
+            recovered = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-cancelled",
+                **{
+                    **confirmation_args,
+                    "expected_audit_digest": refreshed["auditDigest"],
+                },
+            )
+
+        check("submit cancellation is propagated", cancelled is True)
+        check("cancelled claim accepts a fresh preview", refreshed.get("requiresConfirmation") is True)
+        check("cancelled submit can recover", recovered.get("success") is True)
+        check("cancel recovery posts exact sequence", len(http_calls) == 4)
+        check("cancel recovery performs one fresh audit", len(audit_calls) == 2)
+
+    asyncio.run(_run())
+
+
+def test_submit_rejects_incomplete_success_preview():
+    """A legacy 200 success cannot be converted into a confirmation ticket."""
+    print("\n🧪 submit rejects incomplete success preview")
+
+    async def _run():
+        audit_calls = []
+        http_calls = []
+        audit = {
+            "success": True,
+            "verdict": "needs_admin",
+            "autoApprove": False,
+            "summary": "需要管理员审核",
+            "issues": ["缺少权威来源"],
+            "approvedItems": [],
+            "batchId": "draft-legacy-preview",
+            "contentVersion": 3,
+            "snapshotDigest": "7" * 64,
+            "snapshotItems": [
+                {"action": "Create", "word": "阻抑", "code": "zjyka"},
+            ],
+        }
+
+        async def fake_audit(platform, platform_id, batch_id):
+            audit_calls.append((platform, platform_id, batch_id))
+            return dict(audit)
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"success": True, "contentVersion": 3}
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, **kwargs):
+                http_calls.append((url, kwargs))
+                return FakeResponse()
+
+        with (
+            patch.object(
+                _draft_tools,
+                "_audit_current_draft_for_auto_approval",
+                side_effect=fake_audit,
+            ),
+            patch.object(_draft_tools, "get_bot_token", return_value="token"),
+            patch.object(
+                _draft_tools,
+                "get_keytao_url",
+                return_value="https://keytao.test",
+            ),
+            patch.object(
+                _draft_tools,
+                "get_bot_headers",
+                return_value={"Authorization": "Bearer token"},
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
+            ),
+        ):
+            preview = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-legacy-preview",
+                batch_id="draft-legacy-preview",
+                preview_only=True,
+            )
+            confirmed = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "user-legacy-preview",
+                confirmed=True,
+                batch_id="draft-legacy-preview",
+                expected_content_version=3,
+                expected_server_snapshot_digest="8" * 64,
+                expected_warning_digest="9" * 64,
+                expected_audit_digest=_draft_tools._auto_review_confirmation_digest(audit),
+            )
+
+        check("incomplete success preview fails closed", preview.get("error") == "invalid_submit_preview")
+        check("incomplete success preview is uncertain", preview.get("uncertain") is True)
+        check("incomplete preview stores no confirmation", confirmed.get("error") == "submit_confirmation_missing")
+        check("incomplete preview never causes a second POST", len(http_calls) == 1)
+        check("missing confirmation never reruns audit", len(audit_calls) == 1)
+
+    asyncio.run(_run())
+
+
+def test_submit_audit_ticket_generation_guards():
+    """Active claims and stale generations cannot unlock or consume new tickets."""
+    print("\n🧪 submit audit ticket generation guards")
+
+    store = _draft_tools._SubmitAuditTicketStore()
+    args = (
+        "qq",
+        "user-generation",
+        "draft-generation",
+        5,
+        "a" * 64,
+    )
+    review = {"batchId": "draft-generation", "contentVersion": 5}
+
+    first_put = store.put(*args, review)
+    first_status, first_review, first_generation = store.claim(*args)
+    active_replaced = store.put(*args, review)
+    wrong_mark = store.mark_uncertain(*args, "wrong-generation")
+    marked_uncertain = store.mark_uncertain(*args, first_generation or "")
+    refreshed = store.put(*args, review)
+    second_status, second_review, second_generation = store.claim(*args)
+    stale_consumed = store.consume(*args, first_generation or "")
+    still_claimed, _review, _generation = store.claim(*args)
+    current_consumed = store.consume(*args, second_generation or "")
+    missing, _review, _generation = store.claim(*args)
+
+    check("first audit ticket can be claimed", first_put and first_status == "ok" and first_review == review)
+    check("active audit ticket cannot be replaced", active_replaced is False)
+    check("wrong generation cannot mark uncertain", wrong_mark is False)
+    check("active generation can be marked uncertain", marked_uncertain is True)
+    check("uncertain ticket can be refreshed", refreshed is True)
+    check("refreshed ticket has a new generation", second_status == "ok" and second_review == review and second_generation != first_generation)
+    check("stale generation cannot consume refreshed ticket", stale_consumed is False and still_claimed == "claimed")
+    check("current generation consumes its ticket", current_consumed is True and missing == "missing")
+
+    expiring = _draft_tools._SubmitAuditTicketStore(ttl_seconds=1)
+    with patch.object(_draft_tools.time, "monotonic", return_value=100.0):
+        expiring.put(*args, review)
+    with patch.object(_draft_tools.time, "monotonic", return_value=102.0):
+        expired_status, _review, _generation = expiring.claim(*args)
+    check("expired audit ticket cannot be claimed", expired_status == "missing")
 
 
 def test_keep_only_draft_command_removes_others_and_submits():
@@ -3298,6 +3925,7 @@ def test_pending_add_word_add_and_submit_uses_recommended():
                         "batchId": "draft-add-submit",
                         "contentVersion": 4,
                         "warningDigest": create_digest,
+                        "warnings": [],
                     }, ensure_ascii=False)
                 return json.dumps({
                     "success": True,
@@ -3329,6 +3957,13 @@ def test_pending_add_word_add_and_submit_uses_recommended():
                         "snapshotDigest": snapshot_digest,
                         "warningDigest": submit_warning_digest,
                         "auditDigest": audit_digest,
+                        "snapshotItems": [
+                            {
+                                "action": "Create",
+                                "word": "室内乐",
+                                "code": "enyo",
+                            },
+                        ],
                     }, ensure_ascii=False)
                 return json.dumps({
                     "success": True,
@@ -3340,7 +3975,7 @@ def test_pending_add_word_add_and_submit_uses_recommended():
         openai_chat_module.conversation_state_store = store
         try:
             with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-                create_preview = await _handle_pending_add_word(
+                submitted = await _handle_pending_add_word(
                     state,
                     "加入并提交",
                     "qq",
@@ -3350,30 +3985,11 @@ def test_pending_add_word_add_and_submit_uses_recommended():
                     "Garth",
                     MessageCommandIntent(intent="pending_add_and_submit", confidence=0.96),
                 )
-                create_record = store.get_record(conv_key)
-                submit_preview = await openai_chat_module._execute_confirmed_tool(
-                    create_record.state,
-                    "qq",
-                    "2002",
-                    conv_key,
-                    ("qq", "qq:group:42"),
-                    "Garth",
-                )
-                submit_record = store.get_record(conv_key)
-                submitted = await openai_chat_module._execute_confirmed_tool(
-                    submit_record.state,
-                    "qq",
-                    "2002",
-                    conv_key,
-                    ("qq", "qq:group:42"),
-                    "Garth",
-                )
         finally:
             openai_chat_module.conversation_state_store = old_store
 
         check("add preview called first", calls[0][0] == "keytao_create_phrase")
         check("recommended code previewed", calls[0][1] == {"word": "室内乐", "code": "enyo", "preview_only": True})
-        check("create preview creates exact ticket", "确认加入草稿" in create_preview and create_record.state.args.get("expected_warning_digest") == create_digest)
         check("confirmed create binds batch version", calls[1][1] == {
             "word": "室内乐",
             "code": "enyo",
@@ -3382,13 +3998,11 @@ def test_pending_add_word_add_and_submit_uses_recommended():
             "expected_warning_digest": create_digest,
             "confirmed": True,
         })
-        check("confirmed create renders current draft", calls[2][0] == "keytao_get_batch_preview")
-        check("submit preview follows confirmed create", calls[3][:2] == (
+        check("submit preview follows confirmed create", calls[2][:2] == (
             "keytao_submit_batch",
             {"batch_id": "draft-add-submit", "preview_only": True},
         ))
-        check("submit preview creates exact ticket", "确认提交新草稿" in submit_preview and submit_record.state.args.get("expected_server_snapshot_digest") == snapshot_digest)
-        check("confirmed submit binds all digests", calls[4][1] == {
+        check("confirmed submit binds all digests", calls[3][1] == {
             "batch_id": "draft-add-submit",
             "expected_content_version": 5,
             "expected_server_snapshot_digest": snapshot_digest,
@@ -3397,7 +4011,9 @@ def test_pending_add_word_add_and_submit_uses_recommended():
             "confirmed": True,
         })
         check("submit uses current user", all(call[2:] == ("qq", "2002") for call in calls))
-        check("response says submitted", "草稿已成功提交审核" in submitted)
+        check("response says submitted", "已加入草稿并提交审核" in submitted)
+        check("combined command leaves no ticket", store.get_record(conv_key) is None)
+        check("combined command shows no ticket code", "确认票据" not in submitted and "确认操作" not in submitted)
 
     asyncio.run(_run())
 
@@ -3561,6 +4177,8 @@ def test_active_confirmation_nonce_rejects_bare_and_stale_replies():
     )
     first_code = first.confirmation_code
     check("bare confirmation is rejected", not _active_operation_confirmation_matches(first, "确认"))
+    check("targetless submit rejects semantic shortcut", not _active_operation_confirmation_matches(first, "确认提交"))
+    check("targetless submit retains exact nonce", first.confirmation_command == f"确认操作 {first_code}" and first_code in first.prompt_text)
     check(
         "question-marked nonce is rejected",
         not _active_operation_confirmation_matches(
@@ -3593,6 +4211,40 @@ def test_active_confirmation_nonce_rejects_bare_and_stale_replies():
             f"确认操作 {second.confirmation_code}",
         ),
     )
+
+    coordinator.finish(owner_key, second.operation_id)
+    add_operation = coordinator.begin(owner_key, "add_and_submit", word="阻抑", code="zjyka")
+    coordinator.mark_awaiting_confirmation(
+        owner_key,
+        add_operation.operation_id,
+        PendingToolConfirm(
+            function_name="keytao_create_phrase",
+            args={},
+            confirmation_source="server_warning",
+        ),
+        "是否继续加入？",
+    )
+    check("generic add confirmation is rejected", not _active_operation_confirmation_matches(add_operation, "确认加入"))
+    check("target-only add confirmation is rejected", not _active_operation_confirmation_matches(add_operation, "确认加入 阻抑 zjyka"))
+    check("server warning keeps exact nonce", _active_operation_confirmation_matches(add_operation, f"确认操作 {add_operation.confirmation_code}"))
+    check("server warning prompt exposes current nonce", add_operation.confirmation_code in add_operation.prompt_text)
+
+    add_code = add_operation.confirmation_code
+    coordinator.finish(owner_key, add_operation.operation_id)
+    replacement = coordinator.begin(owner_key, "add_and_submit", word="窨制", code="xwfko")
+    coordinator.mark_awaiting_confirmation(
+        owner_key,
+        replacement.operation_id,
+        PendingToolConfirm(
+            function_name="keytao_create_phrase",
+            args={},
+            confirmation_source="server_warning",
+        ),
+        "是否继续加入？",
+    )
+    check("replacement warning rotates nonce", replacement.confirmation_code != add_code)
+    check("stale warning nonce is rejected", not _active_operation_confirmation_matches(replacement, f"确认操作 {add_code}"))
+    check("replacement warning nonce is accepted", _active_operation_confirmation_matches(replacement, f"确认操作 {replacement.confirmation_code}"))
 
 
 def test_question_and_meta_text_never_authorize_deterministic_mutations():
@@ -4014,7 +4666,6 @@ def test_active_add_confirmation_continues_to_submit():
         check("confirmed create is sent first", calls[0] == ("keytao_create_phrase", {
             "word": "技术栈",
             "code": "jeqivv",
-            "preview_only": False,
             "confirmed": True,
             "expected_content_version": 8,
             "expected_warning_digest": "5" * 64,
@@ -4486,8 +5137,8 @@ def test_fresh_current_user_command_detection():
         ),
     )
     check(
-        "confirm submit is not plain fresh submit",
-        not _is_fresh_current_user_command_intent(
+        "confirm submit is an explicit fresh submit",
+        _is_fresh_current_user_command_intent(
             MessageCommandIntent(intent="draft_submit", confidence=0.96),
             "确认提交",
         ),
@@ -4533,7 +5184,7 @@ def test_local_draft_submit_intent_detection():
 
         check("plain submit routes to draft_submit", intent.intent == "draft_submit")
         check("plain submit confidence is deterministic", intent.confidence == 1.0)
-        check("pending context does not use local draft-submit shortcut", pending_intent.intent == "none")
+        check("pending candidate does not steal draft submit", pending_intent.intent == "draft_submit")
         check("explicit add-submit stays with pending add", add_submit_intent.intent == "pending_add_and_submit")
         check("explicit add-submit shortcut is deterministic", add_submit_intent.confidence == 1.0)
 
@@ -7685,6 +8336,12 @@ if __name__ == "__main__":
     test_simple_single_word_query_skips_chat_comparison_questions()
     test_draft_view_command_uses_draft_tools()
     test_draft_submit_command_uses_current_user_tools()
+    test_add_submit_extra_snapshot_shows_one_exact_confirmation()
+    test_submit_confirmation_reuses_preview_audit_snapshot()
+    test_submit_timeout_recovers_after_fresh_preview()
+    test_submit_cancellation_marks_ticket_uncertain()
+    test_submit_rejects_incomplete_success_preview()
+    test_submit_audit_ticket_generation_guards()
     test_keep_only_draft_command_removes_others_and_submits()
     test_keep_only_draft_command_never_recalls_submitted_batch()
     test_recall_batch_requires_exact_server_ticket()

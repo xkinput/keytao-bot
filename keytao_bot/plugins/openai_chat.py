@@ -393,6 +393,10 @@ _DRAFT_SUBMIT_COMMANDS = {
     "提交这个草稿",
     "发起审核",
 }
+_ACTION_SPECIFIC_DRAFT_SUBMIT_COMMANDS = {
+    "确认提交",
+    "继续提交",
+}
 _PENDING_CONTROL_TEXTS = {
     "确认",
     "确定",
@@ -405,9 +409,15 @@ _PENDING_CONTROL_TEXTS = {
     "加",
     "加入",
     "添加",
+    "确认加入",
+    "确认添加",
+    "继续加入",
+    "继续添加",
     "都加",
     "全部加",
     "提交",
+    "确认提交",
+    "继续提交",
     "加入并提交",
     "加并提交",
     "取消",
@@ -481,6 +491,18 @@ def _is_plain_draft_submit_request(message_text: str) -> bool:
                 changed = True
                 break
     return text in _DRAFT_SUBMIT_COMMANDS
+
+
+def _is_explicit_draft_submit_request(message_text: str) -> bool:
+    """Recognize a current-draft submit command without stealing questions."""
+    if _is_plain_draft_submit_request(message_text):
+        return True
+    if re.search(
+        r"[?？]|(?:什么意思|解释|会怎样|会如何|如果|假设|引用|复述|翻译)",
+        message_text,
+    ):
+        return False
+    return _compact_command_text(message_text) in _ACTION_SPECIFIC_DRAFT_SUBMIT_COMMANDS
 
 
 @dataclass(frozen=True)
@@ -725,7 +747,7 @@ def _is_fresh_current_user_command_intent(
     message_text: str = "",
 ) -> bool:
     if command_intent.intent == "draft_submit":
-        return _is_plain_draft_submit_request(message_text)
+        return _is_explicit_draft_submit_request(message_text)
     if command_intent.intent == "clear_history":
         return _message_authorizes_clear_history(message_text, command_intent)
     if command_intent.intent == "draft_keep_only":
@@ -988,6 +1010,18 @@ async def _classify_message_command_intent(
     )
     if pending_accepts_add_submit and compact_message in _PENDING_ADD_AND_SUBMIT_COMMANDS:
         return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
+    if _is_explicit_draft_submit_request(message_text):
+        if (
+            isinstance(pending_state, PendingToolConfirm)
+            and pending_state.function_name == "keytao_submit_batch"
+        ):
+            return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+        return MessageCommandIntent(intent="draft_submit", confidence=1.0)
+    if (
+        isinstance(pending_state, PendingToolConfirm)
+        and _pending_tool_confirmation_matches(pending_state, message_text)
+    ):
+        return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     if pending_state is not None and compact_message.startswith("确认票据"):
         # The structured ticket resolver validates the exact nonce.  Never
         # spend an LLM call interpreting a credential-bearing command.
@@ -1000,8 +1034,6 @@ async def _classify_message_command_intent(
         _PENDING_CONTROL_TEXTS - {"取消", "不用", "不要", "不了", "算了"}
     ):
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
-    if pending_state is None and _is_plain_draft_submit_request(message_text):
-        return MessageCommandIntent(intent="draft_submit", confidence=1.0)
     if not OPENAI_API_KEY or not AsyncOpenAI:
         logger.warning("Command intent model unavailable; falling through to main AI flow")
         return MessageCommandIntent()
@@ -1809,6 +1841,69 @@ _TICKET_PENDING_INTENTS = {
     "pending_choice",
 }
 
+_DIRECT_OWNER_PENDING_ADD_INTENTS = {
+    "pending_confirm",
+    "pending_add_and_submit",
+    "pending_code_request",
+    "pending_choice",
+}
+
+
+def _pending_tool_confirmation_command(state: PendingToolConfirm) -> str:
+    """Build a natural command bound to every authorized create target."""
+    if state.confirmation_source == "server_warning":
+        return ""
+    if state.function_name == "keytao_create_phrase":
+        action = str(state.args.get("action") or "Create")
+        word = str(state.args.get("word") or "").strip()
+        code = str(state.args.get("code") or "").strip().lower()
+        if action == "Create" and word and code:
+            return f"确认加入 {word} {code}"
+        return ""
+    if state.function_name != "keytao_batch_add_to_draft":
+        return ""
+    targets = []
+    for item in state.args.get("items", []):
+        if not isinstance(item, dict) or str(item.get("action") or "Create") != "Create":
+            return ""
+        word = str(item.get("word") or "").strip()
+        code = str(item.get("code") or "").strip().lower()
+        if not word or not code:
+            return ""
+        targets.append(f"{word} {code}")
+    command = "确认加入 " + " ".join(targets) if targets else ""
+    return command if len(command) <= 160 else ""
+
+
+def _pending_tool_confirmation_matches(
+    state: PendingToolConfirm,
+    message_text: str,
+) -> bool:
+    if re.search(r"[?？]", message_text):
+        return False
+    command = _pending_tool_confirmation_command(state)
+    return bool(
+        command
+        and _compact_command_text(message_text) == _compact_command_text(command)
+    )
+
+
+def _message_authorizes_pending_state_control(
+    state: PendingState,
+    message_text: str,
+    command_intent: MessageCommandIntent,
+) -> bool:
+    """Allow a generic short control or an exact target-bound local preview."""
+    if re.search(r"[?？]", message_text):
+        return False
+    if _message_authorizes_pending_control(message_text, command_intent):
+        return True
+    return bool(
+        isinstance(state, PendingToolConfirm)
+        and command_intent.intent == "pending_confirm"
+        and _pending_tool_confirmation_matches(state, message_text)
+    )
+
 
 def _ticket_payload_from_command_intent(
     command_intent: MessageCommandIntent,
@@ -1978,6 +2073,33 @@ async def _resolve_pending_ticket_control(
             "普通的「确认」不会执行。"
         )
 
+    if (
+        isinstance(state_record.state, PendingAddWord)
+        and state_record.owner_key.actor_id == str(user_id)
+        and command_intent.intent in _DIRECT_OWNER_PENDING_ADD_INTENTS
+    ):
+        canonical_intent, canonical_error = await _canonicalize_pending_ticket_intent(
+            state_record.state,
+            message_text,
+            command_intent,
+            platform,
+            user_id,
+        )
+        if canonical_intent is None:
+            return MessageCommandIntent(), canonical_error
+        return canonical_intent, None
+
+    if (
+        isinstance(state_record.state, PendingToolConfirm)
+        and state_record.owner_key.actor_id == str(user_id)
+        and command_intent.intent == "pending_confirm"
+        and _pending_tool_confirmation_matches(
+            state_record.state,
+            message_text,
+        )
+    ):
+        return command_intent, None
+
     if _is_sensitive_pending_control_intent(command_intent):
         canonical_intent, canonical_error = await _canonicalize_pending_ticket_intent(
             state_record.state,
@@ -2019,6 +2141,17 @@ def _append_pending_ticket_challenge(
         or not record.reconfirmation_code
     ):
         return response
+    if isinstance(record.state, PendingAddWord):
+        return response
+    natural_command = _pending_tool_confirmation_command(record.state)
+    if natural_command:
+        if _compact_command_text(natural_command) in _compact_command_text(response):
+            return response
+        return (
+            response.rstrip()
+            + "\n\n为避免确认错目标，请回复"
+            + f"「{natural_command}」继续。"
+        )
 
     challenge = f"确认票据 {record.reconfirmation_code}"
     if challenge.lower() in response.lower():
@@ -2048,7 +2181,7 @@ def _format_active_draft_operation_message(
         "本喵完成后会直接回复最终结果。"
     )
     if operation.status == "awaiting_confirmation" and operation.confirmation_code:
-        message += f"\n请发送「确认操作 {operation.confirmation_code}」继续。"
+        message += f"\n请回复「{operation.confirmation_command}」继续。"
     return message
 
 
@@ -2075,15 +2208,28 @@ def _active_operation_confirmation_matches(
     operation: ActiveDraftOperation,
     message_text: str,
 ) -> bool:
-    """Match only the current operation's nonce-bearing confirmation text."""
-    return bool(
-        operation.status == "awaiting_confirmation"
-        and operation.confirmation_code
+    """Match a legacy nonce or the current operation's target-bound command."""
+    if operation.status != "awaiting_confirmation":
+        return False
+    if re.search(r"[?？]", message_text):
+        return False
+    if (
+        operation.confirmation_code
         and _exact_nonce_command_matches(
             message_text,
             "确认操作",
             operation.confirmation_code,
         )
+    ):
+        return True
+    compact = _compact_command_text(message_text)
+    if not isinstance(operation.pending_state, PendingToolConfirm):
+        return False
+    if operation.confirmation_command.startswith("确认操作 "):
+        return False
+    return bool(
+        operation.confirmation_command
+        and compact == _compact_command_text(operation.confirmation_command)
     )
 
 
@@ -3743,6 +3889,7 @@ async def _execute_add_to_draft(
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
     remark: str = "",
+    auto_confirm: bool = True,
 ) -> str:
     """Directly add a word to draft and return formatted response."""
     args = {"word": word, "code": code, "preview_only": True}
@@ -3758,15 +3905,25 @@ async def _execute_add_to_draft(
 
     if data.get("requiresConfirmation"):
         conv_key = (platform, user_id)
+        pending_state = _pending_state_from_server_warning(
+            PendingToolConfirm(
+                function_name="keytao_create_phrase",
+                args=args,
+            ),
+            data,
+        )
+        if auto_confirm and _create_preview_has_no_new_warnings(data):
+            return await _execute_confirmed_tool(
+                pending_state,
+                platform,
+                user_id,
+                conv_key,
+                space_key,
+                owner_label,
+            )
         conversation_state_store.set(
             conv_key,
-            _pending_state_from_server_warning(
-                PendingToolConfirm(
-                    function_name="keytao_create_phrase",
-                    args=args,
-                ),
-                data,
-            ),
+            pending_state,
             space_key=space_key,
             owner_label=owner_label,
         )
@@ -3775,7 +3932,10 @@ async def _execute_add_to_draft(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
             for w in warnings
         ) if warnings else data.get("message", "存在重码警告")
-        return f"{warn_text}\n\n确认添加吗？可发送下方确认票据继续，或回复「取消」放弃。"
+        return (
+            f"{warn_text}\n\n确认添加吗？"
+            "请按下方精确确认指令继续，或回复「取消」放弃。"
+        )
 
     if not data.get("success"):
         return f"添加失败：{data.get('message', '未知错误')} qwq"
@@ -3800,6 +3960,7 @@ async def _execute_add_to_draft_and_submit(
         platform,
         user_id,
         remark=remark,
+        auto_confirm=True,
     )
     if result.pending_state is not None:
         conversation_state_store.set(
@@ -3809,6 +3970,31 @@ async def _execute_add_to_draft_and_submit(
             owner_label=owner_label,
         )
     return result.text
+
+
+def _create_preview_has_no_new_warnings(preview_data: Dict) -> bool:
+    """Auto-replay only a complete create preview with no newly introduced risk."""
+    content_version = preview_data.get("contentVersion")
+    if (
+        not str(preview_data.get("batchId") or "").strip()
+        or not isinstance(content_version, int)
+        or isinstance(content_version, bool)
+        or content_version < 0
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(preview_data.get("warningDigest") or ""),
+        )
+    ):
+        return False
+    warnings = preview_data.get("warnings")
+    if not isinstance(warnings, list) or warnings:
+        return False
+    warned_count = preview_data.get("warnedCount", 0)
+    return (
+        isinstance(warned_count, int)
+        and not isinstance(warned_count, bool)
+        and warned_count == 0
+    )
 
 
 async def _perform_add_to_draft_and_submit(
@@ -3822,18 +4008,21 @@ async def _perform_add_to_draft_and_submit(
     batch_id: str = "",
     expected_content_version: Optional[int] = None,
     expected_warning_digest: str = "",
+    auto_confirm: bool = False,
 ) -> DraftActionResult:
     """Run add-and-submit without mutating conversational pending state."""
     args = {"word": word, "code": code}
     if remark:
         args["remark"] = remark
-    create_args = {**args, "preview_only": not confirmed_create}
+    create_args = dict(args)
     if confirmed_create:
         create_args.update({
             "confirmed": True,
             "expected_content_version": expected_content_version,
             "expected_warning_digest": expected_warning_digest,
         })
+    else:
+        create_args["preview_only"] = True
     if batch_id:
         create_args["batch_id"] = batch_id
     create_json = await call_tool_function(
@@ -3852,13 +4041,36 @@ async def _perform_add_to_draft_and_submit(
             ),
             create_data,
         )
+        if (
+            auto_confirm
+            and not confirmed_create
+            and _create_preview_has_no_new_warnings(create_data)
+        ):
+            exact_args = pending_state.args
+            return await _perform_add_to_draft_and_submit(
+                word,
+                code,
+                platform,
+                user_id,
+                remark=remark,
+                confirmed_create=True,
+                batch_id=str(exact_args.get("batch_id") or ""),
+                expected_content_version=exact_args.get(
+                    "expected_content_version"
+                ),
+                expected_warning_digest=str(
+                    exact_args.get("expected_warning_digest") or ""
+                ),
+                auto_confirm=True,
+            )
         warnings = create_data.get("warnings", [])
         warn_text = "\n".join(
             f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
             for w in warnings
         ) if warnings else create_data.get("message", "存在重码警告")
         return DraftActionResult(
-            f"{warn_text}\n\n确认添加吗？可发送确认票据继续，或回复「取消」放弃。",
+            f"{warn_text}\n\n确认添加吗？"
+            "请按下方精确确认指令继续，或回复「取消」放弃。",
             pending_state=pending_state,
         )
 
@@ -3871,6 +4083,10 @@ async def _perform_add_to_draft_and_submit(
         user_id,
         batch_id=submit_batch_id,
         preview_only=True,
+        auto_confirm=auto_confirm,
+        authorized_items=[
+            {"action": "Create", "word": word, "code": code},
+        ],
     )
     if submit_result.pending_state is not None:
         return DraftActionResult(
@@ -3899,16 +4115,14 @@ async def _perform_batch_add_to_draft_and_submit(
     confirmed_add: bool = False,
     expected_content_version: Optional[int] = None,
     expected_warning_digest: str = "",
+    auto_confirm: bool = False,
 ) -> DraftActionResult:
     """Add every confirmed reviewed item, then submit exactly that batch."""
     requested_items = [dict(item) for item in items if isinstance(item, dict)]
     if not requested_items:
         return DraftActionResult("没有找到可添加的词条 qwq")
 
-    add_arguments: Dict[str, Any] = {
-        "items": requested_items,
-        "preview_only": not confirmed_add,
-    }
+    add_arguments: Dict[str, Any] = {"items": requested_items}
     if batch_id:
         add_arguments["batch_id"] = batch_id
     if confirmed_add:
@@ -3917,6 +4131,8 @@ async def _perform_batch_add_to_draft_and_submit(
             "expected_content_version": expected_content_version,
             "expected_warning_digest": expected_warning_digest,
         })
+    else:
+        add_arguments["preview_only"] = True
     add_json = await call_tool_function(
         "keytao_batch_add_to_draft",
         add_arguments,
@@ -3935,13 +4151,34 @@ async def _perform_batch_add_to_draft_and_submit(
             ),
             add_data,
         )
+        if (
+            auto_confirm
+            and not confirmed_add
+            and _create_preview_has_no_new_warnings(add_data)
+        ):
+            exact_args = pending_state.args
+            return await _perform_batch_add_to_draft_and_submit(
+                requested_items,
+                platform,
+                user_id,
+                batch_id=str(exact_args.get("batch_id") or ""),
+                confirmed_add=True,
+                expected_content_version=exact_args.get(
+                    "expected_content_version"
+                ),
+                expected_warning_digest=str(
+                    exact_args.get("expected_warning_digest") or ""
+                ),
+                auto_confirm=True,
+            )
         warnings = add_data.get("warnings", [])
         warning_text = "\n".join(
             f"⚠️ {warning.get('message', warning) if isinstance(warning, dict) else warning}"
             for warning in warnings
         ) if warnings else add_data.get("message", "批量添加前需要确认")
         return DraftActionResult(
-            f"{warning_text}\n\n确认继续添加吗？可发送确认票据继续，或回复「取消」放弃。",
+            f"{warning_text}\n\n确认继续添加吗？"
+            "请按下方精确确认指令继续，或回复「取消」放弃。",
             pending_state=pending_state,
         )
 
@@ -3961,6 +4198,8 @@ async def _perform_batch_add_to_draft_and_submit(
         user_id,
         batch_id=str(add_data.get("batchId") or ""),
         preview_only=True,
+        auto_confirm=auto_confirm,
+        authorized_items=requested_items,
     )
     item_lines = "\n".join(
         f"- 「{str(item.get('word') or '').strip()}」→ {str(item.get('code') or '').strip()}"
@@ -4252,6 +4491,34 @@ def _pending_state_from_server_warning(
     )
 
 
+def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
+    """Append every server-bound draft item and its exact confirmation digests."""
+    snapshot_items = (
+        data.get("snapshotItems")
+        if isinstance(data.get("snapshotItems"), list)
+        else []
+    )
+    if not snapshot_items:
+        return
+    lines.append("本次提交快照：")
+    for item in snapshot_items:
+        if not isinstance(item, dict):
+            continue
+        old_word = str(item.get("oldWord") or "")
+        word = str(item.get("word") or "")
+        code = str(item.get("code") or "")
+        action = str(item.get("action") or "")
+        label = f"{old_word} → {word}" if action == "Change" and old_word else word
+        pr_id = item.get("id")
+        pr_label = f"PR#{pr_id}：" if pr_id is not None else ""
+        lines.append(
+            f"• {pr_label}{action} {label} @ {code}（{item.get('type') or ''}）"
+        )
+    lines.append(f"参数摘要：SHA-256 {str(data.get('snapshotDigest') or '')}")
+    lines.append(f"风险摘要：SHA-256 {str(data.get('warningDigest') or '')}")
+    lines.append(f"复审摘要：SHA-256 {str(data.get('auditDigest') or '')}")
+
+
 def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     if function_name in {"keytao_remove_draft_item", "keytao_batch_remove_draft_items"}:
         targets = data.get("targets") if isinstance(data.get("targets"), list) else []
@@ -4270,7 +4537,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 "确认删除这些精确条目并随后核对提交快照吗？"
                 if data.get("submitAfter")
                 else "确认删除这些精确条目吗？"
-            ) + "请发送新的确认票据继续，或回复「取消」放弃。",
+            ) + "请按下方精确确认指令继续，或回复「取消」放弃。",
         ))
         return "\n".join(lines)
 
@@ -4282,7 +4549,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             f"• 批次：{batch_id}\n"
             f"• 内容版本：{version}\n\n"
             "确认把这个精确批次恢复为草稿吗？"
-            "请发送新的确认票据继续，或回复「取消」放弃。"
+            "请按下方精确确认指令继续，或回复「取消」放弃。"
         )
 
     if function_name == "keytao_shift_phrase_code":
@@ -4318,7 +4585,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         lines.extend((
             "",
             "以上每一项都将由服务端按同一批次版本校验。"
-            "确认执行吗？请发送新的确认票据继续，或回复「取消」放弃。",
+            "确认执行吗？请按下方精确确认指令继续，或回复「取消」放弃。",
         ))
         return "\n".join(lines)
 
@@ -4330,23 +4597,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     review_parts: List[str] = []
     if function_name == "keytao_submit_batch":
         _append_submit_review_lines(review_parts, data)
-        snapshot_items = data.get("snapshotItems") if isinstance(data.get("snapshotItems"), list) else []
-        if snapshot_items:
-            review_parts.append("本次提交快照：")
-            for item in snapshot_items:
-                if not isinstance(item, dict):
-                    continue
-                old_word = str(item.get("oldWord") or "")
-                word = str(item.get("word") or "")
-                code = str(item.get("code") or "")
-                action = str(item.get("action") or "")
-                label = f"{old_word} → {word}" if action == "Change" and old_word else word
-                review_parts.append(
-                    f"• PR#{item.get('id')}：{action} {label} @ {code}（{item.get('type') or ''}）"
-                )
-            review_parts.append(f"参数摘要：SHA-256 {str(data.get('snapshotDigest') or '')}")
-            review_parts.append(f"风险摘要：SHA-256 {str(data.get('warningDigest') or '')}")
-            review_parts.append(f"复审摘要：SHA-256 {str(data.get('auditDigest') or '')}")
+        _append_submit_snapshot_lines(review_parts, data)
     review_text = ("\n\n" + "\n".join(review_parts)) if review_parts else ""
     action_text = {
         "keytao_submit_batch": "继续提交",
@@ -4358,7 +4609,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     return (
         f"{warning_text}{review_text}\n\n"
         f"这是服务端在实际校验后返回的风险。确认{action_text}吗？"
-        "请发送新的确认票据继续，或回复「取消」放弃。"
+        "请按下方精确确认指令继续，或回复「取消」放弃。"
     )
 
 
@@ -4514,6 +4765,8 @@ async def _execute_confirmed_tool(
                 parts.append(f"PR：{pr_url}")
             _append_submit_review_lines(parts, data)
             return "\n".join(parts)
+        if data.get("uncertain"):
+            return f"⚠️ {data.get('message', '提交结果暂时无法确定，请先查看草稿。')}"
         return f"提交失败：{data.get('message', '未知错误')} qwq"
 
     if state.function_name == "keytao_batch_add_to_draft":
@@ -4721,7 +4974,12 @@ async def _submit_current_draft(
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
 ) -> str:
-    result = await _perform_submit_current_draft(platform, user_id)
+    result = await _perform_submit_current_draft(
+        platform,
+        user_id,
+        auto_confirm=True,
+        authorize_current_draft=True,
+    )
     if result.pending_state is not None:
         conversation_state_store.set(
             (platform, user_id),
@@ -4730,6 +4988,35 @@ async def _submit_current_draft(
             owner_label=owner_label,
         )
     return result.text
+
+
+def _submit_preview_matches_authorized_items(
+    submit_data: Dict,
+    authorized_items: Optional[List[Dict]],
+) -> bool:
+    """Only auto-confirm a submit preview with the exact authorized create set."""
+    if not authorized_items:
+        return False
+    snapshot_items = submit_data.get("snapshotItems")
+    if not isinstance(snapshot_items, list) or not snapshot_items:
+        return False
+
+    def normalize(items: List[Dict]) -> Optional[List[Tuple[str, str, str]]]:
+        normalized: List[Tuple[str, str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                return None
+            action = str(item.get("action") or "Create").strip()
+            word = str(item.get("word") or "").strip()
+            code = str(item.get("code") or "").strip().lower()
+            if action != "Create" or not word or not code:
+                return None
+            normalized.append((action, word, code))
+        return sorted(normalized)
+
+    expected = normalize(authorized_items)
+    actual = normalize(snapshot_items)
+    return expected is not None and actual is not None and actual == expected
 
 
 async def _perform_submit_current_draft(
@@ -4743,6 +5030,9 @@ async def _perform_submit_current_draft(
     expected_warning_digest: str = "",
     expected_audit_digest: str = "",
     preview_only: bool = True,
+    auto_confirm: bool = False,
+    authorized_items: Optional[List[Dict]] = None,
+    authorize_current_draft: bool = False,
 ) -> DraftActionResult:
     """Submit a draft without writing follow-up state into the conversation slot."""
     # A confirmed server ticket is the mutation stage. Keeping the public
@@ -4771,17 +5061,57 @@ async def _perform_submit_current_draft(
             PendingToolConfirm(function_name="keytao_submit_batch", args=arguments),
             submit_data,
         )
-        warnings = submit_data.get("warnings", [])
-        warn_text = "\n".join(
-            f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
-            for w in warnings
-        ) if warnings else submit_data.get("message", "提交前需要确认")
-        review_parts: List[str] = []
-        _append_submit_review_lines(review_parts, submit_data)
-        review_text = ("\n\n" + "\n".join(review_parts)) if review_parts else ""
+        if (
+            auto_confirm
+            and not confirmed
+            and (
+                _submit_preview_matches_authorized_items(
+                    submit_data,
+                    authorized_items,
+                )
+                or (
+                    authorize_current_draft
+                    and isinstance(submit_data.get("snapshotItems"), list)
+                    and bool(submit_data["snapshotItems"])
+                )
+            )
+        ):
+            exact_args = pending_state.args
+            return await _perform_submit_current_draft(
+                platform,
+                user_id,
+                confirmed=True,
+                batch_id=str(exact_args.get("batch_id") or ""),
+                expected_content_version=exact_args.get(
+                    "expected_content_version"
+                ),
+                expected_server_snapshot_digest=str(
+                    exact_args.get("expected_server_snapshot_digest") or ""
+                ),
+                expected_warning_digest=str(
+                    exact_args.get("expected_warning_digest") or ""
+                ),
+                expected_audit_digest=str(
+                    exact_args.get("expected_audit_digest") or ""
+                ),
+            )
+        warning_prompt = _format_server_warning_confirmation(
+            "keytao_submit_batch",
+            submit_data,
+        )
+        if len(warning_prompt) > MAX_REPLACE_CONFIRMATION_CHARS:
+            return DraftActionResult(
+                "提交快照过大，无法在一条消息中完整展示；"
+                "本次未保存确认，请先查看并精简草稿后重新提交。"
+            )
         return DraftActionResult(
-            f"{warn_text}\n\n是否继续提交？可发送确认票据继续，或回复「取消」放弃。{review_text}",
+            warning_prompt,
             pending_state=pending_state,
+        )
+
+    if submit_data.get("uncertain"):
+        return DraftActionResult(
+            f"⚠️ {submit_data.get('message', '提交结果暂时无法确定，请先查看草稿。')}"
         )
 
     if not submit_data.get("success"):
@@ -4839,6 +5169,7 @@ async def _perform_active_operation_confirmation(
             batch_id=str(args.get("batch_id") or ""),
             expected_content_version=args.get("expected_content_version"),
             expected_warning_digest=str(args.get("expected_warning_digest") or ""),
+            auto_confirm=True,
         )
 
     if (
@@ -4854,6 +5185,7 @@ async def _perform_active_operation_confirmation(
             confirmed_add=pending_state.confirmation_source == "server_warning",
             expected_content_version=args.get("expected_content_version"),
             expected_warning_digest=str(args.get("expected_warning_digest") or ""),
+            auto_confirm=True,
         )
 
     return DraftActionResult("这次后台操作无法继续，请重新发起。")
@@ -4873,7 +5205,11 @@ def _active_operation_reply_matches(
     return bool(
         operation.word
         and operation.word in referenced_text
-        and ("确认添加吗" in referenced_text or "是否继续提交" in referenced_text)
+        and (
+            "确认添加吗" in referenced_text
+            or "是否继续提交" in referenced_text
+            or "确认继续提交吗" in referenced_text
+        )
     )
 
 
@@ -5065,7 +5401,7 @@ async def _try_handle_draft_management_command(
         command_intent = await _classify_message_command_intent(message_text)
 
     response = await _try_handle_draft_submit_command(
-        command_intent if _is_plain_draft_submit_request(message_text) else MessageCommandIntent(),
+        command_intent if _is_explicit_draft_submit_request(message_text) else MessageCommandIntent(),
         platform,
         user_id,
         space_key,
@@ -5329,9 +5665,24 @@ async def handle_pending_message_core(
         raise
     if (
         _is_sensitive_pending_control_intent(pending_command_intent)
-        and not _message_authorizes_pending_control(message, pending_command_intent)
+        and not _message_authorizes_pending_state_control(
+            state,
+            message,
+            pending_command_intent,
+        )
     ):
         pending_command_intent = MessageCommandIntent()
+
+    if (
+        pending_command_intent.intent == "draft_submit"
+        and _is_explicit_draft_submit_request(message)
+    ):
+        return await _submit_current_draft(
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+        )
 
     try:
         pending_command_intent, ticket_response = await _resolve_pending_ticket_control(
@@ -5400,6 +5751,7 @@ async def handle_pending_message_core(
                 expected_warning_digest=str(
                     state.args.get("expected_warning_digest") or ""
                 ),
+                auto_confirm=True,
             )
             if result.pending_state is not None:
                 conversation_state_store.set(
@@ -6813,7 +7165,8 @@ async def _handle_ai_chat_serialized(
             if (
                 pending_state is not None
                 and _is_sensitive_pending_control_intent(classified)
-                and not _message_authorizes_pending_control(
+                and not _message_authorizes_pending_state_control(
+                    pending_state,
                     normalized_message_text,
                     classified,
                 )
@@ -6894,8 +7247,8 @@ async def _handle_ai_chat_serialized(
                 and not active_confirmation_matches
             ):
                 response = (
-                    "普通的“确认”不会继续后台操作，以免延迟消息确认错批次。\n"
-                    f"请发送「确认操作 {active_operation.confirmation_code}」继续。"
+                    "请明确当前要继续的动作。\n"
+                    f"请回复「{active_operation.confirmation_command}」继续。"
                 )
                 remember_conversation(
                     conv_key,
@@ -6996,8 +7349,8 @@ async def _handle_ai_chat_serialized(
                         rotate_code=False,
                     )
                     response = (
-                        "后台任务启动失败，当前确认票据仍有效。"
-                        f"请稍后发送「确认操作 {active_operation.confirmation_code}」重试。"
+                        "后台任务启动失败，当前确认仍有效。"
+                        f"请稍后回复「{active_operation.confirmation_command}」重试。"
                     )
                     remember_conversation(conv_key, memory_context, normalized_message_text, response)
                     await ai_chat.finish(response)
@@ -7225,6 +7578,7 @@ async def _handle_ai_chat_serialized(
                                 platform,
                                 user_id,
                                 remark=state.code_remarks.get(target_code, ""),
+                                auto_confirm=True,
                             ),
                             bot,
                             event,
@@ -7276,10 +7630,16 @@ async def _handle_ai_chat_serialized(
                             for item in items
                             if isinstance(item, dict) and item.get("word")
                         ]
+                        codes = [
+                            str(item.get("code") or "").strip().lower()
+                            for item in items
+                            if isinstance(item, dict) and item.get("code")
+                        ]
                         operation = draft_operation_coordinator.begin(
                             conv_key,
                             "batch_add_and_submit",
                             word="、".join(words),
+                            code="、".join(codes),
                         )
                         if operation is None:
                             restore_pending_state()
@@ -7307,6 +7667,7 @@ async def _handle_ai_chat_serialized(
                                     expected_warning_digest=str(
                                         state.args.get("expected_warning_digest") or ""
                                     ),
+                                    auto_confirm=True,
                                 ),
                                 bot,
                                 event,
@@ -7342,7 +7703,7 @@ async def _handle_ai_chat_serialized(
     if (
         response is None
         and generic_command_intent.intent == "draft_submit"
-        and _is_plain_draft_submit_request(normalized_message_text)
+        and _is_explicit_draft_submit_request(normalized_message_text)
     ):
         current_operation = draft_operation_coordinator.get(conv_key)
         if current_operation is not None:
@@ -7357,7 +7718,12 @@ async def _handle_ai_chat_serialized(
             else:
                 scheduled = _schedule_background_draft_operation(
                     operation,
-                    lambda: _perform_submit_current_draft(platform, user_id),
+                    lambda: _perform_submit_current_draft(
+                        platform,
+                        user_id,
+                        auto_confirm=True,
+                        authorize_current_draft=True,
+                    ),
                     bot,
                     event,
                     user_id,
