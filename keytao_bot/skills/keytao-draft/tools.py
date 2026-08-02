@@ -23,6 +23,9 @@ from keytao_bot.utils.keytao_encoding import (
     build_phrase_pronunciation_codes,
     normalize_contextual_phrase_encoding,
 )
+from keytao_bot.utils.draft_mutation_store import (
+    get_default_draft_mutation_claim_store,
+)
 from keytao_bot.utils.keytao_review import (
     ReviewHttpConfig,
     audit_draft_items,
@@ -274,6 +277,10 @@ class _SubmitAuditTicketStore:
 
 
 _SUBMIT_AUDIT_TICKETS = _SubmitAuditTicketStore()
+
+
+def _draft_mutation_claims():
+    return get_default_draft_mutation_claim_store()
 
 
 def compute_draft_summary(items: List[Dict]) -> Dict:
@@ -619,6 +626,13 @@ def _inject_batch_url(data: Dict) -> Dict:
     if batch_id:
         data["batchUrl"] = make_batch_url(batch_id)
     return data
+
+
+def _inject_known_batch_url(data: Dict, batch_id: Optional[str]) -> Dict:
+    """Preserve the request-bound batch on every definitive/uncertain result."""
+    if batch_id:
+        data.setdefault("batchId", batch_id)
+    return _inject_batch_url(data)
 
 
 def get_bot_token() -> Optional[str]:
@@ -1116,12 +1130,12 @@ async def keytao_create_phrase(
                 data = response.json()
                 data.setdefault("batchId", batch_id)
                 if preview_only and not data.get("requiresConfirmation"):
-                    return {
+                    return _inject_known_batch_url({
                         "success": False,
                         "uncertain": True,
                         "message": "服务端未返回可确认的添加快照，已停止后续操作",
                         "batchId": batch_id,
-                    }
+                    }, batch_id)
                 logger.info(f"[keytao_create_phrase] API response (200): {json.dumps(data, ensure_ascii=False)}")
                 snapshot = await _fetch_draft_snapshot(platform, platform_id)
                 if snapshot is not None:
@@ -1141,26 +1155,46 @@ async def keytao_create_phrase(
                     snapshot = await _fetch_draft_snapshot(platform, platform_id)
                     if snapshot is not None:
                         data["draft_snapshot"] = snapshot
-                    _inject_batch_url(data)
+                _inject_known_batch_url(data, batch_id)
                 return data
             else:
                 logger.error(f"[keytao_create_phrase] API response ({response.status_code}): {response.text}")
-                return {
+                result = {
                     "success": False,
                     "message": f"创建失败: HTTP {response.status_code}"
                 }
+                if confirmed and response.status_code >= 500:
+                    result.update({
+                        "uncertain": True,
+                        "message": "添加结果无法确认；请求可能已经生效，请先查看原草稿",
+                    })
+                return _inject_known_batch_url(result, batch_id)
                 
     except httpx.TimeoutException:
-        return {
+        result = {
             "success": False,
-            "message": "请求超时，请稍后重试"
+            "message": (
+                "添加请求超时，结果可能已经生效；请先查看原草稿"
+                if confirmed
+                else "请求超时，请稍后重试"
+            ),
         }
+        if confirmed:
+            result["uncertain"] = True
+        return _inject_known_batch_url(result, batch_id)
     except Exception as e:
         logger.error(f"Create phrase error: {e}")
-        return {
+        result = {
             "success": False,
-            "message": f"创建失败: {str(e)}"
+            "message": (
+                "添加结果无法确认；请先查看原草稿"
+                if confirmed
+                else f"创建失败: {str(e)}"
+            ),
         }
+        if confirmed:
+            result["uncertain"] = True
+        return _inject_known_batch_url(result, batch_id)
 
 
 def _review_config() -> ReviewHttpConfig:
@@ -1604,10 +1638,10 @@ async def keytao_submit_batch(
         or not re.fullmatch(r"[0-9a-f]{64}", expected_warning_digest)
         or not re.fullmatch(r"[0-9a-f]{64}", expected_audit_digest)
     ):
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "message": "提交确认缺少有效的批次版本，请重新获取最新提交检查结果",
-        }
+        }, batch_id)
 
     # The first request may resolve the latest draft. A confirmation must use
     # the exact batch/version returned by that first server warning.
@@ -1655,21 +1689,21 @@ async def keytao_submit_batch(
             expected_audit_digest,
         )
         if claim_status == "claimed":
-            return {
+            return _inject_known_batch_url({
                 "success": False,
                 "uncertain": True,
                 "error": "submit_confirmation_already_claimed",
                 "message": "这次提交正在执行或结果尚不确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
                 "batchId": batch_id,
-            }
+            }, batch_id)
         if claim_status != "ok" or auto_review is None:
-            return {
+            return _inject_known_batch_url({
                 "success": False,
                 "staleConfirmation": True,
                 "error": "submit_confirmation_missing",
                 "message": "提交检查已过期或不匹配，请重新发送「提交」或「加入并提交」获取最新快照",
                 "batchId": batch_id,
-            }
+            }, batch_id)
         confirmation_claimed = True
     else:
         auto_review = await _audit_current_draft_for_auto_approval(
@@ -1685,15 +1719,15 @@ async def keytao_submit_batch(
         or audited_content_version < 0
     ):
         consume_confirmation()
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "error": "invalid_audit_content_version",
             "message": auto_review.get("summary") or "草稿快照缺少可验证版本，已停止提交",
             "autoReview": auto_review,
-        }
+        }, batch_id)
     if confirmed and expected_content_version != audited_content_version:
         consume_confirmation()
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
             "error": "submit_content_version_changed",
@@ -1701,10 +1735,10 @@ async def keytao_submit_batch(
             "batchId": batch_id,
             "contentVersion": audited_content_version,
             "autoReview": auto_review,
-        }
+        }, batch_id)
     if confirmed and expected_audit_digest != audited_digest:
         consume_confirmation()
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
             "error": "submit_audit_digest_changed",
@@ -1713,7 +1747,7 @@ async def keytao_submit_batch(
             "contentVersion": audited_content_version,
             "auditDigest": audited_digest,
             "autoReview": auto_review,
-        }
+        }, batch_id)
     submission_content_version = audited_content_version
 
     def prepare_submit_preview(data: object) -> Dict:
@@ -1722,14 +1756,14 @@ async def keytao_submit_batch(
             batch_id,
             audited_content_version,
         ):
-            return {
+            return _inject_known_batch_url({
                 "success": False,
                 "uncertain": True,
                 "error": "invalid_submit_preview",
                 "message": "服务端未返回完整的只读提交快照；请先发送「查看草稿」核对状态",
                 "batchId": batch_id,
                 "contentVersion": audited_content_version,
-            }
+            }, batch_id)
         preview_data = dict(data)
         preview_data["autoReview"] = auto_review
         preview_data["auditDigest"] = audited_digest
@@ -1745,13 +1779,13 @@ async def keytao_submit_batch(
             auto_review,
         )
         if not stored:
-            return {
+            return _inject_known_batch_url({
                 "success": False,
                 "error": "audit_snapshot_not_stored",
                 "message": "提交检查无法安全保存（结果过大或容量不足）；请先发送「查看草稿」核对状态",
                 "batchId": batch_id,
                 "contentVersion": audited_content_version,
-            }
+            }, batch_id)
         return preview_data
     
     url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/submit"
@@ -1807,18 +1841,18 @@ async def keytao_submit_batch(
                 return data
             elif response.status_code == 404:
                 consume_confirmation()
-                return {
+                return _inject_known_batch_url({
                     "success": False,
                     "error": "batch_not_found",
                     "message": "批次不存在或已被删除"
-                }
+                }, batch_id)
             elif response.status_code == 403:
                 consume_confirmation()
-                return {
+                return _inject_known_batch_url({
                     "success": False,
                     "error": "batch_forbidden",
                     "message": "无权限操作此批次"
-                }
+                }, batch_id)
             elif response.status_code == 400:
                 data = response.json()
                 if not confirmed and data.get("requiresConfirmation") is True:
@@ -1831,33 +1865,34 @@ async def keytao_submit_batch(
                 data["auditDigest"] = audited_digest
                 data.setdefault("snapshotItems", auto_review.get("snapshotItems", []))
                 data["auditSnapshotDigest"] = auto_review.get("snapshotDigest", "")
+                _inject_known_batch_url(data, batch_id)
                 return data
             elif response.status_code == 409:
                 data = response.json()
                 consume_confirmation()
-                return {
+                return _inject_known_batch_url({
                     **data,
                     "success": False,
                     "error": data.get("error") or "submit_snapshot_changed",
                     "staleConfirmation": True,
                     "batchId": batch_id,
                     "message": data.get("message") or "草稿内容已变化，请重新检查后提交",
-                }
+                }, batch_id)
             else:
                 if confirmed:
                     mark_confirmation_uncertain()
-                    return {
+                    return _inject_known_batch_url({
                         "success": False,
                         "uncertain": True,
                         "error": "submit_result_uncertain",
                         "message": "提交结果暂时无法确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
                         "batchId": batch_id,
-                    }
-                return {
+                    }, batch_id)
+                return _inject_known_batch_url({
                     "success": False,
                     "error": "submit_http_error",
-                    "message": f"提交失败: HTTP {response.status_code}"
-                }
+                    "message": f"提交失败: HTTP {response.status_code}",
+                }, batch_id)
                 
     except asyncio.CancelledError:
         mark_confirmation_uncertain()
@@ -1865,34 +1900,34 @@ async def keytao_submit_batch(
     except httpx.TimeoutException:
         if confirmed:
             mark_confirmation_uncertain()
-            return {
+            return _inject_known_batch_url({
                 "success": False,
                 "uncertain": True,
                 "error": "submit_result_uncertain",
                 "message": "提交请求超时，结果可能已经生效；请先发送「查看草稿」核对状态，再重新发送「提交」",
                 "batchId": batch_id,
-            }
-        return {
+            }, batch_id)
+        return _inject_known_batch_url({
             "success": False,
             "error": "submit_timeout",
-            "message": "请求超时，请稍后重试"
-        }
+            "message": "请求超时，请稍后重试",
+        }, batch_id)
     except Exception as e:
         logger.error(f"Submit batch error: {e}")
         if confirmed:
             mark_confirmation_uncertain()
-            return {
+            return _inject_known_batch_url({
                 "success": False,
                 "uncertain": True,
                 "error": "submit_result_uncertain",
                 "message": "提交结果无法确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
                 "batchId": batch_id,
-            }
-        return {
+            }, batch_id)
+        return _inject_known_batch_url({
             "success": False,
             "error": "submit_failed",
-            "message": f"提交失败: {str(e)}"
-        }
+            "message": f"提交失败: {str(e)}",
+        }, batch_id)
 
 
 async def keytao_get_batch_preview(
@@ -1966,6 +2001,92 @@ async def keytao_recall_batch(
     if not BOT_API_TOKEN:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
+    try:
+        existing_claim = _draft_mutation_claims().get(platform, platform_id)
+    except Exception as error:
+        logger.error(
+            "Failed to read recall claim: %s: %s",
+            type(error).__name__,
+            error,
+        )
+        return _locked_mutation_result(
+            str(batch_id or ""),
+            "无法读取上一次草稿操作的安全状态，本次未执行撤回。",
+        )
+
+    existing_recall_payload: Optional[Dict] = None
+    existing_recall_fingerprint = ""
+    reuse_existing_claim = False
+    if existing_claim is not None:
+        operation_kind = str(existing_claim.get("operationKind") or "")
+        claim_payload = existing_claim.get("payload")
+        claimed_batch_id = str((claim_payload or {}).get("batchId") or "")
+        if operation_kind != "recall" or not isinstance(claim_payload, dict):
+            return _locked_mutation_result(
+                claimed_batch_id or str(batch_id or ""),
+                "上一次草稿操作结果仍不确定；已锁定原操作，本次不会撤回其他批次。",
+            )
+        replay = _replay_resolved_mutation_claim(existing_claim)
+        if replay is not None:
+            return replay
+        existing_recall_payload = claim_payload
+        existing_recall_fingerprint = str(existing_claim.get("fingerprint") or "")
+        claimed_version = claim_payload.get("contentVersion")
+        if (
+            not claimed_batch_id
+            or not existing_recall_fingerprint
+            or not isinstance(claimed_version, int)
+            or isinstance(claimed_version, bool)
+        ):
+            return _locked_mutation_result(
+                claimed_batch_id or str(batch_id or ""),
+                "上一次撤回操作的安全记录不完整，本次不会撤回其他批次。",
+            )
+        recalled_snapshot = await keytao_list_draft_items(
+            platform,
+            platform_id,
+            batch_id=claimed_batch_id,
+        )
+        if (
+            recalled_snapshot.get("success")
+            and str(recalled_snapshot.get("batchId") or "") == claimed_batch_id
+            and str(recalled_snapshot.get("status") or "") == "Draft"
+            and isinstance(recalled_snapshot.get("items"), list)
+        ):
+            applied = {
+                "success": True,
+                "alreadyApplied": True,
+                "batchId": claimed_batch_id,
+                "contentVersion": recalled_snapshot.get("contentVersion"),
+                "items": recalled_snapshot.get("items") or [],
+                "message": "上一次撤回已通过只读草稿快照确认生效",
+            }
+            if recalled_snapshot.get("batchUrl"):
+                applied["batchUrl"] = recalled_snapshot.get("batchUrl")
+            applied = _inject_known_batch_url(applied, claimed_batch_id)
+            if not _resolve_draft_mutation_claim(
+                platform,
+                platform_id,
+                "recall",
+                existing_recall_fingerprint,
+                applied,
+            ):
+                return _locked_mutation_result(
+                    claimed_batch_id,
+                    "原撤回结果已核验，但最终回执无法安全保存；本次不会继续操作。",
+                )
+            return applied
+        if batch_id:
+            if (
+                str(batch_id) != claimed_batch_id
+                or expected_content_version != claimed_version
+            ):
+                return _locked_mutation_result(
+                    claimed_batch_id,
+                    "上一次撤回结果仍无法确认；已锁定原批次，不会撤回其他批次。",
+                )
+            reuse_existing_claim = True
+
     url = f"{KEYTAO_API_BASE}/api/bot/batches/recall"
     logger.info(f"[keytao_recall_batch] platform={platform} platformId={platform_id}")
 
@@ -1985,8 +2106,18 @@ async def keytao_recall_batch(
                 try:
                     data = response.json()
                 except Exception:
+                    if existing_recall_payload is not None:
+                        return _locked_mutation_result(
+                            str(existing_recall_payload.get("batchId") or ""),
+                            "撤回核验接口返回异常；已锁定原批次，不会选择新的提交批次。",
+                        )
                     return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
                 if not response.is_success:
+                    if existing_recall_payload is not None:
+                        return _locked_mutation_result(
+                            str(existing_recall_payload.get("batchId") or ""),
+                            "上一次撤回结果仍无法确认；已锁定原批次，不会选择新的提交批次。",
+                        )
                     return {
                         **data,
                         "success": False,
@@ -2000,14 +2131,32 @@ async def keytao_recall_batch(
                     or isinstance(preview_version, bool)
                     or preview_version < 0
                 ):
+                    if existing_recall_payload is not None:
+                        return _locked_mutation_result(
+                            str(existing_recall_payload.get("batchId") or ""),
+                            "撤回核验结果不完整；已锁定原批次，不会选择新的提交批次。",
+                        )
                     return {"success": False, "message": "待撤回批次缺少可验证版本"}
-                return {
+                if existing_recall_payload is not None:
+                    if (
+                        preview_batch_id
+                        != str(existing_recall_payload.get("batchId") or "")
+                        or preview_version
+                        != existing_recall_payload.get("contentVersion")
+                    ):
+                        return _locked_mutation_result(
+                            str(existing_recall_payload.get("batchId") or ""),
+                            "上一次撤回结果仍不确定；已锁定原批次，不会撤回新的提交批次。",
+                        )
+                preview_data = {
                     **data,
                     "success": False,
                     "requiresConfirmation": True,
                     "confirmationKind": "recallBatch",
                     "message": "即将撤回这个已提交批次并恢复为草稿",
                 }
+                _inject_batch_url(preview_data)
+                return preview_data
             if (
                 not isinstance(expected_content_version, int)
                 or isinstance(expected_content_version, bool)
@@ -2020,6 +2169,35 @@ async def keytao_recall_batch(
                 "batchId": batch_id,
                 "expectedContentVersion": expected_content_version,
             }
+            claim_payload = {
+                "batchId": str(batch_id),
+                "contentVersion": int(expected_content_version),
+            }
+            claim_fingerprint = (
+                existing_recall_fingerprint
+                if reuse_existing_claim
+                else None
+            )
+            if claim_fingerprint is None:
+                try:
+                    claim_fingerprint = _draft_mutation_claims().begin(
+                        platform,
+                        platform_id,
+                        "recall",
+                        claim_payload,
+                    )
+                except Exception as error:
+                    logger.error(
+                        "Failed to acquire recall claim: %s: %s",
+                        type(error).__name__,
+                        error,
+                    )
+                    claim_fingerprint = None
+            if not claim_fingerprint:
+                return _locked_mutation_result(
+                    str(batch_id),
+                    "另一个草稿操作正在核验，本次未执行撤回。",
+                )
             request_body = _json_request_body(request_data)
             response = await client.post(
                 url,
@@ -2036,23 +2214,103 @@ async def keytao_recall_batch(
             try:
                 data = response.json()
             except Exception:
+                if batch_id:
+                    uncertain = {
+                        "success": False,
+                        "uncertain": True,
+                        "batchId": batch_id,
+                        "message": "撤回结果无法确认；请求可能已经生效，请先查看原批次状态",
+                    }
+                    _inject_batch_url(uncertain)
+                    return uncertain
                 return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
 
             logger.info(f"[keytao_recall_batch] status={response.status_code} success={data.get('success')}")
+            data.setdefault("batchId", batch_id)
             if response.status_code == 409:
-                return {
+                stale = {
                     **data,
                     "success": False,
                     "staleConfirmation": True,
                     "message": data.get("message") or "待撤回批次已变化，旧票据已作废",
                 }
+                _inject_batch_url(stale)
+                if not _resolve_draft_mutation_claim(
+                    platform,
+                    platform_id,
+                    "recall",
+                    claim_fingerprint,
+                    stale,
+                ):
+                    return _locked_mutation_result(
+                        str(batch_id),
+                        "撤回失败结果无法安全保存；已锁定原批次。",
+                    )
+                return stale
+            if response.status_code >= 500:
+                data["success"] = False
+                data["uncertain"] = True
+                data["message"] = (
+                    "撤回结果无法确认；请求可能已经生效，请先查看原批次状态"
+                )
             _inject_batch_url(data)
+            if _definitive_mutation_response(response.status_code, data):
+                if not _resolve_draft_mutation_claim(
+                    platform,
+                    platform_id,
+                    "recall",
+                    claim_fingerprint,
+                    data,
+                ):
+                    return _locked_mutation_result(
+                        str(batch_id),
+                        "撤回结果无法安全保存；已锁定原批次，请先核对状态。",
+                    )
+            elif response.status_code < 500:
+                data["success"] = False
+                data["uncertain"] = True
+                data["message"] = "撤回接口未返回同步终态；已锁定原批次，请先核对状态"
             return data
 
+    except asyncio.CancelledError:
+        if batch_id:
+            logger.warning(
+                "Recall cancelled with an unresolved request claim: %s",
+                batch_id,
+            )
+        raise
     except httpx.TimeoutException:
+        if batch_id:
+            uncertain = {
+                "success": False,
+                "uncertain": True,
+                "batchId": batch_id,
+                "message": "撤回请求超时，结果可能已经生效；请先查看原批次状态",
+            }
+            _inject_batch_url(uncertain)
+            return uncertain
+        if existing_recall_payload is not None:
+            return _locked_mutation_result(
+                str(existing_recall_payload.get("batchId") or ""),
+                "撤回核验请求超时；已锁定原批次，不会选择新的提交批次。",
+            )
         return {"success": False, "message": "请求超时，请稍后重试"}
     except Exception as e:
         logger.error(f"[keytao_recall_batch] Error: {e}")
+        if batch_id:
+            uncertain = {
+                "success": False,
+                "uncertain": True,
+                "batchId": batch_id,
+                "message": "撤回结果无法确认；请先查看原批次状态",
+            }
+            _inject_batch_url(uncertain)
+            return uncertain
+        if existing_recall_payload is not None:
+            return _locked_mutation_result(
+                str(existing_recall_payload.get("batchId") or ""),
+                "撤回核验失败；已锁定原批次，不会选择新的提交批次。",
+            )
         return {"success": False, "message": f"撤回失败: {str(e)}"}
 
 
@@ -2148,7 +2406,17 @@ async def _prepare_delete_targets(
         or isinstance(content_version, bool)
         or content_version < 0
     ):
-        return {"success": False, "message": "草稿快照缺少可验证版本"}
+        return _inject_known_batch_url(
+            {"success": False, "message": "草稿快照缺少可验证版本"},
+            current_batch_id,
+        )
+    if batch_id and current_batch_id != str(batch_id):
+        return _inject_known_batch_url({
+            "success": False,
+            "staleConfirmation": True,
+            "message": "草稿查询返回了不同批次，已停止删除",
+            "batchId": current_batch_id,
+        }, current_batch_id)
     items_by_id = {
         int(item["id"]): item
         for item in snapshot.get("items", [])
@@ -2159,11 +2427,11 @@ async def _prepare_delete_targets(
     requested_ids = list(dict.fromkeys(int(item_id) for item_id in ids))
     missing_ids = [item_id for item_id in requested_ids if item_id not in items_by_id]
     if missing_ids:
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
             "message": f"草稿条目已变化，找不到 ID：{missing_ids}",
-        }
+        }, current_batch_id)
     targets = [_canonical_delete_target(items_by_id[item_id]) for item_id in requested_ids]
     digest_payload = {
         "batchId": current_batch_id,
@@ -2176,13 +2444,289 @@ async def _prepare_delete_targets(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
-    return {
+    preview = {
         "success": True,
         "batchId": current_batch_id,
         "contentVersion": content_version,
         "targets": targets,
         "targetDigest": digest,
     }
+    _inject_batch_url(preview)
+    return preview
+
+
+def _locked_mutation_result(batch_id: str, message: str) -> Dict:
+    return _inject_known_batch_url({
+        "success": False,
+        "uncertain": True,
+        "batchId": batch_id,
+        "message": (
+            message.rstrip()
+            + " 确认网站状态后，可发送「放弃不确定操作」解除安全锁。"
+        ),
+    }, batch_id)
+
+
+def _resolve_draft_mutation_claim(
+    platform: str,
+    platform_id: str,
+    operation_kind: str,
+    fingerprint: str,
+    result: Dict,
+) -> bool:
+    try:
+        return _draft_mutation_claims().resolve(
+            platform,
+            platform_id,
+            operation_kind,
+            fingerprint,
+            result,
+        )
+    except Exception as error:
+        logger.error(
+            "Failed to resolve draft mutation claim %s: %s: %s",
+            operation_kind,
+            type(error).__name__,
+            error,
+        )
+        return False
+
+
+def _replay_resolved_mutation_claim(claim: Dict) -> Optional[Dict]:
+    """Return a cached final response without issuing another write."""
+    if str(claim.get("status") or "") != "resolved":
+        return None
+    result = claim.get("result")
+    if not isinstance(result, dict):
+        return None
+    replay = dict(result)
+    replay["replayedResolvedMutation"] = True
+    payload = claim.get("payload") if isinstance(claim.get("payload"), dict) else {}
+    return _inject_known_batch_url(
+        replay,
+        str(replay.get("batchId") or payload.get("batchId") or ""),
+    )
+
+
+def _definitive_mutation_response(status_code: int, data: Dict) -> bool:
+    """Accept only synchronous JSON terminal responses for claim resolution."""
+    if 200 <= status_code < 300:
+        return status_code != 202 and isinstance(data.get("success"), bool)
+    return 400 <= status_code < 500
+
+
+async def _resolve_existing_delete_claim(
+    platform: str,
+    platform_id: str,
+    requested_ids: List[int],
+    batch_id: Optional[str],
+) -> tuple[Optional[Dict], Optional[str]]:
+    """Resolve an earlier uncertain delete without selecting any new targets."""
+    try:
+        claim = _draft_mutation_claims().get(platform, platform_id)
+    except Exception as error:
+        logger.error(
+            "Failed to read delete claim: %s: %s",
+            type(error).__name__,
+            error,
+        )
+        return _locked_mutation_result(
+            str(batch_id or ""),
+            "无法读取上一次删除操作的安全状态，本次未执行删除。",
+        ), None
+    if claim is None:
+        return None, None
+
+    if str(claim.get("operationKind") or "") != "delete":
+        payload = claim.get("payload") if isinstance(claim, dict) else None
+        result = claim.get("result") if isinstance(claim, dict) else None
+        if (
+            str(claim.get("operationKind") or "") == "recall"
+            and str(claim.get("status") or "") == "resolved"
+            and isinstance(payload, dict)
+            and isinstance(result, dict)
+            and str(payload.get("batchId") or "") == str(batch_id or "")
+            and result.get("success") is True
+            and str(result.get("batchId") or "") == str(batch_id or "")
+        ):
+            return None, None
+        return _locked_mutation_result(
+            str((payload or {}).get("batchId") or batch_id or ""),
+            "上一次草稿操作结果仍不确定；已锁定原操作，本次不会删除新目标。",
+        ), None
+
+    replay = _replay_resolved_mutation_claim(claim)
+    if replay is not None:
+        return replay, None
+
+    payload = claim.get("payload") if isinstance(claim, dict) else None
+    fingerprint = str(claim.get("fingerprint") or "") if isinstance(claim, dict) else ""
+    claimed_batch_id = str((payload or {}).get("batchId") or "")
+    claimed_version = (payload or {}).get("contentVersion")
+    claimed_targets = (payload or {}).get("targets")
+    claimed_ids = (payload or {}).get("ids")
+    if (
+        not claimed_batch_id
+        or not fingerprint
+        or not isinstance(claimed_version, int)
+        or isinstance(claimed_version, bool)
+        or not isinstance(claimed_targets, list)
+        or not isinstance(claimed_ids, list)
+    ):
+        return _locked_mutation_result(
+            claimed_batch_id or str(batch_id or ""),
+            "上一次删除操作的安全记录不完整，本次未执行删除。",
+        ), None
+
+    snapshot = await keytao_list_draft_items(
+        platform,
+        platform_id,
+        batch_id=claimed_batch_id,
+    )
+    if (
+        not snapshot.get("success")
+        or str(snapshot.get("batchId") or "") != claimed_batch_id
+        or str(snapshot.get("status") or "") != "Draft"
+        or not isinstance(snapshot.get("items"), list)
+    ):
+        return _locked_mutation_result(
+            claimed_batch_id,
+            "上一次删除结果仍无法确认；已锁定原批次，不会改动新的草稿目标。",
+        ), None
+
+    current_targets = []
+    for item in snapshot.get("items") or []:
+        if not isinstance(item, dict) or not str(item.get("id") or "").isdigit():
+            return _locked_mutation_result(
+                claimed_batch_id,
+                "草稿核验结果不完整；已锁定原批次，不会继续删除。",
+            ), None
+        current_targets.append(_canonical_delete_target(item))
+    current_by_id = {target["id"]: target for target in current_targets}
+    normalized_claimed_ids = [
+        int(item_id)
+        for item_id in claimed_ids
+        if isinstance(item_id, int)
+        and not isinstance(item_id, bool)
+        and item_id > 0
+    ]
+    if len(normalized_claimed_ids) != len(claimed_ids):
+        return _locked_mutation_result(
+            claimed_batch_id,
+            "上一次删除目标记录不完整，本次未执行删除。",
+        ), None
+
+    if all(item_id not in current_by_id for item_id in normalized_claimed_ids):
+        result = {
+            "success": True,
+            "alreadyApplied": True,
+            "batchId": claimed_batch_id,
+            "successCount": len(normalized_claimed_ids),
+            "draftItems": snapshot.get("items") or [],
+            "message": "上一次删除已通过只读草稿快照确认生效",
+        }
+        batch_url = snapshot.get("batchUrl")
+        if batch_url:
+            result["batchUrl"] = batch_url
+        result = _inject_known_batch_url(result, claimed_batch_id)
+        if not _resolve_draft_mutation_claim(
+            platform,
+            platform_id,
+            "delete",
+            fingerprint,
+            result,
+        ):
+            return _locked_mutation_result(
+                claimed_batch_id,
+                "原删除结果已核验，但最终回执无法安全保存；本次不会继续删除。",
+            ), None
+        return result, None
+
+    current_claimed_targets = [
+        current_by_id.get(item_id)
+        for item_id in normalized_claimed_ids
+    ]
+    same_unchanged_snapshot = bool(
+        snapshot.get("contentVersion") == claimed_version
+        and current_claimed_targets == claimed_targets
+    )
+    same_retry_target = bool(
+        str(batch_id or "") == claimed_batch_id
+        and list(requested_ids) == normalized_claimed_ids
+    )
+    if same_unchanged_snapshot and same_retry_target:
+        return None, fingerprint
+
+    return _locked_mutation_result(
+        claimed_batch_id,
+        "上一次删除结果仍不确定；已锁定原批次和原目标，不会删除变化后的内容。",
+    ), None
+
+
+def _begin_delete_claim(
+    platform: str,
+    platform_id: str,
+    batch_id: str,
+    content_version: int,
+    target_digest: str,
+    targets: List[Dict],
+    ids: List[int],
+) -> Optional[str]:
+    payload = {
+        "batchId": batch_id,
+        "contentVersion": content_version,
+        "targetDigest": target_digest,
+        "targets": targets,
+        "ids": ids,
+    }
+    try:
+        store = _draft_mutation_claims()
+        fingerprint = store.begin(
+            platform,
+            platform_id,
+            "delete",
+            payload,
+        )
+        if fingerprint:
+            return fingerprint
+        existing = store.get(platform, platform_id)
+        existing_payload = (
+            existing.get("payload")
+            if isinstance(existing, dict)
+            and isinstance(existing.get("payload"), dict)
+            else {}
+        )
+        existing_result = (
+            existing.get("result")
+            if isinstance(existing, dict)
+            and isinstance(existing.get("result"), dict)
+            else {}
+        )
+        if (
+            isinstance(existing, dict)
+            and existing.get("status") == "resolved"
+            and existing.get("operationKind") == "recall"
+            and existing_payload.get("batchId") == batch_id
+            and existing_result.get("success") is True
+            and existing_result.get("batchId") == batch_id
+        ):
+            payload["continuation"] = "recall_clear"
+            return store.transition_resolved(
+                platform,
+                platform_id,
+                "recall",
+                str(existing.get("fingerprint") or ""),
+                "delete",
+                payload,
+            )
+        return None
+    except Exception as error:
+        logger.error(
+            "Failed to acquire delete claim: %s: %s",
+            type(error).__name__,
+            error,
+        )
+        return None
 
 
 async def keytao_remove_draft_item(
@@ -2209,6 +2753,15 @@ async def keytao_remove_draft_item(
     if not BOT_API_TOKEN:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
+    existing_claim_result, reusable_claim_fingerprint = await _resolve_existing_delete_claim(
+        platform,
+        platform_id,
+        [pr_id],
+        batch_id,
+    )
+    if existing_claim_result is not None:
+        return existing_claim_result
+
     preview = await _prepare_delete_targets(
         platform,
         platform_id,
@@ -2231,11 +2784,26 @@ async def keytao_remove_draft_item(
         or expected_target_digest != preview.get("targetDigest")
         or expected_targets != preview.get("targets")
     ):
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
             "message": "删除目标或草稿版本已变化，旧确认票据已作废",
-        }
+        }, str(preview.get("batchId") or batch_id or ""))
+
+    claim_fingerprint = reusable_claim_fingerprint or _begin_delete_claim(
+        platform,
+        platform_id,
+        str(batch_id or ""),
+        int(expected_content_version),
+        expected_target_digest,
+        expected_targets or [],
+        [pr_id],
+    )
+    if not claim_fingerprint:
+        return _locked_mutation_result(
+            str(batch_id or ""),
+            "另一个草稿操作正在核验，本次未执行删除。",
+        )
 
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/{pr_id}"
     request_data = {
@@ -2267,28 +2835,91 @@ async def keytao_remove_draft_item(
                 data = response.json()
             except Exception:
                 logger.error(f"[keytao_remove_draft_item] Non-JSON response ({response.status_code}): {response.text[:200]}")
-                return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+                uncertain = {
+                    "success": False,
+                    "uncertain": True,
+                    "batchId": batch_id,
+                    "message": "删除结果无法确认；请求可能已经生效，请先查看原草稿",
+                }
+                _inject_batch_url(uncertain)
+                return uncertain
 
             logger.info(f"[keytao_remove_draft_item] PR#{pr_id} status={response.status_code}")
+            data.setdefault("batchId", batch_id)
             if response.status_code == 409:
-                return {
+                stale = {
                     **data,
                     "success": False,
                     "staleConfirmation": True,
                     "message": data.get("message") or "删除目标已变化，旧票据已作废",
                 }
+                _inject_batch_url(stale)
+                if not _resolve_draft_mutation_claim(
+                    platform,
+                    platform_id,
+                    "delete",
+                    claim_fingerprint,
+                    stale,
+                ):
+                    return _locked_mutation_result(
+                        str(batch_id or ""),
+                        "删除失败结果无法安全保存；已锁定原批次。",
+                    )
+                return stale
+            if response.status_code >= 500:
+                data["success"] = False
+                data["uncertain"] = True
+                data["message"] = (
+                    "删除结果无法确认；请求可能已经生效，请先查看原草稿"
+                )
             if data.get("success"):
                 snapshot = await _fetch_draft_snapshot(platform, platform_id)
                 if snapshot is not None:
                     data["draft_snapshot"] = snapshot
             _inject_batch_url(data)
+            if _definitive_mutation_response(response.status_code, data):
+                if not _resolve_draft_mutation_claim(
+                    platform,
+                    platform_id,
+                    "delete",
+                    claim_fingerprint,
+                    data,
+                ):
+                    return _locked_mutation_result(
+                        str(batch_id or ""),
+                        "删除结果无法安全保存；已锁定原批次，请先核对状态。",
+                    )
+            elif response.status_code < 500:
+                data["success"] = False
+                data["uncertain"] = True
+                data["message"] = "删除接口未返回同步终态；已锁定原批次，请先核对状态"
             return data
 
+    except asyncio.CancelledError:
+        logger.warning(
+            "Delete draft item cancelled with an unresolved request claim: %s",
+            batch_id,
+        )
+        raise
     except httpx.TimeoutException:
-        return {"success": False, "message": "请求超时，请稍后重试"}
+        uncertain = {
+            "success": False,
+            "uncertain": True,
+            "batchId": batch_id,
+            "message": "删除请求超时，结果可能已经生效；请先查看原草稿",
+        }
+        _inject_batch_url(uncertain)
+        return uncertain
     except Exception as e:
         logger.error(f"Remove draft item error: {e}")
-        return {"success": False, "message": f"删除失败: {str(e)}"}
+        uncertain = {
+            "success": False,
+            "uncertain": True,
+            "batchId": batch_id,
+            "message": "删除结果无法确认；请先查看原草稿",
+        }
+        _inject_batch_url(uncertain)
+        return uncertain
 
 
 # Tool definitions for OpenAI Function Calling
@@ -2429,7 +3060,10 @@ async def keytao_batch_add_to_draft(
         or expected_content_version < 0
         or not re.fullmatch(r"[0-9a-f]{64}", expected_warning_digest)
     ):
-        return {"success": False, "message": "批量添加确认缺少有效的服务端风险快照"}
+        return _inject_known_batch_url({
+            "success": False,
+            "message": "批量添加确认缺少有效的服务端风险快照",
+        }, batch_id)
 
     valid_items, validation_failed = await _split_items_by_code_validation(items)
     if validation_failed and not valid_items:
@@ -2498,7 +3132,16 @@ async def keytao_batch_add_to_draft(
             try:
                 data = response.json()
             except Exception:
-                return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+                result = {
+                    "success": False,
+                    "message": f"API 返回异常（HTTP {response.status_code}）",
+                }
+                if confirmed:
+                    result.update({
+                        "uncertain": True,
+                        "message": "批量添加结果无法确认；请求可能已经生效，请先查看原草稿",
+                    })
+                return _inject_known_batch_url(result, batch_id)
 
             logger.info(
                 f"[keytao_batch_add_to_draft] status={response.status_code} "
@@ -2509,12 +3152,12 @@ async def keytao_batch_add_to_draft(
                 data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
             data.setdefault("batchId", batch_id)
             if preview_only and not data.get("requiresConfirmation"):
-                return {
+                return _inject_known_batch_url({
                     "success": False,
                     "uncertain": True,
                     "message": "服务端未返回可确认的批量添加快照，已停止后续操作",
                     "batchId": batch_id,
-                }
+                }, batch_id)
             if validation_failed:
                 data["failed"] = [*data.get("failed", []), *validation_failed]
                 data["failedCount"] = data.get("failedCount", 0) + len(validation_failed)
@@ -2526,10 +3169,30 @@ async def keytao_batch_add_to_draft(
             return data
 
     except httpx.TimeoutException:
-        return {"success": False, "message": "请求超时，请稍后重试"}
+        result = {
+            "success": False,
+            "message": (
+                "批量添加请求超时，结果可能已经生效；请先查看原草稿"
+                if confirmed
+                else "请求超时，请稍后重试"
+            ),
+        }
+        if confirmed:
+            result["uncertain"] = True
+        return _inject_known_batch_url(result, batch_id)
     except Exception as e:
         logger.error(f"[keytao_batch_add_to_draft] Error: {e}")
-        return {"success": False, "message": f"批量添加失败: {str(e)}"}
+        result = {
+            "success": False,
+            "message": (
+                "批量添加结果无法确认；请先查看原草稿"
+                if confirmed
+                else f"批量添加失败: {str(e)}"
+            ),
+        }
+        if confirmed:
+            result["uncertain"] = True
+        return _inject_known_batch_url(result, batch_id)
 
 
 async def keytao_batch_remove_draft_items(
@@ -2547,6 +3210,15 @@ async def keytao_batch_remove_draft_items(
 
     if not BOT_API_TOKEN:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
+
+    existing_claim_result, reusable_claim_fingerprint = await _resolve_existing_delete_claim(
+        platform,
+        platform_id,
+        ids,
+        batch_id,
+    )
+    if existing_claim_result is not None:
+        return existing_claim_result
 
     preview = await _prepare_delete_targets(
         platform,
@@ -2570,11 +3242,26 @@ async def keytao_batch_remove_draft_items(
         or expected_target_digest != preview.get("targetDigest")
         or expected_targets != preview.get("targets")
     ):
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
             "message": "批量删除目标或草稿版本已变化，旧确认票据已作废",
-        }
+        }, str(preview.get("batchId") or batch_id or ""))
+
+    claim_fingerprint = reusable_claim_fingerprint or _begin_delete_claim(
+        platform,
+        platform_id,
+        str(batch_id or ""),
+        int(expected_content_version),
+        expected_target_digest,
+        expected_targets or [],
+        list(ids),
+    )
+    if not claim_fingerprint:
+        return _locked_mutation_result(
+            str(batch_id or ""),
+            "另一个草稿操作正在核验，本次未执行批量删除。",
+        )
 
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch-draft"
     payload = {
@@ -2604,27 +3291,90 @@ async def keytao_batch_remove_draft_items(
             try:
                 data: Dict = response.json()
             except Exception:
-                return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+                uncertain = {
+                    "success": False,
+                    "uncertain": True,
+                    "batchId": batch_id,
+                    "message": "批量删除结果无法确认；请求可能已经生效，请先查看原草稿",
+                }
+                _inject_batch_url(uncertain)
+                return uncertain
             logger.info(
                 f"[keytao_batch_remove_draft_items] status={response.status_code} "
                 f"success={data.get('success')} deleted={data.get('successCount')}"
             )
+            data.setdefault("batchId", batch_id)
             if response.status_code == 409:
-                return {
+                stale = {
                     **data,
                     "success": False,
                     "staleConfirmation": True,
                     "message": data.get("message") or "批量删除目标已变化，旧票据已作废",
                 }
+                _inject_batch_url(stale)
+                if not _resolve_draft_mutation_claim(
+                    platform,
+                    platform_id,
+                    "delete",
+                    claim_fingerprint,
+                    stale,
+                ):
+                    return _locked_mutation_result(
+                        str(batch_id or ""),
+                        "批量删除失败结果无法安全保存；已锁定原批次。",
+                    )
+                return stale
+            if response.status_code >= 500:
+                data["success"] = False
+                data["uncertain"] = True
+                data["message"] = (
+                    "批量删除结果无法确认；请求可能已经生效，请先查看原草稿"
+                )
             if isinstance(data.get("draftItems"), list):
                 data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
             _inject_batch_url(data)
+            if _definitive_mutation_response(response.status_code, data):
+                if not _resolve_draft_mutation_claim(
+                    platform,
+                    platform_id,
+                    "delete",
+                    claim_fingerprint,
+                    data,
+                ):
+                    return _locked_mutation_result(
+                        str(batch_id or ""),
+                        "批量删除结果无法安全保存；已锁定原批次，请先核对状态。",
+                    )
+            elif response.status_code < 500:
+                data["success"] = False
+                data["uncertain"] = True
+                data["message"] = "批量删除接口未返回同步终态；已锁定原批次，请先核对状态"
             return data
+    except asyncio.CancelledError:
+        logger.warning(
+            "Batch delete cancelled with an unresolved request claim: %s",
+            batch_id,
+        )
+        raise
     except httpx.TimeoutException:
-        return {"success": False, "message": "请求超时，请稍后重试"}
+        uncertain = {
+            "success": False,
+            "uncertain": True,
+            "batchId": batch_id,
+            "message": "批量删除请求超时，结果可能已经生效；请先查看原草稿",
+        }
+        _inject_batch_url(uncertain)
+        return uncertain
     except Exception as e:
         logger.error(f"[keytao_batch_remove_draft_items] Error: {e}")
-        return {"success": False, "message": f"批量删除失败: {str(e)}"}
+        uncertain = {
+            "success": False,
+            "uncertain": True,
+            "batchId": batch_id,
+            "message": "批量删除结果无法确认；请先查看原草稿",
+        }
+        _inject_batch_url(uncertain)
+        return uncertain
 
 
 async def _keytao_strict_batch_add_to_draft(
@@ -2652,11 +3402,11 @@ async def _keytao_strict_batch_add_to_draft(
 
     valid_items, validation_failed = await _split_items_by_code_validation(items)
     if validation_failed or len(valid_items) != len(items):
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "message": "顺延计划未通过整批编码预检，未写入任何草稿条目",
             "failed": validation_failed,
-        }
+        }, batch_id)
 
     request_items = [
         {
@@ -2703,22 +3453,34 @@ async def _keytao_strict_batch_add_to_draft(
         try:
             data = response.json()
         except Exception:
-            return {"success": False, "message": f"API 返回异常（HTTP {response.status_code}）"}
+            result = {
+                "success": False,
+                "uncertain": True,
+                "message": "整批顺延结果无法确认；请求可能已经生效，请先查看原草稿",
+            }
+            return _inject_known_batch_url(result, batch_id)
+        _inject_known_batch_url(data, batch_id)
         if response.status_code == 409:
-            return {
+            return _inject_known_batch_url({
                 **data,
                 "success": False,
                 "staleConfirmation": True,
                 "message": data.get("message") or "草稿内容已变化，顺延计划已作废",
-            }
+            }, batch_id)
         if data.get("requiresConfirmation"):
             return data
         if not response.is_success or not data.get("success"):
-            return {
+            result = {
                 **data,
                 "success": False,
                 "message": data.get("message") or f"整批顺延写入失败（HTTP {response.status_code}）",
             }
+            if response.status_code >= 500:
+                result.update({
+                    "uncertain": True,
+                    "message": "整批顺延结果无法确认；请求可能已经生效，请先查看原草稿",
+                })
+            return _inject_known_batch_url(result, batch_id)
         data["successCount"] = int(
             data.get("successCount")
             or data.get("pullRequestCount")
@@ -2730,14 +3492,20 @@ async def _keytao_strict_batch_add_to_draft(
         _inject_batch_url(data)
         return data
     except httpx.TimeoutException:
-        return {
+        result = {
             "success": False,
             "uncertain": True,
             "message": "整批顺延请求超时；请先查看草稿确认状态，不要立即重试",
         }
+        return _inject_known_batch_url(result, batch_id)
     except Exception as error:
         logger.error(f"[keytao_shift_phrase_code] strict batch error: {error}")
-        return {"success": False, "message": f"整批顺延写入失败: {str(error)}"}
+        result = {
+            "success": False,
+            "uncertain": True,
+            "message": "整批顺延结果无法确认；请先查看原草稿",
+        }
+        return _inject_known_batch_url(result, batch_id)
 
 
 async def keytao_shift_phrase_code(
@@ -2873,7 +3641,7 @@ async def keytao_shift_phrase_code(
         if isinstance(item, dict) and item.get("word") in planned_words
     ]
     if related_draft_items:
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "policyBlocked": True,
             "requiresDraftCleanup": True,
@@ -2890,7 +3658,7 @@ async def keytao_shift_phrase_code(
                 "shifted": plan.get("shifted", []),
                 "removedDraftIds": [],
             },
-        }
+        }, str(existing_draft.get("batchId") or batch_id or ""))
 
     current_batch_id = str(existing_draft.get("batchId") or "")
     current_content_version = existing_draft.get("contentVersion")
@@ -2900,10 +3668,10 @@ async def keytao_shift_phrase_code(
         or isinstance(current_content_version, bool)
         or current_content_version < 0
     ):
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "message": "当前草稿缺少可验证的内容版本，顺延未执行",
-        }
+        }, current_batch_id or batch_id)
 
     shift_plan = {
         "word": word,
@@ -2926,7 +3694,7 @@ async def keytao_shift_phrase_code(
     ).encode("utf-8")).hexdigest()
 
     if not confirmed_plan_digest:
-        return {
+        preview = {
             "success": False,
             "requiresConfirmation": True,
             "confirmationKind": "shiftPlan",
@@ -2936,18 +3704,20 @@ async def keytao_shift_phrase_code(
             "planDigest": plan_digest,
             "shiftPlan": shift_plan,
         }
+        _inject_batch_url(preview)
+        return preview
     if (
         confirmed_plan_digest.strip().lower() != plan_digest
         or batch_id != current_batch_id
         or expected_content_version != current_content_version
     ):
-        return {
+        return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
             "message": "顺延计划或草稿内容已变化，旧确认票据已作废，请重新发起",
             "batchId": current_batch_id,
             "contentVersion": current_content_version,
-        }
+        }, current_batch_id)
 
     write_result = await _keytao_strict_batch_add_to_draft(
         platform,
@@ -2966,7 +3736,7 @@ async def keytao_shift_phrase_code(
             for item in plan.get("shifted", [])
         )
         write_result["message"] = f"{write_result.get('message', '已写入草稿')}；顺延：{shifted_text}"
-    return write_result
+    return _inject_known_batch_url(write_result, current_batch_id)
 
 
 TOOLS += [

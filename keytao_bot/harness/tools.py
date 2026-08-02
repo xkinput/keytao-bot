@@ -40,7 +40,9 @@ _EXPLANATION_ONLY_RE = re.compile(
 _TEXT_TRANSFORM_RE = re.compile(r"(?:改写|润色|复述|翻译|引用|摘录|转述)")
 _QUESTION_RE = re.compile(
     r"[?？]|(?:是否|能否|可否|会不会|是不是|要不要|怎么样|怎样|如何|"
-    r"想知道|之后的结果|结果是什么)"
+    r"想知道|之后的结果|结果是什么)|"
+    r"(?:吗|么|呢|好不好|行不行|可不可以|能不能|对不对|可以不|"
+    r"不可以|不行)(?:[。.!！])?$"
 )
 _ABORT_RE = re.compile(r"(?:算了|取消|别执行|不要执行|先不要|不用了|不做了|别做了)")
 _EXPLICIT_REQUEST_PREFIX_RE = re.compile(
@@ -175,6 +177,11 @@ def _mutation_authorization_view(message: str) -> str:
                 candidate,
             )
             or re.match(r"除了.{1,80}(?:都删|删除|删掉|去掉|移除)", candidate)
+            or re.match(
+                r"(?:草稿|批次)(?:中的)?(?:全部|都|所有)(?:条目)?"
+                r"(?:删除|删掉|去掉|移除)",
+                candidate,
+            )
         )
         is_protection_clause = bool(
             (has_mutation and _NEGATIVE_MODAL_RE.search(candidate))
@@ -212,6 +219,12 @@ def message_authorizes_mutation(message: str) -> bool:
         return False
     return mutation_match.start() == 0 or bool(
         _EXPLICIT_REQUEST_PREFIX_RE.match(authorization_text)
+    ) or bool(
+        re.match(
+            r"(?:草稿|批次)(?:中的)?(?:全部|都|所有)(?:条目)?"
+            r"(?:删除|删掉|去掉|移除)",
+            authorization_text,
+        )
     )
 
 
@@ -594,7 +607,9 @@ class ToolExecutor:
         self,
         get_tool_function: Callable[[str], Optional[Callable]],
         context_tools: frozenset[str],
-        mutation_guard: Optional[Callable[[ToolContext], Optional[Dict]]] = None,
+        mutation_guard: Optional[
+            Callable[[ToolContext, str, Dict], Optional[Dict]]
+        ] = None,
     ):
         self._get_tool_function = get_tool_function
         self._context_tools = context_tools
@@ -739,7 +754,7 @@ class ToolExecutor:
                 ),
             }
         if tool_name in MUTATING_TOOL_NAMES and self._mutation_guard is not None:
-            guard_error = self._mutation_guard(context)
+            guard_error = self._mutation_guard(context, tool_name, arguments)
             if guard_error:
                 return guard_error
         if (

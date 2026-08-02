@@ -150,6 +150,7 @@ from keytao_bot.plugins.openai_chat import (
     SimpleWordQueryIntent,
     SYSTEM_PROMPT_CORE,
 )
+from keytao_bot.utils.draft_mutation_store import DraftMutationClaimStore
 from keytao_bot.plugins.account_bind import (
     _extract_bind_key,
     _is_bind_command_text,
@@ -268,6 +269,15 @@ def test_message_command_intent_payload():
         "current_user_only": "true",
         "confidence": 0.94,
     })
+    draft_recall = _parse_message_command_intent_payload({
+        "intent": "draft_recall",
+        "clear_after": "true",
+        "confidence": 0.98,
+    })
+    draft_clear = _parse_message_command_intent_payload({
+        "intent": "draft_clear",
+        "confidence": 0.98,
+    })
     replace_char = _parse_message_command_intent_payload({
         "intent": "batch_replace_char",
         "old_char": "粘",
@@ -292,6 +302,8 @@ def test_message_command_intent_payload():
     check("keep-only parsed from intent", command is not None and command.keep_words == ("大盘鸡",))
     check("keep-only submit flag from intent", command is not None and command.submit_after)
     check("operation recall scope parsed", recall.intent == "operation_recall" and recall.current_user_only)
+    check("draft recall clear flag parsed", draft_recall.intent == "draft_recall" and draft_recall.clear_after)
+    check("draft clear parsed", draft_clear.intent == "draft_clear")
     check("replace-char payload parsed", replace_char.old_char == "粘" and replace_char.new_char == "黏")
     check("draft submit parsed", submit.intent == "draft_submit")
     check("draft submit is not pending-sensitive", not _is_sensitive_pending_control_intent(submit))
@@ -2375,7 +2387,49 @@ def test_draft_view_command_uses_draft_tools():
         check("draft list called", tool_calls[0] == ("keytao_list_draft_items", {}))
         check("draft preview called", tool_calls[1] == ("keytao_get_batch_preview", {}))
         check("draft item shown", result is not None and "大盘鸡 → dpjv" in result)
+        check("draft view includes batch link", result is not None and "https://keytao.vercel.app/batch/draft-1" in result)
         check("word lookup not called", all(name != "keytao_lookup_by_word" for name, _ in tool_calls))
+
+    asyncio.run(_run())
+
+
+def test_draft_response_keeps_list_fallback_link():
+    """A failed preview must not discard the list endpoint's batch URL."""
+    print("\n🧪 draft response keeps list fallback link")
+
+    async def _run():
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            if tool_name == "keytao_get_batch_preview":
+                return json.dumps({
+                    "success": False,
+                    "message": "preview unavailable",
+                }, ensure_ascii=False)
+            if tool_name == "keytao_list_draft_items":
+                return json.dumps({
+                    "success": True,
+                    "count": 1,
+                    "items": [{
+                        "id": 2,
+                        "word": "窨制",
+                        "code": "xwfko",
+                        "action": "Create",
+                    }],
+                    "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    "batchUrl": "https://keytao.test/batch/list-fallback",
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await openai_chat_module._format_draft_response(
+                {},
+                "qq",
+                "fallback-user",
+            )
+
+        check(
+            "list fallback batch link is preserved",
+            "https://keytao.test/batch/list-fallback" in result,
+        )
 
     asyncio.run(_run())
 
@@ -2443,6 +2497,7 @@ def test_draft_submit_command_uses_current_user_tools():
         })
         check("plain submit leaves no ticket", record is None)
         check("plain submit shows no ticket code", "确认票据" not in submitted and "确认操作" not in submitted)
+        check("plain submit includes batch link", "https://keytao.vercel.app/batch/current-user" in submitted)
 
     asyncio.run(_run())
 
@@ -3370,7 +3425,529 @@ def test_recall_batch_requires_exact_server_ticket():
             "qq",
             "recall-123",
         ))
-        check("recall succeeds after exact confirmation", "已按确认票据执行" in recalled)
+        check("recall succeeds after exact confirmation", "操作已完成" in recalled)
+
+    asyncio.run(_run())
+
+
+def test_direct_recall_and_clear_uses_exact_snapshots():
+    """One explicit command recalls and clears the exact restored batch."""
+    print("\n🧪 direct recall and clear uses exact snapshots")
+
+    async def _run():
+        calls = []
+        target_digest = "a" * 64
+        targets = [
+            {"id": 11, "word": "窨制", "code": "xwfko", "action": "Create", "type": "Phrase"},
+            {"id": 12, "word": "阻抑", "code": "zjyka", "action": "Create", "type": "Phrase"},
+        ]
+        list_count = 0
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            nonlocal list_count
+            calls.append((tool_name, arguments, platform, user_id))
+            if tool_name == "keytao_recall_batch":
+                if not arguments:
+                    return json.dumps({
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "batchId": "submitted-42",
+                        "contentVersion": 17,
+                        "batchUrl": "https://keytao.test/batch/submitted-42",
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": True,
+                    "batchId": "submitted-42",
+                    "contentVersion": 18,
+                    "batchUrl": "https://keytao.test/batch/submitted-42",
+                }, ensure_ascii=False)
+            if tool_name == "keytao_list_draft_items":
+                list_count += 1
+                assert arguments == {"batch_id": "submitted-42"}
+                return json.dumps({
+                    "success": True,
+                    "batchId": "submitted-42",
+                    "contentVersion": 18 + list_count,
+                    "batchUrl": "https://keytao.test/batch/submitted-42",
+                    "items": targets if list_count == 1 else [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_batch_remove_draft_items":
+                if not arguments.get("expected_target_digest"):
+                    return json.dumps({
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "batchId": "submitted-42",
+                        "contentVersion": 19,
+                        "targetDigest": target_digest,
+                        "targets": targets,
+                        "batchUrl": "https://keytao.test/batch/submitted-42",
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": True,
+                    "successCount": 2,
+                    "batchId": "submitted-42",
+                    "contentVersion": 20,
+                    "batchUrl": "https://keytao.test/batch/submitted-42",
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        intent = MessageCommandIntent(
+            intent="draft_recall",
+            confidence=0.99,
+            clear_after=True,
+        )
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _try_handle_draft_management_command(
+                "撤回提交并清空草稿",
+                "qq",
+                "recall-clear-user",
+                command_intent=intent,
+            )
+
+        check("combined command succeeds", result is not None and "已撤回最近提审，并清空恢复后的草稿" in result)
+        check(
+            "combined command includes one batch link",
+            result.count("https://keytao.test/batch/submitted-42") == 1,
+        )
+        check("combined command exposes no ticket", "确认票据" not in result and "确认操作" not in result)
+        check("recall preview is read-only", calls[0][:2] == ("keytao_recall_batch", {}))
+        check("recall CAS binds exact version", calls[1][:2] == (
+            "keytao_recall_batch",
+            {"batch_id": "submitted-42", "expected_content_version": 17},
+        ))
+        check("clear reads only restored batch", calls[2][:2] == (
+            "keytao_list_draft_items",
+            {"batch_id": "submitted-42"},
+        ))
+        check("delete preview targets all restored items", calls[3][1] == {
+            "ids": [11, 12],
+            "batch_id": "submitted-42",
+        })
+        check("delete CAS binds exact target snapshot", calls[4][1] == {
+            "ids": [11, 12],
+            "batch_id": "submitted-42",
+            "expected_content_version": 19,
+            "expected_target_digest": target_digest,
+            "expected_targets": targets,
+        })
+        check("clear verifies exact batch is empty", calls[5][:2] == (
+            "keytao_list_draft_items",
+            {"batch_id": "submitted-42"},
+        ))
+
+    asyncio.run(_run())
+
+
+def test_direct_recall_stops_before_clear_on_stale_batch():
+    """A stale recall snapshot cannot fall through into draft deletion."""
+    print("\n🧪 stale recall stops before clear")
+
+    async def _run():
+        calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, arguments))
+            if not arguments:
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "submitted-old",
+                    "contentVersion": 7,
+                    "batchUrl": "https://keytao.test/batch/submitted-old",
+                }, ensure_ascii=False)
+            return json.dumps({
+                "success": False,
+                "staleConfirmation": True,
+                "message": "待撤回批次已变化",
+            }, ensure_ascii=False)
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await openai_chat_module._perform_recall_latest_batch(
+                "qq",
+                "stale-user",
+                clear_after=True,
+            )
+
+        check("stale recall reports failure", not result.success and "待撤回批次已变化" in result.text)
+        check(
+            "stale recall keeps preview link once",
+            result.text.count("https://keytao.test/batch/submitted-old") == 1,
+        )
+        check("stale recall makes no clear calls", [name for name, _args in calls] == [
+            "keytao_recall_batch",
+            "keytao_recall_batch",
+        ])
+
+    asyncio.run(_run())
+
+
+def test_submit_cas_failure_keeps_preview_link_once():
+    """A later stale/timeout result keeps the earlier exact snapshot URL."""
+    print("\n🧪 submit CAS failure keeps preview link once")
+
+    async def _run():
+        calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, arguments))
+            if not arguments.get("confirmed"):
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "submit-link-batch",
+                    "contentVersion": 8,
+                    "snapshotDigest": "a" * 64,
+                    "warningDigest": "b" * 64,
+                    "auditDigest": "c" * 64,
+                    "snapshotItems": [{
+                        "action": "Create",
+                        "word": "窨制",
+                        "code": "xwfko",
+                    }],
+                    "batchUrl": "https://keytao.test/batch/submit-link-batch",
+                }, ensure_ascii=False)
+            return json.dumps({
+                "success": False,
+                "staleConfirmation": True,
+                "message": "提交前草稿已变化",
+                "batchId": "submit-link-batch",
+            }, ensure_ascii=False)
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await openai_chat_module._perform_submit_current_draft(
+                "qq",
+                "submit-link-user",
+                auto_confirm=True,
+                authorized_items=[{
+                    "action": "Create",
+                    "word": "窨制",
+                    "code": "xwfko",
+                }],
+            )
+
+        check("submit preview and CAS both run", len(calls) == 2)
+        check("stale submit remains failed", not result.success and "草稿已变化" in result.text)
+        check(
+            "submit failure keeps exactly one batch URL",
+            result.text.count("https://keytao.test/batch/submit-link-batch") == 1,
+        )
+
+    asyncio.run(_run())
+
+
+def test_draft_recall_and_clear_questions_never_write():
+    """Question and negated forms cannot enter deterministic mutations."""
+    print("\n🧪 recall and clear questions never write")
+
+    async def _run():
+        calls = []
+
+        async def fake_call(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("no tool call expected")
+
+        cases = [
+            (
+                "怎么撤回提交并清空草稿？",
+                MessageCommandIntent(intent="draft_recall", confidence=0.99, clear_after=True),
+            ),
+            (
+                "不要撤回提交",
+                MessageCommandIntent(intent="draft_recall", confidence=0.99),
+            ),
+            (
+                "清空草稿会怎样？",
+                MessageCommandIntent(intent="draft_clear", confidence=0.99),
+            ),
+        ]
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            results = [
+                await _try_handle_draft_management_command(
+                    message,
+                    "qq",
+                    "safe-user",
+                    command_intent=intent,
+                )
+                for message, intent in cases
+            ]
+
+        check("unsafe command forms fall through", results == [None, None, None])
+        check("unsafe command forms make zero writes", not calls)
+
+    asyncio.run(_run())
+
+
+def test_draft_recall_authorization_forms():
+    """Recall aliases stay simple without weakening question/quote guards."""
+    print("\n🧪 draft recall authorization forms")
+
+    recall_intent = MessageCommandIntent(intent="draft_recall", confidence=0.99)
+    recall_and_clear_intent = MessageCommandIntent(
+        intent="draft_recall",
+        confidence=0.99,
+        clear_after=True,
+    )
+    allowed = [
+        ("撤回", recall_intent),
+        ("撤销提交", recall_intent),
+        ("取消提审", recall_intent),
+        ("帮我取消最近一次提审", recall_intent),
+        ("撤回提交并清空草稿", recall_and_clear_intent),
+        ("取消提审并清空恢复后的草稿", recall_and_clear_intent),
+    ]
+    denied = [
+        ("取消提交", recall_intent),
+        ("取消提审？", recall_intent),
+        ("撤回提交吗", recall_intent),
+        ("撤回提交好不好", recall_intent),
+        ("撤回提交可不可以", recall_intent),
+        ("不要取消提审", recall_intent),
+        ("请不撤回提交", recall_intent),
+        ("“取消提审”", recall_intent),
+        ("《取消提审》", recall_intent),
+        ("【取消提审并清空草稿】", recall_and_clear_intent),
+        ("解释取消提审", recall_intent),
+        ("取消提审", recall_and_clear_intent),
+        ("撤回提交并删除草稿里的窨制", recall_and_clear_intent),
+        ("撤回提交并清除恢复草稿里的窨制", recall_and_clear_intent),
+    ]
+
+    check(
+        "explicit recall aliases are authorized",
+        all(
+            openai_chat_module._message_authorizes_draft_recall(message, intent)
+            for message, intent in allowed
+        ),
+    )
+    check(
+        "ambiguous or unsafe recall forms are rejected",
+        not any(
+            openai_chat_module._message_authorizes_draft_recall(message, intent)
+            for message, intent in denied
+        ),
+    )
+
+
+def test_draft_clear_authorization_boundaries():
+    """Clear-all cannot absorb a question, negation, recall, or one-item delete."""
+    print("\n🧪 draft clear authorization boundaries")
+
+    clear_intent = MessageCommandIntent(intent="draft_clear", confidence=0.99)
+    allowed = ["清空草稿", "把当前草稿清空", "草稿全部删除"]
+    denied = [
+        "清空草稿吗",
+        "清空草稿行不行",
+        "我想不清空草稿",
+        "撤回提交并清空草稿",
+        "删除草稿里的窨制",
+        "清除草稿里的窨制",
+        "清理草稿中编码 xwfko 的条目",
+        "清空窨制对应的草稿条目",
+        "添加窨制并清空草稿",
+    ]
+    check(
+        "explicit clear-all forms are authorized",
+        all(
+            openai_chat_module._message_authorizes_draft_clear(message, clear_intent)
+            for message in allowed
+        ),
+    )
+    check(
+        "unsafe or cross-intent clear forms are rejected",
+        not any(
+            openai_chat_module._message_authorizes_draft_clear(message, clear_intent)
+            for message in denied
+        ),
+    )
+
+
+def test_structural_recall_and_clear_routes_without_llm():
+    """The common exact commands remain available if intent-model routing fails."""
+    print("\n🧪 structural recall and clear routes without LLM")
+
+    async def _run():
+        with patch.object(openai_chat_module, "OPENAI_API_KEY", ""):
+            recall = await _classify_message_command_intent("撤回")
+            cancel_review = await _classify_message_command_intent("取消提审")
+            recall_clear = await _classify_message_command_intent("撤回提交并清空草稿")
+            clear = await _classify_message_command_intent("清空草稿")
+            question = await _classify_message_command_intent("清空草稿吗")
+
+        check("bare recall routes deterministically", recall.intent == "draft_recall")
+        check("cancel-review alias routes deterministically", cancel_review.intent == "draft_recall")
+        check(
+            "combined route keeps clear-after flag",
+            recall_clear.intent == "draft_recall" and recall_clear.clear_after,
+        )
+        check("bare clear routes deterministically", clear.intent == "draft_clear")
+        check("question remains non-mutating", question.intent == "none")
+
+        recall_result = DraftActionResult(
+            "✅ 已撤回并清空",
+            success=True,
+            invalidate_pending=True,
+        )
+        with patch.object(
+            openai_chat_module,
+            "_perform_recall_latest_batch",
+            AsyncMock(return_value=recall_result),
+        ) as recall_mock:
+            await openai_chat_module._try_handle_draft_recall_command(
+                "撤回提交并清空草稿",
+                MessageCommandIntent(
+                    intent="draft_recall",
+                    confidence=0.99,
+                    clear_after=False,
+                ),
+                "qq",
+                "canonical-clear-user",
+            )
+        check(
+            "raw command canonically restores omitted clear flag",
+            recall_mock.await_args.kwargs.get("clear_after") is True,
+        )
+
+    asyncio.run(_run())
+
+
+def test_recall_clear_batch_binding_and_pending_cleanup():
+    """Restored-batch operations reject drift and retire stale pending tickets."""
+    print("\n🧪 recall/clear batch binding and pending cleanup")
+
+    async def _run():
+        calls = []
+
+        async def mismatched_list(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, arguments))
+            return json.dumps({
+                "success": True,
+                "batchId": "different-batch",
+                "contentVersion": 4,
+                "items": [{"id": 11, "word": "窨制", "code": "xwfko"}],
+                "batchUrl": "https://keytao.test/batch/different-batch",
+            }, ensure_ascii=False)
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=mismatched_list):
+            mismatch = await openai_chat_module._perform_clear_current_draft(
+                "qq",
+                "batch-bind-user",
+                batch_id="restored-batch",
+            )
+
+        check("mismatched restored batch is rejected", not mismatch.success and "不同批次" in mismatch.text)
+        check("mismatch performs no delete preview", calls == [(
+            "keytao_list_draft_items",
+            {"batch_id": "restored-batch"},
+        )])
+
+        active_address = ConversationAddress.group(
+            "qq",
+            "active-group",
+            "active-clear-user",
+        )
+        active_operation = openai_chat_module.draft_operation_coordinator.begin(
+            active_address,
+            "add_and_submit",
+            word="在途词",
+            code="ztk",
+        )
+        assert active_operation is not None
+        active_calls = []
+
+        async def no_active_tools(*args, **kwargs):
+            active_calls.append((args, kwargs))
+            raise AssertionError("active operation must block clear before tools")
+
+        try:
+            with patch.object(openai_chat_module, "call_tool_function", side_effect=no_active_tools):
+                active_reply = await _try_handle_draft_management_command(
+                    "清空草稿",
+                    "qq",
+                    "active-clear-user",
+                    command_intent=MessageCommandIntent(
+                        intent="draft_clear",
+                        confidence=1.0,
+                    ),
+                )
+        finally:
+            openai_chat_module.draft_operation_coordinator.finish(
+                active_address,
+                active_operation.operation_id,
+            )
+
+        check(
+            "active actor mutation is explained directly",
+            active_reply is not None and "草稿操作" in active_reply,
+        )
+        check("active actor clear makes zero tool calls", not active_calls)
+
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.group("qq", "cleanup-group", "cleanup-user")
+        store.set(
+            address,
+            PendingToolConfirm(
+                function_name="keytao_create_phrase",
+                args={"word": "旧候选", "code": "jqk"},
+            ),
+            space_key=address.space_key,
+        )
+
+        async def empty_list(tool_name, arguments, platform=None, user_id=None):
+            assert tool_name == "keytao_list_draft_items"
+            return json.dumps({
+                "success": True,
+                "batchId": "empty-batch",
+                "contentVersion": 2,
+                "items": [],
+                "batchUrl": "https://keytao.test/batch/empty-batch",
+            }, ensure_ascii=False)
+
+        openai_chat_module.conversation_state_store = store
+        try:
+            with patch.object(openai_chat_module, "call_tool_function", side_effect=empty_list):
+                cleared = await _try_handle_draft_management_command(
+                    "清空草稿",
+                    "qq",
+                    "cleanup-user",
+                    command_intent=MessageCommandIntent(
+                        intent="draft_clear",
+                        confidence=1.0,
+                    ),
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("successful clear retires stale actor pending", store.get_record(address) is None)
+        check("clear reply keeps batch link", "https://keytao.test/batch/empty-batch" in cleared)
+
+    asyncio.run(_run())
+
+
+def test_command_result_never_gets_word_priority_appendix():
+    """Structured command handling cannot be reclassified as word lookup."""
+    print("\n🧪 command result skips word-query appendix")
+
+    async def _run():
+        calls = []
+
+        async def fake_call(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("word tools must not run")
+
+        response = "拟执行 keytao_recall_batch：{}\n确认票据 ABC123"
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _augment_simple_word_query_response(
+                "撤回",
+                response,
+                "qq",
+                "command-user",
+                handled_as_command=True,
+            )
+
+        check("command response is unchanged", result == response)
+        check("command response makes no lookup calls", not calls)
+        check("command response has no priority appendix", "编码位置说明" not in result and "常用度对比" not in result)
 
     asyncio.run(_run())
 
@@ -4012,6 +4589,7 @@ def test_pending_add_word_add_and_submit_uses_recommended():
         })
         check("submit uses current user", all(call[2:] == ("qq", "2002") for call in calls))
         check("response says submitted", "已加入草稿并提交审核" in submitted)
+        check("combined success includes batch link", "https://keytao.test/batch/current" in submitted)
         check("combined command leaves no ticket", store.get_record(conv_key) is None)
         check("combined command shows no ticket code", "确认票据" not in submitted and "确认操作" not in submitted)
 
@@ -4453,6 +5031,10 @@ def test_background_confirmation_isolated_from_second_word():
             return DraftActionResult(
                 "是否继续提交？回复「确认」继续提交，回复「取消」放弃。",
                 pending_state=pending_submit,
+                data={
+                    "batchId": "batch-background-link",
+                    "batchUrl": "https://keytao.test/batch/background-link",
+                },
             )
 
         with (
@@ -4478,6 +5060,34 @@ def test_background_confirmation_isolated_from_second_word():
         check("submit confirmation belongs to operation", active.pending_state is pending_submit)
         check("second word remains chat pending", openai_chat_module.conversation_state_store.get(conv_key) is second_pending)
         check("confirmation prompt is sent once", len(bot.messages) == 1)
+
+        async def timed_out_confirmation():
+            await asyncio.sleep(1)
+            return DraftActionResult("不应到达")
+
+        with (
+            patch.object(openai_chat_module, "KEYTAO_BACKGROUND_OPERATION_TIMEOUT", 0.01),
+            patch.object(openai_chat_module, "remember_conversation"),
+            patch.object(openai_chat_module, "schedule_memory_compaction"),
+            patch.object(openai_chat_module.memory_store, "is_generation_current", return_value=True),
+            patch.object(openai_chat_module.history_store, "is_generation_current", return_value=True),
+        ):
+            await openai_chat_module._run_background_draft_operation(
+                operation,
+                timed_out_confirmation,
+                bot,
+                object(),
+                "background-confirm-2002",
+                memory_context,
+                "确认提交",
+                object(),
+                object(),
+            )
+        check(
+            "second-stage timeout keeps the first-stage batch link",
+            len(bot.messages) == 2
+            and "https://keytao.test/batch/background-link" in bot.messages[1],
+        )
         openai_chat_module.conversation_state_store.delete(conv_key)
         openai_chat_module.draft_operation_coordinator.clear(conv_key)
 
@@ -4589,6 +5199,478 @@ def test_draft_tool_guard_blocks_out_of_band_mutations():
         check("own background operation reaches tool executor", json.loads(allowed_json).get("success") is True)
         check("own operation called executor once", executor_call.await_count == 1)
         openai_chat_module.draft_operation_coordinator.clear(conv_key)
+
+    asyncio.run(_run())
+
+
+def test_durable_draft_mutation_claim_lifecycle():
+    """A resolved destructive result is replayed until a reply is delivered."""
+    print("\n🧪 durable draft mutation claim lifecycle")
+
+    class DeliveryBot:
+        def __init__(self):
+            self.messages = []
+
+        async def send(self, **kwargs):
+            self.messages.append(kwargs.get("message"))
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = os.path.join(temp_dir, "claims.db")
+            first = DraftMutationClaimStore(db_path)
+            payload = {"batchId": "batch-a", "contentVersion": 7}
+            fingerprint = first.begin("qq", "claim-user", "recall", payload)
+            second = DraftMutationClaimStore(db_path)
+            persisted = second.get("qq", "claim-user")
+            check("claim survives a new store instance", persisted is not None and persisted["payload"] == payload)
+            check(
+                "claim is actor-wide across operation kinds",
+                second.begin("qq", "claim-user", "delete", {"batchId": "batch-b"}) is None,
+            )
+
+            final_result = {
+                "success": True,
+                "batchId": "batch-a",
+                "batchUrl": "https://keytao.test/batch/a",
+                "message": "已撤回",
+            }
+            check(
+                "final result is persisted before delivery",
+                second.resolve("qq", "claim-user", "recall", fingerprint, final_result),
+            )
+            restarted = DraftMutationClaimStore(db_path)
+            resolved = restarted.get("qq", "claim-user")
+            check(
+                "resolved response survives restart",
+                resolved is not None
+                and resolved["status"] == "resolved"
+                and resolved["result"] == final_result,
+            )
+
+            with patch.object(
+                openai_chat_module,
+                "get_default_draft_mutation_claim_store",
+                return_value=restarted,
+            ):
+                blocked = openai_chat_module._guard_draft_mutation(
+                    ToolContext("qq", "claim-user"),
+                    "keytao_create_phrase",
+                    {"word": "新词", "code": "abcd"},
+                )
+                allowed_replay = openai_chat_module._guard_draft_mutation(
+                    ToolContext("qq", "claim-user"),
+                    "keytao_recall_batch",
+                    {},
+                )
+                check("resolved claim blocks a different mutation", blocked is not None and blocked.get("policyBlocked") is True)
+                check("resolved claim allows only its replay tool", allowed_replay is None)
+
+                delivery_token = openai_chat_module.current_draft_delivery_claims.set([])
+                try:
+                    openai_chat_module._capture_resolved_mutation_delivery(
+                        "keytao_recall_batch",
+                        "qq",
+                        "claim-user",
+                    )
+                    bot = DeliveryBot()
+                    await openai_chat_module._finish_ai_chat_response(
+                        bot,
+                        object(),
+                        "claim-user",
+                        ChatMemoryContext(platform="qq", user_id="claim-user"),
+                        "✅ 已撤回\n草稿地址：https://keytao.test/batch/a",
+                    )
+                finally:
+                    openai_chat_module.current_draft_delivery_claims.reset(delivery_token)
+            check("delivered response is sent once", len(bot.messages) == 1)
+            check("claim is acknowledged only after send", restarted.get("qq", "claim-user") is None)
+
+            chain_fingerprint = restarted.begin(
+                "qq",
+                "claim-user",
+                "recall",
+                payload,
+            )
+            restarted.resolve(
+                "qq",
+                "claim-user",
+                "recall",
+                chain_fingerprint,
+                final_result,
+            )
+            chain_token = openai_chat_module.current_recall_clear_batch_id.set("batch-a")
+            try:
+                with patch.object(
+                    openai_chat_module,
+                    "get_default_draft_mutation_claim_store",
+                    return_value=restarted,
+                ):
+                    chain_guard = openai_chat_module._guard_draft_mutation(
+                        ToolContext("qq", "claim-user"),
+                        "keytao_batch_remove_draft_items",
+                        {"batch_id": "batch-a", "ids": [1]},
+                    )
+            finally:
+                openai_chat_module.current_recall_clear_batch_id.reset(chain_token)
+            check("recall-clear continuation is allowed only for the same batch", chain_guard is None)
+            with patch.object(_draft_tools, "_draft_mutation_claims", return_value=restarted):
+                delete_fingerprint = _draft_tools._begin_delete_claim(
+                    "qq",
+                    "claim-user",
+                    "batch-a",
+                    8,
+                    "e" * 64,
+                    [{"id": 1, "word": "甲", "code": "aa", "action": "Create", "type": "Phrase"}],
+                    [1],
+                )
+            transitioned = restarted.get("qq", "claim-user")
+            check(
+                "recall-clear atomically transitions to a delete fence",
+                delete_fingerprint is not None
+                and transitioned is not None
+                and transitioned["operationKind"] == "delete"
+                and transitioned["status"] == "inflight"
+                and transitioned["payload"].get("continuation") == "recall_clear",
+            )
+
+            with patch.object(
+                openai_chat_module,
+                "get_default_draft_mutation_claim_store",
+                return_value=restarted,
+            ):
+                abandoned = await openai_chat_module._try_handle_draft_management_command(
+                    "放弃不确定操作",
+                    "qq",
+                    "claim-user",
+                )
+            check(
+                "explicit abandon removes only the actor mutation fence",
+                restarted.get("qq", "claim-user") is None,
+            )
+            check(
+                "explicit abandon reports that no write was executed",
+                abandoned is not None and "没有执行新的草稿写入" in abandoned,
+            )
+
+            resumed_payload = {
+                "batchId": "batch-a",
+                "contentVersion": 8,
+                "targetDigest": "e" * 64,
+                "targets": [
+                    {
+                        "id": 1,
+                        "word": "甲",
+                        "code": "aa",
+                        "action": "Create",
+                        "type": "Phrase",
+                    }
+                ],
+                "ids": [1],
+                "continuation": "recall_clear",
+            }
+            resumed_fingerprint = restarted.begin(
+                "qq",
+                "claim-user",
+                "delete",
+                resumed_payload,
+            )
+            resumed_result = {
+                "success": True,
+                "successCount": 1,
+                "batchId": "batch-a",
+                "batchUrl": "https://keytao.test/batch/a",
+                "message": "已删除",
+            }
+            restarted.resolve(
+                "qq",
+                "claim-user",
+                "delete",
+                resumed_fingerprint,
+                resumed_result,
+            )
+            replay_calls = []
+
+            async def replay_executor(tool_name, arguments, context):
+                replay_calls.append((tool_name, arguments))
+                if tool_name == "keytao_batch_remove_draft_items":
+                    replay = _draft_tools._replay_resolved_mutation_claim(
+                        restarted.get("qq", "claim-user")
+                    )
+                    return json.dumps(replay, ensure_ascii=False)
+                if tool_name == "keytao_list_draft_items":
+                    return json.dumps({
+                        "success": True,
+                        "batchId": "batch-a",
+                        "batchUrl": "https://keytao.test/batch/a",
+                        "items": [],
+                    }, ensure_ascii=False)
+                raise AssertionError((tool_name, arguments))
+
+            delivery_token = openai_chat_module.current_draft_delivery_claims.set([])
+            try:
+                with (
+                    patch.object(
+                        openai_chat_module,
+                        "get_default_draft_mutation_claim_store",
+                        return_value=restarted,
+                    ),
+                    patch.object(
+                        openai_chat_module.tool_executor,
+                        "call",
+                        side_effect=replay_executor,
+                    ),
+                ):
+                    resumed_action = await openai_chat_module._perform_recall_latest_batch(
+                        "qq",
+                        "claim-user",
+                        clear_after=True,
+                    )
+                    check(
+                        "restart replays the resolved delete before checking an empty draft",
+                        resumed_action.success
+                        and [name for name, _ in replay_calls]
+                        == ["keytao_batch_remove_draft_items", "keytao_list_draft_items"],
+                    )
+                    check(
+                        "resolved continuation remains fenced before reply delivery",
+                        restarted.get("qq", "claim-user") is not None,
+                    )
+                    resumed_bot = DeliveryBot()
+                    await openai_chat_module._finish_ai_chat_response(
+                        resumed_bot,
+                        object(),
+                        "claim-user",
+                        ChatMemoryContext(platform="qq", user_id="claim-user"),
+                        resumed_action.text,
+                    )
+            finally:
+                openai_chat_module.current_draft_delivery_claims.reset(delivery_token)
+            check(
+                "delivered continuation receipt releases the actor fence",
+                restarted.get("qq", "claim-user") is None,
+            )
+
+    asyncio.run(_run())
+
+
+def test_recall_uncertain_claim_never_switches_batches():
+    """Cancellation keeps batch A fenced and a retry cannot select batch B."""
+    print("\n🧪 recall uncertain claim never switches batches")
+
+    class CancelClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, *args, **kwargs):
+            raise asyncio.CancelledError()
+
+    class PreviewResponse:
+        status_code = 200
+        is_success = True
+
+        def json(self):
+            return {"success": True, "batchId": "batch-b", "contentVersion": 1}
+
+    class PreviewClient(CancelClient):
+        get_count = 0
+        post_count = 0
+
+        async def get(self, *args, **kwargs):
+            type(self).get_count += 1
+            return PreviewResponse()
+
+        async def post(self, *args, **kwargs):
+            type(self).post_count += 1
+            raise AssertionError("must not recall batch B")
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = DraftMutationClaimStore(os.path.join(temp_dir, "claims.db"))
+            with (
+                patch.object(_draft_tools, "_draft_mutation_claims", return_value=store),
+                patch.object(_draft_tools.httpx, "AsyncClient", CancelClient, create=True),
+            ):
+                cancelled = False
+                try:
+                    await _draft_tools.keytao_recall_batch(
+                        "qq",
+                        "recall-user",
+                        batch_id="batch-a",
+                        expected_content_version=7,
+                    )
+                except asyncio.CancelledError:
+                    cancelled = True
+            claim = store.get("qq", "recall-user")
+            check("cancelled recall is propagated", cancelled)
+            check(
+                "cancelled recall keeps an inflight batch-A claim",
+                claim is not None
+                and claim["status"] == "inflight"
+                and claim["payload"]["batchId"] == "batch-a",
+            )
+
+            with (
+                patch.object(_draft_tools, "_draft_mutation_claims", return_value=store),
+                patch.object(
+                    _draft_tools,
+                    "keytao_list_draft_items",
+                    AsyncMock(return_value={"success": False, "message": "unknown"}),
+                ),
+                patch.object(_draft_tools.httpx, "AsyncClient", PreviewClient, create=True),
+            ):
+                retry = await _draft_tools.keytao_recall_batch("qq", "recall-user")
+            check("retry remains bound to batch A", retry.get("batchId") == "batch-a" and retry.get("uncertain") is True)
+            check("retry probes once but never posts batch B", PreviewClient.get_count == 1 and PreviewClient.post_count == 0)
+            check("batch-A claim remains fenced", store.get("qq", "recall-user") is not None)
+
+    asyncio.run(_run())
+
+
+def test_delete_uncertain_claim_never_deletes_new_targets():
+    """Delete cancellation resolves only the original IDs and exact batch."""
+    print("\n🧪 delete uncertain claim never deletes new targets")
+
+    targets = [
+        {"id": 1, "word": "甲", "code": "aa", "action": "Create", "type": "Phrase"},
+        {"id": 2, "word": "乙", "code": "bb", "action": "Create", "type": "Phrase"},
+    ]
+    target_digest = "d" * 64
+
+    class CancelDeleteClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def request(self, *args, **kwargs):
+            raise asyncio.CancelledError()
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = DraftMutationClaimStore(os.path.join(temp_dir, "claims.db"))
+            preview = {
+                "success": True,
+                "batchId": "batch-a",
+                "contentVersion": 9,
+                "targets": targets,
+                "targetDigest": target_digest,
+                "batchUrl": "https://keytao.test/batch/a",
+            }
+            with (
+                patch.object(_draft_tools, "_draft_mutation_claims", return_value=store),
+                patch.object(_draft_tools, "_prepare_delete_targets", AsyncMock(return_value=preview)),
+                patch.object(_draft_tools.httpx, "AsyncClient", CancelDeleteClient, create=True),
+            ):
+                cancelled = False
+                try:
+                    await _draft_tools.keytao_batch_remove_draft_items(
+                        "qq",
+                        "delete-user",
+                        [1, 2],
+                        batch_id="batch-a",
+                        expected_content_version=9,
+                        expected_target_digest=target_digest,
+                        expected_targets=targets,
+                    )
+                except asyncio.CancelledError:
+                    cancelled = True
+            check("cancelled batch delete is propagated", cancelled)
+            check("cancelled batch delete keeps its claim", store.get("qq", "delete-user") is not None)
+
+            new_item = {
+                "id": 99,
+                "word": "新词",
+                "code": "new",
+                "action": "Create",
+                "type": "Phrase",
+            }
+            with (
+                patch.object(_draft_tools, "_draft_mutation_claims", return_value=store),
+                patch.object(
+                    _draft_tools,
+                    "keytao_list_draft_items",
+                    AsyncMock(return_value={
+                        "success": True,
+                        "status": "Draft",
+                        "batchId": "batch-a",
+                        "contentVersion": 11,
+                        "items": [new_item],
+                        "batchUrl": "https://keytao.test/batch/a",
+                    }),
+                ),
+            ):
+                resolved, reusable = await _draft_tools._resolve_existing_delete_claim(
+                    "qq",
+                    "delete-user",
+                    [1, 2],
+                    "batch-a",
+                )
+            check("vanished original targets resolve as already applied", resolved is not None and resolved.get("alreadyApplied") is True)
+            check("new draft item is preserved", resolved is not None and resolved.get("draftItems") == [new_item])
+            check("resolved delete does not authorize another write", reusable is None and store.get("qq", "delete-user")["status"] == "resolved")
+
+            with (
+                patch.object(_draft_tools, "_draft_mutation_claims", return_value=store),
+                patch.object(
+                    _draft_tools,
+                    "keytao_list_draft_items",
+                    AsyncMock(side_effect=AssertionError("resolved receipt must replay without a read")),
+                ),
+            ):
+                replayed, _ = await _draft_tools._resolve_existing_delete_claim(
+                    "qq",
+                    "delete-user",
+                    [1, 2],
+                    "batch-a",
+                )
+            check("resolved delete replays without touching current draft", replayed is not None and replayed.get("replayedResolvedMutation") is True)
+
+            resolved_claim = store.get("qq", "delete-user")
+            store.acknowledge(
+                "qq",
+                "delete-user",
+                "delete",
+                resolved_claim["fingerprint"],
+            )
+            fingerprint = store.begin("qq", "delete-user", "delete", {
+                "batchId": "batch-a",
+                "contentVersion": 9,
+                "targetDigest": target_digest,
+                "targets": targets,
+                "ids": [1, 2],
+            })
+            with (
+                patch.object(_draft_tools, "_draft_mutation_claims", return_value=store),
+                patch.object(
+                    _draft_tools,
+                    "keytao_list_draft_items",
+                    AsyncMock(return_value={
+                        "success": True,
+                        "status": "Draft",
+                        "batchId": "batch-a",
+                        "contentVersion": 9,
+                        "items": targets,
+                    }),
+                ),
+            ):
+                blocked_latest, latest_reuse = await _draft_tools._resolve_existing_delete_claim(
+                    "qq", "delete-user", [1, 2], None,
+                )
+                exact_result, exact_reuse = await _draft_tools._resolve_existing_delete_claim(
+                    "qq", "delete-user", [1, 2], "batch-a",
+                )
+            check("batch-less retry cannot release the old fence", blocked_latest is not None and latest_reuse is None)
+            check("only exact batch retry may reuse the old claim", exact_result is None and exact_reuse == fingerprint)
 
     asyncio.run(_run())
 
@@ -4844,6 +5926,7 @@ def test_mixed_batch_add_and_submit_stays_in_admin_review():
         check("submit write binds exact snapshot", calls[3][1].get("confirmed") is True and calls[3][1].get("expected_server_snapshot_digest") == snapshot_digest)
         check("mixed result says admin review", "该批次需管理员审核" in result.text)
         check("mixed result does not claim dictionary admission", "已加入词库" not in result.text)
+        check("mixed result includes batch link", "https://keytao.test/batch/mixed" in result.text)
         check("mixed preview keeps both requested words", "追速" in submit_preview.text and "摆件" in submit_preview.text)
 
     asyncio.run(_run())
@@ -7228,6 +8311,250 @@ def test_orchestrator_deepseek_policy():
     asyncio.run(_run_orchestrator_deepseek_policy_checks())
 
 
+def test_orchestrator_preserves_authoritative_batch_link():
+    """A model cannot silently omit a trusted tool's batch URL."""
+    print("\n🧪 AgentOrchestrator preserves authoritative batch link")
+
+    async def _run():
+        tool_call = types.SimpleNamespace(
+            id="call_batch_link",
+            type="function",
+            function=types.SimpleNamespace(
+                name="keytao_list_draft_items",
+                arguments=json.dumps({}),
+            ),
+        )
+        batch_url = "https://keytao.test/batch/authoritative"
+        client = _FakeClient([
+            _FakeAIResponse("tool_calls", "", [tool_call]),
+            _FakeAIResponse("stop", "已经处理完成。"),
+        ])
+
+        async def list_draft():
+            return {
+                "success": True,
+                "batchId": "batch-authoritative",
+                "batchUrl": batch_url,
+            }
+
+        class LinkSkillsManager:
+            def get_skill_instructions(self):
+                return ""
+
+            def has_tools(self):
+                return True
+
+            def get_tools(self):
+                return [{
+                    "type": "function",
+                    "function": {
+                        "name": "keytao_list_draft_items",
+                        "description": "List draft items",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }]
+
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="deepseek-v4-flash",
+                max_tokens=1000,
+                temperature=0.7,
+                timeout=180.0,
+            ),
+            skills_manager=LinkSkillsManager(),
+            tool_executor=ToolExecutor(
+                lambda name: list_draft
+                if name == "keytao_list_draft_items"
+                else None,
+                frozenset(),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        result = await orchestrator.run(
+            "处理当前草稿",
+            AgentRequestContext(platform="qq", user_id="link-user"),
+        )
+
+        check("missing model link is appended", batch_url in result)
+        check("authoritative link appears once", result.count(batch_url) == 1)
+        already_present = orchestrator._append_authoritative_result_links(
+            f"批次地址：{batch_url}",
+            {"batchUrl": batch_url},
+        )
+        check("existing model link is not duplicated", already_present.count(batch_url) == 1)
+        duplicate_lines = orchestrator._append_authoritative_result_links(
+            f"批次地址：{batch_url}\n草稿地址：[{batch_url}]({batch_url})",
+            {"batchUrl": batch_url},
+        )
+        check("markdown duplicate link line is removed", duplicate_lines.count(batch_url) == 1)
+
+        switched_links = {}
+        old_pr_url = "https://keytao.test/pr/old"
+        orchestrator._capture_authoritative_result_links({
+            "batchId": "batch-a",
+            "batchUrl": "https://keytao.test/batch/a",
+            "prUrl": old_pr_url,
+        }, switched_links)
+        orchestrator._capture_authoritative_result_links({
+            "batchId": "batch-b",
+            "batchUrl": "https://keytao.test/batch/b",
+        }, switched_links)
+        switched = orchestrator._append_authoritative_result_links(
+            f"已完成\nPR：{old_pr_url}",
+            switched_links,
+        )
+        check("new batch removes stale model PR", old_pr_url not in switched)
+        check("new batch link is retained", switched.count("https://keytao.test/batch/b") == 1)
+        switched_inline = orchestrator._append_authoritative_result_links(
+            f"旧 PR 可见于 {old_pr_url}\n"
+            f"- [查看旧 PR]({old_pr_url})\n"
+            "当前批次 https://keytao.test/batch/b 和 https://keytao.test/batch/b",
+            switched_links,
+        )
+        check("inline and markdown stale PR links are removed", old_pr_url not in switched_inline)
+        check(
+            "inline duplicate current URLs are canonicalized once",
+            switched_inline.count("https://keytao.test/batch/b") == 1,
+        )
+        markdown_duplicates = orchestrator._append_authoritative_result_links(
+            "- [草稿一](https://keytao.test/batch/b)\n"
+            "- [草稿二](https://keytao.test/batch/b)",
+            switched_links,
+        )
+        check(
+            "multiple Markdown forms are canonicalized once",
+            markdown_duplicates.count("https://keytao.test/batch/b") == 1,
+        )
+
+        partial_links = {}
+        orchestrator._capture_authoritative_result_links({
+            "batchUrl": "https://keytao.test/batch/partial-a",
+            "prUrl": "https://keytao.test/pr/partial-a",
+        }, partial_links)
+        orchestrator._capture_authoritative_result_links({
+            "batchId": "batch-partial-b",
+        }, partial_links)
+        check(
+            "partial new identity clears old URL bundle",
+            partial_links.get("batchId") == "batch-partial-b"
+            and "batchUrl" not in partial_links
+            and "prUrl" not in partial_links,
+        )
+        pr_only_links = {}
+        orchestrator._capture_authoritative_result_links({
+            "batchId": "batch-pr-a",
+            "batchUrl": "https://keytao.test/batch/pr-a",
+            "prUrl": "https://keytao.test/pr/pr-a",
+        }, pr_only_links)
+        orchestrator._capture_authoritative_result_links({
+            "prUrl": "https://keytao.test/pr/pr-b",
+        }, pr_only_links)
+        check(
+            "PR-only result never inherits an unverified prior batch",
+            pr_only_links.get("prUrl") == "https://keytao.test/pr/pr-b"
+            and "batchId" not in pr_only_links
+            and "batchUrl" not in pr_only_links,
+        )
+
+        direct_links = {}
+        openai_chat_module._capture_trusted_result_links({
+            "batchId": "direct-a",
+            "batchUrl": "https://keytao.test/batch/direct-a",
+            "prUrl": "https://keytao.test/pr/direct-a",
+        }, direct_links)
+        openai_chat_module._capture_trusted_result_links({
+            "prUrl": "https://keytao.test/pr/direct-b",
+        }, direct_links)
+        check(
+            "background PR-only result also clears an unverified prior batch",
+            direct_links.get("prUrl") == "https://keytao.test/pr/direct-b"
+            and "batchId" not in direct_links
+            and "batchUrl" not in direct_links,
+        )
+        direct_rendered = openai_chat_module._append_batch_url_if_missing(
+            "旧 PR 可见于 https://keytao.test/pr/direct-a\n"
+            "- [查看旧 PR](https://keytao.test/pr/direct-a)\n"
+            "新 PR https://keytao.test/pr/direct-b 和 https://keytao.test/pr/direct-b",
+            direct_links,
+        )
+        check("background stale links are removed in every form", "https://keytao.test/pr/direct-a" not in direct_rendered)
+        check("background current link is canonicalized once", direct_rendered.count("https://keytao.test/pr/direct-b") == 1)
+
+        injected_links = {}
+
+        async def injected_tool_result(tool_name, arguments, context):
+            return json.dumps({
+                "success": True,
+                "batchId": "forged",
+                "batchUrl": "https://keytao.test/batch/forged",
+                "prUrl": "https://keytao.test/pr/forged",
+            })
+
+        injected_token = openai_chat_module.current_draft_result_links.set(injected_links)
+        try:
+            with patch.object(
+                openai_chat_module.tool_executor,
+                "call",
+                side_effect=injected_tool_result,
+            ):
+                await openai_chat_module.call_tool_function(
+                    "keytao_encode",
+                    {"word": "窨茶"},
+                    "qq",
+                    "link-user",
+                )
+        finally:
+            openai_chat_module.current_draft_result_links.reset(injected_token)
+        check("non-authoritative tools cannot inject result links", injected_links == {})
+
+        class _FailAfterToolCompletions(_FakeCompletions):
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                next_response = self.responses.pop(0)
+                if isinstance(next_response, BaseException):
+                    raise next_response
+                return next_response
+
+        failing_completions = _FailAfterToolCompletions([
+            _FakeAIResponse("tool_calls", "", [tool_call]),
+            TimeoutError("second model call timed out"),
+        ])
+        failing_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=failing_completions),
+            completions=failing_completions,
+        )
+        failing_orchestrator = AgentOrchestrator(
+            client_factory=lambda: failing_client,
+            runtime=AgentRuntimeConfig(
+                model="deepseek-v4-flash",
+                max_tokens=1000,
+                temperature=0.7,
+                timeout=180.0,
+            ),
+            skills_manager=LinkSkillsManager(),
+            tool_executor=ToolExecutor(
+                lambda name: list_draft
+                if name == "keytao_list_draft_items"
+                else None,
+                frozenset(),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        failed_result = await failing_orchestrator.run(
+            "处理当前草稿",
+            AgentRequestContext(platform="qq", user_id="link-user-timeout"),
+        )
+        check("link survives the next model call failing", batch_url in failed_result)
+        check("failure path keeps authoritative link once", failed_result.count(batch_url) == 1)
+
+    asyncio.run(_run())
+
+
 async def _run_orchestrator_visual_context_checks():
     client = _FakeClient([_FakeAIResponse("stop", "图片说明完成")])
     captured_contexts = []
@@ -8083,6 +9410,329 @@ def test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate():
     asyncio.run(_run())
 
 
+def test_pending_pronunciation_correction_updates_live_ticket():
+    """A same-owner pronunciation correction must replace the trusted pending target."""
+    print("\n🧪 pending pronunciation correction updates live ticket")
+
+    async def _run():
+        check("nü normalizes to nv", openai_chat_module._plain_pinyin("nü") == "nv")
+        check("nǚ normalizes to nv", openai_chat_module._plain_pinyin("nǚ") == "nv")
+        check("nv remains nv", openai_chat_module._plain_pinyin("nv") == "nv")
+        check("nu is distinct from nü", openai_chat_module._plain_pinyin("nu") != "nv")
+        check("nū is distinct from nü", openai_chat_module._plain_pinyin("nū") != "nv")
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        openai_chat_module.conversation_state_store = store
+        conv_key = ConversationAddress.group("qq", "tea-group", "garth")
+        space_key = conv_key.space_key
+        original = PendingAddWord(
+            word="窨茶",
+            recommended_code="ybwso",
+            candidates=[("ybws", True), ("ybwso", False), ("ybwsoi", False)],
+            occupied_words={"ybws": ["饮茶"]},
+        )
+        store.set(conv_key, original, space_key=space_key, owner_label="Garth")
+        encoding = {
+            "success": True,
+            "word": "窨茶",
+            "candidateCodes": ["xwws", "xwwso", "xwwsoi"],
+            "alternatePhrasePronunciationCodes": [{
+                "char": "窨",
+                "charIndex": 0,
+                "pinyin": "xūn",
+                "codes": ["xwws", "xwwso", "xwwsoi"],
+            }],
+            "candidateStatuses": [
+                {"code": "xwws", "occupied": True, "label": "已有「巡查」"},
+                {"code": "xwwso", "occupied": False, "label": "空位"},
+                {"code": "xwwsoi", "occupied": False, "label": "空位"},
+            ],
+        }
+
+        async def fake_call(tool_name, arguments, platform, user_id):
+            check("correction uses read-only encode", tool_name == "keytao_encode")
+            check("correction re-encodes the pending word", arguments == {"word": "窨茶"})
+            return json.dumps(encoding, ensure_ascii=False)
+
+        try:
+            async def failed_encode(*args, **kwargs):
+                return json.dumps({"success": False, "message": "offline"})
+
+            with (
+                patch.object(openai_chat_module, "call_tool_function", failed_encode),
+                patch.object(
+                    openai_chat_module,
+                    "_classify_message_command_intent",
+                    AsyncMock(return_value=MessageCommandIntent()),
+                ),
+            ):
+                failed_response = await openai_chat_module.handle_pending_message_core(
+                    "窨字读作xun",
+                    "qq",
+                    "garth",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Garth",
+                )
+            failed_record = store.get_record(conv_key)
+            check("failed correction reports retry", "稍后重试" in (failed_response or ""))
+            check(
+                "failed correction preserves the old live candidate",
+                failed_record is not None
+                and failed_record.state is original
+                and not failed_record.execution_id,
+            )
+
+            async def exploding_encode(*args, **kwargs):
+                raise RuntimeError("read failed")
+
+            correction_raised = False
+            try:
+                with (
+                    patch.object(openai_chat_module, "call_tool_function", exploding_encode),
+                    patch.object(
+                        openai_chat_module,
+                        "_classify_message_command_intent",
+                        AsyncMock(return_value=MessageCommandIntent()),
+                    ),
+                ):
+                    await openai_chat_module.handle_pending_message_core(
+                        "窨字读作xun",
+                        "qq",
+                        "garth",
+                        conv_key,
+                        history=[],
+                        space_key=space_key,
+                        owner_label="Garth",
+                    )
+            except RuntimeError:
+                correction_raised = True
+            exception_record = store.get_record(conv_key)
+            check("correction read exception is propagated", correction_raised)
+            check(
+                "correction exception leaves no execution lock",
+                exception_record is not None and not exception_record.execution_id,
+            )
+
+            with patch.object(openai_chat_module, "call_tool_function", fake_call):
+                corrected = await _handle_pending_add_word(
+                    original,
+                    "窨字读作xun",
+                    "qq",
+                    "garth",
+                    [],
+                    space_key,
+                    "Garth",
+                    MessageCommandIntent(),
+                )
+
+            record = store.get_record(conv_key)
+            parsed_reply = openai_chat_module._parse_pending_add_word(corrected or "")
+            check("correction reply uses xun candidate", "xwwso" in (corrected or ""))
+            check("correction reply drops old yin candidate", "ybwso" not in (corrected or ""))
+            check("correction stores a new pending target", isinstance(record.state, PendingAddWord) and record.state.recommended_code == "xwwso")
+            check("quoted corrected prompt matches live state", store.states_equivalent(record.state, parsed_reply))
+            referenced_guard = openai_chat_module._handle_referenced_pending_from_other_user(
+                parsed_reply,
+                record,
+                None,
+                conv_key,
+                space_key,
+                "Garth",
+                MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0),
+            )
+            check("same-owner quote is not treated as restored authority", referenced_guard is None)
+
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_message_command_intent",
+                    AsyncMock(return_value=MessageCommandIntent(
+                        intent="pending_add_and_submit",
+                        confidence=1.0,
+                    )),
+                ),
+                patch.object(
+                    openai_chat_module,
+                    "_execute_add_to_draft_and_submit",
+                    AsyncMock(return_value="added and submitted"),
+                ) as execute_mock,
+            ):
+                result = await openai_chat_module.handle_pending_message_core(
+                    "加入并提交",
+                    "qq",
+                    "garth",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Garth",
+                )
+            check("add-and-submit executes without a nonce round trip", result == "added and submitted")
+            check("add-and-submit exposes no confirmation ticket", "确认票据" not in (result or ""))
+            check("add-and-submit uses corrected target", execute_mock.await_args.args[:2] == ("窨茶", "xwwso"))
+
+            store.delete(conv_key)
+            with patch.object(openai_chat_module, "call_tool_function", fake_call):
+                restored_after_restart = await openai_chat_module._revalidate_referenced_add_pending(
+                    parsed_reply,
+                    "qq",
+                    "garth",
+                )
+            check(
+                "bot-authored quoted candidate can be revalidated after restart",
+                isinstance(restored_after_restart, PendingAddWord)
+                and restored_after_restart.recommended_code == "xwwso",
+            )
+            check(
+                "restart revalidation conservatively requires manual review",
+                isinstance(restored_after_restart, PendingAddWord)
+                and "自动审核：该词需管理员审核"
+                in restored_after_restart.code_remarks.get("xwwso", ""),
+            )
+            store.set(
+                conv_key,
+                restored_after_restart,
+                space_key=space_key,
+                owner_label="Garth",
+            )
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_message_command_intent",
+                    AsyncMock(return_value=MessageCommandIntent(
+                        intent="pending_add_and_submit",
+                        confidence=1.0,
+                    )),
+                ),
+                patch.object(
+                    openai_chat_module,
+                    "_execute_add_to_draft_and_submit",
+                    AsyncMock(return_value="restored and submitted"),
+                ) as restored_execute,
+            ):
+                restored_result = await openai_chat_module.handle_pending_message_core(
+                    "加入并提交",
+                    "qq",
+                    "garth",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Garth",
+                )
+            check("revalidated quote executes without a ticket", restored_result == "restored and submitted")
+            check("revalidated quote keeps xun target", restored_execute.await_args.args[:2] == ("窨茶", "xwwso"))
+            restored_call = restored_execute.await_args
+            restored_remark = (
+                restored_call.kwargs.get("remark", "")
+                or (restored_call.args[6] if len(restored_call.args) > 6 else "")
+            )
+            check(
+                "revalidated execution keeps the manual-review marker",
+                "自动审核：该词需管理员审核"
+                in restored_remark,
+            )
+
+            default_state = PendingAddWord(
+                word="行茶",
+                recommended_code="hhwso",
+                candidates=[("hhwso", False)],
+            )
+            store.set(conv_key, default_state, space_key=space_key, owner_label="Garth")
+            default_encoding = {
+                "success": True,
+                "word": "行茶",
+                "codes": ["xkwso", "xkwsoi"],
+                "chars": [
+                    {"char": "行", "pinyin": "xíng"},
+                    {"char": "茶", "pinyin": "chá"},
+                ],
+                "alternatePhrasePronunciationCodes": [{
+                    "char": "行",
+                    "charIndex": 0,
+                    "pinyin": "háng",
+                    "codes": ["hhwso", "hhwsoi"],
+                }],
+                "candidateStatuses": [
+                    {"code": "xkwso", "occupied": False, "label": "空位"},
+                    {"code": "xkwsoi", "occupied": False, "label": "空位"},
+                    {"code": "hhwso", "occupied": False, "label": "空位"},
+                ],
+            }
+            with patch.object(
+                openai_chat_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps(default_encoding, ensure_ascii=False)),
+            ):
+                default_response = await _handle_pending_add_word(
+                    default_state,
+                    "行字读作xing",
+                    "qq",
+                    "garth",
+                    [],
+                    space_key,
+                    "Garth",
+                    MessageCommandIntent(),
+                )
+            default_record = store.get_record(conv_key)
+            check("correction can return to the service default tone", "xkwso" in (default_response or ""))
+            check(
+                "default-tone correction replaces the alternate candidate",
+                default_record is not None
+                and isinstance(default_record.state, PendingAddWord)
+                and default_record.state.recommended_code == "xkwso",
+            )
+
+            single_state = PendingAddWord(
+                word="行",
+                recommended_code="hko",
+                candidates=[("hko", False)],
+            )
+            store.set(conv_key, single_state, space_key=space_key, owner_label="Garth")
+            single_encoding = {
+                "success": True,
+                "word": "行",
+                "codes": ["xk", "xko"],
+                "chars": [{"char": "行", "pinyin": "xíng"}],
+                "alternatePronunciationCodes": [
+                    {"pinyin": "xíng", "codes": ["xk", "xko"]},
+                    {"pinyin": "háng", "codes": ["hk", "hko"]},
+                ],
+                "candidateStatuses": [
+                    {"code": "xk", "occupied": True, "label": "已有「型」"},
+                    {"code": "xko", "occupied": False, "label": "空位"},
+                    {"code": "hko", "occupied": False, "label": "空位"},
+                ],
+            }
+            with patch.object(
+                openai_chat_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps(single_encoding, ensure_ascii=False)),
+            ):
+                single_response = await _handle_pending_add_word(
+                    single_state,
+                    "行字读作xing",
+                    "qq",
+                    "garth",
+                    [],
+                    space_key,
+                    "Garth",
+                    MessageCommandIntent(),
+                )
+            single_record = store.get_record(conv_key)
+            check("single-character default variant is deduplicated", "xko" in (single_response or ""))
+            check(
+                "single-character correction returns to the default reading",
+                single_record is not None
+                and isinstance(single_record.state, PendingAddWord)
+                and single_record.state.recommended_code == "xko",
+            )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+    asyncio.run(_run())
+
+
 def test_build_code_shift_plan_uses_occupant_encode_chain():
     """Verify displaced words move by their own encode candidates, not the inserted word's chain."""
     print("\n🧪 code shift plan uses occupant encode chain")
@@ -8335,6 +9985,7 @@ if __name__ == "__main__":
     test_simple_single_word_query_skips_draft_commands()
     test_simple_single_word_query_skips_chat_comparison_questions()
     test_draft_view_command_uses_draft_tools()
+    test_draft_response_keeps_list_fallback_link()
     test_draft_submit_command_uses_current_user_tools()
     test_add_submit_extra_snapshot_shows_one_exact_confirmation()
     test_submit_confirmation_reuses_preview_audit_snapshot()
@@ -8345,6 +9996,15 @@ if __name__ == "__main__":
     test_keep_only_draft_command_removes_others_and_submits()
     test_keep_only_draft_command_never_recalls_submitted_batch()
     test_recall_batch_requires_exact_server_ticket()
+    test_direct_recall_and_clear_uses_exact_snapshots()
+    test_direct_recall_stops_before_clear_on_stale_batch()
+    test_submit_cas_failure_keeps_preview_link_once()
+    test_draft_recall_and_clear_questions_never_write()
+    test_draft_recall_authorization_forms()
+    test_draft_clear_authorization_boundaries()
+    test_structural_recall_and_clear_routes_without_llm()
+    test_recall_clear_batch_binding_and_pending_cleanup()
+    test_command_result_never_gets_word_priority_appendix()
     test_augment_simple_word_query_response_appends_priority_note()
     test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority()
     test_augment_simple_word_query_response_handles_multiple_words()
@@ -8372,6 +10032,9 @@ if __name__ == "__main__":
     test_background_draft_operation_timeout_releases_slot()
     test_review_prompt_and_skills_share_submission_semantics()
     test_draft_tool_guard_blocks_out_of_band_mutations()
+    test_durable_draft_mutation_claim_lifecycle()
+    test_recall_uncertain_claim_never_switches_batches()
+    test_delete_uncertain_claim_never_deletes_new_targets()
     test_active_add_confirmation_continues_to_submit()
     test_draft_timeout_fallback_uses_contextual_pronunciation()
     test_mixed_batch_add_and_submit_stays_in_admin_review()
@@ -8431,6 +10094,7 @@ if __name__ == "__main__":
     test_tool_executor_draft_policy_guards()
     test_orchestrator_empty_response_retry()
     test_orchestrator_deepseek_policy()
+    test_orchestrator_preserves_authoritative_batch_link()
     test_orchestrator_visual_context_is_untrusted()
     test_image_only_handler_discloses_disabled_vision()
     test_visual_handler_blocks_pending_injection()
@@ -8443,6 +10107,7 @@ if __name__ == "__main__":
     test_normalize_encode_response_includes_alternate_pronunciation_candidates()
     test_normalize_encode_response_includes_phrase_polyphone_candidates()
     test_pending_add_word_explicit_phonetic_prefix_uses_shape_candidate()
+    test_pending_pronunciation_correction_updates_live_ticket()
     test_build_code_shift_plan_uses_occupant_encode_chain()
     test_build_code_shift_plan_cascades_until_empty()
     test_build_code_shift_plan_rejects_invalid_occupant_code()

@@ -1,6 +1,7 @@
 """OpenAI-compatible agent/tool orchestration loop."""
 import inspect
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -18,6 +19,19 @@ from keytao_bot.utils.llm_policy import (
 from .state import MemoryConversationStateStore, PendingToolConfirm
 from .conversation import ConversationAddress
 from .tools import MUTATING_TOOL_NAMES, ToolContext, ToolExecutor
+
+
+AUTHORITATIVE_LINK_TOOLS = frozenset({
+    "keytao_create_phrase",
+    "keytao_submit_batch",
+    "keytao_list_draft_items",
+    "keytao_remove_draft_item",
+    "keytao_batch_add_to_draft",
+    "keytao_batch_remove_draft_items",
+    "keytao_shift_phrase_code",
+    "keytao_recall_batch",
+    "keytao_get_batch_preview",
+})
 
 
 class DuplicateToolCallAbort(Exception):
@@ -180,6 +194,7 @@ class AgentOrchestrator:
         trusted_draft_items_by_id: Dict[str, Dict[str, str]] = {}
         trusted_phrase_types_by_key: Dict[tuple[str, str], frozenset[str]] = {}
         trusted_reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
+        authoritative_result_links: Dict[str, str] = {}
         receipt_run_id = uuid.uuid4().hex
 
         for iteration in range(max_iterations):
@@ -199,12 +214,27 @@ class AgentOrchestrator:
 
             logger.info(f"Calling {self._runtime.model} (iter {iteration + 1}/{max_iterations})")
             started_at = time.monotonic()
-            response = await client.chat.completions.create(**call_kwargs)
-            elapsed = time.monotonic() - started_at
-            self._log_usage(response)
+            try:
+                response = await client.chat.completions.create(**call_kwargs)
+                elapsed = time.monotonic() - started_at
+                self._log_usage(response)
+            except Exception as error:
+                logger.error(
+                    "Agent model call failed after %.1fs: %s: %s",
+                    time.monotonic() - started_at,
+                    type(error).__name__,
+                    error,
+                )
+                return self._append_authoritative_result_links(
+                    "呜呜，AI 服务暂时没有完成回复 qwq 已执行结果请以链接为准。",
+                    authoritative_result_links,
+                )
 
             if not response.choices:
-                return "呜呜，AI 好像没有回复 qwq 要不再试一次？"
+                return self._append_authoritative_result_links(
+                    "呜呜，AI 好像没有回复 qwq 要不再试一次？",
+                    authoritative_result_links,
+                )
 
             choice = response.choices[0]
             response_tool_calls = choice.message.tool_calls or []
@@ -225,29 +255,44 @@ class AgentOrchestrator:
                     })
                     continue
                 logger.warning("Response truncated even at max cap")
-                return "呜呜，回复太长被截断了 qwq 请把任务拆小一点再试试～"
+                return self._append_authoritative_result_links(
+                    "呜呜，回复太长被截断了 qwq 请把任务拆小一点再试试～",
+                    authoritative_result_links,
+                )
 
             if choice.finish_reason not in {"stop", "tool_calls"}:
                 logger.error(
                     "Refusing incomplete model response before tool execution: "
                     f"finish_reason={choice.finish_reason}"
                 )
-                return "呜呜，AI 返回了未完成的结果 qwq 请稍后再试一次～"
+                return self._append_authoritative_result_links(
+                    "呜呜，AI 返回了未完成的结果 qwq 请稍后再试一次～",
+                    authoritative_result_links,
+                )
 
             if response_tool_calls and choice.finish_reason != "tool_calls":
                 logger.error(
                     "Refusing tool calls with mismatched finish reason: "
                     f"finish_reason={choice.finish_reason} tool_calls={tool_call_count}"
                 )
-                return "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～"
+                return self._append_authoritative_result_links(
+                    "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～",
+                    authoritative_result_links,
+                )
 
             if choice.finish_reason == "tool_calls" and not response_tool_calls:
                 logger.error("Model returned finish_reason=tool_calls without any tool calls")
-                return "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～"
+                return self._append_authoritative_result_links(
+                    "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～",
+                    authoritative_result_links,
+                )
 
             if not response_tool_calls:
                 if content.strip():
-                    return content
+                    return self._append_authoritative_result_links(
+                        content,
+                        authoritative_result_links,
+                    )
                 if empty_response_retries < 1:
                     empty_response_retries += 1
                     logger.warning("Model returned empty final content, retrying once")
@@ -257,7 +302,10 @@ class AgentOrchestrator:
                     })
                     continue
                 logger.error("Model returned empty final content twice")
-                return "呜呜，AI 返回了空回复 qwq 请再说一次要我怎么处理。"
+                return self._append_authoritative_result_links(
+                    "呜呜，AI 返回了空回复 qwq 请再说一次要我怎么处理。",
+                    authoritative_result_links,
+                )
 
             try:
                 parsed_tool_calls = self._parse_tool_calls(
@@ -278,7 +326,10 @@ class AgentOrchestrator:
                     })
                     continue
                 logger.error(f"Refusing invalid tool-call batch: {error}")
-                return "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～"
+                return self._append_authoritative_result_links(
+                    "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～",
+                    authoritative_result_links,
+                )
 
             if total_tool_calls + len(parsed_tool_calls) > _MAX_TOOL_CALLS_PER_RUN:
                 logger.error(
@@ -286,7 +337,10 @@ class AgentOrchestrator:
                     f"current={total_tool_calls} requested={len(parsed_tool_calls)} "
                     f"limit={_MAX_TOOL_CALLS_PER_RUN}"
                 )
-                return "呜呜，这次需要调用的工具太多了 qwq 请把任务拆小一点再试试～"
+                return self._append_authoritative_result_links(
+                    "呜呜，这次需要调用的工具太多了 qwq 请把任务拆小一点再试试～",
+                    authoritative_result_links,
+                )
 
             total_tool_calls += len(parsed_tool_calls)
             seen_tool_call_ids.update(str(tc.id) for tc, _ in parsed_tool_calls)
@@ -330,12 +384,12 @@ class AgentOrchestrator:
                     trusted_phrase_types_by_key=trusted_phrase_types_by_key,
                     trusted_reviewed_items_by_key=trusted_reviewed_items_by_key,
                 )
-                canonical_fn_args = self._tool_executor.canonicalize_arguments(
-                    fn_name,
-                    fn_args,
-                    tool_context,
-                )
                 try:
+                    canonical_fn_args = self._tool_executor.canonicalize_arguments(
+                        fn_name,
+                        fn_args,
+                        tool_context,
+                    )
                     result_str = await self._call_tool_once(
                         fn_name,
                         canonical_fn_args,
@@ -343,12 +397,33 @@ class AgentOrchestrator:
                         seen_tool_calls,
                     )
                 except DuplicateToolCallAbort:
-                    return "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～"
+                    return self._append_authoritative_result_links(
+                        "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～",
+                        authoritative_result_links,
+                    )
+                except Exception as error:
+                    logger.error(
+                        "Agent tool dispatch failed: %s: %s",
+                        type(error).__name__,
+                        error,
+                    )
+                    return self._append_authoritative_result_links(
+                        "呜呜，后续工具处理暂时中断了 qwq 已执行结果请以链接为准。",
+                        authoritative_result_links,
+                    )
 
                 try:
                     result_data = json.loads(result_str)
                     if result_data.get("not_bound"):
-                        return self._bind_help_text
+                        return self._append_authoritative_result_links(
+                            self._bind_help_text,
+                            authoritative_result_links,
+                        )
+                    if fn_name in AUTHORITATIVE_LINK_TOOLS:
+                        self._capture_authoritative_result_links(
+                            result_data,
+                            authoritative_result_links,
+                        )
                     self._update_trusted_capabilities(
                         fn_name,
                         canonical_fn_args,
@@ -380,12 +455,15 @@ class AgentOrchestrator:
                     if result_data.get("localConfirmationRequired") and pending_saved:
                         confirmation_code = self._state_store.arm_reconfirmation(conv_key)
                         if not confirmation_code:
-                            return "待确认操作未能安全保存，请重新发送完整指令。"
-                        return (
+                            return self._append_authoritative_result_links(
+                                "待确认操作未能安全保存，请重新发送完整指令。",
+                                authoritative_result_links,
+                            )
+                        return self._append_authoritative_result_links((
                             f"{result_data.get('message', '操作尚未执行')}\n\n"
                             f"确认无误后，请发送「确认票据 {confirmation_code}」；"
                             "普通的“确认”不会执行。"
-                        )
+                        ), authoritative_result_links)
                     if self._tool_receipt_recorder is not None:
                         recorded = self._tool_receipt_recorder(
                             context,
@@ -411,7 +489,135 @@ class AgentOrchestrator:
 
             continue
 
-        return "呜呜，处理太久了 qwq 要不再试一次？"
+        return self._append_authoritative_result_links(
+            "呜呜，处理太久了 qwq 要不再试一次？",
+            authoritative_result_links,
+        )
+
+    @staticmethod
+    def _capture_authoritative_result_links(
+        result: Dict[str, Any],
+        links: Dict[str, str],
+    ) -> None:
+        """Keep one internally consistent trusted batch/PR link bundle."""
+        batch_id = str(result.get("batchId") or "").strip()
+        batch_url = str(result.get("batchUrl") or "").strip()
+        valid_batch_url = bool(
+            batch_url
+            and len(batch_url) <= 2048
+            and re.fullmatch(r"https?://[^\s]+", batch_url)
+        )
+        pr_url = str(result.get("prUrl") or "").strip()
+        valid_pr_url = bool(
+            pr_url
+            and len(pr_url) <= 2048
+            and re.fullmatch(r"https?://[^\s]+", pr_url)
+        )
+        previous_batch_id = links.get("batchId", "")
+        previous_batch_url = links.get("batchUrl", "")
+        previous_pr_url = links.get("prUrl", "")
+        has_previous_batch = bool(previous_batch_id or previous_batch_url)
+        has_new_batch = bool(batch_id or valid_batch_url)
+        same_by_id = bool(
+            batch_id and previous_batch_id and batch_id == previous_batch_id
+        )
+        same_by_url = bool(
+            valid_batch_url
+            and previous_batch_url
+            and batch_url == previous_batch_url
+        )
+        identity_conflict = bool(
+            (batch_id and previous_batch_id and batch_id != previous_batch_id)
+            or (
+                valid_batch_url
+                and previous_batch_url
+                and batch_url != previous_batch_url
+            )
+        )
+        changed_batch = False
+        if has_new_batch:
+            changed_batch = bool(
+                (
+                    has_previous_batch
+                    and (identity_conflict or not (same_by_id or same_by_url))
+                )
+                or (previous_pr_url and not has_previous_batch)
+            )
+        elif valid_pr_url:
+            changed_batch = bool(
+                (has_previous_batch and pr_url != previous_pr_url)
+                or (previous_pr_url and pr_url != previous_pr_url)
+            )
+        if changed_batch:
+            stale_urls = set(filter(None, links.get("_staleUrls", "").splitlines()))
+            stale_urls.update(filter(None, (
+                links.get("batchUrl", ""),
+                links.get("prUrl", ""),
+            )))
+            for key in ("batchId", "batchUrl", "prUrl"):
+                links.pop(key, None)
+            links["_staleUrls"] = "\n".join(sorted(stale_urls))
+        if batch_id:
+            links["batchId"] = batch_id
+        for key in ("batchUrl", "prUrl"):
+            value = str(result.get(key) or "").strip()
+            if (
+                value
+                and len(value) <= 2048
+                and re.fullmatch(r"https?://[^\s]+", value)
+            ):
+                links[key] = value
+                stale_urls = set(filter(None, links.get("_staleUrls", "").splitlines()))
+                stale_urls.discard(value)
+                links["_staleUrls"] = "\n".join(sorted(stale_urls))
+
+    @staticmethod
+    def _append_authoritative_result_links(
+        content: str,
+        links: Dict[str, str],
+    ) -> str:
+        """Ensure the final prose cannot silently drop authoritative batch links."""
+        stale_urls = set(filter(None, links.get("_staleUrls", "").splitlines()))
+        batch_url = links.get("batchUrl", "")
+        pr_url = links.get("prUrl", "")
+        trusted_urls = set(filter(None, (batch_url, pr_url)))
+        urls_to_remove = sorted(trusted_urls | stale_urls, key=len, reverse=True)
+        cleaned_lines: List[str] = []
+        for line in content.splitlines():
+            cleaned = line
+            for url in urls_to_remove:
+                escaped_url = re.escape(url)
+                cleaned = re.sub(
+                    rf"\[[^\]\n]*\]\(\s*{escaped_url}\s*\)",
+                    "",
+                    cleaned,
+                )
+                cleaned = cleaned.replace(url, "")
+            cleaned = re.sub(r"\[[^\]\n]*\]\(\s*\)", "", cleaned)
+            cleaned = re.sub(
+                r"\s*(?:草稿地址|批次地址|草稿/批次地址|PR|"
+                r"旧\s*PR(?:地址|可见于)?|查看旧\s*PR)[：:]?\s*$",
+                "",
+                cleaned,
+            )
+            if re.fullmatch(r"\s*[-*+]\s*", cleaned):
+                cleaned = ""
+            cleaned_lines.append(cleaned.rstrip())
+        while cleaned_lines and not cleaned_lines[-1]:
+            cleaned_lines.pop()
+        content = "\n".join(cleaned_lines)
+
+        lines: List[str] = []
+        appended_urls: set[str] = set()
+        if batch_url:
+            lines.append(f"草稿/批次地址：{batch_url}")
+            appended_urls.add(batch_url)
+        if pr_url and pr_url not in appended_urls:
+            lines.append(f"PR：{pr_url}")
+        if not lines:
+            return content
+        separator = "\n\n" if content.rstrip() else ""
+        return content.rstrip() + separator + "\n".join(lines)
 
     @staticmethod
     def _update_trusted_capabilities(

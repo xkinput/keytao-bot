@@ -53,6 +53,7 @@ class ActiveDraftOperation:
     pending_state: PendingState = None
     prompt_text: str = ""
     confirmation_code: str = ""
+    trusted_links: Dict[str, str] = field(default_factory=dict)
     started_at: float = field(default_factory=time.monotonic)
     updated_at: float = field(default_factory=time.monotonic)
 
