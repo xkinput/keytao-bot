@@ -4,6 +4,7 @@ Web API plugin — exposes HTTP endpoints for the Live2D chat frontend.
 Routes:
   POST /api/chat          — send a message, get AI reply
   POST /api/keytao/batches/review — run LLM-backed KeyTao batch review
+  POST /api/keytao/pronunciation — infer a meaning-backed pronunciation
   DELETE /api/chat/history — clear session history
 
 Auth: Bearer token via WEB_API_KEY, plus a signed identity for logged-in users.
@@ -34,6 +35,8 @@ from .openai_chat import (
 )
 from ..harness.conversation import ConversationAddress
 from ..utils.keytao_batch_review import review_keytao_batch_with_llm
+from ..utils.keytao_review import infer_semantic_pronunciation
+from ..utils.llm_request_gate import RequestWindowGate
 from ..utils.memory_store import ChatMemoryContext
 from ..utils.web_identity import (
     WebIdentityConfigError,
@@ -52,6 +55,39 @@ WEB_IDENTITY_KEY: str = (
 WEB_CORS_ORIGINS: list[str] = (
     getattr(config, "web_cors_origins", None)
     or ["http://localhost:3000", "http://localhost:3001"]
+)
+
+
+def _bounded_positive_env(name: str, default: int, maximum: int) -> int:
+    raw_value = getattr(config, name.lower(), None)
+    if raw_value is None:
+        raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0:
+        return default
+    return min(value, maximum)
+
+
+SEMANTIC_PRONUNCIATION_GATE = RequestWindowGate(
+    global_limit=_bounded_positive_env(
+        "SEMANTIC_PRONUNCIATION_GLOBAL_REQUESTS_PER_HOUR",
+        120,
+        10_000,
+    ),
+    requester_limit=_bounded_positive_env(
+        "SEMANTIC_PRONUNCIATION_USER_REQUESTS_PER_HOUR",
+        20,
+        1_000,
+    ),
+    window_seconds=60 * 60,
+    max_concurrent=_bounded_positive_env(
+        "SEMANTIC_PRONUNCIATION_MAX_CONCURRENT",
+        2,
+        32,
+    ),
 )
 
 
@@ -76,6 +112,16 @@ class KeyTaoBatchReviewRequest(BaseModel):
     batch: Dict[str, Any]
     local_review: Optional[Dict[str, Any]] = None
     focus_pr_id: Optional[int] = None
+
+
+class KeyTaoPronunciationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    word: str = Field(
+        min_length=1,
+        max_length=12,
+        pattern=r"^[\u3400-\u9fff]+$",
+    )
 
 
 def _check_auth(authorization: Optional[str]) -> None:
@@ -236,6 +282,31 @@ try:
             raise HTTPException(status_code=502, detail=result.get("message") or "喵喵复审失败")
         return result
 
+    @_app.post("/api/keytao/pronunciation")
+    async def keytao_pronunciation(
+        request: KeyTaoPronunciationRequest,
+        authorization: Optional[str] = Header(None),
+        x_keytao_requester: Optional[str] = Header(None),
+    ) -> dict:
+        _check_auth(authorization)
+        requester = (x_keytao_requester or "anonymous").strip()
+        if not requester or len(requester) > 128 or not all(
+            char.isalnum() or char in "-_.:" for char in requester
+        ):
+            raise HTTPException(status_code=400, detail="Invalid requester identity")
+
+        decision = SEMANTIC_PRONUNCIATION_GATE.try_acquire(requester)
+        if not decision.allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Semantic pronunciation capacity exceeded",
+                headers={"Retry-After": str(decision.retry_after_seconds)},
+            )
+        try:
+            return await infer_semantic_pronunciation(request.word)
+        finally:
+            SEMANTIC_PRONUNCIATION_GATE.release()
+
     @_app.delete("/api/chat/history")
     async def clear_history(
         request: HistoryClearRequest,
@@ -280,7 +351,8 @@ try:
         return {"success": True, "deleted": deleted}
 
     logger.info(
-        f"web_api: routes registered  POST /api/chat  POST /api/keytao/batches/review  DELETE /api/chat/history  "
+        f"web_api: routes registered  POST /api/chat  POST /api/keytao/batches/review  "
+        f"POST /api/keytao/pronunciation  DELETE /api/chat/history  "
         f"(auth={'enabled' if WEB_API_KEY else 'disabled'})"
     )
 

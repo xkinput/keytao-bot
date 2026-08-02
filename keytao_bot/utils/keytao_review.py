@@ -709,11 +709,15 @@ def _entity_pronunciation_group(
     word: str,
     entity: Dict[str, Any],
     default_sequence: Sequence[str],
+    encode_data: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Build a context-aware pronunciation only from high-confidence entity knowledge."""
     if not entity.get("recognized"):
         return None
     if float(entity.get("confidence") or 0.0) < ENTITY_PRONUNCIATION_MIN_CONFIDENCE:
+        return None
+    description = str(entity.get("description") or "").strip()
+    if not description:
         return None
 
     sequence = normalize_pinyin_sequence(str(entity.get("pinyin") or ""))
@@ -721,6 +725,24 @@ def _entity_pronunciation_group(
         return None
     if any(not pinyin_to_phonetic_code(syllable) for syllable in sequence):
         return None
+    if encode_data is not None:
+        chars = encode_data.get("chars")
+        if not isinstance(chars, list) or len(chars) != len(sequence):
+            return None
+        for syllable, char_info in zip(sequence, chars):
+            if not isinstance(char_info, dict):
+                return None
+            alternate_readings = char_info.get("pinyins")
+            if not isinstance(alternate_readings, list):
+                alternate_readings = []
+            readings = [char_info.get("pinyin"), *alternate_readings]
+            known_readings = {
+                normalize_pinyin_syllable(str(reading))
+                for reading in readings
+                if str(reading or "").strip()
+            }
+            if syllable not in known_readings:
+                return None
 
     entity_type = str(entity.get("entityType") or "unclear")
     label = _entity_type_label(entity_type)
@@ -739,7 +761,7 @@ def _entity_pronunciation_group(
             "entityType": entity_type,
             "label": label,
             "confidence": float(entity.get("confidence") or 0.0),
-            "description": str(entity.get("description") or "").strip(),
+            "description": description,
             "correctedDefault": corrected,
             "defaultPinyin": pinyin_sequence_label(normalized_default),
         },
@@ -904,7 +926,12 @@ async def prepare_reviewed_word(config: ReviewHttpConfig, word: str) -> Dict:
     groups = evidence.get("groups", []) if evidence.get("success") else []
     if not groups:
         default_sequence = _encode_default_pinyin_sequence(encode_data)
-        entity_group = _entity_pronunciation_group(word, entity_knowledge, default_sequence)
+        entity_group = _entity_pronunciation_group(
+            word,
+            entity_knowledge,
+            default_sequence,
+            encode_data,
+        )
         if not entity_group and default_sequence:
             entity_group = await _contextual_pronunciation_group(
                 config,
@@ -1294,6 +1321,30 @@ async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
     except Exception as error:
         logger.debug(f"Entity knowledge inference failed for {word}: {error}")
         return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
+
+
+async def infer_semantic_pronunciation(word: str) -> Dict[str, Any]:
+    """Return a minimal meaning-backed pronunciation proposal for trusted callers."""
+    normalized_word = str(word or "").strip()
+    entity = await _infer_entity_knowledge(normalized_word)
+    group = _entity_pronunciation_group(normalized_word, entity, ())
+    if not group:
+        return {
+            "success": True,
+            "accepted": False,
+            "word": normalized_word,
+        }
+
+    context = group.get("contextPronunciation") or {}
+    return {
+        "success": True,
+        "accepted": True,
+        "word": normalized_word,
+        "pinyins": list(group.get("normalized") or []),
+        "meaning": str(context.get("description") or "").strip(),
+        "confidence": float(context.get("confidence") or 0.0),
+        "entityType": str(context.get("entityType") or "unclear"),
+    }
 
 
 def _looks_like_person_alias_result(word: str, result: Dict[str, str]) -> bool:

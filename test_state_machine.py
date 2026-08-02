@@ -1276,6 +1276,9 @@ def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_input
 
     check("prompt mentions one or many Chinese words", "如果用户只发了一个或多个中文词/短词" in SYSTEM_PROMPT_CORE)
     check("prompt mentions meaning explanation", "每个词都先用 1-2 句解释它的大致含义" in SYSTEM_PROMPT_CORE)
+    check("prompt gates contextual pronunciation on meaning", "只有当你能给出这个词明确、合理的含义或常见用法时" in SYSTEM_PROMPT_CORE)
+    check("prompt requires semantic pronunciation re-encode", "semantic_pinyin=完整逐字拼音" in SYSTEM_PROMPT_CORE)
+    check("prompt fails closed on authority outage", "如果 pronunciationSource=zdic-unavailable" in SYSTEM_PROMPT_CORE)
     check("prompt mentions batch lookup preference", "多个词时优先使用批量查询工具" in SYSTEM_PROMPT_CORE)
     check("prompt excludes ordinary Q&A from add-word flow", "普通问答，不要为了加词而生成确认句" in SYSTEM_PROMPT_CORE)
     check("prompt mentions duplicate order", "主动说明该词在同码词里的排序位置" in SYSTEM_PROMPT_CORE)
@@ -2039,10 +2042,10 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
             "success": True,
             "codes": ["ylcb", "ylcbv", "ylcbvu"],
             "chars": [
-                {"char": "雅", "pinyin": "ya", "shapeCode": "v"},
-                {"char": "鲁", "pinyin": "lu", "shapeCode": "u"},
-                {"char": "藏", "pinyin": "cang", "shapeCode": "o"},
-                {"char": "布", "pinyin": "bu", "shapeCode": "i"},
+                {"char": "雅", "pinyin": "ya", "pinyins": ["ya"], "shapeCode": "v"},
+                {"char": "鲁", "pinyin": "lu", "pinyins": ["lu"], "shapeCode": "u"},
+                {"char": "藏", "pinyin": "cang", "pinyins": ["cang", "zang"], "shapeCode": "o"},
+                {"char": "布", "pinyin": "bu", "pinyins": ["bu"], "shapeCode": "i"},
             ],
         }
         entity = {
@@ -2104,6 +2107,104 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
             {**entity, "pinyin": "ya lu zang"},
             ("ya", "lu", "cang", "bu"),
         ) is None)
+
+    asyncio.run(_run())
+
+
+def test_semantic_pronunciation_requires_a_concrete_meaning():
+    """LLM pronunciation must not override the encoder without a meaning."""
+    print("\n🧪 semantic pronunciation requires a concrete meaning")
+
+    entity = {
+        "recognized": True,
+        "word": "攀着",
+        "entityType": "common_word",
+        "confidence": 0.98,
+        "canonicalNames": [],
+        "aliases": [],
+        "description": "",
+        "pinyin": "pan zhe",
+        "searchQueries": [],
+        "reviewHint": "",
+    }
+    group = keytao_review_module._entity_pronunciation_group(
+        "攀着",
+        entity,
+        ("pan", "zhuo"),
+    )
+
+    check("descriptionless LLM pronunciation is rejected", group is None)
+
+    supported = keytao_review_module._entity_pronunciation_group(
+        "攀着",
+        {**entity, "description": "表示正攀附着或抓住某物向上移动"},
+        ("pan", "zhuo"),
+        {
+            "chars": [
+                {"char": "攀", "pinyin": "pan", "pinyins": ["pan"]},
+                {"char": "着", "pinyin": "zhuo", "pinyins": ["zhuo", "zhao", "zhe"]},
+            ],
+        },
+    )
+    check("meaningful known pronunciation is accepted", supported is not None)
+
+    hallucinated = keytao_review_module._entity_pronunciation_group(
+        "攀着",
+        {**entity, "description": "表示正攀附着或抓住某物向上移动", "pinyin": "pan zhi"},
+        ("pan", "zhuo"),
+        {
+            "chars": [
+                {"char": "攀", "pinyin": "pan", "pinyins": ["pan"]},
+                {"char": "着", "pinyin": "zhuo", "pinyins": ["zhuo", "zhao", "zhe"]},
+            ],
+        },
+    )
+    check("LLM reading outside the known character readings is rejected", hallucinated is None)
+
+
+def test_semantic_pronunciation_api_result_requires_meaning_and_confidence():
+    """The internal web endpoint must expose only a sufficiently grounded proposal."""
+    print("\n🧪 semantic pronunciation API result validation")
+
+    async def _run():
+        accepted_entity = {
+            "recognized": True,
+            "word": "攀着",
+            "entityType": "common_word",
+            "confidence": 0.98,
+            "canonicalNames": [],
+            "aliases": [],
+            "description": "表示正攀附着或抓住某物向上移动",
+            "pinyin": "pan zhe",
+            "searchQueries": [],
+            "reviewHint": "",
+        }
+        with patch.object(
+            keytao_review_module,
+            "_infer_entity_knowledge",
+            AsyncMock(return_value=accepted_entity),
+        ):
+            accepted = await keytao_review_module.infer_semantic_pronunciation("攀着")
+
+        check("semantic API accepts grounded proposal", accepted.get("accepted") is True)
+        check("semantic API returns normalized pinyin", accepted.get("pinyins") == ["pan", "zhe"])
+        check("semantic API returns concrete meaning", accepted.get("meaning") == accepted_entity["description"])
+
+        with patch.object(
+            keytao_review_module,
+            "_infer_entity_knowledge",
+            AsyncMock(return_value={**accepted_entity, "description": ""}),
+        ):
+            missing_meaning = await keytao_review_module.infer_semantic_pronunciation("攀着")
+        check("semantic API rejects missing meaning", missing_meaning.get("accepted") is False)
+
+        with patch.object(
+            keytao_review_module,
+            "_infer_entity_knowledge",
+            AsyncMock(return_value={**accepted_entity, "confidence": 0.70}),
+        ):
+            low_confidence = await keytao_review_module.infer_semantic_pronunciation("攀着")
+        check("semantic API rejects low confidence", low_confidence.get("accepted") is False)
 
     asyncio.run(_run())
 
@@ -9189,6 +9290,11 @@ def test_normalize_encode_response_codes_first():
         "altCodes": ["ffb", "ffbo"],
         "flyKeyVariants": [{"baseCode": "ffb", "codes": ["ffb", "ffbo"], "changes": []}],
         "requestedCodeAnalysis": {"code": "ffb", "supported": True, "matchType": "flyKey"},
+        "pronunciationSource": "pinyin-pro-context",
+        "phrasePinyins": ["huan", "yan", "zhi"],
+        "contextPhrasePinyins": ["huan", "yan", "zhi"],
+        "semanticPronunciationNeeded": True,
+        "semanticPronunciationAccepted": True,
     })
 
     check("success true", result["success"] is True)
@@ -9196,7 +9302,87 @@ def test_normalize_encode_response_codes_first():
     check("candidateCodes include fly key codes", result["candidateCodes"] == ["hyf", "hyfi", "hyfio", "hyfioo", "ffb", "ffbo"])
     check("flyKeyVariants preserved", result["flyKeyVariants"][0]["baseCode"] == "ffb")
     check("requestedCodeAnalysis preserved", result["requestedCodeAnalysis"]["matchType"] == "flyKey")
+    check("pronunciation source preserved", result["pronunciationSource"] == "pinyin-pro-context")
+    check("phrase pinyin preserved", result["phrasePinyins"] == ["huan", "yan", "zhi"])
+    check("context phrase pinyin preserved", result["contextPhrasePinyins"] == ["huan", "yan", "zhi"])
+    check("semantic pronunciation need preserved", result["semanticPronunciationNeeded"] is True)
+    check("semantic pronunciation acceptance preserved", result["semanticPronunciationAccepted"] is True)
     check("chars are display-only without fullCode", "fullCode" not in result["chars"][0])
+
+
+def test_keytao_encode_forwards_meaning_gated_pronunciation():
+    """The LLM proposal must reach the encoder only as a pinyin/meaning pair."""
+    print("\n🧪 keytao_encode meaning-gated pronunciation forwarding")
+
+    captured = []
+    captured_headers = []
+
+    class FakeResponse:
+        is_success = True
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "input": "攀着",
+                "type": "二字词",
+                "codes": ["pfqe"],
+                "altCodes": [],
+                "flyKeyVariants": [],
+                "pronunciationSource": "llm-semantic",
+                "phrasePinyins": ["pan", "zhe"],
+                "semanticPronunciationAccepted": True,
+                "chars": [],
+            }
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, *, params, headers):
+            check("semantic encode uses bot-only route", url.endswith("/api/bot/phrases/encode"))
+            captured.append(dict(params))
+            captured_headers.append(dict(headers))
+            return FakeResponse()
+
+    async def _run():
+        schema = next(
+            item["function"] for item in _lookup_tools.TOOLS
+            if item["function"]["name"] == "keytao_encode"
+        )
+        properties = schema["parameters"]["properties"]
+        check("tool schema exposes semantic pinyin", "semantic_pinyin" in properties)
+        check("tool schema exposes semantic meaning", "semantic_meaning" in properties)
+
+        lookup_result = {
+            "success": True,
+            "results": [{"code": "pfqe", "phrases": []}],
+        }
+        with patch.object(_lookup_tools.httpx, "AsyncClient", return_value=FakeClient(), create=True):
+            with patch.object(
+                _lookup_tools,
+                "keytao_lookup_by_codes_batch",
+                AsyncMock(return_value=lookup_result),
+            ):
+                result = await _lookup_tools.keytao_encode(
+                    "攀着",
+                    semantic_pinyin="pan zhe",
+                    semantic_meaning="表示正攀附着或抓住某物向上移动",
+                )
+
+        check("semantic pair forwarded together", captured == [{
+            "word": "攀着",
+            "semantic_pinyin": "pan zhe",
+            "semantic_meaning": "表示正攀附着或抓住某物向上移动",
+        }])
+        check("semantic encode authenticates to next", captured_headers == [{"X-Bot-Token": "fake"}])
+        check("accepted semantic source reaches model", result.get("pronunciationSource") == "llm-semantic")
+        check("accepted semantic flag reaches model", result.get("semanticPronunciationAccepted") is True)
+
+    asyncio.run(_run())
 
 
 def test_normalize_encode_response_infer_fallback():
@@ -9977,6 +10163,8 @@ if __name__ == "__main__":
     test_reviewed_add_prompt_keeps_waiting_review_concise()
     test_prepare_reviewed_add_attaches_pre_submit_audit()
     test_reviewed_word_corrects_polyphone_from_entity_context()
+    test_semantic_pronunciation_requires_a_concrete_meaning()
+    test_semantic_pronunciation_api_result_requires_meaning_and_confidence()
     test_reviewed_word_preserves_encode_service_candidate_chains()
     test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable()
     test_auto_approved_review_lines_explain_pass_reason()
@@ -10102,6 +10290,7 @@ if __name__ == "__main__":
     test_orchestrator_reasoning_round_trip()
     test_orchestrator_tool_batch_validation()
     test_normalize_encode_response_codes_first()
+    test_keytao_encode_forwards_meaning_gated_pronunciation()
     test_normalize_encode_response_infer_fallback()
     test_apply_candidate_occupancy_updates_recommendation()
     test_normalize_encode_response_includes_alternate_pronunciation_candidates()

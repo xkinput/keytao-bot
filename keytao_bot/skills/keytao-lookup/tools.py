@@ -204,6 +204,17 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         "requestedCandidateCodes": requested_candidate_codes,
         "flyKeyVariants": encode_data.get("flyKeyVariants") or infer_data.get("flyKeyVariants") or [],
         "codeSource": code_source,
+        "pronunciationSource": encode_data.get("pronunciationSource") or infer_data.get("pronunciationSource") or "",
+        "phrasePinyins": encode_data.get("phrasePinyins") or infer_data.get("phrasePinyins") or [],
+        "contextPhrasePinyins": encode_data.get("contextPhrasePinyins") or infer_data.get("contextPhrasePinyins") or [],
+        "semanticPronunciationNeeded": bool(
+            encode_data.get("semanticPronunciationNeeded")
+            or infer_data.get("semanticPronunciationNeeded")
+        ),
+        "semanticPronunciationAccepted": bool(
+            encode_data.get("semanticPronunciationAccepted")
+            or infer_data.get("semanticPronunciationAccepted")
+        ),
         "chars": chars,
     }
 
@@ -706,7 +717,12 @@ async def keytao_lookup_by_word(word: str) -> Dict:
     }])[0]
 
 
-async def keytao_encode(word: str, requested_code: Optional[str] = None) -> Dict:
+async def keytao_encode(
+    word: str,
+    requested_code: Optional[str] = None,
+    semantic_pinyin: Optional[str] = None,
+    semantic_meaning: Optional[str] = None,
+) -> Dict:
     """
     Calculate keytao encoding and char split for a word (rule-based, not DB query)
     计算词条的键道编码及字根拆分（按规则计算，非数据库查询）
@@ -714,20 +730,36 @@ async def keytao_encode(word: str, requested_code: Optional[str] = None) -> Dict
     Args:
         word: Chinese word or character to encode
         requested_code: Optional user-specified code to analyze against fixed fly-key rules
+        semantic_pinyin: Optional whole-word pinyin proposed from semantic context
+        semantic_meaning: Concrete meaning that justifies semantic_pinyin
 
     Returns:
         dict: Encoding result with codes, altCodes, and per-char split data
     """
     keytao_api_base = get_keytao_url()
-    encode_url = f"{keytao_api_base}/api/phrases/encode"
+    bot_api_token = get_bot_token()
+    encode_url = f"{keytao_api_base}/api/bot/phrases/encode"
     infer_url = f"{keytao_api_base}/api/phrases/infer"
+
+    if not bot_api_token:
+        return {
+            "success": False,
+            "message": "喵喵配置错误：缺少API token",
+        }
 
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             params = {"word": word}
             if requested_code:
                 params["code"] = requested_code
-            response = await client.get(encode_url, params=params)
+            if semantic_pinyin and semantic_meaning:
+                params["semantic_pinyin"] = semantic_pinyin.strip()
+                params["semantic_meaning"] = semantic_meaning.strip()
+            response = await client.get(
+                encode_url,
+                params=params,
+                headers={"X-Bot-Token": bot_api_token},
+            )
             if response.is_success:
                 encode_data = response.json()
                 codes = _clean_code_list(encode_data.get("codes"))
@@ -833,7 +865,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_encode",
-            "description": "按键道规则计算词条的编码、候选码占用情况和字根拆分。返回的 candidateStatuses 是已经查过占用的候选列表，禁止回复'待查占用'；candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。单字多音字会额外返回 alternatePronunciationCodes；词组中多音字会额外返回 alternatePhrasePronunciationCodes；这些合法候选会并入 candidateCodes。用户纠正读音或给出音码前缀时，应传 requested_code 并优先使用 requestedCandidateCodes/firstRequestedAvailableCode。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
+            "description": "按键道规则计算词条的编码、候选码占用情况和字根拆分。返回的 candidateStatuses 是已经查过占用的候选列表，禁止回复'待查占用'；candidateCodes/codes 是唯一可用的词条候选编码，禁止根据 chars/fullCode/phoneticCode 自己拼编码。单字多音字会额外返回 alternatePronunciationCodes；词组中多音字会额外返回 alternatePhrasePronunciationCodes；这些合法候选会并入 candidateCodes。用户纠正读音或给出音码前缀时，应传 requested_code 并优先使用 requestedCandidateCodes/firstRequestedAvailableCode。若首次结果的 semanticPronunciationNeeded=true，且你能明确说明该词含义，可同时传 semantic_pinyin 和 semantic_meaning 复算；两者缺一不可，服务还会校验读音是否属于各字合法读音。与 keytao_lookup_by_word 不同，此工具是按规则实时计算（非数据库查询），会返回推荐编码、进阶选重码、飞键备用码，以及每个字的音码、字根拆分、形码。适用场景：①用户问某词的拆分是什么；②加词前自动生成编码（必须先调用此工具）；③用户问的词可能不在词库中但仍需要编码",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -844,6 +876,14 @@ TOOLS = [
                     "requested_code": {
                         "type": "string",
                         "description": "可选。用户强制指定或询问的编码，如 'ffb'。提供后会返回 requestedCodeAnalysis，说明该编码是否属于标准候选或固定飞键候选，并列出支持的同系列编码"
+                    },
+                    "semantic_pinyin": {
+                        "type": "string",
+                        "description": "可选。仅当没有标准整词读音且你能根据明确语义判断时提供完整逐字拼音，如 'pan zhe'；必须和 semantic_meaning 同时提供"
+                    },
+                    "semantic_meaning": {
+                        "type": "string",
+                        "description": "可选。支撑 semantic_pinyin 的具体词义或常见用法；不能说明含义时不要填写，也不要把语境读音当成推荐"
                     }
                 },
                 "required": ["word"]

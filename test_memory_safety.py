@@ -34,6 +34,7 @@ from keytao_bot.harness.tools import (
 )
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
+from keytao_bot.utils.llm_request_gate import RequestWindowGate
 from keytao_bot.utils.web_identity import (
     WebIdentityConfigError,
     WebIdentityReplayCache,
@@ -42,6 +43,39 @@ from keytao_bot.utils.web_identity import (
     verify_web_user_identity,
 )
 from pydantic import ValidationError
+
+
+class LlmRequestGateTests(unittest.TestCase):
+    def test_bounds_concurrency_and_requester_and_global_windows(self) -> None:
+        now = [100.0]
+        gate = RequestWindowGate(
+            global_limit=3,
+            requester_limit=2,
+            window_seconds=60,
+            max_concurrent=1,
+            clock=lambda: now[0],
+        )
+
+        first = gate.try_acquire("user-a")
+        self.assertTrue(first.allowed)
+        self.assertEqual(gate.try_acquire("user-b").reason, "concurrency")
+        gate.release()
+
+        self.assertTrue(gate.try_acquire("user-a").allowed)
+        gate.release()
+        requester_limited = gate.try_acquire("user-a")
+        self.assertFalse(requester_limited.allowed)
+        self.assertEqual(requester_limited.reason, "requester-window")
+
+        self.assertTrue(gate.try_acquire("user-b").allowed)
+        gate.release()
+        global_limited = gate.try_acquire("user-c")
+        self.assertFalse(global_limited.allowed)
+        self.assertEqual(global_limited.reason, "global-window")
+
+        now[0] += 61
+        self.assertTrue(gate.try_acquire("user-a").allowed)
+        gate.release()
 
 
 class HistoryIsolationTests(unittest.TestCase):
@@ -671,6 +705,10 @@ class WebRequestLimitTests(unittest.IsolatedAsyncioTestCase):
             REQUEST_BODY_LIMITS[("POST", "/api/keytao/batches/review")],
             512 * 1024,
         )
+        self.assertEqual(
+            REQUEST_BODY_LIMITS[("POST", "/api/keytao/pronunciation")],
+            4 * 1024,
+        )
         sent, calls = await self._invoke_middleware(
             method="POST",
             path="/api/keytao/batches/review",
@@ -681,7 +719,7 @@ class WebRequestLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 0)
 
     def test_chat_request_fields_have_hard_length_limits(self) -> None:
-        from keytao_bot.plugins.web_api import ChatRequest
+        from keytao_bot.plugins.web_api import ChatRequest, KeyTaoPronunciationRequest
 
         ChatRequest(message="x" * 8000, session_id="s" * 128, user_id="u" * 128)
         for values in (
@@ -691,6 +729,16 @@ class WebRequestLimitTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaises(ValidationError):
                 ChatRequest(**values)
+
+        KeyTaoPronunciationRequest(word="攀着")
+        for values in (
+            {"word": ""},
+            {"word": "攀着123"},
+            {"word": "词" * 13},
+            {"word": "攀着", "extra": True},
+        ):
+            with self.assertRaises(ValidationError):
+                KeyTaoPronunciationRequest(**values)
 
 
 class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):

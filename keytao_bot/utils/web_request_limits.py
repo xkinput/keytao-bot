@@ -13,6 +13,7 @@ REQUEST_BODY_LIMITS: dict[tuple[str, str], int] = {
     ("POST", "/api/chat"): 32 * 1024,
     ("DELETE", "/api/chat/history"): 4 * 1024,
     ("POST", "/api/keytao/batches/review"): 512 * 1024,
+    ("POST", "/api/keytao/pronunciation"): 4 * 1024,
 }
 
 
