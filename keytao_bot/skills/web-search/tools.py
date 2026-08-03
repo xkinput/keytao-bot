@@ -1,17 +1,41 @@
 """
 Web Search Skill Tools
 通用网络搜索和网页正文抓取工具实现
+
+Security notes
+--------------
+``web_fetch`` takes a URL straight from the model, so it is an SSRF sink. The
+hardening in this module is deliberately layered:
+
+* only ``http`` / ``https`` schemes are accepted;
+* every host is resolved and every resulting address is checked against the
+  private / loopback / link-local / reserved / multicast / cloud-metadata
+  blocklist (IPv6 forms that wrap an IPv4 address are unwrapped first);
+* redirects are followed manually, one hop at a time, re-validating the target
+  each time — automatic redirect following would let a public host bounce us
+  into the private network;
+* response bodies are capped at :data:`MAX_FETCH_BYTES` *before* any regex runs
+  over them;
+* every outbound request passes through the process-wide concurrency gate in
+  :mod:`keytao_bot.utils.http_client`.
 """
 from __future__ import annotations
 
+import asyncio
+import functools
 import html
+import ipaddress
+import zlib
 import re
+import socket
 from typing import Any, Dict, List, Optional, Tuple
 import base64
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 from nonebot.log import logger
+
+from keytao_bot.utils import http_client
 
 
 DUCKDUCKGO_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
@@ -25,6 +49,89 @@ USER_AGENT = (
 )
 DEFAULT_TIMEOUT = 12.0
 
+# Hard ceiling on any single response body we are willing to buffer and regex.
+MAX_FETCH_BYTES = http_client.MAX_FETCH_BYTES
+# Maximum number of redirects we will follow manually (initial request excluded).
+MAX_REDIRECT_HOPS = http_client.MAX_REDIRECT_HOPS
+ALLOWED_SCHEMES = http_client.ALLOWED_FETCH_SCHEMES
+_REDIRECT_STATUS = http_client._REDIRECT_STATUS
+# Cloud instance-metadata endpoints. Both already fall inside a blocked range
+# (link-local / unique-local) but are listed explicitly as a tripwire.
+
+JINA_READER_PREFIX = "https://r.jina.ai/"
+
+# Ask servers not to compress: the size cap is enforced on raw wire bytes, and
+# an identity body makes that cap mean exactly what it says.
+_IDENTITY_ENCODING = http_client._IDENTITY_ENCODING
+
+# Accept header used when fetching an HTML page for text extraction.
+_HTML_ACCEPT_HEADER = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+}
+
+
+BlockedUrlError = http_client.BlockedUrlError
+
+
+# ---------------------------------------------------------------------------
+# SSRF guards
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# SSRF guards
+# ---------------------------------------------------------------------------
+# The real implementation lives in keytao_bot.utils.http_client, which owns the
+# single guarded egress (resolve -> validate every A/AAAA -> pin the connection
+# to a validated IP with Host/SNI preserved -> re-validate every redirect hop).
+# These names are kept as thin aliases so this module and its tests have one
+# vocabulary, but there is deliberately no second implementation to drift.
+
+_unwrap_ipv6 = http_client._unwrap_ipv6
+_is_blocked_ip = http_client.is_blocked_ip
+_assert_peer_allowed = http_client._assert_peer_allowed
+_peer_addresses = http_client._peer_addresses
+_read_capped_body = http_client.read_capped_body
+_decode_body = http_client.decode_body
+_decompress_bounded = http_client._decompress_bounded
+
+
+def _validate_scheme(url: str) -> Optional[str]:
+    """Return an error message when ``url`` does not use http/https."""
+    try:
+        http_client.validate_fetch_scheme(url)
+    except BlockedUrlError as error:
+        return str(error)
+    return None
+
+
+async def _resolve_and_validate_host(host: Optional[str], port: Optional[int] = None) -> Optional[str]:
+    """Return an error message when ``host`` resolves to a forbidden address."""
+    try:
+        await http_client.resolve_validated_addresses(host, port)
+    except BlockedUrlError as error:
+        return str(error)
+    return None
+
+
+async def _validate_fetch_target(url: str) -> Optional[str]:
+    """Full scheme + address validation for one absolute URL."""
+    scheme_error = _validate_scheme(url)
+    if scheme_error:
+        return scheme_error
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return "URL 端口无效"
+    return await _resolve_and_validate_host(parsed.hostname, port)
+
+
+async def _get_text(url: str, *, params: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
+    """Search-provider fetch through the guarded, IP-pinned egress."""
+    response = await http_client.guarded_fetch(url, params=params)
+    return response.status_code, response.text
+
 
 def _strip_tags(value: str) -> str:
     text = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", value, flags=re.IGNORECASE | re.DOTALL)
@@ -32,7 +139,6 @@ def _strip_tags(value: str) -> str:
     text = html.unescape(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
-
 
 def _normalize_result_url(raw_url: str) -> str:
     if not raw_url:
@@ -63,16 +169,6 @@ def _normalize_result_url(raw_url: str) -> str:
 
     return decoded
 
-
-def _is_probably_url(value: str) -> bool:
-    parsed = urlparse(value if "://" in value else f"https://{value}")
-    return bool(parsed.netloc and "." in parsed.netloc)
-
-
-def _has_cjk(value: str) -> bool:
-    return bool(re.search(r"[\u3400-\u9fff]", value))
-
-
 def _dedupe_results(results: List[Dict[str, str]], max_results: int) -> List[Dict[str, str]]:
     deduped: List[Dict[str, str]] = []
     seen: set[str] = set()
@@ -95,7 +191,6 @@ def _dedupe_results(results: List[Dict[str, str]], max_results: int) -> List[Dic
         if len(deduped) >= max_results:
             break
     return deduped
-
 
 def _extract_duckduckgo_html(content: str, max_results: int) -> List[Dict[str, str]]:
     anchors = list(
@@ -123,7 +218,6 @@ def _extract_duckduckgo_html(content: str, max_results: int) -> List[Dict[str, s
         })
     return _dedupe_results(results, max_results)
 
-
 def _extract_duckduckgo_lite(content: str, max_results: int) -> List[Dict[str, str]]:
     matches = list(
         re.finditer(
@@ -150,7 +244,6 @@ def _extract_duckduckgo_lite(content: str, max_results: int) -> List[Dict[str, s
         })
     return _dedupe_results(results, max_results)
 
-
 def _extract_bing(content: str, max_results: int) -> List[Dict[str, str]]:
     matches = list(re.finditer(
         r"<h2[^>]*>.*?<a[^>]+href=\"([^\"]+)\"[^>]*>(.*?)</a>.*?</h2>",
@@ -172,7 +265,6 @@ def _extract_bing(content: str, max_results: int) -> List[Dict[str, str]]:
         if len(results) >= max_results:
             break
     return _dedupe_results(results, max_results)
-
 
 def _extract_so360(content: str, max_results: int) -> List[Dict[str, str]]:
     blocks = re.findall(
@@ -204,30 +296,32 @@ def _extract_so360(content: str, max_results: int) -> List[Dict[str, str]]:
             break
     return _dedupe_results(results, max_results)
 
+def _has_cjk(value: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", value))
 
-async def _get_text(client: httpx.AsyncClient, url: str, *, params: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
-    response = await client.get(url, params=params)
-    return response.status_code, response.text
+def _is_probably_url(value: str) -> bool:
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    return bool(parsed.netloc and "." in parsed.netloc)
 
 
-async def _search_with_provider(client: httpx.AsyncClient, provider: str, query: str, max_results: int) -> List[Dict[str, str]]:
+async def _search_with_provider(provider: str, query: str, max_results: int) -> List[Dict[str, str]]:
     if provider == "duckduckgo-html":
-        status, text = await _get_text(client, DUCKDUCKGO_HTML_ENDPOINT, params={"q": query, "kl": "cn-zh"})
+        status, text = await _get_text(DUCKDUCKGO_HTML_ENDPOINT, params={"q": query, "kl": "cn-zh"})
         if status >= 400:
             raise RuntimeError(f"HTTP {status}")
         return _extract_duckduckgo_html(text, max_results)
     if provider == "duckduckgo-lite":
-        status, text = await _get_text(client, DUCKDUCKGO_LITE_ENDPOINT, params={"q": query, "kl": "cn-zh"})
+        status, text = await _get_text(DUCKDUCKGO_LITE_ENDPOINT, params={"q": query, "kl": "cn-zh"})
         if status >= 400:
             raise RuntimeError(f"HTTP {status}")
         return _extract_duckduckgo_lite(text, max_results)
     if provider == "bing":
-        status, text = await _get_text(client, BING_ENDPOINT, params={"q": query, "setlang": "zh-CN"})
+        status, text = await _get_text(BING_ENDPOINT, params={"q": query, "setlang": "zh-CN"})
         if status >= 400:
             raise RuntimeError(f"HTTP {status}")
         return _extract_bing(text, max_results)
     if provider == "so360":
-        status, text = await _get_text(client, SO360_ENDPOINT, params={"q": query})
+        status, text = await _get_text(SO360_ENDPOINT, params={"q": query})
         if status >= 400:
             raise RuntimeError(f"HTTP {status}")
         return _extract_so360(text, max_results)
@@ -270,7 +364,27 @@ def _extract_main_text(content: str, max_chars: int) -> str:
 
 
 def _jina_reader_url(url: str) -> str:
-    return f"https://r.jina.ai/http://r.jina.ai/http://{url}"
+    """Wrap ``url`` with the Jina reader prefix exactly once.
+
+    The previous implementation concatenated the prefix twice (and downgraded the
+    target to ``http://``), producing ``https://r.jina.ai/http://r.jina.ai/...``
+    which the reader cannot resolve.
+    """
+    target = (url or "").strip()
+    lowered_prefix = JINA_READER_PREFIX.lower()
+    # Strip any prefix the caller already applied (in either scheme form).
+    while True:
+        lowered = target.lower()
+        if lowered.startswith(lowered_prefix):
+            target = target[len(JINA_READER_PREFIX):]
+            continue
+        if lowered.startswith("http://r.jina.ai/"):
+            target = target[len("http://r.jina.ai/"):]
+            continue
+        break
+    if not target.lower().startswith(("http://", "https://")):
+        target = "https://" + target
+    return f"{JINA_READER_PREFIX}{target}"
 
 
 def _parse_jina_reader_text(content: str, max_chars: int) -> Dict[str, str]:
@@ -295,17 +409,11 @@ def _parse_jina_reader_text(content: str, max_chars: int) -> Dict[str, str]:
 
 
 async def _web_fetch_via_jina(url: str, max_chars: int, reason: str) -> Dict[str, Any]:
+    reader_url = _jina_reader_url(url)
     try:
-        async with httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            },
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(_jina_reader_url(url))
-            response.raise_for_status()
+        response = await http_client.guarded_fetch(reader_url)
+        if not response.is_success:
+            raise RuntimeError(f"HTTP {response.status_code}")
         parsed = _parse_jina_reader_text(response.text, max_chars)
         if not parsed.get("text"):
             return {"success": False, "url": url, "error": reason or "网页抓取失败"}
@@ -326,40 +434,47 @@ async def _web_fetch_via_jina(url: str, max_chars: int, reason: str) -> Dict[str
 
 
 async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
-    """Fetch a webpage and return readable text for synthesis."""
-    normalized_url = url.strip()
+    """Fetch a webpage and return readable text for synthesis.
+
+    The URL comes from the model, so it is treated as hostile input: scheme and
+    resolved addresses are validated up front and again on every redirect hop,
+    and the body is capped before any parsing happens.
+    """
+    normalized_url = (url or "").strip()
     if not normalized_url:
         return {"success": False, "url": url, "error": "URL 不能为空"}
-    if not normalized_url.startswith(("http://", "https://")):
+    if "://" in normalized_url:
+        scheme_error = _validate_scheme(normalized_url)
+        if scheme_error:
+            return {"success": False, "url": url, "error": scheme_error}
+    else:
         normalized_url = "https://" + normalized_url
     if not _is_probably_url(normalized_url):
         return {"success": False, "url": url, "error": "看起来不是有效 URL"}
 
+    target_error = await _validate_fetch_target(normalized_url)
+    if target_error:
+        logger.warning(f"Web fetch blocked for {normalized_url}: {target_error}")
+        return {"success": False, "url": url, "error": target_error}
+
     max_chars = max(800, min(max_chars, 12000))
     try:
-        async with httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
-            },
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(normalized_url)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            raw_text = response.text
+        response = await http_client.guarded_fetch(
+            normalized_url, headers=_HTML_ACCEPT_HEADER,
+        )
+        final_url = response.url
+        raw_text = response.text
+        content_type = response.headers.get("content-type", "")
 
         title = _extract_title(raw_text)
         description = _extract_meta_description(raw_text)
         text = raw_text if "text/plain" in content_type else _extract_main_text(raw_text, max_chars)
         text = _strip_tags(text)[:max_chars].strip()
         if not text:
-            return await _web_fetch_via_jina(str(response.url), max_chars, "页面可访问，但没有提取到正文")
+            return await _web_fetch_via_jina(final_url, max_chars, "页面可访问，但没有提取到正文")
         return {
             "success": True,
-            "url": str(response.url),
+            "url": final_url,
             "status": response.status_code,
             "title": title,
             "description": description,
@@ -367,6 +482,9 @@ async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
             "text": text,
             "truncated": len(text) >= max_chars,
         }
+    except BlockedUrlError as exc:
+        logger.warning(f"Web fetch blocked for {normalized_url}: {exc}")
+        return {"success": False, "url": url, "error": str(exc)}
     except httpx.TimeoutException:
         return await _web_fetch_via_jina(normalized_url, max_chars, "网页抓取超时")
     except httpx.HTTPError as exc:
@@ -409,23 +527,15 @@ async def web_search(query: str, max_results: int = 5, fetch_top_n: int = 0) -> 
     merged: List[Dict[str, str]] = []
 
     try:
-        async with httpx.AsyncClient(
-            timeout=DEFAULT_TIMEOUT,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            },
-            follow_redirects=True,
-        ) as client:
-            for provider in providers:
-                try:
-                    results = await _search_with_provider(client, provider, normalized_query, max_results)
-                    merged = _dedupe_results(merged + results, max_results)
-                    if len(merged) >= max_results:
-                        break
-                except Exception as exc:
-                    provider_errors[provider] = str(exc)
-                    logger.warning(f"Web search provider {provider} failed for {normalized_query}: {exc}")
+        for provider in providers:
+            try:
+                results = await _search_with_provider(provider, normalized_query, max_results)
+                merged = _dedupe_results(merged + results, max_results)
+                if len(merged) >= max_results:
+                    break
+            except Exception as exc:
+                provider_errors[provider] = str(exc)
+                logger.warning(f"Web search provider {provider} failed for {normalized_query}: {exc}")
 
         if not merged:
             return {

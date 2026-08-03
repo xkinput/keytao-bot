@@ -7,6 +7,224 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from nonebot.log import logger
 
+try:  # pragma: no cover - depends on the installed runtime
+    import jsonschema as _jsonschema
+except ImportError:  # pragma: no cover
+    _jsonschema = None
+
+
+MAX_BATCH_ITEMS = 200
+_BATCH_LIST_ARGUMENTS = {
+    "keytao_batch_add_to_draft": "items",
+    "keytao_audit_draft_items": "items",
+    "keytao_batch_remove_draft_items": "ids",
+}
+_JSON_TYPE_MAP = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+    "null": type(None),
+}
+_MAX_REPORTED_ERRORS = 5
+_FALLBACK_MAX_DEPTH = 3
+_missing_jsonschema_warned = False
+
+
+def _warn_missing_jsonschema_once() -> None:
+    global _missing_jsonschema_warned
+    if _missing_jsonschema_warned:
+        return
+    _missing_jsonschema_warned = True
+    logger.warning(
+        "jsonschema is not installed; tool argument validation is using the "
+        "bounded required/type/enum fallback"
+    )
+
+
+def _extract_parameters_schema(schema: Optional[Dict]) -> Optional[Dict]:
+    if not isinstance(schema, dict):
+        return None
+    function_spec = schema.get("function")
+    parameters = (
+        function_spec.get("parameters")
+        if isinstance(function_spec, dict)
+        else schema.get("parameters", schema)
+    )
+    if not isinstance(parameters, dict) or not parameters:
+        return None
+    if parameters.get("additionalProperties") is False:
+        parameters = {
+            key: value
+            for key, value in parameters.items()
+            if key != "additionalProperties"
+        }
+    return parameters
+
+
+def _matches_json_type(value: Any, json_type: str) -> bool:
+    expected = _JSON_TYPE_MAP.get(json_type)
+    if expected is None:
+        return True
+    if json_type in ("integer", "number") and isinstance(value, bool):
+        return False
+    return isinstance(value, expected)
+
+
+def _declared_types(spec: Dict) -> List[str]:
+    declared = spec.get("type")
+    if isinstance(declared, str):
+        return [declared]
+    if isinstance(declared, list):
+        return [item for item in declared if isinstance(item, str)]
+    return []
+
+
+def _validate_object_fallback(
+    value: Dict,
+    parameters: Dict,
+    path: str,
+    depth: int,
+) -> List[str]:
+    errors: List[str] = []
+    label = f"'{path}' 中的" if path else ""
+    required = parameters.get("required")
+    if isinstance(required, list):
+        for key in required:
+            if isinstance(key, str) and key not in value:
+                errors.append(f"缺少必填参数 {label}'{key}'")
+
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        return errors
+    for key, spec in properties.items():
+        if key not in value or not isinstance(spec, dict):
+            continue
+        child = value[key]
+        child_path = f"{path}.{key}" if path else key
+        types = _declared_types(spec)
+        if types and not any(_matches_json_type(child, item) for item in types):
+            errors.append(
+                f"参数 '{child_path}' 类型应为 {'/'.join(types)}，实际为 {type(child).__name__}"
+            )
+            continue
+        enum_values = spec.get("enum")
+        if isinstance(enum_values, list) and enum_values and child not in enum_values:
+            errors.append(
+                f"参数 '{child_path}' 取值应为 {enum_values} 之一，实际为 {child!r}"
+            )
+            continue
+        if depth >= _FALLBACK_MAX_DEPTH:
+            continue
+        if isinstance(child, dict):
+            errors.extend(
+                _validate_object_fallback(child, spec, child_path, depth + 1)
+            )
+        elif isinstance(child, list):
+            item_spec = spec.get("items")
+            if not isinstance(item_spec, dict):
+                continue
+            for index, element in enumerate(child):
+                element_path = f"{child_path}[{index}]"
+                item_types = _declared_types(item_spec)
+                if item_types and not any(
+                    _matches_json_type(element, item) for item in item_types
+                ):
+                    errors.append(
+                        f"参数 '{element_path}' 类型应为 {'/'.join(item_types)}，"
+                        f"实际为 {type(element).__name__}"
+                    )
+                    continue
+                if isinstance(element, dict):
+                    errors.extend(
+                        _validate_object_fallback(
+                            element, item_spec, element_path, depth + 1
+                        )
+                    )
+                if len(errors) >= _MAX_REPORTED_ERRORS:
+                    return errors
+    return errors
+
+
+def _validate_arguments_fallback(arguments: Dict, parameters: Dict) -> List[str]:
+    return _validate_object_fallback(arguments, parameters, "", 0)
+
+
+def _validate_root_type(tool_name: str, arguments: Any) -> Optional[Dict]:
+    if isinstance(arguments, dict):
+        return None
+    return {
+        "success": False,
+        "invalidArguments": True,
+        "message": (
+            "参数校验失败：参数必须是 JSON 对象，"
+            f"实际为 {type(arguments).__name__}"
+        ),
+        "tool": tool_name,
+        "errors": ["arguments must be a JSON object"],
+    }
+
+
+def _validate_arguments(
+    tool_name: str,
+    arguments: Any,
+    schema: Optional[Dict],
+) -> Optional[Dict]:
+    root_error = _validate_root_type(tool_name, arguments)
+    if root_error:
+        return root_error
+    parameters = _extract_parameters_schema(schema)
+    if parameters is None:
+        return None
+    errors: List[str] = []
+    if _jsonschema is not None:
+        try:
+            validator_class = _jsonschema.validators.validator_for(parameters)
+            validator = validator_class(parameters)
+            for error in validator.iter_errors(arguments):
+                location = "/".join(
+                    str(part) for part in error.absolute_path
+                ) or "(root)"
+                errors.append(f"{location}: {error.message}")
+                if len(errors) >= _MAX_REPORTED_ERRORS:
+                    break
+        except Exception as error:
+            logger.debug(f"Schema validation skipped for {tool_name}: {error}")
+            return None
+    else:
+        _warn_missing_jsonschema_once()
+        errors = _validate_arguments_fallback(arguments, parameters)[
+            :_MAX_REPORTED_ERRORS
+        ]
+    if not errors:
+        return None
+    return {
+        "success": False,
+        "invalidArguments": True,
+        "message": f"参数校验失败：{'; '.join(errors)}",
+        "tool": tool_name,
+        "errors": errors,
+    }
+
+
+def _validate_batch_size(tool_name: str, arguments: Dict) -> Optional[Dict]:
+    argument_name = _BATCH_LIST_ARGUMENTS.get(tool_name)
+    if not argument_name or not isinstance(arguments, dict):
+        return None
+    value = arguments.get(argument_name)
+    if not isinstance(value, list) or len(value) <= MAX_BATCH_ITEMS:
+        return None
+    return {
+        "success": False,
+        "message": (
+            f"单次批量条目过多（{len(value)} 条），上限 {MAX_BATCH_ITEMS} 条，"
+            "请分批提交。"
+        ),
+        "policyBlocked": True,
+    }
+
 
 @dataclass(frozen=True)
 class ToolContext:
@@ -669,10 +887,22 @@ class ToolExecutor:
         mutation_guard: Optional[
             Callable[[ToolContext, str, Dict], Optional[Dict]]
         ] = None,
+        *,
+        get_tool_schema: Optional[Callable[[str], Optional[Dict]]] = None,
     ):
         self._get_tool_function = get_tool_function
         self._context_tools = context_tools
         self._mutation_guard = mutation_guard
+        self._get_tool_schema = get_tool_schema
+
+    def _resolve_schema(self, tool_name: str) -> Optional[Dict]:
+        if self._get_tool_schema is None:
+            return None
+        try:
+            return self._get_tool_schema(tool_name)
+        except Exception as error:
+            logger.debug(f"Schema lookup failed for {tool_name}: {error}")
+            return None
 
     def canonicalize_arguments(
         self,
@@ -684,11 +914,28 @@ class ToolExecutor:
         return self._with_trusted_mutation_fields(tool_name, arguments, context)
 
     async def call(self, tool_name: str, arguments: Dict, context: ToolContext) -> str:
+        root_error = _validate_root_type(tool_name, arguments)
+        if root_error:
+            logger.warning(
+                f"Tool {tool_name} rejected invalid arguments: {root_error['message']}"
+            )
+            return json.dumps(root_error, ensure_ascii=False)
         call_args = self.canonicalize_arguments(tool_name, arguments, context)
         policy_error = self._validate_policy(tool_name, call_args, context)
         if policy_error:
             logger.warning(f"Tool {tool_name} blocked by policy: {policy_error}")
             return json.dumps(policy_error, ensure_ascii=False)
+
+        schema_error = _validate_arguments(
+            tool_name,
+            arguments,
+            self._resolve_schema(tool_name),
+        )
+        if schema_error:
+            logger.warning(
+                f"Tool {tool_name} rejected invalid arguments: {schema_error['message']}"
+            )
+            return json.dumps(schema_error, ensure_ascii=False)
 
         tool_func = self._get_tool_function(tool_name)
         if not tool_func:
@@ -801,6 +1048,9 @@ class ToolExecutor:
         return call_args
 
     def _validate_policy(self, tool_name: str, arguments: Dict, context: ToolContext) -> Optional[Dict]:
+        batch_size_error = _validate_batch_size(tool_name, arguments)
+        if batch_size_error:
+            return batch_size_error
         message = context.current_message or ""
         if not context.writes_allowed and tool_name in MUTATING_TOOL_NAMES:
             return {

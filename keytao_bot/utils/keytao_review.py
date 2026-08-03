@@ -5,16 +5,14 @@ import asyncio
 import html
 import json
 import math
-import os
 import re
 import time
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-import httpx
-from nonebot import get_driver
 from nonebot.log import logger
 
 try:
@@ -22,6 +20,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
+from . import http_client
+from .http_client import KeytaoApiError
 from .keytao_encoding import (
     build_phrase_code_chain,
     normalize_contextual_phrase_encoding,
@@ -29,17 +29,23 @@ from .keytao_encoding import (
 )
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 from .llm_request_gate import RequestWindowGate
+from .review_flags import (
+    MANUAL_REVIEW_PREFIXES,
+    apply_manual_review_flag,
+    build_auto_review_remark,
+    manual_review_reason,
+    read_manual_review_flag,
+    remark_indicates_manual_review,
+)
 
 
 SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/"
 DUCKDUCKGO_LITE_ENDPOINT = "https://lite.duckduckgo.com/lite/"
 BING_ENDPOINT = "https://www.bing.com/search"
 SO360_ENDPOINT = "https://www.so.com/s"
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/123.0.0.0 Safari/537.36"
-)
+# Kept as a re-export: outbound requests now use the shared external client,
+# which sets this same User-Agent.
+USER_AGENT = http_client.EXTERNAL_USER_AGENT
 
 REVIEW_SIGNAL_WEIGHTS = {
     "corpus": 0.45,
@@ -109,11 +115,13 @@ COMMON_KNOWN_MIN_SCORE = 0.55
 COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
 COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
 CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
-PRONUNCIATION_EVIDENCE_TIMEOUT = 4.0
+# Total budget for gathering pronunciation evidence. Must stay above the
+# per-source budget below, otherwise every source is cancelled before the
+# 12s inner per-request timeouts can even fire.
+PRONUNCIATION_EVIDENCE_TIMEOUT = 20.0
+PRONUNCIATION_SOURCE_TIMEOUT = 8.0
 KEYTAO_ENCODE_REQUEST_TIMEOUT = 30.0
 KEYTAO_ENCODE_MAX_ATTEMPTS = 2
-KEYTAO_ENCODE_RETRY_DELAY = 0.5
-KEYTAO_ENCODE_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 ENTITY_DIRECT_FETCH_TIMEOUT = 3.0
 ENTITY_PRONUNCIATION_MIN_CONFIDENCE = 0.75
 CONTEXT_ENTITY_SOURCE_DOMAINS = ("baike.baidu.com", "zh.wikipedia.org")
@@ -195,18 +203,25 @@ _CJK_WORD_RE = re.compile(r"^[\u3400-\u9fff]+$")
 
 @dataclass(frozen=True)
 class ReviewHttpConfig:
+    """Legacy handle kept for call-signature compatibility.
+
+    The actual base URL / bot token now come from :mod:`keytao_bot.utils.http_client`
+    at request time, so the fields here are only carried for logging and for the
+    callers that still build one.
+    """
+
     api_base: str
     bot_token: str
 
 
+# Reason attached to every item whose dictionary occupancy could not be read.
+# A failed lookup is NOT an empty slot.
+LOOKUP_FAILURE_REASON = "词库占位查询失败，无法确认编码空位"
+DUPLICATE_REASON = "词库已有（跳过）"
+
+
 def _config_value(name: str, env_name: str, default: Any = None) -> Any:
-    try:
-        value = getattr(get_driver().config, name, None)
-        if value not in (None, ""):
-            return value
-    except Exception:
-        pass
-    return os.getenv(env_name, default)
+    return http_client.config_value(name, env_name, default)
 
 
 def _as_float(value: Any, default: float) -> float:
@@ -214,6 +229,131 @@ def _as_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return default
+
+
+# ---------------------------------------------------------------------------
+# In-process TTL cache (task 24)
+# ---------------------------------------------------------------------------
+
+REVIEW_CACHE_TTL_SECONDS = 6 * 60 * 60
+REVIEW_CACHE_MAX_ENTRIES = 512
+
+_review_cache: "OrderedDict[Tuple[str, str], Tuple[float, Any]]" = OrderedDict()
+
+
+def _cache_get(word: str, purpose: str) -> Optional[Any]:
+    key = (word, purpose)
+    entry = _review_cache.get(key)
+    if entry is None:
+        return None
+    expires_at, value = entry
+    if expires_at <= time.monotonic():
+        _review_cache.pop(key, None)
+        return None
+    _review_cache.move_to_end(key)
+    return value
+
+
+def _cache_set(word: str, purpose: str, value: Any) -> Any:
+    key = (word, purpose)
+    _review_cache[key] = (time.monotonic() + REVIEW_CACHE_TTL_SECONDS, value)
+    _review_cache.move_to_end(key)
+    while len(_review_cache) > REVIEW_CACHE_MAX_ENTRIES:
+        _review_cache.popitem(last=False)
+    return value
+
+
+def _clear_review_caches() -> None:
+    """Reset the in-process review caches. Exposed for tests; never called automatically."""
+    _review_cache.clear()
+    _semantic_review_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Single source of truth for LLM configuration (task 23)
+# ---------------------------------------------------------------------------
+
+DEFAULT_LLM_BASE_URL = "https://api.deepseek.com"
+DEFAULT_LLM_MODEL = "deepseek-chat"
+
+_llm_clients: Dict[Tuple[str, str, int], Any] = {}
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def llm_config() -> Dict[str, Any]:
+    """The one place that resolves LLM connection settings for the review pipeline."""
+    raw_timeout = (
+        _config_value("openai_timeout", "OPENAI_TIMEOUT", None)
+        or _config_value("gemini_timeout", "GEMINI_TIMEOUT", None)
+        or _config_value("ark_timeout", "ARK_TIMEOUT", None)
+    )
+    timeout = _as_float(raw_timeout, 180.0) if raw_timeout else 180.0
+    # Short-lived helper calls (entity inference) must not hold a whole
+    # per-item budget hostage.
+    quick_timeout = min(_as_float(raw_timeout, 20.0) if raw_timeout else 20.0, 30.0)
+
+    raw_temperature = (
+        _config_value("openai_temperature", "OPENAI_TEMPERATURE", None)
+        or _config_value("gemini_temperature", "GEMINI_TEMPERATURE", None)
+        or _config_value("ark_temperature", "ARK_TEMPERATURE", None)
+    )
+    max_tokens = min(
+        max(_as_int(_config_value("openai_max_tokens", "OPENAI_MAX_TOKENS", 2500), 2500), 2500),
+        6000,
+    )
+    return {
+        "api_key": str(_config_value("openai_api_key", "OPENAI_API_KEY", "") or ""),
+        "base_url": str(
+            _config_value("openai_base_url", "OPENAI_BASE_URL", DEFAULT_LLM_BASE_URL)
+            or DEFAULT_LLM_BASE_URL
+        ),
+        "model": str(
+            _config_value("keytao_review_model", "KEYTAO_REVIEW_MODEL", "")
+            or _config_value("openai_model", "OPENAI_MODEL", DEFAULT_LLM_MODEL)
+            or DEFAULT_LLM_MODEL
+        ),
+        "max_tokens": max_tokens,
+        "max_tokens_cap": min(
+            max(
+                _as_int(
+                    _config_value("keytao_review_max_tokens_cap", "KEYTAO_REVIEW_MAX_TOKENS_CAP", 12000),
+                    12000,
+                ),
+                max_tokens,
+            ),
+            16000,
+        ),
+        "timeout": timeout,
+        "quick_timeout": quick_timeout,
+        "temperature": _as_float(raw_temperature, 0.2) if raw_temperature else 0.2,
+    }
+
+
+def get_llm_client(client_factory: Any, base_url: str, api_key: str, timeout: float) -> Any:
+    """Return a lazily created, reused ``AsyncOpenAI`` keyed by (base_url, api_key).
+
+    ``client_factory`` identity is part of the key so that a patched constructor
+    in tests never picks up a client built by the real one.
+    """
+    if client_factory is None:
+        return None
+    key = (str(base_url), str(api_key), id(client_factory))
+    client = _llm_clients.get(key)
+    if client is None:
+        client = client_factory(api_key=api_key, base_url=base_url, timeout=timeout)
+        _llm_clients[key] = client
+    return client
+
+
+def _review_llm_config() -> Dict[str, Any]:
+    """Backwards-compatible alias of :func:`llm_config`."""
+    return llm_config()
 
 
 def _load_json_object_from_model_text(content: str) -> Dict[str, Any]:
@@ -233,24 +373,6 @@ def _load_json_object_from_model_text(content: str) -> Dict[str, Any]:
         except Exception:
             return {}
     return value if isinstance(value, dict) else {}
-
-
-def _review_llm_config() -> Dict[str, Any]:
-    timeout_value = (
-        _config_value("openai_timeout", "OPENAI_TIMEOUT", None)
-        or _config_value("gemini_timeout", "GEMINI_TIMEOUT", None)
-        or _config_value("ark_timeout", "ARK_TIMEOUT", None)
-        or 20
-    )
-    return {
-        "api_key": str(_config_value("openai_api_key", "OPENAI_API_KEY", "") or ""),
-        "base_url": str(_config_value("openai_base_url", "OPENAI_BASE_URL", "https://api.deepseek.com") or ""),
-        "model": str(
-            _config_value("keytao_review_model", "KEYTAO_REVIEW_MODEL", "")
-            or _config_value("openai_model", "OPENAI_MODEL", "deepseek-chat")
-        ),
-        "timeout": min(_as_float(timeout_value, 20.0), 30.0),
-    }
 
 
 def _bounded_positive_config(name: str, default: int, maximum: int) -> int:
@@ -496,24 +618,24 @@ async def _search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
     merged: List[Dict[str, str]] = []
     failures: List[str] = []
     try:
-        async with httpx.AsyncClient(
-            timeout=12.0,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
-            follow_redirects=True,
-        ) as client:
-            for provider, endpoint, params, extractor in providers:
-                try:
-                    response = await client.get(endpoint, params=params)
-                    response.raise_for_status()
-                    results = extractor(response.text, max_results)
-                    for result in results:
-                        result.setdefault("provider", provider)
-                    merged = _dedupe_search_results(merged + results, max_results)
-                    if len(merged) >= max_results:
-                        break
-                except Exception as error:
-                    failures.append(f"{provider}: {error}")
-                    logger.debug(f"Review search provider {provider} failed for {query}: {error}")
+        for provider, endpoint, params, extractor in providers:
+            try:
+                # Guarded egress: validated + IP-pinned on every hop, body
+                # capped on the wire. Search engines redirect, and their result
+                # pages are attacker-influencable, so this must not use a plain
+                # client.
+                response = await http_client.guarded_fetch(endpoint, params=params)
+                if not response.is_success:
+                    raise RuntimeError(f"HTTP {response.status_code}")
+                results = extractor(response.text, max_results)
+                for result in results:
+                    result.setdefault("provider", provider)
+                merged = _dedupe_search_results(merged + results, max_results)
+                if len(merged) >= max_results:
+                    break
+            except Exception as error:
+                failures.append(f"{provider}: {error}")
+                logger.debug(f"Review search provider {provider} failed for {query}: {error}")
         if not merged and failures:
             logger.debug(f"Review search returned no results for {query}; provider failures: {'; '.join(failures)}")
         return merged
@@ -523,15 +645,20 @@ async def _search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
 
 
 async def _fetch_text(url: str) -> str:
+    """Fetch a search-result page.
+
+    The URL comes from a search engine, i.e. it is attacker-influencable: anyone
+    can publish a page that ranks and then 302 it at the metadata service. It
+    therefore MUST go through the guarded, IP-pinned egress.
+    """
     try:
-        async with httpx.AsyncClient(
-            timeout=12.0,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"},
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
+        response = await http_client.guarded_fetch(url)
+        if not response.is_success:
+            raise RuntimeError(f"HTTP {response.status_code}")
         return _strip_tags(response.text[:150000])
+    except http_client.BlockedUrlError as error:
+        logger.warning(f"Review page fetch blocked for {url}: {error}")
+        return ""
     except Exception as error:
         logger.debug(f"Review page fetch failed for {url}: {error}")
         return ""
@@ -568,28 +695,67 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
     if not word:
         return {"success": False, "message": "词不能为空", "groups": [], "sources": []}
 
+    cached = _cache_get(word, "pronunciation_evidence")
+    if cached is not None:
+        return cached
+
     source_entries: List[Dict[str, Any]] = []
 
     async def inspect_source(source: Dict[str, Any]) -> None:
-        texts: List[Tuple[str, str, str]] = []
-        for url_template in source.get("direct_urls", []):
-            url = url_template.format(word=quote(word))
-            text = await _fetch_text(url)
-            if text:
-                texts.append((source["label"], url, text[:12000]))
+        # Direct pages and the site-scoped search run together; inside each,
+        # every outbound fetch is issued in parallel as well. Serial per-URL
+        # fetching is what used to blow through the total budget.
+        async def direct_texts() -> List[Tuple[str, str, str]]:
+            urls = [
+                url_template.format(word=quote(word))
+                for url_template in source.get("direct_urls", [])
+            ]
+            if not urls:
+                return []
+            pages = await asyncio.gather(*(_fetch_text(url) for url in urls))
+            return [
+                (source["label"], url, text[:12000])
+                for url, text in zip(urls, pages)
+                if text
+            ]
 
-        results = await _search_web(source["query"].format(word=word), max_results=2)
-        for result in results:
-            parsed = urlparse(result.get("url", ""))
-            if source["domain"] not in parsed.netloc:
-                continue
-            combined = f"{result.get('title', '')} {result.get('snippet', '')}"
-            texts.append((source["label"], result.get("url", ""), combined))
-            page_text = await _fetch_text(result.get("url", ""))
-            if page_text:
-                texts.append((source["label"], result.get("url", ""), page_text[:12000]))
+        async def search_texts() -> List[Tuple[str, str, str]]:
+            results = await _search_web(source["query"].format(word=word), max_results=2)
+            matching = [
+                result for result in results
+                if source["domain"] in urlparse(result.get("url", "")).netloc
+            ]
+            if not matching:
+                return []
+            pages = await asyncio.gather(*(
+                _fetch_text(result.get("url", "")) for result in matching
+            ))
+            collected: List[Tuple[str, str, str]] = []
+            for result, page_text in zip(matching, pages):
+                url = result.get("url", "")
+                collected.append((
+                    source["label"],
+                    url,
+                    f"{result.get('title', '')} {result.get('snippet', '')}",
+                ))
+                if page_text:
+                    collected.append((source["label"], url, page_text[:12000]))
+            return collected
 
-        for label, url, text in texts:
+        try:
+            direct, searched = await asyncio.wait_for(
+                asyncio.gather(direct_texts(), search_texts()),
+                timeout=PRONUNCIATION_SOURCE_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            # A slow source degrades only itself.
+            logger.debug(f"Pronunciation source {source['id']} timed out for {word}")
+            return
+        except Exception as error:
+            logger.debug(f"Pronunciation source {source['id']} failed for {word}: {error}")
+            return
+
+        for label, url, text in [*direct, *searched]:
             for sequence in _extract_labeled_pinyin_sequences(text, len(word)):
                 source_entries.append({
                     "sourceId": source["id"],
@@ -626,13 +792,15 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
             group["score"] += int(entry["trust"])
 
     sorted_groups = sorted(groups.values(), key=lambda item: (-item["score"], item["pinyin"]))
-    return {
+    result = {
         "success": True,
         "word": word,
         "groups": sorted_groups,
         "sources": source_entries,
         "hasEvidence": bool(sorted_groups),
     }
+    # Only successful results are cached; timeouts/failures must be retried.
+    return _cache_set(word, "pronunciation_evidence", result)
 
 
 async def collect_pronunciation_evidence_limited(word: str) -> Dict[str, Any]:
@@ -654,25 +822,21 @@ async def collect_pronunciation_evidence_limited(word: str) -> Dict[str, Any]:
 
 
 async def _call_keytao_api(config: ReviewHttpConfig, path: str, payload: Optional[Dict] = None, method: str = "POST") -> Dict:
-    if not config.bot_token:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
-    url = f"{config.api_base}{path}"
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            if method == "GET":
-                response = await client.get(url, params=payload, headers={"X-Bot-Token": config.bot_token})
-            else:
-                response = await client.post(
-                    url,
-                    json=payload or {},
-                    headers={"X-Bot-Token": config.bot_token, "Content-Type": "application/json"},
-                )
-        data = response.json()
-        if response.is_success:
-            return data
-        return {"success": False, "message": data.get("message") or data.get("error") or f"HTTP {response.status_code}"}
-    except Exception as error:
-        return {"success": False, "message": str(error)}
+    """Authenticated KeyTao API call.
+
+    Raises :class:`KeytaoApiError` on transport/HTTP/JSON failure. It must never
+    return a bare ``{"success": False}`` dict here: callers that read dictionary
+    occupancy cannot distinguish that from "nothing occupies this code", and
+    reading a failure as an empty slot is exactly how a wrong entry gets
+    auto-approved.
+    """
+    if method.upper() == "GET":
+        return await http_client.keytao_json("GET", path, params=payload)
+    # These POST endpoints are batch *lookups*, so replaying one is harmless
+    # and a transient 5xx must not be reported as "nothing occupies this code".
+    return await http_client.keytao_json(
+        "POST", path, json_body=payload or {}, idempotent=True
+    )
 
 
 async def fetch_keytao_encode(
@@ -695,46 +859,33 @@ async def fetch_keytao_encode(
         })
         headers["X-Bot-Token"] = config.bot_token
     try:
-        async with httpx.AsyncClient(timeout=KEYTAO_ENCODE_REQUEST_TIMEOUT) as client:
-            for attempt in range(KEYTAO_ENCODE_MAX_ATTEMPTS):
-                try:
-                    response = await client.get(
-                        f"{config.api_base}{path}",
-                        params=params,
-                        headers=headers,
-                    )
-                except (httpx.TimeoutException, httpx.TransportError) as error:
-                    if attempt == KEYTAO_ENCODE_MAX_ATTEMPTS - 1:
-                        detail = str(error).strip()
-                        error_label = type(error).__name__ + (f": {detail}" if detail else "")
-                        logger.error(f"[keytao_encode] failed after retry: {error_label}")
-                        return {
-                            "success": False,
-                            "message": f"编码服务重试后仍不可用，请稍后再试: {error_label}",
-                        }
-                    logger.warning(
-                        f"[keytao_encode] transient failure, retrying: {type(error).__name__}: {error}"
-                    )
-                else:
-                    if response.is_success:
-                        return normalize_contextual_phrase_encoding(word, response.json())
-                    if (
-                        response.status_code not in KEYTAO_ENCODE_RETRYABLE_STATUS
-                        or attempt == KEYTAO_ENCODE_MAX_ATTEMPTS - 1
-                    ):
-                        return {
-                            "success": False,
-                            "message": f"编码服务返回错误: {response.status_code}",
-                        }
-                    logger.warning(
-                        f"[keytao_encode] transient HTTP {response.status_code}, retrying"
-                    )
-                await asyncio.sleep(KEYTAO_ENCODE_RETRY_DELAY)
+        data = await http_client.keytao_json(
+            "GET",
+            path,
+            params=params,
+            headers=headers,
+            timeout=KEYTAO_ENCODE_REQUEST_TIMEOUT,
+            retries=KEYTAO_ENCODE_MAX_ATTEMPTS,
+            require_token=False,
+        )
+    except KeytaoApiError as error:
+        if error.status_code is None:
+            return {
+                "success": False,
+                "message": f"编码服务重试后仍不可用，请稍后再试: {error.message}",
+            }
+        return {"success": False, "message": f"编码服务返回错误: {error.message}"}
     except Exception as error:
         return {"success": False, "message": f"编码服务暂时不可用: {error}"}
+    return normalize_contextual_phrase_encoding(word, data)
 
 
 async def lookup_codes(config: ReviewHttpConfig, codes: Sequence[str]) -> Dict[str, List[Dict]]:
+    """Return the occupants of each code.
+
+    Raises :class:`KeytaoApiError` when the lookup could not be completed, so a
+    failure can never be mistaken for a free slot.
+    """
     unique_codes = []
     seen = set()
     for code in codes:
@@ -745,9 +896,11 @@ async def lookup_codes(config: ReviewHttpConfig, codes: Sequence[str]) -> Dict[s
     if not unique_codes:
         return {}
     data = await _call_keytao_api(config, "/api/bot/phrases/by-code/batch", {"codes": unique_codes})
-    result: Dict[str, List[Dict]] = {}
     if not data.get("success"):
-        return result
+        raise KeytaoApiError(
+            str(data.get("message") or data.get("error") or "词库编码批量查询失败")
+        )
+    result: Dict[str, List[Dict]] = {}
     for item in data.get("results", []):
         if isinstance(item, dict):
             result[str(item.get("code") or "")] = [
@@ -758,6 +911,12 @@ async def lookup_codes(config: ReviewHttpConfig, codes: Sequence[str]) -> Dict[s
 
 
 async def lookup_words(config: ReviewHttpConfig, words: Sequence[str]) -> Dict[str, List[Dict]]:
+    """Return the existing dictionary rows for each word.
+
+    Raises :class:`KeytaoApiError` when the lookup could not be completed: an
+    empty result here would otherwise be read as "this word is not in the
+    dictionary yet", which hides duplicates.
+    """
     unique_words = []
     seen = set()
     for word in words:
@@ -768,9 +927,11 @@ async def lookup_words(config: ReviewHttpConfig, words: Sequence[str]) -> Dict[s
     if not unique_words:
         return {}
     data = await _call_keytao_api(config, "/api/bot/phrases/by-word/batch", {"words": unique_words})
-    result: Dict[str, List[Dict]] = {}
     if not data.get("success"):
-        return result
+        raise KeytaoApiError(
+            str(data.get("message") or data.get("error") or "词库词条批量查询失败")
+        )
+    result: Dict[str, List[Dict]] = {}
     for item in data.get("results", []):
         if isinstance(item, dict):
             result[str(item.get("word") or "")] = [
@@ -1079,9 +1240,26 @@ def _status_label(phrases: List[Dict]) -> str:
     return label
 
 
-def _build_statuses_for_codes(codes: Sequence[str], code_map: Dict[str, List[Dict]]) -> List[Dict]:
+def _build_statuses_for_codes(
+    codes: Sequence[str],
+    code_map: Dict[str, List[Dict]],
+    *,
+    lookup_failed: bool = False,
+) -> List[Dict]:
     statuses = []
     for code in codes:
+        if lookup_failed:
+            # Unknown, NOT free. `occupied` is deliberately None so any caller
+            # doing a truthiness test errs toward "do not recommend this code".
+            statuses.append({
+                "code": code,
+                "occupied": None,
+                "label": "占位未知（词库查询失败）",
+                "phrases": [],
+                "words": [],
+                "lookupFailed": True,
+            })
+            continue
         phrases = code_map.get(code, [])
         statuses.append({
             "code": code,
@@ -1103,17 +1281,34 @@ async def prepare_reviewed_word(
     if not word:
         return {"success": False, "message": "词不能为空"}
 
-    evidence, encode_data, existing_words = await asyncio.gather(
+    evidence, encode_data, existing_words_result = await asyncio.gather(
         collect_pronunciation_evidence_limited(word),
         fetch_keytao_encode(config, word),
         lookup_words(config, [word]),
+        return_exceptions=True,
     )
+    for result in (evidence, encode_data):
+        if isinstance(result, BaseException) and not isinstance(result, KeytaoApiError):
+            raise result
+
+    lookup_failed = False
     entity_knowledge: Dict[str, Any] = {
         "recognized": False,
         "word": word,
         "entityType": "unclear",
         "confidence": 0.0,
     }
+    existing_words: Dict[str, List[Dict]] = {}
+    if isinstance(existing_words_result, BaseException):
+        logger.warning(f"Existing-word lookup failed for {word}: {existing_words_result}")
+        lookup_failed = True
+    else:
+        existing_words = existing_words_result
+    if isinstance(evidence, BaseException):
+        evidence = {"success": False, "groups": [], "sources": []}
+    if isinstance(encode_data, BaseException):
+        encode_data = {"success": False, "message": str(encode_data)}
+
     if not encode_data.get("success", True) and not encode_data.get("codes"):
         return {"success": False, "message": encode_data.get("message", "编码服务未返回有效结果")}
 
@@ -1147,7 +1342,7 @@ async def prepare_reviewed_word(
                     groups = [semantic_group]
 
             if not groups:
-                return {
+                return apply_manual_review_flag({
                     "success": True,
                     "word": word,
                     "existing": existing_words.get(word, []),
@@ -1162,14 +1357,14 @@ async def prepare_reviewed_word(
                         "暂不推荐编码"
                     ),
                     "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
-                }
+                }, True, "整词语境读音无法验证")
 
         if (
             not groups
             and not semantic_pronunciation_needed
             and str(encode_data.get("pronunciationSource") or "") == "zdic-unavailable"
         ):
-            return {
+            return apply_manual_review_flag({
                 "success": True,
                 "word": word,
                 "existing": existing_words.get(word, []),
@@ -1184,7 +1379,7 @@ async def prepare_reviewed_word(
                     "当前读音无法完成交叉验证，暂不推荐编码"
                 ),
                 "entityKnowledge": None,
-            }
+            }, True, "权威读音服务暂不可用")
 
         if not groups:
             entity_knowledge = await _infer_entity_knowledge(word)
@@ -1239,11 +1434,26 @@ async def prepare_reviewed_word(
     if not pronunciations:
         return {"success": False, "message": f"未能把「{word}」的读音映射到键道候选编码"}
 
-    code_map = await lookup_codes(config, all_codes)
+    code_map: Dict[str, List[Dict]] = {}
+    try:
+        code_map = await lookup_codes(config, all_codes)
+    except KeytaoApiError as error:
+        logger.warning(f"Code occupancy lookup failed for {word}: {error}")
+        lookup_failed = True
+
     global_recommended = ""
     for pronunciation in pronunciations:
-        statuses = _build_statuses_for_codes(pronunciation["codes"], code_map)
+        statuses = _build_statuses_for_codes(
+            pronunciation["codes"],
+            code_map,
+            lookup_failed=lookup_failed,
+        )
         pronunciation["candidateStatuses"] = statuses
+        if lookup_failed:
+            # A failed lookup gives no evidence that any code is free, so no
+            # recommendation may be derived from it.
+            pronunciation["recommendedCode"] = ""
+            continue
         recommended = next((item["code"] for item in statuses if not item["occupied"]), statuses[0]["code"] if statuses else "")
         pronunciation["recommendedCode"] = recommended
         if not global_recommended and recommended:
@@ -1255,22 +1465,31 @@ async def prepare_reviewed_word(
         bool(pron.get("requiresManualReview"))
         for pron in pronunciations
     )
-    return {
+    auto_reviewable = (
+        has_authority
+        and not lookup_failed
+        and not requires_manual_pronunciation_review
+    )
+    if lookup_failed:
+        auto_review_reason = LOOKUP_FAILURE_REASON
+    elif has_authority:
+        auto_review_reason = "至少一个权威来源给出读音"
+    elif has_semantic_pronunciation:
+        auto_review_reason = "本喵已按明确实体语境纠正读音，仍需结合常用词/实体信号完成预审"
+    else:
+        auto_review_reason = "未找到权威来源，仅使用编码服务默认读音"
+
+    result = {
         "success": True,
         "word": word,
         "existing": existing_words.get(word, []),
         "pronunciations": pronunciations,
         "recommendedCode": global_recommended,
-        "autoReviewable": has_authority,
+        "autoReviewable": auto_reviewable,
+        "autoReviewReason": auto_review_reason,
+        "lookupFailed": lookup_failed,
         "requiresManualPronunciationReview": requires_manual_pronunciation_review,
         "standardPronunciationStatus": standard_status,
-        "autoReviewReason": (
-            "至少一个权威来源给出读音"
-            if has_authority else
-            "本喵已按明确实体语境纠正读音，仍需结合常用词/实体信号完成预审"
-            if has_semantic_pronunciation else
-            "未找到权威来源，仅使用编码服务默认读音"
-        ),
         "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
         "sourcePolicy": {
             "acceptedSources": [
@@ -1280,6 +1499,11 @@ async def prepare_reviewed_word(
             "reviewSignalWeights": REVIEW_SIGNAL_WEIGHTS,
         },
     }
+    if lookup_failed:
+        result["lookupFailureReason"] = LOOKUP_FAILURE_REASON
+    # Structured verdict for downstream remark rendering. Code-generated, never
+    # LLM text.
+    return apply_manual_review_flag(result, not auto_reviewable, auto_review_reason)
 
 
 def _candidate_codes_from_review(review: Dict, *, include_fallback: bool = False) -> set[str]:
@@ -1348,33 +1572,39 @@ def _common_known_review_label(commonness: Dict) -> str:
     return "常见词/熟语"
 
 
-_MANUAL_PREAUDIT_MARKERS = (
-    "自动审核：该词需管理员审核",
-    "自动审核:该词需管理员审核",
-    "自动审核：该词需要管理员审核",
-    "自动审核:该词需要管理员审核",
-    "自动审核：预计需管理员审核",
-    "自动审核:预计需管理员审核",
-    "自动审核：预计需要管理员审核",
-    "自动审核:预计需要管理员审核",
-    "自动审核：需管理员审核",
-    "自动审核:需管理员审核",
-    "自动审核：该词暂未完成预审",
-    "自动审核:该词暂未完成预审",
-)
+# Legacy remark markers live in review_flags now; re-exported so existing
+# importers keep working.
+_MANUAL_PREAUDIT_MARKERS = MANUAL_REVIEW_PREFIXES
 
 
 def manual_preaudit_issue_for_item(item: Dict) -> str:
-    """Return a conservative batch blocker recorded during add-stage review."""
+    """Return a conservative batch blocker recorded during add-stage review.
+
+    The decision is driven by the structured ``needsManualReview`` boolean that
+    review code stamps onto the item. Only when that field is absent do we fall
+    back to matching the code-generated remark prefix: items persisted
+    server-side before the structured field existed carry nothing else. LLM-authored
+    prose in ``remark`` can therefore never flip a manual-review item to pass.
+    """
+    word = str(item.get("word") or "").strip() or "该词"
+
+    flag = read_manual_review_flag(item)
+    if flag is False:
+        return ""
+    if flag is True:
+        reason = manual_review_reason(item)
+        if reason:
+            return f"「{word}」加词预审已标记为需管理员审核：{reason}"
+        return f"「{word}」加词预审已标记为需管理员审核"
+
+    # Legacy compatibility path: no structured field on this item.
     remark = str(item.get("remark") or "").strip()
     if not remark:
         return ""
-
-    marker = next((value for value in _MANUAL_PREAUDIT_MARKERS if value in remark), "")
+    marker = remark_indicates_manual_review(remark)
     if not marker:
         return ""
 
-    word = str(item.get("word") or "").strip() or "该词"
     tail = remark.split(marker, 1)[1]
     reason_match = re.match(r"\s*[（(]([^）)]+)[）)]", tail)
     reason = reason_match.group(1).strip() if reason_match else ""
@@ -1384,10 +1614,25 @@ def manual_preaudit_issue_for_item(item: Dict) -> str:
 
 
 def can_llm_override_audit_issues(audit: Dict) -> bool:
-    """Return whether unresolved audit issues are safe to send through LLM review."""
+    """Return whether unresolved audit issues are safe to send through LLM review.
+
+    A structured verdict is terminal. Once code has stamped an item
+    ``needsManualReview`` (or hit a failed lookup / duplicate), the resulting
+    issue is listed in ``structuredManualReviewIssues`` and the whole audit
+    becomes non-overridable — regardless of how the issue happens to read.
+    Without this, an issue whose *reason* quotes an overridable phrase (e.g.
+    "没有权威读音来源") would smuggle a sealed decision back into LLM review.
+    """
     issues = audit.get("issues") or []
     if not issues:
         return False
+
+    # NOTE: the audit-level ``needsManualReview`` flag only records "this audit
+    # did not auto-approve", which is true of every overridable case too. The
+    # sealed list is the precise signal, so gate on that alone.
+    if audit.get("structuredManualReviewIssues"):
+        return False
+
     allowed_fragments = (
         "没有权威读音来源",
         "常用词信号不足",
@@ -1416,6 +1661,27 @@ def _is_css_review_type(phrase_type: str) -> bool:
     return str(phrase_type or "").strip() in CSS_REVIEW_TYPES
 
 
+def _has_exact_existing_phrase(
+    existing: object, word: str, code: str, phrase_type: str
+) -> bool:
+    """True when the dictionary already holds this exact word@code@type row.
+
+    The word MUST be compared as well: a by-word batch lookup can return rows
+    for other words, and matching on code+type alone would declare a brand-new
+    entry a duplicate and silently drop it.
+    """
+    if not isinstance(existing, list) or not code or not word:
+        return False
+    normalized_word = str(word).strip()
+    normalized_code = str(code).strip().lower()
+    for phrase in _same_type_phrases(existing, phrase_type):
+        if str(phrase.get("word") or "").strip() != normalized_word:
+            continue
+        if str(phrase.get("code") or "").strip().lower() == normalized_code:
+            return True
+    return False
+
+
 def _same_type_phrases(phrases: Sequence[Dict], phrase_type: str) -> List[Dict]:
     return [
         phrase for phrase in phrases
@@ -1435,27 +1701,51 @@ async def prepare_css_reviewed_item(config: ReviewHttpConfig, item: Dict) -> Dic
     lookup_words_result, lookup_codes_result = await asyncio.gather(
         lookup_words(config, [word] + ([old_word] if old_word else [])),
         lookup_codes(config, [code]),
+        return_exceptions=True,
     )
+    lookup_failed = False
+    if isinstance(lookup_words_result, BaseException):
+        logger.warning(f"CSS word lookup failed for {word}: {lookup_words_result}")
+        lookup_failed = True
+        lookup_words_result = {}
+    if isinstance(lookup_codes_result, BaseException):
+        logger.warning(f"CSS code lookup failed for {code}: {lookup_codes_result}")
+        lookup_failed = True
+        lookup_codes_result = {}
+
     word_existing = _same_type_phrases(lookup_words_result.get(word, []), phrase_type)
     code_existing = _same_type_phrases(lookup_codes_result.get(code, []), phrase_type)
     exact_existing = [
         phrase for phrase in word_existing
         if str(phrase.get("code") or "").lower() == code
     ]
+    # Same word @ same code @ same type already in the dictionary is a DUPLICATE.
+    # A duplicate is a reason to skip the item, never a reason to auto-approve it.
+    duplicate = bool(exact_existing)
     commonness = await estimate_word_commonness(word)
 
-    return {
+    auto_reviewable = (
+        not duplicate
+        and not lookup_failed
+        and _is_common_known_word(word, commonness)
+    )
+    if lookup_failed:
+        auto_review_reason = LOOKUP_FAILURE_REASON
+    elif duplicate:
+        auto_review_reason = f"同类型声笔笔词库已存在该词条：{DUPLICATE_REASON}"
+    else:
+        auto_review_reason = "声笔笔按短码表和日常优先级审查，不能按普通词组音码判错"
+
+    result = {
         "success": True,
         "word": word,
         "code": code,
         "type": phrase_type,
         "oldWord": old_word or None,
-        "autoReviewable": bool(exact_existing) or _is_common_known_word(word, commonness),
-        "autoReviewReason": (
-            "同类型声笔笔词库已存在该词条"
-            if exact_existing else
-            "声笔笔按短码表和日常优先级审查，不能按普通词组音码判错"
-        ),
+        "duplicate": duplicate,
+        "lookupFailed": lookup_failed,
+        "autoReviewable": auto_reviewable,
+        "autoReviewReason": auto_review_reason,
         "cssShortCodeReview": {
             "accepted": True,
             "policy": (
@@ -1465,9 +1755,14 @@ async def prepare_css_reviewed_item(config: ReviewHttpConfig, item: Dict) -> Dic
             "sameTypeExistingForWord": word_existing[:8],
             "sameTypeExistingForCode": code_existing[:8],
             "exactExisting": exact_existing[:8],
+            "duplicate": duplicate,
+            "lookupFailed": lookup_failed,
             "commonness": commonness,
         },
     }
+    if lookup_failed:
+        result["lookupFailureReason"] = LOOKUP_FAILURE_REASON
+    return apply_manual_review_flag(result, not auto_reviewable, auto_review_reason)
 
 
 def _bounded_log_score(value: float) -> float:
@@ -1530,6 +1825,10 @@ async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
     if not word or not _CJK_WORD_RE.match(word) or len(word) > 12:
         return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
 
+    cached = _cache_get(word, "entity_knowledge")
+    if cached is not None:
+        return cached
+
     config = _review_llm_config()
     if not config["api_key"] or AsyncOpenAI is None:
         return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
@@ -1560,11 +1859,11 @@ async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
     }
 
     try:
-        client = AsyncOpenAI(
-            api_key=config["api_key"],
-            base_url=config["base_url"],
-            timeout=config["timeout"],
-            max_retries=1,
+        client = get_llm_client(
+            AsyncOpenAI,
+            config["base_url"],
+            config["api_key"],
+            config.get("quick_timeout") or config["timeout"],
         )
         response = await client.chat.completions.create(**with_deepseek_chat_policy(
             {
@@ -1588,10 +1887,11 @@ async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
         if not response.choices:
             return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
         content = response.choices[0].message.content or ""
-        return _normalize_entity_knowledge(word, _load_json_object_from_model_text(content))
     except Exception as error:
         logger.debug(f"Entity knowledge inference failed for {word}: {error}")
         return {"recognized": False, "word": word, "entityType": "unclear", "confidence": 0.0}
+    # Only successful inferences are cached.
+    return _cache_set(word, "entity_knowledge", _normalize_entity_knowledge(word, _load_json_object_from_model_text(content)))
 
 
 def _normalize_semantic_pronunciation_proposal(
@@ -2163,6 +2463,10 @@ async def estimate_word_commonness(word: str) -> Dict:
     if not word:
         return {"success": False, "word": word, "message": "词不能为空", "signals": {}, "score": 0.0}
 
+    cached = _cache_get(word, "commonness")
+    if cached is not None:
+        return cached
+
     signal_raw = {key: 0.0 for key in COMMONNESS_SIGNAL_WEIGHTS}
     evidence: Dict[str, List[str]] = {key: [] for key in COMMONNESS_SIGNAL_WEIGHTS}
 
@@ -2175,7 +2479,8 @@ async def estimate_word_commonness(word: str) -> Dict:
             signals[key] * COMMONNESS_SIGNAL_WEIGHTS[key]
             for key in COMMONNESS_SIGNAL_WEIGHTS
         )
-        return {
+        # Only successful results are memoised.
+        return _cache_set(word, "commonness", {
             "success": True,
             "word": word,
             "score": weighted_score,
@@ -2194,7 +2499,7 @@ async def estimate_word_commonness(word: str) -> Dict:
                 "hits": [],
                 "score": 0.0,
             },
-        }
+        })
 
     entity_knowledge = await _estimate_entity_knowledge_signal(word)
     if entity_knowledge.get("accepted"):
@@ -2392,6 +2697,9 @@ async def _review_code_chain_priority(item: Dict, review: Dict) -> Dict:
         "commonness": commonness,
         "hasRecommendation": False,
         "priorityOk": True,
+        # ADVISORY ONLY. A reorder suggestion may raise an admin-facing issue,
+        # but it must never contribute to autoReviewable / auto-pass.
+        "advisory": True,
         "summary": "同编码链未发现需要调整的高置信优先级问题",
         "currentOrder": [],
         "recommendedOrder": [],
@@ -2449,7 +2757,9 @@ async def _review_code_chain_priority(item: Dict, review: Dict) -> Dict:
 
     for entry in entries:
         entry_commonness = commonness_by_word.get(entry["word"], {})
-        entry["score"] = float(entry_commonness.get("score") or 0)
+        # Rounded once, up front, so every later comparison uses the same value
+        # the humans and the payload see.
+        entry["score"] = round(float(entry_commonness.get("score") or 0), 2)
         entry["usage"] = _word_usage_summary(entry["word"], entry_commonness)
         entry["confident"] = _commonness_is_confident(entry_commonness)
 
@@ -2479,12 +2789,35 @@ async def _review_code_chain_priority(item: Dict, review: Dict) -> Dict:
     )
     original_words = [entry["word"] for entry in entries]
     ordered_words = [entry["word"] for entry in ordered_entries]
-    top_delta = max(entry["score"] for entry in entries) - min(entry["score"] for entry in entries)
-    if ordered_words == original_words or top_delta < CODE_CHAIN_REORDER_SCORE_MARGIN:
+    if ordered_words == original_words:
         base_result["summary"] = "同编码链常用度顺序基本合理，不建议新的排序"
         return base_result
 
-    target_codes = [entry["code"] for entry in entries]
+    # Every pair whose relative order flips must clear the margin on its own.
+    # Comparing a single global spread against the constant let a pair with a
+    # near-identical score ride along on an unrelated outlier.
+    rank_before = {entry["word"]: index for index, entry in enumerate(entries)}
+    rank_after = {entry["word"]: index for index, entry in enumerate(ordered_entries)}
+    score_by_word = {entry["word"]: entry["score"] for entry in entries}
+    for left in original_words:
+        for right in original_words:
+            if left == right:
+                continue
+            flipped = (
+                (rank_before[left] < rank_before[right]) != (rank_after[left] < rank_after[right])
+            )
+            if not flipped:
+                continue
+            if abs(score_by_word[left] - score_by_word[right]) < CODE_CHAIN_REORDER_SCORE_MARGIN:
+                base_result["summary"] = "同编码链常用度差距不足以支持调序，不建议新的排序"
+                return base_result
+
+    # Deduped so two different words can never be assigned the same target code.
+    target_codes: List[str] = []
+    for entry in entries:
+        if entry["code"] not in target_codes:
+            target_codes.append(entry["code"])
+
     recommended_order = []
     recommended_moves = []
     original_code_by_word = {entry["word"]: entry["code"] for entry in entries}
@@ -2496,6 +2829,7 @@ async def _review_code_chain_priority(item: Dict, review: Dict) -> Dict:
             "score": entry["score"],
             "usage": entry["usage"],
             "current": entry["current"],
+            "advisory": True,
         }
         recommended_order.append(recommended)
         if recommended["fromCode"] != target_code:
@@ -2508,6 +2842,7 @@ async def _review_code_chain_priority(item: Dict, review: Dict) -> Dict:
     base_result.update({
         "hasRecommendation": True,
         "priorityOk": False,
+        "advisory": True,
         "summary": "同编码链常用度显示当前排序可优化，建议按推荐顺序重排",
         "recommendedOrder": recommended_order,
         "recommendedMoves": recommended_moves,
@@ -2515,19 +2850,37 @@ async def _review_code_chain_priority(item: Dict, review: Dict) -> Dict:
     return base_result
 
 
+def _normalized_pair_word(item: Dict) -> str:
+    """Word component of a move-pair key. Stripped only: it is user-facing text."""
+    return str(item.get("word") or "").strip()
+
+
+def _normalized_pair_code(item_or_code: Any) -> str:
+    """Code component of a move-pair key. Always ``.strip().lower()``."""
+    if isinstance(item_or_code, dict):
+        item_or_code = item_or_code.get("code")
+    return str(item_or_code or "").strip().lower()
+
+
 def _find_move_pairs(items: Sequence[Dict]) -> Dict[Tuple[str, str], Dict]:
+    """Map ``(word, old_code)`` -> the Create item that re-adds it at a new code.
+
+    Keys are normalised through the two helpers above so every producer and
+    every consumer agrees; previously the delete side kept the raw code while
+    lookups used the lower-cased one, so an upper-case draft code never matched.
+    """
     creates_by_word: Dict[str, List[Dict]] = {}
     for item in items:
         if item.get("action") == "Create":
-            creates_by_word.setdefault(str(item.get("word") or ""), []).append(item)
+            creates_by_word.setdefault(_normalized_pair_word(item), []).append(item)
     pairs: Dict[Tuple[str, str], Dict] = {}
     for item in items:
         if item.get("action") != "Delete":
             continue
-        word = str(item.get("word") or "")
-        old_code = str(item.get("code") or "")
+        word = _normalized_pair_word(item)
+        old_code = _normalized_pair_code(item)
         for created in creates_by_word.get(word, []):
-            new_code = str(created.get("code") or "")
+            new_code = _normalized_pair_code(created)
             if new_code and new_code != old_code:
                 pairs[(word, old_code)] = created
                 break
@@ -2538,7 +2891,7 @@ def _find_priority_comparisons(items: Sequence[Dict]) -> List[Dict[str, str]]:
     moves: List[Dict[str, str]] = []
     move_pairs = _find_move_pairs(items)
     for (word, old_code), created in move_pairs.items():
-        new_code = str(created.get("code") or "").strip().lower()
+        new_code = _normalized_pair_code(created)
         if new_code:
             moves.append({"word": word, "oldCode": old_code, "newCode": new_code})
 
@@ -2590,174 +2943,339 @@ def _chain_recommendation_text(priority_review: Dict) -> str:
     return f"{priority_review.get('summary', '建议重排')}：{move_text}"
 
 
+AUDIT_ITEM_CONCURRENCY = 3
+AUDIT_ITEM_TIMEOUT = 30.0
+
+
+def reviewed_word_key(word: str, phrase_type: str) -> str:
+    """Serialised ``reviewedWords`` key.
+
+    Keyed by ``(word, type)`` because the same word can legitimately exist as a
+    Phrase and as a CSS short-code entry with different verdicts; keying by word
+    alone made them collide. Rendered as a string so it survives JSON encoding.
+    """
+    return f"{word}@{str(phrase_type or 'Phrase').strip() or 'Phrase'}"
+
+
+class _ItemOutcome:
+    """Per-item audit result, merged back in submission order."""
+
+    __slots__ = (
+        "issues",
+        "sealed_issues",
+        "approved_items",
+        "skipped_items",
+        "common_known_items",
+        "word_purpose_reviews",
+        "code_chain_priority_reviews",
+        "reviewed_words",
+    )
+
+    def __init__(self) -> None:
+        self.issues: List[str] = []
+        # Issues that originate from a structured terminal verdict (an item
+        # already stamped needsManualReview, a failed occupancy lookup, or a
+        # duplicate). These must never be handed to the LLM for override: their
+        # human-readable text happens to contain the same wording as the
+        # overridable whitelist, so text matching alone would let an LLM
+        # relitigate a decision that code already sealed.
+        self.sealed_issues: List[str] = []
+        self.approved_items: List[str] = []
+        self.skipped_items: List[str] = []
+        self.common_known_items: List[Dict[str, Any]] = []
+        self.word_purpose_reviews: List[Dict[str, Any]] = []
+        self.code_chain_priority_reviews: List[Dict[str, Any]] = []
+        self.reviewed_words: Dict[Tuple[str, str], Dict] = {}
+
+
+async def _shared_prepare_reviewed_word(
+    config: ReviewHttpConfig,
+    word: str,
+    phrase_type: str,
+    review_tasks: Dict[Tuple[str, str], Any],
+) -> Dict:
+    """Review each (word, type) at most once per audit, even under concurrency."""
+    key = (word, phrase_type)
+    task = review_tasks.get(key)
+    if task is None:
+        task = asyncio.ensure_future(prepare_reviewed_word(config, word))
+        review_tasks[key] = task
+    # Shielded: one item hitting its per-item timeout must not cancel the review
+    # that other items are also waiting on.
+    return await asyncio.shield(task)
+
+
+async def _audit_single_item(
+    config: ReviewHttpConfig,
+    item: Dict,
+    move_pairs: Dict[Tuple[str, str], Dict],
+    review_tasks: Dict[Tuple[str, str], Any],
+) -> _ItemOutcome:
+    outcome = _ItemOutcome()
+    action = str(item.get("action") or "Create")
+    word = _normalized_pair_word(item)
+    code = _normalized_pair_code(item)
+    old_word = str(item.get("oldWord") or item.get("old_word") or "").strip()
+    phrase_type = str(item.get("type") or "Phrase").strip() or "Phrase"
+
+    if not word or not code:
+        outcome.issues.append("存在词或编码为空的草稿条目")
+        return outcome
+
+    if action == "Delete":
+        if (word, code) in move_pairs:
+            outcome.approved_items.append(f"调码删除原位：{word}@{code}")
+            return outcome
+        outcome.issues.append(f"纯删除「{word}」@{code} 必须由管理员审核")
+        return outcome
+
+    preaudit_issue = manual_preaudit_issue_for_item(item)
+    if preaudit_issue:
+        outcome.issues.append(preaudit_issue)
+        outcome.sealed_issues.append(preaudit_issue)
+        return outcome
+
+    if _is_css_review_type(phrase_type):
+        css_review = await prepare_css_reviewed_item(config, item)
+        outcome.reviewed_words[(word, phrase_type)] = css_review
+        if not css_review.get("success"):
+            outcome.issues.append(f"「{word}」声笔笔审查失败：{css_review.get('message', '未知错误')}")
+            return outcome
+
+        css_info = css_review.get("cssShortCodeReview") or {}
+        css_commonness = css_info.get("commonness") if isinstance(css_info.get("commonness"), dict) else {}
+        if css_commonness:
+            outcome.word_purpose_reviews.append(
+                _purpose_review_from_commonness(word, code, phrase_type, css_commonness)
+            )
+
+        if css_review.get("lookupFailed"):
+            issue = f"「{word}」@{code} {LOOKUP_FAILURE_REASON}，需要管理员审核"
+            outcome.issues.append(issue)
+            outcome.sealed_issues.append(issue)
+            return outcome
+
+        # An exact same word@code@type row already exists: this is a duplicate,
+        # so the item is SKIPPED as already present, never approved.
+        if css_review.get("duplicate"):
+            outcome.skipped_items.append(f"{action}：{word}@{code} {DUPLICATE_REASON}")
+            issue = f"「{word}」@{code} {DUPLICATE_REASON}，需要管理员确认是否重复提交"
+            outcome.issues.append(issue)
+            outcome.sealed_issues.append(issue)
+            return outcome
+
+        if action == "Change" and old_word:
+            comparison = await compare_word_commonness(word, old_word)
+            css_review["commonnessComparison"] = comparison
+            if comparison.get("verdict") == "front_more_common":
+                outcome.approved_items.append(
+                    f"声笔笔改词：{old_word}→{word}@{code}，按 CSS 短码表/常用度优先级通过"
+                )
+                return outcome
+            outcome.issues.append(
+                f"声笔笔短码替换「{old_word}→{word}」需要确认："
+                f"{comparison.get('summary', '请按 CSS 短码表、词频和结构对齐复核')}"
+            )
+            return outcome
+
+        if css_review.get("autoReviewable"):
+            outcome.approved_items.append(f"{action}：{word}@{code}，按声笔笔短码表/常见词优先级通过")
+            return outcome
+        outcome.issues.append(
+            f"「{word}」@{code} 是声笔笔短码表条目，不能按普通词组音码判错；"
+            "但缺少同类型词库记录或足够常用度证据，需要管理员确认优先级"
+        )
+        return outcome
+
+    if action == "Change" and old_word:
+        old_review, new_review = await asyncio.gather(
+            _shared_prepare_reviewed_word(config, old_word, phrase_type, review_tasks),
+            _shared_prepare_reviewed_word(config, word, phrase_type, review_tasks),
+        )
+        outcome.reviewed_words[(old_word, phrase_type)] = old_review
+        outcome.reviewed_words[(word, phrase_type)] = new_review
+        if old_review.get("lookupFailed") or new_review.get("lookupFailed"):
+            issue = f"改词「{old_word}→{word}」{LOOKUP_FAILURE_REASON}，需要管理员审核"
+            outcome.issues.append(issue)
+            outcome.sealed_issues.append(issue)
+            return outcome
+        if new_review.get("autoReviewable") and not old_review.get("autoReviewable"):
+            outcome.approved_items.append(f"改词：{old_word}→{word}@{code}，新词有权威读音证据，旧词未找到权威证据")
+            return outcome
+        outcome.issues.append(f"改词「{old_word}→{word}」存在歧义，需要管理员判断哪个词形更正确")
+        return outcome
+
+    cache_key = (word, phrase_type)
+    review = await _shared_prepare_reviewed_word(config, word, phrase_type, review_tasks)
+    outcome.reviewed_words[cache_key] = review
+    if not review.get("success"):
+        outcome.issues.append(f"「{word}」审词失败：{review.get('message', '未知错误')}")
+        return outcome
+
+    # A failed occupancy lookup is unknown, not free: no auto-pass, no
+    # recommendation derived from it.
+    if review.get("lookupFailed"):
+        issue = (
+            f"「{word}」@{code} "
+            f"{review.get('lookupFailureReason') or LOOKUP_FAILURE_REASON}，需要管理员审核"
+        )
+        outcome.issues.append(issue)
+        outcome.sealed_issues.append(issue)
+        return outcome
+
+    # Same word @ same code @ same type already in the dictionary is a
+    # DUPLICATE: skip it. Only the CSS branch used to check this, so ordinary
+    # Phrase/Single duplicates fell through and could be auto-approved.
+    if _has_exact_existing_phrase(review.get("existing"), word, code, phrase_type):
+        outcome.skipped_items.append(f"{action}：{word}@{code} {DUPLICATE_REASON}")
+        issue = f"「{word}」@{code} {DUPLICATE_REASON}，需要管理员确认是否重复提交"
+        outcome.issues.append(issue)
+        outcome.sealed_issues.append(issue)
+        return outcome
+
+    candidate_codes = _candidate_codes_from_review(
+        review,
+        include_fallback=not bool(review.get("autoReviewable")),
+    )
+    if not review.get("autoReviewable"):
+        if code not in candidate_codes:
+            available = ", ".join(sorted(candidate_codes)[:8])
+            outcome.issues.append(f"「{word}」编码 {code} 不在读音候选链中，可选：{available or '无'}")
+            return outcome
+
+        if review.get("requiresManualPronunciationReview"):
+            outcome.issues.append(
+                f"「{word}」读音由有明确含义支撑的整词语境判定，"
+                "但缺少权威整词读音来源，需要管理员审核"
+            )
+            return outcome
+
+        commonness = await estimate_word_commonness(word)
+        outcome.word_purpose_reviews.append(_purpose_review_from_commonness(word, code, phrase_type, commonness))
+        if _is_common_known_word(word, commonness):
+            priority_review = await _review_code_chain_priority(item, review)
+            outcome.code_chain_priority_reviews.append(priority_review)
+            # Advisory: it may raise an admin-facing issue, but it can never
+            # turn into an approval on its own.
+            if priority_review.get("hasRecommendation"):
+                outcome.issues.append(
+                    f"「{word}」@{code} 同编码链优先级建议调整：{_chain_recommendation_text(priority_review)}"
+                )
+                return outcome
+            common_known_label = _common_known_review_label(commonness)
+            common_known_type = _common_known_review_type(commonness)
+            summary = (
+                f"「{word}」未找到权威读音页，但属于{common_known_label}，"
+                f"且编码 {code} 在读音候选链中"
+            )
+            review["commonKnownReview"] = {
+                "accepted": True,
+                "summary": summary,
+                "type": common_known_type,
+                "commonness": commonness,
+                "policy": {
+                    "minScore": COMMON_KNOWN_MIN_SCORE,
+                    "minActiveSignals": COMMON_KNOWN_MIN_ACTIVE_SIGNALS,
+                },
+            }
+            outcome.common_known_items.append({
+                "word": word,
+                "code": code,
+                "summary": summary,
+                "type": common_known_type,
+                "commonness": commonness,
+            })
+            outcome.approved_items.append(f"{action}：{word}@{code}，本喵按{common_known_label}语言常识通过")
+            return outcome
+
+        outcome.issues.append(f"「{word}」没有权威读音来源，且常用词信号不足，需要管理员审核")
+        return outcome
+
+    if code not in candidate_codes:
+        available = ", ".join(sorted(candidate_codes)[:8])
+        outcome.issues.append(f"「{word}」编码 {code} 不在权威读音候选链中，可选：{available or '无'}")
+        return outcome
+    priority_review = await _review_code_chain_priority(item, review)
+    outcome.code_chain_priority_reviews.append(priority_review)
+    outcome.word_purpose_reviews.append(_purpose_review_from_commonness(
+        word,
+        code,
+        phrase_type,
+        priority_review.get("commonness") or {},
+    ))
+    if priority_review.get("hasRecommendation"):
+        outcome.issues.append(
+            f"「{word}」@{code} 同编码链优先级建议调整：{_chain_recommendation_text(priority_review)}"
+        )
+        return outcome
+    outcome.approved_items.append(f"{action}：{word}@{code}")
+    return outcome
+
+
 async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> Dict:
     if not items:
-        return {
+        return apply_manual_review_flag({
             "success": True,
             "verdict": "needs_admin",
             "autoApprove": False,
             "summary": "草稿为空，不能自动审核",
             "issues": ["草稿为空"],
             "approvedItems": [],
-        }
+        }, True, "草稿为空")
 
     issues: List[str] = []
+    sealed_issues: List[str] = []
     approved_items: List[str] = []
+    skipped_items: List[str] = []
     common_known_items: List[Dict[str, Any]] = []
     word_purpose_reviews: List[Dict[str, Any]] = []
     code_chain_priority_reviews: List[Dict[str, Any]] = []
-    reviewed_words: Dict[str, Dict] = {}
+    reviewed_words: Dict[Tuple[str, str], Dict] = {}
     move_pairs = _find_move_pairs(items)
     priority_comparisons = _find_priority_comparisons(items)
 
-    for item in items:
-        action = str(item.get("action") or "Create")
-        word = str(item.get("word") or "").strip()
-        code = str(item.get("code") or "").strip().lower()
-        old_word = str(item.get("oldWord") or item.get("old_word") or "").strip()
-        phrase_type = str(item.get("type") or "Phrase").strip() or "Phrase"
+    semaphore = asyncio.Semaphore(AUDIT_ITEM_CONCURRENCY)
+    review_tasks: Dict[Tuple[str, str], Any] = {}
 
-        if not word or not code:
-            issues.append("存在词或编码为空的草稿条目")
-            continue
-
-        if action == "Delete":
-            if (word, code) in move_pairs:
-                approved_items.append(f"调码删除原位：{word}@{code}")
-                continue
-            issues.append(f"纯删除「{word}」@{code} 必须由管理员审核")
-            continue
-
-        preaudit_issue = manual_preaudit_issue_for_item(item)
-        if preaudit_issue:
-            issues.append(preaudit_issue)
-            continue
-
-        if _is_css_review_type(phrase_type):
-            css_review = await prepare_css_reviewed_item(config, item)
-            reviewed_words[word] = css_review
-            if not css_review.get("success"):
-                issues.append(f"「{word}」声笔笔审查失败：{css_review.get('message', '未知错误')}")
-                continue
-
-            css_info = css_review.get("cssShortCodeReview") or {}
-            exact_existing = css_info.get("exactExisting") or []
-            css_commonness = css_info.get("commonness") if isinstance(css_info.get("commonness"), dict) else {}
-            if css_commonness:
-                word_purpose_reviews.append(_purpose_review_from_commonness(word, code, phrase_type, css_commonness))
-            if action == "Change" and old_word:
-                comparison = await compare_word_commonness(word, old_word)
-                css_review["commonnessComparison"] = comparison
-                if exact_existing or comparison.get("verdict") == "front_more_common":
-                    approved_items.append(
-                        f"声笔笔改词：{old_word}→{word}@{code}，按 CSS 短码表/常用度优先级通过"
-                    )
-                    continue
-                issues.append(
-                    f"声笔笔短码替换「{old_word}→{word}」需要确认："
-                    f"{comparison.get('summary', '请按 CSS 短码表、词频和结构对齐复核')}"
+    async def run_item(item: Dict) -> _ItemOutcome:
+        word = _normalized_pair_word(item) or "该词"
+        async with semaphore:
+            try:
+                return await asyncio.wait_for(
+                    _audit_single_item(config, item, move_pairs, review_tasks),
+                    timeout=AUDIT_ITEM_TIMEOUT,
                 )
-                continue
-
-            if css_review.get("autoReviewable"):
-                approved_items.append(f"{action}：{word}@{code}，按声笔笔短码表/常见词优先级通过")
-                continue
-            issues.append(
-                f"「{word}」@{code} 是声笔笔短码表条目，不能按普通词组音码判错；"
-                "但缺少同类型词库记录或足够常用度证据，需要管理员确认优先级"
-            )
-            continue
-
-        review_word = word
-        if action == "Change" and old_word:
-            old_review, new_review = await asyncio.gather(
-                prepare_reviewed_word(config, old_word),
-                prepare_reviewed_word(config, word),
-            )
-            reviewed_words[old_word] = old_review
-            reviewed_words[word] = new_review
-            if new_review.get("autoReviewable") and not old_review.get("autoReviewable"):
-                approved_items.append(f"改词：{old_word}→{word}@{code}，新词有权威读音证据，旧词未找到权威证据")
-                continue
-            issues.append(f"改词「{old_word}→{word}」存在歧义，需要管理员判断哪个词形更正确")
-            continue
-
-        if review_word not in reviewed_words:
-            reviewed_words[review_word] = await prepare_reviewed_word(config, review_word)
-        review = reviewed_words[review_word]
-        if not review.get("success"):
-            issues.append(f"「{word}」审词失败：{review.get('message', '未知错误')}")
-            continue
-
-        candidate_codes = _candidate_codes_from_review(
-            review,
-            include_fallback=not bool(review.get("autoReviewable")),
-        )
-        if not review.get("autoReviewable"):
-            if code not in candidate_codes:
-                available = ", ".join(sorted(candidate_codes)[:8])
-                issues.append(f"「{word}」编码 {code} 不在读音候选链中，可选：{available or '无'}")
-                continue
-
-            if review.get("requiresManualPronunciationReview"):
-                issues.append(
-                    f"「{word}」读音由有明确含义支撑的整词语境判定，"
-                    "但缺少权威整词读音来源，需要管理员审核"
+            except asyncio.TimeoutError:
+                outcome = _ItemOutcome()
+                outcome.issues.append(
+                    f"「{word}」审词超过 {AUDIT_ITEM_TIMEOUT:.0f} 秒，需要管理员审核"
                 )
-                continue
+                return outcome
+            except KeytaoApiError as error:
+                outcome = _ItemOutcome()
+                outcome.issues.append(f"「{word}」{LOOKUP_FAILURE_REASON}：{error.message}")
+                return outcome
+            except Exception as error:  # pragma: no cover - defensive
+                logger.warning(f"Draft item audit failed for {word}: {error}")
+                outcome = _ItemOutcome()
+                outcome.issues.append(f"「{word}」审词异常，需要管理员审核：{error}")
+                return outcome
 
-            commonness = await estimate_word_commonness(word)
-            word_purpose_reviews.append(_purpose_review_from_commonness(word, code, phrase_type, commonness))
-            if _is_common_known_word(word, commonness):
-                priority_review = await _review_code_chain_priority(item, review)
-                code_chain_priority_reviews.append(priority_review)
-                if priority_review.get("hasRecommendation"):
-                    issues.append(f"「{word}」@{code} 同编码链优先级建议调整：{_chain_recommendation_text(priority_review)}")
-                    continue
-                common_known_label = _common_known_review_label(commonness)
-                common_known_type = _common_known_review_type(commonness)
-                summary = (
-                    f"「{word}」未找到权威读音页，但属于{common_known_label}，"
-                    f"且编码 {code} 在读音候选链中"
-                )
-                review["commonKnownReview"] = {
-                    "accepted": True,
-                    "summary": summary,
-                    "type": common_known_type,
-                    "commonness": commonness,
-                    "policy": {
-                        "minScore": COMMON_KNOWN_MIN_SCORE,
-                        "minActiveSignals": COMMON_KNOWN_MIN_ACTIVE_SIGNALS,
-                    },
-                }
-                common_known_items.append({
-                    "word": word,
-                    "code": code,
-                    "summary": summary,
-                    "type": common_known_type,
-                    "commonness": commonness,
-                })
-                approved_items.append(f"{action}：{word}@{code}，本喵按{common_known_label}语言常识通过")
-                continue
-
-            issues.append(f"「{word}」没有权威读音来源，且常用词信号不足，需要管理员审核")
-            continue
-        if code not in candidate_codes:
-            available = ", ".join(sorted(candidate_codes)[:8])
-            issues.append(f"「{word}」编码 {code} 不在权威读音候选链中，可选：{available or '无'}")
-            continue
-        priority_review = await _review_code_chain_priority(item, review)
-        code_chain_priority_reviews.append(priority_review)
-        word_purpose_reviews.append(_purpose_review_from_commonness(
-            word,
-            code,
-            phrase_type,
-            priority_review.get("commonness") or {},
-        ))
-        if priority_review.get("hasRecommendation"):
-            issues.append(f"「{word}」@{code} 同编码链优先级建议调整：{_chain_recommendation_text(priority_review)}")
-            continue
-        approved_items.append(f"{action}：{word}@{code}")
+    try:
+        outcomes = await asyncio.gather(*(run_item(item) for item in items))
+    finally:
+        for task in review_tasks.values():
+            if not task.done():
+                task.cancel()
+    for outcome in outcomes:
+        issues.extend(outcome.issues)
+        sealed_issues.extend(outcome.sealed_issues)
+        approved_items.extend(outcome.approved_items)
+        skipped_items.extend(outcome.skipped_items)
+        common_known_items.extend(outcome.common_known_items)
+        word_purpose_reviews.extend(outcome.word_purpose_reviews)
+        code_chain_priority_reviews.extend(outcome.code_chain_priority_reviews)
+        reviewed_words.update(outcome.reviewed_words)
 
     commonness_results: List[Dict] = []
     for comparison in priority_comparisons:
@@ -2781,19 +3299,28 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         summary = "读音编码可验证，常见词/实体常识信号足够，允许本喵自动通过"
     elif auto_approve:
         summary = "权威来源、编码和常用度证据一致，允许本喵自动通过"
+    elif not issues and skipped_items:
+        summary = "草稿条目词库已有，已跳过，需要管理员确认"
     else:
         summary = "存在不确定项，需要管理员审核"
-    return {
+    result = {
         "success": True,
         "verdict": "pass" if auto_approve else "needs_admin",
         "autoApprove": auto_approve,
         "summary": summary,
         "issues": issues,
+        # Subset of ``issues`` that code has sealed: no LLM pass may reopen them.
+        "structuredManualReviewIssues": sealed_issues,
         "approvedItems": approved_items,
+        "skippedItems": skipped_items,
         "commonKnownItems": common_known_items,
         "wordPurposeReviews": word_purpose_reviews,
         "codeChainPriorityReviews": code_chain_priority_reviews,
-        "reviewedWords": reviewed_words,
+        # Serialised as "word@type" strings so the payload survives JSON encoding.
+        "reviewedWords": {
+            reviewed_word_key(word, phrase_type): review
+            for (word, phrase_type), review in reviewed_words.items()
+        },
         "commonnessComparisons": commonness_results,
         "sourcePolicy": {
             "acceptedSources": [
@@ -2814,11 +3341,31 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
             ),
         },
     }
+    # Authoritative structured verdict for this audit. Every remark rendered
+    # downstream is generated from this boolean, never from LLM prose.
+    reason = summary if auto_approve else (issues[0] if issues else summary)
+    return apply_manual_review_flag(result, not auto_approve, reason)
+
+
+def audit_review_remark(audit: Dict) -> str:
+    """Render the canonical auto-review remark for an audit result."""
+    needs_manual = read_manual_review_flag(audit)
+    if needs_manual is None:
+        needs_manual = not bool(audit.get("autoApprove"))
+    reason = manual_review_reason(audit)
+    if not reason:
+        issues = audit.get("issues") or []
+        reason = str(issues[0]) if (needs_manual and issues) else str(audit.get("summary") or "")
+    return build_auto_review_remark(bool(needs_manual), reason)
 
 
 def build_review_note(audit: Dict) -> str:
     lines = ["喵喵自动审词报告"]
     lines.append(f"结论：{audit.get('summary', '')}")
+    lines.append(audit_review_remark(audit))
+    if audit.get("skippedItems"):
+        lines.append("已跳过（词库已有）：")
+        lines.extend(f"- {item}" for item in audit.get("skippedItems", [])[:20])
     if audit.get("approvedItems"):
         lines.append("通过项：")
         lines.extend(f"- {item}" for item in audit.get("approvedItems", [])[:20])

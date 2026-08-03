@@ -27,6 +27,12 @@ class PendingAddWord:
     code_remarks: Dict[str, str] = field(default_factory=dict)
     pronunciation_codes: Dict[str, str] = field(default_factory=dict)
     pronunciation_recommended_codes: List[str] = field(default_factory=list)
+    # Structured auto-review verdict carried from keytao_prepare_reviewed_add.
+    # ``code_remarks`` are parsed out of LLM prose and are display-only; this
+    # boolean is the authoritative one, so the seal cannot be lost when the
+    # model rewords its answer, nor forged when it happens to echo the prefix.
+    needs_manual_review: Optional[bool] = None
+    manual_review_reason: str = ""
 
 
 @dataclass

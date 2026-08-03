@@ -8,7 +8,9 @@ import asyncio
 import hashlib
 import json
 import re
+import time
 import unicodedata
+from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from itertools import islice
@@ -69,6 +71,7 @@ from ..utils.image_input import (
     request_vision_description,
 )
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
+from ..utils import review_flags
 from ..utils.memory_store import (
     ChatMemoryContext,
     MemoryGenerationToken,
@@ -1742,6 +1745,7 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
                 for code, _ in candidates:
                     pronunciation_codes.setdefault(code, pinyin)
 
+    needs_manual_review, manual_review_reason = _take_reviewed_add_verdict(word)
     return PendingAddWord(
         word=word,
         recommended_code=recommended_code,
@@ -1750,7 +1754,20 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
         code_remarks=code_remarks,
         pronunciation_codes=pronunciation_codes,
         pronunciation_recommended_codes=pronunciation_recommended_codes,
+        needs_manual_review=needs_manual_review,
+        manual_review_reason=manual_review_reason,
     )
+
+
+def _create_phrase_args(state: PendingAddWord, code: str) -> Dict:
+    """Build mutation arguments without losing the structured review verdict."""
+    args: Dict = {"word": state.word, "code": code}
+    remark = state.code_remarks.get(code)
+    if remark:
+        args["remark"] = remark
+    if state.needs_manual_review is not None:
+        args["needs_manual_review"] = bool(state.needs_manual_review)
+    return args
 
 
 def _normalize_generated_review_copy(response: str) -> str:
@@ -1844,6 +1861,9 @@ def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
         remark = _batch_review_remark(normalized_response, word)
         if remark:
             item["remark"] = remark
+        verdict, verdict_reason = _take_reviewed_add_verdict(word)
+        if verdict is not None:
+            review_flags.apply_manual_review_flag(item, verdict, verdict_reason)
         items.append(item)
 
     if len(items) < 2:
@@ -4425,7 +4445,49 @@ tool_executor = ToolExecutor(
     skills_manager.get_tool_function,
     _INJECT_PLATFORM_TOOLS,
     mutation_guard=_guard_draft_mutation,
+    get_tool_schema=skills_manager.get_tool_schema,
 )
+
+
+_REVIEWED_ADD_VERDICT_TTL_SECONDS = 1800
+_REVIEWED_ADD_VERDICT_MAX_ENTRIES = 256
+_reviewed_add_verdicts: "OrderedDict[str, Tuple[float, bool, str]]" = OrderedDict()
+
+
+def _record_reviewed_add_verdict(tool_name: str, arguments: Dict, result: str) -> None:
+    if tool_name != "keytao_prepare_reviewed_add":
+        return
+    try:
+        payload = json.loads(result)
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    word = str(payload.get("word") or (arguments or {}).get("word") or "").strip()
+    flag = review_flags.read_manual_review_flag(payload)
+    if not word or flag is None:
+        return
+    now = time.time()
+    _reviewed_add_verdicts[word] = (
+        now,
+        bool(flag),
+        review_flags.manual_review_reason(payload),
+    )
+    _reviewed_add_verdicts.move_to_end(word)
+    while len(_reviewed_add_verdicts) > _REVIEWED_ADD_VERDICT_MAX_ENTRIES:
+        _reviewed_add_verdicts.popitem(last=False)
+
+
+def _take_reviewed_add_verdict(word: str) -> Tuple[Optional[bool], str]:
+    normalized_word = str(word or "").strip()
+    entry = _reviewed_add_verdicts.get(normalized_word)
+    if not entry:
+        return None, ""
+    stored_at, flag, reason = entry
+    if time.time() - stored_at > _REVIEWED_ADD_VERDICT_TTL_SECONDS:
+        _reviewed_add_verdicts.pop(normalized_word, None)
+        return None, ""
+    return flag, reason
 
 
 _DRAFT_RESOLUTION_TOOL_KINDS = {
@@ -4539,6 +4601,7 @@ async def call_tool_function(
                 ),
             }, ensure_ascii=False)
     result_json = await tool_executor.call(tool_name, arguments, ToolContext(platform, user_id))
+    _record_reviewed_add_verdict(tool_name, arguments, result_json)
     result_data: Optional[Dict[str, Any]] = None
     try:
         parsed_result = json.loads(result_json)
@@ -4771,12 +4834,15 @@ async def _execute_add_to_draft(
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
     remark: str = "",
+    needs_manual_review: Optional[bool] = None,
     auto_confirm: bool = True,
 ) -> str:
     """Directly add a word to draft and return formatted response."""
     args = {"word": word, "code": code, "preview_only": True}
     if remark:
         args["remark"] = remark
+    if needs_manual_review is not None:
+        args["needs_manual_review"] = bool(needs_manual_review)
     result_json = await call_tool_function(
         "keytao_create_phrase", args, platform, user_id,
     )
@@ -4837,6 +4903,7 @@ async def _execute_add_to_draft_and_submit(
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
     remark: str = "",
+    needs_manual_review: Optional[bool] = None,
 ) -> str:
     """Add a word to the draft, then submit the resulting batch."""
     result = await _perform_add_to_draft_and_submit(
@@ -4845,6 +4912,7 @@ async def _execute_add_to_draft_and_submit(
         platform,
         user_id,
         remark=remark,
+        needs_manual_review=needs_manual_review,
         auto_confirm=True,
     )
     if result.pending_state is not None:
@@ -4889,6 +4957,7 @@ async def _perform_add_to_draft_and_submit(
     user_id: str,
     *,
     remark: str = "",
+    needs_manual_review: Optional[bool] = None,
     confirmed_create: bool = False,
     batch_id: str = "",
     expected_content_version: Optional[int] = None,
@@ -4899,6 +4968,8 @@ async def _perform_add_to_draft_and_submit(
     args = {"word": word, "code": code}
     if remark:
         args["remark"] = remark
+    if needs_manual_review is not None:
+        args["needs_manual_review"] = bool(needs_manual_review)
     create_args = dict(args)
     if confirmed_create:
         create_args.update({
@@ -4938,6 +5009,7 @@ async def _perform_add_to_draft_and_submit(
                 platform,
                 user_id,
                 remark=remark,
+                needs_manual_review=needs_manual_review,
                 confirmed_create=True,
                 batch_id=str(exact_args.get("batch_id") or ""),
                 expected_content_version=exact_args.get(
@@ -4980,7 +5052,16 @@ async def _perform_add_to_draft_and_submit(
         preview_only=True,
         auto_confirm=auto_confirm,
         authorized_items=[
-            {"action": "Create", "word": word, "code": code},
+            {
+                "action": "Create",
+                "word": word,
+                "code": code,
+                **(
+                    {"needsManualReview": bool(needs_manual_review)}
+                    if needs_manual_review is not None
+                    else {}
+                ),
+            },
         ],
     )
     if submit_result.pending_state is not None:
@@ -6163,6 +6244,7 @@ async def _perform_active_operation_confirmation(
             platform,
             user_id,
             remark=str(args.get("remark") or operation.remark),
+            needs_manual_review=args.get("needs_manual_review"),
             confirmed_create=(
                 pending_state.confirmation_source == "server_warning"
             ),
@@ -7667,6 +7749,7 @@ async def _handle_pending_add_word(
                         space_key,
                         owner_label,
                         state.code_remarks.get(direct_code, ""),
+                        state.needs_manual_review,
                     )
                 return await _execute_add_to_draft(
                     state.word,
@@ -7676,15 +7759,12 @@ async def _handle_pending_add_word(
                     space_key,
                     owner_label,
                     state.code_remarks.get(direct_code, ""),
+                    state.needs_manual_review,
                 )
             return await _execute_confirmed_tool(
                 PendingToolConfirm(
                     function_name="keytao_create_phrase",
-                    args={
-                        "word": state.word,
-                        "code": direct_code,
-                        **({"remark": state.code_remarks.get(direct_code)} if state.code_remarks.get(direct_code) else {}),
-                    },
+                    args=_create_phrase_args(state, direct_code),
                 ),
                 platform,
                 user_id,
@@ -7711,6 +7791,7 @@ async def _handle_pending_add_word(
                     space_key,
                     owner_label,
                     state.code_remarks.get(target_code, ""),
+                    state.needs_manual_review,
                 )
             return await _execute_add_to_draft(
                 state.word,
@@ -7720,11 +7801,12 @@ async def _handle_pending_add_word(
                 space_key,
                 owner_label,
                 state.code_remarks.get(target_code, ""),
+                state.needs_manual_review,
             )
         return await _execute_confirmed_tool(
             PendingToolConfirm(
                 function_name="keytao_create_phrase",
-                args={"word": state.word, "code": target_code},
+                args=_create_phrase_args(state, target_code),
             ),
             platform,
             user_id,
@@ -7773,6 +7855,7 @@ async def _handle_pending_add_word(
                 space_key,
                 owner_label,
                 state.code_remarks.get(target_code, ""),
+                state.needs_manual_review,
             )
         return await _execute_add_to_draft(
             state.word,
@@ -7782,6 +7865,7 @@ async def _handle_pending_add_word(
             space_key,
             owner_label,
             state.code_remarks.get(target_code, ""),
+            state.needs_manual_review,
         )
 
     if submit_after_add:
@@ -7793,12 +7877,13 @@ async def _handle_pending_add_word(
             space_key,
             owner_label,
             state.code_remarks.get(target_code, ""),
+            state.needs_manual_review,
         )
 
     return await _execute_confirmed_tool(
         PendingToolConfirm(
             function_name="keytao_create_phrase",
-            args={"word": state.word, "code": target_code},
+            args=_create_phrase_args(state, target_code),
         ),
         platform,
         user_id,
@@ -9995,6 +10080,7 @@ async def _handle_ai_chat_serialized(
                                 platform,
                                 user_id,
                                 remark=state.code_remarks.get(target_code, ""),
+                                needs_manual_review=state.needs_manual_review,
                                 auto_confirm=True,
                             ),
                             bot,

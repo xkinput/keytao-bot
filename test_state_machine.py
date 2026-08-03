@@ -8621,7 +8621,7 @@ def test_keytao_draft_headers_allow_optional_user_api_key():
         check("bot token header present", headers.get("X-Bot-Token") == "fake")
         check("content type header present", headers.get("Content-Type") == "application/json")
         check("optional matched user API key header present", headers.get("X-API-Key") == "kt_user_1001")
-        check("platform default API key supported", default_headers.get("X-API-Key") == "kt_default")
+        check("platform default API key is not reused", "X-API-Key" not in default_headers)
 
         _FakeConfig.keytao_user_api_keys = "{}"
         bot_only_headers = _draft_tools.get_bot_headers("qq", "3003")
@@ -9487,15 +9487,16 @@ def test_batch_review_retries_length_with_more_output_tokens():
             "timeout": 30.0,
             "temperature": 0.2,
         }
-        with patch.object(keytao_batch_review_module, "AsyncOpenAI", return_value=client):
-            with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
-                raw = await keytao_batch_review_module._call_llm(
-                    {"id": "retry-batch"},
-                    [{"id": 1, "action": "Create", "word": "雅鲁藏布", "code": "ylzb", "type": "Phrase"}],
-                    {"reviewedWords": {}},
-                    None,
-                    None,
-                )
+        with patch.object(keytao_batch_review_module, "AsyncOpenAI", new=object()):
+            with patch.object(keytao_batch_review_module, "get_llm_client", return_value=client):
+                with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
+                    raw = await keytao_batch_review_module._call_llm(
+                        {"id": "retry-batch"},
+                        [{"id": 1, "action": "Create", "word": "雅鲁藏布", "code": "ylzb", "type": "Phrase"}],
+                        {"reviewedWords": {}},
+                        None,
+                        None,
+                    )
 
         budgets = [call.get("max_tokens") for call in client.completions.calls]
         check("length response with parseable content is retried", len(budgets) == 2)
@@ -9570,15 +9571,16 @@ def test_batch_review_retries_incomplete_json_schema():
             {"id": 1, "action": "Create", "word": "甲词", "code": "abc", "type": "Phrase"},
             {"id": 2, "action": "Create", "word": "乙词", "code": "abd", "type": "Phrase"},
         ]
-        with patch.object(keytao_batch_review_module, "AsyncOpenAI", return_value=client):
-            with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
-                raw = await keytao_batch_review_module._call_llm(
-                    {"id": "schema-retry-batch"},
-                    items,
-                    {"reviewedWords": {}},
-                    None,
-                    None,
-                )
+        with patch.object(keytao_batch_review_module, "AsyncOpenAI", new=object()):
+            with patch.object(keytao_batch_review_module, "get_llm_client", return_value=client):
+                with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
+                    raw = await keytao_batch_review_module._call_llm(
+                        {"id": "schema-retry-batch"},
+                        items,
+                        {"reviewedWords": {}},
+                        None,
+                        None,
+                    )
 
         check("incomplete review JSON is retried", len(client.completions.calls) == 2)
         check(
@@ -9597,15 +9599,16 @@ def test_batch_review_retries_incomplete_json_schema():
             _FakeAIResponse("stop", sparse_payload),
             _FakeAIResponse("stop", sparse_payload),
         ])
-        with patch.object(keytao_batch_review_module, "AsyncOpenAI", return_value=sparse_client):
-            with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
-                fallback_raw, warnings = await keytao_batch_review_module._call_llm_chunked(
-                    {"id": "sparse-pass-batch"},
-                    items,
-                    {"reviewedWords": {}},
-                    None,
-                    None,
-                )
+        with patch.object(keytao_batch_review_module, "AsyncOpenAI", new=object()):
+            with patch.object(keytao_batch_review_module, "get_llm_client", return_value=sparse_client):
+                with patch.object(keytao_batch_review_module, "_llm_config", return_value=config):
+                    fallback_raw, warnings = await keytao_batch_review_module._call_llm_chunked(
+                        {"id": "sparse-pass-batch"},
+                        items,
+                        {"reviewedWords": {}},
+                        None,
+                        None,
+                    )
 
         fallback_review = keytao_batch_review_module._normalize_llm_review(
             fallback_raw,

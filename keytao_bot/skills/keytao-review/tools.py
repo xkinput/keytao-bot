@@ -1,44 +1,45 @@
 """KeyTao review skill tools."""
 from __future__ import annotations
 
+import itertools
 from typing import Any, Dict, List, Optional
 
 from nonebot.log import logger
 
+from keytao_bot.utils import http_client
 from keytao_bot.utils.keytao_review import (
     ReviewHttpConfig,
     audit_draft_items,
     can_llm_override_audit_issues,
     prepare_reviewed_word,
 )
+from keytao_bot.utils.review_flags import apply_manual_review_flag, read_manual_review_flag
 
 
 def get_keytao_url() -> str:
-    try:
-        from nonebot import get_driver
-        driver = get_driver()
-        config = driver.config
-        return getattr(config, "keytao_api_base", "https://keytao.vercel.app")
-    except Exception:
-        return "https://keytao.vercel.app"
+    """Thin wrapper over the shared HTTP config."""
+    return http_client.get_keytao_url()
 
 
 def get_bot_token() -> str:
-    try:
-        from nonebot import get_driver
-        driver = get_driver()
-        config = driver.config
-        return getattr(config, "bot_api_token", "") or ""
-    except Exception:
-        return ""
+    """Thin wrapper over the shared HTTP config."""
+    return http_client.get_bot_token() or ""
 
 
 def _review_config() -> ReviewHttpConfig:
     return ReviewHttpConfig(api_base=get_keytao_url(), bot_token=get_bot_token())
 
 
+# Preview items are never persisted, but the LLM pre-review keys items by id and
+# `_extract_items` drops anything without an int id — without one the preview
+# silently produced no verdict at all. Negative ids can never collide with a
+# real pull-request id.
+_preview_item_ids = itertools.count(-1, -1)
+
+
 def _preview_create_item(word: str, code: str) -> Dict[str, Any]:
     return {
+        "id": next(_preview_item_ids),
         "action": "Create",
         "word": word,
         "code": code,
@@ -72,10 +73,24 @@ async def _try_llm_auto_review_for_preview(
             review_item for review_item in review_items
             if isinstance(review_item, dict) and review_item.get("status") != "pass"
         ]
+        # A structured verdict is terminal. If the deterministic audit already
+        # sealed this item, an LLM "pass" must not write the flag back to false
+        # nor set autoApprove — the preview would then advertise auto-approval
+        # for something code has explicitly reserved for an admin.
+        if (
+            read_manual_review_flag(deterministic_audit) is True
+            and deterministic_audit.get("structuredManualReviewIssues")
+        ):
+            logger.info(
+                "[prepare_reviewed_add] structured manual-review verdict is terminal; "
+                "ignoring LLM preview override"
+            )
+            return None
+
         if ai_review.get("verdict") == "pass" and not non_pass_items and review_items:
             word = str(item.get("word") or "")
             code = str(item.get("code") or "")
-            return {
+            return apply_manual_review_flag({
                 **deterministic_audit,
                 "success": True,
                 "verdict": "pass",
@@ -86,21 +101,22 @@ async def _try_llm_auto_review_for_preview(
                 "llmReview": ai_review,
                 "llmFallback": True,
                 "previewOnly": True,
-            }
+            }, False, "语言常识、读音和编码检查一致")
 
         issues: List[str] = []
         for review_item in non_pass_items[:5]:
             reasons = review_item.get("reasons") if isinstance(review_item.get("reasons"), list) else []
             title = review_item.get("title") or f"PR#{review_item.get('prId')} 需要复核"
             issues.append(str(reasons[0] if reasons else title))
-        return {
+        resolved_issues = issues or deterministic_audit.get("issues", [])
+        return apply_manual_review_flag({
             **deterministic_audit,
             "summary": ai_review.get("headline") or deterministic_audit.get("summary", "存在不确定项，需要管理员审核"),
-            "issues": issues or deterministic_audit.get("issues", []),
+            "issues": resolved_issues,
             "llmReview": ai_review,
             "llmFallback": True,
             "previewOnly": True,
-        }
+        }, True, str(resolved_issues[0]) if resolved_issues else "存在不确定项，需要管理员审核")
     except Exception as error:
         logger.warning(f"[prepare_reviewed_add] LLM preview review failed: {error}")
         return None
@@ -153,14 +169,26 @@ async def keytao_prepare_reviewed_add(
             )
         except Exception as error:
             logger.warning(f"[prepare_reviewed_add] pre-submit audit failed: {error}")
-            review["preSubmitAudit"] = {
+            review["preSubmitAudit"] = apply_manual_review_flag({
                 "success": False,
                 "verdict": "needs_admin",
                 "autoApprove": False,
                 "summary": "加词前预审异常，提交时会重新审核",
                 "issues": [str(error)],
                 "previewOnly": True,
-            }
+            }, True, "加词前预审异常")
+
+    # Surface the pre-submit verdict on the top-level review payload so remark
+    # builders can read a code-generated boolean instead of parsing Chinese text.
+    pre_submit = review.get("preSubmitAudit")
+    if isinstance(pre_submit, dict):
+        flag = read_manual_review_flag(pre_submit)
+        if flag is None:
+            flag = not bool(pre_submit.get("autoApprove"))
+        reason = str(
+            (pre_submit.get("issues") or [""])[0] if flag else pre_submit.get("summary") or ""
+        )
+        apply_manual_review_flag(review, bool(flag), reason)
     return review
 
 

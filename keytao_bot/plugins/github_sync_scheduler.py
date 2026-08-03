@@ -3,14 +3,13 @@ Scheduled KeyTao GitHub dictionary sync checks.
 """
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, Iterable
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import httpx
-from nonebot import get_bots, get_driver
-from nonebot.adapters.onebot.v11 import Bot as QQBot
+from nonebot import get_driver
 from nonebot.log import logger
 
+from keytao_bot.utils import group_notify, http_client
 from keytao_bot.utils.github_sync_notification import build_github_sync_notification
 
 driver = get_driver()
@@ -56,16 +55,6 @@ def _parse_int(value: Any, default: int, minimum: int | None = None, maximum: in
     return parsed
 
 
-def _parse_group_ids(value: Any) -> list[str]:
-    if not value:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        items: Iterable[Any] = value
-    else:
-        items = str(value).replace("，", ",").split(",")
-    return [str(item).strip() for item in items if str(item).strip()]
-
-
 def _get_schedule_timezone() -> ZoneInfo:
     timezone_name = str(_config_value("keytao_sync_timezone", DEFAULT_SYNC_TIMEZONE)).strip() or DEFAULT_SYNC_TIMEZONE
     try:
@@ -87,35 +76,27 @@ def _seconds_until_next_run(now: datetime, hour: int, minute: int) -> float:
     return 24 * 60 * 60
 
 
-def _get_keytao_api_base() -> str:
-    return str(_config_value("keytao_api_base", "https://keytao.vercel.app")).rstrip("/")
-
-
 def _get_bot_token() -> str | None:
-    token = _config_value("bot_api_token")
-    return str(token).strip() if token else None
+    return http_client.get_bot_token()
 
 
 async def _call_auto_sync_endpoint(threshold: int) -> dict[str, Any]:
-    bot_token = _get_bot_token()
-    if not bot_token:
+    if not _get_bot_token():
         raise RuntimeError("BOT_API_TOKEN is not configured")
 
-    url = f"{_get_keytao_api_base()}/api/bot/sync-to-github/auto"
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        response = await client.post(
-            url,
-            headers={
-                "X-Bot-Token": bot_token,
-                "Content-Type": "application/json",
-            },
-            json={"threshold": threshold},
-        )
+    response = await http_client.keytao_request(
+        "POST",
+        "/api/bot/sync-to-github/auto",
+        json_body={"threshold": threshold},
+        timeout=180.0,
+    )
 
     try:
         data = response.json()
     except ValueError:
         data = {"message": response.text}
+    if not isinstance(data, dict):
+        data = {"message": str(data)}
 
     if response.status_code >= 400:
         data.setdefault("success", False)
@@ -126,24 +107,18 @@ async def _call_auto_sync_endpoint(threshold: int) -> dict[str, Any]:
     return data
 
 
-async def _send_group_notification(text: str) -> None:
-    group_ids = _parse_group_ids(_config_value("keytao_sync_notify_group_ids"))
+async def _notify_groups(text: str) -> None:
+    """Broadcast through the shared group helper (chunking + one retry included)."""
+    group_ids = group_notify.parse_group_ids(_config_value("keytao_sync_notify_group_ids"))
     if not group_ids:
         logger.warning("[github_sync_scheduler] KEYTAO_SYNC_NOTIFY_GROUP_IDS is empty, skip group notification")
         return
 
-    qq_bots = [bot for bot in get_bots().values() if isinstance(bot, QQBot)]
-    if not qq_bots:
-        logger.warning("[github_sync_scheduler] no QQ bot connected, cannot send group notification")
-        return
-
-    bot = qq_bots[0]
-    for group_id in group_ids:
-        try:
-            await bot.send_group_msg(group_id=int(group_id), message=text)
-            logger.info(f"[github_sync_scheduler] sent sync notification to QQ group {group_id}")
-        except Exception as exc:
-            logger.error(f"[github_sync_scheduler] failed to notify QQ group {group_id}: {exc}")
+    await group_notify.send_group_notification(
+        text,
+        group_ids,
+        log_prefix="[github_sync_scheduler]",
+    )
 
 
 def _build_notification(data: dict[str, Any]) -> str:
@@ -181,13 +156,13 @@ async def run_github_sync_check_once() -> dict[str, Any] | None:
         data = await _call_auto_sync_endpoint(threshold)
 
         if data.get("triggered") and data.get("prUrl"):
-            await _send_group_notification(_build_notification(data))
+            await _notify_groups(_build_notification(data))
         elif data.get("success") is False or data.get("httpStatus"):
             logger.error(
                 "[github_sync_scheduler] sync check failed: "
                 f"status={data.get('httpStatus')}, message={data.get('message')}"
             )
-            await _send_group_notification(_build_failure_notification(data))
+            await _notify_groups(_build_failure_notification(data))
         else:
             logger.info(
                 "[github_sync_scheduler] sync not triggered: "

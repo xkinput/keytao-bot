@@ -1,11 +1,16 @@
 """
 Keytao Docs Skill Tools
 键道文档查询工具实现 - 通过 GitHub Code Search API 搜索文档内容
+
+GitHub is a third-party host, so every fetch goes through the shared external
+client and its process-wide concurrency gate in
+:mod:`keytao_bot.utils.http_client`. ``httpx`` is never touched directly.
 """
 import os
-import httpx
 from typing import Dict, List
 from nonebot.log import logger
+
+from keytao_bot.utils import http_client
 
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -44,20 +49,21 @@ async def _list_all_md_paths() -> List[str]:
     result: List[str] = []
     dirs_to_visit = [""]  # start at repo root
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        while dirs_to_visit:
-            dir_path = dirs_to_visit.pop()
-            url = f"https://api.github.com/repos/{DOCS_REPO}/contents/{dir_path}".rstrip("/")
-            try:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                for item in resp.json():
-                    if item["type"] == "file" and item["name"].endswith(".md"):
-                        result.append(item["path"])
-                    elif item["type"] == "dir":
-                        dirs_to_visit.append(item["path"])
-            except Exception as e:
-                logger.warning(f"Contents API failed for {dir_path}: {e}")
+    client = await http_client.get_external_client()
+    while dirs_to_visit:
+        dir_path = dirs_to_visit.pop()
+        url = f"https://api.github.com/repos/{DOCS_REPO}/contents/{dir_path}".rstrip("/")
+        try:
+            async with http_client.external_fetch_semaphore():
+                resp = await client.get(url, timeout=10.0)
+            resp.raise_for_status()
+            for item in resp.json():
+                if item["type"] == "file" and item["name"].endswith(".md"):
+                    result.append(item["path"])
+                elif item["type"] == "dir":
+                    dirs_to_visit.append(item["path"])
+        except Exception as e:
+            logger.warning(f"Contents API failed for {dir_path}: {e}")
     return result
 
 
@@ -73,13 +79,14 @@ async def _search_docs(query: str) -> List[str]:
     url = "https://api.github.com/search/code"
     params = {"q": f"{query} repo:{DOCS_REPO} extension:md", "per_page": 5}
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, params=params, headers=_gh_headers())
-            resp.raise_for_status()
-            data = resp.json()
-            paths = [item["path"] for item in data.get("items", [])]
-            if paths:
-                return paths
+        client = await http_client.get_external_client()
+        async with http_client.external_fetch_semaphore():
+            resp = await client.get(url, params=params, headers=_gh_headers(), timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
+        paths = [item["path"] for item in data.get("items", [])]
+        if paths:
+            return paths
     except Exception as e:
         logger.warning(f"GitHub search failed: {e}")
 
@@ -93,10 +100,11 @@ async def _search_docs(query: str) -> List[str]:
 async def _fetch_raw(path: str) -> str:
     url = GITHUB_RAW_PREFIX + path
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return resp.text
+        client = await http_client.get_external_client()
+        async with http_client.external_fetch_semaphore():
+            resp = await client.get(url, timeout=15.0)
+        resp.raise_for_status()
+        return resp.text
     except Exception as e:
         logger.warning(f"Failed to fetch {path}: {e}")
         return ""

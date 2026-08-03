@@ -10,17 +10,18 @@ from nonebot.adapters import Bot, Event
 from nonebot.exception import FinishedException
 from nonebot.log import logger
 from nonebot.rule import Rule
-import httpx
 
-# Get configuration from NoneBot
+from keytao_bot.utils import http_client
+from keytao_bot.utils.http_client import KeytaoApiError
+
+# Configuration is read through the shared HTTP layer at call time, so a value
+# changed after startup is picked up and there is no local silent fallback.
 driver = get_driver()
 config = driver.config
-KEYTAO_API_BASE = getattr(config, "keytao_api_base", "https://keytao.vercel.app")
-BOT_API_TOKEN = getattr(config, "bot_api_token", None)
 
 # Debug log
-logger.info(f"[account_bind] KEYTAO_API_BASE: {KEYTAO_API_BASE}")
-logger.info(f"[account_bind] BOT_API_TOKEN loaded: {bool(BOT_API_TOKEN)}")
+logger.info(f"[account_bind] KEYTAO_API_BASE: {http_client.get_keytao_url()}")
+logger.info(f"[account_bind] BOT_API_TOKEN loaded: {bool(http_client.get_bot_token())}")
 
 GROUP_TRIGGER_KEYWORDS = ("键道", "喵喵")
 
@@ -211,53 +212,57 @@ async def _handle_bind(bot: Bot, event: Event, matcher):
         await matcher.finish(help_text)
         return
 
-    # Check if BOT_API_TOKEN is configured
-    if not BOT_API_TOKEN:
+    # Check if the bot token is configured
+    if not http_client.get_bot_token():
         logger.error("BOT_API_TOKEN not configured")
         await matcher.finish("❌ 机器人配置错误，请联系管理员")
         return
 
     # Call verify API
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{KEYTAO_API_BASE}/api/auth/link/verify",
-                headers={
-                    "X-Bot-Token": BOT_API_TOKEN,
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "key": key,
-                    "platform": platform,
-                    "platformId": platform_id
-                },
-                timeout=10.0
-            )
+        response = await http_client.keytao_request(
+            "POST",
+            "/api/auth/link/verify",
+            json_body={
+                "key": key,
+                "platform": platform,
+                "platformId": platform_id
+            },
+            timeout=10.0,
+        )
 
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("success"):
-                    user_name = data.get("userName", "")
-                    nickname = data.get("userNickname") or user_name
-                    await matcher.finish(
-                        f"✅ 绑定成功！\n\n"
-                        f"账号：{nickname}\n"
-                        f"现在你可以使用机器人创建词条了～ >w<"
-                    )
-                else:
-                    await matcher.finish(f"❌ {data.get('message', '绑定失败')}")
+        if response.status_code == 200:
+            data = response.json()
+            if data.get("success"):
+                user_name = data.get("userName", "")
+                nickname = data.get("userNickname") or user_name
+                await matcher.finish(
+                    f"✅ 绑定成功！\n\n"
+                    f"账号：{nickname}\n"
+                    f"现在你可以使用机器人创建词条了～ >w<"
+                )
             else:
-                try:
-                    error_data = response.json()
-                    message = error_data.get("message", "绑定失败")
-                except:
-                    message = "绑定失败"
-                await matcher.finish(f"❌ {message}")
+                await matcher.finish(f"❌ {data.get('message', '绑定失败')}")
+        else:
+            try:
+                error_data = response.json()
+                message = error_data.get("message", "绑定失败")
+            except ValueError:
+                message = "绑定失败"
+            await matcher.finish(f"❌ {message}")
 
-    except httpx.TimeoutException:
-        await matcher.finish("❌ 请求超时，请稍后重试")
     except FinishedException:
         raise  # Let NoneBot handle this, don't catch it
+    except KeytaoApiError as error:
+        # Redeeming a bind code is a one-shot write, so it is never retried
+        # automatically. The request may still have been applied server-side,
+        # so tell the user to check rather than to blindly retry with a code
+        # that may already be consumed.
+        logger.error(f"Bind request failed: {error}")
+        await matcher.finish(
+            "❌ 绑定请求没有得到确认，可能已经生效。\n"
+            "请先发送任意加词指令确认是否已绑定；若仍未绑定，请重新生成绑定码后再试。"
+        )
     except Exception as e:
         logger.error(f"Bind error: {e}")
         await matcher.finish("❌ 绑定失败，请稍后重试")

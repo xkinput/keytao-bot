@@ -3,12 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from nonebot import get_driver
 from nonebot.log import logger
 
 try:
@@ -16,12 +14,26 @@ try:
 except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
+from . import http_client
+from .http_client import KeytaoApiError
 from .keytao_review import (
+    LOOKUP_FAILURE_REASON,
     ReviewHttpConfig,
     audit_draft_items,
     fetch_keytao_encode,
+    get_llm_client,
+    llm_config,
     lookup_codes,
     prepare_reviewed_word,
+    reviewed_word_key,
+)
+from .review_flags import (
+    MANUAL_REVIEW_FIELD,
+    MANUAL_REVIEW_REASON_FIELD,
+    apply_manual_review_flag,
+    item_requires_manual_review,
+    manual_review_reason,
+    read_manual_review_flag,
 )
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 
@@ -30,14 +42,7 @@ ReviewItem = Dict[str, Any]
 
 
 def _config_value(name: str, env_name: str, default: Any = None) -> Any:
-    try:
-        config = get_driver().config
-        value = getattr(config, name, None)
-        if value not in (None, ""):
-            return value
-    except Exception:
-        pass
-    return os.getenv(env_name, default)
+    return http_client.config_value(name, env_name, default)
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -55,52 +60,30 @@ def _as_float(value: Any, default: float) -> float:
 
 
 def _review_config() -> ReviewHttpConfig:
+    """Thin wrapper over the shared HTTP config (the real values are read at request time)."""
     return ReviewHttpConfig(
-        api_base=str(_config_value("keytao_api_base", "KEYTAO_API_BASE", "https://keytao.vercel.app")).rstrip("/"),
-        bot_token=str(_config_value("bot_api_token", "BOT_API_TOKEN", "") or ""),
+        api_base=http_client.get_keytao_url(),
+        bot_token=http_client.get_bot_token() or "",
     )
 
 
 def _llm_config() -> Dict[str, Any]:
-    timeout_value = (
-        _config_value("openai_timeout", "OPENAI_TIMEOUT", None)
-        or _config_value("gemini_timeout", "GEMINI_TIMEOUT", None)
-        or _config_value("ark_timeout", "ARK_TIMEOUT", None)
-        or 180
-    )
-    temperature_value = (
-        _config_value("openai_temperature", "OPENAI_TEMPERATURE", None)
-        or _config_value("gemini_temperature", "GEMINI_TEMPERATURE", None)
-        or _config_value("ark_temperature", "ARK_TEMPERATURE", None)
-        or 0.2
-    )
-    max_tokens = min(max(_as_int(_config_value("openai_max_tokens", "OPENAI_MAX_TOKENS", 2500), 2500), 2500), 6000)
-    return {
-        "api_key": str(_config_value("openai_api_key", "OPENAI_API_KEY", "") or ""),
-        "base_url": str(
-            _config_value("openai_base_url", "OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-        ),
-        "model": str(
-            _config_value("keytao_review_model", "KEYTAO_REVIEW_MODEL", "")
-            or _config_value("openai_model", "OPENAI_MODEL", "gemini-2.0-flash")
-        ),
-        "max_tokens": max_tokens,
-        "max_tokens_cap": min(max(_as_int(
-            _config_value("keytao_review_max_tokens_cap", "KEYTAO_REVIEW_MAX_TOKENS_CAP", 12000),
-            12000,
-        ), max_tokens), 16000),
-        "timeout": _as_float(timeout_value, 180.0),
-        "temperature": _as_float(temperature_value, 0.2),
-    }
+    """Single source of truth: delegates to :func:`keytao_review.llm_config`."""
+    return llm_config()
 
 
 def _deterministic_audit_timeout() -> float:
-    value = _config_value(
-        "keytao_batch_review_audit_timeout",
-        "KEYTAO_BATCH_REVIEW_AUDIT_TIMEOUT",
-        25,
+    """Overall budget for the deterministic audit of a whole batch.
+
+    The old hard-coded 25s could not cover a batch whose per-item budget alone
+    is 30s, so any non-trivial batch fell into the degraded fallback.
+    """
+    value = http_client.config_value(
+        "keytao_batch_review_total_timeout",
+        "KEYTAO_BATCH_REVIEW_TOTAL_TIMEOUT",
+        180,
     )
-    return max(5.0, _as_float(value, 25.0))
+    return max(30.0, _as_float(value, 180.0))
 
 
 def _review_chunk_size() -> int:
@@ -159,14 +142,101 @@ def _extract_items(batch: Dict[str, Any]) -> List[ReviewItem]:
             "conflictReason": _string(raw.get("conflictReason")),
             "conflictInfo": raw.get("conflictInfo") if isinstance(raw.get("conflictInfo"), dict) else None,
         })
+        # The structured manual-review verdict MUST survive this rebuild. It is
+        # what stops an LLM "pass" from reopening a decision code already
+        # sealed; dropping it here silently disarms that clamp downstream.
+        flag = read_manual_review_flag(raw)
+        if flag is not None:
+            apply_manual_review_flag(items[-1], flag, manual_review_reason(raw))
     return items
 
 
+# Progressively harsher structural trim levels: (max list items, max string
+# length, keys whose verbose detail payload is dropped entirely).
+_COMPACT_TRIM_LEVELS: Tuple[Tuple[int, int, Tuple[str, ...]], ...] = (
+    (8, 400, ()),
+    (6, 240, ("phrases", "hits")),
+    (4, 160, ("phrases", "hits", "rawSignals", "searchQueries")),
+    (3, 100, ("phrases", "hits", "rawSignals", "searchQueries", "sources", "evidence", "chars")),
+    (2, 60, (
+        "phrases", "hits", "rawSignals", "searchQueries", "sources", "evidence", "chars",
+        "commonness", "candidateStatuses", "currentOrder", "recommendedOrder", "sourcePolicy",
+    )),
+    (1, 30, (
+        "phrases", "hits", "rawSignals", "searchQueries", "sources", "evidence", "chars",
+        "commonness", "candidateStatuses", "currentOrder", "recommendedOrder", "sourcePolicy",
+        "commonnessComparisons", "wordPurposeReviews", "codeChainPriorityReviews", "reviewedWords",
+    )),
+)
+
+_COMPACT_MAX_DEPTH = 12
+
+
+def _trim_structure(value: Any, max_list: int, max_str: int, drop_keys: Sequence[str], depth: int = 0) -> Any:
+    if depth >= _COMPACT_MAX_DEPTH:
+        return "…"
+    if isinstance(value, dict):
+        trimmed: Dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in drop_keys:
+                if isinstance(item, list):
+                    trimmed[key_text] = {"_omitted": len(item)}
+                elif item not in (None, "", {}):
+                    trimmed[key_text] = "…"
+                continue
+            trimmed[key_text] = _trim_structure(item, max_list, max_str, drop_keys, depth + 1)
+        return trimmed
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+        kept = [
+            _trim_structure(item, max_list, max_str, drop_keys, depth + 1)
+            for item in items[:max_list]
+        ]
+        if len(items) > max_list:
+            kept.append({"_truncated": len(items) - max_list})
+        return kept
+    if isinstance(value, str):
+        return value if len(value) <= max_str else value[:max_str] + "…"
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    text = str(value)
+    return text if len(text) <= max_str else text[:max_str] + "…"
+
+
 def _compact_json(value: Any, max_chars: int = 18000) -> str:
+    """Serialise ``value`` to JSON that is ALWAYS parseable and within ``max_chars``.
+
+    Slicing the serialized string mid-way produced invalid JSON for the LLM, so
+    trimming is structural: verbose detail lists are dropped, long arrays are
+    truncated with a ``{"_truncated": n}`` marker, and long strings are clipped,
+    repeating with harsher limits until the payload fits.
+    """
     text = json.dumps(value, ensure_ascii=False, default=str)
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "...(truncated)"
+
+    for max_list, max_str, drop_keys in _COMPACT_TRIM_LEVELS:
+        candidate = json.dumps(
+            _trim_structure(value, max_list, max_str, drop_keys),
+            ensure_ascii=False,
+            default=str,
+        )
+        if len(candidate) <= max_chars:
+            return candidate
+
+    # Last resort: a valid JSON object carrying as much of a preview as fits.
+    preview_len = max_chars
+    while preview_len > 0:
+        preview_len //= 2
+        candidate = json.dumps(
+            {"_truncated": True, "preview": text[:preview_len]},
+            ensure_ascii=False,
+        )
+        if len(candidate) <= max_chars:
+            return candidate
+    marker = json.dumps({"_truncated": True}, ensure_ascii=False)
+    return marker if len(marker) <= max_chars else "{}"
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
@@ -292,7 +362,29 @@ def _pinyin_from_encode_chars(encode_data: Dict[str, Any]) -> str:
     return " ".join(pinyins)
 
 
+# The degraded fallback runs AFTER the deterministic audit already blew its
+# budget, so it gets a small budget of its own and degrades further on timeout.
+FALLBACK_AUDIT_BUDGET = 10.0
+FALLBACK_REVIEW_CONCURRENCY = 3
+
+
 async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[ReviewItem], reason: str) -> Dict[str, Any]:
+    try:
+        return await asyncio.wait_for(
+            _fallback_audit_with_encode_inner(config, items, reason),
+            timeout=FALLBACK_AUDIT_BUDGET,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"KeyTao encode-only fallback audit exceeded {FALLBACK_AUDIT_BUDGET:.0f}s; degrading further"
+        )
+        return _fallback_audit_for_llm(
+            items,
+            f"{reason}；降级候选链重建也超过 {FALLBACK_AUDIT_BUDGET:.0f} 秒",
+        )
+
+
+async def _fallback_audit_with_encode_inner(config: ReviewHttpConfig, items: Sequence[ReviewItem], reason: str) -> Dict[str, Any]:
     move_pairs = _move_pairs(items)
     words: List[str] = []
     for item in items:
@@ -303,16 +395,27 @@ async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[
         if word and word not in words:
             words.append(word)
 
+    # Bounded concurrency: the outer wait_for caps total cost, this caps the
+    # instantaneous outbound load.
+    review_semaphore = asyncio.Semaphore(FALLBACK_REVIEW_CONCURRENCY)
+
+    async def review_word(word: str) -> Any:
+        async with review_semaphore:
+            return await prepare_reviewed_word(config, word)
+
     review_results = await asyncio.gather(
-        *(prepare_reviewed_word(config, word) for word in words),
+        *(review_word(word) for word in words),
         return_exceptions=True,
     )
     reviewed_words: Dict[str, Dict[str, Any]] = {}
     fallback_words: List[str] = []
+    lookup_failed = False
     for word, result in zip(words, review_results):
-        if isinstance(result, Exception) or not result.get("success") or not _review_candidate_codes(result):
+        if isinstance(result, BaseException) or not result.get("success") or not _review_candidate_codes(result):
             fallback_words.append(word)
             continue
+        if result.get("lookupFailed"):
+            lookup_failed = True
         reviewed_words[word] = result
 
     encode_results = await asyncio.gather(
@@ -322,7 +425,7 @@ async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[
     encode_by_word: Dict[str, Dict[str, Any]] = {}
     all_codes: List[str] = []
     for word, result in zip(fallback_words, encode_results):
-        if isinstance(result, Exception):
+        if isinstance(result, BaseException):
             encode_by_word[word] = {"success": False, "message": str(result)}
             continue
         encode_by_word[word] = result
@@ -330,29 +433,48 @@ async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[
             if code not in all_codes:
                 all_codes.append(code)
 
+    code_map: Dict[str, List[Dict[str, Any]]] = {}
     try:
         code_map = await lookup_codes(config, all_codes)
-    except Exception:
-        code_map = {}
+    except KeytaoApiError as error:
+        logger.warning(f"Fallback code occupancy lookup failed: {error}")
+        lookup_failed = True
+    except Exception as error:
+        logger.warning(f"Fallback code occupancy lookup failed: {error}")
+        lookup_failed = True
 
     for word, encode_data in encode_by_word.items():
         candidate_codes = _encode_candidate_codes(encode_data)
         statuses = [
             {
                 "code": code,
-                "occupied": bool(code_map.get(code)),
-                "label": _status_label(code_map.get(code, [])),
-                "phrases": code_map.get(code, []),
+                # A failed lookup is unknown, not free.
+                "occupied": None if lookup_failed else bool(code_map.get(code)),
+                "label": "占位未知（词库查询失败）" if lookup_failed else _status_label(code_map.get(code, [])),
+                "phrases": [] if lookup_failed else code_map.get(code, []),
+                **({"lookupFailed": True} if lookup_failed else {}),
             }
             for code in candidate_codes
         ]
-        recommended = next((item["code"] for item in statuses if not item["occupied"]), candidate_codes[0] if candidate_codes else "")
-        reviewed_words[word] = {
+        recommended = (
+            ""
+            if lookup_failed
+            else next(
+                (item["code"] for item in statuses if not item["occupied"]),
+                candidate_codes[0] if candidate_codes else "",
+            )
+        )
+        reviewed_words[word] = apply_manual_review_flag({
             "success": bool(candidate_codes),
             "word": word,
             "autoReviewable": False,
-            "autoReviewReason": "读音优先级复核失败，仅保留 keytao_encode 默认候选链供 LLM 复审",
+            "autoReviewReason": (
+                LOOKUP_FAILURE_REASON
+                if lookup_failed
+                else "读音优先级复核失败，仅保留 keytao_encode 默认候选链供 LLM 复审"
+            ),
             "encodeOnly": True,
+            "lookupFailed": lookup_failed,
             "keytaoEncode": {
                 "candidateCodes": candidate_codes,
                 "candidateStatuses": statuses[:12],
@@ -365,14 +487,20 @@ async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[
                     "pinyin": _pinyin_from_encode_chars(encode_data),
                     "normalized": [],
                     "codes": candidate_codes,
-                    "sources": [{"source": "keytao_encode", "url": config.api_base}],
+                    # No fabricated source entry here: pointing at our own API is
+                    # not evidence of anything.
+                    "sources": [],
                     "score": 0,
                     "fallback": True,
                     "candidateStatuses": statuses[:12],
                     "recommendedCode": recommended,
                 }
             ] if candidate_codes else [],
-        }
+        }, True, (
+            LOOKUP_FAILURE_REASON
+            if lookup_failed
+            else "降级候选链，只能交由管理员/LLM 复审"
+        ))
 
     issues: List[str] = []
     approved_items: List[str] = []
@@ -405,12 +533,23 @@ async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[
             available = ", ".join(candidate_codes[:8])
             issues.append(f"「{word}」编码 {code} 不在 keytao_encode 候选链中，可选：{available or '无'}")
 
-    return {
+    sealed_issues: List[str] = []
+    if lookup_failed:
+        # "Unknown occupancy" is a sealed terminal state: an LLM pass must not
+        # be able to reinterpret it as "the code is free".
+        lookup_issue = f"{LOOKUP_FAILURE_REASON}，本批次不能自动通过"
+        issues.append(lookup_issue)
+        sealed_issues.append(lookup_issue)
+
+    # Nothing produced by this degraded path is ever auto-approvable.
+    return apply_manual_review_flag({
         "success": True,
         "verdict": "needs_admin",
         "autoApprove": False,
+        "autoReviewable": False,
         "summary": "完整来源审查超时，本喵已并行按读音优先级重建候选链并交由 LLM 继续复审",
         "issues": issues or [reason],
+        "structuredManualReviewIssues": sealed_issues,
         "approvedItems": approved_items,
         "commonKnownItems": [],
         "reviewedWords": reviewed_words,
@@ -418,6 +557,7 @@ async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[
         "deterministicAuditTimedOut": True,
         "contextualPronunciationFallback": True,
         "deterministicAuditReason": reason,
+        "lookupFailed": lookup_failed,
         "sourcePolicy": {
             "note": (
                 "本次管理员复查未等完全部网页来源抓取；已按权威来源、实体语境、百科实体全称、"
@@ -425,7 +565,7 @@ async def _fallback_audit_with_encode(config: ReviewHttpConfig, items: Sequence[
                 "CSS 短码表或 KeyTao 文档为准，禁止按通用双拼盲猜。"
             ),
         },
-    }
+    }, True, LOOKUP_FAILURE_REASON if lookup_failed else reason)
 
 
 def _fallback_audit_for_llm(items: Sequence[ReviewItem], reason: str) -> Dict[str, Any]:
@@ -445,10 +585,11 @@ def _fallback_audit_for_llm(items: Sequence[ReviewItem], reason: str) -> Dict[st
             continue
         approved_items.append(f"{action}：{word}@{code} 交由 LLM 结合语言常识、编码链和本地冲突继续复审")
 
-    return {
+    return apply_manual_review_flag({
         "success": True,
         "verdict": "needs_admin",
         "autoApprove": False,
+        "autoReviewable": False,
         "summary": "来源抓取超时，本喵已改用 LLM 继续复审",
         "issues": issues or [reason],
         "approvedItems": approved_items,
@@ -460,7 +601,7 @@ def _fallback_audit_for_llm(items: Sequence[ReviewItem], reason: str) -> Dict[st
         "sourcePolicy": {
             "note": "本次管理员复查未等完网页来源抓取，LLM 仍需按读音、编码、冲突和编码链保守判断。",
         },
-    }
+    }, True, reason)
 
 
 def _normalize_status(value: Any) -> str:
@@ -514,18 +655,52 @@ def _contains_generic_encoding_guess(values: Sequence[str]) -> bool:
     return any(marker in text for marker in _GENERIC_ENCODING_GUESS_MARKERS)
 
 
-def _audit_supports_item_code(audit: Optional[Dict[str, Any]], word: str, code: str) -> bool:
-    return _audit_pronunciation_for_item_code(audit, word, code) is not None
+def _reviewed_word_entry(
+    audit: Optional[Dict[str, Any]],
+    word: str,
+    phrase_type: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Read a reviewedWords entry, tolerating both key formats.
+
+    ``audit_draft_items`` keys by ``"word@type"``; the degraded fallbacks and
+    keytao-draft's own fallback still key by plain word.
+    """
+    if not isinstance(audit, dict) or not word:
+        return None
+    reviewed = audit.get("reviewedWords")
+    if not isinstance(reviewed, dict):
+        return None
+    if phrase_type:
+        entry = reviewed.get(reviewed_word_key(word, phrase_type))
+        if isinstance(entry, dict):
+            return entry
+    entry = reviewed.get(word)
+    if isinstance(entry, dict):
+        return entry
+    for key, value in reviewed.items():
+        if isinstance(key, str) and key.split("@", 1)[0] == word and isinstance(value, dict):
+            return value
+    return None
+
+
+def _audit_supports_item_code(
+    audit: Optional[Dict[str, Any]],
+    word: str,
+    code: str,
+    phrase_type: str = "",
+) -> bool:
+    return _audit_pronunciation_for_item_code(audit, word, code, phrase_type) is not None
 
 
 def _audit_pronunciation_for_item_code(
     audit: Optional[Dict[str, Any]],
     word: str,
     code: str,
+    phrase_type: str = "",
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(audit, dict) or not word or not code:
         return None
-    review = (audit.get("reviewedWords") or {}).get(word)
+    review = _reviewed_word_entry(audit, word, phrase_type)
     if not isinstance(review, dict):
         return None
     for pronunciation in review.get("pronunciations", []):
@@ -674,10 +849,11 @@ def _normalize_llm_review(
                 reasons.insert(0, conflict_reason)
             suggestions.insert(0, "先解决冲突，再决定是否批准。")
 
+        phrase_type = _string(pr.get("type") or "Phrase") or "Phrase"
         sources = _list_of_strings(raw_item.get("sources"), limit=8)
         evidence = _list_of_strings(raw_item.get("evidence"), limit=8)
         pronunciation = _string(raw_item.get("pronunciation"))
-        audit_pronunciation = _audit_pronunciation_for_item_code(audit, word, code)
+        audit_pronunciation = _audit_pronunciation_for_item_code(audit, word, code, phrase_type)
         context_pronunciation = (
             audit_pronunciation.get("contextPronunciation")
             if isinstance(audit_pronunciation, dict)
@@ -705,16 +881,12 @@ def _normalize_llm_review(
         contradicts_context_pronunciation = bool(
             context_corrected and _contains_context_default_misread(combined_review_text)
         )
+        # Substring matches on LLM prose may only DOWNGRADE a verdict or filter
+        # bogus evidence text. They must never upgrade an item to "pass": only
+        # structured fields are allowed to do that.
         if _contains_generic_encoding_guess(combined_review_text) or contradicts_context_pronunciation:
-            has_hard_blocker = (
-                (pr.get("action") == "Delete" and (word, code) not in move_pairs)
-                or bool(pr.get("hasConflict"))
-                or (isinstance(pr.get("conflictInfo"), dict) and pr["conflictInfo"].get("hasConflict"))
-            )
-            if _audit_supports_item_code(audit, word, code):
-                if not has_hard_blocker:
-                    status = "pass"
-                    normalized_title = "本喵建议通过"
+            if _audit_supports_item_code(audit, word, code, phrase_type):
+                status = "pass"
                 reasons = [
                     f"确定性审词候选链包含 {code}，编码按键道规则可推出；"
                     + ("本喵已采用实体语境纠正后的真实读音。" if context_corrected else "本喵已忽略脱离键道规则的错误推导。")
@@ -745,7 +917,21 @@ def _normalize_llm_review(
                     *[line for line in evidence if not _contains_generic_encoding_guess([line])],
                 ]
 
-        normalized_items.append({
+        # A structured verdict is terminal: when code stamped this item
+        # needsManualReview, no LLM verdict may downgrade it to "pass".
+        item_manual_flag = item_requires_manual_review(pr)
+        if item_manual_flag is True and status != "manual_review":
+            status = "manual_review"
+            normalized_title = "本喵建议复核"
+            reason = manual_review_reason(pr)
+            reasons.insert(
+                0,
+                f"该条目已被结构化审核标记为需管理员审核{('：' + reason) if reason else ''}，"
+                "复审结论不能推翻该标记。",
+            )
+            suggestions.insert(0, "请管理员按结构化审核记录确认后再决定是否批准。")
+
+        normalized_item = {
             "prId": pr_id,
             "status": status,
             "severity": _severity_for_status(status),
@@ -760,7 +946,15 @@ def _normalize_llm_review(
                 "sources": sources,
                 "evidence": list(dict.fromkeys(evidence))[:8] or ["本喵已调用 LLM 完成复审。"],
             },
-        })
+        }
+        # Write the structured verdict back onto the normalized item so the
+        # flag survives the LLM round-trip instead of being silently dropped.
+        apply_manual_review_flag(
+            normalized_item,
+            item_manual_flag or status == "manual_review",
+            manual_review_reason(pr),
+        )
+        normalized_items.append(normalized_item)
 
     chain_recommendations = raw.get("codeChainRecommendations")
     chain_by_key: Dict[str, List[str]] = {}
@@ -848,10 +1042,21 @@ def _normalize_llm_review(
             for item in normalized_items[:12]
         )
 
+    # An audit-level seal (failed lookup, structured manual-review issues) makes
+    # the whole batch non-auto-approvable, independent of any per-item verdict.
+    audit_sealed = bool(
+        isinstance(audit, dict)
+        and (audit.get("structuredManualReviewIssues") or audit.get("lookupFailed"))
+    )
+    if audit_sealed and verdict == "pass":
+        verdict = "manual_review"
+        headline = "确定性审查存在需管理员确认的封存项，本批次不能自动通过。" + headline
+
     return {
         "reviewer": "Miaomiao",
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "verdict": verdict,
+        "auditSealed": audit_sealed,
         "headline": headline,
         "suggestedReviewNote": suggested_note,
         "riskCounts": {
@@ -944,14 +1149,22 @@ def _compact_audit_for_items(audit: Dict[str, Any], items: Sequence[ReviewItem])
             "deterministicAuditReason",
             "contextualPronunciationFallback",
             "sourcePolicy",
+            # Sealing fields MUST survive compaction: the sharded LLM call and
+            # the clamp downstream both read them, and dropping them here is a
+            # silent disarm of exactly the same shape as the _extract_items bug.
+            MANUAL_REVIEW_FIELD,
+            MANUAL_REVIEW_REASON_FIELD,
+            "structuredManualReviewIssues",
+            "lookupFailed",
         )
         if key in audit
     }
     reviewed_words = audit.get("reviewedWords") if isinstance(audit.get("reviewedWords"), dict) else {}
+    # Keys may be "word" (legacy fallbacks) or "word@type" (audit_draft_items).
     compact["reviewedWords"] = {
-        word: reviewed_words[word]
-        for word in words
-        if word in reviewed_words
+        key: value
+        for key, value in reviewed_words.items()
+        if isinstance(key, str) and (key in words or key.split("@", 1)[0] in words)
     }
     for key in (
         "commonKnownItems",
@@ -1040,11 +1253,14 @@ def _merge_raw_chunk_reviews(reviews: Sequence[Dict[str, Any]]) -> Dict[str, Any
     return merged
 
 
+_LLM_RETRY_BACKOFF_BASE = 0.5
+
+
 def _validate_llm_review_payload(
     payload: Dict[str, Any],
     items: Sequence[ReviewItem],
 ) -> Dict[str, Any]:
-    """Require one valid review decision for every requested PR before accepting output."""
+    """Require one complete review decision for every requested PR."""
     raw_items = payload.get("items")
     if not isinstance(raw_items, list):
         raise ValueError("review JSON must contain an items array")
@@ -1089,11 +1305,12 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
     if not config["api_key"] or AsyncOpenAI is None:
         raise RuntimeError("喵喵 LLM 未配置，无法完整复审")
 
-    client = AsyncOpenAI(
-        api_key=config["api_key"],
-        base_url=config["base_url"],
-        timeout=config["timeout"],
-        max_retries=0,
+    # Reused, lazily created singleton keyed by (base_url, api_key).
+    client = get_llm_client(
+        AsyncOpenAI,
+        config["base_url"],
+        config["api_key"],
+        config["timeout"],
     )
     system_prompt = (
         "你是键道输入法审词员喵喵。你必须根据给定证据做保守、专业的中文词语审核。"
@@ -1171,27 +1388,40 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
         config["max_tokens_cap"],
     )
 
-    for attempt in range(1, 4):
+    attempts = 3
+    for attempt in range(1, attempts + 1):
         prompt = system_prompt
         if attempt > 1:
             prompt += (
                 "上一次响应为空或不是合法 JSON。现在必须重新生成一个完整 JSON 对象，"
                 "不要解释，不要省略 items；进一步压缩文字，每项只写最关键的一条理由和建议。"
             )
-        response = await client.chat.completions.create(**with_deepseek_chat_policy(
-            {
-                "model": config["model"],
-                "temperature": min(config["temperature"], 0.2),
-                "max_tokens": current_max_tokens,
-                "messages": [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": user_content},
-                ],
-            },
-            thinking=True,
-            reasoning_effort="high",
-            json_output=True,
-        ))
+        try:
+            response = await client.chat.completions.create(**with_deepseek_chat_policy(
+                {
+                    "model": config["model"],
+                    "temperature": min(config["temperature"], 0.2),
+                    "max_tokens": current_max_tokens,
+                    "messages": [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                },
+                thinking=True,
+                reasoning_effort="high",
+                json_output=True,
+            ))
+        except Exception as error:
+            # Transport-level failures (connection reset, timeout, rate limit)
+            # share the same attempt budget as empty/invalid responses.
+            last_error = error
+            logger.warning(
+                f"KeyTao LLM batch review transport error attempt={attempt}: "
+                f"{type(error).__name__}: {error}"
+            )
+            if attempt < attempts:
+                await asyncio.sleep(_LLM_RETRY_BACKOFF_BASE * (2 ** (attempt - 1)))
+            continue
         log_chat_usage(
             logger,
             response,

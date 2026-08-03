@@ -27,6 +27,23 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_stored_timestamp(value: object) -> Optional[datetime]:
+    """Parse current and legacy SQLite timestamps as aware UTC values."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 @dataclass(frozen=True)
 class HistoryGenerationToken:
     """Persistent fence captured before a potentially slow conversation turn."""

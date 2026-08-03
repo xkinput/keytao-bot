@@ -1,63 +1,60 @@
+"""User resolver utility for bot.
+
+Finds keytao-next users by platform ID.
+
+Configuration is read at CALL time through :mod:`keytao_bot.utils.http_client`
+(lower-case driver attribute + ``os.getenv`` fallback). Reading it at import
+time is wrong twice over: NoneBot lower-cases every config key it loads, and the
+driver may not be configured yet when this module is first imported.
 """
-User resolver utility for bot
-Finds users by platform ID
-"""
-import httpx
-from nonebot import get_driver
+from __future__ import annotations
+
+from typing import Any, Dict, Optional
+
 from nonebot.log import logger
-from typing import Optional, Dict, Any
 
-# Get configuration from NoneBot
-driver = get_driver()
-config = driver.config
-KEYTAO_API_BASE = getattr(config, "KEYTAO_API_BASE", "https://keytao.vercel.app")
-BOT_API_TOKEN = getattr(config, "BOT_API_TOKEN", None)
+from . import http_client
 
-# Debug log
-logger.info(f"[user_resolver] KEYTAO_API_BASE: {KEYTAO_API_BASE}")
-logger.info(f"[user_resolver] BOT_API_TOKEN loaded: {bool(BOT_API_TOKEN)}")
+
+# Startup diagnostics. These call the shared helpers so the logged values are
+# the same ones the request path will use.
+logger.info(f"[user_resolver] KEYTAO_API_BASE: {http_client.get_keytao_url()}")
+logger.info(f"[user_resolver] BOT_API_TOKEN loaded: {bool(http_client.get_bot_token())}")
 
 
 async def find_user_by_platform(platform: str, platform_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Find user by platform ID
-    
+    """Find user by platform ID.
+
     Args:
         platform: 'qq' or 'telegram'
         platform_id: Platform user ID
-        
+
     Returns:
-        User info dict or None
+        User info dict, or ``None`` when the user is unknown or the lookup failed.
     """
-    if not BOT_API_TOKEN:
+    if not http_client.get_bot_token():
         logger.error("BOT_API_TOKEN not configured")
         return None
-    
+
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{KEYTAO_API_BASE}/api/bot/user/find",
-                headers={
-                    "X-Bot-Token": BOT_API_TOKEN,
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "platform": platform,
-                    "platformId": platform_id
-                },
-                timeout=10.0
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("found"):
-                    return data.get("user")
-            
-            return None
-
-    except Exception as e:
-        logger.error(f"Find user error: {e}")
+        data = await http_client.keytao_json(
+            "POST",
+            "/api/bot/user/find",
+            json_body={
+                "platform": platform,
+                "platformId": platform_id,
+            },
+            timeout=10.0,
+            # Read-only lookup despite the POST verb: safe to replay.
+            idempotent=True,
+        )
+    except Exception as error:
+        logger.error(f"Find user error: {error}")
         return None
+
+    if data.get("found"):
+        return data.get("user")
+    return None
 
 
 def get_not_bound_message() -> str:

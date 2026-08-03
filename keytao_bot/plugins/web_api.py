@@ -137,7 +137,6 @@ try:
     _app.add_middleware(
         CORSMiddleware,
         allow_origins=WEB_CORS_ORIGINS,
-        allow_origin_regex=r"https?://.*",
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=[
             "Authorization",

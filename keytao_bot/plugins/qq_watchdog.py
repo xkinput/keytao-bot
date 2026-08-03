@@ -23,6 +23,7 @@ NOTIFY_CHAT_ID = getattr(config, "notify_tg_chat_id", None)
 RECONNECT_GRACE = 90   # seconds to wait before treating no-reconnect as real offline
 LOGIN_VERIFY_DELAY = 5  # seconds after reconnect before verifying login
 HEARTBEAT_INTERVAL = 60  # seconds between periodic login checks
+LOGIN_INFO_TIMEOUT = 10  # seconds before a wedged bot is treated as unhealthy
 
 _tg_bots = getattr(config, "telegram_bots", None)
 if _tg_bots:
@@ -31,8 +32,8 @@ if _tg_bots:
         bots = json.loads(_tg_bots) if isinstance(_tg_bots, str) else _tg_bots
         if bots:
             TELEGRAM_TOKEN = bots[0].get("token")
-    except Exception:
-        pass
+    except (ValueError, TypeError, AttributeError, IndexError, KeyError) as error:
+        logger.warning(f"[watchdog] cannot read telegram_bots config, TG alerts disabled: {error}")
 
 # pending tasks: bot_id -> asyncio.Task
 _pending: dict[str, asyncio.Task] = {}
@@ -40,6 +41,22 @@ _pending: dict[str, asyncio.Task] = {}
 _reported_offline: set[str] = set()
 # heartbeat task
 _heartbeat_task: asyncio.Task | None = None
+# strong references to fire-and-forget tasks, so the event loop cannot collect
+# them mid-flight (asyncio only keeps weak references to running tasks)
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_task(coro) -> asyncio.Task:
+    """Create a background task and keep a strong reference until it finishes."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+async def _get_login_info(bot: QQBot) -> dict:
+    """Fetch login info, treating a wedged bot as a failure instead of hanging."""
+    return await asyncio.wait_for(bot.get_login_info(), timeout=LOGIN_INFO_TIMEOUT)
 
 
 async def _send_tg(text: str):
@@ -74,7 +91,7 @@ async def _verify_login_after_reconnect(bot: QQBot, bot_id: str):
     """
     await asyncio.sleep(LOGIN_VERIFY_DELAY)
     try:
-        info = await bot.get_login_info()
+        info = await _get_login_info(bot)
         if not info.get("user_id"):
             raise ValueError("empty user_id in login info")
         logger.info(f"[watchdog] QQ bot {bot_id} login verified after reconnect (uid={info['user_id']})")
@@ -103,12 +120,23 @@ async def _heartbeat_loop():
             if bot_id in _pending:
                 continue
             try:
-                info = await bot.get_login_info()
+                # One wedged bot must not stall the heartbeat for the others.
+                info = await _get_login_info(bot)
                 if not info.get("user_id"):
                     raise ValueError("empty user_id")
                 if bot_id in _reported_offline:
                     logger.info(f"[watchdog] QQ bot {bot_id} recovered (heartbeat)")
                     _reported_offline.discard(bot_id)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[watchdog] heartbeat check for {bot_id} timed out after "
+                    f"{LOGIN_INFO_TIMEOUT}s, treating as unhealthy"
+                )
+                if bot_id not in _reported_offline:
+                    _reported_offline.add(bot_id)
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    msg = f"⚠️ QQ bot 账号无响应！\n账号：{bot_id}\n时间：{ts}\n\nNapCat 心跳检查超时，请检查账号状态。"
+                    await _send_tg(msg)
             except Exception as e:
                 logger.warning(f"[watchdog] heartbeat check failed for {bot_id}: {e}")
                 if bot_id not in _reported_offline:
@@ -121,7 +149,7 @@ async def _heartbeat_loop():
 @driver.on_startup
 async def start_heartbeat():
     global _heartbeat_task
-    _heartbeat_task = asyncio.create_task(_heartbeat_loop())
+    _heartbeat_task = _spawn_task(_heartbeat_loop())
     logger.info(f"[watchdog] heartbeat started, interval={HEARTBEAT_INTERVAL}s")
 
 
@@ -138,8 +166,13 @@ async def on_qq_disconnect(bot: QQBot):
     bot_id = bot.self_id
     ts = datetime.now().strftime("%H:%M:%S")
     logger.warning(f"[watchdog] QQ bot {bot_id} disconnected, waiting {RECONNECT_GRACE}s before notify")
-    task = asyncio.create_task(_delayed_notify(bot_id, ts))
-    _pending[bot_id] = task
+    # A previous grace-period task must be cancelled before it is replaced,
+    # otherwise it keeps running and can fire a stale alert.
+    previous = _pending.pop(bot_id, None)
+    if previous and not previous.done():
+        previous.cancel()
+        logger.debug(f"[watchdog] cancelled stale pending notify task for {bot_id}")
+    _pending[bot_id] = _spawn_task(_delayed_notify(bot_id, ts))
 
 
 @driver.on_bot_connect
@@ -149,4 +182,4 @@ async def on_qq_connect(bot: QQBot):
     if task:
         task.cancel()
         logger.info(f"[watchdog] QQ bot {bot_id} reconnected within grace period, verifying login...")
-        asyncio.create_task(_verify_login_after_reconnect(bot, bot_id))
+        _spawn_task(_verify_login_after_reconnect(bot, bot_id))

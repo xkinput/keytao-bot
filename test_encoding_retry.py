@@ -4,7 +4,7 @@
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -73,27 +73,15 @@ class _EncodingService:
         self.attempts = 0
         self.timeouts = []
 
-    def client_factory(self, *, timeout):
-        service = self
-
-        class _Client:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, exc_type, exc, traceback):
-                return False
-
-            async def get(self, url, **kwargs):
-                service.attempts += 1
-                service.timeouts.append(float(timeout))
-                if service.always_timeout or service.attempts == 1 or timeout < 25.0:
-                    raise httpx.ReadTimeout(
-                        "" if service.always_timeout else "simulated slow encoder",
-                        request=httpx.Request("GET", url),
-                    )
-                return _EncodingResponse()
-
-        return _Client()
+    async def request(self, method, url, **kwargs):
+        self.attempts += 1
+        self.timeouts.append(float(kwargs["timeout"]))
+        if self.always_timeout or self.attempts == 1 or kwargs["timeout"] < 25.0:
+            raise httpx.ReadTimeout(
+                "" if self.always_timeout else "simulated slow encoder",
+                request=httpx.Request(method, url),
+            )
+        return _EncodingResponse()
 
 
 class EncodingRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -101,10 +89,10 @@ class EncodingRetryTests(unittest.IsolatedAsyncioTestCase):
         service = _EncodingService()
 
         with patch.object(
-            keytao_review.httpx,
-            "AsyncClient",
-            side_effect=service.client_factory,
-        ), patch.object(keytao_review.asyncio, "sleep", return_value=None):
+            keytao_review.http_client,
+            "get_keytao_client",
+            AsyncMock(return_value=service),
+        ), patch.object(keytao_review.http_client.asyncio, "sleep", return_value=None):
             result = await keytao_review.fetch_keytao_encode(CONFIG, "唐扬")
 
         self.assertEqual(result.get("codes"), ["tpyp", "tpypo", "tpypoi"])
@@ -115,10 +103,10 @@ class EncodingRetryTests(unittest.IsolatedAsyncioTestCase):
         service = _EncodingService(always_timeout=True)
 
         with patch.object(
-            keytao_review.httpx,
-            "AsyncClient",
-            side_effect=service.client_factory,
-        ), patch.object(keytao_review.asyncio, "sleep", return_value=None):
+            keytao_review.http_client,
+            "get_keytao_client",
+            AsyncMock(return_value=service),
+        ), patch.object(keytao_review.http_client.asyncio, "sleep", return_value=None):
             result = await keytao_review.fetch_keytao_encode(CONFIG, "唐扬")
 
         self.assertEqual(service.attempts, 2)

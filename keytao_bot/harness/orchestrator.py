@@ -5,7 +5,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from nonebot.log import logger
@@ -15,6 +15,7 @@ from keytao_bot.utils.llm_policy import (
     log_chat_usage,
     with_deepseek_chat_policy,
 )
+from keytao_bot.utils.history_store import _parse_stored_timestamp
 
 from .state import MemoryConversationStateStore, PendingToolConfirm
 from .conversation import ConversationAddress
@@ -815,26 +816,22 @@ class AgentOrchestrator:
         if not history:
             return
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         for msg in history:
             role = msg.get("role")
             content = msg.get("content", "")
-            timestamp = msg.get("timestamp", "")
+            recorded_at = _parse_stored_timestamp(msg.get("timestamp", ""))
             ago = ""
-            if timestamp:
-                try:
-                    diff = now - datetime.fromisoformat(timestamp)
-                    seconds = int(diff.total_seconds())
-                    if seconds < 60:
-                        ago = f"{seconds}s ago"
-                    elif seconds < 3600:
-                        ago = f"{seconds // 60}m ago"
-                    elif seconds < 86400:
-                        ago = f"{seconds // 3600}h ago"
-                    else:
-                        ago = f"{seconds // 86400}d ago"
-                except Exception:
-                    pass
+            if recorded_at is not None:
+                seconds = max(0, int((now - recorded_at).total_seconds()))
+                if seconds < 60:
+                    ago = f"{seconds}s ago"
+                elif seconds < 3600:
+                    ago = f"{seconds // 60}m ago"
+                elif seconds < 86400:
+                    ago = f"{seconds // 3600}h ago"
+                else:
+                    ago = f"{seconds // 86400}d ago"
             if role == "user" and ago:
                 messages.append({"role": role, "content": f"[{ago}] {content}"})
             else:

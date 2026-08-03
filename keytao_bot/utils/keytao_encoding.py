@@ -351,7 +351,63 @@ def normalize_contextual_phrase_encoding(word: str, encode_data: Dict) -> Dict:
     normalized["chars"] = normalized_chars
     normalized["codes"] = codes
     normalized["contextPinyinCorrected"] = True
+
+    # Reflow hazard: downstream review code (keytao_review._codes_for_pinyin_sequence)
+    # merges "codes" back together with "altCodes"/"candidateCodes"/
+    # "requestedCandidateCodes" into a single candidate set. Any list still derived
+    # from the OLD (wrong) reading would therefore resurrect the wrong code right
+    # after this correction, so every derived list is filtered down to the codes
+    # derivable from the corrected reading. Filtering to empty is deliberate: a
+    # stale value is worse than no value.
+    derivable = set(codes)
+    for key in ("altCodes", "candidateCodes", "requestedCandidateCodes"):
+        raw_codes = encode_data.get(key)
+        if not isinstance(raw_codes, list):
+            continue
+        normalized[key] = [
+            code for code in _clean_code_list(raw_codes)
+            if code in derivable
+        ]
+
+    # flyKeyVariants are grouped candidate series derived from the *phonetic*
+    # code of a reading, and the skill prompt tells the model to trust that
+    # field verbatim. Groups generated from the old reading must therefore go
+    # too, or the corrected word is still offered its pre-correction fly keys.
+    # A group survives only if it is anchored in the corrected chain; fly keys
+    # cannot be recomputed here, so anything unanchored is dropped rather than
+    # guessed.
+    normalized["flyKeyVariants"] = _filter_fly_key_variants(
+        encode_data.get("flyKeyVariants"), derivable
+    )
+
+    analysis = encode_data.get("requestedCodeAnalysis")
+    if isinstance(analysis, dict):
+        requested = str(analysis.get("code") or "").strip().lower()
+        if requested and requested not in derivable:
+            # The requested code came from the wrong reading: mark it
+            # unsupported instead of letting it read as an endorsement.
+            normalized["requestedCodeAnalysis"] = {
+                **analysis,
+                "supported": False,
+                "contextPinyinCorrected": True,
+                "reason": "该编码来自语境纠正前的旧读音，已失效",
+            }
     return normalized
+
+
+def _filter_fly_key_variants(variants: object, derivable: set) -> List[Dict]:
+    """Keep only fly-key groups anchored in the corrected candidate chain."""
+    if not isinstance(variants, list):
+        return []
+    kept: List[Dict] = []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        base_code = str(variant.get("baseCode") or "").strip().lower()
+        variant_codes = _clean_code_list(variant.get("codes"))
+        if base_code in derivable or any(code in derivable for code in variant_codes):
+            kept.append(variant)
+    return kept
 
 
 def build_alternate_pronunciation_codes(chars: object) -> List[Dict]:

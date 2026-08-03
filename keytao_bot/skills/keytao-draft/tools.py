@@ -15,9 +15,11 @@ import time
 import unicodedata
 import httpx
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from nonebot.log import logger
 
+from keytao_bot.utils import http_client, review_flags
+from keytao_bot.utils.http_client import KeytaoApiError
 from keytao_bot.utils.keytao_encoding import (
     build_alternate_pronunciation_codes,
     build_phrase_pronunciation_codes,
@@ -329,18 +331,71 @@ def _infer_phrase_type(word: str, code: str, phrase_type: str = "Phrase") -> str
     return phrase_type or "Phrase"
 
 
-def _should_validate_create_code(item: Dict) -> bool:
-    action = item.get("action", "Create")
-    if action != "Create":
-        return False
+CSS_CODE_MAX_LENGTH = 8
+GENERAL_CODE_MAX_LENGTH = 32
+_ALPHA_CODE_RE = re.compile(r"[a-z]+")
+_ALNUM_CODE_RE = re.compile(r"[a-z0-9]+")
+_SYMBOL_CODE_RE = re.compile(r";?[a-z0-9]+")
+CHAIN_VALIDATED_TYPES = frozenset({"Phrase", "Single"})
+CODE_WRITING_ACTIONS = frozenset({"Create", "Change"})
+_CODE_SHAPE_RULES: Dict[str, Tuple[re.Pattern, int, int, str]] = {
+    "Phrase": (_ALPHA_CODE_RE, 1, GENERAL_CODE_MAX_LENGTH, "纯小写字母"),
+    "Single": (_ALPHA_CODE_RE, 1, GENERAL_CODE_MAX_LENGTH, "纯小写字母"),
+    "CSS": (_ALPHA_CODE_RE, 1, CSS_CODE_MAX_LENGTH, "纯小写字母"),
+    "CSSSingle": (_ALPHA_CODE_RE, 1, CSS_CODE_MAX_LENGTH, "纯小写字母"),
+    "Supplement": (_ALPHA_CODE_RE, 1, GENERAL_CODE_MAX_LENGTH, "纯小写字母"),
+    "English": (_ALNUM_CODE_RE, 1, GENERAL_CODE_MAX_LENGTH, "小写字母或数字"),
+    "Link": (_ALNUM_CODE_RE, 1, GENERAL_CODE_MAX_LENGTH, "小写字母或数字"),
+    "Symbol": (_SYMBOL_CODE_RE, 1, GENERAL_CODE_MAX_LENGTH, "可选分号前缀加小写字母或数字"),
+}
+_DEFAULT_CODE_SHAPE_RULE = (
+    _SYMBOL_CODE_RE,
+    1,
+    GENERAL_CODE_MAX_LENGTH,
+    "小写字母、数字或分号前缀",
+)
 
-    word = str(item.get("word") or "").strip()
-    code = str(item.get("code") or "").strip().lower()
-    if not word or not code or not re.fullmatch(r"[a-z]+", code):
-        return False
 
-    phrase_type = _infer_phrase_type(word, code, item.get("type") or "Phrase")
-    return phrase_type in {"Phrase", "Single"} and _contains_cjk_text(word)
+def _should_validate_item_code(item: Dict) -> bool:
+    action = str(item.get("action") or "Create")
+    if action not in CODE_WRITING_ACTIONS:
+        return False
+    return bool(
+        str(item.get("word") or "").strip()
+        and str(item.get("code") or "").strip()
+    )
+
+
+def _validate_code_shape(phrase_type: str, code: str) -> Optional[str]:
+    pattern, min_length, max_length, charset_label = _CODE_SHAPE_RULES.get(
+        phrase_type,
+        _DEFAULT_CODE_SHAPE_RULE,
+    )
+    if not pattern.fullmatch(code):
+        return f"编码 {code} 不符合 {phrase_type} 类型的字符集要求（应为{charset_label}）"
+    if not min_length <= len(code) <= max_length:
+        return (
+            f"编码 {code} 长度 {len(code)} 超出 {phrase_type} 类型的合理范围"
+            f"（{min_length}-{max_length}）"
+        )
+    return None
+
+
+def _stamp_item_review_flag(item: Dict, validation: Optional[Dict] = None) -> Dict:
+    explicit = review_flags.read_manual_review_flag(item)
+    reason = review_flags.manual_review_reason(item)
+    needs_manual_review = bool(explicit)
+    if review_flags.remark_indicates_manual_review(item.get("remark")):
+        needs_manual_review = True
+        reason = reason or "加词预审备注已标记为需管理员审核"
+    if isinstance(validation, dict) and validation.get("needsManualReview"):
+        needs_manual_review = True
+        reason = reason or str(validation.get("manualReviewReason") or "")
+    if needs_manual_review:
+        review_flags.apply_manual_review_flag(item, True, reason)
+    elif explicit is False:
+        review_flags.apply_manual_review_flag(item, False, reason)
+    return item
 
 
 def _normalize_draft_item_for_request(item: Dict) -> Dict:
@@ -362,13 +417,7 @@ def _normalize_draft_item_for_request(item: Dict) -> Dict:
             normalized["code"],
             "Phrase",
         )
-    if "needs_manual_review" in normalized:
-        normalized["needsManualReview"] = bool(normalized.pop("needs_manual_review"))
-    if "needsManualReview" not in normalized:
-        normalized["needsManualReview"] = bool(
-            manual_preaudit_issue_for_item(normalized)
-        )
-    return normalized
+    return _stamp_item_review_flag(normalized)
 
 
 def _build_encode_candidate_result(
@@ -605,19 +654,44 @@ def _not_bound_message(platform: str) -> str:
 
 
 def get_keytao_url() -> str:
-    """Get Keytao API base URL from config"""
+    """Return the normalized KeyTao API base URL."""
+    return http_client.get_keytao_url()
+
+
+_UNSAFE_PATH_SEGMENT_RE = re.compile(r"[/?#\\%\s]")
+_MAX_PATH_SEGMENT_LENGTH = 128
+
+
+def _safe_path_segment(value: object) -> Optional[str]:
+    """Return ``value`` usable as one URL path segment, or ``None``."""
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text or len(text) > _MAX_PATH_SEGMENT_LENGTH:
+        return None
+    if ".." in text or _UNSAFE_PATH_SEGMENT_RE.search(text):
+        return None
+    return text
+
+
+def _safe_numeric_id(value: object) -> Optional[int]:
+    """Coerce a caller-supplied record id to a positive int, or ``None``."""
+    if isinstance(value, bool):
+        return None
     try:
-        from nonebot import get_driver
-        driver = get_driver()
-        config = driver.config
-        return getattr(config, "keytao_api_base", "https://keytao.vercel.app")
-    except:
-        return "https://keytao.vercel.app"
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
 
 
 def make_batch_url(batch_id: str) -> str:
     """Build a web URL for a draft batch."""
-    return f"{get_keytao_url()}/batch/{batch_id}"
+    safe_batch_id = _safe_path_segment(batch_id)
+    if not safe_batch_id:
+        logger.warning(f"[make_batch_url] refusing unsafe batch id: {batch_id!r}")
+        return get_keytao_url()
+    return f"{get_keytao_url()}/batch/{safe_batch_id}"
 
 
 def _inject_batch_url(data: Dict) -> Dict:
@@ -636,14 +710,8 @@ def _inject_known_batch_url(data: Dict, batch_id: Optional[str]) -> Dict:
 
 
 def get_bot_token() -> Optional[str]:
-    """Get Bot API token from config"""
-    try:
-        from nonebot import get_driver
-        driver = get_driver()
-        config = driver.config
-        return getattr(config, "bot_api_token", None)
-    except:
-        return None
+    """Return the shared bot token."""
+    return http_client.get_bot_token()
 
 
 def get_bot_identity_secret() -> Optional[str]:
@@ -680,29 +748,8 @@ def _parse_json_mapping(value: object) -> Dict[str, str]:
 
 
 def get_user_api_key(platform: str, platform_id: str) -> Optional[str]:
-    """Get a KeyTao user API key matching the bound platform account."""
-    try:
-        from nonebot import get_driver
-        driver = get_driver()
-        config = driver.config
-        mapping = _parse_json_mapping(
-            getattr(config, "keytao_user_api_keys", None)
-            or getattr(config, "bot_user_api_keys", None)
-        )
-        for key in (
-            f"{platform}:{platform_id}",
-            platform_id,
-            f"{platform}:default",
-            "default",
-        ):
-            if mapping.get(key):
-                return mapping[key]
-        return (
-            getattr(config, "keytao_api_key", None)
-            or getattr(config, "bot_user_api_key", None)
-        )
-    except Exception:
-        return None
+    """Return the API key bound to exactly this platform account."""
+    return http_client.get_user_api_key(platform, platform_id)
 
 
 def get_bot_headers(
@@ -864,20 +911,38 @@ async def _fetch_encode_candidates(word: str, requested_code: Optional[str] = No
 
 
 async def _validate_draft_item_code(item: Dict) -> Dict:
-    """Ensure a Create item's code belongs to that word's encode candidate chain."""
-    phrase_type = str(item.get("type") or "").strip()
-    if phrase_type not in VALID_PHRASE_TYPES:
-        return {
-            "success": False,
-            "word": str(item.get("word") or "").strip(),
-            "code": str(item.get("code") or "").strip(),
-            "reason": f"不支持的词库类型：{phrase_type or '(empty)'}",
-        }
-    if not _should_validate_create_code(item):
+    """Validate every code-writing item; unverifiable types require review."""
+    if not _should_validate_item_code(item):
         return {"success": True, "skipped": True}
 
     word = str(item.get("word") or "").strip()
     code = str(item.get("code") or "").strip().lower()
+    phrase_type = _infer_phrase_type(word, code, item.get("type") or "Phrase")
+    if phrase_type not in VALID_PHRASE_TYPES:
+        return {
+            "success": False,
+            "word": word,
+            "code": code,
+            "reason": f"不支持的词库类型：{phrase_type or '(empty)'}",
+        }
+    shape_error = _validate_code_shape(phrase_type, code)
+    if shape_error:
+        return {
+            "success": False,
+            "word": word,
+            "code": code,
+            "reason": shape_error,
+            "candidateCodes": [],
+        }
+    if phrase_type not in CHAIN_VALIDATED_TYPES or not _contains_cjk_text(word):
+        return {
+            "success": True,
+            "word": word,
+            "code": code,
+            "type": phrase_type,
+            "needsManualReview": True,
+            "manualReviewReason": f"{phrase_type} 类型没有确定性编码校验规则，需管理员人工确认",
+        }
     encoding = await _fetch_encode_candidates(word, code)
     if not encoding.get("success"):
         return {
@@ -890,7 +955,12 @@ async def _validate_draft_item_code(item: Dict) -> Dict:
 
     candidate_codes = encoding.get("candidateCodes", [])
     if code in candidate_codes:
-        return {"success": True, "candidateCodes": candidate_codes}
+        return {
+            "success": True,
+            "word": word,
+            "code": code,
+            "candidateCodes": candidate_codes,
+        }
 
     return {
         "success": False,
@@ -941,7 +1011,7 @@ async def _split_items_by_code_validation(items: List[Dict]) -> tuple[List[Dict]
     failed_items: List[Dict] = []
     for index, item, validation in checked:
         if validation.get("success"):
-            valid_items.append(item)
+            valid_items.append(_stamp_item_review_flag(item, validation))
         else:
             failed_items.append(_format_code_validation_failure(validation, index))
     return valid_items, failed_items
@@ -1059,17 +1129,17 @@ async def keytao_create_phrase(
     type = _infer_phrase_type(word, code, type)
     if type not in VALID_PHRASE_TYPES:
         return {"success": False, "message": f"不支持的词库类型：{type}"}
-    if needs_manual_review is None:
-        needs_manual_review = bool(manual_preaudit_issue_for_item({
-            "word": word,
-            "remark": remark,
-        }))
-    validation = await _validate_draft_item_code({
+    item: Dict = {
         "action": action,
         "word": word,
+        "oldWord": old_word,
         "code": code,
         "type": type,
-    })
+        "remark": remark,
+    }
+    if needs_manual_review is not None:
+        review_flags.apply_manual_review_flag(item, bool(needs_manual_review))
+    validation = await _validate_draft_item_code(item)
     if not validation.get("success"):
         failed = _format_code_validation_failure(validation)
         return {
@@ -1080,21 +1150,14 @@ async def keytao_create_phrase(
             "batchId": batch_id,
             "batchUrl": make_batch_url(batch_id),
         }
+    _stamp_item_review_flag(item, validation)
 
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch"
     
     request_data = {
         "platform": platform,
         "platformId": platform_id,
-        "items": [{
-            "action": action,
-            "word": word,
-            "oldWord": old_word,
-            "code": code,
-            "type": type,
-            "remark": remark,
-            "needsManualReview": bool(needs_manual_review),
-        }],
+        "items": [item],
         "confirmed": confirmed,
         "previewOnly": preview_only,
         "batchId": batch_id,
@@ -1554,7 +1617,11 @@ async def _auto_approve_submitted_batch(
         }
     KEYTAO_API_BASE = get_keytao_url()
     review_note = build_review_note(auto_review)
-    url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/auto-approve"
+    safe_batch_id = _safe_path_segment(batch_id)
+    if not safe_batch_id:
+        logger.error(f"[auto_review] refusing unsafe batch id: {batch_id!r}")
+        return {"success": False, "message": "批次编号非法，已保留给管理员审核"}
+    url = f"{KEYTAO_API_BASE}/api/bot/batches/{safe_batch_id}/auto-approve"
     request_data = {
         "platform": platform,
         "platformId": platform_id,
@@ -1571,7 +1638,7 @@ async def _auto_approve_submitted_batch(
                     platform_id,
                     content_type=True,
                     method="POST",
-                    path=f"/api/bot/batches/{batch_id}/auto-approve",
+                    path=f"/api/bot/batches/{safe_batch_id}/auto-approve",
                     raw_body=request_body,
                 ),
                 content=request_body,
@@ -1791,7 +1858,11 @@ async def keytao_submit_batch(
             }, batch_id)
         return preview_data
     
-    url = f"{KEYTAO_API_BASE}/api/bot/batches/{batch_id}/submit"
+    safe_batch_id = _safe_path_segment(batch_id)
+    if not safe_batch_id:
+        logger.error(f"[keytao_submit_batch] refusing unsafe batch id: {batch_id!r}")
+        return {"success": False, "message": "批次编号非法，无法提交"}
+    url = f"{KEYTAO_API_BASE}/api/bot/batches/{safe_batch_id}/submit"
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1813,7 +1884,7 @@ async def keytao_submit_batch(
                     platform_id,
                     content_type=True,
                     method="POST",
-                    path=f"/api/bot/batches/{batch_id}/submit",
+                    path=f"/api/bot/batches/{safe_batch_id}/submit",
                     raw_body=request_body,
                 ),
                 content=request_body,
@@ -1954,7 +2025,11 @@ async def keytao_get_batch_preview(
     if not batch_id:
         return {"success": False, "message": "没有找到草稿批次"}
 
-    url = f"{KEYTAO_API_BASE}/api/batches/{batch_id}/preview"
+    safe_batch_id = _safe_path_segment(batch_id)
+    if not safe_batch_id:
+        logger.error(f"[keytao_get_batch_preview] refusing unsafe batch id: {batch_id!r}")
+        return {"success": False, "message": "批次编号非法，无法获取预览"}
+    url = f"{KEYTAO_API_BASE}/api/batches/{safe_batch_id}/preview"
     logger.info(f"[keytao_get_batch_preview] batchId={batch_id}")
 
     try:
@@ -2756,6 +2831,12 @@ async def keytao_remove_draft_item(
     if not BOT_API_TOKEN:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
+    safe_pr_id = _safe_numeric_id(pr_id)
+    if safe_pr_id is None:
+        logger.error(f"[keytao_remove_draft_item] rejected invalid PR id: {pr_id!r}")
+        return {"success": False, "message": f"条目 ID 非法：{pr_id}，必须是正整数"}
+    pr_id = safe_pr_id
+
     existing_claim_result, reusable_claim_fingerprint = await _resolve_existing_delete_claim(
         platform,
         platform_id,
@@ -3213,6 +3294,25 @@ async def keytao_batch_remove_draft_items(
 
     if not BOT_API_TOKEN:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
+
+    safe_ids: List[int] = []
+    invalid_ids: List[object] = []
+    for raw_id in ids or []:
+        safe_id = _safe_numeric_id(raw_id)
+        if safe_id is None:
+            invalid_ids.append(raw_id)
+        else:
+            safe_ids.append(safe_id)
+    if invalid_ids:
+        logger.error(
+            "[keytao_batch_remove_draft_items] rejected invalid PR ids: %r",
+            invalid_ids,
+        )
+        return {
+            "success": False,
+            "message": f"条目 ID 非法：{invalid_ids}，必须全部是正整数",
+        }
+    ids = safe_ids
 
     existing_claim_result, reusable_claim_fingerprint = await _resolve_existing_delete_claim(
         platform,
