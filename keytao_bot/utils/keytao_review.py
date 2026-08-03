@@ -110,6 +110,10 @@ COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
 COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
 CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
 PRONUNCIATION_EVIDENCE_TIMEOUT = 4.0
+KEYTAO_ENCODE_REQUEST_TIMEOUT = 30.0
+KEYTAO_ENCODE_MAX_ATTEMPTS = 2
+KEYTAO_ENCODE_RETRY_DELAY = 0.5
+KEYTAO_ENCODE_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
 ENTITY_DIRECT_FETCH_TIMEOUT = 3.0
 ENTITY_PRONUNCIATION_MIN_CONFIDENCE = 0.75
 CONTEXT_ENTITY_SOURCE_DOMAINS = ("baike.baidu.com", "zh.wikipedia.org")
@@ -691,16 +695,41 @@ async def fetch_keytao_encode(
         })
         headers["X-Bot-Token"] = config.bot_token
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.get(
-                f"{config.api_base}{path}",
-                params=params,
-                headers=headers,
-            )
-            if not response.is_success:
-                return {"success": False, "message": f"编码服务返回错误: {response.status_code}"}
-            data = response.json()
-        return normalize_contextual_phrase_encoding(word, data)
+        async with httpx.AsyncClient(timeout=KEYTAO_ENCODE_REQUEST_TIMEOUT) as client:
+            for attempt in range(KEYTAO_ENCODE_MAX_ATTEMPTS):
+                try:
+                    response = await client.get(
+                        f"{config.api_base}{path}",
+                        params=params,
+                        headers=headers,
+                    )
+                except (httpx.TimeoutException, httpx.TransportError) as error:
+                    if attempt == KEYTAO_ENCODE_MAX_ATTEMPTS - 1:
+                        detail = str(error).strip()
+                        error_label = type(error).__name__ + (f": {detail}" if detail else "")
+                        logger.error(f"[keytao_encode] failed after retry: {error_label}")
+                        return {
+                            "success": False,
+                            "message": f"编码服务重试后仍不可用，请稍后再试: {error_label}",
+                        }
+                    logger.warning(
+                        f"[keytao_encode] transient failure, retrying: {type(error).__name__}: {error}"
+                    )
+                else:
+                    if response.is_success:
+                        return normalize_contextual_phrase_encoding(word, response.json())
+                    if (
+                        response.status_code not in KEYTAO_ENCODE_RETRYABLE_STATUS
+                        or attempt == KEYTAO_ENCODE_MAX_ATTEMPTS - 1
+                    ):
+                        return {
+                            "success": False,
+                            "message": f"编码服务返回错误: {response.status_code}",
+                        }
+                    logger.warning(
+                        f"[keytao_encode] transient HTTP {response.status_code}, retrying"
+                    )
+                await asyncio.sleep(KEYTAO_ENCODE_RETRY_DELAY)
     except Exception as error:
         return {"success": False, "message": f"编码服务暂时不可用: {error}"}
 
