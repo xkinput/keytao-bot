@@ -24,13 +24,15 @@ class ToolContext:
 
 _DELETE_INTENT_RE = re.compile(r"删除|删掉|去掉|移除|撤销|清空|清理|全部删|都删")
 _MUTATION_INTENT_RE = re.compile(
-    r"添加|加入|加到|新增|创建|写入|放入|提交|删除|删掉|去掉|移除|清空|清理|"
+    r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|发起审核|"
+    r"删除|删掉|去掉|移除|清空|清理|"
     r"撤销|撤回|召回|修改|改成|改为|替换|顺延|挪开|重新编码|保留|批量处理"
     r"|都删|其余删|其他删"
 )
 _NEGATED_MUTATION_RE = re.compile(
     r"(?:不要|别(?!的)|无需|不用|禁止|不要真的).{0,12}"
-    r"(?:添加|加入|加到|新增|创建|写入|放入|提交|删除|删掉|去掉|移除|清空|清理|撤销|撤回|修改|改成|改为|替换|重新编码|顺延|保留)"
+    r"(?:添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|"
+    r"删除|删掉|去掉|移除|清空|清理|撤销|撤回|修改|改成|改为|替换|重新编码|顺延|保留)"
 )
 _EXPLANATION_ONLY_RE = re.compile(
     r"(?:什么意思|什么含义|解释一下|说明一下|怎么做|如何操作|操作方法|"
@@ -46,7 +48,15 @@ _QUESTION_RE = re.compile(
 )
 _ABORT_RE = re.compile(r"(?:算了|取消|别执行|不要执行|先不要|不用了|不做了|别做了)")
 _EXPLICIT_REQUEST_PREFIX_RE = re.compile(
-    r"^(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|把|将|替我|为我|只|仅|除了)"
+    r"^(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|把|将|替我|为我|"
+    r"能不能|可不可以|能否|可否|可以帮我|可以请你|只|仅|除了)"
+)
+_POLITE_EXECUTION_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"请(?!问)|麻烦|帮我|给我|替我|为我|"
+    r"(?:能不能|可不可以|能否|可否|可以)(?:请|帮我|替我|为我)|"
+    r"(?:能不能|可不可以|能否|可否).{0,80}(?:一下|现在|立即|直接|吧|好吗|行吗)"
+    r")"
 )
 _META_DISCUSSION_RE = re.compile(
     r"(?:这句话|这段话|这条消息|引用|消息里|上面写|刚才说).{0,80}"
@@ -73,6 +83,7 @@ _INLINE_CODE_RE = re.compile(r"`[^`]*`")
 _COMMAND_CLAUSE_SPLIT_RE = re.compile(r"[，,。.!！?？;；\n]+")
 _COMMAND_PREFIX_RE = re.compile(
     r"^(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我|"
+    r"能不能|可不可以|能否|可否|可以帮我|可以请你|"
     r"并|并且|同时|然后|再|还要|以及|另外|接着|顺便)*"
 )
 _NEGATIVE_MODAL_RE = re.compile(
@@ -81,7 +92,7 @@ _NEGATIVE_MODAL_RE = re.compile(
 )
 _CLAUSE_BOUNDARY_RE = re.compile(r"[。！？!?;；\n]")
 _ACTION_TOKENS = {
-    "Create": re.compile(r"添加|加入|加到|新增|创建|写入|放入|加词"),
+    "Create": re.compile(r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|加词"),
     "Change": re.compile(r"修改|改成|改为|替换|重新编码|顺延|挪开|移到"),
     "Delete": re.compile(r"删除|删掉|移除"),
     "Keep": re.compile(
@@ -90,7 +101,7 @@ _ACTION_TOKENS = {
     ),
 }
 _WORD_LEFT_PREFIXES = (
-    "添加", "加入", "加到", "新增", "创建", "写入", "放入", "加词",
+    "添加", "加入", "加到", "新增", "创建", "写入", "放入", "收录", "录入", "记入", "加词",
     "修改", "改成", "替换", "删除", "删掉", "移除", "保留", "只保留", "仅保留",
     "把", "将", "词条", "词语",
 )
@@ -114,7 +125,7 @@ _PROTECTED_WORD_RE = (
     r"(?:别动|不要动|别改|不要改|不动|保持(?:原样)?|"
     r"保留|别碰|不要碰|别删|不要删|不删除|不修改|不顺延|不移动|"
     r"(?:不得|请勿|不予|严禁|不许|不可|不能|切勿|拒绝|莫).{0,3}"
-    r"(?:添加|加入|删除|删掉|移除|修改|替换|顺延|移动))"
+    r"(?:添加|加入|收录|录入|记入|删除|删掉|移除|修改|替换|顺延|移动))"
 )
 _TYPE_HINTS = [
     ("声笔笔单字", "CSSSingle"),
@@ -197,10 +208,17 @@ def message_authorizes_mutation(message: str) -> bool:
     raw_text = re.sub(r"\s+", "", str(message or ""))
     text = re.sub(r"\s+", "", _mutation_authorization_view(message))
     authorization_text = _QUOTED_DATA_RE.sub("", text)
+    question_is_execution_request = bool(
+        _QUESTION_RE.search(raw_text)
+        and _POLITE_EXECUTION_PREFIX_RE.search(raw_text)
+        and not _EXPLANATION_ONLY_RE.search(raw_text)
+        and not _META_DISCUSSION_RE.search(raw_text)
+        and not _DATA_CONTEXT_RE.search(raw_text)
+    )
     if (
         not authorization_text
         or _NEGATED_MUTATION_RE.search(authorization_text)
-        or _QUESTION_RE.search(raw_text)
+        or (_QUESTION_RE.search(raw_text) and not question_is_execution_request)
         or _ABORT_RE.search(raw_text)
     ):
         return False
@@ -226,6 +244,47 @@ def message_authorizes_mutation(message: str) -> bool:
             authorization_text,
         )
     )
+
+
+def _strip_execution_result_suffix(compact: str) -> str:
+    compact = re.sub(r"(?:吗|么|好不好|行不行|可不可以|可以吗|好吗|行吗)$", "", compact)
+    return re.sub(
+        r"(?:(?:并|并且|然后|再|完成后|处理完后|操作完后)?"
+        r"(?:告诉我|回复我|通知我)(?:一下)?(?:处理)?(?:结果)?"
+        r"|(?:并|并且|然后|再)?(?:告诉我|回复我|通知我)(?:一下)?)$",
+        "",
+        compact,
+    )
+
+
+def _explicit_submit_command_matches(compact: str) -> bool:
+    compact = _strip_execution_result_suffix(compact)
+    prefix = (
+        r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我|"
+        r"能不能|可不可以|能否|可否|可以帮我|可以请你)*"
+    )
+    target = r"(?:(?:当前|这个|我的)?(?:草稿|批次))"
+    action = r"(?:提交|提审|送审)(?:审核)?"
+    polite = r"(?:一下)?(?:吧|啦|了)?"
+    return bool(
+        re.fullmatch(rf"{prefix}(?:{action}(?:{target})?|(?:把|将)?{target}{action}|发起审核){polite}", compact)
+    )
+
+
+def _explicit_recall_command_matches(compact: str) -> bool:
+    compact = _strip_execution_result_suffix(compact)
+    prefix = (
+        r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我|"
+        r"能不能|可不可以|能否|可否|可以帮我|可以请你)*"
+    )
+    scope = r"(?:(?:最近|上次|刚才)(?:一次|的)?)?"
+    recall = (
+        rf"(?:(?:撤回|撤销|召回)(?:"
+        rf"{scope}(?:提交|提审|送审|审核|批次)?|"
+        rf"{scope}(?:提交|提审|送审)(?:的)?批次)"
+        rf"|取消{scope}(?:提审|送审))"
+    )
+    return bool(re.fullmatch(rf"{prefix}{recall}(?:一下)?(?:吧|啦|了)?", compact))
 
 
 def _extract_explicit_phrase_type(message: str) -> Optional[str]:
@@ -804,11 +863,11 @@ class ToolExecutor:
                 }
 
         if tool_name != "keytao_batch_add_to_draft":
-            return self._stage_agent_mutation(tool_name, arguments, context)
+            return None
 
         reassignments = _find_code_reassignments(arguments.get("items"))
         if not reassignments or not message:
-            return self._stage_agent_mutation(tool_name, arguments, context)
+            return None
 
         blocked = [
             item for item in reassignments
@@ -818,7 +877,7 @@ class ToolExecutor:
             )
         ]
         if not blocked:
-            return self._stage_agent_mutation(tool_name, arguments, context)
+            return None
 
         blocked_labels = [
             f"{item['word']} {item['oldCode']}→{item['newCode']}"
@@ -887,17 +946,7 @@ class ToolExecutor:
         trusted_draft_items = context.trusted_draft_items_by_id or {}
         compact_message = re.sub(r"[\s，,。.!！?？~～]+", "", message)
         if tool_name == "keytao_submit_batch":
-            allowed = {
-                "提交", "提审", "送审", "提交草稿", "提交批次", "提交审核",
-                "提交当前草稿", "提交这个草稿", "发起审核",
-            }
-            candidate = compact_message
-            if candidate.startswith("请"):
-                candidate = candidate[1:]
-            for suffix in ("一下", "吧", "啦", "了"):
-                if candidate.endswith(suffix):
-                    candidate = candidate[:-len(suffix)]
-            if candidate not in allowed:
+            if not _explicit_submit_command_matches(compact_message):
                 return {
                     "success": False,
                     "policyBlocked": True,
@@ -905,12 +954,7 @@ class ToolExecutor:
                     "message": "安全拦截：提交只能由本轮明确、独立的提交指令授权。",
                 }
         if tool_name == "keytao_recall_batch":
-            recall_candidate = compact_message
-            if recall_candidate.startswith("请"):
-                recall_candidate = recall_candidate[1:]
-            if recall_candidate not in {
-                "撤回", "撤回批次", "撤回最近批次", "撤回最近提交", "召回最近批次",
-            }:
+            if not _explicit_recall_command_matches(compact_message):
                 return {
                     "success": False,
                     "policyBlocked": True,

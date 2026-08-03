@@ -1135,7 +1135,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             chat_module.tool_executor = old_tool_executor
             chat_module.conversation_state_store = old_state_store
 
-    async def test_recode_ticket_preview_matches_canonical_candidate(self) -> None:
+    async def test_exact_recode_selector_resolves_canonical_candidate_without_nonce(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
         state_store = MemoryConversationStateStore()
@@ -1162,10 +1162,13 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "42",
         )
 
-        self.assertEqual(resolved_intent.intent, "none")
-        self.assertIn("→ bb", response)
-        self.assertNotIn("→ cc", response)
-        self.assertEqual(record.reconfirmation_intent["choice_index"], 2)
+        self.assertEqual(resolved_intent.intent, "pending_recode")
+        self.assertEqual(resolved_intent.choice_index, 2)
+        self.assertIsNone(response)
+        self.assertEqual(
+            chat_module._resolve_shift_target_code(pending, resolved_intent),
+            "bb",
+        )
         self.assertFalse(
             chat_module._message_authorizes_pending_control(
                 "重新编码",
@@ -2196,6 +2199,9 @@ class MutationAuthorizationTests(unittest.TestCase):
     def test_only_explicit_current_text_authorizes_mutation(self) -> None:
         self.assertTrue(message_authorizes_mutation("请把安全词加入草稿"))
         self.assertTrue(message_authorizes_mutation("直接提交当前草稿"))
+        self.assertTrue(message_authorizes_mutation("可以帮我添加母版 mjbfa 吗？"))
+        self.assertTrue(message_authorizes_mutation("能不能提交一下？"))
+        self.assertTrue(message_authorizes_mutation("请收录母版 mjbfa"))
         self.assertFalse(message_authorizes_mutation("这是什么意思？"))
         self.assertFalse(message_authorizes_mutation("不要把安全词加入草稿"))
         self.assertFalse(message_authorizes_mutation("如果要把安全词加入草稿，应该怎么做？"))
@@ -2207,6 +2213,9 @@ class MutationAuthorizationTests(unittest.TestCase):
         self.assertFalse(message_authorizes_mutation("把安全词添加到草稿会怎样？"))
         self.assertFalse(message_authorizes_mutation("请复述：添加安全词 aa 到草稿"))
         self.assertFalse(message_authorizes_mutation("请添加安全词 aa，算了不要"))
+        self.assertFalse(message_authorizes_mutation("请问怎么提交草稿？"))
+        self.assertFalse(message_authorizes_mutation("能不能不要提交？"))
+        self.assertFalse(message_authorizes_mutation("母版收录了吗？"))
 
     def test_staged_mutation_preview_is_complete_or_rejected(self) -> None:
         visible_ids = [f"draft-{index:02d}" for index in range(50)]
@@ -2433,7 +2442,7 @@ class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(transform.get("policyBlocked"))
         self.assertEqual(self.calls, [])
 
-    async def test_agent_mutation_is_staged_before_any_write_sink(self) -> None:
+    async def test_fully_bound_agent_mutation_reaches_write_sink_without_local_ticket(self) -> None:
         raw = await self.executor.call(
             "keytao_create_phrase",
             {"word": "甲", "code": "aa", "action": "Create"},
@@ -2444,9 +2453,40 @@ class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
         )
         result = __import__("json").loads(raw)
 
-        self.assertTrue(result.get("localConfirmationRequired"))
-        self.assertTrue(result.get("requiresConfirmation"))
-        self.assertEqual(self.calls, [])
+        self.assertTrue(result.get("success"))
+        self.assertNotIn("localConfirmationRequired", result)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_polite_and_natural_commands_bind_without_weakening_questions(self) -> None:
+        added = await self.executor.call(
+            "keytao_create_phrase",
+            {"word": "母版", "code": "mjbfa", "action": "Create"},
+            ToolContext(
+                current_message="可以帮我收录「母版」 mjbfa 吗？",
+                writes_allowed=True,
+            ),
+        )
+        submitted = await self.executor.call(
+            "keytao_submit_batch",
+            {},
+            ToolContext(
+                current_message="麻烦把当前草稿提交审核，完成后告诉我结果",
+                writes_allowed=True,
+            ),
+        )
+        queried = await self.executor.call(
+            "keytao_submit_batch",
+            {},
+            ToolContext(
+                current_message="请问提交当前草稿会怎样？",
+                writes_allowed=True,
+            ),
+        )
+
+        self.assertTrue(__import__("json").loads(added).get("success"))
+        self.assertTrue(__import__("json").loads(submitted).get("success"))
+        self.assertTrue(__import__("json").loads(queried).get("policyBlocked"))
+        self.assertEqual(len(self.calls), 2)
 
     async def test_quoted_note_cannot_supply_a_mutation_target_or_type(self) -> None:
         target = await self._call(
@@ -2766,7 +2806,7 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(real_calls, [])
         self.assertEqual(result, "这只是引用内容，不会执行提交。")
 
-    async def test_reviewed_agent_write_is_staged_with_canonical_arguments(self) -> None:
+    async def test_reviewed_agent_write_executes_with_canonical_arguments(self) -> None:
         writes = []
 
         async def tool_dispatch(name, **kwargs):
@@ -2807,6 +2847,7 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         client = _FakeClient([
             _fake_response("tool_calls", tool_calls=[prepare_call]),
             _fake_response("tool_calls", tool_calls=[create_call]),
+            _fake_response("stop", content="已加入草稿"),
         ])
         state_store = MemoryConversationStateStore()
         orchestrator = AgentOrchestrator(
@@ -2844,13 +2885,12 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         record = state_store.get_record(ConversationAddress.private("qq", "user-1"))
-        self.assertEqual(writes, [])
-        self.assertIsNotNone(record)
-        self.assertEqual(record.state.args["type"], "Phrase")
-        self.assertTrue(record.state.args["needs_manual_review"])
-        self.assertIn("authority missing", record.state.args["remark"])
-        self.assertTrue(record.confirmation_armed)
-        self.assertIn(record.reconfirmation_code, result)
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0]["type"], "Phrase")
+        self.assertTrue(writes[0]["needs_manual_review"])
+        self.assertIn("authority missing", writes[0]["remark"])
+        self.assertIsNone(record)
+        self.assertEqual(result, "已加入草稿")
 
 
 if __name__ == "__main__":

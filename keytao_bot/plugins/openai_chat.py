@@ -486,37 +486,52 @@ def _strip_command_message_prefixes(message_text: str) -> str:
     return text
 
 
-def _is_plain_draft_submit_request(message_text: str) -> bool:
-    if re.search(
-        r"[?？]|(?:什么意思|解释|会怎样|会如何|如果|假设|引用|复述|翻译)",
-        message_text,
-    ):
+_EXECUTION_QUESTION_SUFFIX_RE = re.compile(
+    r"(?:吗|么|好不好|行不行|可不可以|可以吗|好吗|行吗)$"
+)
+_EXECUTION_RESULT_SUFFIX_RE = re.compile(
+    r"(?:(?:并|并且|然后|再|完成后|处理完后|操作完后)?"
+    r"(?:告诉我|回复我|通知我)(?:一下)?(?:处理)?(?:结果)?"
+    r"|(?:并|并且|然后|再)?(?:告诉我|回复我|通知我)(?:一下)?)$"
+)
+
+
+def _normalized_execution_command_text(message_text: str) -> str:
+    """Normalize one positive execution request without trusting its targets."""
+    if not message_authorizes_mutation(message_text):
+        return ""
+    compact = _compact_command_text(message_text)
+    if not compact:
+        return ""
+    compact = _EXECUTION_QUESTION_SUFFIX_RE.sub("", compact)
+    compact = _EXECUTION_RESULT_SUFFIX_RE.sub("", compact)
+    return compact
+
+
+def _matches_draft_submit_command(compact: str) -> bool:
+    if not compact:
         return False
-    text = _strip_command_message_prefixes(message_text)
-    text = re.sub(r"[\s，,。.!！?？~～]+", "", text)
-    if text.startswith("请"):
-        text = text[1:]
-    changed = True
-    while changed:
-        changed = False
-        for suffix in ("一下", "吧", "啦", "了"):
-            if text.endswith(suffix):
-                text = text[:-len(suffix)]
-                changed = True
-                break
-    return text in _DRAFT_SUBMIT_COMMANDS
+    prefix = (
+        r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我|"
+        r"能不能|可不可以|能否|可否|可以帮我|可以请你)*"
+    )
+    target = r"(?:(?:当前|这个|我的)?(?:草稿|批次))"
+    action = r"(?:提交|提审|送审)(?:审核)?"
+    polite = r"(?:一下)?(?:吧|啦|了)?"
+    return bool(
+        re.fullmatch(rf"{prefix}(?:{action}(?:{target})?|(?:把|将)?{target}{action}|发起审核){polite}", compact)
+    )
+
+
+def _is_plain_draft_submit_request(message_text: str) -> bool:
+    return _matches_draft_submit_command(
+        _normalized_execution_command_text(message_text)
+    )
 
 
 def _is_explicit_draft_submit_request(message_text: str) -> bool:
     """Recognize a current-draft submit command without stealing questions."""
-    if _is_plain_draft_submit_request(message_text):
-        return True
-    if re.search(
-        r"[?？]|(?:什么意思|解释|会怎样|会如何|如果|假设|引用|复述|翻译)",
-        message_text,
-    ):
-        return False
-    return _compact_command_text(message_text) in _ACTION_SPECIFIC_DRAFT_SUBMIT_COMMANDS
+    return _is_plain_draft_submit_request(message_text)
 
 
 @dataclass(frozen=True)
@@ -580,13 +595,58 @@ def _is_target_bound_add_and_submit_request(
     add_clause = r"(?:加词|添加|加入|新增)(?:词条)?"
     code_clause = rf"(?:(?:用|以|按)?(?:编码)?(?:为|是)?)?{re.escape(code)}"
     submit_clause = r"(?:并|并且|然后|再|同时|以及)?(?:提交|提审|送审)(?:审核|草稿|批次)?"
-    polite = r"(?:一下|吧|啦|了)?"
+    polite = r"(?:一下)?(?:吧|啦|了)?"
     return bool(
         re.fullmatch(
             rf"{request_prefix}{add_clause}{re.escape(word)}{code_clause}{submit_clause}{polite}",
             compact,
             flags=re.IGNORECASE,
         )
+    )
+
+
+_QUOTED_PENDING_ADD_CONFIRM_TEXTS = {
+    "确认",
+    "确定",
+    "好的",
+    "好",
+    "是",
+    "对",
+    "可以",
+    "行",
+    "加",
+    "加入",
+    "添加",
+    "确认加入",
+    "确认添加",
+    "继续加入",
+    "继续添加",
+    "都加",
+    "全部加",
+}
+
+
+def _quoted_pending_add_control_intent(
+    message_text: str,
+    state: PendingAddWord,
+) -> Optional[MessageCommandIntent]:
+    """Resolve controls carried by a verified native reply to a bot candidate."""
+    if _is_short_add_and_submit_request(message_text):
+        return MessageCommandIntent(
+            intent="pending_add_and_submit",
+            confidence=1.0,
+        )
+    structural = _structural_pending_add_word_intent(message_text, state)
+    if structural is not None:
+        return structural
+    compact = _compact_command_text(message_text)
+    if compact not in _QUOTED_PENDING_ADD_CONFIRM_TEXTS:
+        return None
+    intent = MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+    return (
+        intent
+        if _message_authorizes_pending_state_control(state, message_text, intent)
+        else None
     )
 
 
@@ -652,7 +712,7 @@ def _compact_requests_draft_clear_all(
         rf"|(?:全部|都|所有)(?:删除|删掉|移除){draft_target}(?:条目|内容)?"
         rf"|(?:删除|删掉|移除)(?:全部|所有){draft_target}(?:条目|内容)?)"
     )
-    polite = r"(?:一下|吧|啦|了)?"
+    polite = r"(?:一下)?(?:吧|啦|了)?"
     if re.fullmatch(rf"{request_prefix}{clear_clause}{polite}", compact):
         return True
     return bool(
@@ -669,22 +729,33 @@ def _canonical_draft_management_command(
 ) -> Optional[MessageCommandIntent]:
     """Parse the complete positive syntax that may authorize draft mutations."""
     raw = _strip_command_message_prefixes(message_text).strip()
-    if (
-        not raw
-        or re.search(r"[?？\"'“”‘’「」《》【】\[\]（）()<>]", raw)
-        or re.search(
-            r"(?:什么意思|解释|如何|怎么|为什么|为何|教程|示例|假设|如果|"
-            r"是否|能否|可否|会不会|会怎样|会如何)",
-            raw,
-        )
-    ):
+    if not raw or re.search(r"[\"'“”‘’「」《》【】\[\]（）()<>]", raw):
         return None
 
-    compact = _compact_command_text(raw)
-    prefix = r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我)*"
+    compact = _normalized_execution_command_text(raw)
+    if not compact:
+        raw_compact = _compact_command_text(raw)
+        if (
+            not re.search(r"[?？]", raw)
+            and not _EXECUTION_QUESTION_SUFFIX_RE.search(raw_compact)
+            and re.match(
+                r"(?:请|麻烦|帮我|给我|现在|立即|直接|我要|我想|替我|为我)*"
+                r"取消(?:(?:最近|上次|刚才)(?:一次|的)?)?(?:提审|送审)",
+                raw_compact,
+            )
+        ):
+            compact = raw_compact
+        else:
+            return None
+    prefix = (
+        r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我|"
+        r"能不能|可不可以|能否|可否|可以帮我|可以请你)*"
+    )
     scope = r"(?:(?:最近|上次|刚才)(?:一次|的)?)?"
     recall_core = (
-        rf"(?:(?:撤回|撤销|召回){scope}(?:提交|提审|送审|审核|批次)?"
+        rf"(?:(?:撤回|撤销|召回)(?:"
+        rf"{scope}(?:提交|提审|送审|审核|批次)?|"
+        rf"{scope}(?:提交|提审|送审)(?:的)?批次)"
         rf"|取消{scope}(?:提审|送审))"
     )
     draft_target = r"(?:恢复(?:后(?:的)?|的))?(?:当前|我的)?(?:草稿|批次)"
@@ -697,7 +768,7 @@ def _canonical_draft_management_command(
         rf"|(?:删除|删掉|移除)(?:全部|所有){draft_target}(?:条目|内容)?)"
     )
     connector = r"(?:并|并且|然后|再|同时|以及)?"
-    polite = r"(?:一下|吧|啦|了)?"
+    polite = r"(?:一下)?(?:吧|啦|了)?"
 
     if re.fullmatch(
         rf"{prefix}{recall_core}{polite}(?:{connector}{clear_clause}{polite})?",
@@ -844,7 +915,7 @@ def _message_authorizes_pending_control(
     """Require a short explicit current reply before consuming a structured ticket."""
     if command_intent.confidence < 0.85:
         return False
-    compact = _compact_command_text(message_text)
+    compact = _compact_command_text(message_text).lower()
     if not compact or len(compact) > 48:
         return False
     if command_intent.intent == "pending_confirm":
@@ -861,16 +932,17 @@ def _message_authorizes_pending_control(
         )
     if command_intent.intent == "pending_code_request":
         code = command_intent.requested_code
+        code_match = re.fullmatch(
+            r"(?:(?:用|以|选|改成)|"
+            r"(?:确认)?(?:加|添加)(?:用|以|选|改成)?|"
+            r"确认(?:用|以|选))?"
+            r"([a-z]{2,12})",
+            compact,
+        )
         return bool(
             code
-            and code in compact
-            and re.fullmatch(
-                r"[a-z]{2,12}|"
-                r"(?:用|以|选|改成)[a-z]{2,12}|"
-                r"(?:确认)?(?:加|添加)(?:用|以|选|改成)?[a-z]{2,12}|"
-                r"确认(?:用|以|选)[a-z]{2,12}",
-                compact,
-            )
+            and code_match
+            and code == code_match.group(1)
         )
     if command_intent.intent == "pending_recode":
         structure_matches = bool(
@@ -921,6 +993,73 @@ def _parse_pending_choice_index(text: str) -> Optional[int]:
         if tens in digit_map and ones in digit_map:
             return digit_map[tens] * 10 + digit_map[ones]
     return None
+
+
+def _structural_pending_add_word_intent(
+    message_text: str,
+    state: PendingAddWord,
+) -> Optional[MessageCommandIntent]:
+    """Parse exact selectors advertised by a live add-word prompt."""
+    stripped = _strip_command_message_prefixes(message_text).strip()
+    if (
+        not stripped
+        or re.search(r"[?？\"'“”‘’「」『』]", stripped)
+    ):
+        return None
+    compact = _compact_command_text(stripped).lower()
+    if not compact:
+        return None
+
+    choice_index = _parse_pending_choice_index(compact)
+    if choice_index is not None:
+        return MessageCommandIntent(
+            intent="pending_choice",
+            confidence=1.0,
+            choice_index=choice_index,
+        )
+
+    code_matches: List[MessageCommandIntent] = []
+    for candidate_code, _occupied in state.candidates:
+        candidate_intent = MessageCommandIntent(
+            intent="pending_code_request",
+            confidence=1.0,
+            requested_code=str(candidate_code or "").strip().lower(),
+        )
+        if (
+            candidate_intent.requested_code
+            and _message_authorizes_pending_control(stripped, candidate_intent)
+        ):
+            code_matches.append(candidate_intent)
+    if len(code_matches) == 1:
+        return code_matches[0]
+
+    recode_match = re.fullmatch(
+        r"(.+?)(重新编码|挪开|顺延|改成)",
+        compact,
+    )
+    if recode_match is None:
+        return None
+    selector = recode_match.group(1)
+    choice_index = _parse_pending_choice_index(selector)
+    if choice_index is not None:
+        return MessageCommandIntent(
+            intent="pending_recode",
+            confidence=1.0,
+            choice_index=choice_index,
+        )
+
+    matching_codes = {
+        code
+        for code, occupied in state.candidates
+        if occupied and selector in state.occupied_words.get(code, [])
+    }
+    if len(matching_codes) != 1:
+        return None
+    return MessageCommandIntent(
+        intent="pending_recode",
+        confidence=1.0,
+        target_word=selector,
+    )
 
 
 def _is_fresh_current_user_command_intent(
@@ -1210,6 +1349,13 @@ async def _classify_message_command_intent(
         return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
     if pending_accepts_add_submit and compact_message in _PENDING_ADD_AND_SUBMIT_COMMANDS:
         return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
+    if isinstance(pending_state, PendingAddWord):
+        structural_pending_intent = _structural_pending_add_word_intent(
+            message_text,
+            pending_state,
+        )
+        if structural_pending_intent is not None:
+            return structural_pending_intent
     if _is_explicit_draft_submit_request(message_text):
         if (
             isinstance(pending_state, PendingToolConfirm)
@@ -2067,6 +2213,7 @@ _TICKET_PENDING_INTENTS = {
 _DIRECT_OWNER_PENDING_ADD_INTENTS = {
     "pending_confirm",
     "pending_add_and_submit",
+    "pending_recode",
     "pending_code_request",
     "pending_choice",
 }
@@ -2125,6 +2272,37 @@ def _message_authorizes_pending_state_control(
         and _is_target_bound_add_and_submit_request(message_text, state)
     ):
         return True
+    if isinstance(state, PendingAddWord):
+        structural_intent = _structural_pending_add_word_intent(
+            message_text,
+            state,
+        )
+        structural_recode_target = (
+            _resolve_shift_target_code(state, structural_intent)
+            if structural_intent is not None
+            and structural_intent.intent == "pending_recode"
+            else None
+        )
+        command_recode_target = (
+            _resolve_shift_target_code(state, command_intent)
+            if command_intent.intent == "pending_recode"
+            else None
+        )
+        recode_targets_match = bool(
+            structural_recode_target
+            and structural_recode_target == command_recode_target
+        )
+        if (
+            recode_targets_match
+            or (
+                structural_intent is not None
+                and structural_intent.intent == command_intent.intent
+                and structural_intent.choice_index == command_intent.choice_index
+                and structural_intent.requested_code == command_intent.requested_code
+                and structural_intent.target_word == command_intent.target_word
+            )
+        ):
+            return True
     if _message_authorizes_pending_control(message_text, command_intent):
         return True
     return bool(
@@ -2273,6 +2451,8 @@ async def _resolve_pending_ticket_control(
     command_intent: MessageCommandIntent,
     platform: str,
     user_id: str,
+    *,
+    verified_bot_reply: bool = False,
 ) -> Tuple[MessageCommandIntent, Optional[str]]:
     """Resolve an exact ticket or stage a new choice without executing it."""
     if not state_record.requires_reconfirmation:
@@ -2321,10 +2501,26 @@ async def _resolve_pending_ticket_control(
     if (
         isinstance(state_record.state, PendingToolConfirm)
         and state_record.owner_key.actor_id == str(user_id)
-        and command_intent.intent == "pending_confirm"
-        and _pending_tool_confirmation_matches(
-            state_record.state,
-            message_text,
+        and (
+            (
+                command_intent.intent == "pending_confirm"
+                and _pending_tool_confirmation_matches(
+                    state_record.state,
+                    message_text,
+                )
+            )
+            or (
+                verified_bot_reply
+                and command_intent.intent in {
+                    "pending_confirm",
+                    "pending_add_and_submit",
+                }
+                and _message_authorizes_pending_state_control(
+                    state_record.state,
+                    message_text,
+                    command_intent,
+                )
+            )
         )
     ):
         return command_intent, None
@@ -2357,6 +2553,27 @@ async def _resolve_pending_ticket_control(
     return command_intent, None
 
 
+def _prompt_capability_digest(text: str) -> str:
+    normalized = re.sub(r"^\s*@\S+\s*", "", str(text or ""), count=1)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _verified_bot_reply_matches_record(
+    reply_reference: ReplyReferenceInfo,
+    record: Optional[PendingStateRecord],
+) -> bool:
+    return bool(
+        record is not None
+        and reply_reference.is_reply
+        and reply_reference.is_to_bot
+        and reply_reference.text
+        and record.origin_prompt_digest
+        and _prompt_capability_digest(reply_reference.text)
+        == record.origin_prompt_digest
+    )
+
+
 def _append_pending_ticket_challenge(
     response: str,
     conv_key: ConversationKey,
@@ -2370,13 +2587,18 @@ def _append_pending_ticket_challenge(
         or not record.reconfirmation_code
     ):
         return response
+
+    def bind_prompt(text: str) -> str:
+        record.origin_prompt_digest = _prompt_capability_digest(text)
+        return text
+
     if isinstance(record.state, PendingAddWord):
-        return response
+        return bind_prompt(response)
     natural_command = _pending_tool_confirmation_command(record.state)
     if natural_command:
         if _compact_command_text(natural_command) in _compact_command_text(response):
-            return response
-        return (
+            return bind_prompt(response)
+        return bind_prompt(
             response.rstrip()
             + "\n\n为避免确认错目标，请回复"
             + f"「{natural_command}」继续。"
@@ -2384,13 +2606,13 @@ def _append_pending_ticket_challenge(
 
     challenge = f"确认票据 {record.reconfirmation_code}"
     if challenge.lower() in response.lower():
-        return response
+        return bind_prompt(response)
     guidance = (
-        f"请发送「{challenge}」采用当前推荐选择；普通的“确认”不会执行。"
+        f"请引用本条回复「确认」采用当前推荐选择；无法引用时发送「{challenge}」。"
         if isinstance(record.state, PendingAddWord)
-        else f"请发送「{challenge}」继续；普通的“确认”不会执行。"
+        else f"请引用本条回复「确认」继续；无法引用时发送「{challenge}」。"
     )
-    return response.rstrip() + "\n\n为防止延迟回复确认错操作，" + guidance
+    return bind_prompt(response.rstrip() + "\n\n" + guidance)
 
 
 def _format_active_draft_operation_message(
@@ -5656,12 +5878,8 @@ async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             draft_count = count
         parts.append(f"\n当前草稿（共 {count} 条）：")
-        for item in items:
-            action_label = item.get("action_label") or {
-                "Create": "新增", "Change": "修改", "Delete": "删除",
-            }.get(item.get("action", ""), "")
-            display = item.get("display_label") or f"{item.get('word', '')} → {item.get('code', '')}"
-            parts.append(f"• {action_label} {display}")
+        for index, item in enumerate(items, start=1):
+            parts.append(_draft_item_display_line(item, index))
 
     # Batch URL
     batch_url = data.get("batchUrl") or preview.get("batchUrl", "") or list_batch_url
@@ -5671,6 +5889,14 @@ async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str
     if draft_count != 0:
         parts.append("\n发送「提交」以提交该草稿")
     return "\n".join(parts)
+
+
+def _draft_item_display_line(item: Dict, index: int) -> str:
+    action_label = item.get("action_label") or {
+        "Create": "新增", "Change": "修改", "Delete": "删除",
+    }.get(item.get("action", ""), "")
+    display = item.get("display_label") or f"{item.get('word', '')} → {item.get('code', '')}"
+    return f"• {index}. {action_label} {display}"
 
 
 def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
@@ -5972,6 +6198,12 @@ def _active_operation_reply_matches(
     """Return whether a quoted bot message belongs to an active operation prompt."""
     if operation.status != "awaiting_confirmation" or not reply_reference.is_to_bot:
         return False
+    if operation.prompt_text:
+        return bool(
+            reply_reference.is_reply
+            and _prompt_capability_digest(reply_reference.text)
+            == _prompt_capability_digest(operation.prompt_text)
+        )
     referenced_state = _parse_pending_state_from_response(reply_reference.text)
     if conversation_state_store.states_equivalent(referenced_state, operation.pending_state):
         return True
@@ -6457,6 +6689,151 @@ async def _perform_clear_current_draft(
     )
 
 
+def _quoted_draft_display_lines(response: str) -> List[str]:
+    return [
+        re.sub(r"\s+", " ", match.group(0)).strip()
+        for match in re.finditer(
+            r"(?m)^\s*•\s*\d+\.\s*(?:新增|修改|删除)\s+.+$",
+            str(response or ""),
+        )
+    ]
+
+
+def _quoted_draft_selection_request(
+    message_text: str,
+    items: List[Dict],
+) -> Optional[Tuple[str, object]]:
+    raw = _strip_command_message_prefixes(message_text).strip()
+    if (
+        not raw
+        or re.search(r"[?？\"'“”‘’「」『』]", raw)
+        or re.search(r"(?:不要|别|无需|不用|算了|取消)", raw)
+    ):
+        return None
+    compact = _compact_command_text(raw)
+    prefix = r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我)*"
+    ordinal_patterns = (
+        rf"{prefix}(?:删除|删掉|移除)(?:第)?([0-9一二三四五六七八九十两]+)(?:条|个)?",
+        rf"{prefix}(?:把|将)?(?:第)?([0-9一二三四五六七八九十两]+)(?:条|个)?(?:删除|删掉|移除)",
+    )
+    for pattern in ordinal_patterns:
+        match = re.fullmatch(pattern, compact)
+        if match:
+            index = _parse_pending_choice_index(match.group(1))
+            return ("index", index) if index is not None else None
+
+    all_target = r"(?:上面|引用里|引用中的)?(?:这些|全部|所有)(?:草稿)?(?:条目|内容)?"
+    if re.fullmatch(
+        rf"{prefix}(?:(?:把|将)?{all_target}(?:都|全部)?(?:删除|删掉|移除)|(?:删除|删掉|移除){all_target})",
+        compact,
+    ):
+        return "all", True
+
+    for item in items:
+        word = _draft_item_word(item)
+        if word and re.fullmatch(
+            rf"{prefix}(?:只|仅)(?:保留|留下|留){re.escape(word)}",
+            compact,
+        ):
+            return "keep", word
+    return None
+
+
+async def _try_handle_quoted_draft_selection(
+    message_text: str,
+    reply_reference: ReplyReferenceInfo,
+    platform: str,
+    user_id: str,
+) -> Optional[str]:
+    """Apply an ordinal/all/keep selection only to an unchanged bot draft list."""
+    if not (
+        reply_reference.is_reply
+        and reply_reference.is_to_bot
+        and reply_reference.text
+    ):
+        return None
+    quoted_lines = _quoted_draft_display_lines(reply_reference.text)
+    if not quoted_lines:
+        return None
+    compact_message = _compact_command_text(message_text)
+    if not re.search(r"删除|删掉|移除|只保留|仅保留|只留下|仅留下|只留|仅留", compact_message):
+        return None
+
+    list_data = await _fetch_current_draft_items(platform, user_id)
+    if list_data.get("not_bound"):
+        return _BIND_HELP_TEXT
+    if not list_data.get("success"):
+        return _append_batch_url_if_missing(
+            f"查看草稿失败：{list_data.get('message', '未知错误')} qwq",
+            list_data,
+        )
+    items = list_data.get("items")
+    if not isinstance(items, list):
+        return "当前草稿快照缺少条目列表，没有执行操作。"
+
+    selection = _quoted_draft_selection_request(message_text, items)
+    if selection is None:
+        return None
+    expected_lines = [
+        re.sub(r"\s+", " ", _draft_item_display_line(item, index)).strip()
+        for index, item in enumerate(items, start=1)
+        if isinstance(item, dict)
+    ]
+    if quoted_lines != expected_lines:
+        return "引用的草稿列表已不是当前快照；没有执行操作，请重新发送「查看草稿」。"
+
+    active_operation = draft_operation_coordinator.find_for_actor((platform, user_id))
+    if active_operation is not None:
+        return _active_operation_message_for_request(active_operation, platform, user_id)
+
+    kind, value = selection
+    if kind == "all":
+        result = await _perform_clear_current_draft(platform, user_id)
+    else:
+        selected_items: List[Dict]
+        if kind == "index":
+            index = int(value or 0)
+            if index < 1 or index > len(items):
+                return f"请选择 1-{len(items)} 之间的草稿编号。"
+            selected_items = [items[index - 1]]
+        else:
+            keep_matches = [item for item in items if _draft_item_word(item) == value]
+            if len(keep_matches) != 1:
+                return "无法唯一确定要保留的词条；没有执行删除。"
+            selected_items = [item for item in items if item is not keep_matches[0]]
+            if not selected_items:
+                return f"当前草稿只剩「{value}」，不需要删除。"
+
+        source_targets = [
+            _canonical_draft_delete_target(item)
+            for item in selected_items
+            if isinstance(item, dict)
+        ]
+        source_version = list_data.get("contentVersion")
+        ids = [target.get("id") for target in source_targets if target is not None]
+        if (
+            not isinstance(source_version, int)
+            or isinstance(source_version, bool)
+            or source_version < 0
+            or len(source_targets) != len(selected_items)
+            or any(target is None for target in source_targets)
+            or len(ids) != len(selected_items)
+        ):
+            return "当前草稿缺少完整 ID 或版本；没有执行删除。"
+        result = await _perform_exact_batch_remove(
+            [int(item_id) for item_id in ids],
+            platform,
+            user_id,
+            batch_id=str(list_data.get("batchId") or ""),
+            source_content_version=source_version,
+            source_targets=[target for target in source_targets if target is not None],
+        )
+
+    if result.success or result.invalidate_pending:
+        conversation_state_store.delete_actor((platform, user_id))
+    return result.text
+
+
 async def _perform_recall_latest_batch(
     platform: str,
     user_id: str,
@@ -6731,6 +7108,7 @@ async def _try_handle_draft_recall_command(
 ) -> Optional[str]:
     if not _message_authorizes_draft_recall(message_text, command_intent):
         return None
+    canonical = _canonical_draft_management_command(message_text)
     active_operation = draft_operation_coordinator.find_for_actor(
         (platform, user_id)
     )
@@ -6743,7 +7121,7 @@ async def _try_handle_draft_recall_command(
     result = await _perform_recall_latest_batch(
         platform,
         user_id,
-        clear_after=_message_requests_draft_clear_all(message_text),
+        clear_after=bool(canonical is not None and canonical.clear_after),
     )
     if result.success or result.invalidate_pending:
         conversation_state_store.delete_actor((platform, user_id))
@@ -9038,15 +9416,23 @@ async def _handle_ai_chat_serialized(
         if reply_reference.is_to_bot and reply_reference.text
         else None
     )
-    quoted_add_and_submit_intent = MessageCommandIntent(
-        intent="pending_add_and_submit",
-        confidence=1.0,
+    verified_current_pending_reply = _verified_bot_reply_matches_record(
+        reply_reference,
+        conversation_state_store.get_record(conv_key),
     )
-    quoted_short_add_and_submit = bool(
+    quoted_pending_add_intent = (
+        _quoted_pending_add_control_intent(
+            normalized_message_text,
+            referenced_pending,
+        )
+        if isinstance(referenced_pending, PendingAddWord)
+        else None
+    )
+    quoted_pending_add_control = bool(
         reply_reference.is_reply
         and reply_reference.is_to_bot
         and isinstance(referenced_pending, PendingAddWord)
-        and _is_short_add_and_submit_request(normalized_message_text)
+        and quoted_pending_add_intent is not None
     )
     if reply_reference.is_reply:
         logger.info(
@@ -9055,8 +9441,8 @@ async def _handle_ai_chat_serialized(
             f"mentions={list(reply_reference.mentioned_user_ids)} "
             f"pending={referenced_pending.__class__.__name__ if referenced_pending else 'none'}"
         )
-    if quoted_short_add_and_submit:
-        generic_command_intent = quoted_add_and_submit_intent
+    if quoted_pending_add_control:
+        generic_command_intent = quoted_pending_add_intent
     elif _is_short_add_and_submit_request(normalized_message_text):
         current_pending = conversation_state_store.get(conv_key)
         response = _format_full_add_and_submit_instruction(
@@ -9129,6 +9515,7 @@ async def _handle_ai_chat_serialized(
             if (
                 active_command_intent.intent == "pending_confirm"
                 and not active_confirmation_matches
+                and not explicit_active_reply
             ):
                 response = (
                     "请明确当前要继续的动作。\n"
@@ -9240,8 +9627,8 @@ async def _handle_ai_chat_serialized(
                     await ai_chat.finish(response)
                     return
 
-    quoted_pending_add_submit_authorized = False
-    if quoted_short_add_and_submit:
+    quoted_pending_add_control_authorized = False
+    if quoted_pending_add_control:
         current_record = conversation_state_store.get_record(conv_key)
         if current_record is not None and current_record.execution_id:
             response = (
@@ -9296,11 +9683,12 @@ async def _handle_ai_chat_serialized(
                 current_record.state.__class__.__name__,
                 _describe_pending_state(current_record.state),
             )
-            command_intent_cache[cache_key] = quoted_add_and_submit_intent
-            quoted_pending_add_submit_authorized = True
+            command_intent_cache[cache_key] = quoted_pending_add_intent
+            quoted_pending_add_control_authorized = True
 
     if (
-        not quoted_pending_add_submit_authorized
+        not quoted_pending_add_control_authorized
+        and not verified_current_pending_reply
         and referenced_pending is not None
         and memory_context.space_type == "group"
     ):
@@ -9407,6 +9795,22 @@ async def _handle_ai_chat_serialized(
             remember_conversation(conv_key, memory_context, normalized_message_text, response)
             await ai_chat.finish(response)
             return
+
+    quoted_draft_response = await _try_handle_quoted_draft_selection(
+        normalized_message_text,
+        reply_reference,
+        platform,
+        user_id,
+    )
+    if quoted_draft_response is not None:
+        remember_conversation(
+            conv_key,
+            memory_context,
+            normalized_message_text,
+            quoted_draft_response,
+        )
+        await ai_chat.finish(quoted_draft_response)
+        return
 
     other_pending_record = (
         conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
@@ -9519,6 +9923,7 @@ async def _handle_ai_chat_serialized(
                         pending_command_intent,
                         platform,
                         user_id,
+                        verified_bot_reply=verified_current_pending_reply,
                     )
                 else:
                     ticket_response = None

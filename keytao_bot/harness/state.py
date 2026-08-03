@@ -256,6 +256,7 @@ class PendingStateRecord:
     expires_at: float = 0.0
     nonce: str = ""
     origin_message_id: str = ""
+    origin_prompt_digest: str = ""
     requires_reconfirmation: bool = False
     confirmation_armed: bool = False
     reconfirmation_code: str = ""

@@ -4996,6 +4996,209 @@ def test_numeric_reply_means_exact_candidate_selection():
     check("'是' maps to recommended code", state.recommended_code == "zrxxv")
 
 
+def test_exact_numeric_pending_reply_executes_without_intent_model():
+    """An advertised numeric choice must not depend on the intent model."""
+    print("\n🧪 exact numeric pending reply executes without intent model")
+
+    async def _run():
+        conv_key = ConversationAddress.group("qq", "numeric-group", "numeric-user")
+        space_key = ("qq", "qq:group:numeric-group")
+        state = PendingAddWord(
+            word="母版",
+            recommended_code="mjbfa",
+            candidates=[
+                ("mjbf", True),
+                ("mjbfa", False),
+                ("mjbfau", False),
+            ],
+        )
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        openai_chat_module.conversation_state_store = store
+        store.set(conv_key, state, space_key=space_key, owner_label="～×！@")
+        try:
+            with (
+                patch.object(openai_chat_module, "OPENAI_API_KEY", ""),
+                patch.object(openai_chat_module, "AsyncOpenAI", None),
+                patch.object(
+                    openai_chat_module,
+                    "_execute_add_to_draft",
+                    AsyncMock(return_value="added"),
+                ) as add_mock,
+            ):
+                response = await openai_chat_module.handle_pending_message_core(
+                    "2",
+                    "qq",
+                    "numeric-user",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="～×！@",
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("numeric choice executes directly", response == "added")
+        check("numeric choice selects advertised code", add_mock.await_count == 1)
+        if add_mock.await_count:
+            check("numeric choice binds candidate two", add_mock.await_args.args[:2] == ("母版", "mjbfa"))
+
+    asyncio.run(_run())
+
+
+def test_exact_pending_selection_syntax_is_structural_and_fail_closed():
+    """Exact candidate selectors are local protocol syntax, not LLM semantics."""
+    print("\n🧪 exact pending selection syntax is structural and fail closed")
+
+    state = PendingAddWord(
+        word="母版",
+        recommended_code="mjbfa",
+        candidates=[
+            ("mjbf", True),
+            ("mjbfa", False),
+            ("mjbfau", False),
+        ],
+        occupied_words={"mjbf": ["木板"]},
+    )
+
+    async def _run():
+        with (
+            patch.object(openai_chat_module, "OPENAI_API_KEY", ""),
+            patch.object(openai_chat_module, "AsyncOpenAI", None),
+        ):
+            cases = {
+                "2": ("pending_choice", 2, "", ""),
+                "第2个": ("pending_choice", 2, "", ""),
+                "mjbfa": ("pending_code_request", None, "mjbfa", ""),
+                "选 mjbfa": ("pending_code_request", None, "mjbfa", ""),
+                "1 重新编码": ("pending_recode", 1, "", ""),
+                "木板 重新编码": ("pending_recode", None, "", "木板"),
+            }
+            for message, expected in cases.items():
+                intent = await openai_chat_module._classify_message_command_intent(
+                    message,
+                    state,
+                )
+                actual = (
+                    intent.intent,
+                    intent.choice_index,
+                    intent.requested_code,
+                    intent.target_word,
+                )
+                check(f"exact selector routes locally: {message}", actual == expected)
+
+            for message in (
+                "2？",
+                "不是 2",
+                "请复述：2",
+                "“2”",
+                "mjbfa 吗",
+                "abcd",
+                "桌子 重新编码",
+            ):
+                intent = await openai_chat_module._classify_message_command_intent(
+                    message,
+                    state,
+                )
+                check(f"unsafe selector stays non-mutating: {message}", intent.intent == "none")
+
+            check(
+                "candidate-code prefixes cannot authorize a longer code",
+                not openai_chat_module._message_authorizes_pending_state_control(
+                    state,
+                    "mjbfa",
+                    MessageCommandIntent(
+                        intent="pending_code_request",
+                        confidence=1.0,
+                        requested_code="mjbf",
+                    ),
+                ),
+            )
+
+    asyncio.run(_run())
+
+
+def test_exact_pending_selectors_execute_only_the_bound_action():
+    """Every advertised exact selector reaches only its current bound target."""
+    print("\n🧪 exact pending selectors execute only the bound action")
+
+    async def _run():
+        conv_key = ConversationAddress.group("qq", "selector-group", "selector-user")
+        space_key = ("qq", "qq:group:selector-group")
+        state = PendingAddWord(
+            word="母版",
+            recommended_code="mjbfa",
+            candidates=[
+                ("mjbf", True),
+                ("mjbfa", False),
+                ("mjbfau", False),
+            ],
+            occupied_words={"mjbf": ["木板"]},
+            pronunciation_recommended_codes=["mjbfa", "mjbfau"],
+        )
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        openai_chat_module.conversation_state_store = store
+        add_mock = AsyncMock(return_value="added")
+        duplicate_mock = AsyncMock(return_value="duplicated")
+        shift_mock = AsyncMock(return_value="shifted")
+        multi_mock = AsyncMock(return_value="multi-added")
+
+        async def run_message(message):
+            store.set(conv_key, state, space_key=space_key, owner_label="～×！@")
+            return await openai_chat_module.handle_pending_message_core(
+                message,
+                "qq",
+                "selector-user",
+                conv_key,
+                history=[],
+                space_key=space_key,
+                owner_label="～×！@",
+            )
+
+        try:
+            with (
+                patch.object(openai_chat_module, "OPENAI_API_KEY", ""),
+                patch.object(openai_chat_module, "AsyncOpenAI", None),
+                patch.object(openai_chat_module, "_execute_add_to_draft", add_mock),
+                patch.object(openai_chat_module, "_execute_confirmed_tool", duplicate_mock),
+                patch.object(openai_chat_module, "_execute_shift_to_code", shift_mock),
+                patch.object(
+                    openai_chat_module,
+                    "_execute_add_multiple_codes_to_draft",
+                    multi_mock,
+                ),
+            ):
+                code_response = await run_message("MJBFA")
+                duplicate_response = await run_message("1")
+                numbered_shift_response = await run_message("1 重新编码")
+                named_shift_response = await run_message("木板 重新编码")
+                multi_response = await run_message("都加")
+                invalid_response = await run_message("4")
+                question_response = await run_message("2？")
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("exact code executes direct add", code_response == "added")
+        check("exact code binds advertised empty slot", add_mock.await_args.args[:2] == ("母版", "mjbfa"))
+        check("occupied number executes duplicate path", duplicate_response == "duplicated")
+        check("occupied number binds one create target", duplicate_mock.await_count == 1)
+        check("numbered recode executes shift", numbered_shift_response == "shifted")
+        check("named recode executes shift", named_shift_response == "shifted")
+        check(
+            "both recode forms bind occupied code",
+            shift_mock.await_count == 2
+            and all(call.args[1] == "mjbf" for call in shift_mock.await_args_list),
+        )
+        check("all-add executes reviewed multi-code path", multi_response == "multi-added")
+        check("all-add binds only recommended pronunciation codes", multi_mock.await_args.args[1] == ["mjbfa", "mjbfau"])
+        check("out-of-range number explains valid range", invalid_response == "请选择 1-3 之间的编号。")
+        check("question does not execute a pending mutation", question_response is None)
+        check("unsafe selectors add no extra writes", add_mock.await_count == 1 and duplicate_mock.await_count == 1 and shift_mock.await_count == 2 and multi_mock.await_count == 1)
+
+    asyncio.run(_run())
+
+
 def test_occupied_numeric_choice_means_duplicate_confirm():
     """Verify selecting an occupied candidate directly means duplicate-code insertion."""
     print("\n🧪 occupied numeric choice means duplicate confirm")
@@ -6120,6 +6323,188 @@ def test_question_and_meta_text_never_authorize_deterministic_mutations():
             ),
         ),
     )
+
+
+def test_polite_execution_requests_are_commands_but_information_questions_are_not():
+    """Polite command grammar must not collapse back into a punctuation ban."""
+    print("\n🧪 polite execution requests stay distinct from questions")
+
+    async def _run():
+        polite_submit = await _classify_message_command_intent("能不能提交一下？")
+        long_submit = await _classify_message_command_intent(
+            "麻烦把当前草稿提交审核，完成后告诉我结果"
+        )
+        recall = await _classify_message_command_intent(
+            "帮我撤回刚才提交的批次并告诉我结果"
+        )
+        informational = await _classify_message_command_intent(
+            "请问提交当前草稿会怎样？"
+        )
+
+        check("polite submit routes locally", polite_submit.intent == "draft_submit")
+        check("long submit ignores result suffix", long_submit.intent == "draft_submit")
+        check("natural recall ignores result suffix", recall.intent == "draft_recall")
+        check("information question stays non-command", informational.intent == "none")
+        check(
+            "polite add is current execution authority",
+            openai_chat_module.message_authorizes_mutation("可以帮我收录母版 mjbfa 吗？"),
+        )
+        check(
+            "negative polite request stays blocked",
+            not openai_chat_module.message_authorizes_mutation("能不能不要提交？"),
+        )
+
+    asyncio.run(_run())
+
+
+def test_verified_bot_reply_is_a_single_prompt_capability():
+    """An exact native reply may confirm once; a stale prompt still needs its nonce."""
+    print("\n🧪 verified bot reply binds one pending prompt")
+
+    async def _run():
+        conv_key = ConversationAddress.group("qq", "reply-group", "reply-user")
+        space_key = ("qq", "qq:group:reply-group")
+        store = MemoryConversationStateStore()
+        old_store = openai_chat_module.conversation_state_store
+        openai_chat_module.conversation_state_store = store
+        try:
+            pending = PendingToolConfirm(
+                function_name="keytao_submit_batch",
+                args={
+                    "batch_id": "batch-1",
+                    "expected_content_version": 4,
+                    "expected_server_snapshot_digest": "a" * 64,
+                    "expected_warning_digest": "b" * 64,
+                    "expected_audit_digest": "c" * 64,
+                },
+                confirmation_source="server_warning",
+            )
+            store.set(conv_key, pending, space_key=space_key, owner_label="Rea")
+            prompt = openai_chat_module._append_pending_ticket_challenge(
+                "提交检查完成，请确认继续提交。",
+                conv_key,
+            )
+            record = store.get_record(conv_key)
+            reply = ReplyReferenceInfo(
+                is_reply=True,
+                is_to_bot=True,
+                text="@Rea " + prompt,
+            )
+            stale_reply = ReplyReferenceInfo(
+                is_reply=True,
+                is_to_bot=True,
+                text="@Rea 旧的提交检查，请确认继续提交。",
+            )
+            intent = MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+            resolved, response = await openai_chat_module._resolve_pending_ticket_control(
+                record,
+                "确认",
+                intent,
+                "qq",
+                "reply-user",
+                verified_bot_reply=openai_chat_module._verified_bot_reply_matches_record(
+                    reply,
+                    record,
+                ),
+            )
+
+            check("exact native reply matches current prompt", openai_chat_module._verified_bot_reply_matches_record(reply, record))
+            check("stale native reply does not match", not openai_chat_module._verified_bot_reply_matches_record(stale_reply, record))
+            check("verified reply confirms without nonce", resolved.intent == "pending_confirm" and response is None)
+            check("prompt explains quote-first confirmation", "引用本条回复「确认」" in prompt)
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+    asyncio.run(_run())
+
+
+def test_bot_quoted_candidate_accepts_exact_selectors_only():
+    """A native candidate quote carries its advertised selector grammar, not prose."""
+    print("\n🧪 bot candidate quote carries exact selectors")
+    state = PendingAddWord(
+        word="母版",
+        recommended_code="mjbfa",
+        candidates=[("mjbf", True), ("mjbfa", False), ("mjbfau", False)],
+        occupied_words={"mjbf": ["木板"]},
+    )
+
+    numeric = openai_chat_module._quoted_pending_add_control_intent("2", state)
+    code = openai_chat_module._quoted_pending_add_control_intent("MJBFA", state)
+    all_codes = openai_chat_module._quoted_pending_add_control_intent("都加", state)
+    recode = openai_chat_module._quoted_pending_add_control_intent("木板 重新编码", state)
+
+    check("quoted number binds advertised index", numeric is not None and numeric.choice_index == 2)
+    check("quoted code binds exact candidate", code is not None and code.requested_code == "mjbfa")
+    check("quoted all-add is an explicit confirmation", all_codes is not None and all_codes.intent == "pending_confirm")
+    check("quoted recode binds occupied word", recode is not None and recode.target_word == "木板")
+    check("quoted question is not a selector", openai_chat_module._quoted_pending_add_control_intent("2？", state) is None)
+    check("unknown code is not a selector", openai_chat_module._quoted_pending_add_control_intent("abcd", state) is None)
+
+
+def test_quoted_draft_list_binds_ordinal_and_rejects_stale_snapshot():
+    """Ordinal deletion is allowed only when the quoted bot list equals the live draft."""
+    print("\n🧪 quoted draft list binds exact ordinal")
+
+    async def _run():
+        items = [
+            {"id": 11, "word": "母版", "code": "mjbfa", "action": "Create"},
+            {"id": 12, "word": "窨茶", "code": "xwwso", "action": "Create"},
+            {"id": 13, "word": "阻抑", "code": "zjyka", "action": "Create"},
+        ]
+        prompt = "当前草稿（共 3 条）：\n" + "\n".join(
+            openai_chat_module._draft_item_display_line(item, index)
+            for index, item in enumerate(items, start=1)
+        )
+        reply = ReplyReferenceInfo(is_reply=True, is_to_bot=True, text=prompt)
+        list_data = {
+            "success": True,
+            "batchId": "batch-list",
+            "batchUrl": "https://keytao.test/batch-list",
+            "contentVersion": 7,
+            "items": items,
+        }
+        remove = AsyncMock(
+            return_value=openai_chat_module.DraftActionResult(
+                "deleted",
+                success=True,
+            )
+        )
+        store = MemoryConversationStateStore()
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(
+                openai_chat_module,
+                "_fetch_current_draft_items",
+                AsyncMock(return_value=list_data),
+            ),
+            patch.object(openai_chat_module, "_perform_exact_batch_remove", remove),
+        ):
+            response = await openai_chat_module._try_handle_quoted_draft_selection(
+                "删除第2条",
+                reply,
+                "qq",
+                "draft-user",
+            )
+            stale_response = await openai_chat_module._try_handle_quoted_draft_selection(
+                "删除第2条",
+                ReplyReferenceInfo(
+                    is_reply=True,
+                    is_to_bot=True,
+                    text=prompt.replace("xwwso", "ybwso"),
+                ),
+                "qq",
+                "draft-user",
+            )
+
+        check("quoted ordinal executes exact delete", response == "deleted")
+        check("quoted ordinal deletes one target", remove.await_count == 1)
+        if remove.await_count:
+            check("quoted ordinal binds item two ID", remove.await_args.args[0] == [12])
+            check("quoted ordinal binds current version", remove.await_args.kwargs["source_content_version"] == 7)
+        check("stale quoted list is rejected", "已不是当前快照" in (stale_response or ""))
+
+    asyncio.run(_run())
 
 
 def test_active_operation_message_preserves_second_word():
@@ -11580,6 +11965,9 @@ if __name__ == "__main__":
     test_augment_simple_word_query_response_skips_draft_action_message()
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()
+    test_exact_numeric_pending_reply_executes_without_intent_model()
+    test_exact_pending_selection_syntax_is_structural_and_fail_closed()
+    test_exact_pending_selectors_execute_only_the_bound_action()
     test_occupied_numeric_choice_means_duplicate_confirm()
     test_shift_request_can_target_by_number_or_word()
     test_pending_add_word_confirm_uses_recommended()
@@ -11597,6 +11985,10 @@ if __name__ == "__main__":
     test_draft_operation_confirmation_lease_expires()
     test_active_confirmation_nonce_rejects_bare_and_stale_replies()
     test_question_and_meta_text_never_authorize_deterministic_mutations()
+    test_polite_execution_requests_are_commands_but_information_questions_are_not()
+    test_verified_bot_reply_is_a_single_prompt_capability()
+    test_bot_quoted_candidate_accepts_exact_selectors_only()
+    test_quoted_draft_list_binds_ordinal_and_rejects_stale_snapshot()
     test_active_operation_message_preserves_second_word()
     test_structured_add_submit_keeps_confirmation_out_of_chat_state()
     test_background_draft_operation_is_silent_and_preserves_new_pending()
