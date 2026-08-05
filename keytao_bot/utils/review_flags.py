@@ -104,6 +104,38 @@ def item_requires_manual_review(item: Any) -> bool:
     return bool(remark_indicates_manual_review(item.get("remark")))
 
 
+def audit_allows_batch_auto_approve(auto_review: Any) -> bool:
+    """Return whether an audit is complete enough to call auto-approval."""
+    return bool(
+        isinstance(auto_review, dict)
+        and auto_review.get("success") is True
+        and auto_review.get("autoApprove") is True
+        and auto_review.get("verdict") == "pass"
+        and not (auto_review.get("issues") or [])
+        and bool(auto_review.get("approvedItems") or [])
+        and not auto_review.get("manualReviewLocked")
+        and not auto_review.get("encodeOnly")
+    )
+
+
+def batch_auto_approve_block_reason(auto_review: Any) -> str:
+    """Explain why the canonical batch predicate refuses auto-approval."""
+    if not isinstance(auto_review, dict) or auto_review.get("success") is not True:
+        return "自动审核未完整完成，请稍后重试或交由管理员审核"
+    if auto_review.get("manualReviewLocked"):
+        return "批次包含已锁定的人工复核项"
+    if auto_review.get("encodeOnly"):
+        return "当前仅完成编码校验，尚未完成逐项自动核验"
+    summary = str(auto_review.get("summary") or "").strip()
+    if auto_review.get("issues") or []:
+        return summary or "批次包含需管理员复核项"
+    if not (auto_review.get("approvedItems") or []):
+        return "纯删除项或缺少词条/编码，无法完成逐项自动核验"
+    if auto_review.get("autoApprove") is not True or auto_review.get("verdict") != "pass":
+        return summary or "审核结论未达到自动批准条件"
+    return ""
+
+
 def remark_indicates_manual_review(remark: Any) -> str:
     """Return the matched legacy marker in a remark string, or ``""``."""
     text = str(remark or "").strip()

@@ -249,17 +249,19 @@ class ToolContext:
     mutation_confirmed: bool = False
 
 
-_DELETE_INTENT_RE = re.compile(r"删除|删掉|去掉|移除|撤销|清空|清理|全部删|都删")
+_DELETE_INTENT_RE = re.compile(
+    r"删除|删掉|删干净|去掉|移除|撤销|清空|清理|全部删|都删"
+)
 _MUTATION_INTENT_RE = re.compile(
     r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|发起审核|"
-    r"删除|删掉|去掉|移除|清空|清理|"
+    r"删除|删掉|删干净|去掉|移除|清空|清理|"
     r"撤销|撤回|召回|修改|改成|改为|替换|顺延|挪开|重新编码|保留|批量处理"
     r"|都删|其余删|其他删"
 )
 _NEGATED_MUTATION_RE = re.compile(
     r"(?:不要|别(?!的)|无需|不用|禁止|不要真的).{0,12}"
     r"(?:添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|"
-    r"删除|删掉|去掉|移除|清空|清理|撤销|撤回|修改|改成|改为|替换|重新编码|顺延|保留)"
+    r"删除|删掉|删干净|去掉|移除|清空|清理|撤销|撤回|修改|改成|改为|替换|重新编码|顺延|保留)"
 )
 _EXPLANATION_ONLY_RE = re.compile(
     r"(?:什么意思|什么含义|解释一下|说明一下|怎么做|如何操作|操作方法|"
@@ -294,7 +296,28 @@ _DATA_CONTEXT_RE = re.compile(
     r"(?:分析|判断|翻译|解释|改写|复述|记录|排版|标注)"
     r"(?:以下|一下|这段|这句|这条|一句话|内容|消息|用户请求|是否)"
 )
+_RECORD_FRAME_RE = re.compile(
+    r"(?:"
+    r"(?:做|作|留)\s*(?:个|份)?\s*"
+    r"(?:记\s*录|記\s*錄|笔\s*记|筆\s*記|备\s*注|備\s*註|"
+    r"标\s*记|標\s*記|备\s*忘|備\s*忘)|"
+    r"(?:记\s*录|記\s*錄)(?:\s*下\s*(?:来|來)|\s*一\s*下)?|"
+    r"(?:记|記)(?:\s*下\s*(?:来|來)?|\s*一\s*下)|"
+    r"(?:备\s*注|備\s*註|标\s*记|標\s*記|登\s*记|登\s*記|"
+    r"保存|记\s*载|記\s*載|备\s*忘|備\s*忘)"
+    r"(?:\s*下\s*(?:来|來)|\s*一\s*下|\s*在\s*案)?|"
+    r"(?:写|寫|抄|录|錄)(?:\s*下\s*(?:来|來)?|\s*一\s*下)|"
+    r"(?:写|寫)\s*(?:进|進|入)\s*"
+    r"(?:备\s*忘\s*录|備\s*忘\s*錄|笔\s*记|筆\s*記|记\s*录|記\s*錄)|"
+    r"(?:存|归|歸|留)\s*(?:档|檔)|"
+    r"(?:转\s*告|轉\s*告|转\s*达|轉\s*達|传\s*达|傳\s*達)"
+    r"(?:\s*一\s*下|\s*给\s*[\u3400-\u9fff]{1,8})?"
+    r")"
+)
 _QUOTED_DATA_RE = re.compile(r"「[^」]*」|“[^”]*”|‘[^’]*’|\"[^\"]*\"|'[^']*'")
+_RECORD_FRAME_BRACKETED_DATA_RE = re.compile(
+    r"『[^』]*』|《[^》]*》|【[^】]*】|\([^)]*\)|（[^）]*）|〈[^〉]*〉|〔[^〕]*〕"
+)
 _UNTRUSTED_QUOTE_PREFIX_RE = re.compile(
     r"(?:引用|复述|改写|翻译|摘录|转述|备注|示例|例句|原话|"
     r"这句|这段|消息里|写着|展示|显示|命令).{0,8}$"
@@ -314,11 +337,68 @@ _COMMAND_CLAUSE_SPLIT_RE = re.compile(r"[，,。.!！?？;；\n]+")
 # "@我 ..." remediation command self-checks through exactly the validators it
 # will face, instead of through a stripped variant of itself.
 _LEADING_MENTION_RE = re.compile(r"^\s*@[^\s@]{1,24}[\s:：]+")
-_COMMAND_PREFIX_RE = re.compile(
-    r"^(?:请|麻烦|帮我|给我|现在|立即|直接|确认|执行|我要|我想|替我|为我|"
-    r"能不能|可不可以|能否|可否|可以帮我|可以请你|"
-    r"并|并且|同时|然后|再|还要|以及|另外|接着|顺便)*"
+_COMMAND_LEAD_IN_PREFIXES = (
+    "请", "麻烦", "帮我", "给我", "现在", "立即", "直接", "确认", "执行",
+    "我要", "我想", "替我", "为我", "能不能", "可不可以", "能否", "可否",
+    "可以帮我", "可以请你", "并", "并且", "同时", "然后", "再", "还要",
+    "以及", "另外", "接着", "顺便",
 )
+# Longest-first alternation keeps a shorter token such as "并" from consuming
+# the start of "并且" when the prefix is stripped independently of the command.
+_COMMAND_PREFIX_PATTERN = rf"(?:{'|'.join(sorted(
+    (re.escape(prefix) for prefix in _COMMAND_LEAD_IN_PREFIXES),
+    key=len,
+    reverse=True,
+))})*"
+_COMMAND_PREFIX_RE = re.compile(rf"^{_COMMAND_PREFIX_PATTERN}")
+_ENTRY_MUTATION_FOR_FRAME_OPERAND_RE = _MUTATION_INTENT_RE
+_RECORD_FRAME_OPERAND_AFTER_RE = re.compile(
+    # Keep this filler vocabulary closed and bounded. It describes only the
+    # entry label, its code, and the common "的编码" bridge; arbitrary prose
+    # must never be skipped before looking for the mutation verb.
+    r"^(?:(?:(?:这个|该)?(?:词|词条)|的(?:编码|代码)|[A-Za-z]{1,12})){0,3}"
+    rf"(?:{_MUTATION_INTENT_RE.pattern})"
+)
+_RECORD_FRAME_DRAFT_DELETE_PREFIX_RE = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}"
+    r"(?:删除|删掉|去掉|移除)(?:草稿|批次)(?:里|里的|中|中的)$"
+)
+_RECORD_FRAME_POSTPOSED_OPERAND_RE = re.compile(
+    r"(?:"
+    r"(?:把|将)(?:这个|该)(?:词|词条)(?:加入|加到|放入|写入)草稿|"
+    r"(?:添加|新增|创建)(?:词条|词语)"
+    r")[：:]$"
+)
+_RECORD_FRAME_EMBEDDED_MUTATION_SUFFIX_RE = re.compile(
+    r"^(?:(?:的(?:编码|代码)|(?:这个|该)?(?:词|词条)|[A-Za-z]{1,12})){0,3}$"
+)
+_RECORD_FRAME_SEPARATOR_CHARS = frozenset("、：:—，。 \t\r\n")
+_COMPLETE_MUTATION_NOISE_RE = re.compile(
+    r"(?:请|請|麻烦|麻煩|帮我|幫我|给我|給我|替我|为我|為我|"
+    r"我要|我想|现在|現在|立即|直接|确认|確認|执行|執行|"
+    r"能不能|可不可以|能否|可否|可以帮我|可以幫我|可以请你|可以請你|"
+    r"把|将|將|这句|這句|这段|這段|这条|這條|一句话|一句話|"
+    r"消息|内容|內容|用户请求|用戶請求|先|再|然后|然後|并且|並且|"
+    r"同时|同時|一下|吧|呢|啊|哦|嘛|呀|就行|即可|可以了|"
+    r"谢谢|謝謝|谢了|謝了|辛苦了)"
+)
+_RECORD_ANALYSIS_TRANSLATION = str.maketrans({
+    "請": "请",
+    "刪": "删",
+    "條": "条",
+    "將": "将",
+    "詞": "词",
+    "錄": "录",
+    "寫": "写",
+    "標": "标",
+    "記": "记",
+    "轉": "转",
+    "傳": "传",
+    "歸": "归",
+    "檔": "档",
+    "備": "备",
+    "註": "注",
+})
 _NEGATIVE_MODAL_RE = re.compile(
     r"(?:不要|别|不|无需|不用|禁止|不得|请勿|不予|严禁|不许|不可|不能|"
     r"切勿|拒绝|莫)"
@@ -327,7 +407,7 @@ _CLAUSE_BOUNDARY_RE = re.compile(r"[。！？!?;；\n]")
 _ACTION_TOKENS = {
     "Create": re.compile(r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|加词"),
     "Change": re.compile(r"修改|改成|改为|替换|重新编码|顺延|挪开|移到"),
-    "Delete": re.compile(r"删除|删掉|移除"),
+    "Delete": re.compile(r"删除|删掉|删干净|移除"),
     "Keep": re.compile(
         r"只保留|仅保留|保留|留下|别动|不要动|"
         r"不动|别删|不要删|不删|留着"
@@ -459,9 +539,7 @@ def _mutation_authorization_view(message: str) -> str:
         is_positive_command = bool(
             _MUTATION_INTENT_RE.match(candidate)
             or re.match(
-                r"(?:把|将).{1,80}(?:添加|加入|加到|新增|创建|写入|放入|"
-                r"提交|删除|删掉|去掉|移除|清空|撤销|撤回|修改|改成|改为|"
-                r"替换|重新编码|顺延|挪开|移到|保留)",
+                rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
                 candidate,
             )
             or re.match(r"除了.{1,80}(?:都删|删除|删掉|去掉|移除)", candidate)
@@ -480,14 +558,28 @@ def _mutation_authorization_view(message: str) -> str:
     return "；".join(trusted_clauses)
 
 
-def message_authorizes_mutation(message: str) -> bool:
-    """Accept write authority only from the current user's explicit raw text."""
+def _message_authorizes_mutation_core(message: str) -> bool:
+    """Judge mutation syntax after higher-level data framing is excluded."""
     raw_text = re.sub(r"\s+", "", str(message or ""))
     text = re.sub(r"\s+", "", _mutation_authorization_view(message))
     authorization_text = _QUOTED_DATA_RE.sub("", text)
+    stripped_command_text = _COMMAND_PREFIX_RE.sub("", text, count=1)
+    direct_command_after_lead_in = bool(
+        _MUTATION_INTENT_RE.match(stripped_command_text)
+        or re.match(
+            rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
+            stripped_command_text,
+        )
+    )
     question_is_execution_request = bool(
         _QUESTION_RE.search(raw_text)
-        and _POLITE_EXECUTION_PREFIX_RE.search(raw_text)
+        and (
+            _POLITE_EXECUTION_PREFIX_RE.search(raw_text)
+            or (
+                re.match(r"^(?:能不能|可不可以|能否|可否)", raw_text)
+                and direct_command_after_lead_in
+            )
+        )
         and not _EXPLANATION_ONLY_RE.search(raw_text)
         and not _META_DISCUSSION_RE.search(raw_text)
         and not _DATA_CONTEXT_RE.search(raw_text)
@@ -522,6 +614,10 @@ def message_authorizes_mutation(message: str) -> bool:
     stripped_match = _MUTATION_INTENT_RE.search(stripped_text)
     return bool(
         (stripped_match is not None and stripped_match.start() == 0)
+        or re.match(
+            rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
+            stripped_command_text,
+        )
         or _EXPLICIT_REQUEST_PREFIX_RE.match(authorization_text)
         or re.match(
             r"(?:草稿|批次)(?:中的)?(?:全部|都|所有)(?:条目)?"
@@ -529,6 +625,171 @@ def message_authorizes_mutation(message: str) -> bool:
             authorization_text,
         )
     )
+
+
+def _mask_quoted_record_frames(message: str) -> str:
+    """Keep source offsets stable while hiding quoted data and inline code."""
+    masked = list(message)
+    for pattern in (
+        _QUOTED_DATA_RE,
+        _INLINE_CODE_RE,
+        _RECORD_FRAME_BRACKETED_DATA_RE,
+    ):
+        for match in pattern.finditer(message):
+            masked[match.start():match.end()] = " " * (match.end() - match.start())
+    return "".join(masked)
+
+
+def _record_frame_is_mutation_operand(
+    masked_message: str,
+    frame_match: re.Match,
+) -> bool:
+    """Return whether the record-shaped words are the dictionary entry itself."""
+    prefix = re.sub(r"\s+", "", masked_message[:frame_match.start()])
+    suffix = re.sub(r"\s+", "", masked_message[frame_match.end():])
+    frame_text = re.sub(r"\s+", "", frame_match.group(0))
+
+    # A label attached to quoted data ("引用…作为备注") describes that data;
+    # it does not turn an otherwise genuine mutation into reported speech.
+    if re.search(r"(?:作为|当作|用作)$", prefix) and not re.match(r"[：:]", suffix):
+        return True
+
+    # Prefix verbs take the following text as their entry operand:
+    # "删除记下来", "添加词条 记录一下", "顺延记下来".
+    if re.fullmatch(
+        rf"{_COMMAND_PREFIX_PATTERN}"
+        rf"(?:{_ENTRY_MUTATION_FOR_FRAME_OPERAND_RE.pattern})"
+        r"(?:词条|词语)?(?:做|作|留)?(?:个|份)?[：:]?$",
+        prefix,
+    ):
+        return True
+
+    # Some frame spellings begin with a mutation verb themselves ("写入笔记").
+    # They are a direct entry command only when the surrounding text is exactly
+    # a legal command lead-in plus optional operand decoration/code.  A
+    # separator or another instruction after the frame keeps it framing data.
+    if (
+        _MUTATION_INTENT_RE.match(frame_text)
+        and re.fullmatch(_COMMAND_PREFIX_PATTERN, prefix)
+        and _RECORD_FRAME_EMBEDDED_MUTATION_SUFFIX_RE.fullmatch(suffix)
+    ):
+        return True
+
+    # The regex can also begin one character inside a preceding mutation verb:
+    # in "保留记录" it prefers the frame "留记录".  Recover the complete
+    # mutation token before deciding whether the remainder is a direct operand.
+    for mutation_match in _MUTATION_INTENT_RE.finditer(masked_message):
+        if not (
+            mutation_match.start() < frame_match.start() < mutation_match.end()
+        ):
+            continue
+        lead_in = re.sub(r"\s+", "", masked_message[:mutation_match.start()])
+        if (
+            re.fullmatch(_COMMAND_PREFIX_PATTERN, lead_in)
+            and _RECORD_FRAME_EMBEDDED_MUTATION_SUFFIX_RE.fullmatch(suffix)
+        ):
+            return True
+
+    # A draft container can sit between a prefix delete verb and the entry:
+    # "删除草稿里的记录". Keep this anchored to the whole prefix so reported
+    # instructions such as "请把这句删除...记录下来" cannot qualify.
+    if _RECORD_FRAME_DRAFT_DELETE_PREFIX_RE.fullmatch(prefix):
+        return True
+
+    # In a 把/将 construction the operand precedes the action verb:
+    # "把记下来加到草稿" and "把记录这个词加入草稿".
+    if (
+        re.search(r"(?:把|将|將)[：:]?$", prefix)
+        and _RECORD_FRAME_OPERAND_AFTER_RE.match(suffix)
+    ):
+        return True
+
+    # A postposed entry after a colon is still the object referred to by
+    # "这个词"/"词条", rather than a request to record the earlier command.
+    return bool(_RECORD_FRAME_POSTPOSED_OPERAND_RE.search(prefix))
+
+
+def _has_complete_mutation_instruction(message: str) -> bool:
+    """Require a mutation verb plus material that can serve as its operand."""
+    if not _message_authorizes_mutation_core(message):
+        return False
+
+    authorization_text = re.sub(r"\s+", "", _mutation_authorization_view(message))
+    for mutation_match in _MUTATION_INTENT_RE.finditer(authorization_text):
+        residual = (
+            authorization_text[:mutation_match.start()]
+            + authorization_text[mutation_match.end():]
+        )
+        residual = _COMPLETE_MUTATION_NOISE_RE.sub("", residual)
+        if re.sub(r"[\W_]+", "", residual, flags=re.UNICODE):
+            return True
+    return False
+
+
+def _record_frame_wraps_complete_mutation(message: str) -> bool:
+    """Detect an instruction being recorded/relayed instead of executed.
+
+    A lexical record-frame match is not enough: the matched words may be the
+    dictionary entry being edited.  Only block when removing a non-operand
+    frame, under either the whole-frame or mutation-overlap interpretation,
+    leaves an independently complete mutation instruction.
+    """
+    raw_message = str(message or "")
+    masked_message = _mask_quoted_record_frames(raw_message)
+    frame_matches = list(_RECORD_FRAME_RE.finditer(masked_message))
+    framing_matches = [
+        match
+        for match in frame_matches
+        if not _record_frame_is_mutation_operand(masked_message, match)
+    ]
+    if not framing_matches:
+        return False
+
+    mutation_spans = [
+        match.span()
+        for match in _MUTATION_INTENT_RE.finditer(masked_message)
+    ]
+    for frame_match in framing_matches:
+        frame_start, frame_end = frame_match.span()
+        for preserve_mutation_tokens in (False, True):
+            candidate = list(raw_message)
+
+            # First test the ordinary interpretation that removes the whole
+            # frame.  Then test the overlap interpretation: "保留备忘" is
+            # matched as "留备忘", so erasing the whole match would also erase
+            # half of the real mutation token.  "写入笔记" is another overlap,
+            # with a complete mutation token at the start of the frame.
+            for index in range(frame_start, frame_end):
+                mutation_overlap = any(
+                    start <= index < end for start, end in mutation_spans
+                )
+                if not preserve_mutation_tokens or not mutation_overlap:
+                    candidate[index] = " "
+
+            # Separators belong to the reporting frame, not to the command
+            # being tested after that frame is removed.  Consume every
+            # product-supported boundary spelling on either side, including
+            # the no-separator case.
+            left = frame_start - 1
+            while left >= 0 and raw_message[left] in _RECORD_FRAME_SEPARATOR_CHARS:
+                candidate[left] = "；"
+                left -= 1
+            right = frame_end
+            while right < len(raw_message) and raw_message[right] in _RECORD_FRAME_SEPARATOR_CHARS:
+                candidate[right] = "；"
+                right += 1
+
+            normalized_candidate = "".join(candidate).translate(_RECORD_ANALYSIS_TRANSLATION)
+            if _has_complete_mutation_instruction(normalized_candidate):
+                return True
+    return False
+
+
+def message_authorizes_mutation(message: str) -> bool:
+    """Accept write authority only from the current user's explicit raw text."""
+    if _record_frame_wraps_complete_mutation(message):
+        return False
+    return _message_authorizes_mutation_core(message)
 
 
 # Verbs that express "change where this code sits" in everyday Chinese.  They
@@ -544,7 +805,7 @@ _CHANGE_VERB_RE = re.compile(
     r"修改|改成|改为|改到|替换|重新编码|顺延|挪开|移到|" + _POSITIONAL_CHANGE_RE.pattern
 )
 _CREATE_VERB_RE = re.compile(r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|加词")
-_DELETE_VERB_RE = re.compile(r"删除|删掉|去掉|移除|清空|清理")
+_DELETE_VERB_RE = re.compile(r"删除|删掉|删干净|去掉|移除|清空|清理")
 _SUBMIT_VERB_RE = re.compile(r"提交|提审|送审|发起审核")
 _RECALL_VERB_RE = re.compile(r"撤回|撤销|召回|取消")
 _TOOL_INTENT_PATTERNS = {
@@ -608,12 +869,28 @@ def message_requests_change(
         or _TEXT_TRANSFORM_RE.search(text)
         or _META_DISCUSSION_RE.search(text)
         or _DATA_CONTEXT_RE.search(text)
+        or _record_frame_wraps_complete_mutation(message)
         or _ABORT_RE.search(text)
         or _NEGATED_MUTATION_RE.search(text)
     ):
         return False
     raw_text = re.sub(r"\s+", "", str(message or ""))
-    if _QUESTION_RE.search(raw_text) and not _POLITE_EXECUTION_PREFIX_RE.search(raw_text):
+    stripped_text = _COMMAND_PREFIX_RE.sub("", text, count=1)
+    direct_command_after_lead_in = bool(
+        _MUTATION_INTENT_RE.match(stripped_text)
+        or re.match(
+            rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
+            stripped_text,
+        )
+    )
+    question_is_execution_request = bool(
+        _POLITE_EXECUTION_PREFIX_RE.search(raw_text)
+        or (
+            re.match(r"^(?:能不能|可不可以|能否|可否)", raw_text)
+            and direct_command_after_lead_in
+        )
+    )
+    if _QUESTION_RE.search(raw_text) and not question_is_execution_request:
         return False
     return bool(pattern.search(_QUOTED_DATA_RE.sub("", text)))
 
@@ -625,7 +902,10 @@ def _suggestion_operands(tool_name: str, arguments: Dict) -> List[str]:
     if tool_name in {"keytao_submit_batch", "keytao_recall_batch"}:
         return []
     if tool_name == "keytao_shift_phrase_code":
-        return [str(arguments.get("word") or "").strip()]
+        return [
+            str(arguments.get("word") or "").strip(),
+            str(arguments.get("target_code") or "").strip(),
+        ]
     if tool_name == "keytao_remove_draft_item":
         return [str(arguments.get("pr_id") or "").strip()]
     if tool_name == "keytao_batch_remove_draft_items":
@@ -643,6 +923,9 @@ def _suggestion_operands(tool_name: str, arguments: Dict) -> List[str]:
         if not isinstance(item, dict):
             return [""]
         operands.append(str(item.get("word") or "").strip())
+        code = str(item.get("code") or "").strip()
+        if code:
+            operands.append(code)
         old_word = str(item.get("old_word") or "").strip()
         if old_word:
             operands.append(old_word)

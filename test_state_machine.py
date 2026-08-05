@@ -162,12 +162,17 @@ from keytao_bot.harness.state import (
     PendingStateRecord,
 )
 from keytao_bot.harness.conversation import ConversationAddress
-from keytao_bot.harness.tools import ToolContext, ToolExecutor
+from keytao_bot.harness.tools import (
+    ToolContext,
+    ToolExecutor,
+    _COMMAND_LEAD_IN_PREFIXES,
+)
 from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 from keytao_bot.utils import keytao_review as keytao_review_module
 from keytao_bot.utils import keytao_batch_review as keytao_batch_review_module
+from keytao_bot.utils import review_flags
 from keytao_bot.utils.keytao_review import ReviewHttpConfig, audit_draft_items
 from keytao_bot.utils.keytao_batch_review import _normalize_llm_review
 import keytao_bot.plugins.openai_chat as openai_chat_module
@@ -2882,6 +2887,150 @@ def test_auto_approved_review_lines_explain_pass_reason():
     check("llm fallback auto approval keeps summary", "语言常识" in llm_text)
 
 
+def test_auto_approve_failure_copy_reports_pass_and_real_reason():
+    """A passed review must not be reframed as the reason administrator review is needed."""
+    print("\n🧪 auto-approve failure copy reports the real blocking reason")
+
+    failure_reasons = [
+        "以下词条需要人工复核，已保留给管理员审核：「存疑词」@cyci",
+        "批次内容已被修改，请刷新后重试",
+        "自动审核禁止纯删除项，已保留给管理员审核",
+        "自动批准接口返回异常（HTTP 502）",
+        "批次已提交，自动批准失败，转交管理员审核",
+        "批次已提交，自动批准超时，转交管理员审核",
+    ]
+    expected_prefix = "本喵审核：常见词/实体常识、编码候选链和同码链检查通过，但自动批准未执行："
+
+    for reason in failure_reasons:
+        parts: List[str] = []
+        _append_submit_review_lines(parts, {
+            "autoApproved": False,
+            "autoReview": {
+                "success": True,
+                "autoApprove": True,
+                "verdict": "pass",
+                "summary": "读音编码可验证，常见词/实体常识信号足够",
+                "issues": [],
+                "approvedItems": ["Create：百岁山@bsev"],
+                "manualReviewLocked": False,
+                "encodeOnly": False,
+                "commonKnownItems": [{"word": "百岁山", "code": "bsev"}],
+            },
+            "autoApproveResult": {"success": False, "message": reason},
+        })
+        text = "\n".join(parts)
+        check(
+            f"failed auto-approval reports real reason: {reason}",
+            text == expected_prefix + reason,
+        )
+        check(
+            f"failed auto-approval avoids contradictory admin claim: {reason}",
+            "该批次需管理员审核（" not in text,
+        )
+
+    pure_delete_review = {
+        "success": True,
+        "autoApprove": True,
+        "verdict": "pass",
+        "summary": "语言常识、读音和编码检查一致",
+        "issues": [],
+        "approvedItems": [],
+        "manualReviewLocked": False,
+        "encodeOnly": False,
+    }
+    expected_manual_line = (
+        "本喵审核：该批次需管理员审核"
+        "（纯删除项或缺少词条/编码，无法完成逐项自动核验）"
+    )
+    pure_delete_parts: List[str] = []
+    _append_submit_review_lines(pure_delete_parts, {
+        "autoApproved": False,
+        "autoReview": pure_delete_review,
+    })
+    check(
+        "pure-delete or code-less review gives an actionable reason",
+        pure_delete_parts == [expected_manual_line],
+    )
+
+    confirmation_parts: List[str] = []
+    _append_submit_review_lines(confirmation_parts, {
+        "autoApproved": False,
+        "requiresConfirmation": True,
+        "autoReview": pure_delete_review,
+    })
+    confirmation_text = "\n".join(confirmation_parts)
+    check(
+        "confirmation copy does not promise an impossible auto approval",
+        confirmation_parts == [expected_manual_line]
+        and "将尝试自动批准入库" not in confirmation_text,
+    )
+    check(
+        "display and skill layers share the exact auto-approve predicate",
+        _draft_tools._audit_allows_batch_auto_approve
+        is review_flags.audit_allows_batch_auto_approve,
+    )
+    check(
+        "the shared predicate rejects an audit with no approved items",
+        not review_flags.audit_allows_batch_auto_approve(pure_delete_review),
+    )
+
+    invalid_parts: List[str] = []
+    _append_submit_review_lines(invalid_parts, None)
+    check("non-dict submit data is ignored safely", invalid_parts == [])
+
+
+def test_auto_approve_generic_exception_is_redacted():
+    """Internal connection coordinates must never reach the submitter."""
+    print("\n🧪 auto-approve generic exception is redacted")
+
+    async def _run():
+        auto_review = {
+            "success": True,
+            "autoApprove": True,
+            "verdict": "pass",
+            "summary": "证据一致",
+            "issues": [],
+            "approvedItems": ["Create：安全词@aqci"],
+            "manualReviewLocked": False,
+            "encodeOnly": False,
+        }
+        internal_detail = "ConnectError http://internal.service:8443/private/path"
+        with (
+            patch.object(_draft_tools, "get_keytao_url", return_value="https://keytao.test"),
+            patch.object(_draft_tools, "get_bot_headers", return_value={}),
+            patch.object(
+                _draft_tools.httpx,
+                "TimeoutException",
+                type("FakeTimeoutException", (Exception,), {}),
+                create=True,
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=RuntimeError(internal_detail),
+                create=True,
+            ),
+        ):
+            result = await _draft_tools._auto_approve_submitted_batch(
+                "qq",
+                "user-1",
+                "batch-1",
+                auto_review,
+                7,
+            )
+
+        check(
+            "generic auto-approve failure uses fixed user-facing copy",
+            result.get("message") == "批次已提交，自动批准失败，转交管理员审核",
+        )
+        check(
+            "generic auto-approve failure hides internal coordinates",
+            internal_detail not in result.get("message", ""),
+        )
+
+    asyncio.run(_run())
+
+
 def test_submit_review_copy_is_decisive_and_non_redundant():
     """Submit replies should expose one clear review result without backend process chatter."""
     print("\n🧪 submit review copy is decisive and non-redundant")
@@ -3208,11 +3357,11 @@ def test_submit_confirmation_reuses_preview_audit_snapshot():
         http_calls = []
         first_audit = {
             "success": True,
-            "verdict": "needs_admin",
-            "autoApprove": False,
+            "verdict": "pass",
+            "autoApprove": True,
             "summary": "首次审计结论",
-            "issues": ["缺少权威来源"],
-            "approvedItems": [],
+            "issues": [],
+            "approvedItems": [{"word": "阻抑", "code": "zjyka"}],
             "batchId": "draft-audit",
             "contentVersion": 7,
             "snapshotDigest": "1" * 64,
@@ -3236,9 +3385,10 @@ def test_submit_confirmation_reuses_preview_audit_snapshot():
             }),
             (200, {
                 "success": True,
-                "contentVersion": 7,
+                "contentVersion": 8,
             }),
         ]
+        auto_approve = AsyncMock(return_value={"success": True})
 
         async def fake_audit(platform, platform_id, batch_id):
             audit_calls.append((platform, platform_id, batch_id))
@@ -3286,6 +3436,11 @@ def test_submit_confirmation_reuses_preview_audit_snapshot():
                 side_effect=lambda **_kwargs: FakeClient(),
                 create=True,
             ),
+            patch.object(
+                _draft_tools,
+                "_auto_approve_submitted_batch",
+                auto_approve,
+            ),
         ):
             preview = await _draft_tools.keytao_submit_batch(
                 "qq",
@@ -3329,7 +3484,128 @@ def test_submit_confirmation_reuses_preview_audit_snapshot():
         check("confirmation reuses one audit", len(audit_calls) == 1)
         check("confirmation reaches server", len(http_calls) == 2)
         check("confirmation succeeds despite wording drift", confirmed.get("success") is True)
+        check(
+            "auto-approve uses the post-submit content version",
+            auto_approve.await_args is not None
+            and auto_approve.await_args.args[-1] == 8,
+        )
         check("audit ticket is single-use", replayed.get("staleConfirmation") is True and len(http_calls) == 2)
+
+    asyncio.run(_run())
+
+
+def test_submit_confirmation_reuses_needs_admin_audit_snapshot():
+    """The needs-admin preview remains sealed and never enters auto-approval."""
+    print("\n🧪 submit confirmation reuses needs-admin audit snapshot")
+
+    async def _run():
+        audit_calls = []
+        http_calls = []
+        audit = {
+            "success": True,
+            "verdict": "needs_admin",
+            "autoApprove": False,
+            "summary": "需要管理员审核",
+            "issues": ["缺少权威来源"],
+            "approvedItems": [],
+            "batchId": "draft-needs-admin",
+            "contentVersion": 7,
+            "snapshotDigest": "4" * 64,
+            "snapshotItems": [
+                {"action": "Create", "word": "阻抑", "code": "zjyka"},
+            ],
+        }
+        response_payloads = [
+            (400, {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "draft-needs-admin",
+                "contentVersion": 7,
+                "snapshotDigest": "5" * 64,
+                "warningDigest": "6" * 64,
+                "warnings": [],
+            }),
+            (200, {
+                "success": True,
+                "contentVersion": 8,
+            }),
+        ]
+        auto_approve = AsyncMock(return_value={"success": True})
+
+        async def fake_audit(platform, platform_id, batch_id):
+            audit_calls.append((platform, platform_id, batch_id))
+            return dict(audit)
+
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return dict(self._payload)
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, **kwargs):
+                http_calls.append((url, kwargs))
+                return FakeResponse(*response_payloads[len(http_calls) - 1])
+
+        with (
+            patch.object(
+                _draft_tools,
+                "_audit_current_draft_for_auto_approval",
+                side_effect=fake_audit,
+            ),
+            patch.object(_draft_tools, "get_bot_token", return_value="token"),
+            patch.object(
+                _draft_tools,
+                "get_keytao_url",
+                return_value="https://keytao.test",
+            ),
+            patch.object(
+                _draft_tools,
+                "get_bot_headers",
+                return_value={"Authorization": "Bearer token"},
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
+            ),
+            patch.object(
+                _draft_tools,
+                "_auto_approve_submitted_batch",
+                auto_approve,
+            ),
+        ):
+            preview = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "needs-admin-user",
+                batch_id="draft-needs-admin",
+                preview_only=True,
+            )
+            confirmed = await _draft_tools.keytao_submit_batch(
+                "qq",
+                "needs-admin-user",
+                confirmed=True,
+                batch_id="draft-needs-admin",
+                expected_content_version=7,
+                expected_server_snapshot_digest="5" * 64,
+                expected_warning_digest="6" * 64,
+                expected_audit_digest=preview["auditDigest"],
+            )
+
+        check("needs-admin preview creates exact submit ticket", preview.get("requiresConfirmation") is True)
+        check("needs-admin confirmation reuses one audit", len(audit_calls) == 1)
+        check("needs-admin confirmation reaches server", len(http_calls) == 2)
+        check("needs-admin confirmation succeeds", confirmed.get("success") is True)
+        check("needs-admin verdict never auto-approves", auto_approve.await_count == 0)
 
     asyncio.run(_run())
 
@@ -3978,6 +4254,12 @@ def test_recall_batch_requires_exact_server_ticket():
         old_store = openai_chat_module.conversation_state_store
         store = MemoryConversationStateStore()
         conv_key = ConversationAddress.private("qq", "recall-123")
+        related_other_session = ConversationAddress.group(
+            "qq", "recall-other-group", "recall-123"
+        )
+        unrelated_other_session = ConversationAddress.group(
+            "qq", "unrelated-group", "recall-123"
+        )
 
         async def fake_call(tool_name, arguments, platform=None, user_id=None):
             calls.append((tool_name, arguments, platform, user_id))
@@ -4022,6 +4304,28 @@ def test_recall_batch_requires_exact_server_ticket():
                     conv_key,
                 )
                 record = store.get_record(conv_key)
+                store.set(
+                    related_other_session,
+                    PendingToolConfirm(
+                        function_name="keytao_shift_phrase_code",
+                        args={
+                            "word": "吃席",
+                            "target_code": "wkxk",
+                            "batch_id": "submitted-42",
+                        },
+                    ),
+                )
+                store.set(
+                    unrelated_other_session,
+                    PendingToolConfirm(
+                        function_name="keytao_shift_phrase_code",
+                        args={
+                            "word": "赤溪",
+                            "target_code": "wkxkv",
+                            "batch_id": "other-batch",
+                        },
+                    ),
+                )
                 recalled = await openai_chat_module._execute_confirmed_tool(
                     record.state,
                     "qq",
@@ -4047,6 +4351,14 @@ def test_recall_batch_requires_exact_server_ticket():
             "recall-123",
         ))
         check("recall succeeds after exact confirmation", "操作已完成" in recalled)
+        check(
+            "tool-confirmed recall voids a related ticket in another session",
+            store.get_record(related_other_session) is None,
+        )
+        check(
+            "tool-confirmed recall keeps an unrelated ticket in another session",
+            store.get_record(unrelated_other_session) is not None,
+        )
 
     asyncio.run(_run())
 
@@ -6067,6 +6379,35 @@ def test_target_bound_add_submit_rejects_questions_negation_and_substrings():
     )
 
 
+def test_draft_suggestion_routes_share_authorization_lead_ins():
+    """Suggestion-only recognizers must not drift from the command grammar."""
+    print("\n🧪 draft suggestion routes share authorization lead-ins")
+    state = PendingAddWord(
+        word="窨茶",
+        recommended_code="xwwso",
+        candidates=[("xwwso", False)],
+    )
+    check(
+        "every authorization lead-in reaches draft submit routing",
+        all(
+            openai_chat_module._is_plain_draft_submit_request(
+                f"{lead_in}提交当前草稿"
+            )
+            for lead_in in _COMMAND_LEAD_IN_PREFIXES
+        ),
+    )
+    check(
+        "every authorization lead-in reaches target-bound add-submit routing",
+        all(
+            openai_chat_module._is_target_bound_add_and_submit_request(
+                f"{lead_in}添加窨茶 xwwso 并提交",
+                state,
+            )
+            for lead_in in _COMMAND_LEAD_IN_PREFIXES
+        ),
+    )
+
+
 def test_cross_user_bot_quote_creates_only_current_actor_operation():
     """A bot quote is a target capability, never authority over the original actor."""
     print("\n🧪 cross-user bot quote stays on current actor")
@@ -7628,6 +7969,7 @@ def test_draft_timeout_fallback_uses_contextual_pronunciation():
         check("fallback no longer labels result encode-only", result.get("encodeOnly") is False)
         check("approval guard rejects incomplete fallback", not _draft_tools._audit_allows_batch_auto_approve(result))
         check("approval guard accepts a complete all-pass result", _draft_tools._audit_allows_batch_auto_approve({
+            "success": True,
             "autoApprove": True,
             "verdict": "pass",
             "issues": [],
@@ -12169,6 +12511,8 @@ if __name__ == "__main__":
     test_reviewed_word_preserves_encode_service_candidate_chains()
     test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable()
     test_auto_approved_review_lines_explain_pass_reason()
+    test_auto_approve_failure_copy_reports_pass_and_real_reason()
+    test_auto_approve_generic_exception_is_redacted()
     test_submit_review_copy_is_decisive_and_non_redundant()
     test_simple_single_word_query_existing_word_falls_through()
     test_simple_single_word_query_skips_draft_commands()
@@ -12178,6 +12522,7 @@ if __name__ == "__main__":
     test_draft_submit_command_uses_current_user_tools()
     test_add_submit_extra_snapshot_shows_one_exact_confirmation()
     test_submit_confirmation_reuses_preview_audit_snapshot()
+    test_submit_confirmation_reuses_needs_admin_audit_snapshot()
     test_submit_timeout_recovers_after_fresh_preview()
     test_submit_cancellation_marks_ticket_uncertain()
     test_submit_rejects_incomplete_success_preview()
@@ -12219,6 +12564,7 @@ if __name__ == "__main__":
     test_unquoted_short_add_submit_requires_full_target_binding()
     test_inline_unquoted_add_submit_requires_target_but_full_command_runs()
     test_target_bound_add_submit_rejects_questions_negation_and_substrings()
+    test_draft_suggestion_routes_share_authorization_lead_ins()
     test_cross_user_bot_quote_creates_only_current_actor_operation()
     test_revalidated_quote_requires_current_semantic_snapshot()
     test_conversation_lock_serializes_same_actor_messages()

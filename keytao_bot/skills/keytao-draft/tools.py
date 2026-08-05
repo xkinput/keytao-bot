@@ -1567,16 +1567,7 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
         return None
 
 
-def _audit_allows_batch_auto_approve(auto_review: Dict) -> bool:
-    """Require an internally consistent all-pass result before calling approval."""
-    return bool(
-        isinstance(auto_review, dict)
-        and auto_review.get("autoApprove") is True
-        and auto_review.get("verdict") == "pass"
-        and not (auto_review.get("issues") or [])
-        and bool(auto_review.get("approvedItems") or [])
-        and not auto_review.get("encodeOnly")
-    )
+_audit_allows_batch_auto_approve = review_flags.audit_allows_batch_auto_approve
 
 
 def _auto_review_confirmation_digest(auto_review: Dict) -> str:
@@ -1682,7 +1673,10 @@ async def _auto_approve_submitted_batch(
         return {"success": False, "message": "批次已提交，自动批准超时，转交管理员审核"}
     except Exception as error:
         logger.warning(f"[auto_review] approve failed: {error}")
-        return {"success": False, "message": f"自动批准失败：{str(error)}"}
+        return {
+            "success": False,
+            "message": "批次已提交，自动批准失败，转交管理员审核",
+        }
 
 
 async def keytao_submit_batch(
@@ -1919,7 +1913,21 @@ async def keytao_submit_batch(
                 if not confirmed:
                     return prepare_submit_preview(data)
                 data["batchId"] = batch_id  # inject so _inject_batch_url can build batchUrl
-                data.setdefault("contentVersion", submission_content_version)
+                submitted_batch = data.get("batch")
+                reported_content_version = data.get("contentVersion")
+                if (
+                    not isinstance(reported_content_version, int)
+                    or isinstance(reported_content_version, bool)
+                    or reported_content_version < 0
+                ) and isinstance(submitted_batch, dict):
+                    reported_content_version = submitted_batch.get("contentVersion")
+                if (
+                    not isinstance(reported_content_version, int)
+                    or isinstance(reported_content_version, bool)
+                    or reported_content_version < 0
+                ):
+                    reported_content_version = submission_content_version
+                data["contentVersion"] = reported_content_version
                 _inject_batch_url(data)
                 data["autoReview"] = auto_review
                 data["auditDigest"] = audited_digest
@@ -1932,7 +1940,7 @@ async def keytao_submit_batch(
                         platform_id,
                         batch_id,
                         auto_review,
-                        submission_content_version,
+                        reported_content_version,
                     )
                     data["autoApproveResult"] = approve_result
                     data["autoApproved"] = bool(approve_result.get("success"))

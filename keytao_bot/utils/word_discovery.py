@@ -107,6 +107,7 @@ MAX_NOTIFY_ATTEMPTS = 5
 RECOVERY_STAGE_DRAFT = "draft"
 RECOVERY_STAGE_SUBMITTED = "submitted"
 RECOVERY_STAGE_APPROVED = "approved"
+RECOVERY_STAGE_UNKNOWN = "unknown"
 
 ACTION_AUTO_ADDED = "auto_added"
 ACTION_RECOMMENDED = "recommended"
@@ -957,6 +958,12 @@ class DiscoveryStore:
             logger.error(f"[word_discovery] cannot persist pending recovery record: {error}")
 
     def list_pending_recovery(self) -> List[Dict[str, Any]]:
+        """Return the unresolved operator ledger; this method does not resolve it.
+
+        No production workflow currently consumes or marks these rows resolved.
+        They are durable evidence surfaced by a failed result/notification for
+        manual operator recovery, not an automated retry queue.
+        """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
@@ -1404,45 +1411,64 @@ def _rejection_index(response: Dict[str, Any]) -> Dict[str, str]:
     return reasons
 
 
-def _draft_item_index(response: Dict[str, Any]) -> Tuple[Dict[Tuple[str, str], Any], Dict[str, Any], bool]:
-    """Index the returned draft snapshot by ``(word, code)`` and by word."""
+def _draft_item_index(
+    response: Dict[str, Any],
+) -> Tuple[Dict[Tuple[str, str, str, str], Any], bool]:
+    """Index rows by the complete shape this discovery round writes."""
     entries = response.get("draftItems")
-    if not isinstance(entries, list) or not entries:
-        return {}, {}, False
-    by_pair: Dict[Tuple[str, str], Any] = {}
-    by_word: Dict[str, Any] = {}
+    if not isinstance(entries, list):
+        return {}, False
+    by_written_shape: Dict[Tuple[str, str, str, str], Any] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         word = str(entry.get("word") or "").strip()
-        if not word:
-            continue
         code = str(entry.get("code") or "").strip().lower()
-        item_id = entry.get("id")
-        by_pair.setdefault((word, code), item_id)
-        by_word.setdefault(word, item_id)
-    return by_pair, by_word, True
+        action = entry.get("action")
+        item_type = entry.get("type")
+        item_id = _safe_item_id(entry.get("id"))
+        if (
+            not word
+            or not code
+            or not isinstance(action, str)
+            or not action.strip()
+            or not isinstance(item_type, str)
+            or not item_type.strip()
+            or item_id is None
+        ):
+            continue
+        # The API returns createAt ascending. Overwrite only an exact tuple
+        # match so the newest matching row wins; an older row with the same
+        # word/code but a different action or type is never selected. Weight is
+        # calculated only by the GET snapshot and cannot be sent in DELETE's
+        # expectedTargets contract, so it is deliberately not identity.
+        by_written_shape[(word, code, action.strip(), item_type.strip())] = item_id
+    return by_written_shape, True
 
 
 def resolve_draft_outcome(
     requested: Sequence[ClassifiedCandidate],
     response: Dict[str, Any],
-) -> Tuple[List[ClassifiedCandidate], List[Tuple[ClassifiedCandidate, str]], List[int]]:
+) -> Tuple[
+    List[ClassifiedCandidate],
+    List[Tuple[ClassifiedCandidate, str]],
+    List[Tuple[int, Tuple[str, str, str, str]]],
+]:
     """Attribute a batch-draft response to individual words.
 
-    Returns ``(accepted, [(candidate, reason)], draft_item_ids)``. A word is
-    accepted only on positive evidence: it is absent from ``failed``/``skipped``
-    **and** either the returned draft snapshot contains it, or the reported
-    ``successCount`` exactly accounts for every remaining word. When the counts
-    disagree and there is no snapshot to disambiguate, nothing is claimed - a
-    partially written batch must not be reported as fully ingested.
+    Returns ``(accepted, [(candidate, reason)], cleanup_targets)``. Each cleanup
+    target binds the returned id to the intended ``(word, code, action, type)``
+    tuple that earned it. A word is accepted only on positive
+    evidence: it is absent from ``failed``/``skipped``, an optional draft
+    snapshot contains its exact shape, and ``successCount`` accounts for every
+    accepted word. A partially attributable response claims nothing.
     """
     rejected_reasons = _rejection_index(response)
-    by_pair, by_word, has_snapshot = _draft_item_index(response)
+    by_written_shape, has_snapshot = _draft_item_index(response)
 
     accepted: List[ClassifiedCandidate] = []
     rejected: List[Tuple[ClassifiedCandidate, str]] = []
-    item_ids: List[int] = []
+    cleanup_targets: List[Tuple[int, Tuple[str, str, str, str]]] = []
 
     for candidate in requested:
         reason = rejected_reasons.get(candidate.word)
@@ -1450,30 +1476,37 @@ def resolve_draft_outcome(
             rejected.append((candidate, reason))
             continue
         if has_snapshot:
-            key = (candidate.word, str(candidate.code or "").strip().lower())
-            item_id = by_pair.get(key, by_word.get(candidate.word))
-            if item_id is None and candidate.word not in by_word:
+            key = (
+                candidate.word,
+                str(candidate.code or "").strip().lower(),
+                "Create",
+                "Phrase",
+            )
+            item_id = by_written_shape.get(key)
+            if item_id is None:
                 rejected.append((candidate, "草稿中未找到该条目，未确认写入"))
                 continue
             accepted.append(candidate)
             numeric_id = _safe_item_id(item_id)
             if numeric_id is not None:
-                item_ids.append(numeric_id)
+                cleanup_targets.append((numeric_id, key))
             continue
         accepted.append(candidate)
 
-    if not has_snapshot:
-        reported = response.get("successCount")
-        if isinstance(reported, bool) or not isinstance(reported, int):
-            reported = _as_int(reported, -1, minimum=-1, maximum=100000)
-        if reported != len(accepted):
-            # Partial write with no per-item evidence: refuse to guess.
-            return [], [
-                (candidate, f"写入结果无法逐条确认（接口报告 {reported} 条）")
-                for candidate in accepted
-            ] + rejected, []
+    reported = response.get("successCount")
+    if isinstance(reported, bool) or not isinstance(reported, int):
+        reported = _as_int(reported, -1, minimum=-1, maximum=100000)
+    if reported != len(accepted):
+        # Even a snapshot can contain an older row with the same identity tuple.
+        # The bot's request/result accounting is authoritative when the server
+        # omits a skip: an inconsistent response cannot identify which ids this
+        # round actually wrote, so refuse to guess or compensate any of them.
+        return [], [
+            (candidate, f"写入结果无法逐条确认（接口报告 {reported} 条）")
+            for candidate in accepted
+        ] + rejected, []
 
-    return accepted, rejected, item_ids
+    return accepted, rejected, cleanup_targets
 
 
 def _safe_item_id(value: Any) -> Optional[int]:
@@ -1486,92 +1519,190 @@ def _safe_item_id(value: Any) -> Optional[int]:
     return number if number > 0 else None
 
 
+def _draft_item_identity_matches(
+    current: Tuple[str, str, str, str],
+    intended: Tuple[str, str, str, str],
+) -> bool:
+    """Compare every field the server accepts in an expected delete target."""
+    return current == intended
+
+
 async def _delete_draft_items(
-    item_ids: Sequence[int],
+    cleanup_targets: Sequence[Tuple[int, Tuple[str, str, str, str]]],
     identity: Dict[str, str],
     call_kwargs: Dict[str, Any],
+    *,
+    batch_id: str = "",
 ) -> bool:
-    """Best-effort removal of draft rows this run wrote. ``True`` when clean."""
-    ids = [i for i in (_safe_item_id(value) for value in item_ids) if i is not None]
+    """Best-effort CAS removal of rows whose id and written shape still match."""
+    ids: List[int] = []
+    intended_by_id: Dict[int, Tuple[str, str, str, str]] = {}
+    for target in cleanup_targets:
+        if not isinstance(target, tuple) or len(target) != 2:
+            return False
+        item_id = _safe_item_id(target[0])
+        shape = target[1]
+        if item_id is None or not isinstance(shape, tuple) or len(shape) != 4:
+            return False
+        word, code, action, item_type = shape
+        if (
+            not all(isinstance(value, str) for value in (word, code, action, item_type))
+            or not word.strip()
+            or not code.strip()
+            or not action.strip()
+            or not item_type.strip()
+            or item_id in intended_by_id
+        ):
+            return False
+        intended_by_id[item_id] = (
+            word.strip(),
+            code.strip().lower(),
+            action.strip(),
+            item_type.strip(),
+        )
+        ids.append(item_id)
     if not ids:
         return False
+
+    requested_batch_id = _safe_path_segment(batch_id) if batch_id else ""
+    if batch_id and not requested_batch_id:
+        logger.error(f"[word_discovery] refusing unsafe cleanup batch id: {batch_id!r}")
+        return False
+
     try:
+        snapshot = await http_client.keytao_json(
+            "GET",
+            "/api/bot/batches/latest-draft/items",
+            params={
+                **identity,
+                **({"batchId": requested_batch_id} if requested_batch_id else {}),
+            },
+            timeout=20.0,
+            **call_kwargs,
+        )
+        snapshot_batch_id = _safe_path_segment(str(snapshot.get("batchId") or ""))
+        content_version = snapshot.get("contentVersion")
+        entries = snapshot.get("items")
+        if (
+            not snapshot_batch_id
+            or (requested_batch_id and snapshot_batch_id != requested_batch_id)
+            or not isinstance(content_version, int)
+            or isinstance(content_version, bool)
+            or content_version < 0
+            or not isinstance(entries, list)
+        ):
+            logger.error("[word_discovery] compensating delete snapshot is invalid")
+            return False
+
+        target_by_id: Dict[int, Dict[str, Any]] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            item_id = _safe_item_id(entry.get("id"))
+            if item_id not in ids:
+                continue
+            word = entry.get("word")
+            code = entry.get("code")
+            action = entry.get("action")
+            item_type = entry.get("type")
+            if (
+                not all(isinstance(value, str) for value in (word, code, action, item_type))
+            ):
+                continue
+            current_shape = (
+                word.strip(),
+                code.strip().lower(),
+                action.strip(),
+                item_type.strip(),
+            )
+            if not _draft_item_identity_matches(
+                current_shape,
+                intended_by_id[item_id],
+            ):
+                continue
+            target_by_id[item_id] = {
+                "id": item_id,
+                "word": current_shape[0],
+                "code": current_shape[1],
+                "action": current_shape[2],
+                "type": current_shape[3],
+            }
+
+        expected_targets = [target_by_id.get(item_id) for item_id in ids]
+        if any(target is None for target in expected_targets):
+            logger.error("[word_discovery] compensating delete targets changed before cleanup")
+            return False
+
         data = await http_client.keytao_json(
             "DELETE",
             "/api/bot/pull-requests/batch-draft",
-            json_body={**identity, "ids": ids},
+            json_body={
+                **identity,
+                "ids": ids,
+                "batchId": snapshot_batch_id,
+                "expectedContentVersion": content_version,
+                "expectedTargets": expected_targets,
+            },
             timeout=30.0,
             **call_kwargs,
         )
     except Exception as error:
         logger.error(f"[word_discovery] compensating delete failed: {error}")
         return False
-    if data.get("success") is False:
+    deleted_version = data.get("contentVersion")
+    if (
+        data.get("success") is not True
+        or str(data.get("batchId") or "") != snapshot_batch_id
+        or data.get("successCount") != len(ids)
+        or not isinstance(deleted_version, int)
+        or isinstance(deleted_version, bool)
+        or deleted_version <= content_version
+    ):
         logger.error(f"[word_discovery] compensating delete rejected: {data.get('message')}")
         return False
     return True
 
 
-async def _find_written_items(
-    words: Sequence[str],
+async def _recall_batch(
+    batch_id: str,
+    expected_content_version: int,
     identity: Dict[str, str],
     call_kwargs: Dict[str, Any],
-) -> Tuple[Optional[List[int]], str]:
-    """Ask the draft which of ``words`` are actually sitting in it right now.
-
-    ``http_client`` no longer replays a write whose read timed out, because the
-    server may well have applied it. That turns "the draft write raised" into a
-    genuinely unknown state, and guessing either way is wrong: assume success and
-    we lose words, assume failure and we leave orphan draft rows that get written
-    again tomorrow. So we settle it with an idempotent GET (which *does* retry)
-    and act on evidence.
-
-    Returns ``(ids, "")`` on a successful probe - an empty list meaning nothing
-    was written - or ``(None, reason)`` when the draft could not be read at all.
-    """
-    try:
-        data = await http_client.keytao_json(
-            "GET",
-            "/api/bot/batches/latest-draft/items",
-            params=identity,
-            timeout=20.0,
-            **call_kwargs,
-        )
-    except Exception as error:
-        logger.error(f"[word_discovery] draft state probe failed: {error}")
-        return None, str(error)
-
-    entries = data.get("items")
-    if not isinstance(entries, list):
-        return None, "草稿条目响应格式异常"
-
-    wanted = {str(word).strip() for word in words if str(word).strip()}
-    found: List[int] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        if str(entry.get("word") or "").strip() not in wanted:
-            continue
-        item_id = _safe_item_id(entry.get("id"))
-        if item_id is not None:
-            found.append(item_id)
-    return found, ""
-
-
-async def _recall_batch(identity: Dict[str, str], call_kwargs: Dict[str, Any]) -> bool:
+) -> bool:
     """Revert the batch we just submitted back to draft so it can be cleaned up."""
+    safe_batch_id = _safe_path_segment(batch_id)
+    if (
+        not safe_batch_id
+        or not isinstance(expected_content_version, int)
+        or isinstance(expected_content_version, bool)
+        or expected_content_version < 0
+    ):
+        logger.error("[word_discovery] refusing compensating recall without a valid batch snapshot")
+        return False
     try:
         data = await http_client.keytao_json(
             "POST",
             "/api/bot/batches/recall",
-            json_body=dict(identity),
+            json_body={
+                **identity,
+                "batchId": safe_batch_id,
+                "expectedContentVersion": expected_content_version,
+            },
             timeout=30.0,
             **call_kwargs,
         )
     except Exception as error:
         logger.error(f"[word_discovery] compensating recall failed: {error}")
         return False
-    if data.get("success") is False:
+    recalled_version = data.get("contentVersion")
+    if (
+        data.get("success") is not True
+        or str(data.get("batchId") or "") != safe_batch_id
+        or data.get("status") != "Draft"
+        or not isinstance(recalled_version, int)
+        or isinstance(recalled_version, bool)
+        or recalled_version <= expected_content_version
+    ):
         logger.error(f"[word_discovery] compensating recall rejected: {data.get('message')}")
         return False
     return True
@@ -1676,13 +1807,10 @@ async def submit_discovered_words(
         **({"batchId": safe_batch_id} if safe_batch_id else {}),
         "items": build_draft_items(items, run_date),
     }
+    # Ask first, confirm second. The preview is guaranteed read-only by the
+    # server, so a preview transport failure must never trigger row cleanup.
     try:
-        # Ask first, confirm second.  Claiming ``confirmed`` without the
-        # server's own contentVersion + warningDigest is rejected outright, so
-        # the digests have to come from the server's answer to this same write.
-        # That answer arrives as HTTP 400 with ``requiresConfirmation`` - the
-        # status is the protocol, not a failure, hence ``allow_status``.
-        added = await http_client.keytao_json(
+        draft_preview = await http_client.keytao_json(
             "POST",
             "/api/bot/pull-requests/batch-draft",
             json_body={**draft_body, "confirmed": False},
@@ -1690,61 +1818,55 @@ async def submit_discovered_words(
             allow_status={400},
             **call_kwargs,
         )
-        if not added.get("requiresConfirmation") and added.get("success") is not True:
-            message = str(added.get("message") or "草稿写入被拒绝")
-            logger.error(f"[word_discovery] batch-draft preview rejected: {message}")
-            return failure(message, batch_id=batch_id)
-        if added.get("requiresConfirmation"):
-            content_version = added.get("contentVersion")
-            warning_digest = str(added.get("warningDigest") or "").strip().lower()
-            if (
-                not isinstance(content_version, int)
-                or isinstance(content_version, bool)
-                or content_version < 0
-                or not re.fullmatch(r"[0-9a-f]{64}", warning_digest)
-            ):
-                logger.error(
-                    "[word_discovery] batch-draft needs confirmation but returned "
-                    "no verifiable snapshot"
-                )
-                return failure(
-                    "草稿写入需要确认，但服务端未返回可校验的风险快照",
-                    batch_id=batch_id,
-                )
-            confirm_batch_id = _safe_path_segment(
-                str(added.get("batchId") or safe_batch_id or "")
-            )
-            added = await http_client.keytao_json(
-                "POST",
-                "/api/bot/pull-requests/batch-draft",
-                json_body={
-                    **draft_body,
-                    **({"batchId": confirm_batch_id} if confirm_batch_id else {}),
-                    "confirmed": True,
-                    "expectedContentVersion": content_version,
-                    "expectedWarningDigest": warning_digest,
-                },
-                timeout=60.0,
-                **call_kwargs,
-            )
     except Exception as error:
-        # Not proof that nothing was written: a read timeout on a write is no
-        # longer retried, so the rows may exist. Settle it by reading the draft.
-        message = f"写入草稿失败：{error}"
-        logger.error(f"[word_discovery] batch-draft failed: {error}")
-        all_words = [item.word for item in items]
-        written, probe_error = await _find_written_items(all_words, identity, call_kwargs)
-        pending = ""
-        if written is None:
-            pending = leave_pending(
-                RECOVERY_STAGE_DRAFT,
-                batch_id,
-                all_words,
-                f"{message}；且无法确认草稿状态（{probe_error}）",
-            )
-        elif written and not await _delete_draft_items(written, identity, call_kwargs):
-            pending = leave_pending(RECOVERY_STAGE_DRAFT, batch_id, all_words, message)
-        return failure(message, batch_id=batch_id, pending=pending)
+        message = f"草稿写入预检失败：{error}"
+        logger.error(f"[word_discovery] batch-draft preview failed: {error}")
+        return failure(message, batch_id=batch_id)
+
+    content_version = draft_preview.get("contentVersion")
+    warning_digest = str(draft_preview.get("warningDigest") or "").strip().lower()
+    confirm_batch_id = _safe_path_segment(
+        str(draft_preview.get("batchId") or safe_batch_id or "")
+    )
+    if (
+        draft_preview.get("success") is not False
+        or draft_preview.get("requiresConfirmation") is not True
+        or not confirm_batch_id
+        or not isinstance(content_version, int)
+        or isinstance(content_version, bool)
+        or content_version < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", warning_digest)
+    ):
+        logger.error("[word_discovery] batch-draft preview returned no verifiable snapshot")
+        return failure(
+            "草稿写入预检未返回可校验的服务端快照",
+            batch_id=batch_id,
+        )
+
+    try:
+        added = await http_client.keytao_json(
+            "POST",
+            "/api/bot/pull-requests/batch-draft",
+            json_body={
+                **draft_body,
+                "batchId": confirm_batch_id,
+                "confirmed": True,
+                "expectedContentVersion": content_version,
+                "expectedWarningDigest": warning_digest,
+            },
+            timeout=60.0,
+            **call_kwargs,
+        )
+    except Exception as error:
+        message = f"草稿确认写入结果无法确认：{error}"
+        logger.error(f"[word_discovery] batch-draft confirm uncertain: {error}")
+        pending = leave_pending(
+            RECOVERY_STAGE_DRAFT,
+            confirm_batch_id,
+            [item.word for item in items],
+            message,
+        )
+        return failure(message, batch_id=confirm_batch_id, pending=pending)
 
     if not safe_batch_id:
         # The batch was created by this write; adopt the id it reports so the
@@ -1757,61 +1879,169 @@ async def submit_discovered_words(
             )
             return failure("草稿写入后仍未获得合法的批次编号")
 
-    accepted, rejected, item_ids = resolve_draft_outcome(items, added)
+    accepted, rejected, cleanup_targets = resolve_draft_outcome(items, added)
     reported_count = _as_int(added.get("successCount"), 0, minimum=0, maximum=100000)
 
     if not accepted:
         message = str(added.get("message") or "草稿写入未确认任何词条")
         pending = ""
         if reported_count > 0:
-            # Rows exist but could not be attributed. Fall back to the draft
-            # probe when the response carried no ids to delete.
-            rollback_ids = list(item_ids)
-            if not rollback_ids:
-                probed, probe_error = await _find_written_items(
-                    [item.word for item in items], identity, call_kwargs
-                )
-                if probed is None:
-                    pending = leave_pending(
-                        RECOVERY_STAGE_DRAFT,
-                        batch_id,
-                        [item.word for item in items],
-                        f"草稿写入 {reported_count} 条但无法逐条确认，且无法读取草稿（{probe_error}）",
-                    )
-                else:
-                    rollback_ids = probed
-            if not pending and rollback_ids and not await _delete_draft_items(
-                rollback_ids, identity, call_kwargs
-            ):
-                pending = leave_pending(
-                    RECOVERY_STAGE_DRAFT,
-                    batch_id,
-                    [item.word for item in items],
-                    f"草稿写入 {reported_count} 条但无法逐条确认，回滚失败",
-                )
+            # A malformed response that claims writes but supplies no exact ids
+            # cannot be settled by matching words: that could delete pre-existing
+            # same-word rows. Escalate without guessing.
+            pending = leave_pending(
+                RECOVERY_STAGE_DRAFT,
+                batch_id,
+                [item.word for item in items],
+                f"草稿写入 {reported_count} 条但无法逐条确认，未自动删除任何条目",
+            )
         logger.error(f"[word_discovery] batch-draft confirmed nothing: {message}")
         return failure(message, batch_id=batch_id, rejected=rejected or None, pending=pending)
 
     accepted_words = [item.word for item in accepted]
 
+    draft_content_version = added.get("contentVersion")
+    if (
+        not isinstance(draft_content_version, int)
+        or isinstance(draft_content_version, bool)
+        or draft_content_version < 0
+    ):
+        message = "草稿写入响应缺少有效的 contentVersion，已停止提交"
+        logger.error(
+            "[word_discovery] batch-draft response missing valid contentVersion; "
+            "refusing submit"
+        )
+        pending = ""
+        if not await _delete_draft_items(
+            cleanup_targets,
+            identity,
+            call_kwargs,
+            batch_id=batch_id,
+        ):
+            pending = leave_pending(RECOVERY_STAGE_DRAFT, batch_id, accepted_words, message)
+        return failure(
+            message,
+            batch_id=batch_id,
+            rejected=[(item, message) for item in accepted] + rejected,
+            pending=pending,
+        )
+
+    submitted: Dict[str, Any] = {}
     try:
-        submitted = await http_client.keytao_json(
+        submit_preview = await http_client.keytao_json(
             "POST",
             f"/api/bot/batches/{safe_batch_id}/submit",
-            json_body={**identity, "confirmed": True},
+            json_body={
+                **identity,
+                "confirmed": False,
+                "previewOnly": True,
+                "expectedContentVersion": draft_content_version,
+            },
             timeout=60.0,
+            allow_status={400},
             **call_kwargs,
         )
-        submit_error = "" if submitted.get("success") is not False else str(
-            submitted.get("message") or "提交批次被拒绝"
-        )
     except Exception as error:
-        submit_error = f"提交批次失败：{error}"
+        submit_error = f"提交预检失败：{error}"
+    else:
+        submit_preview_version = submit_preview.get("contentVersion")
+        submit_warning_digest = str(submit_preview.get("warningDigest") or "").strip().lower()
+        submit_snapshot_digest = str(submit_preview.get("snapshotDigest") or "").strip().lower()
+        submit_error = ""
+        if (
+            submit_preview.get("success") is not False
+            or submit_preview.get("requiresConfirmation") is not True
+            or str(submit_preview.get("batchId") or "") != safe_batch_id
+            or submit_preview_version != draft_content_version
+            or isinstance(submit_preview_version, bool)
+            or not re.fullmatch(r"[0-9a-f]{64}", submit_warning_digest)
+            or not re.fullmatch(r"[0-9a-f]{64}", submit_snapshot_digest)
+        ):
+            submit_error = "提交预检未返回可校验的服务端快照"
+
+    if not submit_error:
+        try:
+            submitted = await http_client.keytao_json(
+                "POST",
+                f"/api/bot/batches/{safe_batch_id}/submit",
+                json_body={
+                    **identity,
+                    "confirmed": True,
+                    "expectedContentVersion": submit_preview_version,
+                    "expectedWarningDigest": submit_warning_digest,
+                    "expectedSnapshotDigest": submit_snapshot_digest,
+                },
+                timeout=60.0,
+                **call_kwargs,
+            )
+        except KeytaoApiError as error:
+            submit_uncertain = error.status_code is None or error.status_code >= 500
+            message = (
+                f"提交确认结果无法确认：{error}"
+                if submit_uncertain
+                else f"提交确认被拒绝：{error}"
+            )
+            logger.error(
+                f"[word_discovery] submit confirm "
+                f"{'uncertain' if submit_uncertain else 'rejected'}: {error}"
+            )
+            if submit_uncertain:
+                pending = leave_pending(
+                    RECOVERY_STAGE_UNKNOWN,
+                    batch_id,
+                    accepted_words,
+                    message,
+                )
+                return failure(
+                    message,
+                    batch_id=batch_id,
+                    rejected=[(item, message) for item in accepted] + rejected,
+                    pending=pending,
+                )
+            submit_error = message
+        except Exception as error:
+            message = f"提交确认结果无法确认：{error}"
+            logger.error(f"[word_discovery] submit confirm uncertain: {error}")
+            pending = leave_pending(
+                RECOVERY_STAGE_UNKNOWN,
+                batch_id,
+                accepted_words,
+                message,
+            )
+            return failure(
+                message,
+                batch_id=batch_id,
+                rejected=[(item, message) for item in accepted] + rejected,
+                pending=pending,
+            )
+        if not submit_error and submitted.get("success") is not True:
+            if submitted.get("success") is False:
+                submit_error = str(submitted.get("message") or "提交批次被拒绝")
+            else:
+                message = "提交确认响应格式异常，批次状态无法确认"
+                logger.error("[word_discovery] submit response missing success=true")
+                pending = leave_pending(
+                    RECOVERY_STAGE_UNKNOWN,
+                    batch_id,
+                    accepted_words,
+                    message,
+                )
+                return failure(
+                    message,
+                    batch_id=batch_id,
+                    rejected=[(item, message) for item in accepted] + rejected,
+                    pending=pending,
+                )
 
     if submit_error:
         logger.error(f"[word_discovery] submit failed: {submit_error}")
         pending = ""
-        if not await _delete_draft_items(item_ids, identity, call_kwargs):
+        if not await _delete_draft_items(
+            cleanup_targets,
+            identity,
+            call_kwargs,
+            batch_id=batch_id,
+        ):
             pending = leave_pending(RECOVERY_STAGE_DRAFT, batch_id, accepted_words, submit_error)
         return failure(
             submit_error,
@@ -1820,8 +2050,45 @@ async def submit_discovered_words(
             pending=pending,
         )
 
+    submitted_batch = submitted.get("batch")
+    submitted_content_version = (
+        submitted_batch.get("contentVersion")
+        if isinstance(submitted_batch, dict)
+        else None
+    )
+    if (
+        not isinstance(submitted_batch, dict)
+        or str(submitted_batch.get("id") or "") != safe_batch_id
+        or submitted_batch.get("status") != "Submitted"
+        or not isinstance(submitted_content_version, int)
+        or isinstance(submitted_content_version, bool)
+        or submitted_content_version < 0
+    ):
+        message = "批次已提交，但响应缺少有效的 batch.contentVersion，已停止自动批准"
+        logger.error(
+            "[word_discovery] submit response missing valid batch.contentVersion; "
+            "refusing auto-approve"
+        )
+        pending = leave_pending(
+            RECOVERY_STAGE_SUBMITTED,
+            batch_id,
+            accepted_words,
+            message,
+        )
+        return failure(
+            message,
+            batch_id=batch_id,
+            rejected=[(item, message) for item in accepted] + rejected,
+            pending=pending,
+        )
+
     review_note = build_review_note(run_date, len(accepted))
-    approve_payload = apply_manual_review_flag({**identity, "reviewNote": review_note}, False)
+    approve_payload = {
+        **identity,
+        "reviewNote": review_note,
+        "expectedContentVersion": submitted_content_version,
+    }
+    approve_uncertain = False
     try:
         approved = await http_client.keytao_json(
             "POST",
@@ -1830,10 +2097,25 @@ async def submit_discovered_words(
             timeout=60.0,
             **call_kwargs,
         )
-        approve_error = "" if approved.get("success") is not False else str(
-            approved.get("message") or "自动批准被拒绝"
-        )
+        approved_batch = approved.get("batch")
+        if (
+            approved.get("success") is True
+            and isinstance(approved_batch, dict)
+            and str(approved_batch.get("id") or "") == safe_batch_id
+            and approved_batch.get("status") == "Approved"
+        ):
+            approve_error = ""
+        elif approved.get("success") is False:
+            approve_error = str(approved.get("message") or "自动批准被拒绝")
+        else:
+            approve_uncertain = True
+            approve_error = "自动批准响应格式异常，批次状态无法确认"
+            logger.error("[word_discovery] auto-approve response missing success=true")
+    except KeytaoApiError as error:
+        approve_uncertain = error.status_code is None or error.status_code >= 500
+        approve_error = f"自动批准失败：{error}"
     except Exception as error:
+        approve_uncertain = True
         approve_error = f"自动批准失败：{error}"
 
     if approve_error:
@@ -1841,9 +2123,26 @@ async def submit_discovered_words(
         # The batch is submitted and awaiting review: recall it back to draft,
         # then delete our rows. Either step failing leaves it for a human.
         pending = ""
-        if not await _recall_batch(identity, call_kwargs):
+        if approve_uncertain:
+            pending = leave_pending(
+                RECOVERY_STAGE_UNKNOWN,
+                batch_id,
+                accepted_words,
+                approve_error,
+            )
+        elif not await _recall_batch(
+            safe_batch_id,
+            submitted_content_version,
+            identity,
+            call_kwargs,
+        ):
             pending = leave_pending(RECOVERY_STAGE_SUBMITTED, batch_id, accepted_words, approve_error)
-        elif not await _delete_draft_items(item_ids, identity, call_kwargs):
+        elif not await _delete_draft_items(
+            cleanup_targets,
+            identity,
+            call_kwargs,
+            batch_id=batch_id,
+        ):
             pending = leave_pending(RECOVERY_STAGE_DRAFT, batch_id, accepted_words, approve_error)
         return failure(
             approve_error,

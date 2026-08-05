@@ -634,9 +634,17 @@ def test_auto_ingest_chain_and_degradation():
         happy = [
             {"batchId": "batch-1"},
             dict(draft_preview),
-            {"successCount": 2},
-            {"success": True},
-            {"success": True},
+            {"successCount": 2, "contentVersion": 4},
+            {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "batch-1",
+                "contentVersion": 4,
+                "warningDigest": "e" * 64,
+                "snapshotDigest": "f" * 64,
+            },
+            {"success": True, "batch": {"id": "batch-1", "status": "Submitted", "contentVersion": 5}},
+            {"success": True, "batch": {"id": "batch-1", "status": "Approved"}},
         ]
 
         recorded = []
@@ -660,11 +668,12 @@ def test_auto_ingest_chain_and_degradation():
         paths = [path for _method, path, _kw in recorded]
         check("the full chain succeeds", result.get("success") is True and result.get("count") == 2)
         check(
-            "the chain is draft -> batch-draft preview -> batch-draft confirm -> submit -> auto-approve",
+            "the chain is draft -> batch-draft preview -> batch-draft confirm -> submit preview -> submit confirm -> auto-approve",
             paths == [
                 "/api/bot/batches/latest-draft",
                 "/api/bot/pull-requests/batch-draft",
                 "/api/bot/pull-requests/batch-draft",
+                "/api/bot/batches/batch-1/submit",
                 "/api/bot/batches/batch-1/submit",
                 "/api/bot/batches/batch-1/auto-approve",
             ],
@@ -682,10 +691,45 @@ def test_auto_ingest_chain_and_degradation():
         )
         check("every call is made as the bot QQ identity", all(kw.get("platform") == "qq" for _m, _p, kw in recorded))
         check("no step retries more than once", all(kw.get("retries") == 2 for _m, _p, kw in recorded))
-        check("submit is confirmed", recorded[3][2]["json_body"].get("confirmed") is True)
+        check(
+            "submit preview sends exactly the server contract keys",
+            recorded[3][2]["json_body"] == {
+                "platform": "qq",
+                "platformId": "10001",
+                "confirmed": False,
+                "previewOnly": True,
+                "expectedContentVersion": 4,
+            },
+        )
+        check(
+            "submit confirmation echoes the server snapshot",
+            recorded[4][2]["json_body"] == {
+                "platform": "qq",
+                "platformId": "10001",
+                "confirmed": True,
+                "expectedContentVersion": 4,
+                "expectedWarningDigest": "e" * 64,
+                "expectedSnapshotDigest": "f" * 64,
+            },
+        )
+        approve_body = recorded[5][2]["json_body"]
+        check(
+            "auto-approve sends exactly the server contract keys",
+            set(approve_body) == {
+                "platform",
+                "platformId",
+                "reviewNote",
+                "expectedContentVersion",
+            },
+        )
+        check(
+            "auto-approve uses the post-submit integer content version",
+            approve_body.get("expectedContentVersion") == 5
+            and not isinstance(approve_body.get("expectedContentVersion"), bool),
+        )
         check(
             "the review note is code-generated",
-            recorded[4][2]["json_body"]["reviewNote"].startswith("daily-discovery 2026-07-26"),
+            approve_body["reviewNote"].startswith("daily-discovery 2026-07-26"),
         )
 
         confirm_needed = {
@@ -694,6 +738,14 @@ def test_auto_ingest_chain_and_degradation():
             "batchId": "b",
             "contentVersion": 1,
             "warningDigest": "e" * 64,
+        }
+        submit_preview = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "b",
+            "contentVersion": 2,
+            "warningDigest": "a" * 64,
+            "snapshotDigest": "b" * 64,
         }
         for step, responses, label in (
             (0, [KeytaoApiError("boom")], "latest-draft"),
@@ -708,7 +760,7 @@ def test_auto_ingest_chain_and_degradation():
                 [
                     {"batchId": "b"},
                     {**confirm_needed, "warningDigest": "not-a-digest"},
-                    {"successCount": 1},
+                    {"successCount": 1, "contentVersion": 2},
                 ],
                 "batch-draft confirmation snapshot unusable",
             ),
@@ -719,12 +771,17 @@ def test_auto_ingest_chain_and_degradation():
             ),
             (
                 2,
-                [{"batchId": "b"}, dict(confirm_needed), {"successCount": 0, "message": "全部冲突"}],
+                [{"batchId": "b"}, dict(confirm_needed), {"successCount": 0, "contentVersion": 2, "message": "全部冲突"}],
                 "batch-draft wrote nothing",
             ),
             (
                 3,
-                [{"batchId": "b"}, dict(confirm_needed), {"successCount": 1}, {"success": False, "message": "no"}],
+                [
+                    {"batchId": "b"},
+                    dict(confirm_needed),
+                    {"successCount": 1, "contentVersion": 2},
+                    {"success": False, "message": "no"},
+                ],
                 "submit",
             ),
             (
@@ -732,8 +789,9 @@ def test_auto_ingest_chain_and_degradation():
                 [
                     {"batchId": "b"},
                     dict(confirm_needed),
-                    {"successCount": 1},
-                    {"success": True},
+                    {"successCount": 1, "contentVersion": 2},
+                    dict(submit_preview),
+                    {"success": True, "batch": {"id": "b", "status": "Submitted", "contentVersion": 3}},
                     KeytaoApiError("no"),
                 ],
                 "auto-approve",
@@ -744,6 +802,139 @@ def test_auto_ingest_chain_and_degradation():
                     patch.object(http_client, "keytao_json", side_effect=make_stub(responses)):
                 result = await wd.submit_discovered_words(items, "2026-07-26")
             check(f"failure at {label} aborts the chain", result.get("success") is False)
+
+        missing_submit_version = [
+            {"batchId": "b"},
+            dict(confirm_needed),
+            {"successCount": 2, "contentVersion": 2},
+            dict(submit_preview),
+            {"success": True, "batch": {}},
+        ]
+        recorded.clear()
+        with patch.object(wd, "bot_platform_id", return_value="10001"), \
+                patch.object(http_client, "keytao_json", side_effect=make_stub(missing_submit_version)):
+            result = await wd.submit_discovered_words(items, "2026-07-26")
+        check("a missing post-submit version fails closed", result.get("success") is False)
+        check("the missing field is named in the failure", "batch.contentVersion" in result.get("message", ""))
+        check(
+            "no auto-approve is attempted without the post-submit version",
+            all(not path.endswith("/auto-approve") for _method, path, _kwargs in recorded),
+        )
+
+        preview_timeout = [
+            {"batchId": "b"},
+            KeytaoApiError("ReadTimeout；只读预检未返回"),
+        ]
+        recorded.clear()
+        with patch.object(wd, "bot_platform_id", return_value="10001"), \
+                patch.object(http_client, "keytao_json", side_effect=make_stub(preview_timeout)):
+            result = await wd.submit_discovered_words(items, "2026-07-26")
+        check("a batch-draft preview timeout aborts the round", result.get("success") is False)
+        check(
+            "a read-only preview timeout never probes or deletes draft rows",
+            [path for _method, path, _kwargs in recorded] == [
+                "/api/bot/batches/latest-draft",
+                "/api/bot/pull-requests/batch-draft",
+            ],
+        )
+
+        submit_confirm_timeout = [
+            {"batchId": "b"},
+            dict(confirm_needed),
+            {"successCount": 2, "contentVersion": 2},
+            dict(submit_preview),
+            KeytaoApiError("ReadTimeout；提交可能已生效"),
+        ]
+        recorded.clear()
+        with patch.object(wd, "bot_platform_id", return_value="10001"), \
+                patch.object(http_client, "keytao_json", side_effect=make_stub(submit_confirm_timeout)):
+            result = await wd.submit_discovered_words(items, "2026-07-26")
+        check("an uncertain submit result is reported as pending", "unknown" in result.get("pendingRecovery", ""))
+        check(
+            "an uncertain submit result does not guess between delete and recall",
+            all(
+                path not in {"/api/bot/batches/recall", "/api/bot/pull-requests/batch-draft"}
+                or method != "DELETE"
+                for method, path, _kwargs in recorded[5:]
+            ),
+        )
+
+        submit_confirm_conflict = [
+            {"batchId": "b"},
+            dict(confirm_needed),
+            {
+                "successCount": 2,
+                "contentVersion": 2,
+                "draftItems": [
+                    {"id": 71, "word": "绝绝子", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                    {"id": 72, "word": "破防", "code": "bbbb", "action": "Create", "type": "Phrase"},
+                ],
+            },
+            dict(submit_preview),
+            KeytaoApiError("警告快照已变化", status_code=409),
+            {
+                "success": True,
+                "batchId": "b",
+                "contentVersion": 2,
+                "items": [
+                    {"id": 71, "word": "绝绝子", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                    {"id": 72, "word": "破防", "code": "bbbb", "action": "Create", "type": "Phrase"},
+                ],
+            },
+            {"success": True, "batchId": "b", "contentVersion": 3, "successCount": 2},
+        ]
+        recorded.clear()
+        with patch.object(wd, "bot_platform_id", return_value="10001"), \
+                patch.object(http_client, "keytao_json", side_effect=make_stub(submit_confirm_conflict)):
+            result = await wd.submit_discovered_words(items, "2026-07-26")
+        check(
+            "a submit-confirm 409 cleans this round's exact draft rows",
+            recorded[-1][0:2] == ("DELETE", "/api/bot/pull-requests/batch-draft")
+            and recorded[-1][2]["json_body"]["ids"] == [71, 72],
+        )
+        check(
+            "a submit-confirm 409 leaves no unknown recovery",
+            result.get("success") is False and result.get("pendingRecovery") == "",
+        )
+
+        submit_confirm_server_error = [
+            {"batchId": "b"},
+            dict(confirm_needed),
+            {
+                "successCount": 2,
+                "contentVersion": 2,
+                "draftItems": [
+                    {"id": 81, "word": "绝绝子", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                    {"id": 82, "word": "破防", "code": "bbbb", "action": "Create", "type": "Phrase"},
+                ],
+            },
+            dict(submit_preview),
+            KeytaoApiError("服务端异常", status_code=500),
+        ]
+        recorded.clear()
+        with patch.object(wd, "bot_platform_id", return_value="10001"), \
+                patch.object(http_client, "keytao_json", side_effect=make_stub(submit_confirm_server_error)):
+            result = await wd.submit_discovered_words(items, "2026-07-26")
+        check(
+            "a submit-confirm 5xx remains unknown",
+            "unknown" in result.get("pendingRecovery", ""),
+        )
+        check(
+            "a submit-confirm 5xx never guesses cleanup",
+            len(recorded) == 5 and all(method != "DELETE" for method, _path, _kwargs in recorded),
+        )
+
+        malformed_approval = [*happy[:-1], {}]
+        recorded.clear()
+        with patch.object(wd, "bot_platform_id", return_value="10001"), \
+                patch.object(http_client, "keytao_json", side_effect=make_stub(malformed_approval)):
+            result = await wd.submit_discovered_words(items, "2026-07-26")
+        check("a malformed auto-approve 200 fails closed", result.get("success") is False)
+        check(
+            "a malformed auto-approve result is not compensated against a guessed state",
+            "unknown" in result.get("pendingRecovery", "")
+            and all(path != "/api/bot/batches/recall" for _method, path, _kwargs in recorded),
+        )
 
         recorded.clear()
         with patch.object(wd, "bot_platform_id", return_value=""), \
@@ -796,20 +987,46 @@ def test_partial_ingest_is_attributed_per_word():
         {
             "successCount": 2,
             "draftItems": [
-                {"id": 11, "word": "甲词", "code": "aaaa"},
-                {"id": 12, "word": "乙词", "code": "bbbb"},
+                {"id": 11, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                {"id": 12, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase"},
             ],
         },
     )
     check("the draft snapshot confirms both words", [i.word for i in accepted] == ["甲词", "乙词"])
-    check("draft item ids are collected for rollback", ids == [11, 12])
+    check(
+        "draft item ids stay bound to the server-comparable shapes that earned them",
+        ids == [
+            (11, ("甲词", "aaaa", "Create", "Phrase")),
+            (12, ("乙词", "bbbb", "Create", "Phrase")),
+        ],
+    )
 
     accepted, rejected, ids = resolve_draft_outcome(
-        items, {"successCount": 2, "draftItems": [{"id": 11, "word": "甲词", "code": "aaaa"}]}
+        items,
+        {
+            "successCount": 2,
+            "draftItems": [
+                {"id": 11, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"},
+            ],
+        },
     )
-    check("a word missing from the snapshot is not claimed", [i.word for i in accepted] == ["甲词"])
-    check("the missing word is explained", "未找到" in rejected[0][1])
-    check("only confirmed ids are collected", ids == [11])
+    check("a count/snapshot disagreement claims no word", accepted == [])
+    check("the count/snapshot disagreement explains both candidates", len(rejected) == 2)
+    check("the count/snapshot disagreement yields no cleanup target", ids == [])
+
+    accepted, rejected, ids = resolve_draft_outcome(
+        items,
+        {
+            "successCount": 1,
+            "draftItems": [
+                {"id": 11, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                {"id": 12, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase"},
+            ],
+        },
+    )
+    check("the bot rejects a snapshot whose successCount cannot identify its own writes", accepted == [])
+    check("the inconsistent snapshot yields no cleanup targets", ids == [])
+    check("every ambiguous candidate is returned for manual handling", len(rejected) == 2)
 
     # -- chain behaviour ----------------------------------------------------
     async def _run():
@@ -835,11 +1052,14 @@ def test_partial_ingest_is_attributed_per_word():
              "contentVersion": 2, "warningDigest": "f" * 64},
             {
                 "successCount": 1,
+                "contentVersion": 3,
                 "failed": [{"word": "乙词", "reason": "编码冲突"}],
-                "draftItems": [{"id": 21, "word": "甲词", "code": "aaaa"}],
+                "draftItems": [{"id": 21, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"}],
             },
-            {"success": True},
-            {"success": True},
+            {"success": False, "requiresConfirmation": True, "batchId": "b1",
+             "contentVersion": 3, "warningDigest": "a" * 64, "snapshotDigest": "b" * 64},
+            {"success": True, "batch": {"id": "b1", "status": "Submitted", "contentVersion": 4}},
+            {"success": True, "batch": {"id": "b1", "status": "Approved"}},
         ]
         recorded.clear()
         with patch.object(wd, "bot_platform_id", return_value="10001"), \
@@ -857,22 +1077,102 @@ def test_partial_ingest_is_attributed_per_word():
             # HTTP 400 + requiresConfirmation is the server's preview answer.
             {"success": False, "requiresConfirmation": True, "batchId": "b1",
              "contentVersion": 2, "warningDigest": "f" * 64},
-            {"successCount": 2, "draftItems": [
-                {"id": 31, "word": "甲词", "code": "aaaa"},
-                {"id": 32, "word": "乙词", "code": "bbbb"},
+            {"successCount": 2, "contentVersion": 3, "draftItems": [
+                {"id": 30, "word": "甲词", "code": "aaaa", "action": "Change", "type": "Word", "weight": 7},
+                {"id": 31, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase", "weight": None},
+                {"id": 32, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase", "weight": None},
             ]},
             {"success": False, "message": "批次校验失败"},
-            {"success": True},  # the compensating DELETE
+            {"success": True, "batchId": "b1", "contentVersion": 3, "items": [
+                {"id": 30, "word": "甲词", "code": "aaaa", "action": "Change", "type": "Word", "weight": 7},
+                {"id": 31, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase", "weight": 100},
+                {"id": 32, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase", "weight": 100},
+            ]},
+            {"success": True, "batchId": "b1", "contentVersion": 4, "successCount": 2},  # the compensating DELETE
         ]
         recorded.clear()
         with patch.object(wd, "bot_platform_id", return_value="10001"), \
                 patch.object(http_client, "keytao_json", side_effect=make_stub(submit_fails)):
             result = await wd.submit_discovered_words(items, "2026-07-26")
-        methods = [(m, p) for m, p, _kw in recorded]
-        check("a failed submit rolls the draft rows back", ("DELETE", "/api/bot/pull-requests/batch-draft") in methods)
-        check("the rollback targets exactly our rows", recorded[-1][2]["json_body"]["ids"] == [31, 32])
+        delete_call = next(
+            (
+                call for call in recorded
+                if call[0] == "DELETE" and call[1] == "/api/bot/pull-requests/batch-draft"
+            ),
+            None,
+        )
+        check("a failed submit rolls the draft rows back", delete_call is not None)
+        check(
+            "the rollback targets exactly our rows",
+            delete_call is not None
+            and delete_call[2].get("json_body", {}).get("ids") == [31, 32],
+        )
+        check(
+            "the compensating delete carries the exact CAS target snapshot",
+            delete_call is not None and delete_call[2].get("json_body") == {
+                "platform": "qq",
+                "platformId": "10001",
+                "ids": [31, 32],
+                "batchId": "b1",
+                "expectedContentVersion": 3,
+                "expectedTargets": [
+                    {"id": 31, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                    {"id": 32, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase"},
+                ],
+            },
+        )
         check("a failed submit reports failure", result.get("success") is False)
         check("a successful rollback leaves nothing pending", result.get("pendingRecovery") == "")
+
+        # The id is not the identity of the row. A browser PATCH can retain it
+        # while changing any server-comparable field. The confirmed-write
+        # response mirrors the POST route (weight null), while the revalidation
+        # snapshot mirrors latest-draft/items (calculated numeric weight).
+        changed_fields = {
+            "word": "改词",
+            "code": "zzzz",
+            "action": "Change",
+            "type": "Word",
+        }
+        for changed_field, changed_value in changed_fields.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                store = DiscoveryStore(
+                    db_path=os.path.join(tmp, f"edited-{changed_field}-cleanup.db")
+                )
+                live_row = {
+                    "id": 61,
+                    "word": "甲词",
+                    "code": "aaaa",
+                    "action": "Create",
+                    "type": "Phrase",
+                    "weight": 100,
+                }
+                live_row[changed_field] = changed_value
+                edited_before_cleanup = [
+                    {"batchId": "b1"},
+                    {"success": False, "requiresConfirmation": True, "batchId": "b1",
+                     "contentVersion": 2, "warningDigest": "f" * 64},
+                    {"successCount": 1, "contentVersion": 3, "draftItems": [
+                        {"id": 61, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase", "weight": None},
+                    ]},
+                    {"success": False, "message": "批次校验失败"},
+                    {"success": True, "batchId": "b1", "contentVersion": 4, "items": [live_row]},
+                ]
+                recorded.clear()
+                with patch.object(wd, "bot_platform_id", return_value="10001"), \
+                        patch.object(http_client, "keytao_json", side_effect=make_stub(edited_before_cleanup)):
+                    result = await wd.submit_discovered_words(
+                        items[:1], "2026-07-26", store=store
+                    )
+                pending = store.list_pending_recovery()
+                check(
+                    f"cleanup refuses when live {changed_field} differs",
+                    all(method != "DELETE" for method, _path, _kwargs in recorded),
+                )
+                check(
+                    f"a refused {changed_field} cleanup is recorded for recovery",
+                    result.get("pendingRecovery") != "" and len(pending) == 1,
+                )
 
         # auto-approve fails -> recall, then delete.
         approve_fails = [
@@ -880,14 +1180,20 @@ def test_partial_ingest_is_attributed_per_word():
             # HTTP 400 + requiresConfirmation is the server's preview answer.
             {"success": False, "requiresConfirmation": True, "batchId": "b1",
              "contentVersion": 2, "warningDigest": "f" * 64},
-            {"successCount": 2, "draftItems": [
-                {"id": 41, "word": "甲词", "code": "aaaa"},
-                {"id": 42, "word": "乙词", "code": "bbbb"},
+            {"successCount": 2, "contentVersion": 3, "draftItems": [
+                {"id": 41, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                {"id": 42, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase"},
             ]},
-            {"success": True},
+            {"success": False, "requiresConfirmation": True, "batchId": "b1",
+             "contentVersion": 3, "warningDigest": "a" * 64, "snapshotDigest": "b" * 64},
+            {"success": True, "batch": {"id": "b1", "status": "Submitted", "contentVersion": 4}},
             {"success": False, "message": "审核服务不可用"},
-            {"success": True},  # recall
-            {"success": True},  # delete
+            {"success": True, "batchId": "b1", "contentVersion": 5, "status": "Draft"},  # recall
+            {"success": True, "batchId": "b1", "contentVersion": 5, "items": [
+                {"id": 41, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                {"id": 42, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase"},
+            ]},
+            {"success": True, "batchId": "b1", "contentVersion": 6, "successCount": 2},  # delete
         ]
         recorded.clear()
         with patch.object(wd, "bot_platform_id", return_value="10001"), \
@@ -895,72 +1201,44 @@ def test_partial_ingest_is_attributed_per_word():
             result = await wd.submit_discovered_words(items, "2026-07-26")
         paths = [p for _m, p, _kw in recorded]
         check("a failed approval recalls the submitted batch", "/api/bot/batches/recall" in paths)
+        recall_call = next(call for call in recorded if call[1] == "/api/bot/batches/recall")
+        check(
+            "the compensating recall carries the submitted batch CAS version",
+            recall_call[2]["json_body"] == {
+                "platform": "qq",
+                "platformId": "10001",
+                "batchId": "b1",
+                "expectedContentVersion": 4,
+            },
+        )
         check(
             "the recalled batch's rows are then deleted",
             recorded[-1][1] == "/api/bot/pull-requests/batch-draft" and recorded[-1][0] == "DELETE",
         )
         check("a fully compensated failure leaves nothing pending", result.get("pendingRecovery") == "")
 
-        # A write whose read timed out is no longer retried by http_client, so
-        # "the draft write raised" is genuinely ambiguous. It must be settled by
-        # reading the draft, not guessed.
-        ambiguous = [
-            {"batchId": "b1"},
-            KeytaoApiError("ReadTimeout；该请求可能已生效，未自动重试"),
-            {"success": True, "items": [
-                {"id": 61, "word": "甲词", "code": "aaaa"},
-                {"id": 62, "word": "乙词", "code": "bbbb"},
-                {"id": 63, "word": "别人的词", "code": "zzzz"},
-            ]},
-            {"success": True},  # the compensating DELETE
-        ]
-        recorded.clear()
-        with patch.object(wd, "bot_platform_id", return_value="10001"), \
-                patch.object(http_client, "keytao_json", side_effect=make_stub(ambiguous)):
-            result = await wd.submit_discovered_words(items, "2026-07-26")
-        probe = [(m, p) for m, p, _kw in recorded]
-        check(
-            "an ambiguous draft write probes the draft instead of guessing",
-            ("GET", "/api/bot/batches/latest-draft/items") in probe,
-        )
-        check("the probe is an idempotent GET (it may be replayed)", probe[2][0] == "GET")
-        check("orphan rows found by the probe are deleted", recorded[-1][2]["json_body"]["ids"] == [61, 62])
-        check("the probe never touches rows we did not write", 63 not in recorded[-1][2]["json_body"]["ids"])
-        check("a settled ambiguity leaves nothing pending", result.get("pendingRecovery") == "")
-        check("the round still reports failure", result.get("success") is False)
-
-        # Same failure, but the write provably never landed: no delete at all.
-        never_landed = [
-            {"batchId": "b1"},
-            KeytaoApiError("ConnectError"),
-            {"success": True, "items": []},
-        ]
-        recorded.clear()
-        with patch.object(wd, "bot_platform_id", return_value="10001"), \
-                patch.object(http_client, "keytao_json", side_effect=make_stub(never_landed)):
-            result = await wd.submit_discovered_words(items, "2026-07-26")
-        check(
-            "an empty draft means nothing to roll back",
-            all(m != "DELETE" for m, _p, _kw in recorded),
-        )
-        check("a clean failure leaves nothing pending", result.get("pendingRecovery") == "")
-
-        # The probe itself failing is the one case that must escalate.
+        # A confirmed write can succeed before its response times out. Without
+        # exact returned ids, cleanup must not guess by word and risk old rows.
         with tempfile.TemporaryDirectory() as tmp:
-            store = DiscoveryStore(db_path=os.path.join(tmp, "probe.db"))
-            unprobeable = [
+            store = DiscoveryStore(db_path=os.path.join(tmp, "confirm-timeout.db"))
+            confirm_timeout = [
                 {"batchId": "b7"},
+                {"success": False, "requiresConfirmation": True, "batchId": "b7",
+                 "contentVersion": 2, "warningDigest": "f" * 64},
                 KeytaoApiError("ReadTimeout；该请求可能已生效，未自动重试"),
-                KeytaoApiError("草稿服务不可用"),
             ]
             recorded.clear()
             with patch.object(wd, "bot_platform_id", return_value="10001"), \
-                    patch.object(http_client, "keytao_json", side_effect=make_stub(unprobeable)):
+                    patch.object(http_client, "keytao_json", side_effect=make_stub(confirm_timeout)):
                 result = await wd.submit_discovered_words(items, "2026-07-26", store=store)
             pending = store.list_pending_recovery()
-            check("an unverifiable draft state escalates", result.get("pendingRecovery") != "")
-            check("the unverifiable state is persisted", len(pending) == 1)
-            check("the record explains it could not be confirmed", "无法确认草稿状态" in pending[0]["detail"])
+            check("an uncertain confirmed draft write escalates", result.get("pendingRecovery") != "")
+            check("the uncertain draft write is persisted", len(pending) == 1)
+            check("the uncertain write remains a draft-stage recovery", pending[0]["stage"] == wd.RECOVERY_STAGE_DRAFT)
+            check(
+                "an uncertain confirmed draft write never guesses rows to delete",
+                all(method != "DELETE" for method, _path, _kwargs in recorded),
+            )
 
         # Compensation itself fails -> pending_recovery is persisted, never silent.
         with tempfile.TemporaryDirectory() as tmp:
@@ -969,11 +1247,13 @@ def test_partial_ingest_is_attributed_per_word():
                 {"batchId": "b9"},
                 {"success": False, "requiresConfirmation": True, "batchId": "b9",
                  "contentVersion": 2, "warningDigest": "f" * 64},
-                {"successCount": 2, "draftItems": [
-                    {"id": 51, "word": "甲词", "code": "aaaa"},
-                    {"id": 52, "word": "乙词", "code": "bbbb"},
+                {"successCount": 2, "contentVersion": 3, "draftItems": [
+                    {"id": 51, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                    {"id": 52, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase"},
                 ]},
-                {"success": True},
+                {"success": False, "requiresConfirmation": True, "batchId": "b9",
+                 "contentVersion": 3, "warningDigest": "a" * 64, "snapshotDigest": "b" * 64},
+                {"success": True, "batch": {"id": "b9", "status": "Submitted", "contentVersion": 4}},
                 {"success": False, "message": "审核服务不可用"},
                 KeytaoApiError("recall 挂了"),
             ]

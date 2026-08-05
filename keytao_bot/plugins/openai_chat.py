@@ -52,6 +52,7 @@ from ..harness.state import (
 from ..harness.tools import (
     ToolContext,
     ToolExecutor,
+    _COMMAND_PREFIX_PATTERN,
     message_authorizes_mutation,
     trusted_mutation_source,
 )
@@ -514,10 +515,7 @@ def _normalized_execution_command_text(message_text: str) -> str:
 def _matches_draft_submit_command(compact: str) -> bool:
     if not compact:
         return False
-    prefix = (
-        r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我|"
-        r"能不能|可不可以|能否|可否|可以帮我|可以请你)*"
-    )
+    prefix = _COMMAND_PREFIX_PATTERN
     target = r"(?:(?:当前|这个|我的)?(?:草稿|批次))"
     action = r"(?:提交|提审|送审)(?:审核)?"
     polite = r"(?:一下)?(?:吧|啦|了)?"
@@ -594,7 +592,7 @@ def _is_target_bound_add_and_submit_request(
     code = str(state.recommended_code or "").strip().lower()
     if not word or not code:
         return False
-    request_prefix = r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我)*"
+    request_prefix = _COMMAND_PREFIX_PATTERN
     add_clause = r"(?:加词|添加|加入|新增)(?:词条)?"
     code_clause = rf"(?:(?:用|以|按)?(?:编码)?(?:为|是)?)?{re.escape(code)}"
     submit_clause = r"(?:并|并且|然后|再|同时|以及)?(?:提交|提审|送审)(?:审核|草稿|批次)?"
@@ -5858,6 +5856,11 @@ async def _execute_confirmed_tool(
         "keytao_recall_batch",
     }:
         if data.get("success"):
+            if state.function_name == "keytao_recall_batch":
+                conversation_state_store.invalidate_actor_related(
+                    (platform, user_id),
+                    batch_id=str(data.get("batchId") or args.get("batch_id") or ""),
+                )
             if state.function_name == "keytao_batch_remove_draft_items":
                 expected_count = len(state.args.get("ids", []))
                 success_count = int(data.get("successCount") or 0)
@@ -6037,28 +6040,35 @@ def _draft_item_display_line(item: Dict, index: int) -> str:
     return f"• {index}. {action_label} {display}"
 
 
-def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
-    auto_review = submit_data.get("autoReview") if isinstance(submit_data, dict) else None
+def _append_submit_review_lines(parts: List[str], submit_data: object) -> None:
+    if not isinstance(submit_data, dict):
+        return
+    auto_review = submit_data.get("autoReview")
+    approve_result = submit_data.get("autoApproveResult") or {}
+    if not isinstance(approve_result, dict):
+        approve_result = {}
     if submit_data.get("autoApproved"):
         parts.append(_format_auto_approved_review_line(auto_review))
         return
 
     if isinstance(auto_review, dict):
-        will_auto_approve = bool(
-            auto_review.get("success")
-            and auto_review.get("autoApprove")
-            and auto_review.get("verdict") == "pass"
-            and not auto_review.get("manualReviewLocked")
-        )
+        will_auto_approve = review_flags.audit_allows_batch_auto_approve(auto_review)
         if will_auto_approve and submit_data.get("requiresConfirmation"):
             parts.append(
                 _format_auto_approved_review_line(auto_review)
                 + "确认提交后将尝试自动批准入库。"
             )
             return
-        summary = _clean_review_audit_reason(str(auto_review.get("summary") or ""))
-        if summary and "管理员审核" not in summary and "管理员确认" not in summary:
-            parts.append(f"本喵审核：该批次需管理员审核（{summary}）")
+        if will_auto_approve and approve_result and not approve_result.get("success"):
+            passed_line = _format_auto_approved_review_line(auto_review).rstrip("。")
+            reason = str(approve_result.get("message") or "未知原因")
+            parts.append(f"{passed_line}，但自动批准未执行：{reason}")
+            return
+        block_reason = _clean_review_audit_reason(
+            review_flags.batch_auto_approve_block_reason(auto_review)
+        )
+        if block_reason and "管理员审核" not in block_reason and "管理员确认" not in block_reason:
+            parts.append(f"本喵审核：该批次需管理员审核（{block_reason}）")
         else:
             parts.append("本喵审核：该批次需管理员审核。")
         issues = auto_review.get("issues") or []
@@ -6068,7 +6078,6 @@ def _append_submit_review_lines(parts: List[str], submit_data: Dict) -> None:
                 for issue in issues[:5]
             )
             parts.append("需管理员审核：\n" + issue_lines)
-    approve_result = submit_data.get("autoApproveResult") or {}
     if approve_result and not approve_result.get("success"):
         parts.append(f"自动批准未执行：{approve_result.get('message', '未知原因')}")
 

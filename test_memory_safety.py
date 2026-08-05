@@ -30,8 +30,10 @@ from keytao_bot.harness.state import (
 from keytao_bot.harness.tools import (
     ToolContext,
     ToolExecutor,
+    _RECORD_FRAME_RE,
     _mutation_authorization_view,
     message_authorizes_mutation,
+    message_requests_change,
 )
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
@@ -534,6 +536,34 @@ class PendingIsolationTests(unittest.TestCase):
         self.assertTrue(record.confirmation_armed)
         self.assertRegex(record.reconfirmation_code, r"^[A-F0-9]{6}$")
         self.assertEqual(record.reconfirmation_intent["intent"], "pending_confirm")
+
+    def test_invalidate_actor_related_crosses_sessions_but_keeps_unrelated_tickets(self) -> None:
+        store = MemoryConversationStateStore(max_pending=8)
+        related_private = ConversationAddress.private("qq", "user-1")
+        related_group = ConversationAddress.group("qq", "group-b", "user-1")
+        unrelated_group = ConversationAddress.group("qq", "group-c", "user-1")
+        other_actor = ConversationAddress.group("qq", "group-b", "user-2")
+        for address, batch_id in (
+            (related_private, "batch-1"),
+            (related_group, "batch-1"),
+            (unrelated_group, "batch-2"),
+            (other_actor, "batch-1"),
+        ):
+            store.set(
+                address,
+                PendingToolConfirm(
+                    "keytao_shift_phrase_code",
+                    {"word": "吃席", "target_code": "wkxk", "batch_id": batch_id},
+                ),
+            )
+
+        dropped = store.invalidate_actor_related(("qq", "user-1"), batch_id="batch-1")
+
+        self.assertEqual(dropped, 2)
+        self.assertIsNone(store.get(related_private))
+        self.assertIsNone(store.get(related_group))
+        self.assertIsNotNone(store.get(unrelated_group))
+        self.assertIsNotNone(store.get(other_actor))
 
 
 class WebIdentityVerificationTests(unittest.TestCase):
@@ -2196,6 +2226,451 @@ class ScopedMemoryConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summaries, 0)
 
 
+RECORD_FRAMING_MUST_BLOCK = (
+    "请把这句删除草稿条目 12 记录下来",
+    "请把这句删除草稿条目 12 记录下来，谢谢",
+    "请把这句删除草稿条目 12 记录下来，",
+    "请把这句删除草稿条目 12 记录下来啊",
+    "请把这句删除草稿条目 12 记录下来哦",
+    "请把这句删除草稿条目 12 记录下来嘛",
+    "请把这句删除草稿条目 12 记录下来就行",
+    "请把这句删除草稿条目 12 记录下来即可",
+    "请把这句删除草稿条目 12 备注一下",
+    "请把这句删除草稿条目 12 写下来",
+    "请把这句删除草稿条目 12 存档",
+    "请把这句删除草稿条目 12 标记一下",
+    "请把这句删除草稿条目 12 记下",
+    "请把这句删除草稿条目 12 保存下来",
+    "请把这句删除草稿条目 12 登记一下",
+    "請把這句刪除草稿條目 12 記錄下來",
+    "记录下来，删除草稿条目 12",
+    "帮我记下来，删除草稿条目 12",
+    "麻烦先记一下，删除草稿条目 12",
+    "记录一下：删除草稿条目 12",
+    "请把这句提交草稿记录下来，谢谢",
+    "请把这句撤回提审记录下来，谢谢",
+    "请把这句顺延「吃席」到 wkxk 记录下来，谢谢",
+    "他说删除草稿条目 12",
+    "请把「删除草稿条目 12」记录下来",
+    "朝歌说要删除草稿条目 12，先记下来",
+)
+
+RECORD_FRAMING_MUST_ALLOW = (
+    "请删除草稿条目 12",
+    "删除草稿条目 12",
+    "请帮我把草稿条目 12 删掉",
+    "请删除草稿条目 12 吧",
+    "麻烦把草稿条目 12 删掉一下",
+    "顺延记下来",
+    "删除记下来",
+    "添加记下来",
+    "添加词条 记录一下",
+    "新增 记录下来",
+    "把这个词加入草稿：记下来",
+    "顺延「记下来」",
+    "添加词条「记下来」 jxl",
+    "把记下来加到草稿",
+    "创建词条「记录一下」",
+    "把「记录」这个词加入草稿",
+    "请把记录 jlu 加入草稿",
+    "把备注 bzu 顺延一位",
+    "删除草稿里的记录",
+    "请把记录的编码顺延一位",
+)
+
+RECORD_FRAMING_REQUEST_REGRESSIONS = (
+    (
+        "请把记录 jlu 加入草稿",
+        "keytao_create_phrase",
+        {"word": "记录", "code": "jlu", "action": "Create"},
+    ),
+    (
+        "把备注 bzu 顺延一位",
+        "keytao_shift_phrase_code",
+        {"word": "备注", "target_code": "bzu"},
+    ),
+    ("删除草稿里的记录", "keytao_create_phrase", {"word": "记录", "action": "Delete"}),
+    (
+        "请把记录的编码顺延一位",
+        "keytao_shift_phrase_code",
+        {"word": "记录", "target_code": ""},
+    ),
+)
+
+RECORD_FRAMING_ADVERSARIAL_BLOCK = (
+    # Simplified/traditional mixes, punctuation and particles must not reopen
+    # authority after the reported instruction.
+    "請把这句删除草稿條目 12 記錄下来，謝謝",
+    "请把这句删除草稿条目 12 记录下来；谢谢",
+    "请把这句删除草稿条目 12 记录下来、",
+    "请把这句删除草稿条目 12 记录下来～",
+    "请把这句删除草稿条目 12 记录下来……",
+    "请把这句删除草稿条目 12 记录下来呀",
+    "请把这句删除草稿条目 12 记录下来可以了",
+    "请把这句删除草稿条目 12 记 录 下 来，谢谢",
+    # Alternate note/archive/relay verbs are the same semantic frame.
+    "请把这句删除草稿条目 12 归档",
+    "请把这句删除草稿条目 12 留档",
+    "请把这句删除草稿条目 12 抄下来",
+    "请把这句删除草稿条目 12 转告一下",
+    "请把这句删除草稿条目 12 做个记录",
+    "请把这句删除草稿条目 12 留个备注",
+    "请把这句删除草稿条目 12 登记在案",
+    "请把这句删除草稿条目 12 写进备忘录",
+    "请把这句删除草稿条目 12 转达给朝歌",
+    "请先保存下来：删除草稿条目 12",
+    "替我登记一下；提交草稿",
+    # Nested quotes and multiple mutation verbs remain reported data.
+    "请把「他说“删除草稿条目 12”」记录下来",
+    "请记下来：先删除草稿条目 12，再提交草稿",
+)
+
+RECORD_FRAMING_VERB_FINAL_REQUIRED_BLOCK = (
+    "请把这句把草稿全部条目删除记录下来",
+    "请把这句把草稿里的所有条目都删除记录下来",
+    "帮我把下面这段把草稿里的所有条目都删除备注一下",
+    "请把下面这段把草稿里的条目全部删除转告给管理员",
+    "请把这句把吃席的编码顺延记录下来",
+    "请把下面这句作为记录：删除草稿全部条目",
+)
+
+_VERB_FINAL_TRAILING_RECORD_FRAMES = tuple(
+    f"{stem}{quantifier}{noun}"
+    for stem in ("做", "作", "留")
+    for quantifier in ("", "个", "份")
+    for noun in ("记录", "笔记", "备注", "标记", "备忘")
+) + (
+    "记录下来", "记录一下", "记下", "记下来", "记一下",
+    "备注下来", "备注一下", "备注在案",
+    "标记下来", "标记一下", "标记在案",
+    "登记下来", "登记一下", "登记在案",
+    "保存下来", "保存一下", "保存在案",
+    "记载下来", "记载一下", "记载在案",
+    "存档", "归档", "留档", "转告一下", "转告给管理员",
+)
+_VERB_FINAL_MUTATION_INSTRUCTIONS = tuple(
+    f"{marker}{object_phrase}{mutation_verb}"
+    for marker in ("把", "将")
+    for object_phrase in (
+        "草稿全部条目",
+        "草稿里的所有条目",
+        "吃席的编码",
+        "词条 12",
+    )
+    for mutation_verb in ("删除", "删掉", "去掉", "移除", "顺延")
+)
+RECORD_FRAMING_VERB_FINAL_SYSTEMATIC_BLOCK = tuple(
+    f"请把这句{instruction}{frame}"
+    for frame in _VERB_FINAL_TRAILING_RECORD_FRAMES
+    for instruction in _VERB_FINAL_MUTATION_INSTRUCTIONS
+) + tuple(
+    f"请把下面这句作为记录：{instruction}"
+    for instruction in _VERB_FINAL_MUTATION_INSTRUCTIONS
+)
+
+_RECORD_TYPE_WORDS = (
+    "记录",
+    "记下来",
+    "备注",
+    "标记",
+    "登记",
+    "保存",
+    "记载",
+    "备忘",
+    "存档",
+    "留档",
+)
+_RECORD_ALLOW_ACTIONS = (
+    ("Create", "请把{operand}加入草稿"),
+    ("Change", "请把{operand}修改为新词"),
+    ("Delete", "请把{operand}删除"),
+    ("shift", "请把{operand}顺延一位"),
+)
+_RECORD_OPERAND_FORMS = (
+    ("bare", ""),
+    ("的编码", "的编码"),
+    ("这个词", "这个词"),
+)
+
+# Product command grammar for the framing gate.  These dimensions are kept
+# explicit instead of being generated from the implementation regexes: the
+# corpus is meant to catch drift between the user-facing grammar and those
+# regexes, not reproduce their current shape.
+_PRODUCT_COMMAND_LEAD_INS = (
+    "",
+    "请",
+    "麻烦",
+    "帮我",
+    "给我",
+    "现在",
+    "立即",
+    "直接",
+    "确认",
+    "执行",
+    "我要",
+    "我想",
+    "替我",
+    "为我",
+    "能不能",
+    "可不可以",
+    "能否",
+    "可否",
+    "可以帮我",
+    "可以请你",
+    "并",
+    "并且",
+    "同时",
+    "然后",
+    "再",
+    "还要",
+    "以及",
+    "另外",
+    "接着",
+    "顺便",
+    # The product grammar permits chained lead-ins.  These two common forms
+    # are explicit corpus dimensions rather than one-off regression strings.
+    "请帮我",
+    "麻烦帮我",
+)
+_PRODUCT_ENTRY_MUTATION_VERBS = (
+    "添加",
+    "加入",
+    "加到",
+    "新增",
+    "创建",
+    "写入",
+    "放入",
+    "收录",
+    "录入",
+    "记入",
+    "提交",
+    "提审",
+    "送审",
+    "发起审核",
+    "删除",
+    "删掉",
+    "去掉",
+    "移除",
+    "清空",
+    "清理",
+    "撤销",
+    "撤回",
+    "召回",
+    "修改",
+    "改成",
+    "改为",
+    "替换",
+    "顺延",
+    "挪开",
+    "重新编码",
+    "保留",
+    "批量处理",
+    "都删",
+    "其余删",
+    "其他删",
+    "删干净",
+)
+_PRODUCT_ENTRY_COMMAND_FORMS = ("verb_initial", "把", "将")
+_PRODUCT_ENTRY_WORDS = (*_RECORD_TYPE_WORDS, "安全词")
+
+
+def _build_product_record_framing_allow_corpus() -> tuple[str, ...]:
+    commands = []
+    for lead_in in _PRODUCT_COMMAND_LEAD_INS:
+        for command_form in _PRODUCT_ENTRY_COMMAND_FORMS:
+            for mutation_verb in _PRODUCT_ENTRY_MUTATION_VERBS:
+                for word in _PRODUCT_ENTRY_WORDS:
+                    for code in ("", "jlu"):
+                        for quoted in (False, True):
+                            target = f"「{word}」" if quoted else word
+                            for _operand_form, decoration in _RECORD_OPERAND_FORMS:
+                                operand = f"{target}{decoration}{f' {code}' if code else ''}"
+                                if command_form == "verb_initial":
+                                    command = f"{lead_in}{mutation_verb}{operand}"
+                                else:
+                                    command = f"{lead_in}{command_form}{operand}{mutation_verb}"
+                                commands.append(command)
+    return tuple(commands)
+
+
+PRODUCT_RECORD_FRAMING_ALLOW = _build_product_record_framing_allow_corpus()
+
+_PRODUCT_RECORD_FRAME_SEPARATORS = ("、", "：", ":", "——", "，", "。", " ", "")
+_PRODUCT_REPORTED_OBJECTS = (
+    "草稿条目12",
+    "词条jlu",
+    "安全词",
+    "安全词的编码",
+)
+
+
+def _build_product_record_frames() -> tuple[str, ...]:
+    frames = set()
+    for stem in ("做", "作", "留"):
+        for quantifier in ("", "个", "份"):
+            for noun in (
+                "记录", "記錄", "笔记", "筆記", "备注",
+                "備註", "标记", "標記", "备忘", "備忘",
+            ):
+                frames.add(f"{stem}{quantifier}{noun}")
+    for noun in ("记录", "記錄"):
+        for suffix in ("", "下来", "下來", "一下"):
+            frames.add(f"{noun}{suffix}")
+    for stem in ("记", "記"):
+        for suffix in ("下", "下来", "下來", "一下"):
+            frames.add(f"{stem}{suffix}")
+    for stem in (
+        "备注", "備註", "标记", "標記", "登记", "登記",
+        "保存", "记载", "記載", "备忘", "備忘",
+    ):
+        for suffix in ("", "下来", "下來", "一下", "在案"):
+            frames.add(f"{stem}{suffix}")
+    for stem in ("写", "寫", "抄", "录", "錄"):
+        for suffix in ("下", "下来", "下來", "一下"):
+            frames.add(f"{stem}{suffix}")
+    for stem in ("写", "寫"):
+        for bridge in ("进", "進", "入"):
+            for noun in ("备忘录", "備忘錄", "笔记", "筆記", "记录", "記錄"):
+                frames.add(f"{stem}{bridge}{noun}")
+    for stem in ("存", "归", "歸", "留"):
+        for noun in ("档", "檔"):
+            frames.add(f"{stem}{noun}")
+    for stem in ("转告", "轉告", "转达", "轉達", "传达", "傳達"):
+        for suffix in ("", "一下", "给管理员"):
+            frames.add(f"{stem}{suffix}")
+    return tuple(sorted(frames))
+
+
+PRODUCT_RECORD_FRAMES = _build_product_record_frames()
+PRODUCT_RECORD_FRAMING_BLOCK_CELL_COUNT = (
+    len(PRODUCT_RECORD_FRAMES)
+    * 2  # leading / trailing
+    * len(_PRODUCT_RECORD_FRAME_SEPARATORS)
+    * 2  # SVO / SOV
+    * len(_PRODUCT_ENTRY_MUTATION_VERBS)
+    * len(_PRODUCT_REPORTED_OBJECTS)
+)
+
+
+def iter_product_record_framing_block_corpus():
+    for frame in PRODUCT_RECORD_FRAMES:
+        for frame_position in ("leading", "trailing"):
+            for separator in _PRODUCT_RECORD_FRAME_SEPARATORS:
+                for command_form in ("SVO", "SOV"):
+                    for mutation_verb in _PRODUCT_ENTRY_MUTATION_VERBS:
+                        for operand in _PRODUCT_REPORTED_OBJECTS:
+                            instruction = (
+                                f"{mutation_verb}{operand}"
+                                if command_form == "SVO"
+                                else f"把{operand}{mutation_verb}"
+                            )
+                            yield (
+                                f"{frame}{separator}{instruction}"
+                                if frame_position == "leading"
+                                else f"{instruction}{separator}{frame}"
+                            )
+
+
+def _build_record_framing_allow_matrix() -> tuple[str, ...]:
+    commands = []
+    for word in _RECORD_TYPE_WORDS:
+        for code in ("", "jlu"):
+            for _action, template in _RECORD_ALLOW_ACTIONS:
+                for quoted in (False, True):
+                    target = f"「{word}」" if quoted else word
+                    for _form, decoration in _RECORD_OPERAND_FORMS:
+                        operand = f"{target}{decoration}{f' {code}' if code else ''}"
+                        commands.append(template.format(operand=operand))
+    return tuple(commands)
+
+
+RECORD_FRAMING_SYSTEMATIC_ALLOW = _build_record_framing_allow_matrix()
+
+RECORD_FRAMING_ADVERSARIAL_ALLOW = (
+    "删除存档",
+    "添加备注一下",
+    "把保存下来加到草稿",
+    "创建词条「登记一下」",
+    "把记录这个词加入草稿",
+    "删除做个记录",
+    "添加词条 留个备注",
+    "把登记在案加到草稿",
+    "删除草稿条目 12，再提交草稿",
+    *RECORD_FRAMING_SYSTEMATIC_ALLOW,
+)
+
+_LAUNDERED_MUTATIONS = (
+    "删除草稿条目 12",
+    "提交当前草稿",
+    "撤回提审",
+    "顺延「吃席」到 wkxk",
+    "把安全词加入草稿",
+    "添加词条「安全词」 aa",
+    "删除草稿中的全部条目",
+    "把安全词的编码改为 abcd",
+)
+_LAUNDERING_FRAMES = (
+    "请把这句{mutation}记录下来{tail}",
+    "请把这段{mutation}备注一下{tail}",
+    "请把这条{mutation}标记一下{tail}",
+    "请把这句{mutation}保存下来{tail}",
+    "请把这句{mutation}登记在案{tail}",
+    "请把这句{mutation}写进备忘录{tail}",
+    "请把这句{mutation}留档{tail}",
+)
+_LAUNDERING_TAILS = ("", "，", "，谢谢", "啊", "哦", "嘛", "呀", "就行", "即可")
+
+RECORD_FRAMING_LAUNDERING_BLOCK = tuple(
+    frame.format(mutation=mutation, tail=tail)
+    for mutation in _LAUNDERED_MUTATIONS
+    for frame in _LAUNDERING_FRAMES
+    for tail in _LAUNDERING_TAILS
+)
+
+_NEW_RECORD_OPERAND_BRACKETS = (
+    ("", ""),
+    ("『", "』"),
+    ("《", "》"),
+    ("【", "】"),
+    ("(", ")"),
+    ("（", "）"),
+    ("〈", "〉"),
+    ("〔", "〕"),
+)
+_BRACKET_RECORD_OPERANDS = (
+    "记录", "备注", "标记", "备忘", "登记", "保存", "存档", "归档",
+    "记载", "转告", "传达", "记下", "写下", "抄下", "录下",
+)
+RECORD_FRAMING_BRACKET_ALLOW = tuple(
+    f"{mutation_verb}词条{opening}{operand}{closing}{f' {code}' if code else ''}"
+    for opening, closing in _NEW_RECORD_OPERAND_BRACKETS
+    for operand in _BRACKET_RECORD_OPERANDS
+    for code in ("", "jlu")
+    for mutation_verb in _PRODUCT_ENTRY_MUTATION_VERBS
+)
+RECORD_FRAMING_BRACKET_LAUNDERING_BLOCK = tuple(
+    frame.format(
+        mutation=f"{opening}{mutation}{closing}",
+        tail=tail,
+    )
+    for opening, closing in _NEW_RECORD_OPERAND_BRACKETS[1:]
+    for mutation in _LAUNDERED_MUTATIONS
+    for frame in _LAUNDERING_FRAMES
+    for tail in _LAUNDERING_TAILS
+)
+RECORD_FRAME_BRACKET_REQUEST_REGRESSIONS = (
+    ("请添加词条【记录】", "记录", "Create"),
+    ("请添加词条（备注）", "备注", "Create"),
+    ("请新增词条《记录》", "记录", "Create"),
+    ("帮我把『备忘』加入草稿", "备忘", "Create"),
+    ("请删除词条【记录】", "记录", "Delete"),
+    ("请把【归档】加到草稿", "归档", "Create"),
+    ("麻烦新增【登记】 djdj", "登记", "Create"),
+    ("请添加词条〔备注〕", "备注", "Create"),
+    ("请添加词条〈记载〉", "记载", "Create"),
+)
+
+
 class MutationAuthorizationTests(unittest.TestCase):
     def test_only_explicit_current_text_authorizes_mutation(self) -> None:
         self.assertTrue(message_authorizes_mutation("请把安全词加入草稿"))
@@ -2245,6 +2720,154 @@ class MutationAuthorizationTests(unittest.TestCase):
                     message_authorizes_mutation(prefixed),
                     message_authorizes_mutation(bare),
                 )
+
+    def test_trailing_record_framing_never_authorizes_the_recorded_command(self) -> None:
+        for restatement in RECORD_FRAMING_MUST_BLOCK:
+            with self.subTest(restatement=restatement):
+                self.assertFalse(message_authorizes_mutation(restatement))
+
+        for command in RECORD_FRAMING_MUST_ALLOW:
+            with self.subTest(command=command):
+                self.assertTrue(message_authorizes_mutation(command))
+
+        for command, tool_name, arguments in RECORD_FRAMING_REQUEST_REGRESSIONS:
+            with self.subTest(request=command):
+                self.assertTrue(message_requests_change(command, tool_name, arguments))
+
+    def test_record_framing_adversarial_variants(self) -> None:
+        self.assertEqual(len(RECORD_FRAMING_SYSTEMATIC_ALLOW), 480)
+        self.assertEqual(len(RECORD_FRAMING_ADVERSARIAL_ALLOW), 489)
+        for restatement in RECORD_FRAMING_ADVERSARIAL_BLOCK:
+            with self.subTest(restatement=restatement):
+                self.assertFalse(message_authorizes_mutation(restatement))
+
+        for command in RECORD_FRAMING_ADVERSARIAL_ALLOW:
+            with self.subTest(command=command):
+                self.assertTrue(message_authorizes_mutation(command))
+
+        self.assertEqual(len(RECORD_FRAMING_LAUNDERING_BLOCK), 504)
+        for restatement in RECORD_FRAMING_LAUNDERING_BLOCK:
+            with self.subTest(restatement=restatement):
+                self.assertFalse(message_authorizes_mutation(restatement))
+
+        self.assertEqual(len(RECORD_FRAMING_BRACKET_LAUNDERING_BLOCK), 3528)
+        for restatement in RECORD_FRAMING_BRACKET_LAUNDERING_BLOCK:
+            with self.subTest(bracketed_restatement=restatement):
+                self.assertFalse(message_authorizes_mutation(restatement))
+
+        for restatement in RECORD_FRAMING_VERB_FINAL_REQUIRED_BLOCK:
+            with self.subTest(restatement=restatement):
+                self.assertFalse(message_authorizes_mutation(restatement))
+
+        self.assertEqual(len(_VERB_FINAL_TRAILING_RECORD_FRAMES), 70)
+        self.assertEqual(len(_VERB_FINAL_MUTATION_INSTRUCTIONS), 40)
+        self.assertEqual(len(RECORD_FRAMING_VERB_FINAL_SYSTEMATIC_BLOCK), 2840)
+        for restatement in RECORD_FRAMING_VERB_FINAL_SYSTEMATIC_BLOCK:
+            with self.subTest(verb_final_restatement=restatement):
+                self.assertFalse(message_authorizes_mutation(restatement))
+
+    def test_bracketed_record_words_remain_operable_dictionary_entries(self) -> None:
+        self.assertEqual(len(RECORD_FRAMING_BRACKET_ALLOW), 8640)
+        rejected = [
+            command
+            for command in RECORD_FRAMING_BRACKET_ALLOW
+            if not message_authorizes_mutation(command)
+        ]
+        if rejected:
+            self.fail(
+                f"{len(rejected)} bracketed record-word commands rejected; "
+                f"first 20: {rejected[:20]}"
+            )
+
+        for command, word, action in RECORD_FRAME_BRACKET_REQUEST_REGRESSIONS:
+            arguments = {
+                "word": word,
+                "code": "djdj" if word == "登记" else "",
+                "action": action,
+            }
+            with self.subTest(command=command):
+                self.assertTrue(message_authorizes_mutation(command))
+                self.assertTrue(
+                    message_requests_change(
+                        command,
+                        "keytao_create_phrase",
+                        arguments,
+                    )
+                )
+
+    def test_direct_execution_questions_are_visible_to_helpfulness_gate(self) -> None:
+        for lead_in in ("能不能", "可不可以", "能否", "可否"):
+            message = f"{lead_in}提交当前草稿？"
+            with self.subTest(lead_in=lead_in):
+                self.assertTrue(message_authorizes_mutation(message))
+                self.assertTrue(
+                    message_requests_change(message, "keytao_submit_batch", {})
+                )
+
+    def test_product_command_grammar_survives_record_framing_gate(self) -> None:
+        self.assertEqual(len(PRODUCT_RECORD_FRAMING_ALLOW), 456192)
+        rejected = [
+            command
+            for command in PRODUCT_RECORD_FRAMING_ALLOW
+            if not message_authorizes_mutation(command)
+        ]
+        if rejected:
+            self.fail(
+                f"{len(rejected)} legitimate product commands rejected; "
+                f"first 20: {rejected[:20]}"
+            )
+        draft_container_commands = [
+            f"{lead_in}{verb}{container}{location}{word}"
+            for lead_in in _PRODUCT_COMMAND_LEAD_INS
+            for verb in ("删除", "删掉", "去掉", "移除")
+            for container in ("草稿", "批次")
+            for location in ("里", "里的", "中", "中的")
+            for word in _RECORD_TYPE_WORDS
+        ]
+        self.assertEqual(len(draft_container_commands), 10240)
+        self.assertTrue(all(map(message_authorizes_mutation, draft_container_commands)))
+
+    def test_product_record_framing_grammar_never_authorizes_reported_commands(self) -> None:
+        self.assertEqual(len(PRODUCT_RECORD_FRAMES), 243)
+        self.assertTrue(all(_RECORD_FRAME_RE.fullmatch(frame) for frame in PRODUCT_RECORD_FRAMES))
+        self.assertEqual(PRODUCT_RECORD_FRAMING_BLOCK_CELL_COUNT, 1119744)
+        leaks = [
+            command
+            for command in iter_product_record_framing_block_corpus()
+            if message_authorizes_mutation(command)
+        ]
+        if leaks:
+            self.fail(
+                f"{len(leaks)} reported commands authorized; first 20: {leaks[:20]}"
+            )
+
+    def test_recorded_mutations_never_reach_the_tool_executor_sink(self) -> None:
+        async def _run() -> None:
+            calls = []
+
+            async def tool(**kwargs):
+                calls.append(kwargs)
+                return {"success": True}
+
+            executor = ToolExecutor(lambda _name: tool, frozenset())
+            for restatement in (
+                *RECORD_FRAMING_MUST_BLOCK,
+                *RECORD_FRAMING_ADVERSARIAL_BLOCK,
+                *RECORD_FRAMING_LAUNDERING_BLOCK,
+            ):
+                result = __import__("json").loads(await executor.call(
+                    "keytao_remove_draft_item",
+                    {"pr_id": 12},
+                    ToolContext(
+                        current_message=restatement,
+                        writes_allowed=message_authorizes_mutation(restatement),
+                    ),
+                ))
+                self.assertTrue(result.get("policyBlocked"), restatement)
+
+            self.assertEqual(calls, [])
+
+        asyncio.run(_run())
 
     def test_staged_mutation_preview_is_complete_or_rejected(self) -> None:
         visible_ids = [f"draft-{index:02d}" for index in range(50)]
@@ -2323,7 +2946,7 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.get("success"), phrasing)
         self.assertEqual(len(self.calls), len(phrasings))
 
-    async def test_unbound_shift_names_the_reason_and_a_working_command(self) -> None:
+    async def test_unbound_shift_names_the_reason_without_inventing_a_code(self) -> None:
         result = await self._shift("把吃席的编码放在赤溪前面")
 
         self.assertTrue(result.get("policyBlocked"))
@@ -2331,11 +2954,14 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         # The reason must not be blamed on history/memory/quotes any more.
         self.assertNotIn("不能授权修改草稿", result["message"])
         self.assertIn("与历史、记忆或引用无关", result["message"])
-        suggestion = result.get("suggestedCommand", "")
-        self.assertTrue(suggestion.startswith("@我 "))
+        self.assertNotIn("suggestedCommand", result)
         self.assertEqual(self.calls, [])
 
-        # The suggestion must be executable exactly as written.
+        # Once the user supplies the target code, the safe suggestion remains
+        # executable exactly as written.
+        with_code = await self._shift("把吃席的编码放到 wkxk")
+        suggestion = with_code.get("suggestedCommand", "")
+        self.assertEqual(suggestion, "@我 顺延「吃席」到 wkxk")
         replayed = await self._shift(suggestion)
         self.assertTrue(replayed.get("success"))
 
@@ -2344,12 +2970,12 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         # names what it applies to, but is not itself an executable instruction.
         cases = [
             (
-                "把吃席的编码放在赤溪前面",
+                "把吃席的编码放到 wkxk",
                 "keytao_shift_phrase_code",
                 {"word": "吃席", "target_code": "wkxk"},
             ),
             (
-                "把甲加到草稿",
+                "那「甲」 aa 也加到草稿吧",
                 "keytao_create_phrase",
                 {"word": "甲", "code": "aa", "action": "Create"},
             ),
@@ -2358,7 +2984,7 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             ("顺便把这个提交掉", "keytao_submit_batch", {}),
             ("刚才提交错了，想撤回一下", "keytao_recall_batch", {}),
             (
-                "把甲和乙都加到草稿里",
+                "那「甲」 aa 和「乙」 bb 都加到草稿吧",
                 "keytao_batch_add_to_draft",
                 {
                     "items": [
@@ -2379,6 +3005,32 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                     allowed.get("success"),
                     f"{tool_name}: {suggestion}",
                 )
+
+    async def test_suggestions_never_repeat_model_supplied_codes_missing_from_user_text(self) -> None:
+        cases = (
+            (
+                "顺延吃席",
+                "keytao_shift_phrase_code",
+                {"word": "吃席", "target_code": "zzzz"},
+            ),
+            (
+                "添加吃席",
+                "keytao_create_phrase",
+                {"word": "吃席", "code": "zzzz", "action": "Create"},
+            ),
+            (
+                "把吃席加入草稿",
+                "keytao_batch_add_to_draft",
+                {"items": [{"word": "吃席", "code": "zzzz", "action": "Create"}]},
+            ),
+        )
+        for message, tool_name, arguments in cases:
+            with self.subTest(tool=tool_name):
+                blocked = await self._call(tool_name, arguments, message)
+                self.assertTrue(blocked.get("policyBlocked"))
+                self.assertNotIn("suggestedCommand", blocked)
+                self.assertNotIn("zzzz", blocked.get("message", ""))
+        self.assertEqual(self.calls, [])
 
     async def test_a_question_never_receives_a_ready_made_authorization(self) -> None:
         for message, tool_name, arguments in (
@@ -3237,7 +3889,7 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
             return {"success": True}
 
         result = await _shift_orchestrator(client, never).run(
-            "把吃席的编码放在赤溪前面",
+            "把吃席的编码放到 wkxk",
             AgentRequestContext(
                 platform="qq",
                 user_id="user-1",
@@ -3266,7 +3918,7 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
             raise AssertionError("write tool must not run")
 
         await _shift_orchestrator(client, never).run(
-            "把吃席的编码放在赤溪前面",
+            "把吃席的编码放到 wkxk",
             AgentRequestContext(
                 platform="qq",
                 user_id="user-1",
@@ -3348,7 +4000,7 @@ class ReadOnlyAuthorizationRequestTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_authorization_tool_returns_a_self_checked_command(self) -> None:
         client, _ = await self._run_turn(
-            "把吃席的编码放在赤溪前面",
+            "把吃席的编码放到 wkxk",
             tool_calls=[self._authorization_call()],
             final="请发送：@我 顺延「吃席」到 wkxk",
         )
