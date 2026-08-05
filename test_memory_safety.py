@@ -34,6 +34,7 @@ from keytao_bot.harness.tools import (
     _mutation_authorization_view,
     message_authorizes_mutation,
     message_requests_change,
+    self_checked_suggested_command,
 )
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
@@ -2865,6 +2866,368 @@ NEWLINE_MUTATION_REQUEST_CORPUS_SIZE = (
     len(NEWLINE_NEGATORISH_PREFIXES) * len(NEWLINE_MUTATION_REQUESTS)
 )
 
+# Positional reorder grammar shown to users by the draft/review product text:
+# an entry may be put/moved/raised before or after a word, moved to a code, or
+# moved relatively by one place.  Every dimension is literal and independent
+# of the production regex so the corpus can catch one-sided vocabulary drift.
+POSITIONAL_REORDER_COMMAND_FORMS = ("把", "将", "bare")
+POSITIONAL_REORDER_DESTINATION_EXPRESSIONS = (
+    "放在{destination}",
+    "放到{destination}",
+    "排在{destination}",
+    "挪到{destination}",
+    "移到{destination}",
+    "提到{destination}",
+    "提前到{destination}",
+)
+POSITIONAL_REORDER_DESTINATIONS = (
+    "赤溪",      # named target word
+    "赤溪前面",  # named word + front reference
+    "赤溪后面",  # named word + back reference
+    "wkxk",      # explicit code
+    "前面",      # relative front reference
+    "后面",      # relative back reference
+)
+POSITIONAL_REORDER_RELATIVE_EXPRESSIONS = (
+    "往前",
+    "往后",
+    "靠前",
+    "靠后",
+    "往前挪一位",
+    "往后挪一位",
+    "往前移一位",
+    "往后移一位",
+    "靠前一点",
+    "靠后一点",
+)
+POSITIONAL_REORDER_QUOTE_VARIANTS = (False, True)
+
+
+def _positional_reorder_destination(destination: str, quoted: bool) -> str:
+    if quoted:
+        if destination.startswith("赤溪"):
+            return f"「赤溪」{destination[len('赤溪'):]}"
+        return f"「{destination}」"
+    return destination
+
+
+def _positional_reorder_command(
+    lead_in: str,
+    command_form: str,
+    expression: str,
+    quoted: bool,
+) -> str:
+    subject = "「吃席」" if quoted else "吃席"
+    prefix = "" if command_form == "bare" else command_form
+    return f"{lead_in}{prefix}{subject}{expression}"
+
+
+def iter_positional_reorder_allow_corpus(
+    lead_ins: tuple[str, ...] = _PRODUCT_COMMAND_LEAD_INS,
+):
+    for lead_in in lead_ins:
+        for command_form in POSITIONAL_REORDER_COMMAND_FORMS:
+            for expression_template in POSITIONAL_REORDER_DESTINATION_EXPRESSIONS:
+                for destination in POSITIONAL_REORDER_DESTINATIONS:
+                    for quoted in POSITIONAL_REORDER_QUOTE_VARIANTS:
+                        expression = expression_template.format(
+                            destination=_positional_reorder_destination(
+                                destination,
+                                quoted,
+                            )
+                        )
+                        yield _positional_reorder_command(
+                            lead_in,
+                            command_form,
+                            expression,
+                            quoted,
+                        )
+            for expression in POSITIONAL_REORDER_RELATIVE_EXPRESSIONS:
+                for quoted in POSITIONAL_REORDER_QUOTE_VARIANTS:
+                    yield _positional_reorder_command(
+                        lead_in,
+                        command_form,
+                        expression,
+                        quoted,
+                    )
+
+
+POSITIONAL_REORDER_ALLOW_CORPUS_SIZE = 9984
+POSITIONAL_REORDER_CANONICAL_COMMANDS = tuple(
+    iter_positional_reorder_allow_corpus(("",))
+)
+# The BLOCK product uses the same independently declared command grammar as
+# ALLOW, with only the lead-in dimension fixed to empty.  It therefore covers
+# 把/将/bare, every destination kind, and quoted/unquoted operands.
+POSITIONAL_REORDER_BLOCK_RECORD_SIZE = (
+    len(PRODUCT_RECORD_FRAMES)
+    * len(_PRODUCT_RECORD_FRAME_SEPARATORS)
+    * len(POSITIONAL_REORDER_CANONICAL_COMMANDS)
+)
+POSITIONAL_REORDER_REPORTED_SPEECH_PREFIXES = (
+    "他说",
+    "她说",
+    "群里有人说",
+    "上条消息是",
+    "据说",
+    "听说",
+    "大家说",
+    "消息里说",
+    "昨天",
+    "她",
+    "他",
+    "传闻",
+    "网传",
+    "我觉得",
+    "报道称",
+    "有人说",
+    "据悉",
+    "消息称",
+    "他称",
+    "她称",
+    "备查",
+    "留存",
+    "存证",
+    "摘记",
+    "纪要",
+    "媒体称",
+    "外界认为",
+    "留作备查",
+    "会议纪要",
+    "有传言称",
+    "小王表示",
+    "请存证",
+    "说",
+    "记",
+    "称",
+    "录",
+    "传",
+    "述",
+)
+POSITIONAL_REORDER_REPORTED_SPEECH_JOINS = (
+    "", " ", "：", ":", "，", ",", "；", ";",
+)
+POSITIONAL_REORDER_NEGATION_PREFIXES = (
+    "先不要",
+    "不要",
+    "别",
+    "暂时不",
+    "不用",
+    "没",
+    "未",
+    "尚未",
+    "不应",
+    "不应该",
+    "并非",
+    "不能",
+    "不宜",
+    "无须",
+    "毋须",
+    "绝不能",
+)
+POSITIONAL_REORDER_EXPLANATION_PREFIXES = (
+    "解释一下：",
+    "说明一下：",
+    "举个例子：",
+    "如果要",
+    "怎么",
+)
+POSITIONAL_REORDER_NARRATIVE_SUFFIXES = (
+    "挺好",
+    "不错",
+    "合适",
+    "不好",
+    "不妥",
+    "太差",
+    "有误",
+    "很怪",
+    "正常",
+    "恰当",
+    "错了",
+    "错误",
+    "太怪",
+    "奇怪",
+    "较好",
+    "更差",
+    "离谱",
+    "正确",
+    "欠妥",
+    "可行",
+    "合理",
+    "这样更合理",
+    "只是陈述",
+)
+POSITIONAL_REORDER_CHOICE_SUFFIXES = (
+    "还是前面",
+    "还是后面",
+    "或前面",
+    "或后面",
+    "还是放前面",
+    "还是放后面",
+    "或放前面",
+    "或放后面",
+    "还是应该把它放后面",
+    "或者应该把它放后面",
+    "要么放到它后面",
+    "还是考虑把它放后面",
+    "或考虑把它放后面",
+    "还是应该移到它后面",
+    "要么考虑移到它后面",
+    "二选一放后面",
+    "前后择一放后面",
+)
+POSITIONAL_REORDER_LOCATIVE_DESTINATIONS = (
+    "冰箱里",
+    "桌子上",
+    "房间中",
+    "屋子外",
+    "冰箱旁",
+    "桌边",
+    "走廊侧",
+    "门口",
+    "墙角",
+    "柜台前",
+    "沙发后",
+    "附近",
+)
+POSITIONAL_REORDER_QUESTION_DESTINATIONS = (
+    "哪",
+    "哪里",
+    "哪儿",
+    "谁",
+    "谁前面",
+    "谁后面",
+    "什么位置",
+)
+POSITIONAL_REORDER_LOCATIVE_STATEMENT_SIZE = 504
+POSITIONAL_REORDER_QUESTION_STATEMENT_SIZE = 147
+# Physical-location ambiguity is verified below at the real binding seam.
+# Predicate-only cells cannot distinguish a known entry from a physical noun.
+POSITIONAL_REORDER_BLOCK_CORPUS_SIZE = 721179
+
+# Adversarial dimensions are deliberately independent of the parser regex.
+# The permission seam is ToolExecutor._validate_current_message_binding:
+# returning None means the model-generated write would be accepted.
+POSITIONAL_ASCII_MATRIX_SUBJECTS = (
+    "会议", "服务", "分支", "配置", "文件", "沙发", "电视", "书本", "快递", "任务",
+    "项目", "环境", "代码", "文档", "镜像", "版本", "日期", "计划", "订单", "消息",
+)
+POSITIONAL_ASCII_MATRIX_VERBS = (
+    "放在", "放到", "排在", "挪到", "移到", "提到", "提前到",
+)
+POSITIONAL_ORDINARY_ASCII_DESTINATIONS = (
+    "monday", "prod", "main", "env", "staging", "server", "branch",
+    "config", "meeting", "service", "table", "desk", "queue", "cloud",
+)
+POSITIONAL_TRUSTED_PHRASE_CODES = (
+    "aa", "wkxk", "cx", "hyfio", "abcd", "qwer", "zxcv",
+    "jklm", "tyui", "ghjk", "bnmm", "xcpio", "mnop", "asdfgh",
+)
+POSITIONAL_ASCII_MATRIX_SIZE = (
+    len(POSITIONAL_ASCII_MATRIX_SUBJECTS)
+    * len(POSITIONAL_ASCII_MATRIX_VERBS)
+    * len(POSITIONAL_ORDINARY_ASCII_DESTINATIONS)
+)
+
+POSITIONAL_SUBORDINATE_MARKERS = (
+    "放在", "放到", "排在", "挪到", "移到", "提到", "提前到",
+    "往前", "往后", "靠前", "靠后",
+)
+NON_POSITIONAL_INTENT_CASES = (
+    (
+        "添加「吃席」 wkxk",
+        "keytao_create_phrase",
+        {"word": "吃席", "code": "wkxk", "action": "Create"},
+    ),
+    ("删除草稿条目 12", "keytao_remove_draft_item", {"pr_id": 12}),
+    ("提交草稿", "keytao_submit_batch", {}),
+    ("撤回提审", "keytao_recall_batch", {}),
+)
+POSITIONAL_SUBORDINATE_TEMPLATES = (
+    "你刚才{marker}的内容，{command}",
+    "{command}，我刚才{marker}过的那段",
+    "关于你刚才{marker}的内容，{command}",
+)
+POSITIONAL_SUBORDINATE_PARITY_SIZE = (
+    len(POSITIONAL_SUBORDINATE_MARKERS)
+    * len(NON_POSITIONAL_INTENT_CASES)
+    * len(POSITIONAL_SUBORDINATE_TEMPLATES)
+)
+
+POSITIONAL_PHYSICAL_SUBJECTS = (
+    "沙发", "椅子", "桌子", "书本", "电视", "冰箱",
+    "快递", "花盆", "汽车", "箱子", "文件夹",
+)
+POSITIONAL_PHYSICAL_DESTINATIONS = (
+    "电视前面", "门后面", "桌子上", "冰箱里", "明天", "下周",
+)
+POSITIONAL_PHYSICAL_MATRIX_SIZE = (
+    len(POSITIONAL_PHYSICAL_SUBJECTS) * 2 * len(POSITIONAL_PHYSICAL_DESTINATIONS)
+)
+
+POSITIONAL_ENTRY_LENGTHS = (
+    "甲",
+    "吃席",
+    "赤溪词",
+    "人工智能",
+    "人工智能词",
+    "自然语言处理",
+    "中华人民共和国",
+    "超级人工智能系统",
+)
+POSITIONAL_FOUR_CHARACTER_ENTRIES = (
+    "人工智能", "细思极恐", "不可思议", "一言为定", "心想事成",
+)
+POSITIONAL_ORDINAL_DESTINATIONS = (
+    "第一个", "第二个", "第三个", "第四个", "第五个",
+    "第一位", "第二位", "第三位", "第四位", "第五位", "第十位",
+)
+POSITIONAL_SHORT_RELATION_COMMANDS = (
+    "把吃席放在赤溪前",
+    "把吃席放在赤溪后",
+    "把吃席放在之前",
+    "把吃席放在之后",
+    "把吃席放到之前",
+    "把吃席放到之后",
+)
+POSITIONAL_TRAILING_POLITENESS = (
+    "谢谢", "谢谢你", "多谢", "辛苦了", "拜托了", "麻烦了",
+    "感谢", "感谢你", "劳驾", "拜托", "有劳", "谢啦",
+)
+POSITIONAL_LEAD_INS = (
+    "请", "麻烦", "帮我", "给我", "麻烦你", "帮忙", "劳驾", "喵喵", "你好", "在吗",
+)
+
+
+def iter_positional_reorder_block_corpus():
+    for frame in PRODUCT_RECORD_FRAMES:
+        for join in _PRODUCT_RECORD_FRAME_SEPARATORS:
+            for command in POSITIONAL_REORDER_CANONICAL_COMMANDS:
+                yield f"{frame}{join}{command}"
+    for command in POSITIONAL_REORDER_CANONICAL_COMMANDS:
+        yield f"{command}是什么意思"
+        yield f"{command}会怎样？"
+        for prefix in POSITIONAL_REORDER_REPORTED_SPEECH_PREFIXES:
+            for join in POSITIONAL_REORDER_REPORTED_SPEECH_JOINS:
+                yield f"{prefix}{join}{command}"
+        for prefix in POSITIONAL_REORDER_NEGATION_PREFIXES:
+            yield f"{prefix}{command}"
+        for prefix in POSITIONAL_REORDER_EXPLANATION_PREFIXES:
+            yield f"{prefix}{command}"
+        for suffix in POSITIONAL_REORDER_NARRATIVE_SUFFIXES:
+            yield f"{command}{suffix}"
+        for suffix in POSITIONAL_REORDER_CHOICE_SUFFIXES:
+            yield f"{command}{suffix}"
+    for command_form in POSITIONAL_REORDER_COMMAND_FORMS:
+        for expression_template in POSITIONAL_REORDER_DESTINATION_EXPRESSIONS:
+            for destination in POSITIONAL_REORDER_QUESTION_DESTINATIONS:
+                yield _positional_reorder_command(
+                    "",
+                    command_form,
+                    expression_template.format(destination=destination),
+                    False,
+                )
+
 
 def iter_negation_window_corpus():
     for negator in NEGATION_WINDOW_NEGATORS:
@@ -3249,12 +3612,13 @@ class MutationAuthorizationTests(unittest.TestCase):
                         message_requests_change(message, "keytao_submit_batch", {})
                     )
 
-    def test_sentence_initial_questions_do_not_bypass_helpfulness_question_gate(self) -> None:
+    def test_polite_positional_execution_questions_are_commands_not_meta_questions(self) -> None:
         for lead_in in ("能不能", "可不可以"):
-            for positional_verb in ("放到", "调到", "挪到", "排在"):
-                message = f"{lead_in}把吃席{positional_verb} wkxk"
+            for positional_verb in ("放在", "放到", "挪到", "排在"):
+                message = f"{lead_in}把吃席{positional_verb}赤溪前面"
                 with self.subTest(lead_in=lead_in, positional_verb=positional_verb):
-                    self.assertFalse(
+                    self.assertTrue(message_authorizes_mutation(message))
+                    self.assertTrue(
                         message_requests_change(
                             message,
                             "keytao_shift_phrase_code",
@@ -3262,15 +3626,158 @@ class MutationAuthorizationTests(unittest.TestCase):
                         )
                     )
 
-        positional_command = "请把吃席挪到 wkxk"
-        self.assertFalse(message_authorizes_mutation(positional_command))
+        for meta_question in (
+            "吃席放在赤溪前面是什么意思",
+            "把吃席放在赤溪前面会怎样？",
+        ):
+            self.assertFalse(message_authorizes_mutation(meta_question))
+            self.assertFalse(
+                message_requests_change(
+                    meta_question,
+                    "keytao_shift_phrase_code",
+                    {"word": "吃席", "target_code": "wkxk"},
+                )
+            )
+
+    def test_positional_words_in_subordinate_clauses_do_not_veto_other_intents(self) -> None:
+        checked = 0
+        failures = []
+        binding_failures = []
+        for marker in POSITIONAL_SUBORDINATE_MARKERS:
+            for command, tool_name, arguments in NON_POSITIONAL_INTENT_CASES:
+                for template in POSITIONAL_SUBORDINATE_TEMPLATES:
+                    message = template.format(marker=marker, command=command)
+                    checked += 1
+                    if not (
+                        message_authorizes_mutation(message)
+                        and message_requests_change(message, tool_name, arguments)
+                    ):
+                        failures.append(message)
+                    if ToolExecutor._validate_current_message_binding(
+                        tool_name,
+                        arguments,
+                        ToolContext(
+                            current_message=message,
+                            writes_allowed=message_authorizes_mutation(message),
+                        ),
+                    ) is not None:
+                        binding_failures.append(message)
+
+        self.assertEqual(checked, POSITIONAL_SUBORDINATE_PARITY_SIZE)
+        self.assertEqual(POSITIONAL_SUBORDINATE_PARITY_SIZE, 132)
+        self.assertEqual(failures, [])
+        self.assertEqual(binding_failures, [])
+
+        exact_review_examples = (
+            (
+                "你刚才提到的吃席，添加 abcd",
+                "keytao_create_phrase",
+                {"word": "abcd", "code": "", "action": "Create"},
+            ),
+            (
+                "把刚才提到的吃席加入草稿",
+                "keytao_create_phrase",
+                {"word": "吃席", "code": "", "action": "Create"},
+            ),
+            ("提交草稿，我提到过的那批", "keytao_submit_batch", {}),
+            (
+                "添加吃席 abcd，不要往前挪",
+                "keytao_create_phrase",
+                {"word": "吃席", "code": "abcd", "action": "Create"},
+            ),
+        )
+        for message, tool_name, arguments in exact_review_examples:
+            with self.subTest(review_example=message):
+                self.assertTrue(message_authorizes_mutation(message))
+                self.assertTrue(
+                    message_requests_change(message, tool_name, arguments)
+                )
+                self.assertIsNone(
+                    ToolExecutor._validate_current_message_binding(
+                        tool_name,
+                        arguments,
+                        ToolContext(
+                            current_message=message,
+                            writes_allowed=message_authorizes_mutation(message),
+                        ),
+                    )
+                )
+
+        control = "你刚才说的吃席，添加 abcd"
+        control_arguments = {"word": "abcd", "code": "", "action": "Create"}
+        self.assertTrue(message_authorizes_mutation(control))
         self.assertTrue(
             message_requests_change(
-                positional_command,
-                "keytao_shift_phrase_code",
-                {"word": "吃席", "target_code": "wkxk"},
+                control,
+                "keytao_create_phrase",
+                control_arguments,
             )
         )
+        self.assertIsNone(
+            ToolExecutor._validate_current_message_binding(
+                "keytao_create_phrase",
+                control_arguments,
+                ToolContext(
+                    current_message=control,
+                    writes_allowed=message_authorizes_mutation(control),
+                ),
+            )
+        )
+
+    def test_positional_reorder_cross_products_authorize_without_consent_leaks(self) -> None:
+        arguments = {"word": "吃席", "target_code": "wkxk"}
+        allow_count = 0
+        wrongly_refused_count = 0
+        wrongly_refused_sample = []
+        for message in iter_positional_reorder_allow_corpus():
+            allow_count += 1
+            if (
+                not message_authorizes_mutation(message)
+                or not message_requests_change(
+                    message,
+                    "keytao_shift_phrase_code",
+                    arguments,
+                )
+            ):
+                wrongly_refused_count += 1
+                if len(wrongly_refused_sample) < 20:
+                    wrongly_refused_sample.append(message)
+        self.assertEqual(allow_count, POSITIONAL_REORDER_ALLOW_CORPUS_SIZE)
+        if wrongly_refused_count:
+            self.fail(
+                f"{wrongly_refused_count} positional reorder commands refused; "
+                f"first 20: {wrongly_refused_sample}"
+            )
+
+        self.assertEqual(
+            POSITIONAL_REORDER_BLOCK_RECORD_SIZE,
+            606528,
+        )
+        self.assertEqual(len(POSITIONAL_REORDER_CANONICAL_COMMANDS), 312)
+        self.assertEqual(POSITIONAL_REORDER_LOCATIVE_STATEMENT_SIZE, 504)
+        self.assertEqual(POSITIONAL_REORDER_QUESTION_STATEMENT_SIZE, 147)
+        block_count = 0
+        leak_count = 0
+        leak_sample = []
+        for message in iter_positional_reorder_block_corpus():
+            block_count += 1
+            if (
+                message_authorizes_mutation(message)
+                or message_requests_change(
+                    message,
+                    "keytao_shift_phrase_code",
+                    arguments,
+                )
+            ):
+                leak_count += 1
+                if len(leak_sample) < 20:
+                    leak_sample.append(message)
+        self.assertEqual(block_count, POSITIONAL_REORDER_BLOCK_CORPUS_SIZE)
+        if leak_count:
+            self.fail(
+                f"{leak_count} positional reorder consent leaks; "
+                f"first 20: {leak_sample}"
+            )
 
     def test_negated_execution_questions_request_no_change(self) -> None:
         for message in ("能不能别删条目12", "可不可以不要删除条目12"):
@@ -3398,12 +3905,314 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
         return __import__("json").loads(raw)
 
-    async def _shift(self, message, word="吃席", code="wkxk"):
+    async def _shift(self, message, word="吃席", code="wkxk", **context_kwargs):
         return await self._call(
             "keytao_shift_phrase_code",
             {"word": word, "target_code": code},
             message,
+            **context_kwargs,
         )
+
+    @staticmethod
+    def _binding_error(message, word, code, **context_kwargs):
+        return ToolExecutor._validate_current_message_binding(
+            "keytao_shift_phrase_code",
+            {"word": word, "target_code": code},
+            ToolContext(
+                current_message=message,
+                writes_allowed=message_authorizes_mutation(message),
+                **context_kwargs,
+            ),
+        )
+
+    def test_ascii_destination_matrix_requires_a_server_trusted_real_code(self) -> None:
+        ordinary_checked = 0
+        ordinary_leaks = []
+        ordinary_suggestions = []
+        for subject in POSITIONAL_ASCII_MATRIX_SUBJECTS:
+            for verb in POSITIONAL_ASCII_MATRIX_VERBS:
+                for destination in POSITIONAL_ORDINARY_ASCII_DESTINATIONS:
+                    message = f"把{subject}{verb} {destination}"
+                    context = ToolContext(
+                        current_message=message,
+                        writes_allowed=message_authorizes_mutation(message),
+                        trusted_codes_by_word={subject: frozenset({"wkxk"})},
+                    )
+                    ordinary_checked += 1
+                    if self._binding_error(
+                        message,
+                        subject,
+                        destination,
+                        trusted_codes_by_word=context.trusted_codes_by_word,
+                    ) is None:
+                        ordinary_leaks.append(message)
+                    suggestion = self_checked_suggested_command(
+                        "keytao_shift_phrase_code",
+                        {"word": subject, "target_code": destination},
+                        context,
+                    )
+                    if suggestion:
+                        ordinary_suggestions.append(f"{message} -> {suggestion}")
+
+        self.assertEqual(ordinary_checked, POSITIONAL_ASCII_MATRIX_SIZE)
+        self.assertEqual(POSITIONAL_ASCII_MATRIX_SIZE, 1960)
+        self.assertEqual(ordinary_leaks, [])
+        self.assertEqual(ordinary_suggestions, [])
+
+        trusted_checked = 0
+        trusted_refusals = []
+        for subject in POSITIONAL_ASCII_MATRIX_SUBJECTS:
+            for verb in POSITIONAL_ASCII_MATRIX_VERBS:
+                for code in POSITIONAL_TRUSTED_PHRASE_CODES:
+                    message = f"把{subject}{verb} {code}"
+                    trusted_checked += 1
+                    if not (
+                        message_authorizes_mutation(message)
+                        and message_requests_change(
+                            message,
+                            "keytao_shift_phrase_code",
+                            {"word": subject, "target_code": code},
+                        )
+                        and self._binding_error(
+                            message,
+                            subject,
+                            code,
+                            trusted_codes_by_word={subject: frozenset({code})},
+                        ) is None
+                    ):
+                        trusted_refusals.append(message)
+
+        self.assertEqual(trusted_checked, POSITIONAL_ASCII_MATRIX_SIZE)
+        self.assertEqual(trusted_refusals, [])
+
+    def test_physical_destination_matrix_is_refused_on_the_real_binding_path(self) -> None:
+        checked = 0
+        leaks = []
+        for subject in POSITIONAL_PHYSICAL_SUBJECTS:
+            for verb in ("放在", "放到"):
+                for destination in POSITIONAL_PHYSICAL_DESTINATIONS:
+                    message = f"把{subject}{verb}{destination}"
+                    checked += 1
+                    if self._binding_error(
+                        message,
+                        subject,
+                        "wkxk",
+                        trusted_codes_by_word={subject: frozenset({"wkxk"})},
+                    ) is None:
+                        leaks.append(message)
+
+        self.assertEqual(checked, POSITIONAL_PHYSICAL_MATRIX_SIZE)
+        self.assertEqual(POSITIONAL_PHYSICAL_MATRIX_SIZE, 132)
+        self.assertEqual(leaks, [])
+
+        original_bare_checked = 0
+        original_bare_leaks = []
+        quoted_checked = 0
+        quoted_refusals = []
+        for command_form in POSITIONAL_REORDER_COMMAND_FORMS:
+            for expression_template in POSITIONAL_REORDER_DESTINATION_EXPRESSIONS:
+                for destination in POSITIONAL_REORDER_LOCATIVE_DESTINATIONS:
+                    for quoted_subject in POSITIONAL_REORDER_QUOTE_VARIANTS:
+                        bare_message = _positional_reorder_command(
+                            "",
+                            command_form,
+                            expression_template.format(destination=destination),
+                            quoted_subject,
+                        )
+                        original_bare_checked += 1
+                        if self._binding_error(
+                            bare_message,
+                            "吃席",
+                            "wkxk",
+                            trusted_codes_by_word={
+                                "吃席": frozenset({"wkxk"}),
+                            },
+                        ) is None:
+                            original_bare_leaks.append(bare_message)
+
+                        quoted_message = _positional_reorder_command(
+                            "",
+                            command_form,
+                            expression_template.format(
+                                destination=f"「{destination}」",
+                            ),
+                            quoted_subject,
+                        )
+                        quoted_checked += 1
+                        if self._binding_error(
+                            quoted_message,
+                            "吃席",
+                            "wkxk",
+                            trusted_codes_by_word={
+                                "吃席": frozenset({"wkxk"}),
+                            },
+                        ) is not None:
+                            quoted_refusals.append(quoted_message)
+
+        self.assertEqual(original_bare_checked, 504)
+        self.assertEqual(original_bare_leaks, [])
+        self.assertEqual(quoted_checked, 504)
+        self.assertEqual(quoted_refusals, [])
+
+    def test_quoted_choice_words_and_position_words_are_operands_not_questions(self) -> None:
+        cases = (
+            ("把「还是」放在赤溪前面", "还是", True),
+            ("把「或者」放在赤溪前面", "或者", True),
+            ("把吃席放在「还是」前面", "吃席", False),
+            ("把前面放在后面", "前面", False),
+        )
+        known_destination = {("赤溪", "cx"): frozenset({"Phrase"})}
+        for message, word, needs_known_destination in cases:
+            with self.subTest(message=message):
+                self.assertTrue(message_authorizes_mutation(message))
+                self.assertTrue(
+                    message_requests_change(
+                        message,
+                        "keytao_shift_phrase_code",
+                        {"word": word, "target_code": "wkxk"},
+                    )
+                )
+                self.assertIsNone(
+                    self._binding_error(
+                        message,
+                        word,
+                        "wkxk",
+                        trusted_codes_by_word={word: frozenset({"wkxk"})},
+                        trusted_phrase_types_by_key=(
+                            known_destination if needs_known_destination else {}
+                        ),
+                    )
+                )
+
+    def test_polite_positional_code_request_needs_a_trusted_candidate(self) -> None:
+        message = "请把吃席挪到 wkxk"
+        self.assertTrue(message_authorizes_mutation(message))
+        self.assertIsNotNone(self._binding_error(message, "吃席", "wkxk"))
+        self.assertIsNone(
+            self._binding_error(
+                message,
+                "吃席",
+                "wkxk",
+                trusted_codes_by_word={"吃席": frozenset({"wkxk"})},
+            )
+        )
+
+    def test_entry_lengths_forms_and_relation_variants_authorize_and_bind(self) -> None:
+        checked = 0
+        failures = []
+        known_destination = {("赤溪", "cx"): frozenset({"Phrase"})}
+        for word in POSITIONAL_ENTRY_LENGTHS:
+            for form in ("", "把", "将"):
+                for destination in ("赤溪", "赤溪前面"):
+                    message = f"{form}{word}放在{destination}"
+                    checked += 1
+                    if not (
+                        message_authorizes_mutation(message)
+                        and message_requests_change(
+                            message,
+                            "keytao_shift_phrase_code",
+                            {"word": word, "target_code": "wkxk"},
+                        )
+                        and self._binding_error(
+                            message,
+                            word,
+                            "wkxk",
+                            trusted_codes_by_word={word: frozenset({"wkxk"})},
+                            trusted_phrase_types_by_key=known_destination,
+                        ) is None
+                    ):
+                        failures.append(message)
+
+        self.assertEqual(checked, 48)
+        self.assertEqual(failures, [])
+
+    def test_four_character_entries_are_not_truncated_to_three(self) -> None:
+        checked = 0
+        failures = []
+        for word in POSITIONAL_FOUR_CHARACTER_ENTRIES:
+            for form in ("", "把"):
+                for verb in ("放在", "放到"):
+                    message = f"{form}{word}{verb}「赤溪」前面"
+                    checked += 1
+                    if not (
+                        message_authorizes_mutation(message)
+                        and self._binding_error(
+                            message,
+                            word,
+                            "wkxk",
+                            trusted_codes_by_word={word: frozenset({"wkxk"})},
+                        ) is None
+                    ):
+                        failures.append(message)
+
+        self.assertEqual(checked, 20)
+        self.assertEqual(failures, [])
+
+    def test_ordinals_short_relations_politeness_and_lead_ins(self) -> None:
+        ordinal_checked = 0
+        ordinal_failures = []
+        for verb in ("放在", "放到", "排在", "挪到", "移到"):
+            for destination in POSITIONAL_ORDINAL_DESTINATIONS:
+                message = f"把吃席{verb}{destination}"
+                ordinal_checked += 1
+                if not (
+                    message_authorizes_mutation(message)
+                    and self._binding_error(
+                        message,
+                        "吃席",
+                        "wkxk",
+                        trusted_codes_by_word={"吃席": frozenset({"wkxk"})},
+                    ) is None
+                ):
+                    ordinal_failures.append(message)
+        self.assertEqual(ordinal_checked, 55)
+        self.assertEqual(ordinal_failures, [])
+
+        known_destination = {("赤溪", "cx"): frozenset({"Phrase"})}
+        short_relation_failures = []
+        for message in POSITIONAL_SHORT_RELATION_COMMANDS:
+            if not (
+                message_authorizes_mutation(message)
+                and self._binding_error(
+                    message,
+                    "吃席",
+                    "wkxk",
+                    trusted_codes_by_word={"吃席": frozenset({"wkxk"})},
+                    trusted_phrase_types_by_key=known_destination,
+                ) is None
+            ):
+                short_relation_failures.append(message)
+        self.assertEqual(short_relation_failures, [])
+
+        politeness_failures = []
+        for polite in POSITIONAL_TRAILING_POLITENESS:
+            message = f"把吃席放在「赤溪」前面，{polite}"
+            if not (
+                message_authorizes_mutation(message)
+                and self._binding_error(
+                    message,
+                    "吃席",
+                    "wkxk",
+                    trusted_codes_by_word={"吃席": frozenset({"wkxk"})},
+                ) is None
+            ):
+                politeness_failures.append(message)
+        self.assertEqual(politeness_failures, [])
+
+        lead_in_failures = []
+        for lead_in in POSITIONAL_LEAD_INS:
+            message = f"{lead_in}把吃席放在「赤溪」前面"
+            if not (
+                message_authorizes_mutation(message)
+                and self._binding_error(
+                    message,
+                    "吃席",
+                    "wkxk",
+                    trusted_codes_by_word={"吃席": frozenset({"wkxk"})},
+                ) is None
+            ):
+                lead_in_failures.append(message)
+        self.assertEqual(lead_in_failures, [])
 
     async def test_incident_shift_phrasings_all_authorize_and_bind(self) -> None:
         phrasings = [
@@ -3426,34 +4235,132 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.get("success"), phrasing)
         self.assertEqual(len(self.calls), len(phrasings))
 
-    async def test_unbound_shift_names_the_reason_without_inventing_a_code(self) -> None:
+    async def test_reported_positional_phrasings_authorize_and_reach_the_bound_request_path(self) -> None:
+        phrasings = (
+            "把吃席放在赤溪前面",
+            "把吃席放到赤溪前面",
+            "把吃席排在赤溪前面",
+            "把吃席挪到赤溪前面",
+            "把吃席移到赤溪前面",
+            "把吃席提前到赤溪前面",
+            "把吃席往前挪一位",
+        )
+        arguments = {"word": "吃席", "target_code": "wkxk"}
+        for phrasing in phrasings:
+            with self.subTest(phrasing=phrasing):
+                self.assertTrue(message_authorizes_mutation(phrasing))
+                self.assertTrue(
+                    message_requests_change(
+                        phrasing,
+                        "keytao_shift_phrase_code",
+                        arguments,
+                    )
+                )
+                result = await self._shift(
+                    phrasing,
+                    trusted_codes_by_word={"吃席": frozenset({"wkxk"})},
+                    trusted_phrase_types_by_key={
+                        ("赤溪", "cx"): frozenset({"Phrase"}),
+                    },
+                )
+                self.assertTrue(result.get("success"), (phrasing, result))
+        self.assertEqual(len(self.calls), len(phrasings))
+
+    async def test_reported_speech_and_narrative_positional_text_never_reaches_sink(self) -> None:
+        messages = (
+            "他说 吃席放在赤溪前面",
+            "她说：将吃席放到赤溪后面",
+            "群里有人说「吃席」排在「赤溪」前面",
+            "上条消息是:把吃席移到赤溪后面",
+            "吃席放在赤溪前面挺好",
+            "据说 吃席放在赤溪前面",
+            "听说 吃席放到赤溪后面",
+            "大家说 吃席排在赤溪前面",
+            "消息里说 吃席移到赤溪后面",
+            "昨天 吃席提前到赤溪前面",
+            "她 吃席提到赤溪",
+            "他吃席提到赤溪",
+            "传闻吃席放在赤溪前面",
+            "网传吃席放到赤溪后面",
+            "我觉得吃席排在赤溪前面",
+            "报道称吃席移到赤溪后面",
+            "吃席放在赤溪不错",
+            "吃席放在赤溪合适",
+            "吃席放在赤溪不好",
+            "吃席放在赤溪不妥",
+            "吃席放在赤溪太差",
+            "吃席放在赤溪有误",
+            "吃席放在赤溪很怪",
+            "吃席放在赤溪正常",
+            "吃席放在赤溪恰当",
+            "吃席放在赤溪错了",
+            "吃席放在赤溪前面还是后面",
+            "报道称，吃席放在赤溪前面",
+            "他称，吃席放在赤溪前面",
+            "备查，吃席放在赤溪前面",
+            "不应，吃席放在赤溪前面",
+            "吃席放在赤溪前面还是放后面",
+            "媒体称，吃席放在赤溪前面",
+            "外界认为，吃席放在赤溪前面",
+            "留作备查，吃席放在赤溪前面",
+            "会议纪要，吃席放在赤溪前面",
+            "不宜，吃席放在赤溪前面",
+            "无须，吃席放在赤溪前面",
+            "吃席放在赤溪欠妥",
+            "吃席放在赤溪可行",
+            "吃席放在赤溪合理",
+            "吃席放在赤溪前面还是应该把它放后面",
+            "吃席放在赤溪前面要么放到它后面",
+            "说吃席放在赤溪前面",
+            "记吃席放在赤溪前面",
+            "称吃席放在赤溪前面",
+            "录吃席放在赤溪前面",
+            "传吃席放在赤溪前面",
+            "述吃席放在赤溪前面",
+            "吃席放在赤溪前面二选一放后面",
+            "吃席放在赤溪前面前后择一放后面",
+            "吃席放在冰箱里",
+            "吃席放在冰箱旁",
+            "吃席放在桌边",
+            "吃席放在哪",
+            "吃席排在谁前面",
+            "吃席放在什么位置",
+        )
+        arguments = {"word": "吃席", "target_code": "wkxk"}
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertFalse(message_authorizes_mutation(message))
+                self.assertFalse(
+                    message_requests_change(
+                        message,
+                        "keytao_shift_phrase_code",
+                        arguments,
+                    )
+                )
+                result = await self._shift(
+                    message,
+                    trusted_codes_by_word={"吃席": frozenset({"wkxk"})},
+                )
+                self.assertTrue(result.get("policyBlocked"), (message, result))
+        self.assertEqual(self.calls, [])
+
+    async def test_positional_shift_without_a_server_code_names_binding_not_verb(self) -> None:
         result = await self._shift("把吃席的编码放在赤溪前面")
 
         self.assertTrue(result.get("policyBlocked"))
-        self.assertEqual(result.get("blockReason"), "verb_not_matched")
-        # The reason must not be blamed on history/memory/quotes any more.
-        self.assertNotIn("不能授权修改草稿", result["message"])
-        self.assertIn("与历史、记忆或引用无关", result["message"])
+        self.assertEqual(result.get("blockReason"), "binding_incomplete")
         self.assertNotIn("suggestedCommand", result)
         self.assertEqual(self.calls, [])
 
-        # Once the user supplies the target code, the safe suggestion remains
-        # executable exactly as written.
+        # Once the user supplies the target code, the instruction executes
+        # directly; it no longer needs a remediation round-trip.
         with_code = await self._shift("把吃席的编码放到 wkxk")
-        suggestion = with_code.get("suggestedCommand", "")
-        self.assertEqual(suggestion, "@我 顺延「吃席」到 wkxk")
-        replayed = await self._shift(suggestion)
-        self.assertTrue(replayed.get("success"))
+        self.assertTrue(with_code.get("success"), with_code)
 
     async def test_every_suggested_command_passes_its_own_validator(self) -> None:
         # Each message is one a real user could send: it asks for this change,
         # names what it applies to, but is not itself an executable instruction.
         cases = [
-            (
-                "把吃席的编码放到 wkxk",
-                "keytao_shift_phrase_code",
-                {"word": "吃席", "target_code": "wkxk"},
-            ),
             (
                 "那「甲」 aa 也加到草稿吧",
                 "keytao_create_phrase",

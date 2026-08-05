@@ -252,17 +252,161 @@ class ToolContext:
 _DELETE_INTENT_RE = re.compile(
     r"删除|删掉|删干净|去掉|移除|撤销|清空|清理|全部删|都删"
 )
-_MUTATION_INTENT_RE = re.compile(
+_POSITIONAL_REORDER_QUOTED_ENTRY_PATTERN = (
+    r"(?:「[^」]{1,16}」|“[^”]{1,16}”|‘[^’]{1,16}’)"
+)
+# Keep this in sync with the Chinese Phrase validator and the encoder chain:
+# Next accepts letters with a six-key ceiling; the bot normalizes generated
+# phrase candidates to lowercase ASCII.  Shape is necessary but never enough
+# for permission -- the binding gate also requires a server-read capability.
+_POSITIONAL_REORDER_CODE_PATTERN = r"[a-z]{1,6}(?![A-Za-z])"
+_POSITIONAL_REORDER_PLAIN_ENTRY_PATTERN = r"[\u3400-\u9fff]{1,8}"
+_POSITIONAL_REORDER_RELATION_PATTERN = r"(?:前面|后面|之前|之后|前|后)"
+_POSITIONAL_REORDER_ORDINAL_PATTERN = (
+    r"第(?:[一二三四五六七八九十百千万两]+|\d{1,3})(?:个|位)"
+)
+_POSITIONAL_REORDER_DESTINATION_PATTERN = (
+    rf"(?:"
+    rf"{_POSITIONAL_REORDER_CODE_PATTERN}|"
+    rf"{_POSITIONAL_REORDER_ORDINAL_PATTERN}|"
+    rf"{_POSITIONAL_REORDER_RELATION_PATTERN}|"
+    rf"{_POSITIONAL_REORDER_QUOTED_ENTRY_PATTERN}"
+    rf"(?:{_POSITIONAL_REORDER_RELATION_PATTERN})?|"
+    rf"{_POSITIONAL_REORDER_PLAIN_ENTRY_PATTERN}"
+    rf"(?:{_POSITIONAL_REORDER_RELATION_PATTERN})?"
+    rf")"
+)
+_POSITIONAL_REORDER_DESTINATION_EXPRESSION_PATTERN = (
+    rf"(?:放在|放到|排在|挪到|移到|提到|提前到)"
+    rf"{_POSITIONAL_REORDER_DESTINATION_PATTERN}"
+)
+_POSITIONAL_REORDER_COMMAND_DESTINATION_EXPRESSION_PATTERN = (
+    rf"(?:放在|放到|排在|挪到|移到|提到|提前到)\s*"
+    rf"{_POSITIONAL_REORDER_DESTINATION_PATTERN}"
+)
+_POSITIONAL_REORDER_RELATIVE_EXPRESSION_PATTERN = (
+    r"(?:往前|往后)(?:(?:挪|移)(?:一位|一下)?)?|"
+    r"(?:靠前|靠后)(?:一点|一位|一些)?"
+)
+_POSITIONAL_REORDER_INTENT_PATTERN = (
+    rf"(?:放在|放到|排在|挪到|移到|提到|提前到)"
+    rf"(?={_POSITIONAL_REORDER_DESTINATION_PATTERN})|"
+    r"(?:往前|往后)(?=(?:挪|移)(?:一位|一下)?)|"
+    r"靠前(?=(?:一点|一位|一些))|靠后(?=(?:一点|一位|一些))"
+)
+_POSITIONAL_REORDER_INTENT_RE = re.compile(_POSITIONAL_REORDER_INTENT_PATTERN)
+_NON_POSITIONAL_MUTATION_INTENT_PATTERN = (
     r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|发起审核|"
     r"删除|删掉|删干净|去掉|移除|清空|清理|"
     r"撤销|撤回|召回|修改|改成|改为|替换|顺延|挪开|重新编码|保留|批量处理"
     r"|都删|其余删|其他删"
+)
+_NON_POSITIONAL_MUTATION_INTENT_RE = re.compile(
+    _NON_POSITIONAL_MUTATION_INTENT_PATTERN
+)
+_MUTATION_INTENT_RE = re.compile(
+    _NON_POSITIONAL_MUTATION_INTENT_PATTERN
+    + r"|"
+    + _POSITIONAL_REORDER_INTENT_PATTERN
+)
+_POSITIONAL_REORDER_SUBJECT_PATTERN = (
+    r"(?:「[^」]{1,16}」|“[^”]{1,16}”|‘[^’]{1,16}’|"
+    r"(?:(?![把将])[\u3400-\u9fffA-Za-z0-9_-]){1,16}?)"
+)
+_POSITIONAL_REORDER_BARE_SUBJECT_PATTERN = (
+    r"(?:「[^」]{1,16}」|“[^”]{1,16}”|‘[^’]{1,16}’|"
+    r"(?:(?![把将])[\u3400-\u9fffA-Za-z0-9_-]){1,8}?)"
+)
+_POSITIONAL_REORDER_COMMAND_RE = re.compile(
+    rf"^(?:(?:把|将)\s*{_POSITIONAL_REORDER_SUBJECT_PATTERN}|"
+    rf"{_POSITIONAL_REORDER_BARE_SUBJECT_PATTERN})\s*(?:的编码)?\s*"
+    rf"(?:{_POSITIONAL_REORDER_COMMAND_DESTINATION_EXPRESSION_PATTERN}|"
+    rf"{_POSITIONAL_REORDER_RELATIVE_EXPRESSION_PATTERN})"
+    r"(?:一下|吧|了|好吗|行吗|可以吗)?[。.!！?？]?$"
+)
+_POSITIONAL_REORDER_RAW_COMMAND_RE = re.compile(
+    rf"^(?:(?:把|将)\s*{_POSITIONAL_REORDER_SUBJECT_PATTERN}|"
+    rf"{_POSITIONAL_REORDER_BARE_SUBJECT_PATTERN})\s*(?:的编码)?\s*"
+    rf"(?:放在|放到|排在|挪到|移到|提到|提前到)\s*"
+    r"(?P<destination>.+?)"
+    r"(?:一下|吧|了|好吗|行吗|可以吗)?[。.!！?？]?$"
+)
+_POSITIONAL_REORDER_DESTINATION_CAPTURE_RE = re.compile(
+    rf"(?:放在|放到|排在|挪到|移到|提到|提前到)\s*"
+    rf"(?P<destination>{_POSITIONAL_REORDER_DESTINATION_PATTERN})"
+    r"(?:一下|吧|了|好吗|行吗|可以吗)?[。.!！?？]?$"
+)
+_POSITIONAL_REORDER_QUOTED_TARGET_RE = re.compile(
+    r"^(?:「[^」]{1,16}」|“[^”]{1,16}”|‘[^’]{1,16}’)$"
+)
+_POSITIONAL_REORDER_PLAIN_LOCATIVE_SUFFIX_RE = re.compile(
+    r"(?:里|上|下|中|内|外|旁|边|侧|处|口|角|前|后|附近|周围)$"
+)
+_POSITIONAL_REORDER_RELATIVE_FRAGMENT_RE = re.compile(
+    rf"^(?:{_POSITIONAL_REORDER_RELATIVE_EXPRESSION_PATTERN})"
+    r"(?:一下|吧|了|好吗|行吗|可以吗)?[。.!！?？]?$"
+)
+_POSITIONAL_REORDER_NARRATIVE_TAIL_RE = re.compile(
+    r"(?:挺好|很好|不错|合适|更好|比较好|不好|不妥|太差|有误|很怪|"
+    r"正常|恰当|错了|错误|太怪|奇怪|较好|更差|离谱|正确|"
+    r"欠妥|可行|合理|这样(?:更)?合理|看起来不错|是个好主意|比较合适|更合适|"
+    r"只是陈述)[。.!！]?$"
+)
+_POSITIONAL_REORDER_CHOICE_QUESTION_RE = re.compile(
+    r"(?:还是|或者|要么|二选一|择一|或)"
+)
+_POSITIONAL_REORDER_TEMPORAL_DESTINATION_RE = re.compile(
+    r"^(?:今天|明天|后天|昨天|今晚|明早|稍后|以后|未来|"
+    r"下周|下月|下季度|明年|周[一二三四五六日天]|"
+    r"\d{1,2}(?:点|时|月|日|号))$"
+)
+_POSITIONAL_REORDER_TRAILING_POLITENESS_RE = re.compile(
+    r"^(?:谢谢|谢谢你|多谢|辛苦了|拜托了|麻烦了|感谢|感谢你|"
+    r"劳驾|拜托|有劳|谢啦)[。.!！]?$"
+)
+_POSITIONAL_SUBORDINATE_CONTEXT_RE = re.compile(
+    r"^(?:关于)?(?:你|我|他|她)(?:刚才)?.*"
+    r"(?:的内容|过的那段|的说法|的吃席|过的那批)$"
+)
+_POSITIONAL_REPORTED_CONTEXT_RE = re.compile(
+    r"^(?:他说|她说|群里有人说|上条消息是|据说|听说|大家说|有人说|"
+    r"消息里说|消息称|据悉|报道称|他称|她称|传闻|网传|我觉得|"
+    r"备查|留存|存证|摘记|纪要|昨天|她|他|媒体称|外界认为|"
+    r"留作备查|会议纪要|有传言称|小王表示|请存证|说|记|称|录|传|述)"
+)
+_POSITIONAL_BARE_DATA_CONTEXT_RE = re.compile(
+    r"^(?:说|记|称|录|传|述).{0,24}"
+    r"(?:放在|放到|排在|挪到|移到|提到|提前到|往前|往后|靠前|靠后)"
+)
+_POSITIONAL_CONTEXT_NEGATION_RE = re.compile(
+    r"^(?:没|未|尚未|不应|不应该|并非|不能)(?:[，,；;：:]|.{0,8})"
+    r".{0,40}(?:放在|放到|排在|挪到|移到|提到|提前到|往前|往后|靠前|靠后)"
+)
+_NEGATED_POSITIONAL_REORDER_RE = re.compile(
+    r"(?:不要|别(?!的)|无需|不用|禁止|先不|暂时不|不必|不再|"
+    r"不需要|甭|勿|不宜|无须|毋须|绝不能).{0,40}"
+    r"(?:放在|放到|排在|挪到|移到|提到|提前到|往前|往后|靠前|靠后)"
+)
+_POSITIONAL_REORDER_EXPLANATION_RE = re.compile(
+    r"^怎么.{1,40}"
+    r"(?:放在|放到|排在|挪到|移到|提到|提前到|往前|往后|靠前|靠后)"
+)
+_POSITIONAL_REORDER_LOCATIVE_DESTINATION_RE = re.compile(
+    r"(?:放在|放到|排在|挪到|移到|提到|提前到)"
+    r"[\u3400-\u9fff]{1,4}[里上下中内外](?:一下|吧|了)?[。.!！?？]?$"
 )
 _NEGATED_MUTATION_RE = re.compile(
     rf"(?:"
     rf"(?<![把将])"
     rf"(?:不要|别(?!的)|无需|不用|禁止|不要真的|先不|暂时不|不必|不再|不需要|甭|勿)"
     rf".{{0,12}}(?:{_MUTATION_INTENT_RE.pattern})"
+    rf")"
+)
+_NEGATED_NON_POSITIONAL_MUTATION_RE = re.compile(
+    rf"(?:"
+    rf"(?<![把将])"
+    rf"(?:不要|别(?!的)|无需|不用|禁止|不要真的|先不|暂时不|不必|不再|不需要|甭|勿)"
+    rf".{{0,12}}(?:{_NON_POSITIONAL_MUTATION_INTENT_PATTERN})"
     rf")"
 )
 _STANDALONE_NEGATION_CLAUSE_RE = re.compile(
@@ -272,6 +416,7 @@ _STANDALONE_NEGATION_CLAUSE_RE = re.compile(
 _EXPLANATION_ONLY_RE = re.compile(
     r"(?:什么意思|什么含义|解释一下|说明一下|怎么做|如何操作|操作方法|"
     r"为什么|为何|教程|示例|假设|如果|是否支持|能否介绍|翻译|怎么理解|怎么说|"
+    r"举个例子|举例|怎么(?:把|将)|"
     r"会发生什么|会怎样|会如何|有什么后果|后果是什么|有什么影响)"
 )
 _TEXT_TRANSFORM_RE = re.compile(r"(?:改写|润色|复述|翻译|引用|摘录|转述)")
@@ -298,9 +443,14 @@ _META_DISCUSSION_RE = re.compile(
     r"(?:什么意思|什么含义|解释|说明|怎么理解)"
 )
 _DATA_CONTEXT_RE = re.compile(
-    r"^(?:请|麻烦|帮我|给我|我要|我想)?"
+    r"^(?:"
+    r"(?:请|麻烦|帮我|给我|我要|我想)?"
     r"(?:分析|判断|翻译|解释|改写|复述|记录|排版|标注)"
-    r"(?:以下|一下|这段|这句|这条|一句话|内容|消息|用户请求|是否)"
+    r"(?:以下|一下|这段|这句|这条|一句话|内容|消息|用户请求|是否)|"
+    r"(?:他说|她说|群里有人说|上条消息是|据说|听说|大家说|有人说|"
+    r"消息里说|消息称|据悉|报道称|他称|她称|传闻|网传|我觉得|"
+    r"备查|留存|存证|摘记|纪要|昨天|她|他)[：:；;]?"
+    r")"
 )
 _RECORD_FRAME_RE = re.compile(
     r"(?:"
@@ -347,7 +497,7 @@ _COMMAND_LEAD_IN_PREFIXES = (
     "请", "麻烦", "帮我", "给我", "现在", "立即", "直接", "确认", "执行",
     "我要", "我想", "替我", "为我", "能不能", "可不可以", "能否", "可否",
     "可以帮我", "可以请你", "并", "并且", "同时", "然后", "再", "还要",
-    "以及", "另外", "接着", "顺便",
+    "以及", "另外", "接着", "顺便", "麻烦你", "帮忙", "劳驾", "喵喵", "你好", "在吗",
 )
 # Longest-first alternation keeps a shorter token such as "并" from consuming
 # the start of "并且" when the prefix is stripped independently of the command.
@@ -357,6 +507,188 @@ _COMMAND_PREFIX_PATTERN = rf"(?:{'|'.join(sorted(
     reverse=True,
 ))})*"
 _COMMAND_PREFIX_RE = re.compile(rf"^{_COMMAND_PREFIX_PATTERN}")
+
+
+@dataclass(frozen=True)
+class _PositionalDestination:
+    kind: str
+    target: str = ""
+    quoted: bool = False
+
+
+def _unquote_positional_entry(value: str) -> Optional[str]:
+    pairs = {"「": "」", "“": "”", "‘": "’"}
+    if len(value) >= 3 and pairs.get(value[0]) == value[-1]:
+        return value[1:-1]
+    return None
+
+
+def _parse_positional_destination(destination: str) -> Optional[_PositionalDestination]:
+    value = str(destination or "").strip()
+    if not value:
+        return None
+    if re.fullmatch(_POSITIONAL_REORDER_CODE_PATTERN, value):
+        return _PositionalDestination("code", target=value)
+    if re.fullmatch(_POSITIONAL_REORDER_ORDINAL_PATTERN, value):
+        return _PositionalDestination("ordinal")
+    if re.fullmatch(_POSITIONAL_REORDER_RELATION_PATTERN, value):
+        return _PositionalDestination("relative")
+
+    quoted = _unquote_positional_entry(value)
+    if quoted is not None:
+        return _PositionalDestination("entry", target=quoted, quoted=True)
+
+    for relation in ("前面", "后面", "之前", "之后", "前", "后"):
+        if not value.endswith(relation):
+            continue
+        raw_target = value[:-len(relation)]
+        if not raw_target:
+            return _PositionalDestination("relative")
+        quoted_target = _unquote_positional_entry(raw_target)
+        if quoted_target is not None:
+            return _PositionalDestination(
+                "entry",
+                target=quoted_target,
+                quoted=True,
+            )
+        if re.fullmatch(_POSITIONAL_REORDER_PLAIN_ENTRY_PATTERN, raw_target):
+            return _PositionalDestination("entry", target=raw_target)
+        return None
+
+    if re.fullmatch(_POSITIONAL_REORDER_PLAIN_ENTRY_PATTERN, value):
+        return _PositionalDestination("entry", target=value)
+    return None
+
+
+def _positional_destination_from_command(message: str) -> Optional[_PositionalDestination]:
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    )
+    clauses = [
+        clause.strip() for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if clause.strip()
+    ]
+    while (
+        len(clauses) > 1
+        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(clauses[-1])
+    ):
+        clauses.pop()
+    if len(clauses) != 1:
+        return None
+    candidate = _COMMAND_PREFIX_RE.sub("", clauses[0], count=1).lstrip()
+    if not _POSITIONAL_REORDER_COMMAND_RE.fullmatch(candidate):
+        return None
+    match = _POSITIONAL_REORDER_DESTINATION_CAPTURE_RE.search(candidate)
+    if match is None:
+        return _PositionalDestination("relative")
+    return _parse_positional_destination(match.group("destination"))
+
+
+def _raw_positional_destination_from_command(message: str) -> Optional[str]:
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    )
+    clauses = [
+        clause.strip() for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if clause.strip()
+    ]
+    while (
+        len(clauses) > 1
+        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(clauses[-1])
+    ):
+        clauses.pop()
+    if len(clauses) != 1:
+        return None
+    candidate = _COMMAND_PREFIX_RE.sub("", clauses[0], count=1).lstrip()
+    match = _POSITIONAL_REORDER_RAW_COMMAND_RE.fullmatch(candidate)
+    return match.group("destination").strip() if match else None
+
+
+def _has_raw_positional_relative_tail(message: str) -> bool:
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    )
+    clauses = [
+        clause.strip() for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if clause.strip()
+    ]
+    while (
+        len(clauses) > 1
+        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(clauses[-1])
+    ):
+        clauses.pop()
+    if len(clauses) != 1:
+        return False
+    candidate = _COMMAND_PREFIX_RE.sub("", clauses[0], count=1).lstrip()
+    return bool(
+        re.search(
+            rf".{{1,32}}(?:{_POSITIONAL_REORDER_RELATIVE_EXPRESSION_PATTERN})"
+            r"(?:一下|吧|了|好吗|行吗|可以吗)?[。.!！?？]?$",
+            candidate,
+        )
+    )
+
+
+def _has_complete_positional_reorder_command(message: str) -> bool:
+    """Match positional grammar without erasing subject-boundary whitespace."""
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    )
+    clauses = [
+        clause for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if clause.strip()
+    ]
+    while (
+        len(clauses) > 1
+        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(
+            clauses[-1].strip()
+        )
+    ):
+        clauses.pop()
+    # Only a closed trailing politeness clause may follow the instruction.
+    # Arbitrary extra clauses never become positional authority.
+    if len(clauses) != 1:
+        return False
+    for clause in clauses:
+        candidate = clause.strip()
+        candidate = _COMMAND_PREFIX_RE.sub("", candidate, count=1).lstrip()
+        if (
+            _POSITIONAL_REORDER_COMMAND_RE.fullmatch(candidate)
+            and not _positional_destination_is_ambiguous_non_command(candidate)
+        ):
+            return True
+    return False
+
+
+def _positional_destination_is_ambiguous_non_command(candidate: str) -> bool:
+    """Fail closed for plain destinations that also read as questions or places.
+
+    A quoted operand, a code, or an explicit ``前面/后面`` relation has a
+    structural word/code boundary.  A bare destination such as ``哪`` or
+    ``冰箱旁`` does not: treating it as a dictionary word would turn questions
+    and ordinary location statements into write consent.  Users can remove
+    that ambiguity by quoting the word or naming the relative side.
+    """
+    match = _POSITIONAL_REORDER_DESTINATION_CAPTURE_RE.search(candidate)
+    if match is None:
+        return False
+    parsed = _parse_positional_destination(match.group("destination"))
+    if parsed is None:
+        return True
+    if parsed.kind in {"code", "ordinal", "relative"} or parsed.quoted:
+        return False
+    return bool(
+        re.search(r"哪|谁|什么|何处|何人|不", parsed.target)
+        or _POSITIONAL_REORDER_PLAIN_LOCATIVE_SUFFIX_RE.search(parsed.target)
+        or _POSITIONAL_REORDER_TEMPORAL_DESTINATION_RE.fullmatch(parsed.target)
+    )
+
+
+def _has_positional_choice_question(text: str) -> bool:
+    masked = _QUOTED_DATA_RE.sub("", text)
+    return bool(_POSITIONAL_REORDER_CHOICE_QUESTION_RE.search(masked))
+
+
 _ENTRY_MUTATION_FOR_FRAME_OPERAND_RE = _MUTATION_INTENT_RE
 _RECORD_FRAME_OPERAND_AFTER_RE = re.compile(
     # Keep this filler vocabulary closed and bounded. It describes only the
@@ -412,7 +744,10 @@ _NEGATIVE_MODAL_RE = re.compile(
 _CLAUSE_BOUNDARY_RE = re.compile(r"[。！？!?;；\n]")
 _ACTION_TOKENS = {
     "Create": re.compile(r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|加词"),
-    "Change": re.compile(r"修改|改成|改为|替换|重新编码|顺延|挪开|移到"),
+    "Change": re.compile(
+        r"修改|改成|改为|替换|重新编码|顺延|挪开|"
+        r"放在|放到|排在|挪到|移到|提到|提前到|往前|往后|靠前|靠后"
+    ),
     "Delete": re.compile(r"删除|删掉|删干净|移除"),
     "Keep": re.compile(
         r"只保留|仅保留|保留|留下|别动|不要动|"
@@ -422,13 +757,15 @@ _ACTION_TOKENS = {
 _WORD_LEFT_PREFIXES = (
     "添加", "加入", "加到", "新增", "创建", "写入", "放入", "收录", "录入", "记入", "加词",
     "修改", "改成", "替换", "删除", "删掉", "移除", "保留", "只保留", "仅保留",
-    "顺延", "移到", "挪到", "改到",
-    "把", "将", "词条", "词语",
+    "顺延", "放在", "放到", "排在", "移到", "挪到", "提到", "提前到", "改到",
+    "往前", "往后", "靠前", "靠后",
+    "把", "将", "词条", "词语", "提到的",
 )
 _WORD_RIGHT_SUFFIXES = (
     "编码", "代码", "改成", "改为", "修改为", "替换为", "加入", "添加",
     "加到草稿", "加入草稿", "删除", "删掉", "移除", "到草稿", "放入草稿",
-    "顺延", "的编码", "的代码", "到", "移到", "挪到", "改到",
+    "顺延", "的编码", "的代码", "到", "放在", "放到", "排在", "移到", "挪到",
+    "提到", "提前到", "改到", "往前", "往后", "靠前", "靠后",
     "和", "与", "及", "、", "都", "并", "以", "为",
 )
 # Machine-readable block reasons.  The model is only allowed to relay the
@@ -561,12 +898,24 @@ def _mutation_authorization_view(message: str) -> str:
             continue
         candidate = _COMMAND_PREFIX_RE.sub("", compact, count=1)
         has_mutation = bool(_MUTATION_INTENT_RE.search(candidate))
-        is_positive_command = bool(
-            _MUTATION_INTENT_RE.match(candidate)
-            or re.match(
-                rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
+        mutation_at_start = _MUTATION_INTENT_RE.match(candidate)
+        positional_command = bool(
+            not _POSITIONAL_SUBORDINATE_CONTEXT_RE.fullmatch(candidate)
+            and _has_complete_positional_reorder_command(clause)
+        )
+        generic_ba_command = bool(
+            re.match(
+                rf"(?:把|将).{{1,80}}(?:{_NON_POSITIONAL_MUTATION_INTENT_PATTERN})",
                 candidate,
             )
+        )
+        is_positive_command = bool(
+            (
+                mutation_at_start
+                and not _POSITIONAL_REORDER_INTENT_RE.match(candidate)
+            )
+            or positional_command
+            or generic_ba_command
             or re.match(r"除了.{1,80}(?:都删|删除|删掉|去掉|移除)", candidate)
             or re.match(
                 r"(?:草稿|批次)(?:中的)?(?:全部|都|所有)(?:条目)?"
@@ -588,8 +937,9 @@ def _has_mutation_instruction_shape(message: str) -> bool:
     text = re.sub(r"\s+", "", _mutation_authorization_view(message))
     authorization_text = _QUOTED_DATA_RE.sub("", text)
     stripped_command_text = _COMMAND_PREFIX_RE.sub("", text, count=1)
+    positional_command = _has_complete_positional_reorder_command(message)
     mutation_match = _MUTATION_INTENT_RE.search(authorization_text)
-    if not authorization_text or mutation_match is None:
+    if not authorization_text or (mutation_match is None and not positional_command):
         return False
 
     # The final checks here describe instruction shape, but the input view also
@@ -602,12 +952,28 @@ def _has_mutation_instruction_shape(message: str) -> bool:
     stripped_text = _COMMAND_PREFIX_RE.sub("", authorization_text, count=1)
     stripped_match = _MUTATION_INTENT_RE.search(stripped_text)
     return bool(
-        (stripped_match is not None and stripped_match.start() == 0)
-        or re.match(
-            rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
-            stripped_command_text,
+        (
+            stripped_match is not None
+            and stripped_match.start() == 0
+            and (
+                not _POSITIONAL_REORDER_INTENT_RE.match(stripped_text)
+                or positional_command
+            )
         )
-        or _EXPLICIT_REQUEST_PREFIX_RE.match(authorization_text)
+        or positional_command
+        or (
+            re.match(
+                rf"(?:把|将).{{1,80}}(?:{_NON_POSITIONAL_MUTATION_INTENT_PATTERN})",
+                stripped_command_text,
+            )
+        )
+        or (
+            _EXPLICIT_REQUEST_PREFIX_RE.match(authorization_text)
+            and (
+                not _POSITIONAL_REORDER_INTENT_RE.search(authorization_text)
+                or positional_command
+            )
+        )
         or re.match(
             r"(?:草稿|批次)(?:中的)?(?:全部|都|所有)(?:条目)?"
             r"(?:删除|删掉|去掉|移除)",
@@ -628,15 +994,27 @@ def _message_authorizes_mutation_core(message: str) -> bool:
         clause for clause in authorization_clauses if clause
     )
     has_negated_mutation_clause = any(
-        _NEGATED_MUTATION_RE.search(clause)
+        _NEGATED_NON_POSITIONAL_MUTATION_RE.search(clause)
         for clause in authorization_clauses
     )
     stripped_command_text = _COMMAND_PREFIX_RE.sub("", text, count=1)
+    positional_command = _has_complete_positional_reorder_command(message)
+    positional_scope = bool(
+        positional_command
+        or _raw_positional_destination_from_command(message) is not None
+        or _has_raw_positional_relative_tail(message)
+    )
     direct_command_after_lead_in = bool(
-        _MUTATION_INTENT_RE.match(stripped_command_text)
-        or re.match(
-            rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
-            stripped_command_text,
+        (
+            _MUTATION_INTENT_RE.match(stripped_command_text)
+            and not _POSITIONAL_REORDER_INTENT_RE.match(stripped_command_text)
+        )
+        or positional_command
+        or (
+            re.match(
+                rf"(?:把|将).{{1,80}}(?:{_NON_POSITIONAL_MUTATION_INTENT_PATTERN})",
+                stripped_command_text,
+            )
         )
     )
     question_is_execution_request = bool(
@@ -656,6 +1034,19 @@ def _message_authorizes_mutation_core(message: str) -> bool:
         not authorization_text
         or _has_standalone_negation_before_mutation(message)
         or has_negated_mutation_clause
+        or (
+            positional_scope
+            and (
+                _NEGATED_POSITIONAL_REORDER_RE.search(raw_text)
+                or _POSITIONAL_CONTEXT_NEGATION_RE.search(raw_text)
+                or _POSITIONAL_BARE_DATA_CONTEXT_RE.search(raw_text)
+                or _POSITIONAL_REPORTED_CONTEXT_RE.search(raw_text)
+                or _POSITIONAL_REORDER_EXPLANATION_RE.search(raw_text)
+                or _POSITIONAL_REORDER_LOCATIVE_DESTINATION_RE.search(raw_text)
+                or _has_positional_choice_question(raw_text)
+                or _POSITIONAL_REORDER_NARRATIVE_TAIL_RE.search(raw_text)
+            )
+        )
         or (_QUESTION_RE.search(raw_text) and not question_is_execution_request)
         or _ABORT_RE.search(raw_text)
     ):
@@ -758,10 +1149,34 @@ def _record_frame_is_mutation_operand(
 
 def _has_complete_mutation_instruction(message: str) -> bool:
     """Require a mutation verb plus material that can serve as its operand."""
+    raw_view = re.sub(r"\s+", "", trusted_mutation_source(message))
+    raw_stripped = _COMMAND_PREFIX_RE.sub("", raw_view, count=1)
+    if (
+        _POSITIONAL_REORDER_INTENT_RE.match(raw_stripped)
+        or _POSITIONAL_REORDER_RELATIVE_FRAGMENT_RE.fullmatch(raw_stripped)
+    ):
+        # Used only after a reporting frame has been removed.  A greedy
+        # "传达给某人" frame can consume the subject and leave precisely this
+        # verb + destination suffix behind.
+        return True
     if not _has_mutation_instruction_shape(message):
         return False
 
-    authorization_text = re.sub(r"\s+", "", _mutation_authorization_view(message))
+    authorization_view = re.sub(r"\s+", "", _mutation_authorization_view(message))
+    stripped_view = _COMMAND_PREFIX_RE.sub("", authorization_view, count=1)
+    if (
+        _POSITIONAL_REORDER_COMMAND_RE.fullmatch(stripped_view)
+        # A trailing record frame can greedily consume the subject and the
+        # start of the verb (for example "传达给管理员把吃席放在...").  The
+        # remaining verb + destination is still enough to prove that the frame
+        # wrapped a complete positional instruction; this only strengthens the
+        # framing refusal and grants no direct authorization class.
+        or _POSITIONAL_REORDER_INTENT_RE.match(stripped_view)
+        or _POSITIONAL_REORDER_RELATIVE_FRAGMENT_RE.fullmatch(stripped_view)
+    ):
+        return True
+
+    authorization_text = re.sub(r"\s+", "", authorization_view)
     for mutation_match in _MUTATION_INTENT_RE.finditer(authorization_text):
         residual = (
             authorization_text[:mutation_match.start()]
@@ -782,6 +1197,26 @@ def _record_frame_wraps_complete_mutation(message: str) -> bool:
     leaves an independently complete mutation instruction.
     """
     raw_message = str(message or "")
+    # A relay frame with a bounded recipient is lexically ambiguous at its
+    # right edge: ``传达给管理员把吃席往前`` can be greedily consumed through
+    # ``往前`` by the frame's recipient slot.  Try every exact frame boundary
+    # before the generic erase-and-recheck pass.  This only strengthens the
+    # record-frame refusal and never creates a positive authorization path.
+    for split_at in range(1, len(raw_message)):
+        frame_prefix = raw_message[:split_at].rstrip()
+        command_suffix = raw_message[split_at:].lstrip(
+            "、：:—，。 \t\r\n"
+        )
+        if not command_suffix:
+            continue
+        compact_suffix = re.sub(r"\s+", "", command_suffix)
+        stripped_suffix = _COMMAND_PREFIX_RE.sub("", compact_suffix, count=1)
+        if (
+            _RECORD_FRAME_RE.fullmatch(frame_prefix)
+            and _POSITIONAL_REORDER_COMMAND_RE.fullmatch(stripped_suffix)
+        ):
+            return True
+
     masked_message = _mask_quoted_record_frames(raw_message)
     frame_matches = list(_RECORD_FRAME_RE.finditer(masked_message))
     framing_matches = [
@@ -834,19 +1269,30 @@ def _record_frame_wraps_complete_mutation(message: str) -> bool:
 
 def message_authorizes_mutation(message: str) -> bool:
     """Accept write authority only from the current user's explicit raw text."""
+    raw_source = re.sub(r"\s+", "", trusted_mutation_source(message))
+    # The authorization view intentionally keeps a later standalone command
+    # clause after harmless chatter.  Report/record frames are not harmless:
+    # once they lead the raw turn, punctuation must not launder the following
+    # positional text into a fresh command.
+    if (
+        _DATA_CONTEXT_RE.search(raw_source)
+        or _POSITIONAL_BARE_DATA_CONTEXT_RE.search(raw_source)
+    ):
+        return False
     if _record_frame_wraps_complete_mutation(message):
         return False
     return _message_authorizes_mutation_core(message)
 
 
-# Verbs that express "change where this code sits" in everyday Chinese.  They
-# are deliberately NOT in _MUTATION_INTENT_RE: they are far too common to grant
-# write authority ("放到明天再说", "调到静音模式").  They are used only to decide
-# whether the user was asking for a change at all, which grants nothing.
+# Verbs that express "change where this code sits" in everyday Chinese.  Most
+# remain helpfulness-only because they are too common to grant write authority
+# ("放到明天再说", "调到静音模式").  The narrower positional subset above is
+# promoted only when the entire dictionary reorder grammar matches.
 _POSITIONAL_CHANGE_RE = re.compile(
     # Deliberately excludes bare position words ("占用|提前|前面|后面|位置"):
     # they carry no request by themselves and appear constantly in small talk.
-    r"放在|放到|调到|调整到|挪到|挪开|排在|插到|插入|抢占|移到|改到|往前|往后"
+    r"放在|放到|调到|调整到|挪到|挪开|排在|插到|插入|抢占|移到|改到|"
+    r"提到|提前到|往前|往后|靠前|靠后"
 )
 _CHANGE_VERB_RE = re.compile(
     r"修改|改成|改为|改到|替换|重新编码|顺延|挪开|移到|" + _POSITIONAL_CHANGE_RE.pattern
@@ -912,6 +1358,12 @@ def message_requests_change(
     text = re.sub(r"\s+", "", source_text)
     if not text:
         return False
+    positional_command = _has_complete_positional_reorder_command(message)
+    positional_scope = bool(
+        positional_command
+        or _raw_positional_destination_from_command(message) is not None
+        or _has_raw_positional_relative_tail(message)
+    )
     authorization_clauses = [
         _QUOTED_DATA_RE.sub("", re.sub(r"\s+", "", clause))
         for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source_text)
@@ -920,7 +1372,7 @@ def message_requests_change(
         clause for clause in authorization_clauses if clause
     )
     has_negated_mutation_clause = any(
-        _NEGATED_MUTATION_RE.search(clause)
+        _NEGATED_NON_POSITIONAL_MUTATION_RE.search(clause)
         for clause in authorization_clauses
     )
     if (
@@ -932,15 +1384,59 @@ def message_requests_change(
         or _ABORT_RE.search(text)
         or _has_standalone_negation_before_mutation(message)
         or has_negated_mutation_clause
+        or (
+            positional_scope
+            and (
+                _NEGATED_POSITIONAL_REORDER_RE.search(text)
+                or _POSITIONAL_CONTEXT_NEGATION_RE.search(text)
+                or _POSITIONAL_BARE_DATA_CONTEXT_RE.search(text)
+                or _POSITIONAL_REPORTED_CONTEXT_RE.search(text)
+                or _POSITIONAL_REORDER_EXPLANATION_RE.search(text)
+                or _POSITIONAL_REORDER_LOCATIVE_DESTINATION_RE.search(text)
+                or _has_positional_choice_question(text)
+                or _POSITIONAL_REORDER_NARRATIVE_TAIL_RE.search(text)
+            )
+        )
+    ):
+        return False
+    if (
+        tool_name == "keytao_shift_phrase_code"
+        and (
+            _POSITIONAL_REPORTED_CONTEXT_RE.search(text)
+            or _POSITIONAL_BARE_DATA_CONTEXT_RE.search(text)
+            or _POSITIONAL_CONTEXT_NEGATION_RE.search(text)
+            or _POSITIONAL_REORDER_EXPLANATION_RE.search(text)
+            or (
+                (
+                    _POSITIONAL_REORDER_NARRATIVE_TAIL_RE.search(text)
+                    or _has_positional_choice_question(text)
+                )
+                and re.search(
+                    r"放在|放到|排在|挪到|移到|提到|提前到|"
+                    r"往前|往后|靠前|靠后",
+                    text,
+                )
+            )
+            or (
+                _POSITIONAL_REORDER_INTENT_RE.search(text)
+                and not positional_command
+            )
+        )
     ):
         return False
     raw_text = re.sub(r"\s+", "", str(message or ""))
     stripped_text = _COMMAND_PREFIX_RE.sub("", text, count=1)
     direct_command_after_lead_in = bool(
-        _MUTATION_INTENT_RE.match(stripped_text)
-        or re.match(
-            rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
-            stripped_text,
+        (
+            _MUTATION_INTENT_RE.match(stripped_text)
+            and not _POSITIONAL_REORDER_INTENT_RE.match(stripped_text)
+        )
+        or positional_command
+        or (
+            re.match(
+                rf"(?:把|将).{{1,80}}(?:{_NON_POSITIONAL_MUTATION_INTENT_PATTERN})",
+                stripped_text,
+            )
         )
     )
     question_is_execution_request = bool(
@@ -1111,6 +1607,22 @@ def self_checked_suggested_command(
         return ""
     if not _operands_are_present(raw_message, tool_name, arguments):
         return ""
+    if (
+        tool_name == "keytao_shift_phrase_code"
+        and _raw_positional_destination_from_command(raw_message) is not None
+    ):
+        word = str(arguments.get("word") or "").strip()
+        target_code = str(arguments.get("target_code") or "").strip()
+        trusted_codes = context.trusted_codes_by_word or {}
+        if (
+            target_code not in trusted_codes.get(word, frozenset())
+            and not _positional_message_explicitly_labels_code(
+                raw_message,
+                word,
+                target_code,
+            )
+        ):
+            return ""
     candidate = _suggested_command_text(tool_name, arguments)
     if not candidate:
         return ""
@@ -1508,6 +2020,90 @@ def _code_is_bound_to_target(
         if code in trusted_codes and not tokens:
             return True
     return False
+
+
+def _server_knows_positional_entry(
+    context: ToolContext,
+    target: str,
+) -> bool:
+    if not target:
+        return False
+    if target in (context.trusted_draft_words_by_id or {}).values():
+        return True
+    if any(
+        word == target
+        for word, _code in (context.trusted_phrase_types_by_key or {})
+    ):
+        return True
+    return any(
+        str(item.get("word") or "").strip() == target
+        for item in (context.trusted_draft_items_by_id or {}).values()
+        if isinstance(item, dict)
+    )
+
+
+def _positional_message_explicitly_labels_code(
+    message: str,
+    word: str,
+    target_code: str,
+) -> bool:
+    return bool(
+        word
+        and target_code
+        and re.search(
+            rf"{re.escape(word)}\s*的(?:编码|代码)\s*"
+            rf"(?:放在|放到|排在|挪到|移到|提到|提前到)\s*"
+            rf"{re.escape(target_code)}(?:\s|$|[。.!！?？])",
+            message,
+        )
+    )
+
+
+def _positional_destination_is_bound(
+    message: str,
+    word: str,
+    target_code: str,
+    context: ToolContext,
+) -> bool:
+    """Require provenance for every destination in positional syntax.
+
+    Bare ASCII is not evidence that a token is a KeyTao code.  Positional
+    commands therefore need a candidate code returned by a read tool for the
+    moved word.  A named destination additionally needs either explicit quotes
+    or a server-read entry capability.  Legacy ``顺延`` commands keep their
+    existing binding contract and never enter this helper.
+    """
+    parsed = _positional_destination_from_command(message)
+    raw_destination = _raw_positional_destination_from_command(message)
+    if parsed is None and raw_destination is None:
+        return True
+    if parsed is None:
+        return False
+
+    trusted_codes = context.trusted_codes_by_word or {}
+    word_codes = trusted_codes.get(word, frozenset())
+    if not re.fullmatch(_POSITIONAL_REORDER_CODE_PATTERN, target_code):
+        return False
+    if parsed.kind == "code":
+        return bool(
+            parsed.target == target_code
+            and (
+                target_code in word_codes
+                or _positional_message_explicitly_labels_code(
+                    message,
+                    word,
+                    target_code,
+                )
+            )
+        )
+    if target_code not in word_codes:
+        return False
+    if parsed.kind == "entry":
+        return parsed.quoted or _server_knows_positional_entry(
+            context,
+            parsed.target,
+        )
+    return parsed.kind in {"ordinal", "relative"}
 
 
 def _change_transition_is_bound(message: str, old_word: str, new_word: str) -> bool:
@@ -2157,6 +2753,12 @@ class ToolExecutor:
                 # A protection word anywhere else in the message still stops the
                 # shift; one that *is* the entry being moved does not.
                 or _has_protection_outside_target(message, word)
+                or not _positional_destination_is_bound(
+                    message,
+                    word,
+                    target_code,
+                    context,
+                )
                 or not _code_is_bound_to_target(
                     message,
                     word,
