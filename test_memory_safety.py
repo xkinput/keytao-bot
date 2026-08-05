@@ -30,6 +30,7 @@ from keytao_bot.harness.state import (
 from keytao_bot.harness.tools import (
     ToolContext,
     ToolExecutor,
+    _mutation_authorization_view,
     message_authorizes_mutation,
 )
 from keytao_bot.utils.history_store import HistoryStore
@@ -2217,6 +2218,34 @@ class MutationAuthorizationTests(unittest.TestCase):
         self.assertFalse(message_authorizes_mutation("能不能不要提交？"))
         self.assertFalse(message_authorizes_mutation("母版收录了吗？"))
 
+    def test_execution_prefix_does_not_authorize_protection_small_talk(self) -> None:
+        """"执行" opens a command; it must not promote a "保留" protection clause."""
+        for chatter in (
+            "执行结果保留一下",
+            "执行完保留原样",
+            "执行日志保留 7 天",
+            "执行前保留一份快照",
+            "执行的时候保留原来的编码",
+            "执行方案已经保留在文档里",
+            "执行摘要保留在群公告",
+        ):
+            with self.subTest(chatter=chatter):
+                self.assertFalse(message_authorizes_mutation(chatter))
+
+    def test_stripping_a_command_prefix_adds_no_new_authorization_class(self) -> None:
+        """Prefix stripping may only reproduce the un-prefixed verdict."""
+        for bare, prefixed in (
+            ("保留策略", "执行保留策略"),
+            ("结果保留一下", "执行结果保留一下"),
+            ("提交草稿", "执行提交草稿"),
+            ("顺延「吃席」到 wkxk", "执行顺延「吃席」到 wkxk"),
+        ):
+            with self.subTest(bare=bare):
+                self.assertEqual(
+                    message_authorizes_mutation(prefixed),
+                    message_authorizes_mutation(bare),
+                )
+
     def test_staged_mutation_preview_is_complete_or_rejected(self) -> None:
         visible_ids = [f"draft-{index:02d}" for index in range(50)]
         staged = ToolExecutor._stage_agent_mutation(
@@ -2239,6 +2268,261 @@ class MutationAuthorizationTests(unittest.TestCase):
         self.assertTrue(rejected["policyBlocked"])
         self.assertFalse(rejected.get("requiresConfirmation", False))
         self.assertIn("未保存票据", rejected["message"])
+
+
+class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
+    """The natural ways a user asks for a code shift must actually work."""
+
+    async def asyncSetUp(self) -> None:
+        self.calls = []
+
+        async def tool(**kwargs):
+            self.calls.append(kwargs)
+            return {"success": True}
+
+        self.executor = ToolExecutor(lambda _name: tool, frozenset())
+
+    async def _call(self, tool_name, arguments, message, **context_kwargs):
+        """Mirror production: writes_allowed comes from the message itself."""
+        raw = await self.executor.call(
+            tool_name,
+            arguments,
+            ToolContext(
+                current_message=message,
+                writes_allowed=message_authorizes_mutation(message),
+                **context_kwargs,
+            ),
+        )
+        return __import__("json").loads(raw)
+
+    async def _shift(self, message, word="吃席", code="wkxk"):
+        return await self._call(
+            "keytao_shift_phrase_code",
+            {"word": word, "target_code": code},
+            message,
+        )
+
+    async def test_incident_shift_phrasings_all_authorize_and_bind(self) -> None:
+        phrasings = [
+            "确认顺延：吃席 → wkxk，赤溪顺延",
+            "确认执行顺延：吃席 → wkxk，赤溪 → wkxkv",
+            "执行顺延：吃席 wkxk，赤溪 wkxkv",
+            "执行顺延 吃席 wkxk 赤溪 wkxkv",
+            "执行顺延吃席wkxk赤溪wkxkv",
+            "顺延 吃席 wkxk",
+            "顺延：吃席 wkxk",
+            "顺延吃席到wkxk",
+            "把吃席顺延到 wkxk",
+            "请把吃席顺延到 wkxk",
+            "把吃席的编码改成 wkxk",
+            "@我 顺延「吃席」到 wkxk",
+        ]
+        for phrasing in phrasings:
+            with self.subTest(phrasing=phrasing):
+                result = await self._shift(phrasing)
+                self.assertTrue(result.get("success"), phrasing)
+        self.assertEqual(len(self.calls), len(phrasings))
+
+    async def test_unbound_shift_names_the_reason_and_a_working_command(self) -> None:
+        result = await self._shift("把吃席的编码放在赤溪前面")
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(result.get("blockReason"), "verb_not_matched")
+        # The reason must not be blamed on history/memory/quotes any more.
+        self.assertNotIn("不能授权修改草稿", result["message"])
+        self.assertIn("与历史、记忆或引用无关", result["message"])
+        suggestion = result.get("suggestedCommand", "")
+        self.assertTrue(suggestion.startswith("@我 "))
+        self.assertEqual(self.calls, [])
+
+        # The suggestion must be executable exactly as written.
+        replayed = await self._shift(suggestion)
+        self.assertTrue(replayed.get("success"))
+
+    async def test_every_suggested_command_passes_its_own_validator(self) -> None:
+        # Each message is one a real user could send: it asks for this change,
+        # names what it applies to, but is not itself an executable instruction.
+        cases = [
+            (
+                "把吃席的编码放在赤溪前面",
+                "keytao_shift_phrase_code",
+                {"word": "吃席", "target_code": "wkxk"},
+            ),
+            (
+                "把甲加到草稿",
+                "keytao_create_phrase",
+                {"word": "甲", "code": "aa", "action": "Create"},
+            ),
+            ("那条 12 麻烦删掉", "keytao_remove_draft_item", {"pr_id": 12}),
+            ("那几条 12 34 麻烦删掉", "keytao_batch_remove_draft_items", {"ids": [12, 34]}),
+            ("顺便把这个提交掉", "keytao_submit_batch", {}),
+            ("刚才提交错了，想撤回一下", "keytao_recall_batch", {}),
+            (
+                "把甲和乙都加到草稿里",
+                "keytao_batch_add_to_draft",
+                {
+                    "items": [
+                        {"word": "甲", "code": "aa", "action": "Create"},
+                        {"word": "乙", "code": "bb", "action": "Create"},
+                    ]
+                },
+            ),
+        ]
+        for message, tool_name, arguments in cases:
+            with self.subTest(tool=tool_name):
+                blocked = await self._call(tool_name, arguments, message)
+                self.assertTrue(blocked.get("policyBlocked"), tool_name)
+                suggestion = blocked.get("suggestedCommand", "")
+                self.assertTrue(suggestion.startswith("@我 "), f"{tool_name}: {message}")
+                allowed = await self._call(tool_name, arguments, suggestion)
+                self.assertTrue(
+                    allowed.get("success"),
+                    f"{tool_name}: {suggestion}",
+                )
+
+    async def test_a_question_never_receives_a_ready_made_authorization(self) -> None:
+        for message, tool_name, arguments in (
+            (
+                "吃席到底怎么打 wkxk",
+                "keytao_shift_phrase_code",
+                {"word": "吃席", "target_code": "wkxk"},
+            ),
+            (
+                "这是什么意思？",
+                "keytao_create_phrase",
+                {"word": "甲", "code": "aa", "action": "Create"},
+            ),
+            ("看看这张图", "keytao_create_phrase", {"word": "甲", "code": "aa"}),
+            ("提交草稿会怎样？", "keytao_submit_batch", {}),
+            # The user asked for an add; a delete is not what they meant.
+            ("把甲加入草稿", "keytao_remove_draft_item", {"pr_id": 12}),
+        ):
+            with self.subTest(message=message, tool=tool_name):
+                blocked = await self._call(tool_name, arguments, message)
+                self.assertTrue(blocked.get("policyBlocked"))
+                self.assertNotIn("suggestedCommand", blocked)
+        self.assertEqual(self.calls, [])
+
+    def test_authorization_view_keeps_token_boundaries(self) -> None:
+        """Collapsing whitespace away would merge separate tokens into one."""
+        self.assertIn("吃席 wkxk", _mutation_authorization_view("顺延 吃席 wkxk"))
+        self.assertIn("吃席 wkxk", _mutation_authorization_view("顺延：吃席 wkxk"))
+        self.assertIn("12 34", _mutation_authorization_view("删除草稿条目 12 34"))
+
+    async def test_separate_ids_do_not_merge_into_one_token(self) -> None:
+        merged = await self._call(
+            "keytao_batch_remove_draft_items",
+            {"ids": [1234]},
+            "删除草稿条目 12 34",
+        )
+        separate = await self._call(
+            "keytao_batch_remove_draft_items",
+            {"ids": [12, 34]},
+            "删除草稿条目 12 34",
+        )
+
+        self.assertTrue(merged.get("policyBlocked"))
+        self.assertTrue(separate.get("success"))
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_code_written_next_to_the_word_still_binds(self) -> None:
+        """The code touching the target is the instruction, not noise."""
+        adjacent = await self._shift("执行顺延吃席wkxk赤溪wkxkv")
+        spaced = await self._shift("顺延：吃席 wkxk")
+
+        self.assertTrue(adjacent.get("success"))
+        self.assertTrue(spaced.get("success"))
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_a_suggestion_can_only_name_what_the_user_named(self) -> None:
+        """The model's own parameters must not become a ready-made command."""
+        for tool_name, arguments in (
+            # The user's message is the incident's first sentence; only the
+            # proposed parameters are the attacker's.
+            ("keytao_shift_phrase_code", {"word": "攻击者选的词", "target_code": "zzzz"}),
+            ("keytao_create_phrase", {"word": "机密", "code": "zzzz", "action": "Create"}),
+            ("keytao_remove_draft_item", {"pr_id": 99}),
+            ("keytao_batch_remove_draft_items", {"ids": [98, 99]}),
+            (
+                "keytao_batch_add_to_draft",
+                {"items": [{"word": "机密", "code": "zzzz", "action": "Create"}]},
+            ),
+        ):
+            with self.subTest(tool=tool_name):
+                blocked = await self._call(
+                    tool_name, arguments, "把吃席的编码放在赤溪前面"
+                )
+                self.assertTrue(blocked.get("policyBlocked"))
+                self.assertNotIn("suggestedCommand", blocked)
+        self.assertEqual(self.calls, [])
+
+    async def test_position_words_alone_never_produce_a_command(self) -> None:
+        for chatter in (
+            "我前面说错了",
+            "占用率有点高",
+            "放到明天再说",
+            "调到静音模式",
+            "插入一张图片看看",
+            "排在我后面的是谁",
+            "提前告诉我结果",
+            "这个位置不太好",
+            "往前翻翻",
+            "后面再说吧",
+        ):
+            with self.subTest(chatter=chatter):
+                blocked = await self._shift(chatter)
+                self.assertTrue(blocked.get("policyBlocked"))
+                self.assertNotIn("suggestedCommand", blocked)
+        self.assertEqual(self.calls, [])
+
+    async def test_quoted_entry_that_is_itself_a_verb_still_authorizes(self) -> None:
+        shifted = await self._shift("把「保留」顺延到 wkxk", word="保留")
+        changed = await self._shift("把「提交」改成 abcd", word="提交", code="abcd")
+
+        self.assertTrue(shifted.get("success"))
+        self.assertTrue(changed.get("success"))
+
+    async def test_quoted_verb_entry_can_be_deleted_by_name(self) -> None:
+        raw = await self.executor.call(
+            "keytao_remove_draft_item",
+            {"pr_id": 7},
+            ToolContext(
+                current_message="把「修改」删除",
+                writes_allowed=True,
+                trusted_draft_words_by_id={"7": "修改"},
+                trusted_draft_items_by_id={
+                    "7": {"word": "修改", "code": "aa", "type": "Phrase"},
+                },
+            ),
+        )
+
+        self.assertTrue(__import__("json").loads(raw).get("success"))
+
+    async def test_quoted_full_command_cannot_bind_a_delete_target(self) -> None:
+        result = await self.executor.call(
+            "keytao_remove_draft_item",
+            {"pr_id": 12},
+            ToolContext(
+                current_message="添加「删除草稿条目 12」 aa",
+                writes_allowed=True,
+            ),
+        )
+
+        self.assertTrue(__import__("json").loads(result).get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+    async def test_quoted_note_is_still_untrusted_when_marked_as_a_quote(self) -> None:
+        result = await self.executor.call(
+            "keytao_create_phrase",
+            {"word": "甲", "code": "aa", "action": "Create"},
+            ToolContext(
+                current_message="请添加「乙」 bb，并引用“不要添加甲 aa”作为备注",
+                writes_allowed=True,
+            ),
+        )
+
+        self.assertTrue(__import__("json").loads(result).get("policyBlocked"))
+        self.assertEqual(self.calls, [])
 
 
 class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
@@ -2744,6 +3028,707 @@ def _fake_response(finish_reason, content="", tool_calls=None):
         )],
         usage=None,
     )
+
+
+class _ShiftSkills:
+    @staticmethod
+    def get_skill_instructions():
+        return ""
+
+    @staticmethod
+    def has_tools():
+        return True
+
+    @staticmethod
+    def get_tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "keytao_shift_phrase_code",
+                    "description": "Shift a code",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "word": {"type": "string"},
+                            "target_code": {"type": "string"},
+                        },
+                        "required": ["word", "target_code"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "keytao_list_draft_items",
+                    "description": "Read the draft",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
+
+def _shift_orchestrator(client, tool_func, state_store=None):
+    return AgentOrchestrator(
+        client_factory=lambda: client,
+        runtime=AgentRuntimeConfig(
+            model="fake-model",
+            max_tokens=500,
+            temperature=0.0,
+            timeout=10.0,
+        ),
+        skills_manager=_ShiftSkills(),
+        tool_executor=ToolExecutor(
+            lambda name: tool_func if name == "keytao_shift_phrase_code" else None,
+            frozenset({"keytao_shift_phrase_code"}),
+        ),
+        state_store=state_store or MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+
+
+def _shift_tool_call(call_id="call-shift"):
+    return types.SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=types.SimpleNamespace(
+            name="keytao_shift_phrase_code",
+            arguments='{"word": "吃席", "target_code": "wkxk"}',
+        ),
+    )
+
+
+class TrustedBatchAnchorTests(unittest.IsolatedAsyncioTestCase):
+    """A model may only address batches the server itself surfaced."""
+
+    async def asyncSetUp(self) -> None:
+        self.delivered = []
+
+        async def tool(**kwargs):
+            self.delivered.append(kwargs)
+            result = {"success": False, "message": "无权限操作此批次"}
+            # Mirrors _inject_known_batch_url: the requested id is echoed back
+            # even when the call failed.
+            result.setdefault("batchId", kwargs.get("batch_id"))
+            return result
+
+        self.executor = ToolExecutor(lambda _name: tool, frozenset())
+
+    async def _call(self, tool_name, arguments, message, trusted=frozenset()):
+        raw = await self.executor.call(
+            tool_name,
+            arguments,
+            ToolContext(
+                current_message=message,
+                writes_allowed=message_authorizes_mutation(message),
+                trusted_batch_ids=frozenset(trusted),
+            ),
+        )
+        return __import__("json").loads(raw)
+
+    async def test_a_write_cannot_launder_a_foreign_batch_id(self) -> None:
+        victim = "victim-batch-uuid-0000"
+        trusted: set = set()
+
+        blocked_read = await self._call(
+            "keytao_get_batch_preview", {"batch_id": victim}, "看看草稿", trusted
+        )
+        self.assertEqual(blocked_read.get("blockReason"), "untrusted_batch_reference")
+
+        # Hop 1: smuggle the id through a write whose word/code bind correctly.
+        blocked_write = await self._call(
+            "keytao_create_phrase",
+            {"word": "甲", "code": "aa", "action": "Create", "batch_id": victim},
+            "添加「甲」 aa",
+            trusted,
+        )
+        self.assertEqual(blocked_write.get("blockReason"), "untrusted_batch_reference")
+        self.assertEqual(self.delivered, [])
+
+        # Hop 2: even if such a result were seen, it must not become trusted.
+        AgentOrchestrator._collect_trusted_batch_ids(
+            {"success": False, "batchId": victim}, trusted, {"batch_id": victim}
+        )
+        self.assertEqual(trusted, set())
+
+        blocked_again = await self._call(
+            "keytao_get_batch_preview", {"batch_id": victim}, "看看草稿", trusted
+        )
+        self.assertEqual(blocked_again.get("blockReason"), "untrusted_batch_reference")
+
+    async def test_a_server_returned_batch_id_stays_usable(self) -> None:
+        trusted: set = set()
+        AgentOrchestrator._collect_trusted_batch_ids(
+            {"success": True, "batchId": "mine-1"}, trusted, {}
+        )
+        self.assertEqual(trusted, {"mine-1"})
+
+        allowed = await self._call(
+            "keytao_get_batch_preview", {"batch_id": "mine-1"}, "看看草稿", trusted
+        )
+        self.assertNotIn("blockReason", allowed)
+        self.assertEqual(len(self.delivered), 1)
+
+    async def test_internal_callers_may_anchor_without_a_message(self) -> None:
+        raw = await self.executor.call(
+            "keytao_list_draft_items",
+            {"batch_id": "restored-42"},
+            ToolContext("qq", "user-1"),
+        )
+
+        self.assertNotIn("blockReason", __import__("json").loads(raw))
+        self.assertEqual(len(self.delivered), 1)
+
+
+class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_read_only_turn_offers_no_write_tools(self) -> None:
+        client = _FakeClient([_fake_response("stop", "草稿里有 2 条。")])
+
+        async def never(**kwargs):
+            raise AssertionError("write tool must not run")
+
+        await _shift_orchestrator(client, never).run(
+            "现在草稿里有什么？",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=False,
+            ),
+        )
+
+        offered = {
+            tool["function"]["name"]
+            for tool in client.completions.calls[0].get("tools", [])
+        }
+        self.assertNotIn("keytao_shift_phrase_code", offered)
+        self.assertIn("keytao_list_draft_items", offered)
+
+    async def test_write_turn_still_offers_write_tools(self) -> None:
+        client = _FakeClient([_fake_response("stop", "好的。")])
+
+        async def never(**kwargs):
+            raise AssertionError("no tool call expected")
+
+        await _shift_orchestrator(client, never).run(
+            "顺延「吃席」到 wkxk",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=True,
+            ),
+        )
+
+        offered = {
+            tool["function"]["name"]
+            for tool in client.completions.calls[0].get("tools", [])
+        }
+        self.assertIn("keytao_shift_phrase_code", offered)
+
+    async def test_withheld_write_tool_answers_with_a_reason_not_a_crash(self) -> None:
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call()]),
+            _fake_response("stop", "本轮只读，已说明需要的指令。"),
+        ])
+        calls = []
+
+        async def never(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        result = await _shift_orchestrator(client, never).run(
+            "把吃席的编码放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=False,
+            ),
+        )
+
+        tool_reply = next(
+            item for item in client.completions.calls[1]["messages"]
+            if item.get("role") == "tool"
+        )
+        payload = __import__("json").loads(tool_reply["content"])
+        self.assertEqual(payload["blockReason"], "verb_not_matched")
+        self.assertTrue(payload["suggestedCommand"].startswith("@我 "))
+        self.assertEqual(calls, [])
+        self.assertEqual(result, "本轮只读，已说明需要的指令。")
+
+    async def test_one_reason_is_explained_once_per_turn(self) -> None:
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call("call-1")]),
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call("call-2")]),
+            _fake_response("stop", "做不到，已说明原因。"),
+        ])
+
+        async def never(**kwargs):
+            raise AssertionError("write tool must not run")
+
+        await _shift_orchestrator(client, never).run(
+            "把吃席的编码放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=False,
+            ),
+        )
+
+        tool_replies = [
+            __import__("json").loads(item["content"])
+            for item in client.completions.calls[2]["messages"]
+            if item.get("role") == "tool"
+        ]
+        self.assertEqual(len(tool_replies), 2)
+        self.assertNotIn("repeatedBlock", tool_replies[0])
+        self.assertTrue(tool_replies[1].get("repeatedBlock"))
+        self.assertNotIn("suggestedCommand", tool_replies[1])
+        self.assertIn("本轮已说明过", tool_replies[1]["message"])
+        self.assertNotIn("原样转述", tool_replies[1]["message"])
+        self.assertIn("原样转述", tool_replies[0]["message"])
+
+
+class ReadOnlyAuthorizationRequestTests(unittest.IsolatedAsyncioTestCase):
+    """A read-only turn must still be able to hand back an exact command."""
+
+    @staticmethod
+    def _authorization_call(tool="keytao_shift_phrase_code", arguments=None):
+        payload = {
+            "tool": tool,
+            "arguments": arguments or {"word": "吃席", "target_code": "wkxk"},
+        }
+        return types.SimpleNamespace(
+            id="call-auth",
+            type="function",
+            function=types.SimpleNamespace(
+                name="keytao_request_write_authorization",
+                arguments=__import__("json").dumps(payload, ensure_ascii=False),
+            ),
+        )
+
+    async def _run_turn(self, message, tool_calls=None, final="好的。"):
+        responses = []
+        if tool_calls:
+            responses.append(_fake_response("tool_calls", tool_calls=tool_calls))
+        responses.append(_fake_response("stop", final))
+        client = _FakeClient(responses)
+
+        async def never(**kwargs):
+            raise AssertionError("write tool must not run")
+
+        result = await _shift_orchestrator(client, never).run(
+            message,
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=False,
+            ),
+        )
+        return client, result
+
+    async def test_change_request_turn_offers_the_authorization_tool(self) -> None:
+        client, _ = await self._run_turn("把吃席的编码放在赤溪前面")
+
+        offered = {
+            tool["function"]["name"]
+            for tool in client.completions.calls[0].get("tools", [])
+        }
+        self.assertIn("keytao_request_write_authorization", offered)
+        self.assertNotIn("keytao_shift_phrase_code", offered)
+
+    async def test_question_turn_offers_no_authorization_tool(self) -> None:
+        client, _ = await self._run_turn("吃席到底怎么打 wkxk")
+
+        offered = {
+            tool["function"]["name"]
+            for tool in client.completions.calls[0].get("tools", [])
+        }
+        self.assertNotIn("keytao_request_write_authorization", offered)
+        self.assertNotIn("keytao_shift_phrase_code", offered)
+
+    async def test_authorization_tool_returns_a_self_checked_command(self) -> None:
+        client, _ = await self._run_turn(
+            "把吃席的编码放在赤溪前面",
+            tool_calls=[self._authorization_call()],
+            final="请发送：@我 顺延「吃席」到 wkxk",
+        )
+
+        payload = __import__("json").loads(next(
+            item for item in client.completions.calls[1]["messages"]
+            if item.get("role") == "tool"
+        )["content"])
+        self.assertEqual(payload["suggestedCommand"], "@我 顺延「吃席」到 wkxk")
+        self.assertNotIn("planDigest", payload)
+        self.assertNotIn("确认票据", payload["message"])
+
+        # And the command it handed out really is executable.
+        calls = []
+
+        async def shift(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        executor = ToolExecutor(lambda _name: shift, frozenset())
+        replayed = await executor.call(
+            "keytao_shift_phrase_code",
+            {"word": "吃席", "target_code": "wkxk"},
+            ToolContext(
+                current_message=payload["suggestedCommand"],
+                writes_allowed=message_authorizes_mutation(
+                    payload["suggestedCommand"]
+                ),
+            ),
+        )
+        self.assertTrue(__import__("json").loads(replayed).get("success"))
+        self.assertEqual(len(calls), 1)
+
+    async def test_authorization_tool_refuses_to_invent_one_for_a_question(self) -> None:
+        client, _ = await self._run_turn(
+            "吃席到底怎么打 wkxk",
+            tool_calls=[self._authorization_call()],
+            final="这是当前编码说明。",
+        )
+
+        payload = __import__("json").loads(next(
+            item for item in client.completions.calls[1]["messages"]
+            if item.get("role") == "tool"
+        )["content"])
+        self.assertNotIn("suggestedCommand", payload)
+        self.assertIn("不要自己编", payload["message"])
+
+
+class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bound_shift_executes_without_asking_for_a_ticket(self) -> None:
+        calls = []
+
+        async def shift(**kwargs):
+            calls.append(kwargs)
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "message": "顺延会移动其他词条，请核对",
+                    "batchId": "batch-1",
+                    "contentVersion": 4,
+                    "planDigest": "a" * 64,
+                    "shiftPlan": {"word": "吃席", "targetCode": "wkxk"},
+                }
+            return {"success": True, "message": "已写入草稿；顺延：赤溪 wkxk→wkxkv"}
+
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call()]),
+            _fake_response("stop", "已完成顺延。"),
+        ])
+        state_store = MemoryConversationStateStore()
+        result = await _shift_orchestrator(client, shift, state_store).run(
+            "顺延「吃席」到 wkxk",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["confirmed_plan_digest"], "a" * 64)
+        self.assertEqual(calls[1]["batch_id"], "batch-1")
+        self.assertEqual(calls[1]["expected_content_version"], 4)
+        tool_reply = next(
+            item for item in client.completions.calls[1]["messages"]
+            if item.get("role") == "tool"
+        )
+        self.assertTrue(__import__("json").loads(tool_reply["content"])["success"])
+        # One authorization, no confirmation ticket left behind.
+        self.assertIsNone(
+            state_store.get_record(ConversationAddress.private("qq", "user-1"))
+        )
+        self.assertEqual(result, "已完成顺延。")
+
+    async def test_shift_without_any_draft_executes_in_one_authorization(self) -> None:
+        """One confirmation materialises a draft from the absence baseline."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        calls = []
+        current_draft = {"batch_id": "", "content_version": 0}
+        warning_digest = "b" * 64
+
+        async def shift(**kwargs):
+            calls.append(kwargs)
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "planDigest": "a" * 64,
+                    "shiftPlan": {"word": "吃席", "targetCode": "wkxk"},
+                }
+            if (
+                str(kwargs.get("batch_id") or "") != current_draft["batch_id"]
+                or kwargs.get("expected_content_version") != current_draft["content_version"]
+            ):
+                return {
+                    "success": False,
+                    "staleConfirmation": True,
+                    "message": "顺延计划或草稿内容已变化",
+                }
+            if not kwargs.get("expected_warning_digest"):
+                # Real Next returns a provisional UUID even though its CAS
+                # baseline is still "no draft exists".
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "provisional-uuid",
+                    "contentVersion": 0,
+                    "planDigest": "a" * 64,
+                    "warningDigest": warning_digest,
+                    "warnings": [],
+                    "message": "请确认写入草稿",
+                }
+            if kwargs.get("expected_warning_digest") != warning_digest:
+                return {
+                    "success": False,
+                    "staleConfirmation": True,
+                    "message": "警告快照已变化",
+                }
+            current_draft.update(batch_id="materialised-1", content_version=1)
+            return {
+                "success": True,
+                "batchId": "materialised-1",
+                "contentVersion": 1,
+                "draft_snapshot": {
+                    "count": 1,
+                    "items": [{"word": "吃席", "code": "wkxk"}],
+                    "summary": {"added": 1, "modified": 0, "deleted": 0},
+                },
+                "message": "已写入草稿",
+            }
+
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call()]),
+            _fake_response("stop", "已完成顺延。"),
+        ])
+        state_store = MemoryConversationStateStore()
+        result = await _shift_orchestrator(client, shift, state_store).run(
+            "顺延「吃席」到 wkxk",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=True,
+            ),
+        )
+
+        address = ConversationAddress.private("qq", "user-1")
+        record = state_store.pop_record(address)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result, "已完成顺延。")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.args["batch_id"], "")
+        self.assertEqual(record.state.args["expected_content_version"], 0)
+        self.assertEqual(record.state.args["expected_warning_digest"], warning_digest)
+
+        old_call_tool_function = chat_module.call_tool_function
+        try:
+            async def fake_call_tool_function(
+                tool_name, arguments, platform=None, user_id=None
+            ):
+                if tool_name == "keytao_shift_phrase_code":
+                    return __import__("json").dumps(
+                        await shift(**arguments), ensure_ascii=False
+                    )
+                if tool_name == "keytao_get_batch_preview":
+                    return __import__("json").dumps({
+                        "success": True,
+                        "batchId": current_draft["batch_id"],
+                        "summary": {"added": 1, "modified": 0, "deleted": 0},
+                        "diff_text": "+ 吃席 wkxk",
+                    }, ensure_ascii=False)
+                raise AssertionError((tool_name, arguments))
+
+            chat_module.call_tool_function = fake_call_tool_function
+            confirmation = await chat_module._execute_confirmed_tool(
+                record.state,
+                "qq",
+                "user-1",
+                address,
+                address.space_key,
+                "user-1",
+            )
+        finally:
+            chat_module.call_tool_function = old_call_tool_function
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[2]["batch_id"], "")
+        self.assertEqual(calls[2]["expected_content_version"], 0)
+        self.assertEqual(calls[2]["expected_warning_digest"], warning_digest)
+        self.assertEqual(current_draft["batch_id"], "materialised-1")
+        self.assertIn("操作已完成", confirmation)
+        self.assertIsNone(state_store.get_record(address))
+
+    async def test_shift_absence_ticket_rejects_a_new_draft_before_confirmation(self) -> None:
+        """The absence sentinel must still reject real pointer drift."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        address = ConversationAddress.private("qq", "user-drift")
+        state_store = MemoryConversationStateStore()
+        current_draft = {"batch_id": "", "content_version": 0}
+        calls = []
+        warning_digest = "b" * 64
+
+        async def fake_call_tool_function(
+            tool_name, arguments, platform=None, user_id=None
+        ):
+            if tool_name != "keytao_shift_phrase_code":
+                raise AssertionError((tool_name, arguments))
+            calls.append(dict(arguments))
+            if not arguments.get("expected_warning_digest"):
+                return __import__("json").dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "provisional-uuid",
+                    "contentVersion": 0,
+                    "planDigest": "a" * 64,
+                    "warningDigest": warning_digest,
+                    "warnings": [],
+                    "message": "请确认写入草稿",
+                }, ensure_ascii=False)
+            if (
+                str(arguments.get("batch_id") or "") != current_draft["batch_id"]
+                or arguments.get("expected_content_version")
+                != current_draft["content_version"]
+            ):
+                return __import__("json").dumps({
+                    "success": False,
+                    "staleConfirmation": True,
+                    "message": "顺延计划或草稿内容已变化",
+                }, ensure_ascii=False)
+            raise AssertionError("a drifted absence ticket must not write")
+
+        old_state_store = chat_module.conversation_state_store
+        old_call_tool_function = chat_module.call_tool_function
+        try:
+            chat_module.conversation_state_store = state_store
+            chat_module.call_tool_function = fake_call_tool_function
+            await chat_module._execute_confirmed_tool(
+                PendingToolConfirm(
+                    function_name="keytao_shift_phrase_code",
+                    args={
+                        "word": "吃席",
+                        "target_code": "wkxk",
+                        "confirmed_plan_digest": "a" * 64,
+                        "batch_id": "",
+                        "expected_content_version": 0,
+                    },
+                    confirmation_source="local_preview",
+                ),
+                "qq",
+                "user-drift",
+                address,
+                address.space_key,
+                "user-drift",
+            )
+            record = state_store.pop_record(address)
+            self.assertIsNotNone(record)
+            self.assertEqual(record.state.args["batch_id"], "")
+            self.assertEqual(record.state.args["expected_content_version"], 0)
+            self.assertEqual(
+                record.state.args["expected_warning_digest"], warning_digest
+            )
+
+            # A real draft appears after the preview, so the absence CAS must
+            # reject this otherwise-valid warning ticket.
+            current_draft.update(batch_id="appeared-draft", content_version=1)
+            result = await chat_module._execute_confirmed_tool(
+                record.state,
+                "qq",
+                "user-drift",
+                address,
+                address.space_key,
+                "user-drift",
+            )
+        finally:
+            chat_module.call_tool_function = old_call_tool_function
+            chat_module.conversation_state_store = old_state_store
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["batch_id"], "")
+        self.assertEqual(calls[1]["expected_content_version"], 0)
+        self.assertEqual(calls[1]["expected_warning_digest"], warning_digest)
+        self.assertIn("草稿内容已变化", result)
+
+    async def test_a_missing_version_still_blocks_auto_confirmation(self) -> None:
+        """An empty batch id only counts together with version 0."""
+        calls = []
+
+        async def shift(**kwargs):
+            calls.append(kwargs)
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "confirmationKind": "shiftPlan",
+                "batchId": "",
+                "contentVersion": 7,
+                "planDigest": "a" * 64,
+            }
+
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call()]),
+            _fake_response("stop", "需要确认。"),
+        ])
+        await _shift_orchestrator(client, shift).run(
+            "顺延「吃席」到 wkxk",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 1)
+
+    async def test_a_saved_shift_ticket_carries_the_server_plan(self) -> None:
+        async def shift(**kwargs):
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "batch-1",
+                    "contentVersion": 4,
+                    "planDigest": "a" * 64,
+                }
+            # The write itself still raises a server risk warning.
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "batch-1",
+                "contentVersion": 4,
+                "warningDigest": "b" * 64,
+                "message": "存在重码风险",
+            }
+
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call()]),
+            _fake_response("stop", "需要你确认风险。"),
+        ])
+        state_store = MemoryConversationStateStore()
+        await _shift_orchestrator(client, shift, state_store).run(
+            "顺延「吃席」到 wkxk",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=True,
+            ),
+        )
+
+        record = state_store.get_record(ConversationAddress.private("qq", "user-1"))
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.args["confirmed_plan_digest"], "a" * 64)
+        self.assertEqual(record.state.args["batch_id"], "batch-1")
+        self.assertEqual(record.state.args["expected_content_version"], 4)
+        self.assertEqual(record.state.args["expected_warning_digest"], "b" * 64)
 
 
 class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):

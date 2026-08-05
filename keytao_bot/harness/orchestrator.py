@@ -4,7 +4,7 @@ import json
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -19,7 +19,15 @@ from keytao_bot.utils.history_store import _parse_stored_timestamp
 
 from .state import MemoryConversationStateStore, PendingToolConfirm
 from .conversation import ConversationAddress
-from .tools import MUTATING_TOOL_NAMES, ToolContext, ToolExecutor
+from .tools import (
+    BLOCK_REASON_VERB_NOT_MATCHED,
+    MUTATING_TOOL_NAMES,
+    ToolContext,
+    ToolExecutor,
+    message_mentions_change_request,
+    policy_block,
+    self_checked_suggested_command,
+)
 
 
 AUTHORITATIVE_LINK_TOOLS = frozenset({
@@ -33,6 +41,45 @@ AUTHORITATIVE_LINK_TOOLS = frozenset({
     "keytao_recall_batch",
     "keytao_get_batch_preview",
 })
+
+
+WRITE_AUTHORIZATION_TOOL_NAME = "keytao_request_write_authorization"
+# Read-only stand-in for the withheld write tools.  It writes nothing; it turns
+# a proposed call into the one command the validators are known to accept, so
+# the wording never has to be guessed by the model.
+WRITE_AUTHORIZATION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": WRITE_AUTHORIZATION_TOOL_NAME,
+        "description": (
+            "本轮无写权限时，用它换取用户可直接发送的授权指令。不会写入任何数据。"
+            "传入你本来打算调用的写工具名和完整参数，返回 suggestedCommand；"
+            "必须把 suggestedCommand 原样转述给用户，不要改写格式。"
+            "若返回没有 suggestedCommand，就只说明原因，不要自己编一条指令。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "enum": sorted(MUTATING_TOOL_NAMES),
+                    "description": "你本来打算调用的写工具名",
+                },
+                "arguments": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "你本来打算传给该写工具的完整参数",
+                },
+            },
+            "required": ["tool", "arguments"],
+        },
+    },
+}
+
+
+def _tool_function_name(tool: Any) -> str:
+    function = tool.get("function") if isinstance(tool, dict) else None
+    return str(function.get("name") or "") if isinstance(function, dict) else ""
 
 
 class DuplicateToolCallAbort(Exception):
@@ -177,13 +224,50 @@ class AgentOrchestrator:
         # Image-derived text is untrusted data. Do not expose even read/network tools:
         # a visual prompt injection could otherwise read private data and exfiltrate it.
         tools = None
+        withheld_tool_names: set[str] = set()
         if not context.visual_context and self._skills_manager.has_tools():
             tools = self._skills_manager.get_tools()
+            if not context.mutations_allowed:
+                # A read-only turn must not advertise write tools at all.  Every
+                # call would be rejected by policy anyway, and offering them is
+                # what used to make the model retry with a new invented format
+                # on every rejection.
+                withheld_tool_names = {
+                    name for name in (
+                        _tool_function_name(tool) for tool in tools
+                    )
+                    if name in MUTATING_TOOL_NAMES
+                }
+                tools = [
+                    tool for tool in tools
+                    if _tool_function_name(tool) not in MUTATING_TOOL_NAMES
+                ]
+                guidance = (
+                    "本轮为只读轮：用户这条消息没有构成明确的写操作授权，"
+                    "写工具已从工具清单中移除。请直接向用户说明需要什么样的指令，"
+                    "不要自创格式。"
+                )
+                # The user did ask for a change, they just did not phrase it as
+                # an executable instruction.  Without a reachable way to obtain
+                # the exact wording, a well-behaved model (which will not call a
+                # tool that is not offered) has to invent one - the precise
+                # failure this workstream exists to remove.
+                if withheld_tool_names and message_mentions_change_request(message):
+                    tools.append(WRITE_AUTHORIZATION_TOOL)
+                    guidance = (
+                        "本轮为只读轮：用户描述了想做的改动，但这条消息没有构成明确的写操作授权，"
+                        f"写工具已从工具清单中移除。请先查清所需参数，再调用 "
+                        f"{WRITE_AUTHORIZATION_TOOL_NAME} 换取用户可直接发送的指令，"
+                        "并原样转述返回的 suggestedCommand，不要自创格式。"
+                    )
+                messages.append({"role": "system", "content": guidance})
         tool_schemas: Dict[str, Dict[str, Any]] = {}
         for tool in tools or []:
             function = tool.get("function") if isinstance(tool, dict) else None
             if isinstance(function, dict):
                 tool_schemas[str(function.get("name") or "")] = function.get("parameters", {})
+        # One (reason, tool, arguments) gets one full explanation per turn.
+        reported_block_reasons: set[tuple] = set()
         conv_key = context.conversation_address
         current_max_tokens = self._initial_max_tokens(message)
         seen_tool_calls: Dict[tuple, int] = {}
@@ -195,6 +279,7 @@ class AgentOrchestrator:
         trusted_draft_items_by_id: Dict[str, Dict[str, str]] = {}
         trusted_phrase_types_by_key: Dict[tuple[str, str], frozenset[str]] = {}
         trusted_reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
+        trusted_batch_ids: set[str] = set()
         unresolved_pronunciation_words: set[str] = set()
         authoritative_result_links: Dict[str, str] = {}
         receipt_run_id = uuid.uuid4().hex
@@ -314,6 +399,13 @@ class AgentOrchestrator:
                     response_tool_calls,
                     tool_schemas,
                     seen_tool_call_ids,
+                    # Naming a tool that is not on this turn's list must produce
+                    # an explanation, never an opaque protocol error.
+                    withheld_tool_names | (
+                        {WRITE_AUTHORIZATION_TOOL_NAME}
+                        if not context.mutations_allowed
+                        else set()
+                    ),
                 )
             except ToolCallValidationError as error:
                 if error.retryable and current_max_tokens < self._runtime.max_tokens_cap:
@@ -386,11 +478,13 @@ class AgentOrchestrator:
                         context.mutations_allowed
                         and not bool(context.visual_context)
                     ),
+                    attachment_context=bool(context.visual_context),
                     trusted_codes_by_word=trusted_codes_by_word,
                     trusted_draft_words_by_id=trusted_draft_words_by_id,
                     trusted_draft_items_by_id=trusted_draft_items_by_id,
                     trusted_phrase_types_by_key=trusted_phrase_types_by_key,
                     trusted_reviewed_items_by_key=trusted_reviewed_items_by_key,
+                    trusted_batch_ids=frozenset(trusted_batch_ids),
                 )
                 try:
                     canonical_fn_args = self._tool_executor.canonicalize_arguments(
@@ -407,7 +501,33 @@ class AgentOrchestrator:
                             or tool_word in reviewed_words_in_batch
                         )
                     )
-                    if encode_blocked:
+                    if fn_name == WRITE_AUTHORIZATION_TOOL_NAME:
+                        result_str = json.dumps(
+                            self._write_authorization_answer(
+                                canonical_fn_args,
+                                tool_context,
+                            ),
+                            ensure_ascii=False,
+                        )
+                    elif fn_name in withheld_tool_names:
+                        # The tool was never offered this turn.  Answer with the
+                        # real reason and a self-checked command instead of an
+                        # opaque protocol error.
+                        logger.warning(
+                            f"Model called a withheld write tool on a read-only turn: {fn_name}"
+                        )
+                        result_str = json.dumps(policy_block(
+                            BLOCK_REASON_VERB_NOT_MATCHED,
+                            "安全拦截：本轮没有收到明确的写操作指令，写工具未启用"
+                            "（与历史、记忆或引用无关）。",
+                            missing=["executionVerb"],
+                            suggestion=self_checked_suggested_command(
+                                fn_name,
+                                canonical_fn_args,
+                                tool_context,
+                            ),
+                        ), ensure_ascii=False)
+                    elif encode_blocked:
                         logger.warning(
                             "Blocked reviewed-add encode fallback: word=%s unresolved=%s",
                             tool_word,
@@ -454,6 +574,31 @@ class AgentOrchestrator:
 
                 try:
                     result_data = json.loads(result_str)
+                    # Learn the batch the server just named before replaying the
+                    # call against it, so the replay passes the anchor check.
+                    self._collect_trusted_batch_ids(
+                        result_data, trusted_batch_ids, canonical_fn_args
+                    )
+                    auto_confirmed = await self._auto_confirm_shift_plan(
+                        fn_name,
+                        canonical_fn_args,
+                        result_data,
+                        replace(
+                            tool_context,
+                            trusted_batch_ids=frozenset(trusted_batch_ids),
+                        ),
+                    )
+                    if auto_confirmed is not None:
+                        # Everything downstream must describe the call that was
+                        # actually executed, not the discarded preview.
+                        result_data, result_str, canonical_fn_args = auto_confirmed
+                    result_str = self._deduplicate_block_reason(
+                        result_data,
+                        result_str,
+                        reported_block_reasons,
+                        fn_name,
+                        canonical_fn_args,
+                    )
                     if (
                         fn_name == "keytao_prepare_reviewed_add"
                         and result_data.get("pronunciationUnresolved") is True
@@ -475,6 +620,9 @@ class AgentOrchestrator:
                             result_data,
                             authoritative_result_links,
                         )
+                    self._collect_trusted_batch_ids(
+                        result_data, trusted_batch_ids, canonical_fn_args
+                    )
                     self._update_trusted_capabilities(
                         fn_name,
                         canonical_fn_args,
@@ -854,7 +1002,9 @@ class AgentOrchestrator:
         tool_calls: List[Any],
         tool_schemas: Dict[str, Dict[str, Any]],
         seen_tool_call_ids: set[str],
+        withheld_tool_names: Optional[set] = None,
     ) -> List[tuple]:
+        withheld = withheld_tool_names or set()
         if len(tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
             raise ToolCallValidationError(
                 f"too many tool calls: {len(tool_calls)} > {_MAX_TOOL_CALLS_PER_RESPONSE}"
@@ -874,7 +1024,7 @@ class AgentOrchestrator:
 
             function = getattr(tool_call, "function", None)
             fn_name = str(getattr(function, "name", "") or "").strip()
-            if not fn_name or fn_name not in tool_schemas:
+            if not fn_name or (fn_name not in tool_schemas and fn_name not in withheld):
                 raise ToolCallValidationError(f"unknown tool: {fn_name or '(missing)'}")
 
             raw_arguments = getattr(function, "arguments", None)
@@ -890,9 +1040,14 @@ class AgentOrchestrator:
             if not isinstance(arguments, dict):
                 raise ToolCallValidationError(f"tool arguments for {fn_name} must be an object")
 
-            schema_error = self._validate_json_schema(arguments, tool_schemas[fn_name], "arguments")
-            if schema_error:
-                raise ToolCallValidationError(f"invalid arguments for {fn_name}: {schema_error}")
+            if fn_name in tool_schemas:
+                schema_error = self._validate_json_schema(
+                    arguments, tool_schemas[fn_name], "arguments"
+                )
+                if schema_error:
+                    raise ToolCallValidationError(
+                        f"invalid arguments for {fn_name}: {schema_error}"
+                    )
 
             batch_ids.add(call_id)
             parsed_tool_calls.append((tool_call, arguments))
@@ -979,6 +1134,202 @@ class AgentOrchestrator:
         seen_tool_calls[call_fingerprint] = 1
         return await self._tool_executor.call(fn_name, fn_args, tool_context)
 
+    @staticmethod
+    def _collect_trusted_batch_ids(
+        result_data: Dict,
+        trusted: set,
+        call_arguments: Optional[Dict] = None,
+    ) -> None:
+        """Remember every batch id the server itself put in front of us.
+
+        An id the caller supplied is never learned from the answer that echoes
+        it back: results carry the requested batch id even when the call failed,
+        so trusting it would let one rejected write turn any id the model names
+        into a "server-provided" one.
+        """
+        if not isinstance(result_data, dict):
+            return
+        supplied = ""
+        if isinstance(call_arguments, dict):
+            supplied = str(call_arguments.get("batch_id") or "").strip()
+        for key in ("batchId", "batch_id"):
+            value = str(result_data.get(key) or "").strip()
+            if value and value != supplied:
+                trusted.add(value)
+        snapshot = result_data.get("draft_snapshot")
+        if isinstance(snapshot, dict):
+            AgentOrchestrator._collect_trusted_batch_ids(
+                snapshot, trusted, call_arguments
+            )
+
+    @staticmethod
+    def _write_authorization_answer(
+        arguments: Dict,
+        tool_context: ToolContext,
+    ) -> Dict:
+        """Turn a proposed write call into the command a user can send."""
+        requested_tool = str(arguments.get("tool") or "").strip()
+        requested_args = arguments.get("arguments")
+        if requested_tool not in MUTATING_TOOL_NAMES or not isinstance(requested_args, dict):
+            return {
+                "success": False,
+                "message": (
+                    "参数无效：tool 必须是一个写工具名，arguments 必须是该工具的完整参数对象。"
+                ),
+            }
+        suggestion = self_checked_suggested_command(
+            requested_tool,
+            requested_args,
+            tool_context,
+        )
+        if not suggestion:
+            return policy_block(
+                BLOCK_REASON_VERB_NOT_MATCHED,
+                "本轮没有可授权这次改动的明确指令，也无法生成一条一定能通过校验的指令。"
+                "请只说明缺少什么，不要自己编一条指令让用户发送。",
+                missing=["executionVerb"],
+            )
+        return policy_block(
+            BLOCK_REASON_VERB_NOT_MATCHED,
+            "本轮没有写权限，未执行任何写操作。",
+            missing=["executionVerb"],
+            suggestion=suggestion,
+        )
+
+    @staticmethod
+    def _server_plan_binding(
+        result_data: Dict,
+        planned_args: Optional[Dict] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Extract the server ticket while preserving an absence CAS anchor."""
+        if not isinstance(result_data, dict):
+            return None
+        digest = str(result_data.get("planDigest") or "").strip().lower()
+        batch_id = str(result_data.get("batchId") or "").strip()
+        content_version = result_data.get("contentVersion")
+        planned_absence = (
+            isinstance(planned_args, dict)
+            and "batch_id" in planned_args
+            and not str(planned_args.get("batch_id") or "").strip()
+            and isinstance(planned_args.get("expected_content_version"), int)
+            and not isinstance(planned_args.get("expected_content_version"), bool)
+            and planned_args.get("expected_content_version") == 0
+        )
+        if planned_absence:
+            # Next names a not-yet-created batch with a provisional UUID in the
+            # warning preview.  It is not the CAS identity: the plan was made
+            # against the absence baseline and must keep that exact anchor.
+            batch_id = ""
+            content_version = 0
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(content_version, int)
+            or isinstance(content_version, bool)
+            or content_version < 0
+            # An empty batch id is a real baseline ("no draft existed"), but
+            # only together with version 0; anything else is a broken preview.
+            or (not batch_id and content_version != 0)
+        ):
+            return None
+        binding = {
+            "confirmed_plan_digest": digest,
+            "batch_id": batch_id,
+            "expected_content_version": content_version,
+        }
+        warning_digest = str(result_data.get("warningDigest") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", warning_digest):
+            binding["expected_warning_digest"] = warning_digest
+        return binding
+
+    async def _auto_confirm_shift_plan(
+        self,
+        fn_name: str,
+        fn_args: Dict,
+        result_data: Dict,
+        tool_context: ToolContext,
+    ) -> Optional[tuple]:
+        """Complete a shift the user already authorized in this same message.
+
+        The preview/confirm split exists so the server can prove the plan did
+        not change between reading and writing.  That proof lives in the
+        server's own ``planDigest`` + ``contentVersion``, not in a second user
+        message, so the loop replays them immediately instead of charging the
+        user two separate confirmation tickets for one instruction.  Every
+        policy check (including current-message binding) runs again on the
+        second call, and the server CAS still rejects a stale plan.
+        """
+        if (
+            fn_name != "keytao_shift_phrase_code"
+            or not tool_context.writes_allowed
+            or not isinstance(result_data, dict)
+            or not result_data.get("requiresConfirmation")
+            or result_data.get("confirmationKind") != "shiftPlan"
+        ):
+            return None
+        binding = self._server_plan_binding(result_data)
+        if binding is None:
+            return None
+        confirm_args = {**fn_args, **binding}
+        logger.info(
+            "Auto-confirming shift plan bound to server digest: "
+            f"batch={binding['batch_id']} version={binding['expected_content_version']}"
+        )
+        confirmed_str = await self._tool_executor.call(
+            fn_name,
+            confirm_args,
+            tool_context,
+        )
+        try:
+            confirmed_data = json.loads(confirmed_str)
+        except Exception:
+            return None
+        if not isinstance(confirmed_data, dict):
+            return None
+        if confirmed_data.get("staleConfirmation"):
+            # The draft moved under us; keep the preview so the user sees the
+            # plan instead of a bare "already void" message.
+            return None
+        return confirmed_data, confirmed_str, confirm_args
+
+    @staticmethod
+    def _deduplicate_block_reason(
+        result_data: Dict,
+        result_str: str,
+        reported: set,
+        tool_name: str = "",
+        arguments: Optional[Dict] = None,
+    ) -> str:
+        """Explain one block reason in full once, then stay short.
+
+        Keyed per (reason, tool, arguments): two different operations in one
+        message each deserve their own full explanation, and only a genuine
+        retry of the same rejected call gets the short form.
+        """
+        if not isinstance(result_data, dict):
+            return result_str
+        reason = str(result_data.get("blockReason") or "")
+        if not reason:
+            return result_str
+        try:
+            argument_fingerprint = json.dumps(
+                arguments or {}, sort_keys=True, ensure_ascii=False, default=str
+            )
+        except (TypeError, ValueError):
+            argument_fingerprint = repr(arguments)
+        key = (reason, tool_name, argument_fingerprint)
+        if key not in reported:
+            reported.add(key)
+            return result_str
+        suggestion = str(result_data.get("suggestedCommand") or "")
+        result_data.pop("suggestedCommand", None)
+        result_data["repeatedBlock"] = True
+        result_data["message"] = (
+            f"安全拦截（{reason}，本轮已说明过）："
+            + (f"仍然只有这条指令可行：{suggestion}" if suggestion else "换写法没有用")
+            + "。请直接回复用户，不要再重试。"
+        )
+        return json.dumps(result_data, ensure_ascii=False)
+
     def _save_pending_tool_confirm(
         self,
         conv_key: tuple,
@@ -997,6 +1348,18 @@ class AgentOrchestrator:
             key: value for key, value in fn_args.items()
             if key not in ("confirmed", "platform", "platform_id")
         }
+        if fn_name == "keytao_shift_phrase_code":
+            # Keep the server's plan identity inside the ticket.  Without it the
+            # ticket could never execute: confirming it only produced a second
+            # preview and a second challenge code for the same instruction.
+            binding = self._server_plan_binding(result_data, saved)
+            if binding:
+                saved.update(binding)
+            warning_digest = str(
+                result_data.get("warningDigest") or ""
+            ).strip().lower()
+            if re.fullmatch(r"[0-9a-f]{64}", warning_digest):
+                saved["expected_warning_digest"] = warning_digest
         saved_ok = self._state_store.set(
             conv_key,
             PendingToolConfirm(

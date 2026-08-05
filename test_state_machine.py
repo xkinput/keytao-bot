@@ -4545,6 +4545,161 @@ def test_recall_clear_batch_binding_and_pending_cleanup():
     asyncio.run(_run())
 
 
+def test_recall_shows_items_from_the_recalled_batch():
+    """A drifted "current draft" pointer must not hide the recalled entries."""
+    print("\n🧪 recall shows the recalled batch, not a drifted pointer")
+
+    async def _run():
+        calls = []
+        restored_items = [{
+            "id": 11,
+            "word": "吃席",
+            "code": "wkxk",
+            "action": "Create",
+            "type": "Phrase",
+        }]
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, arguments))
+            if tool_name == "keytao_recall_batch":
+                if not arguments:
+                    return json.dumps({
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "batchId": "restored-42",
+                        "contentVersion": 5,
+                        "batchUrl": "https://keytao.test/batch/restored-42",
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": True,
+                    "batchId": "restored-42",
+                    "contentVersion": 6,
+                    "batchUrl": "https://keytao.test/batch/restored-42",
+                }, ensure_ascii=False)
+            if tool_name == "keytao_get_batch_preview":
+                return json.dumps({
+                    "success": True,
+                    "batchId": arguments.get("batch_id") or "drifted-99",
+                    "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    "diff_text": "+ 吃席 wkxk",
+                    "batchUrl": "https://keytao.test/batch/restored-42",
+                }, ensure_ascii=False)
+            if tool_name == "keytao_list_draft_items":
+                # An earlier read created an empty batch that now owns the
+                # "latest draft" pointer; only the anchored read sees the entry.
+                if arguments.get("batch_id") == "restored-42":
+                    return json.dumps({
+                        "success": True,
+                        "batchId": "restored-42",
+                        "count": 1,
+                        "items": restored_items,
+                        "summary": {"added": 1, "modified": 0, "deleted": 0},
+                        "batchUrl": "https://keytao.test/batch/restored-42",
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": True,
+                    "batchId": "drifted-99",
+                    "count": 0,
+                    "items": [],
+                    "summary": {"added": 0, "modified": 0, "deleted": 0},
+                    "batchUrl": "https://keytao.test/batch/drifted-99",
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await openai_chat_module._perform_recall_latest_batch(
+                "qq",
+                "recall-visibility-user",
+            )
+
+        check("recall succeeds", result.success)
+        check("recalled entry is visible", "吃席" in result.text)
+        check("empty draft is not reported", "共 0 条" not in result.text)
+        check(
+            "pointer drift is disclosed",
+            "当前草稿指针与上次操作的批次不一致" in result.text
+            and "drifted-99" in result.text,
+        )
+        check(
+            "preview is anchored to the recalled batch",
+            ("keytao_get_batch_preview", {"batch_id": "restored-42"}) in calls,
+        )
+        check(
+            "items are re-read from the recalled batch",
+            ("keytao_list_draft_items", {"batch_id": "restored-42"}) in calls,
+        )
+
+    asyncio.run(_run())
+
+
+def test_recall_only_voids_tickets_bound_to_the_recalled_batch():
+    """An unrelated pending ticket survives the recall the bot itself advised."""
+    print("\n🧪 recall voids only related tickets")
+
+    async def _run():
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            if tool_name == "keytao_recall_batch":
+                if not arguments:
+                    return json.dumps({
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "batchId": "restored-42",
+                        "contentVersion": 5,
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": True,
+                    "batchId": "restored-42",
+                    "contentVersion": 6,
+                }, ensure_ascii=False)
+            return json.dumps({
+                "success": True,
+                "batchId": "restored-42",
+                "count": 0,
+                "items": [],
+                "summary": {},
+            }, ensure_ascii=False)
+
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        related = ConversationAddress.private("qq", "ticket-user")
+        other = ConversationAddress.group("qq", "other-group", "ticket-user")
+        store.set(
+            related,
+            PendingToolConfirm(
+                function_name="keytao_shift_phrase_code",
+                args={"word": "吃席", "target_code": "wkxk", "batch_id": "restored-42"},
+            ),
+            space_key=related.space_key,
+        )
+        store.set(
+            other,
+            PendingAddWord(
+                word="别的词",
+                recommended_code="abcd",
+                candidates=[("abcd", True)],
+            ),
+            space_key=other.space_key,
+        )
+
+        openai_chat_module.conversation_state_store = store
+        try:
+            with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+                reply = await openai_chat_module._try_handle_draft_recall_command(
+                    "撤回",
+                    MessageCommandIntent(intent="draft_recall", confidence=1.0),
+                    "qq",
+                    "ticket-user",
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("recall is handled", reply is not None)
+        check("ticket for the recalled batch is void", store.get_record(related) is None)
+        check("unrelated pending choice survives", store.get_record(other) is not None)
+
+    asyncio.run(_run())
+
+
 def test_command_result_never_gets_word_priority_appendix():
     """Structured command handling cannot be reclassified as word lookup."""
     print("\n🧪 command result skips word-query appendix")
@@ -11754,6 +11909,87 @@ def test_build_code_shift_plan_rejects_invalid_occupant_code():
     check("error mentions occupant", "换言之" in result["message"])
 
 
+def test_shift_phrase_code_works_with_no_draft_batch():
+    """Right after submitting everything, a shift must still be one round trip.
+
+    The server states "no draft" as batchId=null + contentVersion=0 and holds
+    that absence under compare-and-set, so the plan can be built and confirmed
+    against it instead of failing with "no verifiable content version".
+    """
+    print("\n🧪 shift works when the user has no draft batch")
+
+    async def _run():
+        strict_calls = []
+
+        async def fake_fetch(word, requested_code=None):
+            return {
+                "增香": {"success": True, "word": "增香", "candidateCodes": ["zrxx", "zrxxv"]},
+                "增翔": {"success": True, "word": "增翔", "candidateCodes": ["zrxx", "zrxxv"]},
+            }[word]
+
+        async def fake_lookup_words(words):
+            return {"success": True, "results": [{"word": "增香", "phrases": []}]}
+
+        async def fake_lookup_codes(codes):
+            occupied = {"zrxx": [{"word": "增翔", "code": "zrxx", "type": "Phrase", "weight": 100}]}
+            return {
+                "success": True,
+                "results": [{"code": code, "phrases": occupied.get(code, [])} for code in codes],
+            }
+
+        async def empty_draft(platform, platform_id, *, batch_id=None):
+            # keytao-next answers a pure read with the absence baseline.
+            return {
+                "success": True,
+                "batchId": None,
+                "exists": False,
+                "contentVersion": 0,
+                "items": [],
+            }
+
+        async def fake_strict_add(platform, platform_id, items, **kwargs):
+            strict_calls.append(kwargs)
+            return {"success": True, "batchId": "materialised-1", "items": items}
+
+        with patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_fetch), \
+                patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_lookup_words), \
+                patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_lookup_codes), \
+                patch.object(_draft_tools, "keytao_list_draft_items", side_effect=empty_draft), \
+                patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", side_effect=fake_strict_add):
+            preview = await _draft_tools.keytao_shift_phrase_code("qq", "123", "增香", "zrxx")
+            writes_during_preview = len(strict_calls)
+            confirmed = await _draft_tools.keytao_shift_phrase_code(
+                "qq",
+                "123",
+                "增香",
+                "zrxx",
+                confirmed_plan_digest=preview["planDigest"],
+                batch_id=preview["batchId"],
+                expected_content_version=preview["contentVersion"],
+            )
+            stale = await _draft_tools.keytao_shift_phrase_code(
+                "qq",
+                "123",
+                "增香",
+                "zrxx",
+                confirmed_plan_digest="0" * 64,
+                batch_id=preview["batchId"],
+                expected_content_version=preview["contentVersion"],
+            )
+
+        check("no draft still yields a confirmable plan", preview.get("requiresConfirmation") is True)
+        check("the absence baseline is stated, not guessed", preview.get("batchId") == "" and preview.get("contentVersion") == 0)
+        check("the preview writes nothing", writes_during_preview == 0)
+        check("the confirmed shift writes once", len(strict_calls) == 1)
+        check("the write carries no batch id", strict_calls[0].get("batch_id") is None)
+        check("the write asserts the absence baseline", strict_calls[0].get("expected_content_version") == 0)
+        check("the shift succeeds", confirmed.get("success") is True)
+        check("the occupant is still moved", confirmed.get("shiftPlan", {}).get("shifted"))
+        check("a wrong digest is still refused", stale.get("staleConfirmation") is True)
+
+    asyncio.run(_run())
+
+
 def test_shift_phrase_code_plans_real_occupant_move():
     """Verify keytao_shift_phrase_code keeps occupant moves in the final write plan."""
     print("\n🧪 keytao_shift_phrase_code keeps occupant move")
@@ -11957,6 +12193,8 @@ if __name__ == "__main__":
     test_draft_clear_authorization_boundaries()
     test_structural_recall_and_clear_routes_without_llm()
     test_recall_clear_batch_binding_and_pending_cleanup()
+    test_recall_shows_items_from_the_recalled_batch()
+    test_recall_only_voids_tickets_bound_to_the_recalled_batch()
     test_command_result_never_gets_word_priority_appendix()
     test_augment_simple_word_query_response_appends_priority_note()
     test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority()
@@ -12080,6 +12318,7 @@ if __name__ == "__main__":
     test_build_code_shift_plan_uses_occupant_encode_chain()
     test_build_code_shift_plan_cascades_until_empty()
     test_build_code_shift_plan_rejects_invalid_occupant_code()
+    test_shift_phrase_code_works_with_no_draft_batch()
     test_shift_phrase_code_plans_real_occupant_move()
     test_replace_char_preserves_explicit_css_type()
 

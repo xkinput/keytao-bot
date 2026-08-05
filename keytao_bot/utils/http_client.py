@@ -16,7 +16,7 @@ import ipaddress
 import json
 import os
 import socket
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from nonebot.log import logger
 
@@ -381,6 +381,8 @@ async def keytao_request(
 async def keytao_json(
     method: str,
     path: str,
+    *,
+    allow_status: Optional[Iterable[int]] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """``keytao_request`` + JSON decoding.
@@ -388,7 +390,13 @@ async def keytao_json(
     Raises :class:`KeytaoApiError` on transport failure, non-2xx status, or a
     body that is not valid JSON, so that callers can never mistake a failed
     lookup for an empty result.
+
+    ``allow_status`` opts specific non-2xx codes out of that rule, for the
+    endpoints whose *answer* is carried by an error status: the draft write
+    replies 400 with the confirmation snapshot the caller has to echo back.
+    The caller then has to judge the body itself.
     """
+    permitted = frozenset(allow_status or ())
     response = await keytao_request(method, path, **kwargs)
     try:
         data = response.json()
@@ -397,7 +405,7 @@ async def keytao_json(
             f"KeyTao API 返回非 JSON 响应（HTTP {response.status_code}）",
             status_code=response.status_code,
         )
-    if not response.is_success:
+    if not response.is_success and response.status_code not in permitted:
         message = ""
         if isinstance(data, dict):
             message = str(data.get("message") or data.get("error") or "")

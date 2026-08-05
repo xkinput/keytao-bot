@@ -1664,24 +1664,69 @@ async def submit_discovered_words(
         return failure(f"获取草稿批次失败：{error}")
 
     batch_id = str(draft.get("batchId") or "").strip()
-    safe_batch_id = _safe_path_segment(batch_id)
-    if not safe_batch_id:
-        logger.error(f"[word_discovery] refusing unsafe or missing batch id: {batch_id!r}")
+    # latest-draft is a pure read: no draft yet means batchId is null, and the
+    # first write creates the batch server-side. Only a *malformed* id is fatal.
+    safe_batch_id = _safe_path_segment(batch_id) if batch_id else ""
+    if batch_id and not safe_batch_id:
+        logger.error(f"[word_discovery] refusing unsafe batch id: {batch_id!r}")
         return failure("未获得合法的草稿批次编号")
 
+    draft_body = {
+        **identity,
+        **({"batchId": safe_batch_id} if safe_batch_id else {}),
+        "items": build_draft_items(items, run_date),
+    }
     try:
+        # Ask first, confirm second.  Claiming ``confirmed`` without the
+        # server's own contentVersion + warningDigest is rejected outright, so
+        # the digests have to come from the server's answer to this same write.
+        # That answer arrives as HTTP 400 with ``requiresConfirmation`` - the
+        # status is the protocol, not a failure, hence ``allow_status``.
         added = await http_client.keytao_json(
             "POST",
             "/api/bot/pull-requests/batch-draft",
-            json_body={
-                **identity,
-                "batchId": safe_batch_id,
-                "confirmed": True,
-                "items": build_draft_items(items, run_date),
-            },
+            json_body={**draft_body, "confirmed": False},
             timeout=60.0,
+            allow_status={400},
             **call_kwargs,
         )
+        if not added.get("requiresConfirmation") and added.get("success") is not True:
+            message = str(added.get("message") or "草稿写入被拒绝")
+            logger.error(f"[word_discovery] batch-draft preview rejected: {message}")
+            return failure(message, batch_id=batch_id)
+        if added.get("requiresConfirmation"):
+            content_version = added.get("contentVersion")
+            warning_digest = str(added.get("warningDigest") or "").strip().lower()
+            if (
+                not isinstance(content_version, int)
+                or isinstance(content_version, bool)
+                or content_version < 0
+                or not re.fullmatch(r"[0-9a-f]{64}", warning_digest)
+            ):
+                logger.error(
+                    "[word_discovery] batch-draft needs confirmation but returned "
+                    "no verifiable snapshot"
+                )
+                return failure(
+                    "草稿写入需要确认，但服务端未返回可校验的风险快照",
+                    batch_id=batch_id,
+                )
+            confirm_batch_id = _safe_path_segment(
+                str(added.get("batchId") or safe_batch_id or "")
+            )
+            added = await http_client.keytao_json(
+                "POST",
+                "/api/bot/pull-requests/batch-draft",
+                json_body={
+                    **draft_body,
+                    **({"batchId": confirm_batch_id} if confirm_batch_id else {}),
+                    "confirmed": True,
+                    "expectedContentVersion": content_version,
+                    "expectedWarningDigest": warning_digest,
+                },
+                timeout=60.0,
+                **call_kwargs,
+            )
     except Exception as error:
         # Not proof that nothing was written: a read timeout on a write is no
         # longer retried, so the rows may exist. Settle it by reading the draft.
@@ -1700,6 +1745,17 @@ async def submit_discovered_words(
         elif written and not await _delete_draft_items(written, identity, call_kwargs):
             pending = leave_pending(RECOVERY_STAGE_DRAFT, batch_id, all_words, message)
         return failure(message, batch_id=batch_id, pending=pending)
+
+    if not safe_batch_id:
+        # The batch was created by this write; adopt the id it reports so the
+        # submit/auto-approve steps address the batch that actually holds the rows.
+        batch_id = str(added.get("batchId") or "").strip()
+        safe_batch_id = _safe_path_segment(batch_id)
+        if not safe_batch_id:
+            logger.error(
+                f"[word_discovery] draft write returned no usable batch id: {batch_id!r}"
+            )
+            return failure("草稿写入后仍未获得合法的批次编号")
 
     accepted, rejected, item_ids = resolve_draft_outcome(items, added)
     reported_count = _as_int(added.get("successCount"), 0, minimum=0, maximum=100000)

@@ -621,8 +621,19 @@ def test_auto_ingest_chain_and_degradation():
     check("remark builder trims empty URLs", build_discovery_remark("2026-07-26", "  ") == "daily-discovery 2026-07-26")
 
     async def _run():
+        # The draft write answers HTTP 400 + requiresConfirmation first; the
+        # confirmation has to echo that exact snapshot back (see
+        # app/api/bot/pull-requests/batch-draft/route.ts).
+        draft_preview = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "batch-1",
+            "contentVersion": 3,
+            "warningDigest": "d" * 64,
+        }
         happy = [
             {"batchId": "batch-1"},
+            dict(draft_preview),
             {"successCount": 2},
             {"success": True},
             {"success": True},
@@ -649,28 +660,84 @@ def test_auto_ingest_chain_and_degradation():
         paths = [path for _method, path, _kw in recorded]
         check("the full chain succeeds", result.get("success") is True and result.get("count") == 2)
         check(
-            "the chain is draft -> batch-draft -> submit -> auto-approve",
+            "the chain is draft -> batch-draft preview -> batch-draft confirm -> submit -> auto-approve",
             paths == [
                 "/api/bot/batches/latest-draft",
+                "/api/bot/pull-requests/batch-draft",
                 "/api/bot/pull-requests/batch-draft",
                 "/api/bot/batches/batch-1/submit",
                 "/api/bot/batches/batch-1/auto-approve",
             ],
         )
+        check(
+            "the draft preview reads the 400 body instead of raising",
+            recorded[1][2]["json_body"].get("confirmed") is False
+            and 400 in set(recorded[1][2].get("allow_status") or ()),
+        )
+        check(
+            "the draft write is confirmed with the server's own snapshot",
+            recorded[2][2]["json_body"].get("confirmed") is True
+            and recorded[2][2]["json_body"].get("expectedContentVersion") == 3
+            and recorded[2][2]["json_body"].get("expectedWarningDigest") == "d" * 64,
+        )
         check("every call is made as the bot QQ identity", all(kw.get("platform") == "qq" for _m, _p, kw in recorded))
         check("no step retries more than once", all(kw.get("retries") == 2 for _m, _p, kw in recorded))
-        check("submit is confirmed", recorded[2][2]["json_body"].get("confirmed") is True)
+        check("submit is confirmed", recorded[3][2]["json_body"].get("confirmed") is True)
         check(
             "the review note is code-generated",
-            recorded[3][2]["json_body"]["reviewNote"].startswith("daily-discovery 2026-07-26"),
+            recorded[4][2]["json_body"]["reviewNote"].startswith("daily-discovery 2026-07-26"),
         )
 
+        confirm_needed = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "b",
+            "contentVersion": 1,
+            "warningDigest": "e" * 64,
+        }
         for step, responses, label in (
             (0, [KeytaoApiError("boom")], "latest-draft"),
-            (1, [{"batchId": "b"}, KeytaoApiError("boom")], "batch-draft"),
-            (1, [{"batchId": "b"}, {"successCount": 0, "message": "全部冲突"}], "batch-draft wrote nothing"),
-            (2, [{"batchId": "b"}, {"successCount": 1}, {"success": False, "message": "no"}], "submit"),
-            (3, [{"batchId": "b"}, {"successCount": 1}, {"success": True}, KeytaoApiError("no")], "auto-approve"),
+            (1, [{"batchId": "b"}, KeytaoApiError("boom")], "batch-draft preview"),
+            (
+                1,
+                [{"batchId": "b"}, {"success": False, "message": "编码非法"}],
+                "batch-draft rejected outright",
+            ),
+            (
+                1,
+                [
+                    {"batchId": "b"},
+                    {**confirm_needed, "warningDigest": "not-a-digest"},
+                    {"successCount": 1},
+                ],
+                "batch-draft confirmation snapshot unusable",
+            ),
+            (
+                2,
+                [{"batchId": "b"}, dict(confirm_needed), KeytaoApiError("boom")],
+                "batch-draft confirm",
+            ),
+            (
+                2,
+                [{"batchId": "b"}, dict(confirm_needed), {"successCount": 0, "message": "全部冲突"}],
+                "batch-draft wrote nothing",
+            ),
+            (
+                3,
+                [{"batchId": "b"}, dict(confirm_needed), {"successCount": 1}, {"success": False, "message": "no"}],
+                "submit",
+            ),
+            (
+                4,
+                [
+                    {"batchId": "b"},
+                    dict(confirm_needed),
+                    {"successCount": 1},
+                    {"success": True},
+                    KeytaoApiError("no"),
+                ],
+                "auto-approve",
+            ),
         ):
             recorded.clear()
             with patch.object(wd, "bot_platform_id", return_value="10001"), \
@@ -763,6 +830,9 @@ def test_partial_ingest_is_attributed_per_word():
         # Partial success: one word in, one word back to the humans.
         partial = [
             {"batchId": "b1"},
+            # HTTP 400 + requiresConfirmation is the server's preview answer.
+            {"success": False, "requiresConfirmation": True, "batchId": "b1",
+             "contentVersion": 2, "warningDigest": "f" * 64},
             {
                 "successCount": 1,
                 "failed": [{"word": "乙词", "reason": "编码冲突"}],
@@ -784,6 +854,9 @@ def test_partial_ingest_is_attributed_per_word():
         # submit fails -> the draft rows we wrote are deleted again.
         submit_fails = [
             {"batchId": "b1"},
+            # HTTP 400 + requiresConfirmation is the server's preview answer.
+            {"success": False, "requiresConfirmation": True, "batchId": "b1",
+             "contentVersion": 2, "warningDigest": "f" * 64},
             {"successCount": 2, "draftItems": [
                 {"id": 31, "word": "甲词", "code": "aaaa"},
                 {"id": 32, "word": "乙词", "code": "bbbb"},
@@ -804,6 +877,9 @@ def test_partial_ingest_is_attributed_per_word():
         # auto-approve fails -> recall, then delete.
         approve_fails = [
             {"batchId": "b1"},
+            # HTTP 400 + requiresConfirmation is the server's preview answer.
+            {"success": False, "requiresConfirmation": True, "batchId": "b1",
+             "contentVersion": 2, "warningDigest": "f" * 64},
             {"successCount": 2, "draftItems": [
                 {"id": 41, "word": "甲词", "code": "aaaa"},
                 {"id": 42, "word": "乙词", "code": "bbbb"},
@@ -891,6 +967,8 @@ def test_partial_ingest_is_attributed_per_word():
             store = DiscoveryStore(db_path=os.path.join(tmp, "recovery.db"))
             comp_fails = [
                 {"batchId": "b9"},
+                {"success": False, "requiresConfirmation": True, "batchId": "b9",
+                 "contentVersion": 2, "warningDigest": "f" * 64},
                 {"successCount": 2, "draftItems": [
                     {"id": 51, "word": "甲词", "code": "aaaa"},
                     {"id": 52, "word": "乙词", "code": "bbbb"},

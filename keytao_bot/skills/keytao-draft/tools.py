@@ -838,8 +838,16 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
 
             if response.status_code == 200:
                 data = response.json()
+                # The endpoint is a pure read: it answers 200 with batchId=null
+                # (exists=false) when the user has no draft yet, instead of
+                # creating one.  ``None`` therefore means "no draft", not
+                # "failed"; write paths pass it through and let the server
+                # create the batch on demand.
                 batch_id = data.get("batchId")
-                logger.info(f"[get_latest_draft_batch] Got batch ID: {batch_id}")
+                logger.info(
+                    "[get_latest_draft_batch] "
+                    + (f"Got batch ID: {batch_id}" if batch_id else "No draft batch yet")
+                )
                 return batch_id
             elif response.status_code == 404:
                 raise UserNotFoundError()
@@ -852,10 +860,19 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
         return None
 
 
-async def _fetch_draft_snapshot(platform: str, platform_id: str) -> Optional[Dict]:
-    """Fetch current draft items and return as snapshot dict (best-effort, never raises)."""
+async def _fetch_draft_snapshot(
+    platform: str,
+    platform_id: str,
+    batch_id: Optional[str] = None,
+) -> Optional[Dict]:
+    """Fetch current draft items and return as snapshot dict (best-effort, never raises).
+
+    Callers that just wrote to a specific batch pass its id, so the snapshot
+    embedded in their result cannot describe a different batch that happens to
+    be the newest draft.
+    """
     try:
-        result = await keytao_list_draft_items(platform, platform_id)
+        result = await keytao_list_draft_items(platform, platform_id, batch_id=batch_id)
         if result.get("success"):
             items = result.get("items", [])
             return {
@@ -1115,8 +1132,11 @@ async def keytao_create_phrase(
             batch_id = await get_latest_draft_batch(platform, platform_id)
         except UserNotFoundError:
             return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
-    if not batch_id:
-        return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
+    # A missing draft batch is no longer an error: the server creates one on
+    # demand for the first write.  Only a confirmed ticket must still name the
+    # exact batch it was issued against.
+    if confirmed and not batch_id:
+        return {"success": False, "message": "添加确认缺少目标批次，已停止执行"}
     if confirmed and (
         not isinstance(expected_content_version, int)
         or isinstance(expected_content_version, bool)
@@ -1200,7 +1220,9 @@ async def keytao_create_phrase(
                         "batchId": batch_id,
                     }, batch_id)
                 logger.info(f"[keytao_create_phrase] API response (200): {json.dumps(data, ensure_ascii=False)}")
-                snapshot = await _fetch_draft_snapshot(platform, platform_id)
+                snapshot = await _fetch_draft_snapshot(
+                    platform, platform_id, str(data.get("batchId") or batch_id or "") or None
+                )
                 if snapshot is not None:
                     data["draft_snapshot"] = snapshot
                 _inject_batch_url(data)
@@ -1215,7 +1237,9 @@ async def keytao_create_phrase(
                 logger.info(f"[keytao_create_phrase] API response (400): {json.dumps(data, ensure_ascii=False)}")
                 # Attach draft snapshot so AI can report current state even when this item has a warning
                 if data.get("requiresConfirmation"):
-                    snapshot = await _fetch_draft_snapshot(platform, platform_id)
+                    snapshot = await _fetch_draft_snapshot(
+                        platform, platform_id, str(data.get("batchId") or batch_id or "") or None
+                    )
                     if snapshot is not None:
                         data["draft_snapshot"] = snapshot
                 _inject_known_batch_url(data, batch_id)
@@ -2007,10 +2031,15 @@ async def keytao_submit_batch(
 async def keytao_get_batch_preview(
     platform: str,
     platform_id: str,
+    batch_id: Optional[str] = None,
 ) -> Dict:
     """
     Fetch the diff preview of the user's current draft batch.
     Returns summary stats and a formatted unified-diff text block.
+
+    ``batch_id`` anchors the preview to a known batch, so a caller that just
+    operated on one cannot be shown a different batch that happens to be the
+    newest draft.
     """
     KEYTAO_API_BASE = get_keytao_url()
     BOT_API_TOKEN = get_bot_token()
@@ -2018,10 +2047,12 @@ async def keytao_get_batch_preview(
     if not BOT_API_TOKEN:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
-    try:
-        batch_id = await get_latest_draft_batch(platform, platform_id)
-    except UserNotFoundError:
-        return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
+    batch_id = str(batch_id or "").strip() or None
+    if not batch_id:
+        try:
+            batch_id = await get_latest_draft_batch(platform, platform_id)
+        except UserNotFoundError:
+            return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
     if not batch_id:
         return {"success": False, "message": "没有找到草稿批次"}
 
@@ -2957,7 +2988,9 @@ async def keytao_remove_draft_item(
                     "删除结果无法确认；请求可能已经生效，请先查看原草稿"
                 )
             if data.get("success"):
-                snapshot = await _fetch_draft_snapshot(platform, platform_id)
+                snapshot = await _fetch_draft_snapshot(
+                    platform, platform_id, str(data.get("batchId") or batch_id or "") or None
+                )
                 if snapshot is not None:
                     data["draft_snapshot"] = snapshot
             _inject_batch_url(data)
@@ -3075,7 +3108,12 @@ TOOLS = [
             "description": "查看当前草稿批次中所有待审词条。用于用户询问草稿内容、想确认已添加了哪些词条时调用。返回条目列表包含 id、词条、编码、操作类型。",
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "batch_id": {
+                        "type": "string",
+                        "description": "可选：要查看的批次编号，必须是本轮工具结果里出现过的 batchId；不传表示当前草稿"
+                    }
+                },
                 "required": []
             }
         }
@@ -3136,8 +3174,14 @@ async def keytao_batch_add_to_draft(
             batch_id = await get_latest_draft_batch(platform, platform_id)
         except UserNotFoundError:
             return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
-        if not batch_id:
-            return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
+    # A missing draft batch is no longer an error: the server creates one on
+    # demand for the first write.  Only a confirmed ticket must still name the
+    # exact batch it was issued against.
+    if confirmed and not batch_id:
+        return _inject_known_batch_url({
+            "success": False,
+            "message": "批量添加确认缺少目标批次，已停止执行",
+        }, batch_id)
     if confirmed and (
         not isinstance(expected_content_version, int)
         or isinstance(expected_content_version, bool)
@@ -3164,7 +3208,7 @@ async def keytao_batch_add_to_draft(
             "draftItems": [],
             "draftTotal": 0,
         }
-        snapshot = await _fetch_draft_snapshot(platform, platform_id)
+        snapshot = await _fetch_draft_snapshot(platform, platform_id, batch_id)
         if snapshot is not None:
             result["draft_snapshot"] = snapshot
             result["draftItems"] = snapshot.get("items", [])
@@ -3495,14 +3539,15 @@ async def _keytao_strict_batch_add_to_draft(
     if not bot_api_token:
         return {"success": False, "message": "喵喵配置错误：缺少API token"}
 
-    if not batch_id:
+    # A caller that already carries an expected version has a baseline - which
+    # may legitimately be "there was no draft" (batch_id None, version 0).
+    # Re-resolving it here would silently adopt a batch that appeared after the
+    # plan was built, defeating the compare-and-set the server performs.
+    if not batch_id and expected_content_version is None:
         try:
             batch_id = await get_latest_draft_batch(platform, platform_id)
         except UserNotFoundError:
             return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
-    if not batch_id:
-        return {"success": False, "message": "无法获取草稿批次，请稍后重试"}
-
     valid_items, validation_failed = await _split_items_by_code_validation(items)
     if validation_failed or len(valid_items) != len(items):
         return _inject_known_batch_url({
@@ -3524,7 +3569,9 @@ async def _keytao_strict_batch_add_to_draft(
         "platformId": platform_id,
         "items": request_items,
         "confirmed": confirmed,
-        "batchId": batch_id,
+        # Omitted entirely when there is no draft yet: the server materialises
+        # one under its own "no draft existed" assertion.
+        **({"batchId": batch_id} if batch_id else {}),
         **(
             {
                 "expectedContentVersion": expected_content_version,
@@ -3589,7 +3636,9 @@ async def _keytao_strict_batch_add_to_draft(
             or data.get("pullRequestCount")
             or len(request_items)
         )
-        snapshot = await _fetch_draft_snapshot(platform, platform_id)
+        snapshot = await _fetch_draft_snapshot(
+            platform, platform_id, str(data.get("batchId") or batch_id or "") or None
+        )
         if snapshot is not None:
             data["draft_snapshot"] = snapshot
         _inject_batch_url(data)
@@ -3765,9 +3814,14 @@ async def keytao_shift_phrase_code(
 
     current_batch_id = str(existing_draft.get("batchId") or "")
     current_content_version = existing_draft.get("contentVersion")
+    # "No draft at all" is a legitimate baseline, not a missing version: the
+    # server states it as batchId=null + contentVersion=0 and enforces CAS on
+    # that absence, so a shift right after submitting everything still works.
+    # It is part of the digest, so a draft appearing in between voids the plan.
+    if not current_batch_id:
+        current_content_version = 0
     if (
-        not current_batch_id
-        or not isinstance(current_content_version, int)
+        not isinstance(current_content_version, int)
         or isinstance(current_content_version, bool)
         or current_content_version < 0
     ):
@@ -3811,7 +3865,7 @@ async def keytao_shift_phrase_code(
         return preview
     if (
         confirmed_plan_digest.strip().lower() != plan_digest
-        or batch_id != current_batch_id
+        or str(batch_id or "") != current_batch_id
         or expected_content_version != current_content_version
     ):
         return _inject_known_batch_url({
@@ -3826,7 +3880,9 @@ async def keytao_shift_phrase_code(
         platform,
         platform_id,
         plan.get("items", []),
-        batch_id=current_batch_id,
+        # No draft yet: send no batch id and let the server materialise one
+        # under the same absence baseline the plan was built on.
+        batch_id=current_batch_id or None,
         expected_content_version=current_content_version,
         confirmed=bool(expected_warning_digest),
         expected_warning_digest=expected_warning_digest,
@@ -3970,7 +4026,12 @@ TOOLS += [
             ),
             "parameters": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "batch_id": {
+                        "type": "string",
+                        "description": "可选：要查看的批次编号，必须是本轮工具结果里出现过的 batchId；不传表示当前草稿"
+                    }
+                },
                 "required": [],
             },
         },

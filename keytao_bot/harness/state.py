@@ -532,6 +532,51 @@ class MemoryConversationStateStore:
                 return record
         return None
 
+    # Tickets for these tools describe a plan computed against the draft, so a
+    # batch-level change (recall, clear) can invalidate them.  Anything else,
+    # including an unconsumed code choice, survives.
+    _DRAFT_SCOPED_FUNCTIONS = frozenset({
+        "keytao_create_phrase",
+        "keytao_batch_add_to_draft",
+        "keytao_remove_draft_item",
+        "keytao_batch_remove_draft_items",
+        "keytao_shift_phrase_code",
+        "keytao_submit_batch",
+        "keytao_recall_batch",
+    })
+
+    def invalidate_actor_related(
+        self,
+        actor_key: ActorKey,
+        *,
+        batch_id: str = "",
+    ) -> int:
+        """Drop only the actor's tickets that this batch change invalidates.
+
+        A recall used to wipe every pending ticket the user owned, including
+        ones it had nothing to do with.  A ticket is now dropped only when it
+        plans against the affected batch (or against whichever batch is current,
+        when it carries no anchor of its own).
+        """
+        self._purge_expired()
+        anchor = str(batch_id or "").strip()
+        dropped = 0
+        for address in list(self._states):
+            if address.actor_key != actor_key:
+                continue
+            state = self._states.get(address)
+            if not isinstance(state, PendingToolConfirm):
+                continue
+            if state.function_name not in self._DRAFT_SCOPED_FUNCTIONS:
+                continue
+            ticket_batch = str((state.args or {}).get("batch_id") or "").strip()
+            if anchor and ticket_batch and ticket_batch != anchor:
+                continue
+            self._states.pop(address, None)
+            self._records.pop(address, None)
+            dropped += 1
+        return dropped
+
     def delete_actor(self, actor_key: ActorKey) -> int:
         """Delete every pending ticket owned by an actor across spaces."""
         self._purge_expired()

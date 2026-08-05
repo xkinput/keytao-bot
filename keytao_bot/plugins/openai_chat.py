@@ -5439,8 +5439,30 @@ def _pending_state_from_server_warning(
     args = dict(state.args)
     args.pop("confirmed", None)
     args.pop("preview_only", None)
-    batch_id = str(data.get("batchId") or args.get("batch_id") or "").strip()
-    if batch_id and state.function_name in {
+    response_content_version = data.get("contentVersion")
+    planned_content_version = args.get("expected_content_version")
+    planned_absence = state.function_name == "keytao_shift_phrase_code" and (
+        (
+            "batch_id" in args
+            and not str(args.get("batch_id") or "").strip()
+            and isinstance(planned_content_version, int)
+            and not isinstance(planned_content_version, bool)
+            and planned_content_version == 0
+        )
+        or (
+            "batchId" in data
+            and not str(data.get("batchId") or "").strip()
+            and isinstance(response_content_version, int)
+            and not isinstance(response_content_version, bool)
+            and response_content_version == 0
+        )
+    )
+    batch_id = (
+        ""
+        if planned_absence
+        else str(data.get("batchId") or args.get("batch_id") or "").strip()
+    )
+    if (batch_id or planned_absence) and state.function_name in {
         "keytao_create_phrase",
         "keytao_submit_batch",
         "keytao_batch_add_to_draft",
@@ -5450,7 +5472,7 @@ def _pending_state_from_server_warning(
         "keytao_batch_remove_draft_items",
     }:
         args["batch_id"] = batch_id
-    content_version = data.get("contentVersion")
+    content_version = 0 if planned_absence else response_content_version
     if (
         state.function_name in {
             "keytao_submit_batch",
@@ -5702,10 +5724,11 @@ async def _execute_confirmed_tool(
     if state.confirmation_source == "server_warning" and state.function_name == "keytao_shift_phrase_code":
         if (
             not re.fullmatch(r"[0-9a-f]{64}", str(args.get("confirmed_plan_digest") or ""))
-            or not args.get("batch_id")
             or not isinstance(args.get("expected_content_version"), int)
             or isinstance(args.get("expected_content_version"), bool)
             or args["expected_content_version"] < 0
+            # "No draft existed" is a valid anchor, but only at version 0.
+            or (not args.get("batch_id") and args["expected_content_version"] != 0)
         ):
             return "顺延确认票据缺少完整计划版本，已安全拒绝。请重新发起顺延。"
     if state.confirmation_source == "server_warning" and state.function_name == "keytao_recall_batch":
@@ -5905,15 +5928,43 @@ def _is_pending_tool_confirm_message(
     return command_intent.intent == "pending_confirm"
 
 
-async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str:
+async def _format_draft_response(
+    data: Dict,
+    platform: str,
+    user_id: str,
+    batch_id: Optional[str] = None,
+) -> str:
     """Format draft state (summary + diff + items + URL) after an operation."""
-    preview_json = await call_tool_function("keytao_get_batch_preview", {}, platform, user_id)
-    preview = json.loads(preview_json)
+    # "Current draft" is an implicit pointer to the newest draft batch, and a
+    # read can move it.  Whenever this turn knows which batch it just operated
+    # on, the data is read from that batch, and a drifted pointer is reported
+    # rather than silently rendered as an empty draft.
+    #
+    # The one unanchored read is the pointer probe itself, and it doubles as the
+    # preview: when the pointer agrees with the anchor (the normal case) its
+    # result is exactly what we wanted, so nothing is fetched twice.
+    anchor = str(batch_id or data.get("batchId") or "").strip()
+    preview = json.loads(await call_tool_function(
+        "keytao_get_batch_preview", {}, platform, user_id
+    ))
+    pointer_batch_id = ""
+    if anchor:
+        previewed_batch_id = str(preview.get("batchId") or "")
+        if previewed_batch_id and previewed_batch_id != anchor:
+            pointer_batch_id = previewed_batch_id
+            preview = json.loads(await call_tool_function(
+                "keytao_get_batch_preview", {"batch_id": anchor}, platform, user_id
+            ))
 
     snapshot = data.get("draft_snapshot")
     list_batch_url = ""
     if not snapshot:
-        list_json = await call_tool_function("keytao_list_draft_items", {}, platform, user_id)
+        list_json = await call_tool_function(
+            "keytao_list_draft_items",
+            {"batch_id": anchor} if anchor else {},
+            platform,
+            user_id,
+        )
         list_data = json.loads(list_json)
         if list_data.get("success"):
             list_batch_url = str(list_data.get("batchUrl") or "")
@@ -5924,6 +5975,12 @@ async def _format_draft_response(data: Dict, platform: str, user_id: str) -> str
             }
 
     parts: List[str] = []
+    if pointer_batch_id:
+        parts.append(
+            "⚠️ 当前草稿指针与上次操作的批次不一致："
+            f"指针指向 {pointer_batch_id}，本次批次是 {anchor}。"
+            "下面显示的是本次批次的内容。"
+        )
 
     # Notes from Delete operations
     for note in data.get("notes", []):
@@ -7173,6 +7230,7 @@ async def _perform_recall_latest_batch(
         confirmed_data,
         platform,
         user_id,
+        batch_id=exact_batch_id,
     )
     return DraftActionResult(
         "✅ 已撤回最近提审，批次已恢复为草稿。\n" + formatted,
@@ -7206,7 +7264,13 @@ async def _try_handle_draft_recall_command(
         clear_after=bool(canonical is not None and canonical.clear_after),
     )
     if result.success or result.invalidate_pending:
-        conversation_state_store.delete_actor((platform, user_id))
+        # Only the tickets planned against the recalled batch are void; an
+        # unrelated pending choice must survive the user following our own
+        # advice to recall first.
+        conversation_state_store.invalidate_actor_related(
+            (platform, user_id),
+            batch_id=str((result.data or {}).get("batchId") or ""),
+        )
     return result.text
 
 
