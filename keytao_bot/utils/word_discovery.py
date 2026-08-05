@@ -1266,7 +1266,7 @@ def classify_reviewed(
             continue
         review = entry.get("review") if isinstance(entry.get("review"), dict) else None
         error = str(entry.get("error") or "")
-        code = str((review or {}).get("recommendedCode") or "").strip()
+        code = str((review or {}).get("recommendedCode") or "").strip().lower()
 
         block_reason = _manual_block_reason(review, error)
         if block_reason:
@@ -1411,38 +1411,65 @@ def _rejection_index(response: Dict[str, Any]) -> Dict[str, str]:
     return reasons
 
 
+def _draft_item_lookup_key(
+    word: str,
+    code: str,
+    action: str,
+    item_type: str,
+) -> Tuple[str, str, str, str]:
+    """Normalize the written word identically on both sides of attribution."""
+    return (word.strip(), code, action.strip(), item_type.strip())
+
+
 def _draft_item_index(
     response: Dict[str, Any],
-) -> Tuple[Dict[Tuple[str, str, str, str], Any], bool]:
+) -> Tuple[
+    Dict[
+        Tuple[str, str, str, str],
+        Tuple[int, Tuple[str, str, str, str]],
+    ],
+    bool,
+]:
     """Index rows by the complete shape this discovery round writes."""
     entries = response.get("draftItems")
     if not isinstance(entries, list):
         return {}, False
-    by_written_shape: Dict[Tuple[str, str, str, str], Any] = {}
+    by_written_shape: Dict[
+        Tuple[str, str, str, str],
+        Tuple[int, Tuple[str, str, str, str]],
+    ] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        word = str(entry.get("word") or "").strip()
-        code = str(entry.get("code") or "").strip().lower()
+        word = entry.get("word")
+        code = entry.get("code")
         action = entry.get("action")
         item_type = entry.get("type")
         item_id = _safe_item_id(entry.get("id"))
         if (
-            not word
-            or not code
-            or not isinstance(action, str)
+            not all(isinstance(value, str) for value in (word, code, action, item_type))
+            or not word.strip()
+            or not code.strip()
+            or code != code.strip().lower()
             or not action.strip()
-            or not isinstance(item_type, str)
             or not item_type.strip()
             or item_id is None
         ):
             continue
+        lookup_key = _draft_item_lookup_key(
+            word,
+            code,
+            action,
+            item_type,
+        )
+        echoed_shape = (word, code, action, item_type)
         # The API returns createAt ascending. Overwrite only an exact tuple
         # match so the newest matching row wins; an older row with the same
         # word/code but a different action or type is never selected. Weight is
         # calculated only by the GET snapshot and cannot be sent in DELETE's
-        # expectedTargets contract, so it is deliberately not identity.
-        by_written_shape[(word, code, action.strip(), item_type.strip())] = item_id
+        # expectedTargets contract, so it is deliberately not identity. Keep
+        # the server's exact echoed shape for later strict CAS comparison.
+        by_written_shape[lookup_key] = (item_id, echoed_shape)
     return by_written_shape, True
 
 
@@ -1476,20 +1503,19 @@ def resolve_draft_outcome(
             rejected.append((candidate, reason))
             continue
         if has_snapshot:
-            key = (
+            key = _draft_item_lookup_key(
                 candidate.word,
                 str(candidate.code or "").strip().lower(),
                 "Create",
                 "Phrase",
             )
-            item_id = by_written_shape.get(key)
-            if item_id is None:
+            matched_row = by_written_shape.get(key)
+            if matched_row is None:
                 rejected.append((candidate, "草稿中未找到该条目，未确认写入"))
                 continue
             accepted.append(candidate)
-            numeric_id = _safe_item_id(item_id)
-            if numeric_id is not None:
-                cleanup_targets.append((numeric_id, key))
+            item_id, echoed_shape = matched_row
+            cleanup_targets.append((item_id, echoed_shape))
             continue
         accepted.append(candidate)
 
@@ -1554,12 +1580,7 @@ async def _delete_draft_items(
             or item_id in intended_by_id
         ):
             return False
-        intended_by_id[item_id] = (
-            word.strip(),
-            code.strip().lower(),
-            action.strip(),
-            item_type.strip(),
-        )
+        intended_by_id[item_id] = (word, code, action, item_type)
         ids.append(item_id)
     if not ids:
         return False
@@ -1609,12 +1630,7 @@ async def _delete_draft_items(
                 not all(isinstance(value, str) for value in (word, code, action, item_type))
             ):
                 continue
-            current_shape = (
-                word.strip(),
-                code.strip().lower(),
-                action.strip(),
-                item_type.strip(),
-            )
+            current_shape = (word, code, action, item_type)
             if not _draft_item_identity_matches(
                 current_shape,
                 intended_by_id[item_id],

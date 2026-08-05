@@ -339,7 +339,7 @@ def test_classification_routes_every_unknown_to_humans():
     print("\n[4] Classification (needsManualReview / duplicate / no code / limit)")
 
     reviewed = [
-        _entry("干净词", _clean_review("aaaa")),
+        _entry("干净词", _clean_review("AAAA")),
         _entry("需审词", _clean_review("bbbb", **{MANUAL_REVIEW_FIELD: True, "manualReviewReason": "证据不足"})),
         _entry("重复词", _clean_review("cccc", existing=[{"word": "重复词", "code": "cccc"}])),
         _entry("查失败", _clean_review("dddd", lookupFailed=True)),
@@ -371,7 +371,12 @@ def test_classification_routes_every_unknown_to_humans():
     check("unsuccessful review goes to the recommend group", "编码服务" in manual["未成功"].reason)
     check("recommend items keep the suggested code when known", manual["需审词"].code == "bbbb")
     check("every non-auto candidate is accounted for", len(manual_items) == len(reviewed) - 1)
-    check("groups are tagged", auto_items[0].group == GROUP_AUTO and manual_items[0].group == GROUP_MANUAL)
+    check(
+        "groups are tagged and eligible codes are canonicalized",
+        auto_items[0].group == GROUP_AUTO
+        and auto_items[0].code == "aaaa"
+        and manual_items[0].group == GROUP_MANUAL,
+    )
 
     # Daily limit: overflow is recommended, never dropped.
     many = [_entry(f"词{index}", _clean_review(f"c{index}")) for index in range(5)]
@@ -1002,6 +1007,45 @@ def test_partial_ingest_is_attributed_per_word():
     )
 
     accepted, rejected, ids = resolve_draft_outcome(
+        items[:1],
+        {
+            "successCount": 1,
+            "draftItems": [
+                {"id": 13, "word": "甲词", "code": "AAAA", "action": "Create", "type": "Phrase"},
+            ],
+        },
+    )
+    whitespace_candidate = ClassifiedCandidate(
+        WordCandidate("甲词 "),
+        GROUP_AUTO,
+        code="aaaa",
+    )
+    whitespace_accepted, whitespace_rejected, whitespace_ids = resolve_draft_outcome(
+        [whitespace_candidate],
+        {
+            "successCount": 1,
+            "draftItems": [
+                {
+                    "id": 14,
+                    "word": "甲词 ",
+                    "code": "aaaa",
+                    "action": "Create",
+                    "type": "Phrase",
+                },
+            ],
+        },
+    )
+    check(
+        "stored codes stay canonical and matching word whitespace is normalized symmetrically",
+        accepted == []
+        and len(rejected) == 1
+        and ids == []
+        and whitespace_accepted == [whitespace_candidate]
+        and whitespace_rejected == []
+        and whitespace_ids == [(14, ("甲词 ", "aaaa", "Create", "Phrase"))],
+    )
+
+    accepted, rejected, ids = resolve_draft_outcome(
         items,
         {
             "successCount": 2,
@@ -1071,7 +1115,9 @@ def test_partial_ingest_is_attributed_per_word():
         check("the failed word comes back with its reason", result["rejected"] == [(items[1], "编码冲突")])
         check("the message says it was partial", "部分入库" in result.get("message", ""))
 
-        # submit fails -> the draft rows we wrote are deleted again.
+        # submit fails -> the draft rows we wrote are deleted again.  Preserve
+        # the exact POST echo (including raw word bytes) as the cleanup identity;
+        # the later GET must match that echo byte-for-byte for DELETE to fire.
         submit_fails = [
             {"batchId": "b1"},
             # HTTP 400 + requiresConfirmation is the server's preview answer.
@@ -1079,13 +1125,13 @@ def test_partial_ingest_is_attributed_per_word():
              "contentVersion": 2, "warningDigest": "f" * 64},
             {"successCount": 2, "contentVersion": 3, "draftItems": [
                 {"id": 30, "word": "甲词", "code": "aaaa", "action": "Change", "type": "Word", "weight": 7},
-                {"id": 31, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase", "weight": None},
+                {"id": 31, "word": "甲词 ", "code": "aaaa", "action": "Create", "type": "Phrase", "weight": None},
                 {"id": 32, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase", "weight": None},
             ]},
             {"success": False, "message": "批次校验失败"},
             {"success": True, "batchId": "b1", "contentVersion": 3, "items": [
                 {"id": 30, "word": "甲词", "code": "aaaa", "action": "Change", "type": "Word", "weight": 7},
-                {"id": 31, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase", "weight": 100},
+                {"id": 31, "word": "甲词 ", "code": "aaaa", "action": "Create", "type": "Phrase", "weight": 100},
                 {"id": 32, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase", "weight": 100},
             ]},
             {"success": True, "batchId": "b1", "contentVersion": 4, "successCount": 2},  # the compensating DELETE
@@ -1116,7 +1162,7 @@ def test_partial_ingest_is_attributed_per_word():
                 "batchId": "b1",
                 "expectedContentVersion": 3,
                 "expectedTargets": [
-                    {"id": 31, "word": "甲词", "code": "aaaa", "action": "Create", "type": "Phrase"},
+                    {"id": 31, "word": "甲词 ", "code": "aaaa", "action": "Create", "type": "Phrase"},
                     {"id": 32, "word": "乙词", "code": "bbbb", "action": "Create", "type": "Phrase"},
                 ],
             },
@@ -1128,13 +1174,15 @@ def test_partial_ingest_is_attributed_per_word():
         # while changing any server-comparable field. The confirmed-write
         # response mirrors the POST route (weight null), while the revalidation
         # snapshot mirrors latest-draft/items (calculated numeric weight).
-        changed_fields = {
-            "word": "改词",
-            "code": "zzzz",
-            "action": "Change",
-            "type": "Word",
-        }
-        for changed_field, changed_value in changed_fields.items():
+        changed_fields = (
+            ("word", "word", "改词"),
+            ("code", "code", "zzzz"),
+            ("action", "action", "Change"),
+            ("type", "type", "Word"),
+            ("word whitespace", "word", "甲词 "),
+            ("code case", "code", "AAAA"),
+        )
+        for mismatch_label, changed_field, changed_value in changed_fields:
             with tempfile.TemporaryDirectory() as tmp:
                 store = DiscoveryStore(
                     db_path=os.path.join(tmp, f"edited-{changed_field}-cleanup.db")
@@ -1166,11 +1214,11 @@ def test_partial_ingest_is_attributed_per_word():
                     )
                 pending = store.list_pending_recovery()
                 check(
-                    f"cleanup refuses when live {changed_field} differs",
+                    f"cleanup refuses when live {mismatch_label} differs",
                     all(method != "DELETE" for method, _path, _kwargs in recorded),
                 )
                 check(
-                    f"a refused {changed_field} cleanup is recorded for recovery",
+                    f"a refused {mismatch_label} cleanup is recorded for recovery",
                     result.get("pendingRecovery") != "" and len(pending) == 1,
                 )
 

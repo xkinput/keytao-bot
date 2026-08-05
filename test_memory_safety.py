@@ -2670,6 +2670,292 @@ RECORD_FRAME_BRACKET_REQUEST_REGRESSIONS = (
     ("请添加词条〈记载〉", "记载", "Create"),
 )
 
+# Keep this corpus independent from the implementation regex: it is the
+# user-facing mutation vocabulary, crossed with every supported negation
+# distance and every operand/code presence combination.
+NEGATION_WINDOW_NEGATORS = (
+    "不要",
+    "别",
+    "无需",
+    "不用",
+    "禁止",
+    "不要真的",
+    "先不",
+    "暂时不",
+    "不必",
+    "不再",
+    "不需要",
+    "甭",
+    "勿",
+    "先别",
+    "暂时别",
+)
+NEGATION_MUTATION_VERBS = (
+    "添加", "加入", "加到", "新增", "创建", "写入", "放入", "收录", "录入", "记入",
+    "提交", "提审", "送审", "发起审核", "删除", "删掉", "删干净", "去掉", "移除", "清空",
+    "清理", "撤销", "撤回", "召回", "修改", "改成", "改为", "替换", "顺延", "挪开",
+    "重新编码", "保留", "批量处理", "都删", "其余删", "其他删",
+)
+NEGATION_TARGET_SUFFIXES = (
+    "",                 # no operand, no code
+    "条目12",           # operand only
+    " wkxk",            # code only
+    "条目12 wkxk",      # operand and code
+)
+NEGATION_WINDOW_CORPUS_SIZE = (
+    len(NEGATION_WINDOW_NEGATORS)
+    * 13
+    * len(NEGATION_MUTATION_VERBS)
+    * len(NEGATION_TARGET_SUFFIXES)
+)
+
+# Independent reviewer-shaped leak corpus.  Keep every dimension literal here
+# rather than importing or deriving it from the production regex.
+REVIEW_NEGATION_NEGATORS = (
+    "不要", "别", "无需", "不用", "禁止", "不要真的", "先不",
+    "暂时不", "不必", "不再", "不需要", "甭", "勿",
+)
+REVIEW_NEGATION_VERBS = (
+    "添加", "加入", "加到", "新增", "创建", "写入", "放入", "收录", "录入", "记入",
+    "提交", "提审", "送审", "发起审核", "删除", "删掉", "删干净", "去掉", "移除", "清空",
+    "清理", "撤销", "撤回", "召回", "修改", "改成", "改为", "替换", "顺延", "挪开",
+    "重新编码", "保留", "批量处理",
+)
+REVIEW_NEGATION_TARGET_SUFFIXES = ("", "条目12", " wkxk", "条目12 wkxk")
+REVIEW_NEGATION_PREFIXES = ("", "请", "麻烦", "帮我", "现在", "立即")
+REVIEW_NEGATION_CORPUS_SIZE = (
+    len(REVIEW_NEGATION_NEGATORS)
+    * 13
+    * len(REVIEW_NEGATION_VERBS)
+    * len(REVIEW_NEGATION_TARGET_SUFFIXES)
+    * len(REVIEW_NEGATION_PREFIXES)
+)
+
+# Full false-positive cross-product required by the review.  The command
+# builder is grammatical, not regex-derived: 把/将 forms put the entry before
+# the verb, while the empty-prefix form uses ordinary verb-object order so an
+# unquoted word such as 不必 is still visibly the dictionary operand.
+NEGATOR_OPERAND_PREFIXES = ("把", "将", "请把", "请将", "帮我把", "麻烦把", "")
+NEGATOR_OPERANDS = (
+    "不必", "不再", "甭", "勿", "勿忘我", "不需要",
+    "暂时不", "先不", "不必要", "别的", "无需", "不用",
+)
+NEGATOR_OPERAND_VERBS = ("改成", "加到草稿", "加入", "删除", "顺延", "的编码改成")
+NEGATOR_OPERAND_CODE_VARIANTS = (False, True)
+NEGATOR_OPERAND_QUOTE_VARIANTS = (False, True)
+NEGATOR_OPERAND_CLAUSE_VARIANTS = ("same-clause", "cross-clause")
+NEGATOR_OPERAND_CORPUS_SIZE = (
+    len(NEGATOR_OPERAND_PREFIXES)
+    * len(NEGATOR_OPERANDS)
+    * len(NEGATOR_OPERAND_VERBS)
+    * len(NEGATOR_OPERAND_CODE_VARIANTS)
+    * len(NEGATOR_OPERAND_QUOTE_VARIANTS)
+    * len(NEGATOR_OPERAND_CLAUSE_VARIANTS)
+)
+NEGATION_FALSE_POSITIVE_ALLOW = (
+    "这个词不错，删除条目12",
+    "不错，添加吃席 wkxk",
+    "编码不对，改成 wkxk",
+    "这个不合适，删掉条目3",
+    "不用管别的，删除条目5",
+    "添加词条「不错」",
+    "顺延「不必」",
+)
+
+# A record frame must keep wrapping the following mutation even when a
+# standalone negation sits between them.  The first five joins reproduce the
+# reviewer's 3,520-cell leak matrix; the full join set pins every product
+# separator required by this follow-up, including the no-separator spelling.
+RECORD_FRAME_NEGATION_FRAMES = (
+    "记录一下", "备注", "记录", "转告", "存档", "做个记录",
+    "标记", "写进备忘录", "保存", "登记", "记载",
+)
+RECORD_FRAME_NEGATION_REVIEW_JOINS = ("", "：", ":", "、", " ")
+RECORD_FRAME_NEGATION_ALL_JOINS = (
+    *RECORD_FRAME_NEGATION_REVIEW_JOINS,
+    "—",
+    "，",
+)
+RECORD_FRAME_NEGATORS = (
+    "不要", "别", "无需", "不用", "禁止", "不要真的", "先不", "暂时不",
+    "不必", "不再", "不需要", "甭", "勿", "先别", "暂时别", "不要了",
+)
+RECORD_FRAME_NEGATION_COMMANDS = (
+    "删除条目12",
+    "清空草稿",
+    "提交批次",
+    "删除全部条目",
+)
+# The no-negator control deliberately covers more frame and command spellings
+# than the leak matrix.  It proves that the frame gate itself remains active;
+# these reported instructions must never authorize a write.
+RECORD_FRAME_NO_NEGATOR_CONTROL_FRAMES = (
+    *RECORD_FRAME_NEGATION_FRAMES,
+    "归档",
+    "留档",
+    "转达一下",
+    "传达给管理员",
+)
+RECORD_FRAME_NO_NEGATOR_CONTROL_COMMANDS = (
+    *RECORD_FRAME_NEGATION_COMMANDS,
+    "添加吃席 wkxk",
+    "顺延吃席到 wkxk",
+)
+LEGITIMATE_NEGATION_CONTROL_COMMANDS = (
+    *NEGATION_FALSE_POSITIVE_ALLOW,
+    "把「先不」改成不在",
+    "把「暂时不」改成不在",
+    "把「不必」改成不在",
+    "把「不再」改成不在",
+    "把「不需要」改成不在",
+    "把「甭」改成不在",
+    "把「勿」改成不在",
+    "请把安全词加入草稿",
+    "直接提交当前草稿",
+    "请收录母版 mjbfa",
+)
+
+# These prefixes contain a negator spelling as ordinary clause-local language.
+# A newline keeps them separate from the following command just as a comma
+# does.  15 prefixes x 12 commands reproduces all 180 newline regressions.
+NEWLINE_NEGATORISH_PREFIXES = (
+    "勿扰", "不必客气", "不用管别的", "帮我不再", "不要紧",
+    "别担心", "无需客气", "禁止喧哗", "不要真的紧张", "先不说这个",
+    "暂时不管其他", "不需要客气", "甭客气", "先别着急", "暂时别担心",
+)
+NEWLINE_MUTATION_REQUESTS = (
+    ("删除条目12", "keytao_remove_draft_item", {"pr_id": 12}),
+    ("删掉条目12", "keytao_remove_draft_item", {"pr_id": 12}),
+    ("去掉条目12", "keytao_remove_draft_item", {"pr_id": 12}),
+    ("移除条目12", "keytao_remove_draft_item", {"pr_id": 12}),
+    (
+        "添加吃席 wkxk",
+        "keytao_create_phrase",
+        {"word": "吃席", "code": "wkxk", "action": "Create"},
+    ),
+    (
+        "加入吃席 wkxk",
+        "keytao_create_phrase",
+        {"word": "吃席", "code": "wkxk", "action": "Create"},
+    ),
+    (
+        "新增吃席 wkxk",
+        "keytao_create_phrase",
+        {"word": "吃席", "code": "wkxk", "action": "Create"},
+    ),
+    (
+        "收录吃席 wkxk",
+        "keytao_create_phrase",
+        {"word": "吃席", "code": "wkxk", "action": "Create"},
+    ),
+    (
+        "修改吃席为新词",
+        "keytao_create_phrase",
+        {"word": "吃席", "code": "wkxk", "action": "Change"},
+    ),
+    (
+        "重新编码吃席为 wkxk",
+        "keytao_create_phrase",
+        {"word": "吃席", "code": "wkxk", "action": "Change"},
+    ),
+    ("提交批次", "keytao_submit_batch", {}),
+    ("撤回批次", "keytao_recall_batch", {}),
+)
+NEWLINE_MUTATION_REQUEST_CORPUS_SIZE = (
+    len(NEWLINE_NEGATORISH_PREFIXES) * len(NEWLINE_MUTATION_REQUESTS)
+)
+
+
+def iter_negation_window_corpus():
+    for negator in NEGATION_WINDOW_NEGATORS:
+        for filler_length in range(13):
+            filler = "甲" * filler_length
+            for mutation_verb in NEGATION_MUTATION_VERBS:
+                for suffix in NEGATION_TARGET_SUFFIXES:
+                    # The polite prefix reproduces the hazardous production
+                    # form: without the negation guard it grants authority.
+                    yield f"请{negator}{filler}{mutation_verb}{suffix}"
+
+
+def iter_review_negation_corpus():
+    for negator in REVIEW_NEGATION_NEGATORS:
+        for filler_length in range(13):
+            filler = "甲" * filler_length
+            for mutation_verb in REVIEW_NEGATION_VERBS:
+                for suffix in REVIEW_NEGATION_TARGET_SUFFIXES:
+                    for prefix in REVIEW_NEGATION_PREFIXES:
+                        yield f"{prefix}{negator}{filler}{mutation_verb}{suffix}"
+
+
+def _negator_operand_command(
+    prefix: str,
+    operand: str,
+    verb: str,
+    with_code: bool,
+    quoted: bool,
+    clause_variant: str,
+) -> str:
+    operand_text = f"「{operand}」" if quoted else operand
+    code = " wkxk" if with_code else ""
+    separator = "，" if clause_variant == "cross-clause" else ""
+    completions = {
+        "改成": "不在",
+        "加到草稿": "",
+        "加入": "草稿",
+        "删除": "",
+        "顺延": "到 wkxk",
+        "的编码改成": "wkxk",
+    }
+    if prefix:
+        command = f"{prefix}{operand_text}{code}{verb}{completions[verb]}"
+        if clause_variant == "cross-clause" and verb == "的编码改成":
+            return f"按当前草稿，{command}"
+        return f"{prefix}{operand_text}{code}{separator}{verb}{completions[verb]}"
+    target = f"{operand_text}{code}"
+    verb_initial_templates = {
+        "改成": f"修改{target}为不在",
+        "加到草稿": f"加到草稿：{target}",
+        "加入": f"加入草稿：{target}",
+        "删除": f"删除{target}",
+        "顺延": f"顺延{target}到 wkxk",
+        "的编码改成": f"重新编码{target}为 wkxk",
+    }
+    command = verb_initial_templates[verb]
+    return f"按当前草稿，{command}" if clause_variant == "cross-clause" else command
+
+
+def iter_negator_operand_corpus():
+    for prefix in NEGATOR_OPERAND_PREFIXES:
+        for operand in NEGATOR_OPERANDS:
+            for verb in NEGATOR_OPERAND_VERBS:
+                for with_code in NEGATOR_OPERAND_CODE_VARIANTS:
+                    for quoted in NEGATOR_OPERAND_QUOTE_VARIANTS:
+                        for clause_variant in NEGATOR_OPERAND_CLAUSE_VARIANTS:
+                            message = _negator_operand_command(
+                                prefix,
+                                operand,
+                                verb,
+                                with_code,
+                                quoted,
+                                clause_variant,
+                            )
+                            yield message
+
+
+def iter_record_frame_negation_corpus(joins):
+    for frame in RECORD_FRAME_NEGATION_FRAMES:
+        for join in joins:
+            for negator in RECORD_FRAME_NEGATORS:
+                for command in RECORD_FRAME_NEGATION_COMMANDS:
+                    yield f"{frame}{join}{negator}，{command}"
+
+
+def iter_record_frame_no_negator_control():
+    for frame in RECORD_FRAME_NO_NEGATOR_CONTROL_FRAMES:
+        for join in RECORD_FRAME_NEGATION_ALL_JOINS:
+            for command in RECORD_FRAME_NO_NEGATOR_CONTROL_COMMANDS:
+                yield f"{frame}{join}{command}"
+
 
 class MutationAuthorizationTests(unittest.TestCase):
     def test_only_explicit_current_text_authorizes_mutation(self) -> None:
@@ -2692,6 +2978,164 @@ class MutationAuthorizationTests(unittest.TestCase):
         self.assertFalse(message_authorizes_mutation("请问怎么提交草稿？"))
         self.assertFalse(message_authorizes_mutation("能不能不要提交？"))
         self.assertFalse(message_authorizes_mutation("母版收录了吗？"))
+
+        for operand in ("先不", "暂时不", "不必", "不再", "不需要", "甭", "勿"):
+            message = f"把「{operand}」改成不在"
+            with self.subTest(quoted_negator_operand=operand):
+                self.assertTrue(message_authorizes_mutation(message))
+                self.assertTrue(
+                    message_requests_change(
+                        message,
+                        "keytao_create_phrase",
+                        {"word": operand, "code": "wkxk", "action": "Change"},
+                    )
+                )
+
+    def test_negation_corpus_is_refused_without_blocking_unrelated_commands(self) -> None:
+        self.assertEqual(NEGATION_WINDOW_CORPUS_SIZE, 28080)
+        leaks = [
+            message
+            for message in iter_negation_window_corpus()
+            if message_authorizes_mutation(message)
+        ]
+        if leaks:
+            self.fail(
+                f"{len(leaks)} windowed negations authorized; first 20: {leaks[:20]}"
+            )
+
+        self.assertEqual(len(NEGATION_FALSE_POSITIVE_ALLOW), 7)
+        rejected = [
+            message
+            for message in NEGATION_FALSE_POSITIVE_ALLOW
+            if not message_authorizes_mutation(message)
+        ]
+        if rejected:
+            self.fail(
+                f"{len(rejected)} legitimate 不-containing commands rejected: {rejected}"
+            )
+
+        self.assertEqual(REVIEW_NEGATION_CORPUS_SIZE, 133848)
+        review_leaks = [
+            message
+            for message in iter_review_negation_corpus()
+            if message_authorizes_mutation(message)
+        ]
+        if review_leaks:
+            self.fail(
+                f"{len(review_leaks)} reviewer-shaped negations authorized; "
+                f"first 20: {review_leaks[:20]}"
+            )
+
+        self.assertEqual(NEGATOR_OPERAND_CORPUS_SIZE, 4032)
+        corpus = list(iter_negator_operand_corpus())
+        wrongly_refused = [
+            message
+            for message in corpus
+            if not message_authorizes_mutation(message)
+        ]
+        if wrongly_refused:
+            self.fail(
+                f"{len(wrongly_refused)} negator-operand commands refused; "
+                f"first 20: {wrongly_refused[:20]}"
+            )
+
+        # A negator-shaped dictionary entry in one clause must not consume a
+        # later clause's mutation verb.  This covers both the longstanding
+        # 不用/不要/别 spellings and the seven follow-up spellings.
+        for operand in (
+            "不用", "不要", "别", "先不", "暂时不",
+            "不必", "不再", "不需要", "甭", "勿",
+        ):
+            for delete_verb in ("删除", "删掉", "去掉", "移除"):
+                for message in (
+                    f"添加词条{operand}，{delete_verb}条目12",
+                    f"添加{operand}，{delete_verb}条目12",
+                ):
+                    with self.subTest(
+                        cross_clause_operand=operand,
+                        delete_verb=delete_verb,
+                        message=message,
+                    ):
+                        self.assertTrue(message_authorizes_mutation(message))
+
+        self.assertFalse(message_authorizes_mutation("不要，删除条目12"))
+        self.assertTrue(message_authorizes_mutation("不用管别的，删除条目5"))
+        self.assertTrue(
+            message_requests_change(
+                "不用管别的，删除条目5",
+                "keytao_remove_draft_item",
+                {"pr_id": 5},
+            )
+        )
+
+        review_frame_corpus = tuple(iter_record_frame_negation_corpus(
+            RECORD_FRAME_NEGATION_REVIEW_JOINS
+        ))
+        self.assertEqual(len(review_frame_corpus), 3520)
+        review_frame_leaks = [
+            message
+            for message in review_frame_corpus
+            if message_authorizes_mutation(message)
+        ]
+        if review_frame_leaks:
+            self.fail(
+                f"{len(review_frame_leaks)} review record-frame negations authorized; "
+                f"first 20: {review_frame_leaks[:20]}"
+            )
+
+        cross_product_corpus = tuple(iter_record_frame_negation_corpus(
+            RECORD_FRAME_NEGATION_ALL_JOINS
+        ))
+        self.assertEqual(len(cross_product_corpus), 4928)
+        cross_product_leaks = [
+            message
+            for message in cross_product_corpus
+            if message_authorizes_mutation(message)
+        ]
+        if cross_product_leaks:
+            self.fail(
+                f"{len(cross_product_leaks)} cross-product record-frame negations "
+                f"authorized; first 20: {cross_product_leaks[:20]}"
+            )
+
+        no_negator_control = tuple(iter_record_frame_no_negator_control())
+        self.assertEqual(len(no_negator_control), 630)
+        control_leaks = [
+            message
+            for message in no_negator_control
+            if message_authorizes_mutation(message)
+        ]
+        if control_leaks:
+            self.fail(
+                f"{len(control_leaks)} no-negator record frames authorized; "
+                f"first 20: {control_leaks[:20]}"
+            )
+
+        self.assertEqual(len(LEGITIMATE_NEGATION_CONTROL_COMMANDS), 17)
+        legitimate_rejections = [
+            message
+            for message in LEGITIMATE_NEGATION_CONTROL_COMMANDS
+            if not message_authorizes_mutation(message)
+        ]
+        if legitimate_rejections:
+            self.fail(
+                f"{len(legitimate_rejections)} legitimate commands rejected; "
+                f"commands: {legitimate_rejections}"
+            )
+
+        self.assertEqual(NEWLINE_MUTATION_REQUEST_CORPUS_SIZE, 180)
+        newline_inversions = []
+        for prefix in NEWLINE_NEGATORISH_PREFIXES:
+            for command, tool_name, arguments in NEWLINE_MUTATION_REQUESTS:
+                message = f"{prefix}\n{command}"
+                self.assertTrue(message_authorizes_mutation(message), message)
+                if not message_requests_change(message, tool_name, arguments):
+                    newline_inversions.append(message)
+        if newline_inversions:
+            self.fail(
+                f"{len(newline_inversions)} newline-separated commands hidden from "
+                f"the helpfulness gate; first 20: {newline_inversions[:20]}"
+            )
 
     def test_execution_prefix_does_not_authorize_protection_small_talk(self) -> None:
         """"执行" opens a command; it must not promote a "保留" protection clause."""
@@ -2797,11 +3241,47 @@ class MutationAuthorizationTests(unittest.TestCase):
 
     def test_direct_execution_questions_are_visible_to_helpfulness_gate(self) -> None:
         for lead_in in ("能不能", "可不可以", "能否", "可否"):
-            message = f"{lead_in}提交当前草稿？"
-            with self.subTest(lead_in=lead_in):
-                self.assertTrue(message_authorizes_mutation(message))
-                self.assertTrue(
-                    message_requests_change(message, "keytao_submit_batch", {})
+            for punctuation in ("", "？"):
+                message = f"{lead_in}提交当前草稿{punctuation}"
+                with self.subTest(lead_in=lead_in, punctuation=punctuation):
+                    self.assertTrue(message_authorizes_mutation(message))
+                    self.assertTrue(
+                        message_requests_change(message, "keytao_submit_batch", {})
+                    )
+
+    def test_sentence_initial_questions_do_not_bypass_helpfulness_question_gate(self) -> None:
+        for lead_in in ("能不能", "可不可以"):
+            for positional_verb in ("放到", "调到", "挪到", "排在"):
+                message = f"{lead_in}把吃席{positional_verb} wkxk"
+                with self.subTest(lead_in=lead_in, positional_verb=positional_verb):
+                    self.assertFalse(
+                        message_requests_change(
+                            message,
+                            "keytao_shift_phrase_code",
+                            {"word": "吃席", "target_code": "wkxk"},
+                        )
+                    )
+
+        positional_command = "请把吃席挪到 wkxk"
+        self.assertFalse(message_authorizes_mutation(positional_command))
+        self.assertTrue(
+            message_requests_change(
+                positional_command,
+                "keytao_shift_phrase_code",
+                {"word": "吃席", "target_code": "wkxk"},
+            )
+        )
+
+    def test_negated_execution_questions_request_no_change(self) -> None:
+        for message in ("能不能别删条目12", "可不可以不要删除条目12"):
+            with self.subTest(message=message):
+                self.assertFalse(message_authorizes_mutation(message))
+                self.assertFalse(
+                    message_requests_change(
+                        message,
+                        "keytao_remove_draft_item",
+                        {"pr_id": 12},
+                    )
                 )
 
     def test_product_command_grammar_survives_record_framing_gate(self) -> None:

@@ -259,9 +259,15 @@ _MUTATION_INTENT_RE = re.compile(
     r"|都删|其余删|其他删"
 )
 _NEGATED_MUTATION_RE = re.compile(
-    r"(?:不要|别(?!的)|无需|不用|禁止|不要真的).{0,12}"
-    r"(?:添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|"
-    r"删除|删掉|删干净|去掉|移除|清空|清理|撤销|撤回|修改|改成|改为|替换|重新编码|顺延|保留)"
+    rf"(?:"
+    rf"(?<![把将])"
+    rf"(?:不要|别(?!的)|无需|不用|禁止|不要真的|先不|暂时不|不必|不再|不需要|甭|勿)"
+    rf".{{0,12}}(?:{_MUTATION_INTENT_RE.pattern})"
+    rf")"
+)
+_STANDALONE_NEGATION_CLAUSE_RE = re.compile(
+    r"(?:请)?(?:不要|别|无需|不用|禁止|不要真的|先不|暂时不|不必|不再|"
+    r"不需要|甭|勿|先别|暂时别)(?:了)?"
 )
 _EXPLANATION_ONLY_RE = re.compile(
     r"(?:什么意思|什么含义|解释一下|说明一下|怎么做|如何操作|操作方法|"
@@ -270,9 +276,9 @@ _EXPLANATION_ONLY_RE = re.compile(
 )
 _TEXT_TRANSFORM_RE = re.compile(r"(?:改写|润色|复述|翻译|引用|摘录|转述)")
 _QUESTION_RE = re.compile(
-    r"[?？]|(?:是否|能否|可否|会不会|是不是|要不要|怎么样|怎样|如何|"
+    r"[?？]|(?:是否|能否|可否|能不能|可不可以|会不会|是不是|要不要|怎么样|怎样|如何|"
     r"想知道|之后的结果|结果是什么)|"
-    r"(?:吗|么|呢|好不好|行不行|可不可以|能不能|对不对|可以不|"
+    r"(?:吗|么|呢|好不好|行不行|对不对|可以不|"
     r"不可以|不行)(?:[。.!！])?$"
 )
 _ABORT_RE = re.compile(r"(?:算了|取消|别执行|不要执行|先不要|不用了|不做了|别做了)")
@@ -520,6 +526,25 @@ def trusted_mutation_source(message: str) -> str:
     return _UNTRUSTED_DATA_TAIL_RE.sub("", text)
 
 
+def _has_standalone_negation_before_mutation(message: str) -> bool:
+    """Bind an unambiguous standalone negation to the immediately next clause."""
+    text = _LEADING_MENTION_RE.sub("", trusted_mutation_source(message), count=1)
+    # A quoted negator is lexical data, not a standalone refusal.
+    text = _QUOTED_DATA_RE.sub("", text)
+    clauses = [
+        re.sub(r"\s+", "", clause).strip()
+        for clause in _COMMAND_CLAUSE_SPLIT_RE.split(text)
+    ]
+    clauses = [clause for clause in clauses if clause]
+    for previous, current in zip(clauses, clauses[1:]):
+        if (
+            _STANDALONE_NEGATION_CLAUSE_RE.fullmatch(previous)
+            and _MUTATION_INTENT_RE.search(current)
+        ):
+            return True
+    return False
+
+
 def _mutation_authorization_view(message: str) -> str:
     """Return only positive command clauses plus explicit protection clauses."""
     text = _LEADING_MENTION_RE.sub("", trusted_mutation_source(message), count=1)
@@ -558,11 +583,54 @@ def _mutation_authorization_view(message: str) -> str:
     return "；".join(trusted_clauses)
 
 
-def _message_authorizes_mutation_core(message: str) -> bool:
-    """Judge mutation syntax after higher-level data framing is excluded."""
-    raw_text = re.sub(r"\s+", "", str(message or ""))
+def _has_mutation_instruction_shape(message: str) -> bool:
+    """Recognize mutation syntax without deciding whether the user consents."""
     text = re.sub(r"\s+", "", _mutation_authorization_view(message))
     authorization_text = _QUOTED_DATA_RE.sub("", text)
+    stripped_command_text = _COMMAND_PREFIX_RE.sub("", text, count=1)
+    mutation_match = _MUTATION_INTENT_RE.search(authorization_text)
+    if not authorization_text or mutation_match is None:
+        return False
+
+    # The final checks here describe instruction shape, but the input view also
+    # admits explicit protection clauses via _NEGATIVE_MODAL_RE and
+    # _PROTECTED_WORD_RE.  That admission is not consent: the outer core still
+    # rejects negation, questions, aborts, explanations, transforms and data
+    # context independently.  Moving those consent checks out of this helper is
+    # precautionary separation; the measured record-frame defect was limited
+    # to standalone negation, not the other consent-predicate groups.
+    stripped_text = _COMMAND_PREFIX_RE.sub("", authorization_text, count=1)
+    stripped_match = _MUTATION_INTENT_RE.search(stripped_text)
+    return bool(
+        (stripped_match is not None and stripped_match.start() == 0)
+        or re.match(
+            rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
+            stripped_command_text,
+        )
+        or _EXPLICIT_REQUEST_PREFIX_RE.match(authorization_text)
+        or re.match(
+            r"(?:草稿|批次)(?:中的)?(?:全部|都|所有)(?:条目)?"
+            r"(?:删除|删掉|去掉|移除)",
+            authorization_text,
+        )
+    )
+
+
+def _message_authorizes_mutation_core(message: str) -> bool:
+    """Judge mutation consent after higher-level data framing is excluded."""
+    raw_text = re.sub(r"\s+", "", str(message or ""))
+    text = re.sub(r"\s+", "", _mutation_authorization_view(message))
+    authorization_clauses = [
+        _QUOTED_DATA_RE.sub("", clause)
+        for clause in _COMMAND_CLAUSE_SPLIT_RE.split(text)
+    ]
+    authorization_text = "；".join(
+        clause for clause in authorization_clauses if clause
+    )
+    has_negated_mutation_clause = any(
+        _NEGATED_MUTATION_RE.search(clause)
+        for clause in authorization_clauses
+    )
     stripped_command_text = _COMMAND_PREFIX_RE.sub("", text, count=1)
     direct_command_after_lead_in = bool(
         _MUTATION_INTENT_RE.match(stripped_command_text)
@@ -586,15 +654,14 @@ def _message_authorizes_mutation_core(message: str) -> bool:
     )
     if (
         not authorization_text
-        or _NEGATED_MUTATION_RE.search(authorization_text)
+        or _has_standalone_negation_before_mutation(message)
+        or has_negated_mutation_clause
         or (_QUESTION_RE.search(raw_text) and not question_is_execution_request)
         or _ABORT_RE.search(raw_text)
     ):
         return False
-    mutation_match = _MUTATION_INTENT_RE.search(authorization_text)
     if (
-        mutation_match is None
-        or _META_DISCUSSION_RE.search(text)
+        _META_DISCUSSION_RE.search(text)
         or _DATA_CONTEXT_RE.search(authorization_text)
         or re.search(r"(?:作为|设为).{0,8}(?:文章)?标题", authorization_text)
     ):
@@ -604,27 +671,7 @@ def _message_authorizes_mutation_core(message: str) -> bool:
         or _TEXT_TRANSFORM_RE.search(authorization_text)
     ):
         return False
-    # The verb must open the instruction.  Strippable command prefixes ("请",
-    # "确认", "执行", …) are removed first for that judgement only: they are how
-    # people actually start a command, and the view already decided this clause
-    # is a positive command.  Widening _EXPLICIT_REQUEST_PREFIX_RE instead would
-    # also admit clauses that only reached the view as protection clauses
-    # ("执行结果保留一下"), which is authority the user never granted.
-    stripped_text = _COMMAND_PREFIX_RE.sub("", authorization_text, count=1)
-    stripped_match = _MUTATION_INTENT_RE.search(stripped_text)
-    return bool(
-        (stripped_match is not None and stripped_match.start() == 0)
-        or re.match(
-            rf"(?:把|将).{{1,80}}(?:{_MUTATION_INTENT_RE.pattern})",
-            stripped_command_text,
-        )
-        or _EXPLICIT_REQUEST_PREFIX_RE.match(authorization_text)
-        or re.match(
-            r"(?:草稿|批次)(?:中的)?(?:全部|都|所有)(?:条目)?"
-            r"(?:删除|删掉|去掉|移除)",
-            authorization_text,
-        )
-    )
+    return _has_mutation_instruction_shape(message)
 
 
 def _mask_quoted_record_frames(message: str) -> str:
@@ -711,7 +758,7 @@ def _record_frame_is_mutation_operand(
 
 def _has_complete_mutation_instruction(message: str) -> bool:
     """Require a mutation verb plus material that can serve as its operand."""
-    if not _message_authorizes_mutation_core(message):
+    if not _has_mutation_instruction_shape(message):
         return False
 
     authorization_text = re.sub(r"\s+", "", _mutation_authorization_view(message))
@@ -861,9 +908,21 @@ def message_requests_change(
     pattern = _tool_intent_pattern(tool_name, arguments)
     if pattern is None:
         return False
-    text = re.sub(r"\s+", "", trusted_mutation_source(message))
+    source_text = trusted_mutation_source(message)
+    text = re.sub(r"\s+", "", source_text)
     if not text:
         return False
+    authorization_clauses = [
+        _QUOTED_DATA_RE.sub("", re.sub(r"\s+", "", clause))
+        for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source_text)
+    ]
+    authorization_text = "；".join(
+        clause for clause in authorization_clauses if clause
+    )
+    has_negated_mutation_clause = any(
+        _NEGATED_MUTATION_RE.search(clause)
+        for clause in authorization_clauses
+    )
     if (
         _EXPLANATION_ONLY_RE.search(text)
         or _TEXT_TRANSFORM_RE.search(text)
@@ -871,7 +930,8 @@ def message_requests_change(
         or _DATA_CONTEXT_RE.search(text)
         or _record_frame_wraps_complete_mutation(message)
         or _ABORT_RE.search(text)
-        or _NEGATED_MUTATION_RE.search(text)
+        or _has_standalone_negation_before_mutation(message)
+        or has_negated_mutation_clause
     ):
         return False
     raw_text = re.sub(r"\s+", "", str(message or ""))
@@ -892,7 +952,7 @@ def message_requests_change(
     )
     if _QUESTION_RE.search(raw_text) and not question_is_execution_request:
         return False
-    return bool(pattern.search(_QUOTED_DATA_RE.sub("", text)))
+    return bool(pattern.search(authorization_text))
 
 
 def _suggestion_operands(tool_name: str, arguments: Dict) -> List[str]:
