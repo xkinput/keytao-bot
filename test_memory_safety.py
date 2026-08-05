@@ -3123,10 +3123,17 @@ POSITIONAL_TRUSTED_PHRASE_CODES = (
     "aa", "wkxk", "cx", "hyfio", "abcd", "qwer", "zxcv",
     "jklm", "tyui", "ghjk", "bnmm", "xcpio", "mnop", "asdfgh",
 )
+POSITIONAL_ASCII_MESSAGE_TEMPLATES = (
+    "把{subject}{verb} {destination}",
+    "把{subject}的编码{verb} {destination}",
+    "把{subject}的编码{verb}{destination}",
+    "把{subject}的代码{verb} {destination}",
+)
 POSITIONAL_ASCII_MATRIX_SIZE = (
     len(POSITIONAL_ASCII_MATRIX_SUBJECTS)
     * len(POSITIONAL_ASCII_MATRIX_VERBS)
     * len(POSITIONAL_ORDINARY_ASCII_DESTINATIONS)
+    * len(POSITIONAL_ASCII_MESSAGE_TEMPLATES)
 )
 
 POSITIONAL_SUBORDINATE_MARKERS = (
@@ -3932,30 +3939,38 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         for subject in POSITIONAL_ASCII_MATRIX_SUBJECTS:
             for verb in POSITIONAL_ASCII_MATRIX_VERBS:
                 for destination in POSITIONAL_ORDINARY_ASCII_DESTINATIONS:
-                    message = f"把{subject}{verb} {destination}"
-                    context = ToolContext(
-                        current_message=message,
-                        writes_allowed=message_authorizes_mutation(message),
-                        trusted_codes_by_word={subject: frozenset({"wkxk"})},
-                    )
-                    ordinary_checked += 1
-                    if self._binding_error(
-                        message,
-                        subject,
-                        destination,
-                        trusted_codes_by_word=context.trusted_codes_by_word,
-                    ) is None:
-                        ordinary_leaks.append(message)
-                    suggestion = self_checked_suggested_command(
-                        "keytao_shift_phrase_code",
-                        {"word": subject, "target_code": destination},
-                        context,
-                    )
-                    if suggestion:
-                        ordinary_suggestions.append(f"{message} -> {suggestion}")
+                    for template in POSITIONAL_ASCII_MESSAGE_TEMPLATES:
+                        message = template.format(
+                            subject=subject,
+                            verb=verb,
+                            destination=destination,
+                        )
+                        context = ToolContext(
+                            current_message=message,
+                            writes_allowed=message_authorizes_mutation(message),
+                            trusted_codes_by_word={subject: frozenset({"wkxk"})},
+                        )
+                        ordinary_checked += 1
+                        if self._binding_error(
+                            message,
+                            subject,
+                            destination,
+                            trusted_codes_by_word=context.trusted_codes_by_word,
+                        ) is None:
+                            ordinary_leaks.append(message)
+                        if template == POSITIONAL_ASCII_MESSAGE_TEMPLATES[0]:
+                            suggestion = self_checked_suggested_command(
+                                "keytao_shift_phrase_code",
+                                {"word": subject, "target_code": destination},
+                                context,
+                            )
+                            if suggestion:
+                                ordinary_suggestions.append(
+                                    f"{message} -> {suggestion}"
+                                )
 
         self.assertEqual(ordinary_checked, POSITIONAL_ASCII_MATRIX_SIZE)
-        self.assertEqual(POSITIONAL_ASCII_MATRIX_SIZE, 1960)
+        self.assertEqual(POSITIONAL_ASCII_MATRIX_SIZE, 7840)
         self.assertEqual(ordinary_leaks, [])
         self.assertEqual(ordinary_suggestions, [])
 
@@ -3964,23 +3979,28 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         for subject in POSITIONAL_ASCII_MATRIX_SUBJECTS:
             for verb in POSITIONAL_ASCII_MATRIX_VERBS:
                 for code in POSITIONAL_TRUSTED_PHRASE_CODES:
-                    message = f"把{subject}{verb} {code}"
-                    trusted_checked += 1
-                    if not (
-                        message_authorizes_mutation(message)
-                        and message_requests_change(
-                            message,
-                            "keytao_shift_phrase_code",
-                            {"word": subject, "target_code": code},
+                    for template in POSITIONAL_ASCII_MESSAGE_TEMPLATES:
+                        message = template.format(
+                            subject=subject,
+                            verb=verb,
+                            destination=code,
                         )
-                        and self._binding_error(
-                            message,
-                            subject,
-                            code,
-                            trusted_codes_by_word={subject: frozenset({code})},
-                        ) is None
-                    ):
-                        trusted_refusals.append(message)
+                        trusted_checked += 1
+                        if not (
+                            message_authorizes_mutation(message)
+                            and message_requests_change(
+                                message,
+                                "keytao_shift_phrase_code",
+                                {"word": subject, "target_code": code},
+                            )
+                            and self._binding_error(
+                                message,
+                                subject,
+                                code,
+                                trusted_codes_by_word={subject: frozenset({code})},
+                            ) is None
+                        ):
+                            trusted_refusals.append(message)
 
         self.assertEqual(trusted_checked, POSITIONAL_ASCII_MATRIX_SIZE)
         self.assertEqual(trusted_refusals, [])
@@ -4352,10 +4372,21 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("suggestedCommand", result)
         self.assertEqual(self.calls, [])
 
-        # Once the user supplies the target code, the instruction executes
-        # directly; it no longer needs a remediation round-trip.
+        verb_miss = await self._shift("吃席的编码是 wkxk")
+        self.assertTrue(verb_miss.get("policyBlocked"))
+        self.assertEqual(verb_miss.get("blockReason"), "verb_not_matched")
+        self.assertNotIn("不能授权修改草稿", verb_miss["message"])
+        self.assertIn("与历史、记忆或引用无关", verb_miss["message"])
+        self.assertEqual(self.calls, [])
+
+        # A user-written ASCII destination still lacks server provenance.  The
+        # safe legacy suggestion remains executable exactly as written.
         with_code = await self._shift("把吃席的编码放到 wkxk")
-        self.assertTrue(with_code.get("success"), with_code)
+        self.assertTrue(with_code.get("policyBlocked"), with_code)
+        suggestion = with_code.get("suggestedCommand", "")
+        self.assertEqual(suggestion, "@我 顺延「吃席」到 wkxk")
+        replayed = await self._shift(suggestion)
+        self.assertTrue(replayed.get("success"), replayed)
 
     async def test_every_suggested_command_passes_its_own_validator(self) -> None:
         # Each message is one a real user could send: it asks for this change,

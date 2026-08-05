@@ -2087,14 +2087,7 @@ def _positional_destination_is_bound(
     if parsed.kind == "code":
         return bool(
             parsed.target == target_code
-            and (
-                target_code in word_codes
-                or _positional_message_explicitly_labels_code(
-                    message,
-                    word,
-                    target_code,
-                )
-            )
+            and target_code in word_codes
         )
     if target_code not in word_codes:
         return False
