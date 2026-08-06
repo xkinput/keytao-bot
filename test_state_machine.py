@@ -19,7 +19,20 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import types
 
 # httpx (used by tools)
-sys.modules["httpx"] = types.ModuleType("httpx")
+_fake_httpx = types.ModuleType("httpx")
+_fake_httpx.TimeoutException = type("TimeoutException", (Exception,), {})
+_fake_httpx.ConnectTimeout = type(
+    "ConnectTimeout",
+    (_fake_httpx.TimeoutException,),
+    {},
+)
+_fake_httpx.TransportError = type("TransportError", (Exception,), {})
+_fake_httpx.ConnectError = type(
+    "ConnectError",
+    (_fake_httpx.TransportError,),
+    {},
+)
+sys.modules["httpx"] = _fake_httpx
 
 # nonebot core
 _fake_nonebot = types.ModuleType("nonebot")
@@ -9205,6 +9218,68 @@ def test_get_latest_draft_batch_does_not_touch_word_code_locals():
     check("passes platformId param", FakeAsyncClient.last_request["params"].get("platformId") == "12345")
 
 
+def test_fetch_encode_candidates_retries_timeout_then_succeeds():
+    """The shift encoder must recover when a read succeeds on attempt three."""
+    print("\n🧪 shift encode timeout retry")
+
+    class FakeTimeoutException(Exception):
+        pass
+
+    class FakeConnectTimeout(FakeTimeoutException):
+        pass
+
+    class FakeTransportError(Exception):
+        pass
+
+    class FakeConnectError(FakeTransportError):
+        pass
+
+    class FakeResponse:
+        status_code = 200
+        is_success = True
+
+        def json(self):
+            return {
+                "input": "吃席",
+                "codes": ["cixi"],
+                "altCodes": [],
+                "chars": [],
+            }
+
+    class FakeAsyncClient:
+        attempts = 0
+
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None):
+            FakeAsyncClient.attempts += 1
+            if FakeAsyncClient.attempts < 3:
+                raise FakeTimeoutException("simulated timeout")
+            return FakeResponse()
+
+    async def no_sleep(_delay):
+        return None
+
+    with patch.object(_draft_tools.httpx, "TimeoutException", FakeTimeoutException, create=True), \
+         patch.object(_draft_tools.httpx, "ConnectTimeout", FakeConnectTimeout, create=True), \
+         patch.object(_draft_tools.httpx, "TransportError", FakeTransportError, create=True), \
+         patch.object(_draft_tools.httpx, "ConnectError", FakeConnectError, create=True), \
+         patch.object(_draft_tools.httpx, "AsyncClient", FakeAsyncClient, create=True), \
+         patch.object(_draft_tools.http_client.asyncio, "sleep", no_sleep):
+        result = asyncio.run(_draft_tools._fetch_encode_candidates("吃席"))
+
+    check("shift encoder succeeds on attempt three", result.get("success") is True)
+    check("shift encoder returns successful codes", result.get("candidateCodes") == ["cixi"])
+    check("shift encoder made exactly three attempts", FakeAsyncClient.attempts == 3)
+
+
 async def _run_draft_code_validation_checks():
     async def fake_fetch_encode_candidates(word, requested_code=None):
         check("validation passes requested code to encoder", requested_code in {"xiehmp", "xemev"})
@@ -12751,6 +12826,7 @@ if __name__ == "__main__":
     test_background_draft_operation_timeout_releases_slot()
     test_review_prompt_and_skills_share_submission_semantics()
     test_draft_tool_guard_blocks_out_of_band_mutations()
+    test_fetch_encode_candidates_retries_timeout_then_succeeds()
     test_durable_draft_mutation_claim_lifecycle()
     test_recall_uncertain_claim_never_switches_batches()
     test_delete_uncertain_claim_never_deletes_new_targets()

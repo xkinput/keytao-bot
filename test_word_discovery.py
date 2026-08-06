@@ -695,7 +695,10 @@ def test_auto_ingest_chain_and_degradation():
             and recorded[2][2]["json_body"].get("expectedWarningDigest") == "d" * 64,
         )
         check("every call is made as the bot QQ identity", all(kw.get("platform") == "qq" for _m, _p, kw in recorded))
-        check("no step retries more than once", all(kw.get("retries") == 2 for _m, _p, kw in recorded))
+        check(
+            "every step uses one initial attempt plus three retries",
+            all(kw.get("retries") == 4 for _m, _p, kw in recorded),
+        )
         check(
             "submit preview sends exactly the server contract keys",
             recorded[3][2]["json_body"] == {

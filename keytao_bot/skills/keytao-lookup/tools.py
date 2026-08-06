@@ -8,6 +8,7 @@ import httpx
 from typing import Dict, List, Optional
 from nonebot.log import logger
 
+from keytao_bot.utils import http_client
 from keytao_bot.utils.keytao_encoding import (
     build_alternate_pronunciation_codes as _build_alternate_pronunciation_codes,
     build_phrase_pronunciation_codes as _build_phrase_pronunciation_codes,
@@ -403,13 +404,18 @@ async def _call_bot_lookup_api(path: str, payload: Dict) -> Dict:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                url,
-                headers={
-                    "X-Bot-Token": bot_api_token,
-                    "Content-Type": "application/json"
-                },
-                json=payload,
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    url,
+                    headers={
+                        "X-Bot-Token": bot_api_token,
+                        "Content-Type": "application/json"
+                    },
+                    json=payload,
+                ),
+                method="POST",
+                url=path,
+                idempotent=True,
             )
             data = response.json()
 
@@ -760,10 +766,14 @@ async def keytao_encode(
             if semantic_pinyin and semantic_meaning:
                 params["semantic_pinyin"] = semantic_pinyin.strip()
                 params["semantic_meaning"] = semantic_meaning.strip()
-            response = await client.get(
-                encode_url,
-                params=params,
-                headers={"X-Bot-Token": bot_api_token},
+            response = await http_client.request_with_retries(
+                lambda: client.get(
+                    encode_url,
+                    params=params,
+                    headers={"X-Bot-Token": bot_api_token},
+                ),
+                method="GET",
+                url="/api/bot/phrases/encode",
             )
             if response.is_success:
                 encode_data = response.json()
@@ -773,7 +783,11 @@ async def keytao_encode(
                     lookup_result = await keytao_lookup_by_codes_batch(encoding.get("candidateCodes", []))
                     return _apply_candidate_occupancy(encoding, lookup_result)
 
-                infer_response = await client.get(infer_url, params=params)
+                infer_response = await http_client.request_with_retries(
+                    lambda: client.get(infer_url, params=params),
+                    method="GET",
+                    url="/api/phrases/infer",
+                )
                 infer_data = infer_response.json() if infer_response.is_success else {}
                 encoding = _normalize_encode_response(word, encode_data, infer_data)
                 lookup_result = await keytao_lookup_by_codes_batch(encoding.get("candidateCodes", []))

@@ -16,7 +16,7 @@ import ipaddress
 import json
 import os
 import socket
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 from nonebot.log import logger
 
@@ -289,6 +289,78 @@ class KeytaoApiError(Exception):
         self.status_code = status_code
 
 
+async def request_with_retries(
+    request_call: Callable[[], Awaitable[Any]],
+    *,
+    method: str,
+    url: str,
+    idempotent: Optional[bool] = None,
+    max_attempts: int = 4,
+    retry_statuses: Iterable[int] = (),
+    retry_connect_errors: bool = False,
+    retry_transport_errors: bool = False,
+) -> Any:
+    """Run one HTTP request with timeout retries that respect replay safety.
+
+    Reads retry any ``httpx.TimeoutException``. Writes retry only
+    ``httpx.ConnectTimeout``, which happens before a request reaches the
+    server. Callers may opt into the existing transport/status retry behavior
+    used by :func:`keytao_request`; bare-client call sites use timeout retries
+    only.
+    """
+    import httpx
+
+    normalized_method = method.upper()
+    replay_safe = (
+        idempotent if idempotent is not None else normalized_method in _IDEMPOTENT_METHODS
+    )
+    attempts = max(1, int(max_attempts))
+    retryable_statuses = frozenset(retry_statuses)
+
+    async def wait_before_retry(attempt: int, reason: str) -> None:
+        logger.info(
+            f"[http_client] retry {attempt}/{attempts - 1} "
+            f"{normalized_method} {url}: {reason}"
+        )
+        await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = await request_call()
+        except httpx.ConnectTimeout as error:
+            if attempt >= attempts:
+                raise
+            await wait_before_retry(attempt, f"{type(error).__name__}: {error}")
+            continue
+        except httpx.TimeoutException as error:
+            if not replay_safe or attempt >= attempts:
+                raise
+            await wait_before_retry(attempt, f"{type(error).__name__}: {error}")
+            continue
+        except httpx.ConnectError as error:
+            if not retry_connect_errors or attempt >= attempts:
+                raise
+            await wait_before_retry(attempt, f"{type(error).__name__}: {error}")
+            continue
+        except httpx.TransportError as error:
+            if not (replay_safe and retry_transport_errors) or attempt >= attempts:
+                raise
+            await wait_before_retry(attempt, f"{type(error).__name__}: {error}")
+            continue
+
+        status_code = getattr(response, "status_code", None)
+        if (
+            replay_safe
+            and status_code in retryable_statuses
+            and attempt < attempts
+        ):
+            await wait_before_retry(attempt, f"HTTP {status_code}")
+            continue
+        return response
+
+    raise RuntimeError("HTTP retry loop exited without a response")  # pragma: no cover
+
+
 async def keytao_request(
     method: str,
     path: str,
@@ -300,7 +372,7 @@ async def keytao_request(
     platform: Optional[str] = None,
     platform_id: Optional[str] = None,
     timeout: Optional[float] = None,
-    retries: int = 3,
+    retries: int = 4,
     require_token: bool = True,
     idempotent: Optional[bool] = None,
 ) -> Any:
@@ -313,10 +385,9 @@ async def keytao_request(
 
     * Idempotent methods (GET/HEAD/OPTIONS) retry 5xx, timeouts and transport
       errors with exponential backoff.
-    * Every other method retries **only** when the connection was never
-      established (``ConnectError`` / ``ConnectTimeout``), so the server
-      provably never saw the request. A read timeout or a 5xx is not retried:
-      the request may well have been applied.
+    * Every other method retries **only** on ``ConnectTimeout``, so the server
+      provably never saw the request. A read timeout, other transport error, or
+      5xx is not retried: the request may well have been applied.
     * Pass ``idempotent=True`` explicitly for a write endpoint that is safe to
       repeat, to opt back into full retries.
     """
@@ -339,43 +410,44 @@ async def keytao_request(
         idempotent if idempotent is not None else normalized_method in _IDEMPOTENT_METHODS
     )
     attempts = max(1, retries)
-    last_error: Optional[str] = None
 
-    for attempt in range(attempts):
-        try:
-            response = await client.request(
-                normalized_method,
-                url,
-                params=params,
-                json=json_body,
-                content=content,
-                headers=request_headers,
-                timeout=timeout if timeout is not None else _DEFAULT_TIMEOUT,
-            )
-        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
-            # The connection was never established, so the server cannot have
-            # applied anything: safe to retry even for writes.
-            last_error = f"{type(error).__name__}: {error}"
-        except (httpx.TimeoutException, httpx.TransportError) as error:
-            last_error = f"{type(error).__name__}: {error}"
-            if not replay_safe:
-                raise KeytaoApiError(
-                    f"KeyTao API 请求失败（{normalized_method} {path}）：{last_error}；"
-                    "该请求可能已生效，未自动重试"
-                )
-        else:
-            if response.status_code not in _KEYTAO_RETRYABLE_STATUS or attempt == attempts - 1:
-                return response
-            if not replay_safe:
-                # A 5xx on a write may still have been applied server-side.
-                return response
-            last_error = f"HTTP {response.status_code}"
+    async def send_request() -> Any:
+        return await client.request(
+            normalized_method,
+            url,
+            params=params,
+            json=json_body,
+            content=content,
+            headers=request_headers,
+            timeout=timeout if timeout is not None else _DEFAULT_TIMEOUT,
+        )
 
-        if attempt < attempts - 1:
-            await asyncio.sleep(0.5 * (2 ** attempt))
-            logger.debug(f"[http_client] retry {attempt + 1}/{attempts - 1} {method} {path}: {last_error}")
-
-    raise KeytaoApiError(f"KeyTao API 请求失败（{method} {path}）：{last_error}")
+    try:
+        return await request_with_retries(
+            send_request,
+            method=normalized_method,
+            url=path,
+            idempotent=replay_safe,
+            max_attempts=attempts,
+            retry_statuses=_KEYTAO_RETRYABLE_STATUS,
+            retry_connect_errors=replay_safe,
+            retry_transport_errors=True,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+        last_error = f"{type(error).__name__}: {error}"
+        raise KeytaoApiError(
+            f"KeyTao API 请求失败（{normalized_method} {path}）：{last_error}"
+        ) from error
+    except (httpx.TimeoutException, httpx.TransportError) as error:
+        last_error = f"{type(error).__name__}: {error}"
+        suffix = "" if replay_safe else "；该请求可能已生效，未自动重试"
+        if not replay_safe and (
+            "/batches/" in path or "/pull-requests/" in path
+        ):
+            suffix += "；请先查看草稿核对状态，再决定是否重试"
+        raise KeytaoApiError(
+            f"KeyTao API 请求失败（{normalized_method} {path}）：{last_error}{suffix}"
+        ) from error
 
 
 async def keytao_json(

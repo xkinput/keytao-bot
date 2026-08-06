@@ -1732,7 +1732,7 @@ async def submit_discovered_words(
 ) -> Dict[str, Any]:
     """Push the auto group through draft -> submit -> auto-approve as the bot.
 
-    Every API call retries at most once. The result reports *per word* what
+    Every API call retries at most three times. The result reports *per word* what
     actually landed: only words the server positively confirmed are returned as
     ``accepted``; everything else comes back in ``rejected`` with a reason so the
     caller can recommend them to a human instead of burying them in history.
@@ -1758,16 +1758,16 @@ async def submit_discovered_words(
         }
 
     identity = {"platform": BOT_PLATFORM, "platformId": platform_id}
-    # retries=2 caps the attempt count at "one try plus one replay". Under the
-    # shared client's idempotency policy that replay only ever happens for the
-    # GETs here and for a write whose connection was never established; a write
-    # that timed out mid-flight is surfaced, never repeated. None of the
+    # retries=4 caps the attempt count at one initial try plus three replays.
+    # Under the shared client's idempotency policy, reads retry any timeout and
+    # writes retry only ConnectTimeout; a write that timed out after connecting
+    # is surfaced, never repeated. None of the
     # compensation below assumes a retry took place - each step is judged on the
     # state it can actually observe.
     call_kwargs = {
         "platform": BOT_PLATFORM,
         "platform_id": platform_id,
-        "retries": 2,
+        "retries": 4,
     }
 
     def failure(
@@ -1832,6 +1832,7 @@ async def submit_discovered_words(
             json_body={**draft_body, "confirmed": False},
             timeout=60.0,
             allow_status={400},
+            idempotent=True,
             **call_kwargs,
         )
     except Exception as error:
@@ -1955,6 +1956,7 @@ async def submit_discovered_words(
             },
             timeout=60.0,
             allow_status={400},
+            idempotent=True,
             **call_kwargs,
         )
     except Exception as error:

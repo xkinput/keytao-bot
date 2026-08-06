@@ -846,15 +846,19 @@ async def get_latest_draft_batch(platform: str, platform_id: str) -> Optional[st
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    method="GET",
-                    path="/api/bot/batches/latest-draft",
+            response = await http_client.request_with_retries(
+                lambda: client.get(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        method="GET",
+                        path="/api/bot/batches/latest-draft",
+                    ),
+                    params={"platform": platform, "platformId": platform_id},
                 ),
-                params={"platform": platform, "platformId": platform_id}
+                method="GET",
+                url="/api/bot/batches/latest-draft",
             )
 
             if response.status_code == 200:
@@ -916,7 +920,11 @@ async def _fetch_encode_candidates(word: str, requested_code: Optional[str] = No
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(encode_url, params=params)
+            response = await http_client.request_with_retries(
+                lambda: client.get(encode_url, params=params),
+                method="GET",
+                url="/api/phrases/encode",
+            )
             encode_data = normalize_contextual_phrase_encoding(
                 word,
                 response.json() if response.is_success else {},
@@ -924,7 +932,11 @@ async def _fetch_encode_candidates(word: str, requested_code: Optional[str] = No
             codes = _clean_code_list(encode_data.get("codes"))
             alt_codes = _clean_code_list(encode_data.get("altCodes"))
             if not codes:
-                infer_response = await client.get(infer_url, params=params)
+                infer_response = await http_client.request_with_retries(
+                    lambda: client.get(infer_url, params=params),
+                    method="GET",
+                    url="/api/phrases/infer",
+                )
                 infer_data = normalize_contextual_phrase_encoding(
                     word,
                     infer_response.json() if infer_response.is_success else {},
@@ -1063,10 +1075,15 @@ async def _lookup_words_raw(words: List[str]) -> Dict:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                f"{KEYTAO_API_BASE}/api/bot/phrases/by-word/batch",
-                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
-                json={"words": words},
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    f"{KEYTAO_API_BASE}/api/bot/phrases/by-word/batch",
+                    headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                    json={"words": words},
+                ),
+                method="POST",
+                url="/api/bot/phrases/by-word/batch",
+                idempotent=True,
             )
             data = response.json()
             if not data.get("success"):
@@ -1086,10 +1103,15 @@ async def _lookup_codes_raw(codes: List[str]) -> Dict:
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                f"{KEYTAO_API_BASE}/api/bot/phrases/by-code/batch",
-                headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
-                json={"codes": codes},
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    f"{KEYTAO_API_BASE}/api/bot/phrases/by-code/batch",
+                    headers={"X-Bot-Token": BOT_API_TOKEN, "Content-Type": "application/json"},
+                    json={"codes": codes},
+                ),
+                method="POST",
+                url="/api/bot/phrases/by-code/batch",
+                idempotent=True,
             )
             data = response.json()
             if not data.get("success"):
@@ -1229,17 +1251,22 @@ async def keytao_create_phrase(
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    content_type=True,
-                    method="POST",
-                    path="/api/bot/pull-requests/batch",
-                    raw_body=request_body,
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="POST",
+                        path="/api/bot/pull-requests/batch",
+                        raw_body=request_body,
+                    ),
+                    content=request_body,
                 ),
-                content=request_body,
+                method="POST",
+                url="/api/bot/pull-requests/batch",
+                idempotent=preview_only,
             )
             
             if response.status_code == 200:
@@ -1291,16 +1318,16 @@ async def keytao_create_phrase(
                 return _inject_known_batch_url(result, batch_id)
                 
     except httpx.TimeoutException:
+        if preview_only:
+            return _inject_known_batch_url({
+                "success": False,
+                "message": "添加预检超时，请稍后重试",
+            }, batch_id)
         result = {
             "success": False,
-            "message": (
-                "添加请求超时，结果可能已经生效；请先查看原草稿"
-                if confirmed
-                else "请求超时，请稍后重试"
-            ),
+            "uncertain": True,
+            "message": "添加请求超时，草稿可能已经写入；请先查看草稿核对状态，再决定是否重试",
         }
-        if confirmed:
-            result["uncertain"] = True
         return _inject_known_batch_url(result, batch_id)
     except Exception as e:
         logger.error(f"Create phrase error: {e}")
@@ -1679,17 +1706,21 @@ async def _auto_approve_submitted_batch(
     request_body = _json_request_body(request_data)
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    content_type=True,
-                    method="POST",
-                    path=f"/api/bot/batches/{safe_batch_id}/auto-approve",
-                    raw_body=request_body,
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="POST",
+                        path=f"/api/bot/batches/{safe_batch_id}/auto-approve",
+                        raw_body=request_body,
+                    ),
+                    content=request_body,
                 ),
-                content=request_body,
+                method="POST",
+                url=f"/api/bot/batches/{safe_batch_id}/auto-approve",
             )
         try:
             data = response.json()
@@ -1703,7 +1734,10 @@ async def _auto_approve_submitted_batch(
             "details": data,
         }
     except httpx.TimeoutException:
-        return {"success": False, "message": "批次已提交，自动批准超时，转交管理员审核"}
+        return {
+            "success": False,
+            "message": "批次已提交，自动批准超时且可能已经生效；请先查看草稿核对状态，未确认时转交管理员审核",
+        }
     except Exception as error:
         logger.warning(f"[auto_review] approve failed: {error}")
         return {
@@ -1928,17 +1962,22 @@ async def keytao_submit_batch(
                 request_data["expectedSnapshotDigest"] = expected_server_snapshot_digest
                 request_data["expectedWarningDigest"] = expected_warning_digest
             request_body = _json_request_body(request_data)
-            response = await client.post(
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    content_type=True,
-                    method="POST",
-                    path=f"/api/bot/batches/{safe_batch_id}/submit",
-                    raw_body=request_body,
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="POST",
+                        path=f"/api/bot/batches/{safe_batch_id}/submit",
+                        raw_body=request_body,
+                    ),
+                    content=request_body,
                 ),
-                content=request_body,
+                method="POST",
+                url=f"/api/bot/batches/{safe_batch_id}/submit",
+                idempotent=preview_only,
             )
             
             if response.status_code == 200:
@@ -2037,6 +2076,12 @@ async def keytao_submit_batch(
         mark_confirmation_uncertain()
         raise
     except httpx.TimeoutException:
+        if preview_only:
+            return _inject_known_batch_url({
+                "success": False,
+                "error": "submit_preview_timeout",
+                "message": "提交预检超时，请稍后重试",
+            }, batch_id)
         if confirmed:
             mark_confirmation_uncertain()
             return _inject_known_batch_url({
@@ -2048,8 +2093,9 @@ async def keytao_submit_batch(
             }, batch_id)
         return _inject_known_batch_url({
             "success": False,
+            "uncertain": True,
             "error": "submit_timeout",
-            "message": "请求超时，请稍后重试",
+            "message": "提交请求超时，草稿可能已经写入；请先发送「查看草稿」核对状态，再决定是否重试",
         }, batch_id)
     except Exception as e:
         logger.error(f"Submit batch error: {e}")
@@ -2106,7 +2152,11 @@ async def keytao_get_batch_preview(
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url)
+            response = await http_client.request_with_retries(
+                lambda: client.get(url),
+                method="GET",
+                url=f"/api/batches/{safe_batch_id}/preview",
+            )
 
         try:
             data = response.json()
@@ -2243,15 +2293,19 @@ async def keytao_recall_batch(
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             if not batch_id:
-                response = await client.get(
-                    url,
-                    headers=get_bot_headers(
-                        platform,
-                        platform_id,
-                        method="GET",
-                        path="/api/bot/batches/recall",
+                response = await http_client.request_with_retries(
+                    lambda: client.get(
+                        url,
+                        headers=get_bot_headers(
+                            platform,
+                            platform_id,
+                            method="GET",
+                            path="/api/bot/batches/recall",
+                        ),
+                        params={"platform": platform, "platformId": platform_id},
                     ),
-                    params={"platform": platform, "platformId": platform_id},
+                    method="GET",
+                    url="/api/bot/batches/recall",
                 )
                 try:
                     data = response.json()
@@ -2349,17 +2403,21 @@ async def keytao_recall_batch(
                     "另一个草稿操作正在核验，本次未执行撤回。",
                 )
             request_body = _json_request_body(request_data)
-            response = await client.post(
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    content_type=True,
-                    method="POST",
-                    path="/api/bot/batches/recall",
-                    raw_body=request_body,
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="POST",
+                        path="/api/bot/batches/recall",
+                        raw_body=request_body,
+                    ),
+                    content=request_body,
                 ),
-                content=request_body,
+                method="POST",
+                url="/api/bot/batches/recall",
             )
             try:
                 data = response.json()
@@ -2435,7 +2493,7 @@ async def keytao_recall_batch(
                 "success": False,
                 "uncertain": True,
                 "batchId": batch_id,
-                "message": "撤回请求超时，结果可能已经生效；请先查看原批次状态",
+                "message": "撤回请求超时，结果可能已经生效；请先查看草稿或原批次状态",
             }
             _inject_batch_url(uncertain)
             return uncertain
@@ -2486,19 +2544,23 @@ async def keytao_list_draft_items(
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    method="GET",
-                    path="/api/bot/batches/latest-draft/items",
+            response = await http_client.request_with_retries(
+                lambda: client.get(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        method="GET",
+                        path="/api/bot/batches/latest-draft/items",
+                    ),
+                    params={
+                        "platform": platform,
+                        "platformId": platform_id,
+                        **({"batchId": batch_id} if batch_id else {}),
+                    },
                 ),
-                params={
-                    "platform": platform,
-                    "platformId": platform_id,
-                    **({"batchId": batch_id} if batch_id else {}),
-                },
+                method="GET",
+                url="/api/bot/batches/latest-draft/items",
             )
 
             try:
@@ -2973,18 +3035,22 @@ async def keytao_remove_draft_item(
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.request(
-                "DELETE",
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    content_type=True,
-                    method="DELETE",
-                    path=f"/api/bot/pull-requests/{pr_id}",
-                    raw_body=request_body,
+            response = await http_client.request_with_retries(
+                lambda: client.request(
+                    "DELETE",
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="DELETE",
+                        path=f"/api/bot/pull-requests/{pr_id}",
+                        raw_body=request_body,
+                    ),
+                    content=request_body,
                 ),
-                content=request_body,
+                method="DELETE",
+                url=f"/api/bot/pull-requests/{pr_id}",
             )
 
             try:
@@ -3290,17 +3356,22 @@ async def keytao_batch_add_to_draft(
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    content_type=True,
-                    method="POST",
-                    path="/api/bot/pull-requests/batch-draft",
-                    raw_body=request_body,
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="POST",
+                        path="/api/bot/pull-requests/batch-draft",
+                        raw_body=request_body,
+                    ),
+                    content=request_body,
                 ),
-                content=request_body,
+                method="POST",
+                url="/api/bot/pull-requests/batch-draft",
+                idempotent=preview_only,
             )
             try:
                 data = response.json()
@@ -3342,16 +3413,16 @@ async def keytao_batch_add_to_draft(
             return data
 
     except httpx.TimeoutException:
+        if preview_only:
+            return _inject_known_batch_url({
+                "success": False,
+                "message": "批量添加预检超时，请稍后重试",
+            }, batch_id)
         result = {
             "success": False,
-            "message": (
-                "批量添加请求超时，结果可能已经生效；请先查看原草稿"
-                if confirmed
-                else "请求超时，请稍后重试"
-            ),
+            "uncertain": True,
+            "message": "批量添加请求超时，草稿可能已经写入；请先查看草稿核对状态，再决定是否重试",
         }
-        if confirmed:
-            result["uncertain"] = True
         return _inject_known_batch_url(result, batch_id)
     except Exception as e:
         logger.error(f"[keytao_batch_add_to_draft] Error: {e}")
@@ -3468,17 +3539,22 @@ async def keytao_batch_remove_draft_items(
     request_body = _json_request_body(payload)
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.request(
-                "DELETE", url,
-                content=request_body,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    content_type=True,
-                    method="DELETE",
-                    path="/api/bot/pull-requests/batch-draft",
-                    raw_body=request_body,
+            response = await http_client.request_with_retries(
+                lambda: client.request(
+                    "DELETE",
+                    url,
+                    content=request_body,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="DELETE",
+                        path="/api/bot/pull-requests/batch-draft",
+                        raw_body=request_body,
+                    ),
                 ),
+                method="DELETE",
+                url="/api/bot/pull-requests/batch-draft",
             )
             try:
                 data: Dict = response.json()
@@ -3633,17 +3709,21 @@ async def _keytao_strict_batch_add_to_draft(
     request_body = _json_request_body(request_data)
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                url,
-                headers=get_bot_headers(
-                    platform,
-                    platform_id,
-                    content_type=True,
-                    method="POST",
-                    path="/api/bot/pull-requests/batch",
-                    raw_body=request_body,
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    url,
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="POST",
+                        path="/api/bot/pull-requests/batch",
+                        raw_body=request_body,
+                    ),
+                    content=request_body,
                 ),
-                content=request_body,
+                method="POST",
+                url="/api/bot/pull-requests/batch",
             )
         try:
             data = response.json()

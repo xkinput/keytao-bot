@@ -129,7 +129,11 @@ async def _validate_fetch_target(url: str) -> Optional[str]:
 
 async def _get_text(url: str, *, params: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
     """Search-provider fetch through the guarded, IP-pinned egress."""
-    response = await http_client.guarded_fetch(url, params=params)
+    response = await http_client.request_with_retries(
+        lambda: http_client.guarded_fetch(url, params=params),
+        method="GET",
+        url=url,
+    )
     return response.status_code, response.text
 
 
@@ -411,7 +415,11 @@ def _parse_jina_reader_text(content: str, max_chars: int) -> Dict[str, str]:
 async def _web_fetch_via_jina(url: str, max_chars: int, reason: str) -> Dict[str, Any]:
     reader_url = _jina_reader_url(url)
     try:
-        response = await http_client.guarded_fetch(reader_url)
+        response = await http_client.request_with_retries(
+            lambda: http_client.guarded_fetch(reader_url),
+            method="GET",
+            url=reader_url,
+        )
         if not response.is_success:
             raise RuntimeError(f"HTTP {response.status_code}")
         parsed = _parse_jina_reader_text(response.text, max_chars)
@@ -459,8 +467,13 @@ async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
 
     max_chars = max(800, min(max_chars, 12000))
     try:
-        response = await http_client.guarded_fetch(
-            normalized_url, headers=_HTML_ACCEPT_HEADER,
+        response = await http_client.request_with_retries(
+            lambda: http_client.guarded_fetch(
+                normalized_url,
+                headers=_HTML_ACCEPT_HEADER,
+            ),
+            method="GET",
+            url=normalized_url,
         )
         final_url = response.url
         raw_text = response.text

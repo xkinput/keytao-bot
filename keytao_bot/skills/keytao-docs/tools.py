@@ -55,7 +55,11 @@ async def _list_all_md_paths() -> List[str]:
         url = f"https://api.github.com/repos/{DOCS_REPO}/contents/{dir_path}".rstrip("/")
         try:
             async with http_client.external_fetch_semaphore():
-                resp = await client.get(url, timeout=10.0)
+                resp = await http_client.request_with_retries(
+                    lambda: client.get(url, timeout=10.0),
+                    method="GET",
+                    url=url,
+                )
             resp.raise_for_status()
             for item in resp.json():
                 if item["type"] == "file" and item["name"].endswith(".md"):
@@ -81,7 +85,16 @@ async def _search_docs(query: str) -> List[str]:
     try:
         client = await http_client.get_external_client()
         async with http_client.external_fetch_semaphore():
-            resp = await client.get(url, params=params, headers=_gh_headers(), timeout=10.0)
+            resp = await http_client.request_with_retries(
+                lambda: client.get(
+                    url,
+                    params=params,
+                    headers=_gh_headers(),
+                    timeout=10.0,
+                ),
+                method="GET",
+                url=url,
+            )
         resp.raise_for_status()
         data = resp.json()
         paths = [item["path"] for item in data.get("items", [])]
@@ -102,7 +115,11 @@ async def _fetch_raw(path: str) -> str:
     try:
         client = await http_client.get_external_client()
         async with http_client.external_fetch_semaphore():
-            resp = await client.get(url, timeout=15.0)
+            resp = await http_client.request_with_retries(
+                lambda: client.get(url, timeout=15.0),
+                method="GET",
+                url=url,
+            )
         resp.raise_for_status()
         return resp.text
     except Exception as e:
