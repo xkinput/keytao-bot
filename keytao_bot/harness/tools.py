@@ -3215,14 +3215,33 @@ class ToolExecutor:
                             else "code_required"
                         ),
                         (
-                            f"“{destination_word}”对应多个编码，请问要把“{word}”"
-                            "加到哪个编码？"
+                            f"“{destination_word}”对应多个编码："
+                            f"{'、'.join(sorted(destination_codes))}。"
+                            f"请问要把“{word}”加到哪个编码？"
                             if len(destination_codes) > 1
-                            else f"还无法确定“{word}”应添加到哪个编码，请告诉我编码。"
+                            else (
+                                f"请先调用 keytao_lookup_by_word 查询"
+                                f"“{destination_word}”的全部编码，再用查询结果"
+                                "重试本次 keytao_create_phrase；"
+                                "此阶段不要向用户询问编码。"
+                            )
                         ),
                         word=word,
                         destinationWord=destination_word,
                         candidateCodes=sorted(destination_codes),
+                        nextAction=(
+                            {
+                                "type": "ask_user_to_choose_code",
+                                "candidateCodes": sorted(destination_codes),
+                            }
+                            if len(destination_codes) > 1
+                            else {
+                                "tool": "keytao_lookup_by_word",
+                                "arguments": {"word": destination_word},
+                                "then": "retry_same_create",
+                                "askUserForCode": False,
+                            }
+                        ),
                     )
             if (
                 action == "Create"

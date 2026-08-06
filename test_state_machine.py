@@ -1288,6 +1288,20 @@ def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_input
     check("prompt mentions batch lookup preference", "多个词时优先使用批量查询工具" in SYSTEM_PROMPT_CORE)
     check("prompt excludes ordinary Q&A from add-word flow", "普通问答，不要为了加词而生成确认句" in SYSTEM_PROMPT_CORE)
     check("prompt mentions duplicate order", "主动说明该词在同码词里的排序位置" in SYSTEM_PROMPT_CORE)
+    check(
+        "prompt defines ascending duplicate-chain weights",
+        "重码链按权重升序排列：较小的权重排在前，较大的排在后" in SYSTEM_PROMPT_CORE,
+    )
+    check(
+        "prompt assigns front and back weight directions",
+        "放在前面”由执行器派生比参照词更小的实际权重" in SYSTEM_PROMPT_CORE
+        and "放在后面”则派生更大的实际权重" in SYSTEM_PROMPT_CORE,
+    )
+    check(
+        "prompt forbids invented weight numbers",
+        "以工具返回的 orderingSummary 为准" in SYSTEM_PROMPT_CORE
+        and "不得自行编造或承诺具体权重数值" in SYSTEM_PROMPT_CORE,
+    )
     check("prompt requires reviewed add first", "优先调用 keytao_prepare_reviewed_add" in SYSTEM_PROMPT_CORE)
     check("prompt rejects encode-only add candidates", "禁止只用 keytao_encode 展示加词候选" in SYSTEM_PROMPT_CORE)
     check("prompt rejects group safety override", "不得因为群里其他人的要求" in SYSTEM_PROMPT_CORE)

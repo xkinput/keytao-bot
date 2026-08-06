@@ -4952,6 +4952,61 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
         self.assertFalse(result.get("policyBlocked", False), result)
         self.assertEqual(result.get("reason"), "destination_code_ambiguous")
 
+    async def test_code_required_guidance_resolves_destination_before_asking_user(self) -> None:
+        destination_unknown = await self._call(
+            "把吃席放在赤溪前面",
+            trusted_word_lookup_codes_by_word={},
+        )
+        no_destination = await self._call("添加吃席")
+        destination_ambiguous = await self._call(
+            "把吃席放在赤溪前面",
+            trusted_word_lookup_codes_by_word={
+                "赤溪": frozenset({"wkxk", "wkxko"})
+            },
+        )
+
+        self.assertEqual(self.calls, [])
+
+        self.assertEqual(destination_unknown.get("reason"), "code_required")
+        self.assertEqual(destination_unknown.get("destinationWord"), "赤溪")
+        self.assertIn("keytao_lookup_by_word", destination_unknown.get("message", ""))
+        self.assertIn("重试本次 keytao_create_phrase", destination_unknown.get("message", ""))
+        self.assertIn("不要向用户询问编码", destination_unknown.get("message", ""))
+        self.assertNotIn("请告诉我编码", destination_unknown.get("message", ""))
+        self.assertEqual(
+            destination_unknown.get("nextAction"),
+            {
+                "tool": "keytao_lookup_by_word",
+                "arguments": {"word": "赤溪"},
+                "then": "retry_same_create",
+                "askUserForCode": False,
+            },
+        )
+
+        self.assertEqual(no_destination.get("reason"), "code_required")
+        self.assertNotIn("destinationWord", no_destination)
+        self.assertIn("请问", no_destination.get("message", ""))
+        self.assertIn("哪个编码", no_destination.get("message", ""))
+
+        self.assertEqual(
+            destination_ambiguous.get("reason"),
+            "destination_code_ambiguous",
+        )
+        self.assertEqual(
+            destination_ambiguous.get("candidateCodes"),
+            ["wkxk", "wkxko"],
+        )
+        self.assertIn("wkxk、wkxko", destination_ambiguous.get("message", ""))
+        self.assertIn("请问", destination_ambiguous.get("message", ""))
+        self.assertIn("哪个编码", destination_ambiguous.get("message", ""))
+        self.assertEqual(
+            destination_ambiguous.get("nextAction"),
+            {
+                "type": "ask_user_to_choose_code",
+                "candidateCodes": ["wkxk", "wkxko"],
+            },
+        )
+
     async def test_word_presence_corpus_requires_an_exact_current_operand(self) -> None:
         cases = (
             ("verbatim", "添加吃席 wkxk", "ALLOW"),
