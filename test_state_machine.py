@@ -1293,9 +1293,14 @@ def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_input
         "重码链按权重升序排列：较小的权重排在前，较大的排在后" in SYSTEM_PROMPT_CORE,
     )
     check(
-        "prompt assigns front and back weight directions",
-        "放在前面”由执行器派生比参照词更小的实际权重" in SYSTEM_PROMPT_CORE
-        and "放在后面”则派生更大的实际权重" in SYSTEM_PROMPT_CORE,
+        "prompt gates adjacent weights on an explicit same-code marker",
+        "只有位置指令同一子句明确包含" in SYSTEM_PROMPT_CORE
+        and "同码 / 同编码 / 同代码 / 重码" in SYSTEM_PROMPT_CORE,
+    )
+    check(
+        "prompt defines unmarked front and back defaults",
+        "放在占位词前面默认让新词取得该码" in SYSTEM_PROMPT_CORE
+        and "放在占位词后面默认把新词放到其自身候选链中该码之后的首个空位" in SYSTEM_PROMPT_CORE,
     )
     check(
         "prompt forbids invented weight numbers",
@@ -12224,6 +12229,8 @@ def test_build_code_shift_plan_uses_occupant_encode_chain():
             "会员费": ["hyf", "hyfi", "hyfio", "hyfioa"],
             "换言之": ["hyf", "hyfi", "hyfio", "hyfioo"],
         },
+        target_remark="trusted review",
+        target_needs_manual_review=False,
     )
 
     check("shift plan succeeds", result["success"] is True)
@@ -12232,6 +12239,12 @@ def test_build_code_shift_plan_uses_occupant_encode_chain():
     check("换言之 does not use 会员费 next code", result["shifted"][0]["toCode"] != "hyfioa")
     check("delete target old code first", result["items"][0] == {"action": "Delete", "word": "会员费", "code": "hyfa", "type": "Phrase"})
     check("create shifted word at hyfioo", {"action": "Create", "word": "换言之", "code": "hyfioo", "type": "Phrase"} in result["items"])
+    target_create = next(
+        item for item in result["items"]
+        if item.get("action") == "Create" and item.get("word") == "会员费"
+    )
+    check("trusted target auto-pass verdict is preserved", target_create.get("needsManualReview") is False)
+    check("trusted target remark is preserved", target_create.get("remark") == "trusted review")
 
 
 def test_build_code_shift_plan_cascades_until_empty():
@@ -12323,7 +12336,7 @@ def test_shift_phrase_code_works_with_no_draft_batch():
             }
 
         async def fake_strict_add(platform, platform_id, items, **kwargs):
-            strict_calls.append(kwargs)
+            strict_calls.append({"items": items, **kwargs})
             return {"success": True, "batchId": "materialised-1", "items": items}
 
         with patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_fetch), \
@@ -12358,6 +12371,11 @@ def test_shift_phrase_code_works_with_no_draft_batch():
         check("the confirmed shift writes once", len(strict_calls) == 1)
         check("the write carries no batch id", strict_calls[0].get("batch_id") is None)
         check("the write asserts the absence baseline", strict_calls[0].get("expected_content_version") == 0)
+        target_item = next(
+            item for item in strict_calls[0]["items"]
+            if item.get("action") == "Create" and item.get("word") == "增香"
+        )
+        check("an untrusted new target is sealed", target_item.get("needsManualReview") is True)
         check("the shift succeeds", confirmed.get("success") is True)
         check("the occupant is still moved", confirmed.get("shiftPlan", {}).get("shifted"))
         check("a wrong digest is still refused", stale.get("staleConfirmation") is True)
@@ -12430,7 +12448,124 @@ def test_shift_phrase_code_plans_real_occupant_move():
         items = result["shiftPlan"]["items"]
         check("plan deletes occupant old code", {"action": "Delete", "word": "增翔", "code": "zrxx", "type": "Phrase"} in items)
         check("plan recreates occupant at next code", {"action": "Create", "word": "增翔", "code": "zrxxv", "type": "Phrase"} in items)
-        check("plan creates target word at requested code", {"action": "Create", "word": "增香", "code": "zrxx", "type": "Phrase"} in items)
+        target_item = next(
+            item for item in items
+            if item.get("action") == "Create" and item.get("word") == "增香"
+        )
+        occupant_create = next(
+            item for item in items
+            if item.get("action") == "Create" and item.get("word") == "增翔"
+        )
+        check("plan creates target word at requested code", target_item.get("code") == "zrxx")
+        check("plan seals the untrusted target create", target_item.get("needsManualReview") is True)
+        check("relocation create keeps change-class review treatment", "needsManualReview" not in occupant_create)
+        strict_items = strict_calls[0][2]
+        strict_target = next(
+            item for item in strict_items
+            if item.get("action") == "Create" and item.get("word") == "增香"
+        )
+        check("strict server payload preserves the target seal", strict_target.get("needsManualReview") is True)
+
+    asyncio.run(_run())
+
+
+def test_strict_shift_batch_payload_preserves_item_level_seal():
+    """Verify the final HTTP payload keeps only the target create verdict."""
+    print("\n🧪 strict shift payload preserves item-level seal")
+
+    async def _run():
+        captured = {}
+        items = [
+            {
+                "action": "Create",
+                "word": "增香",
+                "code": "zrxx",
+                "type": "Phrase",
+                "remark": "trusted review",
+                "needsManualReview": False,
+            },
+            {
+                "action": "Delete",
+                "word": "增翔",
+                "code": "zrxx",
+                "type": "Phrase",
+            },
+            {
+                "action": "Create",
+                "word": "增翔",
+                "code": "zrxxv",
+                "type": "Phrase",
+            },
+        ]
+
+        class FakeResponse:
+            status_code = 200
+            is_success = True
+
+            @staticmethod
+            def json():
+                return {"success": True, "batchId": "draft-seal"}
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, **kwargs):
+                captured["url"] = url
+                captured["payload"] = json.loads(kwargs["content"])
+                return FakeResponse()
+
+        with (
+            patch.object(_draft_tools, "get_bot_token", return_value="token"),
+            patch.object(
+                _draft_tools,
+                "get_keytao_url",
+                return_value="https://keytao.test",
+            ),
+            patch.object(
+                _draft_tools,
+                "get_bot_headers",
+                return_value={"Authorization": "Bearer token"},
+            ),
+            patch.object(
+                _draft_tools,
+                "_split_items_by_code_validation",
+                new=AsyncMock(return_value=(items, [])),
+            ),
+            patch.object(
+                _draft_tools,
+                "_fetch_draft_snapshot",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
+            ),
+        ):
+            result = await _draft_tools._keytao_strict_batch_add_to_draft(
+                "qq",
+                "123",
+                items,
+                batch_id="draft-seal",
+                expected_content_version=5,
+            )
+
+        request_items = captured["payload"]["items"]
+        target = next(item for item in request_items if item["word"] == "增香")
+        relocation = next(
+            item for item in request_items
+            if item["word"] == "增翔" and item["action"] == "Create"
+        )
+        check("strict write succeeds", result.get("success") is True)
+        check("target auto-pass verdict reaches HTTP payload", target.get("needsManualReview") is False)
+        check("target review remark reaches HTTP payload", target.get("remark") == "trusted review")
+        check("relocation create remains unsealed", "needsManualReview" not in relocation)
+        check("payload keeps exact content version", captured["payload"].get("expectedContentVersion") == 5)
 
     asyncio.run(_run())
 
@@ -12699,6 +12834,7 @@ if __name__ == "__main__":
     test_build_code_shift_plan_rejects_invalid_occupant_code()
     test_shift_phrase_code_works_with_no_draft_batch()
     test_shift_phrase_code_plans_real_occupant_move()
+    test_strict_shift_batch_payload_preserves_item_level_seal()
     test_replace_char_preserves_explicit_css_type()
 
     print("\n" + "=" * 60)

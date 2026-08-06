@@ -266,6 +266,9 @@ class ToolContext:
     trusted_word_lookup_codes_by_word: Optional[
         Dict[str, frozenset[str]]
     ] = None
+    trusted_candidate_slots_by_word: Optional[
+        Dict[str, Tuple[Tuple[str, bool], ...]]
+    ] = None
 
 
 _DELETE_INTENT_RE = re.compile(
@@ -283,6 +286,29 @@ _POSITIONAL_REORDER_PLAIN_ENTRY_PATTERN = r"[\u3400-\u9fff]{1,8}"
 _POSITIONAL_REORDER_RELATION_PATTERN = r"(?:前面|后面|之前|之后|前|后)"
 _POSITIONAL_CREATE_FRONT_RELATIONS = frozenset({"前面", "之前", "前"})
 _POSITIONAL_CREATE_BACK_RELATIONS = frozenset({"后面", "之后", "后"})
+# Exact same-code lexicon. These forms are recognized only when they are
+# unquoted and occur in the positional command clause:
+#
+#   同码 / 同编码 / 同代码
+#   同一码 / 同一编码 / 同一代码
+#   同一个码 / 同一个编码 / 同一个代码
+#   相同码 / 相同编码 / 相同代码 (with optional 的)
+#   码相同 / 编码相同 / 代码相同 (with optional 保持)
+#   重码 / 重复码 / 重复编码 / 重复代码 (with optional 的)
+_POSITIONAL_SAME_CODE_MARKER_PATTERN = (
+    r"(?:"
+    r"同(?:一(?:个)?|一个)?(?:码|编码|代码)|"
+    r"相同(?:的)?(?:码|编码|代码)|"
+    r"(?:码|编码|代码)(?:保持)?相同|"
+    r"重码|重复(?:的)?(?:码|编码|代码)"
+    r")"
+)
+_POSITIONAL_SAME_CODE_MARKER_RE = re.compile(
+    _POSITIONAL_SAME_CODE_MARKER_PATTERN
+)
+_POSITIONAL_COMMAND_VERB_RE = re.compile(
+    r"放在|放到|排在|挪到|移到|提到|提前到|往前|往后|靠前|靠后"
+)
 _POSITIONAL_REORDER_ORDINAL_PATTERN = (
     r"第(?:[一二三四五六七八九十百千万两]+|\d{1,3})(?:个|位)"
 )
@@ -546,6 +572,14 @@ class _PositionalCreateBinding:
     resulting_words: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class ToolExecutionRoute:
+    tool_name: str
+    arguments: Dict[str, Any]
+    positional_binding: Optional[_PositionalCreateBinding] = None
+    response: Optional[Dict[str, Any]] = None
+
+
 def _unquote_positional_entry(value: str) -> Optional[str]:
     pairs = {"「": "」", "“": "”", "‘": "’"}
     if len(value) >= 3 and pairs.get(value[0]) == value[-1]:
@@ -594,6 +628,7 @@ def _positional_create_operands(
     message: str,
 ) -> Optional[Tuple[str, str, str]]:
     """Extract subject, named destination, and explicit relative side."""
+    message, _marker_found = _normalize_positional_same_code_markers(message)
     if not _has_complete_positional_reorder_command(message):
         return None
     source = _LEADING_MENTION_RE.sub(
@@ -649,6 +684,7 @@ def _positional_create_operands(
 
 
 def _positional_destination_from_command(message: str) -> Optional[_PositionalDestination]:
+    message, _marker_found = _normalize_positional_same_code_markers(message)
     source = _LEADING_MENTION_RE.sub(
         "", trusted_mutation_source(message), count=1
     )
@@ -673,6 +709,7 @@ def _positional_destination_from_command(message: str) -> Optional[_PositionalDe
 
 
 def _raw_positional_destination_from_command(message: str) -> Optional[str]:
+    message, _marker_found = _normalize_positional_same_code_markers(message)
     source = _LEADING_MENTION_RE.sub(
         "", trusted_mutation_source(message), count=1
     )
@@ -693,6 +730,7 @@ def _raw_positional_destination_from_command(message: str) -> Optional[str]:
 
 
 def _has_raw_positional_relative_tail(message: str) -> bool:
+    message, _marker_found = _normalize_positional_same_code_markers(message)
     source = _LEADING_MENTION_RE.sub(
         "", trusted_mutation_source(message), count=1
     )
@@ -719,6 +757,7 @@ def _has_raw_positional_relative_tail(message: str) -> bool:
 
 def _has_complete_positional_reorder_command(message: str) -> bool:
     """Match positional grammar without erasing subject-boundary whitespace."""
+    message, _marker_found = _normalize_positional_same_code_markers(message)
     source = _LEADING_MENTION_RE.sub(
         "", trusted_mutation_source(message), count=1
     )
@@ -1165,6 +1204,46 @@ def _mask_quoted_record_frames(message: str) -> str:
         for match in pattern.finditer(message):
             masked[match.start():match.end()] = " " * (match.end() - match.start())
     return "".join(masked)
+
+
+def _normalize_positional_same_code_markers(
+    message: str,
+) -> Tuple[str, bool]:
+    """Remove trusted same-code markers from their positional command clause.
+
+    The returned text keeps source offsets stable. Quoted text, inline code,
+    and record-shaped data are masked before marker matching, so none of them
+    can opt a positional command into duplicate behavior. A marker in a
+    separate clause is also left intact and cannot modify another clause.
+    """
+    trusted = trusted_mutation_source(str(message or ""))
+    masked = _mask_quoted_record_frames(trusted)
+    normalized = list(trusted)
+    marker_found = False
+    clause_start = 0
+    boundaries = [
+        (match.start(), match.end())
+        for match in _COMMAND_CLAUSE_SPLIT_RE.finditer(masked)
+    ]
+    for clause_end, separator_end in [*boundaries, (len(masked), len(masked))]:
+        masked_clause = masked[clause_start:clause_end]
+        if _POSITIONAL_COMMAND_VERB_RE.search(masked_clause):
+            for marker in _POSITIONAL_SAME_CODE_MARKER_RE.finditer(masked_clause):
+                start = clause_start + marker.start()
+                end = clause_start + marker.end()
+                normalized[start:end] = " " * (end - start)
+                marker_found = True
+        clause_start = separator_end
+    return "".join(normalized), marker_found
+
+
+def _positional_same_code_requested(message: str) -> bool:
+    """Return whether a complete positional command explicitly requests a duplicate."""
+    normalized, marker_found = _normalize_positional_same_code_markers(message)
+    return bool(
+        marker_found
+        and _has_complete_positional_reorder_command(normalized)
+    )
 
 
 def _record_frame_is_mutation_operand(
@@ -2439,7 +2518,10 @@ def _destination_derived_positional_create_binding(
     context: ToolContext,
 ) -> Optional[_PositionalCreateBinding]:
     """Bind one create to a unique destination entry read in this turn."""
-    operands = _positional_create_operands(message)
+    binding_message, _marker_found = _normalize_positional_same_code_markers(
+        message
+    )
+    operands = _positional_create_operands(binding_message)
     if operands is None:
         return None
     subject, destination_word, relation = operands
@@ -2455,9 +2537,12 @@ def _destination_derived_positional_create_binding(
         or old_word
         or not word
         or subject != word
-        or not _contains_exact_target(message, word)
+        or not _contains_exact_target(binding_message, word)
         or not destination_word
-        or not _positional_destination_operand_is_exact(message, destination_word)
+        or not _positional_destination_operand_is_exact(
+            binding_message,
+            destination_word,
+        )
         or len(destination_codes) != 1
         or code not in destination_codes
         or relation not in {
@@ -2479,6 +2564,56 @@ def _destination_derived_positional_create_binding(
         weight=weight,
         resulting_words=resulting_words,
     )
+
+
+def _served_candidate_slots(
+    context: ToolContext,
+    word: str,
+) -> Tuple[Tuple[str, bool], ...]:
+    """Return one ordered, occupancy-checked candidate chain for ``word``."""
+    capability = context.pending_candidate
+    if (
+        capability is not None
+        and capability.state_matches
+        and capability.word == word
+    ):
+        raw_slots = capability.candidates
+    else:
+        raw_slots = (context.trusted_candidate_slots_by_word or {}).get(
+            word,
+            (),
+        )
+    normalized: List[Tuple[str, bool]] = []
+    seen: set[str] = set()
+    for raw_code, occupied in raw_slots:
+        code = str(raw_code or "").strip().lower()
+        if (
+            not re.fullmatch(_POSITIONAL_REORDER_CODE_PATTERN, code)
+            or not isinstance(occupied, bool)
+            or code in seen
+        ):
+            return ()
+        normalized.append((code, occupied))
+        seen.add(code)
+    return tuple(normalized)
+
+
+def _next_free_served_candidate(
+    context: ToolContext,
+    word: str,
+    current_code: str,
+) -> Tuple[str, Tuple[Tuple[str, bool], ...]]:
+    slots = _served_candidate_slots(context, word)
+    codes = [code for code, _occupied in slots]
+    if current_code not in codes:
+        return "", slots
+    current_index = codes.index(current_code)
+    if not slots[current_index][1]:
+        return "", slots
+    for code, occupied in slots[current_index + 1:]:
+        if not occupied:
+            return code, slots
+    return "", slots
 
 
 def _positional_destination_is_bound(
@@ -2675,10 +2810,179 @@ class ToolExecutor:
             arguments,
             context,
         )
-        return bool(
-            binding is not None
-            and binding.weight is not None
+        return binding is not None
+
+    def resolve_execution_route(
+        self,
+        tool_name: str,
+        arguments: Dict,
+        context: ToolContext,
+    ) -> ToolExecutionRoute:
+        """Resolve post-authorization positional-create execution semantics."""
+        unchanged = ToolExecutionRoute(tool_name, dict(arguments))
+        if tool_name != "keytao_create_phrase":
+            return unchanged
+        message = _mutation_authorization_view(context.current_message or "")
+        binding = (
+            _pending_positional_create_binding(message, arguments, context)
+            or _destination_derived_positional_create_binding(
+                message,
+                arguments,
+                context,
+            )
         )
+        if binding is None:
+            return unchanged
+        if _positional_same_code_requested(context.current_message or ""):
+            return ToolExecutionRoute(
+                tool_name,
+                dict(arguments),
+                positional_binding=binding,
+            )
+
+        word = str(arguments.get("word") or "").strip()
+        if binding.relation in _POSITIONAL_CREATE_FRONT_RELATIONS:
+            shift_args: Dict[str, Any] = {
+                "word": word,
+                "target_code": binding.code,
+            }
+            if arguments.get("type"):
+                shift_args["target_type"] = arguments["type"]
+            if arguments.get("remark"):
+                shift_args["target_remark"] = arguments["remark"]
+            if "needs_manual_review" in arguments:
+                shift_args["target_needs_manual_review"] = arguments[
+                    "needs_manual_review"
+                ]
+            return ToolExecutionRoute(
+                "keytao_shift_phrase_code",
+                shift_args,
+                positional_binding=binding,
+            )
+
+        if binding.relation in _POSITIONAL_CREATE_BACK_RELATIONS:
+            next_code, slots = _next_free_served_candidate(
+                context,
+                word,
+                binding.code,
+            )
+            if not next_code:
+                candidate_codes = [code for code, _occupied in slots]
+                reason = (
+                    "following_candidate_unavailable"
+                    if slots
+                    else "candidate_chain_required"
+                )
+                return ToolExecutionRoute(
+                    tool_name,
+                    dict(arguments),
+                    positional_binding=binding,
+                    response=text_follow_up(
+                        reason,
+                        (
+                            f"“{word}”在 {binding.code} 之后没有本轮已核验的空闲候选编码，"
+                            "本次未写入。可以明确要求同码，或先重新准备该词的候选编码后再试。"
+                        ),
+                        word=word,
+                        destinationWord=binding.destination_word,
+                        currentCode=binding.code,
+                        candidateCodes=candidate_codes,
+                        nextAction={
+                            "type": "prepare_candidates_or_request_same_code",
+                            "sameCodeMarkers": ["同码", "同编码", "重码"],
+                        },
+                    ),
+                )
+            create_args = self._with_trusted_mutation_fields(
+                "keytao_create_phrase",
+                {
+                    **arguments,
+                    "code": next_code,
+                    "action": "Create",
+                },
+                context,
+            )
+            create_args.pop("weight", None)
+            return ToolExecutionRoute(
+                "keytao_create_phrase",
+                create_args,
+                positional_binding=binding,
+            )
+        return unchanged
+
+    async def _invoke_effective_tool(
+        self,
+        tool_name: str,
+        arguments: Dict,
+        context: ToolContext,
+    ) -> Any:
+        tool_func = self._get_tool_function(tool_name)
+        if not tool_func:
+            return {"error": f"Tool {tool_name} not found"}
+        call_args = dict(arguments)
+        if tool_name in self._context_tools:
+            if not context.platform or not context.user_id:
+                return {"error": "内部错误：无法获取用户平台信息"}
+            call_args["platform"] = context.platform
+            call_args["platform_id"] = context.user_id
+        return await tool_func(**call_args)
+
+    async def replay_shift_plan(
+        self,
+        authorization_tool_name: str,
+        authorization_arguments: Dict,
+        binding: Dict,
+        context: ToolContext,
+    ) -> Tuple[str, Dict]:
+        """Replay one digest-bound shift after rechecking its authorization."""
+        if authorization_tool_name == "keytao_shift_phrase_code":
+            confirm_args = {**authorization_arguments, **binding}
+            return await self.call(
+                authorization_tool_name,
+                confirm_args,
+                context,
+            ), confirm_args
+
+        canonical = self.canonicalize_arguments(
+            authorization_tool_name,
+            authorization_arguments,
+            context,
+        )
+        policy_error = self._validate_policy(
+            authorization_tool_name,
+            canonical,
+            context,
+        )
+        if policy_error:
+            return json.dumps(policy_error, ensure_ascii=False), canonical
+        route = self.resolve_execution_route(
+            authorization_tool_name,
+            canonical,
+            context,
+        )
+        if route.tool_name != "keytao_shift_phrase_code" or route.response:
+            return json.dumps(
+                policy_block(
+                    BLOCK_REASON_BINDING_INCOMPLETE,
+                    "安全拦截：顺延确认已不再对应原始位置指令。",
+                    missing=["boundShiftPlan"],
+                ),
+                ensure_ascii=False,
+            ), canonical
+        confirm_args = {**route.arguments, **binding}
+        try:
+            result = await self._invoke_effective_tool(
+                route.tool_name,
+                confirm_args,
+                context,
+            )
+            return json.dumps(result, ensure_ascii=False), confirm_args
+        except Exception as error:
+            logger.error(
+                f"Tool {route.tool_name} replay error: "
+                f"{type(error).__name__}: {error}"
+            )
+            return json.dumps({"error": str(error)}, ensure_ascii=False), confirm_args
 
     async def call(self, tool_name: str, arguments: Dict, context: ToolContext) -> str:
         root_error = _validate_root_type(tool_name, arguments)
@@ -2704,22 +3008,22 @@ class ToolExecutor:
             )
             return json.dumps(schema_error, ensure_ascii=False)
 
-        tool_func = self._get_tool_function(tool_name)
-        if not tool_func:
-            return json.dumps({"error": f"Tool {tool_name} not found"}, ensure_ascii=False)
+        route = self.resolve_execution_route(tool_name, call_args, context)
+        if route.response is not None:
+            return json.dumps(route.response, ensure_ascii=False)
 
         try:
-            if tool_name in self._context_tools:
-                if not context.platform or not context.user_id:
-                    return json.dumps(
-                        {"error": "内部错误：无法获取用户平台信息"}, ensure_ascii=False
-                    )
-                call_args["platform"] = context.platform
-                call_args["platform_id"] = context.user_id
-
-            result = await tool_func(**call_args)
+            result = await self._invoke_effective_tool(
+                route.tool_name,
+                route.arguments,
+                context,
+            )
             if (
                 tool_name == "keytao_create_phrase"
+                and route.tool_name == "keytao_create_phrase"
+                and _positional_same_code_requested(
+                    context.current_message or ""
+                )
                 and isinstance(result, dict)
                 and (
                     result.get("success") is True
@@ -2732,12 +3036,12 @@ class ToolExecutor:
                 ordering = (
                     _pending_positional_create_binding(
                         message,
-                        call_args,
+                        arguments,
                         context,
                     )
                     or _destination_derived_positional_create_binding(
                         message,
-                        call_args,
+                        arguments,
                         context,
                     )
                 )
@@ -2753,10 +3057,16 @@ class ToolExecutor:
                         f"（新词权重 {ordering.weight}，排在“{ordering.destination_word}”{side}）",
                     )
             result_json = json.dumps(result, ensure_ascii=False)
-            logger.info(f"Tool {tool_name} result: {result_json[:300]}")
+            logger.info(
+                f"Tool {tool_name} executed as {route.tool_name}: "
+                f"{result_json[:300]}"
+            )
             return result_json
         except Exception as error:
-            logger.error(f"Tool {tool_name} error: {type(error).__name__}: {error}")
+            logger.error(
+                f"Tool {tool_name} via {route.tool_name} error: "
+                f"{type(error).__name__}: {error}"
+            )
             return json.dumps({"error": str(error)}, ensure_ascii=False)
 
     @staticmethod
@@ -3130,6 +3440,9 @@ class ToolExecutor:
             code = str(arguments.get("code") or "").strip()
             action = str(arguments.get("action") or "Create")
             old_word = str(arguments.get("old_word") or "").strip()
+            binding_message, _marker_found = (
+                _normalize_positional_same_code_markers(message)
+            )
             pending_positional_create = _pending_positional_create_binding(
                 message,
                 arguments,
@@ -3145,7 +3458,11 @@ class ToolExecutor:
             positional_create = (
                 pending_positional_create or destination_positional_create
             )
-            if positional_create is not None and positional_create.weight is None:
+            if (
+                positional_create is not None
+                and positional_create.weight is None
+                and _positional_same_code_requested(message)
+            ):
                 return text_follow_up(
                     BLOCK_REASON_ORDERING_NOT_EXPRESSIBLE,
                     "当前已有权重之间没有可用的整数位置，无法精确保持这条排序指令。"
@@ -3159,15 +3476,20 @@ class ToolExecutor:
                 targets.append(old_word)
             missing_targets = [
                 target for target in targets
-                if not target or not _contains_exact_target(message, target)
+                if not target
+                or not _contains_exact_target(binding_message, target)
             ]
             create_intent_is_bound = bool(
                 action == "Create"
                 and not old_word
                 and word
-                and _contains_exact_target(message, word)
-                and _action_is_bound_to_target(message, word, "Create")
-                and not _is_word_protected(message, word)
+                and _contains_exact_target(binding_message, word)
+                and _action_is_bound_to_target(
+                    binding_message,
+                    word,
+                    "Create",
+                )
+                and not _is_word_protected(binding_message, word)
             )
             explicit_create_is_bound = bool(
                 create_intent_is_bound
@@ -3189,7 +3511,7 @@ class ToolExecutor:
                 or pending_create_is_bound
                 or positional_create is not None
             )
-            positional_operands = _positional_create_operands(message)
+            positional_operands = _positional_create_operands(binding_message)
             if (
                 action == "Create"
                 and not old_word
@@ -3199,8 +3521,8 @@ class ToolExecutor:
                 and positional_operands[2] in {
                     "前面", "后面", "之前", "之后", "前", "后",
                 }
-                and _contains_exact_target(message, word)
-                and not _is_word_protected(message, word)
+                and _contains_exact_target(binding_message, word)
+                and not _is_word_protected(binding_message, word)
             ):
                 destination_word = positional_operands[1]
                 destination_codes = trusted_word_lookup_codes.get(

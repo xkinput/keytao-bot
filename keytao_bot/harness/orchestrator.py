@@ -24,6 +24,7 @@ from .tools import (
     MUTATING_TOOL_NAMES,
     PendingCandidateCapability,
     ToolContext,
+    ToolExecutionRoute,
     ToolExecutor,
     create_warning_confirmation_binding,
     message_mentions_change_request,
@@ -333,6 +334,10 @@ class AgentOrchestrator:
         total_tool_calls = 0
         empty_response_retries = 0
         trusted_codes_by_word: Dict[str, frozenset[str]] = {}
+        trusted_candidate_slots_by_word: Dict[
+            str,
+            tuple[tuple[str, bool], ...],
+        ] = {}
         trusted_word_lookup_codes_by_word: Dict[str, frozenset[str]] = {}
         trusted_entries_by_code: Dict[str, tuple[tuple[str, int], ...]] = {}
         trusted_draft_words_by_id: Dict[str, str] = {}
@@ -543,6 +548,9 @@ class AgentOrchestrator:
                     trusted_word_lookup_codes_by_word=(
                         trusted_word_lookup_codes_by_word
                     ),
+                    trusted_candidate_slots_by_word=(
+                        trusted_candidate_slots_by_word
+                    ),
                     trusted_entries_by_code=trusted_entries_by_code,
                     trusted_draft_words_by_id=trusted_draft_words_by_id,
                     trusted_draft_items_by_id=trusted_draft_items_by_id,
@@ -654,9 +662,15 @@ class AgentOrchestrator:
                     self._collect_trusted_batch_ids(
                         result_data, trusted_batch_ids, canonical_fn_args
                     )
+                    execution_route = self._tool_executor.resolve_execution_route(
+                        fn_name,
+                        canonical_fn_args,
+                        tool_context,
+                    )
                     auto_confirmed = await self._auto_confirm_shift_plan(
                         fn_name,
                         canonical_fn_args,
+                        execution_route,
                         result_data,
                         replace(
                             tool_context,
@@ -710,6 +724,11 @@ class AgentOrchestrator:
                         result_data,
                         authoritative_result_links,
                     )
+                    self._capture_authoritative_shift_notice(
+                        execution_route.tool_name,
+                        result_data,
+                        authoritative_result_links,
+                    )
                     self._collect_trusted_batch_ids(
                         result_data, trusted_batch_ids, canonical_fn_args
                     )
@@ -724,13 +743,29 @@ class AgentOrchestrator:
                         trusted_draft_items_by_id,
                         trusted_phrase_types_by_key,
                         trusted_reviewed_items_by_key,
+                        trusted_candidate_slots_by_word,
                     )
+                    pending_tool_name = (
+                        execution_route.tool_name
+                        if execution_route.tool_name != fn_name
+                        else fn_name
+                    )
+                    pending_arguments = (
+                        execution_route.arguments
+                        if execution_route.tool_name != fn_name
+                        else canonical_fn_args
+                    )
+                    if (
+                        auto_confirmed is not None
+                        and pending_tool_name == "keytao_shift_phrase_code"
+                    ):
+                        pending_arguments = canonical_fn_args
                     pending_saved = self._save_pending_tool_confirm(
                         conv_key,
                         context.space_key,
                         context.speaker_name,
-                        fn_name,
-                        canonical_fn_args,
+                        pending_tool_name,
+                        pending_arguments,
                         result_data,
                     )
                     if (
@@ -904,6 +939,45 @@ class AgentOrchestrator:
             links["_createNotices"] = "\n".join(notices[:8])
 
     @staticmethod
+    def _capture_authoritative_shift_notice(
+        tool_name: str,
+        result: Dict[str, Any],
+        links: Dict[str, str],
+    ) -> None:
+        """Keep the exact successful relocation outcome visible to the user."""
+        if tool_name != "keytao_shift_phrase_code" or result.get("success") is not True:
+            return
+        shift_plan = result.get("shiftPlan")
+        if not isinstance(shift_plan, dict):
+            return
+        word = str(shift_plan.get("word") or "").strip()
+        target_code = str(shift_plan.get("targetCode") or "").strip()
+        moves = [
+            f"{word} → {target_code}"
+            if word and target_code
+            else ""
+        ]
+        for item in shift_plan.get("shifted") or []:
+            if not isinstance(item, dict):
+                continue
+            moved_word = str(item.get("word") or "").strip()
+            to_code = str(item.get("toCode") or "").strip()
+            if moved_word and to_code:
+                moves.append(f"{moved_word} → {to_code}")
+        moves = [move for move in moves if move]
+        if not moves:
+            return
+        notice = f"顺延结果：{'，'.join(moves)}"
+        notices = [
+            line
+            for line in str(links.get("_createNotices") or "").splitlines()
+            if line
+        ]
+        if notice not in notices:
+            notices.append(notice)
+        links["_createNotices"] = "\n".join(notices[:8])
+
+    @staticmethod
     def _append_authoritative_result_links(
         content: str,
         links: Dict[str, str],
@@ -967,6 +1041,10 @@ class AgentOrchestrator:
         draft_items_by_id: Dict[str, Dict[str, str]],
         phrase_types_by_key: Dict[tuple[str, str], frozenset[str]],
         reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
+        candidate_slots_by_word: Dict[
+            str,
+            tuple[tuple[str, bool], ...],
+        ],
     ) -> None:
         """Capture narrowly scoped capabilities from successful read-tool results."""
         if result.get("policyBlocked") or result.get("error") or result.get("success") is False:
@@ -1002,6 +1080,48 @@ class AgentOrchestrator:
                     codes_by_word[word] = frozenset(
                         set(codes_by_word.get(word, frozenset())) | codes
                     )
+
+                status_groups: List[List[Dict[str, Any]]] = []
+                top_level_statuses = result.get("candidateStatuses")
+                if isinstance(top_level_statuses, list):
+                    status_groups.append(top_level_statuses)
+                for pronunciation in result.get("pronunciations") or []:
+                    if not isinstance(pronunciation, dict):
+                        continue
+                    pronunciation_statuses = pronunciation.get(
+                        "candidateStatuses"
+                    )
+                    if isinstance(pronunciation_statuses, list):
+                        status_groups.append(pronunciation_statuses)
+                recommended = str(result.get("recommendedCode") or "").strip()
+                valid_slot_groups: List[tuple[tuple[str, bool], ...]] = []
+                for statuses in status_groups:
+                    slots: List[tuple[str, bool]] = []
+                    seen_codes: set[str] = set()
+                    valid = bool(statuses)
+                    for status in statuses:
+                        if not isinstance(status, dict):
+                            valid = False
+                            break
+                        code = str(status.get("code") or "").strip().lower()
+                        occupied = status.get("occupied")
+                        if (
+                            not code
+                            or code in seen_codes
+                            or not isinstance(occupied, bool)
+                        ):
+                            valid = False
+                            break
+                        slots.append((code, occupied))
+                        seen_codes.add(code)
+                    if valid and (
+                        not recommended
+                        or recommended in seen_codes
+                    ):
+                        valid_slot_groups.append(tuple(slots))
+                unique_slot_groups = list(dict.fromkeys(valid_slot_groups))
+                if len(unique_slot_groups) == 1:
+                    candidate_slots_by_word[word] = unique_slot_groups[0]
 
                 if tool_name == "keytao_prepare_reviewed_add":
                     recommended_code = str(result.get("recommendedCode") or "").strip()
@@ -1441,8 +1561,9 @@ class AgentOrchestrator:
 
     async def _auto_confirm_shift_plan(
         self,
-        fn_name: str,
-        fn_args: Dict,
+        authorization_tool_name: str,
+        authorization_args: Dict,
+        execution_route: ToolExecutionRoute,
         result_data: Dict,
         tool_context: ToolContext,
     ) -> Optional[tuple]:
@@ -1457,7 +1578,7 @@ class AgentOrchestrator:
         second call, and the server CAS still rejects a stale plan.
         """
         if (
-            fn_name != "keytao_shift_phrase_code"
+            execution_route.tool_name != "keytao_shift_phrase_code"
             or not tool_context.writes_allowed
             or not isinstance(result_data, dict)
             or not result_data.get("requiresConfirmation")
@@ -1467,14 +1588,30 @@ class AgentOrchestrator:
         binding = self._server_plan_binding(result_data)
         if binding is None:
             return None
-        confirm_args = {**fn_args, **binding}
+        if authorization_tool_name == "keytao_create_phrase":
+            positional = execution_route.positional_binding
+            shifted = (
+                (result_data.get("shiftPlan") or {}).get("shifted")
+                if isinstance(result_data.get("shiftPlan"), dict)
+                else None
+            )
+            if (
+                positional is None
+                or not isinstance(shifted, list)
+                or len(shifted) != 1
+                or not isinstance(shifted[0], dict)
+                or str(shifted[0].get("word") or "").strip()
+                != positional.destination_word
+            ):
+                return None
         logger.info(
             "Auto-confirming shift plan bound to server digest: "
             f"batch={binding['batch_id']} version={binding['expected_content_version']}"
         )
-        confirmed_str = await self._tool_executor.call(
-            fn_name,
-            confirm_args,
+        confirmed_str, confirm_args = await self._tool_executor.replay_shift_plan(
+            authorization_tool_name,
+            authorization_args,
+            binding,
             tool_context,
         )
         try:

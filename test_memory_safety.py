@@ -35,6 +35,7 @@ from keytao_bot.harness.tools import (
     _RECORD_FRAME_RE,
     _mutation_authorization_view,
     _pending_positional_create_binding,
+    _positional_same_code_requested,
     create_warning_confirmation_binding,
     message_authorizes_mutation,
     message_requests_change,
@@ -4719,13 +4720,25 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
     async def asyncSetUp(self) -> None:
         self.calls = []
 
-        async def create_phrase(**kwargs):
-            self.calls.append(("keytao_create_phrase", kwargs))
-            return {"success": True}
+        def get_tool(name):
+            if name not in {
+                "keytao_create_phrase",
+                "keytao_shift_phrase_code",
+            }:
+                return None
+
+            async def execute(**kwargs):
+                self.calls.append((name, kwargs))
+                return {"success": True}
+
+            return execute
 
         self.executor = ToolExecutor(
-            lambda name: create_phrase if name == "keytao_create_phrase" else None,
-            frozenset({"keytao_create_phrase"}),
+            get_tool,
+            frozenset({
+                "keytao_create_phrase",
+                "keytao_shift_phrase_code",
+            }),
         )
 
     @staticmethod
@@ -4753,6 +4766,8 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
         trusted_codes_by_word=None,
         trusted_word_lookup_codes_by_word=None,
         trusted_entries_by_code=None,
+        trusted_candidate_slots_by_word=None,
+        trusted_reviewed_items_by_key=None,
     ):
         raw = await self.executor.call(
             "keytao_create_phrase",
@@ -4768,6 +4783,10 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
                     trusted_word_lookup_codes_by_word
                 ),
                 trusted_entries_by_code=trusted_entries_by_code,
+                trusted_candidate_slots_by_word=(
+                    trusted_candidate_slots_by_word
+                ),
+                trusted_reviewed_items_by_key=trusted_reviewed_items_by_key,
             ),
         )
         return __import__("json").loads(raw)
@@ -5060,6 +5079,300 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(len(variants), 5)
         self.assertEqual(leaks, [])
 
+    async def test_same_code_marker_lexicon_and_masking_are_exact(self) -> None:
+        marker_forms = (
+            "同码",
+            "同编码",
+            "同代码",
+            "同一码",
+            "同一编码",
+            "同一代码",
+            "同一个码",
+            "同一个编码",
+            "同一个代码",
+            "相同码",
+            "相同的编码",
+            "相同代码",
+            "码相同",
+            "编码保持相同",
+            "代码相同",
+            "重码",
+            "重复码",
+            "重复的编码",
+            "重复代码",
+        )
+        for marker in marker_forms:
+            with self.subTest(marker=marker):
+                message = f"把吃席{marker}放在赤溪前面"
+                self.assertTrue(message_authorizes_mutation(message))
+                self.assertTrue(_positional_same_code_requested(message))
+
+        before = len(self.calls)
+        quoted = await self._call(
+            "把吃席放在赤溪前面，引用“同码”作为备注",
+            capability=self._capability(),
+        )
+        self.assertTrue(quoted.get("success"))
+        self.assertEqual(
+            [name for name, _kwargs in self.calls[before:]],
+            ["keytao_shift_phrase_code"],
+        )
+        self.assertFalse(_positional_same_code_requested(
+            "把吃席放在赤溪前面，引用“同码”作为备注"
+        ))
+
+        framed = "记录如下：把吃席重码放在赤溪前面"
+        before = len(self.calls)
+        blocked = await self._call(framed, capability=self._capability())
+        self.assertTrue(blocked.get("policyBlocked"))
+        self.assertEqual(self.calls[before:], [])
+        self.assertFalse(_positional_same_code_requested(framed))
+
+    async def test_word_lookup_marker_routes_reach_sealed_duplicate_sink(self) -> None:
+        cases = (
+            ("front-same", "把吃席同码放在赤溪前面", "DUPLICATE"),
+            ("front-duplicate", "把吃席重码放在赤溪前面", "DUPLICATE"),
+            (
+                "front-quoted-destination",
+                "把吃席同码放在「赤溪」前面",
+                "DUPLICATE",
+            ),
+            ("front-rank-verb", "把吃席同码排在赤溪前面", "DUPLICATE"),
+            ("back-same", "把吃席同码放在赤溪后面", "DUPLICATE"),
+            ("back-duplicate", "把吃席重码放在赤溪后面", "DUPLICATE"),
+            (
+                "front-quoted-marker",
+                "把吃席放在赤溪前面，引用“同码”作为备注",
+                "SHIFT",
+            ),
+            (
+                "back-quoted-marker",
+                "把吃席放在赤溪后面，引用“重码”作为备注",
+                "NEXT_FREE",
+            ),
+        )
+        failures = []
+        for label, message, expected in cases:
+            before = len(self.calls)
+            result = await self._call(
+                message,
+                trusted_word_lookup_codes_by_word={
+                    "赤溪": frozenset({"wkxk"}),
+                },
+                trusted_entries_by_code={"wkxk": (("赤溪", 100),)},
+                trusted_candidate_slots_by_word={
+                    "吃席": (("wkxk", True), ("wkxko", False)),
+                },
+            )
+            call_delta = self.calls[before:]
+            actual = "INVALID"
+            if len(call_delta) == 1:
+                tool_name, call_args = call_delta[0]
+                if tool_name == "keytao_shift_phrase_code":
+                    actual = "SHIFT"
+                    self.assertIs(
+                        call_args.get("target_needs_manual_review"),
+                        True,
+                    )
+                elif tool_name == "keytao_create_phrase":
+                    self.assertIs(call_args.get("needs_manual_review"), True)
+                    if call_args.get("code") == "wkxk" and "weight" in call_args:
+                        actual = "DUPLICATE"
+                        self.assertIn("orderingSummary", result)
+                    elif (
+                        call_args.get("code") == "wkxko"
+                        and "weight" not in call_args
+                    ):
+                        actual = "NEXT_FREE"
+            if actual != expected:
+                failures.append((label, expected, actual, result, call_delta))
+
+        self.assertEqual(len(cases), 8)
+        self.assertEqual(failures, [])
+
+    async def test_front_shift_preserves_trusted_auto_pass_verdict(self) -> None:
+        before = len(self.calls)
+        result = await self._call(
+            "把吃席放在赤溪前面",
+            capability=self._capability(),
+            trusted_reviewed_items_by_key={
+                ("吃席", "wkxk"): {
+                    "type": "Phrase",
+                    "remark": "trusted review",
+                    "needs_manual_review": False,
+                },
+            },
+        )
+
+        self.assertTrue(result.get("success"))
+        shift_calls = self.calls[before:]
+        self.assertEqual([name for name, _kwargs in shift_calls], [
+            "keytao_shift_phrase_code",
+        ])
+        self.assertIs(
+            shift_calls[0][1]["target_needs_manual_review"],
+            False,
+        )
+        self.assertEqual(
+            shift_calls[0][1]["target_remark"],
+            "trusted review",
+        )
+
+    async def test_back_uses_only_served_occupancy_checked_candidate_chain(self) -> None:
+        before = len(self.calls)
+        result = await self._call(
+            "把吃席放在赤溪后面",
+            trusted_word_lookup_codes_by_word={
+                "赤溪": frozenset({"wkxk"}),
+            },
+            trusted_entries_by_code={"wkxk": (("赤溪", 100),)},
+            trusted_candidate_slots_by_word={
+                "吃席": (
+                    ("wkxk", True),
+                    ("wkxko", True),
+                    ("wkxkoo", False),
+                ),
+            },
+        )
+
+        self.assertTrue(result.get("success"))
+        call_delta = self.calls[before:]
+        self.assertEqual([name for name, _kwargs in call_delta], [
+            "keytao_create_phrase",
+        ])
+        self.assertEqual(call_delta[0][1]["code"], "wkxkoo")
+        self.assertNotIn("weight", call_delta[0][1])
+
+        before = len(self.calls)
+        unavailable = await self._call(
+            "把吃席放在赤溪后面",
+            trusted_word_lookup_codes_by_word={
+                "赤溪": frozenset({"wkxk"}),
+            },
+            trusted_entries_by_code={"wkxk": (("赤溪", 100),)},
+            trusted_candidate_slots_by_word={
+                "吃席": (
+                    ("wkxk", True),
+                    ("wkxko", True),
+                    ("wkxkoo", True),
+                ),
+            },
+        )
+        self.assertTrue(unavailable.get("requiresTextFollowUp"))
+        self.assertEqual(
+            unavailable.get("reason"),
+            "following_candidate_unavailable",
+        )
+        self.assertEqual(self.calls[before:], [])
+
+    async def test_eviction_default_route_corpus_is_exact(self) -> None:
+        no_free = PendingCandidateCapability(
+            state_matches=True,
+            word="吃席",
+            candidates=(("wkxk", True), ("wkxko", True)),
+            occupied_words=(
+                ("wkxk", ("赤溪",)),
+                ("wkxko", ("青溪",)),
+            ),
+            entries=(("wkxk", "赤溪", 100),),
+        )
+        back_collision = PendingCandidateCapability(
+            state_matches=True,
+            word="吃席",
+            candidates=(("wkxk", True), ("wkxko", False)),
+            occupied_words=(("wkxk", ("赤溪", "下一个")),),
+            entries=(
+                ("wkxk", "赤溪", 100),
+                ("wkxk", "下一个", 101),
+            ),
+        )
+        cases = (
+            ("front-default", "把吃席放在赤溪前面", self._capability(), "SHIFT"),
+            ("front-same", "把吃席同码放在赤溪前面", self._capability(), "DUPLICATE"),
+            (
+                "front-quoted-marker",
+                "把吃席放在赤溪前面，引用“同码”作为备注",
+                self._capability(),
+                "SHIFT",
+            ),
+            ("back-default", "把吃席放在赤溪后面", self._capability(), "NEXT_FREE"),
+            ("back-same", "把吃席放在赤溪后面重码", self._capability(), "DUPLICATE"),
+            (
+                "back-quoted-marker",
+                "把吃席放在赤溪后面，引用“重码”作为备注",
+                self._capability(),
+                "NEXT_FREE",
+            ),
+            (
+                "front-framed",
+                "记录如下：把吃席同编码放在赤溪前面",
+                self._capability(),
+                "BLOCK",
+            ),
+            (
+                "back-framed",
+                "记录如下：把吃席重码放在赤溪后面",
+                self._capability(),
+                "BLOCK",
+            ),
+            ("back-no-free", "把吃席放在赤溪后面", no_free, "ASK"),
+            (
+                "back-same-collision",
+                "把吃席放在赤溪后面同编码",
+                back_collision,
+                "ASK",
+            ),
+        )
+        counts = {
+            "SHIFT": 0,
+            "DUPLICATE": 0,
+            "NEXT_FREE": 0,
+            "BLOCK": 0,
+            "ASK": 0,
+        }
+        failures = []
+        for label, message, capability, expected in cases:
+            before = len(self.calls)
+            result = await self._call(message, capability=capability)
+            call_delta = self.calls[before:]
+            if result.get("policyBlocked") and not call_delta:
+                actual = "BLOCK"
+            elif result.get("requiresTextFollowUp") and not call_delta:
+                actual = "ASK"
+            elif [name for name, _kwargs in call_delta] == [
+                "keytao_shift_phrase_code"
+            ]:
+                actual = "SHIFT"
+                if call_delta[0][1].get("target_needs_manual_review") is not True:
+                    failures.append((label, "missing shift seal", call_delta))
+            elif [name for name, _kwargs in call_delta] == [
+                "keytao_create_phrase"
+            ]:
+                call_args = call_delta[0][1]
+                if call_args.get("needs_manual_review") is not True:
+                    failures.append((label, "missing create seal", call_delta))
+                actual = (
+                    "DUPLICATE"
+                    if "weight" in call_args
+                    else "NEXT_FREE"
+                )
+            else:
+                actual = "INVALID"
+            if actual != expected:
+                failures.append((label, expected, actual, result, call_delta))
+            else:
+                counts[actual] += 1
+
+        self.assertEqual(len(cases), 10)
+        self.assertEqual(counts, {
+            "SHIFT": 2,
+            "DUPLICATE": 2,
+            "NEXT_FREE": 2,
+            "BLOCK": 2,
+            "ASK": 2,
+        })
+        self.assertEqual(failures, [])
+
     async def test_pending_candidate_requires_a_fresh_server_snapshot(self) -> None:
         cases = (
             ("fresh", self._capability(), "ALLOW"),
@@ -5180,10 +5493,15 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
             call_delta = self.calls[before_calls:]
             if cell["authorized"]:
                 allow_count += 1
+                expected_tool = (
+                    "keytao_shift_phrase_code"
+                    if cell["relation"] in {"前面", "之前", "前"}
+                    else "keytao_create_phrase"
+                )
                 if (
                     not result.get("success")
                     or [name for name, _ in call_delta]
-                    != ["keytao_create_phrase"]
+                    != [expected_tool]
                 ):
                     failures.append((cell, result, call_delta))
             elif (
@@ -6042,10 +6360,16 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             tool_executor=ToolExecutor(
                 lambda name: (
                     (lambda **kwargs: dispatch(name, **kwargs))
-                    if name == "keytao_create_phrase"
+                    if name in {
+                        "keytao_create_phrase",
+                        "keytao_shift_phrase_code",
+                    }
                     else None
                 ),
-                frozenset({"keytao_create_phrase"}),
+                frozenset({
+                    "keytao_create_phrase",
+                    "keytao_shift_phrase_code",
+                }),
             ),
             state_store=state_store,
             bind_help_text="bind help",
@@ -6072,12 +6396,56 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             system_prompt_core="system",
         )
 
-    async def test_front_relation_executes_plain_sealed_create(self) -> None:
+    async def test_front_relation_reencodes_occupant_with_sealed_target(self) -> None:
         calls = []
+        shift_plan = {
+            "word": "吃席",
+            "targetCode": "wkxk",
+            "items": [
+                {
+                    "action": "Create",
+                    "word": "吃席",
+                    "code": "wkxk",
+                    "type": "Phrase",
+                    "needsManualReview": True,
+                },
+                {
+                    "action": "Delete",
+                    "word": "赤溪",
+                    "code": "wkxk",
+                    "type": "Phrase",
+                },
+                {
+                    "action": "Create",
+                    "word": "赤溪",
+                    "code": "wkxko",
+                    "type": "Phrase",
+                },
+            ],
+            "shifted": [{
+                "word": "赤溪",
+                "fromCode": "wkxk",
+                "toCode": "wkxko",
+            }],
+        }
 
         async def dispatch(name, **kwargs):
             calls.append((name, kwargs))
-            return {"success": True, "batchId": "batch-positional"}
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "batch-positional",
+                    "contentVersion": 4,
+                    "planDigest": "a" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            return {
+                "success": True,
+                "batchId": "batch-positional",
+                "shiftPlan": shift_plan,
+            }
 
         store = MemoryConversationStateStore()
         address = ConversationAddress.private("qq", "candidate-user")
@@ -6097,15 +6465,177 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             ),
         )
 
-        self.assertEqual([name for name, _ in calls], ["keytao_create_phrase"])
+        self.assertEqual(
+            [name for name, _ in calls],
+            ["keytao_shift_phrase_code", "keytao_shift_phrase_code"],
+        )
         self.assertEqual(calls[0][1]["word"], "吃席")
+        self.assertEqual(calls[0][1]["target_code"], "wkxk")
+        self.assertIs(calls[0][1]["target_needs_manual_review"], True)
+        self.assertIs(calls[1][1]["target_needs_manual_review"], True)
+        self.assertEqual(calls[1][1]["confirmed_plan_digest"], "a" * 64)
+        self.assertIsNone(store.get_record(address))
+        self.assertIn("positioned", result)
+        self.assertIn("顺延结果：吃席 → wkxk，赤溪 → wkxko", result)
+
+    async def test_front_same_code_marker_keeps_duplicate_weight_path(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {"success": True, "batchId": "batch-duplicate"}
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "duplicate complete"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席同码放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual([name for name, _kwargs in calls], ["keytao_create_phrase"])
         self.assertEqual(calls[0][1]["code"], "wkxk")
         self.assertEqual(calls[0][1]["weight"], 99)
         self.assertIs(calls[0][1]["needs_manual_review"], True)
-        self.assertNotIn("target_code", calls[0][1])
-        self.assertIsNone(store.get_record(address))
-        self.assertIn("positioned", result)
         self.assertIn("同码顺序：wkxk：吃席 → 赤溪", result)
+
+    async def test_front_multi_step_plan_requires_explicit_confirmation(self) -> None:
+        calls = []
+        shift_plan = {
+            "word": "吃席",
+            "targetCode": "wkxk",
+            "items": [{
+                "action": "Create",
+                "word": "吃席",
+                "code": "wkxk",
+                "type": "Phrase",
+                "needsManualReview": True,
+            }],
+            "shifted": [
+                {"word": "赤溪", "fromCode": "wkxk", "toCode": "wkxko"},
+                {"word": "青溪", "fromCode": "wkxko", "toCode": "wkxkoo"},
+            ],
+        }
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if kwargs.get("confirmed_plan_digest"):
+                return {"success": True, "unexpectedWrite": True}
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "confirmationKind": "shiftPlan",
+                "batchId": "batch-cascade",
+                "contentVersion": 9,
+                "planDigest": "c" * 64,
+                "shiftPlan": shift_plan,
+            }
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "请确认完整顺延计划。"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "keytao_shift_phrase_code")
+        record = store.get_record(address)
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(record.state.function_name, "keytao_shift_phrase_code")
+        self.assertEqual(record.state.args["confirmed_plan_digest"], "c" * 64)
+        self.assertEqual(record.state.args["expected_content_version"], 9)
+        self.assertIs(record.state.args["target_needs_manual_review"], True)
+        tool_payload = __import__("json").loads(next(
+            message["content"]
+            for message in client.completions.calls[-1]["messages"]
+            if message.get("role") == "tool"
+        ))
+        self.assertEqual(tool_payload["shiftPlan"], shift_plan)
+        self.assertEqual(result, "请确认完整顺延计划。")
+
+    async def test_front_wrong_shifted_word_requires_explicit_confirmation(self) -> None:
+        calls = []
+        shift_plan = {
+            "word": "吃席",
+            "targetCode": "wkxk",
+            "items": [{
+                "action": "Create",
+                "word": "吃席",
+                "code": "wkxk",
+                "type": "Phrase",
+                "needsManualReview": True,
+            }],
+            "shifted": [{
+                "word": "别词",
+                "fromCode": "wkxk",
+                "toCode": "wkxko",
+            }],
+        }
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if kwargs.get("confirmed_plan_digest"):
+                return {"success": True, "unexpectedWrite": True}
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "confirmationKind": "shiftPlan",
+                "batchId": "batch-wrong-word",
+                "contentVersion": 12,
+                "planDigest": "e" * 64,
+                "shiftPlan": shift_plan,
+            }
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "请确认完整顺延计划。"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "keytao_shift_phrase_code")
+        self.assertNotIn("confirmed_plan_digest", calls[0][1])
+        record = store.get_record(address)
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(record.state.function_name, "keytao_shift_phrase_code")
+        self.assertEqual(record.state.args["confirmed_plan_digest"], "e" * 64)
+        self.assertEqual(record.state.args["batch_id"], "batch-wrong-word")
+        self.assertEqual(record.state.args["expected_content_version"], 12)
+        self.assertIs(record.state.args["target_needs_manual_review"], True)
+        self.assertEqual(result, "请确认完整顺延计划。")
 
     async def test_live_pending_candidate_authorizes_plain_add_without_code_text(self) -> None:
         calls = []
@@ -6300,18 +6830,18 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             [
                 "keytao_lookup_by_codes_batch",
                 "keytao_lookup_by_word",
-                "keytao_create_phrase",
+                "keytao_shift_phrase_code",
             ],
         )
-        create_calls = [
+        shift_calls = [
             kwargs
             for name, kwargs in calls
-            if name == "keytao_create_phrase"
+            if name == "keytao_shift_phrase_code"
         ]
-        self.assertEqual(len(create_calls), 1)
-        self.assertEqual(create_calls[0]["word"], subject_word)
-        self.assertEqual(create_calls[0]["code"], "wkxk")
-        self.assertEqual(create_calls[0]["weight"], 99)
+        self.assertEqual(len(shift_calls), 1)
+        self.assertEqual(shift_calls[0]["word"], subject_word)
+        self.assertEqual(shift_calls[0]["target_code"], "wkxk")
+        self.assertIs(shift_calls[0]["target_needs_manual_review"], True)
         tool_payloads = [
             __import__("json").loads(message["content"])
             for message in client.completions.calls[-1]["messages"]
@@ -6321,9 +6851,7 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(tool_payloads[1].get("reason"), "code_required")
         self.assertTrue(tool_payloads[3].get("success"))
         self.assertIn("positioned after lookup", result)
-        ordering_summary = tool_payloads[3].get("orderingSummary")
-        self.assertTrue(ordering_summary)
-        self.assertIn(ordering_summary, result)
+        self.assertNotIn("orderingSummary", tool_payloads[3])
 
     async def test_lookup_results_do_not_authorize_delete_or_shift(self) -> None:
         state = self._pending_state()
@@ -6440,7 +6968,7 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 self.assertTrue(blocked.get("policyBlocked"))
                 self.assertEqual(blocked.get("blockReason"), "binding_incomplete")
 
-    async def test_back_relation_executes_with_explicit_weight(self) -> None:
+    async def test_back_relation_uses_next_free_served_candidate(self) -> None:
         calls = []
 
         async def dispatch(name, **kwargs):
@@ -6466,12 +6994,85 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         )
 
         self.assertEqual([name for name, _kwargs in calls], ["keytao_create_phrase"])
-        self.assertEqual(calls[0][1]["weight"], 101)
+        self.assertEqual(calls[0][1]["code"], "wkxko")
+        self.assertNotIn("weight", calls[0][1])
+        self.assertIs(calls[0][1]["needs_manual_review"], True)
         self.assertIsNone(store.get_record(address))
         self.assertIn("positioned behind", result)
+        self.assertNotIn("同码顺序", result)
+
+    async def test_back_same_code_marker_keeps_duplicate_weight_path(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {"success": True, "batchId": "batch-behind-duplicate"}
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "duplicate behind"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪后面重码",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual([name for name, _kwargs in calls], ["keytao_create_phrase"])
+        self.assertEqual(calls[0][1]["code"], "wkxk")
+        self.assertEqual(calls[0][1]["weight"], 101)
+        self.assertIs(calls[0][1]["needs_manual_review"], True)
         self.assertIn("同码顺序：wkxk：赤溪 → 吃席", result)
 
-    async def test_adjacent_weight_collision_asks_without_reaching_a_sink(self) -> None:
+    async def test_back_without_following_free_candidate_asks_without_sink(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {"success": True, "unexpectedWrite": True}
+
+        pending = self._pending_state()
+        pending.candidates[1] = ("wkxko", True)
+        pending.server_candidates[1] = ("wkxko", True)
+        pending.occupied_words["wkxko"] = ["青溪"]
+        pending.server_occupied_words["wkxko"] = ["青溪"]
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, pending)
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "no free code"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪后面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(calls, [])
+        payload = __import__("json").loads(next(
+            message["content"]
+            for message in client.completions.calls[-1]["messages"]
+            if message.get("role") == "tool"
+        ))
+        self.assertTrue(payload.get("requiresTextFollowUp"))
+        self.assertFalse(payload.get("policyBlocked", False))
+        self.assertEqual(payload.get("reason"), "following_candidate_unavailable")
+        self.assertIsNotNone(store.get_record(address))
+        self.assertEqual(result, "no free code")
+
+    async def test_unmarked_back_ignores_same_code_weight_collision(self) -> None:
         calls = []
 
         async def dispatch(name, **kwargs):
@@ -6499,16 +7100,49 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             ),
         )
 
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "keytao_create_phrase")
+        self.assertEqual(calls[0][1]["code"], "wkxko")
+        self.assertNotIn("weight", calls[0][1])
+        self.assertIsNone(store.get_record(address))
+        self.assertEqual(result, "ordering unavailable")
+
+    async def test_marked_back_weight_collision_asks_without_sink(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {"success": True, "unexpectedWrite": True}
+
+        pending = self._pending_state()
+        pending.server_occupied_words["wkxk"].append("下一个")
+        pending.server_entries_by_code["wkxk"].append(("下一个", 101))
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, pending)
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "ordering unavailable"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪后面同编码",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
         self.assertEqual(calls, [])
-        tool_messages = [
-            message
+        payload = __import__("json").loads(next(
+            message["content"]
             for message in client.completions.calls[-1]["messages"]
             if message.get("role") == "tool"
-        ]
-        follow_up = __import__("json").loads(tool_messages[-1]["content"])
-        self.assertFalse(follow_up.get("policyBlocked", False))
-        self.assertTrue(follow_up.get("requiresTextFollowUp"))
-        self.assertEqual(follow_up.get("reason"), "ordering_not_expressible")
+        ))
+        self.assertTrue(payload.get("requiresTextFollowUp"))
+        self.assertFalse(payload.get("policyBlocked", False))
+        self.assertEqual(payload.get("reason"), "ordering_not_expressible")
         self.assertIsNotNone(store.get_record(address))
         self.assertEqual(result, "ordering unavailable")
 

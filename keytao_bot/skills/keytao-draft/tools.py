@@ -514,6 +514,9 @@ def _build_code_shift_plan(
     current_phrase: Optional[Dict],
     code_phrase_map: Dict[str, List[Dict]],
     word_candidate_code_map: Dict[str, List[str]],
+    target_type: Optional[str] = None,
+    target_remark: str = "",
+    target_needs_manual_review: Optional[bool] = None,
 ) -> Dict:
     if target_code not in target_candidate_codes:
         return {
@@ -523,8 +526,26 @@ def _build_code_shift_plan(
 
     current_code = current_phrase.get("code") if current_phrase else None
     current_type = current_phrase.get("type", "Phrase") if current_phrase else "Phrase"
+    resolved_target_type = _infer_phrase_type(
+        word,
+        target_code,
+        str(target_type or current_type or "Phrase"),
+    )
     deletes: List[Dict] = []
-    creates: List[Dict] = [{"action": "Create", "word": word, "code": target_code, "type": current_type or "Phrase"}]
+    target_create: Dict = {
+        "action": "Create",
+        "word": word,
+        "code": target_code,
+        "type": resolved_target_type,
+    }
+    if target_remark:
+        target_create["remark"] = target_remark
+    if target_needs_manual_review is not None:
+        review_flags.apply_manual_review_flag(
+            target_create,
+            target_needs_manual_review,
+        )
+    creates: List[Dict] = [target_create]
     shifted: List[Dict] = []
     ignored_words = {word}
     reserved_codes = {target_code}
@@ -3065,7 +3086,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_create_phrase",
-            "description": "创建、修改或删除键道词条。用于用户希望添加、修改或删除词条时。信息性单条重码由程序绑定服务端票据自动确认一次，其他警告保留确认流程。自动追加到草稿批次。",
+            "description": (
+                "创建、修改或删除键道词条。新词相对现有词的前后位置也调用本工具，code 传参照词所在编码；"
+                "执行器会根据同码标记、服务端候选链和占用快照决定顺延、后续空位或同码权重。"
+                "信息性单条重码由程序绑定服务端票据自动确认一次，其他警告保留确认流程。自动追加到草稿批次。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3689,6 +3714,9 @@ async def keytao_shift_phrase_code(
     batch_id: Optional[str] = None,
     expected_content_version: Optional[int] = None,
     expected_warning_digest: str = "",
+    target_type: Optional[str] = None,
+    target_remark: str = "",
+    target_needs_manual_review: Optional[bool] = None,
 ) -> Dict:
     """Preview, bind, then atomically write a complete code-shift plan."""
     word = word.strip()
@@ -3714,6 +3742,13 @@ async def keytao_shift_phrase_code(
         return word_lookup
     word_result = next((item for item in word_lookup.get("results", []) if item.get("word") == word), {})
     current_phrase = _select_current_phrase(word, word_result.get("phrases", []))
+    if (
+        target_needs_manual_review is not None
+        and not isinstance(target_needs_manual_review, bool)
+    ):
+        return {"success": False, "message": "人工审核标记必须是布尔值"}
+    if current_phrase is None and target_needs_manual_review is None:
+        target_needs_manual_review = True
 
     ignored_words = {word}
     code_phrase_map: Dict[str, List[Dict]] = {}
@@ -3793,6 +3828,9 @@ async def keytao_shift_phrase_code(
         current_phrase,
         code_phrase_map,
         word_candidate_code_map,
+        target_type=target_type,
+        target_remark=target_remark,
+        target_needs_manual_review=target_needs_manual_review,
     )
     if not plan.get("success"):
         return plan
