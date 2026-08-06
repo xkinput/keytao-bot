@@ -9,6 +9,7 @@ import types
 import unittest
 from contextlib import closing
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import nonebot
 
@@ -28,10 +29,12 @@ from keytao_bot.harness.state import (
     PendingToolConfirm,
 )
 from keytao_bot.harness.tools import (
+    PendingCandidateCapability,
     ToolContext,
     ToolExecutor,
     _RECORD_FRAME_RE,
     _mutation_authorization_view,
+    _pending_positional_create_binding,
     message_authorizes_mutation,
     message_requests_change,
     self_checked_suggested_command,
@@ -2956,6 +2959,74 @@ POSITIONAL_REORDER_ALLOW_CORPUS_SIZE = 9984
 POSITIONAL_REORDER_CANONICAL_COMMANDS = tuple(
     iter_positional_reorder_allow_corpus(("",))
 )
+
+# Product-level grammar for create-with-position commands.  Native reply
+# context is intentionally excluded because ToolExecutor receives the same
+# server capability either way; reply binding belongs to the orchestrator.
+POSITIONAL_CREATE_POLITENESS_VARIANTS = (
+    ("", ""),
+    ("请", ""),
+    ("", "，谢谢"),
+    ("麻烦", "，拜托了"),
+)
+POSITIONAL_CREATE_RELATIONS = ("前面", "后面", "之前", "之后", "前", "后")
+POSITIONAL_CREATE_SUBJECTS = (
+    ("pending-word", "吃席"),
+    ("other-word", "开席"),
+    ("missing", ""),
+)
+POSITIONAL_CREATE_DESTINATIONS = (
+    ("listed-occupant", "赤溪"),
+    ("unlisted-word", "青溪"),
+    ("quoted-variant", "「赤溪」"),
+    ("quoted-variant", "“赤溪”"),
+    ("quoted-variant", "‘赤溪’"),
+    ("code", "wkxk"),
+    ("garbage", "%%%"),
+)
+POSITIONAL_CREATE_CANDIDATE_OCCUPANCY = (False, True)
+POSITIONAL_CREATE_PENDING_STATES = ("present", "absent", "expired")
+POSITIONAL_CREATE_CORPUS_SIZE = (
+    len(POSITIONAL_CREATE_POLITENESS_VARIANTS)
+    * len(POSITIONAL_CREATE_RELATIONS)
+    * len(POSITIONAL_CREATE_SUBJECTS)
+    * len(POSITIONAL_CREATE_DESTINATIONS)
+    * len(POSITIONAL_CREATE_CANDIDATE_OCCUPANCY)
+    * len(POSITIONAL_CREATE_PENDING_STATES)
+)
+
+
+def iter_pending_positional_create_corpus():
+    for prefix, suffix in POSITIONAL_CREATE_POLITENESS_VARIANTS:
+        for relation in POSITIONAL_CREATE_RELATIONS:
+            for subject_kind, subject in POSITIONAL_CREATE_SUBJECTS:
+                for destination_kind, destination in POSITIONAL_CREATE_DESTINATIONS:
+                    for candidate_occupied in POSITIONAL_CREATE_CANDIDATE_OCCUPANCY:
+                        for pending_state in POSITIONAL_CREATE_PENDING_STATES:
+                            message = (
+                                f"{prefix}把{subject}放在"
+                                f"{destination}{relation}{suffix}"
+                            )
+                            authorized = bool(
+                                pending_state == "present"
+                                and subject_kind == "pending-word"
+                                and destination_kind in {
+                                    "listed-occupant",
+                                    "quoted-variant",
+                                }
+                                and candidate_occupied
+                            )
+                            yield {
+                                "politeness": (prefix, suffix),
+                                "relation": relation,
+                                "subject_kind": subject_kind,
+                                "destination_kind": destination_kind,
+                                "destination": destination,
+                                "candidate_occupied": candidate_occupied,
+                                "pending_state": pending_state,
+                                "message": message,
+                                "authorized": authorized,
+                            }
 # The BLOCK product uses the same independently declared command grammar as
 # ALLOW, with only the lead-in dimension fixed to empty.  It therefore covers
 # 把/将/bare, every destination kind, and quoted/unquoted operands.
@@ -4595,6 +4666,243 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, [])
 
 
+class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.calls = []
+
+        async def create_phrase(**kwargs):
+            self.calls.append(("keytao_create_phrase", kwargs))
+            return {"success": True}
+
+        self.executor = ToolExecutor(
+            lambda name: create_phrase if name == "keytao_create_phrase" else None,
+            frozenset({"keytao_create_phrase"}),
+        )
+
+    @staticmethod
+    def _capability(
+        *,
+        state_matches: bool = True,
+        occupied: bool = True,
+        occupied_word: str = "赤溪",
+    ) -> PendingCandidateCapability:
+        return PendingCandidateCapability(
+            state_matches=state_matches,
+            word="吃席",
+            candidates=(("wkxk", occupied), ("wkxko", False)),
+            occupied_words=(("wkxk", (occupied_word,)),),
+        )
+
+    async def _call(
+        self,
+        message: str,
+        *,
+        word: str = "吃席",
+        code: str = "wkxk",
+        capability: PendingCandidateCapability | None = None,
+    ):
+        raw = await self.executor.call(
+            "keytao_create_phrase",
+            {"word": word, "code": code},
+            ToolContext(
+                platform="qq",
+                user_id="candidate-user",
+                current_message=message,
+                writes_allowed=message_authorizes_mutation(message),
+                pending_candidate=capability,
+            ),
+        )
+        return __import__("json").loads(raw)
+
+    async def test_product_grammar_cross_product_is_exactly_scoped(self) -> None:
+        authorized_count = 0
+        authorization_block_count = 0
+        front_create_count = 0
+        back_ordering_block_count = 0
+        failures = []
+        seen_dimensions = {
+            "politeness": set(),
+            "relation": set(),
+            "subject_kind": set(),
+            "destination": set(),
+            "candidate_occupied": set(),
+            "pending_state": set(),
+        }
+
+        for cell in iter_pending_positional_create_corpus():
+            for dimension in seen_dimensions:
+                seen_dimensions[dimension].add(cell[dimension])
+            capability = None
+            if cell["pending_state"] == "present":
+                capability = self._capability(
+                    occupied=cell["candidate_occupied"],
+                )
+            before_calls = len(self.calls)
+            result = await self._call(
+                cell["message"],
+                capability=capability,
+            )
+            call_delta = self.calls[before_calls:]
+            if cell["authorized"]:
+                authorized_count += 1
+                if cell["relation"] in {"前面", "之前", "前"}:
+                    front_create_count += 1
+                    if (
+                        not result.get("success")
+                        or [name for name, _ in call_delta]
+                        != ["keytao_create_phrase"]
+                    ):
+                        failures.append((cell, result, call_delta))
+                else:
+                    back_ordering_block_count += 1
+                    if (
+                        result.get("blockReason") != "ordering_not_expressible"
+                        or call_delta
+                    ):
+                        failures.append((cell, result, call_delta))
+            else:
+                authorization_block_count += 1
+                if not result.get("policyBlocked") or call_delta:
+                    failures.append((cell, result, call_delta))
+
+        self.assertEqual(POSITIONAL_CREATE_CORPUS_SIZE, 3024)
+        self.assertEqual(authorized_count, 96)
+        self.assertEqual(authorization_block_count, 2928)
+        self.assertEqual(front_create_count, 48)
+        self.assertEqual(back_ordering_block_count, 48)
+        self.assertEqual(
+            seen_dimensions,
+            {
+                "politeness": set(POSITIONAL_CREATE_POLITENESS_VARIANTS),
+                "relation": set(POSITIONAL_CREATE_RELATIONS),
+                "subject_kind": {
+                    kind for kind, _subject in POSITIONAL_CREATE_SUBJECTS
+                },
+                "destination": {
+                    destination
+                    for _kind, destination in POSITIONAL_CREATE_DESTINATIONS
+                },
+                "candidate_occupied": set(
+                    POSITIONAL_CREATE_CANDIDATE_OCCUPANCY
+                ),
+                "pending_state": set(POSITIONAL_CREATE_PENDING_STATES),
+            },
+        )
+        self.assertEqual(failures[:20], [])
+
+    async def test_duplicate_candidate_keys_are_blocked_before_the_sink(self) -> None:
+        result = await self._call(
+            "把吃席放在赤溪前面",
+            capability=PendingCandidateCapability(
+                state_matches=True,
+                word="吃席",
+                candidates=(
+                    ("wkxk", True),
+                    ("wkxk", True),
+                    ("wkxko", False),
+                ),
+                occupied_words=(("wkxk", ("赤溪",)),),
+            ),
+        )
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+    async def test_duplicate_occupied_keys_are_blocked_before_the_sink(self) -> None:
+        result = await self._call(
+            "把吃席放在赤溪前面",
+            capability=PendingCandidateCapability(
+                state_matches=True,
+                word="吃席",
+                candidates=(("wkxk", True), ("wkxko", False)),
+                occupied_words=(
+                    ("wkxk", ("赤溪",)),
+                    ("wkxk", ("青溪",)),
+                ),
+            ),
+        )
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+    async def test_complete_command_gate_remains_an_independent_defense(self) -> None:
+        with patch(
+            "keytao_bot.harness.tools._has_complete_positional_reorder_command",
+            return_value=False,
+        ):
+            binding = _pending_positional_create_binding(
+                "把吃席放在赤溪前面",
+                {"word": "吃席", "code": "wkxk"},
+                ToolContext(pending_candidate=self._capability()),
+            )
+
+        self.assertIsNone(binding)
+        self.assertEqual(self.calls, [])
+
+    async def test_state_match_operand_mutant_is_killed(self) -> None:
+        result = await self._call(
+            "把吃席放在赤溪前面",
+            capability=self._capability(state_matches=False),
+        )
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+    async def test_pending_word_operand_mutant_is_killed(self) -> None:
+        result = await self._call(
+            "把开席放在赤溪前面",
+            word="开席",
+            capability=self._capability(),
+        )
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+    async def test_destination_word_operand_mutant_is_killed(self) -> None:
+        result = await self._call(
+            "把吃席放在青溪前面",
+            capability=self._capability(),
+        )
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+    async def test_candidate_code_operand_mutant_is_killed(self) -> None:
+        result = await self._call(
+            "把吃席放在赤溪前面",
+            capability=self._capability(occupied=False),
+        )
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+    async def test_relation_operand_mutant_is_killed(self) -> None:
+        result = await self._call(
+            "把吃席放在赤溪",
+            capability=self._capability(),
+        )
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+    async def test_destination_must_resolve_to_one_candidate_code(self) -> None:
+        result = await self._call(
+            "把吃席放在赤溪前面",
+            capability=PendingCandidateCapability(
+                state_matches=True,
+                word="吃席",
+                candidates=(("wkxk", True), ("wkxko", True)),
+                occupied_words=(
+                    ("wkxk", ("赤溪",)),
+                    ("wkxko", ("赤溪",)),
+                ),
+            ),
+        )
+
+        self.assertTrue(result.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
+
+
 class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.calls = []
@@ -5075,6 +5383,7 @@ class _ReviewedCreateSkills:
                                 "type": "string",
                                 "enum": ["Create", "Change", "Delete"],
                             },
+                            "old_word": {"type": "string"},
                             "type": {"type": "string"},
                             "remark": {"type": "string"},
                         },
@@ -5097,6 +5406,20 @@ def _fake_response(finish_reason, content="", tool_calls=None):
             message=message,
         )],
         usage=None,
+    )
+
+
+def _create_tool_call(
+    call_id="call-create",
+    arguments='{"word": "吃席", "code": "wkxk"}',
+):
+    return types.SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=types.SimpleNamespace(
+            name="keytao_create_phrase",
+            arguments=arguments,
+        ),
     )
 
 
@@ -5167,6 +5490,255 @@ def _shift_tool_call(call_id="call-shift"):
             arguments='{"word": "吃席", "target_code": "wkxk"}',
         ),
     )
+
+
+class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _pending_state() -> PendingAddWord:
+        return PendingAddWord(
+            word="吃席",
+            recommended_code="wkxko",
+            candidates=[("wkxk", True), ("wkxko", False)],
+            occupied_words={"wkxk": ["赤溪"]},
+            server_candidates=[("wkxk", True), ("wkxko", False)],
+            server_occupied_words={"wkxk": ["赤溪"]},
+            needs_manual_review=True,
+        )
+
+    @staticmethod
+    def _orchestrator(client, dispatch, state_store):
+        return AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_ReviewedCreateSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: (
+                    (lambda **kwargs: dispatch(name, **kwargs))
+                    if name == "keytao_create_phrase"
+                    else None
+                ),
+                frozenset({"keytao_create_phrase"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+    async def test_front_relation_executes_plain_sealed_create(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {"success": True, "batchId": "batch-positional"}
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "positioned"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+                reply_context="candidate prompt",
+            ),
+        )
+
+        self.assertEqual([name for name, _ in calls], ["keytao_create_phrase"])
+        self.assertEqual(calls[0][1]["word"], "吃席")
+        self.assertEqual(calls[0][1]["code"], "wkxk")
+        self.assertIs(calls[0][1]["needs_manual_review"], True)
+        self.assertNotIn("target_code", calls[0][1])
+        self.assertIsNone(store.get_record(address))
+        self.assertEqual(result, "positioned")
+
+    async def test_back_relation_blocks_without_reaching_a_sink(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {"success": True, "batchId": "unexpected"}
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "ordering blocked"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪后面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+                reply_context="candidate prompt",
+            ),
+        )
+
+        self.assertEqual(calls, [])
+        tool_messages = [
+            message
+            for message in client.completions.calls[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        block = __import__("json").loads(tool_messages[-1]["content"])
+        self.assertEqual(
+            block.get("blockReason"),
+            "ordering_not_expressible",
+        )
+        self.assertIn("候选编号", block.get("message", ""))
+        self.assertIn("排序在已有词条前面", block.get("message", ""))
+        self.assertIsNotNone(store.get_record(address))
+        self.assertEqual(result, "ordering blocked")
+
+    async def test_change_action_cannot_ride_the_create_exception(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {"success": True, "batchId": "unexpected"}
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_create_tool_call(
+                    arguments=(
+                        '{"action": "Change", "old_word": "赤溪", '
+                        '"word": "吃席", "code": "wkxk"}'
+                    ),
+                )],
+            ),
+            _fake_response("stop", "change blocked"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+                reply_context="candidate prompt",
+            ),
+        )
+
+        self.assertEqual(calls, [])
+        tool_messages = [
+            message
+            for message in client.completions.calls[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        block = __import__("json").loads(tool_messages[-1]["content"])
+        self.assertTrue(block.get("policyBlocked"))
+        self.assertIsNotNone(store.get_record(address))
+        self.assertEqual(result, "change blocked")
+
+    async def test_absent_expired_and_display_only_states_never_reach_a_sink(self) -> None:
+        now = [100.0]
+        cases = []
+
+        absent_store = MemoryConversationStateStore()
+        cases.append(("absent", absent_store))
+
+        expired_store = MemoryConversationStateStore(
+            pending_ttl_seconds=1.0,
+            clock=lambda: now[0],
+        )
+        expired_store.set(
+            ConversationAddress.private("qq", "candidate-user"),
+            self._pending_state(),
+        )
+        now[0] = 102.0
+        cases.append(("expired", expired_store))
+
+        executing_store = MemoryConversationStateStore()
+        executing_address = ConversationAddress.private(
+            "qq", "candidate-user"
+        )
+        executing_store.set(executing_address, self._pending_state())
+        executing_record = executing_store.get_record(executing_address)
+        self.assertIsNotNone(executing_record)
+        self.assertTrue(executing_store.begin_execution(executing_record))
+        cases.append(("executing", executing_store))
+
+        display_only_store = MemoryConversationStateStore()
+        display_only_store.set(
+            ConversationAddress.private("qq", "candidate-user"),
+            PendingAddWord(
+                word="吃席",
+                recommended_code="wkxko",
+                candidates=[("wkxk", True), ("wkxko", False)],
+                occupied_words={"wkxk": ["赤溪"]},
+            ),
+        )
+        cases.append(("display-only", display_only_store))
+
+        mismatched_store = MemoryConversationStateStore()
+        mismatched_store.set(
+            ConversationAddress.private("qq", "candidate-user"),
+            PendingAddWord(
+                word="吃席",
+                recommended_code="wkxko",
+                candidates=[("wkxk", True), ("wkxko", False)],
+                occupied_words={"wkxk": ["赤溪"]},
+                server_candidates=[("wkxk", True), ("wkxko", True)],
+                server_occupied_words={
+                    "wkxk": ["赤溪"],
+                    "wkxko": ["青溪"],
+                },
+            ),
+        )
+        cases.append(("display-server-mismatch", mismatched_store))
+
+        for label, store in cases:
+            with self.subTest(state=label):
+                calls = []
+
+                async def dispatch(name, **kwargs):
+                    calls.append((name, kwargs))
+                    return {"success": True}
+
+                client = _FakeClient([
+                    _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+                    _fake_response("stop", "blocked"),
+                ])
+                result = await self._orchestrator(client, dispatch, store).run(
+                    "把吃席放在赤溪前面",
+                    AgentRequestContext(
+                        platform="qq",
+                        user_id="candidate-user",
+                        mutations_allowed=True,
+                        reply_context="candidate prompt",
+                    ),
+                )
+
+                tool_messages = [
+                    message
+                    for message in client.completions.calls[-1]["messages"]
+                    if message.get("role") == "tool"
+                ]
+                self.assertEqual(calls, [])
+                self.assertTrue(tool_messages)
+                self.assertTrue(
+                    __import__("json").loads(
+                        tool_messages[-1]["content"]
+                    ).get("policyBlocked")
+                )
+                self.assertEqual(result, "blocked")
 
 
 class TrustedBatchAnchorTests(unittest.IsolatedAsyncioTestCase):

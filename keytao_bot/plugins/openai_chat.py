@@ -1757,6 +1757,67 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     )
 
 
+def _server_candidate_snapshot(
+    statuses: List[Dict],
+) -> Tuple[List[Tuple[str, bool]], Dict[str, List[str]]]:
+    """Freeze candidate occupancy from structured server fields only."""
+    by_code: Dict[str, Tuple[bool, Tuple[str, ...]]] = {}
+    order: List[str] = []
+    for status in statuses:
+        if not isinstance(status, dict):
+            return [], {}
+        code = str(status.get("code") or "").strip().lower()
+        if not re.fullmatch(r"[a-z]{1,6}", code):
+            return [], {}
+        raw_occupied = status.get("occupied")
+        raw_words = status.get("words") or []
+        raw_phrases = status.get("phrases") or []
+        if (
+            not isinstance(raw_occupied, bool)
+            or not isinstance(raw_words, list)
+            or not isinstance(raw_phrases, list)
+        ):
+            return [], {}
+        occupied = raw_occupied
+        words = [
+            str(word or "").strip()
+            for word in raw_words
+            if str(word or "").strip()
+        ]
+        if not words:
+            words = [
+                str(phrase.get("word") or "").strip()
+                for phrase in raw_phrases
+                if isinstance(phrase, dict)
+                and str(phrase.get("word") or "").strip()
+            ]
+        normalized = tuple(dict.fromkeys(words if occupied else []))
+        value = (occupied, normalized)
+        if code in by_code and by_code[code] != value:
+            return [], {}
+        if code not in by_code:
+            order.append(code)
+        by_code[code] = value
+    candidates = [(code, by_code[code][0]) for code in order]
+    occupied_words = {
+        code: list(by_code[code][1])
+        for code in order
+        if by_code[code][0]
+    }
+    return candidates, occupied_words
+
+
+def _attach_server_candidate_snapshot(
+    state: PendingAddWord,
+    statuses: List[Dict],
+) -> PendingAddWord:
+    candidates, occupied_words = _server_candidate_snapshot(statuses)
+    if candidates == state.candidates:
+        state.server_candidates = candidates
+        state.server_occupied_words = occupied_words
+    return state
+
+
 def _create_phrase_args(state: PendingAddWord, code: str) -> Dict:
     """Build mutation arguments without losing the structured review verdict."""
     args: Dict = {"word": state.word, "code": code}
@@ -2908,7 +2969,7 @@ async def _revalidate_referenced_add_pending(
         if pinyin
         else {}
     )
-    return PendingAddWord(
+    return _attach_server_candidate_snapshot(PendingAddWord(
         word=referenced_state.word,
         recommended_code=recommended_code,
         candidates=candidates,
@@ -2916,7 +2977,7 @@ async def _revalidate_referenced_add_pending(
         code_remarks={code: reviewed_remark for code, _occupied in candidates},
         pronunciation_codes=pronunciation_codes,
         pronunciation_recommended_codes=[recommended_code],
-    )
+    ), list(status_map.values()))
 
 
 def _ensure_pending_add_word_guidance(response: str) -> str:
@@ -3722,6 +3783,13 @@ async def _try_handle_simple_single_word_query(
     if reviewed_prompt:
         pending = _parse_pending_add_word(reviewed_prompt)
         if pending is not None:
+            server_statuses = [
+                status
+                for pronunciation in review.get("pronunciations") or []
+                if isinstance(pronunciation, dict)
+                for status in pronunciation.get("candidateStatuses") or []
+            ]
+            _attach_server_candidate_snapshot(pending, server_statuses)
             target_key = conv_key or (
                 current_memory_context.get().conversation_address
                 if current_memory_context.get() is not None
@@ -7733,6 +7801,10 @@ async def _try_update_pending_pronunciation(
     updated_state = _parse_pending_add_word(response)
     if updated_state is None:
         return "新读音候选生成异常，旧候选没有执行，请重新发送词条。"
+    _attach_server_candidate_snapshot(
+        updated_state,
+        [status_map[code] for code in variant_codes],
+    )
     stored = conversation_state_store.set(
         (platform, user_id),
         updated_state,

@@ -17,11 +17,12 @@ from keytao_bot.utils.llm_policy import (
 )
 from keytao_bot.utils.history_store import _parse_stored_timestamp
 
-from .state import MemoryConversationStateStore, PendingToolConfirm
+from .state import MemoryConversationStateStore, PendingAddWord, PendingToolConfirm
 from .conversation import ConversationAddress
 from .tools import (
     BLOCK_REASON_VERB_NOT_MATCHED,
     MUTATING_TOOL_NAMES,
+    PendingCandidateCapability,
     ToolContext,
     ToolExecutor,
     message_mentions_change_request,
@@ -80,6 +81,49 @@ WRITE_AUTHORIZATION_TOOL = {
 def _tool_function_name(tool: Any) -> str:
     function = tool.get("function") if isinstance(tool, dict) else None
     return str(function.get("name") or "") if isinstance(function, dict) else ""
+
+
+def _pending_candidate_capability(
+    state: Any,
+) -> Optional[PendingCandidateCapability]:
+    """Project one live server-backed pending state into a tool capability."""
+    if (
+        not isinstance(state, PendingAddWord)
+        or not state.server_candidates
+        or state.server_candidates != state.candidates
+    ):
+        return None
+    try:
+        candidates = tuple(
+            (str(code), bool(occupied))
+            for code, occupied in state.server_candidates
+        )
+        occupied_words = tuple(
+            (
+                str(code),
+                tuple(str(word) for word in words),
+            )
+            for code, words in state.server_occupied_words.items()
+        )
+    except (TypeError, ValueError):
+        return None
+    return PendingCandidateCapability(
+        state_matches=True,
+        word=state.word,
+        candidates=candidates,
+        occupied_words=occupied_words,
+    )
+
+
+def _live_pending_candidate_capability(
+    state_store: MemoryConversationStateStore,
+    key: ConversationAddress,
+) -> Optional[PendingCandidateCapability]:
+    """Reject absent, expired, or already-claimed pending tickets."""
+    record = state_store.get_record(key)
+    if record is None or record.execution_id:
+        return None
+    return _pending_candidate_capability(record.state)
 
 
 class DuplicateToolCallAbort(Exception):
@@ -485,12 +529,23 @@ class AgentOrchestrator:
                     trusted_phrase_types_by_key=trusted_phrase_types_by_key,
                     trusted_reviewed_items_by_key=trusted_reviewed_items_by_key,
                     trusted_batch_ids=frozenset(trusted_batch_ids),
+                    pending_candidate=_live_pending_candidate_capability(
+                        self._state_store,
+                        conv_key,
+                    ),
                 )
                 try:
                     canonical_fn_args = self._tool_executor.canonicalize_arguments(
                         fn_name,
                         fn_args,
                         tool_context,
+                    )
+                    pending_positional_create = (
+                        self._tool_executor.uses_pending_positional_create(
+                            fn_name,
+                            canonical_fn_args,
+                            tool_context,
+                        )
                     )
                     tool_word = str(canonical_fn_args.get("word") or "").strip()
                     encode_blocked = bool(
@@ -641,6 +696,17 @@ class AgentOrchestrator:
                         canonical_fn_args,
                         result_data,
                     )
+                    if (
+                        pending_positional_create
+                        and result_data.get("success") is True
+                        and not result_data.get("requiresConfirmation")
+                        and _live_pending_candidate_capability(
+                            self._state_store,
+                            conv_key,
+                        )
+                        == tool_context.pending_candidate
+                    ):
+                        self._state_store.delete(conv_key)
                     if result_data.get("requiresConfirmation") and not pending_saved:
                         result_data = {
                             "success": False,

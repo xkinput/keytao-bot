@@ -24,6 +24,11 @@ class PendingAddWord:
     recommended_code: str
     candidates: List[Tuple[str, bool]]
     occupied_words: Dict[str, List[str]] = field(default_factory=dict)
+    # This capability is populated only from structured server candidate data.
+    # Display text parsing must leave it empty so quoted or model-authored prose
+    # can never mint positional create authority.
+    server_candidates: List[Tuple[str, bool]] = field(default_factory=list)
+    server_occupied_words: Dict[str, List[str]] = field(default_factory=dict)
     code_remarks: Dict[str, str] = field(default_factory=dict)
     pronunciation_codes: Dict[str, str] = field(default_factory=dict)
     pronunciation_recommended_codes: List[str] = field(default_factory=list)
@@ -480,7 +485,28 @@ class MemoryConversationStateStore:
         if left is None or right is None or type(left) is not type(right):
             return False
         if isinstance(left, PendingAddWord) and isinstance(right, PendingAddWord):
-            return left == right
+            display_fields_match = (
+                left.word == right.word
+                and left.recommended_code == right.recommended_code
+                and left.candidates == right.candidates
+                and left.occupied_words == right.occupied_words
+                and left.code_remarks == right.code_remarks
+                and left.pronunciation_codes == right.pronunciation_codes
+                and left.pronunciation_recommended_codes
+                == right.pronunciation_recommended_codes
+                and left.needs_manual_review == right.needs_manual_review
+                and left.manual_review_reason == right.manual_review_reason
+            )
+            if not display_fields_match:
+                return False
+            if left.server_candidates and right.server_candidates:
+                return (
+                    left.server_candidates == right.server_candidates
+                    and left.server_occupied_words == right.server_occupied_words
+                )
+            # Parsed display text may select an already-live record, but it can
+            # never create the server capability that is absent from the text.
+            return True
         if isinstance(left, PendingToolConfirm) and isinstance(right, PendingToolConfirm):
             return (
                 left.function_name == right.function_name

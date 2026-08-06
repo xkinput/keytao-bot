@@ -1651,6 +1651,12 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
                             "candidateStatuses": [
                                 {"code": "lyfg", "occupied": False, "label": "空位"},
                                 {"code": "lyfga", "occupied": False, "label": "空位"},
+                                {
+                                    "code": "lyfgb",
+                                    "occupied": True,
+                                    "label": "已有「洛阳」",
+                                    "words": ["洛阳"],
+                                },
                             ],
                         },
                     ],
@@ -1706,8 +1712,21 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
         check("pending parsed from tool response", isinstance(pending, PendingAddWord))
         check("pending recommended uses tool code", pending.recommended_code == "lyfg")
         check("pending keeps review remark", "lyfg" in pending.code_remarks)
+        check("display parsing does not mint server capability", pending.server_candidates == [])
         check("deterministic review stores a structured pending", stored_pending is not None and isinstance(stored_pending.state, PendingAddWord))
         check("deterministic pending keeps full group address", stored_pending is not None and stored_pending.owner_key == conv_key)
+        check(
+            "stored pending freezes server candidate occupancy",
+            stored_pending is not None
+            and stored_pending.state.server_candidates == [
+                ("lyfg", False),
+                ("lyfga", False),
+                ("lyfgb", True),
+            ]
+            and stored_pending.state.server_occupied_words == {
+                "lyfgb": ["洛阳"],
+            },
+        )
 
     asyncio.run(_run())
 

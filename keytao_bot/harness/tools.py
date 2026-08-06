@@ -228,6 +228,16 @@ def _validate_batch_size(tool_name: str, arguments: Dict) -> Optional[Dict]:
 
 
 @dataclass(frozen=True)
+class PendingCandidateCapability:
+    """Server-bound candidate state available to one current actor turn."""
+
+    state_matches: bool
+    word: str
+    candidates: Tuple[Tuple[str, bool], ...]
+    occupied_words: Tuple[Tuple[str, Tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True)
 class ToolContext:
     platform: Optional[str] = None
     user_id: Optional[str] = None
@@ -242,6 +252,7 @@ class ToolContext:
     trusted_draft_items_by_id: Optional[Dict[str, Dict[str, str]]] = None
     trusted_phrase_types_by_key: Optional[Dict[Tuple[str, str], frozenset[str]]] = None
     trusted_reviewed_items_by_key: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None
+    pending_candidate: Optional[PendingCandidateCapability] = None
     # Batch ids the server itself surfaced during this run.  A model may only
     # anchor a read to one of these; anything else would let injected text point
     # the bot at a stranger's batch.
@@ -262,6 +273,8 @@ _POSITIONAL_REORDER_QUOTED_ENTRY_PATTERN = (
 _POSITIONAL_REORDER_CODE_PATTERN = r"[a-z]{1,6}(?![A-Za-z])"
 _POSITIONAL_REORDER_PLAIN_ENTRY_PATTERN = r"[\u3400-\u9fff]{1,8}"
 _POSITIONAL_REORDER_RELATION_PATTERN = r"(?:前面|后面|之前|之后|前|后)"
+_POSITIONAL_CREATE_FRONT_RELATIONS = frozenset({"前面", "之前", "前"})
+_POSITIONAL_CREATE_BACK_RELATIONS = frozenset({"后面", "之后", "后"})
 _POSITIONAL_REORDER_ORDINAL_PATTERN = (
     r"第(?:[一二三四五六七八九十百千万两]+|\d{1,3})(?:个|位)"
 )
@@ -516,6 +529,13 @@ class _PositionalDestination:
     quoted: bool = False
 
 
+@dataclass(frozen=True)
+class _PositionalCreateBinding:
+    code: str
+    destination_word: str
+    relation: str
+
+
 def _unquote_positional_entry(value: str) -> Optional[str]:
     pairs = {"「": "」", "“": "”", "‘": "’"}
     if len(value) >= 3 and pairs.get(value[0]) == value[-1]:
@@ -558,6 +578,64 @@ def _parse_positional_destination(destination: str) -> Optional[_PositionalDesti
     if re.fullmatch(_POSITIONAL_REORDER_PLAIN_ENTRY_PATTERN, value):
         return _PositionalDestination("entry", target=value)
     return None
+
+
+def _positional_create_operands(
+    message: str,
+) -> Optional[Tuple[str, str, str]]:
+    """Extract subject, named destination, and explicit relative side."""
+    if not _has_complete_positional_reorder_command(message):
+        return None
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    )
+    clauses = [
+        clause.strip() for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if clause.strip()
+    ]
+    while (
+        len(clauses) > 1
+        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(clauses[-1])
+    ):
+        clauses.pop()
+    if len(clauses) != 1:
+        return None
+    candidate = _COMMAND_PREFIX_RE.sub("", clauses[0], count=1).lstrip()
+    subject_match = re.match(
+        rf"^(?:(?:把|将)\s*(?P<prefixed>{_POSITIONAL_REORDER_SUBJECT_PATTERN})|"
+        rf"(?P<bare>{_POSITIONAL_REORDER_BARE_SUBJECT_PATTERN}))\s*"
+        rf"(?:的编码)?\s*(?:放在|放到|排在|挪到|移到|提到|提前到)",
+        candidate,
+    )
+    if subject_match is None:
+        return None
+    raw_subject = str(
+        subject_match.group("prefixed") or subject_match.group("bare") or ""
+    ).strip()
+    subject = _unquote_positional_entry(raw_subject) or raw_subject
+    raw_destination = _raw_positional_destination_from_command(message)
+    parsed_destination = _positional_destination_from_command(message)
+    if (
+        not subject
+        or raw_destination is None
+        or parsed_destination is None
+        or parsed_destination.kind != "entry"
+    ):
+        return None
+    relation = ""
+    for candidate_relation in ("前面", "后面", "之前", "之后", "前", "后"):
+        if not raw_destination.endswith(candidate_relation):
+            continue
+        base = raw_destination[:-len(candidate_relation)].strip()
+        parsed_base = _parse_positional_destination(base)
+        if (
+            parsed_base is not None
+            and parsed_base.kind == "entry"
+            and parsed_base.target == parsed_destination.target
+        ):
+            relation = candidate_relation
+            break
+    return subject, parsed_destination.target, relation
 
 
 def _positional_destination_from_command(message: str) -> Optional[_PositionalDestination]:
@@ -776,6 +854,7 @@ BLOCK_REASON_BINDING_INCOMPLETE = "binding_incomplete"
 BLOCK_REASON_TICKET_REQUIRED = "ticket_required"
 BLOCK_REASON_BULK_DELETE_NOT_REQUESTED = "bulk_delete_not_requested"
 BLOCK_REASON_MANUAL_SHIFT_FORBIDDEN = "manual_shift_forbidden"
+BLOCK_REASON_ORDERING_NOT_EXPRESSIBLE = "ordering_not_expressible"
 BLOCK_REASON_BATCH_TOO_LARGE = "batch_too_large"
 BLOCK_REASON_UNTRUSTED_BATCH = "untrusted_batch_reference"
 # Group chats drop any message that does not mention the bot, so every
@@ -2059,6 +2138,64 @@ def _positional_message_explicitly_labels_code(
     )
 
 
+def _pending_positional_create_binding(
+    message: str,
+    arguments: Dict,
+    context: ToolContext,
+) -> Optional[_PositionalCreateBinding]:
+    """Authorize one create call from an exact live candidate conjunction."""
+    capability = context.pending_candidate
+    if capability is None or not capability.state_matches:
+        return None
+
+    operands = _positional_create_operands(message)
+    if operands is None:
+        return None
+    subject, destination_word, relation = operands
+    word = str(arguments.get("word") or "").strip()
+    code = str(arguments.get("code") or "").strip().lower()
+    action = str(arguments.get("action") or "Create").strip()
+    old_word = str(arguments.get("old_word") or "").strip()
+
+    if (
+        action != "Create"
+        or old_word
+        or not word
+        or subject != word
+        or word != capability.word
+    ):
+        return None
+
+    candidates = dict(capability.candidates)
+    if (
+        len(candidates) != len(capability.candidates)
+        or code not in candidates
+        or candidates[code] is not True
+    ):
+        return None
+
+    occupied_words = dict(capability.occupied_words)
+    destination_codes = [
+        candidate_code
+        for candidate_code, words in capability.occupied_words
+        if destination_word in words
+    ]
+    if (
+        len(occupied_words) != len(capability.occupied_words)
+        or destination_codes != [code]
+    ):
+        return None
+
+    if relation not in {"前面", "后面", "之前", "之后", "前", "后"}:
+        return None
+
+    return _PositionalCreateBinding(
+        code=code,
+        destination_word=destination_word,
+        relation=relation,
+    )
+
+
 def _positional_destination_is_bound(
     message: str,
     word: str,
@@ -2239,6 +2376,24 @@ class ToolExecutor:
     ) -> Dict:
         """Freeze server-derived fields before execution or pending persistence."""
         return self._with_trusted_mutation_fields(tool_name, arguments, context)
+
+    @staticmethod
+    def uses_pending_positional_create(
+        tool_name: str,
+        arguments: Dict,
+        context: ToolContext,
+    ) -> bool:
+        if tool_name != "keytao_create_phrase":
+            return False
+        binding = _pending_positional_create_binding(
+            _mutation_authorization_view(context.current_message or ""),
+            arguments,
+            context,
+        )
+        return bool(
+            binding is not None
+            and binding.relation in _POSITIONAL_CREATE_FRONT_RELATIONS
+        )
 
     async def call(self, tool_name: str, arguments: Dict, context: ToolContext) -> str:
         root_error = _validate_root_type(tool_name, arguments)
@@ -2634,6 +2789,22 @@ class ToolExecutor:
             code = str(arguments.get("code") or "").strip()
             action = str(arguments.get("action") or "Create")
             old_word = str(arguments.get("old_word") or "").strip()
+            positional_create = _pending_positional_create_binding(
+                message,
+                arguments,
+                context,
+            )
+            if (
+                positional_create is not None
+                and positional_create.relation in _POSITIONAL_CREATE_BACK_RELATIONS
+            ):
+                return policy_block(
+                    BLOCK_REASON_ORDERING_NOT_EXPRESSIBLE,
+                    "安全拦截：当前加词接口无法表达排在已有词条后面。"
+                    "若要添加重码，请直接回复候选编号；"
+                    "新词会作为重码添加并排序在已有词条前面。",
+                    missing=["orderingAfterWeight"],
+                )
             targets = [word]
             if action == "Change" and old_word:
                 targets.append(old_word)
@@ -2641,7 +2812,7 @@ class ToolExecutor:
                 target for target in targets
                 if not target or not _contains_exact_target(message, target)
             ]
-            if (
+            if positional_create is None and (
                 missing_targets
                 or not _action_is_bound_to_target(message, word, action)
                 or any(_is_word_protected(message, target) for target in targets)
