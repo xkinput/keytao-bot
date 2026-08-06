@@ -53,6 +53,7 @@ from ..harness.tools import (
     ToolContext,
     ToolExecutor,
     _COMMAND_PREFIX_PATTERN,
+    create_warning_confirmation_binding,
     message_authorizes_mutation,
     trusted_mutation_source,
 )
@@ -1759,16 +1760,20 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
 
 def _server_candidate_snapshot(
     statuses: List[Dict],
-) -> Tuple[List[Tuple[str, bool]], Dict[str, List[str]]]:
+) -> Tuple[
+    List[Tuple[str, bool]],
+    Dict[str, List[str]],
+    Dict[str, List[Tuple[str, int]]],
+]:
     """Freeze candidate occupancy from structured server fields only."""
     by_code: Dict[str, Tuple[bool, Tuple[str, ...]]] = {}
     order: List[str] = []
     for status in statuses:
         if not isinstance(status, dict):
-            return [], {}
+            return [], {}, {}
         code = str(status.get("code") or "").strip().lower()
         if not re.fullmatch(r"[a-z]{1,6}", code):
-            return [], {}
+            return [], {}, {}
         raw_occupied = status.get("occupied")
         raw_words = status.get("words") or []
         raw_phrases = status.get("phrases") or []
@@ -1777,7 +1782,7 @@ def _server_candidate_snapshot(
             or not isinstance(raw_words, list)
             or not isinstance(raw_phrases, list)
         ):
-            return [], {}
+            return [], {}, {}
         occupied = raw_occupied
         words = [
             str(word or "").strip()
@@ -1794,7 +1799,7 @@ def _server_candidate_snapshot(
         normalized = tuple(dict.fromkeys(words if occupied else []))
         value = (occupied, normalized)
         if code in by_code and by_code[code] != value:
-            return [], {}
+            return [], {}, {}
         if code not in by_code:
             order.append(code)
         by_code[code] = value
@@ -1804,18 +1809,64 @@ def _server_candidate_snapshot(
         for code in order
         if by_code[code][0]
     }
-    return candidates, occupied_words
+    entries_by_code: Dict[str, List[Tuple[str, int]]] = {}
+    for status in statuses:
+        code = str(status.get("code") or "").strip().lower()
+        entries: List[Tuple[str, int]] = []
+        for phrase in status.get("phrases") or []:
+            if not isinstance(phrase, dict):
+                entries = []
+                break
+            word = str(phrase.get("word") or "").strip()
+            weight = phrase.get("weight")
+            if (
+                not word
+                or not isinstance(weight, int)
+                or isinstance(weight, bool)
+                or weight < 0
+            ):
+                entries = []
+                break
+            entry = (word, weight)
+            if entry not in entries:
+                entries.append(entry)
+        if entries:
+            entries_by_code[code] = sorted(
+                entries,
+                key=lambda item: (item[1], item[0]),
+            )
+    return candidates, occupied_words, entries_by_code
 
 
 def _attach_server_candidate_snapshot(
     state: PendingAddWord,
     statuses: List[Dict],
 ) -> PendingAddWord:
-    candidates, occupied_words = _server_candidate_snapshot(statuses)
+    candidates, occupied_words, entries_by_code = _server_candidate_snapshot(
+        statuses
+    )
     if candidates == state.candidates:
         state.server_candidates = candidates
         state.server_occupied_words = occupied_words
+        state.server_entries_by_code = entries_by_code
     return state
+
+
+def _pending_add_ordering_summary(state: PendingAddWord, code: str) -> str:
+    """Describe the default tail insertion using only server-backed entries."""
+    existing_entries = state.server_entries_by_code.get(code, [])
+    existing_words = [
+        word
+        for word, _weight in sorted(existing_entries, key=lambda item: item[1])
+    ]
+    if not existing_words:
+        existing_words = list(state.server_occupied_words.get(code, []))
+    if existing_words:
+        return (
+            f"{code}：{' → '.join([*existing_words, state.word])}"
+            "（新词按默认权重排在后）"
+        )
+    return ""
 
 
 def _create_phrase_args(state: PendingAddWord, code: str) -> Dict:
@@ -1826,6 +1877,9 @@ def _create_phrase_args(state: PendingAddWord, code: str) -> Dict:
         args["remark"] = remark
     if state.needs_manual_review is not None:
         args["needs_manual_review"] = bool(state.needs_manual_review)
+    ordering_summary = _pending_add_ordering_summary(state, code)
+    if ordering_summary:
+        args["_ordering_summary"] = ordering_summary
     return args
 
 
@@ -4926,7 +4980,7 @@ async def _execute_add_to_draft(
             ),
             data,
         )
-        if auto_confirm and _create_preview_has_no_new_warnings(data):
+        if auto_confirm and _create_preview_can_auto_confirm(data, args):
             return await _execute_confirmed_tool(
                 pending_state,
                 platform,
@@ -4934,6 +4988,11 @@ async def _execute_add_to_draft(
                 conv_key,
                 space_key,
                 owner_label,
+                carried_warnings=list(data.get("warnings") or []),
+                carried_ordering_summary=_create_warning_ordering_summary(
+                    data,
+                    args,
+                ),
             )
         conversation_state_store.set(
             conv_key,
@@ -4970,6 +5029,7 @@ async def _execute_add_to_draft_and_submit(
     owner_label: str = "",
     remark: str = "",
     needs_manual_review: Optional[bool] = None,
+    ordering_summary: str = "",
 ) -> str:
     """Add a word to the draft, then submit the resulting batch."""
     result = await _perform_add_to_draft_and_submit(
@@ -4980,6 +5040,7 @@ async def _execute_add_to_draft_and_submit(
         remark=remark,
         needs_manual_review=needs_manual_review,
         auto_confirm=True,
+        ordering_summary=ordering_summary,
     )
     if result.pending_state is not None:
         conversation_state_store.set(
@@ -5016,6 +5077,57 @@ def _create_preview_has_no_new_warnings(preview_data: Dict) -> bool:
     )
 
 
+def _create_preview_can_auto_confirm(
+    preview_data: Dict,
+    arguments: Dict,
+) -> bool:
+    """Accept either a no-warning snapshot or an exact informational warning."""
+    return bool(
+        _create_preview_has_no_new_warnings(preview_data)
+        or create_warning_confirmation_binding(preview_data, arguments)
+    )
+
+
+def _create_notice_lines(data: Dict) -> List[str]:
+    """Render preserved warnings and the authoritative code-chain summary."""
+    lines = [
+        f"⚠️ {warning.get('message', warning) if isinstance(warning, dict) else warning}"
+        for warning in data.get("warnings") or []
+    ]
+    ordering_summary = str(data.get("orderingSummary") or "").strip()
+    if ordering_summary:
+        lines.append(f"同码顺序：{ordering_summary}")
+    return lines
+
+
+def _create_warning_ordering_summary(data: Dict, arguments: Dict) -> str:
+    """Describe the duplicate pair when no fuller server chain is available."""
+    word = str(arguments.get("word") or "").strip()
+    code = str(arguments.get("code") or "").strip().lower()
+    if not word or not code:
+        return ""
+    existing_words: List[str] = []
+    for warning in data.get("warnings") or []:
+        if (
+            not isinstance(warning, dict)
+            or warning.get("warningType") != "duplicate_code"
+        ):
+            continue
+        existing = warning.get("existing")
+        if not isinstance(existing, dict):
+            continue
+        existing_code = str(existing.get("code") or "").strip().lower()
+        existing_word = str(existing.get("word") or "").strip()
+        if existing_code == code and existing_word and existing_word not in existing_words:
+            existing_words.append(existing_word)
+    if not existing_words:
+        return ""
+    return (
+        f"{code}：{' → '.join([*existing_words, word])}"
+        "（新词按默认权重排在后）"
+    )
+
+
 async def _perform_add_to_draft_and_submit(
     word: str,
     code: str,
@@ -5029,6 +5141,8 @@ async def _perform_add_to_draft_and_submit(
     expected_content_version: Optional[int] = None,
     expected_warning_digest: str = "",
     auto_confirm: bool = False,
+    informational_warnings: Optional[List[Any]] = None,
+    ordering_summary: str = "",
 ) -> DraftActionResult:
     """Run add-and-submit without mutating conversational pending state."""
     args = {"word": word, "code": code}
@@ -5051,11 +5165,21 @@ async def _perform_add_to_draft_and_submit(
         "keytao_create_phrase", create_args, platform, user_id,
     )
     create_data = json.loads(create_json)
+    if create_data.get("success") is True and informational_warnings:
+        create_data["warnings"] = list(informational_warnings)
+        create_data["warnedCount"] = len(informational_warnings)
+        create_data["autoConfirmedWarnings"] = True
+    if create_data.get("success") is True and ordering_summary:
+        create_data["orderingSummary"] = ordering_summary
 
     if create_data.get("not_bound"):
         return DraftActionResult(_BIND_HELP_TEXT)
 
     if create_data.get("requiresConfirmation"):
+        warning_ordering_summary = (
+            ordering_summary
+            or _create_warning_ordering_summary(create_data, args)
+        )
         pending_state = _pending_state_from_server_warning(
             PendingToolConfirm(
                 function_name="keytao_create_phrase",
@@ -5066,7 +5190,7 @@ async def _perform_add_to_draft_and_submit(
         if (
             auto_confirm
             and not confirmed_create
-            and _create_preview_has_no_new_warnings(create_data)
+            and _create_preview_can_auto_confirm(create_data, args)
         ):
             exact_args = pending_state.args
             confirmed_result = await _perform_add_to_draft_and_submit(
@@ -5085,6 +5209,8 @@ async def _perform_add_to_draft_and_submit(
                     exact_args.get("expected_warning_digest") or ""
                 ),
                 auto_confirm=True,
+                informational_warnings=list(create_data.get("warnings") or []),
+                ordering_summary=warning_ordering_summary,
             )
             return _preserve_action_result_link(
                 confirmed_result,
@@ -5111,6 +5237,7 @@ async def _perform_add_to_draft_and_submit(
         )
 
     submit_batch_id = str(create_data.get("batchId") or "")
+    create_notice_lines = _create_notice_lines(create_data)
     submit_result = await _perform_submit_current_draft(
         platform,
         user_id,
@@ -5134,6 +5261,7 @@ async def _perform_add_to_draft_and_submit(
         return DraftActionResult(
             _append_batch_url_if_missing((
                 f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
+                + ("\n".join(create_notice_lines) + "\n\n" if create_notice_lines else "")
                 + submit_result.text
             ), create_data, submit_result.data or {}),
             pending_state=submit_result.pending_state,
@@ -5151,7 +5279,11 @@ async def _perform_add_to_draft_and_submit(
         )
         return DraftActionResult(
             _append_batch_url_if_missing(
-                "\n".join([final_status, *submit_lines]),
+                "\n".join([
+                    final_status,
+                    *create_notice_lines,
+                    *submit_lines,
+                ]),
                 submit_result.data or {},
                 create_data,
                 label="批次地址",
@@ -5161,7 +5293,12 @@ async def _perform_add_to_draft_and_submit(
         )
     return DraftActionResult(
         _append_batch_url_if_missing(
-            f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n{submit_result.text}",
+            "\n".join([
+                f"✅ 已将「{word}」以编码 {code} 加入草稿。",
+                *create_notice_lines,
+                "",
+                submit_result.text,
+            ]),
             create_data,
             submit_result.data or {},
         ),
@@ -5732,6 +5869,8 @@ async def _execute_confirmed_tool(
     conv_key: Optional[ConversationKey] = None,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    carried_warnings: Optional[List[Any]] = None,
+    carried_ordering_summary: str = "",
 ) -> str:
     """Execute one staged step without bypassing unseen server warnings."""
     if state.confirmation_source not in {"local_preview", "server_warning"}:
@@ -5739,6 +5878,11 @@ async def _execute_confirmed_tool(
 
     args = dict(state.args)
     args.pop("preview_only", None)
+    ordering_summary = str(
+        args.pop("_ordering_summary", "")
+        or carried_ordering_summary
+        or ""
+    ).strip()
     submit_after = bool(args.pop("_submit_after", False))
     expected_keep_words = tuple(
         str(word)
@@ -5821,11 +5965,41 @@ async def _execute_confirmed_tool(
     result_json = await call_tool_function(state.function_name, args, platform, user_id)
     data = json.loads(result_json)
 
+    if data.get("success") is True and carried_warnings:
+        data["warnings"] = list(carried_warnings)
+        data["warnedCount"] = len(carried_warnings)
+        data["autoConfirmedWarnings"] = True
+    if data.get("success") is True and ordering_summary:
+        data["orderingSummary"] = ordering_summary
+
     if data.get("not_bound"):
         return _BIND_HELP_TEXT
 
     if data.get("requiresConfirmation"):
         pending_state = _pending_state_from_server_warning(state, data)
+        auto_confirm_binding = (
+            create_warning_confirmation_binding(data, args)
+            if (
+                state.function_name == "keytao_create_phrase"
+                and state.confirmation_source == "local_preview"
+            )
+            else None
+        )
+        if auto_confirm_binding is not None:
+            warning_ordering_summary = (
+                ordering_summary
+                or _create_warning_ordering_summary(data, args)
+            )
+            return await _execute_confirmed_tool(
+                pending_state,
+                platform,
+                user_id,
+                conv_key,
+                space_key,
+                owner_label,
+                carried_warnings=list(data.get("warnings") or []),
+                carried_ordering_summary=warning_ordering_summary,
+            )
         display_data = {**data, "submitAfter": submit_after}
         warning_prompt = _format_server_warning_confirmation(
             state.function_name,
@@ -6052,6 +6226,8 @@ async def _format_draft_response(
             f"指针指向 {pointer_batch_id}，本次批次是 {anchor}。"
             "下面显示的是本次批次的内容。"
         )
+
+    parts.extend(_create_notice_lines(data))
 
     # Notes from Delete operations
     for note in data.get("notes", []):
@@ -8023,6 +8199,7 @@ async def _handle_pending_add_word(
             owner_label,
             state.code_remarks.get(target_code, ""),
             state.needs_manual_review,
+            _pending_add_ordering_summary(state, target_code),
         )
 
     return await _execute_confirmed_tool(

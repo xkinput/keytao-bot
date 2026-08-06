@@ -29,6 +29,9 @@ class PendingAddWord:
     # can never mint positional create authority.
     server_candidates: List[Tuple[str, bool]] = field(default_factory=list)
     server_occupied_words: Dict[str, List[str]] = field(default_factory=dict)
+    server_entries_by_code: Dict[str, List[Tuple[str, int]]] = field(
+        default_factory=dict
+    )
     code_remarks: Dict[str, str] = field(default_factory=dict)
     pronunciation_codes: Dict[str, str] = field(default_factory=dict)
     pronunciation_recommended_codes: List[str] = field(default_factory=list)
@@ -503,6 +506,7 @@ class MemoryConversationStateStore:
                 return (
                     left.server_candidates == right.server_candidates
                     and left.server_occupied_words == right.server_occupied_words
+                    and left.server_entries_by_code == right.server_entries_by_code
                 )
             # Parsed display text may select an already-live record, but it can
             # never create the server capability that is absent from the text.

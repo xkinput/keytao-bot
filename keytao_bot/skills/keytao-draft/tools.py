@@ -1095,6 +1095,7 @@ async def keytao_create_phrase(
     expected_content_version: Optional[int] = None,
     expected_warning_digest: str = "",
     preview_only: bool = False,
+    weight: Optional[int] = None,
 ) -> Dict:
     """
     Create, modify or delete a phrase entry via bot API
@@ -1144,6 +1145,15 @@ async def keytao_create_phrase(
         or not re.fullmatch(r"[0-9a-f]{64}", expected_warning_digest)
     ):
         return {"success": False, "message": "添加确认缺少有效的服务端风险快照"}
+    if (
+        weight is not None
+        and (
+            not isinstance(weight, int)
+            or isinstance(weight, bool)
+            or weight < 0
+        )
+    ):
+        return {"success": False, "message": "词条权重必须是非负整数"}
 
     # Auto-detect type when not explicitly specified, mirrors detectPhraseType in keytao-next
     type = _infer_phrase_type(word, code, type)
@@ -1159,6 +1169,8 @@ async def keytao_create_phrase(
     }
     if needs_manual_review is not None:
         review_flags.apply_manual_review_flag(item, bool(needs_manual_review))
+    if weight is not None:
+        item["weight"] = weight
     validation = await _validate_draft_item_code(item)
     if not validation.get("success"):
         failed = _format_code_validation_failure(validation)
@@ -3053,7 +3065,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_create_phrase",
-            "description": "创建、修改或删除键道词条。用于用户希望添加、修改或删除词条时。支持检测冲突和警告，如有重码警告可确认后创建。自动追加到草稿批次。",
+            "description": "创建、修改或删除键道词条。用于用户希望添加、修改或删除词条时。信息性单条重码由程序绑定服务端票据自动确认一次，其他警告保留确认流程。自动追加到草稿批次。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -3085,7 +3097,7 @@ TOOLS = [
                     },
                     "confirmed": {
                         "type": "boolean",
-                        "description": "⚠️ 重要：当工具首次返回警告（requiresConfirmation=true）后，用户确认时必须设置为true！不设置此参数会导致无限循环警告。默认false"
+                        "description": "仅供程序回放已保存的精确服务端确认票据；模型不得设置。默认false"
                     }
                 },
                 "required": ["word", "code"]

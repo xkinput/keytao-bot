@@ -235,6 +235,7 @@ class PendingCandidateCapability:
     word: str
     candidates: Tuple[Tuple[str, bool], ...]
     occupied_words: Tuple[Tuple[str, Tuple[str, ...]], ...]
+    entries: Tuple[Tuple[str, str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,9 @@ class ToolContext:
     # explanation; a plain text turn is never blocked for that reason.
     attachment_context: bool = False
     trusted_codes_by_word: Optional[Dict[str, frozenset[str]]] = None
+    trusted_entries_by_code: Optional[
+        Dict[str, Tuple[Tuple[str, int], ...]]
+    ] = None
     trusted_draft_words_by_id: Optional[Dict[str, str]] = None
     trusted_draft_items_by_id: Optional[Dict[str, Dict[str, str]]] = None
     trusted_phrase_types_by_key: Optional[Dict[Tuple[str, str], frozenset[str]]] = None
@@ -258,6 +262,10 @@ class ToolContext:
     # the bot at a stranger's batch.
     trusted_batch_ids: Optional[frozenset[str]] = None
     mutation_confirmed: bool = False
+    server_warning_confirmed: bool = False
+    trusted_word_lookup_codes_by_word: Optional[
+        Dict[str, frozenset[str]]
+    ] = None
 
 
 _DELETE_INTENT_RE = re.compile(
@@ -534,6 +542,8 @@ class _PositionalCreateBinding:
     code: str
     destination_word: str
     relation: str
+    weight: Optional[int] = None
+    resulting_words: Tuple[str, ...] = ()
 
 
 def _unquote_positional_entry(value: str) -> Optional[str]:
@@ -1753,6 +1763,96 @@ def policy_block(
     return payload
 
 
+def text_follow_up(reason: str, message: str, **extra: Any) -> Dict:
+    """Return a non-policy clarification request without touching a sink."""
+    payload: Dict[str, Any] = {
+        "success": False,
+        "requiresTextFollowUp": True,
+        "reason": reason,
+        "message": message,
+    }
+    payload.update(extra)
+    return payload
+
+
+_AUTO_CONFIRM_CREATE_WARNING_TYPES = frozenset({
+    "duplicate_code",
+    "code_chain_priority",
+})
+
+
+def create_warning_confirmation_binding(
+    preview: Dict,
+    arguments: Dict,
+) -> Optional[Dict[str, Any]]:
+    """Return an exact replay ticket only for informational create warnings."""
+    if not isinstance(preview, dict) or not isinstance(arguments, dict):
+        return None
+    word = str(arguments.get("word") or "").strip()
+    code = str(arguments.get("code") or "").strip().lower()
+    action = str(arguments.get("action") or "Create").strip()
+    content_version = preview.get("contentVersion")
+    batch_id = str(preview.get("batchId") or "").strip()
+    warning_digest = str(preview.get("warningDigest") or "").strip().lower()
+    warnings = preview.get("warnings")
+    warned_count = preview.get("warnedCount")
+    conflict_markers = (
+        "staleConfirmation",
+        "contentVersionConflict",
+        "batchStateChanged",
+        "uncertain",
+    )
+    if (
+        action != "Create"
+        or not word
+        or not code
+        or preview.get("requiresConfirmation") is not True
+        or not batch_id
+        or not isinstance(content_version, int)
+        or isinstance(content_version, bool)
+        or content_version < 0
+        or not re.fullmatch(r"[0-9a-f]{64}", warning_digest)
+        or not isinstance(warnings, list)
+        or not warnings
+        or (
+            warned_count is not None
+            and (
+                not isinstance(warned_count, int)
+                or isinstance(warned_count, bool)
+                or warned_count != len(warnings)
+            )
+        )
+        or any(preview.get(marker) for marker in conflict_markers)
+        or bool(preview.get("conflicts"))
+        or bool(preview.get("failed"))
+        or bool(preview.get("failedCount"))
+    ):
+        return None
+    for warning in warnings:
+        if not isinstance(warning, dict):
+            return None
+        warning_type = str(warning.get("warningType") or "").strip()
+        if warning_type not in _AUTO_CONFIRM_CREATE_WARNING_TYPES:
+            return None
+        item = warning.get("item")
+        source = item if isinstance(item, dict) else warning
+        warning_word = str(source.get("word") or "").strip()
+        warning_code = str(source.get("code") or "").strip().lower()
+        warning_action = str(source.get("action") or "Create").strip()
+        if (
+            warning_word != word
+            or warning_code != code
+            or warning_action != "Create"
+        ):
+            return None
+    return {
+        "confirmed": True,
+        "batch_id": batch_id,
+        "expected_content_version": content_version,
+        "expected_warning_digest": warning_digest,
+    }
+
+
 def _strip_execution_result_suffix(compact: str) -> str:
     compact = re.sub(r"(?:吗|么|好不好|行不行|可不可以|可以吗|好吗|行吗)$", "", compact)
     return re.sub(
@@ -2101,6 +2201,20 @@ def _code_is_bound_to_target(
     return False
 
 
+def _target_clause_has_explicit_code_token(message: str, target: str) -> bool:
+    """Report whether the target clause already supplies any code candidate."""
+    for target_span in _exact_target_spans(message, target):
+        clause_start, clause_end = _clause_bounds(message, *target_span)
+        if _explicit_code_spans(
+            message,
+            clause_start,
+            clause_end,
+            target_span,
+        ):
+            return True
+    return False
+
+
 def _server_knows_positional_entry(
     context: ToolContext,
     target: str,
@@ -2119,6 +2233,75 @@ def _server_knows_positional_entry(
         for item in (context.trusted_draft_items_by_id or {}).values()
         if isinstance(item, dict)
     )
+
+
+def _positional_create_order(
+    entries: Tuple[Tuple[str, int], ...],
+    word: str,
+    destination_word: str,
+    relation: str,
+) -> Tuple[Optional[int], Tuple[str, ...]]:
+    """Choose an unused adjacent integer weight and describe its exact order."""
+    # Ordering authority: keytao-next/lib/services/batchPriorityOrderWarnings.ts
+    # lines 30-34 and 73-82 sort by ascending weight and name index + 1
+    # as the entry behind the current one. Lower weights therefore rank first.
+    normalized: List[Tuple[str, int]] = []
+    seen_entries: set[Tuple[str, int]] = set()
+    for entry_word, entry_weight in entries:
+        clean_word = str(entry_word or "").strip()
+        if (
+            not clean_word
+            or not isinstance(entry_weight, int)
+            or isinstance(entry_weight, bool)
+            or entry_weight < 0
+        ):
+            return None, ()
+        entry = (clean_word, entry_weight)
+        if entry not in seen_entries:
+            normalized.append(entry)
+            seen_entries.add(entry)
+    if not normalized:
+        return None, ()
+    weights = [entry_weight for _entry_word, entry_weight in normalized]
+    if len(set(weights)) != len(weights):
+        return None, ()
+    normalized.sort(key=lambda item: item[1])
+    destinations = [
+        index
+        for index, (entry_word, _entry_weight) in enumerate(normalized)
+        if entry_word == destination_word
+    ]
+    if len(destinations) != 1:
+        return None, ()
+    destination_index = destinations[0]
+    destination_weight = normalized[destination_index][1]
+    if relation in _POSITIONAL_CREATE_FRONT_RELATIONS:
+        previous_weight = (
+            normalized[destination_index - 1][1]
+            if destination_index > 0
+            else None
+        )
+        requested_weight = destination_weight - 1
+        insert_index = destination_index
+        if requested_weight < 0 or (
+            previous_weight is not None and requested_weight <= previous_weight
+        ):
+            return None, ()
+    elif relation in _POSITIONAL_CREATE_BACK_RELATIONS:
+        next_weight = (
+            normalized[destination_index + 1][1]
+            if destination_index + 1 < len(normalized)
+            else None
+        )
+        requested_weight = destination_weight + 1
+        insert_index = destination_index + 1
+        if next_weight is not None and requested_weight >= next_weight:
+            return None, ()
+    else:
+        return None, ()
+    resulting = [entry_word for entry_word, _entry_weight in normalized]
+    resulting.insert(insert_index, word)
+    return requested_weight, tuple(resulting)
 
 
 def _positional_message_explicitly_labels_code(
@@ -2189,10 +2372,112 @@ def _pending_positional_create_binding(
     if relation not in {"前面", "后面", "之前", "之后", "前", "后"}:
         return None
 
+    entries = tuple(
+        (entry_word, entry_weight)
+        for entry_code, entry_word, entry_weight in capability.entries
+        if entry_code == code
+    )
+    weight, resulting_words = _positional_create_order(
+        entries,
+        word,
+        destination_word,
+        relation,
+    )
+
     return _PositionalCreateBinding(
         code=code,
         destination_word=destination_word,
         relation=relation,
+        weight=weight,
+        resulting_words=resulting_words,
+    )
+
+
+def _pending_create_is_bound(
+    message: str,
+    arguments: Dict,
+    context: ToolContext,
+) -> bool:
+    """Bind an add to a candidate preserved in a live server snapshot."""
+    capability = context.pending_candidate
+    if capability is None or not capability.state_matches:
+        return False
+    word = str(arguments.get("word") or "").strip()
+    code = str(arguments.get("code") or "").strip().lower()
+    action = str(arguments.get("action") or "Create").strip()
+    old_word = str(arguments.get("old_word") or "").strip()
+    candidates = dict(capability.candidates)
+    return bool(
+        action == "Create"
+        and not old_word
+        and word
+        and word == capability.word
+        and _contains_exact_target(message, word)
+        and _action_is_bound_to_target(message, word, "Create")
+        and not _is_word_protected(message, word)
+        and len(candidates) == len(capability.candidates)
+        and code in candidates
+    )
+
+
+def _positional_destination_operand_is_exact(
+    message: str,
+    destination_word: str,
+) -> bool:
+    """Require the parsed destination to be the current command's exact Y."""
+    operands = _positional_create_operands(message)
+    return bool(
+        operands is not None
+        and destination_word
+        and operands[1] == destination_word
+    )
+
+
+def _destination_derived_positional_create_binding(
+    message: str,
+    arguments: Dict,
+    context: ToolContext,
+) -> Optional[_PositionalCreateBinding]:
+    """Bind one create to a unique destination entry read in this turn."""
+    operands = _positional_create_operands(message)
+    if operands is None:
+        return None
+    subject, destination_word, relation = operands
+    word = str(arguments.get("word") or "").strip()
+    code = str(arguments.get("code") or "").strip().lower()
+    action = str(arguments.get("action") or "Create").strip()
+    old_word = str(arguments.get("old_word") or "").strip()
+    destination_codes = (
+        context.trusted_word_lookup_codes_by_word or {}
+    ).get(destination_word, frozenset())
+    if (
+        action != "Create"
+        or old_word
+        or not word
+        or subject != word
+        or not _contains_exact_target(message, word)
+        or not destination_word
+        or not _positional_destination_operand_is_exact(message, destination_word)
+        or len(destination_codes) != 1
+        or code not in destination_codes
+        or relation not in {
+            "前面", "后面", "之前", "之后", "前", "后",
+        }
+    ):
+        return None
+    entries = (context.trusted_entries_by_code or {}).get(code, ())
+    weight, resulting_words = _positional_create_order(
+        entries,
+        word,
+        destination_word,
+        relation,
+    )
+    return _PositionalCreateBinding(
+        code=code,
+        destination_word=destination_word,
+        relation=relation,
+        weight=weight,
+        resulting_words=resulting_words,
     )
 
 
@@ -2392,7 +2677,7 @@ class ToolExecutor:
         )
         return bool(
             binding is not None
-            and binding.relation in _POSITIONAL_CREATE_FRONT_RELATIONS
+            and binding.weight is not None
         )
 
     async def call(self, tool_name: str, arguments: Dict, context: ToolContext) -> str:
@@ -2433,6 +2718,40 @@ class ToolExecutor:
                 call_args["platform_id"] = context.user_id
 
             result = await tool_func(**call_args)
+            if (
+                tool_name == "keytao_create_phrase"
+                and isinstance(result, dict)
+                and (
+                    result.get("success") is True
+                    or result.get("requiresConfirmation") is True
+                )
+            ):
+                message = _mutation_authorization_view(
+                    context.current_message or ""
+                )
+                ordering = (
+                    _pending_positional_create_binding(
+                        message,
+                        call_args,
+                        context,
+                    )
+                    or _destination_derived_positional_create_binding(
+                        message,
+                        call_args,
+                        context,
+                    )
+                )
+                if ordering is not None and ordering.resulting_words:
+                    side = (
+                        "前"
+                        if ordering.relation in _POSITIONAL_CREATE_FRONT_RELATIONS
+                        else "后"
+                    )
+                    result.setdefault(
+                        "orderingSummary",
+                        f"{ordering.code}：{' → '.join(ordering.resulting_words)}"
+                        f"（新词权重 {ordering.weight}，排在“{ordering.destination_word}”{side}）",
+                    )
             result_json = json.dumps(result, ensure_ascii=False)
             logger.info(f"Tool {tool_name} result: {result_json[:300]}")
             return result_json
@@ -2474,6 +2793,7 @@ class ToolExecutor:
             sanitized.pop("needs_manual_review", None)
 
             if action == "Create":
+                sanitized.pop("weight", None)
                 capability = (context.trusted_reviewed_items_by_key or {}).get(
                     (word, code)
                 )
@@ -2497,6 +2817,23 @@ class ToolExecutor:
                     else:
                         sanitized.pop("type", None)
                     sanitized["needs_manual_review"] = True
+                positional_create = (
+                    _pending_positional_create_binding(
+                        message,
+                        arguments,
+                        context,
+                    )
+                    or _destination_derived_positional_create_binding(
+                        message,
+                        arguments,
+                        context,
+                    )
+                )
+                if (
+                    positional_create is not None
+                    and positional_create.weight is not None
+                ):
+                    sanitized["weight"] = positional_create.weight
                 return sanitized
 
             target = old_word if action == "Change" and old_word else word
@@ -2593,6 +2930,7 @@ class ToolExecutor:
             message
             and tool_name in MUTATING_TOOL_NAMES
             and "confirmed" in arguments
+            and not context.server_warning_confirmed
         ):
             return policy_block(
                 BLOCK_REASON_TICKET_REQUIRED,
@@ -2713,6 +3051,9 @@ class ToolExecutor:
         """Bind model-generated mutation targets to entities in current raw text."""
         message = _mutation_authorization_view(context.current_message or "")
         trusted_codes = context.trusted_codes_by_word or {}
+        trusted_word_lookup_codes = (
+            context.trusted_word_lookup_codes_by_word or {}
+        )
         trusted_draft_words = context.trusted_draft_words_by_id or {}
         trusted_draft_items = context.trusted_draft_items_by_id or {}
         compact_message = re.sub(r"[\s，,。.!！?？~～]+", "", message)
@@ -2789,21 +3130,29 @@ class ToolExecutor:
             code = str(arguments.get("code") or "").strip()
             action = str(arguments.get("action") or "Create")
             old_word = str(arguments.get("old_word") or "").strip()
-            positional_create = _pending_positional_create_binding(
+            pending_positional_create = _pending_positional_create_binding(
                 message,
                 arguments,
                 context,
             )
-            if (
-                positional_create is not None
-                and positional_create.relation in _POSITIONAL_CREATE_BACK_RELATIONS
-            ):
-                return policy_block(
+            destination_positional_create = (
+                _destination_derived_positional_create_binding(
+                    message,
+                    arguments,
+                    context,
+                )
+            )
+            positional_create = (
+                pending_positional_create or destination_positional_create
+            )
+            if positional_create is not None and positional_create.weight is None:
+                return text_follow_up(
                     BLOCK_REASON_ORDERING_NOT_EXPRESSIBLE,
-                    "安全拦截：当前加词接口无法表达排在已有词条后面。"
-                    "若要添加重码，请直接回复候选编号；"
-                    "新词会作为重码添加并排序在已有词条前面。",
-                    missing=["orderingAfterWeight"],
+                    "当前已有权重之间没有可用的整数位置，无法精确保持这条排序指令。"
+                    "请先调整现有词条优先级，或改为只添加重码。",
+                    word=word,
+                    destinationWord=positional_create.destination_word,
+                    relation=positional_create.relation,
                 )
             targets = [word]
             if action == "Change" and old_word:
@@ -2812,7 +3161,85 @@ class ToolExecutor:
                 target for target in targets
                 if not target or not _contains_exact_target(message, target)
             ]
-            if positional_create is None and (
+            create_intent_is_bound = bool(
+                action == "Create"
+                and not old_word
+                and word
+                and _contains_exact_target(message, word)
+                and _action_is_bound_to_target(message, word, "Create")
+                and not _is_word_protected(message, word)
+            )
+            explicit_create_is_bound = bool(
+                create_intent_is_bound
+                and code
+                and _code_is_bound_to_target(
+                    message,
+                    word,
+                    code,
+                    frozenset(),
+                )
+            )
+            pending_create_is_bound = _pending_create_is_bound(
+                message,
+                arguments,
+                context,
+            )
+            create_is_bound = bool(
+                explicit_create_is_bound
+                or pending_create_is_bound
+                or positional_create is not None
+            )
+            positional_operands = _positional_create_operands(message)
+            if (
+                action == "Create"
+                and not old_word
+                and not create_is_bound
+                and positional_operands is not None
+                and positional_operands[0] == word
+                and positional_operands[2] in {
+                    "前面", "后面", "之前", "之后", "前", "后",
+                }
+                and _contains_exact_target(message, word)
+                and not _is_word_protected(message, word)
+            ):
+                destination_word = positional_operands[1]
+                destination_codes = trusted_word_lookup_codes.get(
+                    destination_word,
+                    frozenset(),
+                )
+                if len(destination_codes) != 1:
+                    return text_follow_up(
+                        (
+                            "destination_code_ambiguous"
+                            if len(destination_codes) > 1
+                            else "code_required"
+                        ),
+                        (
+                            f"“{destination_word}”对应多个编码，请问要把“{word}”"
+                            "加到哪个编码？"
+                            if len(destination_codes) > 1
+                            else f"还无法确定“{word}”应添加到哪个编码，请告诉我编码。"
+                        ),
+                        word=word,
+                        destinationWord=destination_word,
+                        candidateCodes=sorted(destination_codes),
+                    )
+            if (
+                action == "Create"
+                and not old_word
+                and not create_is_bound
+                and create_intent_is_bound
+                and not _target_clause_has_explicit_code_token(message, word)
+            ):
+                return text_follow_up(
+                    "code_required",
+                    f"请问要把“{word}”添加到哪个编码？",
+                    word=word,
+                )
+            if (
+                action == "Create"
+                and not create_is_bound
+            ) or (action != "Create" and (
                 missing_targets
                 or not _action_is_bound_to_target(message, word, action)
                 or any(_is_word_protected(message, target) for target in targets)
@@ -2840,7 +3267,7 @@ class ToolExecutor:
                         )
                     )
                 )
-            ):
+            )):
                 return policy_block(
                     BLOCK_REASON_BINDING_INCOMPLETE,
                     f"安全拦截：{action} 操作的动作、词条或编码"

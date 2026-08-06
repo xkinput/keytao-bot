@@ -25,6 +25,7 @@ from .tools import (
     PendingCandidateCapability,
     ToolContext,
     ToolExecutor,
+    create_warning_confirmation_binding,
     message_mentions_change_request,
     policy_block,
     self_checked_suggested_command,
@@ -105,6 +106,18 @@ def _pending_candidate_capability(
             )
             for code, words in state.server_occupied_words.items()
         )
+        entries = tuple(
+            (str(code), str(word), int(weight))
+            for code, code_entries in state.server_entries_by_code.items()
+            for word, weight in code_entries
+            if (
+                str(code).strip()
+                and str(word).strip()
+                and isinstance(weight, int)
+                and not isinstance(weight, bool)
+                and weight >= 0
+            )
+        )
     except (TypeError, ValueError):
         return None
     return PendingCandidateCapability(
@@ -112,6 +125,7 @@ def _pending_candidate_capability(
         word=state.word,
         candidates=candidates,
         occupied_words=occupied_words,
+        entries=entries,
     )
 
 
@@ -319,6 +333,8 @@ class AgentOrchestrator:
         total_tool_calls = 0
         empty_response_retries = 0
         trusted_codes_by_word: Dict[str, frozenset[str]] = {}
+        trusted_word_lookup_codes_by_word: Dict[str, frozenset[str]] = {}
+        trusted_entries_by_code: Dict[str, tuple[tuple[str, int], ...]] = {}
         trusted_draft_words_by_id: Dict[str, str] = {}
         trusted_draft_items_by_id: Dict[str, Dict[str, str]] = {}
         trusted_phrase_types_by_key: Dict[tuple[str, str], frozenset[str]] = {}
@@ -524,6 +540,10 @@ class AgentOrchestrator:
                     ),
                     attachment_context=bool(context.visual_context),
                     trusted_codes_by_word=trusted_codes_by_word,
+                    trusted_word_lookup_codes_by_word=(
+                        trusted_word_lookup_codes_by_word
+                    ),
+                    trusted_entries_by_code=trusted_entries_by_code,
                     trusted_draft_words_by_id=trusted_draft_words_by_id,
                     trusted_draft_items_by_id=trusted_draft_items_by_id,
                     trusted_phrase_types_by_key=trusted_phrase_types_by_key,
@@ -643,6 +663,16 @@ class AgentOrchestrator:
                             trusted_batch_ids=frozenset(trusted_batch_ids),
                         ),
                     )
+                    if auto_confirmed is None:
+                        auto_confirmed = await self._auto_confirm_create_warning(
+                            fn_name,
+                            canonical_fn_args,
+                            result_data,
+                            replace(
+                                tool_context,
+                                trusted_batch_ids=frozenset(trusted_batch_ids),
+                            ),
+                        )
                     if auto_confirmed is not None:
                         # Everything downstream must describe the call that was
                         # actually executed, not the discarded preview.
@@ -675,6 +705,11 @@ class AgentOrchestrator:
                             result_data,
                             authoritative_result_links,
                         )
+                    self._capture_authoritative_create_notices(
+                        fn_name,
+                        result_data,
+                        authoritative_result_links,
+                    )
                     self._collect_trusted_batch_ids(
                         result_data, trusted_batch_ids, canonical_fn_args
                     )
@@ -683,6 +718,8 @@ class AgentOrchestrator:
                         canonical_fn_args,
                         result_data,
                         trusted_codes_by_word,
+                        trusted_word_lookup_codes_by_word,
+                        trusted_entries_by_code,
                         trusted_draft_words_by_id,
                         trusted_draft_items_by_id,
                         trusted_phrase_types_by_key,
@@ -837,6 +874,36 @@ class AgentOrchestrator:
                 links["_staleUrls"] = "\n".join(sorted(stale_urls))
 
     @staticmethod
+    def _capture_authoritative_create_notices(
+        tool_name: str,
+        result: Dict[str, Any],
+        links: Dict[str, str],
+    ) -> None:
+        """Keep server warnings visible even if the model omits them."""
+        if tool_name != "keytao_create_phrase" or result.get("success") is not True:
+            return
+        notices = [
+            line
+            for line in str(links.get("_createNotices") or "").splitlines()
+            if line
+        ]
+        for warning in result.get("warnings") or []:
+            message = str(
+                warning.get("message")
+                if isinstance(warning, dict)
+                else warning
+            ).replace("\n", " ").strip()[:400]
+            line = f"⚠️ {message}" if message else ""
+            if line and line not in notices:
+                notices.append(line)
+        ordering_summary = str(result.get("orderingSummary") or "").strip()[:400]
+        ordering_line = f"同码顺序：{ordering_summary}" if ordering_summary else ""
+        if ordering_line and ordering_line not in notices:
+            notices.append(ordering_line)
+        if notices:
+            links["_createNotices"] = "\n".join(notices[:8])
+
+    @staticmethod
     def _append_authoritative_result_links(
         content: str,
         links: Dict[str, str],
@@ -872,7 +939,11 @@ class AgentOrchestrator:
             cleaned_lines.pop()
         content = "\n".join(cleaned_lines)
 
-        lines: List[str] = []
+        lines: List[str] = [
+            line
+            for line in str(links.get("_createNotices") or "").splitlines()
+            if line and line not in content
+        ]
         appended_urls: set[str] = set()
         if batch_url:
             lines.append(f"草稿/批次地址：{batch_url}")
@@ -890,6 +961,8 @@ class AgentOrchestrator:
         arguments: Dict,
         result: Dict,
         codes_by_word: Dict[str, frozenset[str]],
+        word_lookup_codes_by_word: Dict[str, frozenset[str]],
+        entries_by_code: Dict[str, tuple[tuple[str, int], ...]],
         draft_words_by_id: Dict[str, str],
         draft_items_by_id: Dict[str, Dict[str, str]],
         phrase_types_by_key: Dict[tuple[str, str], frozenset[str]],
@@ -966,6 +1039,39 @@ class AgentOrchestrator:
         }:
             groups = result.get("results")
             lookup_groups = groups if isinstance(groups, list) else [result]
+            if tool_name in {
+                "keytao_lookup_by_words_batch",
+                "keytao_lookup_by_word",
+            }:
+                requested_words = {
+                    str(value).strip()
+                    for value in (
+                        arguments.get("words")
+                        if isinstance(arguments.get("words"), list)
+                        else [arguments.get("word")]
+                    )
+                    if isinstance(value, str) and value.strip()
+                }
+                for group in lookup_groups:
+                    if not isinstance(group, dict):
+                        continue
+                    group_word = str(group.get("word") or "").strip()
+                    if not group_word or (
+                        requested_words and group_word not in requested_words
+                    ):
+                        continue
+                    enumerated_codes = frozenset(
+                        str(phrase.get("code") or "").strip().lower()
+                        for phrase in group.get("phrases") or []
+                        if (
+                            isinstance(phrase, dict)
+                            and str(
+                                phrase.get("word") or group_word
+                            ).strip() == group_word
+                            and str(phrase.get("code") or "").strip()
+                        )
+                    )
+                    word_lookup_codes_by_word[group_word] = enumerated_codes
             for group in lookup_groups:
                 if not isinstance(group, dict):
                     continue
@@ -975,8 +1081,20 @@ class AgentOrchestrator:
                     if not isinstance(phrase, dict):
                         continue
                     word = str(phrase.get("word") or group_word).strip()
-                    code = str(phrase.get("code") or group_code).strip()
+                    code = str(phrase.get("code") or group_code).strip().lower()
                     phrase_type = str(phrase.get("type") or "").strip()
+                    if word and code:
+                        weight = phrase.get("weight")
+                        if (
+                            isinstance(weight, int)
+                            and not isinstance(weight, bool)
+                            and weight >= 0
+                        ):
+                            entries = set(entries_by_code.get(code, ()))
+                            entries.add((word, weight))
+                            entries_by_code[code] = tuple(
+                                sorted(entries, key=lambda item: (item[1], item[0]))
+                            )
                     if word and code and phrase_type:
                         key = (word, code)
                         phrase_types_by_key[key] = frozenset(
@@ -1197,8 +1315,22 @@ class AgentOrchestrator:
             seen_tool_calls[call_fingerprint] = duplicate_count + 1
             return json.dumps({"error": "重复调用，已忽略", "message": duplicate_hint}, ensure_ascii=False)
 
-        seen_tool_calls[call_fingerprint] = 1
-        return await self._tool_executor.call(fn_name, fn_args, tool_context)
+        result_str = await self._tool_executor.call(
+            fn_name,
+            fn_args,
+            tool_context,
+        )
+        try:
+            result_data = json.loads(result_str)
+        except (TypeError, json.JSONDecodeError):
+            result_data = None
+        if not (
+            isinstance(result_data, dict)
+            and result_data.get("requiresTextFollowUp") is True
+            and result_data.get("policyBlocked") is not True
+        ):
+            seen_tool_calls[call_fingerprint] = 1
+        return result_str
 
     @staticmethod
     def _collect_trusted_batch_ids(
@@ -1355,6 +1487,57 @@ class AgentOrchestrator:
             # The draft moved under us; keep the preview so the user sees the
             # plan instead of a bare "already void" message.
             return None
+        return confirmed_data, confirmed_str, confirm_args
+
+    async def _auto_confirm_create_warning(
+        self,
+        fn_name: str,
+        fn_args: Dict,
+        result_data: Dict,
+        tool_context: ToolContext,
+    ) -> Optional[tuple]:
+        """Replay one exact create ticket for duplicate or ordering warnings."""
+        if fn_name != "keytao_create_phrase" or not tool_context.writes_allowed:
+            return None
+        binding = create_warning_confirmation_binding(result_data, fn_args)
+        if binding is None:
+            return None
+        confirm_args = {
+            key: value
+            for key, value in fn_args.items()
+            if key != "preview_only"
+        }
+        confirm_args.update(binding)
+        logger.info(
+            "Auto-confirming informational create warning: "
+            f"batch={binding['batch_id']} "
+            f"version={binding['expected_content_version']}"
+        )
+        confirmed_str = await self._tool_executor.call(
+            fn_name,
+            confirm_args,
+            replace(
+                tool_context,
+                mutation_confirmed=True,
+                server_warning_confirmed=True,
+            ),
+        )
+        try:
+            confirmed_data = json.loads(confirmed_str)
+        except Exception:
+            return None
+        if not isinstance(confirmed_data, dict):
+            return None
+        if confirmed_data.get("success") is True:
+            confirmed_data["warnings"] = list(result_data.get("warnings") or [])
+            confirmed_data["warnedCount"] = len(confirmed_data["warnings"])
+            confirmed_data["autoConfirmedWarnings"] = True
+            if result_data.get("orderingSummary"):
+                confirmed_data.setdefault(
+                    "orderingSummary",
+                    result_data["orderingSummary"],
+                )
+            confirmed_str = json.dumps(confirmed_data, ensure_ascii=False)
         return confirmed_data, confirmed_str, confirm_args
 
     @staticmethod
