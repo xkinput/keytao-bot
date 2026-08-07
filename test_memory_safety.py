@@ -8054,6 +8054,86 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current_draft["batch_id"], "materialised-1")
         self.assertIsNone(state_store.get_record(address))
 
+    async def test_perpetual_shift_tickets_stop_after_two_replays(self) -> None:
+        """A third ticket stays pending instead of triggering another replay."""
+        calls = []
+        plan_digest = "a" * 64
+        second_warning_digest = "b" * 64
+        pending_warning_digest = "c" * 64
+        shift_plan = {
+            "word": "吃席",
+            "targetCode": "wkxk",
+            "items": [{
+                "action": "Create",
+                "word": "吃席",
+                "code": "wkxk",
+                "type": "Phrase",
+            }],
+            "shifted": [],
+        }
+
+        async def shift(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "batch-1",
+                    "contentVersion": 4,
+                    "planDigest": plan_digest,
+                    "shiftPlan": shift_plan,
+                }
+            if len(calls) == 2:
+                return {
+                    "success": False,
+                    "warnings": [],
+                    "requiresConfirmation": True,
+                    "batchId": "batch-1",
+                    "contentVersion": 4,
+                    "planDigest": plan_digest,
+                    "warningDigest": second_warning_digest,
+                    "shiftPlan": shift_plan,
+                }
+            return {
+                "success": False,
+                "warnings": [],
+                "requiresConfirmation": True,
+                "batchId": "batch-1",
+                "contentVersion": 4,
+                "planDigest": plan_digest,
+                "warningDigest": pending_warning_digest,
+                "shiftPlan": shift_plan,
+            }
+
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call()]),
+            _fake_response("stop", "仍需确认。"),
+        ])
+        state_store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "bounded-replay-user")
+
+        await _shift_orchestrator(client, shift, state_store).run(
+            "顺延「吃席」到 wkxk",
+            AgentRequestContext(
+                platform="qq",
+                user_id="bounded-replay-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            calls[2]["expected_warning_digest"], second_warning_digest
+        )
+        record = state_store.get_record(address)
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(record.state.function_name, "keytao_shift_phrase_code")
+        self.assertEqual(
+            record.state.args["expected_warning_digest"], pending_warning_digest
+        )
+
     async def test_shift_absence_ticket_rejects_a_new_draft_before_confirmation(self) -> None:
         """The absence sentinel must still reject real pointer drift."""
         from keytao_bot.plugins import openai_chat as chat_module
