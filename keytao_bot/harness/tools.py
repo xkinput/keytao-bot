@@ -8,6 +8,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from nonebot.log import logger
 
 try:  # pragma: no cover - depends on the installed runtime
+    import httpx as _httpx
+except ImportError:  # pragma: no cover
+    _httpx = None
+
+try:  # pragma: no cover - depends on the installed runtime
     import jsonschema as _jsonschema
 except ImportError:  # pragma: no cover
     _jsonschema = None
@@ -31,6 +36,18 @@ _JSON_TYPE_MAP = {
 _MAX_REPORTED_ERRORS = 5
 _FALLBACK_MAX_DEPTH = 3
 _missing_jsonschema_warned = False
+
+
+def _tool_exception_payload(error: Exception) -> Dict[str, Any]:
+    """Preserve whether a failed call is safe to retry as a transport attempt."""
+    transport_error = isinstance(error, (TimeoutError, ConnectionError))
+    if _httpx is not None:
+        transport_error = transport_error or isinstance(error, _httpx.TransportError)
+    return {
+        "error": str(error),
+        "errorType": type(error).__name__,
+        "transportError": transport_error,
+    }
 
 
 def _warn_missing_jsonschema_once() -> None:
@@ -2982,7 +2999,7 @@ class ToolExecutor:
                 f"Tool {route.tool_name} replay error: "
                 f"{type(error).__name__}: {error}"
             )
-            return json.dumps({"error": str(error)}, ensure_ascii=False), confirm_args
+            return json.dumps(_tool_exception_payload(error), ensure_ascii=False), confirm_args
 
     async def call(self, tool_name: str, arguments: Dict, context: ToolContext) -> str:
         root_error = _validate_root_type(tool_name, arguments)
@@ -3067,7 +3084,7 @@ class ToolExecutor:
                 f"Tool {tool_name} via {route.tool_name} error: "
                 f"{type(error).__name__}: {error}"
             )
-            return json.dumps({"error": str(error)}, ensure_ascii=False)
+            return json.dumps(_tool_exception_payload(error), ensure_ascii=False)
 
     @staticmethod
     def _trusted_phrase_type(

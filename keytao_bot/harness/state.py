@@ -311,7 +311,7 @@ class MemoryConversationStateStore:
         self,
         states: Optional[Dict[ConversationKey, PendingState]] = None,
         *,
-        pending_ttl_seconds: float = 7200.0,
+        pending_ttl_seconds: float = 14400.0,
         max_pending: int = 2048,
         max_pending_payload_bytes: int = 262_144,
         max_pending_items: int = 200,

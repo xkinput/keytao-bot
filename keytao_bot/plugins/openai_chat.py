@@ -411,7 +411,7 @@ _ACTION_SPECIFIC_DRAFT_SUBMIT_COMMANDS = {
     "确认提交",
     "继续提交",
 }
-_PENDING_CONTROL_TEXTS = {
+_PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     "确认",
     "确定",
     "好的",
@@ -420,6 +420,9 @@ _PENDING_CONTROL_TEXTS = {
     "对",
     "可以",
     "行",
+})
+_PENDING_CONTROL_TEXTS = {
+    *_PENDING_CONFIRM_ASSENT_TEXTS,
     "加",
     "加入",
     "添加",
@@ -966,6 +969,75 @@ def _message_authorizes_pending_control(
             return False
         return not command_intent.target_word or command_intent.target_word in compact
     return False
+
+
+_STALE_CONFIRMATION_ONLY_TEXTS = frozenset({
+    *_PENDING_CONFIRM_ASSENT_TEXTS,
+    "同意",
+    "就这样",
+    "按这个",
+    "执行",
+    "执行吧",
+})
+_STALE_TICKET_CONFIRMATION_RE = re.compile(r"确认票据[A-Z0-9]{4,64}", re.IGNORECASE)
+_ORIGINAL_COMMAND_LINE_RE = re.compile(
+    r"^(?:原始操作指令|原始指令|原指令)\s*[：:]\s*[「“\"]?(.+?)[」”\"]?$"
+)
+
+
+def _is_unambiguous_stale_confirmation(message_text: str) -> bool:
+    """Reuse exact pending-control shapes without interpreting mixed commands."""
+    if re.search(r"[?？]", message_text):
+        return False
+    compact = _compact_command_text(message_text)
+    if _message_authorizes_pending_control(
+        message_text,
+        MessageCommandIntent(intent="pending_confirm", confidence=1.0),
+    ) and compact in _PENDING_CONFIRM_ASSENT_TEXTS:
+        return True
+    if compact in _STALE_CONFIRMATION_ONLY_TEXTS:
+        return True
+    return bool(_STALE_TICKET_CONFIRMATION_RE.fullmatch(compact))
+
+
+def _recover_original_command_from_confirmation_quote(
+    reply_reference: ReplyReferenceInfo,
+) -> str:
+    """Recover only an explicitly labeled original command from a bot quote."""
+    if (
+        not reply_reference.is_reply
+        or not reply_reference.is_to_bot
+        or not reply_reference.text
+    ):
+        return ""
+    for line in reply_reference.text.splitlines():
+        match = _ORIGINAL_COMMAND_LINE_RE.fullmatch(line.strip())
+        if match is None:
+            continue
+        command = match.group(1).strip()
+        if 0 < len(command) <= 160 and message_authorizes_mutation(command):
+            return command
+    return ""
+
+
+def _format_stale_confirmation_response(
+    message_text: str,
+    reply_reference: ReplyReferenceInfo,
+) -> Optional[str]:
+    """Return no-write guidance for a standalone confirmation with no state."""
+    if not _is_unambiguous_stale_confirmation(message_text):
+        return None
+    original_command = _recover_original_command_from_confirmation_quote(reply_reference)
+    guidance = (
+        f"请重新发送原始操作指令「{original_command}」，我会重新生成计划和新票据。"
+        if original_command
+        else "请重新发送原始操作指令，我会重新生成计划和新票据。"
+    )
+    return (
+        "之前等待确认的计划或票据已经过期，或因机器人重启而丢失。"
+        "旧票据通常只保留约 4 小时，而且机器人重启后不会保留。"
+        + guidance
+    )
 
 
 def _parse_pending_choice_index(text: str) -> Optional[int]:
@@ -5871,6 +5943,7 @@ async def _execute_confirmed_tool(
     owner_label: str = "",
     carried_warnings: Optional[List[Any]] = None,
     carried_ordering_summary: str = "",
+    on_transport_failure: Optional[Callable[[], None]] = None,
 ) -> str:
     """Execute one staged step without bypassing unseen server warnings."""
     if state.confirmation_source not in {"local_preview", "server_warning"}:
@@ -5965,6 +6038,14 @@ async def _execute_confirmed_tool(
     result_json = await call_tool_function(state.function_name, args, platform, user_id)
     data = json.loads(result_json)
 
+    if data.get("transportError") is True:
+        if on_transport_failure is not None:
+            on_transport_failure()
+        return (
+            "连接服务时发生超时或网络错误，本次没有取得确定结果。"
+            "当前确认票据仍有效，请立即重试原确认指令。"
+        )
+
     if data.get("success") is True and carried_warnings:
         data["warnings"] = list(carried_warnings)
         data["warnedCount"] = len(carried_warnings)
@@ -5999,6 +6080,7 @@ async def _execute_confirmed_tool(
                 owner_label,
                 carried_warnings=list(data.get("warnings") or []),
                 carried_ordering_summary=warning_ordering_summary,
+                on_transport_failure=on_transport_failure,
             )
         display_data = {**data, "submitAfter": submit_after}
         warning_prompt = _format_server_warning_confirmation(
@@ -8368,8 +8450,12 @@ async def handle_pending_message_core(
                 conv_key,
                 space_key,
                 owner_label,
+                on_transport_failure=preserve_pending_state,
             )
-        conversation_state_store.complete_execution(state_record)
+        if preserve_after_response:
+            conversation_state_store.abort_execution(state_record)
+        else:
+            conversation_state_store.complete_execution(state_record)
         return _append_pending_ticket_challenge(response, conv_key)
 
     return None
@@ -9843,6 +9929,45 @@ async def _handle_ai_chat_serialized(
         and isinstance(referenced_pending, PendingAddWord)
         and quoted_pending_add_intent is not None
     )
+    current_pending_record = conversation_state_store.get_record(conv_key)
+    active_pending_operation = draft_operation_coordinator.get(conv_key)
+    other_owner_pending = (
+        conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
+        if (
+            memory_context.space_type == "group"
+            and _can_use_unrelated_group_pending(reply_reference)
+        )
+        else None
+    )
+    stale_confirmation_response = (
+        _format_stale_confirmation_response(
+            normalized_message_text,
+            reply_reference,
+        )
+        if (
+            current_pending_record is None
+            and active_pending_operation is None
+            and other_owner_pending is None
+            and not quoted_pending_add_control
+        )
+        else None
+    )
+    if stale_confirmation_response is not None:
+        remember_conversation(
+            conv_key,
+            memory_context,
+            normalized_message_text,
+            stale_confirmation_response,
+        )
+        await _finish_ai_chat_response(
+            bot,
+            event,
+            user_id,
+            memory_context,
+            stale_confirmation_response,
+            QQMessageSegment,
+        )
+        return
     if reply_reference.is_reply:
         logger.info(
             "[reply_trace] "
@@ -10519,8 +10644,10 @@ async def _handle_ai_chat_serialized(
                                 conv_key,
                                 space_key,
                                 owner_label,
+                                on_transport_failure=restore_pending_state,
                             )
-                            complete_pending_execution()
+                            if not preserve_pending_after_response:
+                                complete_pending_execution()
                 # else: response stays None, fall through to AI as new request
 
             if response is None and state is not None:

@@ -8575,6 +8575,11 @@ def test_memory_conversation_state_store():
     store.set(key, state)
     check("contains after set", store.contains(key))
     check("get returns same state", store.get(key) == state)
+    record = store.get_record(key)
+    check(
+        "default pending TTL is four hours",
+        record is not None and record.expires_at - record.created_at == 14400.0,
+    )
     check("pop returns same state", store.pop(key) == state)
     check("empty after pop", not store.contains(key))
     store.set(key, state)
@@ -11268,6 +11273,300 @@ def test_generic_ai_prose_does_not_persist_pending():
     asyncio.run(_run())
 
 
+def test_stale_confirmation_short_circuits_only_without_live_state():
+    """Expired confirmations get deterministic guidance without stealing real work."""
+    print("\n🧪 stale confirmation short-circuit")
+
+    class TextEvent:
+        original_message = []
+        message = []
+
+        def __init__(self, text):
+            self.text = text
+
+        def get_plaintext(self):
+            return self.text
+
+    class HandlerBot:
+        pass
+
+    async def run_case(message, reply_reference, *, live_state=None, tool_result=None):
+        user_id = f"stale-confirm-{abs(hash((message, reply_reference.text))) % 100000}"
+        context = ChatMemoryContext(
+            platform="qq",
+            user_id=user_id,
+            space_type="private",
+            space_id=user_id,
+        )
+        store = MemoryConversationStateStore()
+        coordinator = DraftOperationCoordinator()
+        if live_state is not None:
+            store.set(context.conversation_address, live_state)
+            if message == "__LIVE_TICKET__":
+                live_record = store.get_record(context.conversation_address)
+                message = f"确认票据 {live_record.reconfirmation_code}"
+        classifier = AsyncMock(return_value=MessageCommandIntent())
+        main_model = AsyncMock(return_value="normal pipeline response")
+        tool_call = AsyncMock(
+            return_value=json.dumps(
+                tool_result or {"success": True, "batchId": "live-batch"},
+                ensure_ascii=False,
+            )
+        )
+        finish_response = AsyncMock()
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(openai_chat_module, "draft_operation_coordinator", coordinator),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=reply_reference),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=context),
+            ),
+            patch.object(openai_chat_module, "_classify_message_command_intent", classifier),
+            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(openai_chat_module, "build_reply_context", AsyncMock(return_value="")),
+            patch.object(
+                openai_chat_module,
+                "_try_handle_referenced_word_presence_query",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_try_handle_draft_management_command",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(openai_chat_module, "_try_handle_replace_char", AsyncMock(return_value=None)),
+            patch.object(
+                openai_chat_module,
+                "_try_handle_simple_single_word_query",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(openai_chat_module, "call_tool_function", tool_call),
+            patch.object(openai_chat_module, "get_ai_response_core", main_model),
+            patch.object(
+                openai_chat_module,
+                "_augment_simple_word_query_response",
+                AsyncMock(side_effect=lambda message, response, platform, user_id: response),
+            ),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock(return_value=True)),
+            patch.object(openai_chat_module, "schedule_memory_compaction", MagicMock()),
+            patch.object(openai_chat_module, "_finish_ai_chat_response", finish_response),
+        ):
+            await openai_chat_module._handle_ai_chat_serialized(
+                HandlerBot(),
+                TextEvent(message),
+                "qq",
+                user_id,
+            )
+
+        return {
+            "response": finish_response.await_args.args[4],
+            "classifier_calls": classifier.await_count,
+            "main_calls": main_model.await_count,
+            "tool_calls": tool_call.await_count,
+            "store": store,
+            "context": context,
+        }
+
+    async def _run():
+        bare = await run_case("确认", ReplyReferenceInfo())
+        check("bare stale confirm bypasses intent model", bare["classifier_calls"] == 0)
+        check("bare stale confirm bypasses main model", bare["main_calls"] == 0)
+        check("bare stale confirm reaches no tool sink", bare["tool_calls"] == 0)
+        check(
+            "stale reply explains expiry or loss",
+            "过期" in bare["response"] and "丢失" in bare["response"],
+        )
+        check("stale reply explains the ticket lifetime", "4 小时" in bare["response"])
+        check("stale reply explains restart loss", "重启" in bare["response"])
+        check("stale reply asks for the original command", "原始操作指令" in bare["response"])
+        check(
+            "stale reply never recommends confirming again",
+            "再发一次确认" not in bare["response"]
+            and "再发一次「确认」" not in bare["response"],
+        )
+
+        ticket = await run_case("确认票据 E8CA23", ReplyReferenceInfo())
+        check("stale ticket shape is deterministic", ticket["classifier_calls"] == 0 and ticket["main_calls"] == 0)
+        check("stale ticket shape reaches no sink", ticket["tool_calls"] == 0)
+
+        quoted = await run_case(
+            "执行吧",
+            ReplyReferenceInfo(
+                is_reply=True,
+                is_to_bot=True,
+                sender_id="bot-id",
+                sender_name="喵喵",
+                text=(
+                    "原始操作指令：「把吃席放在赤溪前面」\n"
+                    "🔁 服务端已生成完整顺延计划：\n"
+                    "以上每一项都将由服务端按同一批次版本校验。确认执行吗？"
+                ),
+            ),
+        )
+        check("quoted assent bypasses both models", quoted["classifier_calls"] == 0 and quoted["main_calls"] == 0)
+        check("quoted assent reaches no sink", quoted["tool_calls"] == 0)
+        check("recoverable original command is shown", "把吃席放在赤溪前面" in quoted["response"])
+
+        mixed = await run_case("确认，把吃席放在赤溪前面", ReplyReferenceInfo())
+        check("mixed actionable message reaches classifier", mixed["classifier_calls"] == 1)
+        check("mixed actionable message reaches normal model", mixed["main_calls"] == 1)
+        check("mixed actionable message keeps normal response", mixed["response"] == "normal pipeline response")
+
+        live_state = PendingToolConfirm(
+            function_name="keytao_submit_batch",
+            args={
+                "batch_id": "live-batch",
+                "expected_content_version": 2,
+                "expected_server_snapshot_digest": "a" * 64,
+                "expected_warning_digest": "b" * 64,
+                "expected_audit_digest": "c" * 64,
+            },
+            confirmation_source="server_warning",
+        )
+        live = await run_case(
+            "__LIVE_TICKET__",
+            ReplyReferenceInfo(),
+            live_state=live_state,
+        )
+        check("live ticket reaches its replay sink", live["tool_calls"] == 1)
+        check("live ticket bypasses main-model improvisation", live["main_calls"] == 0)
+        check("live ticket is not called stale", "过期" not in live["response"] and "丢失" not in live["response"])
+        check("successful live ticket is consumed", live["store"].get_record(live["context"].conversation_address) is None)
+
+    asyncio.run(_run())
+
+
+def test_pending_replay_transport_failure_retains_exact_ticket():
+    """Only retryable transport failures re-arm the exact replay ticket."""
+    print("\n🧪 pending replay transport retention")
+
+    def pending_submit_state(batch_id):
+        return PendingToolConfirm(
+            function_name="keytao_submit_batch",
+            args={
+                "batch_id": batch_id,
+                "expected_content_version": 7,
+                "expected_server_snapshot_digest": "a" * 64,
+                "expected_warning_digest": "b" * 64,
+                "expected_audit_digest": "c" * 64,
+            },
+            confirmation_source="server_warning",
+        )
+
+    async def _run():
+        async def raise_timeout():
+            raise TimeoutError("request timed out")
+
+        async def raise_connect():
+            raise ConnectionError("connection refused")
+
+        executor = ToolExecutor(
+            lambda name: {
+                "timeout_probe": raise_timeout,
+                "connect_probe": raise_connect,
+            }.get(name),
+            frozenset(),
+        )
+        timeout_payload = json.loads(
+            await executor.call("timeout_probe", {}, ToolContext())
+        )
+        connect_payload = json.loads(
+            await executor.call("connect_probe", {}, ToolContext())
+        )
+        check("tool timeout is marked as a transport failure", timeout_payload.get("transportError") is True)
+        check("tool connect error is marked as a transport failure", connect_payload.get("transportError") is True)
+
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        openai_chat_module.conversation_state_store = store
+        conv_key = ConversationAddress.private("qq", "transport-retry")
+        store.set(conv_key, pending_submit_state("retry-batch"))
+        record = store.get_record(conv_key)
+        code = record.reconfirmation_code
+        results = [
+            json.dumps(
+                {
+                    "error": "request timed out",
+                    "errorType": "ReadTimeout",
+                    "transportError": True,
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {"success": True, "batchId": "retry-batch"},
+                ensure_ascii=False,
+            ),
+        ]
+        try:
+            with patch.object(openai_chat_module, "call_tool_function", AsyncMock(side_effect=results)) as tool_call:
+                failed = await openai_chat_module.handle_pending_message_core(
+                    f"确认票据 {code}",
+                    "qq",
+                    "transport-retry",
+                    conv_key,
+                )
+                retained = store.get_record(conv_key)
+                retained_execution_released = bool(
+                    retained is not None and not retained.execution_id
+                )
+                retried = await openai_chat_module.handle_pending_message_core(
+                    f"确认票据 {code}",
+                    "qq",
+                    "transport-retry",
+                    conv_key,
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("transport failure returns retryable guidance", failed is not None and "仍有效" in failed)
+        check("transport failure retains the same ticket object", retained is record)
+        check("transport failure releases the execution claim", retained_execution_released)
+        check("immediate retry reuses the exact sink", tool_call.await_count == 2)
+        check("immediate retry succeeds", retried is not None and "成功提交" in retried)
+        check("success consumes the retained ticket", store.get_record(conv_key) is None)
+
+        conflict_store = MemoryConversationStateStore()
+        openai_chat_module.conversation_state_store = conflict_store
+        conflict_key = ConversationAddress.private("qq", "transport-conflict")
+        conflict_store.set(conflict_key, pending_submit_state("conflict-batch"))
+        conflict_record = conflict_store.get_record(conflict_key)
+        try:
+            with patch.object(
+                openai_chat_module,
+                "call_tool_function",
+                AsyncMock(
+                    return_value=json.dumps(
+                        {
+                            "success": False,
+                            "contentVersionConflict": True,
+                            "message": "草稿内容版本冲突",
+                        },
+                        ensure_ascii=False,
+                    )
+                ),
+            ):
+                conflict = await openai_chat_module.handle_pending_message_core(
+                    f"确认票据 {conflict_record.reconfirmation_code}",
+                    "qq",
+                    "transport-conflict",
+                    conflict_key,
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("CAS conflict is reported", conflict is not None and "版本冲突" in conflict)
+        check("CAS conflict consumes the ticket", conflict_store.get_record(conflict_key) is None)
+
+    asyncio.run(_run())
+
+
 async def _run_orchestrator_reasoning_round_trip_checks():
     tool_call = types.SimpleNamespace(
         id="call_echo",
@@ -12894,6 +13193,8 @@ if __name__ == "__main__":
     test_image_only_handler_discloses_disabled_vision()
     test_visual_handler_blocks_pending_injection()
     test_generic_ai_prose_does_not_persist_pending()
+    test_stale_confirmation_short_circuits_only_without_live_state()
+    test_pending_replay_transport_failure_retains_exact_ticket()
     test_orchestrator_reasoning_round_trip()
     test_orchestrator_blocks_encode_after_unresolved_review()
     test_orchestrator_tool_batch_validation()
