@@ -1316,6 +1316,12 @@ def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_input
         and "放在占位词后面默认把新词放到其自身候选链中该码之后的首个空位" in SYSTEM_PROMPT_CORE,
     )
     check(
+        "prompt keeps same-code positional writes on the positional tool path",
+        "新词位置指令（无论是否包含同码标记）" in SYSTEM_PROMPT_CORE
+        and "不要转入 keytao_prepare_reviewed_add" in SYSTEM_PROMPT_CORE
+        and "needsManualReview=true" in SYSTEM_PROMPT_CORE,
+    )
+    check(
         "prompt forbids invented weight numbers",
         "以工具返回的 orderingSummary 为准" in SYSTEM_PROMPT_CORE
         and "不得自行编造或承诺具体权重数值" in SYSTEM_PROMPT_CORE,

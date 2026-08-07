@@ -1,0 +1,666 @@
+"""Local stack orchestration, real QQ entry-point harness, and fixture API."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import secrets
+import subprocess
+import time
+from contextvars import ContextVar
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import quote
+
+import httpx
+
+from .recording import ArtifactRecorder
+from .safety import (
+    RESERVED_BINDING_PREFIX,
+    RESERVED_EMAIL_SUFFIX,
+    SafetyViolation,
+    validate_keytao_base,
+    validate_test_binding,
+)
+
+
+class RigInfrastructureError(RuntimeError):
+    """Raised when the local stack or fixture contract is unavailable."""
+
+
+class NextServer:
+    def __init__(
+        self,
+        *,
+        next_dir: Path,
+        base_url: str,
+        artifact_dir: Path,
+        start_timeout: float,
+        child_env: dict[str, str],
+    ) -> None:
+        self.next_dir = next_dir
+        self.base_url = validate_keytao_base(base_url)
+        self.artifact_dir = artifact_dir
+        self.start_timeout = start_timeout
+        self.child_env = child_env
+        self.process: Optional[subprocess.Popen[str]] = None
+        self.log_handle: Any = None
+        self.reused_existing = False
+
+    async def _probe(self) -> bool:
+        try:
+            async with httpx.AsyncClient(timeout=2.0, follow_redirects=False) as client:
+                response = await client.get(
+                    f"{self.base_url}/api/phrases/by-word",
+                    params={"word": "赤溪", "page": 1},
+                )
+            if response.status_code != 200:
+                return False
+            payload = response.json()
+            return isinstance(payload.get("phrases"), list) and isinstance(
+                payload.get("pagination"), dict
+            )
+        except (httpx.HTTPError, ValueError, TypeError):
+            return False
+
+    async def ensure_running(self) -> None:
+        if await self._probe():
+            self.reused_existing = True
+            return
+        next_binary = self.next_dir / "node_modules" / ".bin" / "next"
+        if not next_binary.is_file():
+            raise RigInfrastructureError(
+                "keytao-next dependencies are not installed; local next binary is missing"
+            )
+        log_path = self.artifact_dir / "keytao-next.log"
+        self.log_handle = log_path.open("w", encoding="utf-8")
+        command = [
+            str(next_binary),
+            "dev",
+            "--webpack",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            self.base_url.rsplit(":", 1)[-1],
+        ]
+        self.process = subprocess.Popen(
+            command,
+            cwd=self.next_dir,
+            env=self.child_env,
+            stdout=self.log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + self.start_timeout
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                self.log_handle.flush()
+                tail = (self.artifact_dir / "keytao-next.log").read_text(
+                    encoding="utf-8", errors="replace"
+                )[-4000:]
+                raise RigInfrastructureError(
+                    f"keytao-next exited during startup ({self.process.returncode}):\n{tail}"
+                )
+            if await self._probe():
+                return
+            await asyncio.sleep(0.5)
+        raise RigInfrastructureError(
+            f"keytao-next did not become ready within {self.start_timeout:.0f}s"
+        )
+
+    async def stop(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                await asyncio.to_thread(self.process.wait, 10)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                await asyncio.to_thread(self.process.wait, 5)
+        if self.log_handle is not None:
+            self.log_handle.close()
+            self.log_handle = None
+
+
+class LocalNextClient:
+    def __init__(self, *, base_url: str, bot_token: str) -> None:
+        self.base_url = validate_keytao_base(base_url)
+        self.bot_token = bot_token
+
+    @property
+    def headers(self) -> dict[str, str]:
+        return {"X-Bot-Token": self.bot_token}
+
+    async def _json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        body: Optional[dict[str, Any]] = None,
+        allowed_status: tuple[int, ...] = (200,),
+        authenticated: bool = True,
+    ) -> tuple[int, dict[str, Any]]:
+        headers = dict(self.headers) if authenticated else {}
+        async with httpx.AsyncClient(timeout=90.0, follow_redirects=False) as client:
+            response = await client.request(
+                method,
+                f"{self.base_url}{path}",
+                params=params,
+                json=body,
+                headers=headers,
+            )
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise RigInfrastructureError(
+                f"Local next returned non-JSON for {method} {path}: HTTP {response.status_code}"
+            ) from error
+        if response.status_code not in allowed_status:
+            raise RigInfrastructureError(
+                f"Local next rejected {method} {path}: HTTP {response.status_code} {payload}"
+            )
+        if not isinstance(payload, dict):
+            raise RigInfrastructureError(f"Local next returned a non-object for {method} {path}")
+        return response.status_code, payload
+
+    async def find_user(self, platform_id: str) -> Optional[dict[str, Any]]:
+        status, payload = await self._json(
+            "POST",
+            "/api/bot/user/find",
+            body={"platform": "qq", "platformId": platform_id},
+            allowed_status=(200, 404),
+        )
+        if status == 404:
+            return None
+        if payload.get("found") is not True or not isinstance(payload.get("user"), dict):
+            raise RigInfrastructureError("The reserved QQ binding returned an invalid user payload")
+        return payload["user"]
+
+    async def get_draft(self, platform_id: str) -> dict[str, Any]:
+        _status, payload = await self._json(
+            "GET",
+            "/api/bot/batches/latest-draft/items",
+            params={"platform": "qq", "platformId": platform_id},
+        )
+        if payload.get("success") is not True or not isinstance(payload.get("items"), list):
+            raise RigInfrastructureError(f"Could not read E2E draft: {payload}")
+        return payload
+
+    async def clean_draft(self, platform_id: str) -> dict[str, Any]:
+        snapshot = await self.get_draft(platform_id)
+        items = snapshot.get("items", [])
+        if not items:
+            return {"success": True, "deleted": 0, "batchId": snapshot.get("batchId")}
+        batch_id = snapshot.get("batchId")
+        content_version = snapshot.get("contentVersion")
+        if not isinstance(batch_id, str) or not isinstance(content_version, int):
+            raise RigInfrastructureError("Draft cleanup lacks a concrete batch/version")
+        targets = [
+            {
+                "id": int(item["id"]),
+                "word": str(item.get("word") or ""),
+                "code": str(item.get("code") or ""),
+                "action": str(item.get("action") or ""),
+                "type": str(item.get("type") or "Phrase"),
+            }
+            for item in items
+        ]
+        _status, result = await self._json(
+            "DELETE",
+            "/api/bot/pull-requests/batch-draft",
+            body={
+                "platform": "qq",
+                "platformId": platform_id,
+                "ids": [item["id"] for item in targets],
+                "batchId": batch_id,
+                "expectedContentVersion": content_version,
+                "expectedTargets": targets,
+            },
+            allowed_status=(200, 409),
+        )
+        if result.get("success") is not True:
+            raise RigInfrastructureError(f"Draft cleanup failed closed: {result}")
+        final = await self.get_draft(platform_id)
+        if final.get("items"):
+            raise RigInfrastructureError("Draft cleanup returned success but items remain")
+        return {"success": True, "deleted": len(targets), "batchId": batch_id}
+
+    async def phrases_by_word(self, word: str) -> list[dict[str, Any]]:
+        _status, payload = await self._json(
+            "GET",
+            "/api/phrases/by-word",
+            params={"word": word, "page": 1},
+            authenticated=False,
+        )
+        values = payload.get("phrases")
+        if not isinstance(values, list):
+            raise RigInfrastructureError("by-word response has no phrase list")
+        return [item for item in values if isinstance(item, dict)]
+
+    async def phrases_by_code(self, code: str) -> list[dict[str, Any]]:
+        _status, payload = await self._json(
+            "GET",
+            "/api/phrases/by-code",
+            params={"code": code, "page": 1},
+            authenticated=False,
+        )
+        values = payload.get("phrases")
+        if not isinstance(values, list):
+            raise RigInfrastructureError("by-code response has no phrase list")
+        return [item for item in values if isinstance(item, dict)]
+
+    async def encode(self, word: str) -> dict[str, Any]:
+        _status, payload = await self._json(
+            "GET",
+            "/api/phrases/encode",
+            params={"word": word},
+            authenticated=False,
+        )
+        return payload
+
+    async def seed_phrase(
+        self,
+        *,
+        platform_id: str,
+        word: str,
+        code: str,
+        phrase_type: str = "Phrase",
+    ) -> dict[str, Any]:
+        current = await self.get_draft(platform_id)
+        item = {
+            "action": "Create",
+            "word": word,
+            "code": code,
+            "type": phrase_type,
+            "needsManualReview": False,
+            "remark": "E2E local fixture",
+        }
+        _status, preview = await self._json(
+            "POST",
+            "/api/bot/pull-requests/batch-draft",
+            body={
+                "platform": "qq",
+                "platformId": platform_id,
+                "batchId": current.get("batchId"),
+                "confirmed": False,
+                "previewOnly": True,
+                "items": [item],
+            },
+            allowed_status=(200, 400),
+        )
+        if preview.get("requiresConfirmation") is not True:
+            raise RigInfrastructureError(f"Seed add did not return a preview ticket: {preview}")
+        batch_id = preview.get("batchId")
+        version = preview.get("contentVersion")
+        warning_digest = preview.get("warningDigest")
+        if not isinstance(batch_id, str) or not isinstance(version, int) or not isinstance(
+            warning_digest, str
+        ):
+            raise RigInfrastructureError("Seed add preview is missing its CAS fields")
+        _status, added = await self._json(
+            "POST",
+            "/api/bot/pull-requests/batch-draft",
+            body={
+                "platform": "qq",
+                "platformId": platform_id,
+                "batchId": batch_id,
+                "confirmed": True,
+                "previewOnly": False,
+                "expectedContentVersion": version,
+                "expectedWarningDigest": warning_digest,
+                "items": [item],
+            },
+        )
+        if added.get("successCount") != 1:
+            raise RigInfrastructureError(f"Seed add did not write exactly one draft item: {added}")
+        draft_version = added.get("contentVersion")
+        if not isinstance(draft_version, int):
+            draft_version = (await self.get_draft(platform_id)).get("contentVersion")
+        _status, submit_preview = await self._json(
+            "POST",
+            f"/api/bot/batches/{quote(batch_id, safe='')}/submit",
+            body={
+                "platform": "qq",
+                "platformId": platform_id,
+                "confirmed": False,
+                "previewOnly": True,
+                "expectedContentVersion": draft_version,
+            },
+            allowed_status=(200, 400),
+        )
+        if submit_preview.get("requiresConfirmation") is not True:
+            raise RigInfrastructureError(f"Seed submit did not return a preview ticket: {submit_preview}")
+        _status, submitted = await self._json(
+            "POST",
+            f"/api/bot/batches/{quote(batch_id, safe='')}/submit",
+            body={
+                "platform": "qq",
+                "platformId": platform_id,
+                "confirmed": True,
+                "previewOnly": False,
+                "expectedContentVersion": submit_preview["contentVersion"],
+                "expectedWarningDigest": submit_preview["warningDigest"],
+                "expectedSnapshotDigest": submit_preview["snapshotDigest"],
+            },
+        )
+        if submitted.get("success") is not True:
+            raise RigInfrastructureError(f"Seed submit failed: {submitted}")
+        submitted_version = submitted.get("batch", {}).get("contentVersion")
+        _status, approved = await self._json(
+            "POST",
+            f"/api/bot/batches/{quote(batch_id, safe='')}/auto-approve",
+            body={
+                "platform": "qq",
+                "platformId": platform_id,
+                "reviewNote": "E2E local fixture approval",
+                "expectedContentVersion": submitted_version,
+            },
+            allowed_status=(200, 400, 409, 422),
+        )
+        if approved.get("success") is not True:
+            raise RigInfrastructureError(f"Seed auto-approval failed: {approved}")
+        return {"batchId": batch_id, "submitted": submitted, "approved": approved}
+
+
+def synthetic_qq_id(run_id: str, label: str) -> str:
+    digest = hashlib.sha256(f"{run_id}:{label}".encode("utf-8")).hexdigest()
+    digits = str(int(digest, 16)).zfill(78)
+    return "9" + digits[:31]
+
+
+def test_identity(run_id: str, label: str) -> dict[str, str]:
+    normalized = label.lower().replace("_", "-")
+    name = f"{RESERVED_BINDING_PREFIX}{run_id[:8]}-{normalized}"
+    return {
+        "platform_id": synthetic_qq_id(run_id, label),
+        "name": name,
+        "email": f"{name}{RESERVED_EMAIL_SUFFIX}",
+    }
+
+
+async def provision_test_user(
+    *,
+    client: LocalNextClient,
+    next_dir: Path,
+    next_env: dict[str, str],
+    identity: dict[str, str],
+) -> dict[str, Any]:
+    existing = await client.find_user(identity["platform_id"])
+    if existing is not None:
+        validate_test_binding(
+            platform_id=identity["platform_id"],
+            expected_name=identity["name"],
+            expected_email=identity["email"],
+            user=existing,
+        )
+        return existing
+    tsx_binary = next_dir / "node_modules" / ".bin" / "tsx"
+    if not tsx_binary.is_file():
+        raise RigInfrastructureError(
+            "keytao-next dependencies are not installed; local tsx binary is missing"
+        )
+    command = [str(tsx_binary), "scripts/initBotUser.ts"]
+    child_env = dict(next_env)
+    child_env.update(
+        {
+            "BOT_USER_NAME": identity["name"],
+            "BOT_USER_EMAIL": identity["email"],
+            "BOT_USER_PASSWORD": secrets.token_urlsafe(32),
+            "BOT_QQ_ID": identity["platform_id"],
+        }
+    )
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        command,
+        cwd=next_dir,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RigInfrastructureError(
+            "keytao-next initBotUser.ts failed for a reserved E2E identity:\n"
+            + completed.stdout[-2000:]
+            + completed.stderr[-2000:]
+        )
+    created = await client.find_user(identity["platform_id"])
+    if created is None:
+        raise RigInfrastructureError("initBotUser.ts completed but the binding is absent")
+    validate_test_binding(
+        platform_id=identity["platform_id"],
+        expected_name=identity["name"],
+        expected_email=identity["email"],
+        user=created,
+    )
+    return created
+
+
+class E2EBotHarness:
+    """Fake only OneBot input/output while invoking the real QQ handler."""
+
+    def __init__(
+        self,
+        *,
+        openai_chat: Any,
+        recorder: ArtifactRecorder,
+        state_dir: Path,
+        message_timeout: float,
+    ) -> None:
+        from nonebot.adapters.onebot.v11 import Bot as QQBot
+
+        harness = self
+
+        class BoundaryBot(QQBot):
+            async def send(self, event: Any, message: Any, **_kwargs: Any) -> Any:
+                extract = getattr(message, "extract_plain_text", None)
+                text = str(extract() if callable(extract) else message).strip()
+                platform_id = str(getattr(event, "user_id", ""))
+                harness.recorder.record_message(
+                    direction="reply",
+                    text=text,
+                    platform_id=platform_id,
+                )
+                harness.replies.append(text)
+                harness.reply_event.set()
+                return None
+
+        self.openai_chat = openai_chat
+        self.recorder = recorder
+        self.message_timeout = message_timeout
+        self.bot = BoundaryBot(adapter=None, self_id="99999999999999999999999999999999")
+        self.replies: list[str] = []
+        self.reply_event = asyncio.Event()
+        self._current_event: ContextVar[Any] = ContextVar("e2e_current_event", default=None)
+        self._original_finish = openai_chat.ai_chat.finish
+        self._tool_patches: list[tuple[Any, str, Any]] = []
+        self._assert_isolated_state(state_dir)
+        self._install_boundary_finish()
+        self._install_tool_tracing()
+
+    def _assert_isolated_state(self, state_dir: Path) -> None:
+        from keytao_bot.utils import draft_mutation_store
+
+        expected_paths = {
+            "history": (state_dir / "history.db").resolve(),
+            "memory": (state_dir / "memory.db").resolve(),
+            "draft mutations": (state_dir / "draft-mutation-claims.db").resolve(),
+        }
+        actual_paths = {
+            "history": Path(self.openai_chat.history_store.db_path).resolve(),
+            "memory": Path(self.openai_chat.memory_store.db_path).resolve(),
+            "draft mutations": Path(draft_mutation_store._DEFAULT_STORE.db_path).resolve()
+            if draft_mutation_store._DEFAULT_STORE is not None
+            else None,
+        }
+        if actual_paths != expected_paths:
+            raise SafetyViolation(
+                f"Conversation state is not isolated to the run artifact: {actual_paths}"
+            )
+
+    def _install_boundary_finish(self) -> None:
+        harness = self
+
+        async def finish(message: Any = None, **_kwargs: Any) -> None:
+            event = harness._current_event.get()
+            if event is None:
+                raise RigInfrastructureError("Matcher.finish was called outside an E2E message")
+            await harness.bot.send(event=event, message=message or "")
+
+        self.openai_chat.ai_chat.finish = finish
+
+    def _set_tool_patch(self, target: Any, name: str, replacement: Any) -> None:
+        self._tool_patches.append((target, name, getattr(target, name)))
+        setattr(target, name, replacement)
+
+    def _install_tool_tracing(self) -> None:
+        from keytao_bot.harness.tools import ToolExecutor
+
+        recorder = self.recorder
+        original_call = ToolExecutor.call
+        original_replay = ToolExecutor.replay_shift_plan
+
+        async def call(
+            executor: Any,
+            tool_name: str,
+            arguments: dict[str, Any],
+            context: Any,
+        ) -> str:
+            started = time.monotonic()
+            try:
+                result = await original_call(executor, tool_name, arguments, context)
+            except BaseException as error:
+                recorder.record_tool(
+                    phase="model-dispatch",
+                    name=tool_name,
+                    arguments=dict(arguments),
+                    result={"raised": type(error).__name__, "message": str(error)},
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                raise
+            recorder.record_tool(
+                phase="model-dispatch",
+                name=tool_name,
+                arguments=dict(arguments),
+                result=result,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            return result
+
+        async def replay(
+            executor: Any,
+            authorization_tool_name: str,
+            authorization_arguments: dict[str, Any],
+            binding: dict[str, Any],
+            context: Any,
+        ) -> Any:
+            started = time.monotonic()
+            try:
+                result = await original_replay(
+                    executor,
+                    authorization_tool_name,
+                    authorization_arguments,
+                    binding,
+                    context,
+                )
+            except BaseException as error:
+                recorder.record_tool(
+                    phase="server-ticket-replay",
+                    name=authorization_tool_name,
+                    arguments={**authorization_arguments, **binding},
+                    result={"raised": type(error).__name__, "message": str(error)},
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                raise
+            recorder.record_tool(
+                phase="server-ticket-replay",
+                name=authorization_tool_name,
+                arguments={**authorization_arguments, **binding},
+                result=result[0] if isinstance(result, tuple) else result,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            return result
+
+        self._set_tool_patch(ToolExecutor, "call", call)
+        self._set_tool_patch(ToolExecutor, "replay_shift_plan", replay)
+
+    async def reset_conversation(self, *, platform_id: str) -> None:
+        from keytao_bot.harness.conversation import ConversationAddress
+        from keytao_bot.utils.memory_store import ChatMemoryContext
+
+        address = ConversationAddress.private("qq", platform_id)
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id=platform_id,
+            space_type="private",
+            space_id=platform_id,
+        )
+        await self.openai_chat._clear_conversation_state(address, memory_context)
+
+    async def send(self, *, platform_id: str, sender_name: str, text: str) -> str:
+        from nonebot.adapters.onebot.v11 import Message
+        from nonebot.adapters.onebot.v11.event import PrivateMessageEvent
+
+        message = Message(text)
+        event = PrivateMessageEvent(
+            time=int(time.time()),
+            self_id=int(self.bot.self_id),
+            post_type="message",
+            sub_type="friend",
+            user_id=int(platform_id),
+            message_type="private",
+            message_id=int(time.time_ns() % 2_000_000_000),
+            message=message,
+            original_message=message,
+            raw_message=text,
+            font=0,
+            sender={"user_id": int(platform_id), "nickname": sender_name, "card": ""},
+            to_me=True,
+        )
+        if not await self.openai_chat.should_handle(self.bot, event):
+            raise RigInfrastructureError("The real QQ rule rejected the synthetic private message")
+        self.recorder.record_message(
+            direction="input",
+            text=text,
+            platform_id=platform_id,
+        )
+        reply_index = len(self.replies)
+        self.reply_event.clear()
+        token = self._current_event.set(event)
+        try:
+            await asyncio.wait_for(
+                self.openai_chat.handle_ai_chat(self.bot, event),
+                timeout=self.message_timeout,
+            )
+            if len(self.replies) == reply_index:
+                await asyncio.wait_for(self.reply_event.wait(), timeout=self.message_timeout)
+        finally:
+            self._current_event.reset(token)
+        if len(self.replies) == reply_index:
+            raise RigInfrastructureError("The real QQ handler completed without a reply")
+        return self.replies[-1]
+
+    async def close(self) -> None:
+        await self.openai_chat._shutdown_background_draft_tasks()
+        self.openai_chat.ai_chat.finish = self._original_finish
+        while self._tool_patches:
+            target, name, original = self._tool_patches.pop()
+            setattr(target, name, original)
+
+
+def assert_runtime_configuration(openai_chat: Any, *, keytao_base: str, llm: dict[str, str]) -> None:
+    from keytao_bot.utils import http_client
+
+    actual_keytao = validate_keytao_base(http_client.get_keytao_url())
+    if actual_keytao != validate_keytao_base(keytao_base):
+        raise SafetyViolation(f"Runtime KEYTAO_API_BASE drifted to {actual_keytao}")
+    actual_llm = str(openai_chat.OPENAI_BASE_URL).rstrip("/") + "/"
+    expected_llm = str(llm["base_url"]).rstrip("/") + "/"
+    if actual_llm != expected_llm:
+        raise SafetyViolation("Runtime LLM base URL does not match the preflighted endpoint")
+    if str(openai_chat.OPENAI_MODEL) != llm["model"]:
+        raise SafetyViolation("Runtime LLM model does not match E2E configuration")
+    if not openai_chat.OPENAI_API_KEY:
+        raise SafetyViolation("Runtime real LLM API key is missing")

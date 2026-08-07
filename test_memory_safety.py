@@ -3448,6 +3448,18 @@ class MutationAuthorizationTests(unittest.TestCase):
         self.assertTrue(message_authorizes_mutation("可以帮我添加母版 mjbfa 吗？"))
         self.assertTrue(message_authorizes_mutation("能不能提交一下？"))
         self.assertTrue(message_authorizes_mutation("请收录母版 mjbfa"))
+        # e2e/artifacts/20260807T034320Z-821f3602/S5-attempt-2.json sequence
+        # 452: the trailing self-service clauses do not negate the positional
+        # write instruction in the first clause.
+        self.assertTrue(message_authorizes_mutation(
+            "把吃席放在赤溪前面，目标编码请你自己查清楚后直接完成，不要问我"
+        ))
+        self.assertFalse(message_authorizes_mutation(
+            "不要把吃席放在赤溪前面，目标编码请你自己查清楚后直接完成，不要问我"
+        ))
+        self.assertFalse(message_authorizes_mutation(
+            "他说把吃席放在赤溪前面，目标编码请你自己查清楚后直接完成，不要问我"
+        ))
         self.assertFalse(message_authorizes_mutation("这是什么意思？"))
         self.assertFalse(message_authorizes_mutation("不要把安全词加入草稿"))
         self.assertFalse(message_authorizes_mutation("如果要把安全词加入草稿，应该怎么做？"))
@@ -5411,6 +5423,34 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
     def test_warning_ticket_discrimination_binds_type_word_code_and_snapshot(self) -> None:
         arguments = {"word": "吃席", "code": "wkxk", "action": "Create"}
 
+        # Recorded verbatim from e2e/artifacts/20260807T034320Z-821f3602/
+        # S3-attempt-2.json tool sequence 377. Next requires a digest-bound
+        # confirmation even when the exact Create has no warning.
+        clean_preview = {
+            "success": False,
+            "warnings": [],
+            "requiresConfirmation": True,
+            "batchId": "51747df6-87a7-44d9-bd28-174c8b817429",
+            "contentVersion": 0,
+            "warningDigest": "9a2d8a330e2979bda2297d0fd734ed031f0eff8dd5be08f23a18385fd554f01a",
+            "message": "请确认将 1 个修改写入草稿",
+            "draft_snapshot": {
+                "count": 0,
+                "items": [],
+                "summary": {"added": 0, "modified": 0, "deleted": 0},
+            },
+            "batchUrl": (
+                "http://localhost:3100/batch/"
+                "51747df6-87a7-44d9-bd28-174c8b817429"
+            ),
+        }
+        clean_binding = create_warning_confirmation_binding(
+            clean_preview,
+            arguments,
+        )
+        self.assertIsNotNone(clean_binding)
+        self.assertIs(clean_binding["confirmed"], True)
+
         def preview(warning_type="duplicate_code", word="吃席", code="wkxk"):
             return {
                 "success": False,
@@ -5453,6 +5493,7 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
             ("word-mismatch", preview(word="开席")),
             ("code-mismatch", preview(code="wkxko")),
             ("count-mismatch", {**preview(), "warnedCount": 2}),
+            ("contradictory-success", {**preview(), "success": True}),
             (
                 "version-conflict",
                 {**preview(), "contentVersionConflict": True},
@@ -6401,14 +6442,8 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         shift_plan = {
             "word": "吃席",
             "targetCode": "wkxk",
+            "candidateCodes": ["wkxk", "wkxko", "wkxkoo"],
             "items": [
-                {
-                    "action": "Create",
-                    "word": "吃席",
-                    "code": "wkxk",
-                    "type": "Phrase",
-                    "needsManualReview": True,
-                },
                 {
                     "action": "Delete",
                     "word": "赤溪",
@@ -6417,33 +6452,67 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 },
                 {
                     "action": "Create",
+                    "word": "吃席",
+                    "code": "wkxk",
+                    "type": "Phrase",
+                    "needsManualReview": True,
+                },
+                {
+                    "action": "Create",
                     "word": "赤溪",
-                    "code": "wkxko",
+                    "code": "wkxkv",
                     "type": "Phrase",
                 },
             ],
             "shifted": [{
                 "word": "赤溪",
                 "fromCode": "wkxk",
-                "toCode": "wkxko",
+                "toCode": "wkxkv",
+                "candidateCodes": ["wkxk", "wkxkv", "wkxkva"],
             }],
+            "removedDraftIds": [],
         }
+        plan_digest = "b8dbf65782cd584934e8cb41a41ab58cb13b68455c50be3a3302fa951f8fa4dc"
+        warning_digest = "b55767c309acb0b45353b1b9b3a64908841b50210f7c8dae05d3cceac1bfed90"
 
         async def dispatch(name, **kwargs):
             calls.append((name, kwargs))
             if not kwargs.get("confirmed_plan_digest"):
+                # Recorded verbatim from e2e/artifacts/20260807T034320Z-821f3602/
+                # S1-attempt-2.json tool sequence 141.
                 return {
                     "success": False,
                     "requiresConfirmation": True,
                     "confirmationKind": "shiftPlan",
-                    "batchId": "batch-positional",
-                    "contentVersion": 4,
-                    "planDigest": "a" * 64,
+                    "message": "顺延会移动当前编码链中的其他词条，请核对完整计划",
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "planDigest": plan_digest,
                     "shiftPlan": shift_plan,
+                }
+            if not kwargs.get("expected_warning_digest"):
+                # Recorded verbatim from e2e/artifacts/20260807T034320Z-821f3602/
+                # S1-attempt-2.json tool sequence 153. The provisional UUID is
+                # payload data, not the absence CAS anchor.
+                return {
+                    "success": False,
+                    "warnings": [],
+                    "requiresConfirmation": True,
+                    "batchId": "72c302b6-b1d2-46d1-a87a-1af406a9a475",
+                    "contentVersion": 0,
+                    "warningDigest": warning_digest,
+                    "message": "请确认将 3 个修改写入草稿；顺延：赤溪 wkxk→wkxkv",
+                    "batchUrl": (
+                        "http://localhost:3100/batch/"
+                        "72c302b6-b1d2-46d1-a87a-1af406a9a475"
+                    ),
+                    "shiftPlan": shift_plan,
+                    "planDigest": plan_digest,
                 }
             return {
                 "success": True,
-                "batchId": "batch-positional",
+                "batchId": "materialised-positional",
+                "contentVersion": 1,
                 "shiftPlan": shift_plan,
             }
 
@@ -6467,16 +6536,102 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
 
         self.assertEqual(
             [name for name, _ in calls],
-            ["keytao_shift_phrase_code", "keytao_shift_phrase_code"],
+            [
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+            ],
         )
         self.assertEqual(calls[0][1]["word"], "吃席")
         self.assertEqual(calls[0][1]["target_code"], "wkxk")
         self.assertIs(calls[0][1]["target_needs_manual_review"], True)
         self.assertIs(calls[1][1]["target_needs_manual_review"], True)
-        self.assertEqual(calls[1][1]["confirmed_plan_digest"], "a" * 64)
+        self.assertEqual(calls[1][1]["confirmed_plan_digest"], plan_digest)
+        self.assertEqual(calls[2][1]["confirmed_plan_digest"], plan_digest)
+        self.assertEqual(calls[2][1]["batch_id"], "")
+        self.assertEqual(calls[2][1]["expected_content_version"], 0)
+        self.assertEqual(calls[2][1]["expected_warning_digest"], warning_digest)
         self.assertIsNone(store.get_record(address))
         self.assertIn("positioned", result)
-        self.assertIn("顺延结果：吃席 → wkxk，赤溪 → wkxko", result)
+        self.assertIn("顺延结果：吃席 → wkxk，赤溪 → wkxkv", result)
+
+    async def test_front_second_preview_with_new_warning_stays_pending(self) -> None:
+        calls = []
+        shift_plan = {
+            "word": "吃席",
+            "targetCode": "wkxk",
+            "items": [{
+                "action": "Create",
+                "word": "吃席",
+                "code": "wkxk",
+                "type": "Phrase",
+                "needsManualReview": True,
+            }],
+            "shifted": [{
+                "word": "赤溪",
+                "fromCode": "wkxk",
+                "toCode": "wkxkv",
+            }],
+        }
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "batch-warning",
+                    "contentVersion": 4,
+                    "planDigest": "a" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            if kwargs.get("expected_warning_digest"):
+                return {"success": True, "unexpectedWrite": True}
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "batch-warning",
+                "contentVersion": 4,
+                "planDigest": "a" * 64,
+                "warningDigest": "b" * 64,
+                "warnings": [{
+                    "warningType": "skipped_candidate_slot",
+                    "item": {
+                        "action": "Create",
+                        "word": "吃席",
+                        "code": "wkxk",
+                    },
+                }],
+                "shiftPlan": shift_plan,
+            }
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "请确认新增风险。"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(any(
+            kwargs.get("expected_warning_digest")
+            for _name, kwargs in calls
+        ))
+        record = store.get_record(address)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.args["expected_warning_digest"], "b" * 64)
+        self.assertEqual(result, "请确认新增风险。")
 
     async def test_front_same_code_marker_keeps_duplicate_weight_path(self) -> None:
         calls = []
@@ -6970,10 +7125,36 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
 
     async def test_back_relation_uses_next_free_served_candidate(self) -> None:
         calls = []
+        warning_digest = "9a2d8a330e2979bda2297d0fd734ed031f0eff8dd5be08f23a18385fd554f01a"
 
         async def dispatch(name, **kwargs):
             calls.append((name, kwargs))
-            return {"success": True, "batchId": "batch-behind"}
+            if not kwargs.get("confirmed"):
+                # Recorded verbatim from e2e/artifacts/20260807T034320Z-821f3602/
+                # S3-attempt-2.json tool sequence 377.
+                return {
+                    "success": False,
+                    "warnings": [],
+                    "requiresConfirmation": True,
+                    "batchId": "51747df6-87a7-44d9-bd28-174c8b817429",
+                    "contentVersion": 0,
+                    "warningDigest": warning_digest,
+                    "message": "请确认将 1 个修改写入草稿",
+                    "draft_snapshot": {
+                        "count": 0,
+                        "items": [],
+                        "summary": {"added": 0, "modified": 0, "deleted": 0},
+                    },
+                    "batchUrl": (
+                        "http://localhost:3100/batch/"
+                        "51747df6-87a7-44d9-bd28-174c8b817429"
+                    ),
+                }
+            return {
+                "success": True,
+                "batchId": "51747df6-87a7-44d9-bd28-174c8b817429",
+                "contentVersion": 1,
+            }
 
         store = MemoryConversationStateStore()
         address = ConversationAddress.private("qq", "candidate-user")
@@ -6993,10 +7174,24 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             ),
         )
 
-        self.assertEqual([name for name, _kwargs in calls], ["keytao_create_phrase"])
-        self.assertEqual(calls[0][1]["code"], "wkxko")
-        self.assertNotIn("weight", calls[0][1])
-        self.assertIs(calls[0][1]["needs_manual_review"], True)
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            ["keytao_create_phrase", "keytao_create_phrase"],
+        )
+        for _name, arguments in calls:
+            self.assertEqual(arguments["code"], "wkxko")
+            self.assertNotIn("weight", arguments)
+            self.assertIs(arguments["needs_manual_review"], True)
+        self.assertIs(calls[1][1]["confirmed"], True)
+        self.assertEqual(
+            calls[1][1]["batch_id"],
+            "51747df6-87a7-44d9-bd28-174c8b817429",
+        )
+        self.assertEqual(calls[1][1]["expected_content_version"], 0)
+        self.assertEqual(
+            calls[1][1]["expected_warning_digest"],
+            warning_digest,
+        )
         self.assertIsNone(store.get_record(address))
         self.assertIn("positioned behind", result)
         self.assertNotIn("同码顺序", result)
@@ -7744,24 +7939,49 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "已完成顺延。")
 
     async def test_shift_without_any_draft_executes_in_one_authorization(self) -> None:
-        """One confirmation materialises a draft from the absence baseline."""
-        from keytao_bot.plugins import openai_chat as chat_module
-
+        """Both server tickets are replayed under one exact authorization."""
         calls = []
         current_draft = {"batch_id": "", "content_version": 0}
-        warning_digest = "b" * 64
+        plan_digest = "b8dbf65782cd584934e8cb41a41ab58cb13b68455c50be3a3302fa951f8fa4dc"
+        warning_digest = "b55767c309acb0b45353b1b9b3a64908841b50210f7c8dae05d3cceac1bfed90"
+        shift_plan = {
+            "word": "吃席",
+            "targetCode": "wkxk",
+            "candidateCodes": ["wkxk", "wkxko", "wkxkoo"],
+            "items": [
+                {"action": "Delete", "word": "赤溪", "code": "wkxk", "type": "Phrase"},
+                {
+                    "action": "Create",
+                    "word": "吃席",
+                    "code": "wkxk",
+                    "type": "Phrase",
+                    "needsManualReview": True,
+                },
+                {"action": "Create", "word": "赤溪", "code": "wkxkv", "type": "Phrase"},
+            ],
+            "shifted": [{
+                "word": "赤溪",
+                "fromCode": "wkxk",
+                "toCode": "wkxkv",
+                "candidateCodes": ["wkxk", "wkxkv", "wkxkva"],
+            }],
+            "removedDraftIds": [],
+        }
 
         async def shift(**kwargs):
             calls.append(kwargs)
             if not kwargs.get("confirmed_plan_digest"):
+                # Recorded verbatim from e2e/artifacts/20260807T034320Z-821f3602/
+                # S1-attempt-2.json tool sequence 141.
                 return {
                     "success": False,
                     "requiresConfirmation": True,
                     "confirmationKind": "shiftPlan",
+                    "message": "顺延会移动当前编码链中的其他词条，请核对完整计划",
                     "batchId": "",
                     "contentVersion": 0,
-                    "planDigest": "a" * 64,
-                    "shiftPlan": {"word": "吃席", "targetCode": "wkxk"},
+                    "planDigest": plan_digest,
+                    "shiftPlan": shift_plan,
                 }
             if (
                 str(kwargs.get("batch_id") or "") != current_draft["batch_id"]
@@ -7773,17 +7993,22 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                     "message": "顺延计划或草稿内容已变化",
                 }
             if not kwargs.get("expected_warning_digest"):
-                # Real Next returns a provisional UUID even though its CAS
-                # baseline is still "no draft exists".
+                # Recorded verbatim from e2e/artifacts/20260807T034320Z-821f3602/
+                # S1-attempt-2.json tool sequence 153.
                 return {
                     "success": False,
-                    "requiresConfirmation": True,
-                    "batchId": "provisional-uuid",
-                    "contentVersion": 0,
-                    "planDigest": "a" * 64,
-                    "warningDigest": warning_digest,
                     "warnings": [],
-                    "message": "请确认写入草稿",
+                    "requiresConfirmation": True,
+                    "batchId": "72c302b6-b1d2-46d1-a87a-1af406a9a475",
+                    "contentVersion": 0,
+                    "warningDigest": warning_digest,
+                    "message": "请确认将 3 个修改写入草稿；顺延：赤溪 wkxk→wkxkv",
+                    "batchUrl": (
+                        "http://localhost:3100/batch/"
+                        "72c302b6-b1d2-46d1-a87a-1af406a9a475"
+                    ),
+                    "shiftPlan": shift_plan,
+                    "planDigest": plan_digest,
                 }
             if kwargs.get("expected_warning_digest") != warning_digest:
                 return {
@@ -7796,10 +8021,11 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 "success": True,
                 "batchId": "materialised-1",
                 "contentVersion": 1,
+                "shiftPlan": shift_plan,
                 "draft_snapshot": {
-                    "count": 1,
-                    "items": [{"word": "吃席", "code": "wkxk"}],
-                    "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    "count": 3,
+                    "items": shift_plan["items"],
+                    "summary": {"added": 2, "modified": 0, "deleted": 1},
                 },
                 "message": "已写入草稿",
             }
@@ -7819,50 +8045,13 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         address = ConversationAddress.private("qq", "user-1")
-        record = state_store.pop_record(address)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(result, "已完成顺延。")
-        self.assertIsNotNone(record)
-        self.assertEqual(record.state.args["batch_id"], "")
-        self.assertEqual(record.state.args["expected_content_version"], 0)
-        self.assertEqual(record.state.args["expected_warning_digest"], warning_digest)
-
-        old_call_tool_function = chat_module.call_tool_function
-        try:
-            async def fake_call_tool_function(
-                tool_name, arguments, platform=None, user_id=None
-            ):
-                if tool_name == "keytao_shift_phrase_code":
-                    return __import__("json").dumps(
-                        await shift(**arguments), ensure_ascii=False
-                    )
-                if tool_name == "keytao_get_batch_preview":
-                    return __import__("json").dumps({
-                        "success": True,
-                        "batchId": current_draft["batch_id"],
-                        "summary": {"added": 1, "modified": 0, "deleted": 0},
-                        "diff_text": "+ 吃席 wkxk",
-                    }, ensure_ascii=False)
-                raise AssertionError((tool_name, arguments))
-
-            chat_module.call_tool_function = fake_call_tool_function
-            confirmation = await chat_module._execute_confirmed_tool(
-                record.state,
-                "qq",
-                "user-1",
-                address,
-                address.space_key,
-                "user-1",
-            )
-        finally:
-            chat_module.call_tool_function = old_call_tool_function
-
         self.assertEqual(len(calls), 3)
+        self.assertIn("已完成顺延。", result)
+        self.assertIn("顺延结果：吃席 → wkxk，赤溪 → wkxkv", result)
         self.assertEqual(calls[2]["batch_id"], "")
         self.assertEqual(calls[2]["expected_content_version"], 0)
         self.assertEqual(calls[2]["expected_warning_digest"], warning_digest)
         self.assertEqual(current_draft["batch_id"], "materialised-1")
-        self.assertIn("操作已完成", confirmation)
         self.assertIsNone(state_store.get_record(address))
 
     async def test_shift_absence_ticket_rejects_a_new_draft_before_confirmation(self) -> None:

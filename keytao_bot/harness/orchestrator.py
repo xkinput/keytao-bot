@@ -1624,6 +1624,68 @@ class AgentOrchestrator:
             # The draft moved under us; keep the preview so the user sees the
             # plan instead of a bare "already void" message.
             return None
+        if confirmed_data.get("requiresConfirmation"):
+            second_binding = self._server_plan_binding(
+                confirmed_data,
+                confirm_args,
+            )
+            second_batch_id = str(confirmed_data.get("batchId") or "").strip()
+            second_content_version = confirmed_data.get("contentVersion")
+            absence_baseline = (
+                binding["batch_id"] == ""
+                and binding["expected_content_version"] == 0
+            )
+            conflict_markers = (
+                "staleConfirmation",
+                "contentVersionConflict",
+                "batchStateChanged",
+                "uncertain",
+            )
+            if (
+                confirmed_data.get("success") is not False
+                or confirmed_data.get("warnings") != []
+                or second_binding is None
+                or "expected_warning_digest" not in second_binding
+                or not isinstance(second_content_version, int)
+                or isinstance(second_content_version, bool)
+                or second_content_version != binding["expected_content_version"]
+                or (absence_baseline and not second_batch_id)
+                or (
+                    not absence_baseline
+                    and second_batch_id != binding["batch_id"]
+                )
+                or second_binding["batch_id"] != binding["batch_id"]
+                or second_binding["expected_content_version"]
+                != binding["expected_content_version"]
+                or str(confirmed_data.get("planDigest") or "").strip().lower()
+                != str(result_data.get("planDigest") or "").strip().lower()
+                or confirmed_data.get("shiftPlan") != result_data.get("shiftPlan")
+                or any(confirmed_data.get(marker) for marker in conflict_markers)
+                or bool(confirmed_data.get("conflicts"))
+                or bool(confirmed_data.get("failed"))
+                or bool(confirmed_data.get("failedCount"))
+            ):
+                return confirmed_data, confirmed_str, confirm_args
+            logger.info(
+                "Auto-confirming clean shift write preview bound to server "
+                f"digest: batch={second_binding['batch_id']} "
+                f"version={second_binding['expected_content_version']}"
+            )
+            confirmed_str, confirm_args = await self._tool_executor.replay_shift_plan(
+                authorization_tool_name,
+                authorization_args,
+                second_binding,
+                tool_context,
+            )
+            try:
+                confirmed_data = json.loads(confirmed_str)
+            except Exception:
+                return None
+            if (
+                not isinstance(confirmed_data, dict)
+                or confirmed_data.get("staleConfirmation")
+            ):
+                return None
         return confirmed_data, confirmed_str, confirm_args
 
     async def _auto_confirm_create_warning(
@@ -1633,7 +1695,7 @@ class AgentOrchestrator:
         result_data: Dict,
         tool_context: ToolContext,
     ) -> Optional[tuple]:
-        """Replay one exact create ticket for duplicate or ordering warnings."""
+        """Replay one exact clean or informational server Create ticket."""
         if fn_name != "keytao_create_phrase" or not tool_context.writes_allowed:
             return None
         binding = create_warning_confirmation_binding(result_data, fn_args)
@@ -1646,7 +1708,7 @@ class AgentOrchestrator:
         }
         confirm_args.update(binding)
         logger.info(
-            "Auto-confirming informational create warning: "
+            "Auto-confirming clean/informational create preview: "
             f"batch={binding['batch_id']} "
             f"version={binding['expected_content_version']}"
         )

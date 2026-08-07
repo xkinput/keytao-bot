@@ -56,3 +56,4 @@ napcat/config/webui.json
 .pytest_cache/
 .coverage
 htmlcov/
+e2e/artifacts/

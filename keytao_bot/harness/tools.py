@@ -424,9 +424,10 @@ _POSITIONAL_REORDER_TEMPORAL_DESTINATION_RE = re.compile(
     r"下周|下月|下季度|明年|周[一二三四五六日天]|"
     r"\d{1,2}(?:点|时|月|日|号))$"
 )
-_POSITIONAL_REORDER_TRAILING_POLITENESS_RE = re.compile(
+_POSITIONAL_REORDER_TRAILING_MODIFIER_RE = re.compile(
     r"^(?:谢谢|谢谢你|多谢|辛苦了|拜托了|麻烦了|感谢|感谢你|"
-    r"劳驾|拜托|有劳|谢啦)[。.!！]?$"
+    r"劳驾|拜托|有劳|谢啦|"
+    r"目标编码请你自己查清楚后直接完成|不要问我)[。.!！]?$"
 )
 _POSITIONAL_SUBORDINATE_CONTEXT_RE = re.compile(
     r"^(?:关于)?(?:你|我|他|她)(?:刚才)?.*"
@@ -657,7 +658,7 @@ def _positional_create_operands(
     ]
     while (
         len(clauses) > 1
-        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(clauses[-1])
+        and _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(clauses[-1])
     ):
         clauses.pop()
     if len(clauses) != 1:
@@ -711,7 +712,7 @@ def _positional_destination_from_command(message: str) -> Optional[_PositionalDe
     ]
     while (
         len(clauses) > 1
-        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(clauses[-1])
+        and _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(clauses[-1])
     ):
         clauses.pop()
     if len(clauses) != 1:
@@ -736,7 +737,7 @@ def _raw_positional_destination_from_command(message: str) -> Optional[str]:
     ]
     while (
         len(clauses) > 1
-        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(clauses[-1])
+        and _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(clauses[-1])
     ):
         clauses.pop()
     if len(clauses) != 1:
@@ -757,7 +758,7 @@ def _has_raw_positional_relative_tail(message: str) -> bool:
     ]
     while (
         len(clauses) > 1
-        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(clauses[-1])
+        and _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(clauses[-1])
     ):
         clauses.pop()
     if len(clauses) != 1:
@@ -784,7 +785,7 @@ def _has_complete_positional_reorder_command(message: str) -> bool:
     ]
     while (
         len(clauses) > 1
-        and _POSITIONAL_REORDER_TRAILING_POLITENESS_RE.fullmatch(
+        and _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(
             clauses[-1].strip()
         )
     ):
@@ -1881,7 +1882,7 @@ def create_warning_confirmation_binding(
     preview: Dict,
     arguments: Dict,
 ) -> Optional[Dict[str, Any]]:
-    """Return an exact replay ticket only for informational create warnings."""
+    """Return an exact replay ticket for a clean or informational Create."""
     if not isinstance(preview, dict) or not isinstance(arguments, dict):
         return None
     word = str(arguments.get("word") or "").strip()
@@ -1902,6 +1903,7 @@ def create_warning_confirmation_binding(
         action != "Create"
         or not word
         or not code
+        or preview.get("success") is not False
         or preview.get("requiresConfirmation") is not True
         or not batch_id
         or not isinstance(content_version, int)
@@ -1909,7 +1911,6 @@ def create_warning_confirmation_binding(
         or content_version < 0
         or not re.fullmatch(r"[0-9a-f]{64}", warning_digest)
         or not isinstance(warnings, list)
-        or not warnings
         or (
             warned_count is not None
             and (
