@@ -237,6 +237,47 @@ def test_candidate_cleaning_rules():
     check("bidi characters are stripped from reasons", bidi and bidi[0].reason == "带控制符")
 
 
+def test_scheduled_review_attaches_candidate_commonness():
+    """The scheduled flow carries the same advisory assessment as chat review."""
+    print("\n[1a] Scheduled review attaches candidate commonness")
+
+    async def _run():
+        candidate = WordCandidate(
+            word="射覆",
+            reason="fixture",
+            source_url="https://www.v2ex.com/t/1",
+        )
+        review = _clean_review("eefju")
+        assessment = [{
+            "verdict": "behind_more_common",
+            "newWord": "射覆",
+            "occupantWord": "慑服",
+            "occupantCode": "eefj",
+            "freeCode": "eefju",
+            "newCode": "eefju",
+        }]
+        with (
+            patch.object(
+                wd,
+                "prepare_reviewed_word",
+                new=AsyncMock(return_value=review),
+            ),
+            patch.object(
+                wd,
+                "assess_candidate_chain_commonness",
+                new=AsyncMock(return_value=assessment),
+            ) as assess,
+        ):
+            reviewed = await wd.review_candidates([candidate])
+        check("scheduled flow invokes the shared assessment", assess.await_count == 1)
+        check(
+            "scheduled review carries the structured assessment",
+            reviewed[0]["review"].get("candidateOrderingAssessments") == assessment,
+        )
+
+    asyncio.run(_run())
+
+
 def test_source_url_is_allowlisted():
     print("\n[1b] LLM sourceUrl must match a URL this round actually collected")
 
@@ -1838,6 +1879,7 @@ def test_scheduler_catch_up_and_timing():
 
 def main():
     test_candidate_cleaning_rules()
+    test_scheduled_review_attaches_candidate_commonness()
     test_source_url_is_allowlisted()
     test_llm_payload_parsing()
     test_history_dedupe_window()

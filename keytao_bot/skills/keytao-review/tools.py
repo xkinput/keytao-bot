@@ -9,6 +9,7 @@ from nonebot.log import logger
 from keytao_bot.utils import http_client
 from keytao_bot.utils.keytao_review import (
     ReviewHttpConfig,
+    assess_candidate_chain_commonness,
     audit_draft_items,
     can_llm_override_audit_issues,
     prepare_reviewed_word,
@@ -189,6 +190,9 @@ async def keytao_prepare_reviewed_add(
             (pre_submit.get("issues") or [""])[0] if flag else pre_submit.get("summary") or ""
         )
         apply_manual_review_flag(review, bool(flag), reason)
+    review["candidateOrderingAssessments"] = await assess_candidate_chain_commonness(
+        review
+    )
     return review
 
 
@@ -201,7 +205,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "keytao_prepare_reviewed_add",
-            "description": "加词前审词：核对真实读音，生成键道候选编码和当前占位，并用提交时同一套自动审核逻辑预判推荐编码是否可由本喵自动通过。",
+            "description": "加词前审词：核对真实读音，生成键道候选编码和当前占位，评估空位前占用词的常用度排序，并用提交时同一套自动审核逻辑预判推荐编码是否可由本喵自动通过。",
             "parameters": {
                 "type": "object",
                 "properties": {

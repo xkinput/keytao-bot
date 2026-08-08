@@ -12,6 +12,29 @@ from typing import Any, Iterator, Optional
 from urllib.parse import urlparse
 
 
+SENSITIVE_FIELDS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "authorization",
+        "password",
+        "refresh_token",
+        "token",
+    }
+)
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if str(key).lower() in SENSITIVE_FIELDS else _redact_sensitive(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
+
+
 def _json_value(data: bytes) -> Any:
     if not data:
         return None
@@ -24,14 +47,14 @@ def _json_value(data: bytes) -> Any:
 
 def _request_body(request: Any) -> Any:
     try:
-        return _json_value(bytes(request.content))
+        return _redact_sensitive(_json_value(bytes(request.content)))
     except Exception:
         return {"unavailable": "request body is streaming"}
 
 
 def _response_body(response: Any) -> Any:
     try:
-        return _json_value(bytes(response.content))
+        return _redact_sensitive(_json_value(bytes(response.content)))
     except Exception:
         return {"unavailable": "response body is streaming"}
 
@@ -253,4 +276,3 @@ class ArtifactRecorder:
             "monetaryCost": None,
             "costNote": "Provider billing price is not available locally; token usage is recorded.",
         }
-

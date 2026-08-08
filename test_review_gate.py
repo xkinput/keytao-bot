@@ -1044,6 +1044,130 @@ def test_batch_add_uses_structured_verdict_not_prose():
           "needsManualReview" not in items["other"])
 
 
+def test_candidate_commonness_wiring_and_timeout():
+    """Candidate preparation compares only the first two occupants and degrades."""
+    print("\n🧪 candidate commonness wiring and timeout")
+
+    review = {
+        "success": True,
+        "word": "射覆",
+        "recommendedCode": "eefju",
+        "pronunciations": [{
+            "recommendedCode": "eefju",
+            "candidateStatuses": [
+                {
+                    "code": "eefj",
+                    "occupied": True,
+                    "words": ["慑服"],
+                    "phrases": [{"word": "慑服", "code": "eefj", "type": "Phrase"}],
+                },
+                {
+                    "code": "eefji",
+                    "occupied": True,
+                    "words": ["设伏"],
+                    "phrases": [{"word": "设伏", "code": "eefji", "type": "Phrase"}],
+                },
+                {
+                    "code": "eefjk",
+                    "occupied": True,
+                    "words": ["社福"],
+                    "phrases": [{"word": "社福", "code": "eefjk", "type": "Phrase"}],
+                },
+                {"code": "eefju", "occupied": False, "words": [], "phrases": []},
+            ],
+        }],
+    }
+
+    async def _run():
+        calls = []
+
+        async def compare(front_word, behind_word):
+            calls.append((front_word, behind_word))
+            return {
+                "success": True,
+                "verdict": (
+                    "front_more_common"
+                    if behind_word == "慑服"
+                    else "behind_more_common"
+                ),
+                "summary": "comparison",
+            }
+
+        with patch.object(review_module, "compare_word_commonness", side_effect=compare):
+            assessments = await review_module.assess_candidate_chain_commonness(review)
+        check(
+            "comparator receives the first two new-word/occupant pairs",
+            calls == [("射覆", "慑服"), ("射覆", "设伏")],
+        )
+        check("comparison work is capped at two occupants", len(assessments) == 2)
+        check(
+            "front verdict recommends the occupied code",
+            assessments[0]["newCode"] == "eefj",
+        )
+        check(
+            "behind verdict keeps the free code",
+            assessments[1]["newCode"] == "eefju",
+        )
+
+        started = asyncio.Event()
+
+        async def never_finishes(*_args):
+            started.set()
+            await asyncio.sleep(60)
+
+        with patch.object(
+            review_module,
+            "compare_word_commonness",
+            side_effect=never_finishes,
+        ):
+            timed_out = await review_module.assess_candidate_chain_commonness(
+                review,
+                timeout=0.01,
+            )
+        check("timeout branch was exercised", started.is_set())
+        check(
+            "timeout degrades every pair to insufficient evidence",
+            len(timed_out) == 2
+            and all(item["verdict"] == "not_enough_evidence" for item in timed_out)
+            and all(item["degradation"] == "timeout" for item in timed_out),
+        )
+
+        ordering = [{
+            "verdict": "front_more_common",
+            "newWord": "射覆",
+            "occupantWord": "慑服",
+            "occupantCode": "eefj",
+            "freeCode": "eefju",
+            "newCode": "eefj",
+        }]
+        prepared = {**review, "needsManualReview": False}
+        with (
+            patch.object(
+                _review_tools,
+                "prepare_reviewed_word",
+                new=AsyncMock(return_value=prepared),
+            ),
+            patch.object(
+                _review_tools,
+                "_build_pre_submit_audit",
+                new=AsyncMock(return_value={"autoApprove": True, "summary": "pass"}),
+            ),
+            patch.object(
+                _review_tools,
+                "assess_candidate_chain_commonness",
+                new=AsyncMock(return_value=ordering),
+            ) as wired,
+        ):
+            tool_result = await _review_tools.keytao_prepare_reviewed_add("射覆")
+        check("review tool invokes the shared assessment helper", wired.await_count == 1)
+        check(
+            "review tool returns the structured ordering snapshot",
+            tool_result.get("candidateOrderingAssessments") == ordering,
+        )
+
+    asyncio.run(_run())
+
+
 def main():
     test_lookup_failure_forces_manual_review()
     test_exact_existing_is_duplicate_not_approval()
@@ -1063,6 +1187,7 @@ def main():
     test_unknown_verdict_never_becomes_false()
     test_every_add_branch_carries_the_verdict()
     test_batch_add_uses_structured_verdict_not_prose()
+    test_candidate_commonness_wiring_and_timeout()
 
     print("\n" + "=" * 60)
     print(f"Results: {passed}/{passed + failed} passed" + (f", {failed} failed" if failed else ""))

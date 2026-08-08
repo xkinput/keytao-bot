@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import secrets
 import sys
 import time
 import uuid
@@ -20,13 +21,16 @@ from .runtime import (
     NextServer,
     RigInfrastructureError,
     assert_runtime_configuration,
+    provision_admin_user,
     provision_test_user,
     test_identity,
 )
 from .safety import (
     EncodeDelayController,
     NetworkAllowlist,
+    RESERVED_BINDING_PREFIX,
     SafetyViolation,
+    validate_admin_identity,
     validate_keytao_base,
     validate_llm_base,
     validate_next_database_url,
@@ -38,10 +42,12 @@ from .scenarios import (
     ordered_candidate_codes,
     run_scenario,
 )
+from .zdic_seed import seed_s9_zdic_cache
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_NEXT_DIR = REPO_ROOT.parent / "keytao-next"
+S9_ZDIC_WARMUP_BACKOFF_SECONDS = (4.0, 5.0, 6.0)
 
 
 def _nonempty(value: Any) -> str:
@@ -211,6 +217,7 @@ async def ensure_fixture(
     *,
     client: LocalNextClient,
     seed_identity: dict[str, str],
+    admin_token: str,
 ) -> dict[str, Any]:
     chixi = await client.phrases_by_word("赤溪")
     if not chixi:
@@ -225,7 +232,198 @@ async def ensure_fixture(
             word="赤溪",
             code="wkxk",
         )
-    return await build_fixture_facts(client)
+    try:
+        return await build_fixture_facts(client)
+    except RigInfrastructureError as initial_error:
+        encoded = await client.encode("赤溪")
+        codes = ordered_candidate_codes(encoded)
+        if "wkxk" not in codes or codes.index("wkxk") + 1 >= len(codes):
+            raise initial_error
+        await client.restore_s8_fixture(
+            platform_id=seed_identity["platform_id"],
+            admin_token=admin_token,
+            chixi_next_code=codes[codes.index("wkxk") + 1],
+        )
+        return await build_fixture_facts(client)
+
+
+async def ensure_s9_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+    admin_token: str,
+    recorder: ArtifactRecorder,
+) -> dict[str, Any]:
+    existing_subject = await client.phrases_by_word("射覆")
+    if existing_subject:
+        raise RigInfrastructureError(
+            f"S9 requires 射覆 to be absent from the local dictionary: {existing_subject}"
+        )
+
+    exact_rows = [
+        row
+        for row in await client.phrases_by_code("eefj")
+        if row.get("code") == "eefj"
+    ]
+    if exact_rows:
+        valid_existing = (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == "慑服"
+            and exact_rows[0].get("type") == "Phrase"
+        )
+        if not valid_existing:
+            raise RigInfrastructureError(
+                f"S9 cannot safely use occupied fixture code eefj: {exact_rows}"
+            )
+    else:
+        await client.clean_draft(seed_identity["platform_id"])
+        await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word="慑服",
+            code="eefj",
+        )
+        exact_rows = [
+            row
+            for row in await client.phrases_by_code("eefj")
+            if row.get("code") == "eefj"
+        ]
+
+    if not (
+        len(exact_rows) == 1
+        and exact_rows[0].get("word") == "慑服"
+        and exact_rows[0].get("type") == "Phrase"
+    ):
+        raise RigInfrastructureError(
+            f"S9 fixture did not resolve to sole 慑服@eefj: {exact_rows}"
+        )
+    owner_name = str((exact_rows[0].get("user") or {}).get("name") or "")
+    cleanup_required = owner_name.startswith(RESERVED_BINDING_PREFIX)
+
+    warmup_attempts: list[dict[str, Any]] = []
+    warmup_artifact = (
+        f"S9-zdic-warmup-attempt-{recorder.current_attempt()}.json"
+    )
+    probe_count = len(S9_ZDIC_WARMUP_BACKOFF_SECONDS) + 1
+    encoded: dict[str, Any] = {}
+    for probe_attempt in range(1, probe_count + 1):
+        probe_started = time.monotonic()
+        encoded = await client.encode("射覆")
+        encoded_chars = encoded.get("chars")
+        if isinstance(encoded_chars, list):
+            character_statuses = {
+                str(item.get("char") or ""): item.get("pronunciationLookupStatus")
+                for item in encoded_chars
+                if isinstance(item, dict) and item.get("char")
+            }
+        else:
+            character_statuses = {}
+        probe_fact = {
+            "attempt": probe_attempt,
+            "pronunciationSource": encoded.get("pronunciationSource"),
+            "standardPronunciationStatus": encoded.get("standardPronunciationStatus"),
+            "characterLookupStatuses": character_statuses,
+            "elapsedSeconds": round(time.monotonic() - probe_started, 3),
+        }
+        warmup_attempts.append(probe_fact)
+        print(
+            f"S9 zdic warm-up {probe_attempt}/{probe_count}: "
+            f"pronunciationSource={probe_fact['pronunciationSource']!r}, "
+            f"standardPronunciationStatus={probe_fact['standardPronunciationStatus']!r}, "
+            f"characterLookupStatuses={character_statuses}"
+        )
+        recorder.write_json(
+            warmup_artifact,
+            {
+                "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
+                "finalAssertionAttempt": probe_count,
+                "finalAssertionResult": "pending",
+                "attempts": warmup_attempts,
+            },
+        )
+        if probe_attempt < probe_count:
+            await asyncio.sleep(S9_ZDIC_WARMUP_BACKOFF_SECONDS[probe_attempt - 1])
+
+    candidate_codes = ordered_candidate_codes(encoded)
+    expected_codes = ["eefj", "eefju", "eefjuv"]
+    encoded_chars = encoded.get("chars")
+    expected_chars = {
+        "射": {"pinyin": "shè", "pinyins": ["shè"]},
+        "覆": {"pinyin": "fù", "pinyins": ["fù"]},
+    }
+    if isinstance(encoded_chars, list):
+        chars_by_word = {
+            str(item.get("char") or ""): item
+            for item in encoded_chars
+            if isinstance(item, dict)
+        }
+    else:
+        chars_by_word = {}
+    seeded_characters_found = all(
+        chars_by_word.get(char, {}).get("pinyin") == expected["pinyin"]
+        and chars_by_word.get(char, {}).get("pinyins") == expected["pinyins"]
+        and chars_by_word.get(char, {}).get("pronunciationLookupStatus") == "found"
+        for char, expected in expected_chars.items()
+    )
+    seeded_reality_matches = not (
+        candidate_codes != expected_codes
+        or encoded.get("pronunciationSource") != "pinyin-pro-context"
+        or encoded.get("standardPronunciationStatus") != "absent"
+        or encoded.get("semanticPronunciationNeeded") is not False
+        or not seeded_characters_found
+    )
+    recorder.write_json(
+        warmup_artifact,
+        {
+            "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
+            "finalAssertionAttempt": probe_count,
+            "finalAssertionResult": "passed" if seeded_reality_matches else "failed",
+            "attempts": warmup_attempts,
+        },
+    )
+    if not seeded_reality_matches:
+        if cleanup_required:
+            await client.remove_s9_fixture(
+                platform_id=seed_identity["platform_id"],
+                admin_token=admin_token,
+            )
+        raise RigInfrastructureError(
+            f"S9 射覆 did not use the seeded pronunciation reality: {encoded}"
+        )
+
+    successor_occupancy: list[dict[str, Any]] = []
+    recommended_code = ""
+    for code in candidate_codes[1:]:
+        exact_successors = [
+            row
+            for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        successor_occupancy.append({"code": code, "occupants": exact_successors})
+        if not exact_successors and not recommended_code:
+            recommended_code = code
+    if not recommended_code:
+        if cleanup_required:
+            await client.remove_s9_fixture(
+                platform_id=seed_identity["platform_id"],
+                admin_token=admin_token,
+            )
+        raise RigInfrastructureError(
+            f"S9 射覆 seeded candidate chain has no free successor: {successor_occupancy}"
+        )
+    return {
+        "subjectWord": "射覆",
+        "occupantWord": "慑服",
+        "occupiedCode": "eefj",
+        "recommendedFreeCode": recommended_code,
+        "candidateCodes": candidate_codes,
+        "pronunciationSource": encoded["pronunciationSource"],
+        "standardPronunciationStatus": encoded["standardPronunciationStatus"],
+        "seededCharactersFound": seeded_characters_found,
+        "zdicWarmupAttempts": warmup_attempts,
+        "successorOccupancy": successor_occupancy,
+        "occupant": exact_rows[0],
+        "cleanupRequired": cleanup_required,
+    }
 
 
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
@@ -266,6 +464,7 @@ def make_safety_proof(guard: NetworkAllowlist) -> dict[str, Any]:
         "productionUrlBlockedBeforeDispatch": False,
         "remoteDatabaseRejected": False,
         "productionLikeBindingRejected": False,
+        "productionLikeAdminRejected": False,
     }
     try:
         guard.assert_url_allowed("https://keytao.vercel.app/api/phrases")
@@ -284,6 +483,19 @@ def make_safety_proof(guard: NetworkAllowlist) -> dict[str, Any]:
         )
     except SafetyViolation:
         proof["productionLikeBindingRejected"] = True
+    try:
+        validate_admin_identity(
+            platform_id="12345678",
+            expected_name="admin",
+            expected_email="admin@example.com",
+            user={
+                "name": "admin",
+                "email": "admin@example.com",
+                "roles": [{"value": "R:ROOT"}],
+            },
+        )
+    except SafetyViolation:
+        proof["productionLikeAdminRejected"] = True
     if not all(proof.values()):
         raise SafetyViolation(f"Safety self-check did not fail closed: {proof}")
     return proof
@@ -350,6 +562,8 @@ async def async_main(args: argparse.Namespace) -> int:
         for scenario in scenarios
     }
     seed_identity = test_identity(run_id, "seed")
+    admin_identity = test_identity(run_id, "admin")
+    admin_password = secrets.token_urlsafe(32)
     manifest = {
         "runId": run_id,
         "startedAt": timestamp,
@@ -364,6 +578,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "selectedScenarios": [item.scenario_id for item in scenarios],
         "safetyProof": safety_proof,
         "identities": identities,
+        "adminIdentity": admin_identity,
     }
     try:
         head = await asyncio.to_thread(
@@ -372,6 +587,12 @@ async def async_main(args: argparse.Namespace) -> int:
             REPO_ROOT,
         )
         manifest["repoHead"] = head.strip()
+        if any(scenario.scenario_id == "S9" for scenario in scenarios):
+            manifest["s9ZdicCacheSeed"] = await asyncio.to_thread(
+                seed_s9_zdic_cache,
+                config["next_child_env"]["DATABASE_URL"],
+                next_dir=args.next_dir,
+            )
         guard.install()
         await server.ensure_running()
         manifest["nextServer"] = {
@@ -390,7 +611,36 @@ async def async_main(args: argparse.Namespace) -> int:
                 next_env=config["next_child_env"],
                 identity=identity,
             )
-        fixture_facts = await ensure_fixture(client=client, seed_identity=seed_identity)
+        admin_user = await provision_admin_user(
+            client=client,
+            next_dir=args.next_dir,
+            next_env=config["next_child_env"],
+            identity=admin_identity,
+            password=admin_password,
+        )
+        admin_session = await client.login_admin(
+            identity=admin_identity,
+            password=admin_password,
+        )
+        if admin_session["user"].get("id") != admin_user.get("id"):
+            raise SafetyViolation("The reserved admin login did not resolve to its provisioned user")
+        manifest["adminProof"] = {
+            "userId": admin_user.get("id"),
+            "name": admin_identity["name"],
+            "email": admin_identity["email"],
+            "platformId": admin_identity["platform_id"],
+            "roles": sorted(
+                str(role.get("value") or "")
+                for role in admin_session["user"].get("roles", [])
+                if isinstance(role, dict)
+            ),
+            "jwtLoginVerified": True,
+        }
+        fixture_facts = await ensure_fixture(
+            client=client,
+            seed_identity=seed_identity,
+            admin_token=admin_session["token"],
+        )
         recorder.write_json("fixture-facts.json", fixture_facts)
         state_dir = artifact_dir / "state"
         openai_chat = initialize_openai_chat(config, state_dir=state_dir)
@@ -415,6 +665,20 @@ async def async_main(args: argparse.Namespace) -> int:
             }
             for attempt in (1, 2):
                 with recorder.scope(scenario.scenario_id, attempt):
+                    if scenario.scenario_id == "S8":
+                        await client.restore_s8_fixture(
+                            platform_id=seed_identity["platform_id"],
+                            admin_token=admin_session["token"],
+                            chixi_next_code=fixture_facts["chixi_next_code"],
+                        )
+                    if scenario.scenario_id == "S9":
+                        fixture_facts["s9"] = await ensure_s9_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                            admin_token=admin_session["token"],
+                            recorder=recorder,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
                     await client.clean_draft(identities[scenario.scenario_id]["platform_id"])
                     await bot_harness.reset_conversation(
                         platform_id=identities[scenario.scenario_id]["platform_id"]
@@ -428,8 +692,31 @@ async def async_main(args: argparse.Namespace) -> int:
                         recorder=recorder,
                         encode_delay=encode_delay,
                         fixture_facts=fixture_facts,
+                        admin_identity=admin_identity,
+                        admin_user=admin_session["user"],
+                        admin_token=admin_session["token"],
                     )
                     attempt_result = await run_scenario(scenario, context)
+                    if scenario.scenario_id == "S8":
+                        cleanup = await client.restore_s8_fixture(
+                            platform_id=seed_identity["platform_id"],
+                            admin_token=admin_session["token"],
+                            chixi_next_code=fixture_facts["chixi_next_code"],
+                        )
+                        attempt_result.setdefault("facts", {})["cleanup"] = cleanup
+                    if scenario.scenario_id == "S9":
+                        s9_facts = fixture_facts["s9"]
+                        if s9_facts.get("cleanupRequired"):
+                            cleanup = await client.remove_s9_fixture(
+                                platform_id=seed_identity["platform_id"],
+                                admin_token=admin_session["token"],
+                            )
+                        else:
+                            cleanup = {
+                                "action": "preserved-preexisting",
+                                "verified": True,
+                            }
+                        attempt_result.setdefault("facts", {})["cleanup"] = cleanup
                     cost = recorder.cost_summary(scenario.scenario_id, attempt)
                     attempt_result["cost"] = cost
                     total_duration += float(attempt_result["durationSeconds"])

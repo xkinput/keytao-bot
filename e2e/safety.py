@@ -15,6 +15,7 @@ PRODUCTION_KEYTAO_HOSTS = frozenset({"keytao.vercel.app", "www.keytao.vercel.app
 RESERVED_BINDING_PREFIX = "keytao-e2e-llm-rig-"
 RESERVED_EMAIL_SUFFIX = "@example.invalid"
 MIN_SYNTHETIC_QQ_DIGITS = 30
+ADMIN_ROLE_VALUES = frozenset({"R:ROOT", "R:MANAGER"})
 
 
 class SafetyViolation(RuntimeError):
@@ -104,12 +105,11 @@ def validate_next_database_url(url: str) -> dict[str, Any]:
     return {"scheme": scheme, "host": host, "port": port}
 
 
-def validate_test_binding(
+def validate_reserved_identity(
     *,
     platform_id: str,
     expected_name: str,
     expected_email: str,
-    user: dict[str, Any],
 ) -> None:
     binding = str(platform_id or "")
     if (
@@ -119,6 +119,14 @@ def validate_test_binding(
         or not expected_email.endswith(RESERVED_EMAIL_SUFFIX)
     ):
         raise SafetyViolation("The requested QQ binding is not structurally synthetic")
+
+
+def _validate_identity_metadata(
+    *,
+    expected_name: str,
+    expected_email: str,
+    user: dict[str, Any],
+) -> set[str]:
     actual_name = str(user.get("name") or "")
     actual_email = str(user.get("email") or "")
     if actual_name != expected_name or actual_email != expected_email:
@@ -131,8 +139,53 @@ def validate_test_binding(
         for role in user.get("roles", [])
         if isinstance(role, dict)
     }
+    return role_values
+
+
+def validate_test_binding(
+    *,
+    platform_id: str,
+    expected_name: str,
+    expected_email: str,
+    user: dict[str, Any],
+) -> None:
+    validate_reserved_identity(
+        platform_id=platform_id,
+        expected_name=expected_name,
+        expected_email=expected_email,
+    )
+    role_values = _validate_identity_metadata(
+        expected_name=expected_name,
+        expected_email=expected_email,
+        user=user,
+    )
     if not {"R:NORMAL", "R:BOT"}.issubset(role_values):
         raise SafetyViolation("The E2E account is missing its dedicated bot roles")
+
+
+def validate_admin_identity(
+    *,
+    platform_id: str,
+    expected_name: str,
+    expected_email: str,
+    user: dict[str, Any],
+) -> None:
+    """Require a reserved local rig identity with a real admin database role."""
+
+    validate_reserved_identity(
+        platform_id=platform_id,
+        expected_name=expected_name,
+        expected_email=expected_email,
+    )
+    role_values = _validate_identity_metadata(
+        expected_name=expected_name,
+        expected_email=expected_email,
+        user=user,
+    )
+    if not {"R:NORMAL", "R:BOT"}.issubset(role_values):
+        raise SafetyViolation("The E2E admin account is missing its dedicated bot roles")
+    if not role_values.intersection(ADMIN_ROLE_VALUES):
+        raise SafetyViolation("The E2E admin account has no administrator role")
 
 
 @dataclass

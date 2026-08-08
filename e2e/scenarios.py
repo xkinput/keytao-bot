@@ -76,6 +76,9 @@ class ScenarioContext:
     recorder: ArtifactRecorder
     encode_delay: EncodeDelayController
     fixture_facts: dict[str, Any]
+    admin_identity: dict[str, str]
+    admin_user: dict[str, Any]
+    admin_token: str
 
     @property
     def platform_id(self) -> str:
@@ -302,6 +305,198 @@ async def scenario_s7(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+async def scenario_s8(ctx: ScenarioContext) -> dict[str, Any]:
+    next_code = ctx.fixture_facts["chixi_next_code"]
+    s1 = await scenario_s1(ctx)
+    draft = s1["draft"]
+    batch_id = draft.get("batchId")
+    content_version = draft.get("contentVersion")
+    require(
+        isinstance(batch_id, str) and isinstance(content_version, int),
+        f"S8 draft is missing batch/version: {draft}",
+    )
+    sealed_create = next(
+        (
+            item
+            for item in draft["items"]
+            if item_key(item) == ("Create", "吃席", "wkxk")
+        ),
+        None,
+    )
+    require(
+        isinstance(sealed_create, dict)
+        and sealed_create.get("needsManualReview") is True,
+        f"S8 W-create was not persistently sealed for admin review: {sealed_create}",
+    )
+
+    submit = await ctx.next_client.submit_batch(
+        platform_id=ctx.platform_id,
+        batch_id=batch_id,
+        content_version=content_version,
+    )
+    submitted_detail = await ctx.next_client.get_admin_batch(
+        batch_id=batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        submitted_detail.get("status") == "Submitted",
+        f"S8 batch did not reach Submitted: {submitted_detail}",
+    )
+    submitted_rows = submitted_detail["pullRequests"]
+    require(len(submitted_rows) == 3, f"S8 admin review saw wrong PR count: {submitted_rows}")
+    submitted_sealed = next(
+        (
+            item
+            for item in submitted_rows
+            if item_key(item) == ("Create", "吃席", "wkxk")
+        ),
+        None,
+    )
+    require(
+        isinstance(submitted_sealed, dict)
+        and submitted_sealed.get("needsManualReview") is True,
+        f"S8 admin path lost the sealed review flag: {submitted_sealed}",
+    )
+
+    approval = await ctx.next_client.approve_admin_batch(
+        batch_id=batch_id,
+        admin_token=ctx.admin_token,
+        review_note="E2E S8 human-admin approval of sealed positional move",
+    )
+    approved_detail = await ctx.next_client.get_admin_batch(
+        batch_id=batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        approved_detail.get("status") == "Approved",
+        f"S8 batch is not Approved after admin approval: {approved_detail}",
+    )
+    require(
+        approved_detail.get("reviewerId") == ctx.admin_user.get("id"),
+        "S8 approval was not attributed to the reserved local admin identity",
+    )
+    approved_rows = approved_detail["pullRequests"]
+    require(
+        len(approved_rows) == 3
+        and all(item.get("status") == "Approved" for item in approved_rows),
+        f"S8 PR rows are not all Approved: {approved_rows}",
+    )
+    approved_sealed = next(
+        (
+            item
+            for item in approved_rows
+            if item_key(item) == ("Create", "吃席", "wkxk")
+        ),
+        None,
+    )
+    require(
+        isinstance(approved_sealed, dict)
+        and approved_sealed.get("needsManualReview") is True
+        and approved_sealed.get("status") == "Approved",
+        f"S8 sealed W-create did not pass the real admin gate: {approved_sealed}",
+    )
+
+    wkxk = await ctx.next_client.phrases_by_code("wkxk")
+    shifted = await ctx.next_client.phrases_by_code(next_code)
+    chixi = await ctx.next_client.phrases_by_word("赤溪")
+    exact_wkxk = [row for row in wkxk if row.get("code") == "wkxk"]
+    require(
+        len(exact_wkxk) == 1
+        and exact_wkxk[0].get("word") == "吃席"
+        and exact_wkxk[0].get("type") == "Phrase",
+        f"S8 dictionary lacks 吃席@wkxk: {wkxk}",
+    )
+    require(
+        len(shifted) == 1
+        and shifted[0].get("word") == "赤溪"
+        and shifted[0].get("type") == "Phrase",
+        f"S8 dictionary lacks shifted 赤溪@{next_code}: {shifted}",
+    )
+    require(
+        len(chixi) == 1
+        and chixi[0].get("code") == next_code
+        and not any(item.get("code") == "wkxk" for item in chixi),
+        f"S8 left 赤溪@wkxk or an unexpected 赤溪 row: {chixi}",
+    )
+
+    return {
+        "messages": s1["messages"],
+        "replies": s1["replies"],
+        "draft": draft,
+        "facts": {
+            "batchId": batch_id,
+            "submitStatus": submit["submitted"]["batch"]["status"],
+            "approvalStatus": approval["batch"]["status"],
+            "targetChangedRegressionAbsent": True,
+            "adminReviewerId": approved_detail.get("reviewerId"),
+            "adminRoleGate": "R:MANAGER JWT",
+            "sealedCreateNeedsManualReview": True,
+            "sealedCreateApproved": True,
+            "approvedPullRequestCount": len(approved_rows),
+            "dictionaryBeforeCleanup": {
+                "wkxk": wkxk,
+                next_code: shifted,
+                "chixi": chixi,
+            },
+        },
+    }
+
+
+async def scenario_s9(ctx: ScenarioContext) -> dict[str, Any]:
+    fixture = ctx.fixture_facts["s9"]
+    before = await ctx.draft()
+    message = "喵喵 射覆"
+    reply = await ctx.send(message)
+    after = await ctx.draft()
+    assert_reply_mentions(reply, "常用度评估", "射覆", "慑服", "eefj")
+
+    free_code = str(fixture["recommendedFreeCode"])
+    front_shape = (
+        "建议「射覆」占 eefj、「慑服」顺延" in reply
+        and "重新编码" in reply
+        and free_code in reply
+    )
+    keep_shape = (
+        "「慑服」不弱于「射覆」" in reply
+        and "维持现有排序，推荐空位" in reply
+        and free_code in reply
+    )
+    insufficient_shape = (
+        "常用度信号不足" in reply
+        and "按空位" in reply
+        and free_code in reply
+    )
+    require(
+        sum((front_shape, keep_shape, insufficient_shape)) == 1,
+        f"S9 candidate reply has no valid ordering recommendation shape: {reply}",
+    )
+    require(
+        before.get("batchId") == after.get("batchId")
+        and before.get("contentVersion") == after.get("contentVersion")
+        and before.get("items") == after.get("items") == [],
+        f"S9 presentation wrote to the draft: before={before}, after={after}",
+    )
+    shape = (
+        "reorder"
+        if front_shape
+        else "keep-order"
+        if keep_shape
+        else "insufficient"
+    )
+    return {
+        "messages": [message],
+        "replies": [reply],
+        "draft": after,
+        "facts": {
+            "fixtureOccupant": fixture["occupantWord"],
+            "fixtureCode": fixture["occupiedCode"],
+            "freeCode": free_code,
+            "recommendationShape": shape,
+            "draftUnchanged": True,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -310,6 +505,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S5", "self-service convergence", scenario_s5),
     Scenario("S6", "injection controls", scenario_s6),
     Scenario("S7", "timeout retry", scenario_s7),
+    Scenario("S8", "admin approval chain", scenario_s8),
+    Scenario("S9", "candidate commonness ordering", scenario_s9),
 )
 
 

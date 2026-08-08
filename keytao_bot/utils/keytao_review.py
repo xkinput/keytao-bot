@@ -71,6 +71,8 @@ COMMONNESS_SEARCH_QUERIES = [
 CODE_CHAIN_PRIORITY_WINDOW_AFTER = 2
 CODE_CHAIN_PRIORITY_MAX_OCCUPANTS = 8
 CODE_CHAIN_REORDER_SCORE_MARGIN = 0.20
+CANDIDATE_COMMONNESS_MAX_OCCUPANTS = 2
+CANDIDATE_COMMONNESS_TIMEOUT_SECONDS = 8.0
 PERSON_ALIAS_SEARCH_QUERIES = [
     '"{word}" "字"',
     '"{word}" "号"',
@@ -2624,6 +2626,165 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
         "front": front,
         "behind": behind,
     }
+
+
+def _candidate_commonness_pairs(review: Dict) -> List[Dict[str, str]]:
+    word = str(review.get("word") or "").strip()
+    free_code = str(review.get("recommendedCode") or "").strip().lower()
+    if not word or not free_code:
+        return []
+
+    statuses: List[Dict] = []
+    for pronunciation in review.get("pronunciations") or []:
+        if not isinstance(pronunciation, dict):
+            continue
+        candidate_statuses = [
+            status
+            for status in pronunciation.get("candidateStatuses") or []
+            if isinstance(status, dict)
+        ]
+        if any(
+            str(status.get("code") or "").strip().lower() == free_code
+            for status in candidate_statuses
+        ):
+            statuses = candidate_statuses
+            break
+    if not statuses:
+        return []
+
+    free_index = next(
+        (
+            index
+            for index, status in enumerate(statuses)
+            if str(status.get("code") or "").strip().lower() == free_code
+            and status.get("occupied") is False
+        ),
+        -1,
+    )
+    if free_index <= 0:
+        return []
+
+    pairs: List[Dict[str, str]] = []
+    seen_words: set[str] = set()
+    for status in statuses[:free_index]:
+        if status.get("occupied") is not True:
+            continue
+        occupant_code = str(status.get("code") or "").strip().lower()
+        occupant_words = [
+            str(phrase.get("word") or "").strip()
+            for phrase in status.get("phrases") or []
+            if isinstance(phrase, dict)
+            and str(phrase.get("type") or "Phrase") == "Phrase"
+            and str(phrase.get("word") or "").strip()
+        ]
+        if not occupant_words:
+            occupant_words = [
+                str(value or "").strip()
+                for value in status.get("words") or []
+                if str(value or "").strip()
+            ]
+        for occupant_word in occupant_words:
+            if occupant_word == word or occupant_word in seen_words:
+                continue
+            pairs.append({
+                "newWord": word,
+                "occupantWord": occupant_word,
+                "occupantCode": occupant_code,
+                "freeCode": free_code,
+            })
+            seen_words.add(occupant_word)
+            if len(pairs) >= CANDIDATE_COMMONNESS_MAX_OCCUPANTS:
+                return pairs
+    return pairs
+
+
+def _candidate_commonness_assessment(
+    pair: Dict[str, str],
+    comparison: Optional[Dict],
+    *,
+    degradation: str = "",
+) -> Dict[str, Any]:
+    raw_verdict = str((comparison or {}).get("verdict") or "")
+    allowed_verdicts = {
+        "front_more_common",
+        "behind_more_common",
+        "close",
+        "not_enough_evidence",
+    }
+    verdict = raw_verdict if raw_verdict in allowed_verdicts else "not_enough_evidence"
+    if comparison is not None and comparison.get("success") is False:
+        verdict = "not_enough_evidence"
+    recommended_code = (
+        pair["occupantCode"]
+        if verdict == "front_more_common"
+        else pair["freeCode"]
+    )
+    return {
+        **pair,
+        "verdict": verdict,
+        "newCode": recommended_code,
+        "recommendedCode": recommended_code,
+        "summary": str((comparison or {}).get("summary") or "").strip(),
+        "degradation": degradation,
+    }
+
+
+async def assess_candidate_chain_commonness(
+    review: Dict,
+    *,
+    timeout: float = CANDIDATE_COMMONNESS_TIMEOUT_SECONDS,
+) -> List[Dict[str, Any]]:
+    """Compare a new word with at most two occupants ahead of its free slot."""
+    pairs = _candidate_commonness_pairs(review)
+    if not pairs:
+        return []
+
+    async def compare(pair: Dict[str, str]) -> Any:
+        try:
+            return await compare_word_commonness(
+                pair["newWord"],
+                pair["occupantWord"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Candidate commonness comparison failed for %s/%s: %s",
+                pair["newWord"],
+                pair["occupantWord"],
+                error,
+            )
+            return error
+
+    try:
+        comparisons = await asyncio.wait_for(
+            asyncio.gather(*(compare(pair) for pair in pairs)),
+            timeout=max(0.01, float(timeout)),
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Candidate commonness assessment exceeded %.2fs for %s",
+            timeout,
+            pairs[0]["newWord"],
+        )
+        return [
+            _candidate_commonness_assessment(pair, None, degradation="timeout")
+            for pair in pairs
+        ]
+
+    assessments: List[Dict[str, Any]] = []
+    for pair, comparison in zip(pairs, comparisons):
+        if isinstance(comparison, BaseException):
+            assessments.append(
+                _candidate_commonness_assessment(
+                    pair,
+                    None,
+                    degradation=type(comparison).__name__,
+                )
+            )
+        else:
+            assessments.append(_candidate_commonness_assessment(pair, comparison))
+    return assessments
 
 
 def _active_commonness_signals(commonness: Dict) -> int:

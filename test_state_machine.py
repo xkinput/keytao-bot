@@ -1769,6 +1769,148 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
     asyncio.run(_run())
 
 
+def test_candidate_commonness_copy_snapshot_and_zero_writes():
+    """Render all three copy branches and keep presentation advisory-only."""
+    print("\n🧪 candidate commonness copy, snapshot, and zero writes")
+
+    def review_for(verdict):
+        new_code = "eefj" if verdict == "front_more_common" else "eefju"
+        return {
+            "success": True,
+            "word": "射覆",
+            "recommendedCode": "eefju",
+            "pronunciations": [{
+                "pinyin": "she fu",
+                "recommendedCode": "eefju",
+                "sources": [{"source": "汉典"}],
+                "candidateStatuses": [
+                    {
+                        "code": "eefj",
+                        "occupied": True,
+                        "label": "已有「慑服」",
+                        "words": ["慑服"],
+                        "phrases": [
+                            {
+                                "word": "慑服",
+                                "code": "eefj",
+                                "type": "Phrase",
+                                "weight": 100,
+                            }
+                        ],
+                    },
+                    {
+                        "code": "eefju",
+                        "occupied": False,
+                        "label": "空位",
+                        "words": [],
+                        "phrases": [],
+                    },
+                ],
+            }],
+            "candidateOrderingAssessments": [{
+                "verdict": verdict,
+                "newWord": "射覆",
+                "occupantWord": "慑服",
+                "occupantCode": "eefj",
+                "freeCode": "eefju",
+                "newCode": new_code,
+                "recommendedCode": new_code,
+            }],
+        }
+
+    front_prompt = _format_reviewed_add_prompt(review_for("front_more_common")) or ""
+    behind_prompt = _format_reviewed_add_prompt(review_for("behind_more_common")) or ""
+    insufficient_prompt = _format_reviewed_add_prompt(review_for("not_enough_evidence")) or ""
+    check(
+        "front branch recommends reordering with the exact selector",
+        "建议「射覆」占 eefj、「慑服」顺延" in front_prompt
+        and "回复「1 重新编码」执行" in front_prompt,
+    )
+    check(
+        "front branch keeps the free slot as an alternative",
+        "eefju — 空位（不调序备选）" in front_prompt
+        and "也可仍以编码 eefju 将「射覆」加入草稿" in front_prompt,
+    )
+    check(
+        "occupant branch keeps the current order and free recommendation",
+        "「慑服」不弱于「射覆」，维持现有排序，推荐空位 eefju" in behind_prompt,
+    )
+    check(
+        "insufficient branch degrades to the free recommendation",
+        "常用度信号不足，按空位 eefju 推荐" in insufficient_prompt,
+    )
+    parsed = _parse_pending_add_word(front_prompt)
+    check(
+        "presentation marker does not misparse the occupied slot as free",
+        isinstance(parsed, PendingAddWord)
+        and parsed.candidates == [("eefj", True), ("eefju", False)],
+    )
+
+    async def _run():
+        tool_calls = []
+        front_review = review_for("front_more_common")
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({"success": True, "phrases": []}, ensure_ascii=False)
+            if tool_name == "keytao_prepare_reviewed_add":
+                return json.dumps(front_review, ensure_ascii=False)
+            raise AssertionError(f"presentation reached mutation sink: {tool_name}")
+
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("qq", "commonness-user")
+        openai_chat_module.conversation_state_store = store
+        try:
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    new=AsyncMock(
+                        return_value=SimpleWordQueryIntent(
+                            True,
+                            ("射覆",),
+                            "word_lookup",
+                            0.99,
+                        )
+                    ),
+                ),
+                patch.object(
+                    openai_chat_module,
+                    "call_tool_function",
+                    side_effect=fake_call,
+                ),
+            ):
+                response = await _try_handle_simple_single_word_query(
+                    "射覆",
+                    "qq",
+                    "commonness-user",
+                    conv_key,
+                )
+            record = store.get_record(conv_key)
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("presentation calls only lookup and review tools", [name for name, _ in tool_calls] == ["keytao_lookup_by_word", "keytao_prepare_reviewed_add"])
+        check("presentation returns the ordering assessment", response is not None and "常用度评估" in response)
+        check(
+            "trusted pending state carries server-backed ordering facts",
+            record is not None
+            and isinstance(record.state, PendingAddWord)
+            and record.state.server_ordering_assessments == [{
+                "verdict": "front_more_common",
+                "newWord": "射覆",
+                "occupantWord": "慑服",
+                "occupantCode": "eefj",
+                "freeCode": "eefju",
+                "newCode": "eefj",
+            }],
+        )
+
+    asyncio.run(_run())
+
+
 def test_explicit_add_word_query_uses_review_tool_before_ai():
     """Verify `加词 X` uses the reviewed add tool instead of the old encode prompt."""
     print("\n🧪 explicit add-word query uses review tool")
@@ -13039,6 +13181,7 @@ if __name__ == "__main__":
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
     test_simple_single_word_query_uses_review_tool_before_ai()
+    test_candidate_commonness_copy_snapshot_and_zero_writes()
     test_explicit_add_word_query_uses_review_tool_before_ai()
     test_reviewed_add_prompt_explains_fallback_review_policy()
     test_reviewed_add_prompt_shows_pre_submit_audit_result()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import secrets
+import shutil
 import subprocess
 import time
 from contextvars import ContextVar
@@ -19,7 +20,9 @@ from .safety import (
     RESERVED_BINDING_PREFIX,
     RESERVED_EMAIL_SUFFIX,
     SafetyViolation,
+    validate_admin_identity,
     validate_keytao_base,
+    validate_reserved_identity,
     validate_test_binding,
 )
 
@@ -140,8 +143,11 @@ class LocalNextClient:
         body: Optional[dict[str, Any]] = None,
         allowed_status: tuple[int, ...] = (200,),
         authenticated: bool = True,
+        bearer_token: str = "",
     ) -> tuple[int, dict[str, Any]]:
         headers = dict(self.headers) if authenticated else {}
+        if bearer_token:
+            headers["Authorization"] = f"Bearer {bearer_token}"
         async with httpx.AsyncClient(timeout=90.0, follow_redirects=False) as client:
             response = await client.request(
                 method,
@@ -258,6 +264,397 @@ class LocalNextClient:
             authenticated=False,
         )
         return payload
+
+    async def add_draft_items(
+        self,
+        *,
+        platform_id: str,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        current = await self.get_draft(platform_id)
+        request_body = {
+            "platform": "qq",
+            "platformId": platform_id,
+            "batchId": current.get("batchId"),
+            "confirmed": False,
+            "previewOnly": True,
+            "items": items,
+        }
+        _status, preview = await self._json(
+            "POST",
+            "/api/bot/pull-requests/batch-draft",
+            body=request_body,
+            allowed_status=(200, 400, 409),
+        )
+        if preview.get("requiresConfirmation") is not True:
+            raise RigInfrastructureError(
+                f"Draft write did not return a preview ticket: {preview}"
+            )
+        batch_id = preview.get("batchId")
+        content_version = preview.get("contentVersion")
+        warning_digest = preview.get("warningDigest")
+        if (
+            not isinstance(batch_id, str)
+            or not isinstance(content_version, int)
+            or not isinstance(warning_digest, str)
+        ):
+            raise RigInfrastructureError("Draft preview is missing its CAS fields")
+        _status, added = await self._json(
+            "POST",
+            "/api/bot/pull-requests/batch-draft",
+            body={
+                **request_body,
+                "batchId": batch_id,
+                "confirmed": True,
+                "previewOnly": False,
+                "expectedContentVersion": content_version,
+                "expectedWarningDigest": warning_digest,
+            },
+            allowed_status=(200, 400, 409),
+        )
+        if (
+            added.get("success") is not True
+            or added.get("successCount") != len(items)
+            or added.get("failedCount") != 0
+        ):
+            raise RigInfrastructureError(f"Draft write failed closed: {added}")
+        return added
+
+    async def submit_batch(
+        self,
+        *,
+        platform_id: str,
+        batch_id: str,
+        content_version: int,
+    ) -> dict[str, Any]:
+        path = f"/api/bot/batches/{quote(batch_id, safe='')}/submit"
+        _status, preview = await self._json(
+            "POST",
+            path,
+            body={
+                "platform": "qq",
+                "platformId": platform_id,
+                "confirmed": False,
+                "previewOnly": True,
+                "expectedContentVersion": content_version,
+            },
+            allowed_status=(200, 400, 409),
+        )
+        required_fields = ("contentVersion", "warningDigest", "snapshotDigest")
+        if preview.get("requiresConfirmation") is not True or any(
+            field not in preview for field in required_fields
+        ):
+            raise RigInfrastructureError(
+                f"Batch submit did not return a complete preview ticket: {preview}"
+            )
+        _status, submitted = await self._json(
+            "POST",
+            path,
+            body={
+                "platform": "qq",
+                "platformId": platform_id,
+                "confirmed": True,
+                "previewOnly": False,
+                "expectedContentVersion": preview["contentVersion"],
+                "expectedWarningDigest": preview["warningDigest"],
+                "expectedSnapshotDigest": preview["snapshotDigest"],
+            },
+            allowed_status=(200, 400, 409),
+        )
+        batch = submitted.get("batch")
+        if (
+            submitted.get("success") is not True
+            or not isinstance(batch, dict)
+            or batch.get("id") != batch_id
+            or batch.get("status") != "Submitted"
+        ):
+            raise RigInfrastructureError(f"Batch submit failed closed: {submitted}")
+        return {"preview": preview, "submitted": submitted}
+
+    async def login_admin(
+        self,
+        *,
+        identity: dict[str, str],
+        password: str,
+    ) -> dict[str, Any]:
+        validate_reserved_identity(
+            platform_id=identity["platform_id"],
+            expected_name=identity["name"],
+            expected_email=identity["email"],
+        )
+        _status, payload = await self._json(
+            "POST",
+            "/api/auth/login",
+            body={"name": identity["name"], "password": password},
+            authenticated=False,
+        )
+        user = payload.get("user")
+        token = payload.get("token")
+        if not isinstance(user, dict) or not isinstance(token, str) or not token:
+            raise RigInfrastructureError("Reserved admin login returned an invalid payload")
+        validate_admin_identity(
+            platform_id=identity["platform_id"],
+            expected_name=identity["name"],
+            expected_email=identity["email"],
+            user=user,
+        )
+        _status, current_user = await self._json(
+            "GET",
+            "/api/auth/me",
+            authenticated=False,
+            bearer_token=token,
+        )
+        validate_admin_identity(
+            platform_id=identity["platform_id"],
+            expected_name=identity["name"],
+            expected_email=identity["email"],
+            user=current_user,
+        )
+        if current_user.get("id") != user.get("id"):
+            raise SafetyViolation("The admin token resolved to a different reserved user")
+        return {"token": token, "user": current_user}
+
+    async def get_admin_batch(
+        self,
+        *,
+        batch_id: str,
+        admin_token: str,
+    ) -> dict[str, Any]:
+        _status, payload = await self._json(
+            "GET",
+            f"/api/admin/batches/{quote(batch_id, safe='')}",
+            authenticated=False,
+            bearer_token=admin_token,
+        )
+        batch = payload.get("batch")
+        if not isinstance(batch, dict) or not isinstance(batch.get("pullRequests"), list):
+            raise RigInfrastructureError(f"Admin batch detail is invalid: {payload}")
+        return batch
+
+    async def approve_admin_batch(
+        self,
+        *,
+        batch_id: str,
+        admin_token: str,
+        review_note: str,
+    ) -> dict[str, Any]:
+        status, payload = await self._json(
+            "POST",
+            f"/api/admin/batches/{quote(batch_id, safe='')}/approve",
+            body={"reviewNote": review_note},
+            allowed_status=(200, 400, 401, 403, 404, 409, 422, 500),
+            authenticated=False,
+            bearer_token=admin_token,
+        )
+        batch = payload.get("batch")
+        if status != 200 or not isinstance(batch, dict) or batch.get("status") != "Approved":
+            detail = str(payload.get("details") or payload.get("error") or payload)
+            target_changed = "审批目标词条已变化或缺少实体绑定" in detail
+            error_name = "BatchApprovalTargetChangedError" if target_changed else "AdminApprovalError"
+            raise RigInfrastructureError(
+                f"{error_name}: HTTP {status} {detail}"
+            )
+        return payload
+
+    async def restore_s8_fixture(
+        self,
+        *,
+        platform_id: str,
+        admin_token: str,
+        chixi_next_code: str,
+    ) -> dict[str, Any]:
+        """Restore S8-owned fixture codes through a compensating approved batch."""
+
+        chixi = await self.phrases_by_word("赤溪")
+        wkxk = await self.phrases_by_code("wkxk")
+        shifted = await self.phrases_by_code(chixi_next_code)
+        fixture_codes = {"wkxk", chixi_next_code}
+        exact_wkxk = [row for row in wkxk if row.get("code") == "wkxk"]
+        exact_shifted = [
+            row for row in shifted if row.get("code") == chixi_next_code
+        ]
+        unexpected_chixi = [
+            row for row in chixi if row.get("code") not in fixture_codes
+        ]
+        is_fixture = (
+            len(chixi) == 1
+            and chixi[0].get("word") == "赤溪"
+            and chixi[0].get("code") == "wkxk"
+            and chixi[0].get("type") == "Phrase"
+            and chixi[0].get("weight") == 100
+            and len(exact_wkxk) == 1
+            and exact_wkxk[0].get("word") == "赤溪"
+            and not exact_shifted
+        )
+        if is_fixture:
+            return {"action": "already-restored", "verified": True}
+
+        rows_by_identity: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for row in [*exact_wkxk, *exact_shifted]:
+            identity = (
+                row.get("id"),
+                row.get("word"),
+                row.get("code"),
+                row.get("type"),
+            )
+            rows_by_identity[identity] = row
+        fixture_rows = list(rows_by_identity.values())
+        non_rig_rows = [
+            row
+            for row in fixture_rows
+            if not str((row.get("user") or {}).get("name") or "").startswith(
+                RESERVED_BINDING_PREFIX
+            )
+        ]
+        if unexpected_chixi or not fixture_rows or non_rig_rows:
+            raise RigInfrastructureError(
+                "Refusing ambiguous S8 fixture repair: "
+                f"赤溪={chixi}, wkxk={wkxk}, {chixi_next_code}={shifted}, "
+                f"nonRig={non_rig_rows}"
+            )
+
+        await self.clean_draft(platform_id)
+        cleanup_items = [
+            {
+                "action": "Delete",
+                "word": str(row.get("word") or ""),
+                "code": str(row.get("code") or ""),
+                "type": str(row.get("type") or "Phrase"),
+                "needsManualReview": False,
+                "remark": "E2E S8 compensating cleanup",
+            }
+            for row in fixture_rows
+        ]
+        cleanup_items.append(
+            {
+                "action": "Create",
+                "word": "赤溪",
+                "code": "wkxk",
+                "type": "Phrase",
+                "weight": 100,
+                "needsManualReview": False,
+                "remark": "E2E local fixture",
+            }
+        )
+        added = await self.add_draft_items(platform_id=platform_id, items=cleanup_items)
+        batch_id = added.get("batchId")
+        content_version = added.get("contentVersion")
+        if not isinstance(batch_id, str) or not isinstance(content_version, int):
+            raise RigInfrastructureError("S8 cleanup draft is missing batch/version")
+        submitted = await self.submit_batch(
+            platform_id=platform_id,
+            batch_id=batch_id,
+            content_version=content_version,
+        )
+        approved = await self.approve_admin_batch(
+            batch_id=batch_id,
+            admin_token=admin_token,
+            review_note="E2E S8 API-only fixture restoration",
+        )
+        final_chixi = await self.phrases_by_word("赤溪")
+        final_wkxk = await self.phrases_by_code("wkxk")
+        final_shifted = await self.phrases_by_code(chixi_next_code)
+        final_exact_wkxk = [
+            row for row in final_wkxk if row.get("code") == "wkxk"
+        ]
+        final_exact_shifted = [
+            row
+            for row in final_shifted
+            if row.get("code") == chixi_next_code
+        ]
+        if not (
+            len(final_chixi) == 1
+            and final_chixi[0].get("code") == "wkxk"
+            and final_chixi[0].get("weight") == 100
+            and len(final_exact_wkxk) == 1
+            and final_exact_wkxk[0].get("word") == "赤溪"
+            and not final_exact_shifted
+        ):
+            raise RigInfrastructureError(
+                "S8 cleanup approval completed without restoring the fixture: "
+                f"赤溪={final_chixi}, wkxk={final_wkxk}, "
+                f"{chixi_next_code}={final_shifted}"
+            )
+        return {
+            "action": "compensating-approved-batch",
+            "verified": True,
+            "batchId": batch_id,
+            "deletedFixtureRows": len(fixture_rows),
+            "submittedStatus": submitted["submitted"]["batch"]["status"],
+            "approvedStatus": approved["batch"]["status"],
+        }
+
+    async def remove_s9_fixture(
+        self,
+        *,
+        platform_id: str,
+        admin_token: str,
+    ) -> dict[str, Any]:
+        """Remove only a rig-owned 慑服@eefj fixture through approved APIs."""
+        rows = [
+            row
+            for row in await self.phrases_by_code("eefj")
+            if row.get("code") == "eefj"
+        ]
+        if not rows:
+            return {"action": "already-absent", "verified": True}
+        invalid_rows = [
+            row
+            for row in rows
+            if row.get("word") != "慑服"
+            or row.get("type") != "Phrase"
+            or not str((row.get("user") or {}).get("name") or "").startswith(
+                RESERVED_BINDING_PREFIX
+            )
+        ]
+        if invalid_rows:
+            raise RigInfrastructureError(
+                f"Refusing ambiguous S9 fixture cleanup: eefj={rows}"
+            )
+
+        await self.clean_draft(platform_id)
+        items = [
+            {
+                "action": "Delete",
+                "word": "慑服",
+                "code": "eefj",
+                "type": "Phrase",
+                "needsManualReview": False,
+                "remark": "E2E S9 fixture cleanup",
+            }
+            for _row in rows
+        ]
+        added = await self.add_draft_items(platform_id=platform_id, items=items)
+        batch_id = added.get("batchId")
+        content_version = added.get("contentVersion")
+        if not isinstance(batch_id, str) or not isinstance(content_version, int):
+            raise RigInfrastructureError("S9 cleanup draft is missing batch/version")
+        submitted = await self.submit_batch(
+            platform_id=platform_id,
+            batch_id=batch_id,
+            content_version=content_version,
+        )
+        approved = await self.approve_admin_batch(
+            batch_id=batch_id,
+            admin_token=admin_token,
+            review_note="E2E S9 API-only fixture cleanup",
+        )
+        remaining = [
+            row
+            for row in await self.phrases_by_code("eefj")
+            if row.get("code") == "eefj"
+        ]
+        if remaining:
+            raise RigInfrastructureError(
+                f"S9 cleanup approval completed but eefj remains occupied: {remaining}"
+            )
+        return {
+            "action": "compensating-approved-delete",
+            "verified": True,
+            "batchId": batch_id,
+            "submittedStatus": submitted["submitted"]["batch"]["status"],
+            "approvedStatus": approved["batch"]["status"],
+        }
 
     async def seed_phrase(
         self,
@@ -385,7 +782,13 @@ async def provision_test_user(
     next_dir: Path,
     next_env: dict[str, str],
     identity: dict[str, str],
+    password: str = "",
 ) -> dict[str, Any]:
+    validate_reserved_identity(
+        platform_id=identity["platform_id"],
+        expected_name=identity["name"],
+        expected_email=identity["email"],
+    )
     existing = await client.find_user(identity["platform_id"])
     if existing is not None:
         validate_test_binding(
@@ -406,7 +809,7 @@ async def provision_test_user(
         {
             "BOT_USER_NAME": identity["name"],
             "BOT_USER_EMAIL": identity["email"],
-            "BOT_USER_PASSWORD": secrets.token_urlsafe(32),
+            "BOT_USER_PASSWORD": password or secrets.token_urlsafe(32),
             "BOT_QQ_ID": identity["platform_id"],
         }
     )
@@ -436,6 +839,66 @@ async def provision_test_user(
         user=created,
     )
     return created
+
+
+async def provision_admin_user(
+    *,
+    client: LocalNextClient,
+    next_dir: Path,
+    next_env: dict[str, str],
+    identity: dict[str, str],
+    password: str,
+) -> dict[str, Any]:
+    """Provision a reserved bot user, then grant the real local manager role."""
+
+    if not password:
+        raise SafetyViolation("The E2E admin password must be generated in memory")
+    await provision_test_user(
+        client=client,
+        next_dir=next_dir,
+        next_env=next_env,
+        identity=identity,
+        password=password,
+    )
+    tsx_binary = next_dir / "node_modules" / ".bin" / "tsx"
+    node_binary = shutil.which("node")
+    promoter = Path(__file__).resolve().parent / "provision_admin.ts"
+    if not node_binary or not tsx_binary.is_file() or not promoter.is_file():
+        raise RigInfrastructureError("Reserved admin provisioning helpers are unavailable")
+    child_env = dict(next_env)
+    child_env.update(
+        {
+            "E2E_ADMIN_NAME": identity["name"],
+            "E2E_ADMIN_EMAIL": identity["email"],
+            "E2E_ADMIN_QQ_ID": identity["platform_id"],
+        }
+    )
+    completed = await asyncio.to_thread(
+        subprocess.run,
+        [node_binary, "--import", "tsx", str(promoter)],
+        cwd=next_dir,
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RigInfrastructureError(
+            "Reserved local admin provisioning failed:\n"
+            + completed.stdout[-2000:]
+            + completed.stderr[-2000:]
+        )
+    user = await client.find_user(identity["platform_id"])
+    if user is None:
+        raise RigInfrastructureError("Reserved local admin binding disappeared after promotion")
+    validate_admin_identity(
+        platform_id=identity["platform_id"],
+        expected_name=identity["name"],
+        expected_email=identity["email"],
+        user=user,
+    )
+    return user
 
 
 class E2EBotHarness:

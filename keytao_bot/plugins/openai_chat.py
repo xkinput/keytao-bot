@@ -1910,9 +1910,66 @@ def _server_candidate_snapshot(
     return candidates, occupied_words, entries_by_code
 
 
+def _server_ordering_snapshot(
+    state: PendingAddWord,
+    candidates: List[Tuple[str, bool]],
+    occupied_words: Dict[str, List[str]],
+    assessments: Any,
+) -> List[Dict[str, str]]:
+    """Validate advisory ordering facts against the structured occupancy snapshot."""
+    if assessments is None:
+        return []
+    if not isinstance(assessments, list):
+        return []
+    occupied_by_code = dict(candidates)
+    allowed_verdicts = {
+        "front_more_common",
+        "behind_more_common",
+        "close",
+        "not_enough_evidence",
+    }
+    snapshot: List[Dict[str, str]] = []
+    for assessment in assessments[:2]:
+        if not isinstance(assessment, dict):
+            return []
+        verdict = str(assessment.get("verdict") or "")
+        new_word = str(assessment.get("newWord") or "").strip()
+        occupant_word = str(assessment.get("occupantWord") or "").strip()
+        occupant_code = str(assessment.get("occupantCode") or "").strip().lower()
+        free_code = str(assessment.get("freeCode") or "").strip().lower()
+        new_code = str(
+            assessment.get("newCode")
+            or assessment.get("recommendedCode")
+            or ""
+        ).strip().lower()
+        expected_new_code = (
+            occupant_code if verdict == "front_more_common" else free_code
+        )
+        if (
+            verdict not in allowed_verdicts
+            or new_word != state.word
+            or not occupant_word
+            or occupied_by_code.get(occupant_code) is not True
+            or occupied_by_code.get(free_code) is not False
+            or occupant_word not in occupied_words.get(occupant_code, [])
+            or new_code != expected_new_code
+        ):
+            return []
+        snapshot.append({
+            "verdict": verdict,
+            "newWord": new_word,
+            "occupantWord": occupant_word,
+            "occupantCode": occupant_code,
+            "freeCode": free_code,
+            "newCode": new_code,
+        })
+    return snapshot
+
+
 def _attach_server_candidate_snapshot(
     state: PendingAddWord,
     statuses: List[Dict],
+    ordering_assessments: Any = None,
 ) -> PendingAddWord:
     candidates, occupied_words, entries_by_code = _server_candidate_snapshot(
         statuses
@@ -1921,6 +1978,12 @@ def _attach_server_candidate_snapshot(
         state.server_candidates = candidates
         state.server_occupied_words = occupied_words
         state.server_entries_by_code = entries_by_code
+        state.server_ordering_assessments = _server_ordering_snapshot(
+            state,
+            candidates,
+            occupied_words,
+            ordering_assessments,
+        )
     return state
 
 
@@ -3103,7 +3166,7 @@ async def _revalidate_referenced_add_pending(
         code_remarks={code: reviewed_remark for code, _occupied in candidates},
         pronunciation_codes=pronunciation_codes,
         pronunciation_recommended_codes=[recommended_code],
-    ), list(status_map.values()))
+    ), list(status_map.values()), review.get("candidateOrderingAssessments"))
 
 
 def _ensure_pending_add_word_guidance(response: str) -> str:
@@ -3753,16 +3816,51 @@ def _format_review_candidate_line(
     index: int,
     status: Dict,
     recommended_code: str,
+    ordering_recommended_code: str = "",
 ) -> str:
     code = str(status.get("code") or "").strip()
     occupied = bool(status.get("occupied"))
     if occupied:
         label = str(status.get("label") or "已有占用").strip()
+        if code == ordering_recommended_code:
+            label += " ← 常用度推荐（需重排）"
     elif code == recommended_code:
-        label = "✅ 推荐（空位）"
+        label = (
+            "空位（不调序备选）"
+            if ordering_recommended_code
+            else "✅ 推荐（空位）"
+        )
     else:
         label = "空位"
     return f"{index}. {code} — {label}"
+
+
+def _format_candidate_ordering_assessment(
+    assessment: Dict,
+    candidate_indexes: Dict[str, int],
+) -> str:
+    verdict = str(assessment.get("verdict") or "")
+    word = str(assessment.get("newWord") or "").strip()
+    occupant = str(assessment.get("occupantWord") or "").strip()
+    occupant_code = str(assessment.get("occupantCode") or "").strip().lower()
+    free_code = str(assessment.get("freeCode") or "").strip().lower()
+    if verdict == "front_more_common":
+        selector = candidate_indexes.get(occupant_code)
+        command = f"{selector} 重新编码" if selector is not None else f"{occupant_code} 重新编码"
+        return (
+            f"常用度评估：「{word}」较「{occupant}」更常用 → "
+            f"建议「{word}」占 {occupant_code}、「{occupant}」顺延"
+            f"（回复「{command}」执行）"
+        )
+    if verdict in {"behind_more_common", "close"}:
+        return (
+            f"常用度评估：「{occupant}」不弱于「{word}」，"
+            f"维持现有排序，推荐空位 {free_code}"
+        )
+    return (
+        f"常用度评估：「{word}」与「{occupant}」的常用度信号不足，"
+        f"按空位 {free_code} 推荐"
+    )
 
 
 def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Optional[str]:
@@ -3812,11 +3910,26 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
     if not word or not recommended_code or not pronunciations:
         return None
 
+    ordering_assessments = [
+        assessment
+        for assessment in review.get("candidateOrderingAssessments") or []
+        if isinstance(assessment, dict)
+    ][:2]
+    ordering_recommended_code = next(
+        (
+            str(assessment.get("occupantCode") or "").strip().lower()
+            for assessment in ordering_assessments
+            if assessment.get("verdict") == "front_more_common"
+        ),
+        "",
+    )
+
     lines = [
         f"词库暂无收录「{word}」，先审读音和编码候选：",
         "",
     ]
     candidate_index = 1
+    candidate_indexes: Dict[str, int] = {}
     pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)
     if len(pronunciations) == 1:
         pronunciation = pronunciations[0]
@@ -3832,11 +3945,14 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         lines.append("审词：" + "；".join(review_parts))
         lines.append("候选编码:")
         for status in pronunciation.get("candidateStatuses", [])[:6]:
+            code = str(status.get("code") or "").strip().lower()
+            candidate_indexes.setdefault(code, candidate_index)
             lines.append(
                 _format_review_candidate_line(
                     candidate_index,
                     status,
                     str(pronunciation.get("recommendedCode") or ""),
+                    ordering_recommended_code,
                 )
             )
             candidate_index += 1
@@ -3856,17 +3972,35 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             pinyin = str(pronunciation.get("pinyin") or "").strip()
             lines.append(f"候选编码（读音 {index}）:")
             for status in pronunciation.get("candidateStatuses", [])[:6]:
+                code = str(status.get("code") or "").strip().lower()
+                candidate_indexes.setdefault(code, candidate_index)
                 lines.append(
                     _format_review_candidate_line(
                         candidate_index,
                         status,
                         str(pronunciation.get("recommendedCode") or ""),
+                        ordering_recommended_code,
                     )
                 )
                 candidate_index += 1
             lines.append("")
 
-    lines.append(f"是否以编码 {recommended_code} 将「{word}」加入草稿？可回复编号、编码，或「都加」。")
+    while lines and not lines[-1]:
+        lines.pop()
+    if ordering_assessments:
+        lines.append("")
+        lines.extend(
+            _format_candidate_ordering_assessment(assessment, candidate_indexes)
+            for assessment in ordering_assessments
+        )
+    lines.append("")
+    if ordering_recommended_code:
+        lines.append(
+            f"如不调整现有排序，也可仍以编码 {recommended_code} 将「{word}」加入草稿；"
+            "回复对应编号或编码即可。"
+        )
+    else:
+        lines.append(f"是否以编码 {recommended_code} 将「{word}」加入草稿？可回复编号、编码，或「都加」。")
     lines.append("若选的是已有词编码，回复“编号 重新编码”可挪开原词。")
     return "\n".join(lines).strip()
 
@@ -3915,7 +4049,11 @@ async def _try_handle_simple_single_word_query(
                 if isinstance(pronunciation, dict)
                 for status in pronunciation.get("candidateStatuses") or []
             ]
-            _attach_server_candidate_snapshot(pending, server_statuses)
+            _attach_server_candidate_snapshot(
+                pending,
+                server_statuses,
+                review.get("candidateOrderingAssessments"),
+            )
             target_key = conv_key or (
                 current_memory_context.get().conversation_address
                 if current_memory_context.get() is not None
@@ -8563,6 +8701,11 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      1. abcd — 已有「旧词」
      2. abcde — ✅ 推荐（空位）
      3. abcdea — 空位
+
+     如果返回 candidateOrderingAssessments，必须逐条展示“常用度评估”。
+     front_more_common 时把对应已有词码标为常用度推荐，明确回复“编号 重新编码”执行，
+     并把原 recommendedCode 空位保留为不调序备选；behind_more_common/close 维持空位推荐；
+     not_enough_evidence 诚实说明信号不足、按空位推荐。不得据此自动写入。
 
      是否以编码 abcde 将「词」加入草稿？可回复编号、编码，或「都加」。
      若选的是已有词编码，回复“编号 重新编码”可挪开原词。

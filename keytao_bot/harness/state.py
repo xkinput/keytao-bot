@@ -32,6 +32,11 @@ class PendingAddWord:
     server_entries_by_code: Dict[str, List[Tuple[str, int]]] = field(
         default_factory=dict
     )
+    # Advisory ordering facts are accepted only with the same structured
+    # server snapshot as candidate occupancy. They do not authorize a reply.
+    server_ordering_assessments: List[Dict[str, str]] = field(
+        default_factory=list
+    )
     code_remarks: Dict[str, str] = field(default_factory=dict)
     pronunciation_codes: Dict[str, str] = field(default_factory=dict)
     pronunciation_recommended_codes: List[str] = field(default_factory=list)
