@@ -53,6 +53,7 @@ from ..harness.tools import (
     ToolContext,
     ToolExecutor,
     _COMMAND_PREFIX_PATTERN,
+    batch_warning_confirmation_binding,
     create_warning_confirmation_binding,
     message_authorizes_mutation,
     trusted_mutation_source,
@@ -563,6 +564,39 @@ def _is_sensitive_pending_control_intent(command_intent: MessageCommandIntent) -
         "pending_code_request",
         "pending_choice",
     }
+
+
+def _pending_tool_assent_intent(
+    state: PendingState,
+    message_text: str,
+) -> Optional[MessageCommandIntent]:
+    """Resolve closed assent before interpreting any trailing action."""
+    if not isinstance(state, PendingToolConfirm) or re.search(r"[?？]", message_text):
+        return None
+    compact = _compact_command_text(message_text)
+    if compact in _PENDING_CONFIRM_ASSENT_TEXTS:
+        return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+    if not re.fullmatch(
+        r"(?:确认|确定)(?:(?:并|并且|然后|再|同时|以及))?"
+        r"(?:提交|提审|送审)(?:审核|草稿|批次)?(?:一下)?(?:吧|啦|了)?",
+        compact,
+    ):
+        return None
+    if state.function_name != "keytao_submit_batch":
+        return MessageCommandIntent(
+            intent="pending_add_and_submit",
+            confidence=1.0,
+            submit_after=True,
+        )
+    return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+
+
+def _format_live_ticket_precedence_message(state: PendingToolConfirm) -> str:
+    return (
+        f"当前还有一项待确认操作：{_describe_pending_state(state)}。"
+        "为避免跳过这张票据，本次没有执行其他写入或提交；"
+        "请先确认或取消当前操作。"
+    )
 
 
 def _compact_command_text(message_text: str) -> str:
@@ -1404,6 +1438,12 @@ async def _classify_message_command_intent(
     """Use the configured flash/intent model for command and pending-control semantics."""
     if not message_text.strip():
         return MessageCommandIntent()
+    pending_tool_assent = _pending_tool_assent_intent(
+        pending_state,
+        message_text,
+    )
+    if pending_tool_assent is not None:
+        return pending_tool_assent
     compact_message = re.sub(
         r"[\s，,。.!！?？~～]+",
         "",
@@ -2534,6 +2574,12 @@ def _message_authorizes_pending_state_control(
     """Allow a generic short control or an exact target-bound local preview."""
     if re.search(r"[?？]", message_text):
         return False
+    structural_tool_intent = _pending_tool_assent_intent(state, message_text)
+    if (
+        structural_tool_intent is not None
+        and structural_tool_intent.intent == command_intent.intent
+    ):
+        return True
     if (
         isinstance(state, PendingAddWord)
         and command_intent.intent == "pending_add_and_submit"
@@ -2727,6 +2773,18 @@ async def _resolve_pending_ticket_control(
         return command_intent, None
     if command_intent.intent == "pending_cancel":
         return command_intent, None
+
+    structural_tool_intent = _pending_tool_assent_intent(
+        state_record.state,
+        message_text,
+    )
+    if (
+        structural_tool_intent is not None
+        and isinstance(state_record.state, PendingToolConfirm)
+        and state_record.owner_key.actor_id == str(user_id)
+        and structural_tool_intent.intent == "pending_add_and_submit"
+    ):
+        return structural_tool_intent, None
 
     compact_control = _compact_command_text(message_text)
     if _exact_nonce_command_matches(
@@ -4680,12 +4738,14 @@ _INJECT_PLATFORM_TOOLS = frozenset({
     'keytao_prepare_reviewed_add',
     'keytao_create_phrase', 'keytao_submit_batch',
     'keytao_list_draft_items', 'keytao_remove_draft_item',
+    'keytao_update_draft_item_weight',
     'keytao_batch_add_to_draft', 'keytao_batch_remove_draft_items',
     'keytao_shift_phrase_code', 'keytao_recall_batch', 'keytao_get_batch_preview',
 })
 _DRAFT_MUTATION_TOOLS = frozenset({
     "keytao_create_phrase",
     "keytao_remove_draft_item",
+    "keytao_update_draft_item_weight",
     "keytao_batch_add_to_draft",
     "keytao_batch_remove_draft_items",
     "keytao_shift_phrase_code",
@@ -5095,6 +5155,8 @@ def _canonicalize_authoritative_result_links(
 def _trusted_result_url(source: Dict, key: str) -> str:
     if not isinstance(source, dict):
         return ""
+    if key == "batchUrl" and source.get("batchIdProvisional") is True:
+        return ""
     value = str(source.get(key) or "").strip()
     if len(value) <= 2048 and re.fullmatch(r"https?://[^\s]+", value):
         return value
@@ -5108,9 +5170,14 @@ def _capture_trusted_result_links(
     """Track one internally consistent batch/PR link bundle."""
     stale_urls = set(filter(None, links.get("_staleUrls", "").splitlines()))
     stale_urls.update(filter(None, str(result.get("_staleUrls") or "").splitlines()))
+    provisional_batch = result.get("batchIdProvisional") is True
+    if provisional_batch:
+        links["_provisionalBatch"] = "true"
     batch_url = _trusted_result_url(result, "batchUrl")
     pr_url = _trusted_result_url(result, "prUrl")
-    batch_id = str(result.get("batchId") or "").strip()
+    batch_id = (
+        "" if provisional_batch else str(result.get("batchId") or "").strip()
+    )
     previous_batch_url = links.get("batchUrl", "")
     previous_batch_id = links.get("batchId", "")
     previous_pr_url = links.get("prUrl", "")
@@ -5144,6 +5211,7 @@ def _capture_trusted_result_links(
             links.pop(key, None)
     if batch_id:
         links["batchId"] = batch_id
+        links.pop("_provisionalBatch", None)
     if batch_url:
         links["batchUrl"] = batch_url
     if pr_url:
@@ -5564,7 +5632,10 @@ async def _perform_batch_add_to_draft_and_submit(
         if (
             auto_confirm
             and not confirmed_add
-            and _create_preview_has_no_new_warnings(add_data)
+            and batch_warning_confirmation_binding(
+                add_data,
+                {"items": requested_items},
+            )
         ):
             exact_args = pending_state.args
             confirmed_result = await _perform_batch_add_to_draft_and_submit(
@@ -6196,14 +6267,18 @@ async def _execute_confirmed_tool(
 
     if data.get("requiresConfirmation"):
         pending_state = _pending_state_from_server_warning(state, data)
-        auto_confirm_binding = (
-            create_warning_confirmation_binding(data, args)
-            if (
-                state.function_name == "keytao_create_phrase"
-                and state.confirmation_source == "local_preview"
-            )
-            else None
-        )
+        auto_confirm_binding = None
+        if state.confirmation_source == "local_preview":
+            if state.function_name == "keytao_create_phrase":
+                auto_confirm_binding = create_warning_confirmation_binding(
+                    data,
+                    args,
+                )
+            elif state.function_name == "keytao_batch_add_to_draft":
+                auto_confirm_binding = batch_warning_confirmation_binding(
+                    data,
+                    args,
+                )
         if auto_confirm_binding is not None:
             warning_ordering_summary = (
                 ordering_summary
@@ -6388,9 +6463,24 @@ def _is_pending_tool_confirm_message(
 ) -> bool:
     if state.function_name == "keytao_submit_batch":
         return command_intent.intent == "pending_confirm"
-    if state.function_name == "keytao_batch_add_to_draft":
-        return command_intent.intent in {"pending_confirm", "pending_add_and_submit"}
-    return command_intent.intent == "pending_confirm"
+    return command_intent.intent in {"pending_confirm", "pending_add_and_submit"}
+
+
+def _pending_tool_state_with_trailing_submit(
+    state: PendingToolConfirm,
+    command_intent: MessageCommandIntent,
+) -> PendingToolConfirm:
+    """Carry an explicit trailing submit through the consumed write ticket."""
+    if (
+        command_intent.intent != "pending_add_and_submit"
+        or state.function_name == "keytao_submit_batch"
+    ):
+        return state
+    return PendingToolConfirm(
+        function_name=state.function_name,
+        args={**state.args, "_submit_after": True},
+        confirmation_source=state.confirmation_source,
+    )
 
 
 async def _format_draft_response(
@@ -6960,12 +7050,21 @@ def _append_batch_url_if_missing(
     """Append trusted batch and PR links while keeping each URL once."""
     bundle = _trusted_link_bundle(*sources)
     if not bundle.get("batchUrl") and not bundle.get("prUrl"):
-        return _dedupe_authoritative_link_lines(text)
-    return _canonicalize_authoritative_result_links(
-        text,
-        bundle,
-        batch_label=label,
-    )
+        output = _dedupe_authoritative_link_lines(text)
+    else:
+        output = _canonicalize_authoritative_result_links(
+            text,
+            bundle,
+            batch_label=label,
+        )
+    if (
+        bundle.get("_provisionalBatch") == "true"
+        and not bundle.get("batchUrl")
+        and "待确认后生成" not in output
+    ):
+        separator = "\n\n" if output.rstrip() else ""
+        output = output.rstrip() + separator + f"{label}：待确认后生成"
+    return output
 
 
 async def _perform_exact_batch_remove(
@@ -8472,6 +8571,9 @@ async def handle_pending_message_core(
         pending_command_intent = await _classify_message_command_intent(message, state)
     except BaseException:
         raise
+    structural_tool_intent = _pending_tool_assent_intent(state, message)
+    if structural_tool_intent is not None:
+        pending_command_intent = structural_tool_intent
     if (
         _is_sensitive_pending_control_intent(pending_command_intent)
         and not _message_authorizes_pending_state_control(
@@ -8486,6 +8588,8 @@ async def handle_pending_message_core(
         pending_command_intent.intent == "draft_submit"
         and _is_explicit_draft_submit_request(message)
     ):
+        if isinstance(state, PendingToolConfirm):
+            return _format_live_ticket_precedence_message(state)
         return await _submit_current_draft(
             platform,
             user_id,
@@ -8582,7 +8686,10 @@ async def handle_pending_message_core(
             response = result.text
         else:
             response = await _execute_confirmed_tool(
-                state,
+                _pending_tool_state_with_trailing_submit(
+                    state,
+                    pending_command_intent,
+                ),
                 platform,
                 user_id,
                 conv_key,
@@ -10136,6 +10243,12 @@ async def _handle_ai_chat_serialized(
         return
     else:
         generic_command_intent = await command_intent_for()
+    live_ticket_assent = _pending_tool_assent_intent(
+        current_pending_record.state if current_pending_record is not None else None,
+        normalized_message_text,
+    )
+    if live_ticket_assent is not None:
+        generic_command_intent = live_ticket_assent
     if _message_authorizes_clear_history(
         normalized_message_text,
         generic_command_intent,
@@ -10148,6 +10261,11 @@ async def _handle_ai_chat_serialized(
         generic_command_intent,
         normalized_message_text,
     ) or message_is_prefixed_fresh_word_query
+    if (
+        current_pending_record is not None
+        and isinstance(current_pending_record.state, PendingToolConfirm)
+    ):
+        generic_intent_is_fresh_command = False
 
     if active_operation is not None:
         current_pending_state = conversation_state_store.get(conv_key)
@@ -10782,7 +10900,10 @@ async def _handle_ai_chat_serialized(
                             response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
                         else:
                             response = await _execute_confirmed_tool(
-                                state,
+                                _pending_tool_state_with_trailing_submit(
+                                    state,
+                                    pending_command_intent,
+                                ),
                                 platform,
                                 user_id,
                                 conv_key,
@@ -10792,7 +10913,10 @@ async def _handle_ai_chat_serialized(
                             )
                             if not preserve_pending_after_response:
                                 complete_pending_execution()
-                # else: response stays None, fall through to AI as new request
+                elif message_authorizes_mutation(normalized_message_text):
+                    restore_pending_state()
+                    response = _format_live_ticket_precedence_message(state)
+                # Non-actionable text still falls through to ordinary Q&A.
 
             if response is None and state is not None:
                 restore_pending_state()

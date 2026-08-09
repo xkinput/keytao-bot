@@ -42,7 +42,7 @@ from .scenarios import (
     ordered_candidate_codes,
     run_scenario,
 )
-from .zdic_seed import seed_s9_zdic_cache
+from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_zdic_cache
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -247,6 +247,182 @@ async def ensure_fixture(
         return await build_fixture_facts(client)
 
 
+async def ensure_multi_add_fixture(client: LocalNextClient) -> dict[str, Any]:
+    """Prove both fixed multi-add codes are free before any scenario runs."""
+    codes = ("wfw", "wfwu")
+    occupancy: dict[str, list[dict[str, Any]]] = {}
+    for code in codes:
+        occupancy[code] = [
+            row
+            for row in await client.phrases_by_code(code)
+            if str(row.get("code") or "").strip().lower() == code
+        ]
+    occupied = {code: rows for code, rows in occupancy.items() if rows}
+    if occupied:
+        raise RigInfrastructureError(
+            f"S10/S11 require free exact codes wfw and wfwu: {occupied}"
+        )
+    return {
+        "codes": list(codes),
+        "exactOccupancy": occupancy,
+        "bothFree": True,
+    }
+
+
+def _encoded_matches_zdic_fixture(
+    *,
+    word: str,
+    encoded: dict[str, Any],
+    rows_by_key: dict[tuple[str, str], dict[str, Any]],
+) -> bool:
+    entry_row = rows_by_key.get(("entry", word))
+    encoded_chars = encoded.get("chars")
+    if entry_row is None or not isinstance(encoded_chars, list):
+        return False
+    characters_match = len(encoded_chars) == len(word) and all(
+        isinstance(actual, dict)
+        and actual.get("char") == char
+        and expected is not None
+        and actual.get("pinyin") == expected["pinyins"][0]
+        and actual.get("pinyins") == expected["pinyins"]
+        and actual.get("pronunciationLookupStatus") == expected["status"]
+        for char, actual in zip(word, encoded_chars)
+        if (expected := rows_by_key.get(("char", char))) is not None
+    ) and all(("char", char) in rows_by_key for char in word)
+    return not (
+        encoded.get("pronunciationSource") != "pinyin-pro-context"
+        or encoded.get("standardPronunciationStatus") != entry_row["status"]
+        or encoded.get("semanticPronunciationNeeded") is not False
+        or not characters_match
+    )
+
+
+async def probe_zdic_fixture_with_retry(
+    *,
+    client: LocalNextClient,
+    scenario_id: str,
+    recorder: ArtifactRecorder,
+) -> dict[str, Any]:
+    """Reuse S9's final-probe warm-up pattern for any declared ZDIC fixture."""
+
+    fixture = ZDIC_FIXTURES_BY_SCENARIO.get(scenario_id)
+    if fixture is None:
+        raise RigInfrastructureError(
+            f"No ZDIC cache fixture is declared for scenario {scenario_id}"
+        )
+    probe_words = tuple(fixture["probe_words"])
+    rows_by_key = {
+        (row["kind"], row["entry"]): row
+        for row in fixture["rows"]
+    }
+    warmup_attempts: list[dict[str, Any]] = []
+    warmup_artifact = (
+        f"{scenario_id}-zdic-warmup-attempt-{recorder.current_attempt()}.json"
+    )
+    probe_count = len(S9_ZDIC_WARMUP_BACKOFF_SECONDS) + 1
+    encoded_by_word: dict[str, dict[str, Any]] = {}
+    for probe_attempt in range(1, probe_count + 1):
+        probe_started = time.monotonic()
+        encoded_by_word = {
+            word: await client.encode(word)
+            for word in probe_words
+        }
+        word_facts: dict[str, dict[str, Any]] = {}
+        for word, encoded in encoded_by_word.items():
+            encoded_chars = encoded.get("chars")
+            if isinstance(encoded_chars, list):
+                character_statuses = {
+                    str(item.get("char") or ""): item.get(
+                        "pronunciationLookupStatus"
+                    )
+                    for item in encoded_chars
+                    if isinstance(item, dict) and item.get("char")
+                }
+            else:
+                character_statuses = {}
+            word_facts[word] = {
+                "pronunciationSource": encoded.get("pronunciationSource"),
+                "standardPronunciationStatus": encoded.get(
+                    "standardPronunciationStatus"
+                ),
+                "characterLookupStatuses": character_statuses,
+                "seededRealityMatches": _encoded_matches_zdic_fixture(
+                    word=word,
+                    encoded=encoded,
+                    rows_by_key=rows_by_key,
+                ),
+            }
+        probe_fact: dict[str, Any] = {
+            "attempt": probe_attempt,
+            "words": word_facts,
+            "elapsedSeconds": round(time.monotonic() - probe_started, 3),
+        }
+        if len(probe_words) == 1:
+            probe_fact.update(word_facts[probe_words[0]])
+        warmup_attempts.append(probe_fact)
+        print(
+            f"{scenario_id} zdic warm-up {probe_attempt}/{probe_count}: "
+            f"words={word_facts}"
+        )
+        recorder.write_json(
+            warmup_artifact,
+            {
+                "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
+                "finalAssertionAttempt": probe_count,
+                "finalAssertionResult": "pending",
+                "attempts": warmup_attempts,
+            },
+        )
+        if probe_attempt < probe_count:
+            await asyncio.sleep(S9_ZDIC_WARMUP_BACKOFF_SECONDS[probe_attempt - 1])
+
+    seeded_reality_matches = all(
+        _encoded_matches_zdic_fixture(
+            word=word,
+            encoded=encoded_by_word[word],
+            rows_by_key=rows_by_key,
+        )
+        for word in probe_words
+    )
+    recorder.write_json(
+        warmup_artifact,
+        {
+            "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
+            "finalAssertionAttempt": probe_count,
+            "finalAssertionResult": (
+                "passed" if seeded_reality_matches else "failed"
+            ),
+            "attempts": warmup_attempts,
+        },
+    )
+    return {
+        "probeWords": list(probe_words),
+        "seededRealityMatches": seeded_reality_matches,
+        "encodedByWord": encoded_by_word,
+        "zdicWarmupAttempts": warmup_attempts,
+        "warmupArtifact": warmup_artifact,
+    }
+
+
+async def ensure_scenario_zdic_fixture(
+    *,
+    client: LocalNextClient,
+    scenario_id: str,
+    recorder: ArtifactRecorder,
+) -> dict[str, Any]:
+    result = await probe_zdic_fixture_with_retry(
+        client=client,
+        scenario_id=scenario_id,
+        recorder=recorder,
+    )
+    if not result["seededRealityMatches"]:
+        raise RigInfrastructureError(
+            f"{scenario_id} did not use the seeded ZDIC reality: "
+            f"{result['encodedByWord']}"
+        )
+    return result
+
+
 async def ensure_s9_fixture(
     *,
     client: LocalNextClient,
@@ -299,49 +475,14 @@ async def ensure_s9_fixture(
     owner_name = str((exact_rows[0].get("user") or {}).get("name") or "")
     cleanup_required = owner_name.startswith(RESERVED_BINDING_PREFIX)
 
-    warmup_attempts: list[dict[str, Any]] = []
-    warmup_artifact = (
-        f"S9-zdic-warmup-attempt-{recorder.current_attempt()}.json"
+    warmup = await probe_zdic_fixture_with_retry(
+        client=client,
+        scenario_id="S9",
+        recorder=recorder,
     )
-    probe_count = len(S9_ZDIC_WARMUP_BACKOFF_SECONDS) + 1
-    encoded: dict[str, Any] = {}
-    for probe_attempt in range(1, probe_count + 1):
-        probe_started = time.monotonic()
-        encoded = await client.encode("射覆")
-        encoded_chars = encoded.get("chars")
-        if isinstance(encoded_chars, list):
-            character_statuses = {
-                str(item.get("char") or ""): item.get("pronunciationLookupStatus")
-                for item in encoded_chars
-                if isinstance(item, dict) and item.get("char")
-            }
-        else:
-            character_statuses = {}
-        probe_fact = {
-            "attempt": probe_attempt,
-            "pronunciationSource": encoded.get("pronunciationSource"),
-            "standardPronunciationStatus": encoded.get("standardPronunciationStatus"),
-            "characterLookupStatuses": character_statuses,
-            "elapsedSeconds": round(time.monotonic() - probe_started, 3),
-        }
-        warmup_attempts.append(probe_fact)
-        print(
-            f"S9 zdic warm-up {probe_attempt}/{probe_count}: "
-            f"pronunciationSource={probe_fact['pronunciationSource']!r}, "
-            f"standardPronunciationStatus={probe_fact['standardPronunciationStatus']!r}, "
-            f"characterLookupStatuses={character_statuses}"
-        )
-        recorder.write_json(
-            warmup_artifact,
-            {
-                "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
-                "finalAssertionAttempt": probe_count,
-                "finalAssertionResult": "pending",
-                "attempts": warmup_attempts,
-            },
-        )
-        if probe_attempt < probe_count:
-            await asyncio.sleep(S9_ZDIC_WARMUP_BACKOFF_SECONDS[probe_attempt - 1])
+    warmup_attempts = warmup["zdicWarmupAttempts"]
+    warmup_artifact = warmup["warmupArtifact"]
+    encoded = warmup["encodedByWord"]["射覆"]
 
     candidate_codes = ordered_candidate_codes(encoded)
     expected_codes = ["eefj", "eefju", "eefjuv"]
@@ -375,7 +516,7 @@ async def ensure_s9_fixture(
         warmup_artifact,
         {
             "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
-            "finalAssertionAttempt": probe_count,
+            "finalAssertionAttempt": len(S9_ZDIC_WARMUP_BACKOFF_SECONDS) + 1,
             "finalAssertionResult": "passed" if seeded_reality_matches else "failed",
             "attempts": warmup_attempts,
         },
@@ -587,11 +728,17 @@ async def async_main(args: argparse.Namespace) -> int:
             REPO_ROOT,
         )
         manifest["repoHead"] = head.strip()
-        if any(scenario.scenario_id == "S9" for scenario in scenarios):
-            manifest["s9ZdicCacheSeed"] = await asyncio.to_thread(
-                seed_s9_zdic_cache,
+        zdic_scenario_ids = [
+            scenario.scenario_id
+            for scenario in scenarios
+            if scenario.scenario_id in ZDIC_FIXTURES_BY_SCENARIO
+        ]
+        if zdic_scenario_ids:
+            manifest["zdicCacheSeed"] = await asyncio.to_thread(
+                seed_zdic_cache,
                 config["next_child_env"]["DATABASE_URL"],
                 next_dir=args.next_dir,
+                scenario_ids=zdic_scenario_ids,
             )
         guard.install()
         await server.ensure_running()
@@ -641,6 +788,7 @@ async def async_main(args: argparse.Namespace) -> int:
             seed_identity=seed_identity,
             admin_token=admin_session["token"],
         )
+        fixture_facts["multiAdd"] = await ensure_multi_add_fixture(client)
         recorder.write_json("fixture-facts.json", fixture_facts)
         state_dir = artifact_dir / "state"
         openai_chat = initialize_openai_chat(config, state_dir=state_dir)
@@ -676,6 +824,15 @@ async def async_main(args: argparse.Namespace) -> int:
                             client=client,
                             seed_identity=seed_identity,
                             admin_token=admin_session["token"],
+                            recorder=recorder,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S10":
+                        fixture_facts.setdefault("zdic", {})[
+                            scenario.scenario_id
+                        ] = await ensure_scenario_zdic_fixture(
+                            client=client,
+                            scenario_id=scenario.scenario_id,
                             recorder=recorder,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)

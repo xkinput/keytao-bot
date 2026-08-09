@@ -29,13 +29,15 @@ available. Conversation history, compressed memory, and uncertain-mutation
 fences are initialized inside the current run's artifact directory before the
 real chat plugin is imported.
 
-S9 has one intentionally narrow direct-database fixture: after the same
-loopback-only `DATABASE_URL` validation, the runner upserts six fixed rows into
-`zdic_pinyin_cache` and no other table. `keytao-next` has no API for its internal
-pronunciation cache, while the child-process proxy confinement makes live
-`zdic.net` fetches impossible by design. The rows mark `射覆` and the fixture word
-`慑服` as absent whole-word entries and provide their required character readings,
-so both the fixture API flow and S9's review flow remain deterministic offline.
+Scenarios can declare an intentionally narrow direct-database pronunciation
+fixture. After the same loopback-only `DATABASE_URL` validation, the runner
+upserts only the selected scenarios' declared rows into `zdic_pinyin_cache` and
+no other table. `keytao-next` has no API for its internal pronunciation cache,
+while the child-process proxy confinement makes live `zdic.net` fetches
+impossible by design. S9 declares six rows for `射覆` and `慑服`. S10 declares
+found character readings for `王`, `中`, `微`, `服`, and `务`, plus absent
+whole-word entries for `王中王` and `微服务`. Duplicate declarations are collapsed
+by `(kind, entry)` before the upsert.
 
 ## Prerequisites
 
@@ -97,6 +99,22 @@ an action. Its preflight requires the seeded `射覆` character lookups to be
 accepts the proxy-induced `zdic-unavailable` fallback. A rig-owned S9 fixture is
 removed through an approved API batch after the scenario; a compatible
 pre-existing non-rig fixture is preserved.
+
+Before S9 or S10 dispatches a scenario attempt, the rig probes the declared
+whole words through local next four times with the existing `4s`, `5s`, `6s`
+warm-up backoff. Only the final probe is asserted. It must report an absent
+whole-word lookup and the exact seeded found reading for every character; a cold
+or stale dev server that still reports `zdic-unavailable` therefore fails as rig
+infrastructure before any scenario assertion or model call.
+
+S11 keeps the confirmation path when the server returns a wider live ticket and
+always rejects provisional batch links; the narrow named-occupant shape may
+instead complete through its single server-bound replay. S12 asserts that narrow
+shape materializes in one message with the exact persisted weight cascade
+(`吃席@wkxk` 100 and `赤溪@wkxk` 101), with no value below its type base. S13 sends an explicit weight
+adjustment against an empty draft and asserts a deterministic failure that never
+asks the user to resend the same current message. The orchestrating session owns
+live-rig execution; ordinary offline verification must not start a server.
 
 Optional overrides:
 

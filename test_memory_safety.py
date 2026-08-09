@@ -9,7 +9,7 @@ import types
 import unittest
 from contextlib import closing
 from dataclasses import dataclass
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import nonebot
 
@@ -1212,6 +1212,248 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             chat_module.tool_executor = old_tool_executor
             chat_module.conversation_state_store = old_state_store
+
+    async def test_confirm_plus_submit_consumes_live_write_ticket_first(self) -> None:
+        """An assent-plus-action message cannot orphan the current write ticket."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "group-501", "user-501")
+        items = [
+            {"action": "Create", "word": "王中王", "code": "wfw"},
+            {"action": "Create", "word": "王中王", "code": "wfwu"},
+        ]
+        pending = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": items,
+                "batch_id": "batch-risk",
+                "expected_content_version": 6,
+                "expected_warning_digest": "e" * 64,
+            },
+            confirmation_source="server_warning",
+        )
+        calls = []
+
+        async def dispatch(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, dict(arguments)))
+            if tool_name == "keytao_batch_add_to_draft":
+                return __import__("json").dumps({
+                    "success": True,
+                    "successCount": 2,
+                    "failedCount": 0,
+                    "batchId": "batch-risk",
+                    "contentVersion": 7,
+                    "draft_snapshot": {
+                        "count": 2,
+                        "items": items,
+                        "summary": {"added": 2, "modified": 0, "deleted": 0},
+                    },
+                }, ensure_ascii=False)
+            if tool_name == "keytao_create_phrase":
+                return __import__("json").dumps({
+                    "success": True,
+                    "batchId": "batch-risk",
+                    "contentVersion": 7,
+                    "draft_snapshot": {
+                        "count": 1,
+                        "items": [items[0]],
+                        "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    },
+                }, ensure_ascii=False)
+            if tool_name == "keytao_get_batch_preview":
+                return __import__("json").dumps({
+                    "success": True,
+                    "batchId": "batch-risk",
+                    "summary": {"added": 1, "modified": 0, "deleted": 0},
+                    "diff_text": "+ 王中王 wfw",
+                }, ensure_ascii=False)
+            if tool_name == "keytao_submit_batch" and arguments.get("preview_only"):
+                return __import__("json").dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "batch-risk",
+                    "contentVersion": 7,
+                    "snapshotDigest": "a" * 64,
+                    "warningDigest": "b" * 64,
+                    "auditDigest": "c" * 64,
+                    "snapshotItems": items,
+                    "warnings": [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_submit_batch" and arguments.get("confirmed"):
+                return __import__("json").dumps({
+                    "success": True,
+                    "batchId": "batch-risk",
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        old_state_store = chat_module.conversation_state_store
+        try:
+            chat_module.conversation_state_store = state_store
+            state_store.set(
+                conv_key,
+                pending,
+                space_key=conv_key.space_key,
+                owner_label="Garth",
+            )
+            with (
+                patch.object(
+                    chat_module,
+                    "_classify_message_command_intent",
+                    AsyncMock(
+                        return_value=chat_module.MessageCommandIntent(
+                            intent="draft_submit",
+                            confidence=1.0,
+                        )
+                    ),
+                ),
+                patch.object(chat_module, "call_tool_function", dispatch),
+            ):
+                reply = await chat_module.handle_pending_message_core(
+                    "确认并提交",
+                    "qq",
+                    "user-501",
+                    conv_key,
+                    history=[],
+                    space_key=conv_key.space_key,
+                    owner_label="Garth",
+                )
+
+            self.assertEqual(
+                [name for name, _arguments in calls],
+                [
+                    "keytao_batch_add_to_draft",
+                    "keytao_submit_batch",
+                    "keytao_submit_batch",
+                ],
+            )
+            self.assertTrue(calls[0][1].get("confirmed"))
+            self.assertTrue(calls[1][1].get("preview_only"))
+            self.assertTrue(calls[2][1].get("confirmed"))
+            self.assertNotIn("没有找到待提交的草稿批次", reply)
+            self.assertIsNone(state_store.get_record(conv_key))
+
+            calls.clear()
+            state_store.set(
+                conv_key,
+                pending,
+                space_key=conv_key.space_key,
+                owner_label="Garth",
+            )
+            with (
+                patch.object(
+                    chat_module,
+                    "_classify_message_command_intent",
+                    AsyncMock(
+                        return_value=chat_module.MessageCommandIntent(
+                            intent="draft_submit",
+                            confidence=1.0,
+                        )
+                    ),
+                ),
+                patch.object(chat_module, "call_tool_function", dispatch),
+            ):
+                blocked = await chat_module.handle_pending_message_core(
+                    "提交",
+                    "qq",
+                    "user-501",
+                    conv_key,
+                    history=[],
+                    space_key=conv_key.space_key,
+                    owner_label="Garth",
+                )
+            self.assertEqual(calls, [])
+            self.assertIn("待确认", blocked)
+            self.assertIsNotNone(state_store.get_record(conv_key))
+
+            calls.clear()
+            state_store.set(
+                conv_key,
+                PendingToolConfirm(
+                    function_name="keytao_create_phrase",
+                    args={
+                        "word": "王中王",
+                        "code": "wfw",
+                        "batch_id": "batch-risk",
+                        "expected_content_version": 6,
+                        "expected_warning_digest": "e" * 64,
+                    },
+                    confirmation_source="server_warning",
+                ),
+                space_key=conv_key.space_key,
+                owner_label="Garth",
+            )
+            with (
+                patch.object(
+                    chat_module,
+                    "_classify_message_command_intent",
+                    AsyncMock(
+                        return_value=chat_module.MessageCommandIntent(
+                            intent="draft_submit",
+                            confidence=1.0,
+                        )
+                    ),
+                ),
+                patch.object(chat_module, "call_tool_function", dispatch),
+            ):
+                chained = await chat_module.handle_pending_message_core(
+                    "确认并提交",
+                    "qq",
+                    "user-501",
+                    conv_key,
+                    history=[],
+                    space_key=conv_key.space_key,
+                    owner_label="Garth",
+                )
+            self.assertEqual(
+                [name for name, _arguments in calls],
+                [
+                    "keytao_create_phrase",
+                    "keytao_get_batch_preview",
+                    "keytao_submit_batch",
+                ],
+            )
+            self.assertIn("已确认添加到草稿", chained)
+            self.assertIsInstance(
+                state_store.get(conv_key),
+                PendingToolConfirm,
+            )
+            self.assertEqual(
+                state_store.get(conv_key).function_name,
+                "keytao_submit_batch",
+            )
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+    def test_provisional_batch_preview_renders_no_dead_link(self) -> None:
+        """Both reply renderers suppress the same provisional result payload."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        payload = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "provisional-uuid",
+            "batchIdProvisional": True,
+            "batchUrl": "http://localhost:3100/batch/provisional-uuid",
+        }
+        direct_reply = chat_module._append_batch_url_if_missing(
+            "请确认批量加入草稿",
+            payload,
+        )
+        links = {}
+        AgentOrchestrator._capture_authoritative_result_links(payload, links)
+        routed_reply = AgentOrchestrator._append_authoritative_result_links(
+            "请确认同码前插",
+            links,
+        )
+
+        self.assertEqual(
+            [
+                ("待确认后生成" in reply, "/batch/" in reply)
+                for reply in (direct_reply, routed_reply)
+            ],
+            [(True, False), (True, False)],
+        )
 
     async def test_exact_recode_selector_resolves_canonical_candidate_without_nonce(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
@@ -3487,6 +3729,106 @@ class MutationAuthorizationTests(unittest.TestCase):
                     )
                 )
 
+    def test_multi_add_authorization_requires_every_clause_to_be_closed(self) -> None:
+        allowed = (
+            "喵喵\n加词 王中王 wfw\n加词 微服务 wfwu",
+            "喵喵；录入 王中王 wfw；收录 微服务 wfwu；谢谢",
+            "添加词组「王中王」 wfw；添加词组「微服务」 wfwu",
+        )
+        for message in allowed:
+            with self.subTest(allowed=message):
+                self.assertTrue(message_authorizes_mutation(message))
+
+        blocked = (
+            "喵喵\n加词 王中王 wfw\n稍后再看\n加词 微服务 wfwu",
+            "喵喵\n不要加词 王中王 wfw\n加词 微服务 wfwu",
+            "喵喵\n他说加词 王中王 wfw\n加词 微服务 wfwu",
+            "记录如下：\n加词 王中王 wfw\n加词 微服务 wfwu",
+            "喵喵\n加词 王中王 wfw？\n加词 微服务 wfwu",
+        )
+        for message in blocked:
+            with self.subTest(blocked=message):
+                self.assertFalse(message_authorizes_mutation(message))
+
+    def test_multi_add_item_set_mutations_never_reach_the_sink(self) -> None:
+        async def _run() -> None:
+            calls = []
+
+            async def tool(**kwargs):
+                calls.append(kwargs)
+                return {"success": True}
+
+            executor = ToolExecutor(lambda _name: tool, frozenset())
+            message = "喵喵\n加词 王中王 wfw\n加词 微服务 wfwu"
+
+            async def execute(items, current_message=message, **context):
+                raw = await executor.call(
+                    "keytao_batch_add_to_draft",
+                    {"items": items},
+                    ToolContext(
+                        current_message=current_message,
+                        writes_allowed=message_authorizes_mutation(current_message),
+                        **context,
+                    ),
+                )
+                return __import__("json").loads(raw)
+
+            exact_items = [
+                {"action": "Create", "word": "王中王", "code": "wfw"},
+                {"action": "Create", "word": "微服务", "code": "wfwu"},
+            ]
+            exact = await execute(exact_items)
+            self.assertTrue(exact.get("success"))
+            self.assertEqual(len(calls), 1)
+
+            mutations = (
+                [*exact_items, {"action": "Create", "word": "未点名", "code": "wdm"}],
+                exact_items[:1],
+                [
+                    {"action": "Create", "word": "王中王", "code": "wfwu"},
+                    {"action": "Create", "word": "微服务", "code": "wfw"},
+                ],
+            )
+            for items in mutations:
+                with self.subTest(items=items):
+                    result = await execute(items)
+                    self.assertTrue(result.get("policyBlocked"), result)
+            self.assertEqual(len(calls), 1)
+
+            derived = await execute(
+                [
+                    {"action": "Create", "word": "王中王", "code": "wfw"},
+                    {"action": "Create", "word": "微服务", "code": "wfwu"},
+                ],
+                current_message="加词 王中王\n加词 微服务",
+                trusted_codes_by_word={
+                    "王中王": frozenset({"wfw"}),
+                    "微服务": frozenset({"wfwu"}),
+                },
+            )
+            self.assertTrue(derived.get("success"), derived)
+            self.assertEqual(len(calls), 2)
+
+            too_many_message = "\n".join(
+                f"加词 条目{index} c{chr(97 + index)}x" for index in range(11)
+            )
+            too_many = await execute(
+                [
+                    {
+                        "action": "Create",
+                        "word": f"条目{index}",
+                        "code": f"c{chr(97 + index)}x",
+                    }
+                    for index in range(11)
+                ],
+                current_message=too_many_message,
+            )
+            self.assertTrue(too_many.get("requiresTextFollowUp"), too_many)
+            self.assertEqual(too_many.get("reason"), "multi_add_limit_exceeded")
+            self.assertEqual(len(calls), 2)
+
+        asyncio.run(_run())
+
     def test_negation_corpus_is_refused_without_blocking_unrelated_commands(self) -> None:
         self.assertEqual(NEGATION_WINDOW_CORPUS_SIZE, 28080)
         leaks = [
@@ -4736,6 +5078,7 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
             if name not in {
                 "keytao_create_phrase",
                 "keytao_shift_phrase_code",
+                "keytao_batch_add_to_draft",
             }:
                 return None
 
@@ -4750,6 +5093,7 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
             frozenset({
                 "keytao_create_phrase",
                 "keytao_shift_phrase_code",
+                "keytao_batch_add_to_draft",
             }),
         )
 
@@ -5196,6 +5540,31 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
                         and "weight" not in call_args
                     ):
                         actual = "NEXT_FREE"
+                elif tool_name == "keytao_batch_add_to_draft":
+                    items = call_args.get("items")
+                    self.assertEqual(
+                        items,
+                        [
+                            {
+                                "action": "Create",
+                                "word": "吃席",
+                                "code": "wkxk",
+                                "type": "Phrase",
+                                "weight": 100,
+                                "needsManualReview": True,
+                            },
+                            {
+                                "action": "Change",
+                                "old_word": "赤溪",
+                                "word": "赤溪",
+                                "code": "wkxk",
+                                "type": "Phrase",
+                                "weight": 101,
+                            },
+                        ],
+                    )
+                    actual = "DUPLICATE"
+                    self.assertIn("orderingSummary", result)
             if actual != expected:
                 failures.append((label, expected, actual, result, call_delta))
 
@@ -5368,6 +5737,13 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
                     if "weight" in call_args
                     else "NEXT_FREE"
                 )
+            elif [name for name, _kwargs in call_delta] == [
+                "keytao_batch_add_to_draft"
+            ]:
+                items = call_delta[0][1].get("items")
+                self.assertEqual(items[0].get("weight"), 100)
+                self.assertEqual(items[1].get("weight"), 101)
+                actual = "DUPLICATE"
             else:
                 actual = "INVALID"
             if actual != expected:
@@ -5973,7 +6349,7 @@ class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(quoted_type.get("success"))
         self.assertNotIn("type", self.calls[0])
 
-    async def test_per_target_negation_blocks_only_the_negated_target(self) -> None:
+    async def test_multi_add_negation_blocks_the_whole_turn(self) -> None:
         blocked = await self._call(
             "keytao_create_phrase",
             {"word": "甲", "code": "aa", "action": "Create"},
@@ -5986,8 +6362,8 @@ class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(blocked.get("policyBlocked"))
-        self.assertTrue(allowed.get("success"))
-        self.assertEqual([call["word"] for call in self.calls], ["乙"])
+        self.assertTrue(allowed.get("policyBlocked"))
+        self.assertEqual(self.calls, [])
 
     async def test_delete_contradiction_is_blocked_for_id_and_trusted_word(self) -> None:
         direct = await self._call(
@@ -6342,6 +6718,134 @@ class _ShiftSkills:
         ]
 
 
+class _BatchAddSkills:
+    @staticmethod
+    def get_skill_instructions():
+        return ""
+
+    @staticmethod
+    def has_tools():
+        return True
+
+    @staticmethod
+    def get_tools():
+        return [{
+            "type": "function",
+            "function": {
+                "name": "keytao_batch_add_to_draft",
+                "description": "Add exact items to a draft",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "action": {"type": "string"},
+                                    "word": {"type": "string"},
+                                    "code": {"type": "string"},
+                                },
+                                "required": ["word", "code"],
+                            },
+                        },
+                    },
+                    "required": ["items"],
+                },
+            },
+        }]
+
+
+class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clean_bound_batch_preview_replays_one_server_ticket(self) -> None:
+        """A bound clean multi-add is written by one digest-bound replay."""
+        items = [
+            {"action": "Create", "word": "王中王", "code": "wfw"},
+            {"action": "Create", "word": "微服务", "code": "wfwu"},
+        ]
+        calls = []
+
+        async def dispatch(**kwargs):
+            calls.append(dict(kwargs))
+            if not kwargs.get("confirmed"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warnings": [],
+                    "warnedCount": 0,
+                    "batchId": "provisional-batch",
+                    "batchIdProvisional": True,
+                    "contentVersion": 0,
+                    "warningDigest": "d" * 64,
+                    "batchUrl": (
+                        "http://localhost:3100/batch/provisional-batch"
+                    ),
+                }
+            return {
+                "success": True,
+                "successCount": 2,
+                "failedCount": 0,
+                "batchId": "materialized-batch",
+                "contentVersion": 1,
+                "batchUrl": (
+                    "http://localhost:3100/batch/materialized-batch"
+                ),
+            }
+
+        state_store = MemoryConversationStateStore()
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-batch",
+                    "keytao_batch_add_to_draft",
+                    {"items": items},
+                )],
+            ),
+            _fake_response("stop", "已加入草稿"),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_BatchAddSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: (
+                    dispatch if name == "keytao_batch_add_to_draft" else None
+                ),
+                frozenset({"keytao_batch_add_to_draft"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        result = await orchestrator.run(
+            "喵喵\n加词 王中王 wfw\n加词 微服务 wfwu",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-batch",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(
+            (
+                len(calls),
+                calls[-1].get("confirmed"),
+                calls[-1].get("expected_content_version"),
+                calls[-1].get("expected_warning_digest"),
+                "provisional-batch" in result,
+                "materialized-batch" in result,
+            ),
+            (2, True, 0, "d" * 64, False, True),
+        )
+
+
 def _shift_orchestrator(client, tool_func, state_store=None):
     return AgentOrchestrator(
         client_factory=lambda: client,
@@ -6404,12 +6908,14 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                     if name in {
                         "keytao_create_phrase",
                         "keytao_shift_phrase_code",
+                        "keytao_batch_add_to_draft",
                     }
                     else None
                 ),
                 frozenset({
                     "keytao_create_phrase",
                     "keytao_shift_phrase_code",
+                    "keytao_batch_add_to_draft",
                 }),
             ),
             state_store=state_store,
@@ -6633,12 +7139,52 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(record.state.args["expected_warning_digest"], "b" * 64)
         self.assertEqual(result, "请确认新增风险。")
 
-    async def test_front_same_code_marker_keeps_duplicate_weight_path(self) -> None:
+    async def test_front_same_code_marker_auto_confirms_only_named_occupant(self) -> None:
         calls = []
+        expected_items = [
+            {
+                "action": "Create",
+                "word": "吃席",
+                "code": "wkxk",
+                "type": "Phrase",
+                "weight": 100,
+                "needsManualReview": True,
+            },
+            {
+                "action": "Change",
+                "old_word": "赤溪",
+                "word": "赤溪",
+                "code": "wkxk",
+                "type": "Phrase",
+                "weight": 101,
+            },
+        ]
 
         async def dispatch(name, **kwargs):
             calls.append((name, kwargs))
-            return {"success": True, "batchId": "batch-duplicate"}
+            if kwargs.get("confirmed"):
+                return {
+                    "success": True,
+                    "successCount": 2,
+                    "failedCount": 0,
+                    "batchId": "materialized-duplicate",
+                    "contentVersion": 1,
+                    "draft_snapshot": {
+                        "count": 2,
+                        "items": expected_items,
+                    },
+                }
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "provisional-duplicate",
+                "batchIdProvisional": True,
+                "contentVersion": 0,
+                "warningDigest": "c" * 64,
+                "warnings": [],
+                "warnedCount": 0,
+                "message": "请确认同码前插级联。",
+            }
 
         store = MemoryConversationStateStore()
         address = ConversationAddress.private("qq", "candidate-user")
@@ -6657,11 +7203,118 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             ),
         )
 
-        self.assertEqual([name for name, _kwargs in calls], ["keytao_create_phrase"])
-        self.assertEqual(calls[0][1]["code"], "wkxk")
-        self.assertEqual(calls[0][1]["weight"], 99)
-        self.assertIs(calls[0][1]["needs_manual_review"], True)
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            ["keytao_batch_add_to_draft", "keytao_batch_add_to_draft"],
+        )
+        self.assertEqual(calls[0][1]["items"], expected_items)
+        self.assertEqual(calls[1][1]["items"], expected_items)
+        self.assertIs(calls[1][1]["items"][0]["needsManualReview"], True)
+        self.assertIs(calls[1][1]["confirmed"], True)
+        self.assertEqual(calls[1][1]["batch_id"], "provisional-duplicate")
+        self.assertEqual(calls[1][1]["expected_content_version"], 0)
+        self.assertEqual(calls[1][1]["expected_warning_digest"], "c" * 64)
+        self.assertIsNone(store.get_record(address))
+        self.assertIn("duplicate complete", result)
         self.assertIn("同码顺序：wkxk：吃席 → 赤溪", result)
+
+    async def test_front_same_code_wider_chain_requires_explicit_confirmation(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "batch-wide",
+                "contentVersion": 7,
+                "warningDigest": "d" * 64,
+                "warnings": [],
+                "warnedCount": 0,
+                "message": "请确认完整同码链。",
+            }
+
+        pending = self._pending_state()
+        pending.occupied_words = {"wkxk": ["赤溪", "青溪"]}
+        pending.server_occupied_words = {"wkxk": ["赤溪", "青溪"]}
+        pending.server_entries_by_code = {
+            "wkxk": [("赤溪", 100), ("青溪", 101)],
+        }
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, pending)
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "请确认完整同码链。"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席同码放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [(item["action"], item["word"], item["weight"])
+             for item in calls[0][1]["items"]],
+            [
+                ("Create", "吃席", 100),
+                ("Change", "赤溪", 101),
+                ("Change", "青溪", 102),
+            ],
+        )
+        record = store.get_record(address)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.function_name, "keytao_batch_add_to_draft")
+        self.assertEqual(record.state.args["expected_warning_digest"], "d" * 64)
+        self.assertEqual(result, "请确认完整同码链。")
+
+    async def test_front_same_code_auto_confirm_replay_is_bounded(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            digest = "e" * 64 if len(calls) == 1 else "f" * 64
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "batch-bounded",
+                "contentVersion": 5,
+                "warningDigest": digest,
+                "warnings": [],
+                "warnedCount": 0,
+                "message": "仍需确认。",
+            }
+
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "candidate-user")
+        store.set(address, self._pending_state())
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_create_tool_call()]),
+            _fake_response("stop", "仍需确认。"),
+        ])
+
+        result = await self._orchestrator(client, dispatch, store).run(
+            "把吃席同码放在赤溪前面",
+            AgentRequestContext(
+                platform="qq",
+                user_id="candidate-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][1]["expected_warning_digest"], "e" * 64)
+        self.assertIs(calls[1][1]["items"][0]["needsManualReview"], True)
+        record = store.get_record(address)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.function_name, "keytao_batch_add_to_draft")
+        self.assertEqual(record.state.args["expected_warning_digest"], "f" * 64)
+        self.assertEqual(result, "仍需确认。")
 
     async def test_front_multi_step_plan_requires_explicit_confirmation(self) -> None:
         calls = []
@@ -8443,6 +9096,124 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("authority missing", writes[0]["remark"])
         self.assertIsNone(record)
         self.assertEqual(result, "已加入草稿")
+
+
+class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_weight_adjustment_is_bound_to_server_draft_item(self) -> None:
+        calls = []
+
+        async def execute(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        executor = ToolExecutor(
+            lambda name: execute if name == "keytao_update_draft_item_weight" else None,
+            frozenset({"keytao_update_draft_item_weight"}),
+        )
+        variants = (
+            "将草稿中「亮面」lxmmov 的权重调整为 101",
+            "把草稿中亮面 lxmmov 的权重修改为 101",
+            "把草稿里的亮面 lxmmov 权重改为 101",
+        )
+        for message in variants:
+            with self.subTest(message=message):
+                self.assertTrue(message_authorizes_mutation(message))
+                result = __import__("json").loads(await executor.call(
+                    "keytao_update_draft_item_weight",
+                    {"word": "亮面", "code": "lxmmov", "weight": 101},
+                    ToolContext(
+                        platform="qq",
+                        user_id="weight-user",
+                        current_message=message,
+                        writes_allowed=True,
+                        trusted_draft_items_by_id={
+                            "7": {
+                                "word": "亮面",
+                                "code": "lxmmov",
+                                "type": "Phrase",
+                                "action": "Create",
+                                "weight": 100,
+                            },
+                        },
+                    ),
+                ))
+                self.assertTrue(result.get("success"), result)
+
+        self.assertEqual(len(calls), len(variants))
+
+    async def test_weight_adjustment_requires_word_code_value_and_unique_item(self) -> None:
+        calls = []
+
+        async def execute(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        executor = ToolExecutor(
+            lambda name: execute if name == "keytao_update_draft_item_weight" else None,
+            frozenset({"keytao_update_draft_item_weight"}),
+        )
+        for message, arguments in (
+            (
+                "将草稿中「亮面」lxmmov 的权重调整为 102",
+                {"word": "亮面", "code": "lxmmov", "weight": 101},
+            ),
+            (
+                "不要将草稿中「亮面」lxmmov 的权重调整为 101",
+                {"word": "亮面", "code": "lxmmov", "weight": 101},
+            ),
+        ):
+            with self.subTest(message=message):
+                result = __import__("json").loads(await executor.call(
+                    "keytao_update_draft_item_weight",
+                    arguments,
+                    ToolContext(
+                        current_message=message,
+                        writes_allowed=message_authorizes_mutation(message),
+                        trusted_draft_items_by_id={
+                            "7": {"word": "亮面", "code": "lxmmov", "type": "Phrase"},
+                        },
+                    ),
+                ))
+                self.assertTrue(result.get("policyBlocked"), result)
+        self.assertEqual(calls, [])
+
+
+class FinalReplyLoopBreakerTests(unittest.TestCase):
+    def test_same_turn_resend_is_replaced_with_actual_failure_reason(self) -> None:
+        message = "将草稿中「亮面」lxmmov 的权重调整为 101"
+        reply = "请重新发送同一条消息，我再试一次。"
+        finalized = AgentOrchestrator._finalize_reply(
+            message,
+            reply,
+            {
+                "success": False,
+                "message": "草稿中没有找到“亮面” lxmmov 的唯一条目，本次未写入。",
+                "suggestedCommand": message,
+            },
+        )
+        self.assertIn("没有找到", finalized)
+        self.assertNotRegex(finalized, r"重新|再次|原样")
+        self.assertNotIn("可以改为", finalized)
+
+    def test_only_genuinely_different_validated_suggestion_is_offered(self) -> None:
+        finalized = AgentOrchestrator._finalize_reply(
+            "把亮面权重调低",
+            "请把当前指令重新发送。",
+            {
+                "success": False,
+                "message": "缺少完整编码和整数权重。",
+                "suggestedCommand": "@我 将草稿中「亮面」lxmmov 的权重调整为 101",
+            },
+        )
+        self.assertIn("可以改为：@我 将草稿中", finalized)
+        self.assertNotIn("重新发送", finalized)
+
+    def test_confirmation_can_still_request_original_operation(self) -> None:
+        reply = "确认票据已失效，请重新发送原始操作指令。"
+        self.assertEqual(
+            AgentOrchestrator._finalize_reply("确认", reply, {}),
+            reply,
+        )
 
 
 if __name__ == "__main__":

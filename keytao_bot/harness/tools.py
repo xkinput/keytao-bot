@@ -270,7 +270,7 @@ class ToolContext:
         Dict[str, Tuple[Tuple[str, int], ...]]
     ] = None
     trusted_draft_words_by_id: Optional[Dict[str, str]] = None
-    trusted_draft_items_by_id: Optional[Dict[str, Dict[str, str]]] = None
+    trusted_draft_items_by_id: Optional[Dict[str, Dict[str, Any]]] = None
     trusted_phrase_types_by_key: Optional[Dict[Tuple[str, str], frozenset[str]]] = None
     trusted_reviewed_items_by_key: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None
     pending_candidate: Optional[PendingCandidateCapability] = None
@@ -360,9 +360,10 @@ _POSITIONAL_REORDER_INTENT_PATTERN = (
 )
 _POSITIONAL_REORDER_INTENT_RE = re.compile(_POSITIONAL_REORDER_INTENT_PATTERN)
 _NON_POSITIONAL_MUTATION_INTENT_PATTERN = (
-    r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|发起审核|"
+    r"加词|添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|发起审核|"
     r"删除|删掉|删干净|去掉|移除|清空|清理|"
-    r"撤销|撤回|召回|修改|改成|改为|替换|顺延|挪开|重新编码|保留|批量处理"
+    r"撤销|撤回|召回|修改|改成|改为|替换|顺延|挪开|重新编码|保留|批量处理|"
+    r"调整权重|修改权重|权重调整(?:为|到)?|权重修改(?:为|到)?|权重改(?:为|到)"
     r"|都删|其余删|其他删"
 )
 _NON_POSITIONAL_MUTATION_INTENT_RE = re.compile(
@@ -572,6 +573,163 @@ _COMMAND_PREFIX_PATTERN = rf"(?:{'|'.join(sorted(
     reverse=True,
 ))})*"
 _COMMAND_PREFIX_RE = re.compile(rf"^{_COMMAND_PREFIX_PATTERN}")
+_MULTI_ADD_VERB_RE = re.compile(
+    r"加词|添加|加入|加到|新增|创建|写入|放入|收录|录入|记入"
+)
+_MULTI_ADD_ADDRESS_CLAUSES = frozenset({"喵喵"})
+_MAX_AUTHORIZED_MULTI_ADD_ITEMS = 10
+
+
+@dataclass(frozen=True)
+class _AuthorizedAddClause:
+    word: str
+    code: str = ""
+
+
+@dataclass(frozen=True)
+class _MultiAddAuthorization:
+    clauses: Tuple[_AuthorizedAddClause, ...]
+    valid: bool
+    refused_clauses: Tuple[str, ...] = ()
+
+
+def _parse_complete_add_clause(clause: str) -> Optional[_AuthorizedAddClause]:
+    """Parse one closed add command without deriving either target or code."""
+    candidate = re.sub(r"\s+", " ", str(clause or "")).strip()
+    candidate = _COMMAND_PREFIX_RE.sub("", candidate, count=1).strip()
+    verb = _MULTI_ADD_VERB_RE.match(candidate)
+    if verb is None:
+        return None
+    remainder = candidate[verb.end():].strip()
+    remainder = re.sub(
+        r"^(?:声笔笔单字|声笔笔|词组|词条|词语|单字|补充|符号|链接|英文)\s*",
+        "",
+        remainder,
+        count=1,
+    )
+    remainder = remainder.lstrip("：: ")
+    if not remainder:
+        return None
+
+    word = ""
+    if remainder[0] in "「“‘\"'":
+        closing = {"「": "」", "“": "”", "‘": "’", '"': '"', "'": "'"}[
+            remainder[0]
+        ]
+        closing_at = remainder.find(closing, 1)
+        if closing_at <= 1:
+            return None
+        word = remainder[1:closing_at].strip()
+        remainder = remainder[closing_at + 1:].strip()
+    else:
+        word_match = re.match(r"[\u3400-\u9fffA-Za-z0-9_-]{1,32}", remainder)
+        if word_match is None:
+            return None
+        word = word_match.group(0)
+        remainder = remainder[word_match.end():].strip()
+
+    if not word or _MULTI_ADD_VERB_RE.fullmatch(word):
+        return None
+    remainder = re.sub(
+        r"^(?:(?:的)?(?:编码|代码)(?:为|是)?\s*)?[:：]?\s*",
+        "",
+        remainder,
+        count=1,
+    )
+    code = ""
+    if remainder:
+        code_match = re.match(r"[A-Za-z]{1,12}(?![A-Za-z])", remainder)
+        if code_match is not None:
+            code = code_match.group(0).lower()
+            remainder = remainder[code_match.end():].strip()
+    remainder = re.sub(
+        r"^(?:(?:加到|加入|添加|放入|写入)(?:当前)?草稿)?"
+        r"(?:一下)?(?:吧|啦|了)?$",
+        "",
+        remainder,
+    ).strip()
+    if remainder:
+        return None
+    return _AuthorizedAddClause(word=word, code=code)
+
+
+def _multi_add_authorization_contract(
+    message: str,
+) -> Optional[_MultiAddAuthorization]:
+    """Require every clause to be an add, closed politeness, or leading address."""
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    )
+    raw_clauses = [
+        clause.strip()
+        for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if clause.strip()
+    ]
+    add_intent_count = sum(
+        1 for clause in raw_clauses if _MULTI_ADD_VERB_RE.search(clause)
+    )
+    if add_intent_count < 2:
+        return None
+
+    parsed: List[_AuthorizedAddClause] = []
+    refused: List[str] = []
+    for index, clause in enumerate(raw_clauses):
+        compact = re.sub(r"\s+", "", clause)
+        add_clause = _parse_complete_add_clause(clause)
+        if add_clause is not None:
+            parsed.append(add_clause)
+            continue
+        if (
+            index == 0
+            and compact in _MULTI_ADD_ADDRESS_CLAUSES
+        ) or _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(compact):
+            continue
+        refused.append(clause[:120])
+    return _MultiAddAuthorization(
+        clauses=tuple(parsed),
+        valid=bool(parsed) and not refused and len(parsed) == add_intent_count,
+        refused_clauses=tuple(refused),
+    )
+
+
+def _multi_add_items_match_authorized_set(
+    authorization: _MultiAddAuthorization,
+    items: Any,
+    trusted_codes_by_word: Dict[str, frozenset[str]],
+) -> bool:
+    """Prove the tool item set equals the union of authorizing add clauses."""
+    if not authorization.valid or not isinstance(items, list):
+        return False
+    expected = list(dict.fromkeys(authorization.clauses))
+    actual: List[Tuple[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        action = str(item.get("action") or "Create").strip()
+        word = str(item.get("word") or "").strip()
+        code = str(item.get("code") or "").strip().lower()
+        if action != "Create" or item.get("old_word") or not word or not code:
+            return False
+        actual.append((word, code))
+    if len(actual) != len(expected) or len(set(actual)) != len(actual):
+        return False
+
+    unmatched = list(actual)
+    for clause in sorted(expected, key=lambda item: not bool(item.code)):
+        candidates = [
+            index
+            for index, (word, code) in enumerate(unmatched)
+            if word == clause.word
+            and (
+                code == clause.code
+                if clause.code
+                else code in trusted_codes_by_word.get(word, frozenset())
+            )
+        ]
+        if len(candidates) != 1:
+            return False
+        unmatched.pop(candidates[0])
+    return not unmatched
 
 
 @dataclass(frozen=True)
@@ -586,8 +744,10 @@ class _PositionalCreateBinding:
     code: str
     destination_word: str
     relation: str
+    phrase_type: str = "Phrase"
     weight: Optional[int] = None
     resulting_words: Tuple[str, ...] = ()
+    bumped_entries: Tuple[Tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -891,6 +1051,7 @@ _ACTION_TOKENS = {
     "Create": re.compile(r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|加词"),
     "Change": re.compile(
         r"修改|改成|改为|替换|重新编码|顺延|挪开|"
+        r"调整权重|修改权重|权重调整|权重修改|权重改|"
         r"放在|放到|排在|挪到|移到|提到|提前到|往前|往后|靠前|靠后"
     ),
     "Delete": re.compile(r"删除|删掉|删干净|移除"),
@@ -932,6 +1093,7 @@ _MAX_SUGGESTED_DELETE_IDS = 12
 MUTATING_TOOL_NAMES = frozenset({
     "keytao_create_phrase",
     "keytao_remove_draft_item",
+    "keytao_update_draft_item_weight",
     "keytao_batch_add_to_draft",
     "keytao_batch_remove_draft_items",
     "keytao_shift_phrase_code",
@@ -961,6 +1123,16 @@ _TYPE_HINTS = [
     ("英文", "English"),
 ]
 _PHRASE_TYPES = frozenset(value for _hint, value in _TYPE_HINTS)
+_PHRASE_TYPE_BASE_WEIGHTS = {
+    "Single": 10,
+    "Phrase": 100,
+    "Supplement": 100,
+    "Symbol": 10,
+    "Link": 10000,
+    "CSS": 100,
+    "CSSSingle": 10,
+    "English": 100,
+}
 
 
 # A quoted span is treated as an operable command (not a dictionary entry) when
@@ -1467,7 +1639,10 @@ def message_authorizes_mutation(message: str) -> bool:
         return False
     if _record_frame_wraps_complete_mutation(message):
         return False
-    return _message_authorizes_mutation_core(message)
+    if not _message_authorizes_mutation_core(message):
+        return False
+    multi_add = _multi_add_authorization_contract(message)
+    return multi_add is None or multi_add.valid
 
 
 # Verbs that express "change where this code sits" in everyday Chinese.  Most
@@ -1481,7 +1656,12 @@ _POSITIONAL_CHANGE_RE = re.compile(
     r"提到|提前到|往前|往后|靠前|靠后"
 )
 _CHANGE_VERB_RE = re.compile(
-    r"修改|改成|改为|改到|替换|重新编码|顺延|挪开|移到|" + _POSITIONAL_CHANGE_RE.pattern
+    r"修改|改成|改为|改到|替换|重新编码|顺延|挪开|移到|"
+    r"调整权重|修改权重|权重调整|权重修改|权重改|"
+    + _POSITIONAL_CHANGE_RE.pattern
+)
+_WEIGHT_ADJUST_VERB_RE = re.compile(
+    r"调整权重|修改权重|权重(?:调整|修改|改)(?:为|到)?"
 )
 _CREATE_VERB_RE = re.compile(r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|加词")
 _DELETE_VERB_RE = re.compile(r"删除|删掉|删干净|去掉|移除|清空|清理")
@@ -1490,6 +1670,7 @@ _RECALL_VERB_RE = re.compile(r"撤回|撤销|召回|取消")
 _TOOL_INTENT_PATTERNS = {
     "keytao_shift_phrase_code": _CHANGE_VERB_RE,
     "keytao_remove_draft_item": _DELETE_VERB_RE,
+    "keytao_update_draft_item_weight": _WEIGHT_ADJUST_VERB_RE,
     "keytao_batch_remove_draft_items": _DELETE_VERB_RE,
     "keytao_submit_batch": _SUBMIT_VERB_RE,
     "keytao_recall_batch": _RECALL_VERB_RE,
@@ -1650,6 +1831,13 @@ def _suggestion_operands(tool_name: str, arguments: Dict) -> List[str]:
         ]
     if tool_name == "keytao_remove_draft_item":
         return [str(arguments.get("pr_id") or "").strip()]
+    if tool_name == "keytao_update_draft_item_weight":
+        weight = arguments.get("weight")
+        return [
+            str(arguments.get("word") or "").strip(),
+            str(arguments.get("code") or "").strip(),
+            str(weight if weight is not None else "").strip(),
+        ]
     if tool_name == "keytao_batch_remove_draft_items":
         ids = arguments.get("ids")
         return [str(item).strip() for item in ids] if isinstance(ids, list) else [""]
@@ -1697,6 +1885,10 @@ def message_mentions_change_request(message: str) -> bool:
             ("keytao_shift_phrase_code", {"word": "x", "target_code": "y"}),
             ("keytao_create_phrase", {"word": "x", "code": "y"}),
             ("keytao_remove_draft_item", {"pr_id": "1"}),
+            (
+                "keytao_update_draft_item_weight",
+                {"word": "x", "code": "y", "weight": 100},
+            ),
             ("keytao_submit_batch", {}),
             ("keytao_recall_batch", {}),
         )
@@ -1754,6 +1946,18 @@ def _suggested_command_text(tool_name: str, arguments: Dict) -> str:
     if tool_name == "keytao_remove_draft_item":
         pr_id = str(arguments.get("pr_id") or "").strip()
         return f"删除草稿条目 {pr_id}" if pr_id else ""
+    if tool_name == "keytao_update_draft_item_weight":
+        word = str(arguments.get("word") or "").strip()
+        code = str(arguments.get("code") or "").strip()
+        weight = arguments.get("weight")
+        if (
+            not word
+            or not code
+            or not isinstance(weight, int)
+            or isinstance(weight, bool)
+        ):
+            return ""
+        return f"将草稿中「{word}」{code} 的权重调整为 {weight}"
     if tool_name == "keytao_batch_remove_draft_items":
         ids = arguments.get("ids")
         if (
@@ -1878,16 +2082,12 @@ _AUTO_CONFIRM_CREATE_WARNING_TYPES = frozenset({
 })
 
 
-def create_warning_confirmation_binding(
+def server_warning_confirmation_binding(
     preview: Dict,
-    arguments: Dict,
 ) -> Optional[Dict[str, Any]]:
-    """Return an exact replay ticket for a clean or informational Create."""
-    if not isinstance(preview, dict) or not isinstance(arguments, dict):
+    """Return the CAS fields carried by one complete server warning ticket."""
+    if not isinstance(preview, dict):
         return None
-    word = str(arguments.get("word") or "").strip()
-    code = str(arguments.get("code") or "").strip().lower()
-    action = str(arguments.get("action") or "Create").strip()
     content_version = preview.get("contentVersion")
     batch_id = str(preview.get("batchId") or "").strip()
     warning_digest = str(preview.get("warningDigest") or "").strip().lower()
@@ -1900,10 +2100,7 @@ def create_warning_confirmation_binding(
         "uncertain",
     )
     if (
-        action != "Create"
-        or not word
-        or not code
-        or preview.get("success") is not False
+        preview.get("success") is not False
         or preview.get("requiresConfirmation") is not True
         or not batch_id
         or not isinstance(content_version, int)
@@ -1925,6 +2122,33 @@ def create_warning_confirmation_binding(
         or bool(preview.get("failedCount"))
     ):
         return None
+    return {
+        "confirmed": True,
+        "batch_id": batch_id,
+        "expected_content_version": content_version,
+        "expected_warning_digest": warning_digest,
+    }
+
+
+def create_warning_confirmation_binding(
+    preview: Dict,
+    arguments: Dict,
+) -> Optional[Dict[str, Any]]:
+    """Return an exact replay ticket for a clean or informational Create."""
+    if not isinstance(preview, dict) or not isinstance(arguments, dict):
+        return None
+    word = str(arguments.get("word") or "").strip()
+    code = str(arguments.get("code") or "").strip().lower()
+    action = str(arguments.get("action") or "Create").strip()
+    binding = server_warning_confirmation_binding(preview)
+    warnings = preview.get("warnings")
+    if (
+        action != "Create"
+        or not word
+        or not code
+        or binding is None
+    ):
+        return None
     for warning in warnings:
         if not isinstance(warning, dict):
             return None
@@ -1942,12 +2166,139 @@ def create_warning_confirmation_binding(
             or warning_action != "Create"
         ):
             return None
-    return {
-        "confirmed": True,
-        "batch_id": batch_id,
-        "expected_content_version": content_version,
-        "expected_warning_digest": warning_digest,
-    }
+    return binding
+
+
+def batch_warning_confirmation_binding(
+    preview: Dict,
+    arguments: Dict,
+) -> Optional[Dict[str, Any]]:
+    """Return an exact replay ticket for a bound clean/informational batch."""
+    if not isinstance(arguments, dict):
+        return None
+    binding = server_warning_confirmation_binding(preview)
+    items = arguments.get("items")
+    if binding is None or not isinstance(items, list) or not items:
+        return None
+    exact_items: set[Tuple[str, str, str]] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        action = str(item.get("action") or "Create").strip()
+        word = str(item.get("word") or "").strip()
+        code = str(item.get("code") or "").strip().lower()
+        identity = (action, word, code)
+        if action != "Create" or not word or not code or identity in exact_items:
+            return None
+        exact_items.add(identity)
+    for warning in preview.get("warnings") or []:
+        if not isinstance(warning, dict):
+            return None
+        warning_type = str(warning.get("warningType") or "").strip()
+        if warning_type not in _AUTO_CONFIRM_CREATE_WARNING_TYPES:
+            return None
+        item = warning.get("item")
+        source = item if isinstance(item, dict) else warning
+        warning_identity = (
+            str(source.get("action") or "Create").strip(),
+            str(source.get("word") or "").strip(),
+            str(source.get("code") or "").strip().lower(),
+        )
+        if warning_identity not in exact_items:
+            return None
+    return binding
+
+
+def front_insert_batch_warning_confirmation_binding(
+    preview: Dict,
+    authorization_arguments: Dict,
+    execution_route: ToolExecutionRoute,
+) -> Optional[Dict[str, Any]]:
+    """Bind the narrow same-code front insert already named by the user.
+
+    Only the destination occupant may be bumped automatically. A later entry
+    in the same weight chain is a real additional displacement, even when the
+    +1 cascade makes it mechanically necessary, so that wider plan remains an
+    explicit-confirmation operation.
+    """
+    if (
+        not isinstance(authorization_arguments, dict)
+        or execution_route.tool_name != "keytao_batch_add_to_draft"
+        or execution_route.positional_binding is None
+    ):
+        return None
+    binding = server_warning_confirmation_binding(preview)
+    positional = execution_route.positional_binding
+    newcomer = str(authorization_arguments.get("word") or "").strip()
+    code = str(authorization_arguments.get("code") or "").strip().lower()
+    action = str(authorization_arguments.get("action") or "Create").strip()
+    items = execution_route.arguments.get("items")
+    if (
+        binding is None
+        or action != "Create"
+        or not newcomer
+        or code != positional.code
+        or positional.relation not in _POSITIONAL_CREATE_FRONT_RELATIONS
+        or not isinstance(items, list)
+        or len(items) != 2
+        or len(positional.bumped_entries) != 1
+    ):
+        return None
+    bumped_word, old_weight, new_weight = positional.bumped_entries[0]
+    if (
+        bumped_word != positional.destination_word
+        or not isinstance(old_weight, int)
+        or isinstance(old_weight, bool)
+        or not isinstance(new_weight, int)
+        or isinstance(new_weight, bool)
+        or new_weight != old_weight + 1
+        or positional.weight != old_weight
+    ):
+        return None
+
+    create_items = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("action") or "Create").strip() == "Create"
+    ]
+    change_items = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("action") or "Create").strip() == "Change"
+    ]
+    if len(create_items) != 1 or len(change_items) != 1:
+        return None
+    create_item = create_items[0]
+    change_item = change_items[0]
+    if (
+        str(create_item.get("word") or "").strip() != newcomer
+        or str(create_item.get("code") or "").strip().lower() != positional.code
+        or str(create_item.get("type") or "").strip() != positional.phrase_type
+        or create_item.get("weight") != positional.weight
+        or str(change_item.get("old_word") or "").strip()
+        != positional.destination_word
+        or str(change_item.get("word") or "").strip()
+        != positional.destination_word
+        or str(change_item.get("code") or "").strip().lower() != positional.code
+        or str(change_item.get("type") or "").strip() != positional.phrase_type
+        or change_item.get("weight") != new_weight
+    ):
+        return None
+
+    for warning in preview.get("warnings") or []:
+        if not isinstance(warning, dict):
+            return None
+        warning_type = str(warning.get("warningType") or "").strip()
+        item = warning.get("item")
+        source = item if isinstance(item, dict) else warning
+        if (
+            warning_type not in _AUTO_CONFIRM_CREATE_WARNING_TYPES
+            or str(source.get("action") or "Create").strip() != "Create"
+            or str(source.get("word") or "").strip() != newcomer
+            or str(source.get("code") or "").strip().lower() != positional.code
+        ):
+            return None
+    return binding
 
 
 def _strip_execution_result_suffix(compact: str) -> str:
@@ -2337,8 +2688,13 @@ def _positional_create_order(
     word: str,
     destination_word: str,
     relation: str,
-) -> Tuple[Optional[int], Tuple[str, ...]]:
-    """Choose an unused adjacent integer weight and describe its exact order."""
+    base_weight: int,
+) -> Tuple[
+    Optional[int],
+    Tuple[str, ...],
+    Tuple[Tuple[str, int, int], ...],
+]:
+    """Plan an exact same-code ordering without ever going below type base."""
     # Ordering authority: keytao-next/lib/services/batchPriorityOrderWarnings.ts
     # lines 30-34 and 73-82 sort by ascending weight and name index + 1
     # as the entry behind the current one. Lower weights therefore rank first.
@@ -2350,18 +2706,18 @@ def _positional_create_order(
             not clean_word
             or not isinstance(entry_weight, int)
             or isinstance(entry_weight, bool)
-            or entry_weight < 0
+            or entry_weight < base_weight
         ):
-            return None, ()
+            return None, (), ()
         entry = (clean_word, entry_weight)
         if entry not in seen_entries:
             normalized.append(entry)
             seen_entries.add(entry)
     if not normalized:
-        return None, ()
+        return None, (), ()
     weights = [entry_weight for _entry_word, entry_weight in normalized]
     if len(set(weights)) != len(weights):
-        return None, ()
+        return None, (), ()
     normalized.sort(key=lambda item: item[1])
     destinations = [
         index
@@ -2369,21 +2725,17 @@ def _positional_create_order(
         if entry_word == destination_word
     ]
     if len(destinations) != 1:
-        return None, ()
+        return None, (), ()
     destination_index = destinations[0]
     destination_weight = normalized[destination_index][1]
     if relation in _POSITIONAL_CREATE_FRONT_RELATIONS:
-        previous_weight = (
-            normalized[destination_index - 1][1]
-            if destination_index > 0
-            else None
-        )
-        requested_weight = destination_weight - 1
+        requested_weight = destination_weight
         insert_index = destination_index
-        if requested_weight < 0 or (
-            previous_weight is not None and requested_weight <= previous_weight
-        ):
-            return None, ()
+        bumped_entries = tuple(
+            (entry_word, entry_weight, entry_weight + 1)
+            for entry_word, entry_weight in normalized
+            if entry_weight >= destination_weight
+        )
     elif relation in _POSITIONAL_CREATE_BACK_RELATIONS:
         next_weight = (
             normalized[destination_index + 1][1]
@@ -2393,12 +2745,13 @@ def _positional_create_order(
         requested_weight = destination_weight + 1
         insert_index = destination_index + 1
         if next_weight is not None and requested_weight >= next_weight:
-            return None, ()
+            return None, (), ()
+        bumped_entries = ()
     else:
-        return None, ()
+        return None, (), ()
     resulting = [entry_word for entry_word, _entry_weight in normalized]
     resulting.insert(insert_index, word)
-    return requested_weight, tuple(resulting)
+    return requested_weight, tuple(resulting), bumped_entries
 
 
 def _positional_message_explicitly_labels_code(
@@ -2416,6 +2769,46 @@ def _positional_message_explicitly_labels_code(
             message,
         )
     )
+
+
+def _positional_phrase_type(
+    arguments: Dict,
+    context: ToolContext,
+    word: str,
+    code: str,
+    destination_word: str,
+) -> str:
+    """Resolve one server-backed type for a same-code weight chain."""
+    explicit = str(arguments.get("type") or "").strip()
+    if explicit in _PHRASE_TYPES:
+        return explicit
+    reviewed = (context.trusted_reviewed_items_by_key or {}).get((word, code))
+    reviewed_type = str((reviewed or {}).get("type") or "").strip()
+    if reviewed_type in _PHRASE_TYPES:
+        return reviewed_type
+    destination_types = (
+        context.trusted_phrase_types_by_key or {}
+    ).get((destination_word, code), frozenset())
+    normalized = {value for value in destination_types if value in _PHRASE_TYPES}
+    return next(iter(normalized)) if len(normalized) == 1 else "Phrase"
+
+
+def _same_type_positional_entries(
+    entries: Tuple[Tuple[str, int], ...],
+    code: str,
+    phrase_type: str,
+    context: ToolContext,
+) -> Tuple[Tuple[str, int], ...]:
+    """Keep only entries proven to belong to this type; retain unknown legacy data."""
+    selected: List[Tuple[str, int]] = []
+    for entry_word, entry_weight in entries:
+        known_types = (
+            context.trusted_phrase_types_by_key or {}
+        ).get((entry_word, code), frozenset())
+        normalized = {value for value in known_types if value in _PHRASE_TYPES}
+        if not normalized or normalized == {phrase_type}:
+            selected.append((entry_word, entry_weight))
+    return tuple(selected)
 
 
 def _pending_positional_create_binding(
@@ -2469,24 +2862,33 @@ def _pending_positional_create_binding(
     if relation not in {"前面", "后面", "之前", "之后", "前", "后"}:
         return None
 
-    entries = tuple(
+    raw_entries = tuple(
         (entry_word, entry_weight)
         for entry_code, entry_word, entry_weight in capability.entries
         if entry_code == code
     )
-    weight, resulting_words = _positional_create_order(
+    phrase_type = _positional_phrase_type(
+        arguments, context, word, code, destination_word
+    )
+    entries = _same_type_positional_entries(
+        raw_entries, code, phrase_type, context
+    )
+    weight, resulting_words, bumped_entries = _positional_create_order(
         entries,
         word,
         destination_word,
         relation,
+        _PHRASE_TYPE_BASE_WEIGHTS[phrase_type],
     )
 
     return _PositionalCreateBinding(
         code=code,
         destination_word=destination_word,
         relation=relation,
+        phrase_type=phrase_type,
         weight=weight,
         resulting_words=resulting_words,
+        bumped_entries=bumped_entries,
     )
 
 
@@ -2568,19 +2970,30 @@ def _destination_derived_positional_create_binding(
         }
     ):
         return None
-    entries = (context.trusted_entries_by_code or {}).get(code, ())
-    weight, resulting_words = _positional_create_order(
+    phrase_type = _positional_phrase_type(
+        arguments, context, word, code, destination_word
+    )
+    entries = _same_type_positional_entries(
+        (context.trusted_entries_by_code or {}).get(code, ()),
+        code,
+        phrase_type,
+        context,
+    )
+    weight, resulting_words, bumped_entries = _positional_create_order(
         entries,
         word,
         destination_word,
         relation,
+        _PHRASE_TYPE_BASE_WEIGHTS[phrase_type],
     )
     return _PositionalCreateBinding(
         code=code,
         destination_word=destination_word,
         relation=relation,
+        phrase_type=phrase_type,
         weight=weight,
         resulting_words=resulting_words,
+        bumped_entries=bumped_entries,
     )
 
 
@@ -2852,6 +3265,42 @@ class ToolExecutor:
         if binding is None:
             return unchanged
         if _positional_same_code_requested(context.current_message or ""):
+            if (
+                binding.relation in _POSITIONAL_CREATE_FRONT_RELATIONS
+                and binding.weight is not None
+                and binding.bumped_entries
+            ):
+                create_item: Dict[str, Any] = {
+                    "action": "Create",
+                    "word": str(arguments.get("word") or "").strip(),
+                    "code": binding.code,
+                    "type": binding.phrase_type,
+                    "weight": binding.weight,
+                    "needsManualReview": bool(
+                        arguments.get("needs_manual_review", True)
+                    ),
+                }
+                remark = str(arguments.get("remark") or "").strip()
+                if remark:
+                    create_item["remark"] = remark
+                items = [create_item]
+                items.extend(
+                    {
+                        "action": "Change",
+                        "old_word": entry_word,
+                        "word": entry_word,
+                        "code": binding.code,
+                        "type": binding.phrase_type,
+                        "weight": new_weight,
+                    }
+                    for entry_word, _old_weight, new_weight
+                    in binding.bumped_entries
+                )
+                return ToolExecutionRoute(
+                    "keytao_batch_add_to_draft",
+                    {"items": items},
+                    positional_binding=binding,
+                )
             return ToolExecutionRoute(
                 tool_name,
                 dict(arguments),
@@ -3002,6 +3451,66 @@ class ToolExecutor:
             )
             return json.dumps(_tool_exception_payload(error), ensure_ascii=False), confirm_args
 
+    async def replay_routed_warning(
+        self,
+        authorization_tool_name: str,
+        authorization_arguments: Dict,
+        expected_route: ToolExecutionRoute,
+        binding: Dict,
+        context: ToolContext,
+    ) -> Tuple[str, Dict]:
+        """Replay one routed warning ticket after rechecking its sealed route."""
+        canonical = self.canonicalize_arguments(
+            authorization_tool_name,
+            authorization_arguments,
+            context,
+        )
+        policy_error = self._validate_policy(
+            authorization_tool_name,
+            canonical,
+            context,
+        )
+        if policy_error:
+            return json.dumps(policy_error, ensure_ascii=False), canonical
+        route = self.resolve_execution_route(
+            authorization_tool_name,
+            canonical,
+            context,
+        )
+        if (
+            route.response is not None
+            or route.tool_name != expected_route.tool_name
+            or route.arguments != expected_route.arguments
+            or route.positional_binding != expected_route.positional_binding
+        ):
+            return json.dumps(
+                policy_block(
+                    BLOCK_REASON_BINDING_INCOMPLETE,
+                    "安全拦截：确认票据已不再对应原始位置指令。",
+                    missing=["boundFrontInsertPlan"],
+                ),
+                ensure_ascii=False,
+            ), canonical
+        confirm_args = {
+            key: value
+            for key, value in route.arguments.items()
+            if key != "preview_only"
+        }
+        confirm_args.update(binding)
+        try:
+            result = await self._invoke_effective_tool(
+                route.tool_name,
+                confirm_args,
+                context,
+            )
+            return json.dumps(result, ensure_ascii=False), confirm_args
+        except Exception as error:
+            logger.error(
+                f"Tool {route.tool_name} routed warning replay error: "
+                f"{type(error).__name__}: {error}"
+            )
+            return json.dumps(_tool_exception_payload(error), ensure_ascii=False), confirm_args
+
     async def call(self, tool_name: str, arguments: Dict, context: ToolContext) -> str:
         root_error = _validate_root_type(tool_name, arguments)
         if root_error:
@@ -3038,7 +3547,10 @@ class ToolExecutor:
             )
             if (
                 tool_name == "keytao_create_phrase"
-                and route.tool_name == "keytao_create_phrase"
+                and route.tool_name in {
+                    "keytao_create_phrase",
+                    "keytao_batch_add_to_draft",
+                }
                 and _positional_same_code_requested(
                     context.current_message or ""
                 )
@@ -3199,6 +3711,32 @@ class ToolExecutor:
         if batch_size_error:
             return batch_size_error
         message = context.current_message or ""
+        multi_add = (
+            _multi_add_authorization_contract(message)
+            if message and tool_name in MUTATING_TOOL_NAMES
+            else None
+        )
+        if (
+            multi_add is not None
+            and multi_add.valid
+            and len(multi_add.clauses) > _MAX_AUTHORIZED_MULTI_ADD_ITEMS
+        ):
+            refused = [
+                f"{clause.word} {clause.code}".strip()
+                for clause in multi_add.clauses
+            ]
+            logger.warning(
+                "Refused multi-add above per-message limit: "
+                f"count={len(refused)} items={refused}",
+            )
+            return text_follow_up(
+                "multi_add_limit_exceeded",
+                f"本次点名了 {len(refused)} 条加词，超过单次上限 "
+                f"{_MAX_AUTHORIZED_MULTI_ADD_ITEMS} 条；本次未截断、未写入。"
+                "请拆成更小批次后重试。",
+                refusedItems=refused,
+                limit=_MAX_AUTHORIZED_MULTI_ADD_ITEMS,
+            )
         requested_batch = str(arguments.get("batch_id") or "").strip()
         if (
             requested_batch
@@ -3378,6 +3916,9 @@ class ToolExecutor:
     ) -> Optional[Dict]:
         """Bind model-generated mutation targets to entities in current raw text."""
         message = _mutation_authorization_view(context.current_message or "")
+        multi_add = _multi_add_authorization_contract(
+            context.current_message or ""
+        )
         trusted_codes = context.trusted_codes_by_word or {}
         trusted_word_lookup_codes = (
             context.trusted_word_lookup_codes_by_word or {}
@@ -3398,6 +3939,44 @@ class ToolExecutor:
                     BLOCK_REASON_BINDING_INCOMPLETE,
                     "安全拦截：撤回只能由本轮明确、独立的撤回指令授权。",
                     missing=["recallCommand"],
+                )
+        if tool_name == "keytao_update_draft_item_weight":
+            word = str(arguments.get("word") or "").strip()
+            code = str(arguments.get("code") or "").strip().lower()
+            weight = arguments.get("weight")
+            matching_items = [
+                item
+                for item in trusted_draft_items.values()
+                if isinstance(item, dict)
+                and str(item.get("word") or "").strip() == word
+                and str(item.get("code") or "").strip().lower() == code
+            ]
+            value_bound = bool(
+                isinstance(weight, int)
+                and not isinstance(weight, bool)
+                and re.search(rf"(?<!\d){weight}(?!\d)", message)
+            )
+            item_pair_bound = bool(
+                word
+                and code
+                and re.search(
+                    rf"[「“]?{re.escape(word)}[」”]?\s*{re.escape(code)}(?![A-Za-z])",
+                    message,
+                )
+            )
+            if not (
+                word
+                and code
+                and len(matching_items) == 1
+                and item_pair_bound
+                and value_bound
+                and _WEIGHT_ADJUST_VERB_RE.search(message)
+                and not _is_word_protected(message, word)
+            ):
+                return policy_block(
+                    BLOCK_REASON_BINDING_INCOMPLETE,
+                    "安全拦截：权重调整必须把词条、编码、整数权重与本轮读取到的唯一草稿条目完整绑定。",
+                    missing=["draftItemWord", "draftItemCode", "weight"],
                 )
         if tool_name == "keytao_remove_draft_item":
             pr_id = str(arguments.get("pr_id") or "").strip()
@@ -3641,6 +4220,25 @@ class ToolExecutor:
                     BLOCK_REASON_BINDING_INCOMPLETE,
                     "安全拦截：批量操作缺少可绑定的词条。",
                     missing=["items"],
+                )
+            if (
+                multi_add is not None
+                and not _multi_add_items_match_authorized_set(
+                    multi_add,
+                    items,
+                    trusted_codes,
+                )
+            ):
+                authorized_items = [
+                    f"{clause.word} {clause.code}".strip()
+                    for clause in dict.fromkeys(multi_add.clauses)
+                ]
+                return policy_block(
+                    BLOCK_REASON_BINDING_INCOMPLETE,
+                    "安全拦截：批量加词工具的完整条目集合必须与用户本轮"
+                    "逐句授权的条目集合完全一致，不能遗漏、调换编码或夹带未点名条目。",
+                    missing=["exactAuthorizedItemSet"],
+                    authorizedItems=authorized_items,
                 )
             blocked_items: List[str] = []
             for item in items:

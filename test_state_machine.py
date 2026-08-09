@@ -13092,6 +13092,105 @@ def test_strict_shift_batch_payload_preserves_item_level_seal():
     asyncio.run(_run())
 
 
+def test_absence_batch_preview_never_formats_provisional_url():
+    """The tolerant batch route must preserve its no-draft URL boundary."""
+    print("\n🧪 absence batch preview suppresses its provisional URL")
+
+    async def _run():
+        provisional_id = "89fd0e0b-c7d7-4a79-9d62-2f7eadfd4e5a"
+        items = [
+            {
+                "action": "Create",
+                "word": "吃席",
+                "code": "wkxk",
+                "type": "Phrase",
+                "weight": 100,
+                "needsManualReview": True,
+            },
+            {
+                "action": "Change",
+                "old_word": "赤溪",
+                "word": "赤溪",
+                "code": "wkxk",
+                "type": "Phrase",
+                "weight": 101,
+            },
+        ]
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": provisional_id,
+                    "contentVersion": 0,
+                    "warningDigest": "d" * 64,
+                    "warnings": [],
+                    "warnedCount": 0,
+                    "batchUrl": f"http://localhost:3100/batch/{provisional_id}",
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, _url, **_kwargs):
+                raise AssertionError("the bounded request helper owns dispatch")
+
+        with (
+            patch.object(_draft_tools, "get_bot_token", return_value="token"),
+            patch.object(
+                _draft_tools,
+                "get_latest_draft_batch",
+                new=AsyncMock(return_value=None),
+            ),
+            patch.object(
+                _draft_tools,
+                "_split_items_by_code_validation",
+                new=AsyncMock(return_value=(items, [])),
+            ),
+            patch.object(
+                _draft_tools.http_client,
+                "request_with_retries",
+                new=AsyncMock(return_value=FakeResponse()),
+            ),
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
+            ),
+        ):
+            preview = await _draft_tools.keytao_batch_add_to_draft(
+                "qq",
+                "123",
+                items,
+            )
+
+        formatter = getattr(_draft_tools, "_batch_url_for_result", None)
+        check("one central result URL helper exists", callable(formatter))
+        if callable(formatter):
+            check(
+                "the helper refuses a provisional id",
+                formatter({
+                    "batchId": provisional_id,
+                    "batchIdProvisional": True,
+                    "batchUrl": f"http://localhost:3100/batch/{provisional_id}",
+                }) == "",
+            )
+        check("absence preview is marked provisional", preview.get("batchIdProvisional") is True)
+        check("absence preview carries no batch URL", "batchUrl" not in preview)
+        check("absence preview exposes a non-link status", preview.get("batchUrlStatus") == "待确认后生成")
+
+    asyncio.run(_run())
+
+
 def test_replace_char_preserves_explicit_css_type():
     print("\n🧪 replace-char stages explicit CSS changes for confirmation")
 
@@ -13361,6 +13460,7 @@ if __name__ == "__main__":
     test_shift_phrase_code_works_with_no_draft_batch()
     test_shift_phrase_code_plans_real_occupant_move()
     test_strict_shift_batch_payload_preserves_item_level_seal()
+    test_absence_batch_preview_never_formats_provisional_url()
     test_replace_char_preserves_explicit_css_type()
 
     print("\n" + "=" * 60)

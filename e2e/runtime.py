@@ -1061,6 +1061,22 @@ class E2EBotHarness:
             space_id=platform_id,
         )
         await self.openai_chat._clear_conversation_state(address, memory_context)
+        group_id = str(self._group_id(platform_id))
+        group_address = ConversationAddress.group("qq", group_id, platform_id)
+        group_context = ChatMemoryContext(
+            platform="qq",
+            user_id=platform_id,
+            space_type="group",
+            space_id=group_id,
+        )
+        await self.openai_chat._clear_conversation_state(
+            group_address,
+            group_context,
+        )
+
+    @staticmethod
+    def _group_id(platform_id: str) -> int:
+        return int(str(platform_id)[-15:]) + 1
 
     async def send(self, *, platform_id: str, sender_name: str, text: str) -> str:
         from nonebot.adapters.onebot.v11 import Message
@@ -1103,6 +1119,64 @@ class E2EBotHarness:
             self._current_event.reset(token)
         if len(self.replies) == reply_index:
             raise RigInfrastructureError("The real QQ handler completed without a reply")
+        return self.replies[-1]
+
+    async def send_group(
+        self,
+        *,
+        platform_id: str,
+        sender_name: str,
+        text: str,
+        to_me: bool,
+    ) -> str:
+        from nonebot.adapters.onebot.v11 import Message
+        from nonebot.adapters.onebot.v11.event import GroupMessageEvent
+
+        message = Message(text)
+        event = GroupMessageEvent(
+            time=int(time.time()),
+            self_id=int(self.bot.self_id),
+            post_type="message",
+            sub_type="normal",
+            user_id=int(platform_id),
+            message_type="group",
+            group_id=self._group_id(platform_id),
+            message_id=int(time.time_ns() % 2_000_000_000),
+            message=message,
+            original_message=message,
+            raw_message=text,
+            font=0,
+            sender={"user_id": int(platform_id), "nickname": sender_name, "card": ""},
+            to_me=to_me,
+        )
+        if not await self.openai_chat.should_handle(self.bot, event):
+            raise RigInfrastructureError(
+                "The real QQ rule rejected the synthetic addressed group message"
+            )
+        self.recorder.record_message(
+            direction="input",
+            text=text,
+            platform_id=platform_id,
+        )
+        reply_index = len(self.replies)
+        self.reply_event.clear()
+        token = self._current_event.set(event)
+        try:
+            await asyncio.wait_for(
+                self.openai_chat.handle_ai_chat(self.bot, event),
+                timeout=self.message_timeout,
+            )
+            if len(self.replies) == reply_index:
+                await asyncio.wait_for(
+                    self.reply_event.wait(),
+                    timeout=self.message_timeout,
+                )
+        finally:
+            self._current_event.reset(token)
+        if len(self.replies) == reply_index:
+            raise RigInfrastructureError(
+                "The real QQ group handler completed without a reply"
+            )
         return self.replies[-1]
 
     async def close(self) -> None:

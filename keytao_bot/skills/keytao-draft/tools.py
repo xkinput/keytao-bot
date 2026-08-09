@@ -56,6 +56,16 @@ TYPE_LABELS = {
     "English": "英文",
 }
 VALID_PHRASE_TYPES = frozenset(TYPE_LABELS)
+PHRASE_TYPE_BASE_WEIGHTS = {
+    "Single": 10,
+    "Phrase": 100,
+    "Supplement": 100,
+    "Symbol": 10,
+    "Link": 10000,
+    "CSS": 100,
+    "CSSSingle": 10,
+    "English": 100,
+}
 
 
 class _SubmitAuditTicketStore:
@@ -715,11 +725,31 @@ def make_batch_url(batch_id: str) -> str:
     return f"{get_keytao_url()}/batch/{safe_batch_id}"
 
 
+def _batch_url_for_result(data: Dict) -> str:
+    """Return a URL only when the result names a materialized batch."""
+    if not isinstance(data, dict) or data.get("batchIdProvisional") is True:
+        return ""
+    batch_id = data.get("batchId")
+    return make_batch_url(batch_id) if batch_id else ""
+
+
 def _inject_batch_url(data: Dict) -> Dict:
     """Inject batchUrl into any response dict that contains a batchId."""
-    batch_id = data.get("batchId")
-    if batch_id:
-        data["batchUrl"] = make_batch_url(batch_id)
+    batch_url = _batch_url_for_result(data)
+    if not batch_url:
+        data.pop("batchUrl", None)
+        if data.get("batchIdProvisional") is True:
+            data["batchUrlStatus"] = "待确认后生成"
+        return data
+    data["batchUrl"] = batch_url
+    return data
+
+
+def _mark_provisional_batch(data: Dict) -> Dict:
+    """Mark an absence-CAS preview without publishing its unborn batch URL."""
+    data["batchIdProvisional"] = True
+    data.pop("batchUrl", None)
+    data["batchUrlStatus"] = "待确认后生成"
     return data
 
 
@@ -1176,6 +1206,7 @@ async def keytao_create_phrase(
             batch_id = await get_latest_draft_batch(platform, platform_id)
         except UserNotFoundError:
             return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
+    absence_baseline = not batch_id
     # A missing draft batch is no longer an error: the server creates one on
     # demand for the first write.  Only a confirmed ticket must still name the
     # exact batch it was issued against.
@@ -1285,6 +1316,8 @@ async def keytao_create_phrase(
                 )
                 if snapshot is not None:
                     data["draft_snapshot"] = snapshot
+                if preview_only and data.get("requiresConfirmation") and absence_baseline:
+                    _mark_provisional_batch(data)
                 _inject_batch_url(data)
                 return data
             elif response.status_code == 404:
@@ -1302,6 +1335,8 @@ async def keytao_create_phrase(
                     )
                     if snapshot is not None:
                         data["draft_snapshot"] = snapshot
+                    if preview_only and absence_baseline:
+                        _mark_provisional_batch(data)
                 _inject_known_batch_url(data, batch_id)
                 return data
             else:
@@ -2586,6 +2621,152 @@ async def keytao_list_draft_items(
         return {"success": False, "message": f"获取失败: {type(e).__name__}: {e}"}
 
 
+async def keytao_update_draft_item_weight(
+    platform: str,
+    platform_id: str,
+    word: str,
+    code: str,
+    weight: int,
+) -> Dict:
+    """Update one exact server-known draft item through a CAS-bound route."""
+    word = str(word or "").strip()
+    code = str(code or "").strip().lower()
+    if (
+        not word
+        or not code
+        or not isinstance(weight, int)
+        or isinstance(weight, bool)
+    ):
+        return {
+            "success": False,
+            "message": "权重调整需要完整的词条、编码和整数权重，本次未写入。",
+        }
+
+    snapshot = await keytao_list_draft_items(platform, platform_id)
+    if not snapshot.get("success"):
+        return snapshot
+    matches = [
+        item
+        for item in snapshot.get("items", [])
+        if isinstance(item, dict)
+        and str(item.get("word") or "").strip() == word
+        and str(item.get("code") or "").strip().lower() == code
+    ]
+    if len(matches) != 1:
+        reason = "没有找到" if not matches else "找到多条"
+        return {
+            "success": False,
+            "message": (
+                f"草稿中{reason}“{word}” {code} 的唯一条目，"
+                "本次未写入；请先核对当前草稿。"
+            ),
+            "matchedCount": len(matches),
+        }
+    item = matches[0]
+    phrase_type = str(item.get("type") or "").strip()
+    base_weight = PHRASE_TYPE_BASE_WEIGHTS.get(phrase_type)
+    if base_weight is None:
+        return {
+            "success": False,
+            "message": f"草稿条目类型“{phrase_type or '未知'}”没有可验证的基础权重，本次未写入。",
+        }
+    if weight < base_weight:
+        return {
+            "success": False,
+            "belowBaseWeight": True,
+            "type": phrase_type,
+            "baseWeight": base_weight,
+            "requestedWeight": weight,
+            "message": (
+                f"{TYPE_LABELS[phrase_type]}的基础权重是 {base_weight}，"
+                f"不能调整为 {weight}，也不会自动钳制；本次未写入。"
+                "如需让它更靠前，请提高同码同类型中其他词条的权重。"
+            ),
+        }
+
+    batch_id = str(snapshot.get("batchId") or "").strip()
+    content_version = snapshot.get("contentVersion")
+    item_id = item.get("id")
+    if (
+        not batch_id
+        or not isinstance(content_version, int)
+        or isinstance(content_version, bool)
+        or content_version < 0
+        or not str(item_id).isdigit()
+    ):
+        return {
+            "success": False,
+            "message": "草稿快照缺少可验证的批次、版本或条目 ID，本次未写入。",
+        }
+    canonical_target = {
+        "id": int(item_id),
+        "word": word,
+        "code": code,
+        "action": str(item.get("action") or ""),
+        "type": phrase_type,
+        "weight": item.get("weight"),
+    }
+    path = f"/api/bot/pull-requests/{int(item_id)}"
+    request_data = {
+        "platform": platform,
+        "platformId": platform_id,
+        "batchId": batch_id,
+        "expectedContentVersion": content_version,
+        "expectedTarget": canonical_target,
+        "weight": weight,
+    }
+    request_body = _json_request_body(request_data)
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await http_client.request_with_retries(
+                lambda: client.request(
+                    "PATCH",
+                    f"{get_keytao_url()}{path}",
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="PATCH",
+                        path=path,
+                        raw_body=request_body,
+                    ),
+                    content=request_body,
+                ),
+                method="PATCH",
+                url=path,
+            )
+            try:
+                data = response.json()
+            except Exception:
+                return {
+                    "success": False,
+                    "uncertain": True,
+                    "batchId": batch_id,
+                    "message": "权重调整结果无法确认；请先查看当前草稿，不要直接重试。",
+                }
+            data.setdefault("batchId", batch_id)
+            if response.status_code == 409:
+                data.update({
+                    "success": False,
+                    "staleConfirmation": True,
+                    "message": data.get("message") or "草稿条目或版本已变化，本次未写入。",
+                })
+            _inject_batch_url(data)
+            return data
+    except httpx.TimeoutException:
+        return {
+            "success": False,
+            "uncertain": True,
+            "batchId": batch_id,
+            "message": "权重调整请求超时；请先查看当前草稿，不要直接重试。",
+        }
+    except httpx.TransportError as error:
+        return {
+            "success": False,
+            "message": f"权重调整网络失败：{type(error).__name__}，本次结果未确认。",
+        }
+
+
 def _canonical_delete_target(item: Dict) -> Dict:
     return {
         "id": int(item.get("id")),
@@ -3245,6 +3426,26 @@ TOOLS = [
                 "required": ["pr_id"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_update_draft_item_weight",
+            "description": (
+                "调整草稿中一个已存在词条的权重。必须先调用 keytao_list_draft_items，"
+                "并且只能使用其返回的唯一 word/code；工具会再次读取快照并以版本号和"
+                "完整目标做 CAS 校验。权重低于类型基础值时拒绝，不会自动钳制。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "word": {"type": "string", "description": "草稿中的完整词条"},
+                    "code": {"type": "string", "description": "草稿中的完整编码"},
+                    "weight": {"type": "integer", "description": "目标整数权重"},
+                },
+                "required": ["word", "code", "weight"],
+            },
+        },
     }
 ]
 
@@ -3285,6 +3486,7 @@ async def keytao_batch_add_to_draft(
             batch_id = await get_latest_draft_batch(platform, platform_id)
         except UserNotFoundError:
             return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
+    absence_baseline = not batch_id
     # A missing draft batch is no longer an error: the server creates one on
     # demand for the first write.  Only a confirmed ticket must still name the
     # exact batch it was issued against.
@@ -3409,6 +3611,8 @@ async def keytao_batch_add_to_draft(
                     f"{data.get('message', '已处理草稿')}；"
                     f"{len(validation_failed)} 条编码校验失败未写入"
                 )
+            if data.get("requiresConfirmation") and absence_baseline:
+                _mark_provisional_batch(data)
             _inject_batch_url(data)
             return data
 
@@ -3669,6 +3873,7 @@ async def _keytao_strict_batch_add_to_draft(
             batch_id = await get_latest_draft_batch(platform, platform_id)
         except UserNotFoundError:
             return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
+    absence_baseline = not batch_id and expected_content_version == 0
     valid_items, validation_failed = await _split_items_by_code_validation(items)
     if validation_failed or len(valid_items) != len(items):
         return _inject_known_batch_url({
@@ -3743,6 +3948,8 @@ async def _keytao_strict_batch_add_to_draft(
                 "message": data.get("message") or "草稿内容已变化，顺延计划已作废",
             }, batch_id)
         if data.get("requiresConfirmation"):
+            if absence_baseline:
+                _mark_provisional_batch(data)
             return data
         if not response.is_success or not data.get("success"):
             result = {
@@ -4183,6 +4390,7 @@ TOOL_FUNCTIONS = {
     "keytao_submit_batch": keytao_submit_batch,
     "keytao_list_draft_items": keytao_list_draft_items,
     "keytao_remove_draft_item": keytao_remove_draft_item,
+    "keytao_update_draft_item_weight": keytao_update_draft_item_weight,
     "keytao_batch_add_to_draft": keytao_batch_add_to_draft,
     "keytao_batch_remove_draft_items": keytao_batch_remove_draft_items,
     "keytao_shift_phrase_code": keytao_shift_phrase_code,

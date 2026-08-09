@@ -3,6 +3,7 @@ import inspect
 import json
 import re
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -26,9 +27,12 @@ from .tools import (
     ToolContext,
     ToolExecutionRoute,
     ToolExecutor,
+    batch_warning_confirmation_binding,
     create_warning_confirmation_binding,
+    front_insert_batch_warning_confirmation_binding,
     message_mentions_change_request,
     policy_block,
+    server_warning_confirmation_binding,
     self_checked_suggested_command,
 )
 
@@ -38,6 +42,7 @@ AUTHORITATIVE_LINK_TOOLS = frozenset({
     "keytao_submit_batch",
     "keytao_list_draft_items",
     "keytao_remove_draft_item",
+    "keytao_update_draft_item_weight",
     "keytao_batch_add_to_draft",
     "keytao_batch_remove_draft_items",
     "keytao_shift_phrase_code",
@@ -228,6 +233,23 @@ class AgentOrchestrator:
         context: AgentRequestContext,
         max_iterations: int = 20,
     ) -> Optional[str]:
+        """Emit every final reply through one same-turn loop breaker."""
+        failure_state: Dict[str, Any] = {}
+        reply = await self._run_loop(
+            message,
+            context,
+            max_iterations=max_iterations,
+            failure_state=failure_state,
+        )
+        return self._finalize_reply(message, reply, failure_state)
+
+    async def _run_loop(
+        self,
+        message: str,
+        context: AgentRequestContext,
+        max_iterations: int = 20,
+        failure_state: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
         client = self._client_factory()
 
         platform_label = {'telegram': 'Telegram', 'qq': 'QQ', 'web': 'Web'}.get(context.platform, '未知')
@@ -341,7 +363,7 @@ class AgentOrchestrator:
         trusted_word_lookup_codes_by_word: Dict[str, frozenset[str]] = {}
         trusted_entries_by_code: Dict[str, tuple[tuple[str, int], ...]] = {}
         trusted_draft_words_by_id: Dict[str, str] = {}
-        trusted_draft_items_by_id: Dict[str, Dict[str, str]] = {}
+        trusted_draft_items_by_id: Dict[str, Dict[str, Any]] = {}
         trusted_phrase_types_by_key: Dict[tuple[str, str], frozenset[str]] = {}
         trusted_reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
         trusted_batch_ids: set[str] = set()
@@ -657,6 +679,21 @@ class AgentOrchestrator:
 
                 try:
                     result_data = json.loads(result_str)
+                    if isinstance(result_data, dict):
+                        if (
+                            result_data.get("success") is False
+                            or result_data.get("policyBlocked") is True
+                            or result_data.get("error")
+                        ):
+                            if failure_state is not None:
+                                failure_state.clear()
+                                failure_state.update(result_data)
+                        elif (
+                            result_data.get("success") is True
+                            and fn_name in MUTATING_TOOL_NAMES
+                        ):
+                            if failure_state is not None:
+                                failure_state.clear()
                     # Learn the batch the server just named before replaying the
                     # call against it, so the replay passes the anchor check.
                     self._collect_trusted_batch_ids(
@@ -681,6 +718,7 @@ class AgentOrchestrator:
                         auto_confirmed = await self._auto_confirm_create_warning(
                             fn_name,
                             canonical_fn_args,
+                            execution_route,
                             result_data,
                             replace(
                                 tool_context,
@@ -832,13 +870,82 @@ class AgentOrchestrator:
         )
 
     @staticmethod
+    def _normalize_loop_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).lower()
+        normalized = re.sub(r"@(?:我|机器人|\S+)", "", normalized)
+        return re.sub(r"[\s\W_]+", "", normalized)
+
+    @classmethod
+    def _finalize_reply(
+        cls,
+        current_message: str,
+        reply: Optional[str],
+        failure_state: Dict[str, Any],
+    ) -> Optional[str]:
+        """Suppress requests to resend this turn's failed text at final emission."""
+        if reply is None:
+            return None
+        resend = re.search(
+            r"(?:重新|再次|再|原样|重复).{0,10}(?:发送|发一遍|发|输入|说一遍|提交)",
+            reply,
+        )
+        if not resend:
+            return reply
+        same_reference = re.search(
+            r"(?:同样|相同|同一|原样|这条|当前|刚才|本条).{0,8}(?:消息|指令|请求|内容|说法)?",
+            reply,
+        )
+        normalized_message = cls._normalize_loop_text(current_message)
+        normalized_reply = cls._normalize_loop_text(reply)
+        repeats_literal = bool(
+            normalized_message
+            and len(normalized_message) >= 4
+            and normalized_message in normalized_reply
+        )
+        if not same_reference and not repeats_literal:
+            return reply
+
+        raw_reason = str(
+            failure_state.get("message")
+            or failure_state.get("error")
+            or "本轮没有可执行的已绑定写操作"
+        ).strip()
+        reason = re.split(
+            r"请把下面这条指令|请重新发送|请再次发送|请原样发送",
+            raw_reason,
+            maxsplit=1,
+        )[0].rstrip("；;。 ")
+        missing = failure_state.get("missing")
+        if isinstance(missing, list) and missing:
+            labels = "、".join(
+                str(value).strip() for value in missing if str(value).strip()
+            )
+            if labels and labels not in reason:
+                reason = f"{reason}（缺少：{labels}）"
+        result = f"这条指令按当前表述无法执行，本次未写入。原因：{reason}。"
+        suggestion = str(failure_state.get("suggestedCommand") or "").strip()
+        if (
+            suggestion
+            and cls._normalize_loop_text(suggestion) != normalized_message
+        ):
+            result += f"可以改为：{suggestion}"
+        return result
+
+    @staticmethod
     def _capture_authoritative_result_links(
         result: Dict[str, Any],
         links: Dict[str, str],
     ) -> None:
         """Keep one internally consistent trusted batch/PR link bundle."""
-        batch_id = str(result.get("batchId") or "").strip()
-        batch_url = str(result.get("batchUrl") or "").strip()
+        provisional_batch = result.get("batchIdProvisional") is True
+        if provisional_batch:
+            links["_provisionalBatch"] = "true"
+        batch_id = (
+            "" if provisional_batch else str(result.get("batchId") or "").strip()
+        )
+        batch_url = (
+            "" if provisional_batch else str(result.get("batchUrl") or "").strip()
+        )
         valid_batch_url = bool(
             batch_url
             and len(batch_url) <= 2048
@@ -896,7 +1003,10 @@ class AgentOrchestrator:
             links["_staleUrls"] = "\n".join(sorted(stale_urls))
         if batch_id:
             links["batchId"] = batch_id
+            links.pop("_provisionalBatch", None)
         for key in ("batchUrl", "prUrl"):
+            if key == "batchUrl" and provisional_batch:
+                continue
             value = str(result.get(key) or "").strip()
             if (
                 value
@@ -1022,6 +1132,8 @@ class AgentOrchestrator:
         if batch_url:
             lines.append(f"草稿/批次地址：{batch_url}")
             appended_urls.add(batch_url)
+        elif links.get("_provisionalBatch") == "true":
+            lines.append("草稿/批次地址：待确认后生成")
         if pr_url and pr_url not in appended_urls:
             lines.append(f"PR：{pr_url}")
         if not lines:
@@ -1038,7 +1150,7 @@ class AgentOrchestrator:
         word_lookup_codes_by_word: Dict[str, frozenset[str]],
         entries_by_code: Dict[str, tuple[tuple[str, int], ...]],
         draft_words_by_id: Dict[str, str],
-        draft_items_by_id: Dict[str, Dict[str, str]],
+        draft_items_by_id: Dict[str, Dict[str, Any]],
         phrase_types_by_key: Dict[tuple[str, str], frozenset[str]],
         reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
         candidate_slots_by_word: Dict[
@@ -1246,6 +1358,7 @@ class AgentOrchestrator:
                             "code": str(item.get("code") or "").strip(),
                             "type": str(item.get("type") or "").strip(),
                             "action": str(item.get("action") or "").strip(),
+                            "weight": item.get("weight"),
                         }
 
     def _build_platform_context(self, platform_label: str, context: AgentRequestContext) -> str:
@@ -1692,35 +1805,73 @@ class AgentOrchestrator:
         self,
         fn_name: str,
         fn_args: Dict,
+        execution_route: ToolExecutionRoute,
         result_data: Dict,
         tool_context: ToolContext,
     ) -> Optional[tuple]:
-        """Replay one exact clean or informational server Create ticket."""
-        if fn_name != "keytao_create_phrase" or not tool_context.writes_allowed:
+        """Replay one exact clean or informational server add ticket."""
+        if (
+            fn_name not in {
+                "keytao_create_phrase",
+                "keytao_batch_add_to_draft",
+            }
+            or not tool_context.writes_allowed
+        ):
             return None
-        binding = create_warning_confirmation_binding(result_data, fn_args)
+        routed_front_insert = (
+            fn_name == "keytao_create_phrase"
+            and execution_route.tool_name == "keytao_batch_add_to_draft"
+        )
+        if routed_front_insert:
+            binding = front_insert_batch_warning_confirmation_binding(
+                result_data,
+                fn_args,
+                execution_route,
+            )
+        elif execution_route.tool_name != fn_name:
+            binding = None
+        else:
+            binding = (
+                create_warning_confirmation_binding(result_data, fn_args)
+                if fn_name == "keytao_create_phrase"
+                else batch_warning_confirmation_binding(result_data, fn_args)
+            )
         if binding is None:
             return None
-        confirm_args = {
-            key: value
-            for key, value in fn_args.items()
-            if key != "preview_only"
-        }
-        confirm_args.update(binding)
         logger.info(
-            "Auto-confirming clean/informational create preview: "
+            "Auto-confirming clean/informational add preview: "
             f"batch={binding['batch_id']} "
             f"version={binding['expected_content_version']}"
         )
-        confirmed_str = await self._tool_executor.call(
-            fn_name,
-            confirm_args,
-            replace(
-                tool_context,
-                mutation_confirmed=True,
-                server_warning_confirmed=True,
-            ),
+        confirmed_context = replace(
+            tool_context,
+            mutation_confirmed=True,
+            server_warning_confirmed=True,
         )
+        if routed_front_insert:
+            confirmed_str, _executed_args = (
+                await self._tool_executor.replay_routed_warning(
+                    fn_name,
+                    fn_args,
+                    execution_route,
+                    binding,
+                    confirmed_context,
+                )
+            )
+            downstream_args = fn_args
+        else:
+            confirm_args = {
+                key: value
+                for key, value in fn_args.items()
+                if key != "preview_only"
+            }
+            confirm_args.update(binding)
+            confirmed_str = await self._tool_executor.call(
+                fn_name,
+                confirm_args,
+                confirmed_context,
+            )
+            downstream_args = confirm_args
         try:
             confirmed_data = json.loads(confirmed_str)
         except Exception:
@@ -1737,7 +1888,7 @@ class AgentOrchestrator:
                     result_data["orderingSummary"],
                 )
             confirmed_str = json.dumps(confirmed_data, ensure_ascii=False)
-        return confirmed_data, confirmed_str, confirm_args
+        return confirmed_data, confirmed_str, downstream_args
 
     @staticmethod
     def _deduplicate_block_reason(
@@ -1808,12 +1959,18 @@ class AgentOrchestrator:
             ).strip().lower()
             if re.fullmatch(r"[0-9a-f]{64}", warning_digest):
                 saved["expected_warning_digest"] = warning_digest
+        confirmation_source = "local_preview"
+        if fn_name == "keytao_batch_add_to_draft":
+            binding = server_warning_confirmation_binding(result_data)
+            if binding:
+                saved.update(binding)
+                confirmation_source = "server_warning"
         saved_ok = self._state_store.set(
             conv_key,
             PendingToolConfirm(
                 function_name=fn_name,
                 args=saved,
-                confirmation_source="local_preview",
+                confirmation_source=confirmation_source,
             ),
             space_key=space_key,
             owner_label=owner_label,

@@ -6,12 +6,17 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, call, patch
 
 import httpx
 
 from .recording import ArtifactRecorder, _redact_sensitive
-from .run import S9_ZDIC_WARMUP_BACKOFF_SECONDS, ensure_s9_fixture
+from .run import (
+    S9_ZDIC_WARMUP_BACKOFF_SECONDS,
+    ensure_s9_fixture,
+    ensure_scenario_zdic_fixture,
+)
 from .runtime import LocalNextClient, RigInfrastructureError
 from .safety import (
     NetworkAllowlist,
@@ -22,10 +27,29 @@ from .safety import (
     validate_next_database_url,
     validate_test_binding,
 )
-from .zdic_seed import seed_s9_zdic_cache
+from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_s9_zdic_cache, seed_zdic_cache
 
 
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
+    def test_weight_rule_prompt_copy_has_one_canonical_statement(self) -> None:
+        skill = (
+            Path(__file__).parents[1]
+            / "keytao_bot/skills/keytao-draft/SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertEqual(skill.count("权重规则（唯一口径）"), 1)
+        self.assertIn("数值越小排序越靠前", skill)
+        self.assertIn("Link=10000", skill)
+        self.assertNotIn("（权重 0）", skill)
+
+    def test_e2e_docs_describe_repaired_and_new_scenarios(self) -> None:
+        readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
+        self.assertIn("S11 keeps the confirmation path", readme)
+        self.assertIn("rejects provisional batch links", readme)
+        self.assertIn("S12 asserts that narrow", readme)
+        self.assertIn("exact persisted weight cascade", readme)
+        self.assertIn("S13 sends an explicit weight", readme)
+        self.assertIn("asks the user to resend the same current message", readme)
+
     def test_artifacts_redact_admin_credentials(self) -> None:
         payload = _redact_sensitive(
             {
@@ -66,6 +90,140 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
                 next_dir=Path("/not-inspected-before-database-validation"),
             )
         run_mock.assert_not_called()
+
+    @patch("e2e.zdic_seed.subprocess.run")
+    def test_multi_add_zdic_seed_is_scenario_driven_and_deduplicated(
+        self,
+        run_mock,
+    ) -> None:
+        expected_rows = {
+            ("char", "王", "found", ("wáng",)),
+            ("char", "中", "found", ("zhōng",)),
+            ("char", "微", "found", ("wēi",)),
+            ("char", "服", "found", ("fú",)),
+            ("char", "务", "found", ("wù",)),
+            ("entry", "王中王", "absent", ()),
+            ("entry", "微服务", "absent", ()),
+        }
+        for scenario_id in ("S10",):
+            declared = ZDIC_FIXTURES_BY_SCENARIO[scenario_id]
+            self.assertEqual(set(declared["probe_words"]), {"王中王", "微服务"})
+            self.assertEqual(
+                {
+                    (
+                        row["kind"],
+                        row["entry"],
+                        row["status"],
+                        tuple(row["pinyins"]),
+                    )
+                    for row in declared["rows"]
+                },
+                expected_rows,
+            )
+
+        run_mock.return_value.returncode = 0
+        run_mock.return_value.stdout = ""
+        run_mock.return_value.stderr = ""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            next_dir = Path(temp_dir)
+            prisma = next_dir / "node_modules" / ".bin" / "prisma"
+            prisma.parent.mkdir(parents=True)
+            prisma.touch()
+            (next_dir / "prisma.config.ts").touch()
+            result = seed_zdic_cache(
+                "postgresql://dev:dev@localhost:5432/keytao",
+                next_dir=next_dir,
+                scenario_ids=("S10",),
+            )
+
+        self.assertEqual(result["scenarioIds"], ["S10"])
+        self.assertEqual(
+            {
+                (
+                    row["kind"],
+                    row["entry"],
+                    row["status"],
+                    tuple(row["pinyins"]),
+                )
+                for row in result["rows"]
+            },
+            expected_rows,
+        )
+        self.assertEqual(len(result["rows"]), len(expected_rows))
+        seed_sql = run_mock.call_args.kwargs["input"]
+        for _kind, entry, _status, _pinyins in expected_rows:
+            self.assertEqual(seed_sql.count(f"'{entry}'"), 1)
+
+    async def test_multi_add_zdic_preflight_reuses_final_probe_retry(self) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        pinyin_by_char = {
+            "王": "wáng",
+            "中": "zhōng",
+            "微": "wēi",
+            "服": "fú",
+            "务": "wù",
+        }
+
+        def probe_response(word: str, *, seeded: bool) -> dict[str, Any]:
+            return {
+                "input": word,
+                "pronunciationSource": (
+                    "pinyin-pro-context" if seeded else "zdic-unavailable"
+                ),
+                "standardPronunciationStatus": "absent" if seeded else "unavailable",
+                "semanticPronunciationNeeded": not seeded,
+                "chars": [
+                    {
+                        "char": char,
+                        "pinyin": pinyin_by_char[char] if seeded else "",
+                        "pinyins": [pinyin_by_char[char]] if seeded else [],
+                        "pronunciationLookupStatus": (
+                            "found" if seeded else "unavailable"
+                        ),
+                    }
+                    for char in word
+                ],
+            }
+
+        probe_words = ("王中王", "微服务")
+        client.encode = AsyncMock(
+            side_effect=[
+                probe_response(word, seeded=attempt == 4)
+                for attempt in range(1, 5)
+                for word in probe_words
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = ArtifactRecorder(Path(temp_dir) / "artifacts")
+            with (
+                recorder.scope("S10", 1),
+                patch("e2e.run.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+                patch("builtins.print"),
+            ):
+                result = await ensure_scenario_zdic_fixture(
+                    client=client,
+                    scenario_id="S10",
+                    recorder=recorder,
+                )
+            artifact = json.loads(
+                (recorder.artifact_dir / "S10-zdic-warmup-attempt-1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertTrue(result["seededRealityMatches"])
+        self.assertEqual(client.encode.await_count, 8)
+        self.assertEqual(
+            sleep_mock.await_args_list,
+            [call(delay) for delay in S9_ZDIC_WARMUP_BACKOFF_SECONDS],
+        )
+        self.assertEqual(artifact["finalAssertionAttempt"], 4)
+        self.assertEqual(artifact["finalAssertionResult"], "passed")
+        self.assertEqual(
+            set(artifact["attempts"][-1]["words"]),
+            {"王中王", "微服务"},
+        )
 
     async def test_s9_zdic_preflight_only_asserts_seeded_reality_on_final_probe(
         self,
