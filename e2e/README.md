@@ -38,6 +38,8 @@ impossible by design. S9 declares six rows for `射覆` and `慑服`. S10 declar
 found character readings for `王`, `中`, `微`, `服`, and `务`, plus absent
 whole-word entries for `王中王` and `微服务`. Duplicate declarations are collapsed
 by `(kind, entry)` before the upsert.
+S14 declares found character readings for `亮` and `面` plus an absent
+whole-word entry for `亮面`.
 
 ## Prerequisites
 
@@ -100,7 +102,7 @@ accepts the proxy-induced `zdic-unavailable` fallback. A rig-owned S9 fixture is
 removed through an approved API batch after the scenario; a compatible
 pre-existing non-rig fixture is preserved.
 
-Before S9 or S10 dispatches a scenario attempt, the rig probes the declared
+Before S9, S10, or S14 dispatches a scenario attempt, the rig probes the declared
 whole words through local next four times with the existing `4s`, `5s`, `6s`
 warm-up backoff. Only the final probe is asserted. It must report an absent
 whole-word lookup and the exact seeded found reading for every character; a cold
@@ -115,6 +117,13 @@ shape materializes in one message with the exact persisted weight cascade
 adjustment against an empty draft and asserts a deterministic failure that never
 asks the user to resend the same current message. The orchestrating session owns
 live-rig execution; ordinary offline verification must not start a server.
+
+S14 injects a 汉典-shaped search hit and page for the different entry `光面`
+with pinyin `guāng miàn` while the requested word is `亮面`. The injection is
+armed only for S14 and returns synthetic responses before the network allowlist;
+no external request is dispatched. The scenario rejects any `guang` syllable or
+`gxmm*` candidate and accepts only an `lxmm*` chain or the existing fail-closed
+manual-pronunciation path.
 
 Optional overrides:
 

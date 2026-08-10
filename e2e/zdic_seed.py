@@ -39,6 +39,14 @@ ZDIC_FIXTURES_BY_SCENARIO: dict[str, dict[str, Any]] = {
         "probe_words": ("王中王", "微服务"),
         "rows": _MULTI_ADD_ZDIC_CACHE_ROWS,
     },
+    "S14": {
+        "probe_words": ("亮面",),
+        "rows": (
+            {"kind": "char", "entry": "亮", "status": "found", "pinyins": ["liàng"]},
+            {"kind": "char", "entry": "面", "status": "found", "pinyins": ["miàn"]},
+            {"kind": "entry", "entry": "亮面", "status": "absent", "pinyins": []},
+        ),
+    },
 }
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]

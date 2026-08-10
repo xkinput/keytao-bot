@@ -13,6 +13,7 @@ import os
 import sys
 import types
 from unittest.mock import AsyncMock, patch
+from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -155,8 +156,22 @@ def _encode_data():
         "success": True,
         "codes": ["ceek", "ceeko"],
         "chars": [
-            {"char": "测", "pinyin": "ce", "phoneticCode": "ce", "shapeCode": "k"},
-            {"char": "试", "pinyin": "shi", "phoneticCode": "ek", "shapeCode": "o"},
+            {
+                "char": "测",
+                "pinyin": "ce",
+                "pinyins": ["cè"],
+                "pronunciationLookupStatus": "found",
+                "phoneticCode": "ce",
+                "shapeCode": "k",
+            },
+            {
+                "char": "试",
+                "pinyin": "shi",
+                "pinyins": ["shì"],
+                "pronunciationLookupStatus": "found",
+                "phoneticCode": "ek",
+                "shapeCode": "o",
+            },
         ],
     }
 
@@ -173,6 +188,223 @@ def _authoritative_evidence():
         }],
         "sources": [],
     }
+
+
+def test_s14_wrong_entry_pronunciation_never_reaches_candidates():
+    print("\n🧪 S14 wrong-entry pronunciation poisoning")
+
+    async def _run():
+        review_module._clear_review_caches()
+        encode_data = {
+            "success": True,
+            "codes": ["lxmm", "lxmmo", "lxmmov"],
+            "altCodes": [],
+            "pronunciationSource": "pinyin-pro-context",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": False,
+            "chars": [
+                {
+                    "char": "亮",
+                    "pinyin": "liàng",
+                    "pinyins": ["liàng"],
+                    "pronunciationLookupStatus": "found",
+                    "phoneticCode": "lx",
+                    "shapeCode": "o",
+                },
+                {
+                    "char": "面",
+                    "pinyin": "miàn",
+                    "pinyins": ["miàn"],
+                    "pronunciationLookupStatus": "found",
+                    "phoneticCode": "mm",
+                    "shapeCode": "v",
+                },
+            ],
+        }
+
+        async def poisoned_search(query, max_results=3):
+            if "site:zdic.net" not in query:
+                return []
+            return [{
+                "title": "光面_汉典",
+                "url": "https://www.zdic.net/hans/%E5%85%89%E9%9D%A2",
+                "snippet": "光面 拼音：guāng miàn",
+            }]
+
+        async def poisoned_page(url):
+            if "光面" not in unquote(url):
+                return ""
+            return "光面 汉典 拼音：guāng miàn 光滑的表面。"
+
+        with (
+            patch.object(review_module, "_search_web", side_effect=poisoned_search),
+            patch.object(review_module, "_fetch_text", side_effect=poisoned_page),
+            patch.object(
+                review_module,
+                "fetch_keytao_encode",
+                AsyncMock(return_value=encode_data),
+            ),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+            patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+            patch.object(
+                review_module,
+                "_infer_entity_knowledge",
+                AsyncMock(return_value={"recognized": False}),
+            ),
+            patch.object(
+                review_module,
+                "_contextual_pronunciation_group",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            review = await prepare_reviewed_word(CONFIG, "亮面")
+
+        pronunciations = review.get("pronunciations", [])
+        syllables = {
+            syllable
+            for pronunciation in pronunciations
+            for syllable in pronunciation.get("normalized", [])
+        }
+        codes = {
+            code
+            for pronunciation in pronunciations
+            for code in pronunciation.get("codes", [])
+        }
+        check("S14 rejects the poisoned guang syllable", "guang" not in syllables)
+        check(
+            "S14 rejects every poisoned gxmm candidate",
+            not any(code.startswith("gxmm") for code in codes),
+        )
+        check(
+            "S14 offers the verified lxmm chain or fails closed",
+            any(code.startswith("lxmm") for code in codes)
+            or review.get("pronunciationUnresolved") is True,
+        )
+
+    asyncio.run(_run())
+
+
+def test_pronunciation_word_binding_window_and_exact_direct_entry():
+    print("\n🧪 pronunciation evidence word-binding boundaries")
+
+    near_text = "亮面" + ("甲" * 70) + " 拼音：liàng miàn"
+    near, near_rejections = review_module._extract_labeled_pinyin_sequences(
+        near_text,
+        "亮面",
+    )
+    check("word inside the 80-character vicinity is accepted", near == [("liang", "mian")])
+    check("nearby match records no binding rejection", near_rejections == 0)
+
+    far_text = "亮面" + ("甲" * 90) + " 拼音：liàng miàn"
+    far, far_rejections = review_module._extract_labeled_pinyin_sequences(
+        far_text,
+        "亮面",
+    )
+    check("word outside the 80-character vicinity is rejected", far == [])
+    check("far match records one binding rejection", far_rejections == 1)
+
+    direct, direct_rejections = review_module._extract_labeled_pinyin_sequences(
+        "拼音：liàng miàn",
+        "亮面",
+        exact_entry_direct_url=review_module._direct_url_entry_matches_word(
+            "https://www.zdic.net/hans/%E4%BA%AE%E9%9D%A2",
+            "亮面",
+        ),
+    )
+    check("exact-entry direct URL may bind without nearby title text", direct == [("liang", "mian")])
+    check("exact-entry direct URL records no rejection", direct_rejections == 0)
+    check(
+        "different-entry URL never receives the direct-entry exemption",
+        review_module._direct_url_entry_matches_word(
+            "https://www.zdic.net/hans/%E5%85%89%E9%9D%A2",
+            "亮面",
+        ) is False,
+    )
+
+
+def test_pronunciation_groups_require_known_character_readings():
+    print("\n🧪 pronunciation groups require known per-character readings")
+
+    async def review_with(first_char):
+        review_module._clear_review_caches()
+        evidence = {
+            "success": True,
+            "groups": [{
+                "pinyin": "guang mian",
+                "normalized": ["guang", "mian"],
+                "sources": [{
+                    "source": "汉典",
+                    "url": "https://www.zdic.net/hans/%E4%BA%AE%E9%9D%A2",
+                    "category": "dictionary",
+                    "trust": 5,
+                }],
+                "score": 5,
+            }],
+            "sources": [],
+        }
+        encode_data = {
+            "success": True,
+            "codes": ["lxmm", "lxmmo", "lxmmov"],
+            "pronunciationSource": "pinyin-pro-context",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": False,
+            "chars": [
+                first_char,
+                {
+                    "char": "面",
+                    "pinyin": "miàn",
+                    "pinyins": ["miàn"],
+                    "pronunciationLookupStatus": "found",
+                    "phoneticCode": "mm",
+                    "shapeCode": "v",
+                },
+            ],
+        }
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=evidence),
+            ),
+            patch.object(
+                review_module,
+                "fetch_keytao_encode",
+                AsyncMock(return_value=encode_data),
+            ),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+            patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+            patch.object(review_module.logger, "warning") as warning_mock,
+        ):
+            result = await prepare_reviewed_word(CONFIG, "亮面")
+        return result, warning_mock
+
+    async def _run():
+        mismatch, mismatch_log = await review_with({
+            "char": "亮",
+            "pinyin": "liàng",
+            "pinyins": ["liàng"],
+            "pronunciationLookupStatus": "found",
+            "phoneticCode": "lx",
+            "shapeCode": "o",
+        })
+        check("mismatched guang group is removed", mismatch.get("pronunciations") == [])
+        check("mismatch fails closed", mismatch.get("pronunciationUnresolved") is True)
+        check("mismatch produces no recommendation", mismatch.get("recommendedCode") == "")
+        check("mismatch rejection is logged", mismatch_log.call_count >= 1)
+
+        unavailable, unavailable_log = await review_with({
+            "char": "亮",
+            "pinyin": "guāng",
+            "pinyins": [],
+            "pronunciationLookupStatus": "unavailable",
+            "phoneticCode": "gx",
+            "shapeCode": "o",
+        })
+        check("unavailable lookup does not authorize guang", unavailable.get("pronunciations") == [])
+        check("unavailable lookup fails closed", unavailable.get("pronunciationUnresolved") is True)
+        check("unavailable rejection is logged", unavailable_log.call_count >= 1)
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1401,9 @@ def test_candidate_commonness_wiring_and_timeout():
 
 
 def main():
+    test_s14_wrong_entry_pronunciation_never_reaches_candidates()
+    test_pronunciation_word_binding_window_and_exact_direct_entry()
+    test_pronunciation_groups_require_known_character_readings()
     test_lookup_failure_forces_manual_review()
     test_exact_existing_is_duplicate_not_approval()
     test_compact_json_always_parses()

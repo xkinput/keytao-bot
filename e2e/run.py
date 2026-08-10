@@ -28,6 +28,7 @@ from .runtime import (
 from .safety import (
     EncodeDelayController,
     NetworkAllowlist,
+    PronunciationPoisonController,
     RESERVED_BINDING_PREFIX,
     SafetyViolation,
     validate_admin_identity,
@@ -678,11 +679,13 @@ async def async_main(args: argparse.Namespace) -> int:
         delay_seconds=float(os.getenv("E2E_ENCODE_DELAY_ONCE_SECONDS", "0.20")),
         attempt_timeout_seconds=float(os.getenv("E2E_ENCODE_ATTEMPT_TIMEOUT_SECONDS", "0.05")),
     )
+    pronunciation_poison = PronunciationPoisonController()
     guard = NetworkAllowlist(
         llm_base_url=config["llm"]["base_url"],
         recorder=recorder,
         scenario_getter=recorder.current_scenario,
         encode_delay=encode_delay,
+        pronunciation_poison=pronunciation_poison,
     )
     safety_proof = make_safety_proof(guard)
     selected_ids = {args.only.upper()} if args.only else {item.scenario_id for item in SCENARIOS}
@@ -827,7 +830,10 @@ async def async_main(args: argparse.Namespace) -> int:
                             recorder=recorder,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
-                    if scenario.scenario_id == "S10":
+                    if (
+                        scenario.scenario_id in ZDIC_FIXTURES_BY_SCENARIO
+                        and scenario.scenario_id != "S9"
+                    ):
                         fixture_facts.setdefault("zdic", {})[
                             scenario.scenario_id
                         ] = await ensure_scenario_zdic_fixture(
@@ -848,6 +854,7 @@ async def async_main(args: argparse.Namespace) -> int:
                         bot=bot_harness,
                         recorder=recorder,
                         encode_delay=encode_delay,
+                        pronunciation_poison=pronunciation_poison,
                         fixture_facts=fixture_facts,
                         admin_identity=admin_identity,
                         admin_user=admin_session["user"],

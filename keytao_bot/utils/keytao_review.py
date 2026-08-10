@@ -122,6 +122,7 @@ CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
 # 12s inner per-request timeouts can even fire.
 PRONUNCIATION_EVIDENCE_TIMEOUT = 20.0
 PRONUNCIATION_SOURCE_TIMEOUT = 8.0
+PRONUNCIATION_WORD_BINDING_WINDOW_CHARS = 80
 KEYTAO_ENCODE_REQUEST_TIMEOUT = 30.0
 KEYTAO_ENCODE_MAX_ATTEMPTS = 4
 ENTITY_DIRECT_FETCH_TIMEOUT = 3.0
@@ -673,15 +674,49 @@ def _source_by_id(source_id: str) -> Dict[str, Any]:
     return {}
 
 
-def _extract_labeled_pinyin_sequences(text: str, word_length: int) -> List[Tuple[str, ...]]:
+def _normalize_evidence_binding_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", html.unescape(str(value or "")))
+    normalized = re.sub(r"[\u200b-\u200d\u2060\ufeff]", "", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _direct_url_entry_matches_word(url: str, word: str) -> bool:
+    path = unquote(urlparse(url).path).rstrip("/")
+    entry = path.rsplit("/", 1)[-1] if path else ""
+    return _normalize_evidence_binding_text(entry) == _normalize_evidence_binding_text(word)
+
+
+def _word_is_bound_to_pinyin_match(text: str, word: str, match: re.Match[str]) -> bool:
+    """Require the exact word within 80 normalized text characters of the label."""
+    start = max(0, match.start() - PRONUNCIATION_WORD_BINDING_WINDOW_CHARS)
+    end = min(len(text), match.end() + PRONUNCIATION_WORD_BINDING_WINDOW_CHARS)
+    vicinity = _normalize_evidence_binding_text(text[start:end])
+    normalized_word = _normalize_evidence_binding_text(word)
+    return bool(normalized_word and normalized_word in vicinity)
+
+
+def _extract_labeled_pinyin_sequences(
+    text: str,
+    word: str,
+    *,
+    exact_entry_direct_url: bool = False,
+) -> Tuple[List[Tuple[str, ...]], int]:
     sequences: List[Tuple[str, ...]] = []
     seen: set[Tuple[str, ...]] = set()
+    rejected_unbound = 0
     for match in _PINYIN_LABEL_RE.finditer(text):
+        if (
+            not exact_entry_direct_url
+            and not _word_is_bound_to_pinyin_match(text, word, match)
+        ):
+            rejected_unbound += 1
+            continue
         raw = match.group(1)
         raw = re.split(r"(?:释义|解释|词语|出处|英文|繁体|注音|词性|意思|基本)", raw, maxsplit=1)[0]
         sequence = normalize_pinyin_sequence(raw)
         if not sequence:
             continue
+        word_length = len(word)
         if word_length > 1 and len(sequence) != word_length:
             continue
         if word_length == 1 and len(sequence) != 1:
@@ -689,7 +724,7 @@ def _extract_labeled_pinyin_sequences(text: str, word_length: int) -> List[Tuple
         if sequence not in seen:
             seen.add(sequence)
             sequences.append(sequence)
-    return sequences
+    return sequences, rejected_unbound
 
 
 async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
@@ -702,12 +737,13 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         return cached
 
     source_entries: List[Dict[str, Any]] = []
+    rejections: List[Dict[str, Any]] = []
 
     async def inspect_source(source: Dict[str, Any]) -> None:
         # Direct pages and the site-scoped search run together; inside each,
         # every outbound fetch is issued in parallel as well. Serial per-URL
         # fetching is what used to blow through the total budget.
-        async def direct_texts() -> List[Tuple[str, str, str]]:
+        async def direct_texts() -> List[Tuple[str, str, str, bool]]:
             urls = [
                 url_template.format(word=quote(word))
                 for url_template in source.get("direct_urls", [])
@@ -716,12 +752,17 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                 return []
             pages = await asyncio.gather(*(_fetch_text(url) for url in urls))
             return [
-                (source["label"], url, text[:12000])
+                (
+                    source["label"],
+                    url,
+                    text[:12000],
+                    _direct_url_entry_matches_word(url, word),
+                )
                 for url, text in zip(urls, pages)
                 if text
             ]
 
-        async def search_texts() -> List[Tuple[str, str, str]]:
+        async def search_texts() -> List[Tuple[str, str, str, bool]]:
             results = await _search_web(source["query"].format(word=word), max_results=2)
             matching = [
                 result for result in results
@@ -732,16 +773,17 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
             pages = await asyncio.gather(*(
                 _fetch_text(result.get("url", "")) for result in matching
             ))
-            collected: List[Tuple[str, str, str]] = []
+            collected: List[Tuple[str, str, str, bool]] = []
             for result, page_text in zip(matching, pages):
                 url = result.get("url", "")
                 collected.append((
                     source["label"],
                     url,
                     f"{result.get('title', '')} {result.get('snippet', '')}",
+                    False,
                 ))
                 if page_text:
-                    collected.append((source["label"], url, page_text[:12000]))
+                    collected.append((source["label"], url, page_text[:12000], False))
             return collected
 
         try:
@@ -757,8 +799,27 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
             logger.debug(f"Pronunciation source {source['id']} failed for {word}: {error}")
             return
 
-        for label, url, text in [*direct, *searched]:
-            for sequence in _extract_labeled_pinyin_sequences(text, len(word)):
+        for label, url, text, exact_entry_direct_url in [*direct, *searched]:
+            sequences, rejected_unbound = _extract_labeled_pinyin_sequences(
+                text,
+                word,
+                exact_entry_direct_url=exact_entry_direct_url,
+            )
+            if rejected_unbound:
+                rejection = {
+                    "sourceId": source["id"],
+                    "source": label,
+                    "url": url,
+                    "reason": "queried_word_not_near_pinyin_label",
+                    "count": rejected_unbound,
+                }
+                rejections.append(rejection)
+                logger.warning(
+                    "Pronunciation evidence rejected for "
+                    f"{word} from {url}: queried word absent within "
+                    f"+/-{PRONUNCIATION_WORD_BINDING_WINDOW_CHARS} characters"
+                )
+            for sequence in sequences:
                 source_entries.append({
                     "sourceId": source["id"],
                     "source": label,
@@ -800,6 +861,7 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         "groups": sorted_groups,
         "sources": source_entries,
         "hasEvidence": bool(sorted_groups),
+        "rejections": rejections,
     }
     # Only successful results are cached; timeouts/failures must be retried.
     return _cache_set(word, "pronunciation_evidence", result)
@@ -957,6 +1019,77 @@ def _encode_default_pinyin_sequence(encode_data: Dict) -> Tuple[str, ...]:
             return ()
         result.append(normalized)
     return tuple(result)
+
+
+def _pronunciation_sequence_rejection_reason(
+    word: str,
+    sequence: Sequence[str],
+    encode_data: Dict[str, Any],
+) -> str:
+    word_chars = list(word)
+    normalized_sequence = tuple(
+        normalize_pinyin_syllable(str(syllable or ""))
+        for syllable in sequence
+    )
+    chars = encode_data.get("chars")
+    if len(normalized_sequence) != len(word_chars) or not all(normalized_sequence):
+        return "syllable_count_mismatch"
+    if not isinstance(chars, list) or len(chars) != len(word_chars):
+        return "character_lookup_payload_missing"
+
+    for index, (expected_char, syllable, char_info) in enumerate(
+        zip(word_chars, normalized_sequence, chars)
+    ):
+        if not isinstance(char_info, dict) or char_info.get("char") != expected_char:
+            return f"character_{index + 1}_lookup_mismatch"
+        status = str(char_info.get("pronunciationLookupStatus") or "").strip()
+        if status != "found":
+            return f"character_{index + 1}_lookup_{status or 'missing'}"
+        raw_readings = char_info.get("pinyins")
+        if not isinstance(raw_readings, list):
+            return f"character_{index + 1}_readings_missing"
+        known_readings = {
+            normalize_pinyin_syllable(str(reading or ""))
+            for reading in raw_readings
+            if str(reading or "").strip()
+        }
+        known_readings.discard("")
+        if syllable not in known_readings:
+            return f"character_{index + 1}_reading_mismatch"
+    return ""
+
+
+def _validated_pronunciation_groups(
+    word: str,
+    groups: Sequence[Dict[str, Any]],
+    encode_data: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    accepted: List[Dict[str, Any]] = []
+    rejections: List[Dict[str, Any]] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        sequence = tuple(group.get("normalized") or ())
+        reason = _pronunciation_sequence_rejection_reason(
+            word,
+            sequence,
+            encode_data,
+        )
+        if not reason:
+            accepted.append(group)
+            continue
+        rejection = {
+            "pinyin": str(group.get("pinyin") or pinyin_sequence_label(sequence)),
+            "normalized": list(sequence),
+            "reason": reason,
+            "sourceIds": list(group.get("sourceIds") or []),
+        }
+        rejections.append(rejection)
+        logger.warning(
+            f"Pronunciation group rejected for {word}: "
+            f"{rejection['pinyin']} ({reason})"
+        )
+    return accepted, rejections
 
 
 def _context_pinyin_sequence(encode_data: Dict) -> Tuple[str, ...]:
@@ -1206,6 +1339,22 @@ def _codes_for_pinyin_sequence(encode_data: Dict, sequence: Sequence[str]) -> Li
     if not isinstance(chars, list) or len(chars) != len(sequence):
         return []
 
+    word = "".join(
+        str(item.get("char") or "") if isinstance(item, dict) else ""
+        for item in chars
+    )
+    rejection_reason = _pronunciation_sequence_rejection_reason(
+        word,
+        sequence,
+        encode_data,
+    )
+    if rejection_reason:
+        logger.warning(
+            f"Refused to encode unvalidated pronunciation for {word}: "
+            f"{pinyin_sequence_label(sequence)} ({rejection_reason})"
+        )
+        return []
+
     normalized_sequence = tuple(normalize_pinyin_syllable(str(item)) for item in sequence)
     default_sequence = _encode_default_pinyin_sequence(encode_data)
     if normalized_sequence == default_sequence:
@@ -1314,8 +1463,35 @@ async def prepare_reviewed_word(
     if not encode_data.get("success", True) and not encode_data.get("codes"):
         return {"success": False, "message": encode_data.get("message", "编码服务未返回有效结果")}
 
-    groups = evidence.get("groups", []) if evidence.get("success") else []
+    raw_groups = evidence.get("groups", []) if evidence.get("success") else []
+    groups, cross_validation_rejections = _validated_pronunciation_groups(
+        word,
+        raw_groups,
+        encode_data,
+    )
     standard_status = _standard_pronunciation_status(encode_data)
+    evidence_rejections = [
+        *list(evidence.get("rejections") or []),
+        *cross_validation_rejections,
+    ]
+    if not groups and evidence_rejections:
+        return apply_manual_review_flag({
+            "success": True,
+            "word": word,
+            "existing": existing_words.get(word, []),
+            "pronunciations": [],
+            "recommendedCode": "",
+            "autoReviewable": False,
+            "pronunciationUnresolved": True,
+            "requiresManualPronunciationReview": True,
+            "standardPronunciationStatus": standard_status,
+            "pronunciationRejections": evidence_rejections,
+            "message": (
+                f"「{word}」检索到的读音证据未通过词条或逐字读音校验，"
+                "已拒绝生成候选编码，请人工复核读音"
+            ),
+            "entityKnowledge": None,
+        }, True, "读音证据未通过目标词条逐字校验")
     if not groups:
         default_sequence = _encode_default_pinyin_sequence(encode_data)
         entity_group = None
@@ -1409,6 +1585,30 @@ async def prepare_reviewed_word(
                 "score": 0,
                 "fallback": True,
             }]
+
+    groups, final_validation_rejections = _validated_pronunciation_groups(
+        word,
+        groups,
+        encode_data,
+    )
+    if not groups:
+        return apply_manual_review_flag({
+            "success": True,
+            "word": word,
+            "existing": existing_words.get(word, []),
+            "pronunciations": [],
+            "recommendedCode": "",
+            "autoReviewable": False,
+            "pronunciationUnresolved": True,
+            "requiresManualPronunciationReview": True,
+            "standardPronunciationStatus": standard_status,
+            "pronunciationRejections": final_validation_rejections,
+            "message": (
+                f"「{word}」没有通过逐字权威读音交叉校验的候选读音，"
+                "暂不推荐编码"
+            ),
+            "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
+        }, True, "候选读音未通过逐字权威读音交叉校验")
 
     all_codes: List[str] = []
     pronunciations: List[Dict] = []

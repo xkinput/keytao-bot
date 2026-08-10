@@ -9,7 +9,11 @@ from typing import Any, Awaitable, Callable
 
 from .recording import ArtifactRecorder
 from .runtime import E2EBotHarness, LocalNextClient
-from .safety import EncodeDelayController, SafetyViolation
+from .safety import (
+    EncodeDelayController,
+    PronunciationPoisonController,
+    SafetyViolation,
+)
 
 
 PHRASE_TYPE_BASE_WEIGHTS = {
@@ -143,6 +147,7 @@ class ScenarioContext:
     bot: E2EBotHarness
     recorder: ArtifactRecorder
     encode_delay: EncodeDelayController
+    pronunciation_poison: PronunciationPoisonController
     fixture_facts: dict[str, Any]
     admin_identity: dict[str, str]
     admin_user: dict[str, Any]
@@ -776,6 +781,82 @@ async def scenario_s13(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+async def scenario_s14(ctx: ScenarioContext) -> dict[str, Any]:
+    from keytao_bot.utils.keytao_review import _clear_review_caches
+
+    _clear_review_caches()
+    before = await ctx.draft()
+    ctx.pronunciation_poison.arm(ctx.scenario_id)
+    message = "喵喵 亮面"
+    try:
+        reply = await ctx.send(message)
+    finally:
+        ctx.pronunciation_poison.disarm()
+    after = await ctx.draft()
+
+    require(
+        ctx.pronunciation_poison.injected,
+        "S14 did not inject the wrong-entry search hit and page",
+    )
+    review_events = [
+        event
+        for event in ctx.attempt_events()
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_prepare_reviewed_add"
+        and isinstance(event.get("result"), dict)
+        and event.get("arguments", {}).get("word") == "亮面"
+    ]
+    require(review_events, "S14 did not review 亮面 through the public add-review tool")
+    review = review_events[-1]["result"]
+    pronunciations = [
+        item
+        for item in review.get("pronunciations", [])
+        if isinstance(item, dict)
+    ]
+    syllables = {
+        str(syllable or "").strip().lower()
+        for item in pronunciations
+        for syllable in item.get("normalized", [])
+    }
+    candidate_codes = {
+        str(code or "").strip().lower()
+        for item in pronunciations
+        for code in item.get("codes", [])
+    }
+    wrong_codes = sorted(code for code in candidate_codes if code.startswith("gxmm"))
+    correct_codes = sorted(code for code in candidate_codes if code.startswith("lxmm"))
+    manual_review = bool(
+        review.get("pronunciationUnresolved")
+        or review.get("requiresManualPronunciationReview")
+    )
+    require("guang" not in syllables, f"S14 accepted the poisoned guang reading: {review}")
+    require(not wrong_codes, f"S14 exposed poisoned gxmm candidates: {wrong_codes}")
+    require(
+        bool(correct_codes) or manual_review,
+        f"S14 neither offered lxmm candidates nor failed closed: {review}",
+    )
+    require(
+        before.get("batchId") == after.get("batchId")
+        and before.get("contentVersion") == after.get("contentVersion")
+        and before.get("items") == after.get("items") == [],
+        f"S14 pronunciation review mutated the draft: before={before}, after={after}",
+    )
+    return {
+        "messages": [message],
+        "replies": [reply],
+        "draft": after,
+        "facts": {
+            "faultInjected": True,
+            "poisonedEntry": "光面",
+            "poisonedPinyin": "guang mian",
+            "acceptedSyllables": sorted(syllables),
+            "candidateCodes": sorted(candidate_codes),
+            "manualReview": manual_review,
+            "draftUnchanged": True,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -790,6 +871,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S11", "front-insert ticket before extra action", scenario_s11),
     Scenario("S12", "front-insert weight legality", scenario_s12),
     Scenario("S13", "same-turn resend loop breaker", scenario_s13),
+    Scenario("S14", "wrong-entry pronunciation poisoning", scenario_s14),
 )
 
 

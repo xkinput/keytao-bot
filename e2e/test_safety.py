@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, call, patch
 import httpx
 
 from .recording import ArtifactRecorder, _redact_sensitive
+from .scenarios import SCENARIOS
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
     ensure_s9_fixture,
@@ -20,6 +21,7 @@ from .run import (
 from .runtime import LocalNextClient, RigInfrastructureError
 from .safety import (
     NetworkAllowlist,
+    PronunciationPoisonController,
     SafetyViolation,
     validate_admin_identity,
     validate_keytao_base,
@@ -49,6 +51,7 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("exact persisted weight cascade", readme)
         self.assertIn("S13 sends an explicit weight", readme)
         self.assertIn("asks the user to resend the same current message", readme)
+        self.assertIn("S14 injects a 汉典-shaped search hit", readme)
 
     def test_artifacts_redact_admin_credentials(self) -> None:
         payload = _redact_sensitive(
@@ -153,6 +156,69 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         seed_sql = run_mock.call_args.kwargs["input"]
         for _kind, entry, _status, _pinyins in expected_rows:
             self.assertEqual(seed_sql.count(f"'{entry}'"), 1)
+
+    def test_s14_zdic_seed_declares_exact_character_readings(self) -> None:
+        self.assertIn("S14", {scenario.scenario_id for scenario in SCENARIOS})
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S14"]
+        self.assertEqual(fixture["probe_words"], ("亮面",))
+        self.assertEqual(
+            {
+                (
+                    row["kind"],
+                    row["entry"],
+                    row["status"],
+                    tuple(row["pinyins"]),
+                )
+                for row in fixture["rows"]
+            },
+            {
+                ("char", "亮", "found", ("liàng",)),
+                ("char", "面", "found", ("miàn",)),
+                ("entry", "亮面", "absent", ()),
+            },
+        )
+
+    async def test_s14_poison_injection_is_exact_and_never_dispatches(self) -> None:
+        dispatched: list[str] = []
+
+        async def transport_handler(request: httpx.Request) -> httpx.Response:
+            dispatched.append(str(request.url))
+            return httpx.Response(599, request=request)
+
+        controller = PronunciationPoisonController()
+        controller.arm("S14")
+        with patch.object(
+            NetworkAllowlist,
+            "_resolve_llm_ips",
+            return_value=frozenset({"203.0.113.10"}),
+        ):
+            guard = NetworkAllowlist(
+                llm_base_url="https://llm.example.com/v1",
+                scenario_getter=lambda: "S14",
+                pronunciation_poison=controller,
+            )
+        guard.install()
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(transport_handler)
+            ) as client:
+                search = await client.get(
+                    "https://www.bing.com/search",
+                    params={"q": 'site:zdic.net "亮面" 拼音'},
+                )
+                page = await client.get(
+                    "https://www.zdic.net/hans/%E5%85%89%E9%9D%A2"
+                )
+                with self.assertRaises(SafetyViolation):
+                    await client.get("https://www.zdic.net/hans/%E4%BA%AE%E9%9D%A2")
+        finally:
+            guard.restore()
+            controller.disarm()
+
+        self.assertIn("光面", search.text)
+        self.assertIn("guāng miàn", page.text)
+        self.assertTrue(controller.injected)
+        self.assertEqual(dispatched, [])
 
     async def test_multi_add_zdic_preflight_reuses_final_probe_retry(self) -> None:
         client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")

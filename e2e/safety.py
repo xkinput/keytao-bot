@@ -218,6 +218,71 @@ class EncodeDelayController:
         return True
 
 
+@dataclass
+class PronunciationPoisonController:
+    """Inject one wrong-entry search hit and page for the armed scenario."""
+
+    armed_scenario: str = ""
+    search_injected: bool = False
+    page_injected: bool = False
+
+    def arm(self, scenario_id: str) -> None:
+        self.armed_scenario = scenario_id
+        self.search_injected = False
+        self.page_injected = False
+
+    def disarm(self) -> None:
+        self.armed_scenario = ""
+
+    @property
+    def injected(self) -> bool:
+        return self.search_injected and self.page_injected
+
+    def response_for(
+        self,
+        *,
+        scenario_id: str,
+        method: str,
+        url: str,
+    ) -> Optional[tuple[str, str]]:
+        if (
+            not self.armed_scenario
+            or scenario_id != self.armed_scenario
+            or method.upper() != "GET"
+        ):
+            return None
+
+        parsed = urlparse(url)
+        host = _normalized_host(parsed.hostname)
+        if (
+            host == "www.bing.com"
+            and parsed.path == "/search"
+            and not self.search_injected
+        ):
+            query = " ".join(parse_qs(parsed.query).get("q", []))
+            if "site:zdic.net" in query and "亮面" in query:
+                self.search_injected = True
+                return (
+                    "wrong-entry-search-hit",
+                    '<h2><a href="https://www.zdic.net/hans/%E5%85%89%E9%9D%A2">'
+                    "光面_汉典</a></h2><p>光面 拼音：guāng miàn</p>",
+                )
+
+        if (
+            host in {"zdic.net", "www.zdic.net"}
+            and parsed.path == "/hans/%E5%85%89%E9%9D%A2"
+            and not self.page_injected
+        ):
+            self.page_injected = True
+            return (
+                "wrong-entry-page",
+                "<html><head><title>光面_汉典</title></head>"
+                "<body><h1>光面</h1><div>拼音：guāng miàn</div>"
+                "<p>光滑的表面。</p></body></html>",
+            )
+        return None
+
+
 class NetworkAllowlist:
     """Process-wide guard for HTTP hops and raw Python socket connections."""
 
@@ -228,12 +293,14 @@ class NetworkAllowlist:
         recorder: Any = None,
         scenario_getter: Optional[Callable[[], str]] = None,
         encode_delay: Optional[EncodeDelayController] = None,
+        pronunciation_poison: Optional[PronunciationPoisonController] = None,
     ) -> None:
         self.llm_base_url = validate_llm_base(llm_base_url)
         self.llm_origin = _origin(self.llm_base_url)
         self.recorder = recorder
         self.scenario_getter = scenario_getter or (lambda: "")
         self.encode_delay = encode_delay
+        self.pronunciation_poison = pronunciation_poison
         self._llm_ips = set(self._resolve_llm_ips(self.llm_origin[1], self.llm_origin[2]))
         self._patches: list[tuple[Any, str, Any]] = []
 
@@ -307,8 +374,27 @@ class NetworkAllowlist:
             return await original_async_single(client, request, *args, **kwargs)
 
         async def async_send(client: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
-            guard.assert_url_allowed(request.url)
             scenario_id = guard.scenario_getter()
+            synthetic = (
+                guard.pronunciation_poison.response_for(
+                    scenario_id=scenario_id,
+                    method=request.method,
+                    url=str(request.url),
+                )
+                if guard.pronunciation_poison is not None
+                else None
+            )
+            if synthetic is not None:
+                injection_kind, body = synthetic
+                if guard.recorder is not None:
+                    guard.recorder.record_fault_injection(
+                        scenario_id=scenario_id,
+                        method=request.method,
+                        url=str(request.url),
+                        injection_kind=injection_kind,
+                    )
+                return httpx.Response(200, text=body, request=request)
+            guard.assert_url_allowed(request.url)
             if (
                 guard.encode_delay is not None
                 and guard.encode_delay.should_inject(

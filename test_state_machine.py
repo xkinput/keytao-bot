@@ -2247,10 +2247,10 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
             "success": True,
             "codes": ["ylcb", "ylcbv", "ylcbvu"],
             "chars": [
-                {"char": "雅", "pinyin": "ya", "pinyins": ["ya"], "shapeCode": "v"},
-                {"char": "鲁", "pinyin": "lu", "pinyins": ["lu"], "shapeCode": "u"},
-                {"char": "藏", "pinyin": "cang", "pinyins": ["cang", "zang"], "shapeCode": "o"},
-                {"char": "布", "pinyin": "bu", "pinyins": ["bu"], "shapeCode": "i"},
+                {"char": "雅", "pinyin": "ya", "pinyins": ["ya"], "pronunciationLookupStatus": "found", "shapeCode": "v"},
+                {"char": "鲁", "pinyin": "lu", "pinyins": ["lu"], "pronunciationLookupStatus": "found", "shapeCode": "u"},
+                {"char": "藏", "pinyin": "cang", "pinyins": ["cang", "zang"], "pronunciationLookupStatus": "found", "shapeCode": "o"},
+                {"char": "布", "pinyin": "bu", "pinyins": ["bu"], "pronunciationLookupStatus": "found", "shapeCode": "i"},
             ],
         }
         entity = {
@@ -2725,6 +2725,7 @@ def test_reviewed_word_automatically_disambiguates_polyphone_before_recommending
                     "char": "窨",
                     "pinyin": "yìn",
                     "pinyins": ["yìn", "xūn"],
+                    "pronunciationLookupStatus": "found",
                     "phoneticCode": "yb",
                     "shapeCode": "o",
                 },
@@ -2732,6 +2733,7 @@ def test_reviewed_word_automatically_disambiguates_polyphone_before_recommending
                     "char": "茶",
                     "pinyin": "chá",
                     "pinyins": ["chá"],
+                    "pronunciationLookupStatus": "found",
                     "phoneticCode": "ws",
                     "shapeCode": "i",
                 },
@@ -2946,12 +2948,16 @@ def test_reviewed_word_preserves_encode_service_candidate_chains():
                 {
                     "char": "摇",
                     "pinyin": "yáo",
+                    "pinyins": ["yáo"],
+                    "pronunciationLookupStatus": "found",
                     "phoneticCode": "yz",
                     "shapeCode": "iuuo",
                 },
                 {
                     "char": "光",
                     "pinyin": "guāng",
+                    "pinyins": ["guāng"],
+                    "pronunciationLookupStatus": "found",
                     "phoneticCode": "gm",
                     "shapeCode": "ioua",
                 },
@@ -3000,21 +3006,21 @@ def test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable():
             "success": True,
             "codes": ["ylcb", "ylcbv", "ylcbvu"],
             "chars": [
-                {"char": "雅", "pinyin": "ya", "shapeCode": "v"},
-                {"char": "鲁", "pinyin": "lu", "shapeCode": "u"},
-                {"char": "藏", "pinyin": "cang", "shapeCode": "o"},
-                {"char": "布", "pinyin": "bu", "shapeCode": "i"},
+                {"char": "雅", "pinyin": "ya", "pinyins": ["ya"], "pronunciationLookupStatus": "found", "shapeCode": "v"},
+                {"char": "鲁", "pinyin": "lu", "pinyins": ["lu"], "pronunciationLookupStatus": "found", "shapeCode": "u"},
+                {"char": "藏", "pinyin": "cang", "pinyins": ["cang", "zang"], "pronunciationLookupStatus": "found", "shapeCode": "o"},
+                {"char": "布", "pinyin": "bu", "pinyins": ["bu"], "pronunciationLookupStatus": "found", "shapeCode": "i"},
             ],
         }
         full_encode = {
             "success": True,
             "codes": ["ylzj"],
             "chars": [
-                {"char": "雅", "pinyin": "ya", "shapeCode": "v"},
-                {"char": "鲁", "pinyin": "lu", "shapeCode": "u"},
-                {"char": "藏", "pinyin": "zang", "shapeCode": "o"},
-                {"char": "布", "pinyin": "bu", "shapeCode": "i"},
-                {"char": "江", "pinyin": "jiang", "shapeCode": "v"},
+                {"char": "雅", "pinyin": "ya", "pinyins": ["ya"], "pronunciationLookupStatus": "found", "shapeCode": "v"},
+                {"char": "鲁", "pinyin": "lu", "pinyins": ["lu"], "pronunciationLookupStatus": "found", "shapeCode": "u"},
+                {"char": "藏", "pinyin": "zang", "pinyins": ["cang", "zang"], "pronunciationLookupStatus": "found", "shapeCode": "o"},
+                {"char": "布", "pinyin": "bu", "pinyins": ["bu"], "pronunciationLookupStatus": "found", "shapeCode": "i"},
+                {"char": "江", "pinyin": "jiang", "pinyins": ["jiang"], "pronunciationLookupStatus": "found", "shapeCode": "v"},
             ],
         }
 
