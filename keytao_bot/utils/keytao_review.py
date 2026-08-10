@@ -31,6 +31,7 @@ from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 from .llm_request_gate import RequestWindowGate
 from .review_flags import (
     MANUAL_REVIEW_PREFIXES,
+    apply_review_disposition,
     apply_manual_review_flag,
     build_auto_review_remark,
     manual_review_reason,
@@ -1443,7 +1444,10 @@ async def prepare_reviewed_word(
 ) -> Dict:
     word = word.strip()
     if not word:
-        return {"success": False, "message": "词不能为空"}
+        return apply_review_disposition(
+            {"success": False, "message": "词不能为空"},
+            "empty_word",
+        )
 
     evidence, encode_data, existing_words_result = await asyncio.gather(
         collect_pronunciation_evidence_limited(word),
@@ -1474,7 +1478,10 @@ async def prepare_reviewed_word(
         encode_data = {"success": False, "message": str(encode_data)}
 
     if not encode_data.get("success", True) and not encode_data.get("codes"):
-        return {"success": False, "message": encode_data.get("message", "编码服务未返回有效结果")}
+        return apply_review_disposition({
+            "success": False,
+            "message": encode_data.get("message", "编码服务未返回有效结果"),
+        }, "code_unresolved")
 
     raw_groups = evidence.get("groups", []) if evidence.get("success") else []
     groups, cross_validation_rejections = _validated_pronunciation_groups(
@@ -1519,7 +1526,7 @@ async def prepare_reviewed_word(
                     groups = [semantic_group]
 
             if not groups:
-                return apply_manual_review_flag({
+                return apply_review_disposition(apply_manual_review_flag({
                     "success": True,
                     "word": word,
                     "existing": existing_words.get(word, []),
@@ -1534,7 +1541,7 @@ async def prepare_reviewed_word(
                         "暂不推荐编码"
                     ),
                     "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
-                }, True, "整词语境读音无法验证")
+                }, True, "整词语境读音无法验证"), "pronunciation_unresolved")
 
         own_character_rejection = _pronunciation_sequence_rejection_reason(
             word,
@@ -1547,7 +1554,7 @@ async def prepare_reviewed_word(
             and str(encode_data.get("pronunciationSource") or "") == "zdic-unavailable"
             and own_character_rejection
         ):
-            return apply_manual_review_flag({
+            return apply_review_disposition(apply_manual_review_flag({
                 "success": True,
                 "word": word,
                 "existing": existing_words.get(word, []),
@@ -1572,7 +1579,7 @@ async def prepare_reviewed_word(
                     "当前读音无法完成交叉验证，暂不推荐编码"
                 ),
                 "entityKnowledge": None,
-            }, True, "权威读音服务暂不可用")
+            }, True, "权威读音服务暂不可用"), "pronunciation_unresolved")
 
         if not groups:
             entity_knowledge = await _infer_entity_knowledge(word)
@@ -1609,7 +1616,7 @@ async def prepare_reviewed_word(
         encode_data,
     )
     if not groups:
-        return apply_manual_review_flag({
+        return apply_review_disposition(apply_manual_review_flag({
             "success": True,
             "word": word,
             "existing": existing_words.get(word, []),
@@ -1628,7 +1635,7 @@ async def prepare_reviewed_word(
                 "暂不推荐编码"
             ),
             "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
-        }, True, "候选读音未通过逐字权威读音交叉校验")
+        }, True, "候选读音未通过逐字权威读音交叉校验"), "pronunciation_unresolved")
 
     all_codes: List[str] = []
     pronunciations: List[Dict] = []
@@ -1655,7 +1662,10 @@ async def prepare_reviewed_word(
         })
 
     if not pronunciations:
-        return {"success": False, "message": f"未能把「{word}」的读音映射到键道候选编码"}
+        return apply_review_disposition({
+            "success": False,
+            "message": f"未能把「{word}」的读音映射到键道候选编码",
+        }, "code_unresolved")
 
     code_map: Dict[str, List[Dict]] = {}
     try:
@@ -1727,8 +1737,28 @@ async def prepare_reviewed_word(
     if evidence_rejections:
         result["pronunciationRejections"] = evidence_rejections
     # Structured verdict for downstream remark rendering. Code-generated, never
-    # LLM text.
-    return apply_manual_review_flag(result, not auto_reviewable, auto_review_reason)
+    # LLM text. A resolved candidate without an authoritative page is SEAL, not
+    # BLOCK: it remains writeable with needsManualReview=True.
+    apply_manual_review_flag(result, not auto_reviewable, auto_review_reason)
+    if lookup_failed:
+        return apply_review_disposition(result, "lookup_unavailable")
+    if requires_manual_pronunciation_review:
+        evidence_kinds = {
+            str(pronunciation.get("readingEvidenceKind") or "")
+            for pronunciation in pronunciations
+        }
+        site = (
+            "entity_context_reading"
+            if evidence_kinds & {
+                "own_character_semantic",
+                "own_character_entity_context",
+            }
+            else "missing_authoritative_page"
+        )
+        return apply_review_disposition(result, site)
+    if not has_authority:
+        return apply_review_disposition(result, "missing_authoritative_page")
+    return result
 
 
 def _candidate_codes_from_review(review: Dict, *, include_fallback: bool = False) -> set[str]:
@@ -3081,8 +3111,8 @@ async def _review_code_chain_priority(item: Dict, review: Dict) -> Dict:
         "commonness": commonness,
         "hasRecommendation": False,
         "priorityOk": True,
-        # ADVISORY ONLY. A reorder suggestion may raise an admin-facing issue,
-        # but it must never contribute to autoReviewable / auto-pass.
+        # ADVISORY ONLY. Keep reorder suggestions as context; they must never
+        # downgrade or independently determine the item's verdict.
         "advisory": True,
         "summary": "同编码链未发现需要调整的高置信优先级问题",
         "currentOrder": [],
@@ -3338,13 +3368,24 @@ AUDIT_WORST_CASE_SEQUENTIAL_SECONDS = (
 )
 AUDIT_ITEM_TIMEOUT = 40.0
 
-AUDIT_STAGE_LABELS = {
-    "review": "读音与编码核验",
-    "css_review": "声笔笔审查",
-    "commonness": "常用度评估",
-    "change_commonness": "改词常用度比较",
-    "priority": "编码链优先级评估",
+AUDIT_STAGE_POLICIES = {
+    "review": {"label": "读音与编码核验", "classification": "gating"},
+    "css_review": {"label": "声笔笔审查", "classification": "gating"},
+    "commonness": {"label": "常用度评估", "classification": "advisory"},
+    "change_commonness": {"label": "改词常用度比较", "classification": "advisory"},
+    "priority": {"label": "编码链优先级评估", "classification": "advisory"},
 }
+
+
+def _audit_stage_policy(stage: str) -> Dict[str, str]:
+    policy = AUDIT_STAGE_POLICIES.get(stage)
+    if policy is None:
+        raise ValueError(f"Undeclared audit stage: {stage}")
+    return policy
+
+
+def _audit_stage_is_advisory(stage: str) -> bool:
+    return _audit_stage_policy(stage)["classification"] == "advisory"
 
 
 def reviewed_word_key(word: str, phrase_type: str) -> str:
@@ -3402,6 +3443,7 @@ class _AuditProgress:
         awaitable: Any,
         timeout: float,
     ) -> Any:
+        _audit_stage_policy(stage)
         self.active_stage = stage
         started = time.monotonic()
         try:
@@ -3501,21 +3543,30 @@ async def _audit_single_item(
             return outcome
 
         if action == "Change" and old_word:
+            baseline_issue = (
+                f"声笔笔短码替换「{old_word}→{word}」缺少足够的词库审查证据，"
+                "需要管理员审核"
+            )
+            if css_review.get("autoReviewable"):
+                outcome.approved_items.append(
+                    f"声笔笔改词：{old_word}→{word}@{code}，按声笔笔短码表审查通过"
+                )
+            else:
+                outcome.issues.append(baseline_issue)
             comparison = await progress.run_stage(
                 "change_commonness",
                 compare_word_commonness(word, old_word),
                 AUDIT_COMMONNESS_STAGE_TIMEOUT,
             )
             css_review["commonnessComparison"] = comparison
-            if comparison.get("verdict") == "front_more_common":
+            if (
+                comparison.get("verdict") == "front_more_common"
+                and baseline_issue in outcome.issues
+            ):
+                outcome.issues.remove(baseline_issue)
                 outcome.approved_items.append(
                     f"声笔笔改词：{old_word}→{word}@{code}，按 CSS 短码表/常用度优先级通过"
                 )
-                return outcome
-            outcome.issues.append(
-                f"声笔笔短码替换「{old_word}→{word}」需要确认："
-                f"{comparison.get('summary', '请按 CSS 短码表、词频和结构对齐复核')}"
-            )
             return outcome
 
         if css_review.get("autoReviewable"):
@@ -3598,6 +3649,8 @@ async def _audit_single_item(
             )
             return outcome
 
+        baseline_issue = f"「{word}」没有权威读音来源，需要管理员审核"
+        outcome.issues.append(baseline_issue)
         commonness = await progress.run_stage(
             "commonness",
             estimate_word_commonness(word),
@@ -3605,19 +3658,7 @@ async def _audit_single_item(
         )
         outcome.word_purpose_reviews.append(_purpose_review_from_commonness(word, code, phrase_type, commonness))
         if _is_common_known_word(word, commonness):
-            priority_review = await progress.run_stage(
-                "priority",
-                _review_code_chain_priority(item, review),
-                AUDIT_PRIORITY_STAGE_TIMEOUT,
-            )
-            outcome.code_chain_priority_reviews.append(priority_review)
-            # Advisory: it may raise an admin-facing issue, but it can never
-            # turn into an approval on its own.
-            if priority_review.get("hasRecommendation"):
-                outcome.issues.append(
-                    f"「{word}」@{code} 同编码链优先级建议调整：{_chain_recommendation_text(priority_review)}"
-                )
-                return outcome
+            outcome.issues.remove(baseline_issue)
             common_known_label = _common_known_review_label(commonness)
             common_known_type = _common_known_review_type(commonness)
             summary = (
@@ -3642,15 +3683,21 @@ async def _audit_single_item(
                 "commonness": commonness,
             })
             outcome.approved_items.append(f"{action}：{word}@{code}，本喵按{common_known_label}语言常识通过")
+            priority_review = await progress.run_stage(
+                "priority",
+                _review_code_chain_priority(item, review),
+                AUDIT_PRIORITY_STAGE_TIMEOUT,
+            )
+            outcome.code_chain_priority_reviews.append(priority_review)
             return outcome
 
-        outcome.issues.append(f"「{word}」没有权威读音来源，且常用词信号不足，需要管理员审核")
         return outcome
 
     if code not in candidate_codes:
         available = ", ".join(sorted(candidate_codes)[:8])
         outcome.issues.append(f"「{word}」编码 {code} 不在权威读音候选链中，可选：{available or '无'}")
         return outcome
+    outcome.approved_items.append(f"{action}：{word}@{code}")
     priority_review = await progress.run_stage(
         "priority",
         _review_code_chain_priority(item, review),
@@ -3663,12 +3710,6 @@ async def _audit_single_item(
         phrase_type,
         priority_review.get("commonness") or {},
     ))
-    if priority_review.get("hasRecommendation"):
-        outcome.issues.append(
-            f"「{word}」@{code} 同编码链优先级建议调整：{_chain_recommendation_text(priority_review)}"
-        )
-        return outcome
-    outcome.approved_items.append(f"{action}：{word}@{code}")
     return outcome
 
 
@@ -3720,14 +3761,20 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 stage = progress.active_stage or "review"
                 status = f"timeout:{stage}"
                 outcome = progress.outcome
+                if _audit_stage_is_advisory(stage):
+                    return outcome
+                stage_label = _audit_stage_policy(stage)["label"]
                 issue = (
-                    f"「{word}」{AUDIT_STAGE_LABELS.get(stage, '审词流程')}超时，"
+                    f"「{word}」{stage_label}超时，"
                     "需要管理员审核"
                 )
                 outcome.issues.append(issue)
                 return outcome
             except KeytaoApiError as error:
                 status = "keytao_api_error"
+                stage = progress.active_stage or "review"
+                if _audit_stage_is_advisory(stage):
+                    return progress.outcome
                 outcome = _ItemOutcome()
                 outcome.issues.append(f"「{word}」{LOOKUP_FAILURE_REASON}：{error.message}")
                 return outcome
@@ -3735,6 +3782,9 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 status = f"error:{type(error).__name__}"
                 logger.warning(f"Draft item audit failed for {word}: {error}")
                 outcome = progress.outcome
+                stage = progress.active_stage or "review"
+                if _audit_stage_is_advisory(stage):
+                    return outcome
                 outcome.issues.append(f"「{word}」审词异常，需要管理员审核：{error}")
                 return outcome
             finally:
@@ -3769,20 +3819,33 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
 
     commonness_results: List[Dict] = []
     for comparison in priority_comparisons:
-        commonness = await compare_word_commonness(
-            comparison["frontWord"],
-            comparison["behindWord"],
-        )
+        progress = _AuditProgress()
+        try:
+            commonness = await progress.run_stage(
+                "change_commonness",
+                compare_word_commonness(
+                    comparison["frontWord"],
+                    comparison["behindWord"],
+                ),
+                AUDIT_COMMONNESS_STAGE_TIMEOUT,
+            )
+        except Exception as error:
+            logger.warning(
+                "Advisory priority comparison failed for %s/%s: %s",
+                comparison["frontWord"],
+                comparison["behindWord"],
+                error,
+            )
+            commonness = {
+                "success": False,
+                "verdict": "not_enough_evidence",
+                "summary": "常用度建议暂不可用",
+            }
         commonness_results.append({**comparison, "result": commonness})
         if commonness.get("verdict") == "front_more_common":
             approved_items.append(
                 f"顺序调整：{comparison['frontWord']}@{comparison['code']} 排在 {comparison['behindWord']} 前，常用度证据一致"
             )
-            continue
-        issues.append(
-            f"顺序调整「{comparison['frontWord']}」排在「{comparison['behindWord']}」前的常用度证据不足："
-            f"{commonness.get('summary', '未知原因')}"
-        )
 
     auto_approve = not issues and bool(approved_items)
     if auto_approve and common_known_items:

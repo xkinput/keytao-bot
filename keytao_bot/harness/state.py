@@ -223,7 +223,8 @@ class DraftOperationCoordinator:
             operation.prompt_text = (
                 prompt_text.rstrip()
                 + "\n\n"
-                + f"请回复「{confirmation_command}」继续。"
+                + "请引用本条回复「确认」继续；"
+                + f"无法引用时发送「{confirmation_command}」作为备用。"
             )
         elif not operation.prompt_text:
             operation.prompt_text = prompt_text.rstrip()

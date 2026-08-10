@@ -14,7 +14,12 @@ from keytao_bot.utils.keytao_review import (
     can_llm_override_audit_issues,
     prepare_reviewed_word,
 )
-from keytao_bot.utils.review_flags import apply_manual_review_flag, read_manual_review_flag
+from keytao_bot.utils.review_flags import (
+    apply_manual_review_flag,
+    apply_review_disposition,
+    read_manual_review_flag,
+    read_review_disposition,
+)
 
 
 def get_keytao_url() -> str:
@@ -170,26 +175,32 @@ async def keytao_prepare_reviewed_add(
             )
         except Exception as error:
             logger.warning(f"[prepare_reviewed_add] pre-submit audit failed: {error}")
-            review["preSubmitAudit"] = apply_manual_review_flag({
+            review["preSubmitAudit"] = apply_review_disposition(apply_manual_review_flag({
                 "success": False,
                 "verdict": "needs_admin",
                 "autoApprove": False,
                 "summary": "加词前预审异常，提交时会重新审核",
                 "issues": [str(error)],
                 "previewOnly": True,
-            }, True, "加词前预审异常")
+            }, True, "加词前预审异常"), "pre_submit_review_unavailable")
 
     # Surface the pre-submit verdict on the top-level review payload so remark
     # builders can read a code-generated boolean instead of parsing Chinese text.
     pre_submit = review.get("preSubmitAudit")
     if isinstance(pre_submit, dict):
+        base_disposition = read_review_disposition(review)
         flag = read_manual_review_flag(pre_submit)
         if flag is None:
             flag = not bool(pre_submit.get("autoApprove"))
         reason = str(
             (pre_submit.get("issues") or [""])[0] if flag else pre_submit.get("summary") or ""
         )
+        if base_disposition is not None:
+            flag = True
+            reason = str(review.get("manualReviewReason") or reason)
         apply_manual_review_flag(review, bool(flag), reason)
+        if flag and read_review_disposition(review) is None:
+            apply_review_disposition(review, "pre_submit_judgement")
     review["candidateOrderingAssessments"] = await assess_candidate_chain_commonness(
         review
     )

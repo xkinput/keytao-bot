@@ -119,7 +119,10 @@ from keytao_bot.utils.review_flags import (  # noqa: E402
     MANUAL_REVIEW_FIELD,
     MANUAL_REVIEW_PREFIX,
     MANUAL_REVIEW_REASON_FIELD,
+    REVIEW_VERDICT_SITE_POLICIES,
+    ReviewDisposition,
     read_manual_review_flag,
+    read_review_disposition,
 )
 
 _review_tools_path = os.path.join(
@@ -146,6 +149,28 @@ def check(name: str, result: bool):
     else:
         failed += 1
         print(f"  ❌ {name}")
+
+
+def test_review_disposition_registry():
+    expected = {
+        "empty_word": ReviewDisposition.BLOCK,
+        "pronunciation_unresolved": ReviewDisposition.BLOCK,
+        "code_unresolved": ReviewDisposition.BLOCK,
+        "lookup_unavailable": ReviewDisposition.BLOCK,
+        "invalid_code": ReviewDisposition.BLOCK,
+        "injection_shaped_input": ReviewDisposition.BLOCK,
+        "missing_authoritative_page": ReviewDisposition.SEAL,
+        "entity_context_reading": ReviewDisposition.SEAL,
+        "unvalidated_type": ReviewDisposition.SEAL,
+        "pre_submit_judgement": ReviewDisposition.SEAL,
+        "pre_submit_review_unavailable": ReviewDisposition.SEAL,
+        "duplicate_formation": ReviewDisposition.SEAL,
+        "code_chain_priority": ReviewDisposition.SEAL,
+    }
+    check(
+        "every non-pass review verdict site declares BLOCK or SEAL centrally",
+        REVIEW_VERDICT_SITE_POLICIES == expected,
+    )
 
 
 CONFIG = ReviewHttpConfig(api_base="https://fake", bot_token="fake")
@@ -334,8 +359,11 @@ def test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_cha
         }
         pre_submit_audit = {
             "success": True,
-            "autoApprove": False,
-            "issues": ["无权威整词页，保留人工审核"],
+            "verdict": "pass",
+            "autoApprove": True,
+            "needsManualReview": False,
+            "issues": [],
+            "summary": "后续建议认为可自动通过",
             "previewOnly": True,
         }
 
@@ -380,6 +408,15 @@ def test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_cha
         check("吃席 reviewed-add recommends wkxk", review.get("recommendedCode") == "wkxk")
         check("吃席 is not pronunciation-unresolved", review.get("pronunciationUnresolved") is not True)
         check("吃席 fallback remains sealed for manual review", read_manual_review_flag(review) is True)
+        check(
+            "吃席 entity/context verdict explicitly declares SEAL",
+            read_review_disposition(review) is ReviewDisposition.SEAL
+            and review.get("reviewVerdictSite") == "entity_context_reading",
+        )
+        check(
+            "later preview approval cannot clear the SEAL verdict",
+            read_manual_review_flag(review) is True,
+        )
         first_pronunciation = next(iter(review.get("pronunciations") or []), {})
         check(
             "吃席 fallback keeps the historical entity/context label",
@@ -518,6 +555,10 @@ def test_pronunciation_groups_require_known_character_readings():
         })
         check("unavailable lookup does not authorize guang", unavailable.get("pronunciations") == [])
         check("unavailable lookup fails closed", unavailable.get("pronunciationUnresolved") is True)
+        check(
+            "unresolved pronunciation explicitly declares BLOCK",
+            read_review_disposition(unavailable) is ReviewDisposition.BLOCK,
+        )
         check("unavailable rejection is logged", unavailable_log.call_count >= 1)
 
     asyncio.run(_run())
@@ -1519,6 +1560,20 @@ def test_candidate_commonness_wiring_and_timeout():
 def test_audit_budget_nesting_and_timeout_retains_review():
     print("\n🧪 audit budget nesting and partial-result retention")
 
+    check(
+        "audit stages declare gating or advisory behavior centrally",
+        {
+            stage: policy.get("classification")
+            for stage, policy in review_module.AUDIT_STAGE_POLICIES.items()
+        } == {
+            "review": "gating",
+            "css_review": "gating",
+            "commonness": "advisory",
+            "change_commonness": "advisory",
+            "priority": "advisory",
+        },
+    )
+
     encode_retry_backoff = sum(
         0.5 * (2 ** retry_index)
         for retry_index in range(review_module.KEYTAO_ENCODE_MAX_ATTEMPTS - 1)
@@ -1587,6 +1642,16 @@ def test_audit_budget_nesting_and_timeout_retains_review():
         async def unfinished_priority(_item, _review):
             await asyncio.Event().wait()
 
+        async def recommended_priority(item, _review):
+            return {
+                "word": item["word"],
+                "code": item["code"],
+                "hasRecommendation": True,
+                "advisory": True,
+                "commonness": {},
+                "recommendedMoves": [{"word": item["word"], "toCode": "eksoa"}],
+            }
+
         with (
             patch.object(
                 review_module,
@@ -1598,7 +1663,8 @@ def test_audit_budget_nesting_and_timeout_retains_review():
                 "_review_code_chain_priority",
                 side_effect=unfinished_priority,
             ),
-            patch.object(review_module, "AUDIT_ITEM_TIMEOUT", 0.02),
+            patch.object(review_module, "AUDIT_PRIORITY_STAGE_TIMEOUT", 0.01),
+            patch.object(review_module, "AUDIT_ITEM_TIMEOUT", 0.10),
             patch.object(review_module.logger, "info") as info_log,
         ):
             audit = await audit_draft_items(CONFIG, [{
@@ -1620,12 +1686,11 @@ def test_audit_budget_nesting_and_timeout_retains_review():
             ["shi", "suan"] in normalized,
         )
         check(
-            "timeout names only the unfinished priority stage",
-            any(
-                "编码链优先级评估" in issue and "超时" in issue
-                for issue in audit.get("issues", [])
-            )
-            and all("审词超过" not in issue for issue in audit.get("issues", [])),
+            "advisory timeout preserves the word-review verdict",
+            audit.get("verdict") == "pass"
+            and audit.get("autoApprove") is True
+            and audit.get("issues") == []
+            and all("需管理员审核" not in issue for issue in audit.get("issues", [])),
         )
         audit_log_lines = [
             str(call.args[0])
@@ -1642,10 +1707,37 @@ def test_audit_budget_nesting_and_timeout_retains_review():
             and "\n" not in audit_log_lines[0],
         )
 
+        with (
+            patch.object(
+                review_module,
+                "prepare_reviewed_word",
+                new=AsyncMock(return_value=resolved_review),
+            ),
+            patch.object(
+                review_module,
+                "_review_code_chain_priority",
+                side_effect=recommended_priority,
+            ),
+        ):
+            recommendation_audit = await audit_draft_items(CONFIG, [{
+                "id": 2,
+                "action": "Create",
+                "word": "石蒜",
+                "code": "ekso",
+                "type": "Phrase",
+            }])
+        check(
+            "advisory recommendation cannot downgrade the verdict",
+            recommendation_audit.get("verdict") == "pass"
+            and recommendation_audit.get("issues") == []
+            and recommendation_audit.get("codeChainPriorityReviews", [{}])[0].get("hasRecommendation") is True,
+        )
+
     asyncio.run(_run())
 
 
 def main():
+    test_review_disposition_registry()
     test_s14_wrong_entry_pronunciation_never_reaches_candidates()
     test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_characters()
     test_pronunciation_word_binding_window_and_exact_direct_entry()

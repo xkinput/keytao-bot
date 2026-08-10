@@ -36,6 +36,7 @@ from keytao_bot.harness.tools import (
     _mutation_authorization_view,
     _pending_positional_create_binding,
     _positional_same_code_requested,
+    authorized_multi_add_items,
     create_warning_confirmation_binding,
     message_authorizes_mutation,
     message_requests_change,
@@ -779,6 +780,53 @@ class WebRequestLimitTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
+    def test_warning_renderer_and_reply_guard_reject_raw_python_repr(self) -> None:
+        from keytao_bot.harness import orchestrator as orchestrator_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        @dataclass
+        class WarningRecord:
+            word: str
+            impact: str
+
+        warning = {
+            "id": "2933",
+            "word": "吃席",
+            "code": "wkxko",
+            "weight": 100,
+            "impact": '词条 "吃席" 已存在于编码 "wkxk"，将创建多编码词条',
+        }
+        rendered = chat_module._plain_warning_line(warning)
+        rendered_dataclass = chat_module._plain_warning_line(
+            WarningRecord(
+                word="吃席",
+                impact='词条 "吃席" 已存在于编码 "wkxk"，将创建多编码词条',
+            )
+        )
+        rendered_list = chat_module._plain_warning_line([warning])
+        orchestrator_rendered = orchestrator_module._plain_authoritative_warning(
+            [WarningRecord(
+                word="吃席",
+                impact='词条 "吃席" 已存在于编码 "wkxk"，将创建多编码词条',
+            )]
+        )
+
+        self.assertEqual(
+            rendered,
+            "⚠️ 「吃席」已存在于编码 wkxk，这次会形成多编码词条",
+        )
+        self.assertEqual(rendered_dataclass, rendered)
+        self.assertEqual(rendered_list, rendered)
+        self.assertEqual(orchestrator_rendered, rendered.removeprefix("⚠️ "))
+        for raw_fragment in (
+            "⚠️ {'id': '2933'}",
+            "raw ': ' fragment",
+            "dataclass(value=1)",
+        ):
+            with self.subTest(raw_fragment=raw_fragment):
+                with self.assertRaisesRegex(ValueError, "raw Python representation"):
+                    chat_module._assert_plain_user_facing_reply(raw_fragment)
+
     async def test_candidate_prompt_hides_internal_confirmation_nonce(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
@@ -1528,7 +1576,15 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     "snapshotDigest": "a" * 64,
                     "warningDigest": "b" * 64,
                     "auditDigest": "c" * 64,
-                    "snapshotItems": [],
+                    "snapshotItems": [
+                        {
+                            "id": 7,
+                            "action": "Create",
+                            "word": "石蒜",
+                            "code": "ekso",
+                            "type": "Phrase",
+                        },
+                    ],
                 }
             return {"success": True, "submittedCount": 1}
 
@@ -1560,10 +1616,23 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertIn("提交前请核对快照", first_reply)
+            self.assertIn("请引用本条回复「确认」继续", first_reply)
+            self.assertNotIn("参数摘要", first_reply)
+            self.assertNotIn("风险摘要", first_reply)
+            self.assertNotIn("复审摘要", first_reply)
+            self.assertNotIn("a" * 64, first_reply)
+            self.assertNotIn("b" * 64, first_reply)
+            self.assertNotIn("c" * 64, first_reply)
             self.assertEqual(len(calls), 1)
             self.assertTrue(calls[0]["preview_only"])
             self.assertIsNotNone(state_store.get(conv_key))
+            bound_state = state_store.get(conv_key)
+            self.assertEqual(bound_state.args["expected_content_version"], 7)
+            self.assertEqual(bound_state.args["expected_server_snapshot_digest"], "a" * 64)
+            self.assertEqual(bound_state.args["expected_warning_digest"], "b" * 64)
+            self.assertEqual(bound_state.args["expected_audit_digest"], "c" * 64)
             server_code = state_store.get_record(conv_key).reconfirmation_code
+            self.assertIn(f"确认票据 {server_code}", first_reply)
             server_reply = await chat_module.handle_pending_message_core(
                 f"确认票据 {server_code}",
                 "web",
@@ -1577,6 +1646,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(calls[1]["batch_id"], "batch-1")
             self.assertEqual(calls[1]["expected_content_version"], 7)
             self.assertEqual(calls[1]["expected_server_snapshot_digest"], "a" * 64)
+            self.assertEqual(calls[1]["expected_warning_digest"], "b" * 64)
+            self.assertEqual(calls[1]["expected_audit_digest"], "c" * 64)
             self.assertIsNone(state_store.get(conv_key))
             operations = memory.get_recent_operation_candidates(memory_context)
             self.assertEqual(len(operations), 1)
@@ -3739,6 +3810,20 @@ class MutationAuthorizationTests(unittest.TestCase):
             with self.subTest(allowed=message):
                 self.assertTrue(message_authorizes_mutation(message))
 
+        self.assertEqual(
+            authorized_multi_add_items(allowed[0]),
+            (
+                {"action": "Create", "word": "王中王", "code": "wfw"},
+                {"action": "Create", "word": "微服务", "code": "wfwu"},
+            ),
+        )
+        self.assertEqual(
+            authorized_multi_add_items(
+                "确认加入 王中王 wfw 微服务 wfwu"
+            ),
+            (),
+        )
+
         blocked = (
             "喵喵\n加词 王中王 wfw\n稍后再看\n加词 微服务 wfwu",
             "喵喵\n不要加词 王中王 wfw\n加词 微服务 wfwu",
@@ -4344,7 +4429,9 @@ class MutationAuthorizationTests(unittest.TestCase):
 
         self.assertTrue(staged["requiresConfirmation"])
         self.assertIn(visible_ids[-1], staged["message"])
-        self.assertIn("SHA-256", staged["message"])
+        self.assertNotIn("SHA-256", staged["message"])
+        self.assertNotIn("{'", staged["message"])
+        self.assertIn("请引用本条回复「确认」继续", staged["message"])
         self.assertNotIn("...", staged["message"])
 
         rejected = ToolExecutor._stage_agent_mutation(
@@ -6756,6 +6843,23 @@ class _BatchAddSkills:
         }]
 
 
+class _ReviewedBatchAddSkills:
+    @staticmethod
+    def get_skill_instructions():
+        return ""
+
+    @staticmethod
+    def has_tools():
+        return True
+
+    @staticmethod
+    def get_tools():
+        return [
+            _ReviewedCreateSkills.get_tools()[0],
+            _BatchAddSkills.get_tools()[0],
+        ]
+
+
 class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_clean_bound_batch_preview_replays_one_server_ticket(self) -> None:
         """A bound clean multi-add is written by one digest-bound replay."""
@@ -6844,6 +6948,226 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ),
             (2, True, 0, "d" * 64, False, True),
         )
+
+    async def test_sealed_multi_add_cannot_end_as_candidate_only_reply(self) -> None:
+        """S10 writes exact reviewed pairs even when both reviews need an admin."""
+        requested_items = [
+            {"action": "Create", "word": "王中王", "code": "wfw"},
+            {"action": "Create", "word": "微服务", "code": "wfwu"},
+        ]
+        batch_calls = []
+
+        def sealed_review(word: str, code: str) -> dict:
+            reason = "缺少权威整词读音来源"
+            return {
+                "success": True,
+                "word": word,
+                "type": "Phrase",
+                "recommendedCode": code,
+                "candidateCodes": [code],
+                "candidateStatuses": [{"code": code, "occupied": False}],
+                "needsManualReview": True,
+                "manualReviewReason": reason,
+                "reviewDisposition": "SEAL",
+                "reviewVerdictSite": "missing_authoritative_page",
+                "preSubmitAudit": {
+                    "success": True,
+                    "verdict": "needs_admin",
+                    "autoApprove": False,
+                    "needsManualReview": True,
+                    "manualReviewReason": reason,
+                    "summary": "存在不确定项，需要管理员审核",
+                    "issues": [reason],
+                    "approvedItems": [],
+                },
+            }
+
+        async def dispatch(word=None, items=None, confirmed=False, **kwargs):
+            if word is not None:
+                code = "wfw" if word == "王中王" else "wfwu"
+                return sealed_review(word, code)
+            batch_calls.append({
+                "items": items,
+                "confirmed": confirmed,
+                **kwargs,
+            })
+            if not confirmed:
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warnings": [],
+                    "warnedCount": 0,
+                    "batchId": "provisional-batch",
+                    "batchIdProvisional": True,
+                    "contentVersion": 0,
+                    "warningDigest": "e" * 64,
+                }
+            return {
+                "success": True,
+                "successCount": 2,
+                "failedCount": 0,
+                "batchId": "materialized-batch",
+                "contentVersion": 1,
+                "batchUrl": "http://localhost:3100/batch/materialized-batch",
+            }
+
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[
+                    _named_tool_call(
+                        "call-review-wfw",
+                        "keytao_prepare_reviewed_add",
+                        {"word": "王中王"},
+                    ),
+                    _named_tool_call(
+                        "call-review-wfwu",
+                        "keytao_prepare_reviewed_add",
+                        {"word": "微服务"},
+                    ),
+                ],
+            ),
+            _fake_response(
+                "stop",
+                "【王中王】审词：需管理员审核。候选编码：1. wfw — 空位",
+            ),
+            _fake_response("stop", "已加入草稿"),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_ReviewedBatchAddSkills(),
+            tool_executor=ToolExecutor(
+                lambda _name: dispatch,
+                frozenset({
+                    "keytao_prepare_reviewed_add",
+                    "keytao_batch_add_to_draft",
+                }),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        result = await orchestrator.run(
+            "喵喵\n加词 王中王 wfw\n加词 微服务 wfwu",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-sealed-batch",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertIn("已加入草稿", result)
+        self.assertEqual(len(batch_calls), 2)
+        self.assertFalse(batch_calls[0]["confirmed"])
+        self.assertTrue(batch_calls[1]["confirmed"])
+        self.assertEqual(
+            [
+                {
+                    "action": item["action"],
+                    "word": item["word"],
+                    "code": item["code"],
+                    "needsManualReview": item["needsManualReview"],
+                }
+                for item in batch_calls[0]["items"]
+            ],
+            [
+                {**item, "needsManualReview": True}
+                for item in requested_items
+            ],
+        )
+
+    async def test_blocked_multi_add_never_reaches_batch_sink(self) -> None:
+        batch_calls = []
+
+        async def dispatch(word=None, items=None, **_kwargs):
+            if items is not None:
+                batch_calls.append(items)
+                return {"success": True}
+            if word == "王中王":
+                return {
+                    "success": True,
+                    "word": word,
+                    "recommendedCode": "",
+                    "pronunciationUnresolved": True,
+                    "needsManualReview": True,
+                    "reviewDisposition": "BLOCK",
+                    "reviewVerdictSite": "pronunciation_unresolved",
+                    "message": "读音未解决",
+                }
+            return {
+                "success": True,
+                "word": word,
+                "type": "Phrase",
+                "recommendedCode": "wfwu",
+                "candidateCodes": ["wfwu"],
+                "candidateStatuses": [{"code": "wfwu", "occupied": False}],
+                "needsManualReview": True,
+                "reviewDisposition": "SEAL",
+                "reviewVerdictSite": "missing_authoritative_page",
+                "preSubmitAudit": {
+                    "success": True,
+                    "autoApprove": False,
+                    "issues": ["缺少权威整词读音来源"],
+                },
+            }
+
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[
+                    _named_tool_call(
+                        "call-block-review-wfw",
+                        "keytao_prepare_reviewed_add",
+                        {"word": "王中王"},
+                    ),
+                    _named_tool_call(
+                        "call-seal-review-wfwu",
+                        "keytao_prepare_reviewed_add",
+                        {"word": "微服务"},
+                    ),
+                ],
+            ),
+            _fake_response("stop", "「王中王」读音未解决，本次未写入。"),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_ReviewedBatchAddSkills(),
+            tool_executor=ToolExecutor(
+                lambda _name: dispatch,
+                frozenset({
+                    "keytao_prepare_reviewed_add",
+                    "keytao_batch_add_to_draft",
+                }),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        result = await orchestrator.run(
+            "喵喵\n加词 王中王 wfw\n加词 微服务 wfwu",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-blocked-batch",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertIn("读音未解决", result)
+        self.assertEqual(batch_calls, [])
 
 
 def _shift_orchestrator(client, tool_func, state_store=None):

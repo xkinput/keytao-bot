@@ -12,7 +12,7 @@ import time
 import unicodedata
 from collections import OrderedDict
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from itertools import islice
 from typing import Any, Awaitable, Callable, Optional, List, Dict, Tuple
 
@@ -493,6 +493,53 @@ def _strip_command_message_prefixes(message_text: str) -> str:
             break
         text = stripped
     return text
+
+
+_RAW_PYTHON_REPLY_MARKERS = ("{'", "': '", "dataclass(")
+
+
+def _assert_plain_user_facing_reply(text: str) -> str:
+    reply = str(text or "")
+    marker = next(
+        (candidate for candidate in _RAW_PYTHON_REPLY_MARKERS if candidate in reply),
+        "",
+    )
+    if marker:
+        logger.error("Refusing user-facing reply with raw Python repr marker %r", marker)
+        raise ValueError("User-facing reply contains a raw Python representation")
+    return reply
+
+
+def _humanize_warning_text(text: str) -> str:
+    rendered = re.sub(r"\s+", " ", str(text or "")).strip()
+    rendered = re.sub(r'词条\s*["“]([^"”]+)["”]\s*', r'「\1」', rendered)
+    rendered = re.sub(r'编码\s*["“]([A-Za-z]+)["”]', r'编码 \1', rendered)
+    return rendered.replace("将创建多编码词条", "这次会形成多编码词条")
+
+
+def _plain_warning_message(warning: Any) -> str:
+    if is_dataclass(warning) and not isinstance(warning, type):
+        warning = asdict(warning)
+    if isinstance(warning, dict):
+        for field in ("message", "impact", "reason", "summary"):
+            value = warning.get(field)
+            if isinstance(value, str) and value.strip():
+                return _humanize_warning_text(value)
+        word = str(warning.get("word") or "").strip()
+        code = str(warning.get("code") or "").strip().lower()
+        if word and code:
+            return f"「{word}」在编码 {code} 上有一项需要确认的风险"
+        if word:
+            return f"「{word}」有一项需要确认的风险"
+        return "服务端返回了一项需要确认的风险"
+    if isinstance(warning, (list, tuple)):
+        messages = [_plain_warning_message(item) for item in warning]
+        return "；".join(message for message in messages if message)
+    return _humanize_warning_text(str(warning or "服务端返回了一项需要确认的风险"))
+
+
+def _plain_warning_line(warning: Any) -> str:
+    return _assert_plain_user_facing_reply(f"⚠️ {_plain_warning_message(warning)}")
 
 
 _EXECUTION_QUESTION_SUFFIX_RE = re.compile(
@@ -2804,8 +2851,8 @@ async def _resolve_pending_ticket_control(
     if compact_control.startswith("确认票据"):
         return MessageCommandIntent(), (
             f"当前待确认内容是：{_describe_pending_state(state_record.state)}。\n"
-            f"请发送完整挑战码「确认票据 {state_record.reconfirmation_code}」，"
-            "普通的「确认」不会执行。"
+            "请引用本条回复「确认」继续；"
+            f"无法引用时发送完整挑战码「确认票据 {state_record.reconfirmation_code}」。"
         )
 
     if (
@@ -2873,7 +2920,8 @@ async def _resolve_pending_ticket_control(
         return MessageCommandIntent(), (
             f"当前待确认内容已更新为：{description}。\n"
             "为避免把延迟的旧回复误当成新操作的确认，"
-            f"请发送「确认票据 {confirmation_code}」。"
+            "请引用本条回复「确认」继续；"
+            f"无法引用时发送「确认票据 {confirmation_code}」。"
         )
 
     return command_intent, None
@@ -2962,7 +3010,10 @@ def _format_active_draft_operation_message(
         "本喵完成后会直接回复最终结果。"
     )
     if operation.status == "awaiting_confirmation" and operation.confirmation_code:
-        message += f"\n请回复「{operation.confirmation_command}」继续。"
+        message += (
+            "\n请引用原确认消息回复「确认」继续；"
+            f"无法引用时发送「{operation.confirmation_command}」作为备用。"
+        )
     return message
 
 
@@ -3941,9 +3992,9 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
         return f"自动审核：该词可自动通过（{reason}）"
 
     issues = [
-        str(issue).strip()
+        _plain_warning_message(issue).strip()
         for issue in (audit.get("issues") or [])
-        if str(issue).strip()
+        if _plain_warning_message(issue).strip()
     ]
     reason = issues[0] if issues else summary or "证据不足"
     reason = _clean_review_audit_reason(reason)
@@ -5280,12 +5331,12 @@ async def _execute_add_to_draft(
         )
         warnings = data.get("warnings", [])
         warn_text = "\n".join(
-            f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
+            _plain_warning_line(w)
             for w in warnings
         ) if warnings else data.get("message", "存在重码警告")
         return _append_batch_url_if_missing((
             f"{warn_text}\n\n确认添加吗？"
-            "请按下方精确确认指令继续，或回复「取消」放弃。"
+            "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。"
         ), data)
 
     if not data.get("success"):
@@ -5369,7 +5420,7 @@ def _create_preview_can_auto_confirm(
 def _create_notice_lines(data: Dict) -> List[str]:
     """Render preserved warnings and the authoritative code-chain summary."""
     lines = [
-        f"⚠️ {warning.get('message', warning) if isinstance(warning, dict) else warning}"
+        _plain_warning_line(warning)
         for warning in data.get("warnings") or []
     ]
     ordering_summary = str(data.get("orderingSummary") or "").strip()
@@ -5496,12 +5547,12 @@ async def _perform_add_to_draft_and_submit(
             )
         warnings = create_data.get("warnings", [])
         warn_text = "\n".join(
-            f"⚠️ {w.get('message', w) if isinstance(w, dict) else w}"
+            _plain_warning_line(w)
             for w in warnings
         ) if warnings else create_data.get("message", "存在重码警告")
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warn_text}\n\n确认添加吗？"
-            "请按下方精确确认指令继续，或回复「取消」放弃。",
+            "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。",
             create_data,
         ), pending_state=pending_state, data=create_data)
 
@@ -5658,12 +5709,12 @@ async def _perform_batch_add_to_draft_and_submit(
             )
         warnings = add_data.get("warnings", [])
         warning_text = "\n".join(
-            f"⚠️ {warning.get('message', warning) if isinstance(warning, dict) else warning}"
+            _plain_warning_line(warning)
             for warning in warnings
         ) if warnings else add_data.get("message", "批量添加前需要确认")
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warning_text}\n\n确认继续添加吗？"
-            "请按下方精确确认指令继续，或回复「取消」放弃。",
+            "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。",
             add_data,
         ), pending_state=pending_state, data=add_data)
 
@@ -6011,7 +6062,7 @@ def _pending_state_from_server_warning(
 
 
 def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
-    """Append every server-bound draft item and its exact confirmation digests."""
+    """Append every server-bound draft item without exposing internal digests."""
     snapshot_items = (
         data.get("snapshotItems")
         if isinstance(data.get("snapshotItems"), list)
@@ -6033,9 +6084,6 @@ def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
         lines.append(
             f"• {pr_label}{action} {label} @ {code}（{item.get('type') or ''}）"
         )
-    lines.append(f"参数摘要：SHA-256 {str(data.get('snapshotDigest') or '')}")
-    lines.append(f"风险摘要：SHA-256 {str(data.get('warningDigest') or '')}")
-    lines.append(f"复审摘要：SHA-256 {str(data.get('auditDigest') or '')}")
 
 
 def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
@@ -6049,7 +6097,6 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 f"• PR#{target.get('id')}：{target.get('word', '')} "
                 f"@ {target.get('code', '')}（{target.get('action', '')}/{target.get('type', '')}）"
             )
-        lines.append(f"参数摘要：SHA-256 {str(data.get('targetDigest') or '')}")
         batch_url = _trusted_batch_url(data)
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
@@ -6059,22 +6106,22 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 "确认删除这些精确条目并随后核对提交快照吗？"
                 if data.get("submitAfter")
                 else "确认删除这些精确条目吗？"
-            ) + "请按下方精确确认指令继续，或回复「取消」放弃。",
+            ) + "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。",
         ))
-        return "\n".join(lines)
+        return _assert_plain_user_facing_reply("\n".join(lines))
 
     if function_name == "keytao_recall_batch":
         batch_id = str(data.get("batchId") or "")
         version = data.get("contentVersion")
         batch_url = _trusted_batch_url(data)
         link_line = f"\n• 草稿地址：{batch_url}" if batch_url else ""
-        return (
+        return _assert_plain_user_facing_reply(
             "↩️ 服务端已锁定待撤回批次：\n"
             f"• 批次：{batch_id}\n"
             f"• 内容版本：{version}"
             f"{link_line}\n\n"
             "确认把这个精确批次恢复为草稿吗？"
-            "请按下方精确确认指令继续，或回复「取消」放弃。"
+            "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。"
         )
 
     if function_name == "keytao_shift_phrase_code":
@@ -6092,7 +6139,6 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 lines.append(f"• 修改：{old_word} → {word}（{code}）")
             else:
                 lines.append(f"• {action or '变更'}：{word}（{code}）")
-        lines.append(f"参数摘要：SHA-256 {str(data.get('planDigest') or '')}")
         batch_url = _trusted_batch_url(data)
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
@@ -6101,25 +6147,18 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         if warning_digest:
             lines.append("服务端风险：")
             for warning in warnings:
-                lines.append(
-                    "• "
-                    + str(
-                        warning.get("message", warning)
-                        if isinstance(warning, dict)
-                        else warning
-                    )
-                )
-            lines.append(f"风险摘要：SHA-256 {warning_digest}")
+                lines.append("• " + _plain_warning_message(warning))
         lines.extend((
             "",
             "以上每一项都将由服务端按同一批次版本校验。"
-            "确认执行吗？请按下方精确确认指令继续，或回复「取消」放弃。",
+            "确认执行吗？请引用本条回复「确认」继续；"
+            "无法引用时可使用确认票据，或回复「取消」放弃。",
         ))
-        return "\n".join(lines)
+        return _assert_plain_user_facing_reply("\n".join(lines))
 
-    warnings = data.get("warnings", [])
+    warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
     warning_text = "\n".join(
-        f"⚠️ {warning.get('message', warning) if isinstance(warning, dict) else warning}"
+        _plain_warning_line(warning)
         for warning in warnings
     ) if warnings else str(data.get("message") or "服务端发现需要再次确认的风险")
     review_parts: List[str] = []
@@ -6136,10 +6175,10 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         action_text += "，并随后核对提交快照"
     batch_url = _trusted_batch_url(data)
     link_text = f"\n草稿地址：{batch_url}" if batch_url else ""
-    return (
+    return _assert_plain_user_facing_reply(
         f"{warning_text}{review_text}{link_text}\n\n"
         f"这是服务端在实际校验后返回的风险。确认{action_text}吗？"
-        "请按下方精确确认指令继续，或回复「取消」放弃。"
+        "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。"
     )
 
 
@@ -6628,7 +6667,7 @@ def _append_submit_review_lines(parts: List[str], submit_data: object) -> None:
         issues = auto_review.get("issues") or []
         if issues:
             issue_lines = "\n".join(
-                f"• {str(issue).replace('不能自动通过', '需管理员审核').replace('提交后等待管理员审核', '需管理员审核')}"
+                f"• {_plain_warning_message(issue).replace('不能自动通过', '需管理员审核').replace('提交后等待管理员审核', '需管理员审核')}"
                 for issue in issues[:5]
             )
             parts.append("需管理员审核：\n" + issue_lines)
@@ -8867,12 +8906,15 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
      • 多个词时按词分段回答，避免把多个词混在一段里
      • 多个待加词必须逐词调用 keytao_prepare_reviewed_add，并在末尾使用固定确认格式：
        “这些词是否一起加入草稿并提交？”后逐行列出“- 「词」→ code”
+     • 当前消息若已用独立加词子句逐条写明“加词 词 编码”，该消息本身已经逐项授权；
+       每条审词后只要不是 reviewDisposition=BLOCK，就必须按原词和原编码调用批量写入。
+       reviewDisposition=SEAL 仍要写入，并保留 needsManualReview=true，不能停在候选展示。
      • 多词中任何 pronunciationUnresolved=true 的词只能单独说明工具 message，不得列入候选清单、批量确认或后续写入；
        其余已可靠审词的词如需继续，必须与未决词明确分开。
      • 用户明确确认前不得调用批量写入工具；确认后调用 keytao_batch_add_to_draft 时，
        每个 item.remark 必须完整携带该词对应的“喵喵审词：读音...；来源...；自动审核...”记录
      • 任一词的 preSubmitAudit.autoApprove=false 时，整批都只能提交给管理员审核；
-       其他词通过不能覆盖这一项，也不能把整批描述成已自动通过
+       其他词通过不能覆盖这一项，也不能把整批描述成已自动通过；这不是拒绝写入草稿
      • 不要把“相关词”发散成大段百科，只需围绕当前词和工具查到的同码词/占位词简洁说明
 
 4. 提交草稿
@@ -9008,9 +9050,12 @@ def _format_replace_char_confirmation(
         separators=(",", ":"),
     )
     digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()[:16]
-    parts.append(f"参数摘要：SHA-256 {digest}")
-    parts.extend(("", "确认后我才会把这批修改加入草稿。可发送确认票据继续，或回复「取消」放弃。"))
-    return "\n".join(parts)
+    parts.extend((
+        "",
+        "确认后我才会把这批修改加入草稿。请引用本条回复「确认」继续；"
+        "无法引用时可使用确认票据，或回复「取消」放弃。",
+    ))
+    return _assert_plain_user_facing_reply("\n".join(parts))
 
 
 async def _try_handle_replace_char(
@@ -9613,6 +9658,7 @@ async def _send_event_response(
     text: str,
     qq_message_segment: object = None,
 ) -> bool:
+    text = _assert_plain_user_facing_reply(text)
     try:
         bot_module = bot.__class__.__module__
         if (
@@ -9908,6 +9954,7 @@ async def _finish_ai_chat_response(
 ) -> None:
     """Send one foreground reply with the existing platform formatting."""
 
+    response = _assert_plain_user_facing_reply(response)
     bot_module = bot.__class__.__module__
     if "telegram" in bot_module.lower():
         tg_text = _to_markdownv2(response)

@@ -5,7 +5,7 @@ import re
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -17,6 +17,7 @@ from keytao_bot.utils.llm_policy import (
     with_deepseek_chat_policy,
 )
 from keytao_bot.utils.history_store import _parse_stored_timestamp
+from keytao_bot.utils import review_flags
 
 from .state import MemoryConversationStateStore, PendingAddWord, PendingToolConfirm
 from .conversation import ConversationAddress
@@ -27,6 +28,7 @@ from .tools import (
     ToolContext,
     ToolExecutionRoute,
     ToolExecutor,
+    authorized_multi_add_items,
     batch_warning_confirmation_binding,
     create_warning_confirmation_binding,
     front_insert_batch_warning_confirmation_binding,
@@ -88,6 +90,30 @@ WRITE_AUTHORIZATION_TOOL = {
 def _tool_function_name(tool: Any) -> str:
     function = tool.get("function") if isinstance(tool, dict) else None
     return str(function.get("name") or "") if isinstance(function, dict) else ""
+
+
+def _plain_authoritative_warning(warning: Any) -> str:
+    if is_dataclass(warning) and not isinstance(warning, type):
+        warning = asdict(warning)
+    if isinstance(warning, dict):
+        for field in ("message", "impact", "reason", "summary"):
+            value = warning.get(field)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                text = re.sub(r'词条\s*["“]([^"”]+)["”]\s*', r'「\1」', text)
+                text = re.sub(r'编码\s*["“]([A-Za-z]+)["”]', r'编码 \1', text)
+                return text.replace("将创建多编码词条", "这次会形成多编码词条")
+        word = str(warning.get("word") or "").strip()
+        code = str(warning.get("code") or "").strip().lower()
+        if word and code:
+            return f"「{word}」在编码 {code} 上有一项需要确认的风险"
+        if word:
+            return f"「{word}」有一项需要确认的风险"
+        return "服务端返回了一项需要确认的风险"
+    if isinstance(warning, (list, tuple)):
+        messages = [_plain_authoritative_warning(item) for item in warning]
+        return "；".join(message for message in messages if message)
+    return str(warning or "服务端返回了一项需要确认的风险").strip()
 
 
 def _pending_candidate_capability(
@@ -156,6 +182,19 @@ class ToolCallValidationError(ValueError):
     def __init__(self, message: str, *, retryable: bool = False):
         super().__init__(message)
         self.retryable = retryable
+
+
+@dataclass(frozen=True)
+class _InternalFunctionCall:
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class _InternalToolCall:
+    id: str
+    function: _InternalFunctionCall
+    type: str = "function"
 
 
 _MAX_TOOL_CALLS_PER_RESPONSE = 8
@@ -347,6 +386,7 @@ class AgentOrchestrator:
             function = tool.get("function") if isinstance(tool, dict) else None
             if isinstance(function, dict):
                 tool_schemas[str(function.get("name") or "")] = function.get("parameters", {})
+        exact_multi_add_items = authorized_multi_add_items(message)
         # One (reason, tool, arguments) gets one full explanation per turn.
         reported_block_reasons: set[tuple] = set()
         conv_key = context.conversation_address
@@ -368,6 +408,9 @@ class AgentOrchestrator:
         trusted_reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
         trusted_batch_ids: set[str] = set()
         unresolved_pronunciation_words: set[str] = set()
+        blocked_review_words: set[str] = set()
+        attempted_review_words: set[str] = set()
+        multi_add_write_attempted = False
         authoritative_result_links: Dict[str, str] = {}
         receipt_run_id = uuid.uuid4().hex
 
@@ -412,14 +455,80 @@ class AgentOrchestrator:
 
             choice = response.choices[0]
             response_tool_calls = choice.message.tool_calls or []
-            tool_call_count = len(response_tool_calls)
             content = choice.message.content or ""
+            finish_reason = choice.finish_reason
+            if (
+                not response_tool_calls
+                and exact_multi_add_items
+                and context.mutations_allowed
+                and not context.visual_context
+                and not multi_add_write_attempted
+                and not blocked_review_words
+            ):
+                missing_pairs = [
+                    (item["word"], item["code"])
+                    for item in exact_multi_add_items
+                    if (item["word"], item["code"])
+                    not in trusted_reviewed_items_by_key
+                ]
+                missing_words = list(dict.fromkeys(
+                    word
+                    for word, _code in missing_pairs
+                    if word not in attempted_review_words
+                ))
+                internal_calls: List[_InternalToolCall] = []
+                if (
+                    missing_words
+                    and "keytao_prepare_reviewed_add" in tool_schemas
+                ):
+                    internal_calls = [
+                        _InternalToolCall(
+                            id=f"internal-review-{uuid.uuid4().hex}",
+                            function=_InternalFunctionCall(
+                                name="keytao_prepare_reviewed_add",
+                                arguments=json.dumps(
+                                    {"word": word},
+                                    ensure_ascii=False,
+                                ),
+                            ),
+                        )
+                        for word in missing_words
+                    ]
+                elif (
+                    not missing_pairs
+                    and "keytao_batch_add_to_draft" in tool_schemas
+                ):
+                    internal_calls = [
+                        _InternalToolCall(
+                            id=f"internal-sealed-batch-{uuid.uuid4().hex}",
+                            function=_InternalFunctionCall(
+                                name="keytao_batch_add_to_draft",
+                                arguments=json.dumps(
+                                    {"items": list(exact_multi_add_items)},
+                                    ensure_ascii=False,
+                                ),
+                            ),
+                        )
+                    ]
+                    multi_add_write_attempted = True
+                if internal_calls:
+                    response_tool_calls = internal_calls
+                    finish_reason = "tool_calls"
+                    content = ""
+                    internal_names = [
+                        call.function.name for call in internal_calls
+                    ]
+                    logger.info(
+                        "Continuing exact multi-add after non-BLOCK review: "
+                        f"tools={internal_names}"
+                    )
+            tool_call_count = len(response_tool_calls)
             logger.info(
-                f"Model response: finish_reason={choice.finish_reason} "
+                f"Model response: finish_reason={finish_reason} "
                 f"tool_calls={tool_call_count} content_len={len(content)} elapsed={elapsed:.1f}s"
             )
 
-            if choice.finish_reason == "length":
+            if finish_reason == "length":
                 if current_max_tokens < self._runtime.max_tokens_cap:
                     current_max_tokens = min(current_max_tokens * 2, self._runtime.max_tokens_cap)
                     logger.warning(f"Response truncated, retrying with max_tokens={current_max_tokens}")
@@ -434,27 +543,27 @@ class AgentOrchestrator:
                     authoritative_result_links,
                 )
 
-            if choice.finish_reason not in {"stop", "tool_calls"}:
+            if finish_reason not in {"stop", "tool_calls"}:
                 logger.error(
                     "Refusing incomplete model response before tool execution: "
-                    f"finish_reason={choice.finish_reason}"
+                    f"finish_reason={finish_reason}"
                 )
                 return self._append_authoritative_result_links(
                     "呜呜，AI 返回了未完成的结果 qwq 请稍后再试一次～",
                     authoritative_result_links,
                 )
 
-            if response_tool_calls and choice.finish_reason != "tool_calls":
+            if response_tool_calls and finish_reason != "tool_calls":
                 logger.error(
                     "Refusing tool calls with mismatched finish reason: "
-                    f"finish_reason={choice.finish_reason} tool_calls={tool_call_count}"
+                    f"finish_reason={finish_reason} tool_calls={tool_call_count}"
                 )
                 return self._append_authoritative_result_links(
                     "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～",
                     authoritative_result_links,
                 )
 
-            if choice.finish_reason == "tool_calls" and not response_tool_calls:
+            if finish_reason == "tool_calls" and not response_tool_calls:
                 logger.error("Model returned finish_reason=tool_calls without any tool calls")
                 return self._append_authoritative_result_links(
                     "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～",
@@ -534,7 +643,7 @@ class AgentOrchestrator:
 
             assistant_msg: Dict = {
                 "role": "assistant",
-                "content": choice.message.content,
+                "content": content,
                 "tool_calls": [
                     {
                         "id": tc.id,
@@ -556,6 +665,12 @@ class AgentOrchestrator:
 
             for tc, fn_args in parsed_tool_calls:
                 fn_name = tc.function.name
+                if fn_name == "keytao_prepare_reviewed_add":
+                    attempted_word = str(fn_args.get("word") or "").strip()
+                    if attempted_word:
+                        attempted_review_words.add(attempted_word)
+                elif fn_name == "keytao_batch_add_to_draft" and exact_multi_add_items:
+                    multi_add_write_attempted = True
                 logger.info(f"Tool call: {fn_name}({fn_args})")
                 tool_context = ToolContext(
                     platform=context.platform,
@@ -738,7 +853,11 @@ class AgentOrchestrator:
                     )
                     if (
                         fn_name == "keytao_prepare_reviewed_add"
-                        and result_data.get("pronunciationUnresolved") is True
+                        and (
+                            review_flags.review_blocks_write(result_data)
+                            or result_data.get("pronunciationUnresolved") is True
+                            or result_data.get("success") is False
+                        )
                     ):
                         unresolved_word = str(
                             result_data.get("word")
@@ -747,6 +866,7 @@ class AgentOrchestrator:
                         ).strip()
                         if unresolved_word:
                             unresolved_pronunciation_words.add(unresolved_word)
+                            blocked_review_words.add(unresolved_word)
                     if result_data.get("not_bound"):
                         return self._append_authoritative_result_links(
                             self._bind_help_text,
@@ -836,8 +956,8 @@ class AgentOrchestrator:
                             )
                         return self._append_authoritative_result_links((
                             f"{result_data.get('message', '操作尚未执行')}\n\n"
-                            f"确认无误后，请发送「确认票据 {confirmation_code}」；"
-                            "普通的“确认”不会执行。"
+                            "请引用本条回复「确认」继续；"
+                            f"无法引用时发送「确认票据 {confirmation_code}」作为备用。"
                         ), authoritative_result_links)
                     if self._tool_receipt_recorder is not None:
                         recorded = self._tool_receipt_recorder(
@@ -1033,11 +1153,7 @@ class AgentOrchestrator:
             if line
         ]
         for warning in result.get("warnings") or []:
-            message = str(
-                warning.get("message")
-                if isinstance(warning, dict)
-                else warning
-            ).replace("\n", " ").strip()[:400]
+            message = _plain_authoritative_warning(warning).replace("\n", " ").strip()[:400]
             line = f"⚠️ {message}" if message else ""
             if line and line not in notices:
                 notices.append(line)
@@ -1159,7 +1275,12 @@ class AgentOrchestrator:
         ],
     ) -> None:
         """Capture narrowly scoped capabilities from successful read-tool results."""
-        if result.get("policyBlocked") or result.get("error") or result.get("success") is False:
+        if (
+            result.get("policyBlocked")
+            or result.get("error")
+            or result.get("success") is False
+            or review_flags.review_blocks_write(result)
+        ):
             return
 
         if tool_name in {"keytao_encode", "keytao_prepare_reviewed_add"}:

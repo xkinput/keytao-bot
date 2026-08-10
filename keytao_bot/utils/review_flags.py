@@ -15,12 +15,82 @@ are still safe to trust in the "needs manual review" direction.
 """
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any, Dict, Optional
 
 # Structured field carried on draft items / review results.
 MANUAL_REVIEW_FIELD = "needsManualReview"
 MANUAL_REVIEW_FIELD_SNAKE = "needs_manual_review"
 MANUAL_REVIEW_REASON_FIELD = "manualReviewReason"
+
+
+class ReviewDisposition(str, Enum):
+    """Non-pass review outcomes at the write boundary."""
+
+    BLOCK = "BLOCK"
+    SEAL = "SEAL"
+
+
+REVIEW_DISPOSITION_FIELD = "reviewDisposition"
+REVIEW_VERDICT_SITE_FIELD = "reviewVerdictSite"
+
+# Every non-pass add/review verdict is named here. BLOCK means the target
+# cannot be written safely; SEAL means the target is trustworthy enough to
+# write with needsManualReview=True so an admin decides at approval time.
+REVIEW_VERDICT_SITE_POLICIES = {
+    "empty_word": ReviewDisposition.BLOCK,
+    "pronunciation_unresolved": ReviewDisposition.BLOCK,
+    "code_unresolved": ReviewDisposition.BLOCK,
+    "lookup_unavailable": ReviewDisposition.BLOCK,
+    "invalid_code": ReviewDisposition.BLOCK,
+    "injection_shaped_input": ReviewDisposition.BLOCK,
+    "missing_authoritative_page": ReviewDisposition.SEAL,
+    "entity_context_reading": ReviewDisposition.SEAL,
+    "unvalidated_type": ReviewDisposition.SEAL,
+    "pre_submit_judgement": ReviewDisposition.SEAL,
+    "pre_submit_review_unavailable": ReviewDisposition.SEAL,
+    "duplicate_formation": ReviewDisposition.SEAL,
+    "code_chain_priority": ReviewDisposition.SEAL,
+}
+
+
+def review_disposition_for_site(site: str) -> ReviewDisposition:
+    """Return the declared disposition for one verdict-producing site."""
+    try:
+        return REVIEW_VERDICT_SITE_POLICIES[site]
+    except KeyError as error:
+        raise ValueError(f"Undeclared review verdict site: {site}") from error
+
+
+def apply_review_disposition(
+    payload: Dict[str, Any],
+    site: str,
+) -> Dict[str, Any]:
+    """Stamp one declared BLOCK/SEAL outcome onto a payload in place."""
+    disposition = review_disposition_for_site(site)
+    payload[REVIEW_DISPOSITION_FIELD] = disposition.value
+    payload[REVIEW_VERDICT_SITE_FIELD] = site
+    return payload
+
+
+def read_review_disposition(payload: Any) -> Optional[ReviewDisposition]:
+    """Read a declared non-pass disposition, rejecting unknown values."""
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get(REVIEW_DISPOSITION_FIELD)
+    if isinstance(raw, ReviewDisposition):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return ReviewDisposition(raw.strip().upper())
+        except ValueError:
+            return None
+    return None
+
+
+def review_blocks_write(payload: Any) -> bool:
+    """Only an explicit BLOCK disposition prevents a reviewed add write."""
+    return read_review_disposition(payload) is ReviewDisposition.BLOCK
 
 # Canonical, code-generated remark fragments. Never let an LLM author these.
 AUTO_PASS_PREFIX = "自动审核：该词可自动通过"

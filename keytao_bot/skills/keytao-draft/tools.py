@@ -999,39 +999,39 @@ async def _validate_draft_item_code(item: Dict) -> Dict:
     code = str(item.get("code") or "").strip().lower()
     phrase_type = _infer_phrase_type(word, code, item.get("type") or "Phrase")
     if phrase_type not in VALID_PHRASE_TYPES:
-        return {
+        return review_flags.apply_review_disposition({
             "success": False,
             "word": word,
             "code": code,
             "reason": f"不支持的词库类型：{phrase_type or '(empty)'}",
-        }
+        }, "invalid_code")
     shape_error = _validate_code_shape(phrase_type, code)
     if shape_error:
-        return {
+        return review_flags.apply_review_disposition({
             "success": False,
             "word": word,
             "code": code,
             "reason": shape_error,
             "candidateCodes": [],
-        }
+        }, "invalid_code")
     if phrase_type not in CHAIN_VALIDATED_TYPES or not _contains_cjk_text(word):
-        return {
+        return review_flags.apply_review_disposition({
             "success": True,
             "word": word,
             "code": code,
             "type": phrase_type,
             "needsManualReview": True,
             "manualReviewReason": f"{phrase_type} 类型没有确定性编码校验规则，需管理员人工确认",
-        }
+        }, "unvalidated_type")
     encoding = await _fetch_encode_candidates(word, code)
     if not encoding.get("success"):
-        return {
+        return review_flags.apply_review_disposition({
             "success": False,
             "word": word,
             "code": code,
             "reason": encoding.get("message", "编码校验失败"),
             "candidateCodes": encoding.get("candidateCodes", []),
-        }
+        }, "code_unresolved")
 
     candidate_codes = encoding.get("candidateCodes", [])
     if code in candidate_codes:
@@ -1042,14 +1042,14 @@ async def _validate_draft_item_code(item: Dict) -> Dict:
             "candidateCodes": candidate_codes,
         }
 
-    return {
+    return review_flags.apply_review_disposition({
         "success": False,
         "word": word,
         "code": code,
         "reason": f"编码 {code} 不是「{word}」的有效候选编码",
         "candidateCodes": candidate_codes,
         "requestedCodeAnalysis": encoding.get("requestedCodeAnalysis"),
-    }
+    }, "invalid_code")
 
 
 def _format_code_validation_failure(validation: Dict, index: int = 0) -> Dict:
@@ -1066,6 +1066,12 @@ def _format_code_validation_failure(validation: Dict, index: int = 0) -> Dict:
         "reason": reason,
         "validationError": True,
     }
+    disposition = review_flags.read_review_disposition(validation)
+    if disposition is not None:
+        failed[review_flags.REVIEW_DISPOSITION_FIELD] = disposition.value
+        failed[review_flags.REVIEW_VERDICT_SITE_FIELD] = str(
+            validation.get(review_flags.REVIEW_VERDICT_SITE_FIELD) or ""
+        )
     if validation.get("requestedCodeAnalysis") is not None:
         failed["requestedCodeAnalysis"] = validation.get("requestedCodeAnalysis")
     return failed

@@ -3546,9 +3546,19 @@ def test_add_submit_extra_snapshot_shows_one_exact_confirmation():
         check("extra snapshot blocks automatic confirmation", result.pending_state is not None)
         check("extra snapshot shows authorized create", "Create 阻抑 @ zjyka" in result.text)
         check("extra snapshot shows old delete", "Delete 旧草稿词 @ jqk" in result.text)
-        check("extra snapshot shows exact digests", "SHA-256 " + "1" * 64 in result.text and "SHA-256 " + "2" * 64 in result.text)
+        check("extra snapshot hides internal digests", all(
+            digest not in result.text
+            for digest in ("1" * 64, "2" * 64, "3" * 64)
+        ))
+        check("extra snapshot ticket keeps exact digest binding", (
+            result.pending_state.args.get("expected_server_snapshot_digest") == "1" * 64
+            and result.pending_state.args.get("expected_warning_digest") == "2" * 64
+            and result.pending_state.args.get("expected_audit_digest") == "3" * 64
+            and result.pending_state.args.get("expected_content_version") == 17
+        ))
         check("risk prompt does not advertise unusable natural command", "「确认提交」" not in result.text and "「确认加入」" not in result.text)
         check("risk prompt exposes one executable nonce", operation.prompt_text.count("确认操作 ") == 1)
+        check("risk prompt leads with quoted plain confirmation", "请引用本条回复「确认」继续" in operation.prompt_text)
 
     asyncio.run(_run())
 
@@ -9606,8 +9616,8 @@ def test_review_audit_blocks_bare_delete_and_allows_code_move():
         check("code move records original delete", any("调码删除原位" in item for item in code_move["approvedItems"]))
         check("priority move auto approves with commonness evidence", priority_move["autoApprove"] is True)
         check("priority move records commonness comparison", bool(priority_move.get("commonnessComparisons")))
-        check("unclear priority move needs admin", unclear_priority_move["autoApprove"] is False)
-        check("unclear priority issue explains commonness", any("常用度证据不足" in item for item in unclear_priority_move["issues"]))
+        check("unclear advisory priority keeps the base verdict", unclear_priority_move["autoApprove"] is True)
+        check("unclear advisory priority adds no issue", unclear_priority_move["issues"] == [])
 
     asyncio.run(_run())
 
@@ -9668,8 +9678,8 @@ def test_review_audit_recommends_code_chain_priority_reorder():
         moves = chain_review.get("recommendedMoves", [])
         note = keytao_review_module.build_review_note(audit)
 
-        check("priority reorder blocks auto approval", audit.get("autoApprove") is False)
-        check("priority issue recorded", any("同编码链优先级" in issue for issue in audit.get("issues", [])))
+        check("priority reorder advice preserves auto approval", audit.get("autoApprove") is True)
+        check("priority reorder advice adds no issue", audit.get("issues") == [])
         check("chain recommendation recorded", chain_review.get("hasRecommendation") is True)
         check("new common word moves to short code", any(move.get("word") == "直播间" and move.get("toCode") == "fbjui" for move in moves))
         check("old occupant moves to longer code", any(move.get("word") == "质保金" and move.get("toCode") == "fbjuio" for move in moves))

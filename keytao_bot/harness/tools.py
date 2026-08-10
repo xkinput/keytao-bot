@@ -7,6 +7,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from nonebot.log import logger
 
+from keytao_bot.utils import review_flags
+
 try:  # pragma: no cover - depends on the installed runtime
     import httpx as _httpx
 except ImportError:  # pragma: no cover
@@ -36,6 +38,65 @@ _JSON_TYPE_MAP = {
 _MAX_REPORTED_ERRORS = 5
 _FALLBACK_MAX_DEPTH = 3
 _missing_jsonschema_warned = False
+
+_STAGED_ARGUMENT_LABELS = {
+    "action": "动作",
+    "batch_id": "批次",
+    "code": "编码",
+    "expected_content_version": "内容版本",
+    "ids": "草稿条目",
+    "items": "词条",
+    "needs_manual_review": "管理员复核标记",
+    "old_word": "原词",
+    "pr_id": "草稿条目",
+    "remark": "备注",
+    "target_code": "目标编码",
+    "type": "类型",
+    "weight": "权重",
+    "word": "词语",
+}
+
+_STAGED_ACTION_LABELS = {
+    "Change": "修改",
+    "Create": "新增",
+    "Delete": "删除",
+}
+
+
+def _staged_argument_label(key: Any) -> str:
+    key_text = str(key)
+    return _STAGED_ARGUMENT_LABELS.get(key_text, f"字段 {key_text}")
+
+
+def _staged_argument_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return "；".join(
+            f"{_staged_argument_label(key)}：{_staged_argument_value(item)}"
+            for key, item in value.items()
+        ) or "空"
+    if isinstance(value, (list, tuple)):
+        return "、".join(_staged_argument_value(item) for item in value) or "空"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if value is None:
+        return "未设置"
+    text = str(value)
+    return _STAGED_ACTION_LABELS.get(text, text)
+
+
+def _describe_staged_mutation(tool_name: str, arguments: Dict) -> str:
+    lines = [f"拟执行 {tool_name}，已锁定以下内容："]
+    for key, value in arguments.items():
+        label = _staged_argument_label(key)
+        if isinstance(value, (list, tuple)):
+            lines.append(f"• {label}（{len(value)} 项）：")
+            lines.extend(
+                f"  {index}. {_staged_argument_value(item)}"
+                for index, item in enumerate(value, start=1)
+            )
+        else:
+            lines.append(f"• {label}：{_staged_argument_value(value)}")
+    return "\n".join(lines)
 
 
 def _tool_exception_payload(error: Exception) -> Dict[str, Any]:
@@ -689,6 +750,30 @@ def _multi_add_authorization_contract(
         clauses=tuple(parsed),
         valid=bool(parsed) and not refused and len(parsed) == add_intent_count,
         refused_clauses=tuple(refused),
+    )
+
+
+def authorized_multi_add_items(message: str) -> Tuple[Dict[str, str], ...]:
+    """Return an exact literal multi-add item set, or an empty tuple.
+
+    This is intentionally narrower than general mutation authorization: every
+    clause must carry its own add verb, word, and literal code. The returned set
+    is therefore safe to replay only after each pair has a non-BLOCK review.
+    """
+    authorization = _multi_add_authorization_contract(message)
+    if (
+        authorization is None
+        or not authorization.valid
+        or len(authorization.clauses) > _MAX_AUTHORIZED_MULTI_ADD_ITEMS
+        or any(not clause.code for clause in authorization.clauses)
+    ):
+        return ()
+    identities = [(clause.word, clause.code) for clause in authorization.clauses]
+    if len(set(identities)) != len(identities):
+        return ()
+    return tuple(
+        {"action": "Create", "word": word, "code": code}
+        for word, code in identities
     )
 
 
@@ -2061,6 +2146,11 @@ def policy_block(
             f"{message}请把下面这条指令原样转述给用户，不要自创格式：{suggestion}"
         )
     payload.update(extra)
+    if reason == BLOCK_REASON_SOURCE_UNTRUSTED:
+        review_flags.apply_review_disposition(
+            payload,
+            "injection_shaped_input",
+        )
     return payload
 
 
@@ -2076,10 +2166,16 @@ def text_follow_up(reason: str, message: str, **extra: Any) -> Dict:
     return payload
 
 
-_AUTO_CONFIRM_CREATE_WARNING_TYPES = frozenset({
-    "duplicate_code",
-    "code_chain_priority",
-})
+_AUTO_CONFIRM_CREATE_WARNING_SITES = {
+    "duplicate_code": "duplicate_formation",
+    "code_chain_priority": "code_chain_priority",
+}
+_AUTO_CONFIRM_CREATE_WARNING_TYPES = frozenset(
+    warning_type
+    for warning_type, site in _AUTO_CONFIRM_CREATE_WARNING_SITES.items()
+    if review_flags.review_disposition_for_site(site)
+    is review_flags.ReviewDisposition.SEAL
+)
 
 
 def server_warning_confirmation_binding(
@@ -3902,9 +3998,9 @@ class ToolExecutor:
             "requiresConfirmation": True,
             "localConfirmationRequired": True,
             "message": (
-                f"拟执行 {tool_name}：{preview}\n"
-                f"参数摘要：SHA-256 {preview_digest}\n"
-                "尚未写入。请核对后按机器人给出的确认票据继续。"
+                f"{_describe_staged_mutation(tool_name, arguments)}\n"
+                "尚未写入。请引用本条回复「确认」继续；"
+                "无法引用时使用机器人给出的确认票据。"
             ),
         }
 
