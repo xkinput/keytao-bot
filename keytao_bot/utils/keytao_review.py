@@ -72,7 +72,7 @@ CODE_CHAIN_PRIORITY_WINDOW_AFTER = 2
 CODE_CHAIN_PRIORITY_MAX_OCCUPANTS = 8
 CODE_CHAIN_REORDER_SCORE_MARGIN = 0.20
 CANDIDATE_COMMONNESS_MAX_OCCUPANTS = 2
-CANDIDATE_COMMONNESS_TIMEOUT_SECONDS = 8.0
+CANDIDATE_COMMONNESS_TIMEOUT_SECONDS = 5.0
 PERSON_ALIAS_SEARCH_QUERIES = [
     '"{word}" "字"',
     '"{word}" "号"',
@@ -118,13 +118,14 @@ COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
 COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
 CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
 # Total budget for gathering pronunciation evidence. Must stay above the
-# per-source budget below, otherwise every source is cancelled before the
-# 12s inner per-request timeouts can even fire.
-PRONUNCIATION_EVIDENCE_TIMEOUT = 20.0
-PRONUNCIATION_SOURCE_TIMEOUT = 8.0
+# per-source budget below so a source can finish within its own deadline.
+PRONUNCIATION_EVIDENCE_TIMEOUT = 8.0
+PRONUNCIATION_SOURCE_TIMEOUT = 6.0
 PRONUNCIATION_WORD_BINDING_WINDOW_CHARS = 80
-KEYTAO_ENCODE_REQUEST_TIMEOUT = 30.0
-KEYTAO_ENCODE_MAX_ATTEMPTS = 4
+KEYTAO_ENCODE_REQUEST_TIMEOUT = 10.0
+KEYTAO_ENCODE_MAX_ATTEMPTS = 2
+REVIEW_LOOKUP_REQUEST_TIMEOUT = 3.0
+REVIEW_LOOKUP_MAX_ATTEMPTS = 2
 ENTITY_DIRECT_FETCH_TIMEOUT = 3.0
 ENTITY_PRONUNCIATION_MIN_CONFIDENCE = 0.75
 CONTEXT_ENTITY_SOURCE_DOMAINS = ("baike.baidu.com", "zh.wikipedia.org")
@@ -842,6 +843,7 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                 "sources": [],
                 "sourceIds": [],
                 "score": 0,
+                "readingEvidenceKind": "bound_external",
             }
         group = groups[key]
         group["sources"].append({
@@ -895,11 +897,22 @@ async def _call_keytao_api(config: ReviewHttpConfig, path: str, payload: Optiona
     auto-approved.
     """
     if method.upper() == "GET":
-        return await http_client.keytao_json("GET", path, params=payload)
+        return await http_client.keytao_json(
+            "GET",
+            path,
+            params=payload,
+            timeout=REVIEW_LOOKUP_REQUEST_TIMEOUT,
+            retries=REVIEW_LOOKUP_MAX_ATTEMPTS,
+        )
     # These POST endpoints are batch *lookups*, so replaying one is harmless
     # and a transient 5xx must not be reported as "nothing occupies this code".
     return await http_client.keytao_json(
-        "POST", path, json_body=payload or {}, idempotent=True
+        "POST",
+        path,
+        json_body=payload or {},
+        idempotent=True,
+        timeout=REVIEW_LOOKUP_REQUEST_TIMEOUT,
+        retries=REVIEW_LOOKUP_MAX_ATTEMPTS,
     )
 
 
@@ -1026,6 +1039,13 @@ def _pronunciation_sequence_rejection_reason(
     sequence: Sequence[str],
     encode_data: Dict[str, Any],
 ) -> str:
+    """Verify every syllable against the encoder's readings for that exact character.
+
+    ``chars[*].pinyins`` is the authenticated encoder's own-character evidence.
+    Older encode responses do not include ``pronunciationLookupStatus``; an
+    explicit non-found status still fails closed, while a missing status never
+    overrides a present, matching known-reading list.
+    """
     word_chars = list(word)
     normalized_sequence = tuple(
         normalize_pinyin_syllable(str(syllable or ""))
@@ -1043,8 +1063,8 @@ def _pronunciation_sequence_rejection_reason(
         if not isinstance(char_info, dict) or char_info.get("char") != expected_char:
             return f"character_{index + 1}_lookup_mismatch"
         status = str(char_info.get("pronunciationLookupStatus") or "").strip()
-        if status != "found":
-            return f"character_{index + 1}_lookup_{status or 'missing'}"
+        if status and status != "found":
+            return f"character_{index + 1}_lookup_{status}"
         raw_readings = char_info.get("pinyins")
         if not isinstance(raw_readings, list):
             return f"character_{index + 1}_readings_missing"
@@ -1083,6 +1103,7 @@ def _validated_pronunciation_groups(
             "normalized": list(sequence),
             "reason": reason,
             "sourceIds": list(group.get("sourceIds") or []),
+            "readingEvidenceKind": str(group.get("readingEvidenceKind") or ""),
         }
         rejections.append(rejection)
         logger.warning(
@@ -1172,6 +1193,7 @@ def _semantic_pronunciation_group(
         "fallback": True,
         "semanticPronunciation": True,
         "requiresManualReview": True,
+        "readingEvidenceKind": "own_character_semantic",
         "sourceSummary": f"本喵整词语境判断（{label}，{status_label}）",
         "contextPronunciation": {
             "entityType": usage_type,
@@ -1205,24 +1227,11 @@ def _entity_pronunciation_group(
         return None
     if any(not pinyin_to_phonetic_code(syllable) for syllable in sequence):
         return None
-    if encode_data is not None:
-        chars = encode_data.get("chars")
-        if not isinstance(chars, list) or len(chars) != len(sequence):
-            return None
-        for syllable, char_info in zip(sequence, chars):
-            if not isinstance(char_info, dict):
-                return None
-            alternate_readings = char_info.get("pinyins")
-            if not isinstance(alternate_readings, list):
-                alternate_readings = []
-            readings = [char_info.get("pinyin"), *alternate_readings]
-            known_readings = {
-                normalize_pinyin_syllable(str(reading))
-                for reading in readings
-                if str(reading or "").strip()
-            }
-            if syllable not in known_readings:
-                return None
+    if (
+        encode_data is not None
+        and _pronunciation_sequence_rejection_reason(word, sequence, encode_data)
+    ):
+        return None
 
     entity_type = str(entity.get("entityType") or "unclear")
     label = _entity_type_label(entity_type)
@@ -1236,6 +1245,8 @@ def _entity_pronunciation_group(
         "score": 0,
         "fallback": True,
         "semanticPronunciation": True,
+        "requiresManualReview": True,
+        "readingEvidenceKind": "own_character_entity_context",
         "sourceSummary": f"本喵实体语境判断（{label}，暂无权威页）",
         "contextPronunciation": {
             "entityType": entity_type,
@@ -1319,6 +1330,8 @@ async def _contextual_pronunciation_group(
         "score": 0,
         "fallback": True,
         "semanticPronunciation": True,
+        "requiresManualReview": True,
+        "readingEvidenceKind": "own_character_entity_context",
         "sourceSummary": f"百科实体全称语境（{canonical_name}，暂无独立读音页）",
         "contextPronunciation": {
             "entityType": str(entity.get("entityType") or "unclear"),
@@ -1470,28 +1483,14 @@ async def prepare_reviewed_word(
         encode_data,
     )
     standard_status = _standard_pronunciation_status(encode_data)
+    foreign_evidence_rejections = list(evidence.get("rejections") or [])
     evidence_rejections = [
-        *list(evidence.get("rejections") or []),
+        *foreign_evidence_rejections,
         *cross_validation_rejections,
     ]
-    if not groups and evidence_rejections:
-        return apply_manual_review_flag({
-            "success": True,
-            "word": word,
-            "existing": existing_words.get(word, []),
-            "pronunciations": [],
-            "recommendedCode": "",
-            "autoReviewable": False,
-            "pronunciationUnresolved": True,
-            "requiresManualPronunciationReview": True,
-            "standardPronunciationStatus": standard_status,
-            "pronunciationRejections": evidence_rejections,
-            "message": (
-                f"「{word}」检索到的读音证据未通过词条或逐字读音校验，"
-                "已拒绝生成候选编码，请人工复核读音"
-            ),
-            "entityKnowledge": None,
-        }, True, "读音证据未通过目标词条逐字校验")
+    # Rejected web evidence belongs to another word (or fails this word's
+    # character readings). Keep it rejected and auditable, but do not let its
+    # mere presence suppress a separately verified own-character fallback.
     if not groups:
         default_sequence = _encode_default_pinyin_sequence(encode_data)
         entity_group = None
@@ -1537,10 +1536,16 @@ async def prepare_reviewed_word(
                     "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
                 }, True, "整词语境读音无法验证")
 
+        own_character_rejection = _pronunciation_sequence_rejection_reason(
+            word,
+            default_sequence,
+            encode_data,
+        )
         if (
             not groups
             and not semantic_pronunciation_needed
             and str(encode_data.get("pronunciationSource") or "") == "zdic-unavailable"
+            and own_character_rejection
         ):
             return apply_manual_review_flag({
                 "success": True,
@@ -1552,6 +1557,16 @@ async def prepare_reviewed_word(
                 "pronunciationUnresolved": True,
                 "requiresManualPronunciationReview": True,
                 "standardPronunciationStatus": standard_status,
+                "pronunciationRejections": [
+                    *evidence_rejections,
+                    {
+                        "pinyin": pinyin_sequence_label(default_sequence),
+                        "normalized": list(default_sequence),
+                        "reason": own_character_rejection,
+                        "sourceIds": [],
+                        "readingEvidenceKind": "own_character",
+                    },
+                ],
                 "message": (
                     f"「{word}」的权威整词或逐字读音服务暂不可用，"
                     "当前读音无法完成交叉验证，暂不推荐编码"
@@ -1584,6 +1599,8 @@ async def prepare_reviewed_word(
                 "sourceIds": [],
                 "score": 0,
                 "fallback": True,
+                "requiresManualReview": True,
+                "readingEvidenceKind": "own_character",
             }]
 
     groups, final_validation_rejections = _validated_pronunciation_groups(
@@ -1602,7 +1619,10 @@ async def prepare_reviewed_word(
             "pronunciationUnresolved": True,
             "requiresManualPronunciationReview": True,
             "standardPronunciationStatus": standard_status,
-            "pronunciationRejections": final_validation_rejections,
+            "pronunciationRejections": [
+                *evidence_rejections,
+                *final_validation_rejections,
+            ],
             "message": (
                 f"「{word}」没有通过逐字权威读音交叉校验的候选读音，"
                 "暂不推荐编码"
@@ -1631,6 +1651,7 @@ async def prepare_reviewed_word(
             "requiresManualReview": bool(group.get("requiresManualReview")),
             "sourceSummary": str(group.get("sourceSummary") or "").strip(),
             "contextPronunciation": group.get("contextPronunciation"),
+            "readingEvidenceKind": str(group.get("readingEvidenceKind") or ""),
         })
 
     if not pronunciations:
@@ -1703,6 +1724,8 @@ async def prepare_reviewed_word(
     }
     if lookup_failed:
         result["lookupFailureReason"] = LOOKUP_FAILURE_REASON
+    if evidence_rejections:
+        result["pronunciationRejections"] = evidence_rejections
     # Structured verdict for downstream remark rendering. Code-generated, never
     # LLM text.
     return apply_manual_review_flag(result, not auto_reviewable, auto_review_reason)
@@ -3305,7 +3328,23 @@ def _chain_recommendation_text(priority_review: Dict) -> str:
 
 
 AUDIT_ITEM_CONCURRENCY = 3
-AUDIT_ITEM_TIMEOUT = 30.0
+AUDIT_REVIEW_STAGE_TIMEOUT = 28.0
+AUDIT_COMMONNESS_STAGE_TIMEOUT = 5.0
+AUDIT_PRIORITY_STAGE_TIMEOUT = 5.0
+AUDIT_WORST_CASE_SEQUENTIAL_SECONDS = (
+    AUDIT_REVIEW_STAGE_TIMEOUT
+    + AUDIT_COMMONNESS_STAGE_TIMEOUT
+    + AUDIT_PRIORITY_STAGE_TIMEOUT
+)
+AUDIT_ITEM_TIMEOUT = 40.0
+
+AUDIT_STAGE_LABELS = {
+    "review": "读音与编码核验",
+    "css_review": "声笔笔审查",
+    "commonness": "常用度评估",
+    "change_commonness": "改词常用度比较",
+    "priority": "编码链优先级评估",
+}
 
 
 def reviewed_word_key(word: str, phrase_type: str) -> str:
@@ -3349,6 +3388,36 @@ class _ItemOutcome:
         self.reviewed_words: Dict[Tuple[str, str], Dict] = {}
 
 
+class _AuditProgress:
+    """Keep completed item work available if the parent deadline fires."""
+
+    def __init__(self) -> None:
+        self.outcome = _ItemOutcome()
+        self.active_stage = ""
+        self.stage_seconds: Dict[str, float] = {}
+
+    async def run_stage(
+        self,
+        stage: str,
+        awaitable: Any,
+        timeout: float,
+    ) -> Any:
+        self.active_stage = stage
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(awaitable, timeout=timeout)
+        except BaseException:
+            self.stage_seconds[stage] = (
+                self.stage_seconds.get(stage, 0.0) + time.monotonic() - started
+            )
+            raise
+        self.stage_seconds[stage] = (
+            self.stage_seconds.get(stage, 0.0) + time.monotonic() - started
+        )
+        self.active_stage = ""
+        return result
+
+
 async def _shared_prepare_reviewed_word(
     config: ReviewHttpConfig,
     word: str,
@@ -3371,8 +3440,10 @@ async def _audit_single_item(
     item: Dict,
     move_pairs: Dict[Tuple[str, str], Dict],
     review_tasks: Dict[Tuple[str, str], Any],
+    progress: Optional[_AuditProgress] = None,
 ) -> _ItemOutcome:
-    outcome = _ItemOutcome()
+    progress = progress or _AuditProgress()
+    outcome = progress.outcome
     action = str(item.get("action") or "Create")
     word = _normalized_pair_word(item)
     code = _normalized_pair_code(item)
@@ -3397,7 +3468,11 @@ async def _audit_single_item(
         return outcome
 
     if _is_css_review_type(phrase_type):
-        css_review = await prepare_css_reviewed_item(config, item)
+        css_review = await progress.run_stage(
+            "css_review",
+            prepare_css_reviewed_item(config, item),
+            AUDIT_REVIEW_STAGE_TIMEOUT,
+        )
         outcome.reviewed_words[(word, phrase_type)] = css_review
         if not css_review.get("success"):
             outcome.issues.append(f"「{word}」声笔笔审查失败：{css_review.get('message', '未知错误')}")
@@ -3426,7 +3501,11 @@ async def _audit_single_item(
             return outcome
 
         if action == "Change" and old_word:
-            comparison = await compare_word_commonness(word, old_word)
+            comparison = await progress.run_stage(
+                "change_commonness",
+                compare_word_commonness(word, old_word),
+                AUDIT_COMMONNESS_STAGE_TIMEOUT,
+            )
             css_review["commonnessComparison"] = comparison
             if comparison.get("verdict") == "front_more_common":
                 outcome.approved_items.append(
@@ -3449,9 +3528,13 @@ async def _audit_single_item(
         return outcome
 
     if action == "Change" and old_word:
-        old_review, new_review = await asyncio.gather(
-            _shared_prepare_reviewed_word(config, old_word, phrase_type, review_tasks),
-            _shared_prepare_reviewed_word(config, word, phrase_type, review_tasks),
+        old_review, new_review = await progress.run_stage(
+            "review",
+            asyncio.gather(
+                _shared_prepare_reviewed_word(config, old_word, phrase_type, review_tasks),
+                _shared_prepare_reviewed_word(config, word, phrase_type, review_tasks),
+            ),
+            AUDIT_REVIEW_STAGE_TIMEOUT,
         )
         outcome.reviewed_words[(old_word, phrase_type)] = old_review
         outcome.reviewed_words[(word, phrase_type)] = new_review
@@ -3467,7 +3550,11 @@ async def _audit_single_item(
         return outcome
 
     cache_key = (word, phrase_type)
-    review = await _shared_prepare_reviewed_word(config, word, phrase_type, review_tasks)
+    review = await progress.run_stage(
+        "review",
+        _shared_prepare_reviewed_word(config, word, phrase_type, review_tasks),
+        AUDIT_REVIEW_STAGE_TIMEOUT,
+    )
     outcome.reviewed_words[cache_key] = review
     if not review.get("success"):
         outcome.issues.append(f"「{word}」审词失败：{review.get('message', '未知错误')}")
@@ -3511,10 +3598,18 @@ async def _audit_single_item(
             )
             return outcome
 
-        commonness = await estimate_word_commonness(word)
+        commonness = await progress.run_stage(
+            "commonness",
+            estimate_word_commonness(word),
+            AUDIT_COMMONNESS_STAGE_TIMEOUT,
+        )
         outcome.word_purpose_reviews.append(_purpose_review_from_commonness(word, code, phrase_type, commonness))
         if _is_common_known_word(word, commonness):
-            priority_review = await _review_code_chain_priority(item, review)
+            priority_review = await progress.run_stage(
+                "priority",
+                _review_code_chain_priority(item, review),
+                AUDIT_PRIORITY_STAGE_TIMEOUT,
+            )
             outcome.code_chain_priority_reviews.append(priority_review)
             # Advisory: it may raise an admin-facing issue, but it can never
             # turn into an approval on its own.
@@ -3556,7 +3651,11 @@ async def _audit_single_item(
         available = ", ".join(sorted(candidate_codes)[:8])
         outcome.issues.append(f"「{word}」编码 {code} 不在权威读音候选链中，可选：{available or '无'}")
         return outcome
-    priority_review = await _review_code_chain_priority(item, review)
+    priority_review = await progress.run_stage(
+        "priority",
+        _review_code_chain_priority(item, review),
+        AUDIT_PRIORITY_STAGE_TIMEOUT,
+    )
     outcome.code_chain_priority_reviews.append(priority_review)
     outcome.word_purpose_reviews.append(_purpose_review_from_commonness(
         word,
@@ -3600,27 +3699,57 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
 
     async def run_item(item: Dict) -> _ItemOutcome:
         word = _normalized_pair_word(item) or "该词"
+        phrase_type = str(item.get("type") or "Phrase").strip() or "Phrase"
+        action = str(item.get("action") or "Create").strip() or "Create"
+        progress = _AuditProgress()
+        started = time.monotonic()
+        status = "completed"
         async with semaphore:
             try:
                 return await asyncio.wait_for(
-                    _audit_single_item(config, item, move_pairs, review_tasks),
+                    _audit_single_item(
+                        config,
+                        item,
+                        move_pairs,
+                        review_tasks,
+                        progress,
+                    ),
                     timeout=AUDIT_ITEM_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                outcome = _ItemOutcome()
-                outcome.issues.append(
-                    f"「{word}」审词超过 {AUDIT_ITEM_TIMEOUT:.0f} 秒，需要管理员审核"
+                stage = progress.active_stage or "review"
+                status = f"timeout:{stage}"
+                outcome = progress.outcome
+                issue = (
+                    f"「{word}」{AUDIT_STAGE_LABELS.get(stage, '审词流程')}超时，"
+                    "需要管理员审核"
                 )
+                outcome.issues.append(issue)
                 return outcome
             except KeytaoApiError as error:
+                status = "keytao_api_error"
                 outcome = _ItemOutcome()
                 outcome.issues.append(f"「{word}」{LOOKUP_FAILURE_REASON}：{error.message}")
                 return outcome
             except Exception as error:  # pragma: no cover - defensive
+                status = f"error:{type(error).__name__}"
                 logger.warning(f"Draft item audit failed for {word}: {error}")
-                outcome = _ItemOutcome()
+                outcome = progress.outcome
                 outcome.issues.append(f"「{word}」审词异常，需要管理员审核：{error}")
                 return outcome
+            finally:
+                total_seconds = time.monotonic() - started
+                stage_summary = ",".join(
+                    f"{stage}={seconds:.3f}"
+                    for stage, seconds in progress.stage_seconds.items()
+                ) or "none"
+                log_word = re.sub(r"\s+", " ", word).strip()[:40]
+                logger.info(
+                    "[audit_item] "
+                    f"word={log_word} type={phrase_type[:24]} action={action[:16]} "
+                    f"status={status} totalSeconds={total_seconds:.3f} "
+                    f"stages={stage_summary}"
+                )
 
     try:
         outcomes = await asyncio.gather(*(run_item(item) for item in items))

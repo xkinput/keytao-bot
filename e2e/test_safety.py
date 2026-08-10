@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, call, patch
+from urllib.parse import unquote
 
 import httpx
 
@@ -178,47 +179,38 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_s14_poison_injection_is_exact_and_never_dispatches(self) -> None:
-        dispatched: list[str] = []
+    async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
+        from keytao_bot.utils import keytao_review as review_module
 
-        async def transport_handler(request: httpx.Request) -> httpx.Response:
-            dispatched.append(str(request.url))
-            return httpx.Response(599, request=request)
-
+        review_module._clear_review_caches()
         controller = PronunciationPoisonController()
         controller.arm("S14")
-        with patch.object(
-            NetworkAllowlist,
-            "_resolve_llm_ips",
-            return_value=frozenset({"203.0.113.10"}),
-        ):
-            guard = NetworkAllowlist(
-                llm_base_url="https://llm.example.com/v1",
-                scenario_getter=lambda: "S14",
-                pronunciation_poison=controller,
-            )
-        guard.install()
         try:
-            async with httpx.AsyncClient(
-                transport=httpx.MockTransport(transport_handler)
-            ) as client:
-                search = await client.get(
-                    "https://www.bing.com/search",
-                    params={"q": 'site:zdic.net "亮面" 拼音'},
-                )
-                page = await client.get(
-                    "https://www.zdic.net/hans/%E5%85%89%E9%9D%A2"
-                )
-                with self.assertRaises(SafetyViolation):
-                    await client.get("https://www.zdic.net/hans/%E4%BA%AE%E9%9D%A2")
+            with (
+                patch.object(
+                    review_module,
+                    "_search_web",
+                    side_effect=controller.search_web,
+                ),
+                patch.object(
+                    review_module,
+                    "_fetch_text",
+                    side_effect=controller.fetch_text,
+                ),
+            ):
+                evidence = await review_module.collect_pronunciation_evidence("亮面")
         finally:
-            guard.restore()
             controller.disarm()
 
-        self.assertIn("光面", search.text)
-        self.assertIn("guāng miàn", page.text)
         self.assertTrue(controller.injected)
-        self.assertEqual(dispatched, [])
+        self.assertFalse(evidence["hasEvidence"])
+        self.assertTrue(
+            any(
+                rejection.get("reason") == "queried_word_not_near_pinyin_label"
+                and "光面" in unquote(str(rejection.get("url") or ""))
+                for rejection in evidence["rejections"]
+            )
+        )
 
     async def test_multi_add_zdic_preflight_reuses_final_probe_retry(self) -> None:
         client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")

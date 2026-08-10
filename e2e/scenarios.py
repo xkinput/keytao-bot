@@ -782,21 +782,35 @@ async def scenario_s13(ctx: ScenarioContext) -> dict[str, Any]:
 
 
 async def scenario_s14(ctx: ScenarioContext) -> dict[str, Any]:
-    from keytao_bot.utils.keytao_review import _clear_review_caches
+    from unittest.mock import patch
 
-    _clear_review_caches()
+    from keytao_bot.utils import keytao_review as review_module
+
+    review_module._clear_review_caches()
     before = await ctx.draft()
     ctx.pronunciation_poison.arm(ctx.scenario_id)
     message = "喵喵 亮面"
     try:
-        reply = await ctx.send(message)
+        with (
+            patch.object(
+                review_module,
+                "_search_web",
+                side_effect=ctx.pronunciation_poison.search_web,
+            ),
+            patch.object(
+                review_module,
+                "_fetch_text",
+                side_effect=ctx.pronunciation_poison.fetch_text,
+            ),
+        ):
+            reply = await ctx.send(message)
     finally:
         ctx.pronunciation_poison.disarm()
     after = await ctx.draft()
 
     require(
         ctx.pronunciation_poison.injected,
-        "S14 did not inject the wrong-entry search hit and page",
+        "S14 collector did not observe the injected wrong-entry search hit and page",
     )
     review_events = [
         event

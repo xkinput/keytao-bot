@@ -1523,7 +1523,19 @@ class AgentOrchestrator:
         tool_context: ToolContext,
         seen_tool_calls: Dict[tuple, int],
     ) -> str:
-        call_fingerprint = (fn_name, json.dumps(fn_args, sort_keys=True, ensure_ascii=False))
+        fingerprint_args = fn_args
+        if fn_name == "keytao_prepare_reviewed_add":
+            fingerprint_args = {
+                **fn_args,
+                "word": unicodedata.normalize(
+                    "NFKC",
+                    str(fn_args.get("word") or ""),
+                ).strip(),
+            }
+        call_fingerprint = (
+            fn_name,
+            json.dumps(fingerprint_args, sort_keys=True, ensure_ascii=False),
+        )
         duplicate_count = seen_tool_calls.get(call_fingerprint, 0)
         if duplicate_count > 0:
             if duplicate_count >= 4:

@@ -24,6 +24,17 @@ _MULTI_ADD_ZDIC_CACHE_ROWS: tuple[dict[str, Any], ...] = (
 )
 
 ZDIC_FIXTURES_BY_SCENARIO: dict[str, dict[str, Any]] = {
+    # 吃席 has no authoritative word page, but both characters resolve in
+    # production. Seeding that exact shape is what lets the reviewed-add path
+    # fall back to own-character readings instead of failing closed.
+    "S2": {
+        "probe_words": ("吃席",),
+        "rows": (
+            {"kind": "char", "entry": "吃", "status": "found", "pinyins": ["chī"]},
+            {"kind": "char", "entry": "席", "status": "found", "pinyins": ["xí"]},
+            {"kind": "entry", "entry": "吃席", "status": "absent", "pinyins": []},
+        ),
+    },
     "S9": {
         "probe_words": ("射覆",),
         "rows": (

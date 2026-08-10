@@ -276,9 +276,120 @@ def test_s14_wrong_entry_pronunciation_never_reaches_candidates():
             not any(code.startswith("gxmm") for code in codes),
         )
         check(
-            "S14 offers the verified lxmm chain or fails closed",
-            any(code.startswith("lxmm") for code in codes)
-            or review.get("pronunciationUnresolved") is True,
+            "S14 keeps the verified own-character lxmm chain",
+            any(code.startswith("lxmm") for code in codes),
+        )
+
+    asyncio.run(_run())
+
+
+def test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_characters():
+    """吃席 must remain usable when only its own verified character readings exist."""
+    print("\n🧪 吃席 reviewed-add fallback without authoritative or web evidence")
+
+    async def _run():
+        review_module._clear_review_caches()
+        no_web_evidence = {
+            "success": True,
+            "word": "吃席",
+            "groups": [],
+            "sources": [],
+            "hasEvidence": False,
+            "rejections": [],
+        }
+        own_character_encode = {
+            "success": True,
+            "word": "吃席",
+            "codes": ["wkxk", "wkxko", "wkxkoo"],
+            "altCodes": [],
+            "pronunciationSource": "zdic-unavailable",
+            "standardPronunciationStatus": "unavailable",
+            "semanticPronunciationNeeded": False,
+            "phrasePinyins": ["chī", "xí"],
+            "contextPhrasePinyins": ["chī", "xí"],
+            "chars": [
+                {
+                    "char": "吃",
+                    "pinyin": "chī",
+                    "pinyins": ["chī"],
+                    "phoneticCode": "wk",
+                    "shapeCode": "ouva",
+                },
+                {
+                    "char": "席",
+                    "pinyin": "xí",
+                    "pinyins": ["xí"],
+                    "phoneticCode": "xk",
+                    "shapeCode": "ovia",
+                },
+            ],
+        }
+        entity_knowledge = {
+            "recognized": True,
+            "word": "吃席",
+            "entityType": "common_word",
+            "confidence": 0.95,
+            "description": "赴宴吃酒席，是现代汉语常见说法。",
+            "pinyin": "chī xí",
+        }
+        pre_submit_audit = {
+            "success": True,
+            "autoApprove": False,
+            "issues": ["无权威整词页，保留人工审核"],
+            "previewOnly": True,
+        }
+
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=no_web_evidence),
+            ),
+            patch.object(
+                review_module,
+                "fetch_keytao_encode",
+                AsyncMock(return_value=own_character_encode),
+            ),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+            patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+            patch.object(
+                review_module,
+                "_infer_entity_knowledge",
+                AsyncMock(return_value=entity_knowledge),
+            ) as infer_entity,
+            patch.object(
+                review_module,
+                "_contextual_pronunciation_group",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                _review_tools,
+                "_build_pre_submit_audit",
+                AsyncMock(return_value=pre_submit_audit),
+            ),
+            patch.object(
+                _review_tools,
+                "assess_candidate_chain_commonness",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            review = await _review_tools.keytao_prepare_reviewed_add("吃席")
+
+        check("吃席 entity/context gate still runs", infer_entity.await_count == 1)
+        check("吃席 reviewed-add keeps a usable pronunciation", bool(review.get("pronunciations")))
+        check("吃席 reviewed-add recommends wkxk", review.get("recommendedCode") == "wkxk")
+        check("吃席 is not pronunciation-unresolved", review.get("pronunciationUnresolved") is not True)
+        check("吃席 fallback remains sealed for manual review", read_manual_review_flag(review) is True)
+        first_pronunciation = next(iter(review.get("pronunciations") or []), {})
+        check(
+            "吃席 fallback keeps the historical entity/context label",
+            first_pronunciation.get("sourceSummary")
+            == "本喵实体语境判断（常见词，暂无权威页）",
+        )
+        check(
+            "吃席 fallback is structurally marked as own-character evidence",
+            first_pronunciation.get("readingEvidenceKind")
+            == "own_character_entity_context",
         )
 
     asyncio.run(_run())
@@ -387,9 +498,14 @@ def test_pronunciation_groups_require_known_character_readings():
             "phoneticCode": "lx",
             "shapeCode": "o",
         })
-        check("mismatched guang group is removed", mismatch.get("pronunciations") == [])
-        check("mismatch fails closed", mismatch.get("pronunciationUnresolved") is True)
-        check("mismatch produces no recommendation", mismatch.get("recommendedCode") == "")
+        mismatch_sequences = [
+            item.get("normalized")
+            for item in mismatch.get("pronunciations", [])
+            if isinstance(item, dict)
+        ]
+        check("mismatched guang group is removed", ["guang", "mian"] not in mismatch_sequences)
+        check("verified own-character liang group remains", ["liang", "mian"] in mismatch_sequences)
+        check("mismatch keeps the verified lxmm recommendation", mismatch.get("recommendedCode") == "lxmm")
         check("mismatch rejection is logged", mismatch_log.call_count >= 1)
 
         unavailable, unavailable_log = await review_with({
@@ -1400,8 +1516,138 @@ def test_candidate_commonness_wiring_and_timeout():
     asyncio.run(_run())
 
 
+def test_audit_budget_nesting_and_timeout_retains_review():
+    print("\n🧪 audit budget nesting and partial-result retention")
+
+    encode_retry_backoff = sum(
+        0.5 * (2 ** retry_index)
+        for retry_index in range(review_module.KEYTAO_ENCODE_MAX_ATTEMPTS - 1)
+    )
+    encode_worst_case = (
+        review_module.KEYTAO_ENCODE_REQUEST_TIMEOUT
+        * review_module.KEYTAO_ENCODE_MAX_ATTEMPTS
+        + encode_retry_backoff
+    )
+    lookup_retry_backoff = sum(
+        0.5 * (2 ** retry_index)
+        for retry_index in range(review_module.REVIEW_LOOKUP_MAX_ATTEMPTS - 1)
+    )
+    lookup_worst_case = (
+        review_module.REVIEW_LOOKUP_REQUEST_TIMEOUT
+        * review_module.REVIEW_LOOKUP_MAX_ATTEMPTS
+        + lookup_retry_backoff
+    )
+    ordinary_review_worst_case = (
+        max(
+            review_module.PRONUNCIATION_EVIDENCE_TIMEOUT,
+            encode_worst_case,
+            lookup_worst_case,
+        )
+        + lookup_worst_case
+    )
+    check(
+        "ordinary review children fit the review-stage budget",
+        ordinary_review_worst_case <= review_module.AUDIT_REVIEW_STAGE_TIMEOUT,
+    )
+    check(
+        "worst sequential audit chain fits below its parent budget",
+        review_module.AUDIT_WORST_CASE_SEQUENTIAL_SECONDS
+        < review_module.AUDIT_ITEM_TIMEOUT,
+    )
+    check(
+        "candidate commonness stays within the commonness-stage budget",
+        review_module.CANDIDATE_COMMONNESS_TIMEOUT_SECONDS
+        <= review_module.AUDIT_COMMONNESS_STAGE_TIMEOUT,
+    )
+
+    async def _run():
+        resolved_review = {
+            "success": True,
+            "word": "石蒜",
+            "existing": [],
+            "autoReviewable": True,
+            "pronunciations": [{
+                "pinyin": "shi suan",
+                "normalized": ["shi", "suan"],
+                "codes": ["ekso"],
+                "sources": [{
+                    "source": "汉典",
+                    "url": "https://example.test/shisuan",
+                    "category": "dictionary",
+                    "trust": 5,
+                }],
+                "candidateStatuses": [{
+                    "code": "ekso",
+                    "occupied": False,
+                    "phrases": [],
+                }],
+            }],
+        }
+
+        async def unfinished_priority(_item, _review):
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(
+                review_module,
+                "prepare_reviewed_word",
+                new=AsyncMock(return_value=resolved_review),
+            ),
+            patch.object(
+                review_module,
+                "_review_code_chain_priority",
+                side_effect=unfinished_priority,
+            ),
+            patch.object(review_module, "AUDIT_ITEM_TIMEOUT", 0.02),
+            patch.object(review_module.logger, "info") as info_log,
+        ):
+            audit = await audit_draft_items(CONFIG, [{
+                "id": 1,
+                "action": "Create",
+                "word": "石蒜",
+                "code": "ekso",
+                "type": "Phrase",
+            }])
+
+        retained = audit.get("reviewedWords", {}).get("石蒜@Phrase", {})
+        normalized = [
+            item.get("normalized")
+            for item in retained.get("pronunciations", [])
+            if isinstance(item, dict)
+        ]
+        check(
+            "resolved pronunciation survives the item guillotine",
+            ["shi", "suan"] in normalized,
+        )
+        check(
+            "timeout names only the unfinished priority stage",
+            any(
+                "编码链优先级评估" in issue and "超时" in issue
+                for issue in audit.get("issues", [])
+            )
+            and all("审词超过" not in issue for issue in audit.get("issues", [])),
+        )
+        audit_log_lines = [
+            str(call.args[0])
+            for call in info_log.call_args_list
+            if call.args and str(call.args[0]).startswith("[audit_item]")
+        ]
+        check(
+            "audit emits one bounded INFO line with per-stage timing",
+            len(audit_log_lines) == 1
+            and "word=石蒜" in audit_log_lines[0]
+            and "status=timeout:priority" in audit_log_lines[0]
+            and "review=" in audit_log_lines[0]
+            and "priority=" in audit_log_lines[0]
+            and "\n" not in audit_log_lines[0],
+        )
+
+    asyncio.run(_run())
+
+
 def main():
     test_s14_wrong_entry_pronunciation_never_reaches_candidates()
+    test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_characters()
     test_pronunciation_word_binding_window_and_exact_direct_entry()
     test_pronunciation_groups_require_known_character_readings()
     test_lookup_failure_forces_manual_review()
@@ -1423,6 +1669,7 @@ def main():
     test_every_add_branch_carries_the_verdict()
     test_batch_add_uses_structured_verdict_not_prose()
     test_candidate_commonness_wiring_and_timeout()
+    test_audit_budget_nesting_and_timeout_retains_review()
 
     print("\n" + "=" * 60)
     print(f"Results: {passed}/{passed + failed} passed" + (f", {failed} failed" if failed else ""))

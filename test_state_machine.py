@@ -11917,6 +11917,113 @@ def test_orchestrator_blocks_encode_after_unresolved_review():
     asyncio.run(_run())
 
 
+def test_orchestrator_suppresses_retried_reviewed_add():
+    """A cosmetic model retry must reuse the completed reviewed-add result."""
+    print("\n🧪 AgentOrchestrator suppresses retried reviewed-add")
+
+    async def _run():
+        def review_call(call_id, word):
+            return types.SimpleNamespace(
+                id=call_id,
+                type="function",
+                function=types.SimpleNamespace(
+                    name="keytao_prepare_reviewed_add",
+                    arguments=json.dumps({"word": word}, ensure_ascii=False),
+                ),
+            )
+
+        client = _FakeClient([
+            _FakeAIResponse(
+                "tool_calls",
+                "",
+                [review_call("call_review_first", "石蒜")],
+                reasoning_content="",
+            ),
+            _FakeAIResponse(
+                "tool_calls",
+                "",
+                [review_call("call_review_retry", "　石蒜 ")],
+                reasoning_content="",
+            ),
+            _FakeAIResponse("stop", "已使用第一次审词结果。"),
+        ])
+        review_calls = []
+
+        async def review(word, platform, platform_id):
+            review_calls.append((word, platform, platform_id))
+            return {
+                "success": True,
+                "word": str(word).strip(),
+                "recommendedCode": "ekso",
+                "pronunciations": [{
+                    "normalized": ["shi", "suan"],
+                    "codes": ["ekso"],
+                }],
+            }
+
+        class ReviewSkillsManager:
+            def get_skill_instructions(self):
+                return ""
+
+            def has_tools(self):
+                return True
+
+            def get_tools(self):
+                return [{
+                    "type": "function",
+                    "function": {
+                        "name": "keytao_prepare_reviewed_add",
+                        "description": "review",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"word": {"type": "string"}},
+                            "required": ["word"],
+                        },
+                    },
+                }]
+
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="deepseek-v4-flash",
+                max_tokens=1000,
+                temperature=0.7,
+                timeout=180.0,
+            ),
+            skills_manager=ReviewSkillsManager(),
+            tool_executor=ToolExecutor(
+                lambda name: review
+                if name == "keytao_prepare_reviewed_add"
+                else None,
+                frozenset({"keytao_prepare_reviewed_add"}),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        result = await orchestrator.run(
+            "加词 石蒜",
+            AgentRequestContext(platform="qq", user_id="trusted-user"),
+        )
+
+        tool_messages = [
+            message
+            for message in client.completions.calls[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        check(
+            "reviewed-add executes once across a cosmetic model retry",
+            review_calls == [("石蒜", "qq", "trusted-user")],
+        )
+        check(
+            "retry receives the shared duplicate-call instruction",
+            any("重复调用，已忽略" in message.get("content", "") for message in tool_messages),
+        )
+        check("agent finishes from the first review result", result == "已使用第一次审词结果。")
+
+    asyncio.run(_run())
+
+
 async def _run_orchestrator_tool_batch_validation_checks():
     async def run_case(finish_reason, tool_calls):
         executed = []
@@ -13451,6 +13558,7 @@ if __name__ == "__main__":
     test_pending_replay_transport_failure_retains_exact_ticket()
     test_orchestrator_reasoning_round_trip()
     test_orchestrator_blocks_encode_after_unresolved_review()
+    test_orchestrator_suppresses_retried_reviewed_add()
     test_orchestrator_tool_batch_validation()
     test_normalize_encode_response_codes_first()
     test_keytao_encode_forwards_meaning_gated_pronunciation()

@@ -685,7 +685,6 @@ async def async_main(args: argparse.Namespace) -> int:
         recorder=recorder,
         scenario_getter=recorder.current_scenario,
         encode_delay=encode_delay,
-        pronunciation_poison=pronunciation_poison,
     )
     safety_proof = make_safety_proof(guard)
     selected_ids = {args.only.upper()} if args.only else {item.scenario_id for item in SCENARIOS}
