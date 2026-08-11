@@ -122,12 +122,16 @@ CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
 # per-source budget below so a source can finish within its own deadline.
 PRONUNCIATION_EVIDENCE_TIMEOUT = 8.0
 PRONUNCIATION_SOURCE_TIMEOUT = 6.0
+PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT = 2.25
+PRONUNCIATION_FETCH_MAX_ATTEMPTS = 2
+PRONUNCIATION_FETCH_RETRYABLE_STATUSES = (408, 425, 429, 500, 502, 503, 504)
 PRONUNCIATION_WORD_BINDING_WINDOW_CHARS = 80
 KEYTAO_ENCODE_REQUEST_TIMEOUT = 10.0
 KEYTAO_ENCODE_MAX_ATTEMPTS = 2
 REVIEW_LOOKUP_REQUEST_TIMEOUT = 3.0
 REVIEW_LOOKUP_MAX_ATTEMPTS = 2
 ENTITY_DIRECT_FETCH_TIMEOUT = 3.0
+ENTITY_DIRECT_FETCH_ATTEMPT_TIMEOUT = 2.9
 ENTITY_PRONUNCIATION_MIN_CONFIDENCE = 0.75
 CONTEXT_ENTITY_SOURCE_DOMAINS = ("baike.baidu.com", "zh.wikipedia.org")
 
@@ -609,6 +613,66 @@ def _extract_so360_results(content: str, max_results: int) -> List[Dict[str, str
     return _dedupe_search_results(results, max_results)
 
 
+class _LookupText(str):
+    def __new__(cls, value: str, *, lookup_status: str = "completed"):
+        instance = super().__new__(cls, value)
+        instance.lookup_status = lookup_status
+        return instance
+
+
+class _LookupResults(list):
+    def __init__(self, values: Sequence[Any], *, lookup_status: str = "completed"):
+        super().__init__(values)
+        self.lookup_status = lookup_status
+
+
+def _is_timeout_error(error: BaseException) -> bool:
+    return isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
+
+
+def _merge_lookup_status(statuses: Sequence[str]) -> str:
+    normalized = {str(status or "completed") for status in statuses}
+    if "timed_out" in normalized:
+        return "timed_out"
+    if "errored" in normalized:
+        return "errored"
+    return "completed"
+
+
+async def _fetch_review_url(
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    max_attempts: int = PRONUNCIATION_FETCH_MAX_ATTEMPTS,
+    attempt_timeout: float = PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT,
+) -> Any:
+    async def attempt() -> Any:
+        try:
+            return await asyncio.wait_for(
+                http_client.guarded_fetch(
+                    url,
+                    params=params,
+                    timeout=attempt_timeout,
+                ),
+                timeout=attempt_timeout,
+            )
+        except http_client.BlockedUrlError as error:
+            if getattr(error, "transient", False):
+                raise http_client.TransientFetchError(str(error)) from error
+            raise
+
+    return await http_client.request_with_retries(
+        attempt,
+        method="GET",
+        url=url,
+        max_attempts=max_attempts,
+        retry_statuses=PRONUNCIATION_FETCH_RETRYABLE_STATUSES,
+        retry_connect_errors=True,
+        retry_transport_errors=True,
+        retry_exceptions=(TimeoutError, http_client.TransientFetchError),
+    )
+
+
 async def _search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
     query = query.strip()
     if not query:
@@ -622,6 +686,7 @@ async def _search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
     )
     merged: List[Dict[str, str]] = []
     failures: List[str] = []
+    failure_statuses: List[str] = []
     try:
         for provider, endpoint, params, extractor in providers:
             try:
@@ -629,7 +694,7 @@ async def _search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
                 # capped on the wire. Search engines redirect, and their result
                 # pages are attacker-influencable, so this must not use a plain
                 # client.
-                response = await http_client.guarded_fetch(endpoint, params=params)
+                response = await _fetch_review_url(endpoint, params=params)
                 if not response.is_success:
                     raise RuntimeError(f"HTTP {response.status_code}")
                 results = extractor(response.text, max_results)
@@ -640,16 +705,27 @@ async def _search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
                     break
             except Exception as error:
                 failures.append(f"{provider}: {error}")
+                failure_statuses.append(
+                    "timed_out" if _is_timeout_error(error) else "errored"
+                )
                 logger.debug(f"Review search provider {provider} failed for {query}: {error}")
         if not merged and failures:
             logger.debug(f"Review search returned no results for {query}; provider failures: {'; '.join(failures)}")
-        return merged
+        return _LookupResults(
+            merged,
+            lookup_status=_merge_lookup_status(failure_statuses),
+        )
     except Exception as error:
         logger.warning(f"Review search failed for {query}: {error}")
-        return []
+        return _LookupResults([], lookup_status="errored")
 
 
-async def _fetch_text(url: str) -> str:
+async def _fetch_text(
+    url: str,
+    *,
+    max_attempts: int = PRONUNCIATION_FETCH_MAX_ATTEMPTS,
+    attempt_timeout: float = PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT,
+) -> str:
     """Fetch a search-result page.
 
     The URL comes from a search engine, i.e. it is attacker-influencable: anyone
@@ -657,16 +733,28 @@ async def _fetch_text(url: str) -> str:
     therefore MUST go through the guarded, IP-pinned egress.
     """
     try:
-        response = await http_client.guarded_fetch(url)
+        response = await _fetch_review_url(
+            url,
+            max_attempts=max_attempts,
+            attempt_timeout=attempt_timeout,
+        )
+        if response.status_code in {404, 410}:
+            return _LookupText("", lookup_status="completed")
         if not response.is_success:
             raise RuntimeError(f"HTTP {response.status_code}")
-        return _strip_tags(response.text[:150000])
+        return _LookupText(
+            _strip_tags(response.text[:150000]),
+            lookup_status="completed",
+        )
     except http_client.BlockedUrlError as error:
         logger.warning(f"Review page fetch blocked for {url}: {error}")
-        return ""
+        return _LookupText("", lookup_status="errored")
     except Exception as error:
         logger.debug(f"Review page fetch failed for {url}: {error}")
-        return ""
+        return _LookupText(
+            "",
+            lookup_status=("timed_out" if _is_timeout_error(error) else "errored"),
+        )
 
 
 def _source_by_id(source_id: str) -> Dict[str, Any]:
@@ -738,43 +826,51 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
     if cached is not None:
         return cached
 
-    source_entries: List[Dict[str, Any]] = []
-    rejections: List[Dict[str, Any]] = []
-
-    async def inspect_source(source: Dict[str, Any]) -> None:
+    async def inspect_source(source: Dict[str, Any]) -> Dict[str, Any]:
         # Direct pages and the site-scoped search run together; inside each,
         # every outbound fetch is issued in parallel as well. Serial per-URL
         # fetching is what used to blow through the total budget.
-        async def direct_texts() -> List[Tuple[str, str, str, bool]]:
+        async def direct_texts() -> Tuple[List[Tuple[str, str, str, bool]], str]:
             urls = [
                 url_template.format(word=quote(word))
                 for url_template in source.get("direct_urls", [])
             ]
             if not urls:
-                return []
-            pages = await asyncio.gather(*(_fetch_text(url) for url in urls))
-            return [
-                (
-                    source["label"],
-                    url,
-                    text[:12000],
-                    _direct_url_entry_matches_word(url, word),
-                )
-                for url, text in zip(urls, pages)
-                if text
-            ]
+                return [], "completed"
+            pages = await asyncio.gather(
+                *(_fetch_text(url) for url in urls),
+                return_exceptions=True,
+            )
+            collected: List[Tuple[str, str, str, bool]] = []
+            statuses: List[str] = []
+            for url, page in zip(urls, pages):
+                if isinstance(page, BaseException):
+                    statuses.append(
+                        "timed_out" if _is_timeout_error(page) else "errored"
+                    )
+                    continue
+                statuses.append(str(getattr(page, "lookup_status", "completed")))
+                if page:
+                    collected.append((
+                        source["label"],
+                        url,
+                        page[:12000],
+                        _direct_url_entry_matches_word(url, word),
+                    ))
+            return collected, _merge_lookup_status(statuses)
 
-        async def search_texts() -> List[Tuple[str, str, str, bool]]:
+        async def search_texts() -> Tuple[List[Tuple[str, str, str, bool]], str]:
             results = await _search_web(source["query"].format(word=word), max_results=2)
+            statuses = [str(getattr(results, "lookup_status", "completed"))]
             matching = [
                 result for result in results
                 if source["domain"] in urlparse(result.get("url", "")).netloc
             ]
             if not matching:
-                return []
+                return [], _merge_lookup_status(statuses)
             pages = await asyncio.gather(*(
                 _fetch_text(result.get("url", "")) for result in matching
-            ))
+            ), return_exceptions=True)
             collected: List[Tuple[str, str, str, bool]] = []
             for result, page_text in zip(matching, pages):
                 url = result.get("url", "")
@@ -784,24 +880,54 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                     f"{result.get('title', '')} {result.get('snippet', '')}",
                     False,
                 ))
+                if isinstance(page_text, BaseException):
+                    statuses.append(
+                        "timed_out" if _is_timeout_error(page_text) else "errored"
+                    )
+                    continue
+                statuses.append(
+                    str(getattr(page_text, "lookup_status", "completed"))
+                )
                 if page_text:
                     collected.append((source["label"], url, page_text[:12000], False))
-            return collected
+            return collected, _merge_lookup_status(statuses)
 
-        try:
-            direct, searched = await asyncio.wait_for(
-                asyncio.gather(direct_texts(), search_texts()),
-                timeout=PRONUNCIATION_SOURCE_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            # A slow source degrades only itself.
+        tasks = [
+            asyncio.create_task(direct_texts()),
+            asyncio.create_task(search_texts()),
+        ]
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=PRONUNCIATION_SOURCE_TIMEOUT,
+        )
+        statuses = ["timed_out"] if pending else []
+        texts: List[Tuple[str, str, str, bool]] = []
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in tasks:
+            if task not in done:
+                continue
+            try:
+                task_texts, task_status = task.result()
+            except Exception as error:
+                statuses.append(
+                    "timed_out" if _is_timeout_error(error) else "errored"
+                )
+                continue
+            texts.extend(task_texts)
+            statuses.append(task_status)
+
+        status = _merge_lookup_status(statuses)
+        if status == "timed_out":
             logger.debug(f"Pronunciation source {source['id']} timed out for {word}")
-            return
-        except Exception as error:
-            logger.debug(f"Pronunciation source {source['id']} failed for {word}: {error}")
-            return
+        elif status == "errored":
+            logger.debug(f"Pronunciation source {source['id']} failed for {word}")
 
-        for label, url, text, exact_entry_direct_url in [*direct, *searched]:
+        entries: List[Dict[str, Any]] = []
+        source_rejections: List[Dict[str, Any]] = []
+        for label, url, text, exact_entry_direct_url in texts:
             sequences, rejected_unbound = _extract_labeled_pinyin_sequences(
                 text,
                 word,
@@ -815,14 +941,14 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                     "reason": "queried_word_not_near_pinyin_label",
                     "count": rejected_unbound,
                 }
-                rejections.append(rejection)
+                source_rejections.append(rejection)
                 logger.warning(
                     "Pronunciation evidence rejected for "
                     f"{word} from {url}: queried word absent within "
                     f"+/-{PRONUNCIATION_WORD_BINDING_WINDOW_CHARS} characters"
                 )
             for sequence in sequences:
-                source_entries.append({
+                entries.append({
                     "sourceId": source["id"],
                     "source": label,
                     "url": url,
@@ -831,8 +957,38 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                     "category": source["category"],
                     "trust": source["trust"],
                 })
+        return {
+            "sourceId": source["id"],
+            "source": source["label"],
+            "status": status,
+            "entries": entries,
+            "rejections": source_rejections,
+        }
 
-    await asyncio.gather(*(inspect_source(source) for source in AUTHORITATIVE_SOURCES))
+    inspected = await asyncio.gather(*(
+        inspect_source(source) for source in AUTHORITATIVE_SOURCES
+    ))
+    source_entries = [
+        entry
+        for outcome in inspected
+        for entry in outcome["entries"]
+    ]
+    rejections = [
+        rejection
+        for outcome in inspected
+        for rejection in outcome["rejections"]
+    ]
+    source_outcomes = [
+        {
+            "sourceId": outcome["sourceId"],
+            "source": outcome["source"],
+            "status": outcome["status"],
+        }
+        for outcome in inspected
+    ]
+    lookup_complete = all(
+        outcome["status"] == "completed" for outcome in source_outcomes
+    )
 
     groups: Dict[Tuple[str, ...], Dict[str, Any]] = {}
     for entry in source_entries:
@@ -865,9 +1021,16 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         "sources": source_entries,
         "hasEvidence": bool(sorted_groups),
         "rejections": rejections,
+        "lookupStatus": "completed" if lookup_complete else "incomplete",
+        "lookupComplete": lookup_complete,
+        "sourceOutcomes": source_outcomes,
     }
-    # Only successful results are cached; timeouts/failures must be retried.
-    return _cache_set(word, "pronunciation_evidence", result)
+    # Any incomplete lookup must be retried. In particular, an incomplete
+    # zero-evidence result is not authoritative evidence that the word has no
+    # source page.
+    if lookup_complete:
+        return _cache_set(word, "pronunciation_evidence", result)
+    return result
 
 
 async def collect_pronunciation_evidence_limited(word: str) -> Dict[str, Any]:
@@ -885,6 +1048,9 @@ async def collect_pronunciation_evidence_limited(word: str) -> Dict[str, Any]:
             "groups": [],
             "sources": [],
             "timeout": True,
+            "lookupStatus": "incomplete",
+            "lookupComplete": False,
+            "sourceOutcomes": [],
         }
 
 
@@ -1477,6 +1643,34 @@ async def prepare_reviewed_word(
     if isinstance(encode_data, BaseException):
         encode_data = {"success": False, "message": str(encode_data)}
 
+    source_outcomes = [
+        outcome
+        for outcome in (evidence.get("sourceOutcomes") or [])
+        if isinstance(outcome, dict)
+    ]
+    if "lookupComplete" in evidence:
+        evidence_lookup_complete = evidence.get("lookupComplete") is True
+    else:
+        # Backward-compatible for cached/test payloads produced before lookup
+        # outcome tracking existed.
+        evidence_lookup_complete = bool(evidence.get("success")) and not bool(
+            evidence.get("timeout")
+        )
+    evidence_lookup_status = str(
+        evidence.get("lookupStatus")
+        or ("completed" if evidence_lookup_complete else "incomplete")
+    )
+    failed_source_labels = list(dict.fromkeys(
+        str(outcome.get("source") or outcome.get("sourceId") or "").strip()
+        for outcome in source_outcomes
+        if outcome.get("status") != "completed"
+        and str(outcome.get("source") or outcome.get("sourceId") or "").strip()
+    ))
+    evidence_failure_summary = ""
+    if not evidence_lookup_complete:
+        source_suffix = f"（{'、'.join(failed_source_labels)}）" if failed_source_labels else ""
+        evidence_failure_summary = f"本次权威来源查询未完成{source_suffix}"
+
     if not encode_data.get("success", True) and not encode_data.get("codes"):
         return apply_review_disposition({
             "success": False,
@@ -1597,6 +1791,12 @@ async def prepare_reviewed_word(
                 default_sequence,
             )
         if not groups and entity_group:
+            if evidence_failure_summary:
+                entity_group = dict(entity_group)
+                entity_summary = str(entity_group.get("sourceSummary") or "").strip()
+                entity_group["sourceSummary"] = "；".join(
+                    value for value in (entity_summary, evidence_failure_summary) if value
+                )
             groups = [entity_group]
         elif not groups and default_sequence:
             groups = [{
@@ -1608,6 +1808,7 @@ async def prepare_reviewed_word(
                 "fallback": True,
                 "requiresManualReview": True,
                 "readingEvidenceKind": "own_character",
+                "sourceSummary": evidence_failure_summary,
             }]
 
     groups, final_validation_rejections = _validated_pronunciation_groups(
@@ -1700,11 +1901,14 @@ async def prepare_reviewed_word(
     )
     auto_reviewable = (
         has_authority
+        and evidence_lookup_complete
         and not lookup_failed
         and not requires_manual_pronunciation_review
     )
     if lookup_failed:
         auto_review_reason = LOOKUP_FAILURE_REASON
+    elif not evidence_lookup_complete:
+        auto_review_reason = f"{evidence_failure_summary}，本轮仍需管理员审核"
     elif has_authority:
         auto_review_reason = "至少一个权威来源给出读音"
     elif has_semantic_pronunciation:
@@ -1721,6 +1925,9 @@ async def prepare_reviewed_word(
         "autoReviewable": auto_reviewable,
         "autoReviewReason": auto_review_reason,
         "lookupFailed": lookup_failed,
+        "pronunciationEvidenceStatus": evidence_lookup_status,
+        "pronunciationEvidenceComplete": evidence_lookup_complete,
+        "pronunciationSourceOutcomes": source_outcomes,
         "requiresManualPronunciationReview": requires_manual_pronunciation_review,
         "standardPronunciationStatus": standard_status,
         "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
@@ -1742,6 +1949,8 @@ async def prepare_reviewed_word(
     apply_manual_review_flag(result, not auto_reviewable, auto_review_reason)
     if lookup_failed:
         return apply_review_disposition(result, "lookup_unavailable")
+    if not evidence_lookup_complete:
+        return apply_review_disposition(result, "pronunciation_lookup_incomplete")
     if requires_manual_pronunciation_review:
         evidence_kinds = {
             str(pronunciation.get("readingEvidenceKind") or "")
@@ -2550,7 +2759,14 @@ def _entity_direct_source_urls(word: str, entity: Dict[str, Any]) -> List[Tuple[
 
 async def _fetch_entity_direct_hits(word: str, entity: Dict[str, Any]) -> List[Dict[str, str]]:
     async def inspect_url(label: str, url: str) -> Optional[Dict[str, str]]:
-        text = await _fetch_text(url)
+        # This caller has its own 3-second outer budget. It deliberately keeps
+        # one attempt instead of inheriting the pronunciation collector's
+        # 2.25s + 0.5s + 2.25s retry schedule.
+        text = await _fetch_text(
+            url,
+            max_attempts=1,
+            attempt_timeout=ENTITY_DIRECT_FETCH_ATTEMPT_TIMEOUT,
+        )
         if not text:
             return None
         if not _looks_like_entity_text(word, text[:16000], entity):
@@ -3460,6 +3676,28 @@ class _AuditProgress:
         return result
 
 
+def _pronunciation_lookup_incomplete_reason(review: Dict[str, Any]) -> str:
+    if not (
+        review.get("pronunciationEvidenceComplete") is False
+        or review.get("reviewVerdictSite") == "pronunciation_lookup_incomplete"
+    ):
+        return ""
+    reason = manual_review_reason(review) or str(
+        review.get("autoReviewReason") or ""
+    ).strip()
+    if reason:
+        return reason
+    failed_sources = list(dict.fromkeys(
+        str(outcome.get("source") or outcome.get("sourceId") or "").strip()
+        for outcome in (review.get("pronunciationSourceOutcomes") or [])
+        if isinstance(outcome, dict)
+        and outcome.get("status") != "completed"
+        and str(outcome.get("source") or outcome.get("sourceId") or "").strip()
+    ))
+    suffix = f"（{'、'.join(failed_sources)}）" if failed_sources else ""
+    return f"本次权威来源查询未完成{suffix}"
+
+
 async def _shared_prepare_reviewed_word(
     config: ReviewHttpConfig,
     word: str,
@@ -3594,6 +3832,24 @@ async def _audit_single_item(
             outcome.issues.append(issue)
             outcome.sealed_issues.append(issue)
             return outcome
+        incomplete_details = [
+            f"「{review_word}」{reason}"
+            for review_word, reason in (
+                (old_word, _pronunciation_lookup_incomplete_reason(old_review)),
+                (word, _pronunciation_lookup_incomplete_reason(new_review)),
+            )
+            if reason
+        ]
+        if incomplete_details:
+            issue = (
+                f"改词「{old_word}→{word}」权威来源查询未完成："
+                f"{'；'.join(incomplete_details)}"
+            )
+            if "管理员审核" not in issue:
+                issue += "，需要管理员审核"
+            outcome.issues.append(issue)
+            outcome.sealed_issues.append(issue)
+            return outcome
         if new_review.get("autoReviewable") and not old_review.get("autoReviewable"):
             outcome.approved_items.append(f"改词：{old_word}→{word}@{code}，新词有权威读音证据，旧词未找到权威证据")
             return outcome
@@ -3618,6 +3874,15 @@ async def _audit_single_item(
             f"「{word}」@{code} "
             f"{review.get('lookupFailureReason') or LOOKUP_FAILURE_REASON}，需要管理员审核"
         )
+        outcome.issues.append(issue)
+        outcome.sealed_issues.append(issue)
+        return outcome
+
+    pronunciation_lookup_reason = _pronunciation_lookup_incomplete_reason(review)
+    if pronunciation_lookup_reason:
+        issue = f"「{word}」@{code} {pronunciation_lookup_reason}"
+        if "管理员审核" not in issue:
+            issue += "，需要管理员审核"
         outcome.issues.append(issue)
         outcome.sealed_issues.append(issue)
         return outcome

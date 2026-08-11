@@ -299,6 +299,7 @@ async def request_with_retries(
     retry_statuses: Iterable[int] = (),
     retry_connect_errors: bool = False,
     retry_transport_errors: bool = False,
+    retry_exceptions: Iterable[type[BaseException]] = (),
 ) -> Any:
     """Run one HTTP request with timeout retries that respect replay safety.
 
@@ -316,6 +317,7 @@ async def request_with_retries(
     )
     attempts = max(1, int(max_attempts))
     retryable_statuses = frozenset(retry_statuses)
+    additional_retry_exceptions = tuple(retry_exceptions)
 
     async def wait_before_retry(attempt: int, reason: str) -> None:
         logger.info(
@@ -344,6 +346,11 @@ async def request_with_retries(
             continue
         except httpx.TransportError as error:
             if not (replay_safe and retry_transport_errors) or attempt >= attempts:
+                raise
+            await wait_before_retry(attempt, f"{type(error).__name__}: {error}")
+            continue
+        except additional_retry_exceptions as error:
+            if not replay_safe or attempt >= attempts:
                 raise
             await wait_before_retry(attempt, f"{type(error).__name__}: {error}")
             continue
@@ -577,6 +584,17 @@ _BLOCKED_IPV6_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
 class BlockedUrlError(Exception):
     """Raised when a fetch target fails scheme or address validation."""
 
+    def __init__(self, message: str, *, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
+
+
+class TransientFetchError(BlockedUrlError):
+    """Raised when guarded egress validation failed for a retryable reason."""
+
+    def __init__(self, message: str):
+        super().__init__(message, transient=True)
+
 
 def _unwrap_ipv6(address: Any) -> list:
     """Return every IPv4 address embedded in an IPv6 wrapper form."""
@@ -668,10 +686,10 @@ async def resolve_validated_addresses(host: Optional[str], port: Optional[int]) 
             lambda: socket.getaddrinfo(hostname, port or 0, 0, socket.SOCK_STREAM),
         )
     except Exception as error:
-        raise BlockedUrlError(f"域名解析失败：{hostname}（{error}）")
+        raise TransientFetchError(f"域名解析失败：{hostname}（{error}）")
 
     if not infos:
-        raise BlockedUrlError(f"域名解析失败：{hostname}")
+        raise TransientFetchError(f"域名解析失败：{hostname}")
 
     addresses = []
     for info in infos:

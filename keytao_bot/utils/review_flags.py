@@ -45,6 +45,7 @@ REVIEW_VERDICT_SITE_POLICIES = {
     "invalid_code": ReviewDisposition.BLOCK,
     "injection_shaped_input": ReviewDisposition.BLOCK,
     "missing_authoritative_page": ReviewDisposition.SEAL,
+    "pronunciation_lookup_incomplete": ReviewDisposition.SEAL,
     "entity_context_reading": ReviewDisposition.SEAL,
     "unvalidated_type": ReviewDisposition.SEAL,
     "pre_submit_judgement": ReviewDisposition.SEAL,

@@ -160,6 +160,7 @@ def test_review_disposition_registry():
         "invalid_code": ReviewDisposition.BLOCK,
         "injection_shaped_input": ReviewDisposition.BLOCK,
         "missing_authoritative_page": ReviewDisposition.SEAL,
+        "pronunciation_lookup_incomplete": ReviewDisposition.SEAL,
         "entity_context_reading": ReviewDisposition.SEAL,
         "unvalidated_type": ReviewDisposition.SEAL,
         "pre_submit_judgement": ReviewDisposition.SEAL,
@@ -560,6 +561,406 @@ def test_pronunciation_groups_require_known_character_readings():
             read_review_disposition(unavailable) is ReviewDisposition.BLOCK,
         )
         check("unavailable rejection is logged", unavailable_log.call_count >= 1)
+
+    asyncio.run(_run())
+
+
+def test_pronunciation_source_failure_is_not_cached_and_retry_refetches():
+    print("\n🧪 failed pronunciation lookup is not cached")
+
+    async def _run():
+        review_module._clear_review_caches()
+        fetch_calls = 0
+        source = {
+            "id": "handian",
+            "label": "汉典",
+            "domain": "zdic.net",
+            "category": "dictionary",
+            "trust": 5,
+            "query": 'site:zdic.net "{word}" 拼音',
+            "direct_urls": ["https://www.zdic.net/hans/{word}"],
+        }
+
+        async def cold_then_ready(_url):
+            nonlocal fetch_calls
+            fetch_calls += 1
+            if fetch_calls == 1:
+                raise RuntimeError("simulated cold-start fetch failure")
+            return "诉讼费 拼音：sù sòng fèi 注音"
+
+        with (
+            patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+            patch.object(review_module, "_fetch_text", side_effect=cold_then_ready),
+            patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
+        ):
+            failed_lookup = await review_module.collect_pronunciation_evidence("诉讼费")
+            retried_lookup = await review_module.collect_pronunciation_evidence("诉讼费")
+            cached_positive = await review_module.collect_pronunciation_evidence("诉讼费")
+
+        check("failed lookup is marked incomplete", failed_lookup.get("lookupComplete") is False)
+        check("failed source outcome is exposed", failed_lookup.get("sourceOutcomes") == [{
+            "sourceId": "handian",
+            "source": "汉典",
+            "status": "errored",
+        }])
+        check("retry re-fetches after the failure", fetch_calls == 2)
+        recovered_group = next(iter(retried_lookup.get("groups") or []), {})
+        check("retry recovers authoritative evidence", recovered_group.get("pinyin") == "su song fei")
+        check("recovered positive result is cached", cached_positive == retried_lookup)
+
+    asyncio.run(_run())
+
+
+def test_review_fetch_retries_transient_dns_within_source_budget():
+    print("\n🧪 review fetch retries cold DNS within the source budget")
+
+    class FakeTransportError(Exception):
+        pass
+
+    class FakeTimeoutException(FakeTransportError):
+        pass
+
+    class FakeConnectTimeout(FakeTimeoutException):
+        pass
+
+    class FakeConnectError(FakeTransportError):
+        pass
+
+    async def _run():
+        attempts = []
+
+        class FetchResponse:
+            status_code = 200
+            is_success = True
+            text = "诉讼费 拼音：sù sòng fèi"
+
+        async def cold_dns_then_success(_url, **kwargs):
+            attempts.append(kwargs.get("timeout"))
+            if len(attempts) == 1:
+                raise review_module.http_client.BlockedUrlError(
+                    "域名解析失败：www.zdic.net（temporary failure）",
+                    transient=True,
+                )
+            return FetchResponse()
+
+        fake_httpx = sys.modules["httpx"]
+        with (
+            patch.object(fake_httpx, "ConnectTimeout", FakeConnectTimeout, create=True),
+            patch.object(fake_httpx, "TimeoutException", FakeTimeoutException, create=True),
+            patch.object(fake_httpx, "ConnectError", FakeConnectError, create=True),
+            patch.object(fake_httpx, "TransportError", FakeTransportError, create=True),
+            patch.object(review_module.http_client, "guarded_fetch", side_effect=cold_dns_then_success),
+        ):
+            text = await review_module._fetch_text(
+                "https://www.zdic.net/hans/%E8%AF%89%E8%AE%BC%E8%B4%B9"
+            )
+
+        worst_case = (
+            review_module.PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT
+            * review_module.PRONUNCIATION_FETCH_MAX_ATTEMPTS
+            + 0.5
+        )
+        check("cold DNS retry returns the authoritative page", "sù sòng fèi" in text)
+        check("cold DNS failure gets one bounded retry", len(attempts) == 2)
+        check("each attempt uses the bounded timeout", attempts == [
+            review_module.PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT,
+            review_module.PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT,
+        ])
+        check("two attempts plus backoff fit the source budget", worst_case < review_module.PRONUNCIATION_SOURCE_TIMEOUT)
+
+    asyncio.run(_run())
+
+
+def test_entity_direct_fetch_keeps_its_single_attempt_budget():
+    print("\n🧪 entity direct fetch keeps its original single-attempt budget")
+
+    async def _run():
+        fetch_policies = []
+
+        async def empty_page(_url, **kwargs):
+            fetch_policies.append(kwargs)
+            return ""
+
+        with (
+            patch.object(review_module, "_entity_direct_source_urls", return_value=[(
+                "汉典",
+                "https://www.zdic.net/hans/%E8%AF%89%E8%AE%BC%E8%B4%B9",
+            )]),
+            patch.object(review_module, "_fetch_text", side_effect=empty_page),
+        ):
+            hits = await review_module._fetch_entity_direct_hits(
+                "诉讼费",
+                {"entityType": "common_word", "description": "诉讼案件费用"},
+            )
+
+        check("empty entity page yields no hit", hits == [])
+        check("entity direct fetch does not inherit the two-attempt pronunciation policy", fetch_policies == [{
+            "max_attempts": 1,
+            "attempt_timeout": review_module.ENTITY_DIRECT_FETCH_ATTEMPT_TIMEOUT,
+        }])
+        check(
+            "entity attempt keeps nearly all of its outer budget with cancellation margin",
+            review_module.ENTITY_DIRECT_FETCH_ATTEMPT_TIMEOUT
+            < review_module.ENTITY_DIRECT_FETCH_TIMEOUT
+            and review_module.ENTITY_DIRECT_FETCH_TIMEOUT
+            - review_module.ENTITY_DIRECT_FETCH_ATTEMPT_TIMEOUT
+            >= 0.09,
+        )
+
+    asyncio.run(_run())
+
+
+def test_pronunciation_source_timeout_is_exposed_and_not_cached():
+    print("\n🧪 timed-out pronunciation lookup is not cached")
+
+    async def _run():
+        review_module._clear_review_caches()
+        fetch_calls = 0
+        source = {
+            "id": "handian",
+            "label": "汉典",
+            "domain": "zdic.net",
+            "category": "dictionary",
+            "trust": 5,
+            "query": 'site:zdic.net "{word}" 拼音',
+            "direct_urls": ["https://www.zdic.net/hans/{word}"],
+        }
+
+        async def never_finishes(_url):
+            nonlocal fetch_calls
+            fetch_calls += 1
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+            patch.object(review_module, "PRONUNCIATION_SOURCE_TIMEOUT", 0.01),
+            patch.object(review_module, "_fetch_text", side_effect=never_finishes),
+            patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
+        ):
+            first = await review_module.collect_pronunciation_evidence("超时词")
+            second = await review_module.collect_pronunciation_evidence("超时词")
+
+        check("timed-out lookup is marked incomplete", first.get("lookupComplete") is False)
+        check("timed-out source outcome is exposed", first.get("sourceOutcomes") == [{
+            "sourceId": "handian",
+            "source": "汉典",
+            "status": "timed_out",
+        }])
+        check("timed-out lookup is fetched again", fetch_calls == 2 and second.get("lookupComplete") is False)
+
+    asyncio.run(_run())
+
+
+def test_pronunciation_genuine_no_evidence_is_cached():
+    print("\n🧪 completed pronunciation miss is cached")
+
+    async def _run():
+        review_module._clear_review_caches()
+        fetch_calls = 0
+        source = {
+            "id": "handian",
+            "label": "汉典",
+            "domain": "zdic.net",
+            "category": "dictionary",
+            "trust": 5,
+            "query": 'site:zdic.net "{word}" 拼音',
+            "direct_urls": ["https://www.zdic.net/hans/{word}"],
+        }
+
+        async def no_entry(_url):
+            nonlocal fetch_calls
+            fetch_calls += 1
+            return ""
+
+        with (
+            patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+            patch.object(review_module, "_fetch_text", side_effect=no_entry),
+            patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
+        ):
+            first = await review_module.collect_pronunciation_evidence("不存在词")
+            second = await review_module.collect_pronunciation_evidence("不存在词")
+
+        check("completed miss is marked complete", first.get("lookupComplete") is True)
+        check("completed source outcome is exposed", first.get("sourceOutcomes") == [{
+            "sourceId": "handian",
+            "source": "汉典",
+            "status": "completed",
+        }])
+        check("completed miss has no evidence", first.get("hasEvidence") is False)
+        check("completed miss is served from cache", fetch_calls == 1 and second == first)
+
+    asyncio.run(_run())
+
+
+def test_reviewed_word_distinguishes_incomplete_lookup_from_completed_miss():
+    print("\n🧪 reviewed-word payload distinguishes lookup failure from no evidence")
+
+    async def review_with(evidence):
+        encode_data = {
+            "success": True,
+            "codes": ["ssfw", "ssfwo", "ssfwov"],
+            "altCodes": [],
+            "pronunciationSource": "pinyin-pro-context",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": False,
+            "chars": [
+                {"char": "诉", "pinyin": "sù", "pinyins": ["sù"], "pronunciationLookupStatus": "found"},
+                {"char": "讼", "pinyin": "sòng", "pinyins": ["sòng"], "pronunciationLookupStatus": "found"},
+                {"char": "费", "pinyin": "fèi", "pinyins": ["fèi"], "pronunciationLookupStatus": "found"},
+            ],
+        }
+        with (
+            patch.object(review_module, "collect_pronunciation_evidence_limited", AsyncMock(return_value=evidence)),
+            patch.object(review_module, "fetch_keytao_encode", AsyncMock(return_value=encode_data)),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+            patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+            patch.object(review_module, "_infer_entity_knowledge", AsyncMock(return_value={"recognized": False})),
+            patch.object(review_module, "_contextual_pronunciation_group", AsyncMock(return_value=None)),
+        ):
+            return await prepare_reviewed_word(CONFIG, "诉讼费")
+
+    async def _run():
+        incomplete = await review_with({
+            "success": True,
+            "word": "诉讼费",
+            "groups": [],
+            "sources": [],
+            "hasEvidence": False,
+            "lookupStatus": "incomplete",
+            "lookupComplete": False,
+            "sourceOutcomes": [{
+                "sourceId": "handian",
+                "source": "汉典",
+                "status": "errored",
+            }],
+        })
+        completed = await review_with({
+            "success": True,
+            "word": "诉讼费",
+            "groups": [],
+            "sources": [],
+            "hasEvidence": False,
+            "lookupStatus": "completed",
+            "lookupComplete": True,
+            "sourceOutcomes": [{
+                "sourceId": "handian",
+                "source": "汉典",
+                "status": "completed",
+            }],
+        })
+
+        incomplete_summary = incomplete.get("pronunciations", [{}])[0].get("sourceSummary", "")
+        completed_summary = completed.get("pronunciations", [{}])[0].get("sourceSummary", "")
+        check("failed lookup remains sealed", read_manual_review_flag(incomplete) is True)
+        check(
+            "failed lookup declares the incomplete-lookup SEAL site",
+            read_review_disposition(incomplete) is ReviewDisposition.SEAL
+            and incomplete.get("reviewVerdictSite") == "pronunciation_lookup_incomplete",
+        )
+        check("completed miss remains sealed", read_manual_review_flag(completed) is True)
+        check("caller payload keeps incomplete status", incomplete.get("pronunciationEvidenceComplete") is False)
+        check("caller payload keeps completed status", completed.get("pronunciationEvidenceComplete") is True)
+        check("failed lookup reason says this lookup failed", "本次权威来源查询未完成" in incomplete.get("autoReviewReason", ""))
+        check("failed lookup reason names the failed source", "汉典" in incomplete.get("autoReviewReason", ""))
+        check("failed lookup source summary is truthful", "本次权威来源查询未完成" in incomplete_summary)
+        check("completed miss keeps no-authority wording", completed.get("autoReviewReason") == "未找到权威来源，仅使用编码服务默认读音")
+        check("completed miss is not mislabeled as a failed lookup", "本次权威来源查询未完成" not in completed_summary)
+
+    asyncio.run(_run())
+
+
+def test_audit_never_overrides_incomplete_pronunciation_lookup():
+    print("\n🧪 audit keeps incomplete pronunciation lookups sealed")
+
+    incomplete_review = {
+        "success": True,
+        "word": "诉讼费",
+        "autoReviewable": False,
+        "autoReviewReason": "本次权威来源查询未完成（汉典），本轮仍需管理员审核",
+        "needsManualReview": True,
+        "manualReviewReason": "本次权威来源查询未完成（汉典），本轮仍需管理员审核",
+        "reviewDisposition": "SEAL",
+        "reviewVerdictSite": "pronunciation_lookup_incomplete",
+        "lookupFailed": False,
+        "pronunciationEvidenceComplete": False,
+        "pronunciationSourceOutcomes": [{
+            "sourceId": "handian",
+            "source": "汉典",
+            "status": "errored",
+        }],
+        "existing": [],
+        "pronunciations": [{
+            "pinyin": "su song fei",
+            "codes": ["ssfw", "ssfwo", "ssfwov"],
+            "sources": [],
+            "fallback": True,
+        }],
+    }
+    authoritative_review = {
+        "success": True,
+        "word": "新词",
+        "autoReviewable": True,
+        "needsManualReview": False,
+        "lookupFailed": False,
+        "pronunciationEvidenceComplete": True,
+        "existing": [],
+        "pronunciations": [{
+            "pinyin": "xin ci",
+            "codes": ["xkck"],
+            "sources": [{"source": "汉典", "url": "https://example.test"}],
+        }],
+    }
+
+    async def _run():
+        commonness = AsyncMock(return_value={
+            "success": True,
+            "score": 0.99,
+            "signals": {"corpus": 1.0, "search": 1.0, "dictionary": 1.0},
+            "entityKnowledge": {"accepted": False},
+        })
+        with (
+            patch.object(review_module, "prepare_reviewed_word", AsyncMock(return_value=incomplete_review)),
+            patch.object(review_module, "estimate_word_commonness", commonness),
+        ):
+            create_audit = await audit_draft_items(CONFIG, [{
+                "action": "Create",
+                "word": "诉讼费",
+                "code": "ssfw",
+                "type": "Phrase",
+            }])
+
+        async def review_for_change(_config, word):
+            return incomplete_review if word == "旧词" else authoritative_review
+
+        with patch.object(review_module, "prepare_reviewed_word", side_effect=review_for_change):
+            change_audit = await audit_draft_items(CONFIG, [{
+                "action": "Change",
+                "old_word": "旧词",
+                "word": "新词",
+                "code": "xkck",
+                "type": "Phrase",
+            }])
+
+        check("commonness cannot override an incomplete lookup", commonness.await_count == 0)
+        check("incomplete create remains non-approvable", create_audit.get("autoApprove") is False)
+        check("incomplete create yields no approved item", create_audit.get("approvedItems") == [])
+        check("incomplete create issue names the failed lookup", any(
+            "本次权威来源查询未完成" in issue and "汉典" in issue
+            for issue in create_audit.get("issues", [])
+        ))
+        check("incomplete create issue is structurally sealed", any(
+            "本次权威来源查询未完成" in issue
+            for issue in create_audit.get("structuredManualReviewIssues", [])
+        ))
+        check("incomplete old side blocks change approval", change_audit.get("autoApprove") is False)
+        check("incomplete change yields no approved item", change_audit.get("approvedItems") == [])
+        check("incomplete change is not mislabeled as no authoritative evidence", all(
+            "旧词未找到权威证据" not in issue
+            for issue in change_audit.get("issues", [])
+        ) and any(
+            "权威来源查询未完成" in issue
+            for issue in change_audit.get("issues", [])
+        ))
 
     asyncio.run(_run())
 
@@ -1742,6 +2143,13 @@ def main():
     test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_characters()
     test_pronunciation_word_binding_window_and_exact_direct_entry()
     test_pronunciation_groups_require_known_character_readings()
+    test_pronunciation_source_failure_is_not_cached_and_retry_refetches()
+    test_review_fetch_retries_transient_dns_within_source_budget()
+    test_entity_direct_fetch_keeps_its_single_attempt_budget()
+    test_pronunciation_source_timeout_is_exposed_and_not_cached()
+    test_pronunciation_genuine_no_evidence_is_cached()
+    test_reviewed_word_distinguishes_incomplete_lookup_from_completed_miss()
+    test_audit_never_overrides_incomplete_pronunciation_lookup()
     test_lookup_failure_forces_manual_review()
     test_exact_existing_is_duplicate_not_approval()
     test_compact_json_always_parses()

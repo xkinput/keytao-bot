@@ -9846,7 +9846,7 @@ def test_entity_knowledge_signal_uses_llm_before_search():
                 }
             ]
 
-        async def fake_fetch_text(url):
+        async def fake_fetch_text(url, **_kwargs):
             return ""
 
         with patch.object(keytao_review_module, "_infer_entity_knowledge", side_effect=fake_infer_entity_knowledge):
@@ -9883,7 +9883,7 @@ def test_entity_knowledge_signal_uses_direct_sources_before_search():
                 "reviewHint": "历史人物字号",
             }
 
-        async def fake_fetch_text(url):
+        async def fake_fetch_text(url, **_kwargs):
             if "%E5%B0%89%E8%BF%9F%E6%81%AD" in url:
                 return "尉迟恭，字敬德，唐初名将，民间尊为门神。"
             return ""
@@ -9925,7 +9925,7 @@ def test_entity_knowledge_signal_allows_high_confidence_llm_identity():
                 "reviewHint": "历史人物字号",
             }
 
-        async def fake_fetch_text(url):
+        async def fake_fetch_text(url, **_kwargs):
             return ""
 
         async def fake_search_web(query, max_results=3):
