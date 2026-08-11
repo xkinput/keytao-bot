@@ -1,11 +1,18 @@
 """Conversation and operation state primitives for the agent harness."""
 import asyncio
 import json
+import math
+import os
+import re
+import sqlite3
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Callable, Dict, List, Optional, Tuple, Union
+from pathlib import Path
+from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
+
+from nonebot.log import logger
 
 from .conversation import (
     ConversationAddress,
@@ -375,8 +382,7 @@ class MemoryConversationStateStore:
         # bare "confirm" sent for a consumed ticket could authorize whichever
         # replacement ticket happens to be current when the message arrives.
         requires_reconfirmation = is_mutating_pending or previous is not None
-        self._states[address] = state
-        self._records[address] = PendingStateRecord(
+        record = PendingStateRecord(
             state=state,
             owner_key=address,
             space_key=address.space_key,
@@ -399,6 +405,10 @@ class MemoryConversationStateStore:
                 else {}
             ),
         )
+        if not self._persist_record(record):
+            return False
+        self._states[address] = state
+        self._records[address] = record
         self._evict_over_capacity()
         return self._records.get(address) is not None
 
@@ -411,6 +421,9 @@ class MemoryConversationStateStore:
         self._purge_expired()
         if address is None:
             return None
+        if address in self._records or address in self._states:
+            if not self._delete_persisted(address):
+                return None
         record = self._records.pop(address, None)
         state = self._states.pop(address, None)
         if record is not None:
@@ -436,6 +449,8 @@ class MemoryConversationStateStore:
         address = normalize_conversation_key(record.owner_key, record.space_key)
         record.owner_key = address
         record.space_key = address.space_key
+        if not self._persist_record(record):
+            return False
         self._states[address] = record.state
         self._records[address] = record
         self._evict_over_capacity()
@@ -456,6 +471,8 @@ class MemoryConversationStateStore:
         """Consume the exact ticket, preserving any replacement staged meanwhile."""
         address = normalize_conversation_key(record.owner_key, record.space_key)
         if self._records.get(address) is not record:
+            return False
+        if not self._delete_persisted(address):
             return False
         self._records.pop(address, None)
         self._states.pop(address, None)
@@ -482,11 +499,48 @@ class MemoryConversationStateStore:
         record = self.get_record(key)
         if record is None:
             return None
-        return record.arm_reconfirmation(
+        old_values = (
+            record.requires_reconfirmation,
+            record.confirmation_armed,
+            record.reconfirmation_code,
+            record.reconfirmation_message,
+            dict(record.reconfirmation_intent),
+        )
+        confirmation_code = record.arm_reconfirmation(
             confirmation_message,
             confirmation_intent=confirmation_intent,
             rotate_code=rotate_code,
         )
+        if not self._persist_record(record):
+            (
+                record.requires_reconfirmation,
+                record.confirmation_armed,
+                record.reconfirmation_code,
+                record.reconfirmation_message,
+                record.reconfirmation_intent,
+            ) = old_values
+            return None
+        return confirmation_code
+
+    def bind_origin_prompt_digest(self, key: ConversationKey, digest: str) -> bool:
+        """Persist the exact bot-prompt digest used by native reply binding."""
+        record = self.get_record(key)
+        if record is None:
+            return False
+        previous = record.origin_prompt_digest
+        record.origin_prompt_digest = str(digest or "")
+        if self._persist_record(record):
+            return True
+        record.origin_prompt_digest = previous
+        return False
+
+    def _persist_record(self, record: PendingStateRecord) -> bool:
+        """Persistence hook used by the durable production implementation."""
+        return True
+
+    def _delete_persisted(self, address: ConversationAddress) -> bool:
+        """Persistence hook used by the durable production implementation."""
+        return True
 
     @staticmethod
     def states_equivalent(left: PendingState, right: PendingState) -> bool:
@@ -528,6 +582,8 @@ class MemoryConversationStateStore:
     def delete(self, key: ConversationKey) -> None:
         address = self._resolve_address(key)
         if address is None:
+            return
+        if not self._delete_persisted(address):
             return
         self._states.pop(address, None)
         self._records.pop(address, None)
@@ -608,6 +664,8 @@ class MemoryConversationStateStore:
             ticket_batch = str((state.args or {}).get("batch_id") or "").strip()
             if anchor and ticket_batch and ticket_batch != anchor:
                 continue
+            if not self._delete_persisted(address):
+                continue
             self._states.pop(address, None)
             self._records.pop(address, None)
             dropped += 1
@@ -620,10 +678,14 @@ class MemoryConversationStateStore:
             address for address in self._states
             if address.actor_key == actor_key
         ]
+        deleted = 0
         for address in addresses:
+            if not self._delete_persisted(address):
+                continue
             self._states.pop(address, None)
             self._records.pop(address, None)
-        return len(addresses)
+            deleted += 1
+        return deleted
 
     def _resolve_address(self, key: ConversationKey) -> Optional[ConversationAddress]:
         if isinstance(key, ConversationAddress):
@@ -637,6 +699,9 @@ class MemoryConversationStateStore:
             if record.expires_at <= now
         ]
         for address in expired:
+            # Expiry is fail-closed in memory even if SQLite cleanup is
+            # temporarily unavailable. A later boot re-applies the same TTL.
+            self._delete_persisted(address)
             self._records.pop(address, None)
             self._states.pop(address, None)
 
@@ -649,6 +714,7 @@ class MemoryConversationStateStore:
             key=lambda item: (item[1].created_at, item[1].nonce),
         )[:overflow]
         for address, _ in oldest:
+            self._delete_persisted(address)
             self._records.pop(address, None)
             self._states.pop(address, None)
 
@@ -668,3 +734,330 @@ class MemoryConversationStateStore:
                 and len(state.candidates) <= self._max_pending_items
             )
         return len(repr(state).encode("utf-8")) <= self._max_pending_payload_bytes
+
+
+class SQLiteConversationStateStore(MemoryConversationStateStore):
+    """SQLite-backed tool-confirmation tickets with process-local claims."""
+
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        *,
+        pending_ttl_seconds: float = 14400.0,
+        max_pending: int = 2048,
+        max_pending_payload_bytes: int = 262_144,
+        max_pending_items: int = 200,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        super().__init__(
+            pending_ttl_seconds=pending_ttl_seconds,
+            max_pending=max_pending,
+            max_pending_payload_bytes=max_pending_payload_bytes,
+            max_pending_items=max_pending_items,
+            clock=clock,
+        )
+        if db_path is None:
+            project_root = Path(__file__).parent.parent.parent
+            data_dir = project_root / "data"
+            data_dir.mkdir(exist_ok=True, mode=0o700)
+            db_path = str(data_dir / "pending_confirmations.db")
+        self.db_path = str(db_path)
+        self._secure_storage()
+        self._init_db()
+        self._load_persisted()
+        self._secure_storage()
+        logger.info(f"Initialized pending-confirmation store at: {self.db_path}")
+
+    def _secure_storage(self) -> None:
+        parent = Path(self.db_path).parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            os.chmod(parent, 0o700)
+        except OSError as error:
+            logger.warning(
+                f"Failed to secure pending-confirmation directory {parent}: {error}"
+            )
+        for candidate in (
+            self.db_path,
+            f"{self.db_path}-wal",
+            f"{self.db_path}-shm",
+        ):
+            if not os.path.exists(candidate):
+                continue
+            try:
+                os.chmod(candidate, 0o600)
+            except OSError as error:
+                logger.warning(
+                    f"Failed to secure pending-confirmation database {candidate}: {error}"
+                )
+
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path, timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout = 5000")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA secure_delete = ON")
+            yield conn
+            if conn.in_transaction:
+                conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS pending_confirmations (
+                    platform TEXT NOT NULL,
+                    space_type TEXT NOT NULL,
+                    space_id TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    function_name TEXT NOT NULL,
+                    arguments_json TEXT NOT NULL,
+                    confirmation_source TEXT NOT NULL,
+                    owner_label TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    nonce TEXT NOT NULL,
+                    origin_message_id TEXT NOT NULL DEFAULT '',
+                    origin_prompt_digest TEXT NOT NULL DEFAULT '',
+                    requires_reconfirmation INTEGER NOT NULL DEFAULT 0,
+                    confirmation_armed INTEGER NOT NULL DEFAULT 0,
+                    reconfirmation_code TEXT NOT NULL DEFAULT '',
+                    reconfirmation_message TEXT NOT NULL DEFAULT '',
+                    reconfirmation_intent_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (platform, space_type, space_id, actor_id)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_pending_confirmations_expiry
+                ON pending_confirmations(expires_at)
+            """)
+
+    @staticmethod
+    def _canonical_json(value: object) -> Tuple[str, object]:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return encoded, json.loads(encoded)
+
+    def _persist_record(self, record: PendingStateRecord) -> bool:
+        address = normalize_conversation_key(record.owner_key, record.space_key)
+        if not isinstance(record.state, PendingToolConfirm):
+            # Candidate selection and other conversational state remain
+            # intentionally process-local in this round. Replacing a durable
+            # tool ticket must still remove the old authorization from disk.
+            return self._delete_persisted(address)
+        try:
+            arguments_json, canonical_arguments = self._canonical_json(
+                record.state.args
+            )
+            intent_json, canonical_intent = self._canonical_json(
+                record.reconfirmation_intent
+            )
+        except (TypeError, ValueError) as error:
+            logger.warning(
+                f"Pending confirmation contains non-canonical JSON data: {error}"
+            )
+            return False
+        if not isinstance(canonical_arguments, dict) or not isinstance(
+            canonical_intent, dict
+        ):
+            return False
+        canonical_state = PendingToolConfirm(
+            function_name=str(record.state.function_name),
+            args=canonical_arguments,
+            confirmation_source=str(record.state.confirmation_source),
+        )
+        if not self._state_within_limits(canonical_state):
+            return False
+        try:
+            with self._connect() as conn:
+                conn.execute("""
+                    INSERT INTO pending_confirmations (
+                        platform, space_type, space_id, actor_id,
+                        function_name, arguments_json, confirmation_source,
+                        owner_label, created_at, expires_at, nonce,
+                        origin_message_id, origin_prompt_digest,
+                        requires_reconfirmation, confirmation_armed,
+                        reconfirmation_code, reconfirmation_message,
+                        reconfirmation_intent_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(platform, space_type, space_id, actor_id)
+                    DO UPDATE SET
+                        function_name = excluded.function_name,
+                        arguments_json = excluded.arguments_json,
+                        confirmation_source = excluded.confirmation_source,
+                        owner_label = excluded.owner_label,
+                        created_at = excluded.created_at,
+                        expires_at = excluded.expires_at,
+                        nonce = excluded.nonce,
+                        origin_message_id = excluded.origin_message_id,
+                        origin_prompt_digest = excluded.origin_prompt_digest,
+                        requires_reconfirmation = excluded.requires_reconfirmation,
+                        confirmation_armed = excluded.confirmation_armed,
+                        reconfirmation_code = excluded.reconfirmation_code,
+                        reconfirmation_message = excluded.reconfirmation_message,
+                        reconfirmation_intent_json = excluded.reconfirmation_intent_json,
+                        updated_at = excluded.updated_at
+                """, (
+                    address.platform,
+                    address.space_type,
+                    address.space_id,
+                    address.actor_id,
+                    canonical_state.function_name,
+                    arguments_json,
+                    canonical_state.confirmation_source,
+                    str(record.owner_label or ""),
+                    float(record.created_at),
+                    float(record.expires_at),
+                    str(record.nonce or ""),
+                    str(record.origin_message_id or ""),
+                    str(record.origin_prompt_digest or ""),
+                    int(bool(record.requires_reconfirmation)),
+                    int(bool(record.confirmation_armed)),
+                    str(record.reconfirmation_code or ""),
+                    str(record.reconfirmation_message or ""),
+                    intent_json,
+                    float(self._clock()),
+                ))
+            self._secure_storage()
+            return True
+        except (OSError, sqlite3.Error) as error:
+            logger.error(f"Failed to persist pending confirmation: {error}")
+            return False
+
+    def _delete_persisted(self, address: ConversationAddress) -> bool:
+        try:
+            with self._connect() as conn:
+                conn.execute("""
+                    DELETE FROM pending_confirmations
+                    WHERE platform = ? AND space_type = ?
+                      AND space_id = ? AND actor_id = ?
+                """, (
+                    address.platform,
+                    address.space_type,
+                    address.space_id,
+                    address.actor_id,
+                ))
+            return True
+        except (OSError, sqlite3.Error) as error:
+            logger.error(f"Failed to delete pending confirmation: {error}")
+            return False
+
+    def _load_persisted(self) -> None:
+        now = self._clock()
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("""
+                SELECT rowid, *
+                FROM pending_confirmations
+                ORDER BY created_at, nonce
+            """).fetchall()
+            invalid_rowids: List[int] = []
+            for row in rows:
+                try:
+                    address = ConversationAddress(
+                        platform=str(row["platform"]),
+                        space_type=str(row["space_type"]),
+                        space_id=str(row["space_id"]),
+                        actor_id=str(row["actor_id"]),
+                    )
+                    if (
+                        not address.platform
+                        or not address.actor_id
+                        or address.space_type not in {"private", "group"}
+                        or not address.space_id
+                        or (
+                            address.space_type == "private"
+                            and address.space_id != address.actor_id
+                        )
+                    ):
+                        raise ValueError("invalid conversation address")
+                    arguments = json.loads(str(row["arguments_json"]))
+                    reconfirmation_intent = json.loads(
+                        str(row["reconfirmation_intent_json"])
+                    )
+                    state = PendingToolConfirm(
+                        function_name=str(row["function_name"]),
+                        args=arguments,
+                        confirmation_source=str(row["confirmation_source"]),
+                    )
+                    created_at = float(row["created_at"])
+                    stored_expiry = float(row["expires_at"])
+                    expires_at = min(
+                        stored_expiry,
+                        created_at + self._pending_ttl_seconds,
+                    )
+                    nonce = str(row["nonce"])
+                    origin_prompt_digest = str(row["origin_prompt_digest"])
+                    reconfirmation_code = str(row["reconfirmation_code"])
+                    if (
+                        not isinstance(arguments, dict)
+                        or not isinstance(reconfirmation_intent, dict)
+                        or not state.function_name
+                        or state.confirmation_source
+                        not in {"local_preview", "server_warning"}
+                        or not self._state_within_limits(state)
+                        or not math.isfinite(created_at)
+                        or not math.isfinite(expires_at)
+                        or expires_at <= now
+                        or not nonce
+                        or len(nonce) > 128
+                        or (
+                            origin_prompt_digest
+                            and not re.fullmatch(
+                                r"[0-9a-f]{64}", origin_prompt_digest
+                            )
+                        )
+                        or (
+                            reconfirmation_code
+                            and not re.fullmatch(
+                                r"[A-F0-9]{6}", reconfirmation_code
+                            )
+                        )
+                        or row["requires_reconfirmation"] not in (0, 1)
+                        or row["confirmation_armed"] not in (0, 1)
+                    ):
+                        raise ValueError("invalid pending confirmation row")
+                    record = PendingStateRecord(
+                        state=state,
+                        owner_key=address,
+                        owner_label=str(row["owner_label"]),
+                        created_at=created_at,
+                        expires_at=expires_at,
+                        nonce=nonce,
+                        origin_message_id=str(row["origin_message_id"]),
+                        origin_prompt_digest=origin_prompt_digest,
+                        requires_reconfirmation=bool(
+                            row["requires_reconfirmation"]
+                        ),
+                        confirmation_armed=bool(row["confirmation_armed"]),
+                        reconfirmation_code=reconfirmation_code,
+                        reconfirmation_message=str(
+                            row["reconfirmation_message"]
+                        ),
+                        reconfirmation_intent=reconfirmation_intent,
+                        # execution_id and execution_started_at are deliberately
+                        # reconstructed as empty process-local claims.
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    invalid_rowids.append(int(row["rowid"]))
+                    continue
+                self._states[address] = state
+                self._records[address] = record
+            if invalid_rowids:
+                conn.executemany(
+                    "DELETE FROM pending_confirmations WHERE rowid = ?",
+                    [(rowid,) for rowid in invalid_rowids],
+                )
+        self._evict_over_capacity()

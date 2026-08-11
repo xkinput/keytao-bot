@@ -11,6 +11,15 @@ from contextlib import closing
 from dataclasses import dataclass
 from unittest.mock import AsyncMock, patch
 
+os.environ.setdefault(
+    "KEYTAO_PENDING_CONFIRMATIONS_DB",
+    os.path.join(
+        tempfile.gettempdir(),
+        f"keytao-pending-confirmations-memory-safety-{os.getpid()}",
+        "state.db",
+    ),
+)
+
 import nonebot
 
 nonebot.init()
@@ -27,6 +36,7 @@ from keytao_bot.harness.state import (
     MemoryConversationStateStore,
     PendingAddWord,
     PendingToolConfirm,
+    SQLiteConversationStateStore,
 )
 from keytao_bot.harness.tools import (
     PendingCandidateCapability,
@@ -571,6 +581,212 @@ class PendingIsolationTests(unittest.TestCase):
         self.assertIsNone(store.get(related_group))
         self.assertIsNotNone(store.get(unrelated_group))
         self.assertIsNotNone(store.get(other_actor))
+
+
+class PendingPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "pending-confirmations.db")
+        self.now = 1_000.0
+        self.clock = lambda: self.now
+        self.owner = ConversationAddress.group("qq", "group-42", "user-1")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    async def test_pending_confirmation_survives_restart_with_exact_server_bindings(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        add_owner = ConversationAddress.group("qq", "group-42", "user-add")
+        shift_owner = ConversationAddress.group("qq", "group-42", "user-shift")
+        store = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        sealed_items = [{
+            "action": "Create",
+            "word": "阻抑",
+            "code": "zjyka",
+            "needsManualReview": True,
+            "manualReviewReason": "authority missing",
+        }]
+        add_args = {
+            "items": sealed_items,
+            "batch_id": "batch-add",
+            "expected_content_version": 6,
+            "expected_warning_digest": "a" * 64,
+        }
+        shift_args = {
+            "word": "吃席",
+            "target_code": "wkxk",
+            "batch_id": "batch-shift",
+            "expected_content_version": 9,
+            "confirmed_plan_digest": "b" * 64,
+            "expected_warning_digest": "c" * 64,
+        }
+        submit_args = {
+            "batch_id": "batch-submit",
+            "expected_content_version": 12,
+            "expected_server_snapshot_digest": "d" * 64,
+            "expected_warning_digest": "e" * 64,
+            "expected_audit_digest": "f" * 64,
+        }
+        self.assertTrue(store.set(
+            add_owner,
+            PendingToolConfirm(
+                "keytao_batch_add_to_draft",
+                add_args,
+                confirmation_source="server_warning",
+            ),
+            owner_label="Add owner",
+        ))
+        self.assertTrue(store.set(
+            shift_owner,
+            PendingToolConfirm(
+                "keytao_shift_phrase_code",
+                shift_args,
+                confirmation_source="server_warning",
+            ),
+            owner_label="Shift owner",
+        ))
+        self.assertTrue(store.set(
+            self.owner,
+            PendingToolConfirm(
+                "keytao_submit_batch",
+                submit_args,
+                confirmation_source="server_warning",
+            ),
+            owner_label="Submit owner",
+        ))
+        store.bind_origin_prompt_digest(self.owner, "1" * 64)
+        original = store.get_record(self.owner)
+
+        restored = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        restored_add = restored.get_record(add_owner)
+        restored_shift = restored.get_record(shift_owner)
+        restored_submit = restored.get_record(self.owner)
+
+        self.assertEqual(restored_add.state.args, add_args)
+        self.assertEqual(restored_shift.state.args, shift_args)
+        self.assertEqual(restored_submit.state.args, submit_args)
+        self.assertEqual(restored_submit.nonce, original.nonce)
+        self.assertEqual(
+            restored_submit.reconfirmation_code,
+            original.reconfirmation_code,
+        )
+        self.assertEqual(restored_submit.origin_prompt_digest, "1" * 64)
+        self.assertEqual(restored_submit.owner_key, self.owner)
+
+        calls = []
+
+        async def fake_call_tool_function(
+            tool_name, arguments, platform=None, user_id=None
+        ):
+            calls.append((tool_name, dict(arguments), platform, user_id))
+            return __import__("json").dumps({
+                "success": True,
+                "batchId": "batch-submit",
+            })
+
+        old_state_store = chat_module.conversation_state_store
+        old_call_tool_function = chat_module.call_tool_function
+        try:
+            chat_module.conversation_state_store = restored
+            chat_module.call_tool_function = fake_call_tool_function
+            self.assertTrue(restored.begin_execution(restored_submit))
+            result = await chat_module._execute_confirmed_tool(
+                restored_submit.state,
+                "qq",
+                "user-1",
+                self.owner,
+                self.owner.space_key,
+                "Submit owner",
+            )
+            self.assertTrue(restored.complete_execution(restored_submit))
+        finally:
+            chat_module.call_tool_function = old_call_tool_function
+            chat_module.conversation_state_store = old_state_store
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "keytao_submit_batch")
+        self.assertEqual(calls[0][1], {**submit_args, "confirmed": True})
+        self.assertIn("成功提交审核", result)
+        self.assertIsNone(
+            SQLiteConversationStateStore(
+                self.db_path,
+                clock=self.clock,
+            ).get_record(self.owner)
+        )
+
+    def test_expired_pending_confirmation_is_deleted_during_restart(self) -> None:
+        store = SQLiteConversationStateStore(
+            self.db_path,
+            pending_ttl_seconds=60.0,
+            clock=self.clock,
+        )
+        store.set(
+            self.owner,
+            PendingToolConfirm("keytao_submit_batch", {"batch_id": "expired"}),
+        )
+
+        self.now += 61.0
+        restored = SQLiteConversationStateStore(
+            self.db_path,
+            pending_ttl_seconds=60.0,
+            clock=self.clock,
+        )
+
+        self.assertIsNone(restored.get_record(self.owner))
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM pending_confirmations"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_restored_pending_confirmation_remains_actor_bound(self) -> None:
+        other = ConversationAddress.group("qq", "group-42", "user-2")
+        store = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        store.set(
+            self.owner,
+            PendingToolConfirm(
+                "keytao_submit_batch",
+                {"batch_id": "actor-bound"},
+            ),
+            owner_label="Owner",
+        )
+
+        restored = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+
+        self.assertIsNotNone(restored.get_record(self.owner))
+        self.assertIsNone(restored.get_record(other))
+        self.assertIsNone(restored.pop_record(other))
+        self.assertIsNotNone(restored.get_record(self.owner))
+        other_owner_record = restored.find_pending_for_other_owner(
+            other.space_key,
+            other,
+        )
+        self.assertIsNotNone(other_owner_record)
+        self.assertEqual(other_owner_record.owner_key, self.owner)
+
+    def test_execution_claim_does_not_survive_restart(self) -> None:
+        store = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        store.set(
+            self.owner,
+            PendingToolConfirm(
+                "keytao_submit_batch",
+                {"batch_id": "claim-reset"},
+            ),
+        )
+        claimed = store.get_record(self.owner)
+        self.assertTrue(store.begin_execution(claimed))
+        self.assertTrue(claimed.execution_id)
+
+        restored = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        restored_record = restored.get_record(self.owner)
+
+        self.assertIsNotNone(restored_record)
+        self.assertEqual(restored_record.execution_id, "")
+        self.assertEqual(restored_record.execution_started_at, 0.0)
+        self.assertTrue(restored.begin_execution(restored_record))
 
 
 class WebIdentityVerificationTests(unittest.TestCase):

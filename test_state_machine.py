@@ -13,6 +13,15 @@ import tempfile
 from typing import Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
+os.environ.setdefault(
+    "KEYTAO_PENDING_CONFIRMATIONS_DB",
+    os.path.join(
+        tempfile.gettempdir(),
+        f"keytao-pending-confirmations-state-machine-{os.getpid()}",
+        "state.db",
+    ),
+)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Patch ALL external modules before importing anything from keytao_bot

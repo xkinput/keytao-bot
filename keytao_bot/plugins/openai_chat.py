@@ -7,6 +7,7 @@ Python handles: confirmation routing, direct execution of simple confirms.
 import asyncio
 import hashlib
 import json
+import os
 import re
 import time
 import unicodedata
@@ -48,6 +49,7 @@ from ..harness.state import (
     PendingState,
     PendingStateRecord,
     PendingToolConfirm,
+    SQLiteConversationStateStore,
 )
 from ..harness.tools import (
     ToolContext,
@@ -1743,7 +1745,9 @@ MAX_HISTORY_MESSAGES = 24
 # ---------------------------------------------------------------------------
 
 # Per-conversation state uses the full platform/space/actor address.
-conversation_state_store = MemoryConversationStateStore()
+conversation_state_store = SQLiteConversationStateStore(
+    os.getenv("KEYTAO_PENDING_CONFIRMATIONS_DB") or None
+)
 conversation_states: Dict[ConversationAddress, PendingState] = conversation_state_store.states
 conversation_message_locks = ConversationLockStore()
 # A group clear invalidates every in-flight turn that may have read the shared
@@ -2908,11 +2912,26 @@ async def _resolve_pending_ticket_control(
         )
         if canonical_intent is None:
             return MessageCommandIntent(), canonical_error
-        confirmation_code = state_record.arm_reconfirmation(
-            message_text,
-            confirmation_intent=_ticket_payload_from_command_intent(canonical_intent),
-            rotate_code=True,
-        )
+        confirmation_intent = _ticket_payload_from_command_intent(canonical_intent)
+        if conversation_state_store.get_record(state_record.owner_key) is state_record:
+            confirmation_code = conversation_state_store.arm_reconfirmation(
+                state_record.owner_key,
+                message_text,
+                confirmation_intent=confirmation_intent,
+                rotate_code=True,
+            )
+            if confirmation_code is None:
+                return MessageCommandIntent(), (
+                    "确认票据暂时无法安全保存，请重新发送完整操作指令。"
+                )
+        else:
+            # Compatibility for isolated helpers that intentionally pass a
+            # detached record; production records always take the durable path.
+            confirmation_code = state_record.arm_reconfirmation(
+                message_text,
+                confirmation_intent=confirmation_intent,
+                rotate_code=True,
+            )
         description = _describe_pending_ticket_choice(
             state_record.state,
             canonical_intent,
@@ -2963,7 +2982,10 @@ def _append_pending_ticket_challenge(
         return response
 
     def bind_prompt(text: str) -> str:
-        record.origin_prompt_digest = _prompt_capability_digest(text)
+        conversation_state_store.bind_origin_prompt_digest(
+            conv_key,
+            _prompt_capability_digest(text),
+        )
         return text
 
     if isinstance(record.state, PendingAddWord):
