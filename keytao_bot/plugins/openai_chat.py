@@ -15,6 +15,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from itertools import islice
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, List, Dict, Tuple
 
 from nonebot import on_message, on_command, get_driver
@@ -76,7 +77,19 @@ from ..utils.image_input import (
     request_vision_description,
 )
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
-from ..utils import review_flags
+from ..utils import keytao_review, review_flags
+from ..utils.observability import (
+    begin_turn_metrics,
+    emit_turn_metrics,
+    end_turn_metrics,
+    log_state_metrics,
+    mark_turn_outcome,
+    observe_model_call,
+    record_history_messages,
+    set_turn_flow,
+    suspend_turn_metrics,
+    turn_metrics_emitted,
+)
 from ..utils.memory_store import (
     ChatMemoryContext,
     MemoryGenerationToken,
@@ -485,6 +498,25 @@ class MessageCommandIntent:
     target_word: str = ""
     old_char: str = ""
     new_char: str = ""
+
+
+_DRAFT_FLOW_INTENTS = frozenset({
+    "draft_submit",
+    "draft_view",
+    "draft_recall",
+    "draft_clear",
+    "draft_keep_only",
+    "operation_recall",
+    "batch_replace_char",
+})
+
+
+def _record_flow_for_intent(command_intent: MessageCommandIntent) -> None:
+    """Map the existing router result onto the stable observability buckets."""
+    if command_intent.intent.startswith("pending_"):
+        set_turn_flow("pending-confirmation")
+    elif command_intent.intent in _DRAFT_FLOW_INTENTS:
+        set_turn_flow("draft-op")
 
 
 def _strip_command_message_prefixes(message_text: str) -> str:
@@ -1594,7 +1626,7 @@ async def _classify_message_command_intent(
             timeout=min(OPENAI_TIMEOUT, 20.0),
             max_retries=1,
         )
-        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+        response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
             {
                 "model": WORD_QUERY_INTENT_MODEL,
                 "messages": [
@@ -1606,7 +1638,7 @@ async def _classify_message_command_intent(
             },
             thinking=False,
             json_output=True,
-        ))
+        )), system_prompt_chars=len(system_prompt))
         log_chat_usage(
             logger,
             response,
@@ -1658,7 +1690,7 @@ async def _classify_simple_word_query_intent(
             timeout=min(OPENAI_TIMEOUT, 20.0),
             max_retries=1,
         )
-        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+        response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
             {
                 "model": WORD_QUERY_INTENT_MODEL,
                 "messages": [
@@ -1670,7 +1702,7 @@ async def _classify_simple_word_query_intent(
             },
             thinking=False,
             json_output=True,
-        ))
+        )), system_prompt_chars=len(system_prompt))
         log_chat_usage(
             logger,
             response,
@@ -1762,6 +1794,7 @@ background_draft_tasks: set[asyncio.Task[Any]] = set()
 background_draft_tasks_by_conversation: Dict[ConversationAddress, set[asyncio.Task[Any]]] = {}
 memory_compaction_tasks: Dict[Tuple[str, str], asyncio.Task[Any]] = {}
 retention_cleanup_task: Optional[asyncio.Task[Any]] = None
+state_metrics_task: Optional[asyncio.Task[Any]] = None
 current_memory_context: ContextVar[Optional[ChatMemoryContext]] = ContextVar(
     "current_memory_context",
     default=None,
@@ -3432,7 +3465,7 @@ async def _generate_usage_comparison_note(
             timeout=min(OPENAI_TIMEOUT, 30.0),
             max_retries=1,
         )
-        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+        response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
             {
                 "model": OPENAI_MODEL,
                 "temperature": 0.3,
@@ -3459,7 +3492,7 @@ async def _generate_usage_comparison_note(
                 ],
             },
             thinking=False,
-        ))
+        )))
         log_chat_usage(
             logger,
             response,
@@ -3687,6 +3720,7 @@ async def _try_handle_referenced_word_presence_query(
         return None
     if not reply_reference.is_reply:
         return None
+    set_turn_flow("word-discovery")
     if not reply_reference.text:
         return (
             "本喵看见你是在回复一条消息，但平台没有把被引用的原文给到本喵。"
@@ -4149,6 +4183,7 @@ async def _try_handle_simple_single_word_query(
     words = (explicit_add_word,) if explicit_add_word else await _get_simple_word_query_words(message_text)
     if len(words) != 1:
         return None
+    set_turn_flow("word-discovery")
 
     word = words[0]
     lookup_json = await call_tool_function(
@@ -4688,7 +4723,9 @@ def get_space_key(memory_context: ChatMemoryContext) -> Tuple[str, str]:
 
 def get_history(key: ConversationKey) -> List[Dict]:
     address = normalize_conversation_key(key)
-    return history_store.get_history(address, limit=MAX_HISTORY_MESSAGES)
+    history = history_store.get_history(address, limit=MAX_HISTORY_MESSAGES)
+    record_history_messages(len(history))
+    return history
 
 
 def add_to_history(
@@ -8644,6 +8681,7 @@ async def handle_pending_message_core(
         )
     ):
         pending_command_intent = MessageCommandIntent()
+    _record_flow_for_intent(pending_command_intent)
 
     if (
         pending_command_intent.intent == "draft_submit"
@@ -8975,6 +9013,26 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 • 可以适度活泼，不要堆表情
 • 不同信息分段，空行隔开
 """
+
+
+def representative_system_prompt_chars() -> int:
+    """Return a stable assembled prompt size for hourly trend comparison."""
+    context = AgentRequestContext(
+        platform="qq",
+        user_id="0",
+        space_type="group",
+        space_id="0",
+    )
+    platform_context = AgentOrchestrator._build_platform_context(
+        None,
+        "QQ",
+        context,
+    )
+    return len(
+        SYSTEM_PROMPT_CORE
+        + skills_manager.get_skill_instructions()
+        + platform_context
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -9341,7 +9399,7 @@ async def summarize_memory_with_llm(
         timeout=OPENAI_TIMEOUT,
         max_retries=1,
     )
-    response = await client.chat.completions.create(**with_deepseek_chat_policy(
+    response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
         {
             "model": OPENAI_MODEL,
             "messages": [
@@ -9352,7 +9410,7 @@ async def summarize_memory_with_llm(
             "temperature": 0.2,
         },
         thinking=False,
-    ))
+    )), system_prompt_chars=len(system_prompt))
     log_chat_usage(
         logger,
         response,
@@ -9374,6 +9432,7 @@ def schedule_memory_compaction(memory_context: ChatMemoryContext) -> None:
         return
 
     async def _run() -> None:
+        metrics_token = suspend_turn_metrics()
         try:
             async with _memory_compaction_semaphore:
                 await memory_store.compact_due_scopes(
@@ -9384,6 +9443,8 @@ def schedule_memory_compaction(memory_context: ChatMemoryContext) -> None:
             raise
         except Exception as error:
             logger.warning(f"Background memory compaction failed: {error}")
+        finally:
+            end_turn_metrics(metrics_token)
 
     try:
         task = asyncio.create_task(_run())
@@ -9697,6 +9758,7 @@ async def _send_event_response(
                     memory_context.space_type == "group",
                 )
                 await bot.send(event=event, message=message)
+                emit_turn_metrics(logger)
                 return True
         if "telegram" in bot_module.lower():
             await _send_telegram_plain_chunks(
@@ -9705,8 +9767,10 @@ async def _send_event_response(
                 text,
                 reply_to_message_id=getattr(event, "message_id", None),
             )
+            emit_turn_metrics(logger)
             return True
         await bot.send(event=event, message=text)
+        emit_turn_metrics(logger)
         return True
     except Exception as error:
         logger.warning(f"Failed to send background response: {error}")
@@ -9917,10 +9981,12 @@ def _schedule_background_draft_operation(
 
 async def _shutdown_background_draft_tasks() -> None:
     """Cancel in-memory work during a graceful Bot shutdown."""
-    global retention_cleanup_task
+    global retention_cleanup_task, state_metrics_task
     tasks = list(background_draft_tasks) + list(memory_compaction_tasks.values())
     if retention_cleanup_task is not None:
         tasks.append(retention_cleanup_task)
+    if state_metrics_task is not None:
+        tasks.append(state_metrics_task)
     for task in tasks:
         task.cancel()
     if tasks:
@@ -9929,6 +9995,7 @@ async def _shutdown_background_draft_tasks() -> None:
     background_draft_tasks_by_conversation.clear()
     memory_compaction_tasks.clear()
     retention_cleanup_task = None
+    state_metrics_task = None
 
 
 async def _retention_cleanup_loop() -> None:
@@ -9957,13 +10024,63 @@ async def _start_retention_cleanup() -> None:
         retention_cleanup_task = asyncio.create_task(_retention_cleanup_loop())
 
 
+STATE_METRICS_INTERVAL_SECONDS = 60 * 60
+_STATE_METRICS_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+
+
+def _log_state_metrics_once() -> str:
+    cache_entries = keytao_review.review_cache_entry_counts()
+    cache_entries.update({
+        "reviewed_add": len(_reviewed_add_verdicts),
+        # No process-local ZDIC cache exists in this checkout.
+        "zdic": 0,
+    })
+    return log_state_metrics(
+        logger,
+        _STATE_METRICS_DATA_DIR,
+        cache_entries=cache_entries,
+        pending_live=conversation_state_store.live_entry_count(),
+        system_prompt_chars=representative_system_prompt_chars(),
+    )
+
+
+async def _state_metrics_loop() -> None:
+    while True:
+        await asyncio.sleep(STATE_METRICS_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(_log_state_metrics_once)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                f"[state_metrics_error] collection_failed error={type(error).__name__}"
+            )
+
+
+async def _start_state_metrics() -> None:
+    """Emit the startup snapshot, then schedule hourly snapshots."""
+    global state_metrics_task
+    await asyncio.to_thread(_log_state_metrics_once)
+    if state_metrics_task is None or state_metrics_task.done():
+        state_metrics_task = asyncio.create_task(_state_metrics_loop())
+
+
 if hasattr(driver, "on_shutdown"):
     driver.on_shutdown(_shutdown_background_draft_tasks)
 if hasattr(driver, "on_startup"):
     driver.on_startup(_start_retention_cleanup)
+    driver.on_startup(_start_state_metrics)
 
 
 ai_chat = on_message(rule=should_handle, priority=99, block=True)
+
+
+async def _finish_ai_chat_matcher(response: str) -> None:
+    """Dispatch a matcher reply and close metrics at the same boundary."""
+    try:
+        await ai_chat.finish(response)
+    finally:
+        emit_turn_metrics(logger)
 
 
 async def _finish_ai_chat_response(
@@ -9992,6 +10109,7 @@ async def _finish_ai_chat_response(
                     kwargs["reply_to_message_id"] = message_id
                 await bot.send(**kwargs)
                 _acknowledge_delivered_draft_mutations()
+                emit_turn_metrics(logger)
                 return
             except Exception:
                 logger.debug("Telegram MarkdownV2 send failed; falling back to plain chunks")
@@ -10006,6 +10124,7 @@ async def _finish_ai_chat_response(
             logger.warning(f"Telegram plain-text chunk send failed: {error}")
             raise
         _acknowledge_delivered_draft_mutations()
+        emit_turn_metrics(logger)
         return
 
     if "onebot" in bot_module.lower() or bot.__class__.__name__ == "Bot":
@@ -10024,21 +10143,24 @@ async def _finish_ai_chat_response(
                     ),
                 )
                 _acknowledge_delivered_draft_mutations()
+                emit_turn_metrics(logger)
                 return
             except Exception:
                 pass
         if callable(getattr(bot, "send", None)):
             await bot.send(event=event, message=qq_text)
             _acknowledge_delivered_draft_mutations()
+            emit_turn_metrics(logger)
         else:
-            await ai_chat.finish(qq_text)
+            await _finish_ai_chat_matcher(qq_text)
         return
 
     if callable(getattr(bot, "send", None)):
         await bot.send(event=event, message=response)
         _acknowledge_delivered_draft_mutations()
+        emit_turn_metrics(logger)
     else:
-        await ai_chat.finish(response)
+        await _finish_ai_chat_matcher(response)
 
 
 async def _handle_ai_chat_serialized(
@@ -10104,7 +10226,7 @@ async def _handle_ai_chat_serialized(
         ))
 
     if not message_text and not image_attachments:
-        await ai_chat.finish("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
+        await _finish_ai_chat_matcher("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
         return
     if message_text:
         normalized_message_text = (
@@ -10273,6 +10395,7 @@ async def _handle_ai_chat_serialized(
         else None
     )
     if stale_confirmation_response is not None:
+        set_turn_flow("pending-confirmation")
         remember_conversation(
             conv_key,
             memory_context,
@@ -10299,6 +10422,7 @@ async def _handle_ai_chat_serialized(
         generic_command_intent = quoted_pending_add_intent
     elif _is_short_add_and_submit_request(normalized_message_text):
         current_pending = conversation_state_store.get(conv_key)
+        set_turn_flow("pending-confirmation")
         response = _format_full_add_and_submit_instruction(
             current_pending if isinstance(current_pending, PendingAddWord) else None
         )
@@ -10308,7 +10432,7 @@ async def _handle_ai_chat_serialized(
             normalized_message_text,
             response,
         )
-        await ai_chat.finish(response)
+        await _finish_ai_chat_matcher(response)
         return
     else:
         generic_command_intent = await command_intent_for()
@@ -10318,12 +10442,13 @@ async def _handle_ai_chat_serialized(
     )
     if live_ticket_assent is not None:
         generic_command_intent = live_ticket_assent
+    _record_flow_for_intent(generic_command_intent)
     if _message_authorizes_clear_history(
         normalized_message_text,
         generic_command_intent,
     ):
         had_inflight_draft = await _clear_conversation_state(conv_key, memory_context)
-        await ai_chat.finish(_format_clear_response(had_inflight_draft))
+        await _finish_ai_chat_matcher(_format_clear_response(had_inflight_draft))
         return
     active_operation = draft_operation_coordinator.get(conv_key)
     generic_intent_is_fresh_command = _is_fresh_current_user_command_intent(
@@ -10364,7 +10489,7 @@ async def _handle_ai_chat_serialized(
                     current_pending_state,
                 )
                 remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                await ai_chat.finish(response)
+                await _finish_ai_chat_matcher(response)
                 return
 
         if active_operation.status == "awaiting_confirmation":
@@ -10392,7 +10517,7 @@ async def _handle_ai_chat_serialized(
                     normalized_message_text,
                     response,
                 )
-                await ai_chat.finish(response)
+                await _finish_ai_chat_matcher(response)
                 return
             active_control_requested = active_command_intent.intent in {
                 "pending_confirm",
@@ -10409,7 +10534,7 @@ async def _handle_ai_chat_serialized(
                     current_pending_state,
                 )
                 remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                await ai_chat.finish(response)
+                await _finish_ai_chat_matcher(response)
                 return
 
             if active_control_requested:
@@ -10443,7 +10568,7 @@ async def _handle_ai_chat_serialized(
                         )
                     if active_control_requested:
                         remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                        await ai_chat.finish(response)
+                        await _finish_ai_chat_matcher(response)
                         return
 
                 if not active_control_requested:
@@ -10457,7 +10582,7 @@ async def _handle_ai_chat_serialized(
                         else "好的，已取消这次添加 owo"
                     )
                     remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                    await ai_chat.finish(response)
+                    await _finish_ai_chat_matcher(response)
                     return
                 else:
                     draft_operation_coordinator.mark_running(conv_key, active_operation.operation_id)
@@ -10489,7 +10614,7 @@ async def _handle_ai_chat_serialized(
                         f"请稍后回复「{active_operation.confirmation_command}」重试。"
                     )
                     remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                    await ai_chat.finish(response)
+                    await _finish_ai_chat_matcher(response)
                     return
 
     quoted_pending_add_control_authorized = False
@@ -10506,7 +10631,7 @@ async def _handle_ai_chat_serialized(
                 normalized_message_text,
                 response,
             )
-            await ai_chat.finish(response)
+            await _finish_ai_chat_matcher(response)
             return
         restored_state = await _revalidate_referenced_add_pending(
             referenced_pending,
@@ -10524,7 +10649,7 @@ async def _handle_ai_chat_serialized(
                 normalized_message_text,
                 response,
             )
-            await ai_chat.finish(response)
+            await _finish_ai_chat_matcher(response)
             return
         stored = conversation_state_store.set(
             conv_key,
@@ -10540,7 +10665,7 @@ async def _handle_ai_chat_serialized(
                 normalized_message_text,
                 response,
             )
-            await ai_chat.finish(response)
+            await _finish_ai_chat_matcher(response)
             return
         current_record = conversation_state_store.get_record(conv_key)
         if current_record is not None:
@@ -10627,7 +10752,7 @@ async def _handle_ai_chat_serialized(
                     normalized_message_text,
                     response,
                 )
-                await ai_chat.finish(response)
+                await _finish_ai_chat_matcher(response)
                 return
             stored = conversation_state_store.set(
                 conv_key,
@@ -10645,7 +10770,7 @@ async def _handle_ai_chat_serialized(
                     normalized_message_text,
                     response,
                 )
-                await ai_chat.finish(response)
+                await _finish_ai_chat_matcher(response)
                 return
         response = _handle_referenced_pending_from_other_user(
             referenced_pending,
@@ -10658,7 +10783,7 @@ async def _handle_ai_chat_serialized(
         )
         if response is not None:
             remember_conversation(conv_key, memory_context, normalized_message_text, response)
-            await ai_chat.finish(response)
+            await _finish_ai_chat_matcher(response)
             return
 
     quoted_draft_response = await _try_handle_quoted_draft_selection(
@@ -10674,7 +10799,7 @@ async def _handle_ai_chat_serialized(
             normalized_message_text,
             quoted_draft_response,
         )
-        await ai_chat.finish(quoted_draft_response)
+        await _finish_ai_chat_matcher(quoted_draft_response)
         return
 
     other_pending_record = (
@@ -10716,7 +10841,7 @@ async def _handle_ai_chat_serialized(
             other_pending_record.state,
         )
         remember_conversation(conv_key, memory_context, normalized_message_text, response)
-        await ai_chat.finish(response)
+        await _finish_ai_chat_matcher(response)
         return
 
     response = None
@@ -10729,7 +10854,7 @@ async def _handle_ai_chat_serialized(
         )
     if response is not None:
         remember_conversation(conv_key, memory_context, normalized_message_text, response)
-        await ai_chat.finish(response)
+        await _finish_ai_chat_matcher(response)
         return
 
     response = _try_handle_operation_recall(
@@ -11071,7 +11196,8 @@ async def _handle_ai_chat_serialized(
         )
 
     if not response:
-        await ai_chat.finish("呜呜，处理请求时出错了 qwq 要不再试一次？")
+        mark_turn_outcome("error")
+        await _finish_ai_chat_matcher("呜呜，处理请求时出错了 qwq 要不再试一次？")
         return
 
     response = _normalize_generated_review_copy(response)
@@ -11111,31 +11237,40 @@ async def handle_ai_chat(bot: Bot, event: Event):
     """Serialize one full conversation while long draft reviews run separately."""
     platform, user_id = extract_platform_info(bot, event)
     conv_key = get_conversation_key(bot, event)
-    async with (
-        conversation_space_message_locks.lock(
-            _conversation_scope_barrier_key(conv_key)
-        ),
-        conversation_message_locks.lock(conv_key),
-        draft_actor_message_locks.lock(
-            ConversationAddress.private(platform, user_id)
-        ),
-    ):
-        generation_context = ChatMemoryContext(
-            platform=conv_key.platform,
-            user_id=conv_key.actor_id,
-            space_type=conv_key.space_type,
-            space_id=conv_key.space_id,
-        )
-        history_token = current_history_generation.set(
-            history_store.capture_generation(conv_key)
-        )
-        memory_token = current_memory_generation.set(
-            memory_store.capture_generation(generation_context)
-        )
-        delivery_token = current_draft_delivery_claims.set([])
-        try:
-            await _handle_ai_chat_serialized(bot, event, platform, user_id)
-        finally:
-            current_draft_delivery_claims.reset(delivery_token)
-            current_history_generation.reset(history_token)
-            current_memory_generation.reset(memory_token)
+    metrics_token = begin_turn_metrics(platform, conv_key.space_type)
+    try:
+        async with (
+            conversation_space_message_locks.lock(
+                _conversation_scope_barrier_key(conv_key)
+            ),
+            conversation_message_locks.lock(conv_key),
+            draft_actor_message_locks.lock(
+                ConversationAddress.private(platform, user_id)
+            ),
+        ):
+            generation_context = ChatMemoryContext(
+                platform=conv_key.platform,
+                user_id=conv_key.actor_id,
+                space_type=conv_key.space_type,
+                space_id=conv_key.space_id,
+            )
+            history_token = current_history_generation.set(
+                history_store.capture_generation(conv_key)
+            )
+            memory_token = current_memory_generation.set(
+                memory_store.capture_generation(generation_context)
+            )
+            delivery_token = current_draft_delivery_claims.set([])
+            try:
+                await _handle_ai_chat_serialized(bot, event, platform, user_id)
+            finally:
+                current_draft_delivery_claims.reset(delivery_token)
+                current_history_generation.reset(history_token)
+                current_memory_generation.reset(memory_token)
+    except BaseException:
+        if not turn_metrics_emitted():
+            mark_turn_outcome("error")
+            emit_turn_metrics(logger)
+        raise
+    finally:
+        end_turn_metrics(metrics_token)

@@ -36,6 +36,7 @@ from .review_flags import (
     read_manual_review_flag,
 )
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
+from .observability import observe_model_call
 
 
 ReviewItem = Dict[str, Any]
@@ -1397,7 +1398,7 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
                 "不要解释，不要省略 items；进一步压缩文字，每项只写最关键的一条理由和建议。"
             )
         try:
-            response = await client.chat.completions.create(**with_deepseek_chat_policy(
+            response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
                 {
                     "model": config["model"],
                     "temperature": min(config["temperature"], 0.2),
@@ -1410,7 +1411,7 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
                 thinking=True,
                 reasoning_effort="high",
                 json_output=True,
-            ))
+            )), system_prompt_chars=len(prompt))
         except Exception as error:
             # Transport-level failures (connection reset, timeout, rate limit)
             # share the same attempt budget as empty/invalid responses.

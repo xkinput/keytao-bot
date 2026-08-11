@@ -18,6 +18,13 @@ from keytao_bot.utils.llm_policy import (
 )
 from keytao_bot.utils.history_store import _parse_stored_timestamp
 from keytao_bot.utils import review_flags
+from keytao_bot.utils.observability import (
+    mark_turn_outcome,
+    observe_model_call,
+    observe_tool_result,
+    record_history_messages,
+    set_turn_flow,
+)
 
 from .state import MemoryConversationStateStore, PendingAddWord, PendingToolConfirm
 from .conversation import ConversationAddress
@@ -295,6 +302,7 @@ class AgentOrchestrator:
         platform_ctx = self._build_platform_context(platform_label, context)
         skill_instructions = self._skills_manager.get_skill_instructions()
         system_prompt = self._system_prompt_core + platform_ctx + skill_instructions
+        record_history_messages(len(context.history or []))
 
         logger.info(f"📋 System prompt length: {len(system_prompt)} chars")
         logger.info(f"OpenAI timeout configured: {self._runtime.timeout}s")
@@ -387,6 +395,8 @@ class AgentOrchestrator:
             if isinstance(function, dict):
                 tool_schemas[str(function.get("name") or "")] = function.get("parameters", {})
         exact_multi_add_items = authorized_multi_add_items(message)
+        if exact_multi_add_items:
+            set_turn_flow("multi-add")
         # One (reason, tool, arguments) gets one full explanation per turn.
         reported_block_reasons: set[tuple] = set()
         conv_key = context.conversation_address
@@ -432,10 +442,14 @@ class AgentOrchestrator:
             logger.info(f"Calling {self._runtime.model} (iter {iteration + 1}/{max_iterations})")
             started_at = time.monotonic()
             try:
-                response = await client.chat.completions.create(**call_kwargs)
+                response = await observe_model_call(
+                    client.chat.completions.create(**call_kwargs),
+                    system_prompt_chars=len(system_prompt),
+                )
                 elapsed = time.monotonic() - started_at
                 self._log_usage(response)
             except Exception as error:
+                mark_turn_outcome("error")
                 logger.error(
                     "Agent model call failed after %.1fs: %s: %s",
                     time.monotonic() - started_at,
@@ -448,6 +462,7 @@ class AgentOrchestrator:
                 )
 
             if not response.choices:
+                mark_turn_outcome("error")
                 return self._append_authoritative_result_links(
                     "呜呜，AI 好像没有回复 qwq 要不再试一次？",
                     authoritative_result_links,
@@ -795,6 +810,7 @@ class AgentOrchestrator:
                 try:
                     result_data = json.loads(result_str)
                     if isinstance(result_data, dict):
+                        observe_tool_result(result_data)
                         if (
                             result_data.get("success") is False
                             or result_data.get("policyBlocked") is True

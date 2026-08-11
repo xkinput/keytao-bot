@@ -57,6 +57,7 @@ from .review_flags import (
     manual_review_reason,
     read_manual_review_flag,
 )
+from .observability import observe_model_call
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -635,7 +636,7 @@ async def _call_extraction_llm(prompt: str) -> str:
         config["api_key"],
         config["timeout"],
     )
-    response = await client.chat.completions.create(
+    response = await observe_model_call(client.chat.completions.create(
         model=config["model"],
         temperature=0.2,
         max_tokens=config["max_tokens"],
@@ -643,7 +644,7 @@ async def _call_extraction_llm(prompt: str) -> str:
             {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-    )
+    ), system_prompt_chars=len(EXTRACTION_SYSTEM_PROMPT))
     if not response.choices:
         return ""
     return response.choices[0].message.content or ""

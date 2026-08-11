@@ -2479,6 +2479,7 @@ def test_audit_budget_nesting_and_timeout_retains_review():
             ),
             patch.object(review_module, "AUDIT_PRIORITY_STAGE_TIMEOUT", 0.01),
             patch.object(review_module, "AUDIT_ITEM_TIMEOUT", 0.10),
+            patch.object(review_module, "current_turn_id", return_value="a1b2c3d4"),
             patch.object(review_module.logger, "info") as info_log,
         ):
             audit = await audit_draft_items(CONFIG, [{
@@ -2518,6 +2519,7 @@ def test_audit_budget_nesting_and_timeout_retains_review():
             and "status=timeout:priority" in audit_log_lines[0]
             and "review=" in audit_log_lines[0]
             and "priority=" in audit_log_lines[0]
+            and audit_log_lines[0].endswith("turn_id=a1b2c3d4")
             and "\n" not in audit_log_lines[0],
         )
 

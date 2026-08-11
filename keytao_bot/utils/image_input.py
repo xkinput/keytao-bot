@@ -20,6 +20,8 @@ from urllib.parse import quote, unquote, urljoin, urlparse
 import httpx
 from PIL import Image, UnidentifiedImageError
 
+from .observability import observe_model_call
+
 
 _QQ_IMAGE_HOST_SUFFIXES = (
     "qpic.cn",
@@ -969,7 +971,9 @@ async def _request_vision_description(
             }
         else:
             request_options["max_tokens"] = config.max_tokens
-        response = await client.chat.completions.create(**request_options)
+        response = await observe_model_call(
+            client.chat.completions.create(**request_options)
+        )
     except Exception as error:
         raise VisionServiceError("vision proxy request failed") from error
 

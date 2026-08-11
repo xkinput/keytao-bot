@@ -14,6 +14,8 @@ from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tupl
 
 from nonebot.log import logger
 
+from keytao_bot.utils.observability import mark_turn_outcome
+
 from .conversation import (
     ConversationAddress,
     ConversationKey,
@@ -345,6 +347,15 @@ class MemoryConversationStateStore:
     def states(self) -> Dict[ConversationAddress, PendingState]:
         return self._states
 
+    def live_entry_count(self) -> int:
+        """Return the non-expired in-memory ticket count without mutating state."""
+        now = self._clock()
+        return sum(
+            1
+            for record in self._records.values()
+            if record.expires_at > now
+        )
+
     def get(self, key: ConversationKey) -> PendingState:
         address = self._resolve_address(key)
         self._purge_expired()
@@ -410,7 +421,10 @@ class MemoryConversationStateStore:
         self._states[address] = state
         self._records[address] = record
         self._evict_over_capacity()
-        return self._records.get(address) is not None
+        saved = self._records.get(address) is not None
+        if saved:
+            mark_turn_outcome("asked-confirmation")
+        return saved
 
     def pop(self, key: ConversationKey) -> PendingState:
         record = self.pop_record(key)

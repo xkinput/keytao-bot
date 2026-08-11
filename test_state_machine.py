@@ -8,9 +8,12 @@ import os
 import asyncio
 import importlib.util
 import json
+import re
 import sqlite3
 import tempfile
-from typing import Dict, List
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault(
@@ -197,6 +200,15 @@ from keytao_bot.utils import keytao_batch_review as keytao_batch_review_module
 from keytao_bot.utils import review_flags
 from keytao_bot.utils.keytao_review import ReviewHttpConfig, audit_draft_items
 from keytao_bot.utils.keytao_batch_review import _normalize_llm_review
+from keytao_bot.utils.observability import (
+    begin_turn_metrics,
+    end_turn_metrics,
+    mark_turn_outcome,
+    observe_model_call,
+    observe_tool_call,
+    record_history_messages,
+    set_turn_flow,
+)
 import keytao_bot.plugins.openai_chat as openai_chat_module
 
 _lookup_tools_path = os.path.join(
@@ -1295,6 +1307,18 @@ def test_pending_add_word_guidance_fallback_matcher():
 
     guided = _ensure_pending_add_word_guidance(response)
     check("fallback appends guidance", "原词 重新编码" in guided)
+
+
+# Measured representative assembled prompt: 42,460 chars on 2026-08-11.
+# Raise this only after reviewing the prompt/skill diff; update the measured
+# value and date here, then preserve roughly 10 percent intentional headroom.
+SYSTEM_PROMPT_GROWTH_LIMIT_CHARS = 46_700
+
+
+def test_system_prompt_growth_guard():
+    print("\n🧪 system prompt growth guard")
+    actual = openai_chat_module.representative_system_prompt_chars()
+    check("representative prompt stays below the growth limit", actual <= SYSTEM_PROMPT_GROWTH_LIMIT_CHARS)
 
 
 def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs():
@@ -13404,6 +13428,152 @@ def test_replace_char_preserves_explicit_css_type():
     asyncio.run(_run())
 
 
+async def _capture_mocked_turn_metrics(*, policy_blocked: bool) -> Tuple[str, bool]:
+    class MetricsBot:
+        def __init__(self):
+            self.sent: List[str] = []
+
+        async def send(self, *, event, message, **kwargs):
+            self.sent.append(str(message))
+
+    class MetricsEvent:
+        message_id = 77
+
+    async def model_call():
+        return types.SimpleNamespace(usage=types.SimpleNamespace(
+            prompt_tokens=12,
+            completion_tokens=5,
+            prompt_cache_hit_tokens=7,
+            completion_tokens_details=types.SimpleNamespace(reasoning_tokens=3),
+        ))
+
+    @observe_tool_call
+    async def tool_call():
+        if policy_blocked:
+            return json.dumps({"success": False, "policyBlocked": True})
+        return json.dumps({"success": True})
+
+    bot = MetricsBot()
+    memory_context = ChatMemoryContext(
+        platform="qq",
+        user_id="metrics-user",
+        space_type="group",
+        space_id="metrics-group",
+    )
+    metrics_token = begin_turn_metrics(
+        "qq",
+        "group",
+        started_at=time.monotonic() - 0.05,
+    )
+    try:
+        set_turn_flow("pending-confirmation" if policy_blocked else "word-discovery")
+        record_history_messages(4)
+        await observe_model_call(model_call(), system_prompt_chars=42_460)
+        await tool_call()
+        delivery_seen = []
+
+        def capture_log(line):
+            if str(line).startswith("[turn_metrics]"):
+                delivery_seen.append(bool(bot.sent))
+
+        with patch.object(openai_chat_module.logger, "info", side_effect=capture_log) as info_log:
+            await openai_chat_module._finish_ai_chat_response(
+                bot,
+                MetricsEvent(),
+                "metrics-user",
+                memory_context,
+                "private reply content",
+            )
+        lines = [
+            str(call.args[0])
+            for call in info_log.call_args_list
+            if call.args and str(call.args[0]).startswith("[turn_metrics]")
+        ]
+        return lines[0] if len(lines) == 1 else "", delivery_seen == [True]
+    finally:
+        end_turn_metrics(metrics_token)
+
+
+def test_turn_metrics_normal_mocked_turn():
+    print("\n🧪 turn metrics normal mocked turn")
+    line, emitted_after_send = asyncio.run(
+        _capture_mocked_turn_metrics(policy_blocked=False)
+    )
+    check("normal turn emits after the mocked send", emitted_after_send)
+    check("normal turn emits one bounded line", bool(line) and "\n" not in line)
+    check("normal turn id is short and stable", re.search(r"turn_id=[0-9a-f]{8}(?: |$)", line) is not None)
+    check("normal turn records platform and routed flow", "platform=qq space_kind=group flow=word-discovery" in line)
+    check("normal turn records model and tool totals", "model_calls=1" in line and "tool_calls=1" in line)
+    check("normal turn sums token fields", "input_tokens=12" in line and "output_tokens=5" in line and "cached_tokens=7" in line and "reasoning_tokens=3" in line)
+    check("normal turn records prompt and history sizes", "system_prompt_chars=42460" in line and "history_messages=4" in line)
+    check("normal turn reports replied outcome", line.endswith("outcome=replied"))
+    check("normal turn log excludes reply content", "private reply content" not in line)
+
+
+def test_turn_metrics_policy_blocked_mocked_turn():
+    print("\n🧪 turn metrics policy-blocked mocked turn")
+    line, emitted_after_send = asyncio.run(
+        _capture_mocked_turn_metrics(policy_blocked=True)
+    )
+    check("policy-blocked turn emits after the mocked send", emitted_after_send)
+    check("policy-blocked turn keeps the routed flow", "flow=pending-confirmation" in line)
+    check("policy-blocked turn records the blocked outcome", line.endswith("outcome=policy-blocked"))
+    check("policy-blocked turn retains all required counters", all(
+        field in line
+        for field in (
+            "e2e_seconds=",
+            "model_seconds=",
+            "tool_seconds=",
+            "input_tokens=",
+            "output_tokens=",
+            "cached_tokens=",
+            "reasoning_tokens=",
+            "system_prompt_chars=",
+            "history_messages=",
+        )
+    ))
+
+
+def test_state_metrics_startup_log():
+    print("\n🧪 state metrics startup log")
+
+    async def _run():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "sample.db"
+            with sqlite3.connect(db_path) as connection:
+                connection.execute("CREATE TABLE sample_rows (id INTEGER PRIMARY KEY)")
+                connection.executemany(
+                    "INSERT INTO sample_rows(id) VALUES (?)",
+                    [(1,), (2,)],
+                )
+
+            with (
+                patch.object(openai_chat_module, "_STATE_METRICS_DATA_DIR", Path(tmpdir)),
+                patch.object(openai_chat_module.logger, "info") as info_log,
+            ):
+                await openai_chat_module._start_state_metrics()
+                task = openai_chat_module.state_metrics_task
+                if task is not None:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                openai_chat_module.state_metrics_task = None
+
+            lines = [
+                str(call.args[0])
+                for call in info_log.call_args_list
+                if call.args and str(call.args[0]).startswith("[state_metrics]")
+            ]
+            line = lines[0] if len(lines) == 1 else ""
+            check("startup emits exactly one state line", len(lines) == 1)
+            check("state line includes database size", "db_bytes=sample.db:" in line)
+            check("state line includes main-table rows", "db_rows=sample.db.sample_rows:2" in line)
+            check("state line includes cache counts", "cache_entries=" in line and "review:" in line and "reviewed_add:" in line and "semantic_review:" in line and "zdic:0" in line)
+            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=42460" in line)
+            check("state line is bounded to one line", bool(line) and "\n" not in line)
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("State Machine & Core Logic Tests")
@@ -13439,6 +13609,7 @@ if __name__ == "__main__":
     test_referenced_unknown_pending_recode_falls_through()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
+    test_system_prompt_growth_guard()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
     test_extract_pure_chinese_words()
     test_parse_simple_word_query_intent_payload()
@@ -13633,6 +13804,9 @@ if __name__ == "__main__":
     test_strict_shift_batch_payload_preserves_item_level_seal()
     test_absence_batch_preview_never_formats_provisional_url()
     test_replace_char_preserves_explicit_css_type()
+    test_turn_metrics_normal_mocked_turn()
+    test_turn_metrics_policy_blocked_mocked_turn()
+    test_state_metrics_startup_log()
 
     print("\n" + "=" * 60)
     total = passed + failed

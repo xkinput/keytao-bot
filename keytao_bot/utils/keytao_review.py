@@ -28,6 +28,7 @@ from .keytao_encoding import (
     pinyin_to_phonetic_code,
 )
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
+from .observability import current_turn_id, observe_model_call
 from .llm_request_gate import RequestWindowGate
 from .review_flags import (
     MANUAL_REVIEW_PREFIXES,
@@ -304,6 +305,14 @@ def _clear_review_caches() -> None:
     """Reset the in-process review caches. Exposed for tests; never called automatically."""
     _review_cache.clear()
     _semantic_review_cache.clear()
+
+
+def review_cache_entry_counts() -> Dict[str, int]:
+    """Return cheap process-local cache sizes for state observability."""
+    return {
+        "review": len(_review_cache),
+        "semantic_review": len(_semantic_review_cache),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2638,7 +2647,7 @@ async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
             config["api_key"],
             config.get("quick_timeout") or config["timeout"],
         )
-        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+        response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
             {
                 "model": config["model"],
                 "temperature": 0.0,
@@ -2650,7 +2659,7 @@ async def _infer_entity_knowledge(word: str) -> Dict[str, Any]:
             },
             thinking=False,
             json_output=True,
-        ))
+        )), system_prompt_chars=len(system_prompt))
         log_chat_usage(
             logger,
             response,
@@ -2783,7 +2792,7 @@ async def _infer_semantic_pronunciation_proposal(word: str) -> Dict[str, Any]:
             timeout=config["timeout"],
             max_retries=1,
         )
-        response = await client.chat.completions.create(**with_deepseek_chat_policy(
+        response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
             {
                 "model": config["model"],
                 "temperature": 0.0,
@@ -2795,7 +2804,7 @@ async def _infer_semantic_pronunciation_proposal(word: str) -> Dict[str, Any]:
             },
             thinking=False,
             json_output=True,
-        ))
+        )), system_prompt_chars=len(system_prompt))
         log_chat_usage(
             logger,
             response,
@@ -4372,7 +4381,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                     "[audit_item] "
                     f"word={log_word} type={phrase_type[:24]} action={action[:16]} "
                     f"status={status} totalSeconds={total_seconds:.3f} "
-                    f"stages={stage_summary}"
+                    f"stages={stage_summary} turn_id={current_turn_id()}"
                 )
 
     try:

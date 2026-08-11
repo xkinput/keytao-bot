@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from nonebot.log import logger
 
 from keytao_bot.utils import review_flags
+from keytao_bot.utils.observability import observe_tool_call
 
 try:  # pragma: no cover - depends on the installed runtime
     import httpx as _httpx
@@ -3607,6 +3608,7 @@ class ToolExecutor:
             )
             return json.dumps(_tool_exception_payload(error), ensure_ascii=False), confirm_args
 
+    @observe_tool_call
     async def call(self, tool_name: str, arguments: Dict, context: ToolContext) -> str:
         root_error = _validate_root_type(tool_name, arguments)
         if root_error:

@@ -40,6 +40,14 @@ from ..utils.keytao_review import (
     infer_semantic_pronunciation,
 )
 from ..utils.memory_store import ChatMemoryContext
+from ..utils.observability import (
+    begin_turn_metrics,
+    emit_turn_metrics,
+    end_turn_metrics,
+    mark_turn_outcome,
+    record_history_messages,
+    turn_metrics_emitted,
+)
 from ..utils.web_identity import (
     WebIdentityConfigError,
     WebIdentityVerificationError,
@@ -188,52 +196,62 @@ try:
             space_id=user_key,
             speaker_name=user_key,
         )
-        async with (
-            conversation_message_locks.lock(conv_key),
-            draft_actor_message_locks.lock(conv_key),
-        ):
-            history_token = current_history_generation.set(
-                history_store.capture_generation(conv_key)
-            )
-            memory_token = current_memory_generation.set(
-                memory_store.capture_generation(memory_context)
-            )
-            memory_context_token = current_memory_context.set(memory_context)
-            try:
-                history = history_store.get_history(
-                    conv_key,
-                    limit=MAX_HISTORY_MESSAGES,
+        metrics_token = begin_turn_metrics(platform, "private")
+        try:
+            async with (
+                conversation_message_locks.lock(conv_key),
+                draft_actor_message_locks.lock(conv_key),
+            ):
+                history_token = current_history_generation.set(
+                    history_store.capture_generation(conv_key)
                 )
-                reply = await handle_pending_message_core(
-                    request.message,
-                    platform,
-                    user_key,
-                    conv_key,
-                    history=history,
-                    owner_label=user_key,
+                memory_token = current_memory_generation.set(
+                    memory_store.capture_generation(memory_context)
                 )
-                if reply is None:
-                    reply = await get_ai_response_core(
-                        message=request.message,
-                        platform=platform,
-                        user_id=user_key,
-                        history=history,
-                        memory_context=memory_context,
-                    )
-                if reply:
-                    remember_conversation(
+                memory_context_token = current_memory_context.set(memory_context)
+                try:
+                    history = history_store.get_history(
                         conv_key,
-                        memory_context,
-                        request.message,
-                        reply,
+                        limit=MAX_HISTORY_MESSAGES,
                     )
-                    schedule_memory_compaction(memory_context)
-            finally:
-                current_memory_context.reset(memory_context_token)
-                current_history_generation.reset(history_token)
-                current_memory_generation.reset(memory_token)
-
-        return {"reply": reply or "抱歉，AI 暂时无法响应，请稍后再试"}
+                    record_history_messages(len(history))
+                    reply = await handle_pending_message_core(
+                        request.message,
+                        platform,
+                        user_key,
+                        conv_key,
+                        history=history,
+                        owner_label=user_key,
+                    )
+                    if reply is None:
+                        reply = await get_ai_response_core(
+                            message=request.message,
+                            platform=platform,
+                            user_id=user_key,
+                            history=history,
+                            memory_context=memory_context,
+                        )
+                    if reply:
+                        remember_conversation(
+                            conv_key,
+                            memory_context,
+                            request.message,
+                            reply,
+                        )
+                        schedule_memory_compaction(memory_context)
+                finally:
+                    current_memory_context.reset(memory_context_token)
+                    current_history_generation.reset(history_token)
+                    current_memory_generation.reset(memory_token)
+            emit_turn_metrics(logger)
+            return {"reply": reply or "抱歉，AI 暂时无法响应，请稍后再试"}
+        except BaseException:
+            if not turn_metrics_emitted():
+                mark_turn_outcome("error")
+                emit_turn_metrics(logger)
+            raise
+        finally:
+            end_turn_metrics(metrics_token)
 
     @_app.post("/api/keytao/batches/review")
     async def keytao_batch_review(
