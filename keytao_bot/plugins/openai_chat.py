@@ -6621,7 +6621,7 @@ async def _format_draft_response(
         parts.append(f"\n草稿地址：{batch_url}")
 
     if draft_count != 0:
-        parts.append("\n发送「提交」以提交该草稿")
+        parts.append("\n发送「提交」以提交该草稿，也可继续加改动")
     return "\n".join(parts)
 
 

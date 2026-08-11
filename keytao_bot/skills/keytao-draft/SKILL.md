@@ -173,7 +173,7 @@ diff Phrase  bkxfu, bkxfuu
 
 草稿地址：https://...
 
-发送「提交」以提交该草稿
+发送「提交」以提交该草稿，也可继续加改动
 ```
 
 格式规则：
@@ -181,7 +181,7 @@ diff Phrase  bkxfu, bkxfuu
 - summary 行在代码块前面
 - diff 代码块之后，紧接着展示 `keytao_list_draft_items` 返回的草稿条目列表（格式同 `keytao_list_draft_items` 的回复格式，但无需重复 summary 行）
 - 列表之后附草稿地址
-- 最后一行始终为：`发送「提交」以提交该草稿`
+- 最后一行始终为：`发送「提交」以提交该草稿，也可继续加改动`
 - 若 `diff_text` 为空（草稿内容不影响词库），跳过代码块，直接展示列表，并提示"变更预览暂无数据，可能是新词尚未命中规则"
 - 若 `success: false`，直接显示 `message`
 
@@ -583,12 +583,12 @@ diff Phrase  wltbv, wltb
 
 草稿地址：https://...
 
-发送「提交」以提交该草稿
+发送「提交」以提交该草稿，也可继续加改动
 ```
 
 规则：
 - **每次操作成功后，在回复前调用 `keytao_get_batch_preview`** 获取最新 diff，与 `draft_snapshot` 合并展示
-- 回复末尾始终附草稿地址和提交提示：`发送「提交」以提交该草稿`
+- 回复末尾始终附草稿地址和提交提示：`发送「提交」以提交该草稿，也可继续加改动`
 - 若 `diff_text` 为空，跳过代码块，直接展示条目列表
 
 有警告时（`requiresConfirmation: true`），该次需要确认的条目尚未写入草稿；展示当前草稿并询问用户是否继续：
