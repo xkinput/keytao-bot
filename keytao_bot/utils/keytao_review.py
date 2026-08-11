@@ -134,6 +134,9 @@ ENTITY_DIRECT_FETCH_TIMEOUT = 3.0
 ENTITY_DIRECT_FETCH_ATTEMPT_TIMEOUT = 2.9
 ENTITY_PRONUNCIATION_MIN_CONFIDENCE = 0.75
 CONTEXT_ENTITY_SOURCE_DOMAINS = ("baike.baidu.com", "zh.wikipedia.org")
+ENCODE_WHOLE_WORD_ZDIC_SOURCES = frozenset({"zdic-phrase", "zdic-aabb"})
+ENCODE_ZDIC_SOURCE_ID = "handian_encode"
+ENCODE_ZDIC_SOURCE_LABEL = "汉典（经编码服务）"
 
 AUTHORITATIVE_SOURCES = [
     {
@@ -1303,6 +1306,105 @@ def _standard_pronunciation_status(encode_data: Dict) -> str:
     return "absent"
 
 
+def _encode_zdic_source_outcome(encode_data: Dict[str, Any]) -> Dict[str, str]:
+    lookup_result = _standard_pronunciation_status(encode_data)
+    return {
+        "sourceId": ENCODE_ZDIC_SOURCE_ID,
+        "source": ENCODE_ZDIC_SOURCE_LABEL,
+        "status": "completed" if lookup_result in {"found", "absent"} else "unavailable",
+        "lookupResult": lookup_result,
+    }
+
+
+def _encode_zdic_entry_word(word: str, source: str) -> str:
+    if source == "zdic-phrase":
+        return word
+    chars = list(word)
+    if (
+        source == "zdic-aabb"
+        and len(chars) == 4
+        and chars[0] == chars[1]
+        and chars[2] == chars[3]
+    ):
+        return chars[0] + chars[2]
+    return ""
+
+
+def _encode_whole_word_zdic_group(
+    word: str,
+    encode_data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    source = str(encode_data.get("pronunciationSource") or "").strip()
+    if (
+        _standard_pronunciation_status(encode_data) != "found"
+        or source not in ENCODE_WHOLE_WORD_ZDIC_SOURCES
+    ):
+        return None
+    entry_word = _encode_zdic_entry_word(word, source)
+    raw_pinyins = encode_data.get("phrasePinyins")
+    if not entry_word or not isinstance(raw_pinyins, list):
+        return None
+    sequence = tuple(
+        normalize_pinyin_syllable(str(value or ""))
+        for value in raw_pinyins
+    )
+    if len(sequence) != len(word) or not all(sequence):
+        return None
+    return {
+        "pinyin": pinyin_sequence_label(sequence),
+        "normalized": list(sequence),
+        "sources": [{
+            "source": ENCODE_ZDIC_SOURCE_LABEL,
+            "url": f"https://www.zdic.net/hans/{quote(entry_word)}",
+            "category": "dictionary",
+            "trust": 5,
+            "via": "encode-service",
+            "pronunciationSource": source,
+        }],
+        "sourceIds": [ENCODE_ZDIC_SOURCE_ID],
+        "score": 5,
+        "fallback": False,
+        "readingEvidenceKind": "encode_whole_word_zdic",
+    }
+
+
+def _merge_primary_pronunciation_group(
+    primary: Dict[str, Any],
+    supplementary_groups: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged_primary = dict(primary)
+    merged_primary["sources"] = list(primary.get("sources") or [])
+    merged_primary["sourceIds"] = list(primary.get("sourceIds") or [])
+    result = [merged_primary]
+    primary_sequence = tuple(primary.get("normalized") or ())
+    for group in supplementary_groups:
+        if tuple(group.get("normalized") or ()) != primary_sequence:
+            result.append(group)
+            continue
+        known_urls = {
+            str(source.get("url") or "")
+            for source in merged_primary["sources"]
+            if isinstance(source, dict)
+        }
+        for source in group.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            url = str(source.get("url") or "")
+            if url and url in known_urls:
+                continue
+            merged_primary["sources"].append(source)
+            if url:
+                known_urls.add(url)
+        for source_id in group.get("sourceIds") or []:
+            if source_id not in merged_primary["sourceIds"]:
+                merged_primary["sourceIds"].append(source_id)
+        merged_primary["score"] = max(
+            int(merged_primary.get("score") or 0),
+            int(group.get("score") or 0),
+        )
+    return result
+
+
 def _needs_semantic_pronunciation(encode_data: Dict, word: str) -> bool:
     if len(word) <= 1:
         return False
@@ -1643,23 +1745,46 @@ async def prepare_reviewed_word(
     if isinstance(encode_data, BaseException):
         encode_data = {"success": False, "message": str(encode_data)}
 
-    source_outcomes = [
+    scraper_source_outcomes = [
         outcome
         for outcome in (evidence.get("sourceOutcomes") or [])
         if isinstance(outcome, dict)
     ]
+    standard_status = _standard_pronunciation_status(encode_data)
+    pronunciation_source = str(
+        encode_data.get("pronunciationSource") or ""
+    ).strip()
+    encode_source_outcome = _encode_zdic_source_outcome(encode_data)
+    source_outcomes = [encode_source_outcome, *scraper_source_outcomes]
     if "lookupComplete" in evidence:
-        evidence_lookup_complete = evidence.get("lookupComplete") is True
+        scraper_lookup_complete = evidence.get("lookupComplete") is True
     else:
         # Backward-compatible for cached/test payloads produced before lookup
         # outcome tracking existed.
-        evidence_lookup_complete = bool(evidence.get("success")) and not bool(
+        scraper_lookup_complete = bool(evidence.get("success")) and not bool(
             evidence.get("timeout")
         )
-    evidence_lookup_status = str(
-        evidence.get("lookupStatus")
-        or ("completed" if evidence_lookup_complete else "incomplete")
-    )
+    if (
+        standard_status == "found"
+        and pronunciation_source in ENCODE_WHOLE_WORD_ZDIC_SOURCES
+    ):
+        # The primary same-infrastructure lookup completed with the whole-word
+        # Han Dian entry. Scrapers are supplementary and cannot erase it.
+        evidence_lookup_complete = True
+    elif standard_status == "unavailable":
+        evidence_lookup_complete = False
+    elif standard_status == "absent" and scraper_source_outcomes:
+        # Encode completed the Han Dian lookup and found no entry. Only an
+        # incomplete independent source may keep the wider evidence search
+        # open; a duplicate bot-side Han Dian scrape is supplementary.
+        evidence_lookup_complete = all(
+            outcome.get("status") == "completed"
+            for outcome in scraper_source_outcomes
+            if outcome.get("sourceId") != "handian"
+        )
+    else:
+        evidence_lookup_complete = scraper_lookup_complete
+    evidence_lookup_status = "completed" if evidence_lookup_complete else "incomplete"
     failed_source_labels = list(dict.fromkeys(
         str(outcome.get("source") or outcome.get("sourceId") or "").strip()
         for outcome in source_outcomes
@@ -1678,16 +1803,30 @@ async def prepare_reviewed_word(
         }, "code_unresolved")
 
     raw_groups = evidence.get("groups", []) if evidence.get("success") else []
-    groups, cross_validation_rejections = _validated_pronunciation_groups(
+    scraper_groups, cross_validation_rejections = _validated_pronunciation_groups(
         word,
         raw_groups,
         encode_data,
     )
-    standard_status = _standard_pronunciation_status(encode_data)
+    encode_group = _encode_whole_word_zdic_group(word, encode_data)
+    validated_encode_groups, encode_validation_rejections = (
+        _validated_pronunciation_groups(word, [encode_group], encode_data)
+        if encode_group
+        else ([], [])
+    )
+    groups = (
+        _merge_primary_pronunciation_group(
+            validated_encode_groups[0],
+            scraper_groups,
+        )
+        if validated_encode_groups
+        else scraper_groups
+    )
     foreign_evidence_rejections = list(evidence.get("rejections") or [])
     evidence_rejections = [
         *foreign_evidence_rejections,
         *cross_validation_rejections,
+        *encode_validation_rejections,
     ]
     # Rejected web evidence belongs to another word (or fails this word's
     # character readings). Keep it rejected and auditable, but do not let its

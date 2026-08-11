@@ -2062,6 +2062,44 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
     check("pre-submit preview keeps common-known reason", "实体常识" in (prompt or ""))
     check("pre-submit preview appears once", (prompt or "").count("自动审核：") == 1)
 
+    encode_authority_prompt = _format_reviewed_add_prompt({
+        "success": True,
+        "word": "诉讼费",
+        "recommendedCode": "ssfw",
+        "autoReviewable": True,
+        "preSubmitAudit": {
+            "success": True,
+            "verdict": "pass",
+            "autoApprove": True,
+            "summary": "权威来源、编码和常用度证据一致，允许本喵自动通过",
+            "issues": [],
+        },
+        "pronunciations": [{
+            "pinyin": "su song fei",
+            "recommendedCode": "ssfw",
+            "sources": [{
+                "source": "汉典（经编码服务）",
+                "url": "https://www.zdic.net/hans/%E8%AF%89%E8%AE%BC%E8%B4%B9",
+                "category": "dictionary",
+                "trust": 5,
+                "via": "encode-service",
+                "pronunciationSource": "zdic-phrase",
+            }],
+            "candidateStatuses": [
+                {"code": "ssfw", "occupied": False, "label": "空位"},
+            ],
+        }],
+    })
+    check(
+        "encode authority prompt shows truthful Handian-via-encode provenance",
+        "来源 汉典（经编码服务） https://www.zdic.net/hans/%E8%AF%89%E8%AE%BC%E8%B4%B9"
+        in (encode_authority_prompt or ""),
+    )
+    check(
+        "encode authority prompt reaches the user-facing auto-approval copy",
+        "自动审核：该词可自动通过" in (encode_authority_prompt or ""),
+    )
+
 
 def test_reviewed_add_prompt_explains_entity_common_knowledge():
     """Lookup prompts should surface entity recognition when authority pages are missing."""

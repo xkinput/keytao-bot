@@ -216,6 +216,71 @@ def _authoritative_evidence():
     }
 
 
+def _review_evidence(*, complete=True, handian_status="completed"):
+    return {
+        "success": True,
+        "word": "诉讼费",
+        "groups": [],
+        "sources": [],
+        "hasEvidence": False,
+        "rejections": [],
+        "lookupStatus": "completed" if complete else "incomplete",
+        "lookupComplete": complete,
+        "sourceOutcomes": [{
+            "sourceId": "handian",
+            "source": "汉典",
+            "status": handian_status,
+        }],
+    }
+
+
+def _su_song_fei_encode(*, status, source, phrase_pinyins=None):
+    return {
+        "success": True,
+        "word": "诉讼费",
+        "codes": ["ssfw", "ssfwo", "ssfwov"],
+        "altCodes": [],
+        "pronunciationSource": source,
+        "standardPronunciationStatus": status,
+        "semanticPronunciationNeeded": False,
+        "phrasePinyins": phrase_pinyins or ["sù", "sòng", "fèi"],
+        "contextPhrasePinyins": ["sù", "sòng", "fèi"],
+        "chars": [
+            {"char": "诉", "pinyin": "sù", "pinyins": ["sù"], "pronunciationLookupStatus": "found"},
+            {"char": "讼", "pinyin": "sòng", "pinyins": ["sòng"], "pronunciationLookupStatus": "found"},
+            {"char": "费", "pinyin": "fèi", "pinyins": ["fèi"], "pronunciationLookupStatus": "found"},
+        ],
+    }
+
+
+async def _review_word_with_encode(word, evidence, encode_data):
+    with (
+        patch.object(
+            review_module,
+            "collect_pronunciation_evidence_limited",
+            AsyncMock(return_value=evidence),
+        ),
+        patch.object(
+            review_module,
+            "fetch_keytao_encode",
+            AsyncMock(return_value=encode_data),
+        ),
+        patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+        patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+        patch.object(
+            review_module,
+            "_infer_entity_knowledge",
+            AsyncMock(return_value={"recognized": False}),
+        ),
+        patch.object(
+            review_module,
+            "_contextual_pronunciation_group",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        return await prepare_reviewed_word(CONFIG, word)
+
+
 def test_s14_wrong_entry_pronunciation_never_reaches_candidates():
     print("\n🧪 S14 wrong-entry pronunciation poisoning")
 
@@ -410,9 +475,9 @@ def test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_cha
         check("吃席 is not pronunciation-unresolved", review.get("pronunciationUnresolved") is not True)
         check("吃席 fallback remains sealed for manual review", read_manual_review_flag(review) is True)
         check(
-            "吃席 entity/context verdict explicitly declares SEAL",
+            "吃席 unavailable authority verdict explicitly declares incomplete-lookup SEAL",
             read_review_disposition(review) is ReviewDisposition.SEAL
-            and review.get("reviewVerdictSite") == "entity_context_reading",
+            and review.get("reviewVerdictSite") == "pronunciation_lookup_incomplete",
         )
         check(
             "later preview approval cannot clear the SEAL verdict",
@@ -420,9 +485,12 @@ def test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_cha
         )
         first_pronunciation = next(iter(review.get("pronunciations") or []), {})
         check(
-            "吃席 fallback keeps the historical entity/context label",
+            "吃席 fallback keeps entity context and exposes the authority outage",
             first_pronunciation.get("sourceSummary")
-            == "本喵实体语境判断（常见词，暂无权威页）",
+            == (
+                "本喵实体语境判断（常见词，暂无权威页）；"
+                "本次权威来源查询未完成（汉典（经编码服务））"
+            ),
         )
         check(
             "吃席 fallback is structurally marked as own-character evidence",
@@ -829,8 +897,8 @@ def test_reviewed_word_distinguishes_incomplete_lookup_from_completed_miss():
             "lookupStatus": "incomplete",
             "lookupComplete": False,
             "sourceOutcomes": [{
-                "sourceId": "handian",
-                "source": "汉典",
+                "sourceId": "moedict",
+                "source": "萌典",
                 "status": "errored",
             }],
         })
@@ -861,10 +929,211 @@ def test_reviewed_word_distinguishes_incomplete_lookup_from_completed_miss():
         check("caller payload keeps incomplete status", incomplete.get("pronunciationEvidenceComplete") is False)
         check("caller payload keeps completed status", completed.get("pronunciationEvidenceComplete") is True)
         check("failed lookup reason says this lookup failed", "本次权威来源查询未完成" in incomplete.get("autoReviewReason", ""))
-        check("failed lookup reason names the failed source", "汉典" in incomplete.get("autoReviewReason", ""))
+        check("failed lookup reason names the failed source", "萌典" in incomplete.get("autoReviewReason", ""))
         check("failed lookup source summary is truthful", "本次权威来源查询未完成" in incomplete_summary)
         check("completed miss keeps no-authority wording", completed.get("autoReviewReason") == "未找到权威来源，仅使用编码服务默认读音")
         check("completed miss is not mislabeled as a failed lookup", "本次权威来源查询未完成" not in completed_summary)
+
+    asyncio.run(_run())
+
+
+def test_encode_found_records_handian_authority_and_reaches_auto_approval():
+    print("\n🧪 encode-found whole-word zdic authority reaches auto approval")
+
+    async def _run():
+        check(
+            "whole-word zdic authority source set is exact",
+            review_module.ENCODE_WHOLE_WORD_ZDIC_SOURCES
+            == frozenset({"zdic-phrase", "zdic-aabb"}),
+        )
+        encode_data = _su_song_fei_encode(
+            status="found",
+            source="zdic-phrase",
+        )
+        review = await _review_word_with_encode(
+            "诉讼费",
+            _review_evidence(),
+            encode_data,
+        )
+        pronunciation = next(iter(review.get("pronunciations") or []), {})
+        sources = pronunciation.get("sources") or []
+        check("encode-found is auto reviewable", review.get("autoReviewable") is True)
+        check("encode-found clears the manual-review seal", read_manual_review_flag(review) is False)
+        check(
+            "encode-found records truthful Handian-via-encode provenance",
+            sources == [{
+                "source": "汉典（经编码服务）",
+                "url": "https://www.zdic.net/hans/%E8%AF%89%E8%AE%BC%E8%B4%B9",
+                "category": "dictionary",
+                "trust": 5,
+                "via": "encode-service",
+                "pronunciationSource": "zdic-phrase",
+            }],
+        )
+
+        with patch.object(
+            review_module,
+            "prepare_reviewed_word",
+            AsyncMock(return_value=review),
+        ):
+            audit = await audit_draft_items(CONFIG, [{
+                "id": 1,
+                "action": "Create",
+                "word": "诉讼费",
+                "code": "ssfw",
+                "type": "Phrase",
+            }])
+        check("encode-found reaches the auto-approval decision", audit.get("autoApprove") is True)
+        check("auto-approval summary stays affirmative", "允许本喵自动通过" in audit.get("summary", ""))
+
+        aabb_review = await _review_word_with_encode(
+            "匆匆忙忙",
+            {**_review_evidence(), "word": "匆匆忙忙"},
+            {
+                "success": True,
+                "word": "匆匆忙忙",
+                "codes": ["ccmm"],
+                "altCodes": [],
+                "pronunciationSource": "zdic-aabb",
+                "standardPronunciationStatus": "found",
+                "semanticPronunciationNeeded": False,
+                "phrasePinyins": ["cōng", "cōng", "máng", "máng"],
+                "contextPhrasePinyins": ["cōng", "cōng", "máng", "máng"],
+                "chars": [
+                    {"char": "匆", "pinyin": "cōng", "pinyins": ["cōng"], "pronunciationLookupStatus": "found"},
+                    {"char": "匆", "pinyin": "cōng", "pinyins": ["cōng"], "pronunciationLookupStatus": "found"},
+                    {"char": "忙", "pinyin": "máng", "pinyins": ["máng"], "pronunciationLookupStatus": "found"},
+                    {"char": "忙", "pinyin": "máng", "pinyins": ["máng"], "pronunciationLookupStatus": "found"},
+                ],
+            },
+        )
+        aabb_source = next(iter(aabb_review.get("pronunciations") or []), {}).get("sources", [{}])[0]
+        check(
+            "zdic-aabb provenance points to the actual base entry",
+            aabb_review.get("autoReviewable") is True
+            and aabb_source.get("url")
+            == "https://www.zdic.net/hans/%E5%8C%86%E5%BF%99",
+        )
+
+        mismatched = await _review_word_with_encode(
+            "诉讼费",
+            _review_evidence(),
+            _su_song_fei_encode(
+                status="found",
+                source="zdic-phrase",
+                phrase_pinyins=["shū", "sòng", "fèi"],
+            ),
+        )
+        check(
+            "encode authority still requires every syllable to be a known character reading",
+            mismatched.get("autoReviewable") is False
+            and not any(
+                pronunciation.get("sources")
+                for pronunciation in mismatched.get("pronunciations") or []
+                if isinstance(pronunciation, dict)
+            ),
+        )
+
+    asyncio.run(_run())
+
+
+def test_encode_absent_remains_sealed_as_completed_miss():
+    print("\n🧪 encode-absent is a completed Handian miss and remains sealed")
+
+    async def _run():
+        encode_data = {
+            "success": True,
+            "word": "阿勒泰",
+            "codes": ["altt"],
+            "altCodes": [],
+            "pronunciationSource": "pinyin-pro-context",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": False,
+            "phrasePinyins": ["ā", "lè", "tài"],
+            "contextPhrasePinyins": ["ā", "lè", "tài"],
+            "chars": [
+                {"char": "阿", "pinyin": "ā", "pinyins": ["ā"], "pronunciationLookupStatus": "found"},
+                {"char": "勒", "pinyin": "lè", "pinyins": ["lè"], "pronunciationLookupStatus": "found"},
+                {"char": "泰", "pinyin": "tài", "pinyins": ["tài"], "pronunciationLookupStatus": "found"},
+            ],
+        }
+        evidence = _review_evidence(complete=False, handian_status="timed_out")
+        evidence["word"] = "阿勒泰"
+        review = await _review_word_with_encode("阿勒泰", evidence, encode_data)
+        encode_outcome = next(
+            (
+                outcome
+                for outcome in review.get("pronunciationSourceOutcomes") or []
+                if outcome.get("sourceId") == "handian_encode"
+            ),
+            {},
+        )
+        check("encode-absent remains sealed", read_manual_review_flag(review) is True)
+        check("encode-absent is not auto reviewable", review.get("autoReviewable") is False)
+        check(
+            "encode-absent is recorded as a completed miss",
+            encode_outcome.get("status") == "completed"
+            and encode_outcome.get("lookupResult") == "absent",
+        )
+        check(
+            "encode-absent supersedes a failed duplicate Handian scrape",
+            review.get("pronunciationEvidenceComplete") is True
+            and "本次权威来源查询未完成" not in review.get("autoReviewReason", ""),
+        )
+        check(
+            "encode-absent keeps the missing-authority SEAL site",
+            read_review_disposition(review) is ReviewDisposition.SEAL
+            and review.get("reviewVerdictSite") == "missing_authoritative_page",
+        )
+
+    asyncio.run(_run())
+
+
+def test_encode_unavailable_preserves_incomplete_lookup_semantics():
+    print("\n🧪 encode-unavailable keeps incomplete lookup semantics")
+
+    async def _run():
+        review = await _review_word_with_encode(
+            "诉讼费",
+            _review_evidence(),
+            _su_song_fei_encode(
+                status="unavailable",
+                source="zdic-unavailable",
+            ),
+        )
+        check("encode-unavailable remains sealed", read_manual_review_flag(review) is True)
+        check("encode-unavailable marks evidence incomplete", review.get("pronunciationEvidenceComplete") is False)
+        check(
+            "encode-unavailable declares the incomplete-lookup SEAL site",
+            read_review_disposition(review) is ReviewDisposition.SEAL
+            and review.get("reviewVerdictSite") == "pronunciation_lookup_incomplete",
+        )
+        check(
+            "encode-unavailable reason reports an unfinished authority lookup",
+            "本次权威来源查询未完成" in review.get("autoReviewReason", "")
+            and "汉典（经编码服务）" in review.get("autoReviewReason", ""),
+        )
+
+    asyncio.run(_run())
+
+
+def test_scraper_failure_cannot_erase_encode_found_authority():
+    print("\n🧪 scraper failure cannot erase encode-found authority")
+
+    async def _run():
+        review = await _review_word_with_encode(
+            "诉讼费",
+            _review_evidence(complete=False, handian_status="timed_out"),
+            _su_song_fei_encode(
+                status="found",
+                source="zdic-phrase",
+            ),
+        )
+        pronunciation = next(iter(review.get("pronunciations") or []), {})
+        check("scraper failure retains encode authority", bool(pronunciation.get("sources")))
+        check("scraper failure does not seal encode-found", read_manual_review_flag(review) is False)
+        check("scraper failure leaves encode-found auto reviewable", review.get("autoReviewable") is True)
+        check("primary encode result completes the authority decision", review.get("pronunciationEvidenceComplete") is True)
 
     asyncio.run(_run())
 
@@ -2149,6 +2418,10 @@ def main():
     test_pronunciation_source_timeout_is_exposed_and_not_cached()
     test_pronunciation_genuine_no_evidence_is_cached()
     test_reviewed_word_distinguishes_incomplete_lookup_from_completed_miss()
+    test_encode_found_records_handian_authority_and_reaches_auto_approval()
+    test_encode_absent_remains_sealed_as_completed_miss()
+    test_encode_unavailable_preserves_incomplete_lookup_semantics()
+    test_scraper_failure_cannot_erase_encode_found_authority()
     test_audit_never_overrides_incomplete_pronunciation_lookup()
     test_lookup_failure_forces_manual_review()
     test_exact_existing_is_duplicate_not_approval()
