@@ -11,7 +11,7 @@ import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 from nonebot.log import logger
 
@@ -162,6 +162,30 @@ AUTHORITATIVE_SOURCES = [
         ],
     },
     {
+        "id": "hwxnet_cidian",
+        "label": "汉文学网·汉语词典",
+        "domain": "cd.hwxnet.com",
+        "category": "dictionary",
+        "trust": 4,
+        "query": 'site:cd.hwxnet.com "{word}" 拼音',
+        "direct_urls": [],
+        "follow_search_url": "https://cd.hwxnet.com/search.do?wd={word}",
+        "entry_scope": "multi_character",
+        "adjacent_word_pinyin": True,
+    },
+    {
+        "id": "hwxnet_xinhua",
+        "label": "汉文学网·新华字典",
+        "domain": "zd.hwxnet.com",
+        "category": "dictionary",
+        "trust": 4,
+        "query": 'site:zd.hwxnet.com "{word}" 拼音',
+        "direct_urls": [],
+        "follow_search_url": "https://zd.hwxnet.com/search.do?wd={word}",
+        "entry_scope": "single_character",
+        "adjacent_word_pinyin": True,
+    },
+    {
         "id": "baidu_baike",
         "label": "百度百科",
         "domain": "baike.baidu.com",
@@ -192,6 +216,7 @@ AUTHORITATIVE_SOURCES = [
         "query": 'site:cidian.qianp.com "{word}" 拼音',
         "direct_urls": [],
     },
+    # xh.5156edu.com is a future GB2312/POST carrier option.
 ]
 
 _PINYIN_CHAR_CLASS = (
@@ -728,8 +753,9 @@ async def _fetch_text(
     *,
     max_attempts: int = PRONUNCIATION_FETCH_MAX_ATTEMPTS,
     attempt_timeout: float = PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT,
+    preserve_html: bool = False,
 ) -> str:
-    """Fetch a search-result page.
+    """Fetch a review page, optionally preserving HTML for link inspection.
 
     The URL comes from a search engine, i.e. it is attacker-influencable: anyone
     can publish a page that ranks and then 302 it at the metadata service. It
@@ -746,7 +772,11 @@ async def _fetch_text(
         if not response.is_success:
             raise RuntimeError(f"HTTP {response.status_code}")
         return _LookupText(
-            _strip_tags(response.text[:150000]),
+            (
+                response.text[:150000]
+                if preserve_html
+                else _strip_tags(response.text[:150000])
+            ),
             lookup_status="completed",
         )
     except http_client.BlockedUrlError as error:
@@ -767,6 +797,15 @@ def _source_by_id(source_id: str) -> Dict[str, Any]:
     return {}
 
 
+def _source_applies_to_word(source: Dict[str, Any], word: str) -> bool:
+    scope = str(source.get("entry_scope") or "all")
+    if scope == "single_character":
+        return len(word) == 1
+    if scope == "multi_character":
+        return len(word) > 1
+    return True
+
+
 def _normalize_evidence_binding_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", html.unescape(str(value or "")))
     normalized = re.sub(r"[\u200b-\u200d\u2060\ufeff]", "", normalized)
@@ -777,6 +816,44 @@ def _direct_url_entry_matches_word(url: str, word: str) -> bool:
     path = unquote(urlparse(url).path).rstrip("/")
     entry = path.rsplit("/", 1)[-1] if path else ""
     return _normalize_evidence_binding_text(entry) == _normalize_evidence_binding_text(word)
+
+
+def _exact_word_same_domain_anchor_url(
+    content: str,
+    *,
+    search_url: str,
+    source_domain: str,
+    word: str,
+) -> str:
+    """Return at most one same-domain link whose rendered anchor is the exact word."""
+    search = urlparse(search_url)
+    search_host = str(search.hostname or "").lower().rstrip(".")
+    expected_host = str(source_domain or "").lower().rstrip(".")
+    if not search_host or search_host != expected_host:
+        return ""
+    for anchor in re.finditer(
+        r"<a\b([^>]*)>(.*?)</a>",
+        str(content or ""),
+        re.IGNORECASE | re.DOTALL,
+    ):
+        href_match = re.search(
+            r"\bhref\s*=\s*(['\"])(.*?)\1",
+            anchor.group(1),
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not href_match or _strip_tags(anchor.group(2)) != word:
+            continue
+        candidate = urljoin(search_url, html.unescape(href_match.group(2)).strip())
+        parsed = urlparse(candidate)
+        candidate_host = str(parsed.hostname or "").lower().rstrip(".")
+        if (
+            parsed.scheme == search.scheme
+            and candidate_host == search_host
+            and not parsed.username
+            and not parsed.password
+        ):
+            return candidate
+    return ""
 
 
 def _word_is_bound_to_pinyin_match(text: str, word: str, match: re.Match[str]) -> bool:
@@ -793,7 +870,11 @@ def _extract_labeled_pinyin_sequences(
     word: str,
     *,
     exact_entry_direct_url: bool = False,
+    allow_adjacent_word_pinyin: bool = False,
+    word_binding_confirmed: Optional[bool] = None,
 ) -> Tuple[List[Tuple[str, ...]], int]:
+    if word_binding_confirmed is False:
+        return [], sum(1 for _match in _PINYIN_LABEL_RE.finditer(text))
     sequences: List[Tuple[str, ...]] = []
     seen: set[Tuple[str, ...]] = set()
     rejected_unbound = 0
@@ -817,6 +898,20 @@ def _extract_labeled_pinyin_sequences(
         if sequence not in seen:
             seen.add(sequence)
             sequences.append(sequence)
+    if allow_adjacent_word_pinyin:
+        normalized_text = _normalize_evidence_binding_text(text)
+        normalized_word = _normalize_evidence_binding_text(word)
+        adjacent_pattern = re.compile(
+            rf"{re.escape(normalized_word)}\s+"
+            rf"([{_PINYIN_CHAR_CLASS}\s·,，、/\\-]{{1,120}}?)"
+            rf"\s+(?:词典解释|字典解释)"
+        )
+        for match in adjacent_pattern.finditer(normalized_text):
+            sequence = normalize_pinyin_sequence(match.group(1))
+            if len(sequence) != len(word) or sequence in seen:
+                continue
+            seen.add(sequence)
+            sequences.append(sequence)
     return sequences, rejected_unbound
 
 
@@ -833,36 +928,83 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         # Direct pages and the site-scoped search run together; inside each,
         # every outbound fetch is issued in parallel as well. Serial per-URL
         # fetching is what used to blow through the total budget.
-        async def direct_texts() -> Tuple[List[Tuple[str, str, str, bool]], str]:
+        async def direct_texts() -> Tuple[
+            List[Tuple[str, str, str, bool, Optional[bool]]],
+            str,
+        ]:
             urls = [
                 url_template.format(word=quote(word))
                 for url_template in source.get("direct_urls", [])
             ]
-            if not urls:
-                return [], "completed"
-            pages = await asyncio.gather(
-                *(_fetch_text(url) for url in urls),
-                return_exceptions=True,
-            )
-            collected: List[Tuple[str, str, str, bool]] = []
+            collected: List[
+                Tuple[str, str, str, bool, Optional[bool]]
+            ] = []
             statuses: List[str] = []
-            for url, page in zip(urls, pages):
-                if isinstance(page, BaseException):
-                    statuses.append(
-                        "timed_out" if _is_timeout_error(page) else "errored"
+            if urls:
+                pages = await asyncio.gather(
+                    *(_fetch_text(url) for url in urls),
+                    return_exceptions=True,
+                )
+                for url, page in zip(urls, pages):
+                    if isinstance(page, BaseException):
+                        statuses.append(
+                            "timed_out" if _is_timeout_error(page) else "errored"
+                        )
+                        continue
+                    statuses.append(str(getattr(page, "lookup_status", "completed")))
+                    if page:
+                        collected.append((
+                            source["label"],
+                            url,
+                            page[:12000],
+                            _direct_url_entry_matches_word(url, word),
+                            None,
+                        ))
+
+            follow_search_template = str(source.get("follow_search_url") or "")
+            if follow_search_template:
+                search_url = follow_search_template.format(word=quote(word))
+                search_page = await _fetch_text(
+                    search_url,
+                    max_attempts=1,
+                    preserve_html=True,
+                )
+                statuses.append(
+                    str(getattr(search_page, "lookup_status", "completed"))
+                )
+                if search_page:
+                    entry_url = _exact_word_same_domain_anchor_url(
+                        search_page,
+                        search_url=search_url,
+                        source_domain=source["domain"],
+                        word=word,
                     )
-                    continue
-                statuses.append(str(getattr(page, "lookup_status", "completed")))
-                if page:
                     collected.append((
                         source["label"],
-                        url,
-                        page[:12000],
-                        _direct_url_entry_matches_word(url, word),
+                        search_url,
+                        _strip_tags(search_page[:12000]),
+                        False,
+                        bool(entry_url),
                     ))
+                    if entry_url:
+                        entry_page = await _fetch_text(entry_url, max_attempts=1)
+                        statuses.append(
+                            str(getattr(entry_page, "lookup_status", "completed"))
+                        )
+                        if entry_page:
+                            collected.append((
+                                source["label"],
+                                entry_url,
+                                entry_page[:12000],
+                                False,
+                                None,
+                            ))
             return collected, _merge_lookup_status(statuses)
 
-        async def search_texts() -> Tuple[List[Tuple[str, str, str, bool]], str]:
+        async def search_texts() -> Tuple[
+            List[Tuple[str, str, str, bool, Optional[bool]]],
+            str,
+        ]:
             results = await _search_web(source["query"].format(word=word), max_results=2)
             statuses = [str(getattr(results, "lookup_status", "completed"))]
             matching = [
@@ -874,7 +1016,9 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
             pages = await asyncio.gather(*(
                 _fetch_text(result.get("url", "")) for result in matching
             ), return_exceptions=True)
-            collected: List[Tuple[str, str, str, bool]] = []
+            collected: List[
+                Tuple[str, str, str, bool, Optional[bool]]
+            ] = []
             for result, page_text in zip(matching, pages):
                 url = result.get("url", "")
                 collected.append((
@@ -882,6 +1026,7 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                     url,
                     f"{result.get('title', '')} {result.get('snippet', '')}",
                     False,
+                    None,
                 ))
                 if isinstance(page_text, BaseException):
                     statuses.append(
@@ -892,7 +1037,13 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                     str(getattr(page_text, "lookup_status", "completed"))
                 )
                 if page_text:
-                    collected.append((source["label"], url, page_text[:12000], False))
+                    collected.append((
+                        source["label"],
+                        url,
+                        page_text[:12000],
+                        False,
+                        None,
+                    ))
             return collected, _merge_lookup_status(statuses)
 
         tasks = [
@@ -904,7 +1055,7 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
             timeout=PRONUNCIATION_SOURCE_TIMEOUT,
         )
         statuses = ["timed_out"] if pending else []
-        texts: List[Tuple[str, str, str, bool]] = []
+        texts: List[Tuple[str, str, str, bool, Optional[bool]]] = []
         for task in pending:
             task.cancel()
         if pending:
@@ -930,25 +1081,39 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
 
         entries: List[Dict[str, Any]] = []
         source_rejections: List[Dict[str, Any]] = []
-        for label, url, text, exact_entry_direct_url in texts:
+        for (
+            label,
+            url,
+            text,
+            exact_entry_direct_url,
+            word_binding_confirmed,
+        ) in texts:
             sequences, rejected_unbound = _extract_labeled_pinyin_sequences(
                 text,
                 word,
                 exact_entry_direct_url=exact_entry_direct_url,
+                allow_adjacent_word_pinyin=bool(
+                    source.get("adjacent_word_pinyin")
+                ),
+                word_binding_confirmed=word_binding_confirmed,
             )
             if rejected_unbound:
+                rejection_reason = (
+                    "search_anchor_not_exact_word"
+                    if word_binding_confirmed is False
+                    else "queried_word_not_near_pinyin_label"
+                )
                 rejection = {
                     "sourceId": source["id"],
                     "source": label,
                     "url": url,
-                    "reason": "queried_word_not_near_pinyin_label",
+                    "reason": rejection_reason,
                     "count": rejected_unbound,
                 }
                 source_rejections.append(rejection)
                 logger.warning(
                     "Pronunciation evidence rejected for "
-                    f"{word} from {url}: queried word absent within "
-                    f"+/-{PRONUNCIATION_WORD_BINDING_WINDOW_CHARS} characters"
+                    f"{word} from {url}: {rejection_reason}"
                 )
             for sequence in sequences:
                 entries.append({
@@ -968,8 +1133,13 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
             "rejections": source_rejections,
         }
 
+    applicable_sources = [
+        source
+        for source in AUTHORITATIVE_SOURCES
+        if _source_applies_to_word(source, word)
+    ]
     inspected = await asyncio.gather(*(
-        inspect_source(source) for source in AUTHORITATIVE_SOURCES
+        inspect_source(source) for source in applicable_sources
     ))
     source_entries = [
         entry

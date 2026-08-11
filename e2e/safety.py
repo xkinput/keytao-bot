@@ -12,6 +12,17 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 PRODUCTION_KEYTAO_HOSTS = frozenset({"keytao.vercel.app", "www.keytao.vercel.app"})
+BLOCKED_EXTERNAL_DOMAINS = frozenset({
+    "baike.baidu.com",
+    "cd.hwxnet.com",
+    "cidian.qianp.com",
+    "moedict.tw",
+    "www.moedict.tw",
+    "www.zdic.net",
+    "zd.hwxnet.com",
+    "zdic.net",
+    "zh.wikipedia.org",
+})
 RESERVED_BINDING_PREFIX = "keytao-e2e-llm-rig-"
 RESERVED_EMAIL_SUFFIX = "@example.invalid"
 MIN_SYNTHETIC_QQ_DIGITS = 30
@@ -259,7 +270,7 @@ class PronunciationPoisonController:
             "provider": "e2e-poison",
         }]
 
-    async def fetch_text(self, url: str) -> str:
+    async def fetch_text(self, url: str, **_kwargs: Any) -> str:
         if not self.armed_scenario or self.page_injected:
             return ""
         parsed = urlparse(url)
@@ -312,6 +323,10 @@ class NetworkAllowlist:
         scheme, host, port = _origin(str(url))
         if host in PRODUCTION_KEYTAO_HOSTS or host.endswith(".keytao.vercel.app"):
             raise SafetyViolation(f"Blocked KeyTao production URL before dispatch: {host}")
+        if host in BLOCKED_EXTERNAL_DOMAINS:
+            raise SafetyViolation(
+                f"Blocked external review domain before dispatch: {host}"
+            )
         if scheme not in {"http", "https"}:
             raise SafetyViolation(f"Blocked non-HTTP network URL: {scheme}://{host}")
         if is_local_host(host):
@@ -324,6 +339,10 @@ class NetworkAllowlist:
 
     def assert_socket_allowed(self, host: Any, port: Any) -> None:
         normalized = _normalized_host(host).split("%", 1)[0]
+        if normalized in BLOCKED_EXTERNAL_DOMAINS:
+            raise SafetyViolation(
+                f"Blocked external review domain before socket dispatch: {normalized}"
+            )
         if is_local_host(normalized):
             return
         if normalized == self.llm_origin[1] and int(port) == self.llm_origin[2]:

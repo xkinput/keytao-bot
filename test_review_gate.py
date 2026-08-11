@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from urllib.parse import unquote
 
@@ -175,6 +176,40 @@ def test_review_disposition_registry():
 
 
 CONFIG = ReviewHttpConfig(api_base="https://fake", bot_token="fake")
+PRONUNCIATION_FIXTURES = (
+    Path(__file__).parent / "test_fixtures" / "pronunciation_sources"
+)
+
+
+def _pronunciation_fixture(name):
+    return (PRONUNCIATION_FIXTURES / name).read_text(encoding="utf-8")
+
+
+async def _collect_hwxnet_fixture(search_fixture, entry_fixture):
+    review_module._clear_review_caches()
+    source = dict(review_module._source_by_id("hwxnet_cidian"))
+    search_url = source["follow_search_url"].format(word="%E8%AF%89%E8%AE%BC%E8%B4%B9")
+    calls = []
+
+    async def fixture_fetch(url, **kwargs):
+        calls.append((url, dict(kwargs)))
+        if url == search_url:
+            content = _pronunciation_fixture(search_fixture)
+        elif "/view/" in url:
+            content = _pronunciation_fixture(entry_fixture)
+        else:
+            raise AssertionError(f"Unexpected fixture URL: {url}")
+        if not kwargs.get("preserve_html"):
+            content = review_module._strip_tags(content)
+        return review_module._LookupText(content, lookup_status="completed")
+
+    with (
+        patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+        patch.object(review_module, "_fetch_text", side_effect=fixture_fetch),
+        patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
+    ):
+        evidence = await review_module.collect_pronunciation_evidence("诉讼费")
+    return evidence, calls
 
 
 def _encode_data():
@@ -322,7 +357,7 @@ def test_s14_wrong_entry_pronunciation_never_reaches_candidates():
                 "snippet": "光面 拼音：guāng miàn",
             }]
 
-        async def poisoned_page(url):
+        async def poisoned_page(url, **_kwargs):
             if "光面" not in unquote(url):
                 return ""
             return "光面 汉典 拼音：guāng miàn 光滑的表面。"
@@ -537,6 +572,115 @@ def test_pronunciation_word_binding_window_and_exact_direct_entry():
             "亮面",
         ) is False,
     )
+
+
+def test_hwxnet_real_fixture_extracts_honest_provenance():
+    print("\n🧪 hwxnet real fixture and honest provenance")
+
+    async def _run():
+        evidence, calls = await _collect_hwxnet_fixture(
+            "hwxnet-search-exact.html",
+            "hwxnet-susongfei.html",
+        )
+        group = next(iter(evidence.get("groups") or []), {})
+        sources = group.get("sources") or []
+        entry_calls = [url for url, _kwargs in calls if "/view/" in url]
+        check("real hwxnet fixture yields su song fei", group.get("pinyin") == "su song fei")
+        check("hwxnet label is honest and attached", sources == [{
+            "source": "汉文学网·汉语词典",
+            "url": "https://cd.hwxnet.com/view/pmglmbimchjkneeh.html",
+            "category": "dictionary",
+            "trust": 4,
+        }])
+        check("the first exact anchor is the only followed entry", entry_calls == [
+            "https://cd.hwxnet.com/view/pmglmbimchjkneeh.html",
+        ])
+        check("search and entry use one attempt each", [kwargs.get("max_attempts") for _url, kwargs in calls] == [1, 1])
+        check("search fetch preserves HTML only for exact-anchor inspection", [
+            kwargs.get("preserve_html", False) for _url, kwargs in calls
+        ] == [True, False])
+        check("word and character carriers are length-scoped", (
+            review_module._source_applies_to_word(
+                review_module._source_by_id("hwxnet_cidian"),
+                "诉讼费",
+            )
+            and not review_module._source_applies_to_word(
+                review_module._source_by_id("hwxnet_cidian"),
+                "诉",
+            )
+            and review_module._source_applies_to_word(
+                review_module._source_by_id("hwxnet_xinhua"),
+                "诉",
+            )
+            and not review_module._source_applies_to_word(
+                review_module._source_by_id("hwxnet_xinhua"),
+                "诉讼费",
+            )
+        ))
+
+    asyncio.run(_run())
+
+
+def test_hwxnet_follow_requires_exact_anchor_text():
+    print("\n🧪 hwxnet follow requires exact anchor text")
+
+    async def _run():
+        evidence, calls = await _collect_hwxnet_fixture(
+            "hwxnet-search-wrong-word.html",
+            "hwxnet-susongfei-poisoned.html",
+        )
+        check("wrong-word anchor never triggers a follow", len(calls) == 1)
+        check("wrong-word search page yields no pronunciation", evidence.get("groups") == [])
+        check("wrong-word search page yields no source entry", evidence.get("sources") == [])
+        check("wrong-word search page fails the explicit anchor binding", any(
+            rejection.get("reason") == "search_anchor_not_exact_word"
+            for rejection in evidence.get("rejections") or []
+            if isinstance(rejection, dict)
+        ))
+        check("the completed non-match remains a clean miss", evidence.get("lookupComplete") is True)
+
+    asyncio.run(_run())
+
+
+def test_hwxnet_poisoned_fixture_fails_per_syllable_validation():
+    print("\n🧪 hwxnet poison still fails per-syllable validation")
+
+    async def _run():
+        evidence, _calls = await _collect_hwxnet_fixture(
+            "hwxnet-search-exact.html",
+            "hwxnet-susongfei-poisoned.html",
+        )
+        poisoned = next(iter(evidence.get("groups") or []), {})
+        review = await _review_word_with_encode(
+            "诉讼费",
+            evidence,
+            _su_song_fei_encode(
+                status="absent",
+                source="pinyin-pro-context",
+            ),
+        )
+        check("poison fixture reaches the ordinary extraction stage", poisoned.get("pinyin") == "shu song fei")
+        check("poison fixture carries the hwxnet source id", poisoned.get("sourceIds") == ["hwxnet_cidian"])
+        check("poisoned shu sequence is absent after validation", not any(
+            item.get("normalized") == ["shu", "song", "fei"]
+            for item in review.get("pronunciations") or []
+            if isinstance(item, dict)
+        ))
+        check("per-syllable mismatch is recorded", any(
+            rejection.get("reason") == "character_1_reading_mismatch"
+            and rejection.get("sourceIds") == ["hwxnet_cidian"]
+            for rejection in review.get("pronunciationRejections") or []
+            if isinstance(rejection, dict)
+        ))
+        check("poisoned hwxnet provenance cannot survive validation", not any(
+            source.get("source") == "汉文学网·汉语词典"
+            for item in review.get("pronunciations") or []
+            if isinstance(item, dict)
+            for source in item.get("sources") or []
+            if isinstance(source, dict)
+        ))
+
+    asyncio.run(_run())
 
 
 def test_pronunciation_groups_require_known_character_readings():
@@ -2411,6 +2555,9 @@ def main():
     test_s14_wrong_entry_pronunciation_never_reaches_candidates()
     test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_characters()
     test_pronunciation_word_binding_window_and_exact_direct_entry()
+    test_hwxnet_real_fixture_extracts_honest_provenance()
+    test_hwxnet_follow_requires_exact_anchor_text()
+    test_hwxnet_poisoned_fixture_fails_per_syllable_validation()
     test_pronunciation_groups_require_known_character_readings()
     test_pronunciation_source_failure_is_not_cached_and_retry_refetches()
     test_review_fetch_retries_transient_dns_within_source_budget()

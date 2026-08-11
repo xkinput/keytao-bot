@@ -21,6 +21,7 @@ from .run import (
 )
 from .runtime import LocalNextClient, RigInfrastructureError
 from .safety import (
+    BLOCKED_EXTERNAL_DOMAINS,
     NetworkAllowlist,
     PronunciationPoisonController,
     SafetyViolation,
@@ -34,6 +35,33 @@ from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_s9_zdic_cache, seed_zdic_
 
 
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
+    def test_review_source_domains_are_explicitly_blocked(self) -> None:
+        expected = {
+            "baike.baidu.com",
+            "cd.hwxnet.com",
+            "cidian.qianp.com",
+            "moedict.tw",
+            "www.moedict.tw",
+            "www.zdic.net",
+            "zd.hwxnet.com",
+            "zdic.net",
+            "zh.wikipedia.org",
+        }
+        self.assertEqual(BLOCKED_EXTERNAL_DOMAINS, expected)
+        with patch.object(
+            NetworkAllowlist,
+            "_resolve_llm_ips",
+            return_value=frozenset({"203.0.113.10"}),
+        ):
+            guard = NetworkAllowlist(llm_base_url="https://llm.example.com/v1")
+        for domain in ("cd.hwxnet.com", "zd.hwxnet.com"):
+            with self.subTest(domain=domain):
+                with self.assertRaisesRegex(
+                    SafetyViolation,
+                    "Blocked external review domain",
+                ):
+                    guard.assert_url_allowed(f"https://{domain}/search.do?wd=test")
+
     def test_weight_rule_prompt_copy_has_one_canonical_statement(self) -> None:
         skill = (
             Path(__file__).parents[1]
