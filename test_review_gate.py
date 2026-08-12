@@ -1372,16 +1372,296 @@ def test_pronunciation_source_failure_is_not_cached_and_retry_refetches():
             retried_lookup = await review_module.collect_pronunciation_evidence("诉讼费")
             cached_positive = await review_module.collect_pronunciation_evidence("诉讼费")
 
-        check("failed lookup is marked incomplete", failed_lookup.get("lookupComplete") is False)
+        check("all-unavailable lookup is marked incomplete", failed_lookup.get("lookupComplete") is False)
         check("failed source outcome is exposed", failed_lookup.get("sourceOutcomes") == [{
             "sourceId": "handian",
             "source": "汉典",
             "status": "errored",
+            "lookupResult": "unavailable",
         }])
         check("retry re-fetches after the failure", fetch_calls == 2)
         recovered_group = next(iter(retried_lookup.get("groups") or []), {})
         check("retry recovers authoritative evidence", recovered_group.get("pinyin") == "su song fei")
         check("recovered positive result is cached", cached_positive == retried_lookup)
+
+    asyncio.run(_run())
+
+
+def test_proxy_http_404_absence_is_a_completed_source_outcome():
+    print("\n🧪 proxy HTTP 404 absence is a completed source outcome")
+
+    class ProxyResponse:
+        status_code = 404
+
+        @staticmethod
+        def json():
+            return {"ok": False, "status": 404}
+
+    async def _run():
+        review_module._clear_review_caches()
+        source = dict(review_module._source_by_id("handian"))
+        direct_fetch = AsyncMock(
+            side_effect=AssertionError("proxy absence must not use direct fallback")
+        )
+        search_web = AsyncMock(return_value=review_module._LookupResults([]))
+
+        with (
+            patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+            patch.object(
+                review_module,
+                "_collect_local_pronunciation_evidence",
+                return_value={"entries": [], "outcomes": []},
+            ),
+            patch.object(
+                review_module.http_client,
+                "keytao_request",
+                AsyncMock(return_value=ProxyResponse()),
+            ),
+            patch.object(review_module, "_fetch_text", direct_fetch),
+            patch.object(review_module, "_search_web", search_web),
+            patch.object(
+                review_module,
+                "_bot_evidence_proxy_endpoint_available",
+                None,
+            ),
+            patch.object(
+                review_module,
+                "_bot_evidence_proxy_feature_probe_failed",
+                False,
+            ),
+        ):
+            evidence = await review_module.collect_pronunciation_evidence("你还")
+
+        check("proxy absence completes the lookup", evidence.get("lookupComplete") is True)
+        check("proxy absence yields no evidence", evidence.get("hasEvidence") is False)
+        check("proxy absence is normalized on the source outcome", evidence.get("sourceOutcomes") == [{
+            "sourceId": "handian",
+            "source": "汉典",
+            "status": "completed",
+            "lookupResult": "absent",
+        }])
+        check("proxy absence skips the direct fallback", direct_fetch.await_count == 0)
+        check("proxy absence skips optional search", search_web.await_count == 0)
+
+    asyncio.run(_run())
+
+
+def test_proxy_found_evidence_is_complete_through_review():
+    print("\n🧪 proxy found evidence stays complete through review")
+
+    class ProxyResponse:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "ok": True,
+                "status": 200,
+                "text": "诉讼费 拼音：sù sòng fèi 注音",
+            }
+
+    async def _run():
+        review_module._clear_review_caches()
+        source = dict(review_module._source_by_id("handian"))
+        direct_fetch = AsyncMock(
+            side_effect=AssertionError("proxy found must not use direct fallback")
+        )
+
+        with (
+            patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+            patch.object(
+                review_module,
+                "_collect_local_pronunciation_evidence",
+                return_value={"entries": [], "outcomes": []},
+            ),
+            patch.object(
+                review_module.http_client,
+                "keytao_request",
+                AsyncMock(return_value=ProxyResponse()),
+            ),
+            patch.object(review_module, "_fetch_text", direct_fetch),
+            patch.object(
+                review_module,
+                "_search_web",
+                AsyncMock(return_value=review_module._LookupResults([])),
+            ),
+            patch.object(
+                review_module,
+                "_bot_evidence_proxy_endpoint_available",
+                None,
+            ),
+            patch.object(
+                review_module,
+                "_bot_evidence_proxy_feature_probe_failed",
+                False,
+            ),
+        ):
+            evidence = await review_module.collect_pronunciation_evidence("诉讼费")
+
+        outcome = next(iter(evidence.get("sourceOutcomes") or []), {})
+        group = next(iter(evidence.get("groups") or []), {})
+        check(
+            "proxy found yields complete evidence",
+            evidence.get("lookupComplete") is True
+            and evidence.get("hasEvidence") is True,
+        )
+        check(
+            "proxy found is normalized on the source outcome",
+            outcome.get("status") == "completed"
+            and outcome.get("lookupResult") == "found",
+        )
+        check(
+            "proxy text still passes extraction and validation",
+            group.get("normalized") == ["su", "song", "fei"]
+            and group.get("sourceIds") == ["handian"],
+        )
+        check("proxy found skips the direct fallback", direct_fetch.await_count == 0)
+
+        review = await _review_word_with_encode(
+            "诉讼费",
+            evidence,
+            _su_song_fei_encode(status="found", source="zdic-phrase"),
+        )
+        check(
+            "found evidence stays complete through review",
+            review.get("pronunciationEvidenceComplete") is True
+            and review.get("autoReviewable") is True,
+        )
+
+    asyncio.run(_run())
+
+
+def test_unreachable_optional_sources_do_not_block_completed_absence():
+    print("\n🧪 unreachable optional sources do not block completed absence")
+
+    class ProxyAbsentResponse:
+        status_code = 404
+
+        @staticmethod
+        def json():
+            return {"ok": False, "status": 404}
+
+    async def _run():
+        review_module._clear_review_caches()
+        sources = [
+            dict(review_module._source_by_id(source_id))
+            for source_id in ("handian", "baidu_baike", "cidian")
+        ]
+
+        async def proxy_request(_method, _path, **kwargs):
+            if kwargs.get("json_body", {}).get("sourceId") == "handian":
+                return ProxyAbsentResponse()
+            raise RuntimeError("simulated unavailable proxy carrier")
+
+        async def unavailable_direct(_url, **_kwargs):
+            return review_module._LookupText("", lookup_status="errored")
+
+        async def source_search(query, max_results=3):
+            status = "timed_out" if "cidian.qianp.com" in query else "errored"
+            return review_module._LookupResults([], lookup_status=status)
+
+        with (
+            patch.object(review_module, "AUTHORITATIVE_SOURCES", sources),
+            patch.object(
+                review_module,
+                "_collect_local_pronunciation_evidence",
+                return_value={
+                    "entries": [],
+                    "outcomes": [{
+                        "sourceId": "zdic_cibs",
+                        "source": "汉典词典（离线数据集）",
+                        "status": "completed",
+                        "lookupResult": "absent",
+                    }],
+                },
+            ),
+            patch.object(
+                review_module.http_client,
+                "keytao_request",
+                side_effect=proxy_request,
+            ),
+            patch.object(review_module, "_fetch_text", side_effect=unavailable_direct),
+            patch.object(review_module, "_search_web", side_effect=source_search),
+            patch.object(
+                review_module,
+                "_bot_evidence_proxy_endpoint_available",
+                None,
+            ),
+            patch.object(
+                review_module,
+                "_bot_evidence_proxy_feature_probe_failed",
+                False,
+            ),
+        ):
+            evidence = await review_module.collect_pronunciation_evidence("你还")
+
+        outcomes = {
+            outcome["sourceId"]: outcome
+            for outcome in evidence.get("sourceOutcomes") or []
+        }
+        check("reachable absences complete the lookup", evidence.get("lookupComplete") is True)
+        check("completed reachable lookup still has no evidence", evidence.get("hasEvidence") is False)
+        check(
+            "proxy absence remains terminal",
+            outcomes.get("handian", {}).get("status") == "completed"
+            and outcomes.get("handian", {}).get("lookupResult") == "absent",
+        )
+        check(
+            "errored Baidu carrier is retained as unavailable",
+            outcomes.get("baidu_baike", {}).get("status") == "errored"
+            and outcomes.get("baidu_baike", {}).get("lookupResult") == "unavailable",
+        )
+        check(
+            "timed-out cidian carrier is retained as unavailable",
+            outcomes.get("cidian", {}).get("status") == "timed_out"
+            and outcomes.get("cidian", {}).get("lookupResult") == "unavailable",
+        )
+
+        review = await _review_word_with_encode(
+            "你还",
+            evidence,
+            {
+                "success": True,
+                "word": "你还",
+                "codes": ["nh"],
+                "altCodes": [],
+                "pronunciationSource": "pinyin-pro-context",
+                "standardPronunciationStatus": "absent",
+                "semanticPronunciationNeeded": False,
+                "phrasePinyins": ["nǐ", "hái"],
+                "contextPhrasePinyins": ["nǐ", "hái"],
+                "chars": [
+                    {
+                        "char": "你",
+                        "pinyin": "nǐ",
+                        "pinyins": ["nǐ"],
+                        "pronunciationLookupStatus": "found",
+                    },
+                    {
+                        "char": "还",
+                        "pinyin": "hái",
+                        "pinyins": ["hái", "huán"],
+                        "pronunciationLookupStatus": "found",
+                    },
+                ],
+            },
+        )
+        pronunciation = next(iter(review.get("pronunciations") or []), {})
+        check(
+            "completed no-evidence lookup stays complete through review",
+            review.get("pronunciationEvidenceComplete") is True,
+        )
+        check(
+            "completed no-evidence lookup seals as a missing authority page",
+            read_review_disposition(review) is ReviewDisposition.SEAL
+            and review.get("reviewVerdictSite") == "missing_authoritative_page",
+        )
+        check(
+            "completed no-evidence lookup never gets incomplete wording",
+            "本次权威来源查询未完成" not in review.get("autoReviewReason", "")
+            and "本次权威来源查询未完成"
+            not in pronunciation.get("sourceSummary", ""),
+        )
 
     asyncio.run(_run())
 
@@ -1525,6 +1805,7 @@ def test_pronunciation_source_timeout_is_exposed_and_not_cached():
             "sourceId": "handian",
             "source": "汉典",
             "status": "timed_out",
+            "lookupResult": "unavailable",
         }])
         check("timed-out lookup is fetched again", fetch_calls == 2 and second.get("lookupComplete") is False)
 
@@ -1570,6 +1851,7 @@ def test_pronunciation_genuine_no_evidence_is_cached():
             "sourceId": "handian",
             "source": "汉典",
             "status": "completed",
+            "lookupResult": "absent",
         }])
         check("completed miss has no evidence", first.get("hasEvidence") is False)
         check("completed miss is served from cache", fetch_calls == 1 and second == first)
@@ -1580,13 +1862,17 @@ def test_pronunciation_genuine_no_evidence_is_cached():
 def test_reviewed_word_distinguishes_incomplete_lookup_from_completed_miss():
     print("\n🧪 reviewed-word payload distinguishes lookup failure from no evidence")
 
-    async def review_with(evidence):
+    async def review_with(evidence, *, encode_status):
         encode_data = {
             "success": True,
             "codes": ["ssfw", "ssfwo", "ssfwov"],
             "altCodes": [],
-            "pronunciationSource": "pinyin-pro-context",
-            "standardPronunciationStatus": "absent",
+            "pronunciationSource": (
+                "zdic-unavailable"
+                if encode_status == "unavailable"
+                else "pinyin-pro-context"
+            ),
+            "standardPronunciationStatus": encode_status,
             "semanticPronunciationNeeded": False,
             "chars": [
                 {"char": "诉", "pinyin": "sù", "pinyins": ["sù"], "pronunciationLookupStatus": "found"},
@@ -1618,7 +1904,7 @@ def test_reviewed_word_distinguishes_incomplete_lookup_from_completed_miss():
                 "source": "萌典",
                 "status": "errored",
             }],
-        })
+        }, encode_status="unavailable")
         completed = await review_with({
             "success": True,
             "word": "诉讼费",
@@ -1632,7 +1918,7 @@ def test_reviewed_word_distinguishes_incomplete_lookup_from_completed_miss():
                 "source": "汉典",
                 "status": "completed",
             }],
-        })
+        }, encode_status="absent")
 
         incomplete_summary = incomplete.get("pronunciations", [{}])[0].get("sourceSummary", "")
         completed_summary = completed.get("pronunciations", [{}])[0].get("sourceSummary", "")
@@ -3141,6 +3427,9 @@ def main():
     test_hwxnet_poisoned_fixture_fails_per_syllable_validation()
     test_pronunciation_groups_require_known_character_readings()
     test_pronunciation_source_failure_is_not_cached_and_retry_refetches()
+    test_proxy_http_404_absence_is_a_completed_source_outcome()
+    test_proxy_found_evidence_is_complete_through_review()
+    test_unreachable_optional_sources_do_not_block_completed_absence()
     test_review_fetch_retries_transient_dns_within_source_budget()
     test_entity_direct_fetch_keeps_its_single_attempt_budget()
     test_pronunciation_source_timeout_is_exposed_and_not_cached()

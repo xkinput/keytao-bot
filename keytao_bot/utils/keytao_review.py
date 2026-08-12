@@ -756,6 +756,31 @@ async def _request_bot_evidence_proxy(
             return _BotEvidenceProxyResult("unavailable")
 
         status_code = getattr(response, "status_code", None)
+        if not isinstance(status_code, int):
+            return _BotEvidenceProxyResult("unavailable")
+
+        try:
+            payload = response.json()
+        except Exception as error:
+            payload = None
+            logger.debug(
+                "Bot evidence proxy returned invalid JSON for "
+                f"{collector_source_id}/{word}: {error}"
+            )
+
+        # The route intentionally uses HTTP 404 for a terminal source miss.
+        # Only a 404 that does not match that JSON contract means an older
+        # deployment lacks the route itself.
+        if (
+            status_code == 404
+            and isinstance(payload, dict)
+            and payload.get("ok") is False
+            and payload.get("status") == 404
+            and payload.get("text", "") == ""
+        ):
+            _bot_evidence_proxy_endpoint_available = True
+            _bot_evidence_proxy_feature_probe_failed = False
+            return _BotEvidenceProxyResult("absent")
         if status_code == 404:
             _bot_evidence_proxy_endpoint_available = False
             _bot_evidence_proxy_feature_probe_failed = False
@@ -763,8 +788,6 @@ async def _request_bot_evidence_proxy(
                 "Bot evidence proxy endpoint is absent; "
                 "using direct source fetches for this process"
             )
-            return _BotEvidenceProxyResult("unavailable")
-        if not isinstance(status_code, int):
             return _BotEvidenceProxyResult("unavailable")
 
         # Any non-404 HTTP response proves that the route exists. This does not
@@ -775,14 +798,6 @@ async def _request_bot_evidence_proxy(
         _bot_evidence_proxy_endpoint_available = True
         _bot_evidence_proxy_feature_probe_failed = False
         if not 200 <= status_code < 300:
-            return _BotEvidenceProxyResult("unavailable")
-        try:
-            payload = response.json()
-        except Exception as error:
-            logger.debug(
-                "Bot evidence proxy returned invalid JSON for "
-                f"{collector_source_id}/{word}: {error}"
-            )
             return _BotEvidenceProxyResult("unavailable")
         if not isinstance(payload, dict):
             return _BotEvidenceProxyResult("unavailable")
@@ -833,6 +848,13 @@ def _merge_lookup_status(statuses: Sequence[str]) -> str:
     if "errored" in normalized:
         return "errored"
     return "completed"
+
+
+def _lookup_outcome_is_terminal(outcome: Dict[str, Any]) -> bool:
+    return (
+        outcome.get("status") == "completed"
+        and outcome.get("lookupResult") in {"found", "absent"}
+    )
 
 
 async def _fetch_review_url(
@@ -1326,13 +1348,15 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         async def primary_texts() -> Tuple[
             List[Tuple[str, str, str, bool, Optional[bool]]],
             str,
+            Optional[str],
         ]:
             if source["id"] not in BOT_EVIDENCE_PROXY_SOURCE_IDS:
-                return await fallback_direct_texts()
+                fallback_texts, fallback_status = await fallback_direct_texts()
+                return fallback_texts, fallback_status, None
 
             proxy_result = await _request_bot_evidence_proxy(source["id"], word)
             if proxy_result.status == "absent":
-                return [], "completed"
+                return [], "completed", "absent"
             if proxy_result.status == "found":
                 direct_templates = list(source.get("direct_urls", []))
                 evidence_url = (
@@ -1351,11 +1375,12 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                         and _direct_url_entry_matches_word(evidence_url, word)
                     ),
                     None,
-                )], "completed"
+                )], "completed", "found"
 
             # Proxy transport/HTTP/contract failures, including a remembered
             # feature-missing 404, reach the pre-existing guarded direct path.
-            return await fallback_direct_texts()
+            fallback_texts, fallback_status = await fallback_direct_texts()
+            return fallback_texts, fallback_status, None
 
         has_primary_path = bool(
             source["id"] in BOT_EVIDENCE_PROXY_SOURCE_IDS
@@ -1364,9 +1389,10 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         )
         deadline = asyncio.get_running_loop().time() + PRONUNCIATION_SOURCE_TIMEOUT
         primary_status: Optional[str] = None
+        primary_lookup_result: Optional[str] = None
         if has_primary_path:
             try:
-                primary, primary_status = await asyncio.wait_for(
+                primary, primary_status, primary_lookup_result = await asyncio.wait_for(
                     primary_texts(),
                     timeout=PRONUNCIATION_SOURCE_TIMEOUT,
                 )
@@ -1378,9 +1404,10 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
 
         # Site-scoped search is optional corroboration for a completed primary
         # lookup and the only path for legacy search-only sources. It runs last,
-        # only when the primary text did not yield a usable pronunciation.
+        # only when the primary text did not yield a usable pronunciation. A
+        # proxy absence is already terminal and must not be reopened by search.
         search_status: Optional[str] = None
-        if not entries:
+        if not entries and primary_lookup_result != "absent":
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining > 0:
                 try:
@@ -1408,10 +1435,20 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         elif status == "errored":
             logger.debug(f"Pronunciation source {source['id']} failed for {word}")
 
+        lookup_result = (
+            "found"
+            if entries or primary_lookup_result == "found"
+            else (
+                "absent"
+                if primary_lookup_result == "absent" or status == "completed"
+                else "unavailable"
+            )
+        )
         return {
             "sourceId": source["id"],
             "source": source["label"],
             "status": status,
+            "lookupResult": lookup_result,
             "entries": entries,
             "rejections": source_rejections,
         }
@@ -1444,23 +1481,18 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
             "sourceId": outcome["sourceId"],
             "source": outcome["source"],
             "status": outcome["status"],
+            "lookupResult": outcome["lookupResult"],
         }
         for outcome in inspected
         ),
     ]
-    network_lookup_complete = all(
-        outcome["status"] == "completed" for outcome in inspected
-    )
-    local_lookup_complete = all(
-        outcome["status"] == "completed"
-        for outcome in local_evidence["outcomes"]
-    )
-    # A completed local hit is sufficient authority even when optional live
-    # corroboration fails. A local miss or unavailable DB falls through to the
-    # pre-existing live-source completion rule.
-    lookup_complete = bool(
-        (local_lookup_complete and local_evidence["entries"])
-        or network_lookup_complete
+    # A source is consultable for this lookup only when one of its carriers
+    # actually returned a terminal found/absent answer. Configured sources whose
+    # carriers are missing, timed out, or errored remain visible as unavailable
+    # outcomes, but do not veto terminal answers from reachable sources. Requiring
+    # at least one terminal outcome keeps an all-unavailable lookup incomplete.
+    lookup_complete = any(
+        _lookup_outcome_is_terminal(outcome) for outcome in source_outcomes
     )
 
     groups: Dict[Tuple[str, ...], Dict[str, Any]] = {}
@@ -2246,14 +2278,12 @@ async def prepare_reviewed_word(
         evidence_lookup_complete = True
     elif standard_status == "unavailable":
         evidence_lookup_complete = False
-    elif standard_status == "absent" and collector_source_outcomes:
-        # Encode completed the Han Dian lookup and found no entry. Only an
-        # incomplete independent source may keep the wider evidence search
-        # open; a duplicate bot-side Han Dian scrape is supplementary.
-        evidence_lookup_complete = all(
-            outcome.get("status") == "completed"
-            for outcome in collector_source_outcomes
-            if outcome.get("sourceId") != "handian"
+    elif standard_status == "absent":
+        # Encode itself completed the whole-word Han Dian lookup. Other carriers
+        # that timed out or errored remain visible, but are unavailable for this
+        # attempt and cannot turn that terminal absence into an incomplete lookup.
+        evidence_lookup_complete = any(
+            _lookup_outcome_is_terminal(outcome) for outcome in source_outcomes
         )
     else:
         evidence_lookup_complete = collector_lookup_complete
