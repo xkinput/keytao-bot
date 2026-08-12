@@ -39,7 +39,8 @@ found character readings for `王`, `中`, `微`, `服`, and `务`, plus absent
 whole-word entries for `王中王` and `微服务`. Duplicate declarations are collapsed
 by `(kind, entry)` before the upsert.
 S14 declares found character readings for `亮` and `面` plus an absent
-whole-word entry for `亮面`.
+whole-word entry for `亮面`. S15 reuses the existing S9 `射覆`/`慑服`
+candidate fixture and the S14 `亮面` pronunciation fixture.
 
 ## Prerequisites
 
@@ -124,6 +125,13 @@ armed only for S14 and returns synthetic responses before the network allowlist;
 no external request is dispatched. The scenario rejects any `guang` syllable or
 `gxmm*` candidate and accepts only an `lxmm*` chain or the existing fail-closed
 manual-pronunciation path.
+
+S15 first discovers the server-issued `射覆` candidate list, replies
+`2 添加并提交`, and verifies candidate 2 reaches a submitted batch without the
+old execution-verb rejection. It then asks the bot for its exact corrected
+`亮面` add-and-submit phrasing, copies the rendered `「...」` string literally,
+and verifies that command also reaches a submitted batch without another
+correction.
 
 Optional overrides:
 

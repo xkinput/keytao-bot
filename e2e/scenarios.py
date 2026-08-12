@@ -855,6 +855,157 @@ async def scenario_s14(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+def _successful_submit_batch_id(
+    events: list[dict[str, Any]],
+    *,
+    after_sequence: int,
+) -> str:
+    for event in reversed(events):
+        if (
+            int(event.get("sequence") or 0) <= after_sequence
+            or event.get("kind") != "tool"
+            or event.get("name") != "keytao_submit_batch"
+        ):
+            continue
+        result = event.get("result")
+        if not isinstance(result, dict) or result.get("success") is not True:
+            continue
+        batch_id = str(result.get("batchId") or "").strip()
+        if batch_id:
+            return batch_id
+    return ""
+
+
+def _submitted_item(
+    batch: dict[str, Any],
+    *,
+    word: str,
+    code: str,
+) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in batch.get("pullRequests", [])
+            if isinstance(item, dict)
+            and item_key(item) == ("Create", word, code)
+        ),
+        None,
+    )
+
+
+async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
+    fixture = ctx.fixture_facts["s15"]
+    candidate_codes = list(fixture["candidateCodes"])
+    require(
+        len(candidate_codes) >= 2,
+        f"S15 fixture lacks candidate 2: {fixture}",
+    )
+    selected_code = str(candidate_codes[1])
+    messages = ["喵喵 射覆"]
+    replies = [await ctx.send(messages[-1])]
+    require(
+        re.search(rf"(?m)^2\.\s*{re.escape(selected_code)}\b", replies[-1])
+        is not None,
+        f"S15 discovery did not publish candidate 2={selected_code}: {replies[-1]}",
+    )
+
+    first_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("2 添加并提交")
+    replies.append(await ctx.send(messages[-1]))
+    require(
+        "没有匹配到" not in replies[-1]
+        and "执行动词" not in replies[-1]
+        and "本轮没有可执行的已绑定写操作" not in replies[-1],
+        f"S15 numbered reply hit the old authorization rejection: {replies[-1]}",
+    )
+    first_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=first_cutoff,
+    )
+    require(first_batch_id, "S15 numbered reply never completed submit")
+    first_batch = await ctx.next_client.get_admin_batch(
+        batch_id=first_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        first_batch.get("status") in {"Submitted", "Approved"},
+        f"S15 numbered batch did not pass through submission: {first_batch}",
+    )
+    require(
+        _submitted_item(first_batch, word="射覆", code=selected_code) is not None,
+        f"S15 numbered batch lacks 射覆@{selected_code}: {first_batch}",
+    )
+
+    messages.append("喵喵 亮面")
+    replies.append(await ctx.send(messages[-1]))
+    messages.append("添加并提交")
+    guidance = await ctx.send(messages[-1])
+    replies.append(guidance)
+    suggestion_match = re.search(
+        r"请发送(?P<suggestion>「添加\s+亮面\s+(?P<code>[a-z]{2,12})\s+并提交」)",
+        guidance,
+    )
+    require(
+        suggestion_match is not None,
+        f"S15 did not render a copy-paste add-and-submit suggestion: {guidance}",
+    )
+    quoted_suggestion = suggestion_match.group("suggestion")
+    suggested_code = suggestion_match.group("code")
+    second_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(quoted_suggestion)
+    replies.append(await ctx.send(messages[-1]))
+    require(
+        "没有匹配到" not in replies[-1]
+        and "执行动词" not in replies[-1]
+        and "本轮没有可执行的已绑定写操作" not in replies[-1],
+        f"S15 literal quoted suggestion hit another correction: {replies[-1]}",
+    )
+    second_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=second_cutoff,
+    )
+    require(second_batch_id, "S15 quoted suggestion never completed submit")
+    second_batch = await ctx.next_client.get_admin_batch(
+        batch_id=second_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        second_batch.get("status") in {"Submitted", "Approved"},
+        f"S15 quoted-suggestion batch did not pass through submission: {second_batch}",
+    )
+    require(
+        _submitted_item(
+            second_batch,
+            word="亮面",
+            code=suggested_code,
+        )
+        is not None,
+        f"S15 quoted-suggestion batch lacks 亮面@{suggested_code}: {second_batch}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "numberedCandidateIndex": 2,
+            "numberedCandidateCode": selected_code,
+            "numberedBatchId": first_batch_id,
+            "numberedBatchStatus": first_batch.get("status"),
+            "quotedSuggestion": quoted_suggestion,
+            "quotedSuggestionCode": suggested_code,
+            "quotedSuggestionBatchId": second_batch_id,
+            "quotedSuggestionBatchStatus": second_batch.get("status"),
+            "additionalCorrectionRequired": False,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -870,6 +1021,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S12", "front-insert weight legality", scenario_s12),
     Scenario("S13", "same-turn resend loop breaker", scenario_s13),
     Scenario("S14", "wrong-entry pronunciation poisoning", scenario_s14),
+    Scenario("S15", "numbered add-submit and quoted suggestion closure", scenario_s15),
 )
 
 

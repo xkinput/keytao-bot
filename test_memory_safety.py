@@ -3,6 +3,7 @@
 
 import asyncio
 import os
+import re
 import sqlite3
 import tempfile
 import types
@@ -1068,6 +1069,210 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("确认票据", prompt)
         self.assertNotIn(state_store.get_record(conv_key).reconfirmation_code, prompt)
+
+    async def test_numbered_add_verbs_bind_the_selected_live_candidate(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state = PendingAddWord(
+            word="会比",
+            recommended_code="hbbkiv",
+            candidates=[
+                ("hbbk", True),
+                ("hbbki", False),
+                ("hbbkiv", False),
+            ],
+        )
+        cases = (
+            ("2 添加并提交", "pending_add_and_submit", True),
+            ("2 加入", "pending_choice", False),
+            ("编号2 添加", "pending_choice", False),
+            ("2 都加并提交", "pending_add_and_submit", True),
+        )
+        for message, expected_intent, submit_after in cases:
+            with self.subTest(message=message):
+                intent = chat_module._structural_pending_add_word_intent(
+                    message,
+                    state,
+                )
+                self.assertIsNotNone(intent)
+                self.assertEqual(intent.intent, expected_intent)
+                self.assertEqual(intent.choice_index, 2)
+                self.assertEqual(intent.submit_after, submit_after)
+                self.assertTrue(
+                    chat_module._message_authorizes_pending_state_control(
+                        state,
+                        message,
+                        intent,
+                    )
+                )
+
+        out_of_range = chat_module._structural_pending_add_word_intent(
+            "编号4 添加并提交",
+            state,
+        )
+        self.assertIsNotNone(out_of_range)
+        self.assertEqual(out_of_range.choice_index, 4)
+        mixed = chat_module._structural_pending_add_word_intent(
+            "2 添加并提交，再删除别的词",
+            state,
+        )
+        self.assertIsNone(mixed)
+        self.assertFalse(
+            chat_module._message_authorizes_pending_state_control(
+                state,
+                "2 添加并提交，再删除别的词",
+                chat_module.MessageCommandIntent(
+                    intent="pending_add_and_submit",
+                    confidence=1.0,
+                    submit_after=True,
+                    choice_index=2,
+                ),
+            )
+        )
+
+    async def test_numbered_and_rendered_quoted_add_submit_execute_end_to_end(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        async def exercise(message: str, *, request_suggestion: bool = False):
+            state_store = MemoryConversationStateStore()
+            conv_key = ConversationAddress.group("qq", "group-s15", "user-s15")
+            calls = []
+            warning_digest = "a" * 64
+            snapshot_digest = "b" * 64
+            submit_warning_digest = "c" * 64
+            audit_digest = "d" * 64
+            selected_code = {"value": ""}
+
+            async def create_phrase(**kwargs):
+                calls.append(("keytao_create_phrase", kwargs))
+                selected_code["value"] = str(kwargs.get("code") or "")
+                if kwargs.get("preview_only"):
+                    return {
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "message": "请核对添加快照",
+                        "batchId": "batch-s15",
+                        "contentVersion": 4,
+                        "warningDigest": warning_digest,
+                        "warnedCount": 0,
+                        "warnings": [],
+                    }
+                return {
+                    "success": True,
+                    "batchId": "batch-s15",
+                    "contentVersion": 5,
+                }
+
+            async def submit_batch(**kwargs):
+                calls.append(("keytao_submit_batch", kwargs))
+                if kwargs.get("preview_only"):
+                    return {
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "message": "请核对提交快照",
+                        "batchId": "batch-s15",
+                        "contentVersion": 5,
+                        "snapshotDigest": snapshot_digest,
+                        "warningDigest": submit_warning_digest,
+                        "auditDigest": audit_digest,
+                        "snapshotItems": [
+                            {
+                                "action": "Create",
+                                "word": "会比",
+                                "code": selected_code["value"],
+                            },
+                        ],
+                    }
+                return {
+                    "success": True,
+                    "batchId": "batch-s15",
+                    "contentVersion": 5,
+                }
+
+            old_state_store = chat_module.conversation_state_store
+            old_tool_executor = chat_module.tool_executor
+            try:
+                chat_module.conversation_state_store = state_store
+                chat_module.tool_executor = ToolExecutor(
+                    lambda name: {
+                        "keytao_create_phrase": create_phrase,
+                        "keytao_submit_batch": submit_batch,
+                    }.get(name),
+                    frozenset({"keytao_create_phrase", "keytao_submit_batch"}),
+                )
+                state_store.set(
+                    conv_key,
+                    PendingAddWord(
+                        word="会比",
+                        recommended_code="hbbkiv",
+                        candidates=[
+                            ("hbbk", True),
+                            ("hbbki", False),
+                            ("hbbkiv", False),
+                        ],
+                    ),
+                )
+                incoming = message
+                rendered = ""
+                if request_suggestion:
+                    guidance = await chat_module.handle_pending_message_core(
+                        "添加并提交",
+                        "qq",
+                        "user-s15",
+                        conv_key,
+                        history=[],
+                        space_key=conv_key.space_key,
+                        owner_label="S15",
+                    )
+                    suggestion_match = re.search(r"请发送(「[^」]+」)", guidance or "")
+                    self.assertIsNotNone(suggestion_match, guidance)
+                    rendered = suggestion_match.group(1)
+                    incoming = rendered
+
+                reply = await chat_module.handle_pending_message_core(
+                    incoming,
+                    "qq",
+                    "user-s15",
+                    conv_key,
+                    history=[],
+                    space_key=conv_key.space_key,
+                    owner_label="S15",
+                )
+                return calls, reply, rendered
+            finally:
+                chat_module.tool_executor = old_tool_executor
+                chat_module.conversation_state_store = old_state_store
+
+        numbered_calls, numbered_reply, _rendered = await exercise(
+            "2 添加并提交"
+        )
+        self.assertEqual(
+            [name for name, _arguments in numbered_calls],
+            [
+                "keytao_create_phrase",
+                "keytao_create_phrase",
+                "keytao_submit_batch",
+                "keytao_submit_batch",
+            ],
+        )
+        self.assertEqual(numbered_calls[0][1]["code"], "hbbki")
+        self.assertIn("已加入草稿并提交审核", numbered_reply)
+        self.assertNotIn("没有匹配到", numbered_reply)
+
+        rejected_calls, rejected_reply, _rendered = await exercise(
+            "4 添加并提交"
+        )
+        self.assertEqual(rejected_calls, [])
+        self.assertIn("请选择 1-3", rejected_reply)
+
+        quoted_calls, quoted_reply, rendered = await exercise(
+            "",
+            request_suggestion=True,
+        )
+        self.assertEqual(rendered, "「添加 会比 hbbkiv 并提交」")
+        self.assertEqual(quoted_calls[0][1]["code"], "hbbkiv")
+        self.assertIn("已加入草稿并提交审核", quoted_reply)
+        self.assertNotIn("没有可执行的已绑定写操作", quoted_reply)
 
     async def test_owner_duplicate_add_and_submit_authorizes_exact_preview_chain(self) -> None:
         """One owner command accepts an exact duplicate warning and submit snapshot."""
@@ -3971,6 +4176,60 @@ def iter_record_frame_no_negator_control():
 
 
 class MutationAuthorizationTests(unittest.TestCase):
+    def test_whole_message_quote_authorization_matrix(self) -> None:
+        create_arguments = {
+            "word": "安全词",
+            "code": "aa",
+            "action": "Create",
+        }
+        cases = (
+            ("plain-whole-command", "「添加 安全词 aa」", True),
+            ("plain-curly-command", "“添加 安全词 aa”", True),
+            ("plain-double-corner-command", "『添加 安全词 aa』", True),
+            ("address-and-filler", "@我 「添加 安全词 aa」，谢谢", True),
+            ("execution-question", "「可以帮我添加 安全词 aa 吗？」", True),
+            ("positive-multi-clause", "「添加 安全词 aa；提交草稿」", True),
+            ("negated", "「不要添加 安全词 aa」", False),
+            ("reported-speech-inside", "「他说添加 安全词 aa」", False),
+            ("narrative-framed-outside", "他说「添加 安全词 aa」", False),
+            ("record-framed-outside", "帮我记下「添加 安全词 aa」", False),
+            ("nested-whole-quote", "「『添加 安全词 aa』」", False),
+            ("explanatory-question", "「添加 安全词 aa 会怎样？」", False),
+            ("aborted-multi-clause", "「添加 安全词 aa；算了不要」", False),
+        )
+        for label, message, expected in cases:
+            with self.subTest(label=label, message=message):
+                self.assertEqual(
+                    message_authorizes_mutation(message),
+                    expected,
+                )
+                self.assertEqual(
+                    message_requests_change(
+                        message,
+                        "keytao_create_phrase",
+                        create_arguments,
+                    ),
+                    expected,
+                )
+
+    def test_narrative_quote_guard_kills_loose_unwrap_mutant(self) -> None:
+        from keytao_bot.harness import tools as tools_module
+
+        narrative = "他说「添加 安全词 aa」"
+        self.assertFalse(message_authorizes_mutation(narrative))
+
+        def loose_unwrap(message: str):
+            match = re.search(r"「([^」]+)」", str(message or ""))
+            return match.group(1) if match else None
+
+        with patch.object(
+            tools_module,
+            "_whole_message_unquoted_source",
+            side_effect=loose_unwrap,
+        ):
+            with self.assertRaises(AssertionError):
+                self.assertFalse(message_authorizes_mutation(narrative))
+
     def test_only_explicit_current_text_authorizes_mutation(self) -> None:
         self.assertTrue(message_authorizes_mutation("请把安全词加入草稿"))
         self.assertTrue(message_authorizes_mutation("直接提交当前草稿"))
@@ -5170,11 +5429,27 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 "那「甲」 aa 也加到草稿吧",
                 "keytao_create_phrase",
                 {"word": "甲", "code": "aa", "action": "Create"},
+                {},
             ),
-            ("那条 12 麻烦删掉", "keytao_remove_draft_item", {"pr_id": 12}),
-            ("那几条 12 34 麻烦删掉", "keytao_batch_remove_draft_items", {"ids": [12, 34]}),
-            ("顺便把这个提交掉", "keytao_submit_batch", {}),
-            ("刚才提交错了，想撤回一下", "keytao_recall_batch", {}),
+            ("那条 12 麻烦删掉", "keytao_remove_draft_item", {"pr_id": 12}, {}),
+            (
+                "想把「亮面」 lxmmov 权重改成 101",
+                "keytao_update_draft_item_weight",
+                {"word": "亮面", "code": "lxmmov", "weight": 101},
+                {
+                    "trusted_draft_items_by_id": {
+                        "7": {"word": "亮面", "code": "lxmmov", "type": "Phrase"},
+                    },
+                },
+            ),
+            (
+                "那几条 12 34 麻烦删掉",
+                "keytao_batch_remove_draft_items",
+                {"ids": [12, 34]},
+                {},
+            ),
+            ("顺便把这个提交掉", "keytao_submit_batch", {}, {}),
+            ("刚才提交错了，想撤回一下", "keytao_recall_batch", {}, {}),
             (
                 "那「甲」 aa 和「乙」 bb 都加到草稿吧",
                 "keytao_batch_add_to_draft",
@@ -5184,15 +5459,26 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                         {"word": "乙", "code": "bb", "action": "Create"},
                     ]
                 },
+                {},
             ),
         ]
-        for message, tool_name, arguments in cases:
+        for message, tool_name, arguments, context_kwargs in cases:
             with self.subTest(tool=tool_name):
-                blocked = await self._call(tool_name, arguments, message)
+                blocked = await self._call(
+                    tool_name,
+                    arguments,
+                    message,
+                    **context_kwargs,
+                )
                 self.assertTrue(blocked.get("policyBlocked"), tool_name)
                 suggestion = blocked.get("suggestedCommand", "")
                 self.assertTrue(suggestion.startswith("@我 "), f"{tool_name}: {message}")
-                allowed = await self._call(tool_name, arguments, suggestion)
+                allowed = await self._call(
+                    tool_name,
+                    arguments,
+                    suggestion,
+                    **context_kwargs,
+                )
                 self.assertTrue(
                     allowed.get("success"),
                     f"{tool_name}: {suggestion}",

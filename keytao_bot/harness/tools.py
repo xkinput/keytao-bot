@@ -621,6 +621,21 @@ _COMMAND_CLAUSE_SPLIT_RE = re.compile(r"[，,。.!！?？;；\n]+")
 # "@我 ..." remediation command self-checks through exactly the validators it
 # will face, instead of through a stripped variant of itself.
 _LEADING_MENTION_RE = re.compile(r"^\s*@[^\s@]{1,24}[\s:：]+")
+_WHOLE_MESSAGE_LEADING_ADDRESS_RE = re.compile(
+    r"^\s*(?:@[^\s@]{1,24}|键道|喵喵)[\s:：，,]*",
+    re.IGNORECASE,
+)
+_WHOLE_MESSAGE_CLOSING_FILLER_RE = re.compile(
+    r"\s*(?:[，,。.!！?？;；]\s*)?"
+    r"(?:谢谢|谢谢你|多谢|辛苦了|拜托了|麻烦了|感谢|感谢你|"
+    r"劳驾|拜托|有劳|谢啦)"
+    r"[。.!！?？]*\s*$"
+)
+_WHOLE_MESSAGE_QUOTE_PATTERNS = (
+    re.compile(r"^「(?P<content>[^」]*)」$", re.DOTALL),
+    re.compile(r"^“(?P<content>[^”]*)”$", re.DOTALL),
+    re.compile(r"^『(?P<content>[^』]*)』$", re.DOTALL),
+)
 _COMMAND_LEAD_IN_PREFIXES = (
     "请", "麻烦", "帮我", "给我", "现在", "立即", "直接", "确认", "执行",
     "我要", "我想", "替我", "为我", "能不能", "可不可以", "能否", "可否",
@@ -1240,9 +1255,39 @@ def _quoted_span_is_command(content: str) -> bool:
     )
 
 
+def _whole_message_quote_content(message: str) -> Optional[str]:
+    """Return one exact whole-message quote payload after envelope removal."""
+    candidate = _WHOLE_MESSAGE_LEADING_ADDRESS_RE.sub(
+        "",
+        str(message or ""),
+        count=1,
+    ).strip()
+    candidate = _WHOLE_MESSAGE_CLOSING_FILLER_RE.sub("", candidate).strip()
+    for pattern in _WHOLE_MESSAGE_QUOTE_PATTERNS:
+        match = pattern.fullmatch(candidate)
+        if match is not None:
+            return match.group("content")
+    return None
+
+
+def _whole_message_unquoted_source(message: str) -> Optional[str]:
+    """Unwrap at most one exact command quote after envelope removal."""
+    content = _whole_message_quote_content(message)
+    if content is None:
+        return None
+    # The next layer remains quoted data. Refusing the outer unwrap here keeps
+    # repeated authorization passes from peeling a second quote layer.
+    if _whole_message_quote_content(content) is not None:
+        return None
+    return content
+
+
 def trusted_mutation_source(message: str) -> str:
     """Preserve line structure while removing quoted or marked untrusted data."""
     text = str(message or "")
+    unquoted = _whole_message_unquoted_source(text)
+    if unquoted is not None:
+        text = unquoted
     pieces: List[str] = []
     cursor = 0
     for match in _QUOTED_DATA_RE.finditer(text):
@@ -1713,6 +1758,9 @@ def _record_frame_wraps_complete_mutation(message: str) -> bool:
 
 def message_authorizes_mutation(message: str) -> bool:
     """Accept write authority only from the current user's explicit raw text."""
+    unquoted = _whole_message_unquoted_source(message)
+    if unquoted is not None:
+        message = unquoted
     raw_source = re.sub(r"\s+", "", trusted_mutation_source(message))
     # The authorization view intentionally keeps a later standalone command
     # clause after harmless chatter.  Report/record frames are not harmless:
@@ -1804,6 +1852,9 @@ def message_requests_change(
     """
     if not isinstance(arguments, dict):
         return False
+    unquoted = _whole_message_unquoted_source(message)
+    if unquoted is not None:
+        message = unquoted
     pattern = _tool_intent_pattern(tool_name, arguments)
     if pattern is None:
         return False

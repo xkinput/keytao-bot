@@ -684,7 +684,7 @@ def _compact_command_text(message_text: str) -> str:
     return re.sub(
         r"[\s，,。.!！?？~～…、;；:：\"'“”‘’（）()【】\[\]<>《》]+",
         "",
-        _strip_command_message_prefixes(message_text),
+        _strip_command_message_prefixes(trusted_mutation_source(message_text)),
     )
 
 
@@ -1184,12 +1184,29 @@ def _parse_pending_choice_index(text: str) -> Optional[int]:
     return None
 
 
+_PENDING_NUMBERED_SELECTOR_PATTERN = (
+    r"(?:第)?(?:[1-9]\d{0,2}|[一二两三四五六七八九十]{1,3})(?:个|号|项)?"
+)
+_PENDING_NUMBERED_ADD_REPLY_RE = re.compile(
+    rf"^(?:编号)?(?P<selector>{_PENDING_NUMBERED_SELECTOR_PATTERN})"
+    r"(?:确认)?"
+    r"(?P<add>都加|全加|全部加|加词|添加|加入|加到(?:当前)?草稿|新增|创建|"
+    r"写入|放入|收录|录入|记入)"
+    r"(?:一下)?"
+    r"(?P<submit>(?:(?:并|并且|然后|再|同时|以及))?"
+    r"(?:提交|提审|送审)(?:审核|草稿|批次)?)?"
+    r"(?:一下)?(?:吧|啦|了)?$",
+)
+
+
 def _structural_pending_add_word_intent(
     message_text: str,
     state: PendingAddWord,
 ) -> Optional[MessageCommandIntent]:
     """Parse exact selectors advertised by a live add-word prompt."""
-    stripped = _strip_command_message_prefixes(message_text).strip()
+    stripped = _strip_command_message_prefixes(
+        trusted_mutation_source(message_text)
+    ).strip()
     if (
         not stripped
         or re.search(r"[?？\"'“”‘’「」『』]", stripped)
@@ -1198,6 +1215,23 @@ def _structural_pending_add_word_intent(
     compact = _compact_command_text(stripped).lower()
     if not compact:
         return None
+
+    numbered_add = _PENDING_NUMBERED_ADD_REPLY_RE.fullmatch(compact)
+    if numbered_add is not None:
+        choice_index = _parse_pending_choice_index(
+            numbered_add.group("selector")
+        )
+        if choice_index is None:
+            return None
+        submit_after = numbered_add.group("submit") is not None
+        return MessageCommandIntent(
+            intent=(
+                "pending_add_and_submit" if submit_after else "pending_choice"
+            ),
+            confidence=1.0,
+            submit_after=submit_after,
+            choice_index=choice_index,
+        )
 
     choice_index = _parse_pending_choice_index(compact)
     if choice_index is not None:
@@ -2791,6 +2825,14 @@ async def _canonicalize_pending_ticket_intent(
             command_intent,
             requested_codes=requested_codes,
         )
+
+    if (
+        command_intent.intent == "pending_add_and_submit"
+        and command_intent.choice_index is not None
+    ):
+        if not 1 <= command_intent.choice_index <= len(state.candidates):
+            return None, f"请选择 1-{len(state.candidates)} 之间的编号。"
+        return command_intent, None
 
     if command_intent.intent == "pending_choice":
         choice_index = _parse_pending_choice_index(_compact_command_text(message_text))
@@ -8556,7 +8598,7 @@ async def _handle_pending_add_word(
     target_code: Optional[str] = None
     is_occupied = False
 
-    if command_intent.intent == "pending_choice" and command_intent.choice_index is not None:
+    if command_intent.choice_index is not None:
         idx = command_intent.choice_index - 1
         if 0 <= idx < len(state.candidates):
             target_code, is_occupied = state.candidates[idx]
@@ -10959,47 +11001,59 @@ async def _handle_ai_chat_serialized(
                         owner_label,
                     )
                 elif pending_command_intent.intent == "pending_add_and_submit":
-                    target_code = state.recommended_code
-                    operation = draft_operation_coordinator.begin(
-                        conv_key,
-                        "add_and_submit",
-                        word=state.word,
-                        code=target_code,
-                        remark=state.code_remarks.get(target_code, ""),
-                    )
-                    if operation is None:
+                    choice_index = pending_command_intent.choice_index
+                    if (
+                        choice_index is not None
+                        and not 1 <= choice_index <= len(state.candidates)
+                    ):
                         restore_pending_state()
-                        response = "当前草稿操作刚刚开始，请稍后再试。"
-                    elif not begin_pending_execution():
-                        draft_operation_coordinator.finish(
-                            operation.owner_key,
-                            operation.operation_id,
-                        )
-                        response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                        response = f"请选择 1-{len(state.candidates)} 之间的编号 owo"
                     else:
-                        scheduled = _schedule_background_draft_operation(
-                            operation,
-                            lambda: _perform_add_to_draft_and_submit(
-                                state.word,
-                                target_code,
-                                platform,
-                                user_id,
-                                remark=state.code_remarks.get(target_code, ""),
-                                needs_manual_review=state.needs_manual_review,
-                                auto_confirm=True,
-                            ),
-                            bot,
-                            event,
-                            user_id,
-                            memory_context,
-                            normalized_message_text,
-                            QQMessageSegment,
+                        target_code = (
+                            state.candidates[choice_index - 1][0]
+                            if choice_index is not None
+                            else state.recommended_code
                         )
-                        if scheduled:
-                            complete_pending_execution()
-                            return
-                        restore_pending_state()
-                        response = "后台任务启动失败，候选仍为你保留，请稍后再试。"
+                        operation = draft_operation_coordinator.begin(
+                            conv_key,
+                            "add_and_submit",
+                            word=state.word,
+                            code=target_code,
+                            remark=state.code_remarks.get(target_code, ""),
+                        )
+                        if operation is None:
+                            restore_pending_state()
+                            response = "当前草稿操作刚刚开始，请稍后再试。"
+                        elif not begin_pending_execution():
+                            draft_operation_coordinator.finish(
+                                operation.owner_key,
+                                operation.operation_id,
+                            )
+                            response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                        else:
+                            scheduled = _schedule_background_draft_operation(
+                                operation,
+                                lambda: _perform_add_to_draft_and_submit(
+                                    state.word,
+                                    target_code,
+                                    platform,
+                                    user_id,
+                                    remark=state.code_remarks.get(target_code, ""),
+                                    needs_manual_review=state.needs_manual_review,
+                                    auto_confirm=True,
+                                ),
+                                bot,
+                                event,
+                                user_id,
+                                memory_context,
+                                normalized_message_text,
+                                QQMessageSegment,
+                            )
+                            if scheduled:
+                                complete_pending_execution()
+                                return
+                            restore_pending_state()
+                            response = "后台任务启动失败，候选仍为你保留，请稍后再试。"
                 else:
                     if not begin_pending_execution():
                         response = "该确认票据已被其他请求占用，请先查看草稿后再试。"

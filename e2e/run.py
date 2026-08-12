@@ -821,8 +821,9 @@ async def async_main(args: argparse.Namespace) -> int:
                             admin_token=admin_session["token"],
                             chixi_next_code=fixture_facts["chixi_next_code"],
                         )
-                    if scenario.scenario_id == "S9":
-                        fixture_facts["s9"] = await ensure_s9_fixture(
+                    if scenario.scenario_id in {"S9", "S15"}:
+                        fixture_key = scenario.scenario_id.lower()
+                        fixture_facts[fixture_key] = await ensure_s9_fixture(
                             client=client,
                             seed_identity=seed_identity,
                             admin_token=admin_session["token"],
@@ -867,9 +868,10 @@ async def async_main(args: argparse.Namespace) -> int:
                             chixi_next_code=fixture_facts["chixi_next_code"],
                         )
                         attempt_result.setdefault("facts", {})["cleanup"] = cleanup
-                    if scenario.scenario_id == "S9":
-                        s9_facts = fixture_facts["s9"]
-                        if s9_facts.get("cleanupRequired"):
+                    if scenario.scenario_id in {"S9", "S15"}:
+                        fixture_key = scenario.scenario_id.lower()
+                        candidate_fixture = fixture_facts[fixture_key]
+                        if candidate_fixture.get("cleanupRequired"):
                             cleanup = await client.remove_s9_fixture(
                                 platform_id=seed_identity["platform_id"],
                                 admin_token=admin_session["token"],

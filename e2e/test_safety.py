@@ -81,6 +81,13 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("S13 sends an explicit weight", readme)
         self.assertIn("asks the user to resend the same current message", readme)
         self.assertIn("S14 injects a 汉典-shaped search hit", readme)
+        self.assertIn("S15 first discovers", readme)
+
+    def test_scenario_pack_is_contiguous_through_s15(self) -> None:
+        self.assertEqual(
+            [scenario.scenario_id for scenario in SCENARIOS],
+            [f"S{index}" for index in range(1, 16)],
+        )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
         payload = _redact_sensitive(
@@ -206,6 +213,104 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
                 ("entry", "亮面", "absent", ()),
             },
         )
+
+    def test_s15_reuses_the_s9_and_s14_zdic_fixtures(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S15"]
+        self.assertEqual(fixture["probe_words"], ("射覆", "亮面"))
+        expected = {
+            (row["kind"], row["entry"], row["status"], tuple(row["pinyins"]))
+            for scenario_id in ("S9", "S14")
+            for row in ZDIC_FIXTURES_BY_SCENARIO[scenario_id]["rows"]
+        }
+        actual = {
+            (row["kind"], row["entry"], row["status"], tuple(row["pinyins"]))
+            for row in fixture["rows"]
+        }
+        self.assertEqual(actual, expected)
+
+    async def test_s15_offline_scenario_contract(self) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S15")
+
+        class FakeNextClient:
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assert_token = admin_token
+                if batch_id == "batch-numbered":
+                    return {
+                        "status": "Submitted",
+                        "pullRequests": [
+                            {
+                                "action": "Create",
+                                "word": "射覆",
+                                "code": "eefju",
+                            },
+                        ],
+                    }
+                if batch_id == "batch-quoted":
+                    return {
+                        "status": "Submitted",
+                        "pullRequests": [
+                            {
+                                "action": "Create",
+                                "word": "亮面",
+                                "code": "lxmmov",
+                            },
+                        ],
+                    }
+                raise AssertionError(batch_id)
+
+        class FakeContext:
+            fixture_facts = {
+                "s15": {
+                    "candidateCodes": ["eefj", "eefju", "eefjuv"],
+                },
+            }
+            admin_token = "offline-admin-token"
+
+            def __init__(self):
+                self.events = []
+                self.next_client = FakeNextClient()
+
+            async def send(self, text: str) -> str:
+                if text == "喵喵 射覆":
+                    return "候选编码:\n1. eefj — 已有慑服\n2. eefju — 空位\n3. eefjuv — 空位"
+                if text == "2 添加并提交":
+                    self.events.append({
+                        "sequence": 1,
+                        "kind": "tool",
+                        "name": "keytao_submit_batch",
+                        "result": {"success": True, "batchId": "batch-numbered"},
+                    })
+                    return "✅ 射覆已加入草稿并提交审核"
+                if text == "喵喵 亮面":
+                    return "候选编码:\n1. lxmm — 已有占用\n2. lxmmov — 空位"
+                if text == "添加并提交":
+                    return (
+                        "没有引用机器人给出的候选消息时，需要把词条和编码写完整，"
+                        "请发送「添加 亮面 lxmmov 并提交」。"
+                    )
+                if text == "「添加 亮面 lxmmov 并提交」":
+                    self.events.append({
+                        "sequence": 2,
+                        "kind": "tool",
+                        "name": "keytao_submit_batch",
+                        "result": {"success": True, "batchId": "batch-quoted"},
+                    })
+                    return "✅ 亮面已加入草稿并提交审核"
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {"batchId": None, "contentVersion": 0, "items": []}
+
+            def attempt_events(self):
+                return list(self.events)
+
+        result = await scenario.execute(FakeContext())
+        self.assertEqual(result["facts"]["numberedCandidateCode"], "eefju")
+        self.assertEqual(
+            result["facts"]["quotedSuggestion"],
+            "「添加 亮面 lxmmov 并提交」",
+        )
+        self.assertFalse(result["facts"]["additionalCorrectionRequired"])
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module

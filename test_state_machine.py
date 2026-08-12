@@ -5821,6 +5821,7 @@ def test_exact_pending_selection_syntax_is_structural_and_fail_closed():
         ):
             cases = {
                 "2": ("pending_choice", 2, "", ""),
+                "“2”": ("pending_choice", 2, "", ""),
                 "第2个": ("pending_choice", 2, "", ""),
                 "mjbfa": ("pending_code_request", None, "mjbfa", ""),
                 "选 mjbfa": ("pending_code_request", None, "mjbfa", ""),
@@ -5844,7 +5845,7 @@ def test_exact_pending_selection_syntax_is_structural_and_fail_closed():
                 "2？",
                 "不是 2",
                 "请复述：2",
-                "“2”",
+                "他说“2”",
                 "mjbfa 吗",
                 "abcd",
                 "桌子 重新编码",
@@ -6632,9 +6633,10 @@ def test_target_bound_add_submit_rejects_questions_negation_and_substrings():
         ),
     )
     check(
-        "plain short command is recognized but quoted prose is not",
+        "plain and whole-quoted short commands are recognized but narrative quotes are not",
         openai_chat_module._is_short_add_and_submit_request("添加并提交")
-        and not openai_chat_module._is_short_add_and_submit_request("“添加并提交”"),
+        and openai_chat_module._is_short_add_and_submit_request("“添加并提交”")
+        and not openai_chat_module._is_short_add_and_submit_request("他说“添加并提交”"),
     )
     mixed_case_state = PendingAddWord(
         word="DeepSeek",

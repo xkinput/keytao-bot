@@ -59,6 +59,13 @@ ZDIC_FIXTURES_BY_SCENARIO: dict[str, dict[str, Any]] = {
         ),
     },
 }
+ZDIC_FIXTURES_BY_SCENARIO["S15"] = {
+    "probe_words": ("射覆", "亮面"),
+    "rows": (
+        *ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"],
+        *ZDIC_FIXTURES_BY_SCENARIO["S14"]["rows"],
+    ),
+}
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
