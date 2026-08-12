@@ -6,6 +6,7 @@ import html
 import json
 import math
 import re
+import sqlite3
 import time
 import unicodedata
 from collections import OrderedDict
@@ -36,6 +37,7 @@ from .pinyin_reference import (
     REFERENCE_DATASET_POLICY_BY_ID,
     normalize_pinyin_syllable as normalize_reference_pinyin_syllable,
     query_reference_readings,
+    reference_db_path,
 )
 from .review_flags import (
     MANUAL_REVIEW_PREFIXES,
@@ -63,12 +65,17 @@ REVIEW_SIGNAL_WEIGHTS = {
     "encyclopedia": 0.10,
 }
 
-COMMONNESS_SIGNAL_WEIGHTS = {
+COMMONNESS_SIGNAL_WEIGHTS = {"corpus": 0.75, "dictionary": 0.25}
+COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS = {
     "corpus": 0.45,
     "search": 0.25,
     "dictionary": 0.20,
     "encyclopedia": 0.10,
 }
+COMMONNESS_FREQUENCY_RATIO_THRESHOLD = 2.0
+COMMONNESS_CORPUS_SCORE_SATURATION = 1_000
+COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT = 10
+COMMONNESS_DICTIONARY_PRESENCE_MARGIN = 2
 
 COMMONNESS_SEARCH_QUERIES = [
     ('"{word}"', "search"),
@@ -3331,17 +3338,160 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
     }
 
 
-async def estimate_word_commonness(word: str) -> Dict:
+def _query_commonness_reference(word: str) -> Dict[str, Any]:
+    key = str(word or "").strip()
+    if not key:
+        return {
+            "available": True,
+            "attested": False,
+            "word": key,
+            "corpusFrequency": None,
+            "partOfSpeech": None,
+            "dictionaryPresenceCount": 0,
+        }
+
+    path = reference_db_path().resolve()
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+            timeout=0.1,
+        )
+        connection.execute("PRAGMA query_only = ON")
+        row = connection.execute(
+            """
+            SELECT corpus_frequency, part_of_speech, dictionary_presence_count
+            FROM word_commonness
+            WHERE word = ?
+            """,
+            (key,),
+        ).fetchone()
+    except sqlite3.Error as error:
+        logger.debug(f"Commonness reference unavailable for {key}: {error}")
+        return {
+            "available": False,
+            "attested": False,
+            "word": key,
+            "corpusFrequency": None,
+            "partOfSpeech": None,
+            "dictionaryPresenceCount": 0,
+        }
+    finally:
+        if "connection" in locals():
+            connection.close()
+
+    if row is None:
+        return {
+            "available": True,
+            "attested": False,
+            "word": key,
+            "corpusFrequency": None,
+            "partOfSpeech": None,
+            "dictionaryPresenceCount": 0,
+        }
+
+    raw_frequency, raw_part_of_speech, raw_presence_count = row
+    frequency = int(raw_frequency) if raw_frequency is not None else None
+    presence_count = int(raw_presence_count)
+    if (
+        (frequency is not None and frequency <= 0)
+        or presence_count < 0
+        or presence_count > 3
+    ):
+        logger.warning(f"Invalid commonness reference row for {key}")
+        return {
+            "available": False,
+            "attested": False,
+            "word": key,
+            "corpusFrequency": None,
+            "partOfSpeech": None,
+            "dictionaryPresenceCount": 0,
+        }
+    return {
+        "available": True,
+        "attested": frequency is not None or presence_count > 0,
+        "word": key,
+        "corpusFrequency": frequency,
+        "partOfSpeech": (
+            str(raw_part_of_speech).strip()
+            if raw_part_of_speech is not None
+            else None
+        ),
+        "dictionaryPresenceCount": presence_count,
+    }
+
+
+def _reference_commonness_result(word: str, reference: Dict[str, Any]) -> Dict[str, Any]:
+    frequency = reference.get("corpusFrequency")
+    presence_count = int(reference.get("dictionaryPresenceCount") or 0)
+    corpus_signal = (
+        min(
+            1.0,
+            math.log1p(float(frequency))
+            / math.log1p(COMMONNESS_CORPUS_SCORE_SATURATION),
+        )
+        if isinstance(frequency, int) and frequency > 0
+        else 0.0
+    )
+    dictionary_signal = min(1.0, presence_count / 3.0)
+    signals = {
+        "corpus": corpus_signal,
+        "dictionary": dictionary_signal,
+    }
+    score = sum(
+        signals[signal] * weight
+        for signal, weight in COMMONNESS_SIGNAL_WEIGHTS.items()
+    )
+    evidence: Dict[str, List[str]] = {}
+    if corpus_signal > 0:
+        evidence["corpus"] = ["jieba"]
+    if dictionary_signal > 0:
+        evidence["dictionary"] = ["offline-reference"]
+    entity_knowledge = {
+        "accepted": False,
+        "word": word,
+        "entityType": "unclear",
+        "hits": [],
+        "score": 0.0,
+    }
+    return {
+        "success": True,
+        "word": word,
+        "score": score,
+        "signals": signals,
+        "rawSignals": {
+            "corpus": int(frequency) if isinstance(frequency, int) else 0,
+            "dictionary": presence_count,
+        },
+        "evidence": evidence,
+        "weights": COMMONNESS_SIGNAL_WEIGHTS,
+        "entityKnowledge": entity_knowledge,
+        "personAlias": {
+            "accepted": False,
+            "word": word,
+            "hits": [],
+            "score": 0.0,
+        },
+        "reference": dict(reference),
+        "method": "offline_reference",
+    }
+
+
+async def _estimate_word_commonness_web_fallback(word: str) -> Dict:
     word = word.strip()
     if not word:
         return {"success": False, "word": word, "message": "词不能为空", "signals": {}, "score": 0.0}
 
-    cached = _cache_get(word, "commonness")
+    cached = _cache_get(word, "commonness_web")
     if cached is not None:
         return cached
 
-    signal_raw = {key: 0.0 for key in COMMONNESS_SIGNAL_WEIGHTS}
-    evidence: Dict[str, List[str]] = {key: [] for key in COMMONNESS_SIGNAL_WEIGHTS}
+    signal_raw = {
+        key: 0.0 for key in COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS
+    }
+    evidence: Dict[str, List[str]] = {
+        key: [] for key in COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS
+    }
 
     def build_result(entity_knowledge: Dict[str, Any]) -> Dict[str, Any]:
         signals = {
@@ -3349,11 +3499,11 @@ async def estimate_word_commonness(word: str) -> Dict:
             for key, value in signal_raw.items()
         }
         weighted_score = sum(
-            signals[key] * COMMONNESS_SIGNAL_WEIGHTS[key]
-            for key in COMMONNESS_SIGNAL_WEIGHTS
+            signals[key] * COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS[key]
+            for key in COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS
         )
         # Only successful results are memoised.
-        return _cache_set(word, "commonness", {
+        return _cache_set(word, "commonness_web", {
             "success": True,
             "word": word,
             "score": weighted_score,
@@ -3364,7 +3514,7 @@ async def estimate_word_commonness(word: str) -> Dict:
                 for key, value in evidence.items()
                 if value
             },
-            "weights": COMMONNESS_SIGNAL_WEIGHTS,
+            "weights": COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS,
             "entityKnowledge": entity_knowledge,
             "personAlias": entity_knowledge if entity_knowledge.get("entityType") == "courtesy_name" else {
                 "accepted": False,
@@ -3432,11 +3582,29 @@ async def estimate_word_commonness(word: str) -> Dict:
     return build_result(entity_knowledge)
 
 
+async def estimate_word_commonness(word: str) -> Dict:
+    word = word.strip()
+    if not word:
+        return {"success": False, "word": word, "message": "词不能为空", "signals": {}, "score": 0.0}
+
+    reference = _query_commonness_reference(word)
+    if reference.get("available") and reference.get("attested"):
+        cached = _cache_get(word, "commonness")
+        if cached is not None and cached.get("method") == "offline_reference":
+            return cached
+        return _cache_set(
+            word,
+            "commonness",
+            _reference_commonness_result(word, reference),
+        )
+    return await _estimate_word_commonness_web_fallback(word)
+
+
 def _commonness_signal_votes(front: Dict, behind: Dict) -> Dict[str, str]:
     votes: Dict[str, str] = {}
     front_signals = front.get("signals") or {}
     behind_signals = behind.get("signals") or {}
-    for signal in COMMONNESS_SIGNAL_WEIGHTS:
+    for signal in COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS:
         left = float(front_signals.get(signal) or 0)
         right = float(behind_signals.get(signal) or 0)
         if max(left, right) <= 0:
@@ -3451,20 +3619,156 @@ def _commonness_signal_votes(front: Dict, behind: Dict) -> Dict[str, str]:
     return votes
 
 
-async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
-    front, behind = await asyncio.gather(
-        estimate_word_commonness(front_word),
-        estimate_word_commonness(behind_word),
+def _reference_comparison_summary(
+    verdict: str,
+    front_word: str,
+    behind_word: str,
+    front_reference: Dict[str, Any],
+    behind_reference: Dict[str, Any],
+) -> str:
+    front_frequency = front_reference.get("corpusFrequency")
+    behind_frequency = behind_reference.get("corpusFrequency")
+    frequency_basis = (
+        f"{front_frequency if front_frequency is not None else '无'} vs "
+        f"{behind_frequency if behind_frequency is not None else '无'}"
     )
+    presence_basis = (
+        f"{int(front_reference.get('dictionaryPresenceCount') or 0)} vs "
+        f"{int(behind_reference.get('dictionaryPresenceCount') or 0)}"
+    )
+    basis = f"语料频次 {frequency_basis}，词典收录 {presence_basis}"
+    if verdict == "front_more_common":
+        return f"「{front_word}」较「{behind_word}」更常用：{basis}"
+    if verdict == "behind_more_common":
+        return f"「{behind_word}」较「{front_word}」更常用：{basis}"
+    if verdict == "close":
+        return f"「{front_word}」与「{behind_word}」常用度接近：{basis}"
+    return f"常用度信号不足：{basis}"
+
+
+def _compare_reference_commonness(
+    front_word: str,
+    behind_word: str,
+    front_reference: Dict[str, Any],
+    behind_reference: Dict[str, Any],
+) -> Dict[str, Any]:
+    front_frequency = front_reference.get("corpusFrequency")
+    behind_frequency = behind_reference.get("corpusFrequency")
+    front_presence = int(front_reference.get("dictionaryPresenceCount") or 0)
+    behind_presence = int(behind_reference.get("dictionaryPresenceCount") or 0)
+    front_attested = bool(front_reference.get("attested"))
+    behind_attested = bool(behind_reference.get("attested"))
+    verdict = "not_enough_evidence"
+    reason = "local_signal_insufficient"
+
+    if isinstance(front_frequency, int) and isinstance(behind_frequency, int):
+        if front_frequency >= behind_frequency * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+            verdict = "front_more_common"
+            reason = "frequency_ratio"
+        elif behind_frequency >= front_frequency * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+            verdict = "behind_more_common"
+            reason = "frequency_ratio"
+        else:
+            verdict = "close"
+            reason = "frequency_ratio_below_threshold"
+    elif isinstance(front_frequency, int) != isinstance(behind_frequency, int):
+        frequency_is_front = isinstance(front_frequency, int)
+        frequency = front_frequency if frequency_is_front else behind_frequency
+        frequency_presence = front_presence if frequency_is_front else behind_presence
+        other_presence = behind_presence if frequency_is_front else front_presence
+        other_attested = behind_attested if frequency_is_front else front_attested
+        frequency_verdict = "front_more_common" if frequency_is_front else "behind_more_common"
+        if frequency_presence > 0 and not other_attested:
+            verdict = frequency_verdict
+            reason = "corpus_and_dictionary_vs_absent"
+        elif (
+            frequency is not None
+            and frequency >= COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT
+            and frequency_presence > 0
+            and frequency_presence >= other_presence
+        ):
+            verdict = frequency_verdict
+            reason = "corpus_attested_with_no_presence_deficit"
+
+    if verdict == "not_enough_evidence":
+        presence_delta = front_presence - behind_presence
+        if presence_delta >= COMMONNESS_DICTIONARY_PRESENCE_MARGIN:
+            verdict = "front_more_common"
+            reason = "dictionary_presence_margin"
+        elif presence_delta <= -COMMONNESS_DICTIONARY_PRESENCE_MARGIN:
+            verdict = "behind_more_common"
+            reason = "dictionary_presence_margin"
+
+    front = _reference_commonness_result(front_word, front_reference)
+    behind = _reference_commonness_result(behind_word, behind_reference)
+    return {
+        "success": True,
+        "verdict": verdict,
+        "frontWord": front_word,
+        "behindWord": behind_word,
+        "summary": _reference_comparison_summary(
+            verdict,
+            front_word,
+            behind_word,
+            front_reference,
+            behind_reference,
+        ),
+        "scoreDelta": float(front.get("score") or 0) - float(behind.get("score") or 0),
+        "decisionReason": reason,
+        "front": front,
+        "behind": behind,
+        "webFallback": False,
+    }
+
+
+def _web_fallback_summary(
+    verdict: str,
+    front_word: str,
+    behind_word: str,
+    front: Dict[str, Any],
+    behind: Dict[str, Any],
+    *,
+    reference_available: bool,
+) -> str:
+    basis_label = "离线均无收录" if reference_available else "离线词库不可用"
+    basis = (
+        f"{basis_label}，网页回退得分 "
+        f"{float(front.get('score') or 0):.2f} vs {float(behind.get('score') or 0):.2f}"
+    )
+    if verdict == "front_more_common":
+        return f"「{front_word}」较「{behind_word}」更常用：{basis}"
+    if verdict == "behind_more_common":
+        return f"「{behind_word}」较「{front_word}」更常用：{basis}"
+    if verdict == "close":
+        return f"「{front_word}」与「{behind_word}」常用度接近：{basis}"
+    return f"常用度信号不足：{basis}"
+
+
+def _compare_web_commonness_results(
+    front_word: str,
+    behind_word: str,
+    front: Dict[str, Any],
+    behind: Dict[str, Any],
+    *,
+    reference_available: bool,
+) -> Dict[str, Any]:
     if not front.get("success") or not behind.get("success"):
         return {
             "success": False,
             "verdict": "not_enough_evidence",
             "frontWord": front_word,
             "behindWord": behind_word,
-            "summary": "常用度信号获取失败",
+            "summary": _web_fallback_summary(
+                "not_enough_evidence",
+                front_word,
+                behind_word,
+                front,
+                behind,
+                reference_available=reference_available,
+            ),
             "front": front,
             "behind": behind,
+            "webFallback": True,
         }
 
     votes = _commonness_signal_votes(front, behind)
@@ -3475,16 +3779,44 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
 
     if comparable_count < 2:
         verdict = "not_enough_evidence"
-        summary = "可比较的常用度信号不足"
+        summary = _web_fallback_summary(
+            verdict,
+            front_word,
+            behind_word,
+            front,
+            behind,
+            reference_available=reference_available,
+        )
     elif behind_wins:
         verdict = "behind_more_common"
-        summary = f"反向信号显示「{behind_word}」更常用或不弱于「{front_word}」"
+        summary = _web_fallback_summary(
+            verdict,
+            front_word,
+            behind_word,
+            front,
+            behind,
+            reference_available=reference_available,
+        )
     elif score_delta < 0.15:
         verdict = "close"
-        summary = f"「{front_word}」相对「{behind_word}」优势不足"
+        summary = _web_fallback_summary(
+            verdict,
+            front_word,
+            behind_word,
+            front,
+            behind,
+            reference_available=reference_available,
+        )
     else:
         verdict = "front_more_common"
-        summary = f"常用度证据支持「{front_word}」排在「{behind_word}」前"
+        summary = _web_fallback_summary(
+            verdict,
+            front_word,
+            behind_word,
+            front,
+            behind,
+            reference_available=reference_available,
+        )
 
     return {
         "success": True,
@@ -3496,7 +3828,39 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
         "votes": votes,
         "front": front,
         "behind": behind,
+        "webFallback": True,
     }
+
+
+async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
+    front_word = front_word.strip()
+    behind_word = behind_word.strip()
+    front_reference = _query_commonness_reference(front_word)
+    behind_reference = _query_commonness_reference(behind_word)
+    reference_available = bool(
+        front_reference.get("available") and behind_reference.get("available")
+    )
+    if reference_available and (
+        front_reference.get("attested") or behind_reference.get("attested")
+    ):
+        return _compare_reference_commonness(
+            front_word,
+            behind_word,
+            front_reference,
+            behind_reference,
+        )
+
+    front, behind = await asyncio.gather(
+        _estimate_word_commonness_web_fallback(front_word),
+        _estimate_word_commonness_web_fallback(behind_word),
+    )
+    return _compare_web_commonness_results(
+        front_word,
+        behind_word,
+        front,
+        behind,
+        reference_available=reference_available,
+    )
 
 
 def _candidate_commonness_pairs(review: Dict) -> List[Dict[str, str]]:
@@ -4549,6 +4913,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
             ],
             "reviewSignalWeights": REVIEW_SIGNAL_WEIGHTS,
             "commonnessSignalWeights": COMMONNESS_SIGNAL_WEIGHTS,
+            "commonnessWebFallbackSignalWeights": COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS,
             "commonKnownWordPolicy": {
                 "minScore": COMMON_KNOWN_MIN_SCORE,
                 "relaxedMinScore": COMMON_KNOWN_RELAXED_MIN_SCORE,
@@ -4622,5 +4987,5 @@ def build_review_note(audit: Dict) -> str:
                 f"- {item.get('word')}@{item.get('code')}：{item.get('summary')}；"
                 f"常用度分 {float(commonness.get('score') or 0):.2f}"
             )
-    lines.append("权重：语料 0.45，搜索 0.25，词典 0.20，百科 0.10；自动通过要求读音、编码和调序常用度证据一致。")
+    lines.append("常用度依据：离线语料频次 0.75、独立词典收录 0.25；仅双方离线均无收录时启用网页回退。")
     return "\n".join(lines)

@@ -17,10 +17,11 @@ from .pinyin_reference import (
 )
 
 
-SCHEMA_VERSION = "1"
-BUILDER_VERSION = "2"
+SCHEMA_VERSION = "2"
+BUILDER_VERSION = "3"
 MANIFEST_FILENAME = "manifest.json"
 EXCLUSIONS_FILENAME = "excluded_words.txt"
+COMMONNESS_CORPUS_DATASET_ID = "jieba"
 _CEDICT_LINE_RE = re.compile(r"^(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+/")
 _TONE_MARKS = {
     "a": "āáǎà",
@@ -42,6 +43,13 @@ class ParsedReading:
 
 
 @dataclass(frozen=True)
+class ParsedCorpusEntry:
+    word: str
+    frequency: int
+    part_of_speech: Optional[str]
+
+
+@dataclass(frozen=True)
 class DatasetBuildCount:
     lines: int
     parsed: int
@@ -58,6 +66,8 @@ class BuildResult:
     build_fingerprint: str
     word_count: int
     reading_count: int
+    commonness_word_count: int
+    corpus_word_count: int
     dataset_counts: dict[str, DatasetBuildCount]
 
     def as_json_dict(self) -> dict[str, object]:
@@ -67,6 +77,8 @@ class BuildResult:
             "build_fingerprint": self.build_fingerprint,
             "word_count": self.word_count,
             "reading_count": self.reading_count,
+            "commonness_word_count": self.commonness_word_count,
+            "corpus_word_count": self.corpus_word_count,
             "dataset_counts": {
                 dataset: asdict(count)
                 for dataset, count in sorted(self.dataset_counts.items())
@@ -233,6 +245,27 @@ def parse_cedict_line(line: str) -> Optional[ParsedReading]:
     )
 
 
+def parse_jieba_line(line: str) -> Optional[ParsedCorpusEntry]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    parts = stripped.split()
+    if len(parts) not in {2, 3}:
+        return None
+    word, raw_frequency = parts[:2]
+    try:
+        frequency = int(raw_frequency)
+    except ValueError:
+        return None
+    if not word or frequency <= 0:
+        return None
+    return ParsedCorpusEntry(
+        word=word,
+        frequency=frequency,
+        part_of_speech=parts[2] if len(parts) == 3 else None,
+    )
+
+
 def _iter_parsed(
     source_path: Path,
     source_format: str,
@@ -242,6 +275,15 @@ def _iter_parsed(
         for line in handle:
             data_line = bool(line.strip() and not line.lstrip().startswith("#"))
             yield data_line, parser(line)
+
+
+def _iter_corpus_entries(
+    source_path: Path,
+) -> Iterator[tuple[bool, Optional[ParsedCorpusEntry]]]:
+    with _open_text(source_path) as handle:
+        for line in handle:
+            data_line = bool(line.strip() and not line.lstrip().startswith("#"))
+            yield data_line, parse_jieba_line(line)
 
 
 def _metadata(connection: sqlite3.Connection) -> dict[str, str]:
@@ -281,6 +323,8 @@ def _existing_result(
             build_fingerprint=build_fingerprint,
             word_count=int(metadata["word_count"]),
             reading_count=int(metadata["reading_count"]),
+            commonness_word_count=int(metadata["commonness_word_count"]),
+            corpus_word_count=int(metadata["corpus_word_count"]),
             dataset_counts=dataset_counts,
         )
     except (KeyError, TypeError, ValueError, sqlite3.Error):
@@ -310,6 +354,16 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ),
             PRIMARY KEY (word, dataset, normalized, display, source_reading)
         ) WITHOUT ROWID;
+        CREATE TABLE word_commonness (
+            word TEXT PRIMARY KEY,
+            corpus_frequency INTEGER CHECK (
+                corpus_frequency IS NULL OR corpus_frequency > 0
+            ),
+            part_of_speech TEXT,
+            dictionary_presence_count INTEGER NOT NULL DEFAULT 0 CHECK (
+                dictionary_presence_count BETWEEN 0 AND 3
+            )
+        ) WITHOUT ROWID;
     """)
 
 
@@ -324,6 +378,27 @@ def _batched_insert(
         INSERT OR IGNORE INTO readings
             (word, normalized, display, source_reading, dataset)
         VALUES (?, ?, ?, ?, ?)
+    """
+    for row in rows:
+        batch.append(row)
+        if len(batch) >= batch_size:
+            connection.executemany(statement, batch)
+            batch.clear()
+    if batch:
+        connection.executemany(statement, batch)
+
+
+def _batched_insert_corpus_entries(
+    connection: sqlite3.Connection,
+    rows: Iterable[tuple[str, int, Optional[str]]],
+    *,
+    batch_size: int = 10_000,
+) -> None:
+    batch: list[tuple[str, int, Optional[str]]] = []
+    statement = """
+        INSERT OR IGNORE INTO word_commonness
+            (word, corpus_frequency, part_of_speech)
+        VALUES (?, ?, ?)
     """
     for row in rows:
         batch.append(row)
@@ -366,10 +441,45 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
             if source.get("import") is not True:
                 continue
             dataset = str(source["id"])
-            if dataset not in REFERENCE_DATASET_POLICY_BY_ID:
-                raise ValueError(f"Unknown imported pronunciation dataset: {dataset}")
             source_path = Path(source["path"])
             source_format = str(source.get("format") or "phrase")
+            if dataset == COMMONNESS_CORPUS_DATASET_ID:
+                if source_format != "jieba":
+                    raise ValueError("Jieba corpus source must use the jieba format")
+                lines = parsed = skipped = 0
+                corpus_rows: list[tuple[str, int, Optional[str]]] = []
+                for data_line, entry in _iter_corpus_entries(source_path):
+                    if data_line:
+                        lines += 1
+                    if entry is None:
+                        if data_line:
+                            skipped += 1
+                        continue
+                    parsed += 1
+                    corpus_rows.append((
+                        entry.word,
+                        entry.frequency,
+                        entry.part_of_speech,
+                    ))
+                    if len(corpus_rows) >= 10_000:
+                        _batched_insert_corpus_entries(connection, corpus_rows)
+                        corpus_rows.clear()
+                if corpus_rows:
+                    _batched_insert_corpus_entries(connection, corpus_rows)
+                imported = int(connection.execute(
+                    "SELECT COUNT(*) FROM word_commonness WHERE corpus_frequency IS NOT NULL"
+                ).fetchone()[0])
+                dataset_counts[dataset] = DatasetBuildCount(
+                    lines=lines,
+                    parsed=parsed,
+                    imported=imported,
+                    duplicates=max(0, parsed - imported),
+                    excluded=0,
+                    skipped=skipped,
+                )
+                continue
+            if dataset not in REFERENCE_DATASET_POLICY_BY_ID:
+                raise ValueError(f"Unknown imported pronunciation dataset: {dataset}")
             lines = parsed = excluded = skipped = 0
             rows: list[tuple[str, str, str, str, str]] = []
             for data_line, reading in _iter_parsed(source_path, source_format):
@@ -408,11 +518,33 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
                 skipped=skipped,
             )
 
+        connection.execute("""
+            INSERT OR IGNORE INTO word_commonness (word)
+            SELECT DISTINCT word FROM readings
+        """)
+        connection.execute("""
+            UPDATE word_commonness
+            SET dictionary_presence_count = (
+                SELECT COUNT(DISTINCT CASE
+                    WHEN readings.dataset IN ('zdic_cibs', 'zdic_cybs')
+                        THEN 'zdic'
+                    ELSE readings.dataset
+                END)
+                FROM readings
+                WHERE readings.word = word_commonness.word
+            )
+        """)
         reading_count = int(connection.execute(
             "SELECT COUNT(*) FROM readings"
         ).fetchone()[0])
         word_count = int(connection.execute(
             "SELECT COUNT(DISTINCT word) FROM readings"
+        ).fetchone()[0])
+        commonness_word_count = int(connection.execute(
+            "SELECT COUNT(*) FROM word_commonness"
+        ).fetchone()[0])
+        corpus_word_count = int(connection.execute(
+            "SELECT COUNT(*) FROM word_commonness WHERE corpus_frequency IS NOT NULL"
         ).fetchone()[0])
         metadata = {
             "schema_version": SCHEMA_VERSION,
@@ -421,6 +553,8 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
             "build_fingerprint": build_fingerprint,
             "word_count": str(word_count),
             "reading_count": str(reading_count),
+            "commonness_word_count": str(commonness_word_count),
+            "corpus_word_count": str(corpus_word_count),
             "dataset_counts": json.dumps(
                 {
                     dataset: asdict(count)
@@ -451,5 +585,7 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
         build_fingerprint=build_fingerprint,
         word_count=word_count,
         reading_count=reading_count,
+        commonness_word_count=commonness_word_count,
+        corpus_word_count=corpus_word_count,
         dataset_counts=dataset_counts,
     )

@@ -536,37 +536,20 @@ async def scenario_s9(ctx: ScenarioContext) -> dict[str, Any]:
     assert_reply_mentions(reply, "常用度评估", "射覆", "慑服", "eefj")
 
     free_code = str(fixture["recommendedFreeCode"])
-    front_shape = (
-        "建议「射覆」占 eefj、「慑服」顺延" in reply
-        and "重新编码" in reply
-        and free_code in reply
-    )
     keep_shape = (
         "「慑服」不弱于「射覆」" in reply
         and "维持现有排序，推荐空位" in reply
         and free_code in reply
     )
-    insufficient_shape = (
-        "常用度信号不足" in reply
-        and "按空位" in reply
-        and free_code in reply
-    )
     require(
-        sum((front_shape, keep_shape, insufficient_shape)) == 1,
-        f"S9 candidate reply has no valid ordering recommendation shape: {reply}",
+        keep_shape,
+        f"S9 offline reference did not keep the corpus-attested occupant first: {reply}",
     )
     require(
         before.get("batchId") == after.get("batchId")
         and before.get("contentVersion") == after.get("contentVersion")
         and before.get("items") == after.get("items") == [],
         f"S9 presentation wrote to the draft: before={before}, after={after}",
-    )
-    shape = (
-        "reorder"
-        if front_shape
-        else "keep-order"
-        if keep_shape
-        else "insufficient"
     )
     return {
         "messages": [message],
@@ -576,7 +559,8 @@ async def scenario_s9(ctx: ScenarioContext) -> dict[str, Any]:
             "fixtureOccupant": fixture["occupantWord"],
             "fixtureCode": fixture["occupiedCode"],
             "freeCode": free_code,
-            "recommendationShape": shape,
+            "recommendationShape": "keep-order",
+            "commonnessReferenceVerdict": "慑服保持在射覆前",
             "draftUnchanged": True,
         },
     }

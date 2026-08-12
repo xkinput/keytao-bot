@@ -35,6 +35,13 @@
       "format": "cedict",
       "import": true,
       "sha256": "a2669cd833741becc624a9a00d99e82b23b548310988d96d7b50ee2c481b27b3"
+    },
+    {
+      "id": "jieba",
+      "file": "jieba_dict.txt",
+      "format": "jieba",
+      "import": true,
+      "sha256": "7197c3211ddd98962b036cdf40324d1ea2bfaa12bd028e68faa70111a88e12a8"
     }
   ]
 }

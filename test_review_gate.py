@@ -195,19 +195,35 @@ REFERENCE_FIXTURE_SOURCES = {
         "zdic_cibs.txt.gz",
         "phrase",
         True,
-        "诉讼费: sù sòng fèi\n朝阳: zhāo yáng\n朝阳: cháo yáng\n",
+        (
+            "诉讼费: sù sòng fèi\n"
+            "诉讼法: sù sòng fǎ\n"
+            "光面: guāng miàn\n"
+            "慑服: shè fú\n"
+            "射覆: shè fù\n"
+            "双汉典: shuāng hàn diǎn\n"
+            "朝阳: zhāo yáng\n"
+            "朝阳: cháo yáng\n"
+        ),
     ),
     "zdic_cybs": (
         "zdic_cybs.txt.gz",
         "phrase",
         True,
-        "一心一意: yī xīn yī yì\n",
+        "一心一意: yī xīn yī yì\n双汉典: shuāng hàn diǎn\n",
     ),
     "large_pinyin": (
         "large_pinyin.txt.gz",
         "phrase",
         True,
-        "诉讼费: sù sòng fèi\n阿勒泰: ā lè tài\n",
+        (
+            "诉讼费: sù sòng fèi\n"
+            "诉讼法: sù sòng fǎ\n"
+            "光面: guāng miàn\n"
+            "慑服: shè fú\n"
+            "射覆: shè fù\n"
+            "阿勒泰: ā lè tài\n"
+        ),
     ),
     "pinyin": (
         "pinyin.txt.gz",
@@ -221,9 +237,23 @@ REFERENCE_FIXTURE_SOURCES = {
         True,
         (
             "# CC-CEDICT fixture\n"
+            "诉讼法 诉讼法 [su4 song4 fa3] /procedural law/\n"
             "石蒜 石蒜 [shi2 suan4] /red spider lily/\n"
             "傳統 简体 [lu:4 se4] /fixture/\n"
             "吃席 吃席 [chi1 xi2] /owner-governed exclusion/\n"
+        ),
+    ),
+    "jieba": (
+        "jieba_dict.txt.gz",
+        "jieba",
+        True,
+        (
+            "诉讼法 66 n\n"
+            "诉讼费 15 n\n"
+            "光面 20 n\n"
+            "慑服 26 v\n"
+            "石蒜 11 n\n"
+            "粮棉 55 n\n"
         ),
     ),
 }
@@ -434,6 +464,23 @@ def test_local_reference_import_is_deterministic_and_preserves_readings():
         excluded = pinyin_reference_module.query_reference_readings(
             "吃席", db_path=db_path
         )
+        connection = sqlite3.connect(db_path)
+        try:
+            commonness_rows = {
+                row[0]: row[1:]
+                for row in connection.execute(
+                    """
+                    SELECT word, corpus_frequency, part_of_speech,
+                        dictionary_presence_count
+                    FROM word_commonness
+                    WHERE word IN (
+                        '诉讼法', '诉讼费', '射覆', '粮棉', '双汉典'
+                    )
+                    """
+                )
+            }
+        finally:
+            connection.close()
 
         check("first fixture build writes the DB", first.rebuilt is True)
         check("same source fingerprint skips rebuilding", second.rebuilt is False)
@@ -462,6 +509,23 @@ def test_local_reference_import_is_deterministic_and_preserves_readings():
             and traditional == [],
         )
         check("owner-governed absent word is excluded", excluded == [])
+        check(
+            "jieba frequency and part of speech are stored",
+            commonness_rows["诉讼法"] == (66, "n", 3)
+            and commonness_rows["粮棉"] == (55, "n", 0),
+        )
+        check(
+            "dictionary presence groups the two zdic variants as one source",
+            commonness_rows["诉讼费"] == (15, "n", 2)
+            and commonness_rows["射覆"] == (None, None, 2)
+            and commonness_rows["双汉典"] == (None, None, 1),
+        )
+        check(
+            "build metadata counts corpus and commonness words",
+            first.corpus_word_count == 6
+            and first.commonness_word_count >= first.corpus_word_count
+            and first.dataset_counts["jieba"].imported == 6,
+        )
 
         connection = pinyin_reference_module._read_only_connection(db_path)
         try:
@@ -475,6 +539,150 @@ def test_local_reference_import_is_deterministic_and_preserves_readings():
         finally:
             connection.close()
         check("runtime connection rejects writes", write_blocked)
+
+
+def test_offline_commonness_verdict_rules_and_copy():
+    print("\n🧪 offline commonness verdict rules and evidence copy")
+
+    async def _run():
+        with _reference_fixture_environment():
+            review_module._clear_review_caches()
+            forbidden_fallback = AsyncMock(
+                side_effect=AssertionError("offline-attested comparison used web fallback")
+            )
+            with patch.object(
+                review_module,
+                "_estimate_word_commonness_web_fallback",
+                forbidden_fallback,
+            ):
+                high_ratio = await review_module.compare_word_commonness(
+                    "诉讼法", "诉讼费"
+                )
+                low_ratio = await review_module.compare_word_commonness(
+                    "光面", "诉讼费"
+                )
+                attested_absent = await review_module.compare_word_commonness(
+                    "石蒜", "亮面"
+                )
+                s9 = await review_module.compare_word_commonness("射覆", "慑服")
+                estimate = await review_module.estimate_word_commonness("诉讼法")
+
+            check(
+                "frequency ratio above 2.0 yields a definite verdict",
+                high_ratio.get("verdict") == "front_more_common"
+                and high_ratio.get("decisionReason") == "frequency_ratio",
+            )
+            check(
+                "frequency ratio below 2.0 is close rather than flapping",
+                low_ratio.get("verdict") == "close"
+                and low_ratio.get("decisionReason") == "frequency_ratio_below_threshold",
+            )
+            check(
+                "corpus and dictionary attestation beats a fully absent word",
+                attested_absent.get("verdict") == "front_more_common"
+                and attested_absent.get("decisionReason")
+                == "corpus_and_dictionary_vs_absent",
+            )
+            check(
+                "S9 fixture has a definite keep-order verdict",
+                s9.get("verdict") == "behind_more_common"
+                and s9.get("decisionReason")
+                == "corpus_attested_with_no_presence_deficit",
+            )
+            check(
+                "local estimator exposes log-scaled corpus and presence signals",
+                estimate.get("method") == "offline_reference"
+                and 0 < estimate.get("signals", {}).get("corpus", 0) < 1
+                and estimate.get("signals", {}).get("dictionary") == 1
+                and estimate.get("reference", {}).get("partOfSpeech") == "n",
+            )
+            check(
+                "reference-backed paths never reach the web fallback",
+                forbidden_fallback.await_count == 0,
+            )
+            check(
+                "comparison copy cites frequency and dictionary presence on one line",
+                high_ratio.get("summary")
+                == "「诉讼法」较「诉讼费」更常用：语料频次 66 vs 15，词典收录 3 vs 2"
+                and "\n" not in high_ratio.get("summary", "")
+                and "语料频次 20 vs 15，词典收录 2 vs 2"
+                in low_ratio.get("summary", "")
+                and "语料频次 无 vs 26，词典收录 2 vs 2"
+                in s9.get("summary", ""),
+            )
+            assessment = review_module._candidate_commonness_assessment(
+                {
+                    "newWord": "射覆",
+                    "occupantWord": "慑服",
+                    "occupantCode": "eefj",
+                    "freeCode": "eefju",
+                },
+                s9,
+            )
+            check(
+                "candidate assessment preserves the evidence-citing copy",
+                assessment.get("summary") == s9.get("summary")
+                and assessment.get("newCode") == "eefju",
+            )
+
+    asyncio.run(_run())
+
+
+def test_both_absent_commonness_uses_existing_bounded_web_fallback():
+    print("\n🧪 both-absent commonness uses the bounded web fallback")
+
+    async def _run():
+        with _reference_fixture_environment():
+            review_module._clear_review_caches()
+            entity_signal = AsyncMock(return_value={
+                "accepted": False,
+                "word": "",
+                "entityType": "unclear",
+                "confidence": 0.0,
+            })
+            pronunciation = AsyncMock(return_value={"success": False, "groups": []})
+            search = AsyncMock(return_value=[])
+            with (
+                patch.object(
+                    review_module,
+                    "_estimate_entity_knowledge_signal",
+                    entity_signal,
+                ),
+                patch.object(
+                    review_module,
+                    "collect_pronunciation_evidence_limited",
+                    pronunciation,
+                ),
+                patch.object(review_module, "_search_web", search),
+            ):
+                result = await review_module.compare_word_commonness(
+                    "全无甲", "全无乙"
+                )
+
+            check(
+                "both absent words use web fallback and remain insufficient",
+                result.get("webFallback") is True
+                and result.get("verdict") == "not_enough_evidence",
+            )
+            check(
+                "fallback preserves the existing five queries per word",
+                entity_signal.await_count == 2
+                and pronunciation.await_count == 2
+                and search.await_count
+                == 2 * len(review_module.COMMONNESS_SEARCH_QUERIES),
+            )
+            check(
+                "fallback copy cites its basis without claiming local evidence",
+                result.get("summary")
+                == "常用度信号不足：离线均无收录，网页回退得分 0.00 vs 0.00",
+            )
+            check(
+                "candidate and audit fallback budgets stay at five seconds",
+                review_module.CANDIDATE_COMMONNESS_TIMEOUT_SECONDS == 5.0
+                and review_module.AUDIT_COMMONNESS_STAGE_TIMEOUT == 5.0,
+            )
+
+    asyncio.run(_run())
 
 
 def test_collector_queries_local_reference_first_and_scores_agreement():
@@ -2920,6 +3128,8 @@ def test_audit_budget_nesting_and_timeout_retains_review():
 def main():
     test_review_disposition_registry()
     test_local_reference_import_is_deterministic_and_preserves_readings()
+    test_offline_commonness_verdict_rules_and_copy()
+    test_both_absent_commonness_uses_existing_bounded_web_fallback()
     test_collector_queries_local_reference_first_and_scores_agreement()
     test_local_reference_miss_falls_through_to_live_sources()
     test_poisoned_local_reference_row_fails_per_syllable_validation()
