@@ -133,10 +133,15 @@ COMMON_KNOWN_MIN_SCORE = 0.55
 COMMON_KNOWN_MIN_ACTIVE_SIGNALS = 2
 COMMON_KNOWN_RELAXED_MIN_SCORE = 0.35
 CSS_REVIEW_TYPES = {"CSS", "CSSSingle"}
-# Total budget for gathering pronunciation evidence. Must stay above the
-# per-source budget below so a source can finish within its own deadline.
-PRONUNCIATION_EVIDENCE_TIMEOUT = 8.0
-PRONUNCIATION_SOURCE_TIMEOUT = 6.0
+# Proxy requests fan out in parallel by source. One proxy attempt is capped at
+# 2 seconds; if it is unavailable, the reliable direct path still gets its
+# existing two 2.25-second attempts plus 0.5-second backoff. That 7-second
+# sequential chain fits a source's 8-second envelope, while the evidence
+# deadline leaves another 2 seconds for cancellation and aggregation.
+PRONUNCIATION_EVIDENCE_TIMEOUT = 10.0
+PRONUNCIATION_SOURCE_TIMEOUT = 8.0
+PRONUNCIATION_PROXY_REQUEST_TIMEOUT = 2.0
+PRONUNCIATION_SEARCH_FALLBACK_TIMEOUT = 5.0
 PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT = 2.25
 PRONUNCIATION_FETCH_MAX_ATTEMPTS = 2
 PRONUNCIATION_FETCH_RETRYABLE_STATUSES = (408, 425, 429, 500, 502, 503, 504)
@@ -235,6 +240,24 @@ AUTHORITATIVE_SOURCES = [
     },
     # xh.5156edu.com is a future GB2312/POST carrier option.
 ]
+
+# Authoritative contract from keytao-next's fixed evidence allowlist. Keep this
+# explicit even while the names are identical so drift cannot silently turn a
+# collector source into a caller-selected URL.
+BOT_EVIDENCE_PROXY_SOURCE_IDS = {
+    "handian": "handian",
+    "moedict": "moedict",
+    "hwxnet_cidian": "hwxnet_cidian",
+    "hwxnet_xinhua": "hwxnet_xinhua",
+    "baidu_baike": "baidu_baike",
+    "wikipedia": "wikipedia",
+}
+BOT_EVIDENCE_PROXY_PATH = "/api/bot/evidence/fetch"
+_bot_evidence_proxy_endpoint_available: Optional[bool] = None
+_bot_evidence_proxy_feature_probe_failed = False
+_bot_evidence_proxy_feature_lock: Optional[asyncio.Lock] = None
+_bot_evidence_proxy_feature_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+
 ACCEPTED_PRONUNCIATION_SOURCES = [
     *LOCAL_REFERENCE_SOURCES,
     *AUTHORITATIVE_SOURCES,
@@ -673,6 +696,132 @@ class _LookupResults(list):
         self.lookup_status = lookup_status
 
 
+@dataclass(frozen=True)
+class _BotEvidenceProxyResult:
+    status: str
+    text: str = ""
+
+
+def _get_bot_evidence_proxy_feature_lock() -> asyncio.Lock:
+    global _bot_evidence_proxy_feature_lock
+    global _bot_evidence_proxy_feature_lock_loop
+
+    loop = asyncio.get_running_loop()
+    if (
+        _bot_evidence_proxy_feature_lock is None
+        or _bot_evidence_proxy_feature_lock_loop is not loop
+    ):
+        _bot_evidence_proxy_feature_lock = asyncio.Lock()
+        _bot_evidence_proxy_feature_lock_loop = loop
+    return _bot_evidence_proxy_feature_lock
+
+
+async def _request_bot_evidence_proxy(
+    collector_source_id: str,
+    word: str,
+) -> _BotEvidenceProxyResult:
+    """Fetch one fixed source through keytao-next, falling back at the caller."""
+    global _bot_evidence_proxy_endpoint_available
+    global _bot_evidence_proxy_feature_probe_failed
+
+    proxy_source_id = BOT_EVIDENCE_PROXY_SOURCE_IDS.get(collector_source_id)
+    if not proxy_source_id or _bot_evidence_proxy_endpoint_available is False:
+        return _BotEvidenceProxyResult("unavailable")
+
+    async def request_once() -> _BotEvidenceProxyResult:
+        global _bot_evidence_proxy_endpoint_available
+        global _bot_evidence_proxy_feature_probe_failed
+
+        try:
+            response = await http_client.keytao_request(
+                "POST",
+                BOT_EVIDENCE_PROXY_PATH,
+                json_body={"sourceId": proxy_source_id, "word": word},
+                timeout=PRONUNCIATION_PROXY_REQUEST_TIMEOUT,
+                retries=1,
+                idempotent=True,
+            )
+        except Exception as error:
+            # Missing credentials, timeouts, and transport failures all leave
+            # feature state unknown. Only an actual route-level HTTP 404 is a
+            # durable feature-missing signal.
+            logger.debug(
+                "Bot evidence proxy unavailable for "
+                f"{collector_source_id}/{word}: {error}"
+            )
+            # A transport error is source-local fallback evidence, not proof
+            # that this deployment lacks the route. Other sources still try the
+            # proxy first, without serializing behind this failed feature probe.
+            _bot_evidence_proxy_feature_probe_failed = True
+            return _BotEvidenceProxyResult("unavailable")
+
+        status_code = getattr(response, "status_code", None)
+        if status_code == 404:
+            _bot_evidence_proxy_endpoint_available = False
+            _bot_evidence_proxy_feature_probe_failed = False
+            logger.info(
+                "Bot evidence proxy endpoint is absent; "
+                "using direct source fetches for this process"
+            )
+            return _BotEvidenceProxyResult("unavailable")
+        if not isinstance(status_code, int):
+            return _BotEvidenceProxyResult("unavailable")
+
+        # Any non-404 HTTP response proves that the route exists. This does not
+        # make its source result successful; 4xx/5xx still fall back directly.
+        # A 404 observed by a concurrent request is terminal for this process.
+        if _bot_evidence_proxy_endpoint_available is False:
+            return _BotEvidenceProxyResult("unavailable")
+        _bot_evidence_proxy_endpoint_available = True
+        _bot_evidence_proxy_feature_probe_failed = False
+        if not 200 <= status_code < 300:
+            return _BotEvidenceProxyResult("unavailable")
+        try:
+            payload = response.json()
+        except Exception as error:
+            logger.debug(
+                "Bot evidence proxy returned invalid JSON for "
+                f"{collector_source_id}/{word}: {error}"
+            )
+            return _BotEvidenceProxyResult("unavailable")
+        if not isinstance(payload, dict):
+            return _BotEvidenceProxyResult("unavailable")
+
+        payload_status = payload.get("status")
+        payload_text = payload.get("text")
+        if (
+            payload.get("ok") is True
+            and payload_status == 200
+            and isinstance(payload_text, str)
+        ):
+            # The endpoint already strips active content/tags, collapses
+            # whitespace, and bounds this to 12,000 Unicode code points.
+            return _BotEvidenceProxyResult("found", payload_text)
+        if (
+            payload.get("ok") is False
+            and payload_status == 404
+            and payload_text == ""
+        ):
+            return _BotEvidenceProxyResult("absent")
+        return _BotEvidenceProxyResult("unavailable")
+
+    if (
+        _bot_evidence_proxy_endpoint_available is None
+        and not _bot_evidence_proxy_feature_probe_failed
+    ):
+        # Coalesce feature detection across the six parallel source tasks. A
+        # first 404 therefore causes one route probe, not six concurrent probes.
+        async with _get_bot_evidence_proxy_feature_lock():
+            if _bot_evidence_proxy_endpoint_available is False:
+                return _BotEvidenceProxyResult("unavailable")
+            if (
+                _bot_evidence_proxy_endpoint_available is None
+                and not _bot_evidence_proxy_feature_probe_failed
+            ):
+                return await request_once()
+    return await request_once()
+
+
 def _is_timeout_error(error: BaseException) -> bool:
     return isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
 
@@ -1005,10 +1154,7 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
     local_evidence = _collect_local_pronunciation_evidence(word)
 
     async def inspect_source(source: Dict[str, Any]) -> Dict[str, Any]:
-        # Direct pages and the site-scoped search run together; inside each,
-        # every outbound fetch is issued in parallel as well. Serial per-URL
-        # fetching is what used to blow through the total budget.
-        async def direct_texts() -> Tuple[
+        async def fallback_direct_texts() -> Tuple[
             List[Tuple[str, str, str, bool, Optional[bool]]],
             str,
         ]:
@@ -1126,85 +1272,142 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                     ))
             return collected, _merge_lookup_status(statuses)
 
-        tasks = [
-            asyncio.create_task(direct_texts()),
-            asyncio.create_task(search_texts()),
-        ]
-        done, pending = await asyncio.wait(
-            tasks,
-            timeout=PRONUNCIATION_SOURCE_TIMEOUT,
+        entries: List[Dict[str, Any]] = []
+        source_rejections: List[Dict[str, Any]] = []
+
+        def extract_texts(
+            texts: Sequence[Tuple[str, str, str, bool, Optional[bool]]],
+        ) -> None:
+            for (
+                label,
+                url,
+                text,
+                exact_entry_direct_url,
+                word_binding_confirmed,
+            ) in texts:
+                sequences, rejected_unbound = _extract_labeled_pinyin_sequences(
+                    text,
+                    word,
+                    exact_entry_direct_url=exact_entry_direct_url,
+                    allow_adjacent_word_pinyin=bool(
+                        source.get("adjacent_word_pinyin")
+                    ),
+                    word_binding_confirmed=word_binding_confirmed,
+                )
+                if rejected_unbound:
+                    rejection_reason = (
+                        "search_anchor_not_exact_word"
+                        if word_binding_confirmed is False
+                        else "queried_word_not_near_pinyin_label"
+                    )
+                    rejection = {
+                        "sourceId": source["id"],
+                        "source": label,
+                        "url": url,
+                        "reason": rejection_reason,
+                        "count": rejected_unbound,
+                    }
+                    source_rejections.append(rejection)
+                    logger.warning(
+                        "Pronunciation evidence rejected for "
+                        f"{word} from {url}: {rejection_reason}"
+                    )
+                for sequence in sequences:
+                    entries.append({
+                        "sourceId": source["id"],
+                        "source": label,
+                        "url": url,
+                        "pinyin": pinyin_sequence_label(sequence),
+                        "normalized": list(sequence),
+                        "category": source["category"],
+                        "trust": source["trust"],
+                    })
+
+        async def primary_texts() -> Tuple[
+            List[Tuple[str, str, str, bool, Optional[bool]]],
+            str,
+        ]:
+            if source["id"] not in BOT_EVIDENCE_PROXY_SOURCE_IDS:
+                return await fallback_direct_texts()
+
+            proxy_result = await _request_bot_evidence_proxy(source["id"], word)
+            if proxy_result.status == "absent":
+                return [], "completed"
+            if proxy_result.status == "found":
+                direct_templates = list(source.get("direct_urls", []))
+                evidence_url = (
+                    direct_templates[0].format(word=quote(word))
+                    if direct_templates
+                    else str(source.get("follow_search_url") or "").format(
+                        word=quote(word)
+                    )
+                )
+                return [(
+                    source["label"],
+                    evidence_url,
+                    proxy_result.text[:12000],
+                    bool(
+                        direct_templates
+                        and _direct_url_entry_matches_word(evidence_url, word)
+                    ),
+                    None,
+                )], "completed"
+
+            # Proxy transport/HTTP/contract failures, including a remembered
+            # feature-missing 404, reach the pre-existing guarded direct path.
+            return await fallback_direct_texts()
+
+        has_primary_path = bool(
+            source["id"] in BOT_EVIDENCE_PROXY_SOURCE_IDS
+            or source.get("direct_urls")
+            or source.get("follow_search_url")
         )
-        statuses = ["timed_out"] if pending else []
-        texts: List[Tuple[str, str, str, bool, Optional[bool]]] = []
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        for task in tasks:
-            if task not in done:
-                continue
+        deadline = asyncio.get_running_loop().time() + PRONUNCIATION_SOURCE_TIMEOUT
+        primary_status: Optional[str] = None
+        if has_primary_path:
             try:
-                task_texts, task_status = task.result()
+                primary, primary_status = await asyncio.wait_for(
+                    primary_texts(),
+                    timeout=PRONUNCIATION_SOURCE_TIMEOUT,
+                )
+                extract_texts(primary)
             except Exception as error:
-                statuses.append(
+                primary_status = (
                     "timed_out" if _is_timeout_error(error) else "errored"
                 )
-                continue
-            texts.extend(task_texts)
-            statuses.append(task_status)
 
-        status = _merge_lookup_status(statuses)
+        # Site-scoped search is optional corroboration for a completed primary
+        # lookup and the only path for legacy search-only sources. It runs last,
+        # only when the primary text did not yield a usable pronunciation.
+        search_status: Optional[str] = None
+        if not entries:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining > 0:
+                try:
+                    searched, search_status = await asyncio.wait_for(
+                        search_texts(),
+                        timeout=min(
+                            remaining,
+                            PRONUNCIATION_SEARCH_FALLBACK_TIMEOUT,
+                        ),
+                    )
+                    extract_texts(searched)
+                except Exception as error:
+                    search_status = (
+                        "timed_out" if _is_timeout_error(error) else "errored"
+                    )
+            else:
+                search_status = "timed_out"
+
+        # A proxy-unavailable -> direct-success branch is completed regardless
+        # of optional search-engine health. If there is no primary path, search
+        # remains the source's final outcome as before.
+        status = str(primary_status or search_status or "completed")
         if status == "timed_out":
             logger.debug(f"Pronunciation source {source['id']} timed out for {word}")
         elif status == "errored":
             logger.debug(f"Pronunciation source {source['id']} failed for {word}")
 
-        entries: List[Dict[str, Any]] = []
-        source_rejections: List[Dict[str, Any]] = []
-        for (
-            label,
-            url,
-            text,
-            exact_entry_direct_url,
-            word_binding_confirmed,
-        ) in texts:
-            sequences, rejected_unbound = _extract_labeled_pinyin_sequences(
-                text,
-                word,
-                exact_entry_direct_url=exact_entry_direct_url,
-                allow_adjacent_word_pinyin=bool(
-                    source.get("adjacent_word_pinyin")
-                ),
-                word_binding_confirmed=word_binding_confirmed,
-            )
-            if rejected_unbound:
-                rejection_reason = (
-                    "search_anchor_not_exact_word"
-                    if word_binding_confirmed is False
-                    else "queried_word_not_near_pinyin_label"
-                )
-                rejection = {
-                    "sourceId": source["id"],
-                    "source": label,
-                    "url": url,
-                    "reason": rejection_reason,
-                    "count": rejected_unbound,
-                }
-                source_rejections.append(rejection)
-                logger.warning(
-                    "Pronunciation evidence rejected for "
-                    f"{word} from {url}: {rejection_reason}"
-                )
-            for sequence in sequences:
-                entries.append({
-                    "sourceId": source["id"],
-                    "source": label,
-                    "url": url,
-                    "pinyin": pinyin_sequence_label(sequence),
-                    "normalized": list(sequence),
-                    "category": source["category"],
-                    "trust": source["trust"],
-                })
         return {
             "sourceId": source["id"],
             "source": source["label"],
