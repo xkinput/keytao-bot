@@ -30,6 +30,13 @@ from .keytao_encoding import (
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 from .observability import current_turn_id, observe_model_call
 from .llm_request_gate import RequestWindowGate
+from .pinyin_reference import (
+    PinyinReferenceUnavailable,
+    REFERENCE_DATASET_POLICIES,
+    REFERENCE_DATASET_POLICY_BY_ID,
+    normalize_pinyin_syllable as normalize_reference_pinyin_syllable,
+    query_reference_readings,
+)
 from .review_flags import (
     MANUAL_REVIEW_PREFIXES,
     apply_review_disposition,
@@ -139,6 +146,8 @@ ENCODE_WHOLE_WORD_ZDIC_SOURCES = frozenset({"zdic-phrase", "zdic-aabb"})
 ENCODE_ZDIC_SOURCE_ID = "handian_encode"
 ENCODE_ZDIC_SOURCE_LABEL = "汉典（经编码服务）"
 
+LOCAL_REFERENCE_SOURCES = [dict(policy) for policy in REFERENCE_DATASET_POLICIES]
+
 AUTHORITATIVE_SOURCES = [
     {
         "id": "handian",
@@ -218,6 +227,10 @@ AUTHORITATIVE_SOURCES = [
         "direct_urls": [],
     },
     # xh.5156edu.com is a future GB2312/POST carrier option.
+]
+ACCEPTED_PRONUNCIATION_SOURCES = [
+    *LOCAL_REFERENCE_SOURCES,
+    *AUTHORITATIVE_SOURCES,
 ]
 
 _PINYIN_CHAR_CLASS = (
@@ -460,17 +473,7 @@ _semantic_review_inflight: Dict[str, asyncio.Task] = {}
 
 
 def normalize_pinyin_syllable(value: str) -> str:
-    text = (
-        value.strip().lower()
-        .replace("u:", "v")
-        .translate(str.maketrans("üǖǘǚǜ", "vvvvv"))
-    )
-    text = re.sub(r"[1-5]$", "", text)
-    normalized = unicodedata.normalize("NFD", text)
-    return "".join(
-        char for char in normalized
-        if unicodedata.category(char) != "Mn"
-    ).replace("ê", "e")
+    return normalize_reference_pinyin_syllable(value)
 
 
 def normalize_pinyin_sequence(value: str) -> Tuple[str, ...]:
@@ -924,6 +927,63 @@ def _extract_labeled_pinyin_sequences(
     return sequences, rejected_unbound
 
 
+def _collect_local_pronunciation_evidence(word: str) -> Dict[str, Any]:
+    """Query the exact-word local key before any network-backed source.
+
+    The database lookup itself binds each reading to ``word`` because ``word``
+    is the indexed key, so scraped-text proximity binding is neither needed nor
+    applicable. The ordinary downstream per-syllable validation still applies
+    to every returned group and rejects a malformed or corrupted local row.
+    """
+    try:
+        readings = query_reference_readings(word)
+    except PinyinReferenceUnavailable as error:
+        logger.warning(f"Local pronunciation reference unavailable for {word}: {error}")
+        return {
+            "entries": [],
+            "outcomes": [
+                {
+                    "sourceId": str(source["id"]),
+                    "source": str(source["label"]),
+                    "status": "unavailable",
+                    "lookupResult": "unavailable",
+                }
+                for source in LOCAL_REFERENCE_SOURCES
+            ],
+        }
+
+    found_datasets = {reading.dataset for reading in readings}
+    entries: List[Dict[str, Any]] = []
+    for reading in readings:
+        policy = REFERENCE_DATASET_POLICY_BY_ID[reading.dataset]
+        entries.append({
+            "sourceId": reading.dataset,
+            "source": str(policy["label"]),
+            "url": "",
+            "pinyin": reading.display,
+            "display": reading.display,
+            "normalized": list(reading.normalized),
+            "category": str(policy["category"]),
+            "trust": int(policy["trust"]),
+            "dataset": reading.dataset,
+            "sourceReading": reading.source_reading,
+        })
+    return {
+        "entries": entries,
+        "outcomes": [
+            {
+                "sourceId": str(source["id"]),
+                "source": str(source["label"]),
+                "status": "completed",
+                "lookupResult": (
+                    "found" if str(source["id"]) in found_datasets else "absent"
+                ),
+            }
+            for source in LOCAL_REFERENCE_SOURCES
+        ],
+    }
+
+
 async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
     word = word.strip()
     if not word:
@@ -932,6 +992,10 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
     cached = _cache_get(word, "pronunciation_evidence")
     if cached is not None:
         return cached
+
+    # This synchronous indexed lookup deliberately happens before creation of
+    # any task that can issue a network request.
+    local_evidence = _collect_local_pronunciation_evidence(word)
 
     async def inspect_source(source: Dict[str, Any]) -> Dict[str, Any]:
         # Direct pages and the site-scoped search run together; inside each,
@@ -1151,9 +1215,12 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         inspect_source(source) for source in applicable_sources
     ))
     source_entries = [
+        *local_evidence["entries"],
+        *(
         entry
         for outcome in inspected
         for entry in outcome["entries"]
+        ),
     ]
     rejections = [
         rejection
@@ -1161,15 +1228,29 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         for rejection in outcome["rejections"]
     ]
     source_outcomes = [
+        *local_evidence["outcomes"],
+        *(
         {
             "sourceId": outcome["sourceId"],
             "source": outcome["source"],
             "status": outcome["status"],
         }
         for outcome in inspected
+        ),
     ]
-    lookup_complete = all(
-        outcome["status"] == "completed" for outcome in source_outcomes
+    network_lookup_complete = all(
+        outcome["status"] == "completed" for outcome in inspected
+    )
+    local_lookup_complete = all(
+        outcome["status"] == "completed"
+        for outcome in local_evidence["outcomes"]
+    )
+    # A completed local hit is sufficient authority even when optional live
+    # corroboration fails. A local miss or unavailable DB falls through to the
+    # pre-existing live-source completion rule.
+    lookup_complete = bool(
+        (local_lookup_complete and local_evidence["entries"])
+        or network_lookup_complete
     )
 
     groups: Dict[Tuple[str, ...], Dict[str, Any]] = {}
@@ -1177,7 +1258,7 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         key = tuple(entry["normalized"])
         if key not in groups:
             groups[key] = {
-                "pinyin": pinyin_sequence_label(key),
+                "pinyin": str(entry.get("display") or pinyin_sequence_label(key)),
                 "normalized": list(key),
                 "sources": [],
                 "sourceIds": [],
@@ -1185,12 +1266,15 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
                 "readingEvidenceKind": "bound_external",
             }
         group = groups[key]
-        group["sources"].append({
+        source_record = {
             "source": entry["source"],
             "url": entry["url"],
             "category": entry["category"],
             "trust": entry["trust"],
-        })
+        }
+        if entry.get("dataset"):
+            source_record["dataset"] = entry["dataset"]
+        group["sources"].append(source_record)
         if entry["sourceId"] not in group["sourceIds"]:
             group["sourceIds"].append(entry["sourceId"])
             group["score"] += int(entry["trust"])
@@ -1924,7 +2008,7 @@ async def prepare_reviewed_word(
     if isinstance(encode_data, BaseException):
         encode_data = {"success": False, "message": str(encode_data)}
 
-    scraper_source_outcomes = [
+    collector_source_outcomes = [
         outcome
         for outcome in (evidence.get("sourceOutcomes") or [])
         if isinstance(outcome, dict)
@@ -1934,13 +2018,13 @@ async def prepare_reviewed_word(
         encode_data.get("pronunciationSource") or ""
     ).strip()
     encode_source_outcome = _encode_zdic_source_outcome(encode_data)
-    source_outcomes = [encode_source_outcome, *scraper_source_outcomes]
+    source_outcomes = [encode_source_outcome, *collector_source_outcomes]
     if "lookupComplete" in evidence:
-        scraper_lookup_complete = evidence.get("lookupComplete") is True
+        collector_lookup_complete = evidence.get("lookupComplete") is True
     else:
         # Backward-compatible for cached/test payloads produced before lookup
         # outcome tracking existed.
-        scraper_lookup_complete = bool(evidence.get("success")) and not bool(
+        collector_lookup_complete = bool(evidence.get("success")) and not bool(
             evidence.get("timeout")
         )
     if (
@@ -1952,17 +2036,17 @@ async def prepare_reviewed_word(
         evidence_lookup_complete = True
     elif standard_status == "unavailable":
         evidence_lookup_complete = False
-    elif standard_status == "absent" and scraper_source_outcomes:
+    elif standard_status == "absent" and collector_source_outcomes:
         # Encode completed the Han Dian lookup and found no entry. Only an
         # incomplete independent source may keep the wider evidence search
         # open; a duplicate bot-side Han Dian scrape is supplementary.
         evidence_lookup_complete = all(
             outcome.get("status") == "completed"
-            for outcome in scraper_source_outcomes
+            for outcome in collector_source_outcomes
             if outcome.get("sourceId") != "handian"
         )
     else:
-        evidence_lookup_complete = scraper_lookup_complete
+        evidence_lookup_complete = collector_lookup_complete
     evidence_lookup_status = "completed" if evidence_lookup_complete else "incomplete"
     failed_source_labels = list(dict.fromkeys(
         str(outcome.get("source") or outcome.get("sourceId") or "").strip()
@@ -1982,7 +2066,7 @@ async def prepare_reviewed_word(
         }, "code_unresolved")
 
     raw_groups = evidence.get("groups", []) if evidence.get("success") else []
-    scraper_groups, cross_validation_rejections = _validated_pronunciation_groups(
+    collected_groups, cross_validation_rejections = _validated_pronunciation_groups(
         word,
         raw_groups,
         encode_data,
@@ -1996,10 +2080,10 @@ async def prepare_reviewed_word(
     groups = (
         _merge_primary_pronunciation_group(
             validated_encode_groups[0],
-            scraper_groups,
+            collected_groups,
         )
         if validated_encode_groups
-        else scraper_groups
+        else collected_groups
     )
     foreign_evidence_rejections = list(evidence.get("rejections") or [])
     evidence_rejections = [
@@ -2252,7 +2336,7 @@ async def prepare_reviewed_word(
         "sourcePolicy": {
             "acceptedSources": [
                 {key: source[key] for key in ("id", "label", "domain", "category", "trust")}
-                for source in AUTHORITATIVE_SOURCES
+                for source in ACCEPTED_PRONUNCIATION_SOURCES
             ],
             "reviewSignalWeights": REVIEW_SIGNAL_WEIGHTS,
         },
@@ -4461,7 +4545,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
         "sourcePolicy": {
             "acceptedSources": [
                 {key: source[key] for key in ("id", "label", "domain", "category", "trust")}
-                for source in AUTHORITATIVE_SOURCES
+                for source in ACCEPTED_PRONUNCIATION_SOURCES
             ],
             "reviewSignalWeights": REVIEW_SIGNAL_WEIGHTS,
             "commonnessSignalWeights": COMMONNESS_SIGNAL_WEIGHTS,

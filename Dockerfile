@@ -12,4 +12,4 @@ RUN uv run playwright install chromium --with-deps
 
 COPY . .
 
-CMD ["uv", "run", "python", "bot.py"]
+CMD ["sh", "-c", "uv run python scripts/build_pinyin_reference.py && exec uv run python bot.py"]

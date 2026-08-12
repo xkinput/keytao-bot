@@ -1,0 +1,40 @@
+{
+  "formatVersion": 1,
+  "datasets": [
+    {
+      "id": "zdic_cibs",
+      "file": "zdic_cibs.txt.gz",
+      "format": "phrase",
+      "import": true,
+      "sha256": "b2072e9c232b07b3bc0ce45a3c5650e39f2a178cb18050f2ec6eddf40d6c45da"
+    },
+    {
+      "id": "zdic_cybs",
+      "file": "zdic_cybs.txt.gz",
+      "format": "phrase",
+      "import": true,
+      "sha256": "fc38bd44251a1f219dcb8533f24784e96dd7c803b91f70772e2d4052253bdbbe"
+    },
+    {
+      "id": "large_pinyin",
+      "file": "large_pinyin.txt.gz",
+      "format": "phrase",
+      "import": true,
+      "sha256": "4cf565635a092f3911a7f560fc604aa1a05c95a121488fb28562f3dd2d1441f7"
+    },
+    {
+      "id": "pinyin",
+      "file": "pinyin.txt.gz",
+      "format": "phrase",
+      "import": false,
+      "sha256": "dcc769607c220b312fea3e71cb63421298b4b891b1f7356a95ab58f2c96fff81"
+    },
+    {
+      "id": "cedict",
+      "file": "cedict.txt.gz",
+      "format": "cedict",
+      "import": true,
+      "sha256": "a2669cd833741becc624a9a00d99e82b23b548310988d96d7b50ee2c481b27b3"
+    }
+  ]
+}

@@ -7,11 +7,16 @@ does, so it runs without a NoneBot runtime.
     uv run python test_review_gate.py
 """
 import asyncio
+import gzip
+import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
+import tempfile
 import types
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from urllib.parse import unquote
@@ -109,6 +114,10 @@ from keytao_bot.utils import keytao_batch_review as batch_review_module  # noqa:
 from keytao_bot.utils import keytao_review as review_module  # noqa: E402
 from keytao_bot.utils.http_client import KeytaoApiError  # noqa: E402
 from keytao_bot.utils.keytao_encoding import normalize_contextual_phrase_encoding  # noqa: E402
+from keytao_bot.utils import pinyin_reference as pinyin_reference_module  # noqa: E402
+from keytao_bot.utils.pinyin_reference_build import (  # noqa: E402
+    build_reference_database,
+)
 from keytao_bot.utils.keytao_review import (  # noqa: E402
     ReviewHttpConfig,
     audit_draft_items,
@@ -181,6 +190,83 @@ PRONUNCIATION_FIXTURES = (
 )
 
 
+REFERENCE_FIXTURE_SOURCES = {
+    "zdic_cibs": (
+        "zdic_cibs.txt.gz",
+        "phrase",
+        True,
+        "诉讼费: sù sòng fèi\n朝阳: zhāo yáng\n朝阳: cháo yáng\n",
+    ),
+    "zdic_cybs": (
+        "zdic_cybs.txt.gz",
+        "phrase",
+        True,
+        "一心一意: yī xīn yī yì\n",
+    ),
+    "large_pinyin": (
+        "large_pinyin.txt.gz",
+        "phrase",
+        True,
+        "诉讼费: sù sòng fèi\n阿勒泰: ā lè tài\n",
+    ),
+    "pinyin": (
+        "pinyin.txt.gz",
+        "phrase",
+        False,
+        "不直接导入: bù zhí jiē dǎo rù\n",
+    ),
+    "cedict": (
+        "cedict.txt.gz",
+        "cedict",
+        True,
+        (
+            "# CC-CEDICT fixture\n"
+            "石蒜 石蒜 [shi2 suan4] /red spider lily/\n"
+            "傳統 简体 [lu:4 se4] /fixture/\n"
+            "吃席 吃席 [chi1 xi2] /owner-governed exclusion/\n"
+        ),
+    ),
+}
+
+
+def _write_deterministic_gzip(path, text):
+    with path.open("wb") as raw_handle:
+        with gzip.GzipFile(fileobj=raw_handle, mode="wb", filename="", mtime=0) as handle:
+            handle.write(text.encode("utf-8"))
+
+
+def _build_reference_fixture(root):
+    source_dir = root / "source"
+    source_dir.mkdir()
+    datasets = []
+    for dataset, (filename, source_format, imported, content) in REFERENCE_FIXTURE_SOURCES.items():
+        _write_deterministic_gzip(source_dir / filename, content)
+        datasets.append({
+            "id": dataset,
+            "file": filename,
+            "format": source_format,
+            "import": imported,
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        })
+    (source_dir / "manifest.json").write_text(
+        json.dumps({"formatVersion": 1, "datasets": datasets}),
+        encoding="utf-8",
+    )
+    (source_dir / "excluded_words.txt").write_text("吃席\n", encoding="utf-8")
+    db_path = root / "pinyin_reference.db"
+    result = build_reference_database(source_dir, db_path)
+    return source_dir, db_path, result
+
+
+@contextmanager
+def _reference_fixture_environment():
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source_dir, db_path, result = _build_reference_fixture(root)
+        with patch.dict(os.environ, {"PINYIN_REFERENCE_DB": str(db_path)}):
+            yield source_dir, db_path, result
+
+
 def _pronunciation_fixture(name):
     return (PRONUNCIATION_FIXTURES / name).read_text(encoding="utf-8")
 
@@ -205,6 +291,11 @@ async def _collect_hwxnet_fixture(search_fixture, entry_fixture):
 
     with (
         patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+        patch.object(
+            review_module,
+            "_collect_local_pronunciation_evidence",
+            return_value={"entries": [], "outcomes": []},
+        ),
         patch.object(review_module, "_fetch_text", side_effect=fixture_fetch),
         patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
     ):
@@ -314,6 +405,265 @@ async def _review_word_with_encode(word, evidence, encode_data):
         ),
     ):
         return await prepare_reviewed_word(CONFIG, word)
+
+
+def test_local_reference_import_is_deterministic_and_preserves_readings():
+    print("\n🧪 local reference import correctness and deterministic rebuild")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source_dir, db_path, first = _build_reference_fixture(root)
+        first_bytes = db_path.read_bytes()
+        second = build_reference_database(source_dir, db_path)
+        second_bytes = db_path.read_bytes()
+        duplicate_db = root / "duplicate.db"
+        duplicate = build_reference_database(source_dir, duplicate_db)
+
+        cedict = pinyin_reference_module.query_reference_readings(
+            "石蒜", db_path=db_path
+        )
+        multi_reading = pinyin_reference_module.query_reference_readings(
+            "朝阳", db_path=db_path
+        )
+        simplified = pinyin_reference_module.query_reference_readings(
+            "简体", db_path=db_path
+        )
+        traditional = pinyin_reference_module.query_reference_readings(
+            "傳統", db_path=db_path
+        )
+        excluded = pinyin_reference_module.query_reference_readings(
+            "吃席", db_path=db_path
+        )
+
+        check("first fixture build writes the DB", first.rebuilt is True)
+        check("same source fingerprint skips rebuilding", second.rebuilt is False)
+        check("idempotent skip leaves DB bytes unchanged", second_bytes == first_bytes)
+        check(
+            "independent deterministic builds have identical bytes",
+            duplicate.rebuilt is True and duplicate_db.read_bytes() == first_bytes,
+        )
+        check(
+            "CC-CEDICT tone numbers become tone marks and preserve source form",
+            len(cedict) == 1
+            and cedict[0].normalized == ("shi", "suan")
+            and cedict[0].display == "shí suàn"
+            and cedict[0].source_reading == "shi2 suan4"
+            and cedict[0].dataset == "cedict",
+        )
+        check(
+            "one dataset can retain multiple readings for one word",
+            {reading.normalized for reading in multi_reading}
+            == {("zhao", "yang"), ("chao", "yang")},
+        )
+        check(
+            "CC-CEDICT lookup uses only the simplified key",
+            len(simplified) == 1
+            and simplified[0].display == "lǜ sè"
+            and traditional == [],
+        )
+        check("owner-governed absent word is excluded", excluded == [])
+
+        connection = pinyin_reference_module._read_only_connection(db_path)
+        try:
+            try:
+                connection.execute(
+                    "INSERT INTO metadata (key, value) VALUES ('write_probe', '1')"
+                )
+                write_blocked = False
+            except sqlite3.OperationalError:
+                write_blocked = True
+        finally:
+            connection.close()
+        check("runtime connection rejects writes", write_blocked)
+
+
+def test_collector_queries_local_reference_first_and_scores_agreement():
+    print("\n🧪 collector queries local reference before live corroboration")
+
+    async def _run():
+        with _reference_fixture_environment():
+            review_module._clear_review_caches()
+            events = []
+            real_query = review_module.query_reference_readings
+            live_source = {
+                "id": "live_fixture",
+                "label": "Live fixture dictionary",
+                "domain": "live.test",
+                "category": "dictionary",
+                "trust": 3,
+                "query": 'site:live.test "{word}" 拼音',
+                "direct_urls": [],
+            }
+
+            def tracked_local_query(word):
+                events.append("local")
+                return real_query(word)
+
+            async def live_search(_query, max_results=3):
+                events.append("network")
+                return [{
+                    "title": "诉讼费 pronunciation",
+                    "url": "https://live.test/susongfei",
+                    "snippet": "诉讼费 拼音：sù sòng fèi",
+                }]
+
+            async def live_page(_url, **_kwargs):
+                return review_module._LookupText(
+                    "诉讼费 拼音：sù sòng fèi",
+                    lookup_status="completed",
+                )
+
+            with (
+                patch.object(review_module, "AUTHORITATIVE_SOURCES", [live_source]),
+                patch.object(
+                    review_module,
+                    "query_reference_readings",
+                    side_effect=tracked_local_query,
+                ),
+                patch.object(review_module, "_search_web", side_effect=live_search),
+                patch.object(review_module, "_fetch_text", side_effect=live_page),
+            ):
+                evidence = await review_module.collect_pronunciation_evidence("诉讼费")
+
+            group = next(iter(evidence.get("groups") or []), {})
+            sources = group.get("sources") or []
+            check("local indexed lookup happens before network work", events[0] == "local")
+            check("live corroboration still runs after the local hit", "network" in events)
+            check("toned local reading is preserved for display", group.get("pinyin") == "sù sòng fèi")
+            check(
+                "local Han Dian provenance is honest",
+                any(
+                    source.get("source") == "汉典（离线数据集）"
+                    and source.get("dataset") == "zdic_cibs"
+                    and source.get("trust") == 5
+                    for source in sources
+                ),
+            )
+            check(
+                "matching local and live source trust scores accumulate",
+                group.get("score") == 12
+                and set(group.get("sourceIds") or [])
+                == {"zdic_cibs", "large_pinyin", "live_fixture"},
+            )
+            check("a completed local hit survives as complete authority", evidence.get("lookupComplete") is True)
+
+    asyncio.run(_run())
+
+
+def test_local_reference_miss_falls_through_to_live_sources():
+    print("\n🧪 local reference miss preserves live-source fallback")
+
+    async def _run():
+        with _reference_fixture_environment():
+            review_module._clear_review_caches()
+            network_calls = 0
+            live_source = {
+                "id": "live_fixture",
+                "label": "Live fixture dictionary",
+                "domain": "live.test",
+                "category": "dictionary",
+                "trust": 3,
+                "query": 'site:live.test "{word}" 拼音',
+                "direct_urls": [],
+            }
+
+            async def live_search(_query, max_results=3):
+                nonlocal network_calls
+                network_calls += 1
+                return [{
+                    "title": "测试词 pronunciation",
+                    "url": "https://live.test/test-word",
+                    "snippet": "测试词 拼音：cè shì cí",
+                }]
+
+            async def live_page(_url, **_kwargs):
+                return review_module._LookupText(
+                    "测试词 拼音：cè shì cí",
+                    lookup_status="completed",
+                )
+
+            with (
+                patch.object(review_module, "AUTHORITATIVE_SOURCES", [live_source]),
+                patch.object(review_module, "_search_web", side_effect=live_search),
+                patch.object(review_module, "_fetch_text", side_effect=live_page),
+            ):
+                evidence = await review_module.collect_pronunciation_evidence("测试词")
+
+            group = next(iter(evidence.get("groups") or []), {})
+            local_outcomes = [
+                outcome
+                for outcome in evidence.get("sourceOutcomes") or []
+                if outcome.get("sourceId") in pinyin_reference_module.REFERENCE_DATASET_POLICY_BY_ID
+            ]
+            check("local miss still invokes the existing live path", network_calls == 1)
+            check(
+                "local miss is recorded as completed absence",
+                len(local_outcomes) == 4
+                and all(outcome.get("lookupResult") == "absent" for outcome in local_outcomes),
+            )
+            check(
+                "live evidence is returned unchanged after the local miss",
+                group.get("normalized") == ["ce", "shi", "ci"]
+                and group.get("sourceIds") == ["live_fixture"]
+                and group.get("score") == 3,
+            )
+
+    asyncio.run(_run())
+
+
+def test_poisoned_local_reference_row_fails_per_syllable_validation():
+    print("\n🧪 poisoned local reference row still fails per-syllable validation")
+
+    async def _run():
+        with _reference_fixture_environment() as (_source_dir, db_path, _result):
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """
+                INSERT INTO readings
+                    (word, normalized, display, source_reading, dataset)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                ("诉讼费", "su song", "sù sòng", "sù sòng", "zdic_cibs"),
+            )
+            connection.commit()
+            connection.close()
+            review_module._clear_review_caches()
+
+            with patch.object(review_module, "AUTHORITATIVE_SOURCES", []):
+                evidence = await review_module.collect_pronunciation_evidence("诉讼费")
+            review = await _review_word_with_encode(
+                "诉讼费",
+                evidence,
+                _su_song_fei_encode(
+                    status="absent",
+                    source="pinyin-pro-context",
+                ),
+            )
+
+            check(
+                "corrupt local row reaches collector as a separate group",
+                any(
+                    group.get("normalized") == ["su", "song"]
+                    for group in evidence.get("groups") or []
+                ),
+            )
+            check(
+                "downstream validation records the local syllable-count poison",
+                any(
+                    rejection.get("reason") == "syllable_count_mismatch"
+                    and rejection.get("sourceIds") == ["zdic_cibs"]
+                    for rejection in review.get("pronunciationRejections") or []
+                ),
+            )
+            check(
+                "poisoned local sequence never becomes a reviewed pronunciation",
+                not any(
+                    pronunciation.get("normalized") == ["su", "song"]
+                    for pronunciation in review.get("pronunciations") or []
+                ),
+            )
+
+    asyncio.run(_run())
 
 
 def test_s14_wrong_entry_pronunciation_never_reaches_candidates():
@@ -802,6 +1152,11 @@ def test_pronunciation_source_failure_is_not_cached_and_retry_refetches():
 
         with (
             patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+            patch.object(
+                review_module,
+                "_collect_local_pronunciation_evidence",
+                return_value={"entries": [], "outcomes": []},
+            ),
             patch.object(review_module, "_fetch_text", side_effect=cold_then_ready),
             patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
         ):
@@ -945,6 +1300,11 @@ def test_pronunciation_source_timeout_is_exposed_and_not_cached():
 
         with (
             patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+            patch.object(
+                review_module,
+                "_collect_local_pronunciation_evidence",
+                return_value={"entries": [], "outcomes": []},
+            ),
             patch.object(review_module, "PRONUNCIATION_SOURCE_TIMEOUT", 0.01),
             patch.object(review_module, "_fetch_text", side_effect=never_finishes),
             patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
@@ -986,6 +1346,11 @@ def test_pronunciation_genuine_no_evidence_is_cached():
 
         with (
             patch.object(review_module, "AUTHORITATIVE_SOURCES", [source]),
+            patch.object(
+                review_module,
+                "_collect_local_pronunciation_evidence",
+                return_value={"entries": [], "outcomes": []},
+            ),
             patch.object(review_module, "_fetch_text", side_effect=no_entry),
             patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
         ):
@@ -2554,6 +2919,10 @@ def test_audit_budget_nesting_and_timeout_retains_review():
 
 def main():
     test_review_disposition_registry()
+    test_local_reference_import_is_deterministic_and_preserves_readings()
+    test_collector_queries_local_reference_first_and_scores_agreement()
+    test_local_reference_miss_falls_through_to_live_sources()
+    test_poisoned_local_reference_row_fails_per_syllable_validation()
     test_s14_wrong_entry_pronunciation_never_reaches_candidates()
     test_reviewed_add_chi_xi_no_authoritative_entry_or_web_uses_verified_own_characters()
     test_pronunciation_word_binding_window_and_exact_direct_entry()

@@ -1,0 +1,3 @@
+# Owner-governed exclusions from the local reference lookup.
+# The raw source archives remain unchanged and checksummed in manifest.json.
+吃席
