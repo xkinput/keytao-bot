@@ -584,6 +584,106 @@ class LocalNextClient:
             "approvedStatus": approved["batch"]["status"],
         }
 
+    async def remove_rig_owned_dictionary_words(
+        self,
+        *,
+        platform_id: str,
+        admin_token: str,
+        scenario_id: str,
+        fixture_words: tuple[str, ...],
+    ) -> dict[str, Any]:
+        """Delete declared fixture words only when every exact row is rig-owned."""
+
+        rows_by_identity: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for word in fixture_words:
+            exact_rows = [
+                row
+                for row in await self.phrases_by_word(word)
+                if row.get("word") == word
+            ]
+            non_rig_rows = [
+                row
+                for row in exact_rows
+                if not str((row.get("user") or {}).get("name") or "").startswith(
+                    RESERVED_BINDING_PREFIX
+                )
+            ]
+            if non_rig_rows:
+                raise RigInfrastructureError(
+                    f"{scenario_id} requires {word} to be absent from the local "
+                    f"dictionary: {exact_rows}"
+                )
+            for row in exact_rows:
+                identity = (
+                    row.get("id"),
+                    row.get("word"),
+                    row.get("code"),
+                    row.get("type"),
+                )
+                rows_by_identity[identity] = row
+
+        fixture_rows = list(rows_by_identity.values())
+        if not fixture_rows:
+            return {
+                "action": "already-absent",
+                "verified": True,
+                "fixtureWords": list(fixture_words),
+                "deletedFixtureRows": 0,
+            }
+
+        await self.clean_draft(platform_id)
+        items = [
+            {
+                "action": "Delete",
+                "word": str(row.get("word") or ""),
+                "code": str(row.get("code") or ""),
+                "type": str(row.get("type") or "Phrase"),
+                "needsManualReview": False,
+                "remark": f"E2E {scenario_id} declared fixture cleanup",
+            }
+            for row in fixture_rows
+        ]
+        added = await self.add_draft_items(platform_id=platform_id, items=items)
+        batch_id = added.get("batchId")
+        content_version = added.get("contentVersion")
+        if not isinstance(batch_id, str) or not isinstance(content_version, int):
+            raise RigInfrastructureError(
+                f"{scenario_id} fixture cleanup draft is missing batch/version"
+            )
+        submitted = await self.submit_batch(
+            platform_id=platform_id,
+            batch_id=batch_id,
+            content_version=content_version,
+        )
+        approved = await self.approve_admin_batch(
+            batch_id=batch_id,
+            admin_token=admin_token,
+            review_note=f"E2E {scenario_id} API-only declared fixture cleanup",
+        )
+        remaining = {
+            word: [
+                row
+                for row in await self.phrases_by_word(word)
+                if row.get("word") == word
+            ]
+            for word in fixture_words
+        }
+        remaining = {word: rows for word, rows in remaining.items() if rows}
+        if remaining:
+            raise RigInfrastructureError(
+                f"{scenario_id} fixture cleanup approval completed but declared "
+                f"words remain: {remaining}"
+            )
+        return {
+            "action": "compensating-approved-delete",
+            "verified": True,
+            "batchId": batch_id,
+            "fixtureWords": list(fixture_words),
+            "deletedFixtureRows": len(fixture_rows),
+            "submittedStatus": submitted["submitted"]["batch"]["status"],
+            "approvedStatus": approved["batch"]["status"],
+        }
+
     async def remove_s9_fixture(
         self,
         *,

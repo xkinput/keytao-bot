@@ -90,6 +90,15 @@ from ..utils.observability import (
     suspend_turn_metrics,
     turn_metrics_emitted,
 )
+from ..utils.pending_confirmation import (
+    PENDING_ASSENT_TEXTS,
+    PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
+    PENDING_BATCH_ADD_ASSENT_TEXTS,
+    PENDING_CONFIRM_ASSENT_TEXTS,
+    pending_batch_confirmation_copy,
+    pending_confirmation_copy,
+    pending_confirmation_prompt_instruction,
+)
 from ..utils.memory_store import (
     ChatMemoryContext,
     MemoryGenerationToken,
@@ -427,46 +436,19 @@ _ACTION_SPECIFIC_DRAFT_SUBMIT_COMMANDS = {
     "确认提交",
     "继续提交",
 }
-_PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
-    "确认",
-    "确定",
-    "好的",
-    "好",
-    "是",
-    "对",
-    "可以",
-    "行",
-})
+_PENDING_CONFIRM_ASSENT_TEXTS = PENDING_CONFIRM_ASSENT_TEXTS
 _PENDING_CONTROL_TEXTS = {
-    *_PENDING_CONFIRM_ASSENT_TEXTS,
-    "加",
-    "加入",
-    "添加",
-    "确认加入",
-    "确认添加",
-    "继续加入",
-    "继续添加",
-    "都加",
-    "全部加",
+    *PENDING_ASSENT_TEXTS,
     "提交",
     "确认提交",
     "继续提交",
-    "加入并提交",
-    "加并提交",
-    "添加并提交",
-    "新增并提交",
     "取消",
     "不用",
     "不要",
     "不了",
     "算了",
 }
-_PENDING_ADD_AND_SUBMIT_COMMANDS = {
-    "加入并提交",
-    "加并提交",
-    "添加并提交",
-    "新增并提交",
-}
+_PENDING_ADD_AND_SUBMIT_COMMANDS = PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS
 
 WORD_QUERY_INTENT_MODEL = (
     getattr(config, "word_query_intent_model", None)
@@ -651,10 +633,45 @@ def _pending_tool_assent_intent(
     state: PendingState,
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
-    """Resolve closed assent before interpreting any trailing action."""
-    if not isinstance(state, PendingToolConfirm) or re.search(r"[?？]", message_text):
+    """Resolve closed assent against one server-backed live state."""
+    if re.search(r"[?？]", message_text):
         return None
     compact = _compact_command_text(message_text)
+    if isinstance(state, PendingAddWord):
+        server_backed = bool(
+            state.server_candidates
+            and state.server_candidates == state.candidates
+            and state.recommended_code
+            in {code for code, _occupied in state.server_candidates}
+        )
+        if not server_backed:
+            return None
+        if compact in PENDING_BATCH_ADD_ASSENT_TEXTS:
+            return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+        if compact in PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS:
+            return MessageCommandIntent(
+                intent="pending_add_and_submit",
+                confidence=1.0,
+                submit_after=True,
+            )
+        return None
+    if not isinstance(state, PendingToolConfirm):
+        return None
+    add_confirmation_tool = state.function_name in {
+        "keytao_create_phrase",
+        "keytao_batch_add_to_draft",
+    }
+    if add_confirmation_tool and compact in PENDING_BATCH_ADD_ASSENT_TEXTS:
+        return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+    if (
+        add_confirmation_tool
+        and compact in PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS
+    ):
+        return MessageCommandIntent(
+            intent="pending_add_and_submit",
+            confidence=1.0,
+            submit_after=True,
+        )
     if compact in _PENDING_CONFIRM_ASSENT_TEXTS:
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     if not re.fullmatch(
@@ -726,23 +743,8 @@ def _is_target_bound_add_and_submit_request(
 
 
 _QUOTED_PENDING_ADD_CONFIRM_TEXTS = {
-    "确认",
-    "确定",
-    "好的",
-    "好",
-    "是",
-    "对",
-    "可以",
-    "行",
-    "加",
-    "加入",
-    "添加",
-    "确认加入",
-    "确认添加",
-    "继续加入",
-    "继续添加",
-    "都加",
-    "全部加",
+    *_PENDING_CONFIRM_ASSENT_TEXTS,
+    *PENDING_BATCH_ADD_ASSENT_TEXTS,
 }
 
 
@@ -1086,14 +1088,7 @@ def _message_authorizes_pending_control(
     return False
 
 
-_STALE_CONFIRMATION_ONLY_TEXTS = frozenset({
-    *_PENDING_CONFIRM_ASSENT_TEXTS,
-    "同意",
-    "就这样",
-    "按这个",
-    "执行",
-    "执行吧",
-})
+_STALE_CONFIRMATION_ONLY_TEXTS = _PENDING_CONFIRM_ASSENT_TEXTS
 _STALE_TICKET_CONFIRMATION_RE = re.compile(r"确认票据[A-Z0-9]{4,64}", re.IGNORECASE)
 _ORIGINAL_COMMAND_LINE_RE = re.compile(
     r"^(?:原始操作指令|原始指令|原指令)\s*[：:]\s*[「“\"]?(.+?)[」”\"]?$"
@@ -2908,7 +2903,6 @@ async def _resolve_pending_ticket_control(
         structural_tool_intent is not None
         and isinstance(state_record.state, PendingToolConfirm)
         and state_record.owner_key.actor_id == str(user_id)
-        and structural_tool_intent.intent == "pending_add_and_submit"
     ):
         return structural_tool_intent, None
 
@@ -2930,8 +2924,8 @@ async def _resolve_pending_ticket_control(
     if compact_control.startswith("确认票据"):
         return MessageCommandIntent(), (
             f"当前待确认内容是：{_describe_pending_state(state_record.state)}。\n"
-            "请引用本条回复「确认」继续；"
-            f"无法引用时发送完整挑战码「确认票据 {state_record.reconfirmation_code}」。"
+            f"{pending_confirmation_copy()}"
+            f"也可发送完整挑战码「确认票据 {state_record.reconfirmation_code}」。"
         )
 
     if (
@@ -3014,8 +3008,8 @@ async def _resolve_pending_ticket_control(
         return MessageCommandIntent(), (
             f"当前待确认内容已更新为：{description}。\n"
             "为避免把延迟的旧回复误当成新操作的确认，"
-            "请引用本条回复「确认」继续；"
-            f"无法引用时发送「确认票据 {confirmation_code}」。"
+            f"{pending_confirmation_copy()}"
+            f"也可发送「确认票据 {confirmation_code}」。"
         )
 
     return command_intent, None
@@ -3067,22 +3061,21 @@ def _append_pending_ticket_challenge(
         return bind_prompt(response)
     natural_command = _pending_tool_confirmation_command(record.state)
     if natural_command:
-        if _compact_command_text(natural_command) in _compact_command_text(response):
+        if (
+            pending_confirmation_copy() in response
+            and _compact_command_text(natural_command) in _compact_command_text(response)
+        ):
             return bind_prompt(response)
         return bind_prompt(
             response.rstrip()
-            + "\n\n为避免确认错目标，请回复"
-            + f"「{natural_command}」继续。"
+            + f"\n\n{pending_confirmation_copy()}"
+            + f"也可回复「{natural_command}」继续。"
         )
 
     challenge = f"确认票据 {record.reconfirmation_code}"
     if challenge.lower() in response.lower():
         return bind_prompt(response)
-    guidance = (
-        f"请引用本条回复「确认」采用当前推荐选择；无法引用时发送「{challenge}」。"
-        if isinstance(record.state, PendingAddWord)
-        else f"请引用本条回复「确认」继续；无法引用时发送「{challenge}」。"
-    )
+    guidance = pending_confirmation_copy() + f"也可发送「{challenge}」。"
     return bind_prompt(response.rstrip() + "\n\n" + guidance)
 
 
@@ -3108,8 +3101,8 @@ def _format_active_draft_operation_message(
     )
     if operation.status == "awaiting_confirmation" and operation.confirmation_code:
         message += (
-            "\n请引用原确认消息回复「确认」继续；"
-            f"无法引用时发送「{operation.confirmation_command}」作为备用。"
+            f"\n{pending_confirmation_copy()}"
+            f"也可发送「{operation.confirmation_command}」作为备用。"
         )
     return message
 
@@ -3377,6 +3370,12 @@ async def _revalidate_referenced_add_pending(
 
 def _ensure_pending_add_word_guidance(response: str) -> str:
     """Append deterministic guidance for occupied candidate choices."""
+    if _parse_pending_batch_add(response) is not None:
+        guidance = pending_batch_confirmation_copy()
+        if guidance not in response:
+            return response.rstrip() + f"\n\n{guidance}"
+        return response
+
     guidance = "若所选编号显示“已有…”，直接回复该编号表示添加重码；回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
     if "重新编码" in response and "添加重码" in response:
         return response
@@ -5437,7 +5436,7 @@ async def _execute_add_to_draft(
         ) if warnings else data.get("message", "存在重码警告")
         return _append_batch_url_if_missing((
             f"{warn_text}\n\n确认添加吗？"
-            "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。"
+            f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。"
         ), data)
 
     if not data.get("success"):
@@ -5653,7 +5652,7 @@ async def _perform_add_to_draft_and_submit(
         ) if warnings else create_data.get("message", "存在重码警告")
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warn_text}\n\n确认添加吗？"
-            "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。",
+            f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。",
             create_data,
         ), pending_state=pending_state, data=create_data)
 
@@ -5815,7 +5814,7 @@ async def _perform_batch_add_to_draft_and_submit(
         ) if warnings else add_data.get("message", "批量添加前需要确认")
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warning_text}\n\n确认继续添加吗？"
-            "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。",
+            f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。",
             add_data,
         ), pending_state=pending_state, data=add_data)
 
@@ -6207,7 +6206,8 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 "确认删除这些精确条目并随后核对提交快照吗？"
                 if data.get("submitAfter")
                 else "确认删除这些精确条目吗？"
-            ) + "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。",
+            ) + pending_confirmation_copy()
+            + "也可使用确认票据，或回复「取消」放弃。",
         ))
         return _assert_plain_user_facing_reply("\n".join(lines))
 
@@ -6222,7 +6222,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             f"• 内容版本：{version}"
             f"{link_line}\n\n"
             "确认把这个精确批次恢复为草稿吗？"
-            "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。"
+            f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。"
         )
 
     if function_name == "keytao_shift_phrase_code":
@@ -6252,8 +6252,8 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         lines.extend((
             "",
             "以上每一项都将由服务端按同一批次版本校验。"
-            "确认执行吗？请引用本条回复「确认」继续；"
-            "无法引用时可使用确认票据，或回复「取消」放弃。",
+            f"确认执行吗？{pending_confirmation_copy()}"
+            "也可使用确认票据，或回复「取消」放弃。",
         ))
         return _assert_plain_user_facing_reply("\n".join(lines))
 
@@ -6279,7 +6279,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     return _assert_plain_user_facing_reply(
         f"{warning_text}{review_text}{link_text}\n\n"
         f"这是服务端在实际校验后返回的风险。确认{action_text}吗？"
-        "请引用本条回复「确认」继续；无法引用时可使用确认票据，或回复「取消」放弃。"
+        f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。"
     )
 
 
@@ -8698,7 +8698,11 @@ async def handle_pending_message_core(
             return None
         return uncertain_response
 
-    if isinstance(state, PendingAddWord) and _is_short_add_and_submit_request(message):
+    if (
+        isinstance(state, PendingAddWord)
+        and _is_short_add_and_submit_request(message)
+        and _pending_tool_assent_intent(state, message) is None
+    ):
         return _format_full_add_and_submit_instruction(state)
 
     preserve_after_response = False
@@ -8707,13 +8711,17 @@ async def handle_pending_message_core(
         nonlocal preserve_after_response
         preserve_after_response = True
 
-    try:
-        pending_command_intent = await _classify_message_command_intent(message, state)
-    except BaseException:
-        raise
     structural_tool_intent = _pending_tool_assent_intent(state, message)
     if structural_tool_intent is not None:
         pending_command_intent = structural_tool_intent
+    else:
+        try:
+            pending_command_intent = await _classify_message_command_intent(
+                message,
+                state,
+            )
+        except BaseException:
+            raise
     if (
         _is_sensitive_pending_control_intent(pending_command_intent)
         and not _message_authorizes_pending_state_control(
@@ -9055,6 +9063,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 • 可以适度活泼，不要堆表情
 • 不同信息分段，空行隔开
 """
+SYSTEM_PROMPT_CORE += "\n\n" + pending_confirmation_prompt_instruction()
 
 
 def representative_system_prompt_chars() -> int:
@@ -9174,8 +9183,8 @@ def _format_replace_char_confirmation(
     digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()[:16]
     parts.extend((
         "",
-        "确认后我才会把这批修改加入草稿。请引用本条回复「确认」继续；"
-        "无法引用时可使用确认票据，或回复「取消」放弃。",
+        "确认后我才会把这批修改加入草稿。"
+        f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。",
     ))
     return _assert_plain_user_facing_reply("\n".join(parts))
 
@@ -10372,6 +10381,13 @@ async def _handle_ai_chat_serialized(
             pending_state.__class__.__name__ if pending_state is not None else "none",
             _describe_pending_state(pending_state) if pending_state is not None else "",
         )
+        structural_tool_intent = _pending_tool_assent_intent(
+            pending_state,
+            normalized_message_text,
+        )
+        if structural_tool_intent is not None:
+            command_intent_cache[cache_key] = structural_tool_intent
+            return structural_tool_intent
         if cache_key not in command_intent_cache:
             classified = await _classify_message_command_intent(
                 normalized_message_text,
@@ -10460,9 +10476,16 @@ async def _handle_ai_chat_serialized(
             f"mentions={list(reply_reference.mentioned_user_ids)} "
             f"pending={referenced_pending.__class__.__name__ if referenced_pending else 'none'}"
         )
+    live_ticket_assent = _pending_tool_assent_intent(
+        current_pending_record.state if current_pending_record is not None else None,
+        normalized_message_text,
+    )
     if quoted_pending_add_control:
         generic_command_intent = quoted_pending_add_intent
-    elif _is_short_add_and_submit_request(normalized_message_text):
+    elif (
+        _is_short_add_and_submit_request(normalized_message_text)
+        and live_ticket_assent is None
+    ):
         current_pending = conversation_state_store.get(conv_key)
         set_turn_flow("pending-confirmation")
         response = _format_full_add_and_submit_instruction(
@@ -10477,13 +10500,11 @@ async def _handle_ai_chat_serialized(
         await _finish_ai_chat_matcher(response)
         return
     else:
-        generic_command_intent = await command_intent_for()
-    live_ticket_assent = _pending_tool_assent_intent(
-        current_pending_record.state if current_pending_record is not None else None,
-        normalized_message_text,
-    )
-    if live_ticket_assent is not None:
-        generic_command_intent = live_ticket_assent
+        generic_command_intent = (
+            live_ticket_assent
+            if live_ticket_assent is not None
+            else await command_intent_for()
+        )
     _record_flow_for_intent(generic_command_intent)
     if _message_authorizes_clear_history(
         normalized_message_text,
@@ -10535,9 +10556,21 @@ async def _handle_ai_chat_serialized(
                 return
 
         if active_operation.status == "awaiting_confirmation":
-            active_confirmation_matches = _active_operation_confirmation_matches(
-                active_operation,
+            active_structural_assent = _pending_tool_assent_intent(
+                active_operation.pending_state,
                 normalized_message_text,
+            )
+            single_active_ticket_assent = bool(
+                current_pending_state is None
+                and active_structural_assent is not None
+                and active_structural_assent.intent == "pending_confirm"
+            )
+            active_confirmation_matches = (
+                _active_operation_confirmation_matches(
+                    active_operation,
+                    normalized_message_text,
+                )
+                or single_active_ticket_assent
             )
             active_command_intent = (
                 MessageCommandIntent(intent="pending_confirm", confidence=1.0)

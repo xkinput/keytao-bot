@@ -395,7 +395,7 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 - 「摇光」→ yzgm
 - 「瑶光」→ yzgmv
 
-回复「加入」只加入草稿，回复「加入并提交」则加入后提交。
+{{PENDING_BATCH_CONFIRMATION_COPY}}
 ```
 
 - 必须保留 `「词」→ 编码` 的逐行清单，不能只在自然语言段落中写映射。

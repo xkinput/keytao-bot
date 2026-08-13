@@ -25,6 +25,10 @@ from keytao_bot.utils.observability import (
     record_history_messages,
     set_turn_flow,
 )
+from keytao_bot.utils.pending_confirmation import (
+    pending_batch_confirmation_copy,
+    pending_confirmation_copy,
+)
 
 from .state import MemoryConversationStateStore, PendingAddWord, PendingToolConfirm
 from .conversation import ConversationAddress
@@ -587,6 +591,37 @@ class AgentOrchestrator:
 
             if not response_tool_calls:
                 if content.strip():
+                    pending_items = (
+                        self._advertised_pending_batch_items(
+                            content,
+                            trusted_reviewed_items_by_key,
+                            trusted_candidate_slots_by_word,
+                        )
+                        if context.mutations_allowed and not context.visual_context
+                        else None
+                    )
+                    if pending_items is not None:
+                        advertised_copy = pending_batch_confirmation_copy()
+                        if advertised_copy not in content:
+                            content = content.rstrip() + "\n\n" + advertised_copy
+                        saved = self._state_store.set(
+                            conv_key,
+                            PendingToolConfirm(
+                                function_name="keytao_batch_add_to_draft",
+                                args={"items": pending_items},
+                            ),
+                            space_key=context.space_key,
+                            owner_label=context.speaker_name,
+                        )
+                        if not saved:
+                            return self._append_authoritative_result_links(
+                                "当前候选无法安全保存；没有执行添加，请重新发送词条。",
+                                authoritative_result_links,
+                            )
+                        logger.info(
+                            "Saved advertised reviewed batch candidate: "
+                            f"owner={conv_key} items={len(pending_items)}"
+                        )
                     return self._append_authoritative_result_links(
                         content,
                         authoritative_result_links,
@@ -817,8 +852,16 @@ class AgentOrchestrator:
                             or result_data.get("error")
                         ):
                             if failure_state is not None:
-                                failure_state.clear()
-                                failure_state.update(result_data)
+                                failed_tool_name = (
+                                    str(canonical_fn_args.get("tool") or "")
+                                    if fn_name == WRITE_AUTHORIZATION_TOOL_NAME
+                                    else fn_name
+                                )
+                                self._record_failure_for_remediation(
+                                    failure_state,
+                                    result_data,
+                                    failed_tool_name,
+                                )
                         elif (
                             result_data.get("success") is True
                             and fn_name in MUTATING_TOOL_NAMES
@@ -972,8 +1015,8 @@ class AgentOrchestrator:
                             )
                         return self._append_authoritative_result_links((
                             f"{result_data.get('message', '操作尚未执行')}\n\n"
-                            "请引用本条回复「确认」继续；"
-                            f"无法引用时发送「确认票据 {confirmation_code}」作为备用。"
+                            f"{pending_confirmation_copy()}"
+                            f"也可发送「确认票据 {confirmation_code}」作为备用。"
                         ), authoritative_result_links)
                     if self._tool_receipt_recorder is not None:
                         recorded = self._tool_receipt_recorder(
@@ -1006,10 +1049,89 @@ class AgentOrchestrator:
         )
 
     @staticmethod
+    def _advertised_pending_batch_items(
+        content: str,
+        reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
+        candidate_slots_by_word: Dict[
+            str,
+            tuple[tuple[str, bool], ...],
+        ],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Bind displayed batch choices to this run's structured review results."""
+        batch_prompt_markers = (
+            "一起加入草稿",
+            "一起加这两个词",
+            "两个词是否一起加",
+            "两词是否一起加",
+        )
+        if not any(marker in content for marker in batch_prompt_markers):
+            return None
+        pairs = [
+            (match.group("word").strip(), match.group("code").lower())
+            for match in re.finditer(
+                r"(?m)^\s*[-•]\s*「(?P<word>[^」\n]{1,128})」\s*"
+                r"(?:→|->)\s*(?P<code>[a-z]{1,12})\s*$",
+                content,
+                re.IGNORECASE,
+            )
+        ]
+        if len(pairs) < 2 or len({word for word, _code in pairs}) != len(pairs):
+            return None
+
+        items: List[Dict[str, Any]] = []
+        for word, code in pairs:
+            reviewed = reviewed_items_by_key.get((word, code))
+            slots = candidate_slots_by_word.get(word, ())
+            if reviewed is None or code not in {slot for slot, _occupied in slots}:
+                return None
+            phrase_type = str(reviewed.get("type") or "").strip()
+            if not phrase_type:
+                return None
+            item: Dict[str, Any] = {
+                "action": "Create",
+                "word": word,
+                "code": code,
+                "type": phrase_type,
+                "needsManualReview": bool(
+                    reviewed.get("needs_manual_review", True)
+                ),
+            }
+            review_reason = str(
+                reviewed.get("manual_review_reason") or ""
+            ).strip()
+            if review_reason:
+                item["manualReviewReason"] = review_reason
+            remark = str(reviewed.get("remark") or "").strip()
+            if remark:
+                item["remark"] = remark
+            items.append(item)
+        return items
+
+    @staticmethod
     def _normalize_loop_text(value: str) -> str:
         normalized = unicodedata.normalize("NFKC", str(value or "")).lower()
         normalized = re.sub(r"@(?:我|机器人|\S+)", "", normalized)
         return re.sub(r"[\s\W_]+", "", normalized)
+
+    @staticmethod
+    def _record_failure_for_remediation(
+        selected: Dict[str, Any],
+        failure: Dict[str, Any],
+        failed_tool_name: str,
+    ) -> None:
+        """Keep remediation bound to the failed mutation, not a later submit."""
+        current_tool = str(selected.get("_failedTool") or "")
+        new_tool = str(failed_tool_name or "")
+        if (
+            current_tool
+            and current_tool != "keytao_submit_batch"
+            and new_tool == "keytao_submit_batch"
+        ):
+            return
+        selected.clear()
+        selected.update(failure)
+        if new_tool:
+            selected["_failedTool"] = new_tool
 
     @classmethod
     def _finalize_reply(
@@ -1398,6 +1520,7 @@ class AgentOrchestrator:
                             "type": phrase_type,
                             "remark": f"喵喵审词：{verdict}",
                             "needs_manual_review": needs_manual_review,
+                            "manual_review_reason": reason,
                         }
 
         if tool_name in {

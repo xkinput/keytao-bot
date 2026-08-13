@@ -15,6 +15,7 @@ from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tupl
 from nonebot.log import logger
 
 from keytao_bot.utils.observability import mark_turn_outcome
+from keytao_bot.utils.pending_confirmation import pending_confirmation_copy
 
 from .conversation import (
     ConversationAddress,
@@ -232,8 +233,8 @@ class DraftOperationCoordinator:
             operation.prompt_text = (
                 prompt_text.rstrip()
                 + "\n\n"
-                + "请引用本条回复「确认」继续；"
-                + f"无法引用时发送「{confirmation_command}」作为备用。"
+                + pending_confirmation_copy()
+                + f"也可发送「{confirmation_command}」作为备用。"
             )
         elif not operation.prompt_text:
             operation.prompt_text = prompt_text.rstrip()

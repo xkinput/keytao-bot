@@ -9,6 +9,7 @@ from nonebot.log import logger
 
 from keytao_bot.utils import review_flags
 from keytao_bot.utils.observability import observe_tool_call
+from keytao_bot.utils.pending_confirmation import pending_confirmation_copy
 
 try:  # pragma: no cover - depends on the installed runtime
     import httpx as _httpx
@@ -4052,8 +4053,8 @@ class ToolExecutor:
             "localConfirmationRequired": True,
             "message": (
                 f"{_describe_staged_mutation(tool_name, arguments)}\n"
-                "尚未写入。请引用本条回复「确认」继续；"
-                "无法引用时使用机器人给出的确认票据。"
+                f"尚未写入。{pending_confirmation_copy()}"
+                "也可使用机器人给出的确认票据。"
             ),
         }
 

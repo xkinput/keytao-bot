@@ -66,6 +66,20 @@ ZDIC_FIXTURES_BY_SCENARIO["S15"] = {
         *ZDIC_FIXTURES_BY_SCENARIO["S14"]["rows"],
     ),
 }
+ZDIC_FIXTURES_BY_SCENARIO["S16"] = {
+    "probe_words": ("载流", "载流子", "座落在"),
+    "rows": (
+        {"kind": "char", "entry": "载", "status": "found", "pinyins": ["zǎi", "zài"]},
+        {"kind": "char", "entry": "流", "status": "found", "pinyins": ["liú"]},
+        {"kind": "char", "entry": "子", "status": "found", "pinyins": ["zǐ"]},
+        {"kind": "char", "entry": "座", "status": "found", "pinyins": ["zuò"]},
+        {"kind": "char", "entry": "落", "status": "found", "pinyins": ["luò"]},
+        {"kind": "char", "entry": "在", "status": "found", "pinyins": ["zài"]},
+        {"kind": "entry", "entry": "载流", "status": "absent", "pinyins": []},
+        {"kind": "entry", "entry": "载流子", "status": "absent", "pinyins": []},
+        {"kind": "entry", "entry": "座落在", "status": "absent", "pinyins": []},
+    ),
+}
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
@@ -101,6 +115,27 @@ def _validated_row(raw_row: dict[str, Any], *, scenario_id: str) -> dict[str, An
             f"Inconsistent ZDIC fixture row for {scenario_id}: {raw_row}"
         )
     return {"kind": kind, "entry": entry, "status": status, "pinyins": pinyins}
+
+
+def dictionary_fixture_words_for_scenario(scenario_id: str) -> tuple[str, ...]:
+    """Return the declared dictionary word slots for one scenario."""
+
+    normalized_scenario_id = str(scenario_id).strip().upper()
+    fixture = ZDIC_FIXTURES_BY_SCENARIO.get(normalized_scenario_id)
+    if fixture is None:
+        raise RigInfrastructureError(
+            f"No ZDIC cache fixture is declared for scenario {normalized_scenario_id}"
+        )
+    words = [str(word).strip() for word in fixture["probe_words"]]
+    words.extend(
+        row["entry"]
+        for raw_row in fixture["rows"]
+        if (row := _validated_row(raw_row, scenario_id=normalized_scenario_id))[
+            "kind"
+        ]
+        == "entry"
+    )
+    return tuple(dict.fromkeys(word for word in words if word))
 
 
 def zdic_cache_rows_for_scenarios(

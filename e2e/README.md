@@ -41,6 +41,8 @@ by `(kind, entry)` before the upsert.
 S14 declares found character readings for `亮` and `面` plus an absent
 whole-word entry for `亮面`. S15 reuses the existing S9 `射覆`/`慑服`
 candidate fixture and the S14 `亮面` pronunciation fixture.
+S16 declares the `zài liú`, `zài liú zǐ`, and `zuò luò zài` character reality
+plus absent whole-word entries for `载流`, `载流子`, and `座落在`.
 
 ## Prerequisites
 
@@ -100,15 +102,19 @@ exactly empty: candidate ordering is advisory until the user explicitly selects
 an action. Its preflight requires the seeded `射覆` character lookups to be
 `found` and the exact candidate chain `eefj`, `eefju`, `eefjuv`; it no longer
 accepts the proxy-induced `zdic-unavailable` fallback. A rig-owned S9 fixture is
-removed through an approved API batch after the scenario; a compatible
-pre-existing non-rig fixture is preserved.
+removed through an approved API batch after the scenario; a non-rig row at any
+declared S9 word slot fails closed before the scenario runs.
 
-Before S9, S10, or S14 dispatches a scenario attempt, the rig probes the declared
-whole words through local next four times with the existing `4s`, `5s`, `6s`
-warm-up backoff. Only the final probe is asserted. It must report an absent
-whole-word lookup and the exact seeded found reading for every character; a cold
-or stale dev server that still reports `zdic-unavailable` therefore fails as rig
-infrastructure before any scenario assertion or model call.
+Before any scenario with a ZDIC declaration dispatches an attempt, the rig first
+derives its dictionary slots from that scenario's probe words and whole-word
+fixture rows. Rig-owned leftovers are removed through an approved API batch;
+non-rig rows fail closed. The rig then probes the declared whole words through
+local next four times with the existing `4s`, `5s`, `6s` warm-up backoff. Only
+the final probe is asserted. It must report an absent whole-word lookup and the
+exact seeded found reading for every character; a cold or stale dev server that
+still reports `zdic-unavailable` therefore fails as rig infrastructure before
+any scenario assertion or model call. The same API-only removal runs after each
+attempt so preflight repair remains an aborted-run safety net.
 
 S11 keeps the confirmation path when the server returns a wider live ticket and
 always rejects provisional batch links; the narrow named-occupant shape may
@@ -128,10 +134,19 @@ manual-pronunciation path.
 
 S15 first discovers the server-issued `射覆` candidate list, replies
 `2 添加并提交`, and verifies candidate 2 reaches a submitted batch without the
-old execution-verb rejection. It then asks the bot for its exact corrected
-`亮面` add-and-submit phrasing, copies the rendered `「...」` string literally,
-and verifies that command also reaches a submitted batch without another
-correction.
+old execution-verb rejection. It then sends bare `添加并提交` for `亮面`. Direct
+completion, with at most one legitimate server-bound `确认`, satisfies the
+sub-case only when the discovered code reaches a submitted batch with its
+manual-review seal intact. If the flow instead stops with a corrected
+add-and-submit suggestion, S15 copies the rendered `「...」` string literally
+and verifies that command reaches a submitted batch without another correction.
+
+S16 replays the two-word 载流 production transcript with `座落在@zlz` seeded as
+a Phrase, weight 100 dictionary occupant: it discovers `载流@zhlq` and
+`载流子@zlzu` in one turn, sends bare `加入并提交` without a native quote, and
+requires both exact items to reach the same submitted batch.
+At most one server-bound `确认` step may intervene. The flow rejects
+target-completion guidance and any submit-only remediation.
 
 Optional overrides:
 

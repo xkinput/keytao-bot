@@ -940,54 +940,133 @@ async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
     )
 
     messages.append("喵喵 亮面")
-    replies.append(await ctx.send(messages[-1]))
-    messages.append("添加并提交")
-    guidance = await ctx.send(messages[-1])
-    replies.append(guidance)
-    suggestion_match = re.search(
-        r"请发送(?P<suggestion>「添加\s+亮面\s+(?P<code>[a-z]{2,12})\s+并提交」)",
-        guidance,
-    )
-    require(
-        suggestion_match is not None,
-        f"S15 did not render a copy-paste add-and-submit suggestion: {guidance}",
-    )
-    quoted_suggestion = suggestion_match.group("suggestion")
-    suggested_code = suggestion_match.group("code")
+    discovery_reply = await ctx.send(messages[-1])
+    replies.append(discovery_reply)
     second_cutoff = max(
         (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
         default=0,
     )
-    messages.append(quoted_suggestion)
-    replies.append(await ctx.send(messages[-1]))
-    require(
-        "没有匹配到" not in replies[-1]
-        and "执行动词" not in replies[-1]
-        and "本轮没有可执行的已绑定写操作" not in replies[-1],
-        f"S15 literal quoted suggestion hit another correction: {replies[-1]}",
-    )
+    completion_reply_start = len(replies)
+    messages.append("添加并提交")
+    guidance = await ctx.send(messages[-1])
+    replies.append(guidance)
     second_batch_id = _successful_submit_batch_id(
         ctx.attempt_events(),
         after_sequence=second_cutoff,
     )
-    require(second_batch_id, "S15 quoted suggestion never completed submit")
-    second_batch = await ctx.next_client.get_admin_batch(
-        batch_id=second_batch_id,
-        admin_token=ctx.admin_token,
-    )
-    require(
-        second_batch.get("status") in {"Submitted", "Approved"},
-        f"S15 quoted-suggestion batch did not pass through submission: {second_batch}",
-    )
-    require(
-        _submitted_item(
+    additional_confirmation_steps = 0
+    if not second_batch_id and "回复「确认」、「执行」继续" in guidance:
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        additional_confirmation_steps = 1
+        second_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=second_cutoff,
+        )
+        require(
+            second_batch_id,
+            "S15 one legitimate confirmation did not complete submit",
+        )
+
+    if second_batch_id:
+        expected_code_match = re.search(
+            r"是否以编码\s+(?P<code>[a-z]{2,12})\s+将「亮面」加入草稿",
+            discovery_reply,
+        )
+        require(
+            expected_code_match is not None,
+            f"S15 direct completion lacked a bound expected code: {discovery_reply}",
+        )
+        expected_code = expected_code_match.group("code")
+        for reply in replies[completion_reply_start:]:
+            require(
+                "没有匹配到" not in reply
+                and "执行动词" not in reply
+                and "本轮没有可执行的已绑定写操作" not in reply,
+                f"S15 direct completion hit another correction: {reply}",
+            )
+        second_batch = await ctx.next_client.get_admin_batch(
+            batch_id=second_batch_id,
+            admin_token=ctx.admin_token,
+        )
+        require(
+            second_batch.get("status") in {"Submitted", "Approved"},
+            f"S15 direct-completion batch did not pass through submission: {second_batch}",
+        )
+        direct_item = _submitted_item(
             second_batch,
             word="亮面",
-            code=suggested_code,
+            code=expected_code,
         )
-        is not None,
-        f"S15 quoted-suggestion batch lacks 亮面@{suggested_code}: {second_batch}",
-    )
+        require(
+            direct_item is not None,
+            f"S15 direct-completion batch lacks 亮面@{expected_code}: {second_batch}",
+        )
+        require(
+            direct_item.get("needsManualReview") is True,
+            f"S15 direct completion lost the 亮面 manual-review seal: {direct_item}",
+        )
+        suggestion_facts = {
+            "suggestionSubcase": "direct-completion",
+            "directCompletionCode": expected_code,
+            "directCompletionBatchId": second_batch_id,
+            "directCompletionBatchStatus": second_batch.get("status"),
+            "directCompletionSealed": True,
+            "additionalConfirmationSteps": additional_confirmation_steps,
+        }
+    else:
+        suggestion_match = re.search(
+            r"请发送(?P<suggestion>「添加\s+亮面\s+(?P<code>[a-z]{2,12})\s+并提交」)",
+            guidance,
+        )
+        require(
+            suggestion_match is not None,
+            f"S15 did not render a copy-paste add-and-submit suggestion: {guidance}",
+        )
+        quoted_suggestion = suggestion_match.group("suggestion")
+        suggested_code = suggestion_match.group("code")
+        quoted_cutoff = max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+        messages.append(quoted_suggestion)
+        replies.append(await ctx.send(messages[-1]))
+        require(
+            "没有匹配到" not in replies[-1]
+            and "执行动词" not in replies[-1]
+            and "本轮没有可执行的已绑定写操作" not in replies[-1],
+            f"S15 literal quoted suggestion hit another correction: {replies[-1]}",
+        )
+        second_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=quoted_cutoff,
+        )
+        require(second_batch_id, "S15 quoted suggestion never completed submit")
+        second_batch = await ctx.next_client.get_admin_batch(
+            batch_id=second_batch_id,
+            admin_token=ctx.admin_token,
+        )
+        require(
+            second_batch.get("status") in {"Submitted", "Approved"},
+            f"S15 quoted-suggestion batch did not pass through submission: {second_batch}",
+        )
+        require(
+            _submitted_item(
+                second_batch,
+                word="亮面",
+                code=suggested_code,
+            )
+            is not None,
+            f"S15 quoted-suggestion batch lacks 亮面@{suggested_code}: {second_batch}",
+        )
+        suggestion_facts = {
+            "suggestionSubcase": "quoted-suggestion",
+            "quotedSuggestion": quoted_suggestion,
+            "quotedSuggestionCode": suggested_code,
+            "quotedSuggestionBatchId": second_batch_id,
+            "quotedSuggestionBatchStatus": second_batch.get("status"),
+            "additionalConfirmationSteps": 0,
+        }
     return {
         "messages": messages,
         "replies": replies,
@@ -997,11 +1076,91 @@ async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
             "numberedCandidateCode": selected_code,
             "numberedBatchId": first_batch_id,
             "numberedBatchStatus": first_batch.get("status"),
-            "quotedSuggestion": quoted_suggestion,
-            "quotedSuggestionCode": suggested_code,
-            "quotedSuggestionBatchId": second_batch_id,
-            "quotedSuggestionBatchStatus": second_batch.get("status"),
             "additionalCorrectionRequired": False,
+            **suggestion_facts,
+        },
+    }
+
+
+async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
+    messages = ["喵喵 加词 载流 载流子"]
+    replies = [await ctx.send(messages[-1])]
+    discovery_reply = replies[-1]
+    require(
+        re.search(r"(?m)^-\s*「载流」\s*(?:→|->)\s*zhlq\s*$", discovery_reply)
+        is not None,
+        f"S16 discovery did not bind 载流@zhlq: {discovery_reply}",
+    )
+    require(
+        re.search(r"(?m)^-\s*「载流子」\s*(?:→|->)\s*zlzu\s*$", discovery_reply)
+        is not None,
+        f"S16 discovery did not bind 载流子@zlzu: {discovery_reply}",
+    )
+    require(
+        "加入并提交" in discovery_reply,
+        f"S16 discovery did not advertise bare add-and-submit: {discovery_reply}",
+    )
+
+    cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入并提交")
+    replies.append(await ctx.send(messages[-1]))
+    rejected_markers = (
+        "没有引用机器人给出的候选消息",
+        "需要把词条和编码写完整",
+        "执行动词",
+        "executionVerb",
+        "提交草稿",
+        "本轮没有可执行的已绑定写操作",
+    )
+    batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=cutoff,
+    )
+    if not batch_id:
+        require(
+            "回复「确认」、「执行」继续" in replies[-1],
+            f"S16 bare assent neither submitted nor reached one bound confirmation: {replies[-1]}",
+        )
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=cutoff,
+        )
+    for reply in replies[1:]:
+        require(
+            not any(marker in reply for marker in rejected_markers),
+            f"S16 advertised assent hit old remediation: {reply}",
+        )
+    require(batch_id, "S16 bare assent never completed submit")
+    batch = await ctx.next_client.get_admin_batch(
+        batch_id=batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        batch.get("status") in {"Submitted", "Approved"},
+        f"S16 batch did not pass through submission: {batch}",
+    )
+    expected_items = (("载流", "zhlq"), ("载流子", "zlzu"))
+    for word, code in expected_items:
+        require(
+            _submitted_item(batch, word=word, code=code) is not None,
+            f"S16 submitted batch lacks {word}@{code}: {batch}",
+        )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "submittedWords": [word for word, _code in expected_items],
+            "submittedCodes": [code for _word, code in expected_items],
+            "batchId": batch_id,
+            "batchStatus": batch.get("status"),
+            "quoteRequired": False,
+            "additionalConfirmationSteps": len(messages) - 2,
         },
     }
 
@@ -1021,7 +1180,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S12", "front-insert weight legality", scenario_s12),
     Scenario("S13", "same-turn resend loop breaker", scenario_s13),
     Scenario("S14", "wrong-entry pronunciation poisoning", scenario_s14),
-    Scenario("S15", "numbered add-submit and quoted suggestion closure", scenario_s15),
+    Scenario("S15", "numbered add-submit and suggestion/direct closure", scenario_s15),
+    Scenario("S16", "two-word bare advertised add-submit", scenario_s16),
 )
 
 

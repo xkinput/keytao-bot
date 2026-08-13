@@ -17,7 +17,9 @@ from .scenarios import SCENARIOS
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
     ensure_s9_fixture,
+    ensure_s16_fixture,
     ensure_scenario_zdic_fixture,
+    repair_scenario_dictionary_fixture,
 )
 from .runtime import LocalNextClient, RigInfrastructureError
 from .safety import (
@@ -82,11 +84,12 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("asks the user to resend the same current message", readme)
         self.assertIn("S14 injects a 汉典-shaped search hit", readme)
         self.assertIn("S15 first discovers", readme)
+        self.assertIn("S16 replays the two-word 载流", readme)
 
-    def test_scenario_pack_is_contiguous_through_s15(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s16(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 16)],
+            [f"S{index}" for index in range(1, 17)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -228,6 +231,18 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(actual, expected)
 
+    def test_s16_zdic_seed_declares_dictionary_occupant_readings(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S16"]
+        self.assertEqual(fixture["probe_words"], ("载流", "载流子", "座落在"))
+        declared = {
+            (row["kind"], row["entry"]): (row["status"], tuple(row["pinyins"]))
+            for row in fixture["rows"]
+        }
+        self.assertEqual(declared[("char", "座")], ("found", ("zuò",)))
+        self.assertEqual(declared[("char", "落")], ("found", ("luò",)))
+        self.assertEqual(declared[("char", "在")], ("found", ("zài",)))
+        self.assertEqual(declared[("entry", "座落在")], ("absent", ()))
+
     async def test_s15_offline_scenario_contract(self) -> None:
         scenario = next(item for item in SCENARIOS if item.scenario_id == "S15")
 
@@ -306,11 +321,201 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
 
         result = await scenario.execute(FakeContext())
         self.assertEqual(result["facts"]["numberedCandidateCode"], "eefju")
+        self.assertEqual(result["facts"]["suggestionSubcase"], "quoted-suggestion")
         self.assertEqual(
             result["facts"]["quotedSuggestion"],
             "「添加 亮面 lxmmov 并提交」",
         )
         self.assertFalse(result["facts"]["additionalCorrectionRequired"])
+
+    async def test_s15_direct_completion_satisfies_suggestion_subcase(self) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S15")
+
+        class FakeNextClient:
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assert_token = admin_token
+                if batch_id == "batch-numbered":
+                    return {
+                        "status": "Submitted",
+                        "pullRequests": [
+                            {
+                                "action": "Create",
+                                "word": "射覆",
+                                "code": "eefju",
+                            },
+                        ],
+                    }
+                if batch_id == "batch-direct":
+                    return {
+                        "status": "Submitted",
+                        "pullRequests": [
+                            {
+                                "action": "Create",
+                                "word": "亮面",
+                                "code": "lxmm",
+                                "needsManualReview": True,
+                            },
+                        ],
+                    }
+                raise AssertionError(batch_id)
+
+        class FakeContext:
+            fixture_facts = {
+                "s15": {
+                    "candidateCodes": ["eefj", "eefju", "eefjuv"],
+                },
+            }
+            admin_token = "offline-admin-token"
+
+            def __init__(self, *, require_confirmation: bool):
+                self.events = []
+                self.next_client = FakeNextClient()
+                self.require_confirmation = require_confirmation
+
+            def complete_submit(self) -> str:
+                self.events.append({
+                    "sequence": 2,
+                    "kind": "tool",
+                    "name": "keytao_submit_batch",
+                    "result": {"success": True, "batchId": "batch-direct"},
+                })
+                return "✅ 搞定！「亮面」→ lxmm 已加入草稿并提交审核"
+
+            async def send(self, text: str) -> str:
+                if text == "喵喵 射覆":
+                    return "候选编码:\n1. eefj — 已有慑服\n2. eefju — 空位\n3. eefjuv — 空位"
+                if text == "2 添加并提交":
+                    self.events.append({
+                        "sequence": 1,
+                        "kind": "tool",
+                        "name": "keytao_submit_batch",
+                        "result": {"success": True, "batchId": "batch-numbered"},
+                    })
+                    return "✅ 射覆已加入草稿并提交审核"
+                if text == "喵喵 亮面":
+                    return (
+                        "候选编码:\n1. lxmm — ✅ 推荐（空位）\n2. lxmmo — 空位\n"
+                        "是否以编码 lxmm 将「亮面」加入草稿？"
+                    )
+                if text == "添加并提交":
+                    if self.require_confirmation:
+                        return "提交前请核对服务端快照。\n\n回复「确认」、「执行」继续。"
+                    return self.complete_submit()
+                if text == "确认" and self.require_confirmation:
+                    return self.complete_submit()
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {"batchId": None, "contentVersion": 0, "items": []}
+
+            def attempt_events(self):
+                return list(self.events)
+
+        for require_confirmation, expected_steps in ((False, 0), (True, 1)):
+            with self.subTest(require_confirmation=require_confirmation):
+                result = await scenario.execute(FakeContext(
+                    require_confirmation=require_confirmation,
+                ))
+                self.assertEqual(
+                    result["facts"]["suggestionSubcase"],
+                    "direct-completion",
+                )
+                self.assertEqual(result["facts"]["directCompletionCode"], "lxmm")
+                self.assertTrue(result["facts"]["directCompletionSealed"])
+                self.assertEqual(
+                    result["facts"]["additionalConfirmationSteps"],
+                    expected_steps,
+                )
+
+    async def test_s16_offline_scenario_contract(self) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S16")
+
+        class FakeNextClient:
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assert_token = admin_token
+                if batch_id != "batch-carrier":
+                    raise AssertionError(batch_id)
+                return {
+                    "status": "Submitted",
+                    "pullRequests": [
+                        {
+                            "action": "Create",
+                            "word": "载流",
+                            "code": "zhlq",
+                        },
+                        {
+                            "action": "Create",
+                            "word": "载流子",
+                            "code": "zlzu",
+                        },
+                    ],
+                }
+
+        class FakeContext:
+            fixture_facts = {}
+            admin_token = "offline-admin-token"
+
+            def __init__(self, *, require_confirmation: bool):
+                self.events = []
+                self.next_client = FakeNextClient()
+                self.require_confirmation = require_confirmation
+
+            async def send(self, text: str) -> str:
+                if text == "喵喵 加词 载流 载流子":
+                    return (
+                        "这些词是否一起加入草稿并提交？\n"
+                        "- 「载流」→ zhlq\n"
+                        "- 「载流子」→ zlzu\n\n"
+                        "回复「加入」、「都加」、「添加」只加入草稿；"
+                        "回复「加入并提交」、「都加并提交」、「添加并提交」则加入后提交。"
+                    )
+                if text == "加入并提交":
+                    if self.require_confirmation:
+                        return (
+                            "提交前请核对服务端快照。\n\n"
+                            "回复「确认」、「执行」继续。"
+                        )
+                    self.events.append({
+                        "sequence": 1,
+                        "kind": "tool",
+                        "name": "keytao_submit_batch",
+                        "result": {"success": True, "batchId": "batch-carrier"},
+                    })
+                    return "✅ 载流、载流子已加入草稿并提交审核"
+                if text == "确认" and self.require_confirmation:
+                    self.events.append({
+                        "sequence": 1,
+                        "kind": "tool",
+                        "name": "keytao_submit_batch",
+                        "result": {"success": True, "batchId": "batch-carrier"},
+                    })
+                    return "✅ 载流、载流子已加入草稿并提交审核"
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {"batchId": None, "contentVersion": 0, "items": []}
+
+            def attempt_events(self):
+                return list(self.events)
+
+        for require_confirmation, expected_steps in ((False, 0), (True, 1)):
+            with self.subTest(require_confirmation=require_confirmation):
+                result = await scenario.execute(FakeContext(
+                    require_confirmation=require_confirmation,
+                ))
+                self.assertEqual(
+                    result["facts"]["submittedWords"],
+                    ["载流", "载流子"],
+                )
+                self.assertEqual(
+                    result["facts"]["submittedCodes"],
+                    ["zhlq", "zlzu"],
+                )
+                self.assertFalse(result["facts"]["quoteRequired"])
+                self.assertEqual(
+                    result["facts"]["additionalConfirmationSteps"],
+                    expected_steps,
+                )
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module
@@ -416,6 +621,120 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             {"王中王", "微服务"},
         )
 
+    async def test_s14_zdic_probe_retries_transport_failure_then_passes(self) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        seeded = {
+            "input": "亮面",
+            "pronunciationSource": "pinyin-pro-context",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": False,
+            "chars": [
+                {
+                    "char": "亮",
+                    "pinyin": "liàng",
+                    "pinyins": ["liàng"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "面",
+                    "pinyin": "miàn",
+                    "pinyins": ["miàn"],
+                    "pronunciationLookupStatus": "found",
+                },
+            ],
+        }
+        request = httpx.Request(
+            "GET",
+            "http://localhost:3100/api/phrases/encode?word=亮面",
+        )
+        client.encode = AsyncMock(
+            side_effect=[
+                httpx.ConnectTimeout("cold route compile", request=request),
+                seeded,
+                seeded,
+                seeded,
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = ArtifactRecorder(Path(temp_dir) / "artifacts")
+            with (
+                recorder.scope("S14", 1),
+                patch("e2e.run.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+                patch("builtins.print"),
+            ):
+                result = await ensure_scenario_zdic_fixture(
+                    client=client,
+                    scenario_id="S14",
+                    recorder=recorder,
+                )
+            artifact = json.loads(
+                (recorder.artifact_dir / "S14-zdic-warmup-attempt-1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertTrue(result["seededRealityMatches"])
+        self.assertEqual(client.encode.await_count, 4)
+        self.assertEqual(
+            sleep_mock.await_args_list,
+            [call(delay) for delay in S9_ZDIC_WARMUP_BACKOFF_SECONDS],
+        )
+        self.assertEqual(
+            artifact["attempts"][0]["transportError"],
+            {"type": "ConnectTimeout", "message": "cold route compile"},
+        )
+        self.assertEqual(artifact["attempts"][1]["words"]["亮面"]["seededRealityMatches"], True)
+        self.assertEqual(artifact["finalAssertionResult"], "passed")
+
+    async def test_s14_zdic_probe_wraps_final_transport_failure(self) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        request = httpx.Request(
+            "GET",
+            "http://localhost:3100/api/phrases/encode?word=亮面",
+        )
+        client.encode = AsyncMock(
+            side_effect=[
+                httpx.ConnectTimeout("connect cold", request=request),
+                httpx.ReadTimeout("read cold", request=request),
+                httpx.ConnectError("server restarting", request=request),
+                httpx.ConnectTimeout("still cold", request=request),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = ArtifactRecorder(Path(temp_dir) / "artifacts")
+            with (
+                recorder.scope("S14", 1),
+                patch("e2e.run.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(
+                    RigInfrastructureError,
+                    "S14 ZDIC warm-up probe.*ConnectTimeout: still cold",
+                ):
+                    await ensure_scenario_zdic_fixture(
+                        client=client,
+                        scenario_id="S14",
+                        recorder=recorder,
+                    )
+            artifact = json.loads(
+                (recorder.artifact_dir / "S14-zdic-warmup-attempt-1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(client.encode.await_count, 4)
+        self.assertEqual(
+            sleep_mock.await_args_list,
+            [call(delay) for delay in S9_ZDIC_WARMUP_BACKOFF_SECONDS],
+        )
+        self.assertEqual(
+            [attempt["transportError"]["type"] for attempt in artifact["attempts"]],
+            ["ConnectTimeout", "ReadTimeout", "ConnectError", "ConnectTimeout"],
+        )
+        self.assertEqual(artifact["finalAssertionResult"], "failed")
+
     async def test_s9_zdic_preflight_only_asserts_seeded_reality_on_final_probe(
         self,
     ) -> None:
@@ -494,6 +813,36 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             [attempt["pronunciationSource"] for attempt in artifact["attempts"]],
             ["zdic-unavailable"] * 3 + ["pinyin-pro-context"],
         )
+
+    async def test_s16_dictionary_fixture_seeds_the_exact_incident_occupant(
+        self,
+    ) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        occupant = {
+            "word": "座落在",
+            "code": "zlz",
+            "type": "Phrase",
+            "weight": 100,
+            "user": {"name": "keytao-e2e-llm-rig-run-seed"},
+        }
+        client.phrases_by_code = AsyncMock(side_effect=[[], [occupant]])
+        client.clean_draft = AsyncMock(return_value={"success": True})
+        client.seed_phrase = AsyncMock(return_value={"batchId": "fixture-batch"})
+
+        result = await ensure_s16_fixture(
+            client=client,
+            seed_identity={"platform_id": "9" * 32},
+        )
+
+        client.clean_draft.assert_awaited_once_with("9" * 32)
+        client.seed_phrase.assert_awaited_once_with(
+            platform_id="9" * 32,
+            word="座落在",
+            code="zlz",
+        )
+        self.assertEqual(result["occupantWord"], "座落在")
+        self.assertEqual(result["occupiedCode"], "zlz")
+        self.assertEqual(result["occupant"]["weight"], 100)
 
     def test_llm_endpoint_can_never_be_keytao_production(self) -> None:
         self.assertEqual(
@@ -586,6 +935,69 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         finally:
             guard.restore()
         self.assertFalse(called)
+
+    async def test_declared_dictionary_preflight_repairs_only_rig_owned_rows(
+        self,
+    ) -> None:
+        rig_row = {
+            "id": 31,
+            "word": "射覆",
+            "code": "eefju",
+            "type": "Phrase",
+            "user": {"name": "keytao-e2e-llm-rig-aborted-s15"},
+        }
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        client.phrases_by_word = AsyncMock(side_effect=[[rig_row], [], [], []])
+        client.clean_draft = AsyncMock(return_value={"success": True})
+        client.add_draft_items = AsyncMock(
+            return_value={"batchId": "cleanup", "contentVersion": 3}
+        )
+        client.submit_batch = AsyncMock(
+            return_value={"submitted": {"batch": {"status": "Submitted"}}}
+        )
+        client.approve_admin_batch = AsyncMock(
+            return_value={"batch": {"status": "Approved"}}
+        )
+
+        result = await repair_scenario_dictionary_fixture(
+            client=client,
+            scenario_id="S9",
+            platform_id="9" * 32,
+            admin_token="admin",
+        )
+
+        self.assertEqual(result["fixtureWords"], ["射覆", "慑服"])
+        self.assertEqual(result["deletedFixtureRows"], 1)
+        cleanup_items = client.add_draft_items.await_args.kwargs["items"]
+        self.assertEqual(
+            [(item["action"], item["word"], item["code"]) for item in cleanup_items],
+            [("Delete", "射覆", "eefju")],
+        )
+
+        ordinary_row = {
+            **rig_row,
+            "id": 32,
+            "user": {"name": "ordinary-user"},
+        }
+        refusing_client = LocalNextClient(
+            base_url="http://localhost:3100",
+            bot_token="test",
+        )
+        refusing_client.phrases_by_word = AsyncMock(return_value=[ordinary_row])
+        refusing_client.clean_draft = AsyncMock()
+        refusing_client.add_draft_items = AsyncMock()
+        with self.assertRaisesRegex(
+            RigInfrastructureError,
+            "S9 requires 射覆 to be absent from the local dictionary",
+        ):
+            await repair_scenario_dictionary_fixture(
+                client=refusing_client,
+                scenario_id="S9",
+                platform_id="9" * 32,
+                admin_token="admin",
+            )
+        refusing_client.clean_draft.assert_not_awaited()
+        refusing_client.add_draft_items.assert_not_awaited()
 
     async def test_s8_repair_ignores_prefix_rows_and_removes_rig_rows(self) -> None:
         client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")

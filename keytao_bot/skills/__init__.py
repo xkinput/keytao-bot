@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Dict, List, Callable, Optional
 from nonebot.log import logger
 
+from ..utils.pending_confirmation import expand_pending_confirmation_copy
+
 
 class SkillsManager:
     """Manage and load skills from skills directory"""
@@ -58,7 +60,10 @@ class SkillsManager:
             return None
         try:
             with open(skill_md, 'r', encoding='utf-8') as f:
-                return self._parse_skill_md(f.read(), skill_name)
+                return self._parse_skill_md(
+                    expand_pending_confirmation_copy(f.read()),
+                    skill_name,
+                )
         except OSError as e:
             logger.error(f"Failed to load SKILL.md for {skill_name}: {e}")
             return None

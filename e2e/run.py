@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import dotenv_values
 
 from .recording import ArtifactRecorder
@@ -43,12 +44,81 @@ from .scenarios import (
     ordered_candidate_codes,
     run_scenario,
 )
-from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_zdic_cache
+from .zdic_seed import (
+    ZDIC_FIXTURES_BY_SCENARIO,
+    dictionary_fixture_words_for_scenario,
+    seed_zdic_cache,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_NEXT_DIR = REPO_ROOT.parent / "keytao-next"
 S9_ZDIC_WARMUP_BACKOFF_SECONDS = (4.0, 5.0, 6.0)
+_TRANSIENT_LOCAL_NEXT_ERRORS = (
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+)
+
+
+async def _retry_fixture_client_call(
+    *,
+    probe: str,
+    request: Any,
+    attempt_facts: list[dict[str, Any]],
+) -> Any:
+    """Retry one fixture-only LocalNextClient operation on transient transport errors."""
+
+    attempt_count = len(S9_ZDIC_WARMUP_BACKOFF_SECONDS) + 1
+    had_transport_error = False
+    for attempt in range(1, attempt_count + 1):
+        started = time.monotonic()
+        try:
+            result = await request()
+        except _TRANSIENT_LOCAL_NEXT_ERRORS as error:
+            had_transport_error = True
+            fact = {
+                "probe": probe,
+                "attempt": attempt,
+                "result": "transport-error",
+                "transportError": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+                "elapsedSeconds": round(time.monotonic() - started, 3),
+            }
+            attempt_facts.append(fact)
+            print(
+                f"{probe} transport failure {attempt}/{attempt_count}: "
+                f"{type(error).__name__}: {error}"
+            )
+            if attempt == attempt_count:
+                raise RigInfrastructureError(
+                    f"{probe} failed after {attempt_count} attempts: "
+                    f"{type(error).__name__}: {error}; attempts={attempt_facts}"
+                ) from error
+            await asyncio.sleep(S9_ZDIC_WARMUP_BACKOFF_SECONDS[attempt - 1])
+            continue
+        if had_transport_error:
+            attempt_facts.append(
+                {
+                    "probe": probe,
+                    "attempt": attempt,
+                    "result": "passed",
+                    "elapsedSeconds": round(time.monotonic() - started, 3),
+                }
+            )
+        return result
+    raise AssertionError("fixture retry loop exhausted without returning or raising")
+
+
+def _with_transport_attempts(
+    facts: dict[str, Any],
+    attempt_facts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if attempt_facts:
+        return {**facts, "transportRetryAttempts": attempt_facts}
+    return facts
 
 
 def _nonempty(value: Any) -> str:
@@ -161,9 +231,21 @@ def apply_bot_environment(config: dict[str, Any]) -> None:
             os.environ[key] = value
 
 
-async def build_fixture_facts(client: LocalNextClient) -> dict[str, Any]:
-    chixi = await client.phrases_by_word("赤溪")
-    wkxk = await client.phrases_by_code("wkxk")
+async def build_fixture_facts(
+    client: LocalNextClient,
+    *,
+    transport_attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    chixi = await _retry_fixture_client_call(
+        probe="赤溪 fixture by-word lookup",
+        request=lambda: client.phrases_by_word("赤溪"),
+        attempt_facts=transport_attempts,
+    )
+    wkxk = await _retry_fixture_client_call(
+        probe="赤溪 fixture wkxk occupant lookup",
+        request=lambda: client.phrases_by_code("wkxk"),
+        attempt_facts=transport_attempts,
+    )
     exact_chixi = [
         item
         for item in chixi
@@ -180,24 +262,40 @@ async def build_fixture_facts(client: LocalNextClient) -> dict[str, Any]:
         raise RigInfrastructureError(
             f"Local fixture requires wkxk to contain only 赤溪@100; found {wkxk}"
         )
-    chixi_encode = await client.encode("赤溪")
+    chixi_encode = await _retry_fixture_client_call(
+        probe="赤溪 fixture encode probe",
+        request=lambda: client.encode("赤溪"),
+        attempt_facts=transport_attempts,
+    )
     chixi_codes = ordered_candidate_codes(chixi_encode)
     if "wkxk" not in chixi_codes or chixi_codes.index("wkxk") + 1 >= len(chixi_codes):
         raise RigInfrastructureError(f"赤溪 encode chain has no served successor: {chixi_encode}")
     chixi_next = chixi_codes[chixi_codes.index("wkxk") + 1]
-    chixi_next_occupants = await client.phrases_by_code(chixi_next)
+    chixi_next_occupants = await _retry_fixture_client_call(
+        probe=f"赤溪 fixture successor {chixi_next} occupant lookup",
+        request=lambda: client.phrases_by_code(chixi_next),
+        attempt_facts=transport_attempts,
+    )
     if chixi_next_occupants:
         raise RigInfrastructureError(
             f"赤溪 immediate successor {chixi_next} is occupied: {chixi_next_occupants}"
         )
-    chixi_subject_encode = await client.encode("吃席")
+    chixi_subject_encode = await _retry_fixture_client_call(
+        probe="吃席 fixture encode probe",
+        request=lambda: client.encode("吃席"),
+        attempt_facts=transport_attempts,
+    )
     subject_codes = ordered_candidate_codes(chixi_subject_encode)
     if "wkxk" not in subject_codes:
         raise RigInfrastructureError(f"吃席 encode chain does not include wkxk: {chixi_subject_encode}")
     subject_next_free = ""
     checked_slots: list[dict[str, Any]] = []
     for code in subject_codes[subject_codes.index("wkxk") + 1 :]:
-        occupants = await client.phrases_by_code(code)
+        occupants = await _retry_fixture_client_call(
+            probe=f"吃席 fixture successor {code} occupant lookup",
+            request=lambda code=code: client.phrases_by_code(code),
+            attempt_facts=transport_attempts,
+        )
         checked_slots.append({"code": code, "occupants": occupants})
         if not occupants:
             subject_next_free = code
@@ -220,42 +318,82 @@ async def ensure_fixture(
     seed_identity: dict[str, str],
     admin_token: str,
 ) -> dict[str, Any]:
-    chixi = await client.phrases_by_word("赤溪")
+    transport_attempts: list[dict[str, Any]] = []
+    chixi = await _retry_fixture_client_call(
+        probe="赤溪 fixture seed by-word lookup",
+        request=lambda: client.phrases_by_word("赤溪"),
+        attempt_facts=transport_attempts,
+    )
     if not chixi:
-        wkxk = await client.phrases_by_code("wkxk")
+        wkxk = await _retry_fixture_client_call(
+            probe="赤溪 fixture seed wkxk occupant lookup",
+            request=lambda: client.phrases_by_code("wkxk"),
+            attempt_facts=transport_attempts,
+        )
         if wkxk:
             raise RigInfrastructureError(
                 f"Cannot safely seed 赤溪 because wkxk is already occupied: {wkxk}"
             )
-        await client.clean_draft(seed_identity["platform_id"])
-        await client.seed_phrase(
-            platform_id=seed_identity["platform_id"],
-            word="赤溪",
-            code="wkxk",
+        await _retry_fixture_client_call(
+            probe="赤溪 fixture seed draft cleanup",
+            request=lambda: client.clean_draft(seed_identity["platform_id"]),
+            attempt_facts=transport_attempts,
+        )
+        await _retry_fixture_client_call(
+            probe="赤溪 fixture seed",
+            request=lambda: client.seed_phrase(
+                platform_id=seed_identity["platform_id"],
+                word="赤溪",
+                code="wkxk",
+            ),
+            attempt_facts=transport_attempts,
         )
     try:
-        return await build_fixture_facts(client)
+        facts = await build_fixture_facts(
+            client,
+            transport_attempts=transport_attempts,
+        )
+        return _with_transport_attempts(facts, transport_attempts)
     except RigInfrastructureError as initial_error:
-        encoded = await client.encode("赤溪")
+        if isinstance(initial_error.__cause__, _TRANSIENT_LOCAL_NEXT_ERRORS):
+            raise
+        encoded = await _retry_fixture_client_call(
+            probe="赤溪 fixture repair encode probe",
+            request=lambda: client.encode("赤溪"),
+            attempt_facts=transport_attempts,
+        )
         codes = ordered_candidate_codes(encoded)
         if "wkxk" not in codes or codes.index("wkxk") + 1 >= len(codes):
             raise initial_error
-        await client.restore_s8_fixture(
-            platform_id=seed_identity["platform_id"],
-            admin_token=admin_token,
-            chixi_next_code=codes[codes.index("wkxk") + 1],
+        await _retry_fixture_client_call(
+            probe="S8 fixture restoration",
+            request=lambda: client.restore_s8_fixture(
+                platform_id=seed_identity["platform_id"],
+                admin_token=admin_token,
+                chixi_next_code=codes[codes.index("wkxk") + 1],
+            ),
+            attempt_facts=transport_attempts,
         )
-        return await build_fixture_facts(client)
+        facts = await build_fixture_facts(
+            client,
+            transport_attempts=transport_attempts,
+        )
+        return _with_transport_attempts(facts, transport_attempts)
 
 
 async def ensure_multi_add_fixture(client: LocalNextClient) -> dict[str, Any]:
     """Prove both fixed multi-add codes are free before any scenario runs."""
     codes = ("wfw", "wfwu")
     occupancy: dict[str, list[dict[str, Any]]] = {}
+    transport_attempts: list[dict[str, Any]] = []
     for code in codes:
         occupancy[code] = [
             row
-            for row in await client.phrases_by_code(code)
+            for row in await _retry_fixture_client_call(
+                probe=f"S10/S11 fixture code {code} occupant lookup",
+                request=lambda code=code: client.phrases_by_code(code),
+                attempt_facts=transport_attempts,
+            )
             if str(row.get("code") or "").strip().lower() == code
         ]
     occupied = {code: rows for code, rows in occupancy.items() if rows}
@@ -263,11 +401,14 @@ async def ensure_multi_add_fixture(client: LocalNextClient) -> dict[str, Any]:
         raise RigInfrastructureError(
             f"S10/S11 require free exact codes wfw and wfwu: {occupied}"
         )
-    return {
-        "codes": list(codes),
-        "exactOccupancy": occupancy,
-        "bothFree": True,
-    }
+    return _with_transport_attempts(
+        {
+            "codes": list(codes),
+            "exactOccupancy": occupancy,
+            "bothFree": True,
+        },
+        transport_attempts,
+    )
 
 
 def _encoded_matches_zdic_fixture(
@@ -324,10 +465,45 @@ async def probe_zdic_fixture_with_retry(
     encoded_by_word: dict[str, dict[str, Any]] = {}
     for probe_attempt in range(1, probe_count + 1):
         probe_started = time.monotonic()
-        encoded_by_word = {
-            word: await client.encode(word)
-            for word in probe_words
-        }
+        encoded_by_word = {}
+        probe_word = ""
+        try:
+            for probe_word in probe_words:
+                encoded_by_word[probe_word] = await client.encode(probe_word)
+        except _TRANSIENT_LOCAL_NEXT_ERRORS as error:
+            probe_fact = {
+                "attempt": probe_attempt,
+                "words": {},
+                "probeWord": probe_word,
+                "transportError": {
+                    "type": type(error).__name__,
+                    "message": str(error),
+                },
+                "elapsedSeconds": round(time.monotonic() - probe_started, 3),
+            }
+            warmup_attempts.append(probe_fact)
+            print(
+                f"{scenario_id} zdic warm-up {probe_attempt}/{probe_count}: "
+                f"{probe_word} transport error {type(error).__name__}: {error}"
+            )
+            final_attempt = probe_attempt == probe_count
+            recorder.write_json(
+                warmup_artifact,
+                {
+                    "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
+                    "finalAssertionAttempt": probe_count,
+                    "finalAssertionResult": "failed" if final_attempt else "pending",
+                    "attempts": warmup_attempts,
+                },
+            )
+            if final_attempt:
+                raise RigInfrastructureError(
+                    f"{scenario_id} ZDIC warm-up probe for {probe_word!r} "
+                    f"failed on final attempt {probe_attempt}/{probe_count}: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            await asyncio.sleep(S9_ZDIC_WARMUP_BACKOFF_SECONDS[probe_attempt - 1])
+            continue
         word_facts: dict[str, dict[str, Any]] = {}
         for word, encoded in encoded_by_word.items():
             encoded_chars = encoded.get("chars")
@@ -424,6 +600,30 @@ async def ensure_scenario_zdic_fixture(
     return result
 
 
+async def repair_scenario_dictionary_fixture(
+    *,
+    client: LocalNextClient,
+    scenario_id: str,
+    platform_id: str,
+    admin_token: str,
+) -> dict[str, Any]:
+    """Repair rig-owned dictionary leftovers at this scenario's declared words."""
+
+    fixture_words = dictionary_fixture_words_for_scenario(scenario_id)
+    transport_attempts: list[dict[str, Any]] = []
+    result = await _retry_fixture_client_call(
+        probe=f"{scenario_id} declared fixture leftover repair",
+        request=lambda: client.remove_rig_owned_dictionary_words(
+            platform_id=platform_id,
+            admin_token=admin_token,
+            scenario_id=scenario_id,
+            fixture_words=fixture_words,
+        ),
+        attempt_facts=transport_attempts,
+    )
+    return _with_transport_attempts(result, transport_attempts)
+
+
 async def ensure_s9_fixture(
     *,
     client: LocalNextClient,
@@ -431,7 +631,12 @@ async def ensure_s9_fixture(
     admin_token: str,
     recorder: ArtifactRecorder,
 ) -> dict[str, Any]:
-    existing_subject = await client.phrases_by_word("射覆")
+    transport_attempts: list[dict[str, Any]] = []
+    existing_subject = await _retry_fixture_client_call(
+        probe="S9 射覆 subject occupant lookup",
+        request=lambda: client.phrases_by_word("射覆"),
+        attempt_facts=transport_attempts,
+    )
     if existing_subject:
         raise RigInfrastructureError(
             f"S9 requires 射覆 to be absent from the local dictionary: {existing_subject}"
@@ -439,7 +644,11 @@ async def ensure_s9_fixture(
 
     exact_rows = [
         row
-        for row in await client.phrases_by_code("eefj")
+        for row in await _retry_fixture_client_call(
+            probe="S9 eefj fixture occupant lookup",
+            request=lambda: client.phrases_by_code("eefj"),
+            attempt_facts=transport_attempts,
+        )
         if row.get("code") == "eefj"
     ]
     if exact_rows:
@@ -453,15 +662,27 @@ async def ensure_s9_fixture(
                 f"S9 cannot safely use occupied fixture code eefj: {exact_rows}"
             )
     else:
-        await client.clean_draft(seed_identity["platform_id"])
-        await client.seed_phrase(
-            platform_id=seed_identity["platform_id"],
-            word="慑服",
-            code="eefj",
+        await _retry_fixture_client_call(
+            probe="S9 fixture seed draft cleanup",
+            request=lambda: client.clean_draft(seed_identity["platform_id"]),
+            attempt_facts=transport_attempts,
+        )
+        await _retry_fixture_client_call(
+            probe="S9 慑服 fixture seed",
+            request=lambda: client.seed_phrase(
+                platform_id=seed_identity["platform_id"],
+                word="慑服",
+                code="eefj",
+            ),
+            attempt_facts=transport_attempts,
         )
         exact_rows = [
             row
-            for row in await client.phrases_by_code("eefj")
+            for row in await _retry_fixture_client_call(
+                probe="S9 eefj fixture verification lookup",
+                request=lambda: client.phrases_by_code("eefj"),
+                attempt_facts=transport_attempts,
+            )
             if row.get("code") == "eefj"
         ]
 
@@ -524,9 +745,13 @@ async def ensure_s9_fixture(
     )
     if not seeded_reality_matches:
         if cleanup_required:
-            await client.remove_s9_fixture(
-                platform_id=seed_identity["platform_id"],
-                admin_token=admin_token,
+            await _retry_fixture_client_call(
+                probe="S9 fixture cleanup after ZDIC mismatch",
+                request=lambda: client.remove_s9_fixture(
+                    platform_id=seed_identity["platform_id"],
+                    admin_token=admin_token,
+                ),
+                attempt_facts=transport_attempts,
             )
         raise RigInfrastructureError(
             f"S9 射覆 did not use the seeded pronunciation reality: {encoded}"
@@ -537,7 +762,11 @@ async def ensure_s9_fixture(
     for code in candidate_codes[1:]:
         exact_successors = [
             row
-            for row in await client.phrases_by_code(code)
+            for row in await _retry_fixture_client_call(
+                probe=f"S9 successor {code} occupant lookup",
+                request=lambda code=code: client.phrases_by_code(code),
+                attempt_facts=transport_attempts,
+            )
             if row.get("code") == code
         ]
         successor_occupancy.append({"code": code, "occupants": exact_successors})
@@ -545,27 +774,106 @@ async def ensure_s9_fixture(
             recommended_code = code
     if not recommended_code:
         if cleanup_required:
-            await client.remove_s9_fixture(
-                platform_id=seed_identity["platform_id"],
-                admin_token=admin_token,
+            await _retry_fixture_client_call(
+                probe="S9 fixture cleanup after occupied successor chain",
+                request=lambda: client.remove_s9_fixture(
+                    platform_id=seed_identity["platform_id"],
+                    admin_token=admin_token,
+                ),
+                attempt_facts=transport_attempts,
             )
         raise RigInfrastructureError(
             f"S9 射覆 seeded candidate chain has no free successor: {successor_occupancy}"
         )
-    return {
-        "subjectWord": "射覆",
-        "occupantWord": "慑服",
-        "occupiedCode": "eefj",
-        "recommendedFreeCode": recommended_code,
-        "candidateCodes": candidate_codes,
-        "pronunciationSource": encoded["pronunciationSource"],
-        "standardPronunciationStatus": encoded["standardPronunciationStatus"],
-        "seededCharactersFound": seeded_characters_found,
-        "zdicWarmupAttempts": warmup_attempts,
-        "successorOccupancy": successor_occupancy,
-        "occupant": exact_rows[0],
-        "cleanupRequired": cleanup_required,
-    }
+    return _with_transport_attempts(
+        {
+            "subjectWord": "射覆",
+            "occupantWord": "慑服",
+            "occupiedCode": "eefj",
+            "recommendedFreeCode": recommended_code,
+            "candidateCodes": candidate_codes,
+            "pronunciationSource": encoded["pronunciationSource"],
+            "standardPronunciationStatus": encoded["standardPronunciationStatus"],
+            "seededCharactersFound": seeded_characters_found,
+            "zdicWarmupAttempts": warmup_attempts,
+            "successorOccupancy": successor_occupancy,
+            "occupant": exact_rows[0],
+            "cleanupRequired": cleanup_required,
+        },
+        transport_attempts,
+    )
+
+
+async def ensure_s16_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Ensure the production-incident dictionary occupant for S16."""
+
+    transport_attempts: list[dict[str, Any]] = []
+    exact_rows = [
+        row
+        for row in await _retry_fixture_client_call(
+            probe="S16 zlz fixture occupant lookup",
+            request=lambda: client.phrases_by_code("zlz"),
+            attempt_facts=transport_attempts,
+        )
+        if row.get("code") == "zlz"
+    ]
+    if exact_rows:
+        valid_existing = (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == "座落在"
+            and exact_rows[0].get("type") == "Phrase"
+            and exact_rows[0].get("weight") == 100
+        )
+        if not valid_existing:
+            raise RigInfrastructureError(
+                f"S16 cannot safely use occupied fixture code zlz: {exact_rows}"
+            )
+    else:
+        await _retry_fixture_client_call(
+            probe="S16 fixture seed draft cleanup",
+            request=lambda: client.clean_draft(seed_identity["platform_id"]),
+            attempt_facts=transport_attempts,
+        )
+        await _retry_fixture_client_call(
+            probe="S16 座落在 fixture seed",
+            request=lambda: client.seed_phrase(
+                platform_id=seed_identity["platform_id"],
+                word="座落在",
+                code="zlz",
+            ),
+            attempt_facts=transport_attempts,
+        )
+        exact_rows = [
+            row
+            for row in await _retry_fixture_client_call(
+                probe="S16 zlz fixture verification lookup",
+                request=lambda: client.phrases_by_code("zlz"),
+                attempt_facts=transport_attempts,
+            )
+            if row.get("code") == "zlz"
+        ]
+
+    if not (
+        len(exact_rows) == 1
+        and exact_rows[0].get("word") == "座落在"
+        and exact_rows[0].get("type") == "Phrase"
+        and exact_rows[0].get("weight") == 100
+    ):
+        raise RigInfrastructureError(
+            f"S16 fixture did not resolve to sole 座落在@zlz weight 100: {exact_rows}"
+        )
+    return _with_transport_attempts(
+        {
+            "occupantWord": "座落在",
+            "occupiedCode": "zlz",
+            "occupant": exact_rows[0],
+        },
+        transport_attempts,
+    )
 
 
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
@@ -790,7 +1098,6 @@ async def async_main(args: argparse.Namespace) -> int:
             seed_identity=seed_identity,
             admin_token=admin_session["token"],
         )
-        fixture_facts["multiAdd"] = await ensure_multi_add_fixture(client)
         recorder.write_json("fixture-facts.json", fixture_facts)
         state_dir = artifact_dir / "state"
         openai_chat = initialize_openai_chat(config, state_dir=state_dir)
@@ -815,12 +1122,37 @@ async def async_main(args: argparse.Namespace) -> int:
             }
             for attempt in (1, 2):
                 with recorder.scope(scenario.scenario_id, attempt):
-                    if scenario.scenario_id == "S8":
-                        await client.restore_s8_fixture(
+                    if scenario.scenario_id in ZDIC_FIXTURES_BY_SCENARIO:
+                        fixture_facts.setdefault("dictionaryRepair", {})[
+                            scenario.scenario_id
+                        ] = await repair_scenario_dictionary_fixture(
+                            client=client,
+                            scenario_id=scenario.scenario_id,
                             platform_id=seed_identity["platform_id"],
                             admin_token=admin_session["token"],
-                            chixi_next_code=fixture_facts["chixi_next_code"],
                         )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S10":
+                        fixture_facts["multiAdd"] = await ensure_multi_add_fixture(
+                            client
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S8":
+                        s8_transport_attempts: list[dict[str, Any]] = []
+                        s8_repair = await _retry_fixture_client_call(
+                            probe="S8 pre-scenario fixture restoration",
+                            request=lambda: client.restore_s8_fixture(
+                                platform_id=seed_identity["platform_id"],
+                                admin_token=admin_session["token"],
+                                chixi_next_code=fixture_facts["chixi_next_code"],
+                            ),
+                            attempt_facts=s8_transport_attempts,
+                        )
+                        fixture_facts["s8Repair"] = _with_transport_attempts(
+                            s8_repair,
+                            s8_transport_attempts,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id in {"S9", "S15"}:
                         fixture_key = scenario.scenario_id.lower()
                         fixture_facts[fixture_key] = await ensure_s9_fixture(
@@ -828,6 +1160,12 @@ async def async_main(args: argparse.Namespace) -> int:
                             seed_identity=seed_identity,
                             admin_token=admin_session["token"],
                             recorder=recorder,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S16":
+                        fixture_facts["s16"] = await ensure_s16_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if (
@@ -862,25 +1200,28 @@ async def async_main(args: argparse.Namespace) -> int:
                     )
                     attempt_result = await run_scenario(scenario, context)
                     if scenario.scenario_id == "S8":
-                        cleanup = await client.restore_s8_fixture(
-                            platform_id=seed_identity["platform_id"],
-                            admin_token=admin_session["token"],
-                            chixi_next_code=fixture_facts["chixi_next_code"],
-                        )
-                        attempt_result.setdefault("facts", {})["cleanup"] = cleanup
-                    if scenario.scenario_id in {"S9", "S15"}:
-                        fixture_key = scenario.scenario_id.lower()
-                        candidate_fixture = fixture_facts[fixture_key]
-                        if candidate_fixture.get("cleanupRequired"):
-                            cleanup = await client.remove_s9_fixture(
+                        s8_transport_attempts = []
+                        cleanup = await _retry_fixture_client_call(
+                            probe="S8 post-scenario fixture restoration",
+                            request=lambda: client.restore_s8_fixture(
                                 platform_id=seed_identity["platform_id"],
                                 admin_token=admin_session["token"],
-                            )
-                        else:
-                            cleanup = {
-                                "action": "preserved-preexisting",
-                                "verified": True,
-                            }
+                                chixi_next_code=fixture_facts["chixi_next_code"],
+                            ),
+                            attempt_facts=s8_transport_attempts,
+                        )
+                        cleanup = _with_transport_attempts(
+                            cleanup,
+                            s8_transport_attempts,
+                        )
+                        attempt_result.setdefault("facts", {})["cleanup"] = cleanup
+                    if scenario.scenario_id in ZDIC_FIXTURES_BY_SCENARIO:
+                        cleanup = await repair_scenario_dictionary_fixture(
+                            client=client,
+                            scenario_id=scenario.scenario_id,
+                            platform_id=seed_identity["platform_id"],
+                            admin_token=admin_session["token"],
+                        )
                         attempt_result.setdefault("facts", {})["cleanup"] = cleanup
                     cost = recorder.cost_summary(scenario.scenario_id, attempt)
                     attempt_result["cost"] = cost

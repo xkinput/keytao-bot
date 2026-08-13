@@ -1309,7 +1309,7 @@ def test_pending_add_word_guidance_fallback_matcher():
     check("fallback appends guidance", "原词 重新编码" in guided)
 
 
-# Measured representative assembled prompt: 42,460 chars on 2026-08-11.
+# Measured representative assembled prompt: 42,564 chars on 2026-08-12.
 # Raise this only after reviewing the prompt/skill diff; update the measured
 # value and date here, then preserve roughly 10 percent intentional headroom.
 SYSTEM_PROMPT_GROWTH_LIMIT_CHARS = 46_700
@@ -3629,7 +3629,10 @@ def test_add_submit_extra_snapshot_shows_one_exact_confirmation():
         ))
         check("risk prompt does not advertise unusable natural command", "「确认提交」" not in result.text and "「确认加入」" not in result.text)
         check("risk prompt exposes one executable nonce", operation.prompt_text.count("确认操作 ") == 1)
-        check("risk prompt leads with quoted plain confirmation", "请引用本条回复「确认」继续" in operation.prompt_text)
+        check(
+            "risk prompt advertises bare shared confirmation",
+            "回复「确认」、「执行」继续" in operation.prompt_text,
+        )
 
     asyncio.run(_run())
 
@@ -6457,9 +6460,9 @@ def test_queued_bot_quote_duplicate_is_idempotent():
     asyncio.run(_run())
 
 
-def test_unquoted_short_add_submit_requires_full_target_binding():
-    """Without a bot quote, a short mutation phrase cannot supply word/code authority."""
-    print("\n🧪 unquoted short add-submit requires full target")
+def test_unquoted_short_add_submit_without_server_snapshot_requires_full_target():
+    """Display-parsed candidate text cannot supply word/code authority."""
+    print("\n🧪 unquoted short add-submit without server snapshot")
 
     async def _run():
         state = PendingAddWord(
@@ -6511,9 +6514,9 @@ def test_unquoted_short_add_submit_requires_full_target_binding():
     asyncio.run(_run())
 
 
-def test_inline_unquoted_add_submit_requires_target_but_full_command_runs():
-    """The adapter handler must apply the same quote/target rule as the core helper."""
-    print("\n🧪 inline unquoted add-submit target binding")
+def test_inline_unquoted_add_submit_requires_live_or_target_binding():
+    """Bare assent needs a server-backed live candidate or a complete target."""
+    print("\n🧪 inline unquoted add-submit live/target binding")
 
     class HandlerBot:
         pass
@@ -6528,7 +6531,7 @@ def test_inline_unquoted_add_submit_requires_target_but_full_command_runs():
         def get_plaintext(self):
             return self.text
 
-    async def _run_case(text, should_schedule):
+    async def _run_case(text, should_schedule, *, server_backed=False):
         user_id = "inline-target-actor"
         memory_context = ChatMemoryContext(
             platform="qq",
@@ -6542,6 +6545,9 @@ def test_inline_unquoted_add_submit_requires_target_but_full_command_runs():
             recommended_code="xwwso",
             candidates=[("xwws", True), ("xwwso", False)],
         )
+        if server_backed:
+            state.server_candidates = list(state.candidates)
+            state.server_occupied_words = {"xwws": ["现有词"]}
         store = MemoryConversationStateStore()
         store.set(
             memory_context.conversation_address,
@@ -6611,8 +6617,112 @@ def test_inline_unquoted_add_submit_requires_target_but_full_command_runs():
         check("inline target flow bypasses main model", main_model.await_count == 0)
 
     async def _run():
-        await _run_case("添加并提交", False)
+        await _run_case("添加并提交", False, server_backed=False)
+        await _run_case("添加并提交", True, server_backed=True)
         await _run_case("添加 窨茶 xwwso 并提交", True)
+
+    asyncio.run(_run())
+
+
+def test_inline_live_batch_ticket_accepts_bare_advertised_submit():
+    """The adapter must execute a live batch ticket without quote or model routing."""
+    print("\n🧪 inline live batch ticket accepts bare advertised submit")
+
+    class HandlerBot:
+        pass
+
+    class HandlerEvent:
+        original_message = []
+        message = original_message
+
+        def get_plaintext(self):
+            return "都加并提交"
+
+    async def _run():
+        user_id = "bare-batch-actor"
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id=user_id,
+            space_type="group",
+            space_id="bare-batch-group",
+            speaker_name="Rea",
+        )
+        conv_key = memory_context.conversation_address
+        items = [
+            {"action": "Create", "word": "载流", "code": "zhlq"},
+            {"action": "Create", "word": "载流子", "code": "zlzu"},
+        ]
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": items,
+                "batch_id": "batch-carrier",
+                "expected_content_version": 8,
+                "expected_warning_digest": "e" * 64,
+            },
+            confirmation_source="server_warning",
+        )
+        store = MemoryConversationStateStore()
+        store.set(
+            conv_key,
+            state,
+            space_key=("qq", memory_context.space_scope_id),
+            owner_label="Rea",
+        )
+        coordinator = DraftOperationCoordinator()
+        classifier = AsyncMock(return_value=MessageCommandIntent())
+        schedule = MagicMock(return_value=True)
+        finish = AsyncMock(side_effect=FinishedException())
+        main_model = AsyncMock(return_value="unexpected main-model fallback")
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(openai_chat_module, "draft_operation_coordinator", coordinator),
+            patch.object(openai_chat_module.ai_chat, "finish", finish),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=ReplyReferenceInfo()),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=memory_context),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_classify_message_command_intent",
+                classifier,
+            ),
+            patch.object(
+                openai_chat_module,
+                "_schedule_background_draft_operation",
+                schedule,
+            ),
+            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(openai_chat_module, "get_ai_response_core", main_model),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+        ):
+            await openai_chat_module._handle_ai_chat_serialized(
+                HandlerBot(),
+                HandlerEvent(),
+                "qq",
+                user_id,
+            )
+
+        operation = coordinator.get(conv_key)
+        check("bare batch assent bypasses intent model", classifier.await_count == 0)
+        check("bare batch assent schedules one operation", schedule.call_count == 1)
+        check(
+            "scheduled operation preserves both words and codes",
+            operation is not None
+            and operation.kind == "batch_add_and_submit"
+            and operation.word == "载流、载流子"
+            and operation.code == "zhlq、zlzu",
+        )
+        check("consumed ticket is removed exactly once", store.get_record(conv_key) is None)
+        check("scheduled flow emits no target-completion reply", finish.await_count == 0)
+        check("scheduled flow bypasses the main model", main_model.await_count == 0)
 
     asyncio.run(_run())
 
@@ -7195,7 +7305,10 @@ def test_verified_bot_reply_is_a_single_prompt_capability():
             check("exact native reply matches current prompt", openai_chat_module._verified_bot_reply_matches_record(reply, record))
             check("stale native reply does not match", not openai_chat_module._verified_bot_reply_matches_record(stale_reply, record))
             check("verified reply confirms without nonce", resolved.intent == "pending_confirm" and response is None)
-            check("prompt explains quote-first confirmation", "引用本条回复「确认」" in prompt)
+            check(
+                "prompt explains bare single-ticket confirmation",
+                "回复「确认」、「执行」继续" in prompt,
+            )
         finally:
             openai_chat_module.conversation_state_store = old_store
 
@@ -13570,7 +13683,7 @@ def test_state_metrics_startup_log():
             check("state line includes database size", "db_bytes=sample.db:" in line)
             check("state line includes main-table rows", "db_rows=sample.db.sample_rows:2" in line)
             check("state line includes cache counts", "cache_entries=" in line and "review:" in line and "reviewed_add:" in line and "semantic_review:" in line and "zdic:0" in line)
-            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=42460" in line)
+            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=42564" in line)
             check("state line is bounded to one line", bool(line) and "\n" not in line)
 
     asyncio.run(_run())
@@ -13694,8 +13807,9 @@ if __name__ == "__main__":
     test_quoted_self_add_and_submit_requires_live_ticket()
     test_bot_quoted_candidate_binds_short_add_submit_for_qq_and_telegram()
     test_queued_bot_quote_duplicate_is_idempotent()
-    test_unquoted_short_add_submit_requires_full_target_binding()
-    test_inline_unquoted_add_submit_requires_target_but_full_command_runs()
+    test_unquoted_short_add_submit_without_server_snapshot_requires_full_target()
+    test_inline_unquoted_add_submit_requires_live_or_target_binding()
+    test_inline_live_batch_ticket_accepts_bare_advertised_submit()
     test_target_bound_add_submit_rejects_questions_negation_and_substrings()
     test_draft_suggestion_routes_share_authorization_lead_ins()
     test_cross_user_bot_quote_creates_only_current_actor_operation()
