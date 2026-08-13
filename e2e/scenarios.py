@@ -1165,6 +1165,135 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+def _recommended_empty_code(reply: str, *, word: str) -> str:
+    match = re.search(
+        rf"(?:是否以|仍以)编码\s+(?P<code>[a-z]{{2,12}})\s+将「{re.escape(word)}」加入草稿",
+        reply,
+    )
+    require(match is not None, f"{word} discovery omitted a recommended empty code: {reply}")
+    code = match.group("code")
+    require(
+        re.search(
+            rf"(?m)^\d+\.\s*{re.escape(code)}\s+—\s+.*空位.*$",
+            reply,
+        )
+        is not None,
+        f"{word} recommended code was not rendered as an empty slot: {reply}",
+    )
+    return code
+
+
+async def scenario_s17(ctx: ScenarioContext) -> dict[str, Any]:
+    messages = ["喵喵 加词 产季"]
+    replies = [await ctx.send(messages[-1])]
+    semantic_reply = replies[-1]
+    assert_reply_mentions(
+        semantic_reply,
+        "该词可自动通过",
+        "语境读音与含义明确",
+        "语料/词典证据",
+        "逐字 jieba 词频 产 6838、季 1619",
+        "高频字阈值 1000",
+    )
+    semantic_code = _recommended_empty_code(semantic_reply, word="产季")
+    semantic_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("添加并提交")
+    replies.append(await ctx.send(messages[-1]))
+    semantic_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=semantic_cutoff,
+    )
+    if not semantic_batch_id and "回复「确认」、「执行」继续" in replies[-1]:
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        semantic_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=semantic_cutoff,
+        )
+    require(semantic_batch_id, "S17 产季 add-and-submit never completed")
+    semantic_batch = await ctx.next_client.get_admin_batch(
+        batch_id=semantic_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    semantic_item = _submitted_item(
+        semantic_batch,
+        word="产季",
+        code=semantic_code,
+    )
+    require(
+        semantic_batch.get("status") == "Approved",
+        f"S17 产季 batch was not auto-approved: {semantic_batch}",
+    )
+    require(
+        isinstance(semantic_item, dict)
+        and semantic_item.get("needsManualReview") is False,
+        f"S17 产季 persisted with a manual-review seal: {semantic_item}",
+    )
+
+    messages.append("喵喵 加词 龘季")
+    replies.append(await ctx.send(messages[-1]))
+    obscure_reply = replies[-1]
+    assert_reply_mentions(obscure_reply, "龘季", "该词需管理员审核")
+    obscure_code = _recommended_empty_code(obscure_reply, word="龘季")
+    obscure_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("添加并提交")
+    replies.append(await ctx.send(messages[-1]))
+    obscure_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=obscure_cutoff,
+    )
+    if not obscure_batch_id and "回复「确认」、「执行」继续" in replies[-1]:
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        obscure_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=obscure_cutoff,
+        )
+    require(obscure_batch_id, "S17 龘季 control add-and-submit never completed")
+    obscure_batch = await ctx.next_client.get_admin_batch(
+        batch_id=obscure_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    obscure_item = _submitted_item(
+        obscure_batch,
+        word="龘季",
+        code=obscure_code,
+    )
+    require(
+        obscure_batch.get("status") == "Submitted",
+        f"S17 obscure-character control did not remain submitted: {obscure_batch}",
+    )
+    require(
+        isinstance(obscure_item, dict)
+        and obscure_item.get("needsManualReview") is True,
+        f"S17 obscure-character control lost its seal: {obscure_item}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "semanticWord": "产季",
+            "semanticCode": semantic_code,
+            "semanticBatchId": semantic_batch_id,
+            "semanticBatchStatus": semantic_batch.get("status"),
+            "semanticNeedsManualReview": semantic_item.get("needsManualReview"),
+            "nonObscurityRoute": "common_characters_and_llm",
+            "obscureWord": "龘季",
+            "obscureCode": obscure_code,
+            "obscureBatchId": obscure_batch_id,
+            "obscureBatchStatus": obscure_batch.get("status"),
+            "obscureNeedsManualReview": obscure_item.get("needsManualReview"),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -1182,6 +1311,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S14", "wrong-entry pronunciation poisoning", scenario_s14),
     Scenario("S15", "numbered add-submit and suggestion/direct closure", scenario_s15),
     Scenario("S16", "two-word bare advertised add-submit", scenario_s16),
+    Scenario("S17", "semantic common-character auto-pass", scenario_s17),
 )
 
 

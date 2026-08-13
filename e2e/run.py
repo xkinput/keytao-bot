@@ -15,6 +15,9 @@ from typing import Any
 import httpx
 from dotenv import dotenv_values
 
+from keytao_bot.utils.pinyin_reference import PINYIN_REFERENCE_DB_ENV
+from keytao_bot.utils.pinyin_reference_build import build_reference_database
+
 from .recording import ArtifactRecorder
 from .runtime import (
     E2EBotHarness,
@@ -59,6 +62,21 @@ _TRANSIENT_LOCAL_NEXT_ERRORS = (
     httpx.ReadTimeout,
     httpx.ConnectError,
 )
+
+
+def build_bot_reference_fixture(artifact_dir: Path) -> dict[str, Any]:
+    """Build the complete vendored reference DB before importing the bot plugin."""
+
+    source_dir = REPO_ROOT / "vendor" / "pinyin_reference"
+    database_path = artifact_dir / "state" / "pinyin-reference.db"
+    result = build_reference_database(source_dir, database_path)
+    os.environ[PINYIN_REFERENCE_DB_ENV] = str(database_path)
+    return {
+        "source": "complete-vendored-offline-reference",
+        "databasePath": str(database_path),
+        "environmentVariable": PINYIN_REFERENCE_DB_ENV,
+        "build": result.as_json_dict(),
+    }
 
 
 async def _retry_fixture_client_call(
@@ -1038,6 +1056,10 @@ async def async_main(args: argparse.Namespace) -> int:
             REPO_ROOT,
         )
         manifest["repoHead"] = head.strip()
+        manifest["botReferenceData"] = await asyncio.to_thread(
+            build_bot_reference_fixture,
+            artifact_dir,
+        )
         zdic_scenario_ids = [
             scenario.scenario_id
             for scenario in scenarios

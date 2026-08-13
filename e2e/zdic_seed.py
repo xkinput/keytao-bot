@@ -80,6 +80,16 @@ ZDIC_FIXTURES_BY_SCENARIO["S16"] = {
         {"kind": "entry", "entry": "座落在", "status": "absent", "pinyins": []},
     ),
 }
+ZDIC_FIXTURES_BY_SCENARIO["S17"] = {
+    "probe_words": ("产季", "龘季"),
+    "rows": (
+        {"kind": "char", "entry": "产", "status": "found", "pinyins": ["chǎn"]},
+        {"kind": "char", "entry": "季", "status": "found", "pinyins": ["jì"]},
+        {"kind": "char", "entry": "龘", "status": "found", "pinyins": ["dá"]},
+        {"kind": "entry", "entry": "产季", "status": "absent", "pinyins": []},
+        {"kind": "entry", "entry": "龘季", "status": "absent", "pinyins": []},
+    ),
+}
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 

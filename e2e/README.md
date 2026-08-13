@@ -43,6 +43,11 @@ whole-word entry for `亮面`. S15 reuses the existing S9 `射覆`/`慑服`
 candidate fixture and the S14 `亮面` pronunciation fixture.
 S16 declares the `zài liú`, `zài liú zǐ`, and `zuò luò zài` character reality
 plus absent whole-word entries for `载流`, `载流子`, and `座落在`.
+S17 declares known readings for `产`, `季`, and the obscure control character
+`龘`, while keeping both `产季` and `龘季` absent as whole-word entries. The rig
+also builds the complete vendored pronunciation/commonness database inside the
+run artifact state before importing the bot, so S17 exercises real offline
+character frequencies instead of reduced test rows.
 
 ## Prerequisites
 
@@ -147,6 +152,17 @@ a Phrase, weight 100 dictionary occupant: it discovers `载流@zhlq` and
 requires both exact items to reach the same submitted batch.
 At most one server-bound `确认` step may intervene. The flow rejects
 target-completion guidance and any submit-only remediation.
+
+S17 exercises the common-characters-plus-LLM semantic auto-pass lane. It asks
+for `产季`, requires the compact review line to name the concrete semantic basis
+and exact offline character frequencies, submits the selected server-issued
+code, and verifies the persisted item has `needsManualReview=false` and the
+batch reaches `Approved` through the bot auto-approve route. It then submits
+`龘季` as an obscure-character control and requires
+`needsManualReview=true` with the batch left `Submitted`. Both whole-word ZDIC
+entries and the whole-word offline commonness rows are absent. The lane has only
+the whole-word `corpus_frequency` and `common_characters_and_llm` routes, so the
+pass case must take the latter and cannot silently use whole-word evidence.
 
 Optional overrides:
 

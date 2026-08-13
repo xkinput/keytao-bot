@@ -11,7 +11,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from keytao_bot.utils.pinyin_reference_build import build_reference_database  # noqa: E402
+from keytao_bot.utils.pinyin_reference_build import (  # noqa: E402
+    assert_commonness_reference_schema,
+    build_reference_database,
+)
 
 
 def main() -> int:
@@ -28,6 +31,8 @@ def main() -> int:
     )
     args = parser.parse_args()
     result = build_reference_database(args.source_dir, args.db)
+    if not assert_commonness_reference_schema(args.db):
+        return 1
     print(json.dumps(result.as_json_dict(), ensure_ascii=False, sort_keys=True))
     return 0
 

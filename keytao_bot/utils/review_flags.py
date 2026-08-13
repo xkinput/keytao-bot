@@ -25,8 +25,9 @@ MANUAL_REVIEW_REASON_FIELD = "manualReviewReason"
 
 
 class ReviewDisposition(str, Enum):
-    """Non-pass review outcomes at the write boundary."""
+    """Declared review outcomes at the write boundary."""
 
+    PASS = "PASS"
     BLOCK = "BLOCK"
     SEAL = "SEAL"
 
@@ -34,10 +35,12 @@ class ReviewDisposition(str, Enum):
 REVIEW_DISPOSITION_FIELD = "reviewDisposition"
 REVIEW_VERDICT_SITE_FIELD = "reviewVerdictSite"
 
-# Every non-pass add/review verdict is named here. BLOCK means the target
-# cannot be written safely; SEAL means the target is trustworthy enough to
-# write with needsManualReview=True so an admin decides at approval time.
+# Every add/review verdict site is named here. PASS is an explicit, narrowly
+# defined auto-pass condition; BLOCK means the target cannot be written safely;
+# SEAL means the target is trustworthy enough to write with
+# needsManualReview=True so an admin decides at approval time.
 REVIEW_VERDICT_SITE_POLICIES = {
+    "semantic_context_common_word": ReviewDisposition.PASS,
     "empty_word": ReviewDisposition.BLOCK,
     "pronunciation_unresolved": ReviewDisposition.BLOCK,
     "code_unresolved": ReviewDisposition.BLOCK,
@@ -67,7 +70,7 @@ def apply_review_disposition(
     payload: Dict[str, Any],
     site: str,
 ) -> Dict[str, Any]:
-    """Stamp one declared BLOCK/SEAL outcome onto a payload in place."""
+    """Stamp one declared PASS/BLOCK/SEAL outcome onto a payload in place."""
     disposition = review_disposition_for_site(site)
     payload[REVIEW_DISPOSITION_FIELD] = disposition.value
     payload[REVIEW_VERDICT_SITE_FIELD] = site
@@ -75,7 +78,7 @@ def apply_review_disposition(
 
 
 def read_review_disposition(payload: Any) -> Optional[ReviewDisposition]:
-    """Read a declared non-pass disposition, rejecting unknown values."""
+    """Read a declared disposition value, rejecting unknown values."""
     if not isinstance(payload, dict):
         return None
     raw = payload.get(REVIEW_DISPOSITION_FIELD)

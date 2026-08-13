@@ -15,10 +15,12 @@ from keytao_bot.utils.keytao_review import (
     prepare_reviewed_word,
 )
 from keytao_bot.utils.review_flags import (
+    ReviewDisposition,
     apply_manual_review_flag,
     apply_review_disposition,
     read_manual_review_flag,
     read_review_disposition,
+    review_disposition_for_site,
 )
 
 
@@ -189,13 +191,43 @@ async def keytao_prepare_reviewed_add(
     pre_submit = review.get("preSubmitAudit")
     if isinstance(pre_submit, dict):
         base_disposition = read_review_disposition(review)
+        pre_submit_disposition = read_review_disposition(pre_submit)
+        pre_submit_site = str(pre_submit.get("reviewVerdictSite") or "")
+        registered_pre_submit_disposition = None
+        if pre_submit_site:
+            try:
+                registered_pre_submit_disposition = review_disposition_for_site(
+                    pre_submit_site
+                )
+            except ValueError:
+                registered_pre_submit_disposition = None
         flag = read_manual_review_flag(pre_submit)
         if flag is None:
             flag = not bool(pre_submit.get("autoApprove"))
         reason = str(
             (pre_submit.get("issues") or [""])[0] if flag else pre_submit.get("summary") or ""
         )
-        if base_disposition is not None:
+        if (
+            pre_submit_disposition is ReviewDisposition.PASS
+            and registered_pre_submit_disposition is ReviewDisposition.PASS
+            and base_disposition is not ReviewDisposition.BLOCK
+        ):
+            flag = False
+            semantic_items = [
+                item
+                for item in (pre_submit.get("semanticContextAutoPassItems") or [])
+                if isinstance(item, dict)
+            ]
+            reason = str(
+                (semantic_items[0].get("basisLine") if semantic_items else "")
+                or pre_submit.get("summary")
+                or "语境读音、具体含义和非生僻证据一致"
+            )
+            apply_review_disposition(
+                review,
+                pre_submit_site,
+            )
+        elif base_disposition is not None:
             flag = True
             reason = str(review.get("manualReviewReason") or reason)
         apply_manual_review_flag(review, bool(flag), reason)

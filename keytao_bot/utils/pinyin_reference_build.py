@@ -4,6 +4,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 from dataclasses import asdict, dataclass
@@ -22,6 +23,7 @@ BUILDER_VERSION = "3"
 MANIFEST_FILENAME = "manifest.json"
 EXCLUSIONS_FILENAME = "excluded_words.txt"
 COMMONNESS_CORPUS_DATASET_ID = "jieba"
+logger = logging.getLogger(__name__)
 _CEDICT_LINE_RE = re.compile(r"^(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+/")
 _TONE_MARKS = {
     "a": "āáǎà",
@@ -308,6 +310,7 @@ def _existing_result(
         metadata = _metadata(connection)
         if (
             metadata.get("schema_version") != SCHEMA_VERSION
+            or metadata.get("builder_version") != BUILDER_VERSION
             or metadata.get("source_checksum") != source_checksum
             or metadata.get("build_fingerprint") != build_fingerprint
         ):
@@ -332,6 +335,35 @@ def _existing_result(
     finally:
         if "connection" in locals():
             connection.close()
+
+
+def assert_commonness_reference_schema(db_path: Path | str) -> bool:
+    """Verify once at startup that the semantic lane's required table exists."""
+    path = Path(db_path).resolve()
+    try:
+        connection = sqlite3.connect(
+            f"{path.as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        )
+        row = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'word_commonness'"
+        ).fetchone()
+    except sqlite3.Error as error:
+        logger.warning(
+            "Pronunciation reference startup assertion failed: "
+            f"word_commonness is unavailable in {path}: {error}"
+        )
+        return False
+    finally:
+        if "connection" in locals():
+            connection.close()
+    if row is None:
+        logger.warning(
+            "Pronunciation reference startup assertion failed: "
+            f"word_commonness is missing from {path}"
+        )
+        return False
+    return True
 
 
 def _create_schema(connection: sqlite3.Connection) -> None:

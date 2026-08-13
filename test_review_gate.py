@@ -115,6 +115,7 @@ from keytao_bot.utils import keytao_review as review_module  # noqa: E402
 from keytao_bot.utils.http_client import KeytaoApiError  # noqa: E402
 from keytao_bot.utils.keytao_encoding import normalize_contextual_phrase_encoding  # noqa: E402
 from keytao_bot.utils import pinyin_reference as pinyin_reference_module  # noqa: E402
+from keytao_bot.utils import pinyin_reference_build as pinyin_reference_build_module  # noqa: E402
 from keytao_bot.utils.pinyin_reference_build import (  # noqa: E402
     build_reference_database,
 )
@@ -163,6 +164,7 @@ def check(name: str, result: bool):
 
 def test_review_disposition_registry():
     expected = {
+        "semantic_context_common_word": ReviewDisposition.PASS,
         "empty_word": ReviewDisposition.BLOCK,
         "pronunciation_unresolved": ReviewDisposition.BLOCK,
         "code_unresolved": ReviewDisposition.BLOCK,
@@ -179,9 +181,1030 @@ def test_review_disposition_registry():
         "code_chain_priority": ReviewDisposition.SEAL,
     }
     check(
-        "every non-pass review verdict site declares BLOCK or SEAL centrally",
+        "every PASS/BLOCK/SEAL review verdict site is declared centrally",
         REVIEW_VERDICT_SITE_POLICIES == expected,
     )
+
+
+def _semantic_context_review(
+    word,
+    code,
+    *,
+    complete=True,
+    meaning="表示一个含义和读音都明确的现代汉语组合",
+    confidence=0.96,
+    common_transparent=True,
+    context_method="meaning_backed_semantic_pronunciation",
+    chosen_pinyins=None,
+    known_readings=None,
+    extra_pronunciations=None,
+):
+    chosen_pinyins = list(chosen_pinyins or ["chan", "ji"])
+    known_readings = list(known_readings or [[chosen_pinyins[0]], [chosen_pinyins[1]]])
+    pronunciation = {
+        "pinyin": " ".join(chosen_pinyins),
+        "normalized": list(chosen_pinyins),
+        "codes": [code],
+        "sources": [],
+        "semanticPronunciation": True,
+        "requiresManualReview": True,
+        "readingEvidenceKind": "own_character_semantic",
+        "contextPronunciation": {
+            "entityType": "transparent_compound",
+            "label": "常用透明组合",
+            "confidence": confidence,
+            "description": meaning,
+            "method": context_method,
+            "commonTransparent": common_transparent,
+        },
+        "characterReadings": [
+            {
+                "char": char,
+                "chosenPinyin": chosen,
+                "knownReadings": list(readings),
+                "lookupStatus": "found",
+            }
+            for char, chosen, readings in zip(word, chosen_pinyins, known_readings)
+        ],
+    }
+    return {
+        "success": True,
+        "word": word,
+        "autoReviewable": False,
+        "lookupFailed": False,
+        "pronunciationEvidenceComplete": complete,
+        "requiresManualPronunciationReview": True,
+        "existing": [],
+        "pronunciations": [pronunciation, *(extra_pronunciations or [])],
+        "needsManualReview": True,
+        "manualReviewReason": (
+            "读音由有明确含义支撑的整词语境判定，"
+            "但缺少权威整词读音来源"
+            if complete
+            else "本次权威来源查询未完成"
+        ),
+        "reviewDisposition": "SEAL",
+        "reviewVerdictSite": (
+            "entity_context_reading"
+            if complete
+            else "pronunciation_lookup_incomplete"
+        ),
+    }
+
+
+def _reference_row(
+    word,
+    *,
+    frequency=None,
+    dictionary_presence=0,
+    available=True,
+):
+    return {
+        "available": available,
+        "attested": frequency is not None or dictionary_presence > 0,
+        "word": word,
+        "corpusFrequency": frequency,
+        "partOfSpeech": "n" if frequency is not None else None,
+        "dictionaryPresenceCount": dictionary_presence,
+    }
+
+
+def test_semantic_context_auto_pass_corpus_and_mutation_matrix():
+    """Every predicate leg has an observable corpus case that kills its mutant."""
+    print("\n🧪 semantic context auto-pass corpus and mutation matrix")
+
+    async def audit_case(review, references):
+        word = review["word"]
+
+        def query_reference(value):
+            return references.get(value, _reference_row(value))
+
+        with (
+            patch.object(
+                review_module,
+                "prepare_reviewed_word",
+                AsyncMock(return_value=review),
+            ),
+            patch.object(
+                review_module,
+                "_query_commonness_reference",
+                side_effect=query_reference,
+            ),
+            patch.object(
+                review_module,
+                "_review_code_chain_priority",
+                AsyncMock(return_value={
+                    "word": word,
+                    "code": review["pronunciations"][0]["codes"][0],
+                    "hasRecommendation": False,
+                    "commonness": {},
+                }),
+            ),
+        ):
+            return await audit_draft_items(CONFIG, [{
+                "action": "Create",
+                "word": word,
+                "code": review["pronunciations"][0]["codes"][0],
+                "type": "Phrase",
+            }])
+
+    async def _run():
+        passing_cases = [
+            (
+                "frequency-only leg",
+                _semantic_context_review("粮棉", "llmm"),
+                {
+                    "粮棉": _reference_row("粮棉", frequency=55),
+                    "粮": _reference_row("粮", frequency=1),
+                    "棉": _reference_row("棉", frequency=1),
+                },
+                "corpus_frequency",
+                "jieba 词频 55（阈值 10）",
+            ),
+            (
+                "common-chars plus LLM leg",
+                _semantic_context_review("产季", "ijjk"),
+                {
+                    "产季": _reference_row("产季"),
+                    "产": _reference_row("产", frequency=6838),
+                    "季": _reference_row("季", frequency=1619),
+                },
+                "common_characters_and_llm",
+                "产 6838、季 1619",
+            ),
+        ]
+        for name, review, references, route, copy_marker in passing_cases:
+            audit = await audit_case(review, references)
+            reviewed = audit.get("reviewedWords", {}).get(
+                f"{review['word']}@Phrase",
+                {},
+            )
+            assessment = reviewed.get("semanticContextAutoPass") or {}
+            check(
+                f"{name} auto-passes",
+                audit.get("autoApprove") is True
+                and audit.get("verdict") == "pass"
+                and read_manual_review_flag(audit) is False,
+            )
+            check(
+                f"{name} declares registered PASS",
+                read_review_disposition(audit) is ReviewDisposition.PASS
+                and audit.get("reviewVerdictSite")
+                == "semantic_context_common_word",
+            )
+            check(
+                f"{name} records its unique non-obscurity route",
+                assessment.get("nonObscurity", {}).get("route") == route,
+            )
+            check(
+                f"{name} renders honest evidence copy",
+                copy_marker in str(assessment.get("basisLine") or "")
+                and "该词可自动通过" in str(assessment.get("basisLine") or ""),
+            )
+
+        ambiguous_extra = {
+            **_semantic_context_review(
+                "重行",
+                "isxk",
+                chosen_pinyins=["zhong", "xing"],
+                known_readings=[["zhong", "chong"], ["xing", "hang"]],
+            )["pronunciations"][0],
+            "pinyin": "chong hang",
+            "normalized": ["chong", "hang"],
+            "characterReadings": [
+                {
+                    "char": "重",
+                    "chosenPinyin": "chong",
+                    "knownReadings": ["zhong", "chong"],
+                    "lookupStatus": "found",
+                },
+                {
+                    "char": "行",
+                    "chosenPinyin": "hang",
+                    "knownReadings": ["xing", "hang"],
+                    "lookupStatus": "found",
+                },
+            ],
+        }
+        mutation_cases = [
+            (
+                "lookup-completed condition",
+                _semantic_context_review("产季", "ijjk", complete=False),
+                "lookupCompleted",
+            ),
+            (
+                "known-character-reading condition",
+                _semantic_context_review(
+                    "产季",
+                    "ijjk",
+                    known_readings=[["chan"], ["qi"]],
+                ),
+                "knownCharacterReadings",
+            ),
+            (
+                "single-unambiguous-reading condition",
+                _semantic_context_review(
+                    "重行",
+                    "isxk",
+                    chosen_pinyins=["zhong", "xing"],
+                    known_readings=[["zhong", "chong"], ["xing", "hang"]],
+                    extra_pronunciations=[ambiguous_extra],
+                ),
+                "singleSemanticPronunciation",
+            ),
+            (
+                "concrete-meaning condition",
+                _semantic_context_review("产季", "ijjk", meaning="该词的意思"),
+                "concreteMeaning",
+            ),
+            (
+                "semantic-confidence condition",
+                _semantic_context_review("产季", "ijjk", confidence=0.74),
+                "meaningConfidence",
+            ),
+            (
+                "multi-reading meaning-binding condition",
+                _semantic_context_review(
+                    "重行",
+                    "isxk",
+                    chosen_pinyins=["zhong", "xing"],
+                    known_readings=[["zhong", "chong"], ["xing", "hang"]],
+                    context_method="unbacked_context",
+                ),
+                "multiReadingMeaningBacked",
+            ),
+        ]
+        common_references = {
+            "产季": _reference_row("产季", dictionary_presence=1),
+            "产": _reference_row("产", frequency=6838),
+            "季": _reference_row("季", frequency=1619),
+            "重行": _reference_row("重行", dictionary_presence=1),
+            "重": _reference_row("重", frequency=2000),
+            "行": _reference_row("行", frequency=3000),
+        }
+        for name, review, failed_check in mutation_cases:
+            audit = await audit_case(review, common_references)
+            reviewed = audit.get("reviewedWords", {}).get(
+                f"{review['word']}@Phrase",
+                {},
+            )
+            assessment = reviewed.get("semanticContextAutoPass") or {}
+            issue = next(iter(audit.get("issues") or []), "")
+            expected_issue = (
+                "本次权威来源查询未完成"
+                if failed_check == "lookupCompleted"
+                else (
+                    f"「{review['word']}」读音由有明确含义支撑的整词语境判定，"
+                    "但缺少权威整词读音来源，需要管理员审核"
+                )
+            )
+            check(
+                f"{name} mutant is killed by a sealed result",
+                audit.get("autoApprove") is False
+                and expected_issue in issue
+                and any(
+                    expected_issue in str(item)
+                    for item in (
+                        audit.get("structuredManualReviewIssues") or []
+                    )
+                ),
+            )
+            check(
+                f"{name} has would-have-auto-passed proof",
+                assessment.get("failedChecks") == [failed_check]
+                and assessment.get("wouldPassWithout") == failed_check,
+            )
+
+        non_obscurity_controls = [
+            (
+                "below-threshold frequency",
+                _semantic_context_review("低频", "djpb"),
+                {
+                    "低频": _reference_row("低频", frequency=9),
+                    "低": _reference_row("低", frequency=999),
+                    "频": _reference_row("频", frequency=4000),
+                },
+            ),
+            (
+                "obscure character",
+                _semantic_context_review("龘季", "djjk"),
+                {
+                    "龘季": _reference_row("龘季"),
+                    "龘": _reference_row("龘"),
+                    "季": _reference_row("季", frequency=1619),
+                },
+            ),
+            (
+                "rare common-character combination",
+                _semantic_context_review(
+                    "季产",
+                    "jkij",
+                    common_transparent=False,
+                ),
+                {
+                    "季产": _reference_row("季产"),
+                    "季": _reference_row("季", frequency=1619),
+                    "产": _reference_row("产", frequency=6838),
+                },
+            ),
+        ]
+        for name, review, references in non_obscurity_controls:
+            audit = await audit_case(review, references)
+            reviewed = audit.get("reviewedWords", {}).get(
+                f"{review['word']}@Phrase",
+                {},
+            )
+            assessment = reviewed.get("semanticContextAutoPass") or {}
+            check(
+                f"{name} remains sealed",
+                audit.get("autoApprove") is False
+                and read_manual_review_flag(audit) is True
+                and bool(audit.get("structuredManualReviewIssues")),
+            )
+            check(
+                f"{name} kills removal of the not-obscure condition",
+                assessment.get("failedChecks") == ["notObscure"]
+                and assessment.get("wouldPassWithout") == "notObscure",
+            )
+
+    asyncio.run(_run())
+
+
+def test_rejected_offline_whole_word_reading_cannot_auto_pass_by_dictionary_presence():
+    """A rejected offline reading must not become positive evidence in this lane."""
+    print("\n🧪 rejected offline whole-word reading stays sealed")
+
+    async def _run():
+        word = "行长"
+        code = "xzab"
+        encode_data = {
+            "success": True,
+            "word": word,
+            "codes": [code],
+            "pronunciationSource": "zdic-character-default",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": False,
+            "phrasePinyins": ["xíng", "zhǎng"],
+            "contextPhrasePinyins": ["xíng", "zhǎng"],
+            "chars": [
+                {
+                    "char": "行",
+                    "pinyin": "xíng",
+                    "pinyins": ["xíng"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "长",
+                    "pinyin": "zhǎng",
+                    "pinyins": ["zhǎng"],
+                    "pronunciationLookupStatus": "found",
+                },
+            ],
+        }
+        evidence = {
+            "success": True,
+            "word": word,
+            "groups": [{
+                "pinyin": "háng zhǎng",
+                "normalized": ["hang", "zhang"],
+                "sources": [
+                    {
+                        "source": "CC-CEDICT",
+                        "url": "",
+                        "category": "dictionary",
+                        "trust": 4,
+                        "dataset": "cedict",
+                    },
+                    {
+                        "source": "large_pinyin",
+                        "url": "",
+                        "category": "dictionary",
+                        "trust": 4,
+                        "dataset": "large_pinyin",
+                    },
+                ],
+                "sourceIds": ["cedict", "large_pinyin"],
+                "score": 8,
+                "readingEvidenceKind": "bound_external",
+            }],
+            "sources": [],
+            "hasEvidence": True,
+            "rejections": [],
+            "lookupComplete": True,
+            "lookupStatus": "completed",
+            "sourceOutcomes": [
+                {
+                    "sourceId": "cedict",
+                    "source": "CC-CEDICT",
+                    "status": "completed",
+                    "lookupResult": "found",
+                },
+                {
+                    "sourceId": "handian",
+                    "source": "汉典",
+                    "status": "completed",
+                    "lookupResult": "absent",
+                },
+            ],
+        }
+        entity = {
+            "recognized": True,
+            "entityType": "common_word",
+            "confidence": 0.96,
+            "description": "指某种事物在特定条件下的具体表现和用途",
+            "pinyin": "xing zhang",
+            "commonTransparent": True,
+            "commonnessReason": "两个字都很常用，组合关系透明",
+            "canonicalNames": [],
+            "aliases": [],
+        }
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=evidence),
+            ),
+            patch.object(
+                review_module,
+                "fetch_keytao_encode",
+                AsyncMock(return_value=encode_data),
+            ),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+            patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+            patch.object(
+                review_module,
+                "_infer_entity_knowledge",
+                AsyncMock(return_value=entity),
+            ),
+            patch.object(review_module, "_search_web", AsyncMock(return_value=[])),
+        ):
+            prepared = await prepare_reviewed_word(CONFIG, word)
+
+        check(
+            "mismatching offline whole-word reading is explicitly rejected",
+            prepared.get("pronunciationRejections", [{}])[0].get("reason")
+            == "character_1_reading_mismatch",
+        )
+        check(
+            "contextual replacement begins sealed",
+            read_review_disposition(prepared) is ReviewDisposition.SEAL
+            and read_manual_review_flag(prepared) is True,
+        )
+
+        references = {
+            word: _reference_row(word, dictionary_presence=2),
+            "行": _reference_row("行", frequency=3, dictionary_presence=1),
+            "长": _reference_row("长", frequency=3, dictionary_presence=1),
+        }
+        with (
+            patch.object(
+                review_module,
+                "prepare_reviewed_word",
+                AsyncMock(return_value=prepared),
+            ),
+            patch.object(
+                review_module,
+                "_query_commonness_reference",
+                side_effect=lambda value: references[value],
+            ),
+            patch.object(
+                review_module,
+                "_review_code_chain_priority",
+                AsyncMock(return_value={
+                    "word": word,
+                    "code": code,
+                    "hasRecommendation": False,
+                    "commonness": {},
+                }),
+            ),
+        ):
+            audit = await audit_draft_items(CONFIG, [{
+                "action": "Create",
+                "word": word,
+                "code": code,
+                "type": "Phrase",
+            }])
+
+        reviewed = audit.get("reviewedWords", {}).get(f"{word}@Phrase", {})
+        assessment = reviewed.get("semanticContextAutoPass") or {}
+        check(
+            "dictionary disagreement cannot clear the seal",
+            audit.get("autoApprove") is False
+            and read_review_disposition(reviewed) is ReviewDisposition.SEAL
+            and read_manual_review_flag(audit) is True,
+        )
+        check(
+            "rejected dictionary presence is absent from auto-pass copy",
+            audit.get("semanticContextAutoPassItems") == []
+            and assessment.get("basisLine") == ""
+            and "离线读音/词典收录" not in str(assessment.get("basisLine") or ""),
+        )
+
+    asyncio.run(_run())
+
+
+def test_semantic_context_full_vendored_corpus_facts():
+    """Freeze the production-sized offline facts used by the S17 policy case."""
+    print("\n🧪 semantic context full vendored corpus facts")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        db_path = Path(temporary) / "pinyin-reference.db"
+        result = build_reference_database(
+            Path(__file__).parent / "vendor" / "pinyin_reference",
+            db_path,
+        )
+        with patch.dict(os.environ, {"PINYIN_REFERENCE_DB": str(db_path)}):
+            facts = {
+                value: review_module._query_commonness_reference(value)
+                for value in ("产季", "产", "季", "龘", "粮棉")
+            }
+
+    check(
+        "full vendored corpus was imported instead of a reduced fixture",
+        result.commonness_word_count == 634829
+        and result.corpus_word_count == 349045
+        and result.word_count == 428180,
+    )
+    check(
+        "产季 is absent as a whole word while both characters clear the 1000 threshold",
+        facts["产季"]["attested"] is False
+        and facts["产"]["corpusFrequency"] == 6838
+        and facts["季"]["corpusFrequency"] == 1619,
+    )
+    check(
+        "the full corpus contains a frequency-only control above the word threshold",
+        facts["粮棉"]["dictionaryPresenceCount"] == 0
+        and facts["粮棉"]["corpusFrequency"] == 55,
+    )
+    check(
+        "the obscure-character control has no single-character corpus frequency",
+        facts["龘"]["corpusFrequency"] is None,
+    )
+
+
+def test_semantic_context_pass_clears_prepare_seal_and_enters_autoapprove_chain():
+    """The registered PASS must survive preview copy and the canonical batch gate."""
+    print("\n🧪 semantic context PASS clears the add seal and enters auto-approval")
+
+    async def _run():
+        word = "产季"
+        code = "ijjk"
+        base_review = _semantic_context_review(word, code)
+        base_review["recommendedCode"] = code
+        base_review["pronunciations"][0]["recommendedCode"] = code
+        base_review["pronunciations"][0]["candidateStatuses"] = [{
+            "code": code,
+            "occupied": False,
+            "label": "空位",
+        }]
+        basis_line = (
+            "该词可自动通过（语境读音与含义明确，常用字组合且语义判断为常用或透明组合；"
+            "语料/词典证据：逐字 jieba 词频 产 6838、季 1619（高频字阈值 1000），"
+            "语义判断为常用或透明组合）"
+        )
+        pass_audit = {
+            "success": True,
+            "verdict": "pass",
+            "autoApprove": True,
+            "summary": "语境读音、具体含义和非生僻证据一致，允许本喵自动通过",
+            "issues": [],
+            "approvedItems": [f"Create：{word}@{code}"],
+            "semanticContextAutoPassItems": [{
+                "word": word,
+                "code": code,
+                "basisLine": basis_line,
+            }],
+            "needsManualReview": False,
+            "manualReviewReason": basis_line,
+            "reviewDisposition": "PASS",
+            "reviewVerdictSite": "semantic_context_common_word",
+        }
+        with (
+            patch.object(
+                _review_tools,
+                "prepare_reviewed_word",
+                AsyncMock(return_value=base_review),
+            ),
+            patch.object(
+                _review_tools,
+                "_build_pre_submit_audit",
+                AsyncMock(return_value=pass_audit),
+            ),
+            patch.object(
+                _review_tools,
+                "assess_candidate_chain_commonness",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            prepared = await _review_tools.keytao_prepare_reviewed_add(word)
+
+        check(
+            "registered PASS clears the original prepare-stage SEAL",
+            read_manual_review_flag(prepared) is False
+            and read_review_disposition(prepared) is ReviewDisposition.PASS,
+        )
+        check(
+            "prepare-stage PASS retains the exact registered site",
+            prepared.get("reviewVerdictSite") == "semantic_context_common_word",
+        )
+
+        import keytao_bot.plugins.openai_chat as chat
+        from keytao_bot.utils import review_flags as rf
+
+        prompt = chat._format_reviewed_add_prompt(prepared) or ""
+        check(
+            "review copy is one honest auto-pass basis line",
+            f"审词：读音 chan ji；来源" in prompt
+            and f"自动审核：{basis_line}" in prompt
+            and "需管理员审核" not in prompt,
+        )
+        check(
+            "canonical submit predicate accepts the semantic PASS audit",
+            rf.audit_allows_batch_auto_approve(pass_audit) is True,
+        )
+
+        chat._reviewed_add_verdicts.clear()
+        chat._record_reviewed_add_verdict(
+            "keytao_prepare_reviewed_add",
+            {"word": word},
+            json.dumps(prepared, ensure_ascii=False),
+        )
+        response = (
+            f"是否以编码 {code} 将「{word}」加入草稿？\n"
+            f"1. {code} - ✅ 空位\n"
+            f"审词：读音 chan ji；来源 本喵整词语境判断；自动审核：{basis_line}\n"
+        )
+        pending = chat._parse_pending_add_word(response)
+        check(
+            "bot submit pending state carries the explicit unsealed flag",
+            pending is not None and pending.needs_manual_review is False,
+        )
+        create_args = chat._create_phrase_args(pending, code) if pending else {}
+        check(
+            "draft create receives needsManualReview=false",
+            create_args.get("needs_manual_review") is False,
+        )
+
+        malformed_pass = {
+            **pass_audit,
+            "reviewVerdictSite": "entity_context_reading",
+        }
+        malformed_base = _semantic_context_review(word, code)
+        malformed_base["recommendedCode"] = code
+        with (
+            patch.object(
+                _review_tools,
+                "prepare_reviewed_word",
+                AsyncMock(return_value=malformed_base),
+            ),
+            patch.object(
+                _review_tools,
+                "_build_pre_submit_audit",
+                AsyncMock(return_value=malformed_pass),
+            ),
+            patch.object(
+                _review_tools,
+                "assess_candidate_chain_commonness",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            rejected = await _review_tools.keytao_prepare_reviewed_add(word)
+        check(
+            "PASS value cannot clear SEAL when its registry site declares SEAL",
+            read_manual_review_flag(rejected) is True
+            and read_review_disposition(rejected) is ReviewDisposition.SEAL,
+        )
+
+        blocked_base = _semantic_context_review(word, code)
+        blocked_base["recommendedCode"] = code
+        blocked_base["reviewDisposition"] = "BLOCK"
+        blocked_base["reviewVerdictSite"] = "invalid_code"
+        with (
+            patch.object(
+                _review_tools,
+                "prepare_reviewed_word",
+                AsyncMock(return_value=blocked_base),
+            ),
+            patch.object(
+                _review_tools,
+                "_build_pre_submit_audit",
+                AsyncMock(return_value=pass_audit),
+            ),
+            patch.object(
+                _review_tools,
+                "assess_candidate_chain_commonness",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            blocked = await _review_tools.keytao_prepare_reviewed_add(word)
+        check(
+            "registered PASS cannot clear a base BLOCK",
+            read_manual_review_flag(blocked) is True
+            and read_review_disposition(blocked) is ReviewDisposition.BLOCK,
+        )
+
+    asyncio.run(_run())
+
+
+def test_chanji_semantic_prepare_revalidation_reaches_common_char_pass():
+    """A 产季-style semantic re-encode must produce the evidence the new lane reads."""
+    print("\n🧪 产季 semantic revalidation reaches common-character PASS")
+
+    async def _run():
+        word = "产季"
+        code = "ijjk"
+        baseline_encode = {
+            "success": True,
+            "word": word,
+            "codes": ["isjk"],
+            "pronunciationSource": "zdic-character-default",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": True,
+            "semanticPronunciationAccepted": False,
+            "phrasePinyins": ["shān", "jì"],
+            "contextPhrasePinyins": ["chǎn", "jì"],
+            "chars": [
+                {
+                    "char": "产",
+                    "pinyin": "shān",
+                    "pinyins": ["shān", "chǎn"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "季",
+                    "pinyin": "jì",
+                    "pinyins": ["jì"],
+                    "pronunciationLookupStatus": "found",
+                },
+            ],
+        }
+        semantic_encode = {
+            **baseline_encode,
+            "codes": [code],
+            "pronunciationSource": "llm-semantic",
+            "semanticPronunciationNeeded": False,
+            "semanticPronunciationAccepted": True,
+            "phrasePinyins": ["chǎn", "jì"],
+            "chars": [
+                {**baseline_encode["chars"][0], "pinyin": "chǎn"},
+                baseline_encode["chars"][1],
+            ],
+        }
+        proposal = {
+            "accepted": True,
+            "word": word,
+            "pinyins": ["chan", "ji"],
+            "meaning": "指农产品集中生产或上市的季节",
+            "confidence": 0.96,
+            "usageType": "transparent_compound",
+            "commonTransparent": True,
+            "commonnessReason": "产与季组合关系透明",
+        }
+        evidence = {
+            "success": True,
+            "groups": [],
+            "sources": [],
+            "lookupComplete": True,
+            "sourceOutcomes": [{
+                "sourceId": "handian",
+                "source": "汉典",
+                "status": "completed",
+                "lookupResult": "absent",
+            }],
+        }
+        encode_mock = AsyncMock(side_effect=[baseline_encode, semantic_encode])
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=evidence),
+            ),
+            patch.object(
+                review_module,
+                "fetch_keytao_encode",
+                encode_mock,
+            ),
+            patch.object(
+                review_module,
+                "lookup_words",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                review_module,
+                "lookup_codes",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                review_module,
+                "_infer_semantic_pronunciation_for_review",
+                AsyncMock(return_value=proposal),
+            ),
+        ):
+            prepared = await prepare_reviewed_word(CONFIG, word)
+
+        pronunciation = prepared.get("pronunciations", [{}])[0]
+        check(
+            "semantic reading is revalidated with concrete meaning",
+            encode_mock.await_count == 2
+            and encode_mock.await_args_list[1].kwargs == {
+                "semantic_pinyin": "chan ji",
+                "semantic_meaning": proposal["meaning"],
+            },
+        )
+        check(
+            "prepared review exposes exact known readings for every character",
+            pronunciation.get("characterReadings") == [
+                {
+                    "char": "产",
+                    "chosenPinyin": "chan",
+                    "knownReadings": ["shan", "chan"],
+                    "lookupStatus": "found",
+                },
+                {
+                    "char": "季",
+                    "chosenPinyin": "ji",
+                    "knownReadings": ["ji"],
+                    "lookupStatus": "found",
+                },
+            ],
+        )
+        check(
+            "prepare remains sealed until the non-obscurity predicate runs",
+            read_review_disposition(prepared) is ReviewDisposition.SEAL
+            and read_manual_review_flag(prepared) is True,
+        )
+
+        references = {
+            word: _reference_row(word),
+            "产": _reference_row("产", frequency=6838),
+            "季": _reference_row("季", frequency=1619),
+        }
+        with (
+            patch.object(
+                review_module,
+                "prepare_reviewed_word",
+                AsyncMock(return_value=prepared),
+            ),
+            patch.object(
+                review_module,
+                "_query_commonness_reference",
+                side_effect=lambda value: references[value],
+            ),
+            patch.object(
+                review_module,
+                "_review_code_chain_priority",
+                AsyncMock(return_value={
+                    "word": word,
+                    "code": code,
+                    "hasRecommendation": False,
+                    "commonness": {},
+                }),
+            ),
+        ):
+            audit = await audit_draft_items(CONFIG, [{
+                "action": "Create",
+                "word": word,
+                "code": code,
+                "type": "Phrase",
+            }])
+        check(
+            "产季-style common characters plus semantic judgment auto-pass",
+            audit.get("autoApprove") is True
+            and read_review_disposition(audit) is ReviewDisposition.PASS,
+        )
+
+    asyncio.run(_run())
+
+
+def test_chanji_entity_context_reaches_common_char_pass():
+    """The ordinary no-conflict 产季 path must retain the same semantic fields."""
+    print("\n🧪 产季 entity context reaches common-character PASS")
+
+    async def _run():
+        word = "产季"
+        code = "jfjk"
+        encode_data = {
+            "success": True,
+            "word": word,
+            "codes": [code],
+            "pronunciationSource": "zdic-character-default",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": False,
+            "phrasePinyins": ["chǎn", "jì"],
+            "contextPhrasePinyins": ["chǎn", "jì"],
+            "chars": [
+                {
+                    "char": "产",
+                    "pinyin": "chǎn",
+                    "pinyins": ["chǎn"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "季",
+                    "pinyin": "jì",
+                    "pinyins": ["jì"],
+                    "pronunciationLookupStatus": "found",
+                },
+            ],
+        }
+        evidence = {
+            "success": True,
+            "groups": [],
+            "sources": [],
+            "lookupComplete": True,
+            "sourceOutcomes": [{
+                "sourceId": "handian",
+                "source": "汉典",
+                "status": "completed",
+                "lookupResult": "absent",
+            }],
+        }
+        entity = {
+            "recognized": True,
+            "entityType": "transparent_compound",
+            "confidence": 0.96,
+            "description": "指农产品集中生产或上市的季节",
+            "pinyin": "chan ji",
+            "commonTransparent": True,
+            "commonnessReason": "产与季组合关系透明",
+        }
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=evidence),
+            ),
+            patch.object(
+                review_module,
+                "fetch_keytao_encode",
+                AsyncMock(return_value=encode_data),
+            ),
+            patch.object(
+                review_module,
+                "lookup_words",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                review_module,
+                "lookup_codes",
+                AsyncMock(return_value={}),
+            ),
+            patch.object(
+                review_module,
+                "_infer_entity_knowledge",
+                AsyncMock(return_value=entity),
+            ),
+        ):
+            prepared = await prepare_reviewed_word(CONFIG, word)
+
+        context = prepared["pronunciations"][0]["contextPronunciation"]
+        check(
+            "entity context preserves the transparent-compound judgment",
+            context.get("method") == "entity_knowledge_context"
+            and context.get("commonTransparent") is True
+            and context.get("description") == entity["description"],
+        )
+
+        references = {
+            word: _reference_row(word),
+            "产": _reference_row("产", frequency=6838),
+            "季": _reference_row("季", frequency=1619),
+        }
+        with (
+            patch.object(
+                review_module,
+                "prepare_reviewed_word",
+                AsyncMock(return_value=prepared),
+            ),
+            patch.object(
+                review_module,
+                "_query_commonness_reference",
+                side_effect=lambda value: references[value],
+            ),
+            patch.object(
+                review_module,
+                "_review_code_chain_priority",
+                AsyncMock(return_value={
+                    "word": word,
+                    "code": code,
+                    "hasRecommendation": False,
+                    "commonness": {},
+                }),
+            ),
+        ):
+            audit = await audit_draft_items(CONFIG, [{
+                "action": "Create",
+                "word": word,
+                "code": code,
+                "type": "Phrase",
+            }])
+        check(
+            "ordinary 产季 entity path auto-passes through common characters",
+            audit.get("autoApprove") is True
+            and read_review_disposition(audit) is ReviewDisposition.PASS,
+        )
+
+    asyncio.run(_run())
 
 
 CONFIG = ReviewHttpConfig(api_base="https://fake", bot_token="fake")
@@ -539,6 +1562,95 @@ def test_local_reference_import_is_deterministic_and_preserves_readings():
         finally:
             connection.close()
         check("runtime connection rejects writes", write_blocked)
+
+
+def test_reference_version_mismatch_rebuilds_and_missing_schema_warns():
+    """Startup rebuild keys include builder/schema versions and missing tables are loud."""
+    print("\n🧪 reference version mismatch rebuild and schema warning")
+
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        source_dir, db_path, _first = _build_reference_fixture(root)
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute(
+                "UPDATE metadata SET value = '2' WHERE key = 'builder_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        rebuilt = build_reference_database(source_dir, db_path)
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute(
+                "UPDATE metadata SET value = '1' WHERE key = 'schema_version'"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        schema_rebuilt = build_reference_database(source_dir, db_path)
+        connection = sqlite3.connect(db_path)
+        try:
+            metadata = dict(connection.execute(
+                "SELECT key, value FROM metadata WHERE key IN ('schema_version', 'builder_version')"
+            ))
+        finally:
+            connection.close()
+        check(
+            "builder/schema-version mismatch forces an automatic rebuild",
+            rebuilt.rebuilt is True
+            and schema_rebuilt.rebuilt is True
+            and metadata == {
+                "builder_version": pinyin_reference_build_module.BUILDER_VERSION,
+                "schema_version": pinyin_reference_build_module.SCHEMA_VERSION,
+            },
+        )
+
+        stale_db = root / "missing-commonness.db"
+        connection = sqlite3.connect(stale_db)
+        try:
+            connection.executescript("""
+                CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE readings (word TEXT NOT NULL);
+            """)
+            connection.commit()
+        finally:
+            connection.close()
+
+        with (
+            patch.dict(os.environ, {"PINYIN_REFERENCE_DB": str(stale_db)}),
+            patch.object(review_module.logger, "warning") as query_warning,
+        ):
+            unavailable = review_module._query_commonness_reference("产季")
+        check(
+            "missing commonness query path logs at warning",
+            unavailable.get("available") is False
+            and query_warning.call_count == 1
+            and "word_commonness" in str(query_warning.call_args.args[0]),
+        )
+
+        schema_assertion = getattr(
+            pinyin_reference_build_module,
+            "assert_commonness_reference_schema",
+            None,
+        )
+        check(
+            "startup exposes a one-shot commonness schema assertion",
+            callable(schema_assertion),
+        )
+        if callable(schema_assertion):
+            with patch.object(
+                pinyin_reference_build_module.logger,
+                "warning",
+            ) as startup_warning:
+                schema_ok = schema_assertion(stale_db)
+            check(
+                "startup assertion warns loudly when word_commonness is absent",
+                schema_ok is False
+                and startup_warning.call_count == 1
+                and "word_commonness" in str(startup_warning.call_args.args[0]),
+            )
 
 
 def test_offline_commonness_verdict_rules_and_copy():
@@ -3413,7 +4525,14 @@ def test_audit_budget_nesting_and_timeout_retains_review():
 
 def main():
     test_review_disposition_registry()
+    test_semantic_context_auto_pass_corpus_and_mutation_matrix()
+    test_rejected_offline_whole_word_reading_cannot_auto_pass_by_dictionary_presence()
+    test_semantic_context_full_vendored_corpus_facts()
+    test_semantic_context_pass_clears_prepare_seal_and_enters_autoapprove_chain()
+    test_chanji_semantic_prepare_revalidation_reaches_common_char_pass()
+    test_chanji_entity_context_reaches_common_char_pass()
     test_local_reference_import_is_deterministic_and_preserves_readings()
+    test_reference_version_mismatch_rebuilds_and_missing_schema_warns()
     test_offline_commonness_verdict_rules_and_copy()
     test_both_absent_commonness_uses_existing_bounded_web_fallback()
     test_collector_queries_local_reference_first_and_scores_agreement()

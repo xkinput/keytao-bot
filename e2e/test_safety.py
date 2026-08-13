@@ -16,6 +16,7 @@ from .recording import ArtifactRecorder, _redact_sensitive
 from .scenarios import SCENARIOS
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
+    build_bot_reference_fixture,
     ensure_s9_fixture,
     ensure_s16_fixture,
     ensure_scenario_zdic_fixture,
@@ -85,11 +86,16 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("S14 injects a 汉典-shaped search hit", readme)
         self.assertIn("S15 first discovers", readme)
         self.assertIn("S16 replays the two-word 载流", readme)
+        self.assertIn("S17 exercises the common-characters-plus-LLM", readme)
+        self.assertIn(
+            "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
+            readme,
+        )
 
-    def test_scenario_pack_is_contiguous_through_s16(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s17(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 17)],
+            [f"S{index}" for index in range(1, 18)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -242,6 +248,47 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(declared[("char", "落")], ("found", ("luò",)))
         self.assertEqual(declared[("char", "在")], ("found", ("zài",)))
         self.assertEqual(declared[("entry", "座落在")], ("absent", ()))
+
+    def test_s17_zdic_seed_exercises_absent_words_with_known_characters(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S17"]
+        self.assertEqual(fixture["probe_words"], ("产季", "龘季"))
+        declared = {
+            (row["kind"], row["entry"]): (row["status"], tuple(row["pinyins"]))
+            for row in fixture["rows"]
+        }
+        self.assertEqual(declared[("char", "产")], ("found", ("chǎn",)))
+        self.assertEqual(declared[("char", "季")], ("found", ("jì",)))
+        self.assertEqual(declared[("char", "龘")], ("found", ("dá",)))
+        self.assertEqual(declared[("entry", "产季")], ("absent", ()))
+        self.assertEqual(declared[("entry", "龘季")], ("absent", ()))
+
+    def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
+        class FakeBuildResult:
+            def as_json_dict(self):
+                return {
+                    "commonness_word_count": 634829,
+                    "corpus_word_count": 349045,
+                }
+
+        with tempfile.TemporaryDirectory() as temporary:
+            artifact_dir = Path(temporary) / "artifacts"
+            with (
+                patch(
+                    "e2e.run.build_reference_database",
+                    return_value=FakeBuildResult(),
+                ) as build_mock,
+                patch.dict("os.environ", {}, clear=False),
+            ):
+                result = build_bot_reference_fixture(artifact_dir)
+                configured_path = result["databasePath"]
+
+        self.assertEqual(
+            build_mock.call_args.args[0],
+            Path(__file__).parents[1] / "vendor" / "pinyin_reference",
+        )
+        self.assertEqual(build_mock.call_args.args[1], Path(configured_path))
+        self.assertTrue(configured_path.endswith("state/pinyin-reference.db"))
+        self.assertEqual(result["build"]["corpus_word_count"], 349045)
 
     async def test_s15_offline_scenario_contract(self) -> None:
         scenario = next(item for item in SCENARIOS if item.scenario_id == "S15")
@@ -516,6 +563,97 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
                     result["facts"]["additionalConfirmationSteps"],
                     expected_steps,
                 )
+
+    async def test_s17_offline_scenario_contract(self) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S17")
+
+        class FakeNextClient:
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assert_token = admin_token
+                if batch_id == "batch-semantic-pass":
+                    return {
+                        "status": "Approved",
+                        "pullRequests": [{
+                            "action": "Create",
+                            "word": "产季",
+                            "code": "jfjk",
+                            "needsManualReview": False,
+                        }],
+                    }
+                if batch_id == "batch-obscure-control":
+                    return {
+                        "status": "Submitted",
+                        "pullRequests": [{
+                            "action": "Create",
+                            "word": "龘季",
+                            "code": "dsjk",
+                            "needsManualReview": True,
+                        }],
+                    }
+                raise AssertionError(batch_id)
+
+        class FakeContext:
+            fixture_facts = {}
+            admin_token = "offline-admin-token"
+
+            def __init__(self):
+                self.events = []
+                self.next_client = FakeNextClient()
+
+            async def send(self, text: str) -> str:
+                if text == "喵喵 加词 产季":
+                    return (
+                        "审词：读音 chan ji；来源 本喵实体语境判断；"
+                        "自动审核：该词可自动通过（语境读音与含义明确，"
+                        "常用字组合且语义判断为常用或透明组合；"
+                        "语料/词典证据：逐字 jieba 词频 产 6838、季 1619"
+                        "（高频字阈值 1000），语义判断为常用或透明组合）\n"
+                        "1. jfjk — ✅ 推荐（空位）\n"
+                        "是否以编码 jfjk 将「产季」加入草稿？"
+                    )
+                if text == "添加并提交" and len(self.events) == 0:
+                    self.events.append({
+                        "sequence": 1,
+                        "kind": "tool",
+                        "name": "keytao_submit_batch",
+                        "result": {
+                            "success": True,
+                            "batchId": "batch-semantic-pass",
+                        },
+                    })
+                    return "✅ 产季已加入草稿并自动审核入库"
+                if text == "喵喵 加词 龘季":
+                    return (
+                        "词库暂无收录「龘季」。\n"
+                        "审词：读音 da ji；来源 本喵整词语境判断；"
+                        "自动审核：该词需管理员审核（非生僻条件不满足）\n"
+                        "1. dsjk — ✅ 推荐（空位）\n"
+                        "是否以编码 dsjk 将「龘季」加入草稿？"
+                    )
+                if text == "添加并提交" and len(self.events) == 1:
+                    self.events.append({
+                        "sequence": 2,
+                        "kind": "tool",
+                        "name": "keytao_submit_batch",
+                        "result": {
+                            "success": True,
+                            "batchId": "batch-obscure-control",
+                        },
+                    })
+                    return "✅ 龘季已加入草稿并提交审核"
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {"batchId": None, "contentVersion": 0, "items": []}
+
+            def attempt_events(self):
+                return list(self.events)
+
+        result = await scenario.execute(FakeContext())
+        self.assertEqual(result["facts"]["semanticBatchStatus"], "Approved")
+        self.assertFalse(result["facts"]["semanticNeedsManualReview"])
+        self.assertEqual(result["facts"]["obscureBatchStatus"], "Submitted")
+        self.assertTrue(result["facts"]["obscureNeedsManualReview"])
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module

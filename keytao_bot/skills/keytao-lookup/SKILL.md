@@ -287,7 +287,7 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 ⚠️ 关键规则：词条候选编码只能取 `candidateStatuses` / `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
 
-⚠️ 语境读音规则：当首次调用返回 `semanticPronunciationNeeded=true` 时，只有模型能明确说明该词含义/常见用法，才可再次调用 `keytao_encode(word="词", semantic_pinyin="完整逐字拼音", semantic_meaning="具体含义")`。只有模型读音与词组语境音逐字一致、每字属于已知读音，并且复算结果为 `pronunciationSource=llm-semantic`、`semanticPronunciationAccepted=true` 才可推荐；无法说明含义时必须把读音标为待核对。若 `standardPronunciationStatus=unavailable`，必须保留“权威查询暂不可用”的说明，候选需管理员复核，禁止声称“没有标准读音”。
+⚠️ 语境读音规则：当首次调用返回 `semanticPronunciationNeeded=true` 时，只有模型能明确说明该词含义/常见用法，才可再次调用 `keytao_encode(word="词", semantic_pinyin="完整逐字拼音", semantic_meaning="具体含义")`。只有模型读音与词组语境音逐字一致、每字属于已知读音，并且复算结果为 `pronunciationSource=llm-semantic`、`semanticPronunciationAccepted=true` 才可推荐；无法说明含义时必须把读音标为待核对。若 `standardPronunciationStatus=unavailable`，必须保留“权威查询暂不可用”的说明，候选需管理员复核，禁止声称“没有标准读音”。只有终局 `absent` 且审词模块明确给出 `semantic_context_common_word=PASS` 时，才可依据完整语义、逐字读音和离线非生僻证据自动通过；lookup 未完成不可走该通道。
 
 ⚠️ 声笔笔/CSS 关键规则：`CSS` / `CSSSingle` 条目属于键道6扩展短码表。例如 `fa`、`fao` 在声笔笔表中是短码位置，不应按普通词组音码拆成 `f + ao` 去否定词条。审核这类条目时只按 CSS 表、同码链顺序和常用度判断。
 

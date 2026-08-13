@@ -1155,6 +1155,8 @@ def _compact_audit_for_items(audit: Dict[str, Any], items: Sequence[ReviewItem])
             # silent disarm of exactly the same shape as the _extract_items bug.
             MANUAL_REVIEW_FIELD,
             MANUAL_REVIEW_REASON_FIELD,
+            "reviewDisposition",
+            "reviewVerdictSite",
             "structuredManualReviewIssues",
             "lookupFailed",
         )
@@ -1169,6 +1171,7 @@ def _compact_audit_for_items(audit: Dict[str, Any], items: Sequence[ReviewItem])
     }
     for key in (
         "commonKnownItems",
+        "semanticContextAutoPassItems",
         "wordPurposeReviews",
         "codeChainPriorityReviews",
         "commonnessComparisons",

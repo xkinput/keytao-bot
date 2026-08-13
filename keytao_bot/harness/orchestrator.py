@@ -1506,16 +1506,32 @@ class AgentOrchestrator:
                             phrase_type = "Phrase"
                         needs_manual_review = audit.get("autoApprove") is not True
                         issues = audit.get("issues") if isinstance(audit.get("issues"), list) else []
+                        semantic_basis = ""
+                        if not needs_manual_review and not audit.get("llmFallback"):
+                            semantic_items = [
+                                item
+                                for item in (
+                                    audit.get("semanticContextAutoPassItems") or []
+                                )
+                                if isinstance(item, dict)
+                            ]
+                            semantic_basis = str(
+                                semantic_items[0].get("basisLine")
+                                if semantic_items
+                                else ""
+                            ).strip()
                         reason = str(
                             next((value for value in issues if str(value).strip()), "")
+                            or semantic_basis
                             or audit.get("summary")
                             or "预审证据不足"
                         ).replace("\n", " ").strip()[:240]
-                        verdict = (
-                            f"自动审核：该词需管理员审核（{reason}）"
-                            if needs_manual_review
-                            else f"自动审核：该词可自动通过（{reason}）"
-                        )
+                        if needs_manual_review:
+                            verdict = f"自动审核：该词需管理员审核（{reason}）"
+                        elif semantic_basis:
+                            verdict = f"自动审核：{reason}"
+                        else:
+                            verdict = f"自动审核：该词可自动通过（{reason}）"
                         reviewed_items_by_key[(word, recommended_code)] = {
                             "type": phrase_type,
                             "remark": f"喵喵审词：{verdict}",

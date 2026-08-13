@@ -4076,7 +4076,17 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
 
     summary = str(audit.get("summary") or "").strip()
     if audit.get("autoApprove"):
-        if audit.get("llmFallback"):
+        semantic_items = [
+            item
+            for item in (audit.get("semanticContextAutoPassItems") or [])
+            if isinstance(item, dict)
+        ]
+        if semantic_items and not audit.get("llmFallback"):
+            basis_line = str(semantic_items[0].get("basisLine") or "").strip()
+            if basis_line:
+                return f"自动审核：{basis_line}"
+            reason = "语境读音、具体含义和非生僻证据一致"
+        elif audit.get("llmFallback"):
             reason = "语言常识、读音、编码和同码链检查一致"
         elif audit.get("commonKnownItems"):
             common_item = _common_known_item_for_code(review, recommended_code)
@@ -6780,6 +6790,11 @@ def _format_auto_approved_review_line(auto_review: Optional[Dict]) -> str:
     """Describe why an auto-approved batch passed without overstating source certainty."""
     if isinstance(auto_review, dict):
         summary = _clean_review_audit_reason(str(auto_review.get("summary") or ""))
+        if (
+            auto_review.get("semanticContextAutoPassItems")
+            and not auto_review.get("llmFallback")
+        ):
+            return "本喵审核：语境读音、具体含义、非生僻证据和编码候选链检查通过。"
         if auto_review.get("llmFallback"):
             return "本喵审核：语言常识、读音、编码和同码链检查通过。"
         if auto_review.get("commonKnownItems"):
