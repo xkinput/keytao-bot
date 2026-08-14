@@ -9228,7 +9228,7 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 
 1. 消息处理
    • 只处理标有 [当前请求] 的消息
-   • 带时间标签 [Xm ago] 的是历史记录，不要重复处理
+   • 位于 [当前请求] 之前的消息均为历史记录，不要重复处理
    • 带 [系统提示] 标签的指令必须严格执行
 
 2. 必须调用工具（绝不凭记忆回答编码问题）
@@ -9419,8 +9419,8 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
 SYSTEM_PROMPT_CORE += "\n\n" + pending_confirmation_prompt_instruction()
 
 
-def representative_system_prompt_chars() -> int:
-    """Return a stable assembled prompt size for hourly trend comparison."""
+def representative_system_prompt() -> str:
+    """Return the stable system-prompt layout used for cache guards."""
     context = AgentRequestContext(
         platform="qq",
         user_id="0",
@@ -9432,11 +9432,16 @@ def representative_system_prompt_chars() -> int:
         "QQ",
         context,
     )
-    return len(
+    return (
         SYSTEM_PROMPT_CORE
         + skills_manager.get_skill_instructions()
         + platform_context
     )
+
+
+def representative_system_prompt_chars() -> int:
+    """Return a stable assembled prompt size for hourly trend comparison."""
+    return len(representative_system_prompt())
 
 
 # ---------------------------------------------------------------------------

@@ -2631,13 +2631,6 @@ async def prepare_reviewed_word(
         "requiresManualPronunciationReview": requires_manual_pronunciation_review,
         "standardPronunciationStatus": standard_status,
         "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
-        "sourcePolicy": {
-            "acceptedSources": [
-                {key: source[key] for key in ("id", "label", "domain", "category", "trust")}
-                for source in ACCEPTED_PRONUNCIATION_SOURCES
-            ],
-            "reviewSignalWeights": REVIEW_SIGNAL_WEIGHTS,
-        },
     }
     if lookup_failed:
         result["lookupFailureReason"] = LOOKUP_FAILURE_REASON

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -323,6 +324,38 @@ def test_skills_loader_hardening():
         )
 
 
+def test_skills_loader_order_is_deterministic():
+    print("\n🧪 skills loader order is deterministic")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_skill(
+            root,
+            "skill_zeta",
+            _TOOLS_TEMPLATE.format(tool_name="zeta_tool", skill_name="skill_zeta"),
+        )
+        _write_skill(
+            root,
+            "skill_alpha",
+            _TOOLS_TEMPLATE.format(tool_name="alpha_tool", skill_name="skill_alpha"),
+        )
+
+        manager = SkillsManager(skills_dir=str(root))
+        discovered = [root / "skill_zeta", root / "skill_alpha"]
+        with patch.object(Path, "iterdir", return_value=iter(discovered)):
+            manager.load_all_skills()
+
+        check(
+            "skill block follows name-sorted directory order",
+            list(manager.skill_docs) == ["skill_alpha", "skill_zeta"],
+        )
+        check(
+            "tool registration follows the same deterministic skill order",
+            [tool["function"]["name"] for tool in manager.get_tools()]
+            == ["alpha_tool", "zeta_tool"],
+        )
+
+
 # ---------------------------------------------------------------------------
 # 29. shared group broadcast helper
 # ---------------------------------------------------------------------------
@@ -460,6 +493,7 @@ def main():
     test_path_segment_validation()
     test_remove_draft_item_rejects_unsafe_pr_id()
     test_skills_loader_hardening()
+    test_skills_loader_order_is_deterministic()
     test_group_notification_helper()
     test_item_code_validation_scope()
 

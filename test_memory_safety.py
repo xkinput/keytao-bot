@@ -10,6 +10,7 @@ import types
 import unittest
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault(
@@ -10052,7 +10053,105 @@ class TrustedBatchAnchorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
-    async def test_read_only_turn_offers_no_write_tools(self) -> None:
+    async def test_history_bytes_are_stable_and_age_is_on_current_request_tail(self) -> None:
+        client = _FakeClient([_fake_response("stop", "好的。")])
+
+        async def never(**kwargs):
+            raise AssertionError("no tool call expected")
+
+        await _shift_orchestrator(client, never).run(
+            "继续刚才的话题",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=False,
+                history=[{
+                    "role": "user",
+                    "content": "历史原文保持不变",
+                    "timestamp": (
+                        datetime.now(timezone.utc) - timedelta(hours=2)
+                    ).isoformat(),
+                }],
+            ),
+        )
+
+        messages = client.completions.calls[0]["messages"]
+        history_message = next(
+            item for item in messages
+            if item.get("content") == "历史原文保持不变"
+        )
+        current_request = next(
+            item for item in messages
+            if str(item.get("content") or "").startswith("[当前请求]")
+        )
+
+        self.assertEqual(history_message["content"], "历史原文保持不变")
+        self.assertNotRegex(history_message["content"], r"^\[\d+[smhd] ago\]")
+        self.assertTrue(
+            current_request["content"].endswith(
+                "（历史跨度：最早一条约2小时前）"
+            )
+        )
+
+    async def test_tool_array_is_canonical_and_sorted_across_turn_shapes(self) -> None:
+        cases = [
+            ("现在草稿里有什么？", False),
+            ("把吃席的编码放在赤溪前面", False),
+            ("顺延「吃席」到 wkxk", True),
+        ]
+        arrays = []
+
+        async def never(**kwargs):
+            raise AssertionError("no tool call expected")
+
+        for message, mutations_allowed in cases:
+            client = _FakeClient([_fake_response("stop", "好的。")])
+            await _shift_orchestrator(client, never).run(
+                message,
+                AgentRequestContext(
+                    platform="qq",
+                    user_id="user-1",
+                    mutations_allowed=mutations_allowed,
+                ),
+            )
+            arrays.append([
+                tool["function"]["name"]
+                for tool in client.completions.calls[0].get("tools", [])
+            ])
+
+        self.assertEqual(arrays[0], sorted(arrays[0]))
+        self.assertEqual(arrays[1:], [arrays[0], arrays[0]])
+        self.assertEqual(
+            arrays[0],
+            ["keytao_list_draft_items", "keytao_shift_phrase_code"],
+        )
+
+    async def test_mutating_call_on_read_only_turn_is_rejected_at_sink(self) -> None:
+        delivered = []
+
+        async def shift(**kwargs):
+            delivered.append(kwargs)
+            return {"success": True}
+
+        executor = ToolExecutor(
+            lambda name: shift if name == "keytao_shift_phrase_code" else None,
+            frozenset({"keytao_shift_phrase_code"}),
+        )
+        raw = await executor.call(
+            "keytao_shift_phrase_code",
+            {"word": "吃席", "target_code": "wkxk"},
+            ToolContext(
+                current_message="顺延「吃席」到 wkxk",
+                writes_allowed=False,
+            ),
+        )
+        payload = __import__("json").loads(raw)
+
+        self.assertTrue(payload.get("policyBlocked"))
+        self.assertEqual(payload.get("blockReason"), "verb_not_matched")
+        self.assertEqual(delivered, [])
+
+    async def test_read_only_turn_offers_the_canonical_tool_array(self) -> None:
         client = _FakeClient([_fake_response("stop", "草稿里有 2 条。")])
 
         async def never(**kwargs):
@@ -10071,8 +10170,9 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
             tool["function"]["name"]
             for tool in client.completions.calls[0].get("tools", [])
         }
-        self.assertNotIn("keytao_shift_phrase_code", offered)
+        self.assertIn("keytao_shift_phrase_code", offered)
         self.assertIn("keytao_list_draft_items", offered)
+        self.assertNotIn("keytao_request_write_authorization", offered)
 
     async def test_write_turn_still_offers_write_tools(self) -> None:
         client = _FakeClient([_fake_response("stop", "好的。")])
@@ -10196,17 +10296,17 @@ class ReadOnlyAuthorizationRequestTests(unittest.IsolatedAsyncioTestCase):
         )
         return client, result
 
-    async def test_change_request_turn_offers_the_authorization_tool(self) -> None:
+    async def test_change_request_turn_keeps_the_canonical_tool_array(self) -> None:
         client, _ = await self._run_turn("把吃席的编码放在赤溪前面")
 
         offered = {
             tool["function"]["name"]
             for tool in client.completions.calls[0].get("tools", [])
         }
-        self.assertIn("keytao_request_write_authorization", offered)
-        self.assertNotIn("keytao_shift_phrase_code", offered)
+        self.assertNotIn("keytao_request_write_authorization", offered)
+        self.assertIn("keytao_shift_phrase_code", offered)
 
-    async def test_question_turn_offers_no_authorization_tool(self) -> None:
+    async def test_question_turn_keeps_the_canonical_tool_array(self) -> None:
         client, _ = await self._run_turn("吃席到底怎么打 wkxk")
 
         offered = {
@@ -10214,7 +10314,7 @@ class ReadOnlyAuthorizationRequestTests(unittest.IsolatedAsyncioTestCase):
             for tool in client.completions.calls[0].get("tools", [])
         }
         self.assertNotIn("keytao_request_write_authorization", offered)
-        self.assertNotIn("keytao_shift_phrase_code", offered)
+        self.assertIn("keytao_shift_phrase_code", offered)
 
     async def test_authorization_tool_returns_a_self_checked_command(self) -> None:
         client, _ = await self._run_turn(

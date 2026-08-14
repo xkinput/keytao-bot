@@ -9,6 +9,7 @@ test_state_machine.py does it, before anything from keytao_bot is imported.
 """
 import asyncio
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -657,8 +658,8 @@ def test_history_store_round_trips_utc_timestamps():
     check("empty timestamps parse to None", _parse_stored_timestamp("") is None)
 
 
-def test_orchestrator_relative_time_has_no_skew():
-    print("\n[timezone] orchestrator relative time has no skew")
+def test_orchestrator_history_cache_layout_and_span():
+    print("\n[timezone] orchestrator history cache layout and span")
 
     orchestrator = AgentOrchestrator(
         client_factory=lambda: None,
@@ -688,12 +689,18 @@ def test_orchestrator_relative_time_has_no_skew():
     ]
     messages = []
     orchestrator._append_history(messages, history)
+    span = orchestrator._history_span_annotation(history)
 
-    check("fresh message is labelled 0s ago", messages[0]["content"].startswith("[0s ago]"))
-    check("two-hour-old message is labelled 2h ago", messages[1]["content"].startswith("[2h ago]"))
-    check("legacy naive timestamp is also 2h ago", messages[2]["content"].startswith("[2h ago]"))
-    check("unparseable timestamp drops the label", messages[3]["content"] == "坏时间戳")
-    check("assistant messages keep no relative label", messages[4]["content"] == "助手不带时间标签")
+    check(
+        "representative history messages retain byte-stable content",
+        [message["content"] for message in messages]
+        == [message["content"] for message in history],
+    )
+    check("history carries no volatile age prefix", all(
+        re.match(r"^\[\d+[smhd] ago\]", message["content"]) is None
+        for message in messages
+    ))
+    check("history span is moved to one coarse tail annotation", span == "（历史跨度：最早一条约2小时前）")
 
 
 
@@ -802,7 +809,7 @@ if __name__ == "__main__":
     test_replace_char_caps_generated_items()
 
     test_history_store_round_trips_utc_timestamps()
-    test_orchestrator_relative_time_has_no_skew()
+    test_orchestrator_history_cache_layout_and_span()
 
     print("=" * 60)
     print(f"Results: {passed}/{passed + failed} passed, {failed} failed")

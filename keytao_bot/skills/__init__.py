@@ -38,7 +38,7 @@ class SkillsManager:
             logger.warning(f"Skills directory not found: {self.skills_dir}")
             return
         
-        for skill_path in self.skills_dir.iterdir():
+        for skill_path in sorted(self.skills_dir.iterdir(), key=lambda path: path.name):
             if skill_path.is_dir() and not skill_path.name.startswith('.'):
                 self.load_skill(skill_path)
     

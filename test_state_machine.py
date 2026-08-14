@@ -1309,7 +1309,7 @@ def test_pending_add_word_guidance_fallback_matcher():
     check("fallback appends guidance", "原词 重新编码" in guided)
 
 
-# Measured representative assembled prompt: 42,564 chars on 2026-08-12.
+# Measured representative assembled prompt: 42,940 chars on 2026-08-14.
 # Raise this only after reviewing the prompt/skill diff; update the measured
 # value and date here, then preserve roughly 10 percent intentional headroom.
 SYSTEM_PROMPT_GROWTH_LIMIT_CHARS = 46_700
@@ -1319,6 +1319,18 @@ def test_system_prompt_growth_guard():
     print("\n🧪 system prompt growth guard")
     actual = openai_chat_module.representative_system_prompt_chars()
     check("representative prompt stays below the growth limit", actual <= SYSTEM_PROMPT_GROWTH_LIMIT_CHARS)
+
+
+def test_system_prompt_cache_layout_keeps_platform_context_last():
+    print("\n🧪 system prompt cache layout keeps platform context last")
+    skills = openai_chat_module.skills_manager.get_skill_instructions()
+    prompt = openai_chat_module.representative_system_prompt()
+    platform_offset = prompt.index("【当前平台】")
+
+    check(
+        "platform context starts after every static prompt segment",
+        platform_offset > len(SYSTEM_PROMPT_CORE) + len(skills),
+    )
 
 
 def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs():
@@ -13829,6 +13841,7 @@ if __name__ == "__main__":
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
     test_system_prompt_growth_guard()
+    test_system_prompt_cache_layout_keeps_platform_context_last()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()
     test_extract_pure_chinese_words()
     test_parse_simple_word_query_intent_payload()

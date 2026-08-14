@@ -2068,6 +2068,10 @@ def test_s14_wrong_entry_pronunciation_never_reaches_candidates():
         }
         check("S14 rejects the poisoned guang syllable", "guang" not in syllables)
         check(
+            "prepare result drops the constant source policy payload",
+            "sourcePolicy" not in review,
+        )
+        check(
             "S14 rejects every poisoned gxmm candidate",
             not any(code.startswith("gxmm") for code in codes),
         )
