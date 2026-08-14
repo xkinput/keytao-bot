@@ -3,7 +3,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from nonebot.log import logger
 
@@ -26,6 +26,10 @@ except ImportError:  # pragma: no cover
 
 
 MAX_BATCH_ITEMS = 200
+MODEL_TOOL_RESULT_RAW_DECISION_THRESHOLD_CHARS = 4_000
+MODEL_TOOL_RESULT_MAX_BATCH_ITEMS = 40
+MODEL_TOOL_RESULT_MAX_REMARK_CHARS = 80
+MODEL_TOOL_RESULT_MAX_DIFF_CHARS = 6_000
 _BATCH_LIST_ARGUMENTS = {
     "keytao_batch_add_to_draft": "items",
     "keytao_audit_draft_items": "items",
@@ -43,6 +47,470 @@ _JSON_TYPE_MAP = {
 _MAX_REPORTED_ERRORS = 5
 _FALLBACK_MAX_DEPTH = 3
 _missing_jsonschema_warned = False
+
+
+@dataclass(frozen=True)
+class ModelToolResultProjection:
+    """One model-only result projection and its reviewable size budget."""
+
+    max_chars: int
+    projector: Callable[[Mapping[str, Any]], Dict[str, Any]]
+
+
+def _present_fields(payload: Mapping[str, Any], names: Tuple[str, ...]) -> Dict[str, Any]:
+    return {name: payload[name] for name in names if name in payload}
+
+
+def _short_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _compact_phrase_row(value: Any, *, code: str = "") -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    row = _present_fields(value, ("word", "code", "type", "weight"))
+    if code and not row.get("code"):
+        row["code"] = code
+    return row
+
+
+def _compact_phrase_rows(values: Any, *, code: str = "", limit: int = 40) -> List[Dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for value in values[:limit]:
+        row = _compact_phrase_row(value, code=code)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
+def _compact_candidate_statuses(values: Any, *, limit: int = 40) -> List[Dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    statuses: List[Dict[str, Any]] = []
+    for value in values[:limit]:
+        if not isinstance(value, Mapping):
+            continue
+        status = _present_fields(value, ("code", "occupied", "label"))
+        words = [
+            str(word).strip()
+            for word in value.get("words", [])
+            if str(word).strip()
+        ] if isinstance(value.get("words"), list) else []
+        if not words:
+            words = [
+                str(phrase.get("word") or "").strip()
+                for phrase in value.get("phrases", [])
+                if isinstance(phrase, Mapping)
+                and str(phrase.get("word") or "").strip()
+            ] if isinstance(value.get("phrases"), list) else []
+        if words:
+            status["words"] = words[:8]
+        statuses.append(status)
+    return statuses
+
+
+def _compact_sources(values: Any) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    names: List[str] = []
+    for value in values:
+        name = (
+            str(value.get("source") or value.get("label") or "").strip()
+            if isinstance(value, Mapping)
+            else str(value or "").strip()
+        )
+        if name and name not in names:
+            names.append(name)
+    return names[:6]
+
+
+def _compact_review_audit(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    audit = _present_fields(value, (
+        "success",
+        "verdict",
+        "autoApprove",
+        "needsManualReview",
+        "manualReviewReason",
+        "reviewDisposition",
+        "reviewVerdictSite",
+        "auditSealed",
+        "llmFallback",
+        "previewOnly",
+    ))
+    for name, limit in (("summary", 240), ("warning", 180)):
+        if name in value:
+            audit[name] = _short_text(value.get(name), limit)
+    for name in ("issues", "structuredManualReviewIssues"):
+        if isinstance(value.get(name), list):
+            audit[name] = [_short_text(item, 180) for item in value[name][:6]]
+    for name in ("commonKnownItems", "semanticContextAutoPassItems"):
+        if isinstance(value.get(name), list):
+            audit[name] = [
+                _present_fields(item, ("word", "code", "basisLine"))
+                for item in value[name][:6]
+                if isinstance(item, Mapping)
+            ]
+    return audit
+
+
+def _compact_warning(value: Any) -> Any:
+    if isinstance(value, str):
+        return _short_text(value, 200)
+    if not isinstance(value, Mapping):
+        return _short_text(value, 200)
+    warning = _present_fields(value, (
+        "type", "code", "word", "occupantWord", "occupantCode", "verdict",
+    ))
+    for name in ("message", "reason", "summary", "impact", "basisLine"):
+        if name in value:
+            warning[name] = _short_text(value.get(name), 200)
+    return warning
+
+
+def _project_reviewed_add(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    result = _present_fields(payload, (
+        "success",
+        "word",
+        "recommendedCode",
+        "autoReviewable",
+        "autoReviewReason",
+        "lookupFailed",
+        "lookupFailureReason",
+        "pronunciationEvidenceStatus",
+        "pronunciationEvidenceComplete",
+        "requiresManualPronunciationReview",
+        "standardPronunciationStatus",
+        "pronunciationUnresolved",
+        "needsManualReview",
+        "manualReviewReason",
+        "reviewDisposition",
+        "reviewVerdictSite",
+        "message",
+    ))
+    existing = _compact_phrase_rows(payload.get("existing"), limit=20)
+    if existing:
+        result["existing"] = existing
+
+    pronunciations: List[Dict[str, Any]] = []
+    raw_pronunciations = payload.get("pronunciations")
+    if isinstance(raw_pronunciations, list):
+        for value in raw_pronunciations[:8]:
+            if not isinstance(value, Mapping):
+                continue
+            pronunciation = _present_fields(value, (
+                "pinyin",
+                "normalized",
+                "codes",
+                "recommendedCode",
+                "fallback",
+                "semanticPronunciation",
+                "semanticPronunciationAccepted",
+                "requiresManualReview",
+                "readingEvidenceKind",
+            ))
+            source_names = _compact_sources(value.get("sources"))
+            if source_names:
+                pronunciation["sourceNames"] = source_names
+            if value.get("sourceSummary"):
+                pronunciation["sourceSummary"] = _short_text(
+                    value.get("sourceSummary"),
+                    180,
+                )
+            context = value.get("contextPronunciation")
+            if isinstance(context, Mapping):
+                pronunciation["contextPronunciation"] = {
+                    **_present_fields(context, (
+                        "entityType", "label", "confidence", "method", "commonTransparent",
+                    )),
+                    **({"description": _short_text(context.get("description"), 180)}
+                       if context.get("description") else {}),
+                }
+            readings = value.get("characterReadings")
+            if isinstance(readings, list):
+                pronunciation["characterReadings"] = [
+                    _present_fields(reading, ("char", "chosenPinyin", "lookupStatus"))
+                    for reading in readings[:16]
+                    if isinstance(reading, Mapping)
+                ]
+            statuses = _compact_candidate_statuses(value.get("candidateStatuses"))
+            if statuses or "candidateStatuses" in value:
+                pronunciation["candidateStatuses"] = statuses
+            pronunciations.append(pronunciation)
+    result["pronunciations"] = pronunciations
+
+    audit = _compact_review_audit(payload.get("preSubmitAudit"))
+    if audit is not None:
+        result["preSubmitAudit"] = audit
+    assessments = payload.get("candidateOrderingAssessments")
+    if isinstance(assessments, list):
+        result["candidateOrderingAssessments"] = [
+            _compact_warning(value) for value in assessments[:8]
+        ]
+    for name in ("warning", "warnings", "auditLines", "warningLines"):
+        value = payload.get(name)
+        if isinstance(value, list):
+            result[name] = [_compact_warning(item) for item in value[:8]]
+        elif value:
+            result[name] = _compact_warning(value)
+    return result
+
+
+def _compact_code_variants(values: Any, *, limit: int = 16) -> List[Dict[str, Any]]:
+    if not isinstance(values, list):
+        return []
+    return [
+        _present_fields(value, (
+            "char", "charIndex", "pinyin", "pinyinLabel", "phoneticCode",
+            "isDefault", "recommendedCode", "codes",
+        ))
+        for value in values[:limit]
+        if isinstance(value, Mapping)
+    ]
+
+
+def _project_encode(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    result = _present_fields(payload, (
+        "success",
+        "input",
+        "word",
+        "type",
+        "baseCode",
+        "recommendedCode",
+        "candidateCodes",
+        "codes",
+        "altCodes",
+        "requestedCandidateCodes",
+        "codeSource",
+        "pronunciationSource",
+        "standardPronunciationStatus",
+        "phrasePinyins",
+        "contextPhrasePinyins",
+        "semanticPronunciationNeeded",
+        "semanticPronunciationAccepted",
+        "occupancyChecked",
+        "firstAvailableCode",
+        "firstRequestedAvailableCode",
+        "occupancyError",
+        "suggestion",
+        "suggestionIndex",
+        "isBaseConflict",
+        "wordExists",
+        "message",
+    ))
+    chars = payload.get("chars")
+    if isinstance(chars, list):
+        result["chars"] = [
+            _present_fields(value, (
+                "char", "pinyin", "pinyins", "phoneticCode", "c1", "c2", "shapeCode",
+            ))
+            for value in chars[:64]
+            if isinstance(value, Mapping)
+        ]
+        if len(chars) > 64:
+            result["charsTruncationNotice"] = (
+                f"「…另有 {len(chars) - 64} 字」模型可见拆分已截断"
+            )
+    statuses = _compact_candidate_statuses(payload.get("candidateStatuses"))
+    if statuses or "candidateStatuses" in payload:
+        result["candidateStatuses"] = statuses
+    for name in ("alternatePronunciationCodes", "alternatePhrasePronunciationCodes"):
+        values = _compact_code_variants(payload.get(name))
+        if values or name in payload:
+            result[name] = values
+    if isinstance(payload.get("flyKeyVariants"), list):
+        result["flyKeyVariants"] = payload["flyKeyVariants"][:16]
+    if isinstance(payload.get("requestedCodeAnalysis"), Mapping):
+        result["requestedCodeAnalysis"] = dict(payload["requestedCodeAnalysis"])
+    groups = payload.get("candidateDisplayGroups")
+    if isinstance(groups, list):
+        result["candidateDisplayGroups"] = [
+            {
+                **_present_fields(group, (
+                    "pinyin", "pinyinLabel", "phoneticCode", "isDefault", "recommendedCode",
+                )),
+                "items": [
+                    _present_fields(item, (
+                        "code", "displayLabel", "state", "recommended", "occupied", "words",
+                    ))
+                    for item in group.get("items", [])[:16]
+                    if isinstance(item, Mapping)
+                ],
+            }
+            for group in groups[:8]
+            if isinstance(group, Mapping)
+        ]
+    return result
+
+
+def _compact_draft_item(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    item = _present_fields(value, (
+        "id", "action", "word", "oldWord", "code", "type", "type_label",
+        "display_label", "weight", "needsManualReview",
+    ))
+    if "remark" in value:
+        item["remark"] = _short_text(value.get("remark"), MODEL_TOOL_RESULT_MAX_REMARK_CHARS)
+    if value.get("warning"):
+        item["warning"] = _short_text(value.get("warning"), 80)
+    conflict = value.get("conflictInfo")
+    if isinstance(conflict, Mapping) and conflict.get("impact"):
+        item["conflictInfo"] = {
+            "impact": _short_text(conflict.get("impact"), 80),
+        }
+    return item
+
+
+def _project_draft_listing(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    result = _present_fields(payload, (
+        "success", "batchId", "batchUrl", "count", "summary", "message",
+    ))
+    values = payload.get("items")
+    if isinstance(values, list):
+        items = [
+            item
+            for value in values[:MODEL_TOOL_RESULT_MAX_BATCH_ITEMS]
+            if (item := _compact_draft_item(value)) is not None
+        ]
+        result["items"] = items
+        if len(values) > len(items):
+            remaining = len(values) - len(items)
+            result["itemsTruncated"] = True
+            result["itemsTruncationNotice"] = (
+                f"「…另有 {remaining} 条」模型可见列表已截断；"
+                "不得据此判断完整条目集合"
+            )
+    return result
+
+
+def _project_batch_preview(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    result = _project_draft_listing(payload)
+    diff_text = payload.get("diff_text")
+    if isinstance(diff_text, str):
+        if len(diff_text) <= MODEL_TOOL_RESULT_MAX_DIFF_CHARS:
+            result["diff_text"] = diff_text
+        else:
+            result["diff_text"] = (
+                diff_text[:MODEL_TOOL_RESULT_MAX_DIFF_CHARS].rstrip()
+                + "\n…（模型可见 diff 已截断，完整预览仍由程序保留）"
+            )
+            result["diffTruncated"] = True
+            result["diffTruncationNotice"] = (
+                "模型可见 diff 不完整，不得据此判断完整条目集合"
+            )
+    return result
+
+
+def _compact_duplicate_info(value: Any, *, code: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, Mapping):
+        return None
+    info = _present_fields(value, ("position", "position_label"))
+    rows = _compact_phrase_rows(value.get("all_words"), code=code, limit=40)
+    if rows:
+        info["all_words"] = rows
+    return info or None
+
+
+def _project_lookup_result(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    def project_one(value: Mapping[str, Any]) -> Dict[str, Any]:
+        entry = _present_fields(value, ("success", "word", "code", "count"))
+        phrases: List[Dict[str, Any]] = []
+        raw_phrases = value.get("phrases")
+        if isinstance(raw_phrases, list):
+            for raw_phrase in raw_phrases[:100]:
+                phrase = _compact_phrase_row(raw_phrase)
+                if phrase is None:
+                    continue
+                duplicate = _compact_duplicate_info(
+                    raw_phrase.get("duplicate_info") if isinstance(raw_phrase, Mapping) else None,
+                    code=str(phrase.get("code") or entry.get("code") or ""),
+                )
+                if duplicate is not None:
+                    phrase["duplicate_info"] = duplicate
+                phrases.append(phrase)
+            entry["phrases"] = phrases
+        return entry
+
+    result = project_one(payload)
+    raw_results = payload.get("results")
+    if isinstance(raw_results, list):
+        result["results"] = [
+            project_one(value)
+            for value in raw_results[:100]
+            if isinstance(value, Mapping)
+        ]
+    return result
+
+
+MODEL_TOOL_RESULT_PROJECTIONS = {
+    "keytao_prepare_reviewed_add": ModelToolResultProjection(3_500, _project_reviewed_add),
+    "keytao_encode": ModelToolResultProjection(6_000, _project_encode),
+    "keytao_list_draft_items": ModelToolResultProjection(12_500, _project_draft_listing),
+    "keytao_get_batch_preview": ModelToolResultProjection(8_000, _project_batch_preview),
+    "keytao_lookup_by_word": ModelToolResultProjection(8_000, _project_lookup_result),
+    "keytao_lookup_by_words_batch": ModelToolResultProjection(16_000, _project_lookup_result),
+    "keytao_lookup_by_code": ModelToolResultProjection(8_000, _project_lookup_result),
+    "keytao_lookup_by_codes_batch": ModelToolResultProjection(16_000, _project_lookup_result),
+}
+
+# These tools intentionally remain full-fidelity for the model. Mutations carry
+# server tickets/warnings, while docs and web results are explicitly deferred
+# content features; a future large-result guard must treat them as reviewed.
+MODEL_TOOL_RESULT_LARGE_RAW_WHITELIST = frozenset({
+    "keytao_fetch_docs",
+    "keytao_create_phrase",
+    "keytao_submit_batch",
+    "keytao_remove_draft_item",
+    "keytao_update_draft_item_weight",
+    "keytao_batch_add_to_draft",
+    "keytao_shift_phrase_code",
+    "keytao_batch_remove_draft_items",
+    "keytao_recall_batch",
+    "keytao_audit_draft_items",
+    "web_search",
+    "web_fetch",
+})
+MODEL_TOOL_RESULT_SMALL_RAW_WHITELIST = frozenset({
+    "get_current_datetime",
+})
+
+
+def project_tool_result_for_model(tool_name: str, result_json: str) -> str:
+    """Project only the copy serialized into a model ``tool`` message."""
+    projection = MODEL_TOOL_RESULT_PROJECTIONS.get(tool_name)
+    if projection is None:
+        return result_json
+    try:
+        payload = json.loads(result_json)
+    except (TypeError, ValueError):
+        return result_json
+    if not isinstance(payload, Mapping):
+        return result_json
+    if (
+        payload.get("success") is False
+        or payload.get("policyBlocked") is True
+        or "error" in payload
+    ):
+        return result_json
+    projected = projection.projector(payload)
+    return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+
+
+def large_model_tool_result_has_policy(tool_name: str, result_json: str) -> bool:
+    """Tell guard tests whether a large raw result received an explicit decision."""
+    return (
+        len(result_json) <= MODEL_TOOL_RESULT_RAW_DECISION_THRESHOLD_CHARS
+        or tool_name in MODEL_TOOL_RESULT_PROJECTIONS
+        or tool_name in MODEL_TOOL_RESULT_LARGE_RAW_WHITELIST
+        or tool_name in MODEL_TOOL_RESULT_SMALL_RAW_WHITELIST
+    )
 
 _STAGED_ARGUMENT_LABELS = {
     "action": "动作",

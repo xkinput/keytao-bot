@@ -2,6 +2,7 @@
 """Focused regression tests for conversation and memory isolation."""
 
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -8074,6 +8075,97 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 "approvedItems": [] if needs_review else [word],
             },
         }
+
+    async def test_model_projection_keeps_internal_review_result_full_fidelity(
+        self,
+    ) -> None:
+        """Only the tool message is compacted; receipts retain the raw fact set."""
+        raw_result = self._reviewed_candidate("载流", "zhlq", needs_review=True)
+        raw_result["pronunciations"] = [{
+            "pinyin": "zai liu",
+            "codes": ["zhlq"],
+            "recommendedCode": "zhlq",
+            "sources": [{
+                "source": "汉典",
+                "url": "https://example.test/zailiu",
+                "rawEvidence": "full-fidelity-only",
+            }],
+            "characterReadings": [{
+                "char": "载",
+                "chosenPinyin": "zai",
+                "knownReadings": ["zai", "zai4"],
+                "lookupStatus": "found",
+            }],
+            "candidateStatuses": [{
+                "code": "zhlq",
+                "occupied": False,
+                "label": "空位",
+                "phrases": [],
+            }],
+        }]
+        recorded = []
+
+        def record_receipt(_context, _name, _arguments, result, _receipt_id):
+            recorded.append(result)
+
+        async def dispatch(**_kwargs):
+            return raw_result
+
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-review-projection",
+                    "keytao_prepare_reviewed_add",
+                    {"word": "载流"},
+                )],
+            ),
+            _fake_response("stop", "done"),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_ReviewedCreateSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: dispatch if name == "keytao_prepare_reviewed_add" else None,
+                frozenset({"keytao_prepare_reviewed_add"}),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+            tool_receipt_recorder=record_receipt,
+        )
+
+        result = await orchestrator.run(
+            "加词 载流",
+            AgentRequestContext(
+                platform="qq",
+                user_id="projection-owner",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(result, "done")
+        self.assertEqual(
+            recorded[0]["pronunciations"][0]["sources"][0]["rawEvidence"],
+            "full-fidelity-only",
+        )
+        model_messages = client.completions.calls[1]["messages"]
+        tool_payload = json.loads(next(
+            message["content"]
+            for message in model_messages
+            if message.get("role") == "tool"
+        ))
+        self.assertEqual(
+            tool_payload["pronunciations"][0]["sourceNames"],
+            ["汉典"],
+        )
+        self.assertNotIn("sources", tool_payload["pronunciations"][0])
 
     async def test_advertised_candidate_reply_persists_sealed_live_batch_ticket(
         self,

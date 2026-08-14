@@ -188,9 +188,14 @@ from keytao_bot.harness.state import (
 )
 from keytao_bot.harness.conversation import ConversationAddress
 from keytao_bot.harness.tools import (
+    MODEL_TOOL_RESULT_LARGE_RAW_WHITELIST,
+    MODEL_TOOL_RESULT_PROJECTIONS,
+    MODEL_TOOL_RESULT_SMALL_RAW_WHITELIST,
     ToolContext,
     ToolExecutor,
     _COMMAND_LEAD_IN_PREFIXES,
+    large_model_tool_result_has_policy,
+    project_tool_result_for_model,
 )
 from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
 from keytao_bot.utils.history_store import HistoryStore
@@ -207,6 +212,7 @@ from keytao_bot.utils.observability import (
     observe_model_call,
     observe_tool_call,
     record_history_messages,
+    record_model_tool_result_chars,
     set_turn_flow,
 )
 import keytao_bot.plugins.openai_chat as openai_chat_module
@@ -1309,10 +1315,268 @@ def test_pending_add_word_guidance_fallback_matcher():
     check("fallback appends guidance", "原词 重新编码" in guided)
 
 
-# Measured representative assembled prompt: 42,940 chars on 2026-08-14.
+# Measured representative assembled prompt: 35,679 chars on 2026-08-15.
 # Raise this only after reviewing the prompt/skill diff; update the measured
 # value and date here, then preserve roughly 10 percent intentional headroom.
-SYSTEM_PROMPT_GROWTH_LIMIT_CHARS = 46_700
+SYSTEM_PROMPT_GROWTH_LIMIT_CHARS = 39_300
+
+
+def _model_tool_projection_fixtures():
+    review_statuses = [
+        {
+            "code": f"eefi{'a' * index}",
+            "occupied": index % 2 == 0,
+            "label": "已有「慑服」" if index % 2 == 0 else "空位",
+            "phrases": [
+                {
+                    "word": "慑服",
+                    "code": f"eefi{'a' * index}",
+                    "type": "Phrase",
+                    "weight": 100,
+                    "duplicateAnalysis": "verbose " * 30,
+                },
+            ],
+        }
+        for index in range(8)
+    ]
+    reviewed_add = {
+        "success": True,
+        "word": "射覆",
+        "existing": [{"word": "射覆", "code": "eefj", "type": "Phrase", "weight": 101}],
+        "recommendedCode": "eefju",
+        "autoReviewable": False,
+        "autoReviewReason": "权威来源与候选编码已核对，仍需管理员复核",
+        "needsManualReview": True,
+        "manualReviewReason": "候选顺序需要管理员复核",
+        "reviewDisposition": "SEAL",
+        "reviewVerdictSite": "code_chain_priority",
+        "pronunciations": [{
+            "pinyin": "she fu",
+            "normalized": ["she", "fu"],
+            "codes": [item["code"] for item in review_statuses],
+            "recommendedCode": "eefju",
+            "sources": [
+                {
+                    "source": "汉典",
+                    "url": "https://example.test/" + "evidence/" * 100,
+                    "rawHtml": "source payload " * 100,
+                },
+            ],
+            "sourceSummary": "汉典整词读音",
+            "requiresManualReview": False,
+            "semanticPronunciation": False,
+            "characterReadings": [
+                {
+                    "char": char,
+                    "chosenPinyin": pinyin,
+                    "knownReadings": [pinyin, pinyin + "i", pinyin + "u"],
+                    "lookupStatus": "found",
+                    "sourceOutcomes": ["verbose evidence " * 80],
+                }
+                for char, pinyin in (("射", "she"), ("覆", "fu"))
+            ],
+            "candidateStatuses": review_statuses,
+        }],
+        "preSubmitAudit": {
+            "success": True,
+            "verdict": "needs_admin",
+            "autoApprove": False,
+            "summary": "候选顺序需要管理员复核",
+            "issues": ["同码链顺序仍需确认"],
+            "reviewedWords": {"射覆@Phrase": {"rawEvidence": "audit " * 500}},
+        },
+        "candidateOrderingAssessments": [{
+            "verdict": "not_enough_evidence",
+            "occupantWord": "慑服",
+            "occupantCode": "eefi",
+            "freeCode": "eefiu",
+            "reason": "常用度信号不足",
+            "commonness": {"rawSignals": ["signal " * 300]},
+        }],
+    }
+    encode = {
+        "success": True,
+        "word": "射覆",
+        "input": "射覆",
+        "type": "二字词",
+        "recommendedCode": "eefju",
+        "candidateCodes": [item["code"] for item in review_statuses],
+        "codes": ["eefj", "eefju"],
+        "altCodes": [],
+        "pronunciationSource": "zdic-phrase",
+        "standardPronunciationStatus": "found",
+        "phrasePinyins": ["she", "fu"],
+        "contextPhrasePinyins": ["she", "fu"],
+        "occupancyChecked": True,
+        "candidateStatuses": review_statuses,
+        "chars": [
+            {
+                "char": "射",
+                "pinyin": "she",
+                "pinyins": ["she", "yi", "ye"],
+                "phoneticCode": "ee",
+                "c1": "丿一",
+                "c2": "丨丶",
+                "shapeCode": "eiau",
+                "fullCode": "eeeiau",
+                "internalBranches": ["branch " * 200],
+            },
+            {
+                "char": "覆",
+                "pinyin": "fu",
+                "pinyins": ["fu"],
+                "phoneticCode": "fj",
+                "c1": "一丨",
+                "c2": "丿丶",
+                "shapeCode": "aieu",
+                "fullCode": "fjaieu",
+                "internalBranches": ["branch " * 200],
+            },
+        ],
+    }
+    draft_items = [
+        {
+            "id": index,
+            "action": "Create",
+            "word": f"测试{index}",
+            "code": f"test{index}",
+            "type": "Phrase",
+            "needsManualReview": index % 2 == 0,
+            "remark": "喵喵审词：" + "很长的审词依据" * 40,
+            "conflictInfo": {"impact": "verbose conflict " * 30},
+        }
+        for index in range(200)
+    ]
+    lookup_result = {
+        "success": True,
+        "count": 40,
+        "results": [
+            {
+                "success": True,
+                "word": f"词{index}",
+                "phrases": [{
+                    "word": f"词{index}",
+                    "code": f"code{index}",
+                    "type": "Phrase",
+                    "type_label": "词组",
+                    "weight": 100 + index,
+                    "duplicate_info": {
+                        "position": 1,
+                        "position_label": "二重",
+                        "analysis": "duplicate prose " * 50,
+                        "all_words": [
+                            {"word": f"占位{index}", "weight": 100, "label": ""},
+                            {"word": f"词{index}", "weight": 101, "label": "二重"},
+                        ],
+                    },
+                }],
+            }
+            for index in range(40)
+        ],
+    }
+    return {
+        "keytao_prepare_reviewed_add": reviewed_add,
+        "keytao_encode": encode,
+        "keytao_list_draft_items": {
+            "success": True,
+            "batchId": "batch-1",
+            "count": 200,
+            "summary": {"added": 200, "modified": 0, "deleted": 0},
+            "items": draft_items,
+        },
+        "keytao_get_batch_preview": {
+            "success": True,
+            "batchId": "batch-1",
+            "summary": {"added": 200, "modified": 0, "deleted": 0},
+            "diff_text": "diff Phrase\n" + "+测试 test 100\n" * 1_000,
+        },
+        "keytao_lookup_by_word": lookup_result["results"][0],
+        "keytao_lookup_by_words_batch": lookup_result,
+        "keytao_lookup_by_code": {
+            "success": True,
+            "code": "code0",
+            "phrases": lookup_result["results"][0]["phrases"],
+        },
+        "keytao_lookup_by_codes_batch": {
+            "success": True,
+            "count": len(lookup_result["results"]),
+            "results": [
+                {
+                    "success": True,
+                    "code": item["phrases"][0]["code"],
+                    "phrases": item["phrases"],
+                }
+                for item in lookup_result["results"]
+            ],
+        },
+    }
+
+
+def test_model_tool_result_projection_contract():
+    print("\n🧪 model-only tool-result projections")
+    fixtures = _model_tool_projection_fixtures()
+    check("every registered projection has a guard fixture", set(fixtures) == set(MODEL_TOOL_RESULT_PROJECTIONS))
+    advertised_tools = {
+        tool.get("function", {}).get("name")
+        for tool in openai_chat_module.skills_manager.get_tools()
+    }
+    decided_tools = (
+        set(MODEL_TOOL_RESULT_PROJECTIONS)
+        | set(MODEL_TOOL_RESULT_LARGE_RAW_WHITELIST)
+        | set(MODEL_TOOL_RESULT_SMALL_RAW_WHITELIST)
+    )
+    check("every advertised tool has an explicit model-result size decision", advertised_tools <= decided_tools)
+    for tool_name, payload in fixtures.items():
+        raw = json.dumps(payload, ensure_ascii=False)
+        projected = project_tool_result_for_model(tool_name, raw)
+        budget = MODEL_TOOL_RESULT_PROJECTIONS[tool_name].max_chars
+        check(f"{tool_name} projection stays within its declared budget", len(projected) <= budget)
+
+    reviewed_raw = json.dumps(fixtures["keytao_prepare_reviewed_add"], ensure_ascii=False)
+    reviewed_projected = project_tool_result_for_model(
+        "keytao_prepare_reviewed_add",
+        reviewed_raw,
+    )
+    reviewed = json.loads(reviewed_projected)
+    check("reviewed-add worst fixture exceeds the old measured bulk", len(reviewed_raw) > 9_411)
+    check("reviewed-add worst fixture stays below 3500 model chars", len(reviewed_projected) < 3_500)
+    check("reviewed-add keeps verdict and recommended code", reviewed.get("reviewDisposition") == "SEAL" and reviewed.get("recommendedCode") == "eefju")
+    check("reviewed-add compacts source objects to names", reviewed["pronunciations"][0].get("sourceNames") == ["汉典"])
+    check("reviewed-add drops verbose per-character source expansion", "sourceOutcomes" not in reviewed["pronunciations"][0]["characterReadings"][0])
+    check("reviewed-add keeps compact candidate occupancy", reviewed["pronunciations"][0]["candidateStatuses"][0].get("words") == ["慑服"])
+
+    encode = json.loads(project_tool_result_for_model(
+        "keytao_encode",
+        json.dumps(fixtures["keytao_encode"], ensure_ascii=False),
+    ))
+    check("encode keeps model-consumed split fields", all(
+        field in encode["chars"][0]
+        for field in ("char", "pinyin", "pinyins", "phoneticCode", "c1", "c2", "shapeCode")
+    ))
+    check("encode drops internal full-code branches", "fullCode" not in encode["chars"][0] and "internalBranches" not in encode["chars"][0])
+
+    draft = json.loads(project_tool_result_for_model(
+        "keytao_list_draft_items",
+        json.dumps(fixtures["keytao_list_draft_items"], ensure_ascii=False),
+    ))
+    check("draft projection caps model-visible items", len(draft["items"]) == 40)
+    check("draft projection carries an unambiguous incomplete-list marker", draft.get("itemsTruncated") is True and "「…另有 160 条」" in draft.get("itemsTruncationNotice", ""))
+    check("draft projection truncates remarks with an ellipsis", len(draft["items"][0]["remark"]) <= 80 and draft["items"][0]["remark"].endswith("…"))
+
+    unchanged = json.dumps({"success": True, "blob": "x" * 4_100}, ensure_ascii=False)
+    check("unregistered tools fail open to full fidelity", project_tool_result_for_model("new_tool", unchanged) == unchanged)
+    check("large unregistered new tools fail the policy guard", not large_model_tool_result_has_policy("new_tool", unchanged))
+    whitelisted_name = next(iter(MODEL_TOOL_RESULT_LARGE_RAW_WHITELIST))
+    check("explicit large-result whitelist satisfies the policy guard", large_model_tool_result_has_policy(whitelisted_name, unchanged))
+
+    for payload in (
+        {"success": False, "message": "verbatim failure", "detail": "x" * 5_000},
+        {"success": False, "policyBlocked": True, "message": "verbatim policy"},
+        {"error": "verbatim exception", "detail": "x" * 5_000},
+        {"success": True, "error": "", "detail": "x" * 5_000},
+    ):
+        raw = json.dumps(payload, ensure_ascii=False)
+        check("registered errors and policy blocks remain verbatim", project_tool_result_for_model("keytao_encode", raw) == raw)
 
 
 def test_system_prompt_growth_guard():
@@ -13699,6 +13963,7 @@ async def _capture_mocked_turn_metrics(*, policy_blocked: bool) -> Tuple[str, bo
     try:
         set_turn_flow("pending-confirmation" if policy_blocked else "word-discovery")
         record_history_messages(4)
+        record_model_tool_result_chars(444)
         await observe_model_call(model_call(), system_prompt_chars=42_460)
         await tool_call()
         delivery_seen = []
@@ -13736,7 +14001,7 @@ def test_turn_metrics_normal_mocked_turn():
     check("normal turn records platform and routed flow", "platform=qq space_kind=group flow=word-discovery" in line)
     check("normal turn records model and tool totals", "model_calls=1" in line and "tool_calls=1" in line)
     check("normal turn sums token fields", "input_tokens=12" in line and "output_tokens=5" in line and "cached_tokens=7" in line and "reasoning_tokens=3" in line)
-    check("normal turn records prompt and history sizes", "system_prompt_chars=42460" in line and "history_messages=4" in line)
+    check("normal turn records prompt, history, and model-facing tool-result sizes", "system_prompt_chars=42460" in line and "history_messages=4" in line and "model_tool_result_chars=444" in line)
     check("normal turn reports replied outcome", line.endswith("outcome=replied"))
     check("normal turn log excludes reply content", "private reply content" not in line)
 
@@ -13761,6 +14026,7 @@ def test_turn_metrics_policy_blocked_mocked_turn():
             "reasoning_tokens=",
             "system_prompt_chars=",
             "history_messages=",
+            "model_tool_result_chars=",
         )
     ))
 
@@ -13799,7 +14065,7 @@ def test_state_metrics_startup_log():
             check("state line includes database size", "db_bytes=sample.db:" in line)
             check("state line includes main-table rows", "db_rows=sample.db.sample_rows:2" in line)
             check("state line includes cache counts", "cache_entries=" in line and "review:" in line and "reviewed_add:" in line and "semantic_review:" in line and "zdic:0" in line)
-            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=42940" in line)
+            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=35679" in line)
             check("state line is bounded to one line", bool(line) and "\n" not in line)
 
     asyncio.run(_run())
@@ -13840,6 +14106,7 @@ if __name__ == "__main__":
     test_referenced_unknown_pending_recode_falls_through()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
+    test_model_tool_result_projection_contract()
     test_system_prompt_growth_guard()
     test_system_prompt_cache_layout_keeps_platform_context_last()
     test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_inputs()

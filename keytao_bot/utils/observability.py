@@ -61,6 +61,7 @@ class TurnMetrics:
     reasoning_tokens: int = 0
     system_prompt_chars: int = 0
     history_messages: int = 0
+    model_tool_result_chars: int = 0
     outcome: str = "replied"
     emitted: bool = False
 
@@ -138,6 +139,14 @@ def record_history_messages(count: int) -> None:
     if metrics is None:
         return
     metrics.history_messages = max(metrics.history_messages, max(0, int(count)))
+
+
+def record_model_tool_result_chars(chars: int) -> None:
+    """Add the exact tool-result characters serialized into model messages."""
+    metrics = current_turn_metrics()
+    if metrics is None:
+        return
+    metrics.model_tool_result_chars += max(0, int(chars))
 
 
 T = TypeVar("T")
@@ -224,7 +233,9 @@ def emit_turn_metrics(logger: Any, *, ended_at: Optional[float] = None) -> Optio
         f"input_tokens={metrics.input_tokens} output_tokens={metrics.output_tokens} "
         f"cached_tokens={metrics.cached_tokens} reasoning_tokens={metrics.reasoning_tokens} "
         f"system_prompt_chars={metrics.system_prompt_chars} "
-        f"history_messages={metrics.history_messages} outcome={metrics.outcome}"
+        f"history_messages={metrics.history_messages} "
+        f"model_tool_result_chars={metrics.model_tool_result_chars} "
+        f"outcome={metrics.outcome}"
     )
     logger.info(line)
     return line

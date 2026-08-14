@@ -23,6 +23,7 @@ from keytao_bot.utils.observability import (
     observe_model_call,
     observe_tool_result,
     record_history_messages,
+    record_model_tool_result_chars,
     set_turn_flow,
 )
 from keytao_bot.utils.pending_confirmation import (
@@ -45,6 +46,7 @@ from .tools import (
     create_warning_confirmation_binding,
     front_insert_batch_warning_confirmation_binding,
     policy_block,
+    project_tool_result_for_model,
     server_warning_confirmation_binding,
     self_checked_suggested_command,
 )
@@ -1027,11 +1029,16 @@ class AgentOrchestrator:
                 except Exception:
                     pass
 
+                model_result_str = project_tool_result_for_model(
+                    fn_name,
+                    result_str,
+                )
+                record_model_tool_result_chars(len(model_result_str))
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "name": fn_name,
-                    "content": result_str,
+                    "content": model_result_str,
                 })
 
             continue

@@ -241,49 +241,24 @@ for i, phrase in enumerate(phrases, 1):  # 遍历每个编码
 
 ## keytao_encode 返回结构
 
-```json
-{
-  "input": "你好",
-  "type": "二字词",
-  "codes": ["nkhz", "nkhzi", "nkhzia"],
-  "altCodes": ["fhz"],
-  "chars": [
-    {
-      "char": "你",
-      "pinyin": "ni",
-      "phoneticCode": "nk",
-      "c1": "人",
-      "c2": "丿乙丨",
-      "shapeCode": "iuai",
-      "fullCode": "nkiuai"
-    }
-  ]
-}
-```
+模型可见结果是原始工具结果的等价精简投影，只包含下表字段：
 
-字段说明：
-- `candidateCodes`：所有可选词条编码（`codes + altCodes` 去重），展示候选和查占用时优先使用此字段
-- `candidateStatuses`：已经批量查过占用的候选列表，展示候选编码必须使用此字段的 `label`
-- `occupancyChecked`：是否已经完成候选编码占用查询；为 `true` 时禁止再显示"待查占用"
-- `firstAvailableCode`：首个空位候选码
-- `recommendedCode`：推荐编码；查占用后通常等于 `firstAvailableCode`，否则等于 `codes[0]`
-- `pronunciationSource`：实际用于编码的读音来源。`zdic-phrase` / `zdic-aabb` 为权威整词来源；`zdic-character-default` 为逐字汉典默认音；`pinyin-pro-context` 为词组语境音；`zdic-unavailable` 表示权威站暂不可用；`llm-semantic` 为已通过含义与逐字读音校验的模型语境音
-- `standardPronunciationStatus`：权威整词查询的独立状态。即使最终采用 `llm-semantic`，仍保留 `found` / `absent` / `unavailable`，不能把暂不可用说成没有标准读音
-- `phrasePinyins`：编码服务用于当前词组的逐字语境拼音
-- `contextPhrasePinyins`：pinyin-pro 给出的词组上下文候选音，可能因缺乏权威整词依据而未被采用
-- `semanticPronunciationNeeded`：没有取得可信整词读音（整词页缺失或权威查询暂不可用）且上下文音与逐字默认音冲突时为 `true`
-- `semanticPronunciationAccepted`：只有同时提供 `semantic_pinyin` 与具体的 `semantic_meaning`，并通过逐字合法读音校验后才为 `true`
-- `candidateDisplayGroups`：多音单字专用展示分组。每组含 `pinyinLabel`、`phoneticCode`、`recommendedCode` 和 `items[].displayLabel`，展示时必须直接使用这些字段
-- `alternatePronunciationCodes`：多音单字候选。每组含 `pinyin`、`phoneticCode`、`codes`
-- `alternatePhrasePronunciationCodes`：词组中多音字候选。每组含 `char`、`charIndex`、`pinyin`、`phoneticCode`、`codes`
-- `codes[0]`：最短规则编码
-- `codes[1..]`：逐步加一位形码的选重码
-- `altCodes`：飞键备用编码（zh/ch/uang 双键位产生）
-- `flyKeyVariants`：按固定飞键规则生成的分组候选系列；同音 zh/ch 多字可以组合生成，例如 `qqb` 同时允许 `fqb`、`qfb`、`ffb` 系列时，以此字段为准
-- `requestedCodeAnalysis`：当调用时传入 `requested_code`，返回用户指定编码是否属于标准候选、固定飞键候选、同系列但不支持，或完全不支持；用户强制指定编码/编码系列时必须展示这里的结论
-- `c1` / `c2`：字根拆分（每个字符是一个字根）
-- `shapeCode`：c1+c2 各字根对应的形码字母串
-- `phoneticCode`：音码（2字母）
+| 字段 | 用途 |
+|---|---|
+| `word` / `input` / `type` / `success` / `message` / `codeSource` | 输入、词条类型、成功状态与编码来源 |
+| `baseCode` / `codes` / `altCodes` / `candidateCodes` | 基础码、进阶选重、飞键与完整候选链；候选只能取这些字段 |
+| `recommendedCode` / `firstAvailableCode` / `firstRequestedAvailableCode` | 推荐空位；指定读音/系列时优先使用 requested 结果 |
+| `candidateStatuses[].code/occupied/label/words` / `occupancyChecked` / `occupancyError` | 已核验的码位占用；`occupancyChecked=true` 时禁止说“待查占用” |
+| `pronunciationSource` / `standardPronunciationStatus` / `phrasePinyins` / `contextPhrasePinyins` | 实际读音来源、权威查询状态与逐字语境音 |
+| `semanticPronunciationNeeded` / `semanticPronunciationAccepted` | 是否需语义复算、语义读音是否通过逐字校验 |
+| `chars[].char/pinyin/pinyins/phoneticCode/c1/c2/shapeCode` | 逐字读音、音码、字根和形码；`c1/c2/shapeCode` 因拆分回复需要而保留 |
+| `alternatePronunciationCodes` / `alternatePhrasePronunciationCodes` / `requestedCandidateCodes` | 单字或词组多音候选与用户指定读音候选 |
+| `flyKeyVariants` / `requestedCodeAnalysis` | 固定飞键系列及指定编码判定 |
+| `candidateDisplayGroups` | 多音单字展示分组，直接使用 `pinyinLabel`、`phoneticCode`、`recommendedCode`、`items[].displayLabel` |
+| `suggestion` / `suggestionIndex` / `isBaseConflict` / `wordExists` | infer 回退的推荐与冲突状态；仅按返回值转述 |
+| `charsTruncationNotice` | 超长逐字列表的明确截断标记；出现时不得把可见部分当完整拆分 |
+
+`pronunciationSource` 中 `zdic-phrase` / `zdic-aabb` 是权威整词来源，`zdic-character-default` 是逐字汉典默认音，`pinyin-pro-context` 是词组语境音，`zdic-unavailable` 表示权威站暂不可用，`llm-semantic` 表示含义与逐字读音已校验。`standardPronunciationStatus` 独立保留 `found` / `absent` / `unavailable`，不能把暂不可用说成没有标准读音。
 
 ⚠️ 关键规则：词条候选编码只能取 `candidateStatuses` / `candidateCodes` / `codes` / `altCodes` / `recommendedCode`，禁止根据 `chars` 里的 `phoneticCode`、`shapeCode`、`fullCode` 自己拼词条编码。
 

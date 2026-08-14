@@ -5,27 +5,9 @@ description: 键道输入法草稿批次管理工具。添加词条、查看草�
 
 # 键道草稿批次管理工具
 
-管理用户的键道词条草稿：添加、查看、移除条目，并在就绪时提交审核。
-
 ## 使用前提
 
 ⚠️ 用户必须先绑定键道平台账号（`/bind`），否则所有工具调用都会返回 404。
-
-## 工具一览
-
-| 工具 | 用途 |
-|------|------|
-| `keytao_batch_add_to_draft` | **批量**添加多个词条到草稿 |
-| `keytao_batch_remove_draft_items` | **批量**从草稿中删除词条（按 ID） |
-| `keytao_create_phrase` | 添加 / 修改 / 删除单个词条 |
-| `keytao_get_batch_preview` | 查看草稿 diff 预览（含上下文行，**查看草稿时优先用此工具**） |
-| `keytao_list_draft_items` | 查看草稿条目列表（含 ID，用于删除操作） |
-| `keytao_remove_draft_item` | 从草稿中移除指定条目 |
-| `keytao_update_draft_item_weight` | 调整草稿中唯一已知词条的权重（先读取草稿） |
-| `keytao_recall_batch` | 撤回最近一次提审，恢复为草稿 |
-| `keytao_submit_batch` | 提交草稿批次进行审核 |
-
-## 工具详解
 
 ### keytao_batch_add_to_draft（批量首选）
 
@@ -58,13 +40,7 @@ description: 键道输入法草稿批次管理工具。添加词条、查看草�
 - `code` = 消息中的编码（如 `fpnm`）
 
 ⛔ **严禁**在此情况下调用 `keytao_lookup_by_codes_batch`、`keytao_lookup_by_word`、`keytao_encode` 等任何查询/编码工具。用户已提供所有信息，直接构建并调用 `keytao_batch_add_to_draft` 获取完整只读预览：
-```python
-keytao_batch_add_to_draft(items=[
-  {"action": "Change", "old_word": "防粘", "word": "防黏", "code": "fpnm"},
-  {"action": "Change", "old_word": "胶粘", "word": "胶黏", "code": "jcnm"},
-  # 一次性包含所有词条，不拆分，不做任何预查询
-])
-```
+例如把 `防粘 fpnm`、`胶粘 jcnm` 中“粘”改为“黏”时，一次传入两条 `Change`：各自的 `old_word` 为原词、`word` 为替换后新词、`code` 为原编码；不拆分、不预查询。
 
 **情况 B：用户只提供编码，未提供旧词**
 
@@ -77,25 +53,7 @@ keytao_batch_add_to_draft(items=[
 - 草稿中已存在的相同操作 → 跳过，记入 `skipped`
 - 最终返回 `successCount`、`failedCount`、`skippedCount`、`warnedCount`、`failed[]`、`skipped[]`、`warned[]`、`draftItems[]`
 
-**返回值示例：**
-```json
-{
-  "success": true,
-  "message": "成功写入 2 条，重码警告 2 条",
-  "batchId": "uuid",
-  "successCount": 2,
-  "failedCount": 0,
-  "skippedCount": 0,
-  "warnedCount": 2,
-  "failed": [],
-  "warned": [
-    {"index": 0, "word": "左利手", "code": "zle", "reason": "编码 \"zle\" 已被词条 \"自来水\" 占用，将创建重码（建议权重: 101）"},
-    {"index": 1, "word": "右利手", "code": "yle", "reason": "编码 \"yle\" 已被词条 \"原来是\" 占用，将创建重码（建议权重: 101）"}
-  ],
-  "draftItems": [...],
-  "draftTotal": 3
-}
-```
+返回 `success/message/batchId`、四类计数 `successCount/failedCount/skippedCount/warnedCount`、对应的 `failed/skipped/warned` 明细及 `draftItems/draftTotal`。逐条转述失败和警告原因，不得把警告项说成失败项。
 
 **`warnedCount > 0` 时：执行「编码警告确认协议」**（见下方独立章节）。不得静默删除、改码或重写用户已经选择的词条；如条目已写入，展示重码事实即可。`failed[]` 非空时，在回复中追加「❌ 冲突条目（未写入）」段落。
 
@@ -140,50 +98,11 @@ keytao_batch_add_to_draft(items=[
 
 **用户查看草稿时，必须先调用 `keytao_get_batch_preview`；若用户还需要按 ID 删除某条，再追加调用 `keytao_list_draft_items`。**
 
-**返回值：**
-```json
-{
-  "success": true,
-  "batchId": "uuid",
-  "batchUrl": "https://...",
-  "summary": {"added": 4, "modified": 0, "deleted": 2},
-  "diff_text": "diff Phrase  bkxfu, bkxfuu\n@@ -10,7 +10,9 @@\n ..."
-}
-```
+返回 `success/batchId/batchUrl/summary/diff_text`；`summary` 含 `added/modified/deleted`。
 
 **查看草稿时，必须同时调用 `keytao_get_batch_preview` 和 `keytao_list_draft_items`**，将两者合并展示。
 
-**回复格式：**
-```
-+4 新增  ~0 修改  -2 删除
-
-```diff
-diff Phrase  bkxfu, bkxfuu
-@@ -10,7 +10,9 @@
- 彼岸    bkxf        100
--猛狂    bkxfu       100
-+币安    bkxfu       100
-+猛狂    bkxfuu      100
- 笔形    bkxg        100
-` ``
-
-当前草稿（共 N 条）：
-• 新增 币安 → bkxfu（权重: 100）
-• 新增 猛狂 → bkxfuu（权重: 100）
-
-草稿地址：https://...
-
-发送「提交」以提交该草稿，也可继续加改动
-```
-
-格式规则：
-- `diff_text` 放在 ` ```diff ``` ` 代码块中（Telegram 等平台会显示语法高亮）
-- summary 行在代码块前面
-- diff 代码块之后，紧接着展示 `keytao_list_draft_items` 返回的草稿条目列表（格式同 `keytao_list_draft_items` 的回复格式，但无需重复 summary 行）
-- 列表之后附草稿地址
-- 最后一行始终为：`发送「提交」以提交该草稿，也可继续加改动`
-- 若 `diff_text` 为空（草稿内容不影响词库），跳过代码块，直接展示列表，并提示"变更预览暂无数据，可能是新词尚未命中规则"
-- 若 `success: false`，直接显示 `message`
+回复依次为：`+{added} 新增  ~{modified} 修改  -{deleted} 删除`、` ```diff` 包裹的 `diff_text`、`keytao_list_draft_items` 条目（不重复 summary）、草稿地址、固定末句 `发送「提交」以提交该草稿，也可继续加改动`。`diff_text` 为空则省略代码块并提示“变更预览暂无数据，可能是新词尚未命中规则”；`success=false` 直接显示 `message`。
 
 ---
 
@@ -193,28 +112,7 @@ diff Phrase  bkxfu, bkxfuu
 
 **AI 无需传递任何参数。**
 
-**返回值示例（含冲突警告）：**
-```json
-{
-  "success": true,
-  "batchId": "uuid",
-  "count": 2,
-  "items": [
-    {
-      "id": 410, "action": "Change", "word": "赛百味", "oldWord": "四步舞", "code": "sbw",
-      "weight": null, "conflictInfo": null
-    },
-    {
-      "id": 411, "action": "Create", "word": "四步舞", "code": "sbwii",
-      "weight": 100,
-      "conflictInfo": {
-        "hasConflict": false,
-        "impact": "编码 \"sbwii\" 已被词条 \"赛百味\" 占用，将创建重码（建议权重: 100）"
-      }
-    }
-  ]
-}
-```
+返回 `success/batchId/count/items/summary`。每条用 `id/action/word/oldWord/code/type/weight/needsManualReview/remark`；冲突详情在 `conflictInfo.impact`。模型可见列表若含 `itemsTruncationNotice`，必须明确告诉用户列表不完整，绝不能拿截断列表做完整集合判断。
 
 **回复格式（严格遵循）：**
 
@@ -401,99 +299,6 @@ keytao_shift_phrase_code(word="会员费", target_code="hyfio")
 - 禁止顺延后不告诉用户移动了哪些词
 - 禁止先批量删除草稿中的大量条目，再按模型规划重建
 
-### 示例
-
-```
-词库：会员费@hyfa，换言之@hyfio，换衣服@hyfi
-用户：还是会员费改 hyfio 吧，换衣服别动了
-
-→ 调用 keytao_shift_phrase_code(word="会员费", target_code="hyfio")
-→ 工具计算：
-  1. 会员费可用候选：hyf, hyfi, hyfio, hyfioa；目标 hyfio 有效
-  2. hyfio 当前已有「换言之」
-  3. 对「换言之」调用 encode，候选为 hyf, hyfi, hyfio, hyfioo
-  4. 换言之当前位置是 hyfio，下一位是 hyfioo
-  5. hyfioo 为空，可以顺延
-
-工具写入：
-  [Delete 会员费@hyfa, Delete 换言之@hyfio, Create 会员费@hyfio, Create 换言之@hyfioo]
-
-回复：会员费已改到 hyfio；顺延计算：换言之 hyfio→hyfioo。换衣服保持 hyfi 不动。
-```
-
----
-
-## 典型场景
-
-### 添加词条
-
-```
-用户：帮我加个词：若 ruo
-→ 调用 keytao_create_phrase(word="若", code="ruo")
-→ type 自动推断为 Single（单字）
-```
-
-### 查看草稿
-
-```
-用户：我的草稿里有什么
-→ 同时调用 keytao_get_batch_preview() 和 keytao_list_draft_items()
-→ 展示 summary + diff_text（代码块）+ 草稿条目列表 + 草稿链接 + 提交提示
-
-（若用户还要删除某条，list_draft_items 已经调过，可直接用其返回的 ID）
-→ 调用 keytao_remove_draft_item(pr_id=...)
-```
-
-### 删除草稿条目
-
-```
-用户：把"测试"那条删掉
-→ 调用 keytao_list_draft_items() 找到 "测试" 的 id（如 42）
-→ 调用 keytao_remove_draft_item(pr_id=42)
-```
-
-### 提交审核
-
-```
-用户：提交吧
-→ 调用 keytao_submit_batch()
-→ 成功后回复「批次已提交审核」+ batchUrl，结束，**不再调用任何其他工具**
-```
-
-### 提交时遇到重码警告
-
-```
-用户：提交吧
-→ 调用 keytao_submit_batch()   // 返回 requiresConfirmation: true
-→ 回复警告内容，询问是否继续提交
-
-用户：确认
-→ 程序消费当前精确票据并回放 batchId、版本和三个摘要；模型不调用工具
-→ 成功后回复「批次已提交审核」+ batchUrl，结束
-```
-
-### 撤回提审
-
-```
-用户：撤回一下
-→ 调用 keytao_recall_batch() 取得只读快照
-→ 程序在同一条明确指令内按批次 ID + 版本回放
-→ 批次恢复为草稿状态，并返回 batchUrl
-```
-
-所有草稿新增、删除、撤回和提交的成功或失败回复，只要工具返回了可信 `batchUrl`，都必须把链接带给用户。模型最终回复漏掉链接时，编排层补回一次，不得重复展示。
-
-### 用户指定已占用编码
-
-```
-词库：会员费@hyfa，换言之@hyfio，换衣服@hyfi
-用户：还是会员费改 hyfio 吧，换衣服别动了
-
-→ 调用 keytao_shift_phrase_code(word="会员费", target_code="hyfio")
-→ 工具按各自 encode 链计算顺延
-→ 汇报：会员费已改到 hyfio；顺延计算：换言之 hyfio→hyfioo；换衣服保持 hyfi 不动
-```
-
 ### 编码冲突处理
 
 **`keytao_create_phrase` 遇到目标一致的单条重码：**
@@ -537,68 +342,10 @@ QQ 或 Telegram 的原生回复若能确认被引用消息由机器人本人发�
 
 ### 草稿链接（batchUrl）
 
-所有已知精确批次的成功、失败、待确认、部分成功或结果不确定响应都应包含 `batchUrl`，指向该草稿批次的网页：
-```
-https://keytao.vercel.app/batch/{batchId}
-```
-
-尚未物化的 absence-CAS 预览只显示「待确认后生成」，不得展示服务端返回的临时 UUID 链接。
-
-**每次操作后必须在回复中附上草稿链接**：
-```
-草稿地址：https://keytao.vercel.app/batch/xxx
-```
-
-查看草稿时，也在列表末尾附上链接，方便用户直接访问。
-
-`keytao_create_phrase` 和 `keytao_remove_draft_item` 的返回值中包含 `draft_snapshot` 字段：
-```json
-{
-  "success": true,
-  "draft_snapshot": {
-    "count": 3,
-    "summary": {"added": 2, "modified": 0, "deleted": 1},
-    "items": [
-      {"action": "Delete", "word": "卧推", "code": "wltbv", "type": "Phrase", ...},
-      ...
-    ]
-  }
-}
-```
-
-**必须在每次操作后展示 `draft_snapshot`，并额外调用 `keytao_get_batch_preview` 获取 diff**，格式：
-```
-+2 新增  ~0 修改  -1 删除
-
-```diff
-diff Phrase  wltbv, wltb
-@@ -... @@
- ...
-` ``
-
-当前草稿（共 3 条）：
-• 删除 卧推 → wltbv
-• 删除 我推 → wltb
-• 新增 卧推 → wltb
-
-草稿地址：https://...
-
-发送「提交」以提交该草稿，也可继续加改动
-```
-
-规则：
-- **每次操作成功后，在回复前调用 `keytao_get_batch_preview`** 获取最新 diff，与 `draft_snapshot` 合并展示
-- 回复末尾始终附草稿地址和提交提示：`发送「提交」以提交该草稿，也可继续加改动`
-- 若 `diff_text` 为空，跳过代码块，直接展示条目列表
-
-有警告时（`requiresConfirmation: true`），该次需要确认的条目尚未写入草稿；展示当前草稿并询问用户是否继续：
-```
-✅ 已执行 X 步，当前草稿（共 N 条）：
-• ...
-
-⚠️ 第 Y 步需要确认：编码 "xxx" 已被 "某词" 占用，或跳过了更短空位编码。
-确认继续添加吗？
-```
+- 已知精确批次的成功、失败、待确认、部分成功或结果不确定响应，只要工具返回可信 `batchUrl`，回复都必须带上；模型遗漏时编排层只补一次。格式：`草稿地址：https://keytao.vercel.app/batch/{batchId}`。
+- 尚未物化的 absence-CAS 预览只显示「待确认后生成」，不得展示临时 UUID 链接。
+- `keytao_create_phrase` / `keytao_remove_draft_item` 成功后，展示返回的 `draft_snapshot.summary/items`，并在回复前调用 `keytao_get_batch_preview`，按上文查看草稿格式合并 summary、diff、条目、链接和固定末句 `发送「提交」以提交该草稿，也可继续加改动`。`diff_text` 为空则省略代码块。
+- `requiresConfirmation: true` 表示本次条目尚未写入；如前面已有成功步骤，先展示当前 `draft_snapshot`，再展示本步具体风险并询问是否继续，不能把待确认项写成已完成。
 
 ## 回复格式
 
