@@ -22,7 +22,9 @@ except ImportError:  # pragma: no cover
 
 MAX_BATCH_ITEMS = 200
 MODEL_TOOL_RESULT_RAW_DECISION_THRESHOLD_CHARS = 4_000
-MODEL_TOOL_RESULT_MAX_BATCH_ITEMS = 40
+# Match the authorization layer's largest safely staged mutation list so the
+# model can always inspect one complete staged set before acting on it.
+MODEL_TOOL_RESULT_MAX_BATCH_ITEMS = 50
 MODEL_TOOL_RESULT_MAX_REMARK_CHARS = 80
 MODEL_TOOL_RESULT_MAX_DIFF_CHARS = 6_000
 _BATCH_LIST_ARGUMENTS = {
@@ -49,7 +51,7 @@ class ModelToolResultProjection:
     """One model-only result projection and its reviewable size budget."""
 
     max_chars: int
-    projector: Callable[[Mapping[str, Any]], Dict[str, Any]]
+    projector: Callable[..., Dict[str, Any]]
 
 
 def _present_fields(payload: Mapping[str, Any], names: Tuple[str, ...]) -> Dict[str, Any]:
@@ -66,7 +68,10 @@ def _short_text(value: Any, limit: int) -> str:
 def _compact_phrase_row(value: Any, *, code: str = "") -> Optional[Dict[str, Any]]:
     if not isinstance(value, Mapping):
         return None
-    row = _present_fields(value, ("word", "code", "type", "weight"))
+    row = _present_fields(value, (
+        "word", "code", "type", "type_label", "weight", "label",
+        "position", "position_label",
+    ))
     if code and not row.get("code"):
         row["code"] = code
     return row
@@ -363,24 +368,59 @@ def _compact_draft_item(value: Any) -> Optional[Dict[str, Any]]:
     return item
 
 
-def _project_draft_listing(payload: Mapping[str, Any]) -> Dict[str, Any]:
+def _project_draft_listing(
+    payload: Mapping[str, Any],
+    arguments: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     result = _present_fields(payload, (
-        "success", "batchId", "batchUrl", "count", "summary", "message",
+        "success", "batchId", "batchIdProvisional", "batchUrl",
+        "batchUrlStatus", "count", "summary", "message",
     ))
     values = payload.get("items")
     if isinstance(values, list):
+        raw_offset = arguments.get("offset", 0) if arguments else 0
+        raw_limit = (
+            arguments.get("limit", MODEL_TOOL_RESULT_MAX_BATCH_ITEMS)
+            if arguments else MODEL_TOOL_RESULT_MAX_BATCH_ITEMS
+        )
+        offset = (
+            raw_offset
+            if isinstance(raw_offset, int)
+            and not isinstance(raw_offset, bool)
+            and raw_offset >= 0
+            else 0
+        )
+        limit = (
+            raw_limit
+            if isinstance(raw_limit, int)
+            and not isinstance(raw_limit, bool)
+            and 1 <= raw_limit <= MODEL_TOOL_RESULT_MAX_BATCH_ITEMS
+            else MODEL_TOOL_RESULT_MAX_BATCH_ITEMS
+        )
+        window = values[offset:offset + limit]
         items = [
             item
-            for value in values[:MODEL_TOOL_RESULT_MAX_BATCH_ITEMS]
+            for value in window
             if (item := _compact_draft_item(value)) is not None
         ]
         result["items"] = items
-        if len(values) > len(items):
-            remaining = len(values) - len(items)
+        total = payload.get("count")
+        if not isinstance(total, int) or isinstance(total, bool) or total < len(values):
+            total = len(values)
+        start = offset + 1 if items else 0
+        end = offset + len(items) if items else 0
+        result["itemsWindowNotice"] = (
+            f"共 {total} 条，当前显示 {start}-{end} 条"
+        )
+        if offset > 0 or end < total:
             result["itemsTruncated"] = True
+            pagination = "请设置 offset/limit 分页查看其他条目"
+            if end < total:
+                pagination = f"下一页使用 offset={end}, limit={limit}"
             result["itemsTruncationNotice"] = (
-                f"「…另有 {remaining} 条」模型可见列表已截断；"
-                "不得据此判断完整条目集合"
+                f"共 {total} 条，当前显示 {start}-{end} 条；"
+                "模型可见列表已分页或截断，不得据此判断完整条目集合；"
+                f"{pagination}"
             )
     return result
 
@@ -447,7 +487,7 @@ def _project_lookup_result(payload: Mapping[str, Any]) -> Dict[str, Any]:
 MODEL_TOOL_RESULT_PROJECTIONS = {
     "keytao_prepare_reviewed_add": ModelToolResultProjection(3_500, _project_reviewed_add),
     "keytao_encode": ModelToolResultProjection(6_000, _project_encode),
-    "keytao_list_draft_items": ModelToolResultProjection(12_500, _project_draft_listing),
+    "keytao_list_draft_items": ModelToolResultProjection(16_000, _project_draft_listing),
     "keytao_get_batch_preview": ModelToolResultProjection(8_000, _project_batch_preview),
     "keytao_lookup_by_word": ModelToolResultProjection(8_000, _project_lookup_result),
     "keytao_lookup_by_words_batch": ModelToolResultProjection(16_000, _project_lookup_result),
@@ -477,7 +517,11 @@ MODEL_TOOL_RESULT_SMALL_RAW_WHITELIST = frozenset({
 })
 
 
-def project_tool_result_for_model(tool_name: str, result_json: str) -> str:
+def project_tool_result_for_model(
+    tool_name: str,
+    result_json: str,
+    arguments: Optional[Mapping[str, Any]] = None,
+) -> str:
     """Project only the copy serialized into a model ``tool`` message."""
     projection = MODEL_TOOL_RESULT_PROJECTIONS.get(tool_name)
     if projection is None:
@@ -494,7 +538,11 @@ def project_tool_result_for_model(tool_name: str, result_json: str) -> str:
         or "error" in payload
     ):
         return result_json
-    projected = projection.projector(payload)
+    projected = (
+        projection.projector(payload, arguments)
+        if tool_name == "keytao_list_draft_items"
+        else projection.projector(payload)
+    )
     return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
 
 

@@ -35,7 +35,6 @@ from keytao_bot.utils.pending_confirmation import (
 from .state import MemoryConversationStateStore, PendingAddWord, PendingToolConfirm
 from .conversation import ConversationAddress
 from .tools import (
-    BLOCK_REASON_VERB_NOT_MATCHED,
     MUTATING_TOOL_NAMES,
     PendingCandidateCapability,
     ToolContext,
@@ -45,10 +44,8 @@ from .tools import (
     batch_warning_confirmation_binding,
     create_warning_confirmation_binding,
     front_insert_batch_warning_confirmation_binding,
-    policy_block,
     project_tool_result_for_model,
     server_warning_confirmation_binding,
-    self_checked_suggested_command,
 )
 
 
@@ -64,40 +61,6 @@ AUTHORITATIVE_LINK_TOOLS = frozenset({
     "keytao_recall_batch",
     "keytao_get_batch_preview",
 })
-
-
-WRITE_AUTHORIZATION_TOOL_NAME = "keytao_request_write_authorization"
-# Read-only stand-in for the withheld write tools.  It writes nothing; it turns
-# a proposed call into the one command the validators are known to accept, so
-# the wording never has to be guessed by the model.
-WRITE_AUTHORIZATION_TOOL = {
-    "type": "function",
-    "function": {
-        "name": WRITE_AUTHORIZATION_TOOL_NAME,
-        "description": (
-            "本轮无写权限时，用它换取用户可直接发送的授权指令。不会写入任何数据。"
-            "传入你本来打算调用的写工具名和完整参数，返回 suggestedCommand；"
-            "必须把 suggestedCommand 原样转述给用户，不要改写格式。"
-            "若返回没有 suggestedCommand，就只说明原因，不要自己编一条指令。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tool": {
-                    "type": "string",
-                    "enum": sorted(MUTATING_TOOL_NAMES),
-                    "description": "你本来打算调用的写工具名",
-                },
-                "arguments": {
-                    "type": "object",
-                    "additionalProperties": True,
-                    "description": "你本来打算传给该写工具的完整参数",
-                },
-            },
-            "required": ["tool", "arguments"],
-        },
-    },
-}
 
 
 def build_system_prompt(
@@ -374,7 +337,6 @@ class AgentOrchestrator:
         # Image-derived text is untrusted data. Do not expose even read/network tools:
         # a visual prompt injection could otherwise read private data and exfiltrate it.
         tools = None
-        withheld_tool_names: set[str] = set()
         if not context.visual_context and self._skills_manager.has_tools():
             tools = sorted(
                 self._skills_manager.get_tools(),
@@ -400,7 +362,7 @@ class AgentOrchestrator:
         reported_block_reasons: set[tuple] = set()
         conv_key = context.conversation_address
         current_max_tokens = self._initial_max_tokens(message)
-        seen_tool_calls: Dict[tuple, int] = {}
+        seen_tool_calls: Dict[tuple, tuple[int, bool]] = {}
         seen_tool_call_ids: set[str] = set()
         total_tool_calls = 0
         empty_response_retries = 0
@@ -653,13 +615,6 @@ class AgentOrchestrator:
                     response_tool_calls,
                     tool_schemas,
                     seen_tool_call_ids,
-                    # Naming a tool that is not on this turn's list must produce
-                    # an explanation, never an opaque protocol error.
-                    withheld_tool_names | (
-                        {WRITE_AUTHORIZATION_TOOL_NAME}
-                        if not context.mutations_allowed
-                        else set()
-                    ),
                 )
             except ToolCallValidationError as error:
                 if error.retryable and current_max_tokens < self._runtime.max_tokens_cap:
@@ -779,33 +734,7 @@ class AgentOrchestrator:
                             or tool_word in reviewed_words_in_batch
                         )
                     )
-                    if fn_name == WRITE_AUTHORIZATION_TOOL_NAME:
-                        result_str = json.dumps(
-                            self._write_authorization_answer(
-                                canonical_fn_args,
-                                tool_context,
-                            ),
-                            ensure_ascii=False,
-                        )
-                    elif fn_name in withheld_tool_names:
-                        # The tool was never offered this turn.  Answer with the
-                        # real reason and a self-checked command instead of an
-                        # opaque protocol error.
-                        logger.warning(
-                            f"Model called a withheld write tool on a read-only turn: {fn_name}"
-                        )
-                        result_str = json.dumps(policy_block(
-                            BLOCK_REASON_VERB_NOT_MATCHED,
-                            "安全拦截：本轮没有收到明确的写操作指令，写工具未启用"
-                            "（与历史、记忆或引用无关）。",
-                            missing=["executionVerb"],
-                            suggestion=self_checked_suggested_command(
-                                fn_name,
-                                canonical_fn_args,
-                                tool_context,
-                            ),
-                        ), ensure_ascii=False)
-                    elif encode_blocked:
+                    if encode_blocked:
                         logger.warning(
                             "Blocked reviewed-add encode fallback: word=%s unresolved=%s",
                             tool_word,
@@ -860,15 +789,10 @@ class AgentOrchestrator:
                             or result_data.get("error")
                         ):
                             if failure_state is not None:
-                                failed_tool_name = (
-                                    str(canonical_fn_args.get("tool") or "")
-                                    if fn_name == WRITE_AUTHORIZATION_TOOL_NAME
-                                    else fn_name
-                                )
                                 self._record_failure_for_remediation(
                                     failure_state,
                                     result_data,
-                                    failed_tool_name,
+                                    fn_name,
                                 )
                         elif (
                             result_data.get("success") is True
@@ -1045,6 +969,7 @@ class AgentOrchestrator:
                 model_result_str = project_tool_result_for_model(
                     fn_name,
                     result_str,
+                    canonical_fn_args,
                 )
                 record_model_tool_result_chars(len(model_result_str))
                 messages.append({
@@ -1731,9 +1656,7 @@ class AgentOrchestrator:
         tool_calls: List[Any],
         tool_schemas: Dict[str, Dict[str, Any]],
         seen_tool_call_ids: set[str],
-        withheld_tool_names: Optional[set] = None,
     ) -> List[tuple]:
-        withheld = withheld_tool_names or set()
         if len(tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
             raise ToolCallValidationError(
                 f"too many tool calls: {len(tool_calls)} > {_MAX_TOOL_CALLS_PER_RESPONSE}"
@@ -1753,7 +1676,7 @@ class AgentOrchestrator:
 
             function = getattr(tool_call, "function", None)
             fn_name = str(getattr(function, "name", "") or "").strip()
-            if not fn_name or (fn_name not in tool_schemas and fn_name not in withheld):
+            if not fn_name or fn_name not in tool_schemas:
                 raise ToolCallValidationError(f"unknown tool: {fn_name or '(missing)'}")
 
             raw_arguments = getattr(function, "arguments", None)
@@ -1833,7 +1756,7 @@ class AgentOrchestrator:
         fn_name: str,
         fn_args: Dict,
         tool_context: ToolContext,
-        seen_tool_calls: Dict[tuple, int],
+        seen_tool_calls: Dict[tuple, tuple[int, bool]],
     ) -> str:
         fingerprint_args = fn_args
         if fn_name == "keytao_prepare_reviewed_add":
@@ -1848,28 +1771,34 @@ class AgentOrchestrator:
             fn_name,
             json.dumps(fingerprint_args, sort_keys=True, ensure_ascii=False),
         )
-        duplicate_count = seen_tool_calls.get(call_fingerprint, 0)
-        if duplicate_count > 0:
+        seen_call = seen_tool_calls.get(call_fingerprint)
+        if seen_call is not None:
+            duplicate_count, first_call_succeeded = seen_call
             if duplicate_count >= 4:
                 logger.error(f"Tool call {fn_name} duplicated {duplicate_count} times, aborting")
                 raise DuplicateToolCallAbort()
             logger.warning(f"Duplicate tool call ({duplicate_count}): {fn_name}, injecting forcing hint")
-            write_tools = frozenset({
-                "keytao_batch_add_to_draft", "keytao_create_phrase",
-                "keytao_submit_batch", "keytao_batch_remove_draft_items",
-                "keytao_remove_draft_item", "keytao_recall_batch",
-            })
-            if fn_name in write_tools:
-                duplicate_hint = (
-                    f"工具 {fn_name} 已执行过，数据已写入。"
-                    "禁止重复调用。请直接根据上方执行结果回复用户。"
-                )
+            if fn_name in MUTATING_TOOL_NAMES:
+                if first_call_succeeded:
+                    duplicate_hint = (
+                        f"工具 {fn_name} 已执行过，数据已写入。"
+                        "禁止重复调用。请直接根据上方执行结果回复用户。"
+                    )
+                else:
+                    duplicate_hint = (
+                        f"工具 {fn_name} 首次调用未写入"
+                        "（已被安全层拦截或执行未成功）。"
+                        "禁止重复调用。请直接根据上方结果回复用户。"
+                    )
             else:
                 duplicate_hint = (
                     f"工具 {fn_name} 已调用过，结果已在上方消息中。"
                     "禁止再次调用此工具。请直接使用上方已有数据继续下一步操作。"
                 )
-            seen_tool_calls[call_fingerprint] = duplicate_count + 1
+            seen_tool_calls[call_fingerprint] = (
+                duplicate_count + 1,
+                first_call_succeeded,
+            )
             return json.dumps({"error": "重复调用，已忽略", "message": duplicate_hint}, ensure_ascii=False)
 
         result_str = await self._tool_executor.call(
@@ -1892,7 +1821,13 @@ class AgentOrchestrator:
                 )
             )
         ):
-            seen_tool_calls[call_fingerprint] = 1
+            first_call_succeeded = bool(
+                isinstance(result_data, dict)
+                and result_data.get("success") is True
+                and result_data.get("policyBlocked") is not True
+                and not result_data.get("error")
+            )
+            seen_tool_calls[call_fingerprint] = (1, first_call_succeeded)
         return result_str
 
     @staticmethod
@@ -1922,40 +1857,6 @@ class AgentOrchestrator:
             AgentOrchestrator._collect_trusted_batch_ids(
                 snapshot, trusted, call_arguments
             )
-
-    @staticmethod
-    def _write_authorization_answer(
-        arguments: Dict,
-        tool_context: ToolContext,
-    ) -> Dict:
-        """Turn a proposed write call into the command a user can send."""
-        requested_tool = str(arguments.get("tool") or "").strip()
-        requested_args = arguments.get("arguments")
-        if requested_tool not in MUTATING_TOOL_NAMES or not isinstance(requested_args, dict):
-            return {
-                "success": False,
-                "message": (
-                    "参数无效：tool 必须是一个写工具名，arguments 必须是该工具的完整参数对象。"
-                ),
-            }
-        suggestion = self_checked_suggested_command(
-            requested_tool,
-            requested_args,
-            tool_context,
-        )
-        if not suggestion:
-            return policy_block(
-                BLOCK_REASON_VERB_NOT_MATCHED,
-                "本轮没有可授权这次改动的明确指令，也无法生成一条一定能通过校验的指令。"
-                "请只说明缺少什么，不要自己编一条指令让用户发送。",
-                missing=["executionVerb"],
-            )
-        return policy_block(
-            BLOCK_REASON_VERB_NOT_MATCHED,
-            "本轮没有写权限，未执行任何写操作。",
-            missing=["executionVerb"],
-            suggestion=suggestion,
-        )
 
     @staticmethod
     def _server_plan_binding(

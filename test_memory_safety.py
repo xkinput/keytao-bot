@@ -10349,114 +10349,66 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("原样转述", tool_replies[1]["message"])
         self.assertIn("原样转述", tool_replies[0]["message"])
 
+    async def test_duplicate_write_hint_reports_a_blocked_first_call_honestly(self) -> None:
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call("call-1")]),
+            _fake_response("tool_calls", tool_calls=[_shift_tool_call("call-2")]),
+            _fake_response("stop", "已说明未写入。"),
+        ])
 
-class ReadOnlyAuthorizationRequestTests(unittest.IsolatedAsyncioTestCase):
-    """A read-only turn must still be able to hand back an exact command."""
+        async def never(**kwargs):
+            raise AssertionError("binding-blocked write must not reach the sink")
 
-    @staticmethod
-    def _authorization_call(tool="keytao_shift_phrase_code", arguments=None):
-        payload = {
-            "tool": tool,
-            "arguments": arguments or {"word": "吃席", "target_code": "wkxk"},
-        }
-        return types.SimpleNamespace(
+        await _shift_orchestrator(client, never).run(
+            "顺延「赤溪」到 wkxk",
+            AgentRequestContext(
+                platform="qq",
+                user_id="user-1",
+                mutations_allowed=True,
+            ),
+        )
+
+        duplicate_payload = __import__("json").loads(next(
+            item["content"]
+            for item in reversed(client.completions.calls[2]["messages"])
+            if item.get("role") == "tool"
+        ))
+        self.assertIn("首次调用未写入", duplicate_payload["message"])
+        self.assertNotIn("数据已写入", duplicate_payload["message"])
+
+
+class UnadvertisedAuthorizationToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unadvertised_authorization_tool_is_rejected_as_unknown(self) -> None:
+        call = types.SimpleNamespace(
             id="call-auth",
             type="function",
             function=types.SimpleNamespace(
                 name="keytao_request_write_authorization",
-                arguments=__import__("json").dumps(payload, ensure_ascii=False),
+                arguments=__import__("json").dumps({
+                    "tool": "keytao_shift_phrase_code",
+                    "arguments": {"word": "吃席", "target_code": "wkxk"},
+                }, ensure_ascii=False),
             ),
         )
-
-    async def _run_turn(self, message, tool_calls=None, final="好的。"):
-        responses = []
-        if tool_calls:
-            responses.append(_fake_response("tool_calls", tool_calls=tool_calls))
-        responses.append(_fake_response("stop", final))
-        client = _FakeClient(responses)
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[call]),
+            _fake_response("stop", "不应到达。"),
+        ])
 
         async def never(**kwargs):
-            raise AssertionError("write tool must not run")
+            raise AssertionError("unadvertised tool must not reach a sink")
 
         result = await _shift_orchestrator(client, never).run(
-            message,
+            "把吃席的编码放到 wkxk",
             AgentRequestContext(
                 platform="qq",
                 user_id="user-1",
                 mutations_allowed=False,
             ),
         )
-        return client, result
 
-    async def test_change_request_turn_keeps_the_canonical_tool_array(self) -> None:
-        client, _ = await self._run_turn("把吃席的编码放在赤溪前面")
-
-        offered = {
-            tool["function"]["name"]
-            for tool in client.completions.calls[0].get("tools", [])
-        }
-        self.assertNotIn("keytao_request_write_authorization", offered)
-        self.assertIn("keytao_shift_phrase_code", offered)
-
-    async def test_question_turn_keeps_the_canonical_tool_array(self) -> None:
-        client, _ = await self._run_turn("吃席到底怎么打 wkxk")
-
-        offered = {
-            tool["function"]["name"]
-            for tool in client.completions.calls[0].get("tools", [])
-        }
-        self.assertNotIn("keytao_request_write_authorization", offered)
-        self.assertIn("keytao_shift_phrase_code", offered)
-
-    async def test_authorization_tool_returns_a_self_checked_command(self) -> None:
-        client, _ = await self._run_turn(
-            "把吃席的编码放到 wkxk",
-            tool_calls=[self._authorization_call()],
-            final="请发送：@我 顺延「吃席」到 wkxk",
-        )
-
-        payload = __import__("json").loads(next(
-            item for item in client.completions.calls[1]["messages"]
-            if item.get("role") == "tool"
-        )["content"])
-        self.assertEqual(payload["suggestedCommand"], "@我 顺延「吃席」到 wkxk")
-        self.assertNotIn("planDigest", payload)
-        self.assertNotIn("确认票据", payload["message"])
-
-        # And the command it handed out really is executable.
-        calls = []
-
-        async def shift(**kwargs):
-            calls.append(kwargs)
-            return {"success": True}
-
-        executor = ToolExecutor(lambda _name: shift, frozenset())
-        replayed = await executor.call(
-            "keytao_shift_phrase_code",
-            {"word": "吃席", "target_code": "wkxk"},
-            ToolContext(
-                current_message=payload["suggestedCommand"],
-                writes_allowed=message_authorizes_mutation(
-                    payload["suggestedCommand"]
-                ),
-            ),
-        )
-        self.assertTrue(__import__("json").loads(replayed).get("success"))
-        self.assertEqual(len(calls), 1)
-
-    async def test_authorization_tool_refuses_to_invent_one_for_a_question(self) -> None:
-        client, _ = await self._run_turn(
-            "吃席到底怎么打 wkxk",
-            tool_calls=[self._authorization_call()],
-            final="这是当前编码说明。",
-        )
-
-        payload = __import__("json").loads(next(
-            item for item in client.completions.calls[1]["messages"]
-            if item.get("role") == "tool"
-        )["content"])
-        self.assertNotIn("suggestedCommand", payload)
-        self.assertIn("不要自己编", payload["message"])
+        self.assertIn("工具参数格式错误", result)
+        self.assertEqual(len(client.completions.calls), 1)
 
 
 class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):

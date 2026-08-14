@@ -2567,10 +2567,15 @@ async def keytao_list_draft_items(
     platform: str,
     platform_id: str,
     batch_id: Optional[str] = None,
+    offset: int = 0,
+    limit: int = 50,
 ) -> Dict:
     """
-    List all PR items in the user's latest draft batch
-    列出用户最新草稿批次中的所有条目
+    List all PR items in the user's latest draft batch.
+
+    ``offset``/``limit`` select the model-visible window in the harness; this
+    function deliberately returns the full item set so deterministic item-set
+    validation continues to consume full-fidelity server data.
     """
     KEYTAO_API_BASE = get_keytao_url()
     BOT_API_TOKEN = get_bot_token()
@@ -3410,6 +3415,17 @@ TOOLS = [
                     "batch_id": {
                         "type": "string",
                         "description": "可选：要查看的批次编号，必须是本轮工具结果里出现过的 batchId；不传表示当前草稿"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "可选：模型可见分页起点，从 0 开始；默认 0"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "可选：模型可见分页条数，最多 50；默认 50"
                     }
                 },
                 "required": []

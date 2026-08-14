@@ -303,7 +303,10 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     if not candidates:
         candidates = [(recommended_code, False)]
 
-    review_line_match = re.search(r'(?m)^\s*审词：(.+?)\s*$', response)
+    review_line_match = re.search(
+        r'(?m)^\s*(?:喵喵)?审词：(.+?)\s*$',
+        response,
+    )
     if review_line_match:
         review_text = review_line_match.group(1).strip()
         if review_text:
@@ -526,7 +529,7 @@ def _batch_review_remark(response: str, word: str) -> str:
     next_header = re.search(r"(?m)^「[^」]+」[^\n]*$", response[block_start:])
     block_end = block_start + next_header.start() if next_header else len(response)
     block = response[block_start:block_end]
-    review_match = re.search(r"(?m)^\s*审词：(.+?)\s*$", block)
+    review_match = re.search(r"(?m)^\s*(?:喵喵)?审词：(.+?)\s*$", block)
     if not review_match:
         return ""
     review_text = _normalize_generated_review_copy(review_match.group(1).strip())

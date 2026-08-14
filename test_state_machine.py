@@ -194,6 +194,7 @@ from keytao_bot.harness.tools import (
     ToolContext,
     ToolExecutor,
     _COMMAND_LEAD_IN_PREFIXES,
+    _MAX_STAGED_MUTATION_LIST_ITEMS,
     large_model_tool_result_has_policy,
     project_tool_result_for_model,
 )
@@ -565,11 +566,13 @@ def test_parse_pending_batch_add_inline_priority_recommendation():
     response = """两个词都正确，但含义和用法不同：
 
 「摇光」（yáo guāng）
+喵喵审词：读音 yao guang；来源 汉典；自动审核：该词可自动通过
 候选编码：
 1. yzgm — ✅ 推荐（空位）
 2. yzgmi — 空位
 
 「瑶光」（yáo guāng）
+喵喵审词：读音 yao guang；来源 百度百科；自动审核：该词需管理员审核
 候选编码：
 1. yzgm — ✅ 推荐（空位）
 2. yzgmv — 空位
@@ -587,6 +590,10 @@ def test_parse_pending_batch_add_inline_priority_recommendation():
         "inline recommendation keeps exact mapping",
         [(item.get("word"), item.get("code")) for item in items]
         == [("摇光", "yzgm"), ("瑶光", "yzgmv")],
+    )
+    check(
+        "miaomiao-prefixed review lines keep non-empty per-word remarks",
+        all(str(item.get("remark") or "").startswith("喵喵审词：") for item in items),
     )
 
 
@@ -1320,10 +1327,69 @@ def test_pending_add_word_guidance_fallback_matcher():
     check("fallback appends guidance", "原词 重新编码" in guided)
 
 
-# Measured representative assembled prompt: 35,679 chars on 2026-08-15.
+# Measured representative assembled prompt: 35,891 chars on 2026-08-15.
 # Raise this only after reviewing the prompt/skill diff; update the measured
 # value and date here, then preserve roughly 10 percent intentional headroom.
 SYSTEM_PROMPT_GROWTH_LIMIT_CHARS = 39_300
+
+
+def test_openai_chat_compatibility_exports_cover_shared_module_objects():
+    """Every shared facade binding must keep legacy monkeypatch writes working."""
+    print("\n🧪 openai_chat compatibility export coverage")
+
+    expected_whitelist = {
+        "Any", "Awaitable", "Callable", "ContextVar", "Dict", "List",
+        "Optional", "OrderedDict", "Tuple", "asdict", "asyncio",
+        "dataclass", "hashlib", "is_dataclass", "islice", "json", "os",
+        "re", "replace", "time", "unicodedata",
+    }
+    actual_whitelist = set(
+        openai_chat_module._CHAT_COMPAT_STDLIB_TYPING_WHITELIST
+    )
+    check(
+        "compat guard has only the reviewed stdlib/typing whitelist",
+        actual_whitelist == expected_whitelist,
+    )
+
+    shared_names = {
+        name
+        for name, value in vars(openai_chat_module).items()
+        if not name.startswith("__")
+        and any(
+            name in vars(module) and vars(module)[name] is value
+            for module in openai_chat_module._CHAT_COMPAT_MODULES
+        )
+    }
+    missing = sorted(
+        shared_names
+        - set(openai_chat_module._CHAT_COMPAT_NAMES)
+        - actual_whitelist
+    )
+    check(f"all shared facade names are registered: {missing}", not missing)
+
+
+def test_finish_platform_stage_is_self_enforcing_terminal():
+    """The final delivery stage must stop the pipeline even if stages are reordered."""
+    print("\n🧪 finish platform stage is terminal")
+
+    async def _run():
+        ctx = openai_chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="terminal-user",
+            response="done",
+        )
+        with patch.object(
+            openai_chat_module,
+            "_finish_ai_chat_response",
+            new_callable=AsyncMock,
+        ) as finish:
+            terminal = await openai_chat_module._stage_finish_platform_response(ctx)
+        check("finish stage returns the terminal signal", terminal is True)
+        check("finish stage delivers exactly once", finish.await_count == 1)
+
+    asyncio.run(_run())
 
 
 def _model_tool_projection_fixtures():
@@ -1465,13 +1531,21 @@ def _model_tool_projection_fixtures():
                     "type": "Phrase",
                     "type_label": "词组",
                     "weight": 100 + index,
+                    "position": 2,
+                    "position_label": "二重",
                     "duplicate_info": {
                         "position": 1,
                         "position_label": "二重",
                         "analysis": "duplicate prose " * 50,
                         "all_words": [
-                            {"word": f"占位{index}", "weight": 100, "label": ""},
-                            {"word": f"词{index}", "weight": 101, "label": "二重"},
+                            {
+                                "word": f"占位{index}", "weight": 100,
+                                "label": "", "position": 1,
+                            },
+                            {
+                                "word": f"词{index}", "weight": 101,
+                                "label": "二重", "position": 2,
+                            },
                         ],
                     },
                 }],
@@ -1485,6 +1559,8 @@ def _model_tool_projection_fixtures():
         "keytao_list_draft_items": {
             "success": True,
             "batchId": "batch-1",
+            "batchIdProvisional": True,
+            "batchUrlStatus": "待确认后生成",
             "count": 200,
             "summary": {"added": 200, "modified": 0, "deleted": 0},
             "items": draft_items,
@@ -1560,13 +1636,86 @@ def test_model_tool_result_projection_contract():
     ))
     check("encode drops internal full-code branches", "fullCode" not in encode["chars"][0] and "internalBranches" not in encode["chars"][0])
 
+    lookup = json.loads(project_tool_result_for_model(
+        "keytao_lookup_by_word",
+        json.dumps(fixtures["keytao_lookup_by_word"], ensure_ascii=False),
+    ))
+    phrase = lookup["phrases"][0]
+    check(
+        "lookup projection keeps phrase display contract fields",
+        all(
+            phrase.get(field) == expected
+            for field, expected in {
+                "type_label": "词组",
+                "position": 2,
+                "position_label": "二重",
+            }.items()
+        ),
+    )
+    duplicate_rows = phrase["duplicate_info"]["all_words"]
+    check(
+        "lookup projection keeps duplicate-row labels and positions",
+        [(row.get("label"), row.get("position")) for row in duplicate_rows]
+        == [("", 1), ("二重", 2)],
+    )
+
+    draft_raw = json.dumps(
+        fixtures["keytao_list_draft_items"],
+        ensure_ascii=False,
+    )
     draft = json.loads(project_tool_result_for_model(
         "keytao_list_draft_items",
-        json.dumps(fixtures["keytao_list_draft_items"], ensure_ascii=False),
+        draft_raw,
     ))
-    check("draft projection caps model-visible items", len(draft["items"]) == 40)
-    check("draft projection carries an unambiguous incomplete-list marker", draft.get("itemsTruncated") is True and "「…另有 160 条」" in draft.get("itemsTruncationNotice", ""))
+    check(
+        "draft projection default matches the 50-item staged cap",
+        len(draft["items"]) == _MAX_STAGED_MUTATION_LIST_ITEMS == 50,
+    )
+    check(
+        "draft projection renders the default window range",
+        draft.get("itemsWindowNotice") == "共 200 条，当前显示 1-50 条",
+    )
+    check(
+        "draft projection marker advertises offset/limit pagination",
+        draft.get("itemsTruncated") is True
+        and "offset=50" in draft.get("itemsTruncationNotice", "")
+        and "limit=50" in draft.get("itemsTruncationNotice", ""),
+    )
     check("draft projection truncates remarks with an ellipsis", len(draft["items"][0]["remark"]) <= 80 and draft["items"][0]["remark"].endswith("…"))
+    check(
+        "draft projection keeps provisional batch safety markers",
+        draft.get("batchIdProvisional") is True
+        and draft.get("batchUrlStatus") == "待确认后生成",
+    )
+    second_page = json.loads(project_tool_result_for_model(
+        "keytao_list_draft_items",
+        draft_raw,
+        {"offset": 50, "limit": 25},
+    ))
+    check(
+        "draft projection renders the requested server-side window",
+        [item.get("word") for item in second_page["items"]]
+        == [f"测试{index}" for index in range(50, 75)],
+    )
+    check(
+        "draft projection renders the requested window range",
+        second_page.get("itemsWindowNotice") == "共 200 条，当前显示 51-75 条",
+    )
+    check(
+        "draft projection does not mutate the full-fidelity item set",
+        len(fixtures["keytao_list_draft_items"]["items"]) == 200,
+    )
+    list_tool = next(
+        tool for tool in openai_chat_module.skills_manager.get_tools()
+        if tool.get("function", {}).get("name") == "keytao_list_draft_items"
+    )
+    list_properties = list_tool["function"]["parameters"]["properties"]
+    check(
+        "draft list schema advertises bounded offset/limit pagination",
+        list_properties.get("offset", {}).get("minimum") == 0
+        and list_properties.get("limit", {}).get("minimum") == 1
+        and list_properties.get("limit", {}).get("maximum") == 50,
+    )
 
     unchanged = json.dumps({"success": True, "blob": "x" * 4_100}, ensure_ascii=False)
     check("unregistered tools fail open to full fidelity", project_tool_result_for_model("new_tool", unchanged) == unchanged)
@@ -14089,7 +14238,7 @@ def test_state_metrics_startup_log():
             check("state line includes database size", "db_bytes=sample.db:" in line)
             check("state line includes main-table rows", "db_rows=sample.db.sample_rows:2" in line)
             check("state line includes cache counts", "cache_entries=" in line and "review:" in line and "reviewed_add:" in line and "semantic_review:" in line and "zdic:0" in line)
-            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=35679" in line)
+            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=35891" in line)
             check("state line is bounded to one line", bool(line) and "\n" not in line)
 
     asyncio.run(_run())
@@ -14130,6 +14279,8 @@ if __name__ == "__main__":
     test_referenced_unknown_pending_recode_falls_through()
     test_pending_add_word_guidance_appended_for_occupied_candidates()
     test_pending_add_word_guidance_fallback_matcher()
+    test_openai_chat_compatibility_exports_cover_shared_module_objects()
+    test_finish_platform_stage_is_self_enforcing_terminal()
     test_model_tool_result_projection_contract()
     test_system_prompt_growth_guard()
     test_system_prompt_cache_layout_keeps_platform_context_last()
