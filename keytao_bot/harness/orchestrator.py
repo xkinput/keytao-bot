@@ -100,6 +100,15 @@ WRITE_AUTHORIZATION_TOOL = {
 }
 
 
+def build_system_prompt(
+    core: str,
+    skill_instructions: str,
+    platform_ctx: str,
+) -> str:
+    """Assemble the stable prompt prefix with platform context at the tail."""
+    return core + skill_instructions + platform_ctx
+
+
 def _tool_function_name(tool: Any) -> str:
     function = tool.get("function") if isinstance(tool, dict) else None
     return str(function.get("name") or "") if isinstance(function, dict) else ""
@@ -307,7 +316,11 @@ class AgentOrchestrator:
         platform_label = {'telegram': 'Telegram', 'qq': 'QQ', 'web': 'Web'}.get(context.platform, '未知')
         platform_ctx = self._build_platform_context(platform_label, context)
         skill_instructions = self._skills_manager.get_skill_instructions()
-        system_prompt = self._system_prompt_core + skill_instructions + platform_ctx
+        system_prompt = build_system_prompt(
+            self._system_prompt_core,
+            skill_instructions,
+            platform_ctx,
+        )
         record_history_messages(len(context.history or []))
 
         logger.info(f"📋 System prompt length: {len(system_prompt)} chars")

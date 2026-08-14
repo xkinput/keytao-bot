@@ -197,7 +197,12 @@ from keytao_bot.harness.tools import (
     large_model_tool_result_has_policy,
     project_tool_result_for_model,
 )
-from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRequestContext, AgentRuntimeConfig
+from keytao_bot.harness.orchestrator import (
+    AgentOrchestrator,
+    AgentRequestContext,
+    AgentRuntimeConfig,
+    build_system_prompt,
+)
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 from keytao_bot.utils import keytao_review as keytao_review_module
@@ -1588,12 +1593,31 @@ def test_system_prompt_growth_guard():
 def test_system_prompt_cache_layout_keeps_platform_context_last():
     print("\n🧪 system prompt cache layout keeps platform context last")
     skills = openai_chat_module.skills_manager.get_skill_instructions()
-    prompt = openai_chat_module.representative_system_prompt()
+    context = AgentRequestContext(
+        platform="qq",
+        user_id="0",
+        space_type="group",
+        space_id="0",
+    )
+    platform_context = AgentOrchestrator._build_platform_context(
+        None,
+        "QQ",
+        context,
+    )
+    prompt = build_system_prompt(
+        SYSTEM_PROMPT_CORE,
+        skills,
+        platform_context,
+    )
     platform_offset = prompt.index("【当前平台】")
 
     check(
         "platform context starts after every static prompt segment",
         platform_offset > len(SYSTEM_PROMPT_CORE) + len(skills),
+    )
+    check(
+        "platform context remains the final prompt segment",
+        prompt.endswith(platform_context),
     )
 
 

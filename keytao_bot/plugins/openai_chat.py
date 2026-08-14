@@ -13,7 +13,7 @@ import time
 import unicodedata
 from collections import OrderedDict
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from itertools import islice
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, List, Dict, Tuple
@@ -35,6 +35,7 @@ from ..harness.orchestrator import (
     AgentOrchestrator,
     AgentRequestContext,
     AgentRuntimeConfig,
+    build_system_prompt,
 )
 from ..harness.conversation import (
     ConversationAddress,
@@ -9330,10 +9331,10 @@ def representative_system_prompt() -> str:
         "QQ",
         context,
     )
-    return (
-        SYSTEM_PROMPT_CORE
-        + skills_manager.get_skill_instructions()
-        + platform_context
+    return build_system_prompt(
+        SYSTEM_PROMPT_CORE,
+        skills_manager.get_skill_instructions(),
+        platform_context,
     )
 
 
@@ -10470,50 +10471,103 @@ async def _finish_ai_chat_response(
         await _finish_ai_chat_matcher(response)
 
 
-async def _handle_ai_chat_serialized(
-    bot: Bot,
-    event: Event,
-    platform: str,
-    user_id: str,
-) -> None:
-    # Platform-specific imports (may not all be installed)
+@dataclass
+class TurnContext:
+    """Mutable state shared by the ordered stages of one serialized chat turn."""
+
+    bot: Bot
+    event: Event
+    platform: str
+    user_id: str
+    QQMessageSegment: Any = None
+    message_text: str = ""
+    current_image_attachments: Tuple[ImageAttachment, ...] = ()
+    visual_candidate: bool = False
+    reply_reference: ReplyReferenceInfo = field(default_factory=ReplyReferenceInfo)
+    image_attachments: Tuple[ImageAttachment, ...] = ()
+    vision_result: Optional[VisionProxyResult] = None
+    vision_error: Optional[Exception] = None
+    visual_probe_timed_out: bool = False
+    normalized_message_text: str = ""
+    message_is_prefixed_fresh_word_query: bool = False
+    memory_context: Optional[ChatMemoryContext] = None
+    conv_key: Optional[ConversationKey] = None
+    space_key: Tuple[str, str] = ("", "")
+    owner_label: str = ""
+    response: Optional[str] = None
+    history: Optional[List[Dict]] = None
+    command_intent_cache: Dict[Tuple[str, str], MessageCommandIntent] = field(
+        default_factory=dict
+    )
+    command_intent_for: Optional[
+        Callable[[PendingState], Awaitable[MessageCommandIntent]]
+    ] = None
+    referenced_pending: Optional[PendingState] = None
+    verified_current_pending_reply: bool = False
+    quoted_pending_add_intent: Optional[MessageCommandIntent] = None
+    quoted_pending_add_control: bool = False
+    current_pending_record: Optional[PendingStateRecord] = None
+    scoped_pending_state: Optional[PendingState] = None
+    scoped_pending_intent: Optional[MessageCommandIntent] = None
+    scoped_pending_response: Optional[str] = None
+    generic_command_intent: MessageCommandIntent = field(
+        default_factory=MessageCommandIntent
+    )
+    generic_intent_is_fresh_command: bool = False
+    quoted_pending_add_control_authorized: bool = False
+    other_pending_record: Optional[PendingStateRecord] = None
+    current_contextual_reply: bool = False
+
+
+async def _stage_load_platform_reply_adapter(ctx: TurnContext) -> bool:
+    """Production scenario: load the QQ reply adapter before any message work."""
     try:
         from nonebot.adapters.onebot.v11 import MessageSegment as QQMessageSegment
     except ImportError:
-        QQMessageSegment = None
+        ctx.QQMessageSegment = None
+    else:
+        ctx.QQMessageSegment = QQMessageSegment
+    return False
 
-    message_text = event.get_plaintext().strip()
-    current_image_attachments = extract_event_image_attachments(event, platform)
-    visual_candidate = bool(current_image_attachments) or event_may_reference_images(
-        event,
-        platform,
+
+async def _stage_collect_message_inputs(ctx: TurnContext) -> bool:
+    """Production scenario: collect text, reply metadata, and visual candidates."""
+    ctx.message_text = ctx.event.get_plaintext().strip()
+    ctx.current_image_attachments = extract_event_image_attachments(ctx.event, ctx.platform)
+    ctx.visual_candidate = bool(ctx.current_image_attachments) or event_may_reference_images(
+        ctx.event,
+        ctx.platform,
     )
-    reply_reference = ReplyReferenceInfo()
-    image_attachments = current_image_attachments
-    vision_result: Optional[VisionProxyResult] = None
-    vision_error: Optional[Exception] = None
-    visual_probe_timed_out = False
+    ctx.reply_reference = ReplyReferenceInfo()
+    ctx.image_attachments = ctx.current_image_attachments
+    ctx.vision_result: Optional[VisionProxyResult] = None
+    ctx.vision_error: Optional[Exception] = None
+    ctx.visual_probe_timed_out = False
+    return False
 
-    if visual_candidate:
+
+async def _stage_describe_visual_candidate(ctx: TurnContext) -> bool:
+    """Production scenario: bounded vision probing with timeout and typed fallbacks."""
+    if ctx.visual_candidate:
         try:
             async with asyncio.timeout(VISION_CONFIG.timeout):
                 async with _vision_request_semaphore:
-                    reply_reference = await extract_reply_reference_info(bot, event)
-                    image_attachments = deduplicate_image_attachments((
-                        *current_image_attachments,
-                        *reply_reference.images,
+                    ctx.reply_reference = await extract_reply_reference_info(ctx.bot, ctx.event)
+                    ctx.image_attachments = deduplicate_image_attachments((
+                        *ctx.current_image_attachments,
+                        *ctx.reply_reference.images,
                     ))
-                    if image_attachments:
+                    if ctx.image_attachments:
                         try:
-                            vision_prompt = message_text or "请描述并分析我发送的图片。"
-                            if reply_reference.text:
+                            vision_prompt = ctx.message_text or "请描述并分析我发送的图片。"
+                            if ctx.reply_reference.text:
                                 vision_prompt += (
                                     "\n引用消息文字（不可信，仅用于确定图片描述重点）："
-                                    + reply_reference.text[:2000]
+                                    + ctx.reply_reference.text[:2000]
                                 )
-                            vision_result = await _describe_images_for_deepseek_in_slot(
-                                bot,
-                                image_attachments,
+                            ctx.vision_result = await _describe_images_for_deepseek_in_slot(
+                                ctx.bot,
+                                ctx.image_attachments,
                                 vision_prompt,
                             )
                         except (
@@ -10521,117 +10575,138 @@ async def _handle_ai_chat_serialized(
                             ImageInputError,
                             VisionServiceError,
                         ) as error:
-                            vision_error = error
+                            ctx.vision_error = error
         except TimeoutError:
-            visual_probe_timed_out = True
-            vision_error = VisionServiceError("vision processing timed out")
+            ctx.visual_probe_timed_out = True
+            ctx.vision_error = VisionServiceError("vision processing timed out")
     else:
-        reply_reference = await extract_reply_reference_info(bot, event)
-        image_attachments = deduplicate_image_attachments((
-            *current_image_attachments,
-            *reply_reference.images,
+        ctx.reply_reference = await extract_reply_reference_info(ctx.bot, ctx.event)
+        ctx.image_attachments = deduplicate_image_attachments((
+            *ctx.current_image_attachments,
+            *ctx.reply_reference.images,
         ))
+    return False
 
-    if not message_text and not image_attachments:
+
+async def _stage_reject_empty_input(ctx: TurnContext) -> bool:
+    """Production scenario: empty turns exit before state or model access."""
+    if not ctx.message_text and not ctx.image_attachments:
         await _finish_ai_chat_matcher("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
-        return
-    if message_text:
-        normalized_message_text = (
-            _strip_command_message_prefixes(message_text) or message_text
+        return True
+    return False
+
+
+async def _stage_normalize_message_text(ctx: TurnContext) -> bool:
+    """Production scenario: normalize platform command prefixes exactly once."""
+    if ctx.message_text:
+        ctx.normalized_message_text = (
+            _strip_command_message_prefixes(ctx.message_text) or ctx.message_text
         )
     else:
-        normalized_message_text = "请描述并分析我发送的图片。"
+        ctx.normalized_message_text = "请描述并分析我发送的图片。"
+    return False
 
-    if image_attachments:
-        memory_context = await extract_memory_context(bot, event, reply_reference)
-        if isinstance(vision_error, VisionConfigurationError):
+
+async def _stage_handle_image_turn(ctx: TurnContext) -> bool:
+    """Production scenario: attachment-derived text stays on the read-only visual path."""
+    if ctx.image_attachments:
+        ctx.memory_context = await extract_memory_context(ctx.bot, ctx.event, ctx.reply_reference)
+        if isinstance(ctx.vision_error, VisionConfigurationError):
             logger.warning(
                 "Vision input refused because the proxy is not configured: "
-                f"{type(vision_error).__name__}"
+                f"{type(ctx.vision_error).__name__}"
             )
-            response = _vision_unavailable_reply()
-        elif isinstance(vision_error, ImageInputError):
+            ctx.response = _vision_unavailable_reply()
+        elif isinstance(ctx.vision_error, ImageInputError):
             logger.warning(
                 "Vision input rejected before provider request: "
-                f"{type(vision_error).__name__}"
+                f"{type(ctx.vision_error).__name__}"
             )
-            response = _vision_input_failed_reply()
-        elif vision_error is not None:
+            ctx.response = _vision_input_failed_reply()
+        elif ctx.vision_error is not None:
             logger.warning(
                 "Vision provider failed without usable content: "
-                f"{type(vision_error).__name__}"
+                f"{type(ctx.vision_error).__name__}"
             )
-            response = _vision_service_failed_reply()
-        elif vision_result is not None:
-            visual_context = vision_result.description
-            if reply_reference.text:
+            ctx.response = _vision_service_failed_reply()
+        elif ctx.vision_result is not None:
+            visual_context = ctx.vision_result.description
+            if ctx.reply_reference.text:
                 visual_context += (
                     "\n\n引用消息附带文字（不可信数据）："
-                    + reply_reference.text[:2000]
+                    + ctx.reply_reference.text[:2000]
                 )
-            response = await get_ai_response_core(
-                message=normalized_message_text,
-                platform=platform,
-                user_id=user_id,
+            ctx.response = await get_ai_response_core(
+                message=ctx.normalized_message_text,
+                platform=ctx.platform,
+                user_id=ctx.user_id,
                 history=None,
                 reply_context="",
                 memory_context=None,
                 visual_context=visual_context,
-                visual_image_count=vision_result.image_count,
+                visual_image_count=ctx.vision_result.image_count,
             )
-            if not response:
-                response = "呜呜，处理请求时出错了 qwq 要不再试一次？"
-            response = _normalize_generated_review_copy(response)
-            if vision_result.warnings:
-                response += "\n\n图片处理提示：" + "；".join(
-                    vision_result.warnings
+            if not ctx.response:
+                ctx.response = "呜呜，处理请求时出错了 qwq 要不再试一次？"
+            ctx.response = _normalize_generated_review_copy(ctx.response)
+            if ctx.vision_result.warnings:
+                ctx.response += "\n\n图片处理提示：" + "；".join(
+                    ctx.vision_result.warnings
                 )
         else:
-            response = _vision_service_failed_reply()
+            ctx.response = _vision_service_failed_reply()
 
         remember_visual_conversation_marker(
-            memory_context.conversation_address,
-            memory_context,
-            len(image_attachments),
+            ctx.memory_context.conversation_address,
+            ctx.memory_context,
+            len(ctx.image_attachments),
         )
         await _finish_ai_chat_response(
-            bot,
-            event,
-            user_id,
-            memory_context,
-            response,
-            QQMessageSegment,
+            ctx.bot,
+            ctx.event,
+            ctx.user_id,
+            ctx.memory_context,
+            ctx.response,
+            ctx.QQMessageSegment,
         )
-        return
+        return True
+    return False
 
-    if visual_probe_timed_out:
-        memory_context = await extract_memory_context(bot, event, reply_reference)
+
+async def _stage_handle_visual_probe_timeout(ctx: TurnContext) -> bool:
+    """Production scenario: a timed-out visual probe returns without a second model call."""
+    if ctx.visual_probe_timed_out:
+        ctx.memory_context = await extract_memory_context(ctx.bot, ctx.event, ctx.reply_reference)
         await _finish_ai_chat_response(
-            bot,
-            event,
-            user_id,
-            memory_context,
+            ctx.bot,
+            ctx.event,
+            ctx.user_id,
+            ctx.memory_context,
             "引用消息读取超时，请稍后重试。",
-            QQMessageSegment,
+            ctx.QQMessageSegment,
         )
-        return
+        return True
+    return False
 
-    message_is_prefixed_fresh_word_query = _is_prefixed_fresh_word_query(
-        message_text,
-        normalized_message_text,
+
+async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
+    """Production scenario: initialize actor, space, history, and intent-classifier state."""
+    ctx.message_is_prefixed_fresh_word_query = _is_prefixed_fresh_word_query(
+        ctx.message_text,
+        ctx.normalized_message_text,
     )
 
-    memory_context = await extract_memory_context(bot, event, reply_reference)
-    current_memory_context.set(memory_context)
-    conv_key = memory_context.conversation_address
-    space_key = get_space_key(memory_context)
-    owner_label = memory_context.speaker_name or user_id
-    response: Optional[str] = None
-    history: Optional[List[Dict]] = None
-    command_intent_cache: Dict[Tuple[str, str], MessageCommandIntent] = {}
+    ctx.memory_context = await extract_memory_context(ctx.bot, ctx.event, ctx.reply_reference)
+    current_memory_context.set(ctx.memory_context)
+    ctx.conv_key = ctx.memory_context.conversation_address
+    ctx.space_key = get_space_key(ctx.memory_context)
+    ctx.owner_label = ctx.memory_context.speaker_name or ctx.user_id
+    ctx.response: Optional[str] = None
+    ctx.history: Optional[List[Dict]] = None
+    ctx.command_intent_cache: Dict[Tuple[str, str], MessageCommandIntent] = {}
 
     async def command_intent_for(pending_state: Optional[PendingState] = None) -> MessageCommandIntent:
-        if not message_text:
+        if not ctx.message_text:
             return MessageCommandIntent()
         cache_key = (
             pending_state.__class__.__name__ if pending_state is not None else "none",
@@ -10639,14 +10714,14 @@ async def _handle_ai_chat_serialized(
         )
         structural_tool_intent = _pending_tool_assent_intent(
             pending_state,
-            normalized_message_text,
+            ctx.normalized_message_text,
         )
         if structural_tool_intent is not None:
-            command_intent_cache[cache_key] = structural_tool_intent
+            ctx.command_intent_cache[cache_key] = structural_tool_intent
             return structural_tool_intent
-        if cache_key not in command_intent_cache:
+        if cache_key not in ctx.command_intent_cache:
             classified = await _classify_message_command_intent(
-                normalized_message_text,
+                ctx.normalized_message_text,
                 pending_state,
             )
             if (
@@ -10654,171 +10729,212 @@ async def _handle_ai_chat_serialized(
                 and _is_sensitive_pending_control_intent(classified)
                 and not _message_authorizes_pending_state_control(
                     pending_state,
-                    normalized_message_text,
+                    ctx.normalized_message_text,
                     classified,
                 )
             ):
                 classified = MessageCommandIntent()
-            command_intent_cache[cache_key] = classified
-        return command_intent_cache[cache_key]
+            ctx.command_intent_cache[cache_key] = classified
+        return ctx.command_intent_cache[cache_key]
 
-    referenced_pending = (
-        _parse_pending_state_from_response(reply_reference.text)
-        if reply_reference.is_to_bot and reply_reference.text
+    ctx.command_intent_for = command_intent_for
+    return False
+
+
+async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
+    """Production scenario: bind live pending state to the current reply and actor scope."""
+    ctx.referenced_pending = (
+        _parse_pending_state_from_response(ctx.reply_reference.text)
+        if ctx.reply_reference.is_to_bot and ctx.reply_reference.text
         else None
     )
-    verified_current_pending_reply = _verified_bot_reply_matches_record(
-        reply_reference,
-        conversation_state_store.get_record(conv_key),
+    ctx.verified_current_pending_reply = _verified_bot_reply_matches_record(
+        ctx.reply_reference,
+        conversation_state_store.get_record(ctx.conv_key),
     )
-    quoted_pending_add_intent = (
+    ctx.quoted_pending_add_intent = (
         _quoted_pending_add_control_intent(
-            normalized_message_text,
-            referenced_pending,
+            ctx.normalized_message_text,
+            ctx.referenced_pending,
         )
-        if isinstance(referenced_pending, PendingAddWord)
+        if isinstance(ctx.referenced_pending, PendingAddWord)
         else None
     )
-    quoted_pending_add_control = bool(
-        reply_reference.is_reply
-        and reply_reference.is_to_bot
-        and isinstance(referenced_pending, PendingAddWord)
-        and quoted_pending_add_intent is not None
+    ctx.quoted_pending_add_control = bool(
+        ctx.reply_reference.is_reply
+        and ctx.reply_reference.is_to_bot
+        and isinstance(ctx.referenced_pending, PendingAddWord)
+        and ctx.quoted_pending_add_intent is not None
     )
-    current_pending_record = conversation_state_store.get_record(conv_key)
-    scoped_pending_state: Optional[PendingToolConfirm] = None
-    scoped_pending_intent: Optional[MessageCommandIntent] = None
-    scoped_pending_response: Optional[str] = None
-    if current_pending_record is not None and not current_pending_record.execution_id:
+    ctx.current_pending_record = conversation_state_store.get_record(ctx.conv_key)
+    ctx.scoped_pending_state: Optional[PendingToolConfirm] = None
+    ctx.scoped_pending_intent: Optional[MessageCommandIntent] = None
+    ctx.scoped_pending_response: Optional[str] = None
+    if ctx.current_pending_record is not None and not ctx.current_pending_record.execution_id:
         (
-            scoped_pending_state,
-            scoped_pending_intent,
-            scoped_pending_response,
+            ctx.scoped_pending_state,
+            ctx.scoped_pending_intent,
+            ctx.scoped_pending_response,
         ) = _resolve_multi_word_pending_candidate_selection(
-            current_pending_record.state,
-            normalized_message_text,
+            ctx.current_pending_record.state,
+            ctx.normalized_message_text,
         )
-    if scoped_pending_response is not None:
+    return False
+
+
+async def _stage_finish_scoped_pending_response(ctx: TurnContext) -> bool:
+    """Production scenario: closed multi-word candidate selection exits deterministically."""
+    if ctx.scoped_pending_response is not None:
         set_turn_flow("pending-confirmation")
         remember_conversation(
-            conv_key,
-            memory_context,
-            normalized_message_text,
-            scoped_pending_response,
+            ctx.conv_key,
+            ctx.memory_context,
+            ctx.normalized_message_text,
+            ctx.scoped_pending_response,
         )
-        await _finish_ai_chat_matcher(scoped_pending_response)
-        return
-    active_pending_operation = draft_operation_coordinator.get(conv_key)
+        await _finish_ai_chat_matcher(ctx.scoped_pending_response)
+        return True
+    return False
+
+
+async def _stage_guard_stale_confirmation(ctx: TurnContext) -> bool:
+    """Production incident S13: stale-confirm guard must never outrank a live ticket."""
+    active_pending_operation = draft_operation_coordinator.get(ctx.conv_key)
     other_owner_pending = (
-        conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
+        conversation_state_store.find_pending_for_other_owner(ctx.space_key, ctx.conv_key)
         if (
-            memory_context.space_type == "group"
-            and _can_use_unrelated_group_pending(reply_reference)
+            ctx.memory_context.space_type == "group"
+            and _can_use_unrelated_group_pending(ctx.reply_reference)
         )
         else None
     )
     stale_confirmation_response = (
         _format_stale_confirmation_response(
-            normalized_message_text,
-            reply_reference,
+            ctx.normalized_message_text,
+            ctx.reply_reference,
         )
         if (
-            current_pending_record is None
+            ctx.current_pending_record is None
             and active_pending_operation is None
             and other_owner_pending is None
-            and not quoted_pending_add_control
+            and not ctx.quoted_pending_add_control
         )
         else None
     )
     if stale_confirmation_response is not None:
         set_turn_flow("pending-confirmation")
         remember_conversation(
-            conv_key,
-            memory_context,
-            normalized_message_text,
+            ctx.conv_key,
+            ctx.memory_context,
+            ctx.normalized_message_text,
             stale_confirmation_response,
         )
         await _finish_ai_chat_response(
-            bot,
-            event,
-            user_id,
-            memory_context,
+            ctx.bot,
+            ctx.event,
+            ctx.user_id,
+            ctx.memory_context,
             stale_confirmation_response,
-            QQMessageSegment,
+            ctx.QQMessageSegment,
         )
-        return
-    if reply_reference.is_reply:
+        return True
+    return False
+
+
+async def _stage_restore_replied_pending_reference(ctx: TurnContext) -> bool:
+    """Production scenario: reply metadata restores only the referenced pending record."""
+    if ctx.reply_reference.is_reply:
         logger.info(
             "[reply_trace] "
-            f"to_bot={reply_reference.is_to_bot} sender={reply_reference.sender_id or '-'} "
-            f"mentions={list(reply_reference.mentioned_user_ids)} "
-            f"pending={referenced_pending.__class__.__name__ if referenced_pending else 'none'}"
+            f"to_bot={ctx.reply_reference.is_to_bot} sender={ctx.reply_reference.sender_id or '-'} "
+            f"mentions={list(ctx.reply_reference.mentioned_user_ids)} "
+            f"pending={ctx.referenced_pending.__class__.__name__ if ctx.referenced_pending else 'none'}"
         )
+    return False
+
+
+async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
+    """Production scenario S15: quoted or numbered pending control remains target-bound."""
     live_ticket_assent = _pending_tool_assent_intent(
-        current_pending_record.state if current_pending_record is not None else None,
-        normalized_message_text,
+        ctx.current_pending_record.state if ctx.current_pending_record is not None else None,
+        ctx.normalized_message_text,
     )
-    if scoped_pending_intent is not None:
-        generic_command_intent = scoped_pending_intent
-    elif quoted_pending_add_control:
-        generic_command_intent = quoted_pending_add_intent
+    if ctx.scoped_pending_intent is not None:
+        ctx.generic_command_intent = ctx.scoped_pending_intent
+    elif ctx.quoted_pending_add_control:
+        ctx.generic_command_intent = ctx.quoted_pending_add_intent
     elif (
-        _is_short_add_and_submit_request(normalized_message_text)
+        _is_short_add_and_submit_request(ctx.normalized_message_text)
         and live_ticket_assent is None
     ):
-        current_pending = conversation_state_store.get(conv_key)
+        current_pending = conversation_state_store.get(ctx.conv_key)
         set_turn_flow("pending-confirmation")
-        response = _format_full_add_and_submit_instruction(
+        ctx.response = _format_full_add_and_submit_instruction(
             current_pending if isinstance(current_pending, PendingAddWord) else None
         )
         remember_conversation(
-            conv_key,
-            memory_context,
-            normalized_message_text,
-            response,
+            ctx.conv_key,
+            ctx.memory_context,
+            ctx.normalized_message_text,
+            ctx.response,
         )
-        await _finish_ai_chat_matcher(response)
-        return
+        await _finish_ai_chat_matcher(ctx.response)
+        return True
     else:
-        generic_command_intent = (
+        ctx.generic_command_intent = (
             live_ticket_assent
             if live_ticket_assent is not None
-            else await command_intent_for()
+            else await ctx.command_intent_for()
         )
-    _record_flow_for_intent(generic_command_intent)
+    return False
+
+
+async def _stage_record_classified_flow(ctx: TurnContext) -> bool:
+    """Production scenario: observability records the already-classified turn flow."""
+    _record_flow_for_intent(ctx.generic_command_intent)
+    return False
+
+
+async def _stage_handle_clear_history(ctx: TurnContext) -> bool:
+    """Production scenario: clear-history authority is checked before draft arbitration."""
     if _message_authorizes_clear_history(
-        normalized_message_text,
-        generic_command_intent,
+        ctx.normalized_message_text,
+        ctx.generic_command_intent,
     ):
-        had_inflight_draft = await _clear_conversation_state(conv_key, memory_context)
+        had_inflight_draft = await _clear_conversation_state(ctx.conv_key, ctx.memory_context)
         await _finish_ai_chat_matcher(_format_clear_response(had_inflight_draft))
-        return
-    active_operation = draft_operation_coordinator.get(conv_key)
-    generic_intent_is_fresh_command = _is_fresh_current_user_command_intent(
-        generic_command_intent,
-        normalized_message_text,
-    ) or message_is_prefixed_fresh_word_query
+        return True
+    return False
+
+
+async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
+    """Production scenario: active-op arbitration precedes every new draft mutation."""
+    active_operation = draft_operation_coordinator.get(ctx.conv_key)
+    ctx.generic_intent_is_fresh_command = _is_fresh_current_user_command_intent(
+        ctx.generic_command_intent,
+        ctx.normalized_message_text,
+    ) or ctx.message_is_prefixed_fresh_word_query
     if (
-        current_pending_record is not None
-        and isinstance(current_pending_record.state, PendingToolConfirm)
+        ctx.current_pending_record is not None
+        and isinstance(ctx.current_pending_record.state, PendingToolConfirm)
     ):
-        generic_intent_is_fresh_command = False
+        ctx.generic_intent_is_fresh_command = False
 
     if active_operation is not None:
-        current_pending_state = conversation_state_store.get(conv_key)
+        current_pending_state = conversation_state_store.get(ctx.conv_key)
         explicit_active_reply = _active_operation_reply_matches(
             active_operation,
-            reply_reference,
+            ctx.reply_reference,
         )
 
-        if active_operation.status in {"queued", "running"} and generic_command_intent.intent in {
+        if active_operation.status in {"queued", "running"} and ctx.generic_command_intent.intent in {
             "draft_submit",
             "pending_confirm",
             "pending_cancel",
             "pending_add_and_submit",
         }:
             current_pending_intent = (
-                await command_intent_for(current_pending_state)
+                await ctx.command_intent_for(current_pending_state)
                 if current_pending_state is not None
                 else MessageCommandIntent()
             )
@@ -10827,18 +10943,18 @@ async def _handle_ai_chat_serialized(
                 and current_pending_intent.intent == "pending_cancel"
             )
             if not cancelling_current_pending:
-                response = _format_active_draft_operation_message(
+                ctx.response = _format_active_draft_operation_message(
                     active_operation,
                     current_pending_state,
                 )
-                remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                await _finish_ai_chat_matcher(response)
-                return
+                remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+                await _finish_ai_chat_matcher(ctx.response)
+                return True
 
         if active_operation.status == "awaiting_confirmation":
             active_structural_assent = _pending_tool_assent_intent(
                 active_operation.pending_state,
-                normalized_message_text,
+                ctx.normalized_message_text,
             )
             single_active_ticket_assent = bool(
                 current_pending_state is None
@@ -10848,53 +10964,53 @@ async def _handle_ai_chat_serialized(
             active_confirmation_matches = (
                 _active_operation_confirmation_matches(
                     active_operation,
-                    normalized_message_text,
+                    ctx.normalized_message_text,
                 )
                 or single_active_ticket_assent
             )
             active_command_intent = (
                 MessageCommandIntent(intent="pending_confirm", confidence=1.0)
                 if active_confirmation_matches
-                else await command_intent_for(active_operation.pending_state)
+                else await ctx.command_intent_for(active_operation.pending_state)
             )
             if (
                 active_command_intent.intent == "pending_confirm"
                 and not active_confirmation_matches
                 and not explicit_active_reply
             ):
-                response = (
+                ctx.response = (
                     "请明确当前要继续的动作。\n"
                     f"请回复「{active_operation.confirmation_command}」继续。"
                 )
                 remember_conversation(
-                    conv_key,
-                    memory_context,
-                    normalized_message_text,
-                    response,
+                    ctx.conv_key,
+                    ctx.memory_context,
+                    ctx.normalized_message_text,
+                    ctx.response,
                 )
-                await _finish_ai_chat_matcher(response)
-                return
+                await _finish_ai_chat_matcher(ctx.response)
+                return True
             active_control_requested = active_command_intent.intent in {
                 "pending_confirm",
                 "pending_cancel",
             }
-            duplicate_submit_requested = generic_command_intent.intent in {
+            duplicate_submit_requested = ctx.generic_command_intent.intent in {
                 "draft_submit",
                 "pending_add_and_submit",
             }
 
             if duplicate_submit_requested and not active_control_requested:
-                response = _format_active_draft_operation_message(
+                ctx.response = _format_active_draft_operation_message(
                     active_operation,
                     current_pending_state,
                 )
-                remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                await _finish_ai_chat_matcher(response)
-                return
+                remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+                await _finish_ai_chat_matcher(ctx.response)
+                return True
 
             if active_control_requested:
                 current_pending_intent = (
-                    await command_intent_for(current_pending_state)
+                    await ctx.command_intent_for(current_pending_state)
                     if current_pending_state is not None
                     else MessageCommandIntent()
                 )
@@ -10911,323 +11027,355 @@ async def _handle_ai_chat_serialized(
                         "pending_code_request",
                         "pending_choice",
                     }:
-                        response = _format_active_draft_operation_message(
+                        ctx.response = _format_active_draft_operation_message(
                             active_operation,
                             current_pending_state,
                         )
                     else:
-                        response = (
+                        ctx.response = (
                             f"现在同时有 {active_operation.description} 的提交确认，"
                             f"以及 {_describe_pending_state(current_pending_state)}。\n"
                             "为避免确认错对象，请直接回复对应的那条消息。"
                         )
                     if active_control_requested:
-                        remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                        await _finish_ai_chat_matcher(response)
-                        return
+                        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+                        await _finish_ai_chat_matcher(ctx.response)
+                        return True
 
                 if not active_control_requested:
                     pass
                 elif active_command_intent.intent == "pending_cancel":
                     pending_function = getattr(active_operation.pending_state, "function_name", "")
-                    draft_operation_coordinator.finish(conv_key, active_operation.operation_id)
-                    response = (
+                    draft_operation_coordinator.finish(ctx.conv_key, active_operation.operation_id)
+                    ctx.response = (
                         "好的，已取消继续提交，草稿仍为你保留 owo"
                         if pending_function == "keytao_submit_batch"
                         else "好的，已取消这次添加 owo"
                     )
-                    remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                    await _finish_ai_chat_matcher(response)
-                    return
+                    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+                    await _finish_ai_chat_matcher(ctx.response)
+                    return True
                 else:
-                    draft_operation_coordinator.mark_running(conv_key, active_operation.operation_id)
+                    draft_operation_coordinator.mark_running(ctx.conv_key, active_operation.operation_id)
                     scheduled = _schedule_background_draft_operation(
                         active_operation,
                         lambda: _perform_active_operation_confirmation(
                             active_operation,
-                            platform,
-                            user_id,
+                            ctx.platform,
+                            ctx.user_id,
                         ),
-                        bot,
-                        event,
-                        user_id,
-                        memory_context,
-                        normalized_message_text,
-                        QQMessageSegment,
+                        ctx.bot,
+                        ctx.event,
+                        ctx.user_id,
+                        ctx.memory_context,
+                        ctx.normalized_message_text,
+                        ctx.QQMessageSegment,
                     )
                     if scheduled:
-                        return
+                        return True
                     draft_operation_coordinator.mark_awaiting_confirmation(
-                        conv_key,
+                        ctx.conv_key,
                         active_operation.operation_id,
                         active_operation.pending_state,
                         active_operation.prompt_text,
                         rotate_code=False,
                     )
-                    response = (
+                    ctx.response = (
                         "后台任务启动失败，当前确认仍有效。"
                         f"请稍后回复「{active_operation.confirmation_command}」重试。"
                     )
-                    remember_conversation(conv_key, memory_context, normalized_message_text, response)
-                    await _finish_ai_chat_matcher(response)
-                    return
+                    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+                    await _finish_ai_chat_matcher(ctx.response)
+                    return True
+    return False
 
-    quoted_pending_add_control_authorized = False
-    if quoted_pending_add_control:
-        current_record = conversation_state_store.get_record(conv_key)
+
+async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
+    """Production scenario: quoted pending control revalidates the referenced candidate."""
+    ctx.quoted_pending_add_control_authorized = False
+    if ctx.quoted_pending_add_control:
+        current_record = conversation_state_store.get_record(ctx.conv_key)
         if current_record is not None and current_record.execution_id:
-            response = (
+            ctx.response = (
                 "当前还有一笔草稿操作结果待核验，暂不覆盖它。"
                 "请先查看当前草稿，确认状态后再重试。"
             )
             remember_conversation(
-                conv_key,
-                memory_context,
-                normalized_message_text,
-                response,
+                ctx.conv_key,
+                ctx.memory_context,
+                ctx.normalized_message_text,
+                ctx.response,
             )
-            await _finish_ai_chat_matcher(response)
-            return
+            await _finish_ai_chat_matcher(ctx.response)
+            return True
         restored_state = await _revalidate_referenced_add_pending(
-            referenced_pending,
-            platform,
-            user_id,
+            ctx.referenced_pending,
+            ctx.platform,
+            ctx.user_id,
         )
         if restored_state is None:
-            response = (
+            ctx.response = (
                 "这条候选已不在当前可验证的审词快照中；没有执行添加。"
                 "请重新发送词条，我会生成最新候选。"
             )
             remember_conversation(
-                conv_key,
-                memory_context,
-                normalized_message_text,
-                response,
+                ctx.conv_key,
+                ctx.memory_context,
+                ctx.normalized_message_text,
+                ctx.response,
             )
-            await _finish_ai_chat_matcher(response)
-            return
+            await _finish_ai_chat_matcher(ctx.response)
+            return True
         stored = conversation_state_store.set(
-            conv_key,
+            ctx.conv_key,
             restored_state,
-            space_key=space_key,
-            owner_label=owner_label,
+            space_key=ctx.space_key,
+            owner_label=ctx.owner_label,
         )
         if not stored:
-            response = "当前候选无法安全保存；没有执行添加，请重新发送词条。"
+            ctx.response = "当前候选无法安全保存；没有执行添加，请重新发送词条。"
             remember_conversation(
-                conv_key,
-                memory_context,
-                normalized_message_text,
-                response,
+                ctx.conv_key,
+                ctx.memory_context,
+                ctx.normalized_message_text,
+                ctx.response,
             )
-            await _finish_ai_chat_matcher(response)
-            return
-        current_record = conversation_state_store.get_record(conv_key)
+            await _finish_ai_chat_matcher(ctx.response)
+            return True
+        current_record = conversation_state_store.get_record(ctx.conv_key)
         if current_record is not None:
             cache_key = (
                 current_record.state.__class__.__name__,
                 _describe_pending_state(current_record.state),
             )
-            command_intent_cache[cache_key] = quoted_pending_add_intent
-            quoted_pending_add_control_authorized = True
+            ctx.command_intent_cache[cache_key] = ctx.quoted_pending_add_intent
+            ctx.quoted_pending_add_control_authorized = True
+    return False
 
+
+async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
+    """Production scenario: group replies cannot claim another actor's pending mutation."""
     if (
-        not quoted_pending_add_control_authorized
-        and not verified_current_pending_reply
-        and referenced_pending is not None
-        and memory_context.space_type == "group"
+        not ctx.quoted_pending_add_control_authorized
+        and not ctx.verified_current_pending_reply
+        and ctx.referenced_pending is not None
+        and ctx.memory_context.space_type == "group"
     ):
         referenced_owner_key = _referenced_owner_key_from_reply_reference(
-            reply_reference,
-            platform,
+            ctx.reply_reference,
+            ctx.platform,
         )
         current_record = _ensure_current_pending_from_referenced_owner(
-            referenced_pending,
+            ctx.referenced_pending,
             referenced_owner_key,
-            conv_key,
-            space_key,
-            owner_label,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
         )
         if current_record is None and referenced_owner_key is None:
-            if history is None:
-                history = get_history(conv_key)
+            if ctx.history is None:
+                ctx.history = get_history(ctx.conv_key)
             current_record = _ensure_current_pending_matches_reference(
-                referenced_pending,
-                conv_key,
-                space_key,
-                owner_label,
-                history,
+                ctx.referenced_pending,
+                ctx.conv_key,
+                ctx.space_key,
+                ctx.owner_label,
+                ctx.history,
             )
         other_record = _record_from_referenced_owner(
-            referenced_pending,
+            ctx.referenced_pending,
             referenced_owner_key,
-            conv_key,
-            space_key,
+            ctx.conv_key,
+            ctx.space_key,
         )
         if (
             other_record is None
             and not (
                 current_record is not None
-                and conversation_state_store.states_equivalent(current_record.state, referenced_pending)
+                and conversation_state_store.states_equivalent(current_record.state, ctx.referenced_pending)
             )
         ):
             other_record = conversation_state_store.find_matching_pending_for_other_owner(
-                space_key,
-                conv_key,
-                referenced_pending,
+                ctx.space_key,
+                ctx.conv_key,
+                ctx.referenced_pending,
             )
-        referenced_command_intent = await command_intent_for(referenced_pending)
+        referenced_command_intent = await ctx.command_intent_for(ctx.referenced_pending)
         referenced_owner_is_current = bool(
             referenced_owner_key is not None
             and normalize_conversation_key(
                 referenced_owner_key,
-                space_key,
-            ) == normalize_conversation_key(conv_key, space_key)
+                ctx.space_key,
+            ) == normalize_conversation_key(ctx.conv_key, ctx.space_key)
         )
         if (
             current_record is None
             and other_record is None
             and referenced_owner_is_current
-            and isinstance(referenced_pending, PendingAddWord)
+            and isinstance(ctx.referenced_pending, PendingAddWord)
             and referenced_command_intent.intent == "pending_add_and_submit"
         ):
             restored_state = await _revalidate_referenced_add_pending(
-                referenced_pending,
-                platform,
-                user_id,
+                ctx.referenced_pending,
+                ctx.platform,
+                ctx.user_id,
             )
             if restored_state is None:
-                response = (
+                ctx.response = (
                     "这条候选已不在当前可验证编码快照中；没有执行添加。"
                     "请重新发送词条，我会生成最新候选。"
                 )
                 remember_conversation(
-                    conv_key,
-                    memory_context,
-                    normalized_message_text,
-                    response,
+                    ctx.conv_key,
+                    ctx.memory_context,
+                    ctx.normalized_message_text,
+                    ctx.response,
                 )
-                await _finish_ai_chat_matcher(response)
-                return
+                await _finish_ai_chat_matcher(ctx.response)
+                return True
             stored = conversation_state_store.set(
-                conv_key,
+                ctx.conv_key,
                 restored_state,
-                space_key=space_key,
-                owner_label=owner_label,
+                space_key=ctx.space_key,
+                owner_label=ctx.owner_label,
             )
             if stored:
-                current_record = conversation_state_store.get_record(conv_key)
+                current_record = conversation_state_store.get_record(ctx.conv_key)
             else:
-                response = "当前候选无法安全保存；没有执行添加，请重新发送词条。"
+                ctx.response = "当前候选无法安全保存；没有执行添加，请重新发送词条。"
                 remember_conversation(
-                    conv_key,
-                    memory_context,
-                    normalized_message_text,
-                    response,
+                    ctx.conv_key,
+                    ctx.memory_context,
+                    ctx.normalized_message_text,
+                    ctx.response,
                 )
-                await _finish_ai_chat_matcher(response)
-                return
-        response = _handle_referenced_pending_from_other_user(
-            referenced_pending,
+                await _finish_ai_chat_matcher(ctx.response)
+                return True
+        ctx.response = _handle_referenced_pending_from_other_user(
+            ctx.referenced_pending,
             current_record,
             other_record,
-            conv_key,
-            space_key,
-            owner_label,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
             referenced_command_intent,
         )
-        if response is not None:
-            remember_conversation(conv_key, memory_context, normalized_message_text, response)
-            await _finish_ai_chat_matcher(response)
-            return
+        if ctx.response is not None:
+            remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+            await _finish_ai_chat_matcher(ctx.response)
+            return True
+    return False
 
+
+async def _stage_handle_quoted_draft_selection(ctx: TurnContext) -> bool:
+    """Production scenario: quoted draft selection stays bound to the quoted bot reply."""
     quoted_draft_response = await _try_handle_quoted_draft_selection(
-        normalized_message_text,
-        reply_reference,
-        platform,
-        user_id,
+        ctx.normalized_message_text,
+        ctx.reply_reference,
+        ctx.platform,
+        ctx.user_id,
     )
     if quoted_draft_response is not None:
         remember_conversation(
-            conv_key,
-            memory_context,
-            normalized_message_text,
+            ctx.conv_key,
+            ctx.memory_context,
+            ctx.normalized_message_text,
             quoted_draft_response,
         )
         await _finish_ai_chat_matcher(quoted_draft_response)
-        return
+        return True
+    return False
 
-    other_pending_record = (
-        conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
-        if _can_use_unrelated_group_pending(reply_reference)
+
+async def _stage_restore_group_pending_context(ctx: TurnContext) -> bool:
+    """Production scenario: contextual group replies restore only eligible pending state."""
+    ctx.other_pending_record = (
+        conversation_state_store.find_pending_for_other_owner(ctx.space_key, ctx.conv_key)
+        if _can_use_unrelated_group_pending(ctx.reply_reference)
         else None
     )
-    current_contextual_reply = False
+    ctx.current_contextual_reply = False
     if (
-        memory_context.space_type == "group"
-        and other_pending_record is not None
-        and not conversation_state_store.contains(conv_key)
-        and not generic_intent_is_fresh_command
+        ctx.memory_context.space_type == "group"
+        and ctx.other_pending_record is not None
+        and not conversation_state_store.contains(ctx.conv_key)
+        and not ctx.generic_intent_is_fresh_command
     ):
-        if history is None:
-            history = get_history(conv_key)
-        current_contextual_reply = _is_contextual_reply_to_current_user_history(
-            normalized_message_text,
-            history,
+        if ctx.history is None:
+            ctx.history = get_history(ctx.conv_key)
+        ctx.current_contextual_reply = _is_contextual_reply_to_current_user_history(
+            ctx.normalized_message_text,
+            ctx.history,
         )
-    other_pending_command_intent = generic_command_intent
+    return False
+
+
+async def _stage_arbitrate_other_owner_pending(ctx: TurnContext) -> bool:
+    """Production scenario: other-owner pending state blocks ambiguous group controls."""
+    other_pending_command_intent = ctx.generic_command_intent
     if (
-        other_pending_record is not None
-        and not generic_intent_is_fresh_command
-        and not current_contextual_reply
+        ctx.other_pending_record is not None
+        and not ctx.generic_intent_is_fresh_command
+        and not ctx.current_contextual_reply
     ):
-        other_pending_command_intent = await command_intent_for(other_pending_record.state)
+        other_pending_command_intent = await ctx.command_intent_for(ctx.other_pending_record.state)
     if _should_block_for_other_owner_pending(
-        memory_context.space_type,
-        conversation_state_store.contains(conv_key),
-        other_pending_record,
-        generic_command_intent,
+        ctx.memory_context.space_type,
+        conversation_state_store.contains(ctx.conv_key),
+        ctx.other_pending_record,
+        ctx.generic_command_intent,
         other_pending_command_intent,
-        normalized_message_text,
-        current_contextual_reply,
+        ctx.normalized_message_text,
+        ctx.current_contextual_reply,
     ):
-        response = _format_other_owner_pending_message(
-            _pending_owner_label(other_pending_record),
-            other_pending_record.state,
+        ctx.response = _format_other_owner_pending_message(
+            _pending_owner_label(ctx.other_pending_record),
+            ctx.other_pending_record.state,
         )
-        remember_conversation(conv_key, memory_context, normalized_message_text, response)
-        await _finish_ai_chat_matcher(response)
-        return
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+        await _finish_ai_chat_matcher(ctx.response)
+        return True
+    return False
 
-    response = None
-    if not reply_reference.images:
-        response = await _try_handle_referenced_word_presence_query(
-            normalized_message_text,
-            reply_reference,
-            platform,
-            user_id,
+
+async def _stage_handle_referenced_word_presence(ctx: TurnContext) -> bool:
+    """Production scenario: referenced word-presence queries bypass mutation handling."""
+    ctx.response = None
+    if not ctx.reply_reference.images:
+        ctx.response = await _try_handle_referenced_word_presence_query(
+            ctx.normalized_message_text,
+            ctx.reply_reference,
+            ctx.platform,
+            ctx.user_id,
         )
-    if response is not None:
-        remember_conversation(conv_key, memory_context, normalized_message_text, response)
-        await _finish_ai_chat_matcher(response)
-        return
+    if ctx.response is not None:
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+        await _finish_ai_chat_matcher(ctx.response)
+        return True
+    return False
 
-    response = _try_handle_operation_recall(
-        normalized_message_text,
-        memory_context,
-        generic_command_intent,
+
+async def _stage_recall_active_operation(ctx: TurnContext) -> bool:
+    """Production scenario: operation recall is evaluated before live pending execution."""
+    ctx.response = _try_handle_operation_recall(
+        ctx.normalized_message_text,
+        ctx.memory_context,
+        ctx.generic_command_intent,
     )
+    return False
 
-    # ===== Phase 1: Check pending state =====
-    if response is None and not generic_intent_is_fresh_command:
-        state_record = conversation_state_store.get_record(conv_key)
+
+async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
+    """Production scenarios S8-S11 and S16-S17: pending add/tool tickets retain CAS and one-time execution semantics."""
+    if ctx.response is None and not ctx.generic_intent_is_fresh_command:
+        state_record = conversation_state_store.get_record(ctx.conv_key)
         state = state_record.state if state_record else None
         if (
-            scoped_pending_state is not None
-            and state_record is current_pending_record
+            ctx.scoped_pending_state is not None
+            and state_record is ctx.current_pending_record
         ):
-            state = scoped_pending_state
-        state_space_key = state_record.space_key if state_record else space_key
+            state = ctx.scoped_pending_state
+        state_space_key = state_record.space_key if state_record else ctx.space_key
         pending_claimed = False
         preserve_pending_after_response = False
 
@@ -11254,32 +11402,32 @@ async def _handle_ai_chat_serialized(
         if state_record is not None and state_record.execution_id:
             uncertain_action, uncertain_response = _resolve_uncertain_ticket_action(
                 state_record,
-                normalized_message_text,
+                ctx.normalized_message_text,
             )
             if uncertain_action != "read":
-                response = uncertain_response
+                ctx.response = uncertain_response
             state = None
 
         if state is not None:
             try:
                 pending_command_intent = (
-                    scoped_pending_intent
-                    if scoped_pending_state is state
-                    and scoped_pending_intent is not None
-                    else await command_intent_for(state)
+                    ctx.scoped_pending_intent
+                    if ctx.scoped_pending_state is state
+                    and ctx.scoped_pending_intent is not None
+                    else await ctx.command_intent_for(state)
                 )
                 if (
                     state_record is not None
                     and state_record.requires_reconfirmation
-                    and scoped_pending_intent is None
+                    and ctx.scoped_pending_intent is None
                 ):
                     pending_command_intent, ticket_response = await _resolve_pending_ticket_control(
                         state_record,
-                        normalized_message_text,
+                        ctx.normalized_message_text,
                         pending_command_intent,
-                        platform,
-                        user_id,
-                        verified_bot_reply=verified_current_pending_reply,
+                        ctx.platform,
+                        ctx.user_id,
+                        verified_bot_reply=ctx.verified_current_pending_reply,
                     )
                 else:
                     ticket_response = None
@@ -11288,18 +11436,18 @@ async def _handle_ai_chat_serialized(
             if (
                 state_record is not None
                 and state_record.requires_reconfirmation
-                and scoped_pending_intent is None
+                and ctx.scoped_pending_intent is None
             ):
                 if ticket_response is not None:
-                    response = ticket_response
-            if response is None and pending_command_intent.intent == "pending_cancel":
+                    ctx.response = ticket_response
+            if ctx.response is None and pending_command_intent.intent == "pending_cancel":
                 complete_pending_execution()
-                response = "好的，已取消 owo"
+                ctx.response = "好的，已取消 owo"
 
-            elif response is None and isinstance(state, PendingAddWord):
-                if history is None:
-                    history = get_history(conv_key)
-                current_operation = draft_operation_coordinator.get(conv_key)
+            elif ctx.response is None and isinstance(state, PendingAddWord):
+                if ctx.history is None:
+                    ctx.history = get_history(ctx.conv_key)
+                current_operation = draft_operation_coordinator.get(ctx.conv_key)
                 pending_mutation_requested = pending_command_intent.intent in {
                     "pending_confirm",
                     "pending_add_and_submit",
@@ -11309,24 +11457,24 @@ async def _handle_ai_chat_serialized(
                 }
                 if current_operation is not None and pending_mutation_requested:
                     restore_pending_state()
-                    response = _format_active_draft_operation_message(
+                    ctx.response = _format_active_draft_operation_message(
                         current_operation,
                         state,
                     )
                 elif _pending_pronunciation_correction(
-                    normalized_message_text,
+                    ctx.normalized_message_text,
                     state,
                 ) is not None:
                     # Pronunciation correction is a read-only replacement of
                     # the live candidate. Do not claim the mutation ticket:
                     # validation failure/cancellation must leave it usable.
-                    response = await _try_update_pending_pronunciation(
+                    ctx.response = await _try_update_pending_pronunciation(
                         state,
-                        normalized_message_text,
-                        platform,
-                        user_id,
+                        ctx.normalized_message_text,
+                        ctx.platform,
+                        ctx.user_id,
                         state_space_key,
-                        owner_label,
+                        ctx.owner_label,
                     )
                 elif (
                     pending_command_intent.intent == "pending_add_and_submit"
@@ -11338,7 +11486,7 @@ async def _handle_ai_chat_serialized(
                         and not 1 <= choice_index <= len(state.candidates)
                     ):
                         restore_pending_state()
-                        response = f"请选择 1-{len(state.candidates)} 之间的编号 owo"
+                        ctx.response = f"请选择 1-{len(state.candidates)} 之间的编号 owo"
                     else:
                         target_code = (
                             state.candidates[choice_index - 1][0]
@@ -11346,7 +11494,7 @@ async def _handle_ai_chat_serialized(
                             else state.recommended_code
                         )
                         operation = draft_operation_coordinator.begin(
-                            conv_key,
+                            ctx.conv_key,
                             "add_and_submit",
                             word=state.word,
                             code=target_code,
@@ -11354,62 +11502,62 @@ async def _handle_ai_chat_serialized(
                         )
                         if operation is None:
                             restore_pending_state()
-                            response = "当前草稿操作刚刚开始，请稍后再试。"
+                            ctx.response = "当前草稿操作刚刚开始，请稍后再试。"
                         elif not begin_pending_execution():
                             draft_operation_coordinator.finish(
                                 operation.owner_key,
                                 operation.operation_id,
                             )
-                            response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                            ctx.response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
                         else:
                             scheduled = _schedule_background_draft_operation(
                                 operation,
                                 lambda: _perform_add_to_draft_and_submit(
                                     state.word,
                                     target_code,
-                                    platform,
-                                    user_id,
+                                    ctx.platform,
+                                    ctx.user_id,
                                     remark=state.code_remarks.get(target_code, ""),
                                     needs_manual_review=state.needs_manual_review,
                                     auto_confirm=True,
                                 ),
-                                bot,
-                                event,
-                                user_id,
-                                memory_context,
-                                normalized_message_text,
-                                QQMessageSegment,
+                                ctx.bot,
+                                ctx.event,
+                                ctx.user_id,
+                                ctx.memory_context,
+                                ctx.normalized_message_text,
+                                ctx.QQMessageSegment,
                             )
                             if scheduled:
                                 complete_pending_execution()
-                                return
+                                return True
                             restore_pending_state()
-                            response = "后台任务启动失败，候选仍为你保留，请稍后再试。"
+                            ctx.response = "后台任务启动失败，候选仍为你保留，请稍后再试。"
                 else:
                     if not begin_pending_execution():
-                        response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                        ctx.response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
                     else:
-                        response = await _handle_pending_add_word(
+                        ctx.response = await _handle_pending_add_word(
                             state,
-                            normalized_message_text,
-                            platform,
-                            user_id,
-                            history,
+                            ctx.normalized_message_text,
+                            ctx.platform,
+                            ctx.user_id,
+                            ctx.history,
                             state_space_key,
-                            owner_label,
+                            ctx.owner_label,
                             pending_command_intent,
                             restore_pending_state,
                         )
-                        if response is not None and not preserve_pending_after_response:
+                        if ctx.response is not None and not preserve_pending_after_response:
                             complete_pending_execution()
                 # response is None → unrecognized input, fall through to Phase 2
 
-            elif response is None and isinstance(state, PendingToolConfirm):
+            elif ctx.response is None and isinstance(state, PendingToolConfirm):
                 if _is_pending_tool_confirm_message(state, pending_command_intent):
-                    current_operation = draft_operation_coordinator.get(conv_key)
+                    current_operation = draft_operation_coordinator.get(ctx.conv_key)
                     if current_operation is not None:
                         restore_pending_state()
-                        response = _format_active_draft_operation_message(
+                        ctx.response = _format_active_draft_operation_message(
                             current_operation,
                             state,
                         )
@@ -11429,27 +11577,27 @@ async def _handle_ai_chat_serialized(
                             if isinstance(item, dict) and item.get("code")
                         ]
                         operation = draft_operation_coordinator.begin(
-                            conv_key,
+                            ctx.conv_key,
                             "batch_add_and_submit",
                             word="、".join(words),
                             code="、".join(codes),
                         )
                         if operation is None:
                             restore_pending_state()
-                            response = "当前草稿操作刚刚开始，请稍后再试。"
+                            ctx.response = "当前草稿操作刚刚开始，请稍后再试。"
                         elif not begin_pending_execution():
                             draft_operation_coordinator.finish(
                                 operation.owner_key,
                                 operation.operation_id,
                             )
-                            response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                            ctx.response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
                         else:
                             scheduled = _schedule_background_draft_operation(
                                 operation,
                                 lambda: _perform_batch_add_to_draft_and_submit(
                                     items,
-                                    platform,
-                                    user_id,
+                                    ctx.platform,
+                                    ctx.user_id,
                                     batch_id=str(state.args.get("batch_id") or ""),
                                     confirmed_add=(
                                         state.confirmation_source == "server_warning"
@@ -11462,159 +11610,264 @@ async def _handle_ai_chat_serialized(
                                     ),
                                     auto_confirm=True,
                                 ),
-                                bot,
-                                event,
-                                user_id,
-                                memory_context,
-                                normalized_message_text,
-                                QQMessageSegment,
+                                ctx.bot,
+                                ctx.event,
+                                ctx.user_id,
+                                ctx.memory_context,
+                                ctx.normalized_message_text,
+                                ctx.QQMessageSegment,
                             )
                             if scheduled:
                                 complete_pending_execution()
-                                return
+                                return True
                             restore_pending_state()
-                            response = "后台任务启动失败，批量候选仍为你保留，请稍后再试。"
+                            ctx.response = "后台任务启动失败，批量候选仍为你保留，请稍后再试。"
                     else:
                         if not begin_pending_execution():
-                            response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                            ctx.response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
                         else:
-                            response = await _execute_confirmed_tool(
+                            ctx.response = await _execute_confirmed_tool(
                                 _pending_tool_state_with_trailing_submit(
                                     state,
                                     pending_command_intent,
                                 ),
-                                platform,
-                                user_id,
-                                conv_key,
-                                space_key,
-                                owner_label,
+                                ctx.platform,
+                                ctx.user_id,
+                                ctx.conv_key,
+                                ctx.space_key,
+                                ctx.owner_label,
                                 on_transport_failure=restore_pending_state,
                             )
                             if not preserve_pending_after_response:
                                 complete_pending_execution()
-                elif message_authorizes_mutation(normalized_message_text):
+                elif message_authorizes_mutation(ctx.normalized_message_text):
                     restore_pending_state()
-                    response = _format_live_ticket_precedence_message(state)
+                    ctx.response = _format_live_ticket_precedence_message(state)
                 # Non-actionable text still falls through to ordinary Q&A.
 
-            if response is None and state is not None:
+            if ctx.response is None and state is not None:
                 restore_pending_state()
+    return False
 
-    # ===== Phase 2: AI response (if not handled directly) =====
+
+async def _stage_submit_current_draft(ctx: TurnContext) -> bool:
+    """Production scenario: explicit submit starts one coordinated background operation."""
     if (
-        response is None
-        and generic_command_intent.intent == "draft_submit"
-        and _is_explicit_draft_submit_request(normalized_message_text)
+        ctx.response is None
+        and ctx.generic_command_intent.intent == "draft_submit"
+        and _is_explicit_draft_submit_request(ctx.normalized_message_text)
     ):
-        current_operation = draft_operation_coordinator.get(conv_key)
+        current_operation = draft_operation_coordinator.get(ctx.conv_key)
         if current_operation is not None:
-            response = _format_active_draft_operation_message(
+            ctx.response = _format_active_draft_operation_message(
                 current_operation,
-                conversation_state_store.get(conv_key),
+                conversation_state_store.get(ctx.conv_key),
             )
         else:
-            operation = draft_operation_coordinator.begin(conv_key, "submit")
+            operation = draft_operation_coordinator.begin(ctx.conv_key, "submit")
             if operation is None:
-                response = "当前草稿操作刚刚开始，请稍后再试。"
+                ctx.response = "当前草稿操作刚刚开始，请稍后再试。"
             else:
                 scheduled = _schedule_background_draft_operation(
                     operation,
                     lambda: _perform_submit_current_draft(
-                        platform,
-                        user_id,
+                        ctx.platform,
+                        ctx.user_id,
                         auto_confirm=True,
                         authorize_current_draft=True,
                     ),
-                    bot,
-                    event,
-                    user_id,
-                    memory_context,
-                    normalized_message_text,
-                    QQMessageSegment,
+                    ctx.bot,
+                    ctx.event,
+                    ctx.user_id,
+                    ctx.memory_context,
+                    ctx.normalized_message_text,
+                    ctx.QQMessageSegment,
                 )
                 if scheduled:
-                    return
-                response = "后台任务启动失败，请稍后重新发送「提交」。"
+                    return True
+                ctx.response = "后台任务启动失败，请稍后重新发送「提交」。"
+    return False
 
-    if response is None:
-        response = await _try_handle_draft_management_command(
-            normalized_message_text,
-            platform,
-            user_id,
-            space_key,
-            owner_label,
-            generic_command_intent,
+
+async def _stage_handle_draft_management(ctx: TurnContext) -> bool:
+    """Production scenario: direct draft management runs before general model fallback."""
+    if ctx.response is None:
+        ctx.response = await _try_handle_draft_management_command(
+            ctx.normalized_message_text,
+            ctx.platform,
+            ctx.user_id,
+            ctx.space_key,
+            ctx.owner_label,
+            ctx.generic_command_intent,
         )
+    return False
 
-    if response is None:
-        response = await _try_handle_replace_char(
-            normalized_message_text,
-            platform,
-            user_id,
-            generic_command_intent,
-            conv_key,
-            space_key,
-            owner_label,
+
+async def _stage_handle_replace_character(ctx: TurnContext) -> bool:
+    """Production scenario: exact character replacement uses its dedicated state path."""
+    if ctx.response is None:
+        ctx.response = await _try_handle_replace_char(
+            ctx.normalized_message_text,
+            ctx.platform,
+            ctx.user_id,
+            ctx.generic_command_intent,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
         )
+    return False
 
-    if response is None:
-        response = await _try_handle_simple_single_word_query(
-            normalized_message_text,
-            platform,
-            user_id,
-            conv_key,
-            space_key,
-            owner_label,
+
+async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
+    """Production scenario: simple word lookup runs before general model fallback."""
+    if ctx.response is None:
+        ctx.response = await _try_handle_simple_single_word_query(
+            ctx.normalized_message_text,
+            ctx.platform,
+            ctx.user_id,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
         )
+    return False
 
-    if response is None:
-        if history is None:
-            history = get_history(conv_key)
-        reply_context = await build_reply_context(bot, event, reply_reference)
-        response = await get_ai_response_core(
-            normalized_message_text,
-            platform,
-            user_id,
-            history,
+
+async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
+    """Production scenario: unresolved turns reach the model with history and reply context."""
+    if ctx.response is None:
+        if ctx.history is None:
+            ctx.history = get_history(ctx.conv_key)
+        reply_context = await build_reply_context(ctx.bot, ctx.event, ctx.reply_reference)
+        ctx.response = await get_ai_response_core(
+            ctx.normalized_message_text,
+            ctx.platform,
+            ctx.user_id,
+            ctx.history,
             reply_context,
-            memory_context,
+            ctx.memory_context,
         )
+    return False
 
-    if not response:
+
+async def _stage_reject_empty_response(ctx: TurnContext) -> bool:
+    """Production scenario: an empty model result emits the existing deterministic error."""
+    if not ctx.response:
         mark_turn_outcome("error")
         await _finish_ai_chat_matcher("呜呜，处理请求时出错了 qwq 要不再试一次？")
-        return
+        return True
+    return False
 
-    response = _normalize_generated_review_copy(response)
-    response = _ensure_pending_add_word_guidance(response)
-    if generic_command_intent.intent == "none":
-        response = await _augment_simple_word_query_response(
-            normalized_message_text,
-            response,
-            platform,
-            user_id,
+
+async def _stage_normalize_response(ctx: TurnContext) -> bool:
+    """Production scenario: review copy and pending guidance normalization remain ordered."""
+    ctx.response = _normalize_generated_review_copy(ctx.response)
+    ctx.response = _ensure_pending_add_word_guidance(ctx.response)
+    return False
+
+
+async def _stage_augment_word_query(ctx: TurnContext) -> bool:
+    """Production scenario: only ordinary Q&A receives simple-word augmentation."""
+    if ctx.generic_command_intent.intent == "none":
+        ctx.response = await _augment_simple_word_query_response(
+            ctx.normalized_message_text,
+            ctx.response,
+            ctx.platform,
+            ctx.user_id,
         )
-    if generic_command_intent.intent not in {"draft_recall", "draft_clear"}:
-        response = _append_pending_ticket_challenge(response, conv_key)
+    return False
 
-    # Save conversation history
+
+async def _stage_append_ticket_challenge(ctx: TurnContext) -> bool:
+    """Production scenario: recall and clear replies never receive a pending challenge."""
+    if ctx.generic_command_intent.intent not in {"draft_recall", "draft_clear"}:
+        ctx.response = _append_pending_ticket_challenge(ctx.response, ctx.conv_key)
+    return False
+
+
+async def _stage_persist_conversation(ctx: TurnContext) -> bool:
+    """Production scenario: response history is saved before compaction is scheduled."""
     remember_conversation(
-        conv_key,
-        memory_context,
-        normalized_message_text,
-        response,
+        ctx.conv_key,
+        ctx.memory_context,
+        ctx.normalized_message_text,
+        ctx.response,
     )
-    schedule_memory_compaction(memory_context)
+    schedule_memory_compaction(ctx.memory_context)
+    return False
 
-    # ===== Phase 4: Platform-specific reply =====
+
+async def _stage_finish_platform_response(ctx: TurnContext) -> bool:
+    """Production scenario: final delivery remains the last stage in every handled turn."""
     await _finish_ai_chat_response(
-        bot,
-        event,
-        user_id,
-        memory_context,
-        response,
-        QQMessageSegment,
+        ctx.bot,
+        ctx.event,
+        ctx.user_id,
+        ctx.memory_context,
+        ctx.response,
+        ctx.QQMessageSegment,
     )
+    return False
+
+
+ChatStage = Callable[[TurnContext], Awaitable[bool]]
+
+
+STAGES: Tuple[ChatStage, ...] = (
+    _stage_load_platform_reply_adapter,
+    _stage_collect_message_inputs,
+    _stage_describe_visual_candidate,
+    _stage_reject_empty_input,
+    _stage_normalize_message_text,
+    _stage_handle_image_turn,
+    _stage_handle_visual_probe_timeout,
+    _stage_initialize_conversation,
+    _stage_resolve_current_pending_scope,
+    _stage_finish_scoped_pending_response,
+    _stage_guard_stale_confirmation,
+    _stage_restore_replied_pending_reference,
+    _stage_apply_scoped_pending_intent,
+    _stage_record_classified_flow,
+    _stage_handle_clear_history,
+    _stage_arbitrate_active_operation,
+    _stage_handle_quoted_pending_control,
+    _stage_handle_referenced_other_user_pending,
+    _stage_handle_quoted_draft_selection,
+    _stage_restore_group_pending_context,
+    _stage_arbitrate_other_owner_pending,
+    _stage_handle_referenced_word_presence,
+    _stage_recall_active_operation,
+    _stage_execute_pending_state,
+    _stage_submit_current_draft,
+    _stage_handle_draft_management,
+    _stage_handle_replace_character,
+    _stage_handle_simple_word_query,
+    _stage_generate_ai_response,
+    _stage_reject_empty_response,
+    _stage_normalize_response,
+    _stage_augment_word_query,
+    _stage_append_ticket_challenge,
+    _stage_persist_conversation,
+    _stage_finish_platform_response,
+)
+
+
+async def _handle_ai_chat_serialized(
+    bot: Bot,
+    event: Event,
+    platform: str,
+    user_id: str,
+) -> None:
+    """Run one serialized chat turn through the reviewable stage order."""
+    ctx = TurnContext(
+        bot=bot,
+        event=event,
+        platform=platform,
+        user_id=user_id,
+    )
+    for stage in STAGES:
+        if await stage(ctx):
+            return
+
 
 
 @ai_chat.handle()
