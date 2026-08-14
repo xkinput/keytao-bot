@@ -1052,6 +1052,9 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "⚠️ {'id': '2933'}",
             "raw ': ' fragment",
             "dataclass(value=1)",
+            "安全拦截：boundTarget 未绑定",
+            "安全拦截（缺少：boundTarget）",
+            "blockReason=binding_incomplete",
         ):
             with self.subTest(raw_fragment=raw_fragment):
                 with self.assertRaisesRegex(ValueError, "raw Python representation"):
@@ -1094,8 +1097,14 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 ("hbbki", False),
                 ("hbbkiv", False),
             ],
+            server_candidates=[
+                ("hbbk", True),
+                ("hbbki", False),
+                ("hbbkiv", False),
+            ],
         )
         cases = (
+            ("添加1", "pending_choice", False),
             ("2 添加并提交", "pending_add_and_submit", True),
             ("2 加入", "pending_choice", False),
             ("编号2 添加", "pending_choice", False),
@@ -1109,7 +1118,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertIsNotNone(intent)
                 self.assertEqual(intent.intent, expected_intent)
-                self.assertEqual(intent.choice_index, 2)
+                self.assertEqual(
+                    intent.choice_index or intent.choice_indices[0],
+                    1 if message == "添加1" else 2,
+                )
                 self.assertEqual(intent.submit_after, submit_after)
                 self.assertTrue(
                     chat_module._message_authorizes_pending_state_control(
@@ -1141,6 +1153,476 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     choice_index=2,
                 ),
             )
+        )
+
+    async def test_multi_candidate_selection_grammar_binds_exact_live_slots(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state = PendingAddWord(
+            word="还车",
+            recommended_code="htjev",
+            candidates=[
+                ("htje", True),
+                ("htjev", False),
+                ("htjevu", False),
+                ("htwe", True),
+            ],
+            occupied_words={"htje": ["幻觉"], "htwe": ["换车"]},
+            server_candidates=[
+                ("htje", True),
+                ("htjev", False),
+                ("htjevu", False),
+                ("htwe", True),
+            ],
+            server_occupied_words={"htje": ["幻觉"], "htwe": ["换车"]},
+        )
+        accepted = {
+            "添加2、4": ((2, 4), ("htjev", "htwe"), False),
+            "2、4 添加": ((2, 4), ("htjev", "htwe"), False),
+            "添加 2 4": ((2, 4), ("htjev", "htwe"), False),
+            "添加2和4": ((2, 4), ("htjev", "htwe"), False),
+            "2、4": ((2, 4), ("htjev", "htwe"), False),
+            "添加2、4并提交": ((2, 4), ("htjev", "htwe"), True),
+            "添加 htjev、htwe": ((), ("htjev", "htwe"), False),
+            "htjev, htwe 添加": ((), ("htjev", "htwe"), False),
+        }
+        for message, (indices, codes, submit_after) in accepted.items():
+            with self.subTest(message=message):
+                intent = chat_module._structural_pending_add_word_intent(
+                    message,
+                    state,
+                )
+                self.assertIsNotNone(intent)
+                self.assertEqual(intent.choice_indices, indices)
+                self.assertEqual(intent.requested_codes, codes)
+                self.assertEqual(intent.submit_after, submit_after)
+                self.assertTrue(
+                    chat_module._message_authorizes_pending_state_control(
+                        state,
+                        message,
+                        intent,
+                    )
+                )
+
+        out_of_range = chat_module._structural_pending_add_word_intent(
+            "添加2、99",
+            state,
+        )
+        self.assertIsNotNone(out_of_range)
+        canonical, error = await chat_module._canonicalize_pending_ticket_intent(
+            state,
+            "添加2、99",
+            out_of_range,
+            "qq",
+            "704974384",
+        )
+        self.assertIsNone(canonical)
+        self.assertEqual(error, "请选择 1-4 之间的编号。")
+
+        for message in (
+            "添加2、2",
+            "添加2、4吗",
+            "不要添加2、4",
+            "添加2、4，再删除别的词",
+            "添加 htjev、fake",
+        ):
+            with self.subTest(rejected=message):
+                intent = chat_module._structural_pending_add_word_intent(
+                    message,
+                    state,
+                )
+                if intent is None:
+                    continue
+                canonical, error = await chat_module._canonicalize_pending_ticket_intent(
+                    state,
+                    message,
+                    intent,
+                    "qq",
+                    "704974384",
+                )
+                self.assertIsNone(canonical)
+                self.assertTrue(error)
+
+    async def test_multi_word_candidate_numbers_require_word_scope(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        old_state_store = chat_module.conversation_state_store
+        state_store = MemoryConversationStateStore()
+        chat_module.conversation_state_store = state_store
+        conv_key = ConversationAddress.group("qq", "group-s16", "704974384")
+        space_key = ("qq", "qq:group:group-s16")
+
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [
+                    {
+                        "action": "Create",
+                        "word": "载流",
+                        "code": "zhlq",
+                        "type": "Phrase",
+                        "needsManualReview": True,
+                    },
+                    {
+                        "action": "Create",
+                        "word": "载流子",
+                        "code": "zlzu",
+                        "type": "Phrase",
+                        "needsManualReview": False,
+                    },
+                ],
+                "_candidate_scopes": [
+                    {
+                        "word": "载流",
+                        "candidates": [
+                            ["zhlq", False],
+                            ["zhlqu", False],
+                            ["zhlqua", False],
+                        ],
+                    },
+                    {
+                        "word": "载流子",
+                        "candidates": [
+                            ["zlz", True],
+                            ["zlzu", False],
+                            ["zlzua", False],
+                            ["zlzuaa", False],
+                        ],
+                    },
+                ],
+            },
+        )
+
+        def seed_state() -> None:
+            state_store.delete(conv_key)
+            state_store.set(
+                conv_key,
+                state,
+                space_key=space_key,
+                owner_label="Ealin",
+            )
+
+        execute = AsyncMock(return_value="batch-added")
+        classifier = AsyncMock(return_value=chat_module.MessageCommandIntent())
+        try:
+            with (
+                patch.object(chat_module, "_execute_confirmed_tool", execute),
+                patch.object(
+                    chat_module,
+                    "_classify_message_command_intent",
+                    classifier,
+                ),
+            ):
+                for message in ("添加1", "添加2、4"):
+                    with self.subTest(message=message):
+                        seed_state()
+                        response = await chat_module.handle_pending_message_core(
+                            message,
+                            "qq",
+                            "704974384",
+                            conv_key,
+                            history=[],
+                            space_key=space_key,
+                            owner_label="Ealin",
+                        )
+                        self.assertIn("载流", response)
+                        self.assertIn("载流子", response)
+                        self.assertIn("请带上词条", response)
+                        self.assertEqual(execute.await_count, 0)
+                        self.assertIsNotNone(state_store.get_record(conv_key))
+
+                seed_state()
+                response = await chat_module.handle_pending_message_core(
+                    "载流子 添加1",
+                    "qq",
+                    "704974384",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Ealin",
+                )
+                self.assertEqual(response, "batch-added")
+                self.assertEqual(execute.await_count, 1)
+                selected_state = execute.await_args.args[0]
+                self.assertEqual(
+                    [
+                        (item["word"], item["code"])
+                        for item in selected_state.args["items"]
+                    ],
+                    [("载流", "zhlq"), ("载流子", "zlz")],
+                )
+                selected_particle = selected_state.args["items"][1]
+                self.assertIs(selected_particle["needsManualReview"], True)
+                self.assertIn("重码", selected_particle["manualReviewReason"])
+                self.assertNotIn("_candidate_scopes", selected_state.args)
+                self.assertIsNone(state_store.get_record(conv_key))
+                self.assertEqual(classifier.await_count, 0)
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+    def test_candidate_footer_matches_single_and_multi_word_scope(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        single_word = (
+            "是否以编码 htjev 将「还车」加入草稿？"
+            "可回复编号、编码，或「都加」；可多选，如「添加2、4」。"
+        )
+        self.assertIn(
+            "可多选，如「添加2、4」",
+            chat_module._ensure_pending_add_word_guidance(single_word),
+        )
+
+        multi_word = (
+            "是否以编码 zhlq 将「载流」加入草稿？\n"
+            "是否以编码 zlzu 将「载流子」加入草稿？\n"
+            "回复「加入」、「都加」、「添加」只加入草稿；"
+            "回复「加入并提交」、「都加并提交」、「添加并提交」则加入后提交。\n"
+            "可多选，如「添加2、4」。\n"
+            "若所选编号显示“已有…”，直接回复该编号表示添加重码；"
+            "回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
+        )
+        rendered = chat_module._ensure_pending_add_word_guidance(multi_word)
+        self.assertIn("载流子 添加2、4", rendered)
+        self.assertNotIn("可多选，如「添加2、4」", rendered)
+        self.assertNotIn("直接回复该编号表示添加重码", rendered)
+
+    async def test_multi_number_selection_consumes_one_actor_snapshot_once(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        old_state_store = chat_module.conversation_state_store
+        state_store = MemoryConversationStateStore()
+        chat_module.conversation_state_store = state_store
+        conv_key = ConversationAddress.group("qq", "group-s18", "704974384")
+        space_key = ("qq", "qq:group:group-s18")
+
+        def seed_state() -> None:
+            state_store.set(
+                conv_key,
+                PendingAddWord(
+                    word="还车",
+                    recommended_code="htjev",
+                    candidates=[
+                        ("htje", True),
+                        ("htjev", False),
+                        ("htjevu", False),
+                        ("htwe", True),
+                    ],
+                    occupied_words={"htje": ["幻觉"], "htwe": ["换车"]},
+                    server_candidates=[
+                        ("htje", True),
+                        ("htjev", False),
+                        ("htjevu", False),
+                        ("htwe", True),
+                    ],
+                    server_occupied_words={
+                        "htje": ["幻觉"],
+                        "htwe": ["换车"],
+                    },
+                    needs_manual_review=True,
+                ),
+                space_key=space_key,
+                owner_label="Ealin",
+            )
+
+        execute = AsyncMock(return_value="batch-added")
+        try:
+            with (
+                patch.object(chat_module, "_execute_add_multiple_codes_to_draft", execute),
+                patch.object(chat_module, "OPENAI_API_KEY", ""),
+                patch.object(chat_module, "AsyncOpenAI", None),
+            ):
+                seed_state()
+                control = await chat_module.handle_pending_message_core(
+                    "添加2、99",
+                    "qq",
+                    "704974384",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Ealin",
+                )
+                self.assertEqual(control, "请选择 1-4 之间的编号。")
+                self.assertEqual(execute.await_count, 0)
+                self.assertIsNotNone(state_store.get_record(conv_key))
+
+                response = await chat_module.handle_pending_message_core(
+                    "添加2、4",
+                    "qq",
+                    "704974384",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Ealin",
+                )
+                self.assertEqual(response, "batch-added")
+                self.assertEqual(execute.await_count, 1)
+                self.assertEqual(
+                    execute.await_args.args[1],
+                    ["htjev", "htwe"],
+                )
+                self.assertFalse(execute.await_args.kwargs["submit_after"])
+                self.assertIsNone(state_store.get_record(conv_key))
+
+                seed_state()
+                response = await chat_module.handle_pending_message_core(
+                    "添加 htjev、htwe",
+                    "qq",
+                    "704974384",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Ealin",
+                )
+                self.assertEqual(response, "batch-added")
+                self.assertEqual(execute.await_count, 2)
+                self.assertEqual(
+                    execute.await_args.args[1],
+                    ["htjev", "htwe"],
+                )
+                self.assertIsNone(state_store.get_record(conv_key))
+
+                seed_state()
+                response = await chat_module.handle_pending_message_core(
+                    "添加2、4并提交",
+                    "qq",
+                    "704974384",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Ealin",
+                )
+                self.assertEqual(response, "batch-added")
+                self.assertEqual(execute.await_count, 3)
+                self.assertEqual(
+                    execute.await_args.args[1],
+                    ["htjev", "htwe"],
+                )
+                self.assertTrue(execute.await_args.kwargs["submit_after"])
+                self.assertIsNone(state_store.get_record(conv_key))
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+    async def test_batch_sink_binds_exact_multi_selection_to_candidate_capability(self) -> None:
+        delivered = []
+
+        async def tool(**kwargs):
+            delivered.append(kwargs)
+            return {"success": True, "successCount": len(kwargs["items"])}
+
+        executor = ToolExecutor(
+            lambda name: tool if name == "keytao_batch_add_to_draft" else None,
+            frozenset(),
+        )
+        capability = PendingCandidateCapability(
+            state_matches=True,
+            word="还车",
+            candidates=(
+                ("htje", True),
+                ("htjev", False),
+                ("htjevu", False),
+                ("htwe", True),
+            ),
+            occupied_words=(("htje", ("幻觉",)), ("htwe", ("换车",))),
+        )
+        exact_items = [
+            {"action": "Create", "word": "还车", "code": "htjev"},
+            {"action": "Create", "word": "还车", "code": "htwe"},
+        ]
+
+        raw = await executor.call(
+            "keytao_batch_add_to_draft",
+            {"items": exact_items},
+            ToolContext(
+                current_message="添加2、4",
+                writes_allowed=True,
+                pending_candidate=capability,
+            ),
+        )
+        allowed = __import__("json").loads(raw)
+        self.assertTrue(allowed.get("success"), allowed)
+        self.assertEqual(
+            [
+                (item["action"], item["word"], item["code"])
+                for item in delivered[0]["items"]
+            ],
+            [("Create", "还车", "htjev"), ("Create", "还车", "htwe")],
+        )
+        self.assertTrue(
+            all(item.get("needsManualReview") is True for item in delivered[0]["items"])
+        )
+
+        for message, items in (
+            (
+                "添加2、4",
+                [*exact_items, {"action": "Create", "word": "别词", "code": "fake"}],
+            ),
+            ("添加2、99", exact_items),
+        ):
+            with self.subTest(message=message):
+                raw = await executor.call(
+                    "keytao_batch_add_to_draft",
+                    {"items": items},
+                    ToolContext(
+                        current_message=message,
+                        writes_allowed=True,
+                        pending_candidate=capability,
+                    ),
+                )
+                blocked = __import__("json").loads(raw)
+                self.assertEqual(blocked.get("blockReason"), "binding_incomplete")
+                self.assertEqual(len(delivered), 1)
+                self.assertNotIn("boundTarget", blocked.get("message", ""))
+                suggestion = blocked.get("suggestedCommand", "")
+                if suggestion:
+                    self.assertEqual(
+                        authorized_multi_add_items(suggestion),
+                        tuple(exact_items),
+                    )
+
+        raw = await executor.call(
+            "keytao_batch_add_to_draft",
+            {"items": exact_items},
+            ToolContext(
+                current_message="添加2、4",
+                writes_allowed=True,
+            ),
+        )
+        no_state = __import__("json").loads(raw)
+        self.assertEqual(no_state.get("blockReason"), "binding_incomplete")
+        self.assertEqual(len(delivered), 1)
+
+    async def test_multi_selection_applies_review_verdict_per_selected_slot(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state = PendingAddWord(
+            word="还车",
+            recommended_code="htjev",
+            candidates=[("htjev", False), ("htwe", True)],
+            occupied_words={"htwe": ["换车"]},
+            server_candidates=[("htjev", False), ("htwe", True)],
+            server_occupied_words={"htwe": ["换车"]},
+            needs_manual_review=False,
+        )
+        execute = AsyncMock(return_value="previewed")
+        with patch.object(chat_module, "_execute_confirmed_tool", execute):
+            result = await chat_module._execute_add_multiple_codes_to_draft(
+                state,
+                ["htjev", "htwe"],
+                "qq",
+                "704974384",
+                submit_after=True,
+            )
+
+        self.assertEqual(result, "previewed")
+        ticket = execute.await_args.args[0]
+        self.assertIsInstance(ticket, PendingToolConfirm)
+        self.assertTrue(ticket.args["_submit_after"])
+        items = {item["code"]: item for item in ticket.args["items"]}
+        self.assertIs(items["htjev"]["needsManualReview"], False)
+        self.assertIs(items["htwe"]["needsManualReview"], True)
+        self.assertEqual(
+            items["htwe"]["manualReviewReason"],
+            "重码添加需管理员审核",
         )
 
     async def test_numbered_and_rendered_quoted_add_submit_execute_end_to_end(self) -> None:
@@ -1946,8 +2428,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         rendered_candidate = chat_module._ensure_pending_add_word_guidance(
             model_candidate
         )
-        self.assertTrue(rendered_candidate.endswith(advertised_copy))
         self.assertEqual(rendered_candidate.count(advertised_copy), 1)
+        self.assertIn("载流子 添加1", rendered_candidate)
+        self.assertIn("载流子 添加2、4", rendered_candidate)
+        self.assertNotIn("可多选，如「添加2、4」", rendered_candidate)
         parsed_candidate = chat_module._parse_pending_batch_add(rendered_candidate)
         self.assertIsInstance(parsed_candidate, PendingToolConfirm)
         self.assertEqual(
@@ -7607,11 +8091,16 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         model_reply = (
-            "是否将以下词一起加入草稿？\n"
-            "- 「载流」→ zhlq\n"
-            "- 「载流子」→ zlzu"
+            "是否以编码 zhlq 将「载流」加入草稿？\n"
+            "是否以编码 zlzu 将「载流子」加入草稿？"
         )
-        advertised_reply = model_reply + "\n\n" + pending_batch_confirmation_copy()
+        advertised_reply = (
+            model_reply
+            + "\n\n"
+            + pending_batch_confirmation_copy()
+            + "\n多个词的候选编号分别从 1 开始；选择时请带上词条，"
+            "例如「载流子 添加1」；多选请回复「载流子 添加2、4」。"
+        )
         client = _FakeClient([
             _fake_response(
                 "tool_calls",
@@ -7672,6 +8161,13 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.owner_key, context.conversation_address)
         self.assertIsInstance(record.state, PendingToolConfirm)
         self.assertEqual(record.state.function_name, "keytao_batch_add_to_draft")
+        self.assertEqual(
+            record.state.args["_candidate_scopes"],
+            [
+                {"word": "载流", "candidates": [["zhlq", False]]},
+                {"word": "载流子", "candidates": [["zlzu", False]]},
+            ],
+        )
         self.assertEqual(
             record.state.args["items"],
             [
@@ -10407,6 +10903,59 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalReplyLoopBreakerTests(unittest.TestCase):
+    def test_binding_failure_copy_hides_internal_fields_and_closes_retry(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        suggestion = "@我 添加「还车」 htjev；添加「还车」 htwe"
+        finalized = AgentOrchestrator._finalize_reply(
+            "添加2、4",
+            "请重新发送这条请求。",
+            {
+                "success": False,
+                "policyBlocked": True,
+                "blockReason": "binding_incomplete",
+                "message": (
+                    "安全拦截：无法把以下条目与本轮消息逐项对应："
+                    "「还车」htjev、「还车」htwe；整批均未写入。"
+                ),
+                "missing": ["boundTarget"],
+                "unboundItems": ["「还车」htjev", "「还车」htwe"],
+                "suggestedCommand": suggestion,
+            },
+        )
+        self.assertIn("「还车」htjev", finalized)
+        self.assertIn(suggestion, finalized)
+        self.assertNotRegex(
+            finalized,
+            r"boundTarget|blockReason|binding_incomplete|missing",
+        )
+        self.assertEqual(
+            authorized_multi_add_items(suggestion),
+            (
+                {"action": "Create", "word": "还车", "code": "htjev"},
+                {"action": "Create", "word": "还车", "code": "htwe"},
+            ),
+        )
+        self.assertEqual(chat_module._assert_plain_user_facing_reply(finalized), finalized)
+        direct_leak = AgentOrchestrator._finalize_reply(
+            "添加2、4",
+            "安全拦截：整批目标未绑定（缺少：boundTarget）",
+            {
+                "blockReason": "binding_incomplete",
+                "message": (
+                    "安全拦截：无法把以下条目与本轮消息逐项对应："
+                    "「还车」htjev、「还车」htwe；整批均未写入。"
+                ),
+                "suggestedCommand": suggestion,
+            },
+        )
+        self.assertNotIn("boundTarget", direct_leak)
+        self.assertIn(suggestion, direct_leak)
+        self.assertEqual(
+            chat_module._assert_plain_user_facing_reply(direct_leak),
+            direct_leak,
+        )
+
     def test_same_turn_resend_is_replaced_with_actual_failure_reason(self) -> None:
         message = "将草稿中「亮面」lxmmov 的权重调整为 101"
         reply = "请重新发送同一条消息，我再试一次。"

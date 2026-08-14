@@ -48,6 +48,10 @@ S17 declares known readings for `产`, `季`, and the obscure control character
 also builds the complete vendored pronunciation/commonness database inside the
 run artifact state before importing the bot, so S17 exercises real offline
 character frequencies instead of reduced test rows.
+S18 declares the `huán/hái`, `chē`, and `huàn` character readings for `还`,
+`车`, and `换`, mirrors the authoritative `还车` whole-word entry as
+`huán chē`, keeps `换车` absent as a pronunciation entry, and seeds `换车@htwe`
+as the exact local dictionary occupant.
 
 ## Prerequisites
 
@@ -163,6 +167,14 @@ batch reaches `Approved` through the bot auto-approve route. It then submits
 entries and the whole-word offline commonness rows are absent. The lane has only
 the whole-word `corpus_frequency` and `common_characters_and_llm` routes, so the
 pass case must take the latter and cannot silently use whole-word evidence.
+
+S18 replays the multi-number candidate incident for `还车`. It parses the live
+rendered indices for the empty `htjev` slot and occupied `htwe` slot across the
+authoritative `huán chē` and offline `hái chē` candidate readings, proves an
+out-of-range mixed selection writes nothing and leaks no policy identifiers,
+then sends one multi-number reply. The exact two-item set must land in one batch,
+the duplicate item keeps its manual-review seal, the empty item keeps its own
+audit verdict, and submission may use at most one server-bound `确认` step.
 
 Optional overrides:
 

@@ -9,7 +9,10 @@ from nonebot.log import logger
 
 from keytao_bot.utils import review_flags
 from keytao_bot.utils.observability import observe_tool_call
-from keytao_bot.utils.pending_confirmation import pending_confirmation_copy
+from keytao_bot.utils.pending_confirmation import (
+    parse_pending_candidate_selection,
+    pending_confirmation_copy,
+)
 
 try:  # pragma: no cover - depends on the installed runtime
     import httpx as _httpx
@@ -3068,6 +3071,65 @@ def _pending_create_is_bound(
     )
 
 
+def _pending_batch_selected_items(
+    message: str,
+    context: ToolContext,
+) -> Optional[Tuple[Tuple[str, str, str], ...]]:
+    """Resolve an exact multi-selection against one live server snapshot."""
+    capability = context.pending_candidate
+    if capability is None or not capability.state_matches:
+        return None
+    selection = parse_pending_candidate_selection(message)
+    if selection is None:
+        return None
+    candidates = dict(capability.candidates)
+    if len(candidates) != len(capability.candidates):
+        return None
+    if selection.indices:
+        if (
+            len(set(selection.indices)) != len(selection.indices)
+            or any(
+                not 1 <= index <= len(capability.candidates)
+                for index in selection.indices
+            )
+        ):
+            return None
+        codes = tuple(
+            capability.candidates[index - 1][0]
+            for index in selection.indices
+        )
+    else:
+        if (
+            len(set(selection.codes)) != len(selection.codes)
+            or any(code not in candidates for code in selection.codes)
+        ):
+            return None
+        codes = selection.codes
+    return tuple(("Create", capability.word, code) for code in codes)
+
+
+def _pending_batch_items_match_selection(
+    items: Any,
+    selected_items: Optional[Tuple[Tuple[str, str, str], ...]],
+) -> bool:
+    if selected_items is None or not isinstance(items, list):
+        return False
+    normalized: List[Tuple[str, str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        action = str(item.get("action") or "Create").strip()
+        word = str(item.get("word") or "").strip()
+        code = str(item.get("code") or "").strip().lower()
+        if action != "Create" or not word or not code or item.get("old_word"):
+            return False
+        normalized.append((action, word, code))
+    return (
+        len(normalized) == len(selected_items)
+        and set(normalized) == set(selected_items)
+    )
+
+
 def _positional_destination_operand_is_exact(
     message: str,
     destination_word: str,
@@ -4371,6 +4433,34 @@ class ToolExecutor:
                     "安全拦截：批量操作缺少可绑定的词条。",
                     missing=["items"],
                 )
+            pending_selected_items = _pending_batch_selected_items(
+                message,
+                context,
+            )
+            pending_batch_is_bound = _pending_batch_items_match_selection(
+                items,
+                pending_selected_items,
+            )
+            if pending_selected_items is not None and not pending_batch_is_bound:
+                expected_items = [
+                    {"action": action, "word": word, "code": code}
+                    for action, word, code in pending_selected_items
+                ]
+                expected_labels = "、".join(
+                    f"「{word}」{code}"
+                    for _action, word, code in pending_selected_items
+                )
+                retry = _suggested_command_text(
+                    "keytao_batch_add_to_draft",
+                    {"items": expected_items},
+                )
+                return policy_block(
+                    BLOCK_REASON_BINDING_INCOMPLETE,
+                    "安全拦截：本次批量写入无法与候选快照中选中的"
+                    f"{expected_labels}精确对应；整批均未写入。",
+                    missing=["exactAuthorizedItemSet"],
+                    suggestion=(SUGGESTION_MENTION_PREFIX + retry) if retry else "",
+                )
             if (
                 multi_add is not None
                 and not _multi_add_items_match_authorized_set(
@@ -4391,9 +4481,9 @@ class ToolExecutor:
                     authorizedItems=authorized_items,
                 )
             blocked_items: List[str] = []
-            for item in items:
+            for item in ([] if pending_batch_is_bound else items):
                 if not isinstance(item, dict):
-                    blocked_items.append("(invalid item)")
+                    blocked_items.append("无效条目")
                     continue
                 word = str(item.get("word") or "").strip()
                 old_word = str(item.get("old_word") or "").strip()
@@ -4431,12 +4521,26 @@ class ToolExecutor:
                         )
                     )
                 ):
-                    blocked_items.append(f"{action}:{word or '(missing word)'}")
+                    visible_word = (
+                        f"「{word}」"
+                        if word and _contains_exact_target(message, word)
+                        else "未能对应的词条"
+                    )
+                    visible_code = (
+                        code
+                        if code and _contains_exact_target(message, code)
+                        else "编码未能对应"
+                    )
+                    blocked_items.append(
+                        f"{visible_word}（{visible_code}）"
+                    )
             if blocked_items:
                 return policy_block(
                     BLOCK_REASON_BINDING_INCOMPLETE,
-                    "安全拦截：批量操作中每一条的动作、词条和编码"
-                    "都必须与用户本轮原始文字单独绑定。",
+                    "安全拦截：无法把以下条目与本轮消息逐项对应："
+                    + "、".join(blocked_items[:12])
+                    + "；整批均未写入。请在下一条消息中逐项写全动作、"
+                    "词条和编码后重试。",
                     missing=["boundTarget"],
                     unboundItems=blocked_items[:12],
                 )

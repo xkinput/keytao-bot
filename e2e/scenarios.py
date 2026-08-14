@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from keytao_bot.utils.pending_confirmation import advertised_batch_binding_pairs
+
 from .recording import ArtifactRecorder
 from .runtime import E2EBotHarness, LocalNextClient
 from .safety import (
@@ -1086,16 +1088,40 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
     messages = ["喵喵 加词 载流 载流子"]
     replies = [await ctx.send(messages[-1])]
     discovery_reply = replies[-1]
+    expected_bindings = {("载流", "zhlq"), ("载流子", "zlzu")}
+    review_events = [
+        event
+        for event in ctx.attempt_events()
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_prepare_reviewed_add"
+        and isinstance(event.get("result"), dict)
+    ]
+    structured_bindings = {
+        (
+            str(event["result"].get("word") or "").strip(),
+            str(event["result"].get("recommendedCode") or "").strip().lower(),
+        )
+        for event in review_events
+    }
     require(
-        re.search(r"(?m)^-\s*「载流」\s*(?:→|->)\s*zhlq\s*$", discovery_reply)
-        is not None,
-        f"S16 discovery did not bind 载流@zhlq: {discovery_reply}",
+        expected_bindings <= structured_bindings,
+        f"S16 structured review did not bind both exact items: {review_events}",
     )
+    displayed_bindings = set(advertised_batch_binding_pairs(discovery_reply))
     require(
-        re.search(r"(?m)^-\s*「载流子」\s*(?:→|->)\s*zlzu\s*$", discovery_reply)
-        is not None,
-        f"S16 discovery did not bind 载流子@zlzu: {discovery_reply}",
+        displayed_bindings == expected_bindings,
+        f"S16 discovery rendering did not advertise both exact bindings: {discovery_reply}",
     )
+    saved_ticket_events = [
+        event
+        for event in ctx.attempt_events()
+        if event.get("kind") == "log"
+        and "Saved advertised reviewed batch candidate" in str(
+            event.get("message") or ""
+        )
+        and "items=2" in str(event.get("message") or "")
+    ]
+    require(saved_ticket_events, "S16 discovery did not persist one trusted two-item ticket")
     require(
         "加入并提交" in discovery_reply,
         f"S16 discovery did not advertise bare add-and-submit: {discovery_reply}",
@@ -1114,6 +1140,7 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
         "executionVerb",
         "提交草稿",
         "本轮没有可执行的已绑定写操作",
+        "重新发送完整操作指令",
     )
     batch_id = _successful_submit_batch_id(
         ctx.attempt_events(),
@@ -1136,6 +1163,7 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
             f"S16 advertised assent hit old remediation: {reply}",
         )
     require(batch_id, "S16 bare assent never completed submit")
+    require(len(messages) - 2 <= 1, "S16 used more than one server-bound confirmation")
     batch = await ctx.next_client.get_admin_batch(
         batch_id=batch_id,
         admin_token=ctx.admin_token,
@@ -1294,6 +1322,222 @@ async def scenario_s17(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+def _rendered_candidate_index(reply: str, code: str) -> int:
+    match = re.search(
+        rf"(?m)^(?P<index>\d+)\.\s*{re.escape(code)}\b.*$",
+        reply,
+    )
+    require(match is not None, f"candidate list omitted {code}: {reply}")
+    return int(match.group("index"))
+
+
+def _rendered_candidate_reading_rows(reply: str) -> list[tuple[str, str]]:
+    return [
+        (match.group("pinyin").strip(), match.group("sources").strip())
+        for match in re.finditer(
+            r"(?m)^\d+\.\s*(?P<pinyin>[^；\n]+)；来源\s+(?P<sources>.+)$",
+            reply,
+        )
+    ]
+
+
+async def scenario_s18(ctx: ScenarioContext) -> dict[str, Any]:
+    messages = ["喵喵 还车"]
+    replies = [await ctx.send(messages[-1])]
+    discovery = replies[-1]
+    candidate_reading_rows = _rendered_candidate_reading_rows(discovery)
+    candidate_readings = [pinyin for pinyin, _sources in candidate_reading_rows]
+    reading_sections = re.findall(
+        r"(?m)^候选编码（读音 (?P<index>\d+)）:$",
+        discovery,
+    )
+    require(
+        candidate_readings == ["huan che", "hái chē"]
+        and "汉典（经编码服务）" in candidate_reading_rows[0][1]
+        and any(
+            label in candidate_reading_rows[1][1]
+            for label in (
+                "开放拼音数据（large_pinyin）",
+                "汉典（离线数据集）",
+            )
+        )
+        and reading_sections == ["1", "2"],
+        f"S18 discovery did not render both incident readings: {discovery}",
+    )
+    empty_code = "htjev"
+    occupied_code = "htwe"
+    empty_index = _rendered_candidate_index(discovery, empty_code)
+    occupied_index = _rendered_candidate_index(discovery, occupied_code)
+    require(
+        re.search(
+            rf"(?m)^{empty_index}\.\s*{empty_code}\b.*空位.*$",
+            discovery,
+        )
+        is not None,
+        f"S18 {empty_code} was not rendered as an empty slot: {discovery}",
+    )
+    require(
+        re.search(
+            rf"(?m)^{occupied_index}\.\s*{occupied_code}\b.*已有.*换车.*$",
+            discovery,
+        )
+        is not None,
+        f"S18 {occupied_code} was not occupied by 换车: {discovery}",
+    )
+    require(
+        "可多选，如「添加2、4」" in discovery,
+        f"S18 discovery omitted the advertised multi-select form: {discovery}",
+    )
+    if "该词可自动通过" in discovery:
+        empty_needs_manual_review = False
+    else:
+        require(
+            "该词需管理员审核" in discovery,
+            f"S18 discovery omitted its review verdict: {discovery}",
+        )
+        empty_needs_manual_review = True
+
+    control = f"添加{empty_index}、99"
+    messages.append(control)
+    replies.append(await ctx.send(control))
+    control_draft = await ctx.draft()
+    require(
+        not control_draft.get("items"),
+        f"S18 out-of-range control wrote a partial batch: {control_draft}",
+    )
+    internal_markers = (
+        "boundTarget",
+        "blockReason",
+        "binding_incomplete",
+        "exactAuthorizedItemSet",
+    )
+    require(
+        not any(marker in replies[-1] for marker in internal_markers),
+        f"S18 control leaked an internal policy field: {replies[-1]}",
+    )
+
+    selected = f"添加{empty_index}、{occupied_index}"
+    selected_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(selected)
+    replies.append(await ctx.send(selected))
+    draft = await ctx.draft()
+    confirmation_steps = 0
+    if not draft.get("items"):
+        require(
+            "确认" in replies[-1],
+            f"S18 selection neither wrote nor offered one bound confirmation: {replies[-1]}",
+        )
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        confirmation_steps = 1
+        draft = await ctx.draft()
+
+    expected = {
+        ("Create", "还车", empty_code),
+        ("Create", "还车", occupied_code),
+    }
+    actual = {item_key(item) for item in draft.get("items", [])}
+    require(
+        len(draft.get("items", [])) == 2 and actual == expected,
+        f"S18 did not write the exact selected pair in one batch: {draft}",
+    )
+    require(
+        bool(str(draft.get("batchId") or "")),
+        f"S18 exact pair lacks one materialized batch: {draft}",
+    )
+    empty_item = next(
+        item for item in draft["items"] if item_key(item) == ("Create", "还车", empty_code)
+    )
+    occupied_item = next(
+        item for item in draft["items"] if item_key(item) == ("Create", "还车", occupied_code)
+    )
+    require(
+        empty_item.get("needsManualReview") is empty_needs_manual_review,
+        f"S18 empty slot did not preserve its own review verdict: {empty_item}",
+    )
+    require(
+        occupied_item.get("needsManualReview") is True,
+        f"S18 occupied slot lost the duplicate-code review seal: {occupied_item}",
+    )
+    duplicate_warnings = [
+        warning
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > selected_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+        and isinstance(event.get("result"), dict)
+        for warning in (event["result"].get("warnings") or [])
+        if isinstance(warning, dict)
+        and warning.get("warningType") == "duplicate_code"
+        and isinstance(warning.get("item"), dict)
+        and item_key(warning["item"]) == ("Create", "还车", occupied_code)
+    ]
+    require(
+        duplicate_warnings,
+        "S18 occupied selection lacked an exact duplicate-code warning ticket",
+    )
+
+    submit_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("提交")
+    replies.append(await ctx.send(messages[-1]))
+    batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=submit_cutoff,
+    )
+    if not batch_id and "确认" in replies[-1]:
+        require(
+            confirmation_steps == 0,
+            f"S18 required more than one server-bound confirmation: {replies[-1]}",
+        )
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        confirmation_steps += 1
+        batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=submit_cutoff,
+        )
+    require(batch_id, "S18 exact multi-select batch did not submit")
+    require(confirmation_steps <= 1, "S18 used more than one confirmation step")
+    batch = await ctx.next_client.get_admin_batch(
+        batch_id=batch_id,
+        admin_token=ctx.admin_token,
+    )
+    submitted = {
+        item_key(item)
+        for item in batch.get("pullRequests", [])
+        if isinstance(item, dict)
+    }
+    require(
+        batch.get("status") in {"Submitted", "Approved"}
+        and submitted == expected
+        and len(batch.get("pullRequests", [])) == 2,
+        f"S18 submitted batch does not equal the parsed selection set: {batch}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "selectedIndexes": [empty_index, occupied_index],
+            "selectedCodes": [empty_code, occupied_code],
+            "candidateReadings": candidate_readings,
+            "controlIndex": 99,
+            "exactItemSet": sorted(expected),
+            "batchId": batch_id,
+            "batchStatus": batch.get("status"),
+            "duplicateWarningSealed": True,
+            "emptyNeedsManualReview": empty_needs_manual_review,
+            "additionalConfirmationSteps": confirmation_steps,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -1312,6 +1556,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S15", "numbered add-submit and suggestion/direct closure", scenario_s15),
     Scenario("S16", "two-word bare advertised add-submit", scenario_s16),
     Scenario("S17", "semantic common-character auto-pass", scenario_s17),
+    Scenario("S18", "multi-number candidate snapshot selection", scenario_s18),
 )
 
 

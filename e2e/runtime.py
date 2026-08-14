@@ -31,6 +31,11 @@ class RigInfrastructureError(RuntimeError):
     """Raised when the local stack or fixture contract is unavailable."""
 
 
+LOCAL_NEXT_RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+LOCAL_NEXT_CONNECT_TIMEOUT_SECONDS = 5.0
+LOCAL_NEXT_REQUEST_TIMEOUT_SECONDS = 90.0
+
+
 class NextServer:
     def __init__(
         self,
@@ -129,10 +134,63 @@ class LocalNextClient:
     def __init__(self, *, base_url: str, bot_token: str) -> None:
         self.base_url = validate_keytao_base(base_url)
         self.bot_token = bot_token
+        self._client: Optional[httpx.AsyncClient] = None
 
     @property
     def headers(self) -> dict[str, str]:
         return {"X-Bot-Token": self.bot_token}
+
+    def _pooled_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    LOCAL_NEXT_REQUEST_TIMEOUT_SECONDS,
+                    connect=LOCAL_NEXT_CONNECT_TIMEOUT_SECONDS,
+                    pool=LOCAL_NEXT_CONNECT_TIMEOUT_SECONDS,
+                ),
+                follow_redirects=False,
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                    keepalive_expiry=30.0,
+                ),
+            )
+        return self._client
+
+    async def _reset_client(self) -> None:
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.aclose()
+
+    async def close(self) -> None:
+        """Close the shared local transport pool."""
+
+        await self._reset_client()
+
+    async def _request_with_retries(
+        self,
+        method: str,
+        path: str,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        url = f"{self.base_url}{path}"
+        attempt_count = len(LOCAL_NEXT_RETRY_BACKOFF_SECONDS) + 1
+        for attempt in range(1, attempt_count + 1):
+            try:
+                return await self._pooled_client().request(method, url, **kwargs)
+            except httpx.TransportError as error:
+                await self._reset_client()
+                if attempt == attempt_count:
+                    raise
+                delay = LOCAL_NEXT_RETRY_BACKOFF_SECONDS[attempt - 1]
+                print(
+                    f"Local next transport retry {attempt}/{attempt_count} "
+                    f"for {method} {url} after {type(error).__name__}: {error}; "
+                    f"resetting connection pool and backing off {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+        raise AssertionError("local next retry loop exhausted without a result")
 
     async def _json(
         self,
@@ -148,14 +206,13 @@ class LocalNextClient:
         headers = dict(self.headers) if authenticated else {}
         if bearer_token:
             headers["Authorization"] = f"Bearer {bearer_token}"
-        async with httpx.AsyncClient(timeout=90.0, follow_redirects=False) as client:
-            response = await client.request(
-                method,
-                f"{self.base_url}{path}",
-                params=params,
-                json=body,
-                headers=headers,
-            )
+        response = await self._request_with_retries(
+            method,
+            path,
+            params=params,
+            json=body,
+            headers=headers,
+        )
         try:
             payload = response.json()
         except ValueError as error:

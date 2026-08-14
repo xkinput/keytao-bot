@@ -95,6 +95,9 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
+    advertised_batch_binding_pairs,
+    ensure_multi_word_candidate_copy,
+    parse_pending_candidate_selection,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     pending_confirmation_prompt_instruction,
@@ -475,6 +478,7 @@ class MessageCommandIntent:
     clear_after: bool = False
     current_user_only: bool = False
     choice_index: Optional[int] = None
+    choice_indices: Tuple[int, ...] = ()
     requested_code: str = ""
     requested_codes: Tuple[str, ...] = ()
     target_word: str = ""
@@ -512,6 +516,11 @@ def _strip_command_message_prefixes(message_text: str) -> str:
 
 
 _RAW_PYTHON_REPLY_MARKERS = ("{'", "': '", "dataclass(")
+_INTERNAL_REPLY_FRAGMENT_RE = re.compile(
+    r"(?:\bboundTarget\b|\bblockReason\b|\bbinding_incomplete\b|"
+    r"[（(]\s*缺少\s*[：:]\s*[^）)]*"
+    r"(?:[a-z]+[A-Z_][A-Za-z0-9_]*|[a-z]+_[a-z0-9_]+)[^）)]*[）)])"
+)
 
 
 def _assert_plain_user_facing_reply(text: str) -> str:
@@ -522,6 +531,9 @@ def _assert_plain_user_facing_reply(text: str) -> str:
     )
     if marker:
         logger.error("Refusing user-facing reply with raw Python repr marker %r", marker)
+        raise ValueError("User-facing reply contains a raw Python representation")
+    if _INTERNAL_REPLY_FRAGMENT_RE.search(reply):
+        logger.error("Refusing user-facing reply with an internal policy identifier")
         raise ValueError("User-facing reply contains a raw Python representation")
     return reply
 
@@ -1211,6 +1223,52 @@ def _structural_pending_add_word_intent(
     if not compact:
         return None
 
+    multi_selection = parse_pending_candidate_selection(stripped)
+    if multi_selection is not None:
+        server_backed = bool(
+            state.server_candidates
+            and state.server_candidates == state.candidates
+        )
+        if not server_backed:
+            return None
+        resolved_codes = multi_selection.codes
+        if multi_selection.indices and all(
+            1 <= index <= len(state.candidates)
+            for index in multi_selection.indices
+        ):
+            resolved_codes = tuple(
+                state.candidates[index - 1][0]
+                for index in multi_selection.indices
+            )
+        return MessageCommandIntent(
+            intent=(
+                "pending_add_and_submit"
+                if multi_selection.submit_after
+                else "pending_choice"
+            ),
+            confidence=1.0,
+            submit_after=multi_selection.submit_after,
+            choice_indices=multi_selection.indices,
+            requested_codes=resolved_codes,
+        )
+
+    prefixed_number = re.fullmatch(
+        r"(?:添加|加入|加词|加)(?P<selector>[1-9]\d{0,2})"
+        r"(?P<submit>并提交)?",
+        compact,
+    )
+    if prefixed_number is not None:
+        choice_index = int(prefixed_number.group("selector"))
+        submit_after = prefixed_number.group("submit") is not None
+        return MessageCommandIntent(
+            intent=(
+                "pending_add_and_submit" if submit_after else "pending_choice"
+            ),
+            confidence=1.0,
+            submit_after=submit_after,
+            choice_index=choice_index,
+        )
+
     numbered_add = _PENDING_NUMBERED_ADD_REPLY_RE.fullmatch(compact)
     if numbered_add is not None:
         choice_index = _parse_pending_choice_index(
@@ -1278,6 +1336,196 @@ def _structural_pending_add_word_intent(
         confidence=1.0,
         target_word=selector,
     )
+
+
+def _closed_candidate_selection(
+    text: str,
+) -> Optional[Tuple[Tuple[int, ...], Tuple[str, ...], bool]]:
+    """Parse the exact numbered/code selection forms advertised in discovery."""
+    parsed = parse_pending_candidate_selection(text)
+    if parsed is not None:
+        return parsed.indices, parsed.codes, parsed.submit_after
+    compact = _compact_command_text(text).lower()
+    match = re.fullmatch(
+        r"(?:添加|加入|加词|加)?(?P<index>[1-9]\d{0,2})"
+        r"(?P<submit>并提交)?",
+        compact,
+    )
+    if match is None:
+        return None
+    return (
+        (int(match.group("index")),),
+        (),
+        match.group("submit") is not None,
+    )
+
+
+def _multi_word_candidate_scope_rows(
+    state: PendingState,
+) -> Tuple[List[Dict[str, Any]], Dict[str, List[Tuple[str, bool]]]]:
+    """Validate the structured candidate metadata carried by a batch ticket."""
+    if (
+        not isinstance(state, PendingToolConfirm)
+        or state.function_name != "keytao_batch_add_to_draft"
+    ):
+        return [], {}
+    items = state.args.get("items")
+    if not isinstance(items, list):
+        return [], {}
+    clean_items = [item for item in items if isinstance(item, dict)]
+    words = [str(item.get("word") or "").strip() for item in clean_items]
+    if (
+        len(clean_items) != len(items)
+        or len(words) < 2
+        or any(not word for word in words)
+        or len(set(words)) != len(words)
+    ):
+        return [], {}
+
+    raw_scopes = state.args.get("_candidate_scopes")
+    if not isinstance(raw_scopes, list):
+        return clean_items, {}
+    scopes: Dict[str, List[Tuple[str, bool]]] = {}
+    for raw_scope in raw_scopes:
+        if not isinstance(raw_scope, dict):
+            return clean_items, {}
+        word = str(raw_scope.get("word") or "").strip()
+        raw_candidates = raw_scope.get("candidates")
+        if word not in words or word in scopes or not isinstance(raw_candidates, list):
+            return clean_items, {}
+        candidates: List[Tuple[str, bool]] = []
+        seen_codes: set[str] = set()
+        for raw_candidate in raw_candidates:
+            if not isinstance(raw_candidate, (list, tuple)) or len(raw_candidate) != 2:
+                return clean_items, {}
+            code = str(raw_candidate[0] or "").strip().lower()
+            occupied = raw_candidate[1]
+            if (
+                not re.fullmatch(r"[a-z]{1,12}", code)
+                or code in seen_codes
+                or not isinstance(occupied, bool)
+            ):
+                return clean_items, {}
+            seen_codes.add(code)
+            candidates.append((code, occupied))
+        if not candidates:
+            return clean_items, {}
+        current_code = str(
+            next(item for item in clean_items if str(item.get("word") or "").strip() == word).get("code")
+            or ""
+        ).strip().lower()
+        if current_code not in seen_codes:
+            return clean_items, {}
+        scopes[word] = candidates
+    if set(scopes) != set(words):
+        return clean_items, {}
+    return clean_items, scopes
+
+
+def _resolve_multi_word_pending_candidate_selection(
+    state: PendingState,
+    message_text: str,
+) -> Tuple[Optional[PendingToolConfirm], Optional[MessageCommandIntent], Optional[str]]:
+    """Require word scope when several live candidate lists reuse numbers."""
+    items, scopes = _multi_word_candidate_scope_rows(state)
+    if len(items) < 2:
+        return None, None, None
+    words = tuple(str(item["word"]).strip() for item in items)
+    source = unicodedata.normalize(
+        "NFKC",
+        _strip_command_message_prefixes(trusted_mutation_source(message_text)),
+    ).strip()
+    if (
+        not source
+        or re.search(r"[?？\"'“”‘’「」『』]", source)
+        or re.search(r"(?:不要|别|取消|删除|移除|解释|复述|他说)", source)
+    ):
+        return None, None, None
+
+    target_word = ""
+    selection_text = ""
+    for word in sorted(words, key=len, reverse=True):
+        match = re.fullmatch(rf"{re.escape(word)}[\s:：，,]*(.+)", source)
+        if match is not None:
+            target_word = word
+            selection_text = match.group(1).strip()
+            break
+
+    selection = _closed_candidate_selection(selection_text or source)
+    unscoped_recode = bool(
+        not target_word
+        and re.fullmatch(r"(?:第)?[1-9]\d{0,2}(?:个|号|项)?重新编码", _compact_command_text(source))
+    )
+    if not target_word and (selection is not None or unscoped_recode):
+        named_words = "、".join(f"「{word}」" for word in words)
+        example = words[-1]
+        return None, None, (
+            f"当前有多个词（{named_words}），每个候选列表都从 1 开始。"
+            f"请带上词条选择，例如「{example} 添加1」或"
+            f"「{example} 添加2、4」。"
+        )
+    if not target_word or selection is None:
+        return None, None, None
+    if not scopes:
+        return None, None, "当前多词候选缺少可信编号快照，请重新发起审词。"
+
+    indices, requested_codes, submit_after = selection
+    candidates = scopes[target_word]
+    if indices:
+        if (
+            len(set(indices)) != len(indices)
+            or any(not 1 <= index <= len(candidates) for index in indices)
+        ):
+            return None, None, f"「{target_word}」请选择 1-{len(candidates)} 之间的编号。"
+        selected_codes = tuple(candidates[index - 1][0] for index in indices)
+    else:
+        candidate_codes = {code for code, _occupied in candidates}
+        if (
+            not requested_codes
+            or len(set(requested_codes)) != len(requested_codes)
+            or any(code not in candidate_codes for code in requested_codes)
+        ):
+            return None, None, f"所选编码不全在「{target_word}」当前候选中，请重新选择。"
+        selected_codes = requested_codes
+
+    target_item = next(
+        item
+        for item in items
+        if str(item.get("word") or "").strip() == target_word
+    )
+    occupancy = dict(candidates)
+    selected_items: List[Dict[str, Any]] = []
+    for code in selected_codes:
+        item = dict(target_item)
+        item["code"] = code
+        if occupancy[code]:
+            item["needsManualReview"] = True
+            item["manualReviewReason"] = "重码添加需管理员审核"
+        selected_items.append(item)
+
+    derived_items: List[Dict[str, Any]] = []
+    for item in items:
+        if str(item.get("word") or "").strip() == target_word:
+            derived_items.extend(selected_items)
+        else:
+            derived_items.append(dict(item))
+    derived_args = dict(state.args)
+    derived_args.pop("_candidate_scopes", None)
+    derived_args["items"] = derived_items
+    derived_state = PendingToolConfirm(
+        function_name=state.function_name,
+        args=derived_args,
+        confirmation_source=state.confirmation_source,
+    )
+    intent = MessageCommandIntent(
+        intent="pending_add_and_submit" if submit_after else "pending_confirm",
+        confidence=1.0,
+        submit_after=submit_after,
+        choice_indices=indices,
+        requested_codes=selected_codes,
+        target_word=target_word,
+    )
+    return derived_state, intent, None
 
 
 def _is_fresh_current_user_command_intent(
@@ -1527,7 +1775,11 @@ def _pending_context_for_command_intent(state: Optional[PendingState]) -> str:
             {
                 "type": "pending_tool_confirm",
                 "function_name": state.function_name,
-                "args": state.args,
+                "args": {
+                    key: value
+                    for key, value in state.args.items()
+                    if not str(key).startswith("_")
+                },
             },
             ensure_ascii=False,
         )
@@ -2216,7 +2468,11 @@ def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
         "两个词是否一起加",
         "两词是否一起加",
     )
-    if not any(marker in normalized_response for marker in batch_prompt_markers):
+    visible_pairs = advertised_batch_binding_pairs(normalized_response)
+    if (
+        len(visible_pairs) < 2
+        and not any(marker in normalized_response for marker in batch_prompt_markers)
+    ):
         return None
 
     confirm_line = next(
@@ -2251,7 +2507,13 @@ def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
             re.IGNORECASE,
         )
     ]
-    for code, word in [*inline_pairs, *arrow_pairs, *inline_arrow_pairs]:
+    exact_line_pairs = [(code, word) for word, code in visible_pairs]
+    for code, word in [
+        *exact_line_pairs,
+        *inline_pairs,
+        *arrow_pairs,
+        *inline_arrow_pairs,
+    ]:
         code = code.lower()
         word = word.strip()
         key = (word, code)
@@ -2725,7 +2987,9 @@ def _message_authorizes_pending_state_control(
                 structural_intent is not None
                 and structural_intent.intent == command_intent.intent
                 and structural_intent.choice_index == command_intent.choice_index
+                and structural_intent.choice_indices == command_intent.choice_indices
                 and structural_intent.requested_code == command_intent.requested_code
+                and structural_intent.requested_codes == command_intent.requested_codes
                 and structural_intent.target_word == command_intent.target_word
             )
         ):
@@ -2748,6 +3012,7 @@ def _ticket_payload_from_command_intent(
         "confidence": 1.0,
         "submit_after": bool(command_intent.submit_after),
         "choice_index": command_intent.choice_index,
+        "choice_indices": list(command_intent.choice_indices),
         "requested_code": command_intent.requested_code,
         "requested_codes": list(command_intent.requested_codes),
         "target_word": command_intent.target_word,
@@ -2771,6 +3036,13 @@ def _command_intent_from_ticket_payload(
         confidence=1.0,
         submit_after=bool(payload.get("submit_after")),
         choice_index=choice_index,
+        choice_indices=tuple(
+            value
+            for value in payload.get("choice_indices", [])
+            if isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        ) if isinstance(payload.get("choice_indices"), list) else (),
         requested_code=str(payload.get("requested_code") or "")[:32],
         requested_codes=_sanitize_optional_codes(payload.get("requested_codes")),
         target_word=str(payload.get("target_word") or "")[:128],
@@ -2811,6 +3083,45 @@ async def _canonicalize_pending_ticket_intent(
     """Freeze the exact action and target that the ticket will later execute."""
     if not isinstance(state, PendingAddWord):
         return command_intent, None
+
+    multi_selection = parse_pending_candidate_selection(
+        _strip_command_message_prefixes(trusted_mutation_source(message_text))
+    )
+    if multi_selection is not None:
+        if multi_selection.indices:
+            if (
+                len(set(multi_selection.indices)) != len(multi_selection.indices)
+                or any(
+                    not 1 <= index <= len(state.candidates)
+                    for index in multi_selection.indices
+                )
+            ):
+                return None, f"请选择 1-{len(state.candidates)} 之间的编号。"
+            requested_codes = tuple(
+                state.candidates[index - 1][0]
+                for index in multi_selection.indices
+            )
+        else:
+            candidate_codes = {code for code, _occupied in state.candidates}
+            if (
+                len(set(multi_selection.codes)) != len(multi_selection.codes)
+                or any(code not in candidate_codes for code in multi_selection.codes)
+            ):
+                return None, "所选编码不全在当前候选中，请按候选列表重新选择。"
+            requested_codes = multi_selection.codes
+        return replace(
+            command_intent,
+            intent=(
+                "pending_add_and_submit"
+                if multi_selection.submit_after
+                else "pending_choice"
+            ),
+            submit_after=multi_selection.submit_after,
+            choice_index=None,
+            choice_indices=multi_selection.indices,
+            requested_code="",
+            requested_codes=requested_codes,
+        ), None
 
     requested_codes = tuple(
         _requested_codes_from_pending_message(message_text, state)
@@ -3371,10 +3682,7 @@ async def _revalidate_referenced_add_pending(
 def _ensure_pending_add_word_guidance(response: str) -> str:
     """Append deterministic guidance for occupied candidate choices."""
     if _parse_pending_batch_add(response) is not None:
-        guidance = pending_batch_confirmation_copy()
-        if guidance not in response:
-            return response.rstrip() + f"\n\n{guidance}"
-        return response
+        return ensure_multi_word_candidate_copy(response)
 
     guidance = "若所选编号显示“已有…”，直接回复该编号表示添加重码；回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
     if "重新编码" in response and "添加重码" in response:
@@ -4213,10 +4521,13 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
     if ordering_recommended_code:
         lines.append(
             f"如不调整现有排序，也可仍以编码 {recommended_code} 将「{word}」加入草稿；"
-            "回复对应编号或编码即可。"
+            "回复对应编号或编码即可。可多选，如「添加2、4」。"
         )
     else:
-        lines.append(f"是否以编码 {recommended_code} 将「{word}」加入草稿？可回复编号、编码，或「都加」。")
+        lines.append(
+            f"是否以编码 {recommended_code} 将「{word}」加入草稿？"
+            "可回复编号、编码，或「都加」；可多选，如「添加2、4」。"
+        )
     lines.append("若选的是已有词编码，回复“编号 重新编码”可挪开原词。")
     return "\n".join(lines).strip()
 
@@ -6016,13 +6327,20 @@ async def _execute_add_multiple_codes_to_draft(
     user_id: str,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    submit_after: bool = False,
 ) -> str:
     items = []
+    occupancy = dict(state.candidates)
     for code in codes:
         item = {"word": state.word, "code": code, "action": "Create"}
         remark = state.code_remarks.get(code)
         if remark:
             item["remark"] = remark
+        if occupancy.get(code) is True:
+            item["needsManualReview"] = True
+            item["manualReviewReason"] = "重码添加需管理员审核"
+        elif state.needs_manual_review is not None:
+            item["needsManualReview"] = bool(state.needs_manual_review)
         items.append(item)
     if not items:
         return "没有找到可添加的编码 qwq"
@@ -6030,7 +6348,10 @@ async def _execute_add_multiple_codes_to_draft(
     return await _execute_confirmed_tool(
         PendingToolConfirm(
             function_name="keytao_batch_add_to_draft",
-            args={"items": items},
+            args={
+                "items": items,
+                **({"_submit_after": True} if submit_after else {}),
+            },
             confirmation_source="local_preview",
         ),
         platform,
@@ -6310,6 +6631,7 @@ async def _execute_confirmed_tool(
 
     args = dict(state.args)
     args.pop("preview_only", None)
+    args.pop("_candidate_scopes", None)
     ordering_summary = str(
         args.pop("_ordering_summary", "")
         or carried_ordering_summary
@@ -8516,6 +8838,7 @@ async def _handle_pending_add_word(
             user_id,
             space_key,
             owner_label,
+            submit_after=submit_after_add,
         )
 
     shift_target_code = _resolve_shift_target_code(state, command_intent)
@@ -8713,6 +9036,14 @@ async def handle_pending_message_core(
             return None
         return uncertain_response
 
+    scoped_state, scoped_intent, scoped_response = (
+        _resolve_multi_word_pending_candidate_selection(state, message)
+    )
+    if scoped_response is not None:
+        return scoped_response
+    if scoped_state is not None:
+        state = scoped_state
+
     if (
         isinstance(state, PendingAddWord)
         and _is_short_add_and_submit_request(message)
@@ -8727,7 +9058,9 @@ async def handle_pending_message_core(
         preserve_after_response = True
 
     structural_tool_intent = _pending_tool_assent_intent(state, message)
-    if structural_tool_intent is not None:
+    if scoped_intent is not None:
+        pending_command_intent = scoped_intent
+    elif structural_tool_intent is not None:
         pending_command_intent = structural_tool_intent
     else:
         try:
@@ -8738,6 +9071,8 @@ async def handle_pending_message_core(
         except BaseException:
             raise
     if (
+        scoped_intent is None
+        and
         _is_sensitive_pending_control_intent(pending_command_intent)
         and not _message_authorizes_pending_state_control(
             state,
@@ -8762,13 +9097,16 @@ async def handle_pending_message_core(
         )
 
     try:
-        pending_command_intent, ticket_response = await _resolve_pending_ticket_control(
-            state_record,
-            message,
-            pending_command_intent,
-            platform,
-            user_id,
-        )
+        if scoped_intent is not None:
+            ticket_response = None
+        else:
+            pending_command_intent, ticket_response = await _resolve_pending_ticket_control(
+                state_record,
+                message,
+                pending_command_intent,
+                platform,
+                user_id,
+            )
     except BaseException:
         raise
     if ticket_response is not None:
@@ -10445,6 +10783,28 @@ async def _handle_ai_chat_serialized(
         and quoted_pending_add_intent is not None
     )
     current_pending_record = conversation_state_store.get_record(conv_key)
+    scoped_pending_state: Optional[PendingToolConfirm] = None
+    scoped_pending_intent: Optional[MessageCommandIntent] = None
+    scoped_pending_response: Optional[str] = None
+    if current_pending_record is not None and not current_pending_record.execution_id:
+        (
+            scoped_pending_state,
+            scoped_pending_intent,
+            scoped_pending_response,
+        ) = _resolve_multi_word_pending_candidate_selection(
+            current_pending_record.state,
+            normalized_message_text,
+        )
+    if scoped_pending_response is not None:
+        set_turn_flow("pending-confirmation")
+        remember_conversation(
+            conv_key,
+            memory_context,
+            normalized_message_text,
+            scoped_pending_response,
+        )
+        await _finish_ai_chat_matcher(scoped_pending_response)
+        return
     active_pending_operation = draft_operation_coordinator.get(conv_key)
     other_owner_pending = (
         conversation_state_store.find_pending_for_other_owner(space_key, conv_key)
@@ -10495,7 +10855,9 @@ async def _handle_ai_chat_serialized(
         current_pending_record.state if current_pending_record is not None else None,
         normalized_message_text,
     )
-    if quoted_pending_add_control:
+    if scoped_pending_intent is not None:
+        generic_command_intent = scoped_pending_intent
+    elif quoted_pending_add_control:
         generic_command_intent = quoted_pending_add_intent
     elif (
         _is_short_add_and_submit_request(normalized_message_text)
@@ -10957,6 +11319,11 @@ async def _handle_ai_chat_serialized(
     if response is None and not generic_intent_is_fresh_command:
         state_record = conversation_state_store.get_record(conv_key)
         state = state_record.state if state_record else None
+        if (
+            scoped_pending_state is not None
+            and state_record is current_pending_record
+        ):
+            state = scoped_pending_state
         state_space_key = state_record.space_key if state_record else space_key
         pending_claimed = False
         preserve_pending_after_response = False
@@ -10992,10 +11359,16 @@ async def _handle_ai_chat_serialized(
 
         if state is not None:
             try:
-                pending_command_intent = await command_intent_for(state)
+                pending_command_intent = (
+                    scoped_pending_intent
+                    if scoped_pending_state is state
+                    and scoped_pending_intent is not None
+                    else await command_intent_for(state)
+                )
                 if (
                     state_record is not None
                     and state_record.requires_reconfirmation
+                    and scoped_pending_intent is None
                 ):
                     pending_command_intent, ticket_response = await _resolve_pending_ticket_control(
                         state_record,
@@ -11009,7 +11382,11 @@ async def _handle_ai_chat_serialized(
                     ticket_response = None
             except BaseException:
                 raise
-            if state_record is not None and state_record.requires_reconfirmation:
+            if (
+                state_record is not None
+                and state_record.requires_reconfirmation
+                and scoped_pending_intent is None
+            ):
                 if ticket_response is not None:
                     response = ticket_response
             if response is None and pending_command_intent.intent == "pending_cancel":
@@ -11048,7 +11425,10 @@ async def _handle_ai_chat_serialized(
                         state_space_key,
                         owner_label,
                     )
-                elif pending_command_intent.intent == "pending_add_and_submit":
+                elif (
+                    pending_command_intent.intent == "pending_add_and_submit"
+                    and len(pending_command_intent.requested_codes) <= 1
+                ):
                     choice_index = pending_command_intent.choice_index
                     if (
                         choice_index is not None

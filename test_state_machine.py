@@ -1870,6 +1870,15 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
         "eefju — 空位（不调序备选）" in front_prompt
         and "也可仍以编码 eefju 将「射覆」加入草稿" in front_prompt,
     )
+    hinted_selection = openai_chat_module.parse_pending_candidate_selection(
+        "添加2、4"
+    )
+    check(
+        "multi-select hint is advertised by a closed parser form",
+        "可多选，如「添加2、4」" in front_prompt
+        and hinted_selection is not None
+        and hinted_selection.indices == (2, 4),
+    )
     check(
         "occupant branch keeps the current order and free recommendation",
         "「慑服」不弱于「射覆」，维持现有排序，推荐空位 eefju" in behind_prompt,
@@ -13778,7 +13787,7 @@ def test_state_metrics_startup_log():
             check("state line includes database size", "db_bytes=sample.db:" in line)
             check("state line includes main-table rows", "db_rows=sample.db.sample_rows:2" in line)
             check("state line includes cache counts", "cache_entries=" in line and "review:" in line and "reviewed_add:" in line and "semantic_review:" in line and "zdic:0" in line)
-            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=42851" in line)
+            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=42940" in line)
             check("state line is bounded to one line", bool(line) and "\n" not in line)
 
     asyncio.run(_run())

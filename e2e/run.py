@@ -6,11 +6,13 @@ import argparse
 import asyncio
 import os
 import secrets
+import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from dotenv import dotenv_values
@@ -62,6 +64,83 @@ _TRANSIENT_LOCAL_NEXT_ERRORS = (
     httpx.ReadTimeout,
     httpx.ConnectError,
 )
+
+
+def collect_local_socket_stats(base_url: str) -> dict[str, Any]:
+    """Capture a cheap, best-effort TIME_WAIT snapshot for a local target."""
+
+    parsed = urlparse(base_url)
+    target_port = parsed.port or 80
+    command = ["netstat", "-an", "-p", "tcp"]
+    result: dict[str, Any] = {
+        "command": " ".join(command),
+        "targetPort": target_port,
+    }
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {
+            **result,
+            "status": "unavailable",
+            "errorType": type(error).__name__,
+            "error": str(error),
+        }
+    if completed.returncode != 0:
+        return {
+            **result,
+            "status": "unavailable",
+            "returnCode": completed.returncode,
+            "error": completed.stderr.strip()[-500:],
+        }
+    time_wait_lines = [
+        line
+        for line in completed.stdout.splitlines()
+        if "TIME_WAIT" in line.upper()
+    ]
+    port_suffix = f".{target_port}"
+    target_time_wait_count = sum(
+        1
+        for line in time_wait_lines
+        if any(field.endswith(port_suffix) for field in line.split()[3:5])
+    )
+    return {
+        **result,
+        "status": "captured",
+        "tcpTimeWaitCount": len(time_wait_lines),
+        "targetPortTimeWaitCount": target_time_wait_count,
+    }
+
+
+def abort_record_for_error(error: BaseException) -> dict[str, Any]:
+    """Retain the HTTP target even when a transport error is wrapped."""
+
+    record: dict[str, Any] = {
+        "type": type(error).__name__,
+        "message": str(error),
+    }
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        try:
+            request = getattr(current, "request", None)
+        except RuntimeError:
+            request = None
+        if request is not None:
+            record["request"] = {
+                "method": str(getattr(request, "method", "")),
+                "url": str(getattr(request, "url", "")),
+            }
+            record["transportErrorType"] = type(current).__name__
+            break
+        current = current.__cause__ or current.__context__
+    return record
 
 
 def build_bot_reference_fixture(artifact_dir: Path) -> dict[str, Any]:
@@ -439,18 +518,34 @@ def _encoded_matches_zdic_fixture(
     encoded_chars = encoded.get("chars")
     if entry_row is None or not isinstance(encoded_chars, list):
         return False
+    if entry_row["status"] == "found":
+        expected_pinyins = entry_row["pinyins"]
+        expected_source = "zdic-phrase"
+    else:
+        expected_pinyins = [
+            rows_by_key[("char", char)]["pinyins"][0]
+            for char in word
+            if ("char", char) in rows_by_key
+        ]
+        expected_source = "pinyin-pro-context"
     characters_match = len(encoded_chars) == len(word) and all(
         isinstance(actual, dict)
         and actual.get("char") == char
         and expected is not None
-        and actual.get("pinyin") == expected["pinyins"][0]
+        and actual.get("pinyin") == expected_pinyin
         and actual.get("pinyins") == expected["pinyins"]
         and actual.get("pronunciationLookupStatus") == expected["status"]
-        for char, actual in zip(word, encoded_chars)
+        for char, actual, expected_pinyin in zip(
+            word,
+            encoded_chars,
+            expected_pinyins,
+        )
         if (expected := rows_by_key.get(("char", char))) is not None
-    ) and all(("char", char) in rows_by_key for char in word)
+    ) and len(expected_pinyins) == len(word) and all(
+        ("char", char) in rows_by_key for char in word
+    )
     return not (
-        encoded.get("pronunciationSource") != "pinyin-pro-context"
+        encoded.get("pronunciationSource") != expected_source
         or encoded.get("standardPronunciationStatus") != entry_row["status"]
         or encoded.get("semanticPronunciationNeeded") is not False
         or not characters_match
@@ -478,6 +573,16 @@ async def probe_zdic_fixture_with_retry(
     warmup_attempts: list[dict[str, Any]] = []
     warmup_artifact = (
         f"{scenario_id}-zdic-warmup-attempt-{recorder.current_attempt()}.json"
+    )
+    socket_stats = await asyncio.to_thread(
+        collect_local_socket_stats,
+        client.base_url,
+    )
+    print(
+        f"{scenario_id} zdic warm-up socket stats: "
+        f"status={socket_stats['status']} "
+        f"TIME_WAIT={socket_stats.get('tcpTimeWaitCount', 'unknown')} "
+        f"targetPortTIME_WAIT={socket_stats.get('targetPortTimeWaitCount', 'unknown')}"
     )
     probe_count = len(S9_ZDIC_WARMUP_BACKOFF_SECONDS) + 1
     encoded_by_word: dict[str, dict[str, Any]] = {}
@@ -509,6 +614,7 @@ async def probe_zdic_fixture_with_retry(
                 warmup_artifact,
                 {
                     "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
+                    "localSocketStatsAtStart": socket_stats,
                     "finalAssertionAttempt": probe_count,
                     "finalAssertionResult": "failed" if final_attempt else "pending",
                     "attempts": warmup_attempts,
@@ -563,6 +669,7 @@ async def probe_zdic_fixture_with_retry(
             warmup_artifact,
             {
                 "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
+                "localSocketStatsAtStart": socket_stats,
                 "finalAssertionAttempt": probe_count,
                 "finalAssertionResult": "pending",
                 "attempts": warmup_attempts,
@@ -583,6 +690,7 @@ async def probe_zdic_fixture_with_retry(
         warmup_artifact,
         {
             "backoffSeconds": list(S9_ZDIC_WARMUP_BACKOFF_SECONDS),
+            "localSocketStatsAtStart": socket_stats,
             "finalAssertionAttempt": probe_count,
             "finalAssertionResult": (
                 "passed" if seeded_reality_matches else "failed"
@@ -595,6 +703,7 @@ async def probe_zdic_fixture_with_retry(
         "seededRealityMatches": seeded_reality_matches,
         "encodedByWord": encoded_by_word,
         "zdicWarmupAttempts": warmup_attempts,
+        "localSocketStatsAtStart": socket_stats,
         "warmupArtifact": warmup_artifact,
     }
 
@@ -894,6 +1003,78 @@ async def ensure_s16_fixture(
     )
 
 
+async def ensure_s18_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Ensure the exact duplicate-code occupant from the S18 incident."""
+
+    transport_attempts: list[dict[str, Any]] = []
+    exact_rows = [
+        row
+        for row in await _retry_fixture_client_call(
+            probe="S18 htwe fixture occupant lookup",
+            request=lambda: client.phrases_by_code("htwe"),
+            attempt_facts=transport_attempts,
+        )
+        if row.get("code") == "htwe"
+    ]
+    if exact_rows:
+        valid_existing = (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == "换车"
+            and exact_rows[0].get("type") == "Phrase"
+            and exact_rows[0].get("weight") == 100
+        )
+        if not valid_existing:
+            raise RigInfrastructureError(
+                f"S18 cannot safely use occupied fixture code htwe: {exact_rows}"
+            )
+    else:
+        await _retry_fixture_client_call(
+            probe="S18 fixture seed draft cleanup",
+            request=lambda: client.clean_draft(seed_identity["platform_id"]),
+            attempt_facts=transport_attempts,
+        )
+        await _retry_fixture_client_call(
+            probe="S18 换车 fixture seed",
+            request=lambda: client.seed_phrase(
+                platform_id=seed_identity["platform_id"],
+                word="换车",
+                code="htwe",
+            ),
+            attempt_facts=transport_attempts,
+        )
+        exact_rows = [
+            row
+            for row in await _retry_fixture_client_call(
+                probe="S18 htwe fixture verification lookup",
+                request=lambda: client.phrases_by_code("htwe"),
+                attempt_facts=transport_attempts,
+            )
+            if row.get("code") == "htwe"
+        ]
+
+    if not (
+        len(exact_rows) == 1
+        and exact_rows[0].get("word") == "换车"
+        and exact_rows[0].get("type") == "Phrase"
+        and exact_rows[0].get("weight") == 100
+    ):
+        raise RigInfrastructureError(
+            f"S18 fixture did not resolve to sole 换车@htwe weight 100: {exact_rows}"
+        )
+    return _with_transport_attempts(
+        {
+            "occupantWord": "换车",
+            "occupiedCode": "htwe",
+            "occupant": exact_rows[0],
+        },
+        transport_attempts,
+    )
+
+
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
     apply_bot_environment(config)
     import nonebot
@@ -1025,6 +1206,7 @@ async def async_main(args: argparse.Namespace) -> int:
         child_env=config["next_child_env"],
     )
     bot_harness: E2EBotHarness | None = None
+    client: LocalNextClient | None = None
     results: list[dict[str, Any]] = []
     identities = {
         scenario.scenario_id: test_identity(run_id, scenario.scenario_id)
@@ -1190,6 +1372,12 @@ async def async_main(args: argparse.Namespace) -> int:
                             seed_identity=seed_identity,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S18":
+                        fixture_facts["s18"] = await ensure_s18_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
                     if (
                         scenario.scenario_id in ZDIC_FIXTURES_BY_SCENARIO
                         and scenario.scenario_id != "S9"
@@ -1303,12 +1491,14 @@ async def async_main(args: argparse.Namespace) -> int:
         return 1 if any(item["verdict"] != "PASSED" for item in results) else 0
     except BaseException as error:
         manifest["abortedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        manifest["abort"] = {"type": type(error).__name__, "message": str(error)}
+        manifest["abort"] = abort_record_for_error(error)
         recorder.write_json("manifest.json", manifest)
         raise
     finally:
         if bot_harness is not None:
             await bot_harness.close()
+        if client is not None:
+            await client.close()
         recorder.remove_log_sink()
         await server.stop()
         guard.restore()

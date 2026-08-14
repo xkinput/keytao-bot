@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,9 +17,12 @@ from .recording import ArtifactRecorder, _redact_sensitive
 from .scenarios import SCENARIOS
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
+    abort_record_for_error,
     build_bot_reference_fixture,
+    collect_local_socket_stats,
     ensure_s9_fixture,
     ensure_s16_fixture,
+    ensure_s18_fixture,
     ensure_scenario_zdic_fixture,
     repair_scenario_dictionary_fixture,
 )
@@ -38,6 +42,112 @@ from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_s9_zdic_cache, seed_zdic_
 
 
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_local_next_client_retries_transport_errors_with_fresh_pool(
+        self,
+    ) -> None:
+        request = httpx.Request(
+            "GET",
+            "http://localhost:3100/api/phrases/encode?word=亮面",
+        )
+
+        class FakeAsyncClient:
+            def __init__(self, *results: Any) -> None:
+                self.request = AsyncMock(side_effect=results)
+                self.aclose = AsyncMock()
+
+            async def __aenter__(self) -> "FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *_args: Any) -> None:
+                await self.aclose()
+
+        clients = [
+            FakeAsyncClient(
+                httpx.ConnectTimeout("connect busy", request=request),
+            ),
+            FakeAsyncClient(
+                httpx.ReadTimeout("route busy", request=request),
+            ),
+            FakeAsyncClient(
+                httpx.ConnectError("connection reset", request=request),
+            ),
+            FakeAsyncClient(
+                httpx.Response(200, json={"word": "亮面"}, request=request),
+                httpx.Response(200, json={"word": "亮面"}, request=request),
+            ),
+        ]
+        client = LocalNextClient(
+            base_url="http://localhost:3100",
+            bot_token="test",
+        )
+
+        with (
+            patch("e2e.runtime.httpx.AsyncClient", side_effect=clients) as factory,
+            patch("e2e.runtime.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+        ):
+            first = await client.encode("亮面")
+            second = await client.encode("亮面")
+            await client.close()
+
+        self.assertEqual(first, {"word": "亮面"})
+        self.assertEqual(second, {"word": "亮面"})
+        self.assertEqual(factory.call_count, 4)
+        configured_timeout = factory.call_args_list[0].kwargs["timeout"]
+        self.assertEqual(configured_timeout.connect, 5.0)
+        self.assertEqual(configured_timeout.pool, 5.0)
+        self.assertEqual(configured_timeout.read, 90.0)
+        self.assertEqual(
+            sleep_mock.await_args_list,
+            [call(0.5), call(1.0), call(2.0)],
+        )
+        for failed_client in clients[:3]:
+            failed_client.aclose.assert_awaited_once_with()
+        self.assertEqual(clients[3].request.await_count, 2)
+        clients[3].aclose.assert_awaited_once_with()
+
+    def test_local_socket_stats_count_time_wait_for_next_port(self) -> None:
+        netstat = """\
+tcp4  0  0  127.0.0.1.49152  127.0.0.1.3100  TIME_WAIT
+tcp4  0  0  127.0.0.1.3100   127.0.0.1.49153 TIME_WAIT
+tcp4  0  0  127.0.0.1.49154  127.0.0.1.9999  TIME_WAIT
+tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
+"""
+        completed = subprocess.CompletedProcess(
+            args=["netstat", "-an", "-p", "tcp"],
+            returncode=0,
+            stdout=netstat,
+            stderr="",
+        )
+        with patch("e2e.run.subprocess.run", return_value=completed):
+            stats = collect_local_socket_stats("http://localhost:3100")
+
+        self.assertEqual(stats["status"], "captured")
+        self.assertEqual(stats["tcpTimeWaitCount"], 3)
+        self.assertEqual(stats["targetPortTimeWaitCount"], 2)
+
+    def test_abort_record_keeps_wrapped_transport_request_target(self) -> None:
+        request = httpx.Request(
+            "GET",
+            "http://localhost:3100/api/phrases/encode?word=亮面",
+        )
+        try:
+            try:
+                raise httpx.ConnectTimeout("", request=request)
+            except httpx.ConnectTimeout as transport_error:
+                raise RigInfrastructureError("warm-up exhausted") from transport_error
+        except RigInfrastructureError as error:
+            record = abort_record_for_error(error)
+
+        self.assertEqual(record["type"], "RigInfrastructureError")
+        self.assertEqual(record["transportErrorType"], "ConnectTimeout")
+        self.assertEqual(
+            record["request"],
+            {
+                "method": "GET",
+                "url": "http://localhost:3100/api/phrases/encode?word=%E4%BA%AE%E9%9D%A2",
+            },
+        )
+
     def test_review_source_domains_are_explicitly_blocked(self) -> None:
         expected = {
             "baike.baidu.com",
@@ -87,15 +197,16 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("S15 first discovers", readme)
         self.assertIn("S16 replays the two-word 载流", readme)
         self.assertIn("S17 exercises the common-characters-plus-LLM", readme)
+        self.assertIn("S18 replays the multi-number candidate incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s17(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s18(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 18)],
+            [f"S{index}" for index in range(1, 19)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -261,6 +372,22 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(declared[("char", "龘")], ("found", ("dá",)))
         self.assertEqual(declared[("entry", "产季")], ("absent", ()))
         self.assertEqual(declared[("entry", "龘季")], ("absent", ()))
+
+    def test_s18_zdic_seed_declares_multi_reading_candidate_reality(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S18"]
+        self.assertEqual(fixture["probe_words"], ("还车", "换车"))
+        declared = {
+            (row["kind"], row["entry"]): (row["status"], tuple(row["pinyins"]))
+            for row in fixture["rows"]
+        }
+        self.assertEqual(declared[("char", "还")], ("found", ("huán", "hái")))
+        self.assertEqual(declared[("char", "车")], ("found", ("chē",)))
+        self.assertEqual(declared[("char", "换")], ("found", ("huàn",)))
+        self.assertEqual(
+            declared[("entry", "还车")],
+            ("found", ("huán", "chē")),
+        )
+        self.assertEqual(declared[("entry", "换车")], ("absent", ()))
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
         class FakeBuildResult:
@@ -502,13 +629,55 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             fixture_facts = {}
             admin_token = "offline-admin-token"
 
-            def __init__(self, *, require_confirmation: bool):
+            def __init__(self, *, require_confirmation: bool, per_word_rendering: bool):
                 self.events = []
                 self.next_client = FakeNextClient()
                 self.require_confirmation = require_confirmation
+                self.per_word_rendering = per_word_rendering
 
             async def send(self, text: str) -> str:
                 if text == "喵喵 加词 载流 载流子":
+                    self.events.extend([
+                        {
+                            "sequence": 1,
+                            "kind": "tool",
+                            "name": "keytao_prepare_reviewed_add",
+                            "result": {
+                                "success": True,
+                                "word": "载流",
+                                "recommendedCode": "zhlq",
+                                "needsManualReview": True,
+                            },
+                        },
+                        {
+                            "sequence": 2,
+                            "kind": "tool",
+                            "name": "keytao_prepare_reviewed_add",
+                            "result": {
+                                "success": True,
+                                "word": "载流子",
+                                "recommendedCode": "zlzu",
+                                "needsManualReview": False,
+                            },
+                        },
+                        {
+                            "sequence": 3,
+                            "kind": "log",
+                            "message": (
+                                "Saved advertised reviewed batch candidate: "
+                                "owner=fake items=2"
+                            ),
+                        },
+                    ])
+                    if self.per_word_rendering:
+                        return (
+                            "是否以编码 zhlq 将「载流」加入草稿？\n"
+                            "是否以编码 zlzu 将「载流子」加入草稿？\n\n"
+                            "回复「加入」、「都加」、「添加」只加入草稿；"
+                            "回复「加入并提交」、「都加并提交」、「添加并提交」则加入后提交。\n"
+                            "多个词的候选编号分别从 1 开始；选择时请带上词条，"
+                            "例如「载流子 添加1」；多选请回复「载流子 添加2、4」。"
+                        )
                     return (
                         "这些词是否一起加入草稿并提交？\n"
                         "- 「载流」→ zhlq\n"
@@ -523,7 +692,7 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
                             "回复「确认」、「执行」继续。"
                         )
                     self.events.append({
-                        "sequence": 1,
+                        "sequence": 10,
                         "kind": "tool",
                         "name": "keytao_submit_batch",
                         "result": {"success": True, "batchId": "batch-carrier"},
@@ -531,7 +700,7 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
                     return "✅ 载流、载流子已加入草稿并提交审核"
                 if text == "确认" and self.require_confirmation:
                     self.events.append({
-                        "sequence": 1,
+                        "sequence": 10,
                         "kind": "tool",
                         "name": "keytao_submit_batch",
                         "result": {"success": True, "batchId": "batch-carrier"},
@@ -545,24 +714,29 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             def attempt_events(self):
                 return list(self.events)
 
-        for require_confirmation, expected_steps in ((False, 0), (True, 1)):
-            with self.subTest(require_confirmation=require_confirmation):
-                result = await scenario.execute(FakeContext(
+        for per_word_rendering in (False, True):
+            for require_confirmation, expected_steps in ((False, 0), (True, 1)):
+                with self.subTest(
+                    per_word_rendering=per_word_rendering,
                     require_confirmation=require_confirmation,
-                ))
-                self.assertEqual(
-                    result["facts"]["submittedWords"],
-                    ["载流", "载流子"],
-                )
-                self.assertEqual(
-                    result["facts"]["submittedCodes"],
-                    ["zhlq", "zlzu"],
-                )
-                self.assertFalse(result["facts"]["quoteRequired"])
-                self.assertEqual(
-                    result["facts"]["additionalConfirmationSteps"],
-                    expected_steps,
-                )
+                ):
+                    result = await scenario.execute(FakeContext(
+                        require_confirmation=require_confirmation,
+                        per_word_rendering=per_word_rendering,
+                    ))
+                    self.assertEqual(
+                        result["facts"]["submittedWords"],
+                        ["载流", "载流子"],
+                    )
+                    self.assertEqual(
+                        result["facts"]["submittedCodes"],
+                        ["zhlq", "zlzu"],
+                    )
+                    self.assertFalse(result["facts"]["quoteRequired"])
+                    self.assertEqual(
+                        result["facts"]["additionalConfirmationSteps"],
+                        expected_steps,
+                    )
 
     async def test_s17_offline_scenario_contract(self) -> None:
         scenario = next(item for item in SCENARIOS if item.scenario_id == "S17")
@@ -654,6 +828,143 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["facts"]["semanticNeedsManualReview"])
         self.assertEqual(result["facts"]["obscureBatchStatus"], "Submitted")
         self.assertTrue(result["facts"]["obscureNeedsManualReview"])
+
+    async def test_s18_offline_incident_replay_uses_rendered_numbers(self) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S18")
+
+        class FakeNextClient:
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assert_token = admin_token
+                if batch_id != "batch-s18":
+                    raise AssertionError(batch_id)
+                return {
+                    "status": "Submitted",
+                    "pullRequests": [
+                        {
+                            "action": "Create",
+                            "word": "还车",
+                            "code": "htjev",
+                            "needsManualReview": False,
+                        },
+                        {
+                            "action": "Create",
+                            "word": "还车",
+                            "code": "htwe",
+                            "needsManualReview": True,
+                        },
+                    ],
+                }
+
+        class FakeContext:
+            fixture_facts = {
+                "s18": {"occupantWord": "换车", "occupiedCode": "htwe"},
+            }
+            admin_token = "offline-admin-token"
+
+            def __init__(self):
+                self.events = []
+                self.items = []
+                self.next_client = FakeNextClient()
+
+            async def send(self, text: str) -> str:
+                if text == "喵喵 还车":
+                    return (
+                        "词库暂无收录「还车」，先审读音和编码候选：\n\n"
+                        "读音与来源:\n"
+                        "1. huan che；来源 汉典（经编码服务） "
+                        "https://www.zdic.net/hans/%E8%BF%98%E8%BD%A6\n"
+                        "2. hái chē；来源 开放拼音数据（large_pinyin）；"
+                        "汉典（离线数据集）\n"
+                        "自动审核：该词可自动通过"
+                        "（权威来源、编码和常用度证据一致）\n\n"
+                        "候选编码（读音 1）:\n"
+                        "1. htje — ✅ 推荐（空位）\n"
+                        "2. htjev — 空位\n"
+                        "3. htjevv — 空位\n"
+                        "4. htwe — 已有「换车」\n"
+                        "5. htwev — 空位\n"
+                        "6. htwevv — 空位\n\n"
+                        "候选编码（读音 2）:\n"
+                        "7. hhje — ✅ 推荐（空位）\n"
+                        "8. hhjev — 空位\n"
+                        "9. hhjevv — 空位\n\n"
+                        "是否以编码 htje 将「还车」加入草稿？可回复编号、编码，"
+                        "或「都加」；可多选，如「添加2、4」。\n"
+                        "若选的是已有词编码，回复“编号 重新编码”可挪开原词。\n"
+                        "若所选编号显示“已有…”，直接回复该编号表示添加重码；"
+                        "回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
+                    )
+                if text == "添加2、99":
+                    return "请选择 1-9 之间的编号；本次没有写入。"
+                if text == "添加2、4":
+                    self.events.append({
+                        "sequence": 1,
+                        "kind": "tool",
+                        "name": "keytao_batch_add_to_draft",
+                        "result": {
+                            "success": False,
+                            "requiresConfirmation": True,
+                            "warningDigest": "a" * 64,
+                            "warnings": [{
+                                "warningType": "duplicate_code",
+                                "item": {
+                                    "action": "Create",
+                                    "word": "还车",
+                                    "code": "htwe",
+                                },
+                            }],
+                        },
+                    })
+                    return "发现重码，回复「确认」、「执行」继续。"
+                if text == "确认":
+                    self.items = [
+                        {
+                            "action": "Create",
+                            "word": "还车",
+                            "code": "htjev",
+                            "needsManualReview": False,
+                        },
+                        {
+                            "action": "Create",
+                            "word": "还车",
+                            "code": "htwe",
+                            "needsManualReview": True,
+                        },
+                    ]
+                    return "✅ 已加入草稿"
+                if text == "提交":
+                    self.events.append({
+                        "sequence": 2,
+                        "kind": "tool",
+                        "name": "keytao_submit_batch",
+                        "result": {"success": True, "batchId": "batch-s18"},
+                    })
+                    return "✅ 草稿已提交审核"
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {
+                    "batchId": "batch-s18" if self.items else None,
+                    "contentVersion": 2 if self.items else 0,
+                    "items": list(self.items),
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+        result = await scenario.execute(FakeContext())
+        self.assertEqual(
+            result["messages"],
+            ["喵喵 还车", "添加2、99", "添加2、4", "确认", "提交"],
+        )
+        self.assertEqual(result["facts"]["selectedIndexes"], [2, 4])
+        self.assertEqual(result["facts"]["selectedCodes"], ["htjev", "htwe"])
+        self.assertEqual(
+            result["facts"]["candidateReadings"],
+            ["huan che", "hái chē"],
+        )
+        self.assertEqual(result["facts"]["additionalConfirmationSteps"], 1)
+        self.assertTrue(result["facts"]["duplicateWarningSealed"])
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module
@@ -759,6 +1070,87 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             {"王中王", "微服务"},
         )
 
+    async def test_s18_zdic_preflight_accepts_production_entry_shapes(self) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        authoritative_word = {
+            "input": "还车",
+            "pronunciationSource": "zdic-phrase",
+            "standardPronunciationStatus": "found",
+            "semanticPronunciationNeeded": False,
+            "chars": [
+                {
+                    "char": "还",
+                    "pinyin": "huán",
+                    "pinyins": ["huán", "hái"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "车",
+                    "pinyin": "chē",
+                    "pinyins": ["chē"],
+                    "pronunciationLookupStatus": "found",
+                },
+            ],
+        }
+        absent_occupant_word = {
+            "input": "换车",
+            "pronunciationSource": "pinyin-pro-context",
+            "standardPronunciationStatus": "absent",
+            "semanticPronunciationNeeded": False,
+            "chars": [
+                {
+                    "char": "换",
+                    "pinyin": "huàn",
+                    "pinyins": ["huàn"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "车",
+                    "pinyin": "chē",
+                    "pinyins": ["chē"],
+                    "pronunciationLookupStatus": "found",
+                },
+            ],
+        }
+        client.encode = AsyncMock(
+            side_effect=[
+                response
+                for _ in range(4)
+                for response in (authoritative_word, absent_occupant_word)
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = ArtifactRecorder(Path(temp_dir) / "artifacts")
+            with (
+                recorder.scope("S18", 1),
+                patch("e2e.run.asyncio.sleep", new_callable=AsyncMock),
+                patch("builtins.print"),
+            ):
+                result = await ensure_scenario_zdic_fixture(
+                    client=client,
+                    scenario_id="S18",
+                    recorder=recorder,
+                )
+            artifact = json.loads(
+                (recorder.artifact_dir / "S18-zdic-warmup-attempt-1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertTrue(result["seededRealityMatches"])
+        self.assertEqual(client.encode.await_count, 8)
+        self.assertEqual(
+            artifact["attempts"][-1]["words"]["还车"],
+            {
+                "pronunciationSource": "zdic-phrase",
+                "standardPronunciationStatus": "found",
+                "characterLookupStatuses": {"还": "found", "车": "found"},
+                "seededRealityMatches": True,
+            },
+        )
+        self.assertEqual(artifact["finalAssertionResult"], "passed")
+
     async def test_s14_zdic_probe_retries_transport_failure_then_passes(self) -> None:
         client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
         seeded = {
@@ -827,6 +1219,12 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_s14_zdic_probe_wraps_final_transport_failure(self) -> None:
         client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        socket_stats = {
+            "status": "captured",
+            "targetPort": 3100,
+            "tcpTimeWaitCount": 1200,
+            "targetPortTimeWaitCount": 900,
+        }
         request = httpx.Request(
             "GET",
             "http://localhost:3100/api/phrases/encode?word=亮面",
@@ -844,6 +1242,10 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             recorder = ArtifactRecorder(Path(temp_dir) / "artifacts")
             with (
                 recorder.scope("S14", 1),
+                patch(
+                    "e2e.run.collect_local_socket_stats",
+                    return_value=socket_stats,
+                ),
                 patch("e2e.run.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
                 patch("builtins.print"),
             ):
@@ -871,6 +1273,7 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             [attempt["transportError"]["type"] for attempt in artifact["attempts"]],
             ["ConnectTimeout", "ReadTimeout", "ConnectError", "ConnectTimeout"],
         )
+        self.assertEqual(artifact["localSocketStatsAtStart"], socket_stats)
         self.assertEqual(artifact["finalAssertionResult"], "failed")
 
     async def test_s9_zdic_preflight_only_asserts_seeded_reality_on_final_probe(
@@ -944,7 +1347,11 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
             sleep_mock.await_args_list,
             [call(delay) for delay in S9_ZDIC_WARMUP_BACKOFF_SECONDS],
         )
-        self.assertEqual(print_mock.call_count, 4)
+        self.assertEqual(print_mock.call_count, 5)
+        self.assertIn(
+            "S9 zdic warm-up socket stats",
+            print_mock.call_args_list[0].args[0],
+        )
         self.assertEqual(artifact["finalAssertionAttempt"], 4)
         self.assertEqual(artifact["finalAssertionResult"], "passed")
         self.assertEqual(
@@ -980,6 +1387,36 @@ class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["occupantWord"], "座落在")
         self.assertEqual(result["occupiedCode"], "zlz")
+        self.assertEqual(result["occupant"]["weight"], 100)
+
+    async def test_s18_dictionary_fixture_seeds_the_exact_duplicate_occupant(
+        self,
+    ) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        occupant = {
+            "word": "换车",
+            "code": "htwe",
+            "type": "Phrase",
+            "weight": 100,
+            "user": {"name": "keytao-e2e-llm-rig-run-seed"},
+        }
+        client.phrases_by_code = AsyncMock(side_effect=[[], [occupant]])
+        client.clean_draft = AsyncMock(return_value={"success": True})
+        client.seed_phrase = AsyncMock(return_value={"batchId": "fixture-batch"})
+
+        result = await ensure_s18_fixture(
+            client=client,
+            seed_identity={"platform_id": "8" * 32},
+        )
+
+        client.clean_draft.assert_awaited_once_with("8" * 32)
+        client.seed_phrase.assert_awaited_once_with(
+            platform_id="8" * 32,
+            word="换车",
+            code="htwe",
+        )
+        self.assertEqual(result["occupantWord"], "换车")
+        self.assertEqual(result["occupiedCode"], "htwe")
         self.assertEqual(result["occupant"]["weight"], 100)
 
     def test_llm_endpoint_can_never_be_keytao_production(self) -> None:

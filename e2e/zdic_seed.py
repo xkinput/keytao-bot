@@ -90,6 +90,16 @@ ZDIC_FIXTURES_BY_SCENARIO["S17"] = {
         {"kind": "entry", "entry": "龘季", "status": "absent", "pinyins": []},
     ),
 }
+ZDIC_FIXTURES_BY_SCENARIO["S18"] = {
+    "probe_words": ("还车", "换车"),
+    "rows": (
+        {"kind": "char", "entry": "还", "status": "found", "pinyins": ["huán", "hái"]},
+        {"kind": "char", "entry": "车", "status": "found", "pinyins": ["chē"]},
+        {"kind": "char", "entry": "换", "status": "found", "pinyins": ["huàn"]},
+        {"kind": "entry", "entry": "还车", "status": "found", "pinyins": ["huán", "chē"]},
+        {"kind": "entry", "entry": "换车", "status": "absent", "pinyins": []},
+    ),
+}
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 

@@ -26,7 +26,8 @@ from keytao_bot.utils.observability import (
     set_turn_flow,
 )
 from keytao_bot.utils.pending_confirmation import (
-    pending_batch_confirmation_copy,
+    advertised_batch_binding_pairs,
+    ensure_multi_word_candidate_copy,
     pending_confirmation_copy,
 )
 
@@ -601,14 +602,27 @@ class AgentOrchestrator:
                         else None
                     )
                     if pending_items is not None:
-                        advertised_copy = pending_batch_confirmation_copy()
-                        if advertised_copy not in content:
-                            content = content.rstrip() + "\n\n" + advertised_copy
+                        content = ensure_multi_word_candidate_copy(content)
+                        candidate_scopes = [
+                            {
+                                "word": item["word"],
+                                "candidates": [
+                                    [code, occupied]
+                                    for code, occupied in trusted_candidate_slots_by_word[
+                                        item["word"]
+                                    ]
+                                ],
+                            }
+                            for item in pending_items
+                        ]
                         saved = self._state_store.set(
                             conv_key,
                             PendingToolConfirm(
                                 function_name="keytao_batch_add_to_draft",
-                                args={"items": pending_items},
+                                args={
+                                    "items": pending_items,
+                                    "_candidate_scopes": candidate_scopes,
+                                },
                             ),
                             space_key=context.space_key,
                             owner_label=context.speaker_name,
@@ -1058,23 +1072,7 @@ class AgentOrchestrator:
         ],
     ) -> Optional[List[Dict[str, Any]]]:
         """Bind displayed batch choices to this run's structured review results."""
-        batch_prompt_markers = (
-            "一起加入草稿",
-            "一起加这两个词",
-            "两个词是否一起加",
-            "两词是否一起加",
-        )
-        if not any(marker in content for marker in batch_prompt_markers):
-            return None
-        pairs = [
-            (match.group("word").strip(), match.group("code").lower())
-            for match in re.finditer(
-                r"(?m)^\s*[-•]\s*「(?P<word>[^」\n]{1,128})」\s*"
-                r"(?:→|->)\s*(?P<code>[a-z]{1,12})\s*$",
-                content,
-                re.IGNORECASE,
-            )
-        ]
+        pairs = list(advertised_batch_binding_pairs(content))
         if len(pairs) < 2 or len({word for word, _code in pairs}) != len(pairs):
             return None
 
@@ -1143,6 +1141,40 @@ class AgentOrchestrator:
         """Suppress requests to resend this turn's failed text at final emission."""
         if reply is None:
             return None
+        binding_reply_is_internal = bool(
+            re.search(
+                r"(?:\bboundTarget\b|\bblockReason\b|\bbinding_incomplete\b|"
+                r"[（(]\s*缺少\s*[：:])",
+                reply,
+            )
+        )
+        binding_reply_retries_same_turn = bool(
+            re.search(
+                r"(?:重新|再次|再|原样|重复).{0,10}"
+                r"(?:发送|发一遍|发|输入|说一遍|提交)",
+                reply,
+            )
+        )
+        if (
+            failure_state.get("blockReason") == "binding_incomplete"
+            and (binding_reply_is_internal or binding_reply_retries_same_turn)
+        ):
+            raw_reason = str(
+                failure_state.get("message")
+                or "无法把本次操作与消息中的完整目标逐项对应；整批均未写入"
+            ).strip()
+            reason = re.split(
+                r"请把下面这条指令|请重新发送|请再次发送|请原样发送",
+                raw_reason,
+                maxsplit=1,
+            )[0].rstrip("；;。 ")
+            result = f"这条指令按当前表述无法执行，本次未写入。原因：{reason}。"
+            suggestion = str(
+                failure_state.get("suggestedCommand") or ""
+            ).strip()
+            if suggestion:
+                result += f"可以改为：{suggestion}"
+            return result
         resend = re.search(
             r"(?:重新|再次|再|原样|重复).{0,10}(?:发送|发一遍|发|输入|说一遍|提交)",
             reply,
@@ -1173,13 +1205,6 @@ class AgentOrchestrator:
             raw_reason,
             maxsplit=1,
         )[0].rstrip("；;。 ")
-        missing = failure_state.get("missing")
-        if isinstance(missing, list) and missing:
-            labels = "、".join(
-                str(value).strip() for value in missing if str(value).strip()
-            )
-            if labels and labels not in reason:
-                reason = f"{reason}（缺少：{labels}）"
         result = f"这条指令按当前表述无法执行，本次未写入。原因：{reason}。"
         suggestion = str(failure_state.get("suggestedCommand") or "").strip()
         if (
