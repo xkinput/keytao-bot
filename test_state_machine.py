@@ -11804,7 +11804,8 @@ async def _run_orchestrator_visual_context_checks():
         ),
     )
     check("visual injection cannot execute a real write tool", mutation_calls == [])
-    check("visual injection tool call is rejected before execution", "工具参数格式错误" in mutation_result)
+    check("visual injection tool call is rejected before execution", "未开放的工具" in mutation_result)
+    check("unknown-tool copy does not blame argument format", "参数格式错误" not in mutation_result)
     check("visual injection cannot trigger a second model turn", len(mutation_client.completions.calls) == 1)
 
 
@@ -12826,12 +12827,6 @@ async def _run_orchestrator_tool_batch_validation_checks():
     check("duplicate tool ids execute nothing", executed == [])
 
     _, executed = await run_case("tool_calls", [
-        tool_call(f"call_{index}", json.dumps({"value": str(index)}))
-        for index in range(9)
-    ])
-    check("oversized tool batches execute nothing", executed == [])
-
-    _, executed = await run_case("tool_calls", [
         tool_call("call_known", '{"value":"first"}'),
         tool_call("call_unknown", '{}', name="unknown"),
     ])
@@ -12880,11 +12875,268 @@ async def _run_orchestrator_tool_batch_validation_checks():
     )
     check("tool batch replays reasoning exactly", assistant_message.get("reasoning_content") == "keep exactly")
 
+    executed = []
+    progress_lines = []
+
+    async def chunked_echo(value):
+        executed.append(value)
+        return {"value": value}
+
+    async def report_progress(line):
+        progress_lines.append(line)
+
+    chunked_calls = [
+        tool_call(f"call_chunked_{index}", json.dumps({"value": f"item-{index}"}))
+        for index in range(11)
+    ]
+    client = _FakeClient([
+        _FakeAIResponse("tool_calls", "开始处理", chunked_calls),
+        _FakeAIResponse("stop", "已完成全部 11 项。"),
+    ])
+    orchestrator = AgentOrchestrator(
+        client_factory=lambda: client,
+        runtime=AgentRuntimeConfig(
+            model="deepseek-v4-flash",
+            max_tokens=1000,
+            temperature=0.7,
+            timeout=180.0,
+        ),
+        skills_manager=_FakeToolSkillsManager(),
+        tool_executor=ToolExecutor(
+            lambda name: chunked_echo if name == "echo" else None,
+            frozenset(),
+        ),
+        state_store=MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+    result = await orchestrator.run(
+        "依次处理 11 项",
+        AgentRequestContext(
+            platform="qq",
+            user_id="123",
+            progress_reporter=report_progress,
+        ),
+    )
+    follow_up = client.completions.calls[1]["messages"]
+    nudge_text = "\n".join(
+        str(message.get("content") or "")
+        for message in follow_up
+        if message.get("role") in {"system", "user"}
+    )
+    check(
+        "oversized tool batches execute every call in original order",
+        executed == [f"item-{index}" for index in range(11)],
+    )
+    check("chunked tool batch reaches one final response", result == "已完成全部 11 项。")
+    check(
+        "chunk progress reports completed total and remaining rounds",
+        progress_lines == [
+            "正在处理「item-0、item-1、item-2…」，已完成 8/11，预计还剩 1 轮"
+        ],
+    )
+    check(
+        "chunk continuation names executed and queued calls",
+        "echo(item-0)" in nudge_text
+        and "echo(item-8)" in nudge_text
+        and "尚有 3 项" in nudge_text,
+    )
+    check("count overflow never uses argument-format copy", "参数格式错误" not in result)
+
+    executed = []
+    last_iteration_client = _FakeClient([
+        _FakeAIResponse("tool_calls", "开始处理", chunked_calls),
+    ])
+    last_iteration_orchestrator = AgentOrchestrator(
+        client_factory=lambda: last_iteration_client,
+        runtime=AgentRuntimeConfig(
+            model="deepseek-v4-flash",
+            max_tokens=1000,
+            temperature=0.7,
+            timeout=180.0,
+        ),
+        skills_manager=_FakeToolSkillsManager(),
+        tool_executor=ToolExecutor(
+            lambda name: chunked_echo if name == "echo" else None,
+            frozenset(),
+        ),
+        state_store=MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+    last_iteration_result = await last_iteration_orchestrator.run(
+        "在最后一个模型轮次处理 11 项",
+        AgentRequestContext(platform="qq", user_id="123"),
+        max_iterations=1,
+    )
+    check(
+        "queued calls drain without consuming extra model iterations",
+        executed == [f"item-{index}" for index in range(11)],
+    )
+    check(
+        "model-iteration exhaustion reports completed work honestly",
+        "已完成 11 项" in last_iteration_result
+        and "最终汇总尚未完成" in last_iteration_result,
+    )
+
+    executed = []
+    budget_calls = [
+        tool_call(f"call_budget_{index}", json.dumps({"value": f"budget-{index}"}))
+        for index in range(42)
+    ]
+    budget_client = _FakeClient([
+        _FakeAIResponse("tool_calls", "开始处理", budget_calls),
+    ])
+    budget_orchestrator = AgentOrchestrator(
+        client_factory=lambda: budget_client,
+        runtime=AgentRuntimeConfig(
+            model="deepseek-v4-flash",
+            max_tokens=1000,
+            temperature=0.7,
+            timeout=180.0,
+        ),
+        skills_manager=_FakeToolSkillsManager(),
+        tool_executor=ToolExecutor(
+            lambda name: chunked_echo if name == "echo" else None,
+            frozenset(),
+        ),
+        state_store=MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+    budget_result = await budget_orchestrator.run(
+        "依次处理 42 项",
+        AgentRequestContext(platform="qq", user_id="123"),
+    )
+    check("run budget executes the first 40 calls", executed == [f"budget-{index}" for index in range(40)])
+    check("run budget names completed and remaining counts", "已完成 40/42" in budget_result and "尚有 2 项" in budget_result)
+    check("run budget explains how to continue", "继续" in budget_result)
+    check("run budget never falls back to blanket refusal", "请把任务拆小一点再试试" not in budget_result)
+
 
 def test_orchestrator_tool_batch_validation():
     """Invalid or incomplete tool-call batches must execute no tools."""
     print("\n🧪 AgentOrchestrator tool-call batch validation")
     asyncio.run(_run_orchestrator_tool_batch_validation_checks())
+
+
+def test_agent_chunk_progress_uses_existing_event_delivery():
+    """Multi-round model work sends interim copy through the shared event path."""
+    print("\n🧪 Agent chunk progress event delivery")
+
+    async def _run():
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id="progress-user",
+            space_type="private",
+            space_id="progress-user",
+        )
+        ctx = openai_chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="progress-user",
+            normalized_message_text="其他都加",
+            memory_context=memory_context,
+            conv_key=memory_context.conversation_address,
+            history=[],
+            resolved_advertised_words=("显眼包", "嘴替"),
+            advertised_snapshot_token="a" * 32,
+        )
+        delivered = []
+
+        async def generate(*_args, progress_reporter=None, **_kwargs):
+            check("agent core receives a progress reporter", progress_reporter is not None)
+            check(
+                "agent core receives the resolved advertised set",
+                _kwargs.get("resolved_advertised_words") == ("显眼包", "嘴替"),
+            )
+            check(
+                "agent core receives the exact advertised snapshot token",
+                _kwargs.get("advertised_snapshot_token") == "a" * 32,
+            )
+            await progress_reporter(
+                "正在处理「显眼包、嘴替…」，已完成 8/11，预计还剩 1 轮"
+            )
+            return "最终汇总"
+
+        async def deliver(*args, **_kwargs):
+            delivered.append(args[4])
+            return True
+
+        with (
+            patch.object(openai_chat_module, "build_reply_context", AsyncMock(return_value="")),
+            patch.object(openai_chat_module, "get_ai_response_core", side_effect=generate),
+            patch.object(openai_chat_module, "_send_event_response", side_effect=deliver),
+        ):
+            handled = await openai_chat_module._stage_generate_ai_response(ctx)
+
+        check("progress stage continues to finalization", handled is False)
+        check("progress copy uses the shared event delivery once", delivered == [
+            "正在处理「显眼包、嘴替…」，已完成 8/11，预计还剩 1 轮"
+        ])
+        check("progress never replaces the final reply", ctx.response == "最终汇总")
+
+    asyncio.run(_run())
+
+
+def test_advertised_set_selection_enters_the_production_stage_pipeline():
+    """The staged adapter carries one actor-owned difference to the agent core."""
+    print("\n🧪 advertised set selection production pipeline")
+
+    async def _run():
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.group("qq", "865189947", "739497722")
+        token = store.add_advertised_word_set(
+            address,
+            ("显眼包", "嘴替", "天选打工人", "沙县小吃"),
+            owner_label="Rea",
+        )
+        ctx = openai_chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="739497722",
+            normalized_message_text=(
+                "天选打工人先不要，其他可以加，沙县小吃也不要"
+            ),
+            conv_key=address,
+        )
+        with patch.object(
+            openai_chat_module,
+            "conversation_state_store",
+            store,
+        ):
+            terminal = await openai_chat_module._stage_resolve_current_pending_scope(ctx)
+        check("selection stage continues", terminal is False)
+        check(
+            "selection stage carries the exact difference",
+            ctx.resolved_advertised_words == ("显眼包", "嘴替"),
+        )
+        check(
+            "selection stage carries the one-shot token",
+            ctx.advertised_snapshot_token == token,
+        )
+        check("selection stage does not preempt with ASK", ctx.scoped_pending_response is None)
+
+        unknown = openai_chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="739497722",
+            normalized_message_text="火星词先不要，其他都加",
+            conv_key=address,
+        )
+        with patch.object(
+            openai_chat_module,
+            "conversation_state_store",
+            store,
+        ):
+            await openai_chat_module._stage_resolve_current_pending_scope(unknown)
+        check("out-of-snapshot exclusion deterministically asks", "火星词" in (unknown.scoped_pending_response or ""))
+        check("ASK path carries no inferred set", unknown.resolved_advertised_words == ())
+
+    asyncio.run(_run())
 
 
 def test_orchestrator_empty_response_retry():
@@ -14464,6 +14716,8 @@ if __name__ == "__main__":
     test_orchestrator_suppresses_retried_reviewed_add()
     test_orchestrator_persists_semantic_basis_in_review_capability()
     test_orchestrator_tool_batch_validation()
+    test_agent_chunk_progress_uses_existing_event_delivery()
+    test_advertised_set_selection_enters_the_production_stage_pipeline()
     test_normalize_encode_response_codes_first()
     test_keytao_encode_forwards_meaning_gated_pronunciation()
     test_normalize_encode_response_infer_fallback()

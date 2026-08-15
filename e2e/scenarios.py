@@ -1538,6 +1538,160 @@ async def scenario_s18(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S19_ADVERTISED_WORDS = (
+    "显眼包",
+    "嘴替",
+    "松弛感",
+    "电子榨菜",
+    "情绪价值",
+    "班味",
+    "泼天富贵",
+    "精神状态",
+    "职场搭子",
+    "天选打工人",
+    "沙县小吃",
+)
+
+
+async def scenario_s19(ctx: ScenarioContext) -> dict[str, Any]:
+    scan_message = (
+        "喵喵，请批量检查这些常用词是否已收录；只列出未收录词，"
+        "并说明可以把列表中的词加入草稿："
+        + "、".join(S19_ADVERTISED_WORDS)
+    )
+    messages = [scan_message]
+    replies = [await ctx.send(scan_message)]
+    discovery = replies[-1]
+    require(
+        all(word in discovery for word in S19_ADVERTISED_WORDS),
+        f"S19 scan did not render the complete absent-word set: {discovery}",
+    )
+    require(
+        "草稿" in discovery and any(marker in discovery for marker in ("加入", "添加", "加到")),
+        f"S19 scan did not advertise the rendered list as addable: {discovery}",
+    )
+
+    control = "火星词先不要，其他都加"
+    messages.append(control)
+    replies.append(await ctx.send(control))
+    require(
+        "火星词" in replies[-1]
+        and any(marker in replies[-1] for marker in ("不在", "候选", "选择")),
+        f"S19 out-of-snapshot exclusion did not deterministically ASK: {replies[-1]}",
+    )
+    control_draft = await ctx.draft()
+    require(
+        not control_draft.get("items"),
+        f"S19 out-of-snapshot exclusion wrote draft items: {control_draft}",
+    )
+
+    selection = "天选打工人先不要，其他可以加，沙县小吃也不要"
+    expected_words = S19_ADVERTISED_WORDS[:-2]
+    cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(selection)
+    replies.append(await ctx.send(selection))
+    selection_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > cutoff
+    ]
+    progress_lines = [
+        str(event.get("text") or "")
+        for event in selection_events
+        if event.get("kind") == "message"
+        and event.get("direction") == "reply"
+        and "正在处理" in str(event.get("text") or "")
+    ]
+    require(
+        any(
+            "已完成 8/9" in line and "预计还剩 1 轮" in line
+            for line in progress_lines
+        ),
+        f"S19 chunked review did not report 8/9 progress: {progress_lines}",
+    )
+    require(
+        "确认" in replies[-1]
+        and all(word in replies[-1] for word in expected_words)
+        and "天选打工人" not in replies[-1]
+        and "沙县小吃" not in replies[-1],
+        f"S19 final confirmation did not show only the resolved set: {replies[-1]}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S19 inferred set wrote before its one required confirmation",
+    )
+
+    confirmation_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("确认")
+    replies.append(await ctx.send(messages[-1]))
+    draft = await ctx.draft()
+    actual_words = [
+        str(item.get("word") or "")
+        for item in draft.get("items", [])
+        if isinstance(item, dict)
+    ]
+    require(
+        len(actual_words) == len(expected_words)
+        and set(actual_words) == set(expected_words)
+        and all(
+            item.get("action") == "Create"
+            for item in draft.get("items", [])
+            if isinstance(item, dict)
+        ),
+        f"S19 draft does not equal snapshot minus exclusions: {draft}",
+    )
+    require(
+        bool(str(draft.get("batchId") or "")),
+        f"S19 resolved items did not reach one materialized draft batch: {draft}",
+    )
+    write_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > confirmation_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(write_calls, "S19 confirmation did not invoke the batch draft tool")
+    for event in write_calls:
+        tool_items = event.get("arguments", {}).get("items", [])
+        require(
+            isinstance(tool_items, list)
+            and [str(item.get("word") or "") for item in tool_items]
+            == list(expected_words),
+            f"S19 tool call was not bound to the complete resolved set: {event}",
+        )
+    all_reply_text = [
+        str(event.get("text") or "")
+        for event in ctx.attempt_events()
+        if event.get("kind") == "message"
+        and event.get("direction") == "reply"
+    ] + replies
+    require(
+        not any("参数格式错误" in reply for reply in all_reply_text),
+        f"S19 surfaced the obsolete argument-format diagnosis: {all_reply_text}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "advertisedWords": list(S19_ADVERTISED_WORDS),
+            "excludedWords": ["天选打工人", "沙县小吃"],
+            "resolvedWords": list(expected_words),
+            "progressLines": progress_lines,
+            "batchId": draft.get("batchId"),
+            "confirmationSteps": 1,
+            "outOfSnapshotControl": "ASK-without-write",
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -1557,6 +1711,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S16", "two-word bare advertised add-submit", scenario_s16),
     Scenario("S17", "semantic common-character auto-pass", scenario_s17),
     Scenario("S18", "multi-number candidate snapshot selection", scenario_s18),
+    Scenario("S19", "advertised-set subtraction with chunked progress", scenario_s19),
 )
 
 

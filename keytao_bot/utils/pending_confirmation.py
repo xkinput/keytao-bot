@@ -96,6 +96,75 @@ class PendingCandidateSelection:
     submit_after: bool = False
 
 
+@dataclass(frozen=True)
+class AdvertisedSetReference:
+    """Closed current-message grammar for snapshot-minus-exclusions."""
+
+    matched: bool = False
+    exclusions: tuple[str, ...] = ()
+
+
+_SET_REFERENCE_ACTION_RE = re.compile(
+    r"(?:其他|其余|剩下的?)(?:一些|的)?(?:都|全部|也)?"
+    r"(?:可以|可)?(?:加入|添加|加)(?:到|进|入)?(?:草稿)?"
+)
+_SET_REFERENCE_UNSAFE_FRAME_RE = re.compile(
+    r"(?:他说|她说|他们说|有人说|引用|转述|复述|解释|举例|例子|"
+    r"假设|如果|不要执行|别执行|不执行|不是让你|并非让你)"
+)
+_SET_REFERENCE_EXCLUSION_RE = re.compile(
+    r"(?P<word>[\u3400-\u9fffA-Za-z0-9_-]{1,32}?)\s*"
+    r"(?:也\s*)?(?:(?:先|暂时)\s*)?(?:不要|不加|别加)"
+)
+_SET_REFERENCE_EXCEPT_RE = re.compile(
+    r"除了(?P<body>.+?)(?=(?:其他|其余|剩下的?))"
+)
+
+
+def _mask_set_reference_quotes(text: str) -> str:
+    source = list(unicodedata.normalize("NFKC", str(text or "")))
+    normalized = "".join(source)
+    for pattern in (
+        re.compile(r"「[^」]*」|『[^』]*』|“[^”]*”|‘[^’]*’"),
+        re.compile(r'"[^"\n]*"|\'[^\'\n]*\'|`[^`\n]*`'),
+    ):
+        for match in pattern.finditer(normalized):
+            source[match.start():match.end()] = " " * (match.end() - match.start())
+    return "".join(source)
+
+
+def parse_advertised_set_reference(text: str) -> AdvertisedSetReference:
+    """Parse only literal, unframed remainder-add commands from this message."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    source = _mask_set_reference_quotes(normalized)
+    if (
+        not source.strip()
+        or source != normalized
+        or "?" in source
+        or "？" in source
+        or _SET_REFERENCE_UNSAFE_FRAME_RE.search(source)
+        or _SET_REFERENCE_ACTION_RE.search(source) is None
+    ):
+        return AdvertisedSetReference()
+    exclusions: list[str] = []
+    for match in _SET_REFERENCE_EXCEPT_RE.finditer(source):
+        exclusions.extend(
+            token
+            for token in re.split(r"[\s、,，;；和与及]+", match.group("body"))
+            if token
+        )
+    exclusions.extend(
+        match.group("word")
+        for match in _SET_REFERENCE_EXCLUSION_RE.finditer(source)
+    )
+    if re.search(r"(?:除了|不要|不加|别加)", source) and not exclusions:
+        return AdvertisedSetReference()
+    return AdvertisedSetReference(
+        matched=True,
+        exclusions=tuple(dict.fromkeys(exclusions)),
+    )
+
+
 def _selection_action_forms(forms: frozenset[str]) -> tuple[str, ...]:
     return tuple(sorted(forms, key=lambda value: (-len(value), value)))
 

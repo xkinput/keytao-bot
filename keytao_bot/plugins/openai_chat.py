@@ -38,6 +38,7 @@ from ..harness.state import (
     DraftOperationCoordinator,
     MemoryConversationStateStore,
     PendingAddWord,
+    PendingAdvertisedWordSets,
     PendingState,
     PendingStateRecord,
     PendingToolConfirm,
@@ -237,6 +238,7 @@ from .chat_commands import (
     _recover_pending_state_from_history,
     _requested_codes_from_pending_message,
     _resolve_pending_ticket_control,
+    _resolved_advertised_items_match,
     _resolve_requested_code_for_pending_add,
     _resolve_uncertain_ticket_action,
     _restore_current_pending_from_history_for_sensitive_control,
@@ -425,6 +427,7 @@ from .chat_routing import (
     _prompt_capability_digest,
     _quoted_pending_add_control_intent,
     _record_flow_for_intent,
+    _resolve_advertised_word_set_selection,
     _recover_original_command_from_confirmation_quote,
     _referenced_owner_key_from_reply_reference,
     _resolve_multi_word_pending_candidate_selection,
@@ -1403,6 +1406,9 @@ async def get_ai_response_core(
     visual_context: str = "",
     visual_image_count: int = 0,
     max_iterations: int = 20,
+    progress_reporter: Optional[Callable[[str], Awaitable[None]]] = None,
+    resolved_advertised_words: Tuple[str, ...] = (),
+    advertised_snapshot_token: str = "",
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
 
@@ -1458,8 +1464,14 @@ async def get_ai_response_core(
                 visual_image_count=visual_image_count,
                 mutations_allowed=(
                     not bool(visual_context)
-                    and message_authorizes_mutation(message)
+                    and (
+                        message_authorizes_mutation(message)
+                        or bool(resolved_advertised_words)
+                    )
                 ),
+                progress_reporter=progress_reporter,
+                resolved_advertised_words=resolved_advertised_words,
+                advertised_snapshot_token=advertised_snapshot_token,
             ),
             max_iterations=max_iterations,
         )
@@ -1657,6 +1669,8 @@ async def _send_event_response(
     memory_context: ChatMemoryContext,
     text: str,
     qq_message_segment: object = None,
+    *,
+    emit_metrics: bool = True,
 ) -> bool:
     text = _assert_plain_user_facing_reply(text)
     try:
@@ -1675,7 +1689,8 @@ async def _send_event_response(
                     memory_context.space_type == "group",
                 )
                 await bot.send(event=event, message=message)
-                emit_turn_metrics(logger)
+                if emit_metrics:
+                    emit_turn_metrics(logger)
                 return True
         if "telegram" in bot_module.lower():
             await _send_telegram_plain_chunks(
@@ -1684,10 +1699,12 @@ async def _send_event_response(
                 text,
                 reply_to_message_id=getattr(event, "message_id", None),
             )
-            emit_turn_metrics(logger)
+            if emit_metrics:
+                emit_turn_metrics(logger)
             return True
         await bot.send(event=event, message=text)
-        emit_turn_metrics(logger)
+        if emit_metrics:
+            emit_turn_metrics(logger)
         return True
     except Exception as error:
         logger.warning(f"Failed to send background response: {error}")
@@ -2119,6 +2136,8 @@ class TurnContext:
     scoped_pending_state: Optional[PendingState] = None
     scoped_pending_intent: Optional[MessageCommandIntent] = None
     scoped_pending_response: Optional[str] = None
+    resolved_advertised_words: Tuple[str, ...] = ()
+    advertised_snapshot_token: str = ""
     generic_command_intent: MessageCommandIntent = field(
         default_factory=MessageCommandIntent
     )
@@ -2351,15 +2370,31 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     ctx.scoped_pending_state: Optional[PendingToolConfirm] = None
     ctx.scoped_pending_intent: Optional[MessageCommandIntent] = None
     ctx.scoped_pending_response: Optional[str] = None
+    ctx.resolved_advertised_words = ()
+    ctx.advertised_snapshot_token = ""
     if ctx.current_pending_record is not None and not ctx.current_pending_record.execution_id:
-        (
-            ctx.scoped_pending_state,
-            ctx.scoped_pending_intent,
-            ctx.scoped_pending_response,
-        ) = _resolve_multi_word_pending_candidate_selection(
+        if isinstance(
             ctx.current_pending_record.state,
-            ctx.normalized_message_text,
-        )
+            PendingAdvertisedWordSets,
+        ):
+            selection = _resolve_advertised_word_set_selection(
+                ctx.current_pending_record.state,
+                ctx.normalized_message_text,
+            )
+            if selection.ask:
+                ctx.scoped_pending_response = selection.ask
+            elif selection.resolved_words:
+                ctx.resolved_advertised_words = selection.resolved_words
+                ctx.advertised_snapshot_token = selection.snapshot_token
+        else:
+            (
+                ctx.scoped_pending_state,
+                ctx.scoped_pending_intent,
+                ctx.scoped_pending_response,
+            ) = _resolve_multi_word_pending_candidate_selection(
+                ctx.current_pending_record.state,
+                ctx.normalized_message_text,
+            )
     return False
 
 
@@ -2442,6 +2477,8 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
     )
     if ctx.scoped_pending_intent is not None:
         ctx.generic_command_intent = ctx.scoped_pending_intent
+    elif ctx.resolved_advertised_words:
+        ctx.generic_command_intent = MessageCommandIntent()
     elif ctx.quoted_pending_add_control:
         ctx.generic_command_intent = ctx.quoted_pending_add_intent
     elif (
@@ -2495,6 +2532,8 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
         ctx.generic_command_intent,
         ctx.normalized_message_text,
     ) or ctx.message_is_prefixed_fresh_word_query
+    if ctx.resolved_advertised_words:
+        ctx.generic_intent_is_fresh_command = True
     if (
         ctx.current_pending_record is not None
         and isinstance(ctx.current_pending_record.state, PendingToolConfirm)
@@ -3135,6 +3174,13 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
 
             elif ctx.response is None and isinstance(state, PendingToolConfirm):
                 if _is_pending_tool_confirm_message(state, pending_command_intent):
+                    if not _resolved_advertised_items_match(state):
+                        complete_pending_execution()
+                        ctx.response = (
+                            "候选集合校验失败，确认票据已作废；"
+                            "本次未写入。请重新扫描后再选择。"
+                        )
+                        return False
                     current_operation = draft_operation_coordinator.get(ctx.conv_key)
                     if current_operation is not None:
                         restore_pending_state()
@@ -3319,6 +3365,18 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
         if ctx.history is None:
             ctx.history = get_history(ctx.conv_key)
         reply_context = await build_reply_context(ctx.bot, ctx.event, ctx.reply_reference)
+
+        async def report_progress(text: str) -> None:
+            await _send_event_response(
+                ctx.bot,
+                ctx.event,
+                ctx.user_id,
+                ctx.memory_context,
+                text,
+                ctx.QQMessageSegment,
+                emit_metrics=False,
+            )
+
         ctx.response = await get_ai_response_core(
             ctx.normalized_message_text,
             ctx.platform,
@@ -3326,6 +3384,9 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
             ctx.history,
             reply_context,
             ctx.memory_context,
+            progress_reporter=report_progress,
+            resolved_advertised_words=ctx.resolved_advertised_words,
+            advertised_snapshot_token=ctx.advertised_snapshot_token,
         )
     return False
 
@@ -3530,6 +3591,7 @@ _CHAT_COMPAT_NAMES = (
     "ConversationLockStore",
     "DraftOperationCoordinator",
     "PendingAddWord",
+    "PendingAdvertisedWordSets",
     "PendingState",
     "PendingStateRecord",
     "PendingToolConfirm",
@@ -3808,6 +3870,8 @@ _CHAT_COMPAT_NAMES = (
     "_requested_codes_from_pending_message",
     "_resolve_multi_word_pending_candidate_selection",
     "_resolve_pending_ticket_control",
+    "_resolve_advertised_word_set_selection",
+    "_resolved_advertised_items_match",
     "_resolve_requested_code_for_pending_add",
     "_resolve_shift_target_code",
     "_resolve_uncertain_ticket_action",

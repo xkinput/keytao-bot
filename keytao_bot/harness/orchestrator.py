@@ -29,10 +29,17 @@ from keytao_bot.utils.observability import (
 from keytao_bot.utils.pending_confirmation import (
     advertised_batch_binding_pairs,
     ensure_multi_word_candidate_copy,
+    parse_advertised_set_reference,
+    pending_batch_confirmation_copy,
     pending_confirmation_copy,
 )
 
-from .state import MemoryConversationStateStore, PendingAddWord, PendingToolConfirm
+from .state import (
+    MemoryConversationStateStore,
+    PendingAddWord,
+    PendingAdvertisedWordSets,
+    PendingToolConfirm,
+)
 from .conversation import ConversationAddress
 from .tools import (
     MUTATING_TOOL_NAMES,
@@ -164,8 +171,15 @@ class DuplicateToolCallAbort(Exception):
 class ToolCallValidationError(ValueError):
     """Reject an incomplete or unsafe tool-call batch before any execution."""
 
-    def __init__(self, message: str, *, retryable: bool = False):
+    def __init__(
+        self,
+        message: str,
+        *,
+        cause: str = "invalid_arguments",
+        retryable: bool = False,
+    ):
         super().__init__(message)
+        self.cause = cause
         self.retryable = retryable
 
 
@@ -210,6 +224,9 @@ class AgentRequestContext:
     visual_context: str = ""
     visual_image_count: int = 0
     mutations_allowed: bool = False
+    progress_reporter: Optional[Callable[[str], Any]] = None
+    resolved_advertised_words: tuple[str, ...] = ()
+    advertised_snapshot_token: str = ""
 
     @property
     def actor_key(self) -> tuple:
@@ -334,6 +351,16 @@ class AgentOrchestrator:
             "content": current_request,
         })
 
+        resolved_advertised_words = self._validated_resolved_advertised_words(
+            message,
+            context,
+        )
+        if context.resolved_advertised_words and not resolved_advertised_words:
+            return (
+                "刚才的候选快照已变化或失效；本次未写入，"
+                "请重新扫描后再选择。"
+            )
+
         # Image-derived text is untrusted data. Do not expose even read/network tools:
         # a visual prompt injection could otherwise read private data and exfiltrate it.
         tools = None
@@ -342,6 +369,15 @@ class AgentOrchestrator:
                 self._skills_manager.get_tools(),
                 key=_tool_function_name,
             )
+            if resolved_advertised_words:
+                # A snapshot-minus-exclusions command is deliberately a
+                # review-and-stage turn.  The resolved list must be shown and
+                # confirmed before any mutation tool is exposed.
+                tools = [
+                    tool
+                    for tool in tools
+                    if _tool_function_name(tool) not in MUTATING_TOOL_NAMES
+                ]
             if not context.mutations_allowed:
                 guidance = (
                     "本轮为只读轮：用户这条消息没有构成明确的写操作授权，"
@@ -356,6 +392,16 @@ class AgentOrchestrator:
             if isinstance(function, dict):
                 tool_schemas[str(function.get("name") or "")] = function.get("parameters", {})
         exact_multi_add_items = authorized_multi_add_items(message)
+        if resolved_advertised_words:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "[系统] 当前加词集合已由执行器从同一发送者的服务端"
+                    "查询快照中解析，并扣除了用户本条消息字面点名的排除项。"
+                    "本轮只审词，不得写入；审完后完整展示以下集合并等待一次确认："
+                    + "、".join(resolved_advertised_words)
+                ),
+            })
         if exact_multi_add_items:
             set_turn_flow("multi-add")
         # One (reason, tool, arguments) gets one full explanation per turn.
@@ -365,6 +411,7 @@ class AgentOrchestrator:
         seen_tool_calls: Dict[tuple, tuple[int, bool]] = {}
         seen_tool_call_ids: set[str] = set()
         total_tool_calls = 0
+        completed_run_labels: List[str] = []
         empty_response_retries = 0
         trusted_codes_by_word: Dict[str, frozenset[str]] = {}
         trusted_candidate_slots_by_word: Dict[
@@ -378,61 +425,132 @@ class AgentOrchestrator:
         trusted_phrase_types_by_key: Dict[tuple[str, str], frozenset[str]] = {}
         trusted_reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
         trusted_batch_ids: set[str] = set()
+        trusted_absent_word_sets: List[tuple[str, ...]] = []
         unresolved_pronunciation_words: set[str] = set()
         blocked_review_words: set[str] = set()
         attempted_review_words: set[str] = set()
         multi_add_write_attempted = False
         authoritative_result_links: Dict[str, str] = {}
         receipt_run_id = uuid.uuid4().hex
+        queued_tool_calls: List[Any] = []
+        queued_batch_labels: List[str] = []
+        queued_batch_subjects: List[str] = []
+        queued_batch_total = 0
+        queued_batch_completed = 0
+        queued_budget_omitted: List[str] = []
 
-        for iteration in range(max_iterations):
-            call_kwargs: Dict = with_deepseek_chat_policy(
-                {
-                    "model": self._runtime.model,
-                    "messages": messages,
-                    "max_tokens": current_max_tokens,
-                    "temperature": self._runtime.temperature,
-                },
-                thinking=True,
-                reasoning_effort="high",
-            )
-            if tools:
-                call_kwargs["tools"] = tools
-                call_kwargs["tool_choice"] = "auto"
+        model_iterations = 0
+        while True:
+            replaying_queued_calls = bool(queued_tool_calls)
+            response_reasoning_content = None
+            if replaying_queued_calls:
+                response_tool_calls = queued_tool_calls[:_MAX_TOOL_CALLS_PER_RESPONSE]
+                del queued_tool_calls[:_MAX_TOOL_CALLS_PER_RESPONSE]
+                content = ""
+                finish_reason = "tool_calls"
+                elapsed = 0.0
+                logger.info(
+                    "Replaying queued tool-call chunk: "
+                    f"size={len(response_tool_calls)} remaining={len(queued_tool_calls)}"
+                )
+            elif resolved_advertised_words:
+                reviewed_words = {
+                    word for word, _code in trusted_reviewed_items_by_key
+                }
+                missing_words = [
+                    word
+                    for word in resolved_advertised_words
+                    if word not in reviewed_words
+                    and word not in attempted_review_words
+                ]
+                if (
+                    missing_words
+                    and "keytao_prepare_reviewed_add" in tool_schemas
+                ):
+                    response_tool_calls = [
+                        _InternalToolCall(
+                            id=f"internal-advertised-review-{uuid.uuid4().hex}",
+                            function=_InternalFunctionCall(
+                                name="keytao_prepare_reviewed_add",
+                                arguments=json.dumps(
+                                    {"word": word},
+                                    ensure_ascii=False,
+                                ),
+                            ),
+                        )
+                        for word in missing_words
+                    ]
+                    content = ""
+                    finish_reason = "tool_calls"
+                    elapsed = 0.0
+                    logger.info(
+                        "Starting resolved advertised set review: words=%s",
+                        missing_words,
+                    )
+                else:
+                    response_tool_calls = []
+                    content = ""
+                    finish_reason = "stop"
+                    elapsed = 0.0
+            else:
+                if model_iterations >= max_iterations:
+                    break
+                model_iterations += 1
+                call_kwargs: Dict = with_deepseek_chat_policy(
+                    {
+                        "model": self._runtime.model,
+                        "messages": messages,
+                        "max_tokens": current_max_tokens,
+                        "temperature": self._runtime.temperature,
+                    },
+                    thinking=True,
+                    reasoning_effort="high",
+                )
+                if tools:
+                    call_kwargs["tools"] = tools
+                    call_kwargs["tool_choice"] = "auto"
 
-            logger.info(f"Calling {self._runtime.model} (iter {iteration + 1}/{max_iterations})")
-            started_at = time.monotonic()
-            try:
-                response = await observe_model_call(
-                    client.chat.completions.create(**call_kwargs),
-                    system_prompt_chars=len(system_prompt),
+                logger.info(
+                    f"Calling {self._runtime.model} "
+                    f"(iter {model_iterations}/{max_iterations})"
                 )
-                elapsed = time.monotonic() - started_at
-                self._log_usage(response)
-            except Exception as error:
-                mark_turn_outcome("error")
-                logger.error(
-                    "Agent model call failed after %.1fs: %s: %s",
-                    time.monotonic() - started_at,
-                    type(error).__name__,
-                    error,
-                )
-                return self._append_authoritative_result_links(
-                    "呜呜，AI 服务暂时没有完成回复 qwq 已执行结果请以链接为准。",
-                    authoritative_result_links,
-                )
+                started_at = time.monotonic()
+                try:
+                    response = await observe_model_call(
+                        client.chat.completions.create(**call_kwargs),
+                        system_prompt_chars=len(system_prompt),
+                    )
+                    elapsed = time.monotonic() - started_at
+                    self._log_usage(response)
+                except Exception as error:
+                    mark_turn_outcome("error")
+                    logger.error(
+                        "Agent model call failed after %.1fs: %s: %s",
+                        time.monotonic() - started_at,
+                        type(error).__name__,
+                        error,
+                    )
+                    return self._append_authoritative_result_links(
+                        "呜呜，AI 服务暂时没有完成回复 qwq 已执行结果请以链接为准。",
+                        authoritative_result_links,
+                    )
 
-            if not response.choices:
-                mark_turn_outcome("error")
-                return self._append_authoritative_result_links(
-                    "呜呜，AI 好像没有回复 qwq 要不再试一次？",
-                    authoritative_result_links,
-                )
+                if not response.choices:
+                    mark_turn_outcome("error")
+                    return self._append_authoritative_result_links(
+                        "呜呜，AI 好像没有回复 qwq 要不再试一次？",
+                        authoritative_result_links,
+                    )
 
-            choice = response.choices[0]
-            response_tool_calls = choice.message.tool_calls or []
-            content = choice.message.content or ""
-            finish_reason = choice.finish_reason
+                choice = response.choices[0]
+                response_tool_calls = choice.message.tool_calls or []
+                content = choice.message.content or ""
+                finish_reason = choice.finish_reason
+                response_reasoning_content = getattr(
+                    choice.message,
+                    "reasoning_content",
+                    None,
+                )
             if (
                 not response_tool_calls
                 and exact_multi_add_items
@@ -547,6 +665,72 @@ class AgentOrchestrator:
                 )
 
             if not response_tool_calls:
+                if resolved_advertised_words:
+                    blocked = [
+                        word
+                        for word in resolved_advertised_words
+                        if word in blocked_review_words
+                    ]
+                    if blocked:
+                        return self._append_authoritative_result_links(
+                            "以下词未通过完整审词，本次没有建立写入确认："
+                            + "、".join(f"「{word}」" for word in blocked)
+                            + "。其余词也未写入。",
+                            authoritative_result_links,
+                        )
+                    pending_items = self._resolved_advertised_pending_items(
+                        resolved_advertised_words,
+                        trusted_reviewed_items_by_key,
+                        trusted_candidate_slots_by_word,
+                    )
+                    if pending_items is not None:
+                        candidate_scopes = [
+                            {
+                                "word": item["word"],
+                                "candidates": [
+                                    [code, occupied]
+                                    for code, occupied
+                                    in trusted_candidate_slots_by_word[
+                                        item["word"]
+                                    ]
+                                ],
+                            }
+                            for item in pending_items
+                        ]
+                        pending = PendingToolConfirm(
+                            function_name="keytao_batch_add_to_draft",
+                            args={
+                                "items": pending_items,
+                                "_candidate_scopes": candidate_scopes,
+                                "_resolved_advertised_words": list(
+                                    resolved_advertised_words
+                                ),
+                            },
+                        )
+                        saved = self._state_store.replace_advertised_word_set(
+                            conv_key,
+                            context.advertised_snapshot_token,
+                            pending,
+                            space_key=context.space_key,
+                            owner_label=context.speaker_name,
+                        )
+                        if not saved:
+                            return self._append_authoritative_result_links(
+                                "刚才的候选快照已变化或失效；本次未写入，"
+                                "请重新扫描后再选择。",
+                                authoritative_result_links,
+                            )
+                        content = self._resolved_advertised_confirmation_copy(
+                            pending_items
+                        )
+                        logger.info(
+                            "Saved resolved advertised batch confirmation: "
+                            f"owner={conv_key} items={len(pending_items)}"
+                        )
+                        return self._append_authoritative_result_links(
+                            content,
+                            authoritative_result_links,
+                        )
                 if content.strip():
                     pending_items = (
                         self._advertised_pending_batch_items(
@@ -592,6 +776,23 @@ class AgentOrchestrator:
                             "Saved advertised reviewed batch candidate: "
                             f"owner={conv_key} items={len(pending_items)}"
                         )
+                    for absent_words in trusted_absent_word_sets:
+                        if not self._content_advertises_word_set(
+                            content,
+                            absent_words,
+                        ):
+                            continue
+                        token = self._state_store.add_advertised_word_set(
+                            conv_key,
+                            absent_words,
+                            space_key=context.space_key,
+                            owner_label=context.speaker_name,
+                        )
+                        if token:
+                            logger.info(
+                                "Saved server-derived advertised word set: "
+                                f"owner={conv_key} items={len(absent_words)}"
+                            )
                     return self._append_authoritative_result_links(
                         content,
                         authoritative_result_links,
@@ -611,13 +812,76 @@ class AgentOrchestrator:
                 )
 
             try:
-                parsed_tool_calls = self._parse_tool_calls(
-                    response_tool_calls,
-                    tool_schemas,
-                    seen_tool_call_ids,
-                )
+                if replaying_queued_calls:
+                    # Queued calls are validated again immediately before
+                    # execution.  Queueing never becomes a policy/schema
+                    # bypass merely because the original response was valid.
+                    parsed_tool_calls = self._parse_tool_calls(
+                        response_tool_calls,
+                        tool_schemas,
+                        seen_tool_call_ids,
+                    )
+                else:
+                    # Validate the complete model batch atomically before the
+                    # first chunk executes.  An unknown tool, duplicate id or
+                    # malformed later call must not hide behind the chunk cap.
+                    complete_batch = self._parse_tool_calls(
+                        response_tool_calls,
+                        tool_schemas,
+                        seen_tool_call_ids,
+                    )
+                    remaining_run_budget = max(
+                        0,
+                        _MAX_TOOL_CALLS_PER_RUN - total_tool_calls,
+                    )
+                    executable_count = min(
+                        len(complete_batch),
+                        remaining_run_budget,
+                    )
+                    if executable_count == 0:
+                        labels = [
+                            self._tool_call_label(tc, fn_args)
+                            for tc, fn_args in complete_batch
+                        ]
+                        return self._append_authoritative_result_links(
+                            self._run_budget_reply(
+                                completed=total_tool_calls,
+                                total=total_tool_calls + len(complete_batch),
+                                completed_labels=completed_run_labels,
+                                remaining_labels=labels,
+                            ),
+                            authoritative_result_links,
+                        )
+                    executable_batch = complete_batch[:executable_count]
+                    queued_batch_labels = [
+                        self._tool_call_label(tc, fn_args)
+                        for tc, fn_args in complete_batch
+                    ]
+                    queued_batch_subjects = [
+                        self._tool_call_primary_argument(fn_args)
+                        for _tc, fn_args in complete_batch
+                    ]
+                    queued_batch_total = len(complete_batch)
+                    queued_batch_completed = 0
+                    queued_budget_omitted = queued_batch_labels[executable_count:]
+                    parsed_tool_calls = executable_batch[
+                        :_MAX_TOOL_CALLS_PER_RESPONSE
+                    ]
+                    response_tool_calls = [
+                        tc for tc, _fn_args in parsed_tool_calls
+                    ]
+                    queued_tool_calls = [
+                        tc
+                        for tc, _fn_args in executable_batch[
+                            _MAX_TOOL_CALLS_PER_RESPONSE:
+                        ]
+                    ]
             except ToolCallValidationError as error:
-                if error.retryable and current_max_tokens < self._runtime.max_tokens_cap:
+                if (
+                    not replaying_queued_calls
+                    and error.retryable
+                    and current_max_tokens < self._runtime.max_tokens_cap
+                ):
                     current_max_tokens = min(current_max_tokens * 2, self._runtime.max_tokens_cap)
                     logger.warning(
                         "Tool-call validation failed, retrying with "
@@ -630,22 +894,15 @@ class AgentOrchestrator:
                     continue
                 logger.error(f"Refusing invalid tool-call batch: {error}")
                 return self._append_authoritative_result_links(
-                    "呜呜，AI 返回的工具参数格式错误 qwq 请把任务拆小一点再试试～",
-                    authoritative_result_links,
-                )
-
-            if total_tool_calls + len(parsed_tool_calls) > _MAX_TOOL_CALLS_PER_RUN:
-                logger.error(
-                    "Refusing tool-call run over local limit: "
-                    f"current={total_tool_calls} requested={len(parsed_tool_calls)} "
-                    f"limit={_MAX_TOOL_CALLS_PER_RUN}"
-                )
-                return self._append_authoritative_result_links(
-                    "呜呜，这次需要调用的工具太多了 qwq 请把任务拆小一点再试试～",
+                    self._tool_call_validation_reply(error),
                     authoritative_result_links,
                 )
 
             total_tool_calls += len(parsed_tool_calls)
+            completed_run_labels.extend(
+                self._tool_call_label(tc, fn_args)
+                for tc, fn_args in parsed_tool_calls
+            )
             seen_tool_call_ids.update(str(tc.id) for tc, _ in parsed_tool_calls)
             reviewed_words_in_batch = {
                 str(fn_args.get("word") or "").strip()
@@ -669,7 +926,7 @@ class AgentOrchestrator:
                     for tc, _ in parsed_tool_calls
                 ],
             }
-            reasoning_content = getattr(choice.message, 'reasoning_content', None)
+            reasoning_content = response_reasoning_content
             if is_deepseek_model(self._runtime.model):
                 assistant_msg["reasoning_content"] = reasoning_content or ""
             elif reasoning_content is not None:
@@ -893,6 +1150,7 @@ class AgentOrchestrator:
                         trusted_phrase_types_by_key,
                         trusted_reviewed_items_by_key,
                         trusted_candidate_slots_by_word,
+                        trusted_absent_word_sets,
                     )
                     pending_tool_name = (
                         execution_route.tool_name
@@ -979,10 +1237,73 @@ class AgentOrchestrator:
                     "content": model_result_str,
                 })
 
+            is_chunked_batch = bool(
+                queued_batch_total > _MAX_TOOL_CALLS_PER_RESPONSE
+                or queued_budget_omitted
+            )
+            if is_chunked_batch:
+                chunk_start = queued_batch_completed
+                queued_batch_completed += len(parsed_tool_calls)
+                chunk_labels = queued_batch_labels[
+                    chunk_start:queued_batch_completed
+                ]
+                remaining_labels = queued_batch_labels[
+                    queued_batch_completed:
+                ]
+                if queued_batch_completed < queued_batch_total:
+                    rounds_remaining = (
+                        queued_batch_total
+                        - queued_batch_completed
+                        + _MAX_TOOL_CALLS_PER_RESPONSE
+                        - 1
+                    ) // _MAX_TOOL_CALLS_PER_RESPONSE
+                    await self._report_chunk_progress(
+                        context.progress_reporter,
+                        subjects=queued_batch_subjects,
+                        completed=queued_batch_completed,
+                        total=queued_batch_total,
+                        rounds_remaining=rounds_remaining,
+                    )
+                if queued_tool_calls:
+                    messages.append({
+                        "role": "system",
+                        "content": self._queued_calls_nudge(
+                            executed_labels=chunk_labels,
+                            remaining_labels=remaining_labels,
+                        ),
+                    })
+                    continue
+                if queued_budget_omitted:
+                    return self._append_authoritative_result_links(
+                        self._run_budget_reply(
+                            completed=total_tool_calls,
+                            total=total_tool_calls + len(queued_budget_omitted),
+                            completed_labels=completed_run_labels,
+                            remaining_labels=queued_budget_omitted,
+                        ),
+                        authoritative_result_links,
+                    )
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        f"[系统] 本批排队的 {queued_batch_total} 项工具调用"
+                        "已全部按原顺序执行。请根据以上结果继续下一步；"
+                        "不要重新调用已完成项目。"
+                    ),
+                })
+                queued_batch_labels = []
+                queued_batch_subjects = []
+                queued_batch_total = 0
+                queued_batch_completed = 0
+                queued_budget_omitted = []
+
             continue
 
+        completed_text = "、".join(completed_run_labels) or "无工具调用"
         return self._append_authoritative_result_links(
-            "呜呜，处理太久了 qwq 要不再试一次？",
+            f"本轮已完成 {total_tool_calls} 项：{completed_text}。"
+            f"但模型处理已达到 {max_iterations} 轮上限，最终汇总尚未完成；"
+            "请发送「继续处理剩余项」。",
             authoritative_result_links,
         )
 
@@ -1028,6 +1349,119 @@ class AgentOrchestrator:
                 item["remark"] = remark
             items.append(item)
         return items
+
+    def _validated_resolved_advertised_words(
+        self,
+        message: str,
+        context: AgentRequestContext,
+    ) -> tuple[str, ...]:
+        """Re-derive a staged set difference from the live actor-owned snapshot."""
+        requested = tuple(dict.fromkeys(
+            str(word or "").strip()
+            for word in context.resolved_advertised_words
+            if str(word or "").strip()
+        ))
+        token = str(context.advertised_snapshot_token or "").strip()
+        if not requested and not token:
+            return ()
+        if not requested or not token:
+            return ()
+        command = parse_advertised_set_reference(message)
+        if not command.matched:
+            return ()
+        record = self._state_store.get_record(context.conversation_address)
+        if (
+            record is None
+            or record.execution_id
+            or not isinstance(record.state, PendingAdvertisedWordSets)
+            or len(record.state.snapshots) != 1
+        ):
+            return ()
+        snapshot = record.state.snapshots[0]
+        if snapshot.token != token:
+            return ()
+        if any(word not in snapshot.words for word in command.exclusions):
+            return ()
+        resolved = tuple(
+            word for word in snapshot.words if word not in command.exclusions
+        )
+        if not resolved or resolved != requested:
+            return ()
+        return resolved
+
+    @staticmethod
+    def _resolved_advertised_pending_items(
+        words: tuple[str, ...],
+        reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
+        candidate_slots_by_word: Dict[
+            str,
+            tuple[tuple[str, bool], ...],
+        ],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Seal one reviewed item per word from the exact resolved universe."""
+        if not words:
+            return None
+        items: List[Dict[str, Any]] = []
+        for word in words:
+            slots = candidate_slots_by_word.get(word, ())
+            allowed_codes = {code for code, _occupied in slots}
+            reviewed_matches = [
+                (code, reviewed)
+                for (reviewed_word, code), reviewed in reviewed_items_by_key.items()
+                if reviewed_word == word and code in allowed_codes
+            ]
+            if len(reviewed_matches) != 1:
+                return None
+            code, reviewed = reviewed_matches[0]
+            phrase_type = str(reviewed.get("type") or "").strip()
+            if not phrase_type:
+                return None
+            item: Dict[str, Any] = {
+                "action": "Create",
+                "word": word,
+                "code": code,
+                "type": phrase_type,
+                "needsManualReview": bool(
+                    reviewed.get("needs_manual_review", True)
+                ),
+            }
+            review_reason = str(
+                reviewed.get("manual_review_reason") or ""
+            ).strip()
+            if review_reason:
+                item["manualReviewReason"] = review_reason
+            remark = str(reviewed.get("remark") or "").strip()
+            if remark:
+                item["remark"] = remark
+            items.append(item)
+        return items
+
+    @staticmethod
+    def _resolved_advertised_confirmation_copy(
+        items: List[Dict[str, Any]],
+    ) -> str:
+        words = "、".join(
+            str(item.get("word") or "").strip()
+            for item in items
+            if str(item.get("word") or "").strip()
+        )
+        return (
+            f"已解析为以下 {len(items)} 个词：{words}\n"
+            "确认后才会写入草稿。\n\n"
+            + pending_batch_confirmation_copy()
+        )
+
+    @staticmethod
+    def _content_advertises_word_set(
+        content: str,
+        words: tuple[str, ...],
+    ) -> bool:
+        """Mint a selectable snapshot only when the full server set is rendered."""
+        text = str(content or "")
+        if len(words) < 2 or not all(word in text for word in words):
+            return False
+        compact = re.sub(r"\s+", "", text)
+        return bool(re.search(r"(?:加入|添加|加到|放入|放进)(?:这批|这些|其余|剩下)?草稿", compact))
 
     @staticmethod
     def _normalize_loop_text(value: str) -> str:
@@ -1360,6 +1794,7 @@ class AgentOrchestrator:
             str,
             tuple[tuple[str, bool], ...],
         ],
+        absent_word_sets: Optional[List[tuple[str, ...]]] = None,
     ) -> None:
         """Capture narrowly scoped capabilities from successful read-tool results."""
         if (
@@ -1369,6 +1804,44 @@ class AgentOrchestrator:
             or review_flags.review_blocks_write(result)
         ):
             return
+
+        if tool_name == "keytao_lookup_by_words_batch":
+            requested_values = arguments.get("words")
+            requested_words = tuple(
+                str(word).strip()
+                for word in requested_values
+                if isinstance(word, str) and str(word).strip()
+            ) if isinstance(requested_values, list) else ()
+            groups = result.get("results")
+            complete = bool(
+                len(requested_words) >= 2
+                and len(set(requested_words)) == len(requested_words)
+                and result.get("count") == len(requested_words)
+                and isinstance(groups, list)
+                and len(groups) == len(requested_words)
+            )
+            if complete:
+                absent: List[str] = []
+                for expected_word, group in zip(requested_words, groups):
+                    if (
+                        not isinstance(group, dict)
+                        or group.get("success") is False
+                        or str(group.get("word") or "").strip()
+                        != expected_word
+                        or not isinstance(group.get("phrases"), list)
+                    ):
+                        complete = False
+                        break
+                    if not group["phrases"]:
+                        absent.append(expected_word)
+                absent_set = tuple(absent)
+                if (
+                    complete
+                    and len(absent_set) >= 2
+                    and absent_word_sets is not None
+                    and absent_set not in absent_word_sets
+                ):
+                    absent_word_sets.append(absent_set)
 
         if tool_name in {"keytao_encode", "keytao_prepare_reviewed_add"}:
             word = str(arguments.get("word") or result.get("word") or "").strip()
@@ -1651,46 +2124,166 @@ class AgentOrchestrator:
             model=self._runtime.model,
         )
 
+    @staticmethod
+    def _tool_call_primary_argument(arguments: Dict[str, Any]) -> str:
+        """Return one short, deterministic identifier for progress copy."""
+        for key in ("word", "target_word", "code", "value", "batch_id"):
+            value = arguments.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()[:64]
+        for key in ("words", "codes", "ids"):
+            values = arguments.get(key)
+            if isinstance(values, list) and values:
+                labels = [str(value).strip() for value in values[:3]]
+                suffix = "…" if len(values) > 3 else ""
+                return "、".join(label for label in labels if label) + suffix
+        items = arguments.get("items")
+        if isinstance(items, list) and items:
+            labels = [
+                str(item.get("word") or item.get("code") or "").strip()
+                for item in items[:3]
+                if isinstance(item, dict)
+            ]
+            suffix = "…" if len(items) > 3 else ""
+            if any(labels):
+                return "、".join(label for label in labels if label) + suffix
+        for value in arguments.values():
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()[:64]
+        return "无主参数"
+
+    @classmethod
+    def _tool_call_label(cls, tool_call: Any, arguments: Dict[str, Any]) -> str:
+        function = getattr(tool_call, "function", None)
+        name = str(getattr(function, "name", "") or "未知工具").strip()
+        return f"{name}({cls._tool_call_primary_argument(arguments)})"
+
+    @staticmethod
+    def _queued_calls_nudge(
+        *,
+        executed_labels: List[str],
+        remaining_labels: List[str],
+    ) -> str:
+        return (
+            "[系统] 执行器已按原顺序完成："
+            + "、".join(executed_labels)
+            + f"；尚有 {len(remaining_labels)} 项已安全排队："
+            + "、".join(remaining_labels)
+            + "。执行器将继续处理队列；不要重新生成或重复已完成调用。"
+        )
+
+    @staticmethod
+    def _run_budget_reply(
+        *,
+        completed: int,
+        total: int,
+        completed_labels: List[str],
+        remaining_labels: List[str],
+    ) -> str:
+        completed_text = "、".join(completed_labels) or "无"
+        remaining_text = "、".join(remaining_labels) or "无"
+        return (
+            f"本轮工具调用已达到 {_MAX_TOOL_CALLS_PER_RUN} 次上限；"
+            f"当前这批已完成 {completed}/{total}：{completed_text}。"
+            f"尚有 {len(remaining_labels)} 项未执行：{remaining_text}。"
+            "已完成结果会保留；请发送「继续处理剩余项」开启下一轮。"
+        )
+
+    @staticmethod
+    async def _report_chunk_progress(
+        reporter: Optional[Callable[[str], Any]],
+        *,
+        subjects: List[str],
+        completed: int,
+        total: int,
+        rounds_remaining: int,
+    ) -> None:
+        if reporter is None:
+            return
+        preview = "、".join(subjects[:3]) + ("…" if len(subjects) > 3 else "")
+        line = (
+            f"正在处理「{preview}」，已完成 {completed}/{total}，"
+            f"预计还剩 {rounds_remaining} 轮"
+        )
+        try:
+            result = reporter(line)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as error:
+            logger.warning(
+                "Failed to send tool-call chunk progress: %s: %s",
+                type(error).__name__,
+                error,
+            )
+
+    @staticmethod
+    def _tool_call_validation_reply(error: ToolCallValidationError) -> str:
+        detail = str(error)
+        if error.cause == "unknown_tool":
+            name = detail.partition(":")[2].strip() or "未命名工具"
+            return f"AI 请求了未开放的工具「{name}」；本批没有执行。"
+        if error.cause == "duplicate_id":
+            return "AI 返回了重复的工具调用编号；本批没有执行。"
+        if error.cause == "invalid_json":
+            return "AI 返回的工具参数不是完整 JSON；本批没有执行，请再试一次。"
+        if error.cause == "invalid_schema":
+            return "AI 返回的工具参数不符合该工具的字段要求；本批没有执行。"
+        return "AI 返回了不完整的工具调用；本批没有执行，请再试一次。"
+
     def _parse_tool_calls(
         self,
         tool_calls: List[Any],
         tool_schemas: Dict[str, Dict[str, Any]],
         seen_tool_call_ids: set[str],
     ) -> List[tuple]:
-        if len(tool_calls) > _MAX_TOOL_CALLS_PER_RESPONSE:
-            raise ToolCallValidationError(
-                f"too many tool calls: {len(tool_calls)} > {_MAX_TOOL_CALLS_PER_RESPONSE}"
-            )
-
         parsed_tool_calls: List[tuple] = []
         batch_ids: set[str] = set()
         for tool_call in tool_calls:
             if getattr(tool_call, "type", None) != "function":
-                raise ToolCallValidationError("tool call type must be function")
+                raise ToolCallValidationError(
+                    "tool call type must be function",
+                    cause="invalid_protocol",
+                )
 
             call_id = str(getattr(tool_call, "id", "") or "").strip()
             if not call_id:
-                raise ToolCallValidationError("tool call id is missing")
+                raise ToolCallValidationError(
+                    "tool call id is missing",
+                    cause="invalid_protocol",
+                )
             if call_id in batch_ids or call_id in seen_tool_call_ids:
-                raise ToolCallValidationError(f"duplicate tool call id: {call_id}")
+                raise ToolCallValidationError(
+                    f"duplicate tool call id: {call_id}",
+                    cause="duplicate_id",
+                )
 
             function = getattr(tool_call, "function", None)
             fn_name = str(getattr(function, "name", "") or "").strip()
             if not fn_name or fn_name not in tool_schemas:
-                raise ToolCallValidationError(f"unknown tool: {fn_name or '(missing)'}")
+                raise ToolCallValidationError(
+                    f"unknown tool: {fn_name or '(missing)'}",
+                    cause="unknown_tool",
+                )
 
             raw_arguments = getattr(function, "arguments", None)
             if not isinstance(raw_arguments, str):
-                raise ToolCallValidationError("tool arguments must be a JSON object string")
+                raise ToolCallValidationError(
+                    "tool arguments must be a JSON object string",
+                    cause="invalid_json",
+                )
             try:
                 arguments = json.loads(raw_arguments)
             except json.JSONDecodeError as error:
                 raise ToolCallValidationError(
                     f"invalid JSON arguments for {fn_name}: {error}",
+                    cause="invalid_json",
                     retryable=True,
                 ) from error
             if not isinstance(arguments, dict):
-                raise ToolCallValidationError(f"tool arguments for {fn_name} must be an object")
+                raise ToolCallValidationError(
+                    f"tool arguments for {fn_name} must be an object",
+                    cause="invalid_schema",
+                )
 
             if fn_name in tool_schemas:
                 schema_error = self._validate_json_schema(
@@ -1698,7 +2291,8 @@ class AgentOrchestrator:
                 )
                 if schema_error:
                     raise ToolCallValidationError(
-                        f"invalid arguments for {fn_name}: {schema_error}"
+                        f"invalid arguments for {fn_name}: {schema_error}",
+                        cause="invalid_schema",
                     )
 
             batch_ids.add(call_id)

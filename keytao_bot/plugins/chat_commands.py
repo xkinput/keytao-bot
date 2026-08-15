@@ -2890,6 +2890,37 @@ def _pending_state_from_server_warning(
     )
 
 
+def _resolved_advertised_items_match(state: PendingToolConfirm) -> bool:
+    """Fail closed if a snapshot-derived ticket no longer seals the exact set."""
+    if "_resolved_advertised_words" not in state.args:
+        return True
+    expected = state.args.get("_resolved_advertised_words")
+    items = state.args.get("items")
+    if (
+        state.function_name != "keytao_batch_add_to_draft"
+        or not isinstance(expected, list)
+        or not expected
+        or not all(isinstance(word, str) and word.strip() for word in expected)
+        or len(set(expected)) != len(expected)
+        or not isinstance(items, list)
+        or len(items) != len(expected)
+    ):
+        return False
+    actual: List[str] = []
+    for item in items:
+        if (
+            not isinstance(item, dict)
+            or item.get("action") != "Create"
+            or item.get("old_word")
+            or item.get("oldWord")
+            or not isinstance(item.get("word"), str)
+            or not str(item.get("word") or "").strip()
+        ):
+            return False
+        actual.append(str(item["word"]).strip())
+    return actual == expected
+
+
 def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
     """Append every server-bound draft item without exposing internal digests."""
     snapshot_items = (
@@ -3026,10 +3057,13 @@ async def _execute_confirmed_tool(
     """Execute one staged step without bypassing unseen server warnings."""
     if state.confirmation_source not in {"local_preview", "server_warning"}:
         return "确认票据来源无效，已拒绝执行，请重新发起操作。"
+    if not _resolved_advertised_items_match(state):
+        return "候选集合校验失败，确认票据已作废；本次未写入。请重新扫描后再选择。"
 
     args = dict(state.args)
     args.pop("preview_only", None)
     args.pop("_candidate_scopes", None)
+    args.pop("_resolved_advertised_words", None)
     ordering_summary = str(
         args.pop("_ordering_summary", "")
         or carried_ordering_summary
@@ -5408,6 +5442,9 @@ async def handle_pending_message_core(
         isinstance(state, PendingToolConfirm)
         and _is_pending_tool_confirm_message(state, pending_command_intent)
     ):
+        if not _resolved_advertised_items_match(state):
+            conversation_state_store.complete_execution(state_record)
+            return "候选集合校验失败，确认票据已作废；本次未写入。请重新扫描后再选择。"
         if not conversation_state_store.begin_execution(state_record):
             return "该确认票据已被其他请求占用，请先查看草稿后再试。"
         if (

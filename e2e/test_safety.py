@@ -14,7 +14,7 @@ from urllib.parse import unquote
 import httpx
 
 from .recording import ArtifactRecorder, _redact_sensitive
-from .scenarios import SCENARIOS
+from .scenarios import SCENARIOS, S19_ADVERTISED_WORDS
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
     abort_record_for_error,
@@ -198,15 +198,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S16 replays the two-word 载流", readme)
         self.assertIn("S17 exercises the common-characters-plus-LLM", readme)
         self.assertIn("S18 replays the multi-number candidate incident", readme)
+        self.assertIn("S19 replays the oversized advertised-set incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s18(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s19(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 19)],
+            [f"S{index}" for index in range(1, 20)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -388,6 +389,84 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             ("found", ("huán", "chē")),
         )
         self.assertEqual(declared[("entry", "换车")], ("absent", ()))
+
+    def test_s19_zdic_seed_declares_the_complete_advertised_word_set(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S19"]
+        self.assertEqual(len(fixture["probe_words"]), 11)
+        expected_character_pinyins = {
+            "显": ("xiǎn",),
+            "眼": ("yǎn",),
+            "包": ("bāo",),
+            "嘴": ("zuǐ",),
+            "替": ("tì",),
+            "松": ("sōng",),
+            "弛": ("chí",),
+            "感": ("gǎn",),
+            "电": ("diàn",),
+            "子": ("zǐ",),
+            "榨": ("zhà",),
+            "菜": ("cài",),
+            "情": ("qíng",),
+            "绪": ("xù",),
+            "价": ("jià",),
+            "值": ("zhí",),
+            "班": ("bān",),
+            "味": ("wèi",),
+            "泼": ("pō",),
+            "天": ("tiān",),
+            "富": ("fù",),
+            "贵": ("guì",),
+            "精": ("jīng",),
+            "神": ("shén",),
+            "状": ("zhuàng",),
+            "态": ("tài",),
+            "职": ("zhí",),
+            "场": ("chǎng",),
+            "搭": ("dā",),
+            "选": ("xuǎn",),
+            "打": ("dǎ",),
+            "工": ("gōng",),
+            "人": ("rén",),
+            "沙": ("shā",),
+            "县": ("xiàn",),
+            "小": ("xiǎo",),
+            "吃": ("chī",),
+        }
+        self.assertEqual(
+            set(expected_character_pinyins),
+            set("".join(fixture["probe_words"])),
+        )
+        self.assertEqual(
+            {
+                row["entry"]: (row["status"], tuple(row["pinyins"]))
+                for row in fixture["rows"]
+                if row["kind"] == "char"
+            },
+            {
+                char: ("found", pinyins)
+                for char, pinyins in expected_character_pinyins.items()
+            },
+        )
+        self.assertEqual(
+            {
+                row["entry"]: (row["status"], tuple(row["pinyins"]))
+                for row in fixture["rows"]
+                if row["kind"] == "entry"
+            },
+            {
+                "显眼包": ("found", ("xiǎn", "yǎn", "bāo")),
+                "嘴替": ("found", ("zuǐ", "tì")),
+                "松弛感": ("found", ("sōng", "chí", "gǎn")),
+                "电子榨菜": ("found", ("diàn", "zǐ", "zhà", "cài")),
+                "情绪价值": ("found", ("qíng", "xù", "jià", "zhí")),
+                "班味": ("found", ("bān", "wèi")),
+                "泼天富贵": ("found", ("pō", "tiān", "fù", "guì")),
+                "精神状态": ("found", ("jīng", "shén", "zhuàng", "tài")),
+                "职场搭子": ("found", ("zhí", "chǎng", "dā", "zǐ")),
+                "天选打工人": ("found", ("tiān", "xuǎn", "dǎ", "gōng", "rén")),
+                "沙县小吃": ("found", ("shā", "xiàn", "xiǎo", "chī")),
+            },
+        )
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
         class FakeBuildResult:
@@ -965,6 +1044,74 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         )
         self.assertEqual(result["facts"]["additionalConfirmationSteps"], 1)
         self.assertTrue(result["facts"]["duplicateWarningSealed"])
+
+    async def test_s19_offline_incident_replay_chunks_and_writes_exact_remainder(
+        self,
+    ) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S19")
+
+        class FakeContext:
+            def __init__(self):
+                self.events = []
+                self.items = []
+                self.batch_id = None
+
+            async def send(self, text: str) -> str:
+                if text.startswith("喵喵，请批量检查这些常用词"):
+                    return (
+                        "未收录词：" + "、".join(S19_ADVERTISED_WORDS)
+                        + "。可以把这些词加入草稿。"
+                    )
+                if text == "火星词先不要，其他都加":
+                    return "「火星词」不在刚才的候选中，请只从候选列表选择；本次未写入。"
+                if text == "天选打工人先不要，其他可以加，沙县小吃也不要":
+                    self.events.append({
+                        "sequence": 1,
+                        "kind": "message",
+                        "direction": "reply",
+                        "text": "正在处理「显眼包、嘴替、松弛感…」，已完成 8/9，预计还剩 1 轮",
+                    })
+                    return (
+                        "已解析为以下 9 个词："
+                        + "、".join(S19_ADVERTISED_WORDS[:-2])
+                        + "\n确认后才会写入草稿。回复「确认」、「执行」继续。"
+                    )
+                if text == "确认":
+                    self.items = [
+                        {
+                            "action": "Create",
+                            "word": word,
+                            "code": f"code{index}",
+                        }
+                        for index, word in enumerate(S19_ADVERTISED_WORDS[:-2])
+                    ]
+                    self.batch_id = "batch-s19"
+                    self.events.append({
+                        "sequence": 2,
+                        "kind": "tool",
+                        "name": "keytao_batch_add_to_draft",
+                        "arguments": {"items": list(self.items)},
+                        "result": {"success": True, "batchId": self.batch_id},
+                    })
+                    return "✅ 已加入草稿"
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {
+                    "batchId": self.batch_id,
+                    "contentVersion": 1 if self.items else 0,
+                    "items": list(self.items),
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+        result = await scenario.execute(FakeContext())
+        self.assertEqual(result["facts"]["resolvedWords"], list(S19_ADVERTISED_WORDS[:-2]))
+        self.assertEqual(result["facts"]["excludedWords"], ["天选打工人", "沙县小吃"])
+        self.assertEqual(result["facts"]["confirmationSteps"], 1)
+        self.assertEqual(result["facts"]["outOfSnapshotControl"], "ASK-without-write")
+        self.assertEqual(result["facts"]["batchId"], "batch-s19")
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module

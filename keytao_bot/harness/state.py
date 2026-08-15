@@ -66,7 +66,29 @@ class PendingToolConfirm:
     confirmation_source: str = "local_preview"
 
 
-PendingState = Union[PendingAddWord, PendingToolConfirm, None]
+@dataclass(frozen=True)
+class AdvertisedWordSetSnapshot:
+    """One actor-owned word universe derived from a server batch lookup."""
+
+    token: str
+    words: Tuple[str, ...]
+    created_at: float
+    expires_at: float
+
+
+@dataclass
+class PendingAdvertisedWordSets:
+    """Live advertised universes awaiting one set-reference selection."""
+
+    snapshots: List[AdvertisedWordSetSnapshot] = field(default_factory=list)
+
+
+PendingState = Union[
+    PendingAddWord,
+    PendingAdvertisedWordSets,
+    PendingToolConfirm,
+    None,
+]
 
 
 @dataclass
@@ -394,13 +416,23 @@ class MemoryConversationStateStore:
         # bare "confirm" sent for a consumed ticket could authorize whichever
         # replacement ticket happens to be current when the message arrives.
         requires_reconfirmation = is_mutating_pending or previous is not None
+        advertised_created_at = (
+            min(snapshot.created_at for snapshot in state.snapshots)
+            if isinstance(state, PendingAdvertisedWordSets) and state.snapshots
+            else now
+        )
+        advertised_expires_at = (
+            max(snapshot.expires_at for snapshot in state.snapshots)
+            if isinstance(state, PendingAdvertisedWordSets) and state.snapshots
+            else now + self._pending_ttl_seconds
+        )
         record = PendingStateRecord(
             state=state,
             owner_key=address,
             space_key=address.space_key,
             owner_label=owner_label,
-            created_at=now,
-            expires_at=now + self._pending_ttl_seconds,
+            created_at=advertised_created_at,
+            expires_at=advertised_expires_at,
             nonce=uuid.uuid4().hex,
             origin_message_id=str(origin_message_id or ""),
             requires_reconfirmation=requires_reconfirmation,
@@ -426,6 +458,104 @@ class MemoryConversationStateStore:
         if saved:
             mark_turn_outcome("asked-confirmation")
         return saved
+
+    def add_advertised_word_set(
+        self,
+        key: ConversationKey,
+        words: Tuple[str, ...] | List[str],
+        *,
+        space_key: Optional[SpaceKey] = None,
+        owner_label: str = "",
+    ) -> str:
+        """Append one bounded server-derived universe without replacing a ticket."""
+        normalized = tuple(dict.fromkeys(
+            str(word or "").strip()
+            for word in words
+            if str(word or "").strip()
+        ))
+        if len(normalized) < 2 or len(normalized) > self._max_pending_items:
+            return ""
+        if any(len(word.encode("utf-8")) > 512 for word in normalized):
+            return ""
+        self._purge_expired()
+        address = normalize_conversation_key(key, space_key)
+        current = self._records.get(address)
+        if current is not None and not isinstance(
+            current.state,
+            PendingAdvertisedWordSets,
+        ):
+            return ""
+        now = self._clock()
+        snapshots = list(
+            current.state.snapshots
+            if current is not None
+            and isinstance(current.state, PendingAdvertisedWordSets)
+            else []
+        )
+        snapshots = [
+            snapshot
+            for snapshot in snapshots
+            if snapshot.expires_at > now and snapshot.words != normalized
+        ]
+        token = uuid.uuid4().hex
+        snapshots.append(AdvertisedWordSetSnapshot(
+            token=token,
+            words=normalized,
+            created_at=now,
+            expires_at=now + self._pending_ttl_seconds,
+        ))
+        if len(snapshots) > 4:
+            return ""
+        saved = self.set(
+            address,
+            PendingAdvertisedWordSets(snapshots=snapshots),
+            space_key=address.space_key,
+            owner_label=owner_label,
+        )
+        return token if saved else ""
+
+    def advertised_word_sets(
+        self,
+        key: ConversationKey,
+    ) -> Tuple[AdvertisedWordSetSnapshot, ...]:
+        """Return only live universes owned by this exact conversation actor."""
+        record = self.get_record(key)
+        if record is None or not isinstance(
+            record.state,
+            PendingAdvertisedWordSets,
+        ):
+            return ()
+        return tuple(record.state.snapshots)
+
+    def replace_advertised_word_set(
+        self,
+        key: ConversationKey,
+        token: str,
+        pending: PendingToolConfirm,
+        *,
+        space_key: Optional[SpaceKey] = None,
+        owner_label: str = "",
+    ) -> bool:
+        """Consume one exact advertised snapshot by replacing it with its ticket."""
+        record = self.get_record(key)
+        if (
+            record is None
+            or record.execution_id
+            or not isinstance(record.state, PendingAdvertisedWordSets)
+            or sum(
+                1
+                for snapshot in record.state.snapshots
+                if snapshot.token == token
+            )
+            != 1
+        ):
+            return False
+        return self.set(
+            record.owner_key,
+            pending,
+            space_key=space_key or record.space_key,
+            owner_label=owner_label or record.owner_label,
+        )
 
     def pop(self, key: ConversationKey) -> PendingState:
         record = self.pop_record(key)
@@ -592,6 +722,11 @@ class MemoryConversationStateStore:
                 and left.args == right.args
                 and left.confirmation_source == right.confirmation_source
             )
+        if isinstance(left, PendingAdvertisedWordSets) and isinstance(
+            right,
+            PendingAdvertisedWordSets,
+        ):
+            return left.snapshots == right.snapshots
         return left == right
 
     def delete(self, key: ConversationKey) -> None:
@@ -709,6 +844,21 @@ class MemoryConversationStateStore:
 
     def _purge_expired(self) -> None:
         now = self._clock()
+        for address, record in list(self._records.items()):
+            if not isinstance(record.state, PendingAdvertisedWordSets):
+                continue
+            live = [
+                snapshot
+                for snapshot in record.state.snapshots
+                if snapshot.expires_at > now
+            ]
+            if live:
+                record.state.snapshots = live
+                record.created_at = min(snapshot.created_at for snapshot in live)
+                record.expires_at = max(snapshot.expires_at for snapshot in live)
+                self._states[address] = record.state
+            else:
+                record.expires_at = now
         expired = [
             address for address, record in self._records.items()
             if record.expires_at <= now
@@ -747,6 +897,28 @@ class MemoryConversationStateStore:
             return (
                 len(state.word.encode("utf-8")) <= 512
                 and len(state.candidates) <= self._max_pending_items
+            )
+        if isinstance(state, PendingAdvertisedWordSets):
+            if not 1 <= len(state.snapshots) <= 4:
+                return False
+            tokens = [snapshot.token for snapshot in state.snapshots]
+            return bool(
+                len(set(tokens)) == len(tokens)
+                and all(re.fullmatch(r"[0-9a-f]{32}", token) for token in tokens)
+                and all(
+                    2 <= len(snapshot.words) <= self._max_pending_items
+                    and len(set(snapshot.words)) == len(snapshot.words)
+                    and all(
+                        word and len(word.encode("utf-8")) <= 512
+                        for word in snapshot.words
+                    )
+                    and math.isfinite(snapshot.created_at)
+                    and math.isfinite(snapshot.expires_at)
+                    and snapshot.expires_at > snapshot.created_at
+                    for snapshot in state.snapshots
+                )
+                and len(repr(state).encode("utf-8"))
+                <= self._max_pending_payload_bytes
             )
         return len(repr(state).encode("utf-8")) <= self._max_pending_payload_bytes
 

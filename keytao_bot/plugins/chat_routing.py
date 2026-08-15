@@ -11,7 +11,9 @@ from nonebot.log import logger
 
 from ..harness.state import (
     ActiveDraftOperation,
+    AdvertisedWordSetSnapshot,
     PendingAddWord,
+    PendingAdvertisedWordSets,
     PendingState,
     PendingStateRecord,
     PendingToolConfirm,
@@ -28,6 +30,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
+    parse_advertised_set_reference,
     parse_pending_candidate_selection,
 )
 from .chat_adapters import (
@@ -45,6 +48,72 @@ GROUP_TRIGGER_KEYWORD_START = "键道"
 
 
 GROUP_TRIGGER_KEYWORD_ANY = "喵喵"
+
+
+@dataclass(frozen=True)
+class AdvertisedWordSetSelection:
+    """One closed set-subtraction resolution, or a deterministic ASK."""
+
+    matched: bool = False
+    snapshot_token: str = ""
+    resolved_words: Tuple[str, ...] = ()
+    exclusions: Tuple[str, ...] = ()
+    ask: str = ""
+
+
+def _resolve_advertised_word_set_selection(
+    state: PendingState,
+    message_text: str,
+) -> AdvertisedWordSetSelection:
+    """Resolve snapshot minus literal current-message exclusions, fail closed."""
+    if not isinstance(state, PendingAdvertisedWordSets):
+        return AdvertisedWordSetSelection()
+    command = parse_advertised_set_reference(message_text)
+    if not command.matched:
+        return AdvertisedWordSetSelection()
+    snapshots = tuple(state.snapshots)
+    if len(snapshots) != 1:
+        groups = "；".join(
+            f"第{index}组：" + "、".join(snapshot.words)
+            for index, snapshot in enumerate(snapshots, start=1)
+        )
+        return AdvertisedWordSetSelection(
+            matched=True,
+            ask=f"当前有两组仍有效的候选（{groups}）。请先点名要处理哪一组；本次未写入。",
+        )
+    snapshot: AdvertisedWordSetSnapshot = snapshots[0]
+    exclusions = command.exclusions
+    unknown = tuple(word for word in exclusions if word not in snapshot.words)
+    if unknown:
+        return AdvertisedWordSetSelection(
+            matched=True,
+            snapshot_token=snapshot.token,
+            exclusions=exclusions,
+            ask=(
+                "以下暂不添加的词不在刚才的候选中："
+                + "、".join(f"「{word}」" for word in unknown)
+                + "。请只从「"
+                + "、".join(snapshot.words)
+                + "」中选择；本次未写入。"
+            ),
+        )
+    resolved = tuple(word for word in snapshot.words if word not in exclusions)
+    if not resolved:
+        return AdvertisedWordSetSelection(
+            matched=True,
+            snapshot_token=snapshot.token,
+            exclusions=exclusions,
+            ask=(
+                "按这些排除项计算后没有剩余词；请重新说明至少保留哪个词，"
+                "本次未写入。"
+            ),
+        )
+    return AdvertisedWordSetSelection(
+        matched=True,
+        snapshot_token=snapshot.token,
+        resolved_words=resolved,
+        exclusions=exclusions,
+    )
 
 
 _LEADING_COMMAND_PREFIX_RE = re.compile(
@@ -1746,6 +1815,10 @@ def _pending_owner_label(record: PendingStateRecord) -> str:
 def _describe_pending_state(state: PendingState) -> str:
     if isinstance(state, PendingAddWord):
         return f"加词「{state.word}」→ {state.recommended_code}"
+
+    if isinstance(state, PendingAdvertisedWordSets):
+        total_words = sum(len(snapshot.words) for snapshot in state.snapshots)
+        return f"待筛选候选词（{total_words} 个）"
 
     if isinstance(state, PendingToolConfirm):
         if state.function_name == "keytao_batch_add_to_draft":

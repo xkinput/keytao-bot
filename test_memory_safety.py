@@ -34,12 +34,17 @@ from keytao_bot.harness.orchestrator import (
     AgentRuntimeConfig,
 )
 from keytao_bot.harness.state import (
+    AdvertisedWordSetSnapshot,
     ConversationLockStore,
     DraftOperationCoordinator,
     MemoryConversationStateStore,
     PendingAddWord,
+    PendingAdvertisedWordSets,
     PendingToolConfirm,
     SQLiteConversationStateStore,
+)
+from keytao_bot.plugins.chat_routing import (
+    _resolve_advertised_word_set_selection,
 )
 from keytao_bot.harness.tools import (
     PendingCandidateCapability,
@@ -588,6 +593,169 @@ class PendingIsolationTests(unittest.TestCase):
         self.assertIsNone(store.get(related_group))
         self.assertIsNotNone(store.get(unrelated_group))
         self.assertIsNotNone(store.get(other_actor))
+
+
+class AdvertisedWordSetSelectionTests(unittest.TestCase):
+    WORDS = (
+        "显眼包",
+        "嘴替",
+        "松弛感",
+        "天选打工人",
+        "沙县小吃",
+    )
+
+    def setUp(self) -> None:
+        self.now = 2_000.0
+        self.store = MemoryConversationStateStore(
+            pending_ttl_seconds=60.0,
+            max_pending=8,
+            clock=lambda: self.now,
+        )
+        self.owner = ConversationAddress.group(
+            "qq",
+            "865189947",
+            "739497722",
+        )
+
+    def seed(self, words=None) -> str:
+        return self.store.add_advertised_word_set(
+            self.owner,
+            words or self.WORDS,
+            owner_label="Rea",
+        )
+
+    def resolve(self, text: str):
+        state = self.store.get(self.owner)
+        self.assertIsInstance(state, PendingAdvertisedWordSets)
+        return _resolve_advertised_word_set_selection(state, text)
+
+    def test_legacy_exact_message_binding_blocks_the_incident_difference(
+        self,
+    ) -> None:
+        message = (
+            "天选打工人先不要，其他一些可以加，"
+            "沙县小吃也不要，其他可以加"
+        )
+        items = [
+            {
+                "action": "Create",
+                "word": word,
+                "code": f"code{index}",
+                "type": "Phrase",
+            }
+            for index, word in enumerate(self.WORDS[:3])
+        ]
+
+        blocked = ToolExecutor._validate_current_message_binding(
+            "keytao_batch_add_to_draft",
+            {"items": items},
+            ToolContext(current_message=message, writes_allowed=True),
+        )
+
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked.get("blockReason"), "binding_incomplete")
+        self.assertEqual(blocked.get("missing"), ["boundTarget"])
+
+    def test_supported_set_reference_grammar_resolves_exact_difference(self) -> None:
+        grammar = {
+            "其他都加": self.WORDS,
+            "剩下的都加": self.WORDS,
+            "除了天选打工人、沙县小吃其他都加": self.WORDS[:3],
+            "天选打工人 先不要，其他可以加": (
+                "显眼包", "嘴替", "松弛感", "沙县小吃",
+            ),
+            "天选打工人 先不要，其他一些可以加，沙县小吃也不要，其他可以加": self.WORDS[:3],
+        }
+        for text, expected in grammar.items():
+            with self.subTest(text=text):
+                self.store.delete(self.owner)
+                token = self.seed()
+                selection = self.resolve(text)
+                self.assertTrue(selection.matched)
+                self.assertEqual(selection.snapshot_token, token)
+                self.assertEqual(selection.resolved_words, expected)
+                self.assertEqual(selection.ask, "")
+
+    def test_ambiguous_or_invalid_difference_asks_without_consuming(self) -> None:
+        first_token = self.seed()
+        second_token = self.seed(("电子榨菜", "情绪价值", "班味"))
+        self.assertNotEqual(first_token, second_token)
+
+        ambiguous = self.resolve("其他都加")
+
+        self.assertTrue(ambiguous.matched)
+        self.assertIn("两组", ambiguous.ask)
+        self.assertIn("显眼包", ambiguous.ask)
+        self.assertIn("电子榨菜", ambiguous.ask)
+        self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 2)
+
+        self.store.delete(self.owner)
+        self.seed()
+        unknown = self.resolve("火星词先不要，其他都加")
+        self.assertIn("火星词", unknown.ask)
+        self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 1)
+
+        empty = self.resolve(
+            "除了显眼包、嘴替、松弛感、天选打工人、沙县小吃其他都加"
+        )
+        self.assertIn("没有剩余", empty.ask)
+        self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 1)
+
+    def test_snapshot_is_actor_owned_ttl_bound_and_one_shot(self) -> None:
+        token = self.seed()
+        other = ConversationAddress.group("qq", "865189947", "other-user")
+        self.assertEqual(self.store.advertised_word_sets(other), ())
+
+        selection = self.resolve("天选打工人先不要，其他都加")
+        pending = PendingToolConfirm(
+            "keytao_batch_add_to_draft",
+            {
+                "items": [
+                    {"action": "Create", "word": word, "code": f"code{index}"}
+                    for index, word in enumerate(selection.resolved_words)
+                ],
+                "_resolved_advertised_words": list(selection.resolved_words),
+            },
+        )
+        self.assertTrue(
+            self.store.replace_advertised_word_set(
+                self.owner,
+                token,
+                pending,
+                owner_label="Rea",
+            )
+        )
+        self.assertFalse(
+            self.store.replace_advertised_word_set(
+                self.owner,
+                token,
+                pending,
+                owner_label="Rea",
+            )
+        )
+        self.assertIsInstance(self.store.get(self.owner), PendingToolConfirm)
+
+        self.store.delete(self.owner)
+        self.seed()
+        self.now += 61.0
+        self.assertEqual(self.store.advertised_word_sets(self.owner), ())
+        self.assertIsNone(self.store.get(self.owner))
+
+    def test_quoted_framed_or_negated_set_reference_never_matches(self) -> None:
+        for text in (
+            "他说“除了天选打工人其他都加”",
+            "请解释「其他都加」是什么意思",
+            "「天选打工人」先不要，其他都加",
+            "不要执行除了天选打工人其他都加",
+            "如果除了天选打工人其他都加会怎样？",
+        ):
+            with self.subTest(text=text):
+                self.store.delete(self.owner)
+                self.seed()
+                selection = self.resolve(text)
+                self.assertFalse(selection.matched)
+                self.assertEqual(selection.resolved_words, ())
+                self.assertEqual(selection.ask, "")
 
 
 class PendingPersistenceTests(unittest.IsolatedAsyncioTestCase):
@@ -8047,6 +8215,39 @@ class _ReviewedBatchAddSkills:
         ]
 
 
+class _AdvertisedSetSkills:
+    @staticmethod
+    def get_skill_instructions():
+        return ""
+
+    @staticmethod
+    def has_tools():
+        return True
+
+    @staticmethod
+    def get_tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "keytao_lookup_by_words_batch",
+                    "description": "Look up words in one server batch",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "words": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["words"],
+                    },
+                },
+            },
+            *_ReviewedBatchAddSkills.get_tools(),
+        ]
+
+
 class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _reviewed_candidate(word: str, code: str, *, needs_review: bool) -> dict:
@@ -8284,6 +8485,254 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         )
+
+    async def test_server_advertised_set_subtraction_stages_exact_confirmed_batch(
+        self,
+    ) -> None:
+        """The incident sentence resolves server snapshot minus two exclusions."""
+        words = (
+            "显眼包", "嘴替", "松弛感", "电子榨菜", "情绪价值", "班味",
+            "泼天富贵", "精神状态", "职场搭子", "天选打工人", "沙县小吃",
+        )
+        expected = words[:-2]
+        codes = {
+            word: f"a{chr(ord('a') + index)}"
+            for index, word in enumerate(words)
+        }
+        state_store = MemoryConversationStateStore()
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="739497722",
+            space_type="group",
+            space_id="865189947",
+            speaker_name="Rea",
+        )
+
+        async def scan_dispatch(words=None, **_kwargs):
+            return {
+                "success": True,
+                "count": len(words),
+                "results": [
+                    {"success": True, "word": word, "phrases": []}
+                    for word in words
+                ],
+            }
+
+        advertised = (
+            "本次缺少这些常用词：\n"
+            + "\n".join(f"- {word}" for word in words)
+            + "\n直接发「把显眼包、嘴替、松弛感加入草稿」这类指令。"
+        )
+        scan_client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-scan",
+                    "keytao_lookup_by_words_batch",
+                    {"words": list(words)},
+                )],
+            ),
+            _fake_response("stop", advertised),
+        ])
+        scan_orchestrator = AgentOrchestrator(
+            client_factory=lambda: scan_client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_AdvertisedSetSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: scan_dispatch
+                if name == "keytao_lookup_by_words_batch"
+                else None,
+                frozenset({"keytao_lookup_by_words_batch"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        scan_reply = await scan_orchestrator.run("扫描这些常用词", context)
+
+        self.assertEqual(scan_reply, advertised)
+        snapshots = state_store.advertised_word_sets(context.conversation_address)
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0].words, words)
+
+        selection = _resolve_advertised_word_set_selection(
+            state_store.get(context.conversation_address),
+            "天选打工人 先不要，其他一些可以加，沙县小吃也不要，其他可以加",
+        )
+        self.assertEqual(selection.resolved_words, expected)
+        review_calls = []
+        write_calls = []
+        progress_lines = []
+
+        async def review_dispatch(word=None, items=None, **_kwargs):
+            if items is not None:
+                write_calls.append(items)
+                return {"success": True}
+            review_calls.append(word)
+            return self._reviewed_candidate(
+                word,
+                codes[word],
+                needs_review=False,
+            )
+
+        review_client = _FakeClient([
+            _fake_response("stop", "开始处理。"),
+            _fake_response("stop", "模型最终汇总不作为授权来源。"),
+        ])
+        review_orchestrator = AgentOrchestrator(
+            client_factory=lambda: review_client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_AdvertisedSetSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: review_dispatch
+                if name in {
+                    "keytao_prepare_reviewed_add",
+                    "keytao_batch_add_to_draft",
+                }
+                else None,
+                frozenset({
+                    "keytao_prepare_reviewed_add",
+                    "keytao_batch_add_to_draft",
+                }),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        review_reply = await review_orchestrator.run(
+            "天选打工人 先不要，其他一些可以加，沙县小吃也不要，其他可以加",
+            AgentRequestContext(
+                **{
+                    **context.__dict__,
+                    "mutations_allowed": True,
+                    "resolved_advertised_words": expected,
+                    "advertised_snapshot_token": selection.snapshot_token,
+                    "progress_reporter": progress_lines.append,
+                }
+            ),
+        )
+
+        record = state_store.get_record(context.conversation_address)
+        self.assertEqual(review_calls, list(expected))
+        self.assertEqual(write_calls, [])
+        self.assertEqual(progress_lines, [
+            "正在处理「显眼包、嘴替、松弛感…」，已完成 8/9，预计还剩 1 轮"
+        ])
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(record.state.args["_resolved_advertised_words"], list(expected))
+        self.assertEqual(
+            [item["word"] for item in record.state.args["items"]],
+            list(expected),
+        )
+        self.assertIn("已解析为以下 9 个词", review_reply)
+        self.assertIn("显眼包、嘴替、松弛感", review_reply)
+        self.assertIn(pending_batch_confirmation_copy(), review_reply)
+        self.assertNotIn("参数格式错误", review_reply)
+
+    async def test_unrendered_or_incomplete_lookup_set_mints_no_snapshot(self) -> None:
+        words = ("显眼包", "嘴替", "松弛感")
+        state_store = MemoryConversationStateStore()
+        context = AgentRequestContext(platform="qq", user_id="snapshot-control")
+
+        async def dispatch(words=None, **_kwargs):
+            return {
+                "success": True,
+                "count": len(words),
+                "results": [
+                    {"success": True, "word": word, "phrases": []}
+                    for word in words
+                ],
+            }
+
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-scan-control",
+                    "keytao_lookup_by_words_batch",
+                    {"words": list(words)},
+                )],
+            ),
+            _fake_response("stop", "缺少显眼包和嘴替。"),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_AdvertisedSetSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: dispatch
+                if name == "keytao_lookup_by_words_batch"
+                else None,
+                frozenset({"keytao_lookup_by_words_batch"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        await orchestrator.run("扫描", context)
+
+        self.assertEqual(
+            state_store.advertised_word_sets(context.conversation_address),
+            (),
+        )
+
+    async def test_resolved_set_ticket_tamper_is_rejected_before_any_write(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        calls = []
+
+        async def fake_call_tool_function(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("tampered exact-set ticket must not reach a tool")
+
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [
+                    {
+                        "action": "Create",
+                        "word": "显眼包",
+                        "code": "aa",
+                        "type": "Phrase",
+                    },
+                    {
+                        "action": "Create",
+                        "word": "沙县小吃",
+                        "code": "ab",
+                        "type": "Phrase",
+                    },
+                ],
+                "_resolved_advertised_words": ["显眼包", "嘴替"],
+            },
+        )
+        with patch.object(
+            chat_module,
+            "call_tool_function",
+            side_effect=fake_call_tool_function,
+        ):
+            result = await chat_module._execute_confirmed_tool(
+                state,
+                "qq",
+                "739497722",
+            )
+
+        self.assertEqual(calls, [])
+        self.assertIn("候选集合校验失败", result)
+        self.assertIn("未写入", result)
 
     async def test_advertised_candidate_reply_cannot_mint_unreviewed_code(self) -> None:
         """Model copy cannot replace the recommended server-backed code."""
@@ -10407,7 +10856,8 @@ class UnadvertisedAuthorizationToolTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("工具参数格式错误", result)
+        self.assertIn("未开放的工具", result)
+        self.assertNotIn("参数格式错误", result)
         self.assertEqual(len(client.completions.calls), 1)
 
 

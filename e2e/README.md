@@ -52,6 +52,9 @@ S18 declares the `huán/hái`, `chē`, and `huàn` character readings for `还`,
 `车`, and `换`, mirrors the authoritative `还车` whole-word entry as
 `huán chē`, keeps `换车` absent as a pronunciation entry, and seeds `换车@htwe`
 as the exact local dictionary occupant.
+S19 declares authoritative whole-word readings for its 11 advertised common
+words while the scenario repair step removes those words from the local
+dictionary. This keeps the scan result absent and the later review deterministic.
 
 ## Prerequisites
 
@@ -175,6 +178,12 @@ out-of-range mixed selection writes nothing and leaks no policy identifiers,
 then sends one multi-number reply. The exact two-item set must land in one batch,
 the duplicate item keeps its manual-review seal, the empty item keeps its own
 audit verdict, and submission may use at most one server-bound `确认` step.
+
+S19 replays the oversized advertised-set incident. It scans and renders 11
+server-derived absent words, proves an out-of-snapshot exclusion asks without
+writing, then sends `天选打工人先不要，其他可以加，沙县小吃也不要`. The nine-word
+remainder must emit an 8/9 progress line, require one confirmation, and reach
+one draft batch with no excluded or extra words and no `参数格式错误` diagnosis.
 
 Optional overrides:
 
