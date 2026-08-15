@@ -906,17 +906,27 @@ async def guarded_fetch(
     *,
     params: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
+    method: str = "GET",
+    json_body: Optional[Dict[str, Any]] = None,
     max_bytes: int = MAX_FETCH_BYTES,
     max_hops: int = MAX_REDIRECT_HOPS,
     timeout: Optional[float] = None,
 ) -> FetchResult:
-    """Fetch a possibly-hostile URL safely.
+    """Request a possibly-hostile URL safely.
 
     Validates and pins every hop, caps the body on the wire, and follows at most
-    ``max_hops`` redirects. Raises :class:`BlockedUrlError` when a hop targets a
-    forbidden address or the redirect budget is exhausted.
+    ``max_hops`` redirects. ``GET`` remains the default; ``POST`` exists only
+    for read-shaped third-party search endpoints such as Exa. Raises
+    :class:`BlockedUrlError` when a hop targets a forbidden address or the
+    redirect budget is exhausted.
     """
     from urllib.parse import urljoin, urlparse
+
+    normalized_method = str(method or "GET").upper()
+    if normalized_method not in {"GET", "POST"}:
+        raise BlockedUrlError(f"guarded egress 不支持 HTTP {normalized_method}")
+    if normalized_method == "GET" and json_body is not None:
+        raise BlockedUrlError("guarded GET 不接受 JSON 请求体")
 
     client = await get_guarded_client()
     current_url = _absolutize(url, params)
@@ -938,12 +948,17 @@ async def guarded_fetch(
         request_headers["Host"] = host_header
 
         async with external_fetch_semaphore():
+            stream_kwargs = {
+                "headers": request_headers,
+                "extensions": {"sni_hostname": sni_hostname},
+                "timeout": timeout if timeout is not None else _EXTERNAL_TIMEOUT,
+            }
+            if json_body is not None:
+                stream_kwargs["json"] = json_body
             async with client.stream(
-                "GET",
+                normalized_method,
                 pinned_url,
-                headers=request_headers,
-                extensions={"sni_hostname": sni_hostname},
-                timeout=timeout if timeout is not None else _EXTERNAL_TIMEOUT,
+                **stream_kwargs,
             ) as response:
                 _assert_peer_allowed(response, current_url)
                 if response.status_code in _REDIRECT_STATUS:

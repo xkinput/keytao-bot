@@ -12,6 +12,7 @@ Covers:
 Run with: uv run python test_security_fixes.py
 """
 import asyncio
+import base64
 import importlib.util
 import ipaddress
 import json
@@ -532,6 +533,329 @@ def test_jina_reader_prefix_applied_once():
 
     bare = web_tools._jina_reader_url("example.com/a")
     check("scheme-less target gets https", bare == "https://r.jina.ai/https://example.com/a")
+
+
+def test_web_channel_detection_and_registry():
+    print("\n[test] web channel detection and registry")
+
+    check(
+        "GitHub URL selects the GitHub channel",
+        web_tools.detect_url_channel("https://github.com/Panniantong/agent-reach") == "github",
+    )
+    check(
+        "RSS URL selects the RSS channel",
+        web_tools.detect_url_channel("https://example.com/news/feed.xml") == "rss",
+    )
+    check(
+        "RSS shape wins even on a platform host",
+        web_tools.detect_url_channel("https://github.com/example/repo/releases.atom") == "rss",
+    )
+    check(
+        "markdown URL selects the plain-text channel",
+        web_tools.detect_url_channel("https://example.com/README.md") == "plain-text",
+    )
+    check(
+        "X URL selects the disabled Twitter channel",
+        web_tools.detect_url_channel("https://x.com/example/status/1") == "twitter",
+    )
+    check(
+        "query site intent selects GitHub",
+        web_tools.detect_query_channel("agent reach site:github.com") == "github",
+    )
+    check(
+        "Chinese query intent selects Xiaohongshu",
+        web_tools.detect_query_channel("帮我搜一下小红书上的键道讨论") == "xiaohongshu",
+    )
+    check(
+        "generic query selects web search",
+        web_tools.detect_query_channel("键道 输入法 最新版本") == "web",
+    )
+    check(
+        "RSS query intent selects the RSS channel",
+        web_tools.detect_query_channel("找一下项目的 RSS feed") == "rss",
+    )
+
+    login_channels = {
+        "twitter", "reddit", "facebook", "instagram", "tiktok",
+        "xiaohongshu", "linkedin",
+    }
+    check(
+        "all login-session channels are explicitly registered",
+        login_channels <= set(web_tools.CHANNEL_REGISTRY),
+    )
+    check(
+        "all login-session channels are disabled",
+        all(not web_tools.CHANNEL_REGISTRY[name]["enabled"] for name in login_channels),
+    )
+
+
+def test_web_channel_failover_order_and_reasons():
+    print("\n[test] web channel failover order and reasons")
+
+    async def _run():
+        original_validate = web_tools._validate_fetch_target
+        original_backends = dict(web_tools.FETCH_BACKENDS)
+
+        async def allow_target(_url):
+            return None
+
+        async def run_case(url, expected_channel, expected_order):
+            calls = []
+
+            async def first(_url, _max_chars):
+                calls.append(expected_order[0])
+                raise web_tools.EmptyBackendResult("没有提取到正文")
+
+            async def second(_url, max_chars):
+                calls.append(expected_order[1])
+                return {
+                    "success": True,
+                    "url": url,
+                    "title": "ok",
+                    "description": "",
+                    "text": "body"[:max_chars],
+                    "truncated": False,
+                    "provider": expected_order[1],
+                }
+
+            web_tools.FETCH_BACKENDS[expected_order[0]] = first
+            web_tools.FETCH_BACKENDS[expected_order[1]] = second
+            result = await web_tools.web_fetch(url, max_chars=800)
+            check(f"{expected_channel} follows its ordered failover chain", calls == expected_order[:2])
+            check(f"{expected_channel} records the empty-attempt reason", result["attempts"][0] == {
+                "backend": expected_order[0],
+                "status": "empty",
+                "reason": "没有提取到正文",
+            })
+            check(f"{expected_channel} records the successful attempt", result["attempts"][1]["status"] == "success")
+            check(f"{expected_channel} reports the detected channel", result.get("channel") == expected_channel)
+
+        try:
+            web_tools._validate_fetch_target = allow_target
+            await run_case(
+                "https://example.com/article",
+                "web",
+                ["jina-reader", "direct"],
+            )
+            await run_case(
+                "https://github.com/Panniantong/agent-reach",
+                "github",
+                ["github-rest", "jina-reader", "direct"],
+            )
+            await run_case(
+                "https://example.com/feed.xml",
+                "rss",
+                ["rss-parser", "jina-reader", "direct"],
+            )
+            await run_case(
+                "https://example.com/README.md",
+                "plain-text",
+                ["plain-text", "jina-reader", "direct"],
+            )
+        finally:
+            web_tools._validate_fetch_target = original_validate
+            web_tools.FETCH_BACKENDS.clear()
+            web_tools.FETCH_BACKENDS.update(original_backends)
+
+    asyncio.run(_run())
+
+
+def test_disabled_web_channel_message_is_honest():
+    print("\n[test] disabled web channel honesty")
+
+    async def _run():
+        result = await web_tools.web_fetch("https://www.instagram.com/example/")
+        check("disabled channel fails clearly", result.get("success") is False)
+        check(
+            "disabled channel uses the required login-session message",
+            result.get("error") == "该渠道需要登录会话，本服务器未启用",
+        )
+        check("disabled channel includes a reason", bool(result.get("reason")))
+        check("disabled channel is named", result.get("channel") == "instagram")
+
+        search = await web_tools.web_search("site:reddit.com 键道 输入法")
+        check("disabled search intent uses the same honest message", search.get("error") == result.get("error"))
+        check("disabled search intent makes no provider attempts", search.get("attempts") == [])
+
+    asyncio.run(_run())
+
+
+def test_every_new_fetch_backend_rejects_private_targets():
+    print("\n[test] every new fetch backend applies SSRF guards")
+
+    async def _run():
+        for backend in (
+            "jina-reader", "direct", "github-rest", "rss-parser", "plain-text",
+        ):
+            rejected = False
+            try:
+                await web_tools.FETCH_BACKENDS[backend]("http://127.0.0.1/private", 800)
+            except web_tools.BlockedUrlError:
+                rejected = True
+            check(f"{backend} rejects a private-IP target", rejected)
+
+    asyncio.run(_run())
+
+
+def test_github_rest_shapes_and_rss_parser_are_bounded():
+    print("\n[test] GitHub REST shapes and bounded RSS parser")
+
+    repo = web_tools._github_api_target("https://github.com/openai/openai-python")
+    issue = web_tools._github_api_target("https://github.com/openai/openai-python/issues/123")
+    readme = web_tools._github_api_target(
+        "https://github.com/openai/openai-python/blob/main/README.md"
+    )
+    raw_file = web_tools._github_api_target(
+        "https://raw.githubusercontent.com/openai/openai-python/main/README.md"
+    )
+    check("repository URL maps to the REST repository shape", repo == (
+        "https://api.github.com/repos/openai/openai-python", "repo",
+    ))
+    check("issue URL maps to the REST issue shape", issue == (
+        "https://api.github.com/repos/openai/openai-python/issues/123", "issue",
+    ))
+    check("README URL maps to the contents endpoint", readme == (
+        "https://api.github.com/repos/openai/openai-python/contents/README.md?ref=main", "file",
+    ))
+    check("raw file URL maps to the same contents endpoint", raw_file == readme)
+
+    encoded = base64.b64encode(("README body " * 200).encode()).decode()
+    title, _description, text = web_tools._render_github_payload({
+        "name": "README.md", "encoding": "base64", "content": encoded,
+    }, "file", 800)
+    check("GitHub file content is decoded", title == "README.md" and text.startswith("README body"))
+    check("GitHub file content obeys max_chars", len(text) == 800)
+
+    rss = """<?xml version="1.0"?>
+    <rss><channel><title>Example Feed</title><description>Feed summary</description>
+    <item><title>First item</title><description><![CDATA[<p>正文内容</p>]]></description>
+    <link>https://example.com/1</link></item></channel></rss>"""
+    parsed_rss = web_tools._parse_rss_or_atom(rss, 800)
+    check("RSS title is parsed", parsed_rss["title"] == "Example Feed")
+    check("RSS item text and link are parsed", "First item" in parsed_rss["text"] and "https://example.com/1" in parsed_rss["text"])
+
+    atom = """<feed xmlns="http://www.w3.org/2005/Atom"><title>Atom Feed</title>
+    <entry><title>Atom item</title><summary>Atom body</summary>
+    <link href="https://example.com/a" /></entry></feed>"""
+    parsed_atom = web_tools._parse_rss_or_atom(atom, 24)
+    check("Atom namespaces and href links are parsed", parsed_atom["title"] == "Atom Feed")
+    check("Atom output obeys max_chars", len(parsed_atom["text"]) <= 24)
+
+    blocked_doctype = False
+    try:
+        web_tools._parse_rss_or_atom("<!DOCTYPE rss><rss />", 800)
+    except web_tools.EmptyBackendResult:
+        blocked_doctype = True
+    check("RSS parser refuses DOCTYPE entity surfaces", blocked_doctype)
+
+
+def test_search_channel_keeps_cjk_order_and_records_failover():
+    print("\n[test] search channel CJK order and failover reasons")
+
+    cjk_chain = web_tools.search_backend_chain("中文查询", channel="web", exa_enabled=False)
+    latin_chain = web_tools.search_backend_chain("english query", channel="web", exa_enabled=False)
+    check(
+        "CJK search keeps all four existing backends in order",
+        cjk_chain == ["so360", "bing", "duckduckgo-html", "duckduckgo-lite"],
+    )
+    check(
+        "Latin search keeps all four existing backends in order",
+        latin_chain == ["bing", "duckduckgo-html", "duckduckgo-lite", "so360"],
+    )
+    check(
+        "configured Exa joins ahead of the existing chain",
+        web_tools.search_backend_chain("中文查询", channel="web", exa_enabled=True)
+        == ["exa", *cjk_chain],
+    )
+
+    async def _run():
+        original = web_tools._search_with_provider
+        calls = []
+
+        async def fake(provider, _query, _max_results):
+            calls.append(provider)
+            if provider == "so360":
+                raise RuntimeError("连接失败")
+            if provider == "bing":
+                return []
+            return [{
+                "title": "结果",
+                "url": "https://example.com/result",
+                "snippet": "摘要",
+                "provider": provider,
+            }]
+
+        try:
+            web_tools._search_with_provider = fake
+            result = await web_tools.web_search("中文查询", max_results=1)
+        finally:
+            web_tools._search_with_provider = original
+
+        check("search fails over error then empty then success", calls == cjk_chain[:3])
+        check(
+            "search records every attempt reason",
+            [(item["status"], item["reason"]) for item in result["attempts"]]
+            == [("error", "连接失败"), ("empty", "未返回结果"), ("success", "返回 1 条结果")],
+        )
+
+    asyncio.run(_run())
+
+
+def test_exa_is_opt_in_and_does_not_forward_secret_on_redirect():
+    print("\n[test] Exa opt-in and redirect secret containment")
+    check(
+        "Exa is absent when explicitly disabled",
+        "exa" not in web_tools.search_backend_chain("query", exa_enabled=False),
+    )
+
+    async def _run():
+        original_key = web_tools._exa_api_key
+        web_tools._exa_api_key = lambda: "test-secret"
+        try:
+            with _PatchedDns({
+                "api.exa.ai": ["93.184.216.34"],
+                "evil.example.com": ["93.184.216.35"],
+            }):
+                with _InstalledGuardedClient(lambda _url: _FakeStreamResponse(
+                    302, headers={"location": "https://evil.example.com/steal"},
+                )) as client:
+                    blocked = False
+                    try:
+                        await web_tools._search_exa("query", 1)
+                    except web_tools.BlockedUrlError:
+                        blocked = True
+        finally:
+            web_tools._exa_api_key = original_key
+
+        check("Exa rejects redirects before forwarding its API key", blocked)
+        check("Exa redirect target is never requested", client.requested == ["https://api.exa.ai/search"])
+
+    asyncio.run(_run())
+
+
+def test_web_channels_doctor_static_mode_is_network_free():
+    print("\n[test] web channels doctor static mode")
+    original = http_client.guarded_fetch
+    calls = []
+
+    async def explode(*_args, **_kwargs):
+        calls.append(True)
+        raise AssertionError("static doctor must not use the network")
+
+    try:
+        http_client.guarded_fetch = explode
+        report = web_tools.web_channels_doctor()
+    finally:
+        http_client.guarded_fetch = original
+
+    check("static doctor makes no network calls", calls == [])
+    check("static doctor identifies its mode", report.get("mode") == "static")
+    check("static doctor reports every channel", len(report.get("channels", [])) == len(web_tools.CHANNEL_REGISTRY))
+    check(
+        "doctor reports configured backend order",
+        next(item for item in report["channels"] if item["channel"] == "web")["fetchBackends"]
+        == ["jina-reader", "direct"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1427,6 +1751,14 @@ if __name__ == "__main__":
     test_connection_is_pinned_to_validated_ip()
     test_params_survive_redirects()
     test_jina_reader_prefix_applied_once()
+    test_web_channel_detection_and_registry()
+    test_web_channel_failover_order_and_reasons()
+    test_disabled_web_channel_message_is_honest()
+    test_every_new_fetch_backend_rejects_private_targets()
+    test_github_rest_shapes_and_rss_parser_are_bounded()
+    test_search_channel_keeps_cjk_order_and_records_failover()
+    test_exa_is_opt_in_and_does_not_forward_secret_on_redirect()
+    test_web_channels_doctor_static_mode_is_network_free()
     test_schema_validation_rejects_bad_arguments()
     test_executor_schema_validation_blocks_dispatch()
     test_batch_item_cap()

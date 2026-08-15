@@ -22,15 +22,17 @@ hardening in this module is deliberately layered:
 from __future__ import annotations
 
 import asyncio
+import base64
 import functools
 import html
 import ipaddress
-import zlib
+import json
 import re
 import socket
+import xml.etree.ElementTree as ElementTree
+import zlib
 from typing import Any, Dict, List, Optional, Tuple
-import base64
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import httpx
 from nonebot.log import logger
@@ -42,6 +44,8 @@ DUCKDUCKGO_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
 DUCKDUCKGO_LITE_ENDPOINT = "https://lite.duckduckgo.com/lite/"
 BING_ENDPOINT = "https://www.bing.com/search"
 SO360_ENDPOINT = "https://www.so.com/s"
+EXA_SEARCH_ENDPOINT = "https://api.exa.ai/search"
+GITHUB_API_PREFIX = "https://api.github.com"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -69,8 +73,298 @@ _HTML_ACCEPT_HEADER = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
 }
 
+_JSON_ACCEPT_HEADER = {
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "keytao-bot-web-search",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+_RSS_ACCEPT_HEADER = {
+    "Accept": "application/atom+xml,application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.5",
+}
+_TEXT_ACCEPT_HEADER = {
+    "Accept": "text/plain,text/markdown;q=0.9,*/*;q=0.5",
+}
+
+LOGIN_REQUIRED_MESSAGE = "该渠道需要登录会话，本服务器未启用"
+_LOGIN_REQUIRED_REASON = "需要复用桌面 Chrome 登录态；共享生产服务器禁止启动浏览器会话"
+
+# Registry entries are data, not executable integrations. Keeping disabled
+# agent-reach channels here makes capability reporting honest without pulling
+# OpenCLI, Chrome, Playwright, MCP clients, or persistent processes into the bot.
+CHANNEL_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "web": {
+        "enabled": True,
+        "fetch_backends": ("jina-reader", "direct"),
+        "search_backends": (),
+        "reason": "通用网页；Jina Reader 主用，hardened direct 备用",
+    },
+    "github": {
+        "enabled": True,
+        "fetch_backends": ("github-rest", "jina-reader", "direct"),
+        "search_backends": ("github-search",),
+        "reason": "公开仓库内容使用 GitHub REST，无需凭据",
+    },
+    "rss": {
+        "enabled": True,
+        "fetch_backends": ("rss-parser", "jina-reader", "direct"),
+        "search_backends": (),
+        "reason": "标准库 XML 解析，响应体先经过 hardened fetch 与字节上限",
+    },
+    "plain-text": {
+        "enabled": True,
+        "fetch_backends": ("plain-text", "jina-reader", "direct"),
+        "search_backends": (),
+        "reason": "纯文本和 Markdown 直接读取",
+    },
+    "youtube": {
+        "enabled": False,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": "本轮跳过：字幕需新增 yt-dlp，且对中文输入法词典机器人的核心用例不足",
+    },
+    "bilibili": {
+        "enabled": False,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": "本轮未接入 bili-cli、OpenCLI 或站点搜索适配器",
+    },
+    "twitter": {
+        "enabled": False,
+        "login_required": True,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": _LOGIN_REQUIRED_REASON,
+    },
+    "reddit": {
+        "enabled": False,
+        "login_required": True,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": _LOGIN_REQUIRED_REASON,
+    },
+    "facebook": {
+        "enabled": False,
+        "login_required": True,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": _LOGIN_REQUIRED_REASON,
+    },
+    "instagram": {
+        "enabled": False,
+        "login_required": True,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": _LOGIN_REQUIRED_REASON,
+    },
+    "tiktok": {
+        "enabled": False,
+        "login_required": True,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": _LOGIN_REQUIRED_REASON,
+    },
+    "xiaohongshu": {
+        "enabled": False,
+        "login_required": True,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": _LOGIN_REQUIRED_REASON,
+    },
+    "linkedin": {
+        "enabled": False,
+        "login_required": True,
+        "fetch_backends": (),
+        "search_backends": (),
+        "reason": _LOGIN_REQUIRED_REASON,
+    },
+}
+
+_CHANNEL_HOSTS = {
+    "github": ("github.com", "raw.githubusercontent.com", "gist.github.com", "api.github.com"),
+    "youtube": ("youtube.com", "youtu.be"),
+    "bilibili": ("bilibili.com", "b23.tv"),
+    "twitter": ("twitter.com", "x.com"),
+    "reddit": ("reddit.com", "redd.it"),
+    "facebook": ("facebook.com", "fb.com"),
+    "instagram": ("instagram.com",),
+    "tiktok": ("tiktok.com",),
+    "xiaohongshu": ("xiaohongshu.com", "xhslink.com"),
+    "linkedin": ("linkedin.com",),
+}
+
+_QUERY_INTENTS = (
+    ("github", (r"\bgithub\b", r"site:\s*(?:www\.)?github\.com")),
+    ("rss", (r"\brss\b", r"\batom\s+feed\b", r"filetype:\s*(?:rss|atom|xml)\b")),
+    ("plain-text", (r"filetype:\s*(?:txt|md|markdown)\b",)),
+    ("youtube", (r"\byoutube\b", r"油管", r"site:\s*(?:www\.)?youtube\.com")),
+    ("bilibili", (r"\bbilibili\b", r"B站", r"site:\s*(?:www\.)?bilibili\.com")),
+    ("twitter", (r"\btwitter\b", r"推特", r"site:\s*(?:www\.)?(?:twitter|x)\.com")),
+    ("reddit", (r"\breddit\b", r"site:\s*(?:www\.)?reddit\.com")),
+    ("facebook", (r"\bfacebook\b", r"site:\s*(?:www\.)?facebook\.com")),
+    ("instagram", (r"\binstagram\b", r"site:\s*(?:www\.)?instagram\.com")),
+    ("tiktok", (r"\btiktok\b", r"site:\s*(?:www\.)?tiktok\.com")),
+    ("xiaohongshu", (r"小红书", r"site:\s*(?:www\.)?xiaohongshu\.com")),
+    ("linkedin", (r"\blinkedin\b", r"领英", r"site:\s*(?:www\.)?linkedin\.com")),
+)
+
+_LAST_BACKEND_STATUS: Dict[str, Dict[str, str]] = {}
+
 
 BlockedUrlError = http_client.BlockedUrlError
+
+
+class EmptyBackendResult(Exception):
+    """A backend completed safely but returned no usable content."""
+
+
+def _host_matches(host: str, candidate: str) -> bool:
+    normalized = (host or "").lower().rstrip(".")
+    return normalized == candidate or normalized.endswith("." + candidate)
+
+
+def detect_url_channel(url: str) -> str:
+    """Classify a URL without making a network request."""
+    parsed = urlparse((url or "").strip())
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower().rstrip("/")
+    if (
+        path.endswith((".rss", ".atom", ".xml"))
+        or path.endswith(("/feed", "/rss", "/atom"))
+    ):
+        return "rss"
+    for channel, hosts in _CHANNEL_HOSTS.items():
+        if any(_host_matches(host, candidate) for candidate in hosts):
+            return channel
+    if path.endswith((".txt", ".text", ".md", ".markdown")):
+        return "plain-text"
+    return "web"
+
+
+def detect_query_channel(query: str) -> str:
+    """Classify explicit host/platform intent in a search query."""
+    value = (query or "").strip()
+    for raw_url in re.findall(r"https?://[^\s<>\]\[()]+", value, flags=re.IGNORECASE):
+        channel = detect_url_channel(raw_url.rstrip(".,，。!?！？;；"))
+        if channel != "web":
+            return channel
+    for channel, patterns in _QUERY_INTENTS:
+        if any(re.search(pattern, value, flags=re.IGNORECASE) for pattern in patterns):
+            return channel
+    return "web"
+
+
+def _exa_api_key() -> Optional[str]:
+    value = http_client.config_value("exa_api_key", "EXA_API_KEY", None)
+    return str(value).strip() if value else None
+
+
+def search_backend_chain(
+    query: str,
+    *,
+    channel: str = "web",
+    exa_enabled: Optional[bool] = None,
+) -> List[str]:
+    """Return the ordered search chain while preserving the legacy CJK order."""
+    legacy = (
+        ["so360", "bing", "duckduckgo-html", "duckduckgo-lite"]
+        if _has_cjk(query)
+        else ["bing", "duckduckgo-html", "duckduckgo-lite", "so360"]
+    )
+    configured = bool(_exa_api_key()) if exa_enabled is None else bool(exa_enabled)
+    prefix = list(CHANNEL_REGISTRY.get(channel, {}).get("search_backends", ()))
+    if configured:
+        prefix.append("exa")
+    return [*prefix, *legacy]
+
+
+def _record_backend_status(channel: str, backend: str, status: str, reason: str) -> None:
+    _LAST_BACKEND_STATUS[f"{channel}:{backend}"] = {
+        "status": status,
+        "reason": str(reason)[:300],
+    }
+
+
+def _safe_reason(value: object) -> str:
+    return (str(value).strip() or "未知原因")[:300]
+
+
+def _disabled_channel_result(
+    channel: str,
+    *,
+    url: Optional[str] = None,
+    query: Optional[str] = None,
+) -> Dict[str, Any]:
+    spec = CHANNEL_REGISTRY[channel]
+    login_required = bool(spec.get("login_required"))
+    error = LOGIN_REQUIRED_MESSAGE if login_required else "该渠道本轮未启用"
+    result: Dict[str, Any] = {
+        "success": False,
+        "channel": channel,
+        "error": error,
+        "reason": str(spec.get("reason") or "未配置可用后端"),
+        "attempts": [],
+    }
+    if url is not None:
+        result["url"] = url
+    if query is not None:
+        result.update({"query": query, "provider": "multi", "results": []})
+    return result
+
+
+def web_channels_doctor() -> Dict[str, Any]:
+    """Return static configuration and last-known in-process status only.
+
+    This function deliberately performs no DNS resolution and no HTTP call.
+    Live probes are separated into :func:`probe_web_channels` and require the
+    standalone script's explicit ``--live`` flag.
+    """
+    exa_enabled = bool(_exa_api_key())
+    channels: List[Dict[str, Any]] = []
+    for channel, spec in CHANNEL_REGISTRY.items():
+        fetch_backends = list(spec.get("fetch_backends", ()))
+        search_cjk = (
+            search_backend_chain("中文", channel=channel, exa_enabled=exa_enabled)
+            if spec.get("enabled")
+            else []
+        )
+        search_latin = (
+            search_backend_chain("english", channel=channel, exa_enabled=exa_enabled)
+            if spec.get("enabled")
+            else []
+        )
+        statuses = {
+            backend: _LAST_BACKEND_STATUS.get(
+                f"{channel}:{backend}",
+                {"status": "unknown", "reason": "本进程尚未调用"},
+            )
+            for backend in dict.fromkeys([*fetch_backends, *search_cjk, *search_latin])
+        }
+        observed = [value.get("status") for value in statuses.values()]
+        if not spec.get("enabled"):
+            channel_status = "disabled"
+        elif "success" in observed:
+            channel_status = "available"
+        elif any(value != "unknown" for value in observed):
+            channel_status = "degraded"
+        else:
+            channel_status = "unknown"
+        channels.append({
+            "channel": channel,
+            "enabled": bool(spec.get("enabled")),
+            "loginRequired": bool(spec.get("login_required")),
+            "reason": str(spec.get("reason") or ""),
+            "fetchBackends": fetch_backends,
+            "searchBackendsCjk": search_cjk,
+            "searchBackendsLatin": search_latin,
+            "lastKnownStatus": channel_status,
+            "backendStatus": statuses,
+        })
+    return {
+        "mode": "static",
+        "liveProbe": False,
+        "exaEnabled": exa_enabled,
+        "channels": channels,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +421,44 @@ async def _validate_fetch_target(url: str) -> Optional[str]:
     return await _resolve_and_validate_host(parsed.hostname, port)
 
 
+async def _require_public_target(url: str) -> None:
+    error = await _validate_fetch_target(url)
+    if error:
+        raise BlockedUrlError(error)
+
+
+async def _guarded_request(
+    url: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    method: str = "GET",
+    json_body: Optional[Dict[str, Any]] = None,
+    max_hops: Optional[int] = None,
+) -> Any:
+    """Use the single guarded egress and its three-retry policy."""
+    normalized_method = method.upper()
+    fetch_options: Dict[str, Any] = {
+        "params": params,
+        "headers": headers,
+        "method": normalized_method,
+        "json_body": json_body,
+    }
+    if max_hops is not None:
+        fetch_options["max_hops"] = max_hops
+    return await http_client.request_with_retries(
+        lambda: http_client.guarded_fetch(url, **fetch_options),
+        method=normalized_method,
+        url=url,
+        # Exa search is a read operation carried over POST and is safe to replay.
+        idempotent=normalized_method in {"GET", "HEAD", "OPTIONS"} or url == EXA_SEARCH_ENDPOINT,
+        max_attempts=4,
+    )
+
+
 async def _get_text(url: str, *, params: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
     """Search-provider fetch through the guarded, IP-pinned egress."""
-    response = await http_client.request_with_retries(
-        lambda: http_client.guarded_fetch(url, params=params),
-        method="GET",
-        url=url,
-    )
+    response = await _guarded_request(url, params=params)
     return response.status_code, response.text
 
 
@@ -308,7 +633,77 @@ def _is_probably_url(value: str) -> bool:
     return bool(parsed.netloc and "." in parsed.netloc)
 
 
+async def _search_exa(query: str, max_results: int) -> List[Dict[str, str]]:
+    api_key = _exa_api_key()
+    if not api_key:
+        raise RuntimeError("Exa 未配置")
+    response = await _guarded_request(
+        EXA_SEARCH_ENDPOINT,
+        method="POST",
+        headers={"x-api-key": api_key, "Content-Type": "application/json"},
+        json_body={
+            "query": query,
+            "numResults": max_results,
+            "contents": {"text": {"maxCharacters": 360}},
+        },
+        # Never forward the API key to a redirect target.
+        max_hops=0,
+    )
+    if not response.is_success:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    try:
+        payload = json.loads(response.text)
+    except (TypeError, ValueError) as error:
+        raise EmptyBackendResult(f"Exa 返回无法解析的 JSON：{error}")
+    results: List[Dict[str, str]] = []
+    for item in payload.get("results", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        snippet = item.get("text")
+        if not snippet:
+            highlights = item.get("highlights")
+            snippet = " ".join(str(value) for value in highlights[:3]) if isinstance(highlights, list) else ""
+        results.append({
+            "title": str(item.get("title") or item.get("url") or "")[:180],
+            "url": str(item.get("url") or ""),
+            "snippet": str(snippet or "")[:360],
+            "provider": "exa",
+        })
+    return _dedupe_results(results, max_results)
+
+
+async def _search_github(query: str, max_results: int) -> List[Dict[str, str]]:
+    cleaned = re.sub(r"site:\s*(?:www\.)?github\.com", " ", query, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bgithub\b", " ", cleaned, flags=re.IGNORECASE).strip() or query
+    response = await _guarded_request(
+        f"{GITHUB_API_PREFIX}/search/repositories",
+        params={"q": cleaned, "per_page": str(max_results)},
+        headers=_JSON_ACCEPT_HEADER,
+    )
+    if not response.is_success:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    try:
+        payload = json.loads(response.text)
+    except (TypeError, ValueError) as error:
+        raise EmptyBackendResult(f"GitHub 返回无法解析的 JSON：{error}")
+    results: List[Dict[str, str]] = []
+    for item in payload.get("items", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        results.append({
+            "title": str(item.get("full_name") or item.get("name") or "")[:180],
+            "url": str(item.get("html_url") or ""),
+            "snippet": str(item.get("description") or "")[:360],
+            "provider": "github-search",
+        })
+    return _dedupe_results(results, max_results)
+
+
 async def _search_with_provider(provider: str, query: str, max_results: int) -> List[Dict[str, str]]:
+    if provider == "exa":
+        return await _search_exa(query, max_results)
+    if provider == "github-search":
+        return await _search_github(query, max_results)
     if provider == "duckduckgo-html":
         status, text = await _get_text(DUCKDUCKGO_HTML_ENDPOINT, params={"q": query, "kl": "cn-zh"})
         if status >= 400:
@@ -412,33 +807,284 @@ def _parse_jina_reader_text(content: str, max_chars: int) -> Dict[str, str]:
     }
 
 
-async def _web_fetch_via_jina(url: str, max_chars: int, reason: str) -> Dict[str, Any]:
+async def _fetch_via_jina(url: str, max_chars: int) -> Dict[str, Any]:
+    await _require_public_target(url)
     reader_url = _jina_reader_url(url)
+    response = await _guarded_request(reader_url)
+    if not response.is_success:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    parsed = _parse_jina_reader_text(response.text, max_chars)
+    if not parsed.get("text"):
+        raise EmptyBackendResult("Jina Reader 没有提取到正文")
+    return {
+        "success": True,
+        "url": parsed.get("url") or url,
+        "status": response.status_code,
+        "title": parsed.get("title", ""),
+        "description": "",
+        "contentType": response.headers.get("content-type", ""),
+        "text": parsed["text"],
+        "truncated": len(parsed["text"]) >= max_chars,
+        "provider": "jina-reader",
+    }
+
+
+async def _web_fetch_via_jina(url: str, max_chars: int, reason: str) -> Dict[str, Any]:
+    """Compatibility wrapper retained for existing direct callers/tests."""
     try:
-        response = await http_client.request_with_retries(
-            lambda: http_client.guarded_fetch(reader_url),
-            method="GET",
-            url=reader_url,
+        return await _fetch_via_jina(url, max_chars)
+    except Exception as error:
+        logger.warning(f"Jina reader fetch failed for {url}: {error}")
+        return {"success": False, "url": url, "error": reason or f"网页抓取失败: {error}"}
+
+
+async def _fetch_direct(url: str, max_chars: int) -> Dict[str, Any]:
+    await _require_public_target(url)
+    response = await _guarded_request(url, headers=_HTML_ACCEPT_HEADER)
+    if not response.is_success:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    raw_text = response.text
+    content_type = response.headers.get("content-type", "")
+    title = _extract_title(raw_text)
+    description = _extract_meta_description(raw_text)
+    extracted = raw_text if "text/plain" in content_type else _extract_main_text(raw_text, max_chars)
+    text = _strip_tags(extracted)[:max_chars].strip()
+    if not text:
+        raise EmptyBackendResult("页面可访问，但没有提取到正文")
+    return {
+        "success": True,
+        "url": response.url,
+        "status": response.status_code,
+        "title": title,
+        "description": description,
+        "contentType": content_type,
+        "text": text,
+        "truncated": len(text) >= max_chars,
+        "provider": "direct",
+    }
+
+
+async def _fetch_plain_text(url: str, max_chars: int) -> Dict[str, Any]:
+    await _require_public_target(url)
+    response = await _guarded_request(url, headers=_TEXT_ACCEPT_HEADER)
+    if not response.is_success:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    text = str(response.text or "").replace("\x00", "").strip()
+    if not text:
+        raise EmptyBackendResult("纯文本响应为空")
+    return {
+        "success": True,
+        "url": response.url,
+        "status": response.status_code,
+        "title": urlparse(response.url).path.rsplit("/", 1)[-1],
+        "description": "",
+        "contentType": response.headers.get("content-type", ""),
+        "text": text[:max_chars],
+        "truncated": len(text) > max_chars,
+        "provider": "plain-text",
+    }
+
+
+def _xml_name(tag: object) -> str:
+    return str(tag).rsplit("}", 1)[-1].lower()
+
+
+def _xml_child_text(node: Any, *names: str) -> str:
+    wanted = {name.lower() for name in names}
+    for child in list(node):
+        if _xml_name(child.tag) in wanted:
+            value = "".join(child.itertext()).strip()
+            if value:
+                return value
+    return ""
+
+
+def _parse_rss_or_atom(content: str, max_chars: int) -> Dict[str, str]:
+    if "<!DOCTYPE" in content.upper():
+        raise EmptyBackendResult("RSS/Atom 包含不允许的 DOCTYPE")
+    try:
+        root = ElementTree.fromstring(content)
+    except ElementTree.ParseError as error:
+        raise EmptyBackendResult(f"不是可解析的 RSS/Atom：{error}")
+
+    is_rss = _xml_name(root.tag) in {"rss", "rdf"}
+    feed = next((child for child in list(root) if _xml_name(child.tag) == "channel"), root)
+    title = _xml_child_text(feed, "title")
+    description = _strip_tags(_xml_child_text(feed, "description", "subtitle"))[:360]
+    entry_names = {"item"} if is_rss else {"entry"}
+    entries = [node for node in feed.iter() if _xml_name(node.tag) in entry_names][:20]
+    lines: List[str] = []
+    for entry in entries:
+        entry_title = _strip_tags(_xml_child_text(entry, "title"))
+        summary = _strip_tags(_xml_child_text(entry, "description", "summary", "content", "encoded"))
+        link = _xml_child_text(entry, "link")
+        if not link:
+            for child in list(entry):
+                if _xml_name(child.tag) == "link" and child.attrib.get("href"):
+                    link = str(child.attrib["href"])
+                    break
+        if not entry_title and not summary:
+            continue
+        item = entry_title or "未命名条目"
+        if summary:
+            item += "\n" + summary[:500]
+        if link:
+            item += "\n" + link
+        lines.append(item)
+    text = "\n\n".join(lines).strip()
+    if not text:
+        raise EmptyBackendResult("RSS/Atom 没有可用条目")
+    return {"title": title, "description": description, "text": text[:max_chars]}
+
+
+async def _fetch_rss(url: str, max_chars: int) -> Dict[str, Any]:
+    await _require_public_target(url)
+    response = await _guarded_request(url, headers=_RSS_ACCEPT_HEADER)
+    if not response.is_success:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    parsed = _parse_rss_or_atom(response.text, max_chars)
+    return {
+        "success": True,
+        "url": response.url,
+        "status": response.status_code,
+        "title": parsed["title"],
+        "description": parsed["description"],
+        "contentType": response.headers.get("content-type", ""),
+        "text": parsed["text"],
+        "truncated": len(parsed["text"]) >= max_chars,
+        "provider": "rss-parser",
+    }
+
+
+def _github_api_target(url: str) -> Tuple[str, str]:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    segments = [unquote(value) for value in parsed.path.split("/") if value]
+    if host == "api.github.com":
+        return url, "api"
+    if host == "raw.githubusercontent.com" and len(segments) >= 4:
+        owner, repo, ref = segments[:3]
+        path = "/".join(segments[3:])
+        endpoint = (
+            f"{GITHUB_API_PREFIX}/repos/{quote(owner)}/{quote(repo)}/contents/"
+            f"{quote(path, safe='/')}?ref={quote(ref, safe='')}"
         )
-        if not response.is_success:
-            raise RuntimeError(f"HTTP {response.status_code}")
-        parsed = _parse_jina_reader_text(response.text, max_chars)
-        if not parsed.get("text"):
-            return {"success": False, "url": url, "error": reason or "网页抓取失败"}
-        return {
-            "success": True,
-            "url": parsed.get("url") or url,
-            "status": response.status_code,
-            "title": parsed.get("title", ""),
-            "description": "",
-            "contentType": response.headers.get("content-type", ""),
-            "text": parsed["text"],
-            "truncated": len(parsed["text"]) >= max_chars,
-            "provider": "jina-reader",
-        }
-    except Exception as exc:
-        logger.warning(f"Jina reader fetch failed for {url}: {exc}")
-        return {"success": False, "url": url, "error": reason or f"网页抓取失败: {exc}"}
+        return endpoint, "file"
+    if host not in {"github.com", "www.github.com"} or len(segments) < 2:
+        raise EmptyBackendResult("不是受支持的 GitHub 公共内容 URL")
+
+    owner, repo = segments[0], segments[1].removesuffix(".git")
+    prefix = f"{GITHUB_API_PREFIX}/repos/{quote(owner)}/{quote(repo)}"
+    if len(segments) == 2:
+        return prefix, "repo"
+    if len(segments) >= 4 and segments[2] == "issues" and segments[3].isdigit():
+        return f"{prefix}/issues/{segments[3]}", "issue"
+    if len(segments) >= 5 and segments[2] in {"blob", "tree"}:
+        ref = segments[3]
+        path = "/".join(segments[4:])
+        return f"{prefix}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}", "file"
+    raise EmptyBackendResult("GitHub URL 不是仓库、文件、README 或 issue 形态")
+
+
+def _decode_github_content(payload: Dict[str, Any]) -> str:
+    encoded = payload.get("content")
+    if not isinstance(encoded, str) or payload.get("encoding") != "base64":
+        return ""
+    try:
+        return base64.b64decode(encoded, validate=False).decode("utf-8", errors="ignore")
+    except (ValueError, TypeError):
+        return ""
+
+
+def _render_github_payload(payload: Any, shape: str, max_chars: int) -> Tuple[str, str, str]:
+    if isinstance(payload, list):
+        rows = [
+            f"{item.get('type', 'item')}: {item.get('name', '')} {item.get('html_url', '')}".strip()
+            for item in payload[:100]
+            if isinstance(item, dict)
+        ]
+        text = "\n".join(rows)
+        return "GitHub directory", "", text[:max_chars]
+    if not isinstance(payload, dict):
+        return "", "", ""
+    if shape == "repo" or payload.get("full_name"):
+        title = str(payload.get("full_name") or payload.get("name") or "")
+        description = str(payload.get("description") or "")
+        text = "\n".join(filter(None, [
+            description,
+            f"Language: {payload.get('language')}" if payload.get("language") else "",
+            f"Stars: {payload.get('stargazers_count')}" if payload.get("stargazers_count") is not None else "",
+            f"Forks: {payload.get('forks_count')}" if payload.get("forks_count") is not None else "",
+            f"Default branch: {payload.get('default_branch')}" if payload.get("default_branch") else "",
+            str(payload.get("html_url") or ""),
+        ]))
+        return title, description[:360], text[:max_chars]
+    if shape == "issue" or (payload.get("number") is not None and payload.get("title")):
+        title = f"#{payload.get('number')} {payload.get('title', '')}".strip()
+        labels = payload.get("labels") if isinstance(payload.get("labels"), list) else []
+        label_names = [str(item.get("name")) for item in labels if isinstance(item, dict) and item.get("name")]
+        text = "\n".join(filter(None, [
+            f"State: {payload.get('state')}" if payload.get("state") else "",
+            f"Labels: {', '.join(label_names)}" if label_names else "",
+            str(payload.get("body") or ""),
+            str(payload.get("html_url") or ""),
+        ]))
+        return title, "", text[:max_chars]
+    decoded = _decode_github_content(payload)
+    if decoded:
+        return str(payload.get("name") or "GitHub file"), "", decoded[:max_chars]
+    return str(payload.get("name") or "GitHub content"), "", json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    )[:max_chars]
+
+
+async def _fetch_github_rest(url: str, max_chars: int) -> Dict[str, Any]:
+    await _require_public_target(url)
+    endpoint, shape = _github_api_target(url)
+    response = await _guarded_request(endpoint, headers=_JSON_ACCEPT_HEADER)
+    if not response.is_success:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    try:
+        payload = json.loads(response.text)
+    except (TypeError, ValueError) as error:
+        raise EmptyBackendResult(f"GitHub 返回无法解析的 JSON：{error}")
+    title, description, text = _render_github_payload(payload, shape, max_chars)
+
+    # A repository URL also exposes its README through the documented REST
+    # shape. Failure here does not discard useful repository metadata.
+    if shape == "repo" and isinstance(payload, dict):
+        readme_url = endpoint.rstrip("/") + "/readme"
+        try:
+            readme_response = await _guarded_request(readme_url, headers=_JSON_ACCEPT_HEADER)
+            if readme_response.is_success:
+                readme_payload = json.loads(readme_response.text)
+                readme = _decode_github_content(readme_payload) if isinstance(readme_payload, dict) else ""
+                if readme:
+                    text = (text + "\n\nREADME\n" + readme)[:max_chars]
+        except Exception as error:
+            logger.debug(f"GitHub README fetch failed for {url}: {error}")
+    if not text.strip():
+        raise EmptyBackendResult("GitHub REST 没有返回可读内容")
+    return {
+        "success": True,
+        "url": url,
+        "status": response.status_code,
+        "title": title,
+        "description": description,
+        "contentType": response.headers.get("content-type", ""),
+        "text": text[:max_chars].strip(),
+        "truncated": len(text) >= max_chars,
+        "provider": "github-rest",
+    }
+
+
+FETCH_BACKENDS = {
+    "jina-reader": _fetch_via_jina,
+    "direct": _fetch_direct,
+    "github-rest": _fetch_github_rest,
+    "rss-parser": _fetch_rss,
+    "plain-text": _fetch_plain_text,
+}
 
 
 async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
@@ -460,52 +1106,43 @@ async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
     if not _is_probably_url(normalized_url):
         return {"success": False, "url": url, "error": "看起来不是有效 URL"}
 
+    channel = detect_url_channel(normalized_url)
+    channel_spec = CHANNEL_REGISTRY[channel]
+    if not channel_spec.get("enabled"):
+        return _disabled_channel_result(channel, url=normalized_url)
+
     target_error = await _validate_fetch_target(normalized_url)
     if target_error:
         logger.warning(f"Web fetch blocked for {normalized_url}: {target_error}")
-        return {"success": False, "url": url, "error": target_error}
+        return {"success": False, "url": url, "channel": channel, "error": target_error, "attempts": []}
 
     max_chars = max(800, min(max_chars, 12000))
-    try:
-        response = await http_client.request_with_retries(
-            lambda: http_client.guarded_fetch(
-                normalized_url,
-                headers=_HTML_ACCEPT_HEADER,
-            ),
-            method="GET",
-            url=normalized_url,
-        )
-        final_url = response.url
-        raw_text = response.text
-        content_type = response.headers.get("content-type", "")
+    attempts: List[Dict[str, str]] = []
+    for backend_name in channel_spec.get("fetch_backends", ()):
+        backend = FETCH_BACKENDS[backend_name]
+        try:
+            result = await backend(normalized_url, max_chars)
+            reason = f"返回 {len(str(result.get('text') or ''))} 字符"
+            attempts.append({"backend": backend_name, "status": "success", "reason": reason})
+            _record_backend_status(channel, backend_name, "success", reason)
+            return {**result, "channel": channel, "attempts": attempts}
+        except EmptyBackendResult as error:
+            reason = _safe_reason(error)
+            attempts.append({"backend": backend_name, "status": "empty", "reason": reason})
+            _record_backend_status(channel, backend_name, "empty", reason)
+        except Exception as error:
+            reason = _safe_reason(error)
+            attempts.append({"backend": backend_name, "status": "error", "reason": reason})
+            _record_backend_status(channel, backend_name, "error", reason)
+            logger.warning(f"Web fetch backend {backend_name} failed for {normalized_url}: {error}")
 
-        title = _extract_title(raw_text)
-        description = _extract_meta_description(raw_text)
-        text = raw_text if "text/plain" in content_type else _extract_main_text(raw_text, max_chars)
-        text = _strip_tags(text)[:max_chars].strip()
-        if not text:
-            return await _web_fetch_via_jina(final_url, max_chars, "页面可访问，但没有提取到正文")
-        return {
-            "success": True,
-            "url": final_url,
-            "status": response.status_code,
-            "title": title,
-            "description": description,
-            "contentType": content_type,
-            "text": text,
-            "truncated": len(text) >= max_chars,
-        }
-    except BlockedUrlError as exc:
-        logger.warning(f"Web fetch blocked for {normalized_url}: {exc}")
-        return {"success": False, "url": url, "error": str(exc)}
-    except httpx.TimeoutException:
-        return await _web_fetch_via_jina(normalized_url, max_chars, "网页抓取超时")
-    except httpx.HTTPError as exc:
-        logger.warning(f"Web fetch HTTP error for {normalized_url}: {exc}")
-        return await _web_fetch_via_jina(normalized_url, max_chars, f"网页抓取失败: {exc}")
-    except Exception as exc:
-        logger.exception(f"Web fetch failed for {normalized_url}: {exc}")
-        return await _web_fetch_via_jina(normalized_url, max_chars, f"网页抓取失败: {exc}")
+    return {
+        "success": False,
+        "url": normalized_url,
+        "channel": channel,
+        "error": "所有可用抓取后端均失败或未返回正文",
+        "attempts": attempts,
+    }
 
 
 async def web_search(query: str, max_results: int = 5, fetch_top_n: int = 0) -> Dict[str, Any]:
@@ -529,36 +1166,60 @@ async def web_search(query: str, max_results: int = 5, fetch_top_n: int = 0) -> 
             "results": [],
         }
 
+    channel = detect_query_channel(normalized_query)
+    channel_spec = CHANNEL_REGISTRY[channel]
+    if not channel_spec.get("enabled"):
+        return _disabled_channel_result(channel, query=normalized_query)
+
     max_results = max(1, min(max_results, 10))
     fetch_top_n = max(0, min(fetch_top_n, 3))
-    providers = (
-        ["so360", "bing", "duckduckgo-html", "duckduckgo-lite"]
-        if _has_cjk(normalized_query)
-        else ["bing", "duckduckgo-html", "duckduckgo-lite", "so360"]
-    )
+    providers = search_backend_chain(normalized_query, channel=channel)
     provider_errors: Dict[str, str] = {}
     merged: List[Dict[str, str]] = []
+    attempts: List[Dict[str, str]] = []
 
     try:
         for provider in providers:
             try:
                 results = await _search_with_provider(provider, normalized_query, max_results)
+                if not results:
+                    attempts.append({"backend": provider, "status": "empty", "reason": "未返回结果"})
+                    _record_backend_status(channel, provider, "empty", "未返回结果")
+                    continue
+                previous_count = len(merged)
                 merged = _dedupe_results(merged + results, max_results)
+                added = len(merged) - previous_count
+                if added <= 0:
+                    attempts.append({"backend": provider, "status": "empty", "reason": "结果均重复"})
+                    _record_backend_status(channel, provider, "empty", "结果均重复")
+                    continue
+                reason = f"返回 {added} 条结果"
+                attempts.append({"backend": provider, "status": "success", "reason": reason})
+                _record_backend_status(channel, provider, "success", reason)
                 if len(merged) >= max_results:
                     break
+            except EmptyBackendResult as exc:
+                reason = _safe_reason(exc)
+                attempts.append({"backend": provider, "status": "empty", "reason": reason})
+                _record_backend_status(channel, provider, "empty", reason)
             except Exception as exc:
-                provider_errors[provider] = str(exc)
+                reason = _safe_reason(exc)
+                provider_errors[provider] = reason
+                attempts.append({"backend": provider, "status": "error", "reason": reason})
+                _record_backend_status(channel, provider, "error", reason)
                 logger.warning(f"Web search provider {provider} failed for {normalized_query}: {exc}")
 
         if not merged:
             return {
                 "success": False,
                 "query": normalized_query,
+                "channel": channel,
                 "provider": "multi",
                 "providersTried": providers,
                 "providerErrors": provider_errors,
                 "error": "没有拿到可用搜索结果，可能是搜索引擎限制或网络异常",
                 "results": [],
+                "attempts": attempts,
             }
 
         fetched_pages: List[Dict[str, Any]] = []
@@ -575,22 +1236,46 @@ async def web_search(query: str, max_results: int = 5, fetch_top_n: int = 0) -> 
         return {
             "success": True,
             "query": normalized_query,
+            "channel": channel,
             "provider": "multi",
             "providersTried": providers,
             "providerErrors": provider_errors,
             "results": merged,
             "fetchedPages": fetched_pages,
             "count": len(merged),
+            "attempts": attempts,
         }
     except Exception as exc:
         logger.exception(f"Web search failed: {exc}")
         return {
             "success": False,
             "query": normalized_query,
+            "channel": channel,
             "provider": "multi",
             "error": f"搜索失败: {exc}",
             "results": [],
+            "attempts": attempts,
         }
+
+
+async def probe_web_channels() -> Dict[str, Any]:
+    """Run explicit lightweight live probes for the standalone doctor script."""
+    probes = {
+        "web": await web_fetch("https://example.com/", max_chars=800),
+        "github": await web_fetch(
+            "https://github.com/Panniantong/agent-reach",
+            max_chars=800,
+        ),
+        "rss": await web_fetch("https://planetpython.org/rss20.xml", max_chars=800),
+        "plain-text": await web_fetch(
+            "https://www.rfc-editor.org/rfc/rfc9110.txt",
+            max_chars=800,
+        ),
+        "search": await web_search("KeyTao 输入法", max_results=1),
+    }
+    report = web_channels_doctor()
+    report.update({"mode": "live", "liveProbe": True, "probes": probes})
+    return report
 
 
 TOOLS = [
@@ -659,3 +1344,9 @@ TOOL_FUNCTIONS = {
     "web_search": web_search,
     "web_fetch": web_fetch,
 }
+
+
+logger.info(
+    "[web_channels] doctor="
+    + json.dumps(web_channels_doctor(), ensure_ascii=False, separators=(",", ":"))
+)
