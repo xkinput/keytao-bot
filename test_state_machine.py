@@ -221,6 +221,12 @@ from keytao_bot.utils.observability import (
     record_model_tool_result_chars,
     set_turn_flow,
 )
+from keytao_bot.utils.pending_confirmation import (
+    advertised_batch_binding_pairs,
+    pending_batch_confirmation_copy,
+    pending_confirmation_copy,
+    scoped_multi_word_candidate_copy,
+)
 import keytao_bot.plugins.openai_chat as openai_chat_module
 
 _lookup_tools_path = os.path.join(
@@ -12568,6 +12574,239 @@ def test_generic_ai_prose_does_not_persist_pending():
     asyncio.run(_run())
 
 
+def test_outgoing_advertisement_requires_matching_live_state():
+    """Every shared assent/selection rendering must be backed at delivery."""
+    print("\n🧪 outgoing advertisement requires matching live state")
+    context = ChatMemoryContext(
+        platform="qq",
+        user_id="739497722",
+        space_type="group",
+        space_id="865189947",
+        speaker_name="Rea",
+    )
+    conv_key = context.conversation_address
+    pairs = (("显眼包", "xybo"), ("嘴替", "zbtk"))
+    incident_summary = (
+        "2 个词审词复核完成，读音、编码和占用状态与之前一致：\n"
+        "审词复核：1. 显眼包 → xybo（空位）…"
+        "2. 嘴替 → zbtk（空位）\n"
+        "将这 2 个词加入草稿并提交，或直接回复「加入并提交」。"
+    )
+    batch_state = PendingToolConfirm(
+        function_name="keytao_batch_add_to_draft",
+        args={
+            "items": [
+                {"action": "Create", "word": word, "code": code}
+                for word, code in pairs
+            ],
+            "_candidate_scopes": [
+                {"word": word, "candidates": [[code, False]]}
+                for word, code in pairs
+            ],
+        },
+    )
+    batch_renderer = (
+        "\n".join(f'- 「{word}」 → {code}' for word, code in pairs)
+        + "\n"
+        + pending_batch_confirmation_copy()
+    )
+    selection_renderer = (
+        batch_renderer
+        + "\n"
+        + scoped_multi_word_candidate_copy(tuple(word for word, _code in pairs))
+    )
+    generic_renderer = "服务端风险待确认。\n" + pending_confirmation_copy()
+
+    store = MemoryConversationStateStore()
+    with (
+        patch.object(openai_chat_module, "conversation_state_store", store),
+        patch.object(openai_chat_module.logger, "info") as info_log,
+        patch.object(openai_chat_module.logger, "warning") as warning_log,
+    ):
+        replaced = openai_chat_module._enforce_advertised_reply_contract(
+            incident_summary,
+            conv_key,
+        )
+        check(
+            "orphan advertisement is replaced before delivery",
+            "加入并提交" not in replaced and "可执行候选状态" in replaced,
+        )
+        check(
+            "orphan replacement names the exact re-review operands",
+            all(word in replaced for word, _code in pairs),
+        )
+        check(
+            "orphan replacement branch is observable",
+            any(
+                "branch=replace_missing_state" in str(call.args[0])
+                for call in warning_log.call_args_list
+                if call.args
+            ),
+        )
+
+        store.set(conv_key, batch_state, owner_label="Rea")
+        for label, rendered in (
+            ("incident-model-summary", incident_summary),
+            ("batch-renderer", batch_renderer),
+            ("selection-renderer", selection_renderer),
+        ):
+            with_bound_state = openai_chat_module._enforce_advertised_reply_contract(
+                rendered,
+                conv_key,
+            )
+            check(
+                f"{label} is unchanged with matching live state",
+                with_bound_state == rendered,
+            )
+
+        store.set(
+            conv_key,
+            PendingToolConfirm(function_name="keytao_submit_batch", args={}),
+            owner_label="Rea",
+        )
+        check(
+            "generic renderer is unchanged with a live confirm state",
+            openai_chat_module._enforce_advertised_reply_contract(
+                generic_renderer,
+                conv_key,
+            )
+            == generic_renderer,
+        )
+        check(
+            "backed delivery branch is observable",
+            any(
+                "branch=send_backed" in str(call.args[0])
+                for call in info_log.call_args_list
+                if call.args
+            ),
+        )
+
+    check(
+        "incident renderer exposes exact binding pairs",
+        advertised_batch_binding_pairs(incident_summary) == pairs,
+    )
+
+
+def test_short_add_submit_copy_distinguishes_quote_without_live_state():
+    """A detected quote is never diagnosed as an absent quote."""
+    print("\n🧪 short add-submit quote/live-state copy matrix")
+
+    class HandlerBot:
+        pass
+
+    class HandlerEvent:
+        original_message = []
+        message = original_message
+
+        @staticmethod
+        def get_plaintext():
+            return "加入并提交"
+
+    incident_summary = (
+        "审词复核：1. 显眼包 → xybo（空位）…"
+        "2. 嘴替 → zbtk（空位）\n"
+        "或直接回复「加入并提交」。"
+    )
+
+    async def run_case(reply_reference):
+        context = ChatMemoryContext(
+            platform="qq",
+            user_id="739497722",
+            space_type="group",
+            space_id="865189947",
+            speaker_name="Rea",
+        )
+        finish = AsyncMock()
+        classifier = AsyncMock(return_value=MessageCommandIntent())
+        main_model = AsyncMock(return_value="unexpected model response")
+        with (
+            patch.object(
+                openai_chat_module,
+                "conversation_state_store",
+                MemoryConversationStateStore(),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=reply_reference),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=context),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_classify_message_command_intent",
+                classifier,
+            ),
+            patch.object(openai_chat_module, "get_ai_response_core", main_model),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+            patch.object(openai_chat_module, "_finish_ai_chat_matcher", finish),
+        ):
+            await openai_chat_module._handle_ai_chat_serialized(
+                HandlerBot(),
+                HandlerEvent(),
+                "qq",
+                "739497722",
+            )
+        return str(finish.await_args.args[0]), classifier, main_model
+
+    async def _run():
+        quoted, quoted_classifier, quoted_model = await run_case(
+            ReplyReferenceInfo(
+                is_reply=True,
+                is_to_bot=True,
+                sender_id="bot-id",
+                sender_name="喵喵",
+                text=incident_summary,
+            )
+        )
+        check(
+            "quoted/no-state copy acknowledges the detected quote",
+            "已检测到你引用" in quoted,
+        )
+        check("quoted/no-state copy never claims no quote", "没有引用" not in quoted)
+        check(
+            "quoted/no-state copy names the exact review words",
+            "显眼包" in quoted and "嘴替" in quoted,
+        )
+        check(
+            "quoted/no-state copy contains no placeholder command",
+            "词条 编码" not in quoted and " XX" not in quoted and "…" not in quoted,
+        )
+        check(
+            "quoted/no-state copy advertises no orphan assent",
+            "回复「加入并提交」" not in quoted,
+        )
+        check(
+            "quoted/no-state case bypasses both models",
+            quoted_classifier.await_count == 0 and quoted_model.await_count == 0,
+        )
+
+        unquoted, unquoted_classifier, unquoted_model = await run_case(
+            ReplyReferenceInfo()
+        )
+        check(
+            "unquoted/no-state copy states the missing live candidate",
+            "当前没有可执行候选状态" in unquoted,
+        )
+        check(
+            "unquoted/no-state copy does not pretend a quote was detected",
+            "已检测到你引用" not in unquoted,
+        )
+        check(
+            "unquoted/no-state copy contains no placeholders",
+            "词条 编码" not in unquoted and " XX" not in unquoted and "…" not in unquoted,
+        )
+        check(
+            "unquoted/no-state case bypasses both models",
+            unquoted_classifier.await_count == 0 and unquoted_model.await_count == 0,
+        )
+
+    asyncio.run(_run())
+
+
 def test_stale_confirmation_short_circuits_only_without_live_state():
     """Expired confirmations get deterministic guidance without stealing real work."""
     print("\n🧪 stale confirmation short-circuit")
@@ -15154,6 +15393,8 @@ if __name__ == "__main__":
     test_image_only_handler_discloses_disabled_vision()
     test_visual_handler_blocks_pending_injection()
     test_generic_ai_prose_does_not_persist_pending()
+    test_outgoing_advertisement_requires_matching_live_state()
+    test_short_add_submit_copy_distinguishes_quote_without_live_state()
     test_stale_confirmation_short_circuits_only_without_live_state()
     test_pending_replay_transport_failure_retains_exact_ticket()
     test_orchestrator_reasoning_round_trip()

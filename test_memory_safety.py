@@ -64,6 +64,7 @@ from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 from keytao_bot.utils.llm_request_gate import RequestWindowGate
 from keytao_bot.utils.pending_confirmation import (
+    advertised_batch_binding_pairs,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     render_executable_suggestion,
@@ -6835,6 +6836,19 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                     f"{tool_name}: {rendered}",
                 )
 
+        for placeholder_command in (
+            "添加 词条 编码 并提交",
+            "添加 XX aa",
+            "添加 甲 XX",
+            "添加 … aa",
+            "添加 甲 ...",
+        ):
+            with self.subTest(placeholder_command=placeholder_command):
+                self.assertEqual(
+                    render_executable_suggestion(placeholder_command),
+                    "",
+                )
+
     async def test_suggestions_never_repeat_model_supplied_codes_missing_from_user_text(self) -> None:
         cases = (
             (
@@ -8747,6 +8761,15 @@ class _AdvertisedSetSkills:
 
 
 class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
+    class _CountingStateStore(MemoryConversationStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.set_count = 0
+
+        def set(self, *args, **kwargs) -> bool:
+            self.set_count += 1
+            return super().set(*args, **kwargs)
+
     @staticmethod
     def _reviewed_candidate(word: str, code: str, *, needs_review: bool) -> dict:
         reason = (
@@ -8870,6 +8893,9 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         """A displayed multi-word candidate becomes one server-backed live ticket."""
+        from keytao_bot.harness import orchestrator as orchestrator_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
         review_calls = []
 
         async def dispatch(word=None, items=None, **_kwargs):
@@ -8911,7 +8937,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ),
             _fake_response("stop", model_reply),
         ])
-        state_store = MemoryConversationStateStore()
+        state_store = self._CountingStateStore()
         orchestrator = AgentOrchestrator(
             client_factory=lambda: client,
             runtime=AgentRuntimeConfig(
@@ -8941,15 +8967,51 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             mutations_allowed=True,
         )
 
-        result = await orchestrator.run(
-            "喵喵 加词 载流 载流子",
-            context,
-        )
+        with patch.object(orchestrator_module.logger, "info") as info_log:
+            result = await orchestrator.run(
+                "喵喵 加词 载流 载流子",
+                context,
+            )
 
         record = state_store.get_record(context.conversation_address)
+        self.assertIsNotNone(record)
+        nonce = record.nonce
+        with (
+            patch.object(
+                chat_module,
+                "conversation_state_store",
+                state_store,
+            ),
+            patch.object(chat_module.logger, "info") as delivery_log,
+        ):
+            delivered = chat_module._enforce_advertised_reply_contract(
+                result,
+                context.conversation_address,
+            )
+        self.assertEqual(delivered, result)
+        self.assertEqual(state_store.set_count, 1)
+        self.assertEqual(
+            state_store.get_record(context.conversation_address).nonce,
+            nonce,
+        )
+        establishment_logs = [
+            str(call.args[0])
+            for call in info_log.call_args_list
+            if call.args
+            and "branch=establish_from_authorized_turn" in str(call.args[0])
+        ]
+        self.assertEqual(len(establishment_logs), 1)
+        self.assertIn(
+            "Saved advertised reviewed batch candidate",
+            establishment_logs[0],
+        )
+        self.assertTrue(any(
+            call.args
+            and "branch=send_backed" in str(call.args[0])
+            for call in delivery_log.call_args_list
+        ))
         self.assertEqual(review_calls, ["载流", "载流子"])
         self.assertEqual(result, advertised_reply)
-        self.assertIsNotNone(record)
         self.assertEqual(record.owner_key, context.conversation_address)
         self.assertIsInstance(record.state, PendingToolConfirm)
         self.assertEqual(record.state.function_name, "keytao_batch_add_to_draft")
@@ -8982,6 +9044,135 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                     "manualReviewReason": "authoritative pronunciation and code agree",
                 },
             ],
+        )
+
+    async def test_read_only_rereview_advertisement_reestablishes_live_ticket(
+        self,
+    ) -> None:
+        """A later record-derived review cannot advertise an unbacked assent."""
+        from keytao_bot.harness import orchestrator as orchestrator_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        codes = {"显眼包": "xybo", "嘴替": "zbtk"}
+        review_calls = []
+
+        async def dispatch(word=None, items=None, **_kwargs):
+            if items is not None:
+                self.fail("re-review must not write before the advertised assent")
+            review_calls.append(word)
+            return self._reviewed_candidate(
+                word,
+                codes[word],
+                needs_review=False,
+            )
+
+        model_reply = (
+            "2 个词审词复核完成，读音、编码和占用状态与之前一致：\n"
+            "审词复核：1. 显眼包 → xybo（空位）…"
+            "2. 嘴替 → zbtk（空位）\n"
+            "将这 2 个词加入草稿并提交，或直接回复「加入并提交」。"
+        )
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[
+                    _named_tool_call(
+                        f"call-rereview-{index}",
+                        "keytao_prepare_reviewed_add",
+                        {"word": word},
+                    )
+                    for index, word in enumerate(codes)
+                ],
+            ),
+            _fake_response("stop", model_reply),
+        ])
+        state_store = self._CountingStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_ReviewedBatchAddSkills(),
+            tool_executor=ToolExecutor(
+                lambda _name: dispatch,
+                frozenset({
+                    "keytao_prepare_reviewed_add",
+                    "keytao_batch_add_to_draft",
+                }),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="739497722",
+            space_type="group",
+            space_id="865189947",
+            speaker_name="Rea",
+            mutations_allowed=False,
+        )
+
+        with patch.object(orchestrator_module.logger, "info") as info_log:
+            result = await orchestrator.run(
+                "请重新复核显眼包和嘴替，确认读音、编码与占用状态",
+                context,
+            )
+
+        record = state_store.get_record(context.conversation_address)
+        self.assertIsNotNone(record)
+        nonce = record.nonce
+        with (
+            patch.object(
+                chat_module,
+                "conversation_state_store",
+                state_store,
+            ),
+            patch.object(chat_module.logger, "info") as delivery_log,
+        ):
+            delivered = chat_module._enforce_advertised_reply_contract(
+                result,
+                context.conversation_address,
+            )
+        self.assertEqual(delivered, result)
+        self.assertEqual(state_store.set_count, 1)
+        self.assertEqual(
+            state_store.get_record(context.conversation_address).nonce,
+            nonce,
+        )
+        establishment_logs = [
+            str(call.args[0])
+            for call in info_log.call_args_list
+            if call.args
+            and "branch=establish_from_server_records" in str(call.args[0])
+        ]
+        self.assertEqual(len(establishment_logs), 1)
+        self.assertIn(
+            "Saved advertised reviewed batch candidate",
+            establishment_logs[0],
+        )
+        self.assertTrue(any(
+            call.args
+            and "branch=send_backed" in str(call.args[0])
+            for call in delivery_log.call_args_list
+        ))
+        self.assertEqual(review_calls, ["显眼包", "嘴替"])
+        self.assertEqual(
+            advertised_batch_binding_pairs(result),
+            (("显眼包", "xybo"), ("嘴替", "zbtk")),
+        )
+        self.assertEqual(record.owner_key, context.conversation_address)
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(record.state.function_name, "keytao_batch_add_to_draft")
+        self.assertEqual(
+            [
+                (item["word"], item["code"])
+                for item in record.state.args["items"]
+            ],
+            [("显眼包", "xybo"), ("嘴替", "zbtk")],
         )
 
     async def test_server_advertised_set_subtraction_stages_exact_confirmed_batch(

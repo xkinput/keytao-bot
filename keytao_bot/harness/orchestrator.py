@@ -28,6 +28,7 @@ from keytao_bot.utils.observability import (
 )
 from keytao_bot.utils.pending_confirmation import (
     advertised_batch_binding_pairs,
+    advertised_reply_contract,
     ensure_multi_word_candidate_copy,
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
@@ -777,13 +778,20 @@ class AgentOrchestrator:
                             authoritative_result_links,
                         )
                 if content.strip():
+                    reply_contract = advertised_reply_contract(content)
                     pending_items = (
                         self._advertised_pending_batch_items(
                             content,
                             trusted_reviewed_items_by_key,
                             trusted_candidate_slots_by_word,
                         )
-                        if context.mutations_allowed and not context.visual_context
+                        if (
+                            not context.visual_context
+                            and (
+                                context.mutations_allowed
+                                or reply_contract.requires_live_state
+                            )
+                        )
                         else None
                     )
                     if pending_items is not None:
@@ -813,11 +821,23 @@ class AgentOrchestrator:
                             owner_label=context.speaker_name,
                         )
                         if not saved:
+                            logger.warning(
+                                "[advertised_reply_contract] "
+                                "branch=replace_state_save_failed "
+                                f"owner={conv_key} items={len(pending_items)}"
+                            )
                             return self._append_authoritative_result_links(
                                 "当前候选无法安全保存；没有执行添加，请重新发送词条。",
                                 authoritative_result_links,
                             )
+                        branch = (
+                            "establish_from_server_records"
+                            if not context.mutations_allowed
+                            else "establish_from_authorized_turn"
+                        )
                         logger.info(
+                            "[advertised_reply_contract] "
+                            f"branch={branch} "
                             "Saved advertised reviewed batch candidate: "
                             f"owner={conv_key} items={len(pending_items)}"
                         )
@@ -1576,7 +1596,9 @@ class AgentOrchestrator:
                 failure_state.get("suggestedCommand") or ""
             ).strip()
             if suggestion:
-                result += "可以改为：\n" + render_executable_suggestion(suggestion)
+                rendered = render_executable_suggestion(suggestion)
+                if rendered:
+                    result += "可以改为：\n" + rendered
             return result
         resend = re.search(
             r"(?:重新|再次|再|原样|重复).{0,10}(?:发送|发一遍|发|输入|说一遍|提交)",
@@ -1614,7 +1636,9 @@ class AgentOrchestrator:
             suggestion
             and cls._normalize_loop_text(suggestion) != normalized_message
         ):
-            result += "可以改为：\n" + render_executable_suggestion(suggestion)
+            rendered = render_executable_suggestion(suggestion)
+            if rendered:
+                result += "可以改为：\n" + rendered
         return result
 
     @staticmethod

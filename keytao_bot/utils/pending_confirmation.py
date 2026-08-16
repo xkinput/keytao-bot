@@ -70,6 +70,13 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
             r"将「(?P<word>[^」\n]{1,128})」加入草稿[？?]?\s*$",
             re.IGNORECASE,
         ),
+        re.compile(
+            r"(?:^|[\n:：;；…]|\.{3,})\s*\d{1,3}[.)、]\s*"
+            r"[「“『]?(?P<word>[\u3400-\u9fffA-Za-z0-9_-]{1,128})[」”』]?\s*"
+            r"(?:→|->)\s*(?P<code>[a-z]{1,12})"
+            r"(?:\s*[（(][^）)\n]{0,64}[）)])?",
+            re.IGNORECASE,
+        ),
     )
     matches = sorted(
         (match for pattern in patterns for match in pattern.finditer(normalized)),
@@ -165,6 +172,20 @@ def advertised_batch_assent_verb(text: str) -> str:
     return match.group("verb") if match is not None else ""
 
 
+_PLACEHOLDER_OPERAND_RE = re.compile(
+    r"(?<![\u3400-\u9fffA-Za-z0-9_])"
+    r"(?:词条|编码|x{2,}|…|\.{3,})"
+    r"(?![\u3400-\u9fffA-Za-z0-9_])",
+    re.IGNORECASE,
+)
+
+
+def advertised_command_has_placeholder(command: str) -> bool:
+    """Reject operand-shaped placeholders from copyable user commands."""
+    normalized = unicodedata.normalize("NFKC", str(command or ""))
+    return _PLACEHOLDER_OPERAND_RE.search(normalized) is not None
+
+
 def render_executable_suggestion(
     command: str,
     *,
@@ -172,7 +193,7 @@ def render_executable_suggestion(
 ) -> str:
     """Render one full copyable line accepted by the command-envelope parser."""
     clean_command = str(command or "").strip()
-    if not clean_command:
+    if not clean_command or advertised_command_has_placeholder(clean_command):
         return ""
     clean_words = tuple(dict.fromkeys(
         str(word or "").strip()
@@ -369,6 +390,70 @@ def scoped_multi_word_candidate_copy(words: tuple[str, ...]) -> str:
     return (
         "多个词的候选编号分别从 1 开始；选择时请带上词条，"
         f"例如「{example} 添加1」；多选请回复「{example} 添加2、4」。"
+    )
+
+
+@dataclass(frozen=True)
+class AdvertisedReplyContract:
+    """Stateful reply forms discovered from the shared advertised vocabulary."""
+
+    generic_assent_forms: tuple[str, ...] = ()
+    batch_assent_forms: tuple[str, ...] = ()
+    candidate_selection: bool = False
+    deictic_batch_command: bool = False
+
+    @property
+    def requires_live_state(self) -> bool:
+        return bool(
+            self.generic_assent_forms
+            or self.batch_assent_forms
+            or self.candidate_selection
+            or self.deictic_batch_command
+        )
+
+
+_ADVERTISED_QUOTE_PAIRS = (
+    ("「", "」"),
+    ("“", "”"),
+    ("『", "』"),
+)
+_DEICTIC_BATCH_ADVERTISEMENT_RE = re.compile(
+    r"(?<!已)(?:将|把)这\s*[1-9]\d{0,2}\s*个词"
+    r"(?:都|全部)?(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿"
+    r"(?:(?:并|然后|再)提交)?"
+)
+
+
+def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
+    """Detect only stateful forms emitted by the shared reply renderers."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+
+    def advertised_forms(forms: tuple[str, ...]) -> tuple[str, ...]:
+        found = []
+        for form in forms:
+            if any(
+                f"回复{left}{form}{right}" in normalized
+                or f"发送{left}{form}{right}" in normalized
+                for left, right in _ADVERTISED_QUOTE_PAIRS
+            ):
+                found.append(form)
+        return tuple(found)
+
+    candidate_selection = any(
+        f" 添加1{right}" in normalized
+        or f" 添加2、4{right}" in normalized
+        for _left, right in _ADVERTISED_QUOTE_PAIRS
+    )
+    return AdvertisedReplyContract(
+        generic_assent_forms=advertised_forms(PENDING_CONFIRM_ADVERTISED_FORMS),
+        batch_assent_forms=advertised_forms((
+            *PENDING_BATCH_ADD_ADVERTISED_FORMS,
+            *PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS,
+        )),
+        candidate_selection=candidate_selection,
+        deictic_batch_command=(
+            _DEICTIC_BATCH_ADVERTISEMENT_RE.search(normalized) is not None
+        ),
     )
 
 

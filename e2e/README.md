@@ -57,6 +57,8 @@ words while the scenario repair step removes those words from the local
 dictionary. This keeps the scan result absent and the later review deterministic.
 S20 reuses the first three S19 word/character declarations for a native-quoted
 batch confirmation and applies the same rig-owned dictionary cleanup.
+S22 reuses the first nine S19 word/character declarations for the orphaned
+re-review advertisement replay and applies the same rig-owned cleanup.
 
 ## Prerequisites
 
@@ -202,6 +204,15 @@ quoted command still cannot authorize. It then takes the bot's own fully
 rendered remediation line (bullet, command quote, and record-derived
 parenthetical included), sends that whole line back verbatim, and requires the
 exact live ticket set to reach one batch.
+
+S22 replays the orphaned re-review advertisement incident. It first establishes
+an exact nine-word candidate list, clears the actor conversation to force state
+loss, then quotes that list while requesting a later read-only review of the
+same exact words. If the re-review advertises `加入并提交`, the delivery contract
+must have rebuilt an actor-owned ticket from same-turn server review records.
+The scenario natively quotes that re-review, sends bare `加入并提交`, and requires
+all nine displayed word/code pairs to reach one batch. It rejects placeholder
+commands and any response claiming no quote was present.
 
 Optional overrides:
 

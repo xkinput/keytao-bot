@@ -88,6 +88,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
     advertised_batch_binding_pairs,
+    advertised_reply_contract,
     ensure_multi_word_candidate_copy,
     parse_pending_candidate_selection,
     pending_batch_confirmation_copy,
@@ -1681,6 +1682,112 @@ async def trace_sensitive_message(bot: Bot, event: Event):
     )
 
 
+def _pending_state_binding_pairs(state: PendingState) -> Tuple[Tuple[str, str], ...]:
+    """Return the exact sealed word/code pairs for delivery-time comparison."""
+    if isinstance(state, PendingToolConfirm):
+        raw_items = state.args.get("items")
+        if not isinstance(raw_items, list):
+            return ()
+        pairs = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return ()
+            word = str(item.get("word") or "").strip()
+            code = str(item.get("code") or "").strip().lower()
+            if not word or not re.fullmatch(r"[a-z]{1,12}", code):
+                return ()
+            pairs.append((word, code))
+        return tuple(pairs)
+    if isinstance(state, PendingAddWord):
+        word = str(state.word or "").strip()
+        code = str(state.recommended_code or "").strip().lower()
+        return ((word, code),) if word and code else ()
+    return ()
+
+
+def _advertised_reply_matches_live_record(
+    response: str,
+    record: Optional[PendingStateRecord],
+) -> bool:
+    """Prove that every advertised stateful form has an actor-owned live target."""
+    contract = advertised_reply_contract(response)
+    if not contract.requires_live_state:
+        return True
+    if record is None or record.execution_id or record.state is None:
+        return False
+
+    state = record.state
+    advertises_batch_action = bool(
+        contract.batch_assent_forms or contract.deictic_batch_command
+    )
+    if advertises_batch_action and not (
+        (
+            isinstance(state, PendingToolConfirm)
+            and state.function_name == "keytao_batch_add_to_draft"
+        )
+        or isinstance(state, PendingAddWord)
+    ):
+        return False
+    if contract.generic_assent_forms and not isinstance(state, PendingToolConfirm):
+        return False
+    if contract.candidate_selection and not (
+        isinstance(state, PendingAddWord)
+        or (
+            isinstance(state, PendingToolConfirm)
+            and isinstance(state.args.get("_candidate_scopes"), list)
+            and bool(state.args.get("_candidate_scopes"))
+        )
+    ):
+        return False
+
+    displayed_pairs = advertised_batch_binding_pairs(response)
+    return (
+        not displayed_pairs
+        or displayed_pairs == _pending_state_binding_pairs(state)
+    )
+
+
+def _enforce_advertised_reply_contract(
+    response: str,
+    conv_key: Optional[ConversationKey],
+) -> str:
+    """Single delivery guard for the advertisement-implies-live-state invariant."""
+    text = str(response or "")
+    contract = advertised_reply_contract(text)
+    if not contract.requires_live_state:
+        return text
+    record = (
+        conversation_state_store.get_record(conv_key)
+        if conv_key is not None
+        else None
+    )
+    displayed_pairs = advertised_batch_binding_pairs(text)
+    if _advertised_reply_matches_live_record(text, record):
+        logger.info(
+            "[advertised_reply_contract] branch=send_backed "
+            f"state={record.state.__class__.__name__} bindings={len(displayed_pairs)}"
+        )
+        return text
+
+    logger.warning(
+        "[advertised_reply_contract] branch=replace_missing_state "
+        f"state={record.state.__class__.__name__ if record is not None else 'none'} "
+        f"bindings={len(displayed_pairs)}"
+    )
+    words = tuple(dict.fromkeys(word for word, _code in displayed_pairs))
+    if words:
+        return (
+            "这份复核消息没有匹配的可执行候选状态，本次不会写入。"
+            "请重新发起这些词的审词复核："
+            + "、".join(words)
+            + "。"
+        )
+    return (
+        "这条消息没有匹配的可执行候选状态，本次不会写入。"
+        "请重新发起对原候选词的审词复核。"
+    )
+
+
 async def _send_event_response(
     bot: Bot,
     event: Event,
@@ -1691,6 +1798,10 @@ async def _send_event_response(
     *,
     emit_metrics: bool = True,
 ) -> bool:
+    text = _enforce_advertised_reply_contract(
+        text,
+        memory_context.conversation_address,
+    )
     text = _assert_plain_user_facing_reply(text)
     try:
         bot_module = bot.__class__.__module__
@@ -2042,6 +2153,11 @@ ai_chat = on_message(rule=should_handle, priority=99, block=True)
 
 async def _finish_ai_chat_matcher(response: str) -> None:
     """Dispatch a matcher reply and close metrics at the same boundary."""
+    memory_context = current_memory_context.get()
+    response = _enforce_advertised_reply_contract(
+        response,
+        memory_context.conversation_address if memory_context is not None else None,
+    )
     try:
         await ai_chat.finish(response)
     finally:
@@ -2058,6 +2174,10 @@ async def _finish_ai_chat_response(
 ) -> None:
     """Send one foreground reply with the existing platform formatting."""
 
+    response = _enforce_advertised_reply_contract(
+        response,
+        memory_context.conversation_address,
+    )
     response = _assert_plain_user_facing_reply(response)
     bot_module = bot.__class__.__module__
     if "telegram" in bot_module.lower():
@@ -2519,7 +2639,14 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
         current_pending = conversation_state_store.get(ctx.conv_key)
         set_turn_flow("pending-confirmation")
         ctx.response = _format_full_add_and_submit_instruction(
-            current_pending if isinstance(current_pending, PendingAddWord) else None
+            current_pending if isinstance(current_pending, PendingAddWord) else None,
+            quoted=ctx.reply_reference.is_reply,
+            referenced_words=tuple(
+                word
+                for word, _code in advertised_batch_binding_pairs(
+                    ctx.reply_reference.text
+                )
+            ),
         )
         remember_conversation(
             ctx.conv_key,
@@ -3468,6 +3595,15 @@ async def _stage_append_ticket_challenge(ctx: TurnContext) -> bool:
     return False
 
 
+async def _stage_enforce_advertised_reply_contract(ctx: TurnContext) -> bool:
+    """Persist only the same state-safe text that the delivery guard will send."""
+    ctx.response = _enforce_advertised_reply_contract(
+        ctx.response,
+        ctx.conv_key,
+    )
+    return False
+
+
 async def _stage_persist_conversation(ctx: TurnContext) -> bool:
     """Production scenario: response history is saved before compaction is scheduled."""
     remember_conversation(
@@ -3530,6 +3666,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_normalize_response,
     _stage_augment_word_query,
     _stage_append_ticket_challenge,
+    _stage_enforce_advertised_reply_contract,
     _stage_persist_conversation,
     _stage_finish_platform_response,
 )

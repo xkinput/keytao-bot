@@ -2059,6 +2059,256 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S22_BATCH_WORDS = S19_ADVERTISED_WORDS[:9]
+
+
+async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
+    """Re-review after state loss must couple its advertisement to a live ticket."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(
+        cleanup.get("success") is True,
+        f"S22 draft cleanup failed: {cleanup}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S22 requires an empty actor draft before candidate discovery",
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    discovery_message = "喵喵 加词 " + " ".join(S22_BATCH_WORDS)
+    messages.append(discovery_message)
+    discovery = await ctx.send_group(discovery_message, to_me=True)
+    replies.append(discovery)
+    discovery_message_id = ctx.last_reply_message_id
+    discovery_pairs = advertised_batch_binding_pairs(discovery)
+    require(
+        discovery_message_id is not None,
+        "S22 discovery did not expose a bot message id",
+    )
+    require(
+        len(discovery_pairs) == len(S22_BATCH_WORDS)
+        and tuple(word for word, _code in discovery_pairs) == S22_BATCH_WORDS,
+        f"S22 discovery did not render the exact nine-word candidate: {discovery}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S22 discovery wrote before assent",
+    )
+
+    # Reproduce the incident's missing-state precondition, then ask a later
+    # read-only turn to re-resolve every word from server review results.
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    rereview_message = (
+        "喵喵 请重新复核这 9 个词的读音、编码和占用状态，"
+        "按候选列表格式逐项重列并说明可用的下一步："
+        + "、".join(S22_BATCH_WORDS)
+    )
+    messages.append(rereview_message)
+    rereview = await ctx.send_group_reply(
+        rereview_message,
+        reply_message_id=discovery_message_id,
+        to_me=True,
+    )
+    replies.append(rereview)
+    rereview_message_id = ctx.last_reply_message_id
+    rereview_pairs = advertised_batch_binding_pairs(rereview)
+    require(
+        rereview_message_id is not None
+        and rereview_message_id != discovery_message_id,
+        "S22 re-review did not expose a distinct bot message id",
+    )
+    require(
+        rereview_pairs == discovery_pairs,
+        f"S22 re-review changed or omitted the exact candidate bindings: {rereview}",
+    )
+    require(
+        "加入并提交" in rereview,
+        f"S22 re-review did not advertise the incident assent path: {rereview}",
+    )
+    require(
+        not any(
+            marker in rereview
+            for marker in (
+                "添加 词条 编码",
+                "加入 词条 编码",
+                "添加 XX",
+                "加入 XX",
+            )
+        ),
+        f"S22 re-review advertised a placeholder command: {rereview}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S22 re-review wrote before the quoted assent",
+    )
+
+    write_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入并提交")
+    assent_reply = await ctx.send_group_reply(
+        "加入并提交",
+        reply_message_id=rereview_message_id,
+        to_me=True,
+    )
+    replies.append(assent_reply)
+    draft = await ctx.draft()
+    completed_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=write_cutoff,
+    )
+    confirmation_steps = 0
+    if not draft.get("items") and not completed_batch_id:
+        require(
+            "确认" in assent_reply or "确认票据" in assent_reply,
+            f"S22 quoted assent neither wrote nor reached confirmation: {assent_reply}",
+        )
+        confirmation_steps = 1
+        messages.append("确认")
+        replies.append(await ctx.send_group("确认", to_me=True))
+        draft = await ctx.draft()
+        completed_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=write_cutoff,
+        )
+
+    batch_status = "Draft"
+    auto_approved = False
+    expected_item_keys = tuple(
+        ("Create", word, code)
+        for word, code in rereview_pairs
+    )
+    if completed_batch_id:
+        batch_id = completed_batch_id
+        completed_batch = await ctx.next_client.get_admin_batch(
+            batch_id=batch_id,
+            admin_token=ctx.admin_token,
+        )
+        actual_item_keys = tuple(
+            item_key(item)
+            for item in completed_batch.get("pullRequests", [])
+            if isinstance(item, dict)
+        )
+        actual_pairs = tuple((word, code) for _action, word, code in actual_item_keys)
+        batch_status = str(completed_batch.get("status") or "")
+        require(
+            batch_status in {"Submitted", "Approved"},
+            f"S22 completed batch did not pass through submission: {completed_batch}",
+        )
+        successful_submit_results = [
+            event.get("result")
+            for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > write_cutoff
+            and event.get("kind") == "tool"
+            and event.get("name") == "keytao_submit_batch"
+            and isinstance(event.get("result"), dict)
+            and event["result"].get("success") is True
+            and str(event["result"].get("batchId") or "") == batch_id
+        ]
+        auto_approved = any(
+            result.get("autoApproved") is True
+            for result in successful_submit_results
+        )
+        if auto_approved or "批次已加入词库" in replies[-1]:
+            require(
+                batch_status == "Approved",
+                f"S22 claimed completed approval without an approved batch: {completed_batch}",
+            )
+        require(
+            advertised_batch_binding_pairs(replies[-1]) == rereview_pairs,
+            f"S22 completion copy did not honestly render the exact batch: {replies[-1]}",
+        )
+    else:
+        batch_id = str(draft.get("batchId") or "")
+        actual_item_keys = tuple(
+            item_key(item)
+            for item in draft.get("items", [])
+            if isinstance(item, dict)
+        )
+        actual_pairs = tuple((word, code) for _action, word, code in actual_item_keys)
+        require(batch_id, f"S22 did not materialize a draft batch: {draft}")
+
+    require(
+        actual_item_keys == expected_item_keys and actual_pairs == rereview_pairs,
+        "S22 advertised path did not land the exact nine words in one batch: "
+        f"status={batch_status}, actual={actual_item_keys}",
+    )
+    linked_batch_ids = batch_link_ids(replies[-1])
+    require(
+        not linked_batch_ids or linked_batch_ids == {batch_id},
+        "S22 completion copy exposed a mismatched batch URL: "
+        f"linked={sorted(linked_batch_ids)}, batch={batch_id}",
+    )
+
+    write_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > write_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(write_events, "S22 advertised path never reached the batch tool")
+    require(
+        any(
+            isinstance(event.get("result"), dict)
+            and event["result"].get("success") is True
+            and str(event["result"].get("batchId") or "") == batch_id
+            for event in write_events
+        ),
+        f"S22 batch tool never materialized the completed batch: {write_events}",
+    )
+    for event in write_events:
+        event_pairs = tuple(
+            (
+                str(item.get("word") or "").strip(),
+                str(item.get("code") or "").strip().lower(),
+            )
+            for item in event.get("arguments", {}).get("items", [])
+            if isinstance(item, dict)
+        )
+        require(
+            event_pairs == rereview_pairs,
+            f"S22 batch tool escaped the re-established ticket: {event}",
+        )
+
+    require(
+        not any("没有引用机器人给出的候选消息" in reply for reply in replies),
+        f"S22 falsely diagnosed a missing quote: {replies}",
+    )
+    require(
+        not any(
+            marker in reply
+            for reply in replies
+            for marker in (
+                "添加 词条 编码",
+                "加入 词条 编码",
+                "添加 XX",
+                "加入 XX",
+            )
+        ),
+        f"S22 exposed a placeholder remediation: {replies}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "advertisedPairs": [list(pair) for pair in rereview_pairs],
+            "discoveryMessageId": discovery_message_id,
+            "rereviewMessageId": rereview_message_id,
+            "forcedStateLoss": True,
+            "confirmationSteps": confirmation_steps,
+            "batchId": batch_id,
+            "batchStatus": batch_status,
+            "autoApproved": auto_approved,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -2081,6 +2331,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S19", "advertised-set subtraction with chunked progress", scenario_s19),
     Scenario("S20", "native-quoted batch assent", scenario_s20),
     Scenario("S21", "assent modifier and rendered remediation closure", scenario_s21),
+    Scenario("S22", "re-review advertisement state coupling", scenario_s22),
 )
 
 

@@ -162,21 +162,52 @@ def _plain_warning_line(warning: Any) -> str:
 
 def _format_full_add_and_submit_instruction(
     state: Optional[PendingAddWord] = None,
+    *,
+    quoted: bool = False,
+    referenced_words: Tuple[str, ...] = (),
 ) -> str:
     """Explain how to bind an add-and-submit command without a native quote."""
-    if isinstance(state, PendingAddWord):
-        example = f"添加 {state.word} {state.recommended_code} 并提交"
-    else:
-        example = "添加 词条 编码 并提交"
+    if not isinstance(state, PendingAddWord):
+        words = tuple(dict.fromkeys(
+            str(word or "").strip()
+            for word in referenced_words
+            if str(word or "").strip()
+        ))
+        if quoted:
+            next_step = (
+                "请重新发起这些词的审词复核：" + "、".join(words) + "。"
+                if words
+                else "请重新发起对原候选词的审词复核。"
+            )
+            return (
+                "已检测到你引用了机器人消息，但这条消息对应的可执行候选状态"
+                "不存在（可能已过期，或发送时未建立）；本次不会写入。"
+                + next_step
+            )
+        return (
+            "当前没有可执行候选状态，本次不会写入。"
+            "请先发送需要复核的具体词条；复核完成后再按新消息中的具体操作继续。"
+        )
+
+    example = f"添加 {state.word} {state.recommended_code} 并提交"
     suggestion = render_executable_suggestion(
         example,
-        words=(state.word,) if isinstance(state, PendingAddWord) else (),
+        words=(state.word,),
     )
+    if quoted:
+        lead = (
+            "已检测到你引用了机器人消息，但引用内容没有匹配当前可执行候选。"
+            "当前候选仍有效，请复制发送下面完整一行：\n"
+        )
+    else:
+        lead = (
+            "没有引用机器人给出的候选消息时，需要把词条和编码写完整，"
+            "请复制发送下面完整一行：\n"
+        )
     return (
-        "没有引用机器人给出的候选消息时，需要把词条和编码写完整，"
-        "请复制发送下面完整一行：\n"
-        f"{suggestion}\n"
-        "也可以直接引用那条候选消息回复「添加并提交」。"
+        lead
+        + suggestion
+        + ("" if quoted else "\n也可以直接引用那条候选消息回复「添加并提交」。")
     )
 
 

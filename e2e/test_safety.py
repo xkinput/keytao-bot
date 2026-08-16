@@ -21,6 +21,7 @@ from .scenarios import (
     S19_ADVERTISED_WORDS,
     S20_BATCH_WORDS,
     S21_BATCH_WORDS,
+    S22_BATCH_WORDS,
 )
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
@@ -255,15 +256,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S19 replays the oversized advertised-set incident", readme)
         self.assertIn("S20 replays native-quoted batch assent", readme)
         self.assertIn("S21 replays the 2026-08-16 advertised-contract incidents", readme)
+        self.assertIn("S22 replays the orphaned re-review advertisement incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s21(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s22(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 22)],
+            [f"S{index}" for index in range(1, 23)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -560,6 +562,27 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             set(S21_BATCH_WORDS),
         )
         self.assertEqual(rows[("entry", "嘴替")], ("zuǐ", "tì"))
+
+    def test_s22_reuses_the_exact_nine_word_incident_fixture(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S22"]
+        self.assertEqual(fixture["probe_words"], S22_BATCH_WORDS)
+        self.assertEqual(S22_BATCH_WORDS, S19_ADVERTISED_WORDS[:9])
+        self.assertEqual(
+            {
+                row["entry"]
+                for row in fixture["rows"]
+                if row["kind"] == "entry"
+            },
+            set(S22_BATCH_WORDS),
+        )
+        self.assertEqual(
+            {
+                row["entry"]
+                for row in fixture["rows"]
+                if row["kind"] == "char"
+            },
+            set("".join(S22_BATCH_WORDS)),
+        )
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
         class FakeBuildResult:
@@ -1413,6 +1436,196 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             "blocked-without-write",
         )
         self.assertEqual(result["facts"]["renderedBatchId"], "batch-s21-rendered")
+
+    async def test_s22_offline_reestablishes_then_quotes_the_exact_nine_word_ticket(
+        self,
+    ) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S22")
+        expected_pairs = tuple(
+            (word, f"a{chr(ord('a') + index)}")
+            for index, word in enumerate(S22_BATCH_WORDS)
+        )
+
+        class FakeContext:
+            admin_token = "offline-admin-token"
+
+            def __init__(self):
+                self.events = []
+                self.completed_batch_id = None
+                self.sequence = 0
+                self.next_client = self
+                self.bot = self
+                self.platform_id = "739497722"
+                self.last_reply_message_id = None
+                self.reset_calls = 0
+                self.reply_requests = []
+
+            def record(
+                self,
+                *,
+                kind,
+                name="",
+                arguments=None,
+                result=None,
+                message="",
+            ):
+                self.sequence += 1
+                event = {"sequence": self.sequence, "kind": kind}
+                if name:
+                    event["name"] = name
+                if arguments is not None:
+                    event["arguments"] = arguments
+                if result is not None:
+                    event["result"] = result
+                if message:
+                    event["message"] = message
+                self.events.append(event)
+
+            async def clean_draft(self, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                return {"success": True, "deleted": 0}
+
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assertEqual(batch_id, self.completed_batch_id)
+                self.assertEqual(admin_token, self.admin_token)
+                return {
+                    "status": "Approved",
+                    "pullRequests": [
+                        {
+                            "action": "Create",
+                            "word": word,
+                            "code": code,
+                            "needsManualReview": False,
+                        }
+                        for word, code in expected_pairs
+                    ],
+                }
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                self.reset_calls += 1
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assertTrue(to_me)
+                if text.startswith("喵喵 加词 "):
+                    self.last_reply_message_id = 501
+                    return (
+                        "首轮候选：\n"
+                        + "\n".join(
+                            f'- 「{word}」 → {code}'
+                            for word, code in expected_pairs
+                        )
+                        + "\n回复「加入并提交」则加入后提交。"
+                    )
+                if text == "确认":
+                    raise AssertionError("offline S22 should not need extra confirmation")
+                raise AssertionError(text)
+
+            async def send_group_reply(
+                self,
+                text: str,
+                *,
+                reply_message_id: int,
+                to_me: bool,
+            ) -> str:
+                self.assertTrue(to_me)
+                self.reply_requests.append((text, reply_message_id))
+                if text.startswith("喵喵 请重新复核这 9 个词"):
+                    self.assertEqual(reply_message_id, 501)
+                    self.last_reply_message_id = 502
+                    self.record(
+                        kind="log",
+                        message=(
+                            "[advertised_reply_contract] "
+                            "branch=establish_from_server_records items=9"
+                        ),
+                    )
+                    return (
+                        "9 个词审词复核完成，读音、编码和占用状态与之前一致：\n"
+                        "审词复核："
+                        + "…".join(
+                            f"{index}. {word} → {code}（空位）"
+                            for index, (word, code) in enumerate(
+                                expected_pairs,
+                                start=1,
+                            )
+                        )
+                        + "\n将这 9 个词加入草稿并提交，"
+                        "或直接回复「加入并提交」。"
+                    )
+                if text == "加入并提交":
+                    self.assertEqual(reply_message_id, 502)
+                    items = [
+                        {"action": "Create", "word": word, "code": code}
+                        for word, code in expected_pairs
+                    ]
+                    self.completed_batch_id = "batch-s22"
+                    self.record(
+                        kind="tool",
+                        name="keytao_batch_add_to_draft",
+                        arguments={"items": list(items)},
+                        result={
+                            "success": True,
+                            "batchId": self.completed_batch_id,
+                        },
+                    )
+                    self.record(
+                        kind="tool",
+                        name="keytao_submit_batch",
+                        result={
+                            "success": True,
+                            "batchId": self.completed_batch_id,
+                            "autoApproved": True,
+                        },
+                    )
+                    return (
+                        "✅ 批次已加入词库！\n"
+                        + "\n".join(
+                            f'- 「{word}」→ {code}'
+                            for word, code in expected_pairs
+                        )
+                        + f"\n草稿地址：http://localhost:3100/batch/{self.completed_batch_id}"
+                    )
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {
+                    "batchId": None,
+                    "contentVersion": 0,
+                    "items": [],
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+            def assertEqual(self, left, right):
+                if left != right:
+                    raise AssertionError((left, right))
+
+            def assertTrue(self, value):
+                if not value:
+                    raise AssertionError(value)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+
+        self.assertEqual(context.reset_calls, 2)
+        self.assertEqual(
+            context.reply_requests[0][1],
+            result["facts"]["discoveryMessageId"],
+        )
+        self.assertEqual(
+            context.reply_requests[1],
+            ("加入并提交", result["facts"]["rereviewMessageId"]),
+        )
+        self.assertTrue(result["facts"]["forcedStateLoss"])
+        self.assertEqual(result["facts"]["confirmationSteps"], 0)
+        self.assertEqual(result["facts"]["batchStatus"], "Approved")
+        self.assertEqual(
+            result["facts"]["advertisedPairs"],
+            [list(pair) for pair in expected_pairs],
+        )
+        self.assertEqual(result["facts"]["batchId"], "batch-s22")
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module
