@@ -7352,6 +7352,109 @@ def test_inline_live_batch_ticket_accepts_bare_advertised_submit():
     asyncio.run(_run())
 
 
+def test_inline_live_batch_modifier_bypasses_both_models():
+    """A closed exclusion modifier is resolved before either model router."""
+    print("\n🧪 inline live batch modifier bypasses both models")
+
+    class HandlerBot:
+        pass
+
+    class HandlerEvent:
+        original_message = []
+        message = original_message
+
+        @staticmethod
+        def get_plaintext():
+            return "都加 跳过嘴替"
+
+    async def _run():
+        user_id = "modifier-batch-actor"
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id=user_id,
+            space_type="group",
+            space_id="modifier-batch-group",
+            speaker_name="Rea",
+        )
+        conv_key = memory_context.conversation_address
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [
+                    {"action": "Create", "word": "显眼包", "code": "xyb"},
+                    {"action": "Create", "word": "嘴替", "code": "zbtk"},
+                ],
+                "batch_id": "batch-modifier",
+                "expected_content_version": 4,
+                "expected_warning_digest": "e" * 64,
+            },
+            confirmation_source="server_warning",
+        )
+        store = MemoryConversationStateStore()
+        store.set(
+            conv_key,
+            state,
+            space_key=("qq", memory_context.space_scope_id),
+            owner_label="Rea",
+        )
+        classifier = AsyncMock(return_value=MessageCommandIntent())
+        main_model = AsyncMock(return_value="unexpected main-model fallback")
+        execute = AsyncMock(return_value="✅ 已加入草稿")
+        finish = AsyncMock(side_effect=FinishedException())
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(openai_chat_module.ai_chat, "finish", finish),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=ReplyReferenceInfo()),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=memory_context),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_classify_message_command_intent",
+                classifier,
+            ),
+            patch.object(openai_chat_module, "_execute_confirmed_tool", execute),
+            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(openai_chat_module, "get_ai_response_core", main_model),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+        ):
+            try:
+                await openai_chat_module._handle_ai_chat_serialized(
+                    HandlerBot(),
+                    HandlerEvent(),
+                    "qq",
+                    user_id,
+                )
+            except FinishedException:
+                pass
+
+        execute.assert_awaited_once()
+        selected_state = execute.await_args.args[0]
+        check(
+            "modifier executes only the record-derived remainder",
+            [item["word"] for item in selected_state.args["items"]]
+            == ["显眼包"],
+        )
+        check(
+            "modifier preserves record CAS fields",
+            selected_state.args["batch_id"] == "batch-modifier"
+            and selected_state.args["expected_content_version"] == 4
+            and selected_state.args["expected_warning_digest"] == "e" * 64,
+        )
+        check("modifier bypasses intent model", classifier.await_count == 0)
+        check("modifier bypasses main model", main_model.await_count == 0)
+        check("modifier consumes the actor ticket once", store.get_record(conv_key) is None)
+
+    asyncio.run(_run())
+
+
 def test_native_quoted_batch_assent_executes_only_the_live_payload():
     """A native batch quote selects but never contributes mutation arguments."""
     print("\n🧪 native quoted batch assent uses live payload")
@@ -11695,6 +11798,60 @@ async def _run_orchestrator_empty_response_retry_checks():
     check("empty final content retries once", len(client.completions.calls) == 2)
     check("retry returns visible reply", result == "已根据已有结果继续处理")
 
+    reasoning_only_client = _FakeClient([
+        _FakeAIResponse(
+            "length",
+            None,
+            reasoning_content="first reasoning-only response",
+        ),
+        _FakeAIResponse(
+            "length",
+            None,
+            reasoning_content="second reasoning-only response",
+        ),
+        _FakeAIResponse(
+            "stop",
+            "third request must never be sent",
+        ),
+    ])
+    reasoning_only_orchestrator = AgentOrchestrator(
+        client_factory=lambda: reasoning_only_client,
+        runtime=AgentRuntimeConfig(
+            model="fake-model",
+            max_tokens=1800,
+            temperature=0.7,
+            timeout=180.0,
+            max_tokens_cap=7200,
+        ),
+        skills_manager=_FakeSkillsManager(),
+        tool_executor=ToolExecutor(lambda name: None, frozenset()),
+        state_store=MemoryConversationStateStore(),
+        bind_help_text="bind help",
+        system_prompt_core="system",
+    )
+
+    reasoning_only_result = await reasoning_only_orchestrator.run(
+        "按当前票据执行",
+        AgentRequestContext(platform="qq", user_id="reasoning-only"),
+    )
+
+    check(
+        "two reasoning-only empty responses cap retries",
+        len(reasoning_only_client.completions.calls) == 2,
+    )
+    check(
+        "reasoning-only retry does not escalate to 7200",
+        [
+            call["max_tokens"]
+            for call in reasoning_only_client.completions.calls
+        ]
+        == [1800, 3600],
+    )
+    check(
+        "reasoning-only cap returns an honest deterministic fallback",
+        "本次未执行" in reasoning_only_result,
+    )
+
 
 async def _run_orchestrator_deepseek_policy_checks():
     client = _FakeClient([_FakeAIResponse("stop", "已完成")])
@@ -14907,6 +15064,7 @@ if __name__ == "__main__":
     test_unquoted_short_add_submit_without_server_snapshot_requires_full_target()
     test_inline_unquoted_add_submit_requires_live_or_target_binding()
     test_inline_live_batch_ticket_accepts_bare_advertised_submit()
+    test_inline_live_batch_modifier_bypasses_both_models()
     test_native_quoted_batch_assent_executes_only_the_live_payload()
     test_target_bound_add_submit_rejects_questions_negation_and_substrings()
     test_draft_suggestion_routes_share_authorization_lead_ins()

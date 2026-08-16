@@ -193,6 +193,16 @@ the exact three-word `显眼包`/`嘴替`/`松弛感` batch, then sends a real O
 word/code pairs must reach one draft batch exactly, with at most one additional
 server-bound confirmation and no `引用文字不能创建或恢复确认权限` response.
 
+S21 replays the 2026-08-16 advertised-contract incidents against a live
+actor-owned two-word batch ticket. Before each ticket is created, the scenario
+cleans and verifies the actor draft and resets its conversation state. It proves
+`都加 跳过X` writes exactly the one-word record-derived remainder, an
+out-of-ticket exclusion asks without a write, and unrelated text outside a
+quoted command still cannot authorize. It then takes the bot's own fully
+rendered remediation line (bullet, command quote, and record-derived
+parenthetical included), sends that whole line back verbatim, and requires the
+exact live ticket set to reach one batch.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`

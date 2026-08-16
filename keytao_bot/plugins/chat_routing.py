@@ -20,6 +20,7 @@ from ..harness.state import (
 )
 from ..harness.tools import (
     _COMMAND_PREFIX_PATTERN,
+    _whole_message_unquoted_source,
     message_authorizes_mutation,
     trusted_mutation_source,
 )
@@ -32,6 +33,7 @@ from ..utils.pending_confirmation import (
     PENDING_CONFIRM_ASSENT_TEXTS,
     parse_advertised_set_reference,
     parse_pending_candidate_selection,
+    render_executable_suggestion,
 )
 from .chat_adapters import (
     AsyncOpenAI,
@@ -48,6 +50,27 @@ GROUP_TRIGGER_KEYWORD_START = "键道"
 
 
 GROUP_TRIGGER_KEYWORD_ANY = "喵喵"
+
+
+_ADVERTISED_COMMAND_QUOTE_SPAN_PATTERNS = (
+    re.compile(r"「(?P<content>[^「」]*)」", re.DOTALL),
+    re.compile(r"“(?P<content>[^“”]*)”", re.DOTALL),
+    re.compile(r"『(?P<content>[^『』]*)』", re.DOTALL),
+)
+
+
+def _has_rejected_advertised_command_envelope(
+    message_text: str,
+    live_words: Tuple[str, ...],
+) -> bool:
+    """Recognize a live-set command quote whose outside residue is not allowed."""
+    if _whole_message_unquoted_source(message_text, live_words) is not None:
+        return False
+    return any(
+        parse_advertised_set_reference(match.group("content")).matched
+        for pattern in _ADVERTISED_COMMAND_QUOTE_SPAN_PATTERNS
+        for match in pattern.finditer(str(message_text or ""))
+    )
 
 
 @dataclass(frozen=True)
@@ -68,10 +91,15 @@ def _resolve_advertised_word_set_selection(
     """Resolve snapshot minus literal current-message exclusions, fail closed."""
     if not isinstance(state, PendingAdvertisedWordSets):
         return AdvertisedWordSetSelection()
-    command = parse_advertised_set_reference(message_text)
+    snapshots = tuple(state.snapshots)
+    live_words = snapshots[0].words if len(snapshots) == 1 else ()
+    source = _whole_message_unquoted_source(
+        message_text,
+        live_words,
+    ) or message_text
+    command = parse_advertised_set_reference(source)
     if not command.matched:
         return AdvertisedWordSetSelection()
-    snapshots = tuple(state.snapshots)
     if len(snapshots) != 1:
         groups = "；".join(
             f"第{index}组：" + "、".join(snapshot.words)
@@ -82,6 +110,17 @@ def _resolve_advertised_word_set_selection(
             ask=f"当前有两组仍有效的候选（{groups}）。请先点名要处理哪一组；本次未写入。",
         )
     snapshot: AdvertisedWordSetSnapshot = snapshots[0]
+    if command.expected_count is not None and command.expected_count != len(snapshot.words):
+        return AdvertisedWordSetSelection(
+            matched=True,
+            snapshot_token=snapshot.token,
+            ask=(
+                f"当前有效候选共有 {len(snapshot.words)} 个，不是指令中的 "
+                f"{command.expected_count} 个。请只从「"
+                + "、".join(snapshot.words)
+                + "」中选择；本次未写入。"
+            ),
+        )
     exclusions = command.exclusions
     unknown = tuple(word for word in exclusions if word not in snapshot.words)
     if unknown:
@@ -104,8 +143,9 @@ def _resolve_advertised_word_set_selection(
             snapshot_token=snapshot.token,
             exclusions=exclusions,
             ask=(
-                "按这些排除项计算后没有剩余词；请重新说明至少保留哪个词，"
-                "本次未写入。"
+                "按这些排除项计算后没有剩余词；当前有效候选为「"
+                + "、".join(snapshot.words)
+                + "」。请重新说明至少保留哪个词，本次未写入。"
             ),
         )
     return AdvertisedWordSetSelection(
@@ -384,11 +424,25 @@ def _pending_tool_assent_intent(
 
 
 def _format_live_ticket_precedence_message(state: PendingToolConfirm) -> str:
-    return (
+    response = (
         f"当前还有一项待确认操作：{_describe_pending_state(state)}。"
         "为避免跳过这张票据，本次没有执行其他写入或提交；"
         "请先确认或取消当前操作。"
     )
+    items, _scopes = _multi_word_candidate_scope_rows(state)
+    words = tuple(
+        str(item.get("word") or "").strip()
+        for item in items
+        if str(item.get("word") or "").strip()
+    )
+    if len(words) >= 2:
+        suggestion = render_executable_suggestion(
+            f"将这 {len(words)} 个词加入草稿",
+            words=words,
+        )
+        if suggestion:
+            response += "\n如需执行当前整批，请复制发送：\n" + suggestion
+    return response
 
 
 def _compact_command_text(message_text: str) -> str:
@@ -1104,6 +1158,78 @@ def _resolve_multi_word_pending_candidate_selection(
     if len(items) < 2:
         return None, None, None
     words = tuple(str(item["word"]).strip() for item in items)
+    unwrapped = _whole_message_unquoted_source(message_text, words)
+    if unwrapped is None and _has_rejected_advertised_command_envelope(
+        message_text,
+        words,
+    ):
+        return None, None, (
+            "命令引号外含有非允许内容；请直接发送完整建议行。"
+            "当前确认票据仍保留，本次未写入。"
+        )
+    set_reference = parse_advertised_set_reference(unwrapped or message_text)
+    if set_reference.matched:
+        if (
+            set_reference.expected_count is not None
+            and set_reference.expected_count != len(words)
+        ):
+            return None, None, (
+                f"当前有效候选共有 {len(words)} 个，不是指令中的 "
+                f"{set_reference.expected_count} 个。请只从「"
+                + "、".join(words)
+                + "」中选择；本次未写入。"
+            )
+        unknown = tuple(
+            word for word in set_reference.exclusions if word not in words
+        )
+        if unknown:
+            return None, None, (
+                "以下暂不添加的词不在当前确认票据中："
+                + "、".join(f"「{word}」" for word in unknown)
+                + "。当前有效候选为「"
+                + "、".join(words)
+                + "」；本次未写入。"
+            )
+        resolved_words = tuple(
+            word for word in words if word not in set_reference.exclusions
+        )
+        if not resolved_words:
+            return None, None, (
+                "按这些排除项计算后没有剩余词；当前有效候选为「"
+                + "、".join(words)
+                + "」。请重新说明至少保留哪个词，本次未写入。"
+            )
+        resolved_set = set(resolved_words)
+        derived_args = dict(state.args)
+        derived_args["items"] = [
+            dict(item)
+            for item in items
+            if str(item.get("word") or "").strip() in resolved_set
+        ]
+        derived_args["_resolved_advertised_words"] = list(resolved_words)
+        raw_scopes = derived_args.get("_candidate_scopes")
+        if isinstance(raw_scopes, list):
+            derived_args["_candidate_scopes"] = [
+                dict(scope)
+                for scope in raw_scopes
+                if isinstance(scope, dict)
+                and str(scope.get("word") or "").strip() in resolved_set
+            ]
+        derived_state = PendingToolConfirm(
+            function_name=state.function_name,
+            args=derived_args,
+            confirmation_source=state.confirmation_source,
+        )
+        intent = MessageCommandIntent(
+            intent=(
+                "pending_add_and_submit"
+                if set_reference.submit_after
+                else "pending_confirm"
+            ),
+            confidence=1.0,
+            submit_after=set_reference.submit_after,
+        )
+        return derived_state, intent, None
     source = unicodedata.normalize(
         "NFKC",
         _strip_command_message_prefixes(trusted_mutation_source(message_text)),

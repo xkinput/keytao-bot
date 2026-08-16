@@ -228,6 +228,7 @@ from .chat_commands import (
     _perform_recall_latest_batch,
     _perform_submit_current_draft,
     _plain_pinyin,
+    _prepend_resolved_advertised_words,
     _preserve_action_result_link,
     _quoted_draft_display_lines,
     _quoted_draft_selection_request,
@@ -1432,6 +1433,23 @@ async def get_ai_response_core(
             temperature=OPENAI_TEMPERATURE,
             timeout=OPENAI_TIMEOUT,
         )
+
+        async def deterministic_fallback_handler(
+            fallback_message: str,
+            fallback_context: AgentRequestContext,
+        ) -> Optional[str]:
+            """Retry only closed structural pending controls; never invoke a router."""
+            return await handle_pending_message_core(
+                fallback_message,
+                fallback_context.platform,
+                fallback_context.user_id,
+                fallback_context.conversation_address,
+                history=fallback_context.history,
+                space_key=fallback_context.space_key,
+                owner_label=fallback_context.speaker_name,
+                allow_intent_model=False,
+            )
+
         orchestrator = AgentOrchestrator(
             client_factory=lambda: client_cls(
                 api_key=OPENAI_API_KEY,
@@ -1446,6 +1464,7 @@ async def get_ai_response_core(
             bind_help_text=_BIND_HELP_TEXT,
             system_prompt_core=SYSTEM_PROMPT_CORE,
             tool_receipt_recorder=_record_agent_tool_receipt,
+            deterministic_fallback_handler=deterministic_fallback_handler,
         )
         result = await orchestrator.run(
             message=message,
@@ -1911,6 +1930,18 @@ def _schedule_background_draft_operation(
         f"kind={operation.kind} target={operation.description}"
     )
     return True
+
+
+async def _with_resolved_advertised_echo(
+    state: PendingToolConfirm,
+    action: Awaitable[DraftActionResult],
+) -> DraftActionResult:
+    """Prefix an async ticket operation with its record-derived exact set."""
+    result = await action
+    return replace(
+        result,
+        text=_prepend_resolved_advertised_words(state, result.text),
+    )
 
 
 async def _shutdown_background_draft_tasks() -> None:
@@ -3225,21 +3256,24 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                         else:
                             scheduled = _schedule_background_draft_operation(
                                 operation,
-                                lambda: _perform_batch_add_to_draft_and_submit(
-                                    items,
-                                    ctx.platform,
-                                    ctx.user_id,
-                                    batch_id=str(state.args.get("batch_id") or ""),
-                                    confirmed_add=(
-                                        state.confirmation_source == "server_warning"
+                                lambda: _with_resolved_advertised_echo(
+                                    state,
+                                    _perform_batch_add_to_draft_and_submit(
+                                        items,
+                                        ctx.platform,
+                                        ctx.user_id,
+                                        batch_id=str(state.args.get("batch_id") or ""),
+                                        confirmed_add=(
+                                            state.confirmation_source == "server_warning"
+                                        ),
+                                        expected_content_version=state.args.get(
+                                            "expected_content_version"
+                                        ),
+                                        expected_warning_digest=str(
+                                            state.args.get("expected_warning_digest") or ""
+                                        ),
+                                        auto_confirm=True,
                                     ),
-                                    expected_content_version=state.args.get(
-                                        "expected_content_version"
-                                    ),
-                                    expected_warning_digest=str(
-                                        state.args.get("expected_warning_digest") or ""
-                                    ),
-                                    auto_confirm=True,
                                 ),
                                 ctx.bot,
                                 ctx.event,
@@ -3268,6 +3302,10 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                                 ctx.space_key,
                                 ctx.owner_label,
                                 on_transport_failure=restore_pending_state,
+                            )
+                            ctx.response = _prepend_resolved_advertised_words(
+                                state,
+                                ctx.response,
                             )
                             if not preserve_pending_after_response:
                                 complete_pending_execution()
@@ -3858,6 +3896,7 @@ _CHAT_COMPAT_NAMES = (
     "_plain_pinyin",
     "_plain_warning_line",
     "_plain_warning_message",
+    "_prepend_resolved_advertised_words",
     "_preserve_action_result_link",
     "_prompt_capability_digest",
     "_quoted_draft_display_lines",

@@ -7,7 +7,10 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from nonebot.log import logger
 
 from keytao_bot.utils.observability import observe_tool_call
-from keytao_bot.utils.pending_confirmation import pending_confirmation_copy
+from keytao_bot.utils.pending_confirmation import (
+    advertised_batch_assent_verb,
+    pending_confirmation_copy,
+)
 
 try:  # pragma: no cover - depends on the installed runtime
     import httpx as _httpx
@@ -1646,6 +1649,15 @@ class ToolExecutor:
                         tool_name, arguments, context
                     ),
                 )
+            advertised_verb = advertised_batch_assent_verb(message)
+            if advertised_verb:
+                return policy_block(
+                    BLOCK_REASON_VERB_NOT_MATCHED,
+                    f"安全拦截：识别到了已公示执行动词「{advertised_verb}」，"
+                    "但附带的排除条件未通过确定性解析，或没有绑定到当前"
+                    "发送者仍有效的批量确认票据；本次未写入。",
+                    missing=["liveBatchTicketModifierBinding"],
+                )
             return policy_block(
                 BLOCK_REASON_VERB_NOT_MATCHED,
                 "安全拦截：这条消息里没有识别到明确的执行指令"
@@ -1664,6 +1676,15 @@ class ToolExecutor:
             and tool_name in MUTATING_TOOL_NAMES
             and not message_authorizes_mutation(message)
         ):
+            advertised_verb = advertised_batch_assent_verb(message)
+            if advertised_verb:
+                return policy_block(
+                    BLOCK_REASON_VERB_NOT_MATCHED,
+                    f"安全拦截：识别到了已公示执行动词「{advertised_verb}」，"
+                    "但附带的排除条件未通过确定性解析，或没有绑定到当前"
+                    "发送者仍有效的批量确认票据；本次未写入。",
+                    missing=["liveBatchTicketModifierBinding"],
+                )
             return policy_block(
                 BLOCK_REASON_VERB_NOT_MATCHED,
                 "安全拦截：当前文字不是明确的执行指令。"

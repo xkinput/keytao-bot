@@ -173,6 +173,40 @@ ZDIC_FIXTURES_BY_SCENARIO["S20"] = {
         )
     ),
 }
+_S21_BATCH_WORDS = (
+    "显眼包", "嘴替",
+)
+_S21_CHARACTER_PINYINS = {
+    "显": ["xiǎn"], "眼": ["yǎn"], "包": ["bāo"],
+    "嘴": ["zuǐ"], "替": ["tì"],
+}
+_S21_ENTRY_PINYINS = {
+    "显眼包": ["xiǎn", "yǎn", "bāo"],
+    "嘴替": ["zuǐ", "tì"],
+}
+ZDIC_FIXTURES_BY_SCENARIO["S21"] = {
+    "probe_words": _S21_BATCH_WORDS,
+    "rows": (
+        *(
+            {
+                "kind": "char",
+                "entry": character,
+                "status": "found",
+                "pinyins": pinyins,
+            }
+            for character, pinyins in _S21_CHARACTER_PINYINS.items()
+        ),
+        *(
+            {
+                "kind": "entry",
+                "entry": word,
+                "status": "found",
+                "pinyins": pinyins,
+            }
+            for word, pinyins in _S21_ENTRY_PINYINS.items()
+        ),
+    ),
+}
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 

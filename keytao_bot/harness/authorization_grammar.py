@@ -279,20 +279,52 @@ _COMMAND_CLAUSE_SPLIT_RE = re.compile(r"[，,。.!！?？;；\n]+")
 # "@我 ..." remediation command self-checks through exactly the validators it
 # will face, instead of through a stripped variant of itself.
 _LEADING_MENTION_RE = re.compile(r"^\s*@[^\s@]{1,24}[\s:：]+")
-_WHOLE_MESSAGE_LEADING_ADDRESS_RE = re.compile(
-    r"^\s*(?:@[^\s@]{1,24}|键道|喵喵)[\s:：，,]*",
-    re.IGNORECASE,
+_WHOLE_MESSAGE_ADDRESS_PATTERN = (
+    r"(?:@[^\s@]{1,24}|键道|喵喵)[\s:：，,]*"
 )
-_WHOLE_MESSAGE_CLOSING_FILLER_RE = re.compile(
+_WHOLE_MESSAGE_COSMETIC_LIST_PATTERN = (
+    r"(?:(?:[-•*])|(?:1[.)、]))\s*"
+)
+_WHOLE_MESSAGE_CLOSING_FILLER_PATTERN = (
     r"\s*(?:[，,。.!！?？;；]\s*)?"
     r"(?:谢谢|谢谢你|多谢|辛苦了|拜托了|麻烦了|感谢|感谢你|"
     r"劳驾|拜托|有劳|谢啦)"
-    r"[。.!！?？]*\s*$"
+    r"[。.!！?？]*\s*"
+)
+# Compatibility exports retained for callers/tests that historically patched
+# these names through ``harness.tools``.  The authorization predicate below no
+# longer composes them with successive substitutions.
+_WHOLE_MESSAGE_LEADING_ADDRESS_RE = re.compile(
+    rf"^\s*{_WHOLE_MESSAGE_ADDRESS_PATTERN}",
+    re.IGNORECASE,
+)
+_WHOLE_MESSAGE_CLOSING_FILLER_RE = re.compile(
+    rf"{_WHOLE_MESSAGE_CLOSING_FILLER_PATTERN}$"
 )
 _WHOLE_MESSAGE_QUOTE_PATTERNS = (
-    re.compile(r"^「(?P<content>[^」]*)」$", re.DOTALL),
-    re.compile(r"^“(?P<content>[^”]*)”$", re.DOTALL),
-    re.compile(r"^『(?P<content>[^』]*)』$", re.DOTALL),
+    re.compile(r"^「(?P<content>[^「」]*)」$", re.DOTALL),
+    re.compile(r"^“(?P<content>[^“”]*)”$", re.DOTALL),
+    re.compile(r"^『(?P<content>[^『』]*)』$", re.DOTALL),
+)
+# This is the complete outside-residue allowlist.  Fullmatching one pattern
+# permits only: whitespace; one pre-existing address/@ mention; at most one
+# cosmetic marker; one command quote pair; one optional parenthetical; and one
+# pre-existing closing filler.  Nothing is deleted speculatively before the
+# match, so prose cannot expose a later marker or quoted command.
+_WHOLE_MESSAGE_ENVELOPE_PATTERNS = tuple(
+    re.compile(
+        rf"^\s*"
+        rf"(?:{_WHOLE_MESSAGE_ADDRESS_PATTERN})?"
+        rf"(?:{_WHOLE_MESSAGE_COSMETIC_LIST_PATTERN})?"
+        rf"{open_quote}(?P<content>[^{open_quote}{close_quote}]*){close_quote}"
+        rf"(?P<suffix>（[^）]+）|\([^)]+\))?"
+        rf"\s*(?:{_WHOLE_MESSAGE_CLOSING_FILLER_PATTERN})?\s*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for open_quote, close_quote in (("「", "」"), ("“", "”"), ("『", "』"))
+)
+_WHOLE_MESSAGE_ENUMERATED_WORD_RE = re.compile(
+    r"^[\u3400-\u9fffA-Za-z0-9_-]{1,32}$"
 )
 _COMMAND_LEAD_IN_PREFIXES = (
     "请", "麻烦", "帮我", "给我", "现在", "立即", "直接", "确认", "执行",
@@ -908,24 +940,58 @@ def _quoted_span_is_command(content: str) -> bool:
     )
 
 
-def _whole_message_quote_content(message: str) -> Optional[str]:
-    """Return one exact whole-message quote payload after envelope removal."""
-    candidate = _WHOLE_MESSAGE_LEADING_ADDRESS_RE.sub(
-        "",
-        str(message or ""),
-        count=1,
-    ).strip()
-    candidate = _WHOLE_MESSAGE_CLOSING_FILLER_RE.sub("", candidate).strip()
-    for pattern in _WHOLE_MESSAGE_QUOTE_PATTERNS:
+def _whole_message_quote_content(
+    message: str,
+    allowed_trailing_words: Tuple[str, ...] = (),
+) -> Optional[str]:
+    """Return one command quote only when all outside residue is allowlisted."""
+    candidate = str(message or "")
+    for pattern in _WHOLE_MESSAGE_ENVELOPE_PATTERNS:
         match = pattern.fullmatch(candidate)
         if match is not None:
-            return match.group("content")
+            content = match.group("content")
+            suffix = match.group("suffix") or ""
+            if not suffix:
+                return content
+            body = suffix[1:-1].strip()
+            enumerated = tuple(
+                token.strip().strip("「」『』“”")
+                for token in re.split(r"[\s、,，;；]+", body)
+                if token.strip()
+            )
+            if (
+                not enumerated
+                or len(set(enumerated)) != len(enumerated)
+                or any(
+                    _WHOLE_MESSAGE_ENUMERATED_WORD_RE.fullmatch(word) is None
+                    for word in enumerated
+                )
+            ):
+                return None
+            live_words = tuple(
+                str(word or "").strip()
+                for word in allowed_trailing_words
+                if str(word or "").strip()
+            )
+            # With an active record the parenthetical is record metadata, never
+            # command prose: require the renderer's exact ordered word tuple.
+            # The recordless grammar keeps its older, narrower property that a
+            # suffix may only repeat operands already present in the command;
+            # it cannot supply the command's authorization by itself.
+            if live_words:
+                return content if enumerated == live_words else None
+            if all(word in content for word in enumerated):
+                return content
+            return None
     return None
 
 
-def _whole_message_unquoted_source(message: str) -> Optional[str]:
+def _whole_message_unquoted_source(
+    message: str,
+    allowed_trailing_words: Tuple[str, ...] = (),
+) -> Optional[str]:
     """Unwrap at most one exact command quote after envelope removal."""
-    content = _whole_message_quote_content(message)
+    content = _whole_message_quote_content(message, allowed_trailing_words)
     if content is None:
         return None
     # The next layer remains quoted data. Refusing the outer unwrap here keeps

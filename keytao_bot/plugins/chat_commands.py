@@ -2982,6 +2982,25 @@ def _resolved_advertised_items_match(state: PendingToolConfirm) -> bool:
     return actual == expected
 
 
+def _prepend_resolved_advertised_words(
+    state: PendingToolConfirm,
+    response: str,
+) -> str:
+    """Echo the exact record-derived set before its execution result."""
+    expected = state.args.get("_resolved_advertised_words")
+    if not isinstance(expected, list) or not expected:
+        return response
+    words = [str(word).strip() for word in expected if str(word).strip()]
+    if len(words) != len(expected):
+        return response
+    return (
+        f"已按当前确认票据解析为以下 {len(words)} 个词："
+        + "、".join(words)
+        + "。\n"
+        + str(response or "")
+    )
+
+
 def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
     """Append every server-bound draft item without exposing internal digests."""
     snapshot_items = (
@@ -5366,6 +5385,7 @@ async def handle_pending_message_core(
     history: Optional[List[Dict]] = None,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    allow_intent_model: bool = True,
 ) -> Optional[str]:
     """Consume or re-arm one pending ticket outside an adapter-specific handler."""
     state_record = conversation_state_store.get_record(conv_key)
@@ -5407,6 +5427,8 @@ async def handle_pending_message_core(
         pending_command_intent = scoped_intent
     elif structural_tool_intent is not None:
         pending_command_intent = structural_tool_intent
+    elif not allow_intent_model:
+        return None
     else:
         try:
             pending_command_intent = await _classify_message_command_intent(
@@ -5547,6 +5569,7 @@ async def handle_pending_message_core(
                 owner_label,
                 on_transport_failure=preserve_pending_state,
             )
+        response = _prepend_resolved_advertised_words(state, response)
         if preserve_after_response:
             conversation_state_store.abort_execution(state_record)
         else:

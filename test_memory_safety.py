@@ -66,6 +66,7 @@ from keytao_bot.utils.llm_request_gate import RequestWindowGate
 from keytao_bot.utils.pending_confirmation import (
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
+    render_executable_suggestion,
 )
 from keytao_bot.utils.web_identity import (
     WebIdentityConfigError,
@@ -1611,6 +1612,367 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             chat_module.conversation_state_store = old_state_store
 
+    async def test_live_batch_ticket_assent_modifiers_resolve_from_record(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        words = ("显眼包", "嘴替", "绝绝子")
+        items = [
+            {
+                "action": "Create",
+                "word": word,
+                "code": f"a{index}",
+                "type": "Phrase",
+            }
+            for index, word in enumerate(words)
+        ]
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "865189947", "739497722")
+        space_key = ("qq", "qq:group:865189947")
+        old_state_store = chat_module.conversation_state_store
+        chat_module.conversation_state_store = state_store
+        execute = AsyncMock(return_value="✅ 已加入草稿")
+
+        def seed_state() -> None:
+            state_store.set(
+                conv_key,
+                PendingToolConfirm(
+                    function_name="keytao_batch_add_to_draft",
+                    args={
+                        "items": [dict(item) for item in items],
+                        "batch_id": "batch-live",
+                        "expected_content_version": 7,
+                    },
+                ),
+                space_key=space_key,
+                owner_label="Rea",
+            )
+
+        try:
+            with patch.object(chat_module, "_execute_confirmed_tool", execute):
+                cases = {
+                    "都加 跳过绝绝子": ["显眼包", "嘴替"],
+                    "都加，除了绝绝子": ["显眼包", "嘴替"],
+                    "都加 但绝绝子不要": ["显眼包", "嘴替"],
+                    "都加 绝绝子先不要": ["显眼包", "嘴替"],
+                    "都加 跳过嘴替、绝绝子": ["显眼包"],
+                }
+                for message, expected_words in cases.items():
+                    with self.subTest(message=message):
+                        seed_state()
+                        response = await chat_module.handle_pending_message_core(
+                            message,
+                            "qq",
+                            "739497722",
+                            conv_key,
+                            history=[],
+                            space_key=space_key,
+                            owner_label="Rea",
+                            allow_intent_model=False,
+                        )
+                        selected = execute.await_args.args[0]
+                        self.assertEqual(
+                            [item["word"] for item in selected.args["items"]],
+                            expected_words,
+                        )
+                        self.assertEqual(
+                            selected.args["_resolved_advertised_words"],
+                            expected_words,
+                        )
+                        self.assertEqual(selected.args["batch_id"], "batch-live")
+                        self.assertEqual(
+                            selected.args["expected_content_version"],
+                            7,
+                        )
+                        self.assertIn("、".join(expected_words), response)
+                        for excluded in set(words) - set(expected_words):
+                            self.assertNotIn(excluded, response)
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+    async def test_live_batch_ticket_add_submit_modifier_preserves_record_cas(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "865189947", "739497722")
+        state_store.set(
+            conv_key,
+            PendingToolConfirm(
+                function_name="keytao_batch_add_to_draft",
+                args={
+                    "items": [
+                        {"action": "Create", "word": "显眼包", "code": "xybo"},
+                        {"action": "Create", "word": "嘴替", "code": "zbtk"},
+                        {"action": "Create", "word": "绝绝子", "code": "jjzi"},
+                    ],
+                    "batch_id": "batch-live",
+                    "expected_content_version": 7,
+                    "expected_warning_digest": "a" * 64,
+                },
+                confirmation_source="server_warning",
+            ),
+            owner_label="Rea",
+        )
+        old_state_store = chat_module.conversation_state_store
+        chat_module.conversation_state_store = state_store
+        execute = AsyncMock(
+            return_value=chat_module.DraftActionResult("✅ 已加入草稿并提交审核")
+        )
+        try:
+            with patch.object(
+                chat_module,
+                "_perform_batch_add_to_draft_and_submit",
+                execute,
+            ):
+                response = await chat_module.handle_pending_message_core(
+                    "都加并提交 跳过绝绝子",
+                    "qq",
+                    "739497722",
+                    conv_key,
+                    history=[],
+                    owner_label="Rea",
+                )
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+        execute.assert_awaited_once()
+        call = execute.await_args
+        self.assertEqual(
+            [item["word"] for item in call.args[0]],
+            ["显眼包", "嘴替"],
+        )
+        self.assertEqual(call.kwargs["batch_id"], "batch-live")
+        self.assertEqual(call.kwargs["expected_content_version"], 7)
+        self.assertEqual(call.kwargs["expected_warning_digest"], "a" * 64)
+        self.assertTrue(call.kwargs["confirmed_add"])
+        self.assertIn("显眼包、嘴替", response)
+        self.assertNotIn("绝绝子", response)
+        self.assertIsNone(state_store.get_record(conv_key))
+
+    async def test_background_add_submit_echoes_the_record_derived_set(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [
+                    {"action": "Create", "word": "显眼包", "code": "xybo"},
+                    {"action": "Create", "word": "嘴替", "code": "zbtk"},
+                ],
+                "_resolved_advertised_words": ["显眼包", "嘴替"],
+            },
+        )
+
+        async def action():
+            return chat_module.DraftActionResult(
+                "✅ 已加入草稿并提交审核",
+                success=True,
+            )
+
+        result = await chat_module._with_resolved_advertised_echo(
+            state,
+            action(),
+        )
+
+        self.assertTrue(result.success)
+        self.assertIn("以下 2 个词：显眼包、嘴替", result.text)
+        self.assertIn("已加入草稿并提交审核", result.text)
+
+    async def test_live_batch_ticket_modifier_controls_ask_without_write(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        words = ("显眼包", "嘴替", "绝绝子")
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [
+                    {
+                        "action": "Create",
+                        "word": word,
+                        "code": f"a{index}",
+                        "type": "Phrase",
+                    }
+                    for index, word in enumerate(words)
+                ],
+            },
+        )
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "865189947", "739497722")
+        space_key = ("qq", "qq:group:865189947")
+        old_state_store = chat_module.conversation_state_store
+        chat_module.conversation_state_store = state_store
+        execute = AsyncMock(return_value="must not execute")
+        try:
+            with patch.object(chat_module, "_execute_confirmed_tool", execute):
+                for message in (
+                    "都加 跳过火星词",
+                    "都加，除了显眼包、嘴替、绝绝子",
+                ):
+                    with self.subTest(message=message):
+                        state_store.set(
+                            conv_key,
+                            state,
+                            space_key=space_key,
+                            owner_label="Rea",
+                        )
+                        response = await chat_module.handle_pending_message_core(
+                            message,
+                            "qq",
+                            "739497722",
+                            conv_key,
+                            history=[],
+                            space_key=space_key,
+                            owner_label="Rea",
+                        )
+                        self.assertIn("显眼包、嘴替、绝绝子", response)
+                        self.assertIn("本次未写入", response)
+                        self.assertIsNotNone(state_store.get_record(conv_key))
+                execute.assert_not_awaited()
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+    async def test_rendered_live_batch_remediation_executes_as_a_full_line(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        words = ("和平", "嘴替", "松弛感")
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [
+                    {
+                        "action": "Create",
+                        "word": word,
+                        "code": f"a{index}",
+                        "type": "Phrase",
+                    }
+                    for index, word in enumerate(words)
+                ],
+            },
+        )
+        guidance = chat_module._format_live_ticket_precedence_message(state)
+        rendered_match = re.search(r"(?m)^- .+$", guidance)
+        self.assertIsNotNone(rendered_match, guidance)
+        rendered_line = rendered_match.group(0)
+        self.assertIn("「", rendered_line)
+        self.assertIn("（和平、嘴替、松弛感）", rendered_line)
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "865189947", "739497722")
+        old_state_store = chat_module.conversation_state_store
+        chat_module.conversation_state_store = state_store
+        state_store.set(conv_key, state, owner_label="Rea")
+        execute = AsyncMock(return_value="✅ 已加入草稿")
+        try:
+            with patch.object(chat_module, "_execute_confirmed_tool", execute):
+                response = await chat_module.handle_pending_message_core(
+                    rendered_line,
+                    "qq",
+                    "739497722",
+                    conv_key,
+                    history=[],
+                    owner_label="Rea",
+                )
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+        execute.assert_awaited_once()
+        self.assertIn("和平、嘴替、松弛感", response)
+
+    async def test_rendered_batch_command_envelope_is_allowlisted_at_sink(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [
+                    {"action": "Create", "word": "显眼包", "code": "xybo"},
+                    {"action": "Create", "word": "嘴替", "code": "zbtk"},
+                ],
+            },
+        )
+        guidance = chat_module._format_live_ticket_precedence_message(state)
+        rendered = next(
+            line for line in guidance.splitlines() if line.startswith("- ")
+        )
+        unbulleted = rendered.removeprefix("- ")
+        cases = (
+            ("exact-rendered-with-bullet", rendered, True),
+            ("exact-rendered-without-bullet", unbulleted, True),
+            ("mention-prefix", "@喵喵 " + rendered, True),
+            ("trailing-whitespace-and-newlines", rendered + " \n\n", True),
+            ("s21-read-frame", "请阅读" + rendered, False),
+            ("reported-speech", "他说" + unbulleted, False),
+            ("forward-frame", "转发：" + unbulleted, False),
+            ("hypothetical-frame", "如果我说" + unbulleted + "呢", False),
+            ("meta-question-tail", unbulleted + "这句话对吗", False),
+            ("prose-after-parenthetical", rendered + "，这是别人说的", False),
+            ("two-quote-pairs", unbulleted + " 「提交草稿」", False),
+            ("non-allowlisted-numbered-marker", "2. " + unbulleted, False),
+            (
+                "non-record-parenthetical-word",
+                rendered.replace("（显眼包、嘴替）", "（显眼包、火星词）"),
+                False,
+            ),
+            (
+                "command-words-not-record",
+                rendered.replace("（显眼包、嘴替）", "（加入、草稿）"),
+                False,
+            ),
+        )
+        old_state_store = chat_module.conversation_state_store
+        try:
+            for label, message, should_write in cases:
+                with self.subTest(label=label, message=message):
+                    state_store = MemoryConversationStateStore()
+                    conv_key = ConversationAddress.group(
+                        "qq",
+                        "s21-envelope-group",
+                        f"s21-envelope-{label}",
+                    )
+                    state_store.set(conv_key, state, owner_label="S21")
+                    chat_module.conversation_state_store = state_store
+                    sink = AsyncMock(return_value="✅ 已加入草稿")
+                    classify = AsyncMock(
+                        return_value=chat_module.MessageCommandIntent(
+                            intent="pending_confirm",
+                            confidence=1.0,
+                        )
+                    )
+
+                    with (
+                        patch.object(
+                            chat_module,
+                            "_execute_confirmed_tool",
+                            sink,
+                        ),
+                        patch.object(
+                            chat_module,
+                            "_classify_message_command_intent",
+                            classify,
+                        ),
+                    ):
+                        response = await chat_module.handle_pending_message_core(
+                            message,
+                            "qq",
+                            f"s21-envelope-{label}",
+                            conv_key,
+                            history=[],
+                            owner_label="S21",
+                        )
+
+                    classify.assert_not_awaited()
+                    if should_write:
+                        sink.assert_awaited_once()
+                        selected = sink.await_args.args[0]
+                        self.assertEqual(
+                            [item["word"] for item in selected.args["items"]],
+                            ["显眼包", "嘴替"],
+                        )
+                    else:
+                        sink.assert_not_awaited()
+                        self.assertIn("本次未写入", response)
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
     def test_candidate_footer_matches_single_and_multi_word_scope(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
@@ -1970,7 +2332,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                         space_key=conv_key.space_key,
                         owner_label="S15",
                     )
-                    suggestion_match = re.search(r"请发送(「[^」]+」)", guidance or "")
+                    suggestion_match = re.search(r"(?m)^(- .+)$", guidance or "")
                     self.assertIsNotNone(suggestion_match, guidance)
                     rendered = suggestion_match.group(1)
                     incoming = rendered
@@ -2015,7 +2377,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "",
             request_suggestion=True,
         )
-        self.assertEqual(rendered, "「添加 会比 hbbkiv 并提交」")
+        self.assertEqual(
+            rendered,
+            "- 「添加 会比 hbbkiv 并提交」（会比）",
+        )
         self.assertEqual(quoted_calls[0][1]["code"], "hbbkiv")
         self.assertIn("已加入草稿并提交审核", quoted_reply)
         self.assertNotIn("没有可执行的已绑定写操作", quoted_reply)
@@ -5130,6 +5495,56 @@ class MutationAuthorizationTests(unittest.TestCase):
             ("nested-whole-quote", "「『添加 安全词 aa』」", False),
             ("explanatory-question", "「添加 安全词 aa 会怎样？」", False),
             ("aborted-multi-clause", "「添加 安全词 aa；算了不要」", False),
+            (
+                "rendered-cosmetic-envelope",
+                "- 「添加 安全词 aa」（安全词）",
+                True,
+            ),
+            (
+                "rendered-numbered-envelope",
+                "1. 「添加 安全词 aa」（安全词）",
+                True,
+            ),
+            (
+                "rendered-dot-envelope",
+                "• 「添加 安全词 aa」（安全词）",
+                True,
+            ),
+            (
+                "rendered-star-envelope",
+                "* 「添加 安全词 aa」（安全词）",
+                True,
+            ),
+            (
+                "rendered-number-parenthesis-envelope",
+                "1) 「添加 安全词 aa」（安全词）",
+                True,
+            ),
+            (
+                "rendered-number-cjk-envelope",
+                "1、 「添加 安全词 aa」（安全词）",
+                True,
+            ),
+            (
+                "rendered-unrelated-parenthetical",
+                "- 「添加 安全词 aa」（别词）",
+                False,
+            ),
+            (
+                "rendered-word-containing-conjunction-character",
+                "- 「添加 和平 aa」（和平）",
+                True,
+            ),
+            (
+                "rendered-mismatched-parentheses",
+                "- 「添加 安全词 aa」（安全词)",
+                False,
+            ),
+            (
+                "unrelated-text-outside-quote",
+                "请阅读「添加 安全词 aa」",
+                False,
+            ),
         )
         for label, message, expected in cases:
             with self.subTest(label=label, message=message):
@@ -6407,15 +6822,17 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(blocked.get("policyBlocked"), tool_name)
                 suggestion = blocked.get("suggestedCommand", "")
                 self.assertTrue(suggestion.startswith("@我 "), f"{tool_name}: {message}")
+                rendered = render_executable_suggestion(suggestion)
+                self.assertRegex(rendered, r"^- [「“『].+[」”』]$")
                 allowed = await self._call(
                     tool_name,
                     arguments,
-                    suggestion,
+                    rendered,
                     **context_kwargs,
                 )
                 self.assertTrue(
                     allowed.get("success"),
-                    f"{tool_name}: {suggestion}",
+                    f"{tool_name}: {rendered}",
                 )
 
     async def test_suggestions_never_repeat_model_supplied_codes_missing_from_user_text(self) -> None:
@@ -10675,6 +11092,39 @@ class TrustedBatchAnchorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_advertised_assent_modifier_names_ticket_binding_not_missing_verb(self) -> None:
+        calls = []
+
+        async def batch_add(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        executor = ToolExecutor(
+            lambda name: batch_add if name == "keytao_batch_add_to_draft" else None,
+            frozenset({"keytao_batch_add_to_draft"}),
+        )
+        raw = await executor.call(
+            "keytao_batch_add_to_draft",
+            {
+                "items": [
+                    {"action": "Create", "word": "显眼包", "code": "xybo"},
+                    {"action": "Create", "word": "嘴替", "code": "zbtk"},
+                ],
+            },
+            ToolContext(
+                current_message="都加 跳过绝绝子",
+                writes_allowed=False,
+            ),
+        )
+        payload = json.loads(raw)
+
+        self.assertEqual(payload.get("blockReason"), "verb_not_matched")
+        self.assertIn("识别到了已公示执行动词「都加」", payload["message"])
+        self.assertIn("排除条件", payload["message"])
+        self.assertNotIn("没有识别到明确的执行指令", payload["message"])
+        self.assertNotIn("缺少可执行的动词", payload["message"])
+        self.assertEqual(calls, [])
+
     async def test_history_bytes_are_stable_and_age_is_on_current_request_tail(self) -> None:
         client = _FakeClient([_fake_response("stop", "好的。")])
 
@@ -11351,6 +11801,42 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reasoning_only_cap_attempts_deterministic_fallback_first(self) -> None:
+        responses = [
+            _fake_response("length", None),
+            _fake_response("length", None),
+        ]
+        responses[0].choices[0].message.reasoning_content = "first reasoning"
+        responses[1].choices[0].message.reasoning_content = "second reasoning"
+        client = _FakeClient(responses)
+        fallback = AsyncMock(return_value="deterministic pending result")
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=1800,
+                temperature=0.0,
+                timeout=10.0,
+                max_tokens_cap=7200,
+            ),
+            skills_manager=_SubmitSkills(),
+            tool_executor=ToolExecutor(lambda name: None, frozenset()),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+            deterministic_fallback_handler=fallback,
+        )
+        context = AgentRequestContext(platform="qq", user_id="fallback-user")
+
+        result = await orchestrator.run("都加 跳过嘴替", context)
+
+        self.assertEqual(result, "deterministic pending result")
+        fallback.assert_awaited_once_with("都加 跳过嘴替", context)
+        self.assertEqual(
+            [call["max_tokens"] for call in client.completions.calls],
+            [1800, 3600],
+        )
+
     async def test_memory_and_quote_cannot_authorize_model_requested_write(self) -> None:
         real_calls = []
 
@@ -11600,6 +12086,14 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         )
         self.assertIn("「还车」htjev", finalized)
         self.assertIn(suggestion, finalized)
+        rendered_line = re.search(r"(?m)^- .+$", finalized).group(0)
+        self.assertEqual(
+            authorized_multi_add_items(rendered_line),
+            (
+                {"action": "Create", "word": "还车", "code": "htjev"},
+                {"action": "Create", "word": "还车", "code": "htwe"},
+            ),
+        )
         self.assertNotRegex(
             finalized,
             r"boundTarget|blockReason|binding_incomplete|missing",
@@ -11657,7 +12151,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
                 "suggestedCommand": "@我 将草稿中「亮面」lxmmov 的权重调整为 101",
             },
         )
-        self.assertIn("可以改为：@我 将草稿中", finalized)
+        self.assertIn("可以改为：\n- “@我 将草稿中", finalized)
         self.assertNotIn("重新发送", finalized)
 
     def test_confirmation_can_still_request_original_operation(self) -> None:

@@ -16,7 +16,12 @@ from urllib.parse import unquote
 import httpx
 
 from .recording import ArtifactRecorder, _redact_sensitive
-from .scenarios import SCENARIOS, S19_ADVERTISED_WORDS, S20_BATCH_WORDS
+from .scenarios import (
+    SCENARIOS,
+    S19_ADVERTISED_WORDS,
+    S20_BATCH_WORDS,
+    S21_BATCH_WORDS,
+)
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
     abort_record_for_error,
@@ -249,15 +254,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S18 replays the multi-number candidate incident", readme)
         self.assertIn("S19 replays the oversized advertised-set incident", readme)
         self.assertIn("S20 replays native-quoted batch assent", readme)
+        self.assertIn("S21 replays the 2026-08-16 advertised-contract incidents", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s20(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s21(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 21)],
+            [f"S{index}" for index in range(1, 22)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -538,6 +544,23 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             set("".join(S20_BATCH_WORDS)),
         )
 
+    def test_s21_zdic_seed_declares_the_minimal_contract_word_set(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S21"]
+        self.assertEqual(fixture["probe_words"], S21_BATCH_WORDS)
+        rows = {
+            (row["kind"], row["entry"]): tuple(row["pinyins"])
+            for row in fixture["rows"]
+        }
+        self.assertEqual(
+            {entry for kind, entry in rows if kind == "char"},
+            set("".join(S21_BATCH_WORDS)),
+        )
+        self.assertEqual(
+            {entry for kind, entry in rows if kind == "entry"},
+            set(S21_BATCH_WORDS),
+        )
+        self.assertEqual(rows[("entry", "嘴替")], ("zuǐ", "tì"))
+
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
         class FakeBuildResult:
             def as_json_dict(self):
@@ -624,9 +647,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 if text == "添加并提交":
                     return (
                         "没有引用机器人给出的候选消息时，需要把词条和编码写完整，"
-                        "请发送「添加 亮面 lxmmov 并提交」。"
+                        "请复制发送下面完整一行：\n"
+                        "- 「添加 亮面 lxmmov 并提交」（亮面）"
                     )
-                if text == "「添加 亮面 lxmmov 并提交」":
+                if text == "- 「添加 亮面 lxmmov 并提交」（亮面）":
                     self.events.append({
                         "sequence": 2,
                         "kind": "tool",
@@ -647,7 +671,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["suggestionSubcase"], "quoted-suggestion")
         self.assertEqual(
             result["facts"]["quotedSuggestion"],
-            "「添加 亮面 lxmmov 并提交」",
+            "- 「添加 亮面 lxmmov 并提交」（亮面）",
         )
         self.assertFalse(result["facts"]["additionalCorrectionRequired"])
 
@@ -1256,6 +1280,139 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["advertisedPairs"], [list(pair) for pair in expected_pairs])
         self.assertEqual(result["facts"]["additionalConfirmationSteps"], 0)
         self.assertEqual(result["facts"]["batchId"], "batch-s20")
+
+    async def test_s21_offline_replays_modifier_and_real_rendered_copy(self) -> None:
+        from keytao_bot.harness.state import PendingToolConfirm
+        from keytao_bot.plugins.chat_routing import (
+            _format_live_ticket_precedence_message,
+        )
+
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S21")
+        expected_pairs = tuple(
+            (word, f"a{chr(ord('a') + index)}")
+            for index, word in enumerate(S21_BATCH_WORDS)
+        )
+
+        class FakeContext:
+            def __init__(self):
+                self.events = []
+                self.items = [
+                    {"action": "Create", "word": "stale", "code": "stale"}
+                ]
+                self.batch_id = "batch-stale"
+                self.sequence = 0
+                self.next_client = self
+                self.bot = self
+                self.platform_id = "739497722"
+                self.rendered_line = ""
+                self.reset_calls = 0
+
+            def add_write(self, pairs, batch_id):
+                self.items = [
+                    {"action": "Create", "word": word, "code": code}
+                    for word, code in pairs
+                ]
+                self.batch_id = batch_id
+                self.sequence += 1
+                self.events.append({
+                    "sequence": self.sequence,
+                    "kind": "tool",
+                    "name": "keytao_batch_add_to_draft",
+                    "arguments": {"items": list(self.items)},
+                    "result": {"success": True, "batchId": batch_id},
+                })
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assert_to_me = to_me
+                if text.startswith("喵喵 加词 "):
+                    self.assertEqual(self.items, [])
+                    return (
+                        "建议批量加入：\n"
+                        + "\n".join(
+                            f'- 「{word}」 → {code}'
+                            for word, code in expected_pairs
+                        )
+                        + "\n回复「加入」、「都加」、「添加」只加入草稿。"
+                    )
+                if text == "都加 跳过火星词":
+                    return (
+                        "「火星词」不在当前确认票据中；当前有效候选为「"
+                        + "、".join(S21_BATCH_WORDS)
+                        + "」；本次未写入。"
+                    )
+                if text == "都加 跳过嘴替":
+                    self.add_write(expected_pairs[:-1], "batch-s21-modifier")
+                    return "已按当前确认票据解析为以下 1 个词：" + "、".join(
+                        S21_BATCH_WORDS[:-1]
+                    )
+                if text == "提交草稿":
+                    state = PendingToolConfirm(
+                        function_name="keytao_batch_add_to_draft",
+                        args={
+                            "items": [
+                                {"action": "Create", "word": word, "code": code}
+                                for word, code in expected_pairs
+                            ],
+                        },
+                    )
+                    guidance = _format_live_ticket_precedence_message(state)
+                    self.rendered_line = next(
+                        line for line in guidance.splitlines() if line.startswith("- ")
+                    )
+                    return guidance
+                if text == "请阅读" + self.rendered_line:
+                    return "这段引用不会授权写入。"
+                if text == self.rendered_line:
+                    self.add_write(expected_pairs, "batch-s21-rendered")
+                    return "✅ 已加入草稿"
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {
+                    "batchId": self.batch_id,
+                    "contentVersion": 1 if self.items else 0,
+                    "items": list(self.items),
+                }
+
+            async def clean_draft(self, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                deleted = len(self.items)
+                self.items = []
+                self.batch_id = None
+                return {"success": True, "deleted": deleted}
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                self.reset_calls += 1
+
+            def assertEqual(self, left, right):
+                if left != right:
+                    raise AssertionError((left, right))
+
+            def attempt_events(self):
+                return list(self.events)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+
+        self.assertEqual(context.reset_calls, 2)
+        self.assertEqual(result["facts"]["excludedWord"], "嘴替")
+        self.assertEqual(
+            result["facts"]["resolvedWords"],
+            list(S21_BATCH_WORDS[:-1]),
+        )
+        self.assertEqual(
+            result["facts"]["renderedRemediationLine"],
+            context.rendered_line,
+        )
+        self.assertTrue(context.rendered_line.startswith("- 「将这 2 个词加入草稿」"))
+        self.assertIn("（" + "、".join(S21_BATCH_WORDS) + "）", context.rendered_line)
+        self.assertEqual(result["facts"]["outOfTicketControl"], "ASK-without-write")
+        self.assertEqual(
+            result["facts"]["unrelatedQuoteControl"],
+            "blocked-without-write",
+        )
+        self.assertEqual(result["facts"]["renderedBatchId"], "batch-s21-rendered")
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module

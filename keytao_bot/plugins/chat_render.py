@@ -10,7 +10,10 @@ from nonebot.log import logger
 
 from ..harness.state import ActiveDraftOperation, PendingAddWord, PendingState
 from ..utils import review_flags
-from ..utils.pending_confirmation import pending_confirmation_copy
+from ..utils.pending_confirmation import (
+    pending_confirmation_copy,
+    render_executable_suggestion,
+)
 
 
 def _strip_markdown(text: str) -> str:
@@ -165,9 +168,14 @@ def _format_full_add_and_submit_instruction(
         example = f"添加 {state.word} {state.recommended_code} 并提交"
     else:
         example = "添加 词条 编码 并提交"
+    suggestion = render_executable_suggestion(
+        example,
+        words=(state.word,) if isinstance(state, PendingAddWord) else (),
+    )
     return (
         "没有引用机器人给出的候选消息时，需要把词条和编码写完整，"
-        f"请发送「{example}」。\n"
+        "请复制发送下面完整一行：\n"
+        f"{suggestion}\n"
         "也可以直接引用那条候选消息回复「添加并提交」。"
     )
 
@@ -202,11 +210,15 @@ def _format_active_draft_operation_message(
         full_command = (
             f"添加 {pending_state.word} {pending_state.recommended_code} 并提交"
         )
+        suggestion = render_executable_suggestion(
+            full_command,
+            words=(pending_state.word,),
+        )
         return (
             f"上一批 {operation.description} {phase}，为避免两个批次写进同一份草稿，"
             f"本喵暂时不会操作「{pending_state.word}」。\n"
-            f"「{pending_state.word}」的候选仍为你保留；上一批结束后请发送"
-            f"「{full_command}」，或引用候选消息回复「添加并提交」。"
+            f"「{pending_state.word}」的候选仍为你保留；上一批结束后请复制发送：\n"
+            f"{suggestion}\n或引用候选消息回复「添加并提交」。"
         )
     message = (
         f"{operation.description} {phase}，不用重复发送。"

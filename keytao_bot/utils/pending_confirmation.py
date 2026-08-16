@@ -102,9 +102,12 @@ class AdvertisedSetReference:
 
     matched: bool = False
     exclusions: tuple[str, ...] = ()
+    submit_after: bool = False
+    expected_count: int | None = None
+    advertised_verb: str = ""
 
 
-_SET_REFERENCE_ACTION_RE = re.compile(
+_SET_REFERENCE_REMAINDER_ACTION_RE = re.compile(
     r"(?:其他|其余|剩下的?)(?:一些|的)?(?:都|全部|也)?"
     r"(?:可以|可)?(?:加入|添加|加)(?:到|进|入)?(?:草稿)?"
 )
@@ -119,6 +122,73 @@ _SET_REFERENCE_EXCLUSION_RE = re.compile(
 _SET_REFERENCE_EXCEPT_RE = re.compile(
     r"除了(?P<body>.+?)(?=(?:其他|其余|剩下的?))"
 )
+_SET_REFERENCE_SKIP_RE = re.compile(
+    r"(?:跳过|略过)(?P<body>.+?)(?=(?:其他|其余|剩下的?))"
+)
+_SET_REFERENCE_WORD_RE = re.compile(r"^[\u3400-\u9fffA-Za-z0-9_-]{1,32}$")
+_SET_REFERENCE_SEPARATORS_RE = re.compile(r"[\s、,，;；]+|和|与|及")
+_BATCH_ADVERTISED_FORMS = tuple(sorted(
+    (
+        *PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS,
+        *PENDING_BATCH_ADD_ADVERTISED_FORMS,
+    ),
+    key=lambda value: (-len(value), value),
+))
+_BATCH_ADVERTISED_VERB_RE = re.compile(
+    r"^\s*(?P<verb>"
+    + "|".join(re.escape(value) for value in _BATCH_ADVERTISED_FORMS)
+    + r")(?P<tail>.*)$",
+    re.DOTALL,
+)
+_DEICTIC_BATCH_COMMAND_RE = re.compile(
+    r"^(?:将|把)这\s*(?P<count>[1-9]\d{0,2})\s*个词"
+    r"(?:都|全部)?(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿"
+    r"(?P<submit>(?:并|然后|再)提交)?$"
+)
+
+
+def _split_set_reference_words(body: str) -> tuple[str, ...]:
+    tokens = tuple(
+        token.strip()
+        for token in _SET_REFERENCE_SEPARATORS_RE.split(str(body or ""))
+        if token.strip()
+    )
+    if not tokens or any(_SET_REFERENCE_WORD_RE.fullmatch(token) is None for token in tokens):
+        return ()
+    return tuple(dict.fromkeys(tokens))
+
+
+def advertised_batch_assent_verb(text: str) -> str:
+    """Return the exact advertised batch verb at the start of current text."""
+    normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
+    match = _BATCH_ADVERTISED_VERB_RE.match(normalized)
+    return match.group("verb") if match is not None else ""
+
+
+def render_executable_suggestion(
+    command: str,
+    *,
+    words: tuple[str, ...] = (),
+) -> str:
+    """Render one full copyable line accepted by the command-envelope parser."""
+    clean_command = str(command or "").strip()
+    if not clean_command:
+        return ""
+    clean_words = tuple(dict.fromkeys(
+        str(word or "").strip()
+        for word in words
+        if str(word or "").strip()
+    ))
+    suffix = f"（{'、'.join(clean_words)}）" if clean_words else ""
+    if "」" not in clean_command:
+        wrapped = f"「{clean_command}」"
+    elif "”" not in clean_command:
+        wrapped = f"“{clean_command}”"
+    elif "』" not in clean_command:
+        wrapped = f"『{clean_command}』"
+    else:
+        return ""
+    return f"- {wrapped}{suffix}"
 
 
 def _mask_set_reference_quotes(text: str) -> str:
@@ -134,7 +204,7 @@ def _mask_set_reference_quotes(text: str) -> str:
 
 
 def parse_advertised_set_reference(text: str) -> AdvertisedSetReference:
-    """Parse only literal, unframed remainder-add commands from this message."""
+    """Parse the shared closed grammar for server-advertised word sets."""
     normalized = unicodedata.normalize("NFKC", str(text or ""))
     source = _mask_set_reference_quotes(normalized)
     if (
@@ -143,21 +213,57 @@ def parse_advertised_set_reference(text: str) -> AdvertisedSetReference:
         or "?" in source
         or "？" in source
         or _SET_REFERENCE_UNSAFE_FRAME_RE.search(source)
-        or _SET_REFERENCE_ACTION_RE.search(source) is None
     ):
         return AdvertisedSetReference()
-    exclusions: list[str] = []
-    for match in _SET_REFERENCE_EXCEPT_RE.finditer(source):
-        exclusions.extend(
-            token
-            for token in re.split(r"[\s、,，;；和与及]+", match.group("body"))
-            if token
+
+    compact = re.sub(r"\s+", "", source).strip("，,。.!！;；:：")
+    deictic = _DEICTIC_BATCH_COMMAND_RE.fullmatch(compact)
+    if deictic is not None:
+        return AdvertisedSetReference(
+            matched=True,
+            submit_after=bool(deictic.group("submit")),
+            expected_count=int(deictic.group("count")),
+            advertised_verb=deictic.group(0),
         )
+
+    assent = _BATCH_ADVERTISED_VERB_RE.match(source.strip())
+    if assent is not None:
+        verb = assent.group("verb")
+        tail = assent.group("tail").strip().lstrip("，,。.!！;；:：").strip()
+        body = ""
+        for pattern in (
+            re.compile(r"^(?:跳过|略过)(?P<body>.+)$"),
+            re.compile(r"^(?:除了|除去)(?P<body>.+)$"),
+            re.compile(
+                r"^(?:(?:但|但是|不过)\s*)?(?P<body>.+?)\s*"
+                r"(?:也\s*)?(?:(?:先|暂时)\s*)?(?:不要|不加|别加)$"
+            ),
+        ):
+            match = pattern.fullmatch(tail)
+            if match is not None:
+                body = match.group("body")
+                break
+        exclusions = _split_set_reference_words(body)
+        if not exclusions:
+            return AdvertisedSetReference()
+        return AdvertisedSetReference(
+            matched=True,
+            exclusions=exclusions,
+            submit_after=verb in PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS,
+            advertised_verb=verb,
+        )
+
+    if _SET_REFERENCE_REMAINDER_ACTION_RE.search(source) is None:
+        return AdvertisedSetReference()
+    exclusions: list[str] = []
+    for pattern in (_SET_REFERENCE_EXCEPT_RE, _SET_REFERENCE_SKIP_RE):
+        for match in pattern.finditer(source):
+            exclusions.extend(_split_set_reference_words(match.group("body")))
     exclusions.extend(
         match.group("word")
         for match in _SET_REFERENCE_EXCLUSION_RE.finditer(source)
     )
-    if re.search(r"(?:除了|不要|不加|别加)", source) and not exclusions:
+    if re.search(r"(?:除了|跳过|略过|不要|不加|别加)", source) and not exclusions:
         return AdvertisedSetReference()
     return AdvertisedSetReference(
         matched=True,

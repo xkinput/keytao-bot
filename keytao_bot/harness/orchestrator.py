@@ -7,7 +7,7 @@ import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from nonebot.log import logger
 
@@ -32,6 +32,7 @@ from keytao_bot.utils.pending_confirmation import (
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
+    render_executable_suggestion,
 )
 
 from .state import (
@@ -198,6 +199,7 @@ class _InternalToolCall:
 
 _MAX_TOOL_CALLS_PER_RESPONSE = 8
 _MAX_TOOL_CALLS_PER_RUN = 40
+_MAX_CONSECUTIVE_REASONING_ONLY_EMPTY_RESPONSES = 2
 
 
 @dataclass(frozen=True)
@@ -258,6 +260,9 @@ class AgentOrchestrator:
         bind_help_text: str,
         system_prompt_core: str,
         tool_receipt_recorder: Optional[Callable[..., Any]] = None,
+        deterministic_fallback_handler: Optional[
+            Callable[[str, AgentRequestContext], Awaitable[Optional[str]]]
+        ] = None,
     ):
         self._client_factory = client_factory
         self._runtime = runtime
@@ -267,6 +272,7 @@ class AgentOrchestrator:
         self._bind_help_text = bind_help_text
         self._system_prompt_core = system_prompt_core
         self._tool_receipt_recorder = tool_receipt_recorder
+        self._deterministic_fallback_handler = deterministic_fallback_handler
 
     async def run(
         self,
@@ -413,6 +419,7 @@ class AgentOrchestrator:
         total_tool_calls = 0
         completed_run_labels: List[str] = []
         empty_response_retries = 0
+        reasoning_only_empty_responses = 0
         trusted_codes_by_word: Dict[str, frozenset[str]] = {}
         trusted_candidate_slots_by_word: Dict[
             str,
@@ -621,6 +628,44 @@ class AgentOrchestrator:
                 f"Model response: finish_reason={finish_reason} "
                 f"tool_calls={tool_call_count} content_len={len(content)} elapsed={elapsed:.1f}s"
             )
+
+            reasoning_only_empty = bool(
+                not response_tool_calls
+                and not content.strip()
+                and str(response_reasoning_content or "").strip()
+            )
+            if reasoning_only_empty:
+                reasoning_only_empty_responses += 1
+                if (
+                    reasoning_only_empty_responses
+                    >= _MAX_CONSECUTIVE_REASONING_ONLY_EMPTY_RESPONSES
+                ):
+                    if self._deterministic_fallback_handler is not None:
+                        deterministic_reply = await self._deterministic_fallback_handler(
+                            message,
+                            context,
+                        )
+                        if deterministic_reply:
+                            logger.info(
+                                "Resolved reasoning-only empty response through "
+                                "the deterministic fallback handler"
+                            )
+                            return self._append_authoritative_result_links(
+                                deterministic_reply,
+                                authoritative_result_links,
+                            )
+                    logger.error(
+                        "Stopping after consecutive reasoning-only empty responses: "
+                        f"count={reasoning_only_empty_responses} "
+                        f"max_tokens={current_max_tokens}"
+                    )
+                    return self._append_authoritative_result_links(
+                        "连续两次没有生成可见回复或工具调用，已停止扩大处理预算。"
+                        "本次未执行任何新写入；请按当前待确认提示重试或取消。",
+                        authoritative_result_links,
+                    )
+            else:
+                reasoning_only_empty_responses = 0
 
             if finish_reason == "length":
                 if current_max_tokens < self._runtime.max_tokens_cap:
@@ -1531,7 +1576,7 @@ class AgentOrchestrator:
                 failure_state.get("suggestedCommand") or ""
             ).strip()
             if suggestion:
-                result += f"可以改为：{suggestion}"
+                result += "可以改为：\n" + render_executable_suggestion(suggestion)
             return result
         resend = re.search(
             r"(?:重新|再次|再|原样|重复).{0,10}(?:发送|发一遍|发|输入|说一遍|提交)",
@@ -1569,7 +1614,7 @@ class AgentOrchestrator:
             suggestion
             and cls._normalize_loop_text(suggestion) != normalized_message
         ):
-            result += f"可以改为：{suggestion}"
+            result += "可以改为：\n" + render_executable_suggestion(suggestion)
         return result
 
     @staticmethod

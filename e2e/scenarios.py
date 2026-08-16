@@ -1037,7 +1037,8 @@ async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
         }
     else:
         suggestion_match = re.search(
-            r"请发送(?P<suggestion>「添加\s+亮面\s+(?P<code>[a-z]{2,12})\s+并提交」)",
+            r"(?m)^(?P<suggestion>-\s*[「“『]添加\s+亮面\s+"
+            r"(?P<code>[a-z]{2,12})\s+并提交[」”』](?:（亮面）)?)$",
             guidance,
         )
         require(
@@ -1840,6 +1841,224 @@ async def scenario_s20(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S21_BATCH_WORDS = (
+    "显眼包",
+    "嘴替",
+)
+
+
+async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
+    async def discover() -> tuple[str, tuple[tuple[str, str], ...]]:
+        message = "喵喵 加词 " + " ".join(S21_BATCH_WORDS)
+        messages.append(message)
+        reply = await ctx.send_group(message, to_me=True)
+        replies.append(reply)
+        pairs = advertised_batch_binding_pairs(reply)
+        require(
+            len(pairs) == len(S21_BATCH_WORDS)
+            and tuple(word for word, _code in pairs) == S21_BATCH_WORDS,
+            f"S21 did not persist/render the exact live multi-word ticket: {reply}",
+        )
+        return reply, pairs
+
+    async def establish_clean_ticket(label: str) -> tuple[
+        tuple[tuple[str, str], ...],
+        dict[str, Any],
+    ]:
+        cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(
+            cleanup.get("success") is True,
+            f"S21 {label} draft cleanup failed: {cleanup}",
+        )
+        clean_snapshot = await ctx.draft()
+        require(
+            not clean_snapshot.get("items"),
+            f"S21 {label} requires an empty actor draft before ticket creation: "
+            f"{clean_snapshot}",
+        )
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+        _reply, pairs = await discover()
+        return pairs, cleanup
+
+    def batch_write_events(after_sequence: int) -> list[dict[str, Any]]:
+        return [
+            event
+            for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > after_sequence
+            and event.get("kind") == "tool"
+            and event.get("name") == "keytao_batch_add_to_draft"
+        ]
+
+    messages: list[str] = []
+    replies: list[str] = []
+    first_pairs, first_precondition_cleanup = await establish_clean_ticket("first")
+    excluded_word = S21_BATCH_WORDS[-1]
+    expected_remaining = S21_BATCH_WORDS[:-1]
+
+    outside_control = "都加 跳过火星词"
+    messages.append(outside_control)
+    replies.append(await ctx.send_group(outside_control, to_me=True))
+    require(
+        "火星词" in replies[-1]
+        and all(word in replies[-1] for word in S21_BATCH_WORDS),
+        f"S21 out-of-ticket exclusion did not ASK with the live words: {replies[-1]}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S21 out-of-ticket exclusion wrote before a valid selection",
+    )
+
+    modifier_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    modifier = f"都加 跳过{excluded_word}"
+    messages.append(modifier)
+    replies.append(await ctx.send_group(modifier, to_me=True))
+    first_draft = await ctx.draft()
+    modifier_confirmation_steps = 0
+    if not first_draft.get("items"):
+        require(
+            "确认" in replies[-1] or "确认票据" in replies[-1],
+            f"S21 modifier neither wrote nor reached one bound confirmation: {replies[-1]}",
+        )
+        modifier_confirmation_steps = 1
+        messages.append("确认")
+        replies.append(await ctx.send_group("确认", to_me=True))
+        first_draft = await ctx.draft()
+    first_items = [
+        item for item in first_draft.get("items", []) if isinstance(item, dict)
+    ]
+    require(
+        [str(item.get("word") or "") for item in first_items]
+        == list(expected_remaining),
+        f"S21 modifier did not write ticket minus {excluded_word}: {first_draft}",
+    )
+    require(
+        excluded_word not in {str(item.get("word") or "") for item in first_items},
+        f"S21 excluded word reached the draft: {first_draft}",
+    )
+    modifier_writes = batch_write_events(modifier_cutoff)
+    require(modifier_writes, "S21 modifier never reached the batch tool")
+    for event in modifier_writes:
+        tool_words = [
+            str(item.get("word") or "")
+            for item in event.get("arguments", {}).get("items", [])
+            if isinstance(item, dict)
+        ]
+        require(
+            tool_words == list(expected_remaining),
+            f"S21 modifier tool call escaped the resolved exact set: {event}",
+        )
+    first_batch_id = str(first_draft.get("batchId") or "")
+    require(first_batch_id, f"S21 modifier did not materialize one batch: {first_draft}")
+
+    second_pairs, second_precondition_cleanup = await establish_clean_ticket("second")
+    require(second_pairs == first_pairs, "S21 second live ticket changed advertised bindings")
+
+    messages.append("提交草稿")
+    guidance = await ctx.send_group("提交草稿", to_me=True)
+    replies.append(guidance)
+    rendered_match = re.search(
+        r"(?m)^-\s*[「“『].+[」”』](?:（[^）]+）)?$",
+        guidance,
+    )
+    require(
+        rendered_match is not None,
+        f"S21 failed instruction did not render a copyable full line: {guidance}",
+    )
+    rendered_line = rendered_match.group(0)
+    require(
+        all(word in rendered_line for word in S21_BATCH_WORDS),
+        f"S21 rendered remediation did not enumerate the live record: {rendered_line}",
+    )
+
+    unrelated = "请阅读" + rendered_line
+    unrelated_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(unrelated)
+    replies.append(await ctx.send_group(unrelated, to_me=True))
+    require(
+        not batch_write_events(unrelated_cutoff),
+        "S21 unrelated text outside the quote authorized a batch write",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S21 unrelated quote envelope changed the draft",
+    )
+
+    rendered_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(rendered_line)
+    replies.append(await ctx.send_group(rendered_line, to_me=True))
+    rendered_draft = await ctx.draft()
+    rendered_confirmation_steps = 0
+    if not rendered_draft.get("items"):
+        require(
+            "确认" in replies[-1] or "确认票据" in replies[-1],
+            f"S21 rendered line neither wrote nor reached confirmation: {replies[-1]}",
+        )
+        rendered_confirmation_steps = 1
+        messages.append("确认")
+        replies.append(await ctx.send_group("确认", to_me=True))
+        rendered_draft = await ctx.draft()
+    rendered_items = [
+        item for item in rendered_draft.get("items", []) if isinstance(item, dict)
+    ]
+    require(
+        tuple(
+            (
+                str(item.get("word") or "").strip(),
+                str(item.get("code") or "").strip().lower(),
+            )
+            for item in rendered_items
+        )
+        == second_pairs,
+        f"S21 rendered remediation did not execute the record exact set: {rendered_draft}",
+    )
+    rendered_writes = batch_write_events(rendered_cutoff)
+    require(rendered_writes, "S21 rendered remediation never reached the batch tool")
+    for event in rendered_writes:
+        tool_pairs = tuple(
+            (
+                str(item.get("word") or "").strip(),
+                str(item.get("code") or "").strip().lower(),
+            )
+            for item in event.get("arguments", {}).get("items", [])
+            if isinstance(item, dict)
+        )
+        require(
+            tool_pairs == second_pairs,
+            f"S21 rendered remediation tool call escaped the live ticket: {event}",
+        )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": rendered_draft,
+        "facts": {
+            "advertisedWords": list(S21_BATCH_WORDS),
+            "excludedWord": excluded_word,
+            "resolvedWords": list(expected_remaining),
+            "modifierBatchId": first_batch_id,
+            "modifierConfirmationSteps": modifier_confirmation_steps,
+            "renderedRemediationLine": rendered_line,
+            "renderedConfirmationSteps": rendered_confirmation_steps,
+            "outOfTicketControl": "ASK-without-write",
+            "unrelatedQuoteControl": "blocked-without-write",
+            "renderedBatchId": rendered_draft.get("batchId"),
+            "preconditionCleanups": {
+                "first": first_precondition_cleanup,
+                "second": second_precondition_cleanup,
+            },
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -1861,6 +2080,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S18", "multi-number candidate snapshot selection", scenario_s18),
     Scenario("S19", "advertised-set subtraction with chunked progress", scenario_s19),
     Scenario("S20", "native-quoted batch assent", scenario_s20),
+    Scenario("S21", "assent modifier and rendered remediation closure", scenario_s21),
 )
 
 
