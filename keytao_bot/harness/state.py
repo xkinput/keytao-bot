@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -64,6 +65,36 @@ class PendingToolConfirm:
     function_name: str
     args: Dict
     confirmation_source: str = "local_preview"
+
+
+def pending_batch_display_pairs(
+    state: PendingToolConfirm,
+) -> Tuple[Tuple[str, str], ...]:
+    """Return the normalized ordered word/code facts visible for a batch."""
+    if state.function_name != "keytao_batch_add_to_draft":
+        return ()
+    items = state.args.get("items")
+    if not isinstance(items, list) or not items:
+        return ()
+    pairs: List[Tuple[str, str]] = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            return ()
+        word = unicodedata.normalize(
+            "NFKC",
+            str(item.get("word") or ""),
+        ).strip()
+        code = unicodedata.normalize(
+            "NFKC",
+            str(item.get("code") or ""),
+        ).strip().lower()
+        pair = (word, code)
+        if not word or not code or pair in seen:
+            return ()
+        seen.add(pair)
+        pairs.append(pair)
+    return tuple(pairs)
 
 
 @dataclass(frozen=True)
@@ -717,6 +748,18 @@ class MemoryConversationStateStore:
             # never create the server capability that is absent from the text.
             return True
         if isinstance(left, PendingToolConfirm) and isinstance(right, PendingToolConfirm):
+            if (
+                left.function_name == right.function_name
+                == "keytao_batch_add_to_draft"
+            ):
+                left_pairs = pending_batch_display_pairs(left)
+                right_pairs = pending_batch_display_pairs(right)
+                # Parsed batch display text may SELECT only the actor's own
+                # already-live record. Execution must keep using that live
+                # record's args, digests/warningDigest, CAS/version, nonce,
+                # one-shot consumption, and actor binding; no quoted field may
+                # reach the write payload or create/restore capability.
+                return bool(left_pairs and left_pairs == right_pairs)
             return (
                 left.function_name == right.function_name
                 and left.args == right.args
@@ -726,6 +769,8 @@ class MemoryConversationStateStore:
             right,
             PendingAdvertisedWordSets,
         ):
+            # These snapshots are server-derived and have no display-text
+            # parser. Keep their tokens, lifetimes, and word order exact.
             return left.snapshots == right.snapshots
         return left == right
 

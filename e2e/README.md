@@ -55,6 +55,8 @@ as the exact local dictionary occupant.
 S19 declares authoritative whole-word readings for its 11 advertised common
 words while the scenario repair step removes those words from the local
 dictionary. This keeps the scan result absent and the later review deterministic.
+S20 reuses the first three S19 word/character declarations for a native-quoted
+batch confirmation and applies the same rig-owned dictionary cleanup.
 
 ## Prerequisites
 
@@ -184,6 +186,12 @@ server-derived absent words, proves an out-of-snapshot exclusion asks without
 writing, then sends `天选打工人先不要，其他可以加，沙县小吃也不要`. The nine-word
 remainder must emit an 8/9 progress line, require one confirmation, and reach
 one draft batch with no excluded or extra words and no `参数格式错误` diagnosis.
+
+S20 replays native-quoted batch assent in a QQ group. It discovers and persists
+the exact three-word `显眼包`/`嘴替`/`松弛感` batch, then sends a real OneBot
+`reply` segment quoting that bot advertisement plus bare `都加`. The displayed
+word/code pairs must reach one draft batch exactly, with at most one additional
+server-bound confirmation and no `引用文字不能创建或恢复确认权限` response.
 
 Optional overrides:
 

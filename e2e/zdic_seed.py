@@ -156,6 +156,23 @@ ZDIC_FIXTURES_BY_SCENARIO["S19"] = {
         {"kind": "entry", "entry": "沙县小吃", "status": "found", "pinyins": ["shā", "xiàn", "xiǎo", "chī"]},
     ),
 }
+_S20_BATCH_WORDS = tuple(ZDIC_FIXTURES_BY_SCENARIO["S19"]["probe_words"][:3])
+_S20_BATCH_CHARACTERS = set("".join(_S20_BATCH_WORDS))
+ZDIC_FIXTURES_BY_SCENARIO["S20"] = {
+    "probe_words": _S20_BATCH_WORDS,
+    "rows": tuple(
+        row
+        for row in ZDIC_FIXTURES_BY_SCENARIO["S19"]["rows"]
+        if (
+            row["kind"] == "char"
+            and row["entry"] in _S20_BATCH_CHARACTERS
+        )
+        or (
+            row["kind"] == "entry"
+            and row["entry"] in _S20_BATCH_WORDS
+        )
+    ),
+}
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 

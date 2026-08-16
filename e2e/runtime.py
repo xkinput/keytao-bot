@@ -1078,18 +1078,44 @@ class E2EBotHarness:
                 extract = getattr(message, "extract_plain_text", None)
                 text = str(extract() if callable(extract) else message).strip()
                 platform_id = str(getattr(event, "user_id", ""))
+                message_id = harness._next_bot_message_id
+                harness._next_bot_message_id += 1
+                harness._sent_messages[message_id] = {
+                    "message_id": message_id,
+                    "user_id": int(self.self_id),
+                    "sender": {
+                        "user_id": int(self.self_id),
+                        "nickname": "喵喵",
+                        "card": "",
+                    },
+                    "message": message,
+                    "raw_message": text,
+                }
+                harness.last_reply_message_id = message_id
                 harness.recorder.record_message(
                     direction="reply",
                     text=text,
                     platform_id=platform_id,
+                    message_id=message_id,
                 )
                 harness.replies.append(text)
                 harness.reply_event.set()
-                return None
+                return {"message_id": message_id}
+
+            async def get_msg(self, *, message_id: int) -> dict[str, Any]:
+                payload = harness._sent_messages.get(int(message_id))
+                if payload is None:
+                    raise RigInfrastructureError(
+                        f"Unknown synthetic OneBot message id {message_id}"
+                    )
+                return payload
 
         self.openai_chat = openai_chat
         self.recorder = recorder
         self.message_timeout = message_timeout
+        self._sent_messages: dict[int, dict[str, Any]] = {}
+        self._next_bot_message_id = 1_500_000_000
+        self.last_reply_message_id: int | None = None
         self.bot = BoundaryBot(adapter=None, self_id="99999999999999999999999999999999")
         self.replies: list[str] = []
         self.reply_event = asyncio.Event()
@@ -1285,11 +1311,23 @@ class E2EBotHarness:
         sender_name: str,
         text: str,
         to_me: bool,
+        reply_message_id: int | None = None,
     ) -> str:
-        from nonebot.adapters.onebot.v11 import Message
+        from nonebot.adapters.onebot.v11 import Message, MessageSegment
         from nonebot.adapters.onebot.v11.event import GroupMessageEvent
 
-        message = Message(text)
+        if (
+            reply_message_id is not None
+            and int(reply_message_id) not in self._sent_messages
+        ):
+            raise RigInfrastructureError(
+                f"Cannot quote unknown synthetic bot message {reply_message_id}"
+            )
+        message = (
+            MessageSegment.reply(int(reply_message_id)) + text
+            if reply_message_id is not None
+            else Message(text)
+        )
         event = GroupMessageEvent(
             time=int(time.time()),
             self_id=int(self.bot.self_id),
@@ -1314,6 +1352,8 @@ class E2EBotHarness:
             direction="input",
             text=text,
             platform_id=platform_id,
+            message_id=event.message_id,
+            reply_message_id=reply_message_id,
         )
         reply_index = len(self.replies)
         self.reply_event.clear()
@@ -1335,6 +1375,24 @@ class E2EBotHarness:
                 "The real QQ group handler completed without a reply"
             )
         return self.replies[-1]
+
+    async def send_group_reply(
+        self,
+        *,
+        platform_id: str,
+        sender_name: str,
+        text: str,
+        reply_message_id: int,
+        to_me: bool,
+    ) -> str:
+        """Send a real OneBot reply segment quoting one recorded bot message."""
+        return await self.send_group(
+            platform_id=platform_id,
+            sender_name=sender_name,
+            text=text,
+            to_me=to_me,
+            reply_message_id=reply_message_id,
+        )
 
     async def close(self) -> None:
         await self.openai_chat._shutdown_background_draft_tasks()

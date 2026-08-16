@@ -29,6 +29,7 @@ from ..harness.state import (
     PendingStateRecord,
     PendingToolConfirm,
     SQLiteConversationStateStore,
+    pending_batch_display_pairs,
 )
 from ..harness.tools import (
     ToolContext,
@@ -1255,6 +1256,58 @@ def _format_other_owner_pending_message(
     )
 
 
+def _format_batch_display_mismatch(
+    live_state: PendingState,
+    referenced_state: PendingState,
+) -> Optional[str]:
+    """Name visible batch differences without treating quoted text as data."""
+    if not (
+        isinstance(live_state, PendingToolConfirm)
+        and isinstance(referenced_state, PendingToolConfirm)
+        and live_state.function_name
+        == referenced_state.function_name
+        == "keytao_batch_add_to_draft"
+    ):
+        return None
+    live_pairs = pending_batch_display_pairs(live_state)
+    referenced_pairs = pending_batch_display_pairs(referenced_state)
+    if not live_pairs or not referenced_pairs or live_pairs == referenced_pairs:
+        return None
+
+    def render(pairs: Tuple[Tuple[str, str], ...]) -> str:
+        preview = "、".join(
+            f"「{word}」→ {code}"
+            for word, code in pairs[:3]
+        )
+        if len(pairs) > 3:
+            preview += f" 等 {len(pairs)} 条"
+        return preview
+
+    referenced_only = tuple(
+        pair for pair in referenced_pairs if pair not in live_pairs
+    )
+    live_only = tuple(pair for pair in live_pairs if pair not in referenced_pairs)
+    if referenced_only or live_only:
+        differences = []
+        if referenced_only:
+            differences.append("引用显示 " + render(referenced_only))
+        if live_only:
+            differences.append("当前票据显示 " + render(live_only))
+        detail = "；".join(differences)
+    else:
+        detail = (
+            "展示顺序不同：引用为 "
+            + render(referenced_pairs)
+            + "；当前票据为 "
+            + render(live_pairs)
+        )
+    return (
+        f"你引用的批量加词与当前待确认批次不一致：{detail}。\n"
+        "为避免写错，本次未执行。请回复当前未修改的机器人消息，"
+        "或重新发送完整操作指令。"
+    )
+
+
 def _handle_referenced_pending_from_other_user(
     referenced_state: PendingState,
     current_record: Optional[PendingStateRecord],
@@ -1278,6 +1331,14 @@ def _handle_referenced_pending_from_other_user(
             _pending_owner_label(other_record),
             referenced_state,
         )
+
+    if current_record is not None:
+        mismatch = _format_batch_display_mismatch(
+            current_record.state,
+            referenced_state,
+        )
+        if mismatch is not None:
+            return mismatch
 
     if recode_requested:
         return None

@@ -163,6 +163,10 @@ class ScenarioContext:
     def sender_name(self) -> str:
         return self.identity["name"]
 
+    @property
+    def last_reply_message_id(self) -> int | None:
+        return self.bot.last_reply_message_id
+
     async def send(self, text: str) -> str:
         return await self.bot.send(
             platform_id=self.platform_id,
@@ -175,6 +179,21 @@ class ScenarioContext:
             platform_id=self.platform_id,
             sender_name=self.sender_name,
             text=text,
+            to_me=to_me,
+        )
+
+    async def send_group_reply(
+        self,
+        text: str,
+        *,
+        reply_message_id: int,
+        to_me: bool,
+    ) -> str:
+        return await self.bot.send_group_reply(
+            platform_id=self.platform_id,
+            sender_name=self.sender_name,
+            text=text,
+            reply_message_id=reply_message_id,
             to_me=to_me,
         )
 
@@ -1692,6 +1711,135 @@ async def scenario_s19(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S20_BATCH_WORDS = S19_ADVERTISED_WORDS[:3]
+
+
+async def scenario_s20(ctx: ScenarioContext) -> dict[str, Any]:
+    initial = "喵喵 加词 " + " ".join(S20_BATCH_WORDS)
+    messages = [initial]
+    replies = [await ctx.send_group(initial, to_me=True)]
+    advertised_pairs = advertised_batch_binding_pairs(replies[-1])
+    require(
+        len(advertised_pairs) == len(S20_BATCH_WORDS)
+        and tuple(word for word, _code in advertised_pairs) == S20_BATCH_WORDS,
+        f"S20 did not advertise the exact three-word batch: {replies[-1]}",
+    )
+    require(
+        len(set(advertised_pairs)) == len(advertised_pairs),
+        f"S20 advertised duplicate word/code bindings: {advertised_pairs}",
+    )
+    saved_ticket_events = [
+        event
+        for event in ctx.attempt_events()
+        if event.get("kind") == "log"
+        and "Saved advertised reviewed batch candidate" in str(
+            event.get("message") or ""
+        )
+        and f"items={len(S20_BATCH_WORDS)}" in str(event.get("message") or "")
+    ]
+    require(saved_ticket_events, "S20 discovery did not persist one trusted batch ticket")
+
+    quote_message_id = ctx.last_reply_message_id
+    require(
+        isinstance(quote_message_id, int) and quote_message_id > 0,
+        "S20 harness did not expose the bot advertisement message id",
+    )
+    cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("都加")
+    replies.append(await ctx.send_group_reply(
+        "都加",
+        reply_message_id=quote_message_id,
+        to_me=True,
+    ))
+
+    additional_confirmation_steps = 0
+    draft = await ctx.draft()
+    if not draft.get("items"):
+        require(
+            "回复「确认」、「执行」继续" in replies[-1]
+            or "确认票据" in replies[-1],
+            f"S20 quoted assent neither wrote nor reached one bound confirmation: {replies[-1]}",
+        )
+        additional_confirmation_steps = 1
+        messages.append("确认")
+        replies.append(await ctx.send_group("确认", to_me=True))
+        draft = await ctx.draft()
+
+    actual_items = [
+        item
+        for item in draft.get("items", [])
+        if isinstance(item, dict)
+    ]
+    actual_pairs = tuple(
+        (
+            str(item.get("word") or "").strip(),
+            str(item.get("code") or "").strip().lower(),
+        )
+        for item in actual_items
+    )
+    require(
+        len(actual_items) == len(advertised_pairs)
+        and actual_pairs == advertised_pairs
+        and all(item.get("action") == "Create" for item in actual_items),
+        f"S20 draft differs from the native-quoted advertised batch: {draft}",
+    )
+    require(
+        bool(str(draft.get("batchId") or "")),
+        f"S20 exact items did not reach one materialized draft batch: {draft}",
+    )
+    write_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(write_calls, "S20 quoted assent did not invoke the batch draft tool")
+    for event in write_calls:
+        tool_items = event.get("arguments", {}).get("items", [])
+        tool_pairs = tuple(
+            (
+                str(item.get("word") or "").strip(),
+                str(item.get("code") or "").strip().lower(),
+            )
+            for item in tool_items
+            if isinstance(item, dict)
+        )
+        require(
+            len(tool_items) == len(advertised_pairs)
+            and tool_pairs == advertised_pairs,
+            f"S20 tool call was not bound to the complete displayed set: {event}",
+        )
+
+    all_reply_text = [
+        str(event.get("text") or "")
+        for event in ctx.attempt_events()
+        if event.get("kind") == "message"
+        and event.get("direction") == "reply"
+    ] + replies
+    require(
+        not any(
+            "引用文字不能创建或恢复确认权限" in reply
+            for reply in all_reply_text
+        ),
+        f"S20 hit the quoted-ticket refusal: {all_reply_text}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "advertisedPairs": [list(pair) for pair in advertised_pairs],
+            "nativeQuoteMessageId": quote_message_id,
+            "additionalConfirmationSteps": additional_confirmation_steps,
+            "batchId": draft.get("batchId"),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -1712,6 +1860,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S17", "semantic common-character auto-pass", scenario_s17),
     Scenario("S18", "multi-number candidate snapshot selection", scenario_s18),
     Scenario("S19", "advertised-set subtraction with chunked progress", scenario_s19),
+    Scenario("S20", "native-quoted batch assent", scenario_s20),
 )
 
 

@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import tempfile
 import unittest
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from urllib.parse import unquote
 
 import httpx
 
 from .recording import ArtifactRecorder, _redact_sensitive
-from .scenarios import SCENARIOS, S19_ADVERTISED_WORDS
+from .scenarios import SCENARIOS, S19_ADVERTISED_WORDS, S20_BATCH_WORDS
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
     abort_record_for_error,
@@ -26,7 +28,7 @@ from .run import (
     ensure_scenario_zdic_fixture,
     repair_scenario_dictionary_fixture,
 )
-from .runtime import LocalNextClient, RigInfrastructureError
+from .runtime import E2EBotHarness, LocalNextClient, RigInfrastructureError
 from .safety import (
     BLOCKED_EXTERNAL_DOMAINS,
     NetworkAllowlist,
@@ -42,6 +44,53 @@ from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_s9_zdic_cache, seed_zdic_
 
 
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_e2e_harness_builds_a_native_onebot_group_reply_segment(
+        self,
+    ) -> None:
+        from keytao_bot.plugins.chat_adapters import extract_onebot_reply_id
+
+        harness = object.__new__(E2EBotHarness)
+        harness._sent_messages = {501: {"message_id": 501}}
+        harness.message_timeout = 1.0
+        harness.replies = []
+        harness.reply_event = asyncio.Event()
+        harness._current_event = ContextVar("test_e2e_current_event", default=None)
+        harness.recorder = MagicMock()
+
+        class FakeBot:
+            self_id = "99999999999999999999999999999999"
+
+        class FakeOpenAIChat:
+            captured_event = None
+
+            async def should_handle(self, _bot, _event):
+                return True
+
+            async def handle_ai_chat(self, _bot, event):
+                self.captured_event = event
+                harness.replies.append("accepted")
+                harness.reply_event.set()
+
+        harness.bot = FakeBot()
+        harness.openai_chat = FakeOpenAIChat()
+
+        reply = await harness.send_group_reply(
+            platform_id="123456789012345678901234567890",
+            sender_name="Rea",
+            text="都加",
+            reply_message_id=501,
+            to_me=True,
+        )
+
+        event = harness.openai_chat.captured_event
+        self.assertEqual(reply, "accepted")
+        self.assertEqual(extract_onebot_reply_id(event), "501")
+        self.assertEqual(event.get_plaintext(), "都加")
+        self.assertEqual(
+            harness.recorder.record_message.call_args.kwargs["reply_message_id"],
+            501,
+        )
+
     async def test_local_next_client_retries_transport_errors_with_fresh_pool(
         self,
     ) -> None:
@@ -199,15 +248,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S17 exercises the common-characters-plus-LLM", readme)
         self.assertIn("S18 replays the multi-number candidate incident", readme)
         self.assertIn("S19 replays the oversized advertised-set incident", readme)
+        self.assertIn("S20 replays native-quoted batch assent", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s19(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s20(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 20)],
+            [f"S{index}" for index in range(1, 21)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -466,6 +516,26 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 "天选打工人": ("found", ("tiān", "xuǎn", "dǎ", "gōng", "rén")),
                 "沙县小吃": ("found", ("shā", "xiàn", "xiǎo", "chī")),
             },
+        )
+
+    def test_s20_reuses_the_exact_three_word_s19_fixture_shape(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S20"]
+        self.assertEqual(fixture["probe_words"], S20_BATCH_WORDS)
+        self.assertEqual(
+            {
+                row["entry"]
+                for row in fixture["rows"]
+                if row["kind"] == "entry"
+            },
+            set(S20_BATCH_WORDS),
+        )
+        self.assertEqual(
+            {
+                row["entry"]
+                for row in fixture["rows"]
+                if row["kind"] == "char"
+            },
+            set("".join(S20_BATCH_WORDS)),
         )
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
@@ -1112,6 +1182,80 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["confirmationSteps"], 1)
         self.assertEqual(result["facts"]["outOfSnapshotControl"], "ASK-without-write")
         self.assertEqual(result["facts"]["batchId"], "batch-s19")
+
+    async def test_s20_offline_native_quote_writes_the_exact_advertised_batch(
+        self,
+    ) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S20")
+        expected_pairs = (
+            ("显眼包", "xybo"),
+            ("嘴替", "zbtk"),
+            ("松弛感", "swgv"),
+        )
+
+        class FakeContext:
+            def __init__(self):
+                self.events = []
+                self.items = []
+                self.batch_id = None
+                self.last_reply_message_id = 501
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assert_to_me = to_me
+                self.events.append({
+                    "sequence": 1,
+                    "kind": "log",
+                    "message": "Saved advertised reviewed batch candidate: items=3",
+                })
+                return (
+                    "建议批量加入：\n"
+                    + "\n".join(
+                        f'- 「{word}」 → {code}'
+                        for word, code in expected_pairs
+                    )
+                    + "\n回复「加入」、「都加」、「添加」只加入草稿。"
+                )
+
+            async def send_group_reply(
+                self,
+                text: str,
+                *,
+                reply_message_id: int,
+                to_me: bool,
+            ) -> str:
+                self.reply_request = (text, reply_message_id, to_me)
+                self.items = [
+                    {"action": "Create", "word": word, "code": code}
+                    for word, code in expected_pairs
+                ]
+                self.batch_id = "batch-s20"
+                self.events.append({
+                    "sequence": 2,
+                    "kind": "tool",
+                    "name": "keytao_batch_add_to_draft",
+                    "arguments": {"items": list(self.items)},
+                    "result": {"success": True, "batchId": self.batch_id},
+                })
+                return "✅ 已加入草稿"
+
+            async def draft(self):
+                return {
+                    "batchId": self.batch_id,
+                    "contentVersion": 1 if self.items else 0,
+                    "items": list(self.items),
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+        self.assertTrue(context.assert_to_me)
+        self.assertEqual(context.reply_request, ("都加", 501, True))
+        self.assertEqual(result["facts"]["nativeQuoteMessageId"], 501)
+        self.assertEqual(result["facts"]["advertisedPairs"], [list(pair) for pair in expected_pairs])
+        self.assertEqual(result["facts"]["additionalConfirmationSteps"], 0)
+        self.assertEqual(result["facts"]["batchId"], "batch-s20")
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module

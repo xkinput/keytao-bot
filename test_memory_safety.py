@@ -507,6 +507,59 @@ class PendingIsolationTests(unittest.TestCase):
         self.assertFalse(store.set(self.group_a, state))
         self.assertIsNone(store.get(self.group_a))
 
+    def test_quoted_batch_display_selects_only_the_matching_live_ticket(self) -> None:
+        live_items = [
+            {
+                "action": "Create",
+                "word": "显眼包",
+                "code": "xybo",
+                "type": "Phrase",
+                "needsManualReview": True,
+                "manualReviewReason": "authority missing",
+                "remark": "喵喵审词：待人工复核",
+            },
+            {
+                "action": "Create",
+                "word": "嘴替",
+                "code": "zbtk",
+                "type": "Phrase",
+                "needsManualReview": False,
+            },
+        ]
+        live = PendingToolConfirm(
+            "keytao_batch_add_to_draft",
+            {
+                "items": live_items,
+                "batch_id": "batch-live",
+                "expected_content_version": 7,
+                "expected_warning_digest": "a" * 64,
+            },
+            confirmation_source="server_warning",
+        )
+        parsed_display = PendingToolConfirm(
+            "keytao_batch_add_to_draft",
+            {
+                "items": [
+                    {"action": "Create", "word": "显眼包", "code": "XYBO"},
+                    {"action": "Create", "word": "嘴替", "code": "zbtk"},
+                ],
+            },
+        )
+        changed_code = PendingToolConfirm(
+            "keytao_batch_add_to_draft",
+            {
+                "items": [
+                    {"action": "Create", "word": "显眼包", "code": "xybp"},
+                    {"action": "Create", "word": "嘴替", "code": "zbtk"},
+                ],
+            },
+        )
+
+        self.assertTrue(self.store.states_equivalent(live, parsed_display))
+        self.assertFalse(self.store.states_equivalent(live, changed_code))
+        self.assertEqual(live.args["items"], live_items)
+        self.assertEqual(live.args["expected_warning_digest"], "a" * 64)
+
     def test_overwriting_a_live_ticket_requires_a_second_confirmation(self) -> None:
         first = PendingToolConfirm(
             "keytao_create_phrase",
@@ -675,6 +728,34 @@ class AdvertisedWordSetSelectionTests(unittest.TestCase):
                 self.assertEqual(selection.snapshot_token, token)
                 self.assertEqual(selection.resolved_words, expected)
                 self.assertEqual(selection.ask, "")
+
+    def test_native_quote_uses_the_live_advertised_snapshot_without_parsing_one(self) -> None:
+        from keytao_bot.plugins.chat_commands import (
+            _parse_pending_state_from_response,
+        )
+
+        token = self.seed()
+        live = self.store.get(self.owner)
+        quoted_advertisement = (
+            "未收录词：" + "、".join(self.WORDS)
+            + "。可以把这些词加入草稿。"
+        )
+
+        self.assertIsNone(_parse_pending_state_from_response(quoted_advertisement))
+        selection = self.resolve("其他都加")
+        self.assertEqual(selection.snapshot_token, token)
+        self.assertEqual(selection.resolved_words, self.WORDS)
+        self.assertFalse(self.store.states_equivalent(
+            live,
+            PendingAdvertisedWordSets(snapshots=[
+                AdvertisedWordSetSnapshot(
+                    token="f" * 32,
+                    words=self.WORDS,
+                    created_at=self.now,
+                    expires_at=self.now + 60.0,
+                ),
+            ]),
+        ))
 
     def test_ambiguous_or_invalid_difference_asks_without_consuming(self) -> None:
         first_token = self.seed()

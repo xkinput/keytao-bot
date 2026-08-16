@@ -2871,9 +2871,13 @@ async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
                 )
                 await _finish_ai_chat_matcher(ctx.response)
                 return True
+        guard_current_record = (
+            current_record
+            or conversation_state_store.get_record(ctx.conv_key)
+        )
         ctx.response = _handle_referenced_pending_from_other_user(
             ctx.referenced_pending,
-            current_record,
+            guard_current_record,
             other_record,
             ctx.conv_key,
             ctx.space_key,

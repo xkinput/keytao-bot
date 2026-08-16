@@ -124,14 +124,26 @@ class ArtifactRecorder:
         logger.remove(self._log_sink_id)
         self._log_sink_id = None
 
-    def record_message(self, *, direction: str, text: str, platform_id: str) -> None:
-        self._append(
-            "message",
-            direction=direction,
-            text=text,
-            platform="qq",
-            platformId=platform_id,
-        )
+    def record_message(
+        self,
+        *,
+        direction: str,
+        text: str,
+        platform_id: str,
+        message_id: int | None = None,
+        reply_message_id: int | None = None,
+    ) -> None:
+        payload = {
+            "direction": direction,
+            "text": text,
+            "platform": "qq",
+            "platformId": platform_id,
+        }
+        if message_id is not None:
+            payload["messageId"] = int(message_id)
+        if reply_message_id is not None:
+            payload["replyMessageId"] = int(reply_message_id)
+        self._append("message", **payload)
 
     def record_tool(
         self,

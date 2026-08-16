@@ -953,6 +953,129 @@ def test_referenced_pending_prefers_current_live_ticket():
         openai_chat_module.conversation_state_store = old_store
 
 
+def test_quoted_batch_pending_requires_exact_live_display_match():
+    """A batch quote selects one live ticket but never supplies its payload."""
+    print("\n🧪 quoted batch pending exact display match")
+
+    prompt = """建议批量加入：
+- 「显眼包」 → xybo
+- 「嘴替」 → zbtk
+- 「松弛感」 → swgv
+- 「炒冷饭」 → jlfoo
+
+回复「加入」、「都加」、「添加」只加入草稿。"""
+    parsed = _parse_pending_state_from_response(prompt)
+    live = PendingToolConfirm(
+        function_name="keytao_batch_add_to_draft",
+        args={
+            "items": [
+                {
+                    "action": "Create",
+                    "word": word,
+                    "code": code,
+                    "type": "Phrase",
+                    "needsManualReview": True,
+                    "remark": f"喵喵审词：{word}",
+                }
+                for word, code in (
+                    ("显眼包", "xybo"),
+                    ("嘴替", "zbtk"),
+                    ("松弛感", "swgv"),
+                    ("炒冷饭", "jlfoo"),
+                )
+            ],
+            "batch_id": "batch-live",
+            "expected_content_version": 11,
+            "expected_warning_digest": "a" * 64,
+        },
+        confirmation_source="server_warning",
+    )
+    tampered = _parse_pending_state_from_response(
+        prompt.replace("「炒冷饭」 → jlfoo", "「炒冷饭」 → jlbar")
+    )
+    intent = MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+    current_key = ConversationAddress.group("qq", "865189947", "739497722")
+    other_key = ConversationAddress.group("qq", "865189947", "other-user")
+    space_key = ("qq", "qq:group:865189947")
+    store = MemoryConversationStateStore()
+    tool_call = AsyncMock(side_effect=AssertionError("quote guard must not write"))
+
+    old_store = openai_chat_module.conversation_state_store
+    openai_chat_module.conversation_state_store = store
+    try:
+        store.set(current_key, live, space_key=space_key, owner_label="Rea")
+        current_record = store.get_record(current_key)
+        exact_response = _handle_referenced_pending_from_other_user(
+            parsed,
+            current_record,
+            None,
+            current_key,
+            space_key,
+            "Rea",
+            intent,
+        )
+        with patch.object(openai_chat_module, "call_tool_function", tool_call):
+            tampered_response = _handle_referenced_pending_from_other_user(
+                tampered,
+                current_record,
+                None,
+                current_key,
+                space_key,
+                "Rea",
+                intent,
+            )
+
+        store.delete(current_key)
+        missing_response = _handle_referenced_pending_from_other_user(
+            parsed,
+            None,
+            None,
+            current_key,
+            space_key,
+            "Rea",
+            intent,
+        )
+
+        store.set(other_key, live, space_key=space_key, owner_label="EVO")
+        other_record = store.find_matching_pending_for_other_owner(
+            space_key,
+            current_key,
+            parsed,
+        )
+        other_response = _handle_referenced_pending_from_other_user(
+            parsed,
+            None,
+            other_record,
+            current_key,
+            space_key,
+            "Rea",
+            intent,
+        )
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+    check("quoted batch prompt parses as display-only state", isinstance(parsed, PendingToolConfirm))
+    check("exact same-owner display selects the live ticket", exact_response is None)
+    check(
+        "tampered display is a deterministic mismatch ASK",
+        tampered_response is not None
+        and "不一致" in tampered_response
+        and "炒冷饭" in tampered_response
+        and "jlbar" in tampered_response
+        and "jlfoo" in tampered_response
+        and "未执行" in tampered_response,
+    )
+    check("tampered display reaches no write sink", tool_call.await_count == 0)
+    check(
+        "missing live ticket keeps the existing refusal",
+        missing_response is not None and "引用文字不能创建或恢复确认权限" in missing_response,
+    )
+    check(
+        "other actor batch ticket remains refused",
+        other_response is not None and "不能替 EVO 确认" in other_response,
+    )
+
+
 def test_referenced_pending_does_not_scan_current_user_history():
     """Assistant prose must not recreate an expired or missing authorization ticket."""
     print("\n🧪 referenced pending does not scan current user history")
@@ -7225,6 +7348,168 @@ def test_inline_live_batch_ticket_accepts_bare_advertised_submit():
         check("consumed ticket is removed exactly once", store.get_record(conv_key) is None)
         check("scheduled flow emits no target-completion reply", finish.await_count == 0)
         check("scheduled flow bypasses the main model", main_model.await_count == 0)
+
+    asyncio.run(_run())
+
+
+def test_native_quoted_batch_assent_executes_only_the_live_payload():
+    """A native batch quote selects but never contributes mutation arguments."""
+    print("\n🧪 native quoted batch assent uses live payload")
+
+    prompt = """建议批量加入：
+- 「显眼包」 → xybo
+- 「嘴替」 → zbtk
+- 「松弛感」 → swgv
+- 「炒冷饭」 → jlfoo
+
+回复「加入」、「都加」、「添加」只加入草稿；回复「加入并提交」则加入后提交。"""
+    live_items = [
+        {
+            "action": "Create",
+            "word": word,
+            "code": code,
+            "type": "Phrase",
+            "needsManualReview": needs_review,
+            "manualReviewReason": reason,
+            "remark": f"喵喵审词：{word}",
+        }
+        for word, code, needs_review, reason in (
+            ("显眼包", "xybo", True, "authority missing"),
+            ("嘴替", "zbtk", False, ""),
+            ("松弛感", "swgv", True, "commonness uncertain"),
+            ("炒冷饭", "jlfoo", False, ""),
+        )
+    ]
+    live_args = {
+        "items": live_items,
+        "batch_id": "batch-live",
+        "expected_content_version": 11,
+        "expected_warning_digest": "a" * 64,
+    }
+
+    class HandlerBot:
+        pass
+
+    class HandlerEvent:
+        original_message = []
+        message = original_message
+
+        @staticmethod
+        def get_plaintext():
+            return "都加"
+
+    async def run_case(quoted_prompt):
+        user_id = "quoted-batch-actor"
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id=user_id,
+            space_type="group",
+            space_id="865189947",
+            speaker_name="Rea",
+        )
+        conv_key = memory_context.conversation_address
+        store = MemoryConversationStateStore()
+        store.set(
+            conv_key,
+            PendingToolConfirm(
+                function_name="keytao_batch_add_to_draft",
+                args=live_args,
+                confirmation_source="server_warning",
+            ),
+            space_key=("qq", memory_context.space_scope_id),
+            owner_label="Rea",
+        )
+        coordinator = DraftOperationCoordinator()
+        classifier = AsyncMock(return_value=MessageCommandIntent())
+        main_model = AsyncMock(return_value="unexpected main-model fallback")
+        tool_call = AsyncMock(return_value=json.dumps({
+            "success": True,
+            "successCount": len(live_items),
+            "failedCount": 0,
+            "batchId": "batch-live",
+        }, ensure_ascii=False))
+        format_draft = AsyncMock(return_value="current draft contains exact live items")
+        finish = AsyncMock(side_effect=FinishedException())
+        reply_reference = ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=True,
+            sender_id="bot-id",
+            sender_name="喵喵",
+            text=quoted_prompt,
+        )
+
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(openai_chat_module, "draft_operation_coordinator", coordinator),
+            patch.object(openai_chat_module.ai_chat, "finish", finish),
+            patch.object(
+                openai_chat_module,
+                "extract_reply_reference_info",
+                AsyncMock(return_value=reply_reference),
+            ),
+            patch.object(
+                openai_chat_module,
+                "extract_memory_context",
+                AsyncMock(return_value=memory_context),
+            ),
+            patch.object(openai_chat_module, "_classify_message_command_intent", classifier),
+            patch.object(openai_chat_module, "call_tool_function", tool_call),
+            patch.object(openai_chat_module, "_format_draft_response", format_draft),
+            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(openai_chat_module, "get_ai_response_core", main_model),
+            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+        ):
+            try:
+                await openai_chat_module._handle_ai_chat_serialized(
+                    HandlerBot(),
+                    HandlerEvent(),
+                    "qq",
+                    user_id,
+                )
+            except FinishedException:
+                pass
+
+        response = str(finish.await_args.args[0]) if finish.await_args else ""
+        return {
+            "tool_call": tool_call,
+            "classifier": classifier,
+            "main_model": main_model,
+            "record": store.get_record(conv_key),
+            "response": response,
+        }
+
+    async def _run():
+        exact = await run_case(prompt)
+        tampered = await run_case(
+            prompt.replace("「炒冷饭」 → jlfoo", "「炒冷饭」 → jlbar")
+        )
+
+        check("exact native quote performs one batch write", exact["tool_call"].await_count == 1)
+        if exact["tool_call"].await_count:
+            tool_name, arguments, platform, user_id = exact["tool_call"].await_args.args
+            check("native quote executes the live function", tool_name == "keytao_batch_add_to_draft")
+            check("native quote keeps the live sealed item set", arguments.get("items") == live_items)
+            check(
+                "native quote keeps live CAS and digest fields",
+                arguments.get("batch_id") == "batch-live"
+                and arguments.get("expected_content_version") == 11
+                and arguments.get("expected_warning_digest") == "a" * 64
+                and arguments.get("confirmed") is True,
+            )
+            check("native quote executes as the current actor", (platform, user_id) == ("qq", "quoted-batch-actor"))
+        check("successful native quote consumes the ticket once", exact["record"] is None)
+        check("exact native quote bypasses both models", exact["classifier"].await_count == 0 and exact["main_model"].await_count == 0)
+
+        check("tampered native quote performs zero writes", tampered["tool_call"].await_count == 0)
+        check("tampered native quote preserves the live ticket", tampered["record"] is not None)
+        check(
+            f"tampered native quote names the mismatch: {tampered['response']}",
+            "不一致" in tampered["response"]
+            and "jlbar" in tampered["response"]
+            and "jlfoo" in tampered["response"]
+            and "未执行" in tampered["response"],
+        )
+        check("tampered native quote bypasses the main model", tampered["main_model"].await_count == 0)
 
     asyncio.run(_run())
 
@@ -14520,6 +14805,7 @@ if __name__ == "__main__":
     test_unquoted_draft_submit_bypasses_other_owner_pending_guard()
     test_contextual_short_reply_bypasses_other_owner_pending_guard()
     test_referenced_pending_prefers_current_live_ticket()
+    test_quoted_batch_pending_requires_exact_live_display_match()
     test_referenced_pending_does_not_scan_current_user_history()
     test_referenced_pending_does_not_restore_from_bot_mention()
     test_referenced_pending_mention_blocks_other_user_direct_action()
@@ -14621,6 +14907,7 @@ if __name__ == "__main__":
     test_unquoted_short_add_submit_without_server_snapshot_requires_full_target()
     test_inline_unquoted_add_submit_requires_live_or_target_binding()
     test_inline_live_batch_ticket_accepts_bare_advertised_submit()
+    test_native_quoted_batch_assent_executes_only_the_live_payload()
     test_target_bound_add_submit_rejects_questions_negation_and_substrings()
     test_draft_suggestion_routes_share_authorization_lead_ins()
     test_cross_user_bot_quote_creates_only_current_actor_operation()
