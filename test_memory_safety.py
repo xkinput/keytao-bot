@@ -1470,7 +1470,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "704974384",
         )
         self.assertIsNone(canonical)
-        self.assertEqual(error, "请选择 1-4 之间的编号。")
+        self.assertIn("只接受 1-4", error)
+        self.assertIn("当前没有可安全执行的后续命令", error)
 
         for message in (
             "添加2、2",
@@ -1580,7 +1581,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertIn("载流", response)
                         self.assertIn("载流子", response)
-                        self.assertIn("请带上词条", response)
+                        self.assertIn("可执行选择示例", response)
+                        self.assertIn("- 「载流子 添加1」（载流子）", response)
                         self.assertEqual(execute.await_count, 0)
                         self.assertIsNotNone(state_store.get_record(conv_key))
 
@@ -2055,7 +2057,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     space_key=space_key,
                     owner_label="Ealin",
                 )
-                self.assertEqual(control, "请选择 1-4 之间的编号。")
+                self.assertIn("只接受 1-4", control)
+                self.assertIn("当前没有可安全执行的后续命令", control)
                 self.assertEqual(execute.await_count, 0)
                 self.assertIsNotNone(state_store.get_record(conv_key))
 
@@ -2372,7 +2375,11 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "4 添加并提交"
         )
         self.assertEqual(rejected_calls, [])
-        self.assertIn("请选择 1-3", rejected_reply)
+        self.assertIn("只接受 1-3", rejected_reply)
+        self.assertIn(
+            "当前没有可安全执行的后续命令",
+            rejected_reply,
+        )
 
         quoted_calls, quoted_reply, rendered = await exercise(
             "",
@@ -9067,10 +9074,16 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         model_reply = (
-            "2 个词审词复核完成，读音、编码和占用状态与之前一致：\n"
-            "审词复核：1. 显眼包 → xybo（空位）…"
-            "2. 嘴替 → zbtk（空位）\n"
-            "将这 2 个词加入草稿并提交，或直接回复「加入并提交」。"
+            "2 个词已全部重新复核完毕。以下按候选列表格式逐项重列：\n\n"
+            "1. 「显眼包」\n"
+            "   候选：\n"
+            "   1. xybo — 空位（推荐）\n"
+            "   2. xyboi — 空位\n\n"
+            "2. 「嘴替」\n"
+            "   候选：1. zbtk — 空位（推荐）｜2. zbtko — 空位\n\n"
+            "可用的下一步：\n"
+            "- 「加入」、「都加」、「添加」→ 只加入草稿\n"
+            "- 「加入并提交」、「都加并提交」、「添加并提交」→ 加入后提交"
         )
         client = _FakeClient([
             _fake_response(
@@ -9324,8 +9337,11 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             [item["word"] for item in record.state.args["items"]],
             list(expected),
         )
-        self.assertIn("已解析为以下 9 个词", review_reply)
-        self.assertIn("显眼包、嘴替、松弛感", review_reply)
+        self.assertIn("已重新复核以下 9 个词", review_reply)
+        self.assertIn("空位；可自动通过", review_reply)
+        self.assertTrue(
+            all(f"「{word}」" in review_reply for word in expected)
+        )
         self.assertIn(pending_batch_confirmation_copy(), review_reply)
         self.assertNotIn("参数格式错误", review_reply)
 
@@ -12342,7 +12358,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
                 "suggestedCommand": "@我 将草稿中「亮面」lxmmov 的权重调整为 101",
             },
         )
-        self.assertIn("可以改为：\n- “@我 将草稿中", finalized)
+        self.assertIn("可执行命令：\n- “@我 将草稿中", finalized)
         self.assertNotIn("重新发送", finalized)
 
     def test_confirmation_can_still_request_original_operation(self) -> None:

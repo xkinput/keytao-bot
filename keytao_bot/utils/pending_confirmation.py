@@ -59,10 +59,12 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
     normalized = unicodedata.normalize("NFKC", str(text or ""))
     pairs: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
+    positioned_pairs: list[tuple[int, str, str]] = []
     patterns = (
         re.compile(
             r"(?m)^\s*[-•]\s*「(?P<word>[^」\n]{1,128})」\s*"
-            r"(?:→|->)\s*(?P<code>[a-z]{1,12})\s*$",
+            r"(?:→|->)\s*(?P<code>[a-z]{1,12})"
+            r"(?:\s*[（(][^）)\n]{0,128}[）)])?\s*$",
             re.IGNORECASE,
         ),
         re.compile(
@@ -78,14 +80,43 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
             re.IGNORECASE,
         ),
     )
-    matches = sorted(
-        (match for pattern in patterns for match in pattern.finditer(normalized)),
-        key=lambda match: match.start(),
+    positioned_pairs.extend(
+        (match.start(), match.group("word"), match.group("code"))
+        for pattern in patterns
+        for match in pattern.finditer(normalized)
     )
-    for match in matches:
+
+    numbered_heading = re.compile(
+        r"(?m)^\s*\d{1,3}[.)、]\s*"
+        r"[「“『]?(?P<word>[\u3400-\u9fffA-Za-z0-9_-]{1,128})[」”』]?\s*$"
+    )
+    recommended_candidate = re.compile(
+        r"(?:^|[：:｜|])\s*\d{1,3}[.)、]\s*"
+        r"(?P<code>[a-z]{1,12})\s*(?:—|–|-)\s*"
+        r"[^\n｜|]{0,64}[（(]\s*(?:✅\s*)?推荐\s*[）)]",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    headings = list(numbered_heading.finditer(normalized))
+    for index, heading in enumerate(headings):
+        block_end = (
+            headings[index + 1].start()
+            if index + 1 < len(headings)
+            else len(normalized)
+        )
+        block = normalized[heading.end():block_end]
+        if "候选" not in block:
+            continue
+        candidate = recommended_candidate.search(block)
+        if candidate is None:
+            continue
+        positioned_pairs.append(
+            (heading.start(), heading.group("word"), candidate.group("code"))
+        )
+
+    for _position, raw_word, raw_code in sorted(positioned_pairs):
         pair = (
-            match.group("word").strip(),
-            match.group("code").strip().lower(),
+            raw_word.strip(),
+            raw_code.strip().lower(),
         )
         if pair in seen:
             continue
@@ -212,6 +243,20 @@ def render_executable_suggestion(
     return f"- {wrapped}{suffix}"
 
 
+def render_remediation_reply(
+    reason: str,
+    *,
+    command: str = "",
+    words: tuple[str, ...] = (),
+) -> str:
+    """Render a refusal with one executable command, or state that none exists."""
+    clean_reason = str(reason or "").strip().rstrip("；;。")
+    suggestion = render_executable_suggestion(command, words=words)
+    if suggestion:
+        return f"{clean_reason}。\n可执行命令：\n{suggestion}"
+    return f"{clean_reason}。当前没有可安全执行的后续命令。"
+
+
 def _mask_set_reference_quotes(text: str) -> str:
     source = list(unicodedata.normalize("NFKC", str(text or "")))
     normalized = "".join(source)
@@ -251,6 +296,12 @@ def parse_advertised_set_reference(text: str) -> AdvertisedSetReference:
     if assent is not None:
         verb = assent.group("verb")
         tail = assent.group("tail").strip().lstrip("，,。.!！;；:：").strip()
+        if not tail:
+            return AdvertisedSetReference(
+                matched=True,
+                submit_after=verb in PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS,
+                advertised_verb=verb,
+            )
         body = ""
         for pattern in (
             re.compile(r"^(?:跳过|略过)(?P<body>.+)$"),
@@ -431,11 +482,35 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
     def advertised_forms(forms: tuple[str, ...]) -> tuple[str, ...]:
         found = []
         for form in forms:
-            if any(
+            direct_advertisement = any(
                 f"回复{left}{form}{right}" in normalized
                 or f"发送{left}{form}{right}" in normalized
                 for left, right in _ADVERTISED_QUOTE_PAIRS
-            ):
+            )
+            action_list_advertisement = False
+            if form in PENDING_BATCH_ADD_ADVERTISED_FORMS:
+                action_list_advertisement = any(
+                    re.search(
+                        rf"(?m)^\s*[-•]\s*[^\n]{{0,128}}"
+                        rf"{re.escape(left + form + right)}[^\n]{{0,128}}"
+                        r"(?:→|->)\s*只加入草稿\s*$",
+                        normalized,
+                    )
+                    is not None
+                    for left, right in _ADVERTISED_QUOTE_PAIRS
+                )
+            elif form in PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS:
+                action_list_advertisement = any(
+                    re.search(
+                        rf"(?m)^\s*[-•]\s*[^\n]{{0,128}}"
+                        rf"{re.escape(left + form + right)}[^\n]{{0,128}}"
+                        r"(?:→|->)\s*加入后提交\s*$",
+                        normalized,
+                    )
+                    is not None
+                    for left, right in _ADVERTISED_QUOTE_PAIRS
+                )
+            if direct_advertisement or action_list_advertisement:
                 found.append(form)
         return tuple(found)
 

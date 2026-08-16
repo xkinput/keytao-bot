@@ -57,8 +57,10 @@ words while the scenario repair step removes those words from the local
 dictionary. This keeps the scan result absent and the later review deterministic.
 S20 reuses the first three S19 word/character declarations for a native-quoted
 batch confirmation and applies the same rig-owned dictionary cleanup.
-S22 reuses the first nine S19 word/character declarations for the orphaned
+S22 reuses the first two S19 word/character declarations for the orphaned
 re-review advertisement replay and applies the same rig-owned cleanup.
+S23 keeps the first nine S19 declarations for stale advertised-assent recovery;
+the forced state loss is rig-owned and does not touch the dictionary.
 
 ## Prerequisites
 
@@ -205,14 +207,26 @@ rendered remediation line (bullet, command quote, and record-derived
 parenthetical included), sends that whole line back verbatim, and requires the
 exact live ticket set to reach one batch.
 
-S22 replays the orphaned re-review advertisement incident. It first establishes
-an exact nine-word candidate list, clears the actor conversation to force state
-loss, then quotes that list while requesting a later read-only review of the
-same exact words. If the re-review advertises `加入并提交`, the delivery contract
-must have rebuilt an actor-owned ticket from same-turn server review records.
-The scenario natively quotes that re-review, sends bare `加入并提交`, and requires
-all nine displayed word/code pairs to reach one batch. It rejects placeholder
-commands and any response claiming no quote was present.
+S22 replays the orphaned re-review advertisement incident with the minimum
+multi-word shape. It first establishes an exact two-word candidate list, clears
+the actor conversation to force state loss, then quotes that list while asking a
+later read-only review to recompute the same exact words. The refreshed codes may
+legitimately differ from the first display. If the re-review advertises
+`加入并提交`, the delivery contract must rebuild an actor-owned ticket whose
+bindings exactly equal the refreshed display. A following unquoted bare
+`加入并提交` must write exactly those two displayed pairs to one batch. The
+scenario rejects invented/dropped words, placeholder commands, dishonest
+completion copy, and any response claiming no quote was present.
+
+S23 replays the stale advertised-assent production incident directly. It first
+establishes the exact nine-word candidate list, clears only the actor's live
+conversation state, then natively quotes the stale bot message and sends
+`加入并提交`. That same turn must run the existing review path for exactly the
+display-bound words, emit a fresh state-backed candidate list, and perform zero
+draft writes. A following unquoted `加入并提交` must write exactly the fresh
+displayed set to one batch. Offline safety coverage also forces an unresolvable
+quoted display and requires an honest renderer-backed `加词 ...` alternative
+without minting a write ticket or inventing any word.
 
 Optional overrides:
 

@@ -13,6 +13,7 @@ from nonebot.rule import Rule
 
 from keytao_bot.utils import http_client
 from keytao_bot.utils.http_client import KeytaoApiError
+from keytao_bot.utils.pending_confirmation import render_remediation_reply
 
 # Configuration is read through the shared HTTP layer at call time, so a value
 # changed after startup is picked up and there is no local silent fallback.
@@ -260,9 +261,13 @@ async def _handle_bind(bot: Bot, event: Event, matcher):
         # that may already be consumed.
         logger.error(f"Bind request failed: {error}")
         await matcher.finish(
-            "❌ 绑定请求没有得到确认，可能已经生效。\n"
-            "请先发送任意加词指令确认是否已绑定；若仍未绑定，请重新生成绑定码后再试。"
+            render_remediation_reply(
+                "❌ 绑定请求没有得到确认，可能已经生效；"
+                "绑定核对与重新生成绑定码都需要站外状态，当前没有可绑定的聊天命令"
+            )
         )
     except Exception as e:
         logger.error(f"Bind error: {e}")
-        await matcher.finish("❌ 绑定失败，请稍后重试")
+        await matcher.finish(render_remediation_reply(
+            "❌ 绑定失败；当前错误没有提供可安全重试的绑定码"
+        ))

@@ -10,6 +10,7 @@ from keytao_bot.utils.observability import observe_tool_call
 from keytao_bot.utils.pending_confirmation import (
     advertised_batch_assent_verb,
     pending_confirmation_copy,
+    render_remediation_reply,
 )
 
 try:  # pragma: no cover - depends on the installed runtime
@@ -1231,7 +1232,9 @@ class ToolExecutor:
                         reason,
                         (
                             f"“{word}”在 {binding.code} 之后没有本轮已核验的空闲候选编码，"
-                            "本次未写入。可以明确要求同码，或先重新准备该词的候选编码后再试。"
+                            + render_remediation_reply(
+                                "本轮没有唯一安全的后续命令；本次未写入"
+                            )
                         ),
                         word=word,
                         destinationWord=binding.destination_word,
@@ -1615,9 +1618,11 @@ class ToolExecutor:
             )
             return text_follow_up(
                 "multi_add_limit_exceeded",
-                f"本次点名了 {len(refused)} 条加词，超过单次上限 "
-                f"{_MAX_AUTHORIZED_MULTI_ADD_ITEMS} 条；本次未截断、未写入。"
-                "请拆成更小批次后重试。",
+                render_remediation_reply(
+                    f"本次点名了 {len(refused)} 条加词，超过单次上限 "
+                    f"{_MAX_AUTHORIZED_MULTI_ADD_ITEMS} 条；本次未截断、未写入；"
+                    "系统不能替用户决定批次拆分边界"
+                ),
                 refusedItems=refused,
                 limit=_MAX_AUTHORIZED_MULTI_ADD_ITEMS,
             )
@@ -1634,8 +1639,10 @@ class ToolExecutor:
             # echoed back in the result, launders it into the trusted set.
             return policy_block(
                 BLOCK_REASON_UNTRUSTED_BATCH,
-                "安全拦截：只能操作本轮由服务端返回过的批次。"
-                "请先读取当前草稿，再用它返回的批次编号。",
+                render_remediation_reply(
+                    "安全拦截：只能操作本轮由服务端返回过的批次",
+                    command="查看草稿",
+                ),
                 missing=["trustedBatchId"],
                 requestedBatchId=requested_batch[:64],
             )
@@ -1734,7 +1741,10 @@ class ToolExecutor:
                     "success": False,
                     "policyBlocked": True,
                     "blockReason": BLOCK_REASON_BULK_DELETE_NOT_REQUESTED,
-                    "message": "安全拦截：当前消息不是批量删除请求，禁止一次删除多个草稿条目。请只删除本次明确需要替换的条目，或先向用户确认。",
+                    "message": render_remediation_reply(
+                        "安全拦截：当前消息不是批量删除请求，禁止一次删除多个草稿条目；"
+                        "系统不能替用户选择要删除的目标"
+                    ),
                     "blockedIds": ids,
                 }
 
@@ -1792,8 +1802,10 @@ class ToolExecutor:
                 "success": False,
                 "policyBlocked": True,
                 "message": (
-                    "安全拦截：拟执行内容过大，无法在一条确认消息中完整展示。"
-                    "请拆成更小批次后重新发送；本次未保存票据，也未写入。"
+                    render_remediation_reply(
+                        "安全拦截：拟执行内容过大，无法在一条确认消息中完整展示；"
+                        "本次未保存票据，也未写入；系统不能替用户决定批次拆分边界"
+                    )
                 ),
                 "previewCharacters": len(preview),
                 "oversizedLists": oversized_lists,

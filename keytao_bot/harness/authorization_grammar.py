@@ -6,7 +6,10 @@ from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 from keytao_bot.utils import review_flags
-from keytao_bot.utils.pending_confirmation import parse_pending_candidate_selection
+from keytao_bot.utils.pending_confirmation import (
+    parse_pending_candidate_selection,
+    render_remediation_reply,
+)
 
 _DELETE_INTENT_RE = re.compile(
     r"删除|删掉|删干净|去掉|移除|撤销|清空|清理|全部删|都删"
@@ -3278,8 +3281,10 @@ def _validate_current_message_binding(
         ):
             return text_follow_up(
                 BLOCK_REASON_ORDERING_NOT_EXPRESSIBLE,
-                "当前已有权重之间没有可用的整数位置，无法精确保持这条排序指令。"
-                "请先调整现有词条优先级，或改为只添加重码。",
+                render_remediation_reply(
+                    "当前已有权重之间没有可用的整数位置，"
+                    "无法精确保持这条排序指令；系统不能替用户选择调整优先级或重码"
+                ),
                 word=word,
                 destinationWord=positional_create.destination_word,
                 relation=positional_create.relation,

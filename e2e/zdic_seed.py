@@ -207,23 +207,28 @@ ZDIC_FIXTURES_BY_SCENARIO["S21"] = {
         ),
     ),
 }
-_S22_BATCH_WORDS = tuple(ZDIC_FIXTURES_BY_SCENARIO["S19"]["probe_words"][:9])
-_S22_BATCH_CHARACTERS = set("".join(_S22_BATCH_WORDS))
-ZDIC_FIXTURES_BY_SCENARIO["S22"] = {
-    "probe_words": _S22_BATCH_WORDS,
-    "rows": tuple(
-        row
-        for row in ZDIC_FIXTURES_BY_SCENARIO["S19"]["rows"]
-        if (
-            row["kind"] == "char"
-            and row["entry"] in _S22_BATCH_CHARACTERS
-        )
-        or (
-            row["kind"] == "entry"
-            and row["entry"] in _S22_BATCH_WORDS
-        )
-    ),
-}
+def _s19_subset_fixture(word_count: int) -> dict[str, object]:
+    words = tuple(ZDIC_FIXTURES_BY_SCENARIO["S19"]["probe_words"][:word_count])
+    characters = set("".join(words))
+    return {
+        "probe_words": words,
+        "rows": tuple(
+            row
+            for row in ZDIC_FIXTURES_BY_SCENARIO["S19"]["rows"]
+            if (
+                row["kind"] == "char"
+                and row["entry"] in characters
+            )
+            or (
+                row["kind"] == "entry"
+                and row["entry"] in words
+            )
+        ),
+    }
+
+
+ZDIC_FIXTURES_BY_SCENARIO["S22"] = _s19_subset_fixture(2)
+ZDIC_FIXTURES_BY_SCENARIO["S23"] = _s19_subset_fixture(9)
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 

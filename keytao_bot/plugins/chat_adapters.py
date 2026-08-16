@@ -23,6 +23,7 @@ from ..utils.image_input import (
 )
 from ..utils.llm_policy import log_chat_usage
 from ..utils.memory_store import ChatMemoryContext
+from ..utils.pending_confirmation import render_remediation_reply
 from .chat_render import _split_telegram_text
 
 
@@ -699,19 +700,21 @@ async def _describe_images_for_deepseek(
 
 
 def _vision_unavailable_reply() -> str:
-    return (
+    return render_remediation_reply(
         "我收到图片了，但当前主模型 DeepSeek V4 Flash 是纯文本模型，"
         "独立图片理解服务还没有启用，所以这次不能可靠地看图。"
-        "请管理员配置视觉代理后再试，避免我假装看到了图片。"
+        "配置视觉代理属于管理员站外操作"
     )
 
 
 def _vision_input_failed_reply() -> str:
-    return (
+    return render_remediation_reply(
         "图片已收到，但下载、大小或格式校验没有通过，因此没有发送给视觉服务。"
-        "请改用 JPG、PNG 或 WEBP，并尽量控制在 5 MB 以内再试。"
+        "更换文件格式或大小不属于可绑定的聊天命令"
     )
 
 
 def _vision_service_failed_reply() -> str:
-    return "图片理解服务这次没有返回完整结果，请稍后重试；我不会凭空猜图片内容。"
+    return render_remediation_reply(
+        "图片理解服务这次没有返回完整结果；我不会凭空猜图片内容"
+    )

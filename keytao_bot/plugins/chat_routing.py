@@ -34,6 +34,7 @@ from ..utils.pending_confirmation import (
     parse_advertised_set_reference,
     parse_pending_candidate_selection,
     render_executable_suggestion,
+    render_remediation_reply,
 )
 from .chat_adapters import (
     AsyncOpenAI,
@@ -107,18 +108,21 @@ def _resolve_advertised_word_set_selection(
         )
         return AdvertisedWordSetSelection(
             matched=True,
-            ask=f"当前有两组仍有效的候选（{groups}）。请先点名要处理哪一组；本次未写入。",
+            ask=render_remediation_reply(
+                f"当前有两组仍有效的候选（{groups}）；"
+                "系统不能替用户选择其中一组，本次未写入"
+            ),
         )
     snapshot: AdvertisedWordSetSnapshot = snapshots[0]
     if command.expected_count is not None and command.expected_count != len(snapshot.words):
         return AdvertisedWordSetSelection(
             matched=True,
             snapshot_token=snapshot.token,
-            ask=(
+            ask=render_remediation_reply(
                 f"当前有效候选共有 {len(snapshot.words)} 个，不是指令中的 "
-                f"{command.expected_count} 个。请只从「"
-                + "、".join(snapshot.words)
-                + "」中选择；本次未写入。"
+                f"{command.expected_count} 个；本次未写入",
+                command="加词 " + " ".join(snapshot.words),
+                words=tuple(snapshot.words),
             ),
         )
     exclusions = command.exclusions
@@ -142,10 +146,10 @@ def _resolve_advertised_word_set_selection(
             matched=True,
             snapshot_token=snapshot.token,
             exclusions=exclusions,
-            ask=(
+            ask=render_remediation_reply(
                 "按这些排除项计算后没有剩余词；当前有效候选为「"
                 + "、".join(snapshot.words)
-                + "」。请重新说明至少保留哪个词，本次未写入。"
+                + "」；必须由用户重新选择至少一个词，本次未写入"
             ),
         )
     return AdvertisedWordSetSelection(
@@ -426,8 +430,7 @@ def _pending_tool_assent_intent(
 def _format_live_ticket_precedence_message(state: PendingToolConfirm) -> str:
     response = (
         f"当前还有一项待确认操作：{_describe_pending_state(state)}。"
-        "为避免跳过这张票据，本次没有执行其他写入或提交；"
-        "请先确认或取消当前操作。"
+        "为避免跳过这张票据，本次没有执行其他写入或提交。"
     )
     items, _scopes = _multi_word_candidate_scope_rows(state)
     words = tuple(
@@ -441,7 +444,10 @@ def _format_live_ticket_precedence_message(state: PendingToolConfirm) -> str:
             words=words,
         )
         if suggestion:
-            response += "\n如需执行当前整批，请复制发送：\n" + suggestion
+            response += "\n可执行命令：\n" + suggestion
+    cancel = render_executable_suggestion("取消")
+    if cancel:
+        response += "\n或取消当前票据：\n" + cancel
     return response
 
 
@@ -875,15 +881,10 @@ def _format_stale_confirmation_response(
     if not _is_unambiguous_stale_confirmation(message_text):
         return None
     original_command = _recover_original_command_from_confirmation_quote(reply_reference)
-    guidance = (
-        f"请重新发送原始操作指令「{original_command}」，我会重新生成计划和新票据。"
-        if original_command
-        else "请重新发送原始操作指令，我会重新生成计划和新票据。"
-    )
-    return (
+    return render_remediation_reply(
         "之前等待确认的计划或票据已经过期，或因机器人重启而丢失。"
-        "旧票据通常只保留约 4 小时，而且机器人重启后不会保留。"
-        + guidance
+        "旧票据通常只保留约 4 小时，而且机器人重启后不会保留",
+        command=original_command,
     )
 
 
@@ -1163,9 +1164,10 @@ def _resolve_multi_word_pending_candidate_selection(
         message_text,
         words,
     ):
-        return None, None, (
-            "命令引号外含有非允许内容；请直接发送完整建议行。"
-            "当前确认票据仍保留，本次未写入。"
+        return None, None, render_remediation_reply(
+            "命令引号外含有非允许内容；当前确认票据仍保留，本次未写入",
+            command=f"将这 {len(words)} 个词加入草稿",
+            words=words,
         )
     set_reference = parse_advertised_set_reference(unwrapped or message_text)
     if set_reference.matched:
@@ -1173,31 +1175,31 @@ def _resolve_multi_word_pending_candidate_selection(
             set_reference.expected_count is not None
             and set_reference.expected_count != len(words)
         ):
-            return None, None, (
+            return None, None, render_remediation_reply(
                 f"当前有效候选共有 {len(words)} 个，不是指令中的 "
-                f"{set_reference.expected_count} 个。请只从「"
+                f"{set_reference.expected_count} 个；只能从「"
                 + "、".join(words)
-                + "」中选择；本次未写入。"
+                + "」中选择；本次未写入"
             )
         unknown = tuple(
             word for word in set_reference.exclusions if word not in words
         )
         if unknown:
-            return None, None, (
+            return None, None, render_remediation_reply(
                 "以下暂不添加的词不在当前确认票据中："
                 + "、".join(f"「{word}」" for word in unknown)
                 + "。当前有效候选为「"
                 + "、".join(words)
-                + "」；本次未写入。"
+                + "」；本次未写入"
             )
         resolved_words = tuple(
             word for word in words if word not in set_reference.exclusions
         )
         if not resolved_words:
-            return None, None, (
+            return None, None, render_remediation_reply(
                 "按这些排除项计算后没有剩余词；当前有效候选为「"
                 + "、".join(words)
-                + "」。请重新说明至少保留哪个词，本次未写入。"
+                + "」；本次未写入；系统不能替你决定至少保留哪个词"
             )
         resolved_set = set(resolved_words)
         derived_args = dict(state.args)
@@ -1258,15 +1260,27 @@ def _resolve_multi_word_pending_candidate_selection(
     if not target_word and (selection is not None or unscoped_recode):
         named_words = "、".join(f"「{word}」" for word in words)
         example = words[-1]
+        first = render_executable_suggestion(
+            f"{example} 添加1",
+            words=(example,),
+        )
+        multiple = render_executable_suggestion(
+            f"{example} 添加2、4",
+            words=(example,),
+        )
         return None, None, (
             f"当前有多个词（{named_words}），每个候选列表都从 1 开始。"
-            f"请带上词条选择，例如「{example} 添加1」或"
-            f"「{example} 添加2、4」。"
+            "可执行选择示例：\n"
+            + "\n".join(item for item in (first, multiple) if item)
         )
     if not target_word or selection is None:
         return None, None, None
     if not scopes:
-        return None, None, "当前多词候选缺少可信编号快照，请重新发起审词。"
+        return None, None, render_remediation_reply(
+            "当前多词候选缺少可信编号快照，本次未写入",
+            command="加词 " + " ".join(words),
+            words=words,
+        )
 
     indices, requested_codes, submit_after = selection
     candidates = scopes[target_word]
@@ -1275,7 +1289,10 @@ def _resolve_multi_word_pending_candidate_selection(
             len(set(indices)) != len(indices)
             or any(not 1 <= index <= len(candidates) for index in indices)
         ):
-            return None, None, f"「{target_word}」请选择 1-{len(candidates)} 之间的编号。"
+            return None, None, render_remediation_reply(
+                f"「{target_word}」只接受 1-{len(candidates)} 之间的编号；"
+                "系统不能替你选择其中一个"
+            )
         selected_codes = tuple(candidates[index - 1][0] for index in indices)
     else:
         candidate_codes = {code for code, _occupied in candidates}
@@ -1284,7 +1301,10 @@ def _resolve_multi_word_pending_candidate_selection(
             or len(set(requested_codes)) != len(requested_codes)
             or any(code not in candidate_codes for code in requested_codes)
         ):
-            return None, None, f"所选编码不全在「{target_word}」当前候选中，请重新选择。"
+            return None, None, render_remediation_reply(
+                f"所选编码不全在「{target_word}」当前候选中；"
+                "系统不能替你选择另一个编码"
+            )
         selected_codes = requested_codes
 
     target_item = next(

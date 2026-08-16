@@ -13,6 +13,7 @@ from ..utils import review_flags
 from ..utils.pending_confirmation import (
     pending_confirmation_copy,
     render_executable_suggestion,
+    render_remediation_reply,
 )
 
 
@@ -174,19 +175,15 @@ def _format_full_add_and_submit_instruction(
             if str(word or "").strip()
         ))
         if quoted:
-            next_step = (
-                "请重新发起这些词的审词复核：" + "、".join(words) + "。"
-                if words
-                else "请重新发起对原候选词的审词复核。"
-            )
-            return (
+            return render_remediation_reply(
                 "已检测到你引用了机器人消息，但这条消息对应的可执行候选状态"
-                "不存在（可能已过期，或发送时未建立）；本次不会写入。"
-                + next_step
+                "不存在（可能已过期，或发送时未建立）；本次不会写入",
+                command=("加词 " + " ".join(words)) if words else "",
+                words=words,
             )
-        return (
-            "当前没有可执行候选状态，本次不会写入。"
-            "请先发送需要复核的具体词条；复核完成后再按新消息中的具体操作继续。"
+        return render_remediation_reply(
+            "当前没有可执行候选状态，本次不会写入；"
+            "这条消息也没有提供可绑定的具体词条"
         )
 
     example = f"添加 {state.word} {state.recommended_code} 并提交"

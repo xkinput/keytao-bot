@@ -101,7 +101,7 @@ async def _verify_login_after_reconnect(bot: QQBot, bot_id: str):
         if bot_id not in _reported_offline:
             _reported_offline.add(bot_id)
             ts = datetime.now().strftime("%H:%M:%S")
-            msg = f"⚠️ QQ bot 掉线了！\n账号：{bot_id}\n时间：{ts}\n\nNapCat 已重启但账号仍未登录，请重新扫码。"
+            msg = f"⚠️ QQ bot 掉线了！\n账号：{bot_id}\n时间：{ts}\n\nNapCat 已重启但账号仍未登录；需要人工扫码，没有可由 bot 执行的命令。"
             await _send_tg(msg)
 
 
@@ -135,14 +135,14 @@ async def _heartbeat_loop():
                 if bot_id not in _reported_offline:
                     _reported_offline.add(bot_id)
                     ts = datetime.now().strftime("%H:%M:%S")
-                    msg = f"⚠️ QQ bot 账号无响应！\n账号：{bot_id}\n时间：{ts}\n\nNapCat 心跳检查超时，请检查账号状态。"
+                    msg = f"⚠️ QQ bot 账号无响应！\n账号：{bot_id}\n时间：{ts}\n\nNapCat 心跳检查超时；需要人工检查账号状态，没有可由 bot 执行的命令。"
                     await _send_tg(msg)
             except Exception as e:
                 logger.warning(f"[watchdog] heartbeat check failed for {bot_id}: {e}")
                 if bot_id not in _reported_offline:
                     _reported_offline.add(bot_id)
                     ts = datetime.now().strftime("%H:%M:%S")
-                    msg = f"⚠️ QQ bot 账号失效！\n账号：{bot_id}\n时间：{ts}\n\nNapCat WebSocket 在线但账号已离线，请重新登录。"
+                    msg = f"⚠️ QQ bot 账号失效！\n账号：{bot_id}\n时间：{ts}\n\nNapCat WebSocket 在线但账号已离线；需要人工登录，没有可由 bot 执行的命令。"
                     await _send_tg(msg)
 
 

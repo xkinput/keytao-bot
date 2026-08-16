@@ -14,6 +14,7 @@ from keytao_bot.utils.keytao_encoding import (
     build_phrase_pronunciation_codes as _build_phrase_pronunciation_codes,
     normalize_contextual_phrase_encoding,
 )
+from keytao_bot.utils.pending_confirmation import render_remediation_reply
 
 
 TYPE_LABELS = {
@@ -800,7 +801,9 @@ async def keytao_encode(
         logger.error(f"[keytao_encode] error: {error}")
         return {
             "success": False,
-            "message": "编码服务暂时不可用，请稍后再试"
+            "message": render_remediation_reply(
+                "编码服务暂时不可用；当前没有服务端可绑定的候选"
+            )
         }
 
 

@@ -40,6 +40,7 @@ from ..utils.keytao_review import (
     infer_semantic_pronunciation,
 )
 from ..utils.memory_store import ChatMemoryContext
+from ..utils.pending_confirmation import render_remediation_reply
 from ..utils.observability import (
     begin_turn_metrics,
     emit_turn_metrics,
@@ -244,7 +245,9 @@ try:
                     current_history_generation.reset(history_token)
                     current_memory_generation.reset(memory_token)
             emit_turn_metrics(logger)
-            return {"reply": reply or "抱歉，AI 暂时无法响应，请稍后再试"}
+            return {"reply": reply or render_remediation_reply(
+                "AI 暂时无法响应；本轮没有生成可绑定的后续命令"
+            )}
         except BaseException:
             if not turn_metrics_emitted():
                 mark_turn_outcome("error")

@@ -20,6 +20,8 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 from nonebot.log import logger
 
+from .pending_confirmation import render_remediation_reply
+
 # ---------------------------------------------------------------------------
 # Configuration helpers
 # ---------------------------------------------------------------------------
@@ -451,7 +453,10 @@ async def keytao_request(
         if not replay_safe and (
             "/batches/" in path or "/pull-requests/" in path
         ):
-            suffix += "；请先查看草稿核对状态，再决定是否重试"
+            suffix += "；" + render_remediation_reply(
+                "写请求结果不确定；不要直接重试",
+                command="查看草稿",
+            )
         raise KeytaoApiError(
             f"KeyTao API 请求失败（{normalized_method} {path}）：{last_error}{suffix}"
         ) from error

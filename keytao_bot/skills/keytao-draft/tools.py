@@ -37,6 +37,7 @@ from keytao_bot.utils.keytao_review import (
     manual_preaudit_issue_for_item,
     prepare_reviewed_word,
 )
+from keytao_bot.utils.pending_confirmation import render_remediation_reply
 
 
 ACTION_LABELS = {
@@ -680,8 +681,13 @@ class UserNotFoundError(Exception):
 
 def _not_bound_message(platform: str) -> str:
     if platform in ("web", "web-anon"):
-        return "请先登录 KeyTao 后再进行加词操作"
-    return "未找到绑定账号，请先使用 /bind 命令绑定你的键道平台账号"
+        return render_remediation_reply(
+            "当前未登录 KeyTao；登录属于站外操作"
+        )
+    return render_remediation_reply(
+        "未找到绑定账号",
+        command="/bind",
+    )
 
 
 def get_keytao_url() -> str:
@@ -1354,7 +1360,10 @@ async def keytao_create_phrase(
                 if confirmed and response.status_code >= 500:
                     result.update({
                         "uncertain": True,
-                        "message": "添加结果无法确认；请求可能已经生效，请先查看原草稿",
+                        "message": render_remediation_reply(
+                            "添加结果无法确认；请求可能已经生效",
+                            command="查看草稿",
+                        ),
                     })
                 return _inject_known_batch_url(result, batch_id)
                 
@@ -1362,12 +1371,15 @@ async def keytao_create_phrase(
         if preview_only:
             return _inject_known_batch_url({
                 "success": False,
-                "message": "添加预检超时，请稍后重试",
+                "message": render_remediation_reply("添加预检超时"),
             }, batch_id)
         result = {
             "success": False,
             "uncertain": True,
-            "message": "添加请求超时，草稿可能已经写入；请先查看草稿核对状态，再决定是否重试",
+            "message": render_remediation_reply(
+                "添加请求超时，草稿可能已经写入",
+                command="查看草稿",
+            ),
         }
         return _inject_known_batch_url(result, batch_id)
     except Exception as e:
@@ -1375,7 +1387,10 @@ async def keytao_create_phrase(
         result = {
             "success": False,
             "message": (
-                "添加结果无法确认；请先查看原草稿"
+                render_remediation_reply(
+                    "添加结果无法确认",
+                    command="查看草稿",
+                )
                 if confirmed
                 else f"创建失败: {str(e)}"
             ),
@@ -1777,7 +1792,11 @@ async def _auto_approve_submitted_batch(
     except httpx.TimeoutException:
         return {
             "success": False,
-            "message": "批次已提交，自动批准超时且可能已经生效；请先查看草稿核对状态，未确认时转交管理员审核",
+            "message": render_remediation_reply(
+                "批次已提交，自动批准超时且可能已经生效；"
+                "转交管理员属于站外处理",
+                command="查看草稿",
+            ),
         }
     except Exception as error:
         logger.warning(f"[auto_review] approve failed: {error}")
@@ -1833,7 +1852,10 @@ async def keytao_submit_batch(
     ):
         return _inject_known_batch_url({
             "success": False,
-            "message": "提交确认缺少有效的批次版本，请重新获取最新提交检查结果",
+            "message": render_remediation_reply(
+                "提交确认缺少有效的批次版本",
+                command="提交",
+            ),
         }, batch_id)
 
     # The first request may resolve the latest draft. A confirmation must use
@@ -1886,7 +1908,10 @@ async def keytao_submit_batch(
                 "success": False,
                 "uncertain": True,
                 "error": "submit_confirmation_already_claimed",
-                "message": "这次提交正在执行或结果尚不确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
+                "message": render_remediation_reply(
+                    "这次提交正在执行或结果尚不确定",
+                    command="查看草稿",
+                ),
                 "batchId": batch_id,
             }, batch_id)
         if claim_status != "ok" or auto_review is None:
@@ -1895,8 +1920,11 @@ async def keytao_submit_batch(
                 "staleConfirmation": True,
                 "error": "submit_confirmation_missing",
                 "message": (
-                    "提交检查已过期或不匹配，请重新发送「提交」获取最新快照；"
-                    "若这是加词后提交，请重新发送包含词条和编码的完整指令"
+                    render_remediation_reply(
+                        "提交检查已过期或不匹配；若这是加词后提交，"
+                        "当前结果不含可绑定的词条和编码",
+                        command="提交",
+                    )
                 ),
                 "batchId": batch_id,
             }, batch_id)
@@ -1927,7 +1955,10 @@ async def keytao_submit_batch(
             "success": False,
             "staleConfirmation": True,
             "error": "submit_content_version_changed",
-            "message": "草稿内容已变化，本次确认已失效，请重新发送「提交」",
+            "message": render_remediation_reply(
+                "草稿内容已变化，本次确认已失效",
+                command="提交",
+            ),
             "batchId": batch_id,
             "contentVersion": audited_content_version,
             "autoReview": auto_review,
@@ -1938,7 +1969,10 @@ async def keytao_submit_batch(
             "success": False,
             "staleConfirmation": True,
             "error": "submit_audit_digest_changed",
-            "message": "提交检查与当前快照不匹配，本次确认已失效，请重新发送「提交」",
+            "message": render_remediation_reply(
+                "提交检查与当前快照不匹配，本次确认已失效",
+                command="提交",
+            ),
             "batchId": batch_id,
             "contentVersion": audited_content_version,
             "auditDigest": audited_digest,
@@ -1956,7 +1990,10 @@ async def keytao_submit_batch(
                 "success": False,
                 "uncertain": True,
                 "error": "invalid_submit_preview",
-                "message": "服务端未返回完整的只读提交快照；请先发送「查看草稿」核对状态",
+                "message": render_remediation_reply(
+                    "服务端未返回完整的只读提交快照",
+                    command="查看草稿",
+                ),
                 "batchId": batch_id,
                 "contentVersion": audited_content_version,
             }, batch_id)
@@ -1978,7 +2015,10 @@ async def keytao_submit_batch(
             return _inject_known_batch_url({
                 "success": False,
                 "error": "audit_snapshot_not_stored",
-                "message": "提交检查无法安全保存（结果过大或容量不足）；请先发送「查看草稿」核对状态",
+                "message": render_remediation_reply(
+                    "提交检查无法安全保存（结果过大或容量不足）",
+                    command="查看草稿",
+                ),
                 "batchId": batch_id,
                 "contentVersion": audited_content_version,
             }, batch_id)
@@ -2095,7 +2135,10 @@ async def keytao_submit_batch(
                     "error": data.get("error") or "submit_snapshot_changed",
                     "staleConfirmation": True,
                     "batchId": batch_id,
-                    "message": data.get("message") or "草稿内容已变化，请重新检查后提交",
+                    "message": data.get("message") or render_remediation_reply(
+                        "草稿内容已变化",
+                        command="提交",
+                    ),
                 }, batch_id)
             else:
                 if confirmed:
@@ -2104,7 +2147,10 @@ async def keytao_submit_batch(
                         "success": False,
                         "uncertain": True,
                         "error": "submit_result_uncertain",
-                        "message": "提交结果暂时无法确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
+                        "message": render_remediation_reply(
+                            "提交结果暂时无法确定",
+                            command="查看草稿",
+                        ),
                         "batchId": batch_id,
                     }, batch_id)
                 return _inject_known_batch_url({
@@ -2121,7 +2167,7 @@ async def keytao_submit_batch(
             return _inject_known_batch_url({
                 "success": False,
                 "error": "submit_preview_timeout",
-                "message": "提交预检超时，请稍后重试",
+                "message": render_remediation_reply("提交预检超时"),
             }, batch_id)
         if confirmed:
             mark_confirmation_uncertain()
@@ -2129,14 +2175,20 @@ async def keytao_submit_batch(
                 "success": False,
                 "uncertain": True,
                 "error": "submit_result_uncertain",
-                "message": "提交请求超时，结果可能已经生效；请先发送「查看草稿」核对状态，再重新发送「提交」",
+                "message": render_remediation_reply(
+                    "提交请求超时，结果可能已经生效",
+                    command="查看草稿",
+                ),
                 "batchId": batch_id,
             }, batch_id)
         return _inject_known_batch_url({
             "success": False,
             "uncertain": True,
             "error": "submit_timeout",
-            "message": "提交请求超时，草稿可能已经写入；请先发送「查看草稿」核对状态，再决定是否重试",
+            "message": render_remediation_reply(
+                "提交请求超时，草稿可能已经写入",
+                command="查看草稿",
+            ),
         }, batch_id)
     except Exception as e:
         logger.error(f"Submit batch error: {e}")
@@ -2146,7 +2198,10 @@ async def keytao_submit_batch(
                 "success": False,
                 "uncertain": True,
                 "error": "submit_result_uncertain",
-                "message": "提交结果无法确定，请先发送「查看草稿」核对状态，再重新发送「提交」",
+                "message": render_remediation_reply(
+                    "提交结果无法确定",
+                    command="查看草稿",
+                ),
                 "batchId": batch_id,
             }, batch_id)
         return _inject_known_batch_url({
@@ -2220,7 +2275,7 @@ async def keytao_get_batch_preview(
         }
 
     except httpx.TimeoutException:
-        return {"success": False, "message": "请求超时，请稍后重试"}
+        return {"success": False, "message": render_remediation_reply("请求超时")}
     except Exception as e:
         logger.error(f"[keytao_get_batch_preview] Error: {e}")
         return {"success": False, "message": f"获取预览失败: {str(e)}"}
@@ -2468,7 +2523,10 @@ async def keytao_recall_batch(
                         "success": False,
                         "uncertain": True,
                         "batchId": batch_id,
-                        "message": "撤回结果无法确认；请求可能已经生效，请先查看原批次状态",
+                        "message": render_remediation_reply(
+                            "撤回结果无法确认；请求可能已经生效",
+                            command="查看草稿",
+                        ),
                     }
                     _inject_batch_url(uncertain)
                     return uncertain
@@ -2499,8 +2557,9 @@ async def keytao_recall_batch(
             if response.status_code >= 500:
                 data["success"] = False
                 data["uncertain"] = True
-                data["message"] = (
-                    "撤回结果无法确认；请求可能已经生效，请先查看原批次状态"
+                data["message"] = render_remediation_reply(
+                    "撤回结果无法确认；请求可能已经生效",
+                    command="查看草稿",
                 )
             _inject_batch_url(data)
             if _definitive_mutation_response(response.status_code, data):
@@ -2513,12 +2572,18 @@ async def keytao_recall_batch(
                 ):
                     return _locked_mutation_result(
                         str(batch_id),
-                        "撤回结果无法安全保存；已锁定原批次，请先核对状态。",
+                        render_remediation_reply(
+                            "撤回结果无法安全保存；已锁定原批次",
+                            command="查看草稿",
+                        ),
                     )
             elif response.status_code < 500:
                 data["success"] = False
                 data["uncertain"] = True
-                data["message"] = "撤回接口未返回同步终态；已锁定原批次，请先核对状态"
+                data["message"] = render_remediation_reply(
+                    "撤回接口未返回同步终态；已锁定原批次",
+                    command="查看草稿",
+                )
             return data
 
     except asyncio.CancelledError:
@@ -2534,7 +2599,10 @@ async def keytao_recall_batch(
                 "success": False,
                 "uncertain": True,
                 "batchId": batch_id,
-                "message": "撤回请求超时，结果可能已经生效；请先查看草稿或原批次状态",
+                "message": render_remediation_reply(
+                    "撤回请求超时，结果可能已经生效",
+                    command="查看草稿",
+                ),
             }
             _inject_batch_url(uncertain)
             return uncertain
@@ -2543,7 +2611,10 @@ async def keytao_recall_batch(
                 str(existing_recall_payload.get("batchId") or ""),
                 "撤回核验请求超时；已锁定原批次，不会选择新的提交批次。",
             )
-        return {"success": False, "message": "请求超时，请稍后重试"}
+        return {
+            "success": False,
+            "message": render_remediation_reply("撤回预检请求超时"),
+        }
     except Exception as e:
         logger.error(f"[keytao_recall_batch] Error: {e}")
         if batch_id:
@@ -2551,7 +2622,10 @@ async def keytao_recall_batch(
                 "success": False,
                 "uncertain": True,
                 "batchId": batch_id,
-                "message": "撤回结果无法确认；请先查看原批次状态",
+                "message": render_remediation_reply(
+                    "撤回结果无法确认",
+                    command="查看草稿",
+                ),
             }
             _inject_batch_url(uncertain)
             return uncertain
@@ -2623,7 +2697,10 @@ async def keytao_list_draft_items(
             return data
 
     except httpx.TimeoutException:
-        return {"success": False, "message": "请求超时，请稍后重试"}
+        return {
+            "success": False,
+            "message": render_remediation_reply("查看草稿请求超时"),
+        }
     except httpx.TransportError as e:
         logger.error(f"List draft items network error: {type(e).__name__}: {e!r}")
         return {"success": False, "message": f"网络错误: {type(e).__name__}"}
@@ -2667,9 +2744,9 @@ async def keytao_update_draft_item_weight(
         reason = "没有找到" if not matches else "找到多条"
         return {
             "success": False,
-            "message": (
-                f"草稿中{reason}“{word}” {code} 的唯一条目，"
-                "本次未写入；请先核对当前草稿。"
+            "message": render_remediation_reply(
+                f"草稿中{reason}“{word}” {code} 的唯一条目，本次未写入",
+                command="查看草稿",
             ),
             "matchedCount": len(matches),
         }
@@ -2753,7 +2830,10 @@ async def keytao_update_draft_item_weight(
                     "success": False,
                     "uncertain": True,
                     "batchId": batch_id,
-                    "message": "权重调整结果无法确认；请先查看当前草稿，不要直接重试。",
+                    "message": render_remediation_reply(
+                        "权重调整结果无法确认；不要直接重试",
+                        command="查看草稿",
+                    ),
                 }
             data.setdefault("batchId", batch_id)
             if response.status_code == 409:
@@ -2769,7 +2849,10 @@ async def keytao_update_draft_item_weight(
             "success": False,
             "uncertain": True,
             "batchId": batch_id,
-            "message": "权重调整请求超时；请先查看当前草稿，不要直接重试。",
+            "message": render_remediation_reply(
+                "权重调整请求超时；不要直接重试",
+                command="查看草稿",
+            ),
         }
     except httpx.TransportError as error:
         return {
@@ -2864,9 +2947,9 @@ def _locked_mutation_result(batch_id: str, message: str) -> Dict:
         "success": False,
         "uncertain": True,
         "batchId": batch_id,
-        "message": (
-            message.rstrip()
-            + " 确认网站状态后，可发送「放弃不确定操作」解除安全锁。"
+        "message": render_remediation_reply(
+            message.rstrip() + "；网站状态核对属于站外操作",
+            command="放弃不确定操作",
         ),
     }, batch_id)
 
@@ -3253,7 +3336,10 @@ async def keytao_remove_draft_item(
                     "success": False,
                     "uncertain": True,
                     "batchId": batch_id,
-                    "message": "删除结果无法确认；请求可能已经生效，请先查看原草稿",
+                    "message": render_remediation_reply(
+                        "删除结果无法确认；请求可能已经生效",
+                        command="查看草稿",
+                    ),
                 }
                 _inject_batch_url(uncertain)
                 return uncertain
@@ -3283,8 +3369,9 @@ async def keytao_remove_draft_item(
             if response.status_code >= 500:
                 data["success"] = False
                 data["uncertain"] = True
-                data["message"] = (
-                    "删除结果无法确认；请求可能已经生效，请先查看原草稿"
+                data["message"] = render_remediation_reply(
+                    "删除结果无法确认；请求可能已经生效",
+                    command="查看草稿",
                 )
             if data.get("success"):
                 snapshot = await _fetch_draft_snapshot(
@@ -3303,12 +3390,18 @@ async def keytao_remove_draft_item(
                 ):
                     return _locked_mutation_result(
                         str(batch_id or ""),
-                        "删除结果无法安全保存；已锁定原批次，请先核对状态。",
+                        render_remediation_reply(
+                            "删除结果无法安全保存；已锁定原批次",
+                            command="查看草稿",
+                        ),
                     )
             elif response.status_code < 500:
                 data["success"] = False
                 data["uncertain"] = True
-                data["message"] = "删除接口未返回同步终态；已锁定原批次，请先核对状态"
+                data["message"] = render_remediation_reply(
+                    "删除接口未返回同步终态；已锁定原批次",
+                    command="查看草稿",
+                )
             return data
 
     except asyncio.CancelledError:
@@ -3322,7 +3415,10 @@ async def keytao_remove_draft_item(
             "success": False,
             "uncertain": True,
             "batchId": batch_id,
-            "message": "删除请求超时，结果可能已经生效；请先查看原草稿",
+            "message": render_remediation_reply(
+                "删除请求超时，结果可能已经生效",
+                command="查看草稿",
+            ),
         }
         _inject_batch_url(uncertain)
         return uncertain
@@ -3332,7 +3428,10 @@ async def keytao_remove_draft_item(
             "success": False,
             "uncertain": True,
             "batchId": batch_id,
-            "message": "删除结果无法确认；请先查看原草稿",
+            "message": render_remediation_reply(
+                "删除结果无法确认",
+                command="查看草稿",
+            ),
         }
         _inject_batch_url(uncertain)
         return uncertain
@@ -3607,7 +3706,10 @@ async def keytao_batch_add_to_draft(
                 if confirmed:
                     result.update({
                         "uncertain": True,
-                        "message": "批量添加结果无法确认；请求可能已经生效，请先查看原草稿",
+                        "message": render_remediation_reply(
+                            "批量添加结果无法确认；请求可能已经生效",
+                            command="查看草稿",
+                        ),
                     })
                 return _inject_known_batch_url(result, batch_id)
 
@@ -3642,12 +3744,15 @@ async def keytao_batch_add_to_draft(
         if preview_only:
             return _inject_known_batch_url({
                 "success": False,
-                "message": "批量添加预检超时，请稍后重试",
+                "message": render_remediation_reply("批量添加预检超时"),
             }, batch_id)
         result = {
             "success": False,
             "uncertain": True,
-            "message": "批量添加请求超时，草稿可能已经写入；请先查看草稿核对状态，再决定是否重试",
+            "message": render_remediation_reply(
+                "批量添加请求超时，草稿可能已经写入；不要直接重试",
+                command="查看草稿",
+            ),
         }
         return _inject_known_batch_url(result, batch_id)
     except Exception as e:
@@ -3655,7 +3760,10 @@ async def keytao_batch_add_to_draft(
         result = {
             "success": False,
             "message": (
-                "批量添加结果无法确认；请先查看原草稿"
+                render_remediation_reply(
+                    "批量添加结果无法确认",
+                    command="查看草稿",
+                )
                 if confirmed
                 else f"批量添加失败: {str(e)}"
             ),
@@ -3789,7 +3897,10 @@ async def keytao_batch_remove_draft_items(
                     "success": False,
                     "uncertain": True,
                     "batchId": batch_id,
-                    "message": "批量删除结果无法确认；请求可能已经生效，请先查看原草稿",
+                    "message": render_remediation_reply(
+                        "批量删除结果无法确认；请求可能已经生效",
+                        command="查看草稿",
+                    ),
                 }
                 _inject_batch_url(uncertain)
                 return uncertain
@@ -3821,8 +3932,9 @@ async def keytao_batch_remove_draft_items(
             if response.status_code >= 500:
                 data["success"] = False
                 data["uncertain"] = True
-                data["message"] = (
-                    "批量删除结果无法确认；请求可能已经生效，请先查看原草稿"
+                data["message"] = render_remediation_reply(
+                    "批量删除结果无法确认；请求可能已经生效",
+                    command="查看草稿",
                 )
             if isinstance(data.get("draftItems"), list):
                 data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
@@ -3837,12 +3949,18 @@ async def keytao_batch_remove_draft_items(
                 ):
                     return _locked_mutation_result(
                         str(batch_id or ""),
-                        "批量删除结果无法安全保存；已锁定原批次，请先核对状态。",
+                        render_remediation_reply(
+                            "批量删除结果无法安全保存；已锁定原批次",
+                            command="查看草稿",
+                        ),
                     )
             elif response.status_code < 500:
                 data["success"] = False
                 data["uncertain"] = True
-                data["message"] = "批量删除接口未返回同步终态；已锁定原批次，请先核对状态"
+                data["message"] = render_remediation_reply(
+                    "批量删除接口未返回同步终态；已锁定原批次",
+                    command="查看草稿",
+                )
             return data
     except asyncio.CancelledError:
         logger.warning(
@@ -3855,7 +3973,10 @@ async def keytao_batch_remove_draft_items(
             "success": False,
             "uncertain": True,
             "batchId": batch_id,
-            "message": "批量删除请求超时，结果可能已经生效；请先查看原草稿",
+            "message": render_remediation_reply(
+                "批量删除请求超时，结果可能已经生效",
+                command="查看草稿",
+            ),
         }
         _inject_batch_url(uncertain)
         return uncertain
@@ -3865,7 +3986,10 @@ async def keytao_batch_remove_draft_items(
             "success": False,
             "uncertain": True,
             "batchId": batch_id,
-            "message": "批量删除结果无法确认；请先查看原草稿",
+            "message": render_remediation_reply(
+                "批量删除结果无法确认",
+                command="查看草稿",
+            ),
         }
         _inject_batch_url(uncertain)
         return uncertain
@@ -3958,7 +4082,10 @@ async def _keytao_strict_batch_add_to_draft(
             result = {
                 "success": False,
                 "uncertain": True,
-                "message": "整批顺延结果无法确认；请求可能已经生效，请先查看原草稿",
+                "message": render_remediation_reply(
+                    "整批顺延结果无法确认；请求可能已经生效",
+                    command="查看草稿",
+                ),
             }
             return _inject_known_batch_url(result, batch_id)
         _inject_known_batch_url(data, batch_id)
@@ -3982,7 +4109,10 @@ async def _keytao_strict_batch_add_to_draft(
             if response.status_code >= 500:
                 result.update({
                     "uncertain": True,
-                    "message": "整批顺延结果无法确认；请求可能已经生效，请先查看原草稿",
+                    "message": render_remediation_reply(
+                        "整批顺延结果无法确认；请求可能已经生效",
+                        command="查看草稿",
+                    ),
                 })
             return _inject_known_batch_url(result, batch_id)
         data["successCount"] = int(
@@ -4001,7 +4131,10 @@ async def _keytao_strict_batch_add_to_draft(
         result = {
             "success": False,
             "uncertain": True,
-            "message": "整批顺延请求超时；请先查看草稿确认状态，不要立即重试",
+            "message": render_remediation_reply(
+                "整批顺延请求超时；不要立即重试",
+                command="查看草稿",
+            ),
         }
         return _inject_known_batch_url(result, batch_id)
     except Exception as error:
@@ -4009,7 +4142,10 @@ async def _keytao_strict_batch_add_to_draft(
         result = {
             "success": False,
             "uncertain": True,
-            "message": "整批顺延结果无法确认；请先查看原草稿",
+            "message": render_remediation_reply(
+                "整批顺延结果无法确认",
+                command="查看草稿",
+            ),
         }
         return _inject_known_batch_url(result, batch_id)
 
@@ -4164,9 +4300,9 @@ async def keytao_shift_phrase_code(
             "success": False,
             "policyBlocked": True,
             "requiresDraftCleanup": True,
-            "message": (
+            "message": render_remediation_reply(
                 "相关词条已存在于草稿中；为避免非原子地先删后写，"
-                "本次顺延未修改草稿。请先明确处理这些旧草稿条目，再重新发起顺延。"
+                "本次顺延未修改草稿；必须由用户决定如何处理旧草稿条目"
             ),
             "relatedDraftItems": related_draft_items[:20],
             "shiftPlan": {
@@ -4238,7 +4374,11 @@ async def keytao_shift_phrase_code(
         return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
-            "message": "顺延计划或草稿内容已变化，旧确认票据已作废，请重新发起",
+            "message": render_remediation_reply(
+                "顺延计划或草稿内容已变化，旧确认票据已作废",
+                command=f"顺延「{word}」到 {target_code}",
+                words=(word,),
+            ),
             "batchId": current_batch_id,
             "contentVersion": current_content_version,
         }, current_batch_id)

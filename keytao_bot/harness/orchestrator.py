@@ -34,6 +34,7 @@ from keytao_bot.utils.pending_confirmation import (
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     render_executable_suggestion,
+    render_remediation_reply,
 )
 
 from .state import (
@@ -363,9 +364,11 @@ class AgentOrchestrator:
             context,
         )
         if context.resolved_advertised_words and not resolved_advertised_words:
-            return (
-                "刚才的候选快照已变化或失效；本次未写入，"
-                "请重新扫描后再选择。"
+            requested_words = tuple(context.resolved_advertised_words)
+            return render_remediation_reply(
+                "刚才的候选快照已变化或失效；本次未写入",
+                command="加词 " + " ".join(requested_words),
+                words=requested_words,
             )
 
         # Image-derived text is untrusted data. Do not expose even read/network tools:
@@ -661,8 +664,10 @@ class AgentOrchestrator:
                         f"max_tokens={current_max_tokens}"
                     )
                     return self._append_authoritative_result_links(
-                        "连续两次没有生成可见回复或工具调用，已停止扩大处理预算。"
-                        "本次未执行任何新写入；请按当前待确认提示重试或取消。",
+                        render_remediation_reply(
+                            "连续两次没有生成可见回复或工具调用，已停止扩大处理预算；"
+                            "本次未执行任何新写入"
+                        ),
                         authoritative_result_links,
                     )
             else:
@@ -679,7 +684,9 @@ class AgentOrchestrator:
                     continue
                 logger.warning("Response truncated even at max cap")
                 return self._append_authoritative_result_links(
-                    "呜呜，回复太长被截断了 qwq 请把任务拆小一点再试试～",
+                    render_remediation_reply(
+                        "回复太长且已达到处理预算上限，本轮不能生成安全的拆分命令"
+                    ),
                     authoritative_result_links,
                 )
 
@@ -689,7 +696,9 @@ class AgentOrchestrator:
                     f"finish_reason={finish_reason}"
                 )
                 return self._append_authoritative_result_links(
-                    "呜呜，AI 返回了未完成的结果 qwq 请稍后再试一次～",
+                    render_remediation_reply(
+                        "AI 返回了未完成的结果；本轮没有可安全执行的后续命令"
+                    ),
                     authoritative_result_links,
                 )
 
@@ -699,14 +708,18 @@ class AgentOrchestrator:
                     f"finish_reason={finish_reason} tool_calls={tool_call_count}"
                 )
                 return self._append_authoritative_result_links(
-                    "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～",
+                    render_remediation_reply(
+                        "AI 返回了不完整的工具请求；本批没有执行"
+                    ),
                     authoritative_result_links,
                 )
 
             if finish_reason == "tool_calls" and not response_tool_calls:
                 logger.error("Model returned finish_reason=tool_calls without any tool calls")
                 return self._append_authoritative_result_links(
-                    "呜呜，AI 返回了不完整的工具请求 qwq 请再试一次～",
+                    render_remediation_reply(
+                        "AI 返回了不完整的工具请求；本批没有执行"
+                    ),
                     authoritative_result_links,
                 )
 
@@ -762,12 +775,16 @@ class AgentOrchestrator:
                         )
                         if not saved:
                             return self._append_authoritative_result_links(
-                                "刚才的候选快照已变化或失效；本次未写入，"
-                                "请重新扫描后再选择。",
+                                render_remediation_reply(
+                                    "刚才的候选快照已变化或失效；本次未写入",
+                                    command="加词 " + " ".join(resolved_advertised_words),
+                                    words=resolved_advertised_words,
+                                ),
                                 authoritative_result_links,
                             )
                         content = self._resolved_advertised_confirmation_copy(
-                            pending_items
+                            pending_items,
+                            trusted_candidate_slots_by_word,
                         )
                         logger.info(
                             "Saved resolved advertised batch confirmation: "
@@ -827,7 +844,17 @@ class AgentOrchestrator:
                                 f"owner={conv_key} items={len(pending_items)}"
                             )
                             return self._append_authoritative_result_links(
-                                "当前候选无法安全保存；没有执行添加，请重新发送词条。",
+                                render_remediation_reply(
+                                    "当前候选无法安全保存；没有执行添加",
+                                    command="加词 " + " ".join(
+                                        str(item.get("word") or "").strip()
+                                        for item in pending_items
+                                    ),
+                                    words=tuple(
+                                        str(item.get("word") or "").strip()
+                                        for item in pending_items
+                                    ),
+                                ),
                                 authoritative_result_links,
                             )
                         branch = (
@@ -872,7 +899,9 @@ class AgentOrchestrator:
                     continue
                 logger.error("Model returned empty final content twice")
                 return self._append_authoritative_result_links(
-                    "呜呜，AI 返回了空回复 qwq 请再说一次要我怎么处理。",
+                    render_remediation_reply(
+                        "AI 连续返回空回复；本轮没有取得可绑定的操作目标"
+                    ),
                     authoritative_result_links,
                 )
 
@@ -1255,9 +1284,9 @@ class AgentOrchestrator:
                         result_data = {
                             "success": False,
                             "policyBlocked": True,
-                            "message": (
-                                "待确认操作过大，未保存确认票据。"
-                                "请把任务拆成更小批次后重新发送。"
+                            "message": render_remediation_reply(
+                                "待确认操作过大，未保存确认票据；"
+                                "系统无法替用户决定如何拆分本批"
                             ),
                         }
                         result_str = json.dumps(result_data, ensure_ascii=False)
@@ -1265,13 +1294,19 @@ class AgentOrchestrator:
                         confirmation_code = self._state_store.arm_reconfirmation(conv_key)
                         if not confirmation_code:
                             return self._append_authoritative_result_links(
-                                "待确认操作未能安全保存，请重新发送完整指令。",
+                                render_remediation_reply(
+                                    "待确认操作未能安全保存；"
+                                    "当前没有仍受服务端票据绑定的完整指令"
+                                ),
                                 authoritative_result_links,
                             )
+                        ticket_command = render_executable_suggestion(
+                            f"确认票据 {confirmation_code}"
+                        )
                         return self._append_authoritative_result_links((
                             f"{result_data.get('message', '操作尚未执行')}\n\n"
                             f"{pending_confirmation_copy()}"
-                            f"也可发送「确认票据 {confirmation_code}」作为备用。"
+                            f"备用可执行命令：\n{ticket_command}"
                         ), authoritative_result_links)
                     if self._tool_receipt_recorder is not None:
                         recorded = self._tool_receipt_recorder(
@@ -1368,7 +1403,8 @@ class AgentOrchestrator:
         return self._append_authoritative_result_links(
             f"本轮已完成 {total_tool_calls} 项：{completed_text}。"
             f"但模型处理已达到 {max_iterations} 轮上限，最终汇总尚未完成；"
-            "请发送「继续处理剩余项」。",
+            "可执行命令：\n"
+            + render_executable_suggestion("继续处理剩余项"),
             authoritative_result_links,
         )
 
@@ -1504,15 +1540,45 @@ class AgentOrchestrator:
     @staticmethod
     def _resolved_advertised_confirmation_copy(
         items: List[Dict[str, Any]],
+        candidate_slots_by_word: Dict[
+            str,
+            tuple[tuple[str, bool], ...],
+        ],
     ) -> str:
-        words = "、".join(
-            str(item.get("word") or "").strip()
-            for item in items
-            if str(item.get("word") or "").strip()
-        )
+        lines: List[str] = []
+        for item in items:
+            word = str(item.get("word") or "").strip()
+            code = str(item.get("code") or "").strip().lower()
+            if not word or not code:
+                continue
+            occupied = next(
+                (
+                    slot_occupied
+                    for slot_code, slot_occupied in candidate_slots_by_word.get(
+                        word, ()
+                    )
+                    if slot_code == code
+                ),
+                None,
+            )
+            occupancy_copy = (
+                "已占用" if occupied is True
+                else "空位" if occupied is False
+                else "占用状态未知"
+            )
+            review_copy = (
+                "需管理员审核"
+                if bool(item.get("needsManualReview", True))
+                else "可自动通过"
+            )
+            lines.append(
+                f'- 「{word}」 → {code}（{occupancy_copy}；{review_copy}）'
+            )
         return (
-            f"已解析为以下 {len(items)} 个词：{words}\n"
-            "确认后才会写入草稿。\n\n"
+            f"已重新复核以下 {len(lines)} 个词，读音、编码、占用状态和审核结论"
+            "均以当前服务端结果为准：\n"
+            + "\n".join(lines)
+            + "\n确认后才会写入草稿。\n\n"
             + pending_batch_confirmation_copy()
         )
 
@@ -1591,15 +1657,13 @@ class AgentOrchestrator:
                 raw_reason,
                 maxsplit=1,
             )[0].rstrip("；;。 ")
-            result = f"这条指令按当前表述无法执行，本次未写入。原因：{reason}。"
             suggestion = str(
                 failure_state.get("suggestedCommand") or ""
             ).strip()
-            if suggestion:
-                rendered = render_executable_suggestion(suggestion)
-                if rendered:
-                    result += "可以改为：\n" + rendered
-            return result
+            return render_remediation_reply(
+                f"这条指令按当前表述无法执行，本次未写入；原因：{reason}",
+                command=suggestion,
+            )
         resend = re.search(
             r"(?:重新|再次|再|原样|重复).{0,10}(?:发送|发一遍|发|输入|说一遍|提交)",
             reply,
@@ -1630,16 +1694,18 @@ class AgentOrchestrator:
             raw_reason,
             maxsplit=1,
         )[0].rstrip("；;。 ")
-        result = f"这条指令按当前表述无法执行，本次未写入。原因：{reason}。"
         suggestion = str(failure_state.get("suggestedCommand") or "").strip()
         if (
             suggestion
             and cls._normalize_loop_text(suggestion) != normalized_message
         ):
-            rendered = render_executable_suggestion(suggestion)
-            if rendered:
-                result += "可以改为：\n" + rendered
-        return result
+            return render_remediation_reply(
+                f"这条指令按当前表述无法执行，本次未写入；原因：{reason}",
+                command=suggestion,
+            )
+        return render_remediation_reply(
+            f"这条指令按当前表述无法执行，本次未写入；原因：{reason}"
+        )
 
     @staticmethod
     def _capture_authoritative_result_links(
@@ -2255,7 +2321,8 @@ class AgentOrchestrator:
             f"本轮工具调用已达到 {_MAX_TOOL_CALLS_PER_RUN} 次上限；"
             f"当前这批已完成 {completed}/{total}：{completed_text}。"
             f"尚有 {len(remaining_labels)} 项未执行：{remaining_text}。"
-            "已完成结果会保留；请发送「继续处理剩余项」开启下一轮。"
+            "已完成结果会保留。\n可执行命令：\n"
+            + render_executable_suggestion("继续处理剩余项")
         )
 
     @staticmethod
@@ -2294,10 +2361,14 @@ class AgentOrchestrator:
         if error.cause == "duplicate_id":
             return "AI 返回了重复的工具调用编号；本批没有执行。"
         if error.cause == "invalid_json":
-            return "AI 返回的工具参数不是完整 JSON；本批没有执行，请再试一次。"
+            return render_remediation_reply(
+                "AI 返回的工具参数不是完整 JSON；本批没有执行"
+            )
         if error.cause == "invalid_schema":
             return "AI 返回的工具参数不符合该工具的字段要求；本批没有执行。"
-        return "AI 返回了不完整的工具调用；本批没有执行，请再试一次。"
+        return render_remediation_reply(
+            "AI 返回了不完整的工具调用；本批没有执行"
+        )
 
     def _parse_tool_calls(
         self,

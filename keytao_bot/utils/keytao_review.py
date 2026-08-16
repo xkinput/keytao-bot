@@ -30,6 +30,7 @@ from .keytao_encoding import (
 )
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 from .observability import current_turn_id, observe_model_call
+from .pending_confirmation import render_remediation_reply
 from .llm_request_gate import RequestWindowGate
 from .pinyin_reference import (
     PinyinReferenceUnavailable,
@@ -1638,7 +1639,9 @@ async def fetch_keytao_encode(
         if error.status_code is None:
             return {
                 "success": False,
-                "message": f"编码服务重试后仍不可用，请稍后再试: {error.message}",
+                "message": render_remediation_reply(
+                    f"编码服务重试后仍不可用：{error.message}"
+                ),
             }
         return {"success": False, "message": f"编码服务返回错误: {error.message}"}
     except Exception as error:

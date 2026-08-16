@@ -22,6 +22,7 @@ from .scenarios import (
     S20_BATCH_WORDS,
     S21_BATCH_WORDS,
     S22_BATCH_WORDS,
+    S23_BATCH_WORDS,
 )
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
@@ -257,15 +258,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S20 replays native-quoted batch assent", readme)
         self.assertIn("S21 replays the 2026-08-16 advertised-contract incidents", readme)
         self.assertIn("S22 replays the orphaned re-review advertisement incident", readme)
+        self.assertIn("S23 replays the stale advertised-assent production incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s22(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s23(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 23)],
+            [f"S{index}" for index in range(1, 24)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -563,10 +565,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         )
         self.assertEqual(rows[("entry", "嘴替")], ("zuǐ", "tì"))
 
-    def test_s22_reuses_the_exact_nine_word_incident_fixture(self) -> None:
+    def test_s22_uses_the_minimum_two_word_incident_fixture(self) -> None:
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S22"]
         self.assertEqual(fixture["probe_words"], S22_BATCH_WORDS)
-        self.assertEqual(S22_BATCH_WORDS, S19_ADVERTISED_WORDS[:9])
+        self.assertEqual(S22_BATCH_WORDS, S19_ADVERTISED_WORDS[:2])
         self.assertEqual(
             {
                 row["entry"]
@@ -582,6 +584,15 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 if row["kind"] == "char"
             },
             set("".join(S22_BATCH_WORDS)),
+        )
+
+    def test_s23_reuses_the_exact_nine_word_incident_fixture(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S23"]
+        self.assertEqual(S23_BATCH_WORDS, S19_ADVERTISED_WORDS[:9])
+        self.assertEqual(fixture["probe_words"], S23_BATCH_WORDS)
+        self.assertEqual(
+            {row["entry"] for row in fixture["rows"] if row["kind"] == "entry"},
+            set(S23_BATCH_WORDS),
         )
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
@@ -1437,13 +1448,17 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         )
         self.assertEqual(result["facts"]["renderedBatchId"], "batch-s21-rendered")
 
-    async def test_s22_offline_reestablishes_then_quotes_the_exact_nine_word_ticket(
+    async def test_s22_offline_reestablishes_then_bare_assent_writes_displayed_set(
         self,
     ) -> None:
         scenario = next(item for item in SCENARIOS if item.scenario_id == "S22")
         expected_pairs = tuple(
             (word, f"a{chr(ord('a') + index)}")
             for index, word in enumerate(S22_BATCH_WORDS)
+        )
+        discovery_pairs = tuple(
+            (word, code + "z")
+            for word, code in expected_pairs
         )
 
         class FakeContext:
@@ -1459,6 +1474,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 self.last_reply_message_id = None
                 self.reset_calls = 0
                 self.reply_requests = []
+                self.group_requests = []
 
             def record(
                 self,
@@ -1507,54 +1523,18 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
 
             async def send_group(self, text: str, *, to_me: bool) -> str:
                 self.assertTrue(to_me)
+                self.group_requests.append(text)
                 if text.startswith("喵喵 加词 "):
                     self.last_reply_message_id = 501
                     return (
                         "首轮候选：\n"
                         + "\n".join(
                             f'- 「{word}」 → {code}'
-                            for word, code in expected_pairs
+                            for word, code in discovery_pairs
                         )
                         + "\n回复「加入并提交」则加入后提交。"
                     )
-                if text == "确认":
-                    raise AssertionError("offline S22 should not need extra confirmation")
-                raise AssertionError(text)
-
-            async def send_group_reply(
-                self,
-                text: str,
-                *,
-                reply_message_id: int,
-                to_me: bool,
-            ) -> str:
-                self.assertTrue(to_me)
-                self.reply_requests.append((text, reply_message_id))
-                if text.startswith("喵喵 请重新复核这 9 个词"):
-                    self.assertEqual(reply_message_id, 501)
-                    self.last_reply_message_id = 502
-                    self.record(
-                        kind="log",
-                        message=(
-                            "[advertised_reply_contract] "
-                            "branch=establish_from_server_records items=9"
-                        ),
-                    )
-                    return (
-                        "9 个词审词复核完成，读音、编码和占用状态与之前一致：\n"
-                        "审词复核："
-                        + "…".join(
-                            f"{index}. {word} → {code}（空位）"
-                            for index, (word, code) in enumerate(
-                                expected_pairs,
-                                start=1,
-                            )
-                        )
-                        + "\n将这 9 个词加入草稿并提交，"
-                        "或直接回复「加入并提交」。"
-                    )
                 if text == "加入并提交":
-                    self.assertEqual(reply_message_id, 502)
                     items = [
                         {"action": "Create", "word": word, "code": code}
                         for word, code in expected_pairs
@@ -1586,6 +1566,44 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                         )
                         + f"\n草稿地址：http://localhost:3100/batch/{self.completed_batch_id}"
                     )
+                if text == "确认":
+                    raise AssertionError("offline S22 should not need extra confirmation")
+                raise AssertionError(text)
+
+            async def send_group_reply(
+                self,
+                text: str,
+                *,
+                reply_message_id: int,
+                to_me: bool,
+            ) -> str:
+                self.assertTrue(to_me)
+                self.reply_requests.append((text, reply_message_id))
+                if text.startswith("喵喵 请只重新复核以下 2 个词"):
+                    self.assertEqual(reply_message_id, 501)
+                    self.last_reply_message_id = 502
+                    self.record(
+                        kind="log",
+                        message=(
+                            "[advertised_reply_contract] "
+                            "branch=establish_from_server_records items=2"
+                        ),
+                    )
+                    return (
+                        "2 个词已全部重新复核完毕。以下按候选列表格式逐项重列：\n\n"
+                        + "\n\n".join(
+                            f"{index}. 「{word}」\n"
+                            f"   候选：1. {code} — 空位（推荐）｜"
+                            f"2. {code}o — 空位"
+                            for index, (word, code) in enumerate(
+                                expected_pairs,
+                                start=1,
+                            )
+                        )
+                        + "\n\n可用的下一步：\n"
+                        "- 「加入」、「都加」、「添加」→ 只加入草稿\n"
+                        "- 「加入并提交」、「都加并提交」、「添加并提交」→ 加入后提交"
+                    )
                 raise AssertionError(text)
 
             async def draft(self):
@@ -1614,10 +1632,8 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             context.reply_requests[0][1],
             result["facts"]["discoveryMessageId"],
         )
-        self.assertEqual(
-            context.reply_requests[1],
-            ("加入并提交", result["facts"]["rereviewMessageId"]),
-        )
+        self.assertEqual(len(context.reply_requests), 1)
+        self.assertEqual(context.group_requests[-1], "加入并提交")
         self.assertTrue(result["facts"]["forcedStateLoss"])
         self.assertEqual(result["facts"]["confirmationSteps"], 0)
         self.assertEqual(result["facts"]["batchStatus"], "Approved")
@@ -1625,7 +1641,219 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             result["facts"]["advertisedPairs"],
             [list(pair) for pair in expected_pairs],
         )
+        self.assertEqual(
+            result["facts"]["discoveryPairs"],
+            [list(pair) for pair in discovery_pairs],
+        )
         self.assertEqual(result["facts"]["batchId"], "batch-s22")
+
+    async def test_s23_offline_recovers_stale_quote_then_bare_assent_writes_exact_set(
+        self,
+    ) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S23")
+        expected_pairs = tuple(
+            (word, f"b{chr(ord('a') + index)}")
+            for index, word in enumerate(S23_BATCH_WORDS)
+        )
+
+        class FakeContext:
+            admin_token = "offline-admin-token"
+
+            def __init__(self):
+                self.events = []
+                self.sequence = 0
+                self.completed_batch_id = None
+                self.next_client = self
+                self.bot = self
+                self.platform_id = "739497722"
+                self.last_reply_message_id = None
+                self.reset_calls = 0
+                self.reply_requests = []
+
+            def record(self, *, name, arguments=None, result=None):
+                self.sequence += 1
+                event = {
+                    "sequence": self.sequence,
+                    "kind": "tool",
+                    "name": name,
+                    "result": result or {},
+                }
+                if arguments is not None:
+                    event["arguments"] = arguments
+                self.events.append(event)
+
+            async def clean_draft(self, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                return {"success": True, "deleted": 0}
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                self.reset_calls += 1
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assertTrue(to_me)
+                if text.startswith("喵喵 加词 "):
+                    self.last_reply_message_id = 601
+                    return (
+                        "陈旧候选：\n"
+                        + "\n".join(
+                            f'- 「{word}」 → {code}'
+                            for word, code in expected_pairs
+                        )
+                        + "\n回复「加入并提交」则加入后提交。"
+                    )
+                if text == "加入并提交":
+                    items = [
+                        {"action": "Create", "word": word, "code": code}
+                        for word, code in expected_pairs
+                    ]
+                    self.completed_batch_id = "batch-s23"
+                    self.record(
+                        name="keytao_batch_add_to_draft",
+                        arguments={"items": items},
+                        result={"success": True, "batchId": self.completed_batch_id},
+                    )
+                    self.record(
+                        name="keytao_submit_batch",
+                        result={
+                            "success": True,
+                            "batchId": self.completed_batch_id,
+                            "autoApproved": True,
+                        },
+                    )
+                    return "✅ 已按新确认票据加入并提交"
+                if text == "确认":
+                    raise AssertionError("offline S23 should not need extra confirmation")
+                raise AssertionError(text)
+
+            async def send_group_reply(
+                self,
+                text: str,
+                *,
+                reply_message_id: int,
+                to_me: bool,
+            ) -> str:
+                self.assertTrue(to_me)
+                self.reply_requests.append((text, reply_message_id))
+                self.assertEqual((text, reply_message_id), ("加入并提交", 601))
+                self.last_reply_message_id = 602
+                return (
+                    "已重新复核以下 9 个词，当前候选如下：\n"
+                    + "\n".join(
+                        f'- 「{word}」 → {code}'
+                        for word, code in expected_pairs
+                    )
+                    + "\n回复「加入并提交」则加入后提交。"
+                )
+
+            async def draft(self):
+                return {"batchId": None, "contentVersion": 0, "items": []}
+
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assertEqual(batch_id, self.completed_batch_id)
+                self.assertEqual(admin_token, self.admin_token)
+                return {
+                    "status": "Approved",
+                    "pullRequests": [
+                        {"action": "Create", "word": word, "code": code}
+                        for word, code in expected_pairs
+                    ],
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+            def assertEqual(self, left, right):
+                if left != right:
+                    raise AssertionError((left, right))
+
+            def assertTrue(self, value):
+                if not value:
+                    raise AssertionError(value)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+
+        self.assertEqual(context.reset_calls, 2)
+        self.assertEqual(context.reply_requests, [("加入并提交", 601)])
+        self.assertEqual(result["facts"]["recoveryWrites"], 0)
+        self.assertEqual(result["facts"]["confirmationSteps"], 0)
+        self.assertEqual(result["facts"]["batchId"], "batch-s23")
+        self.assertEqual(result["facts"]["batchStatus"], "Approved")
+        self.assertEqual(
+            result["facts"]["freshAdvertisedPairs"],
+            [list(pair) for pair in expected_pairs],
+        )
+
+    async def test_s23_unresolvable_quote_control_never_mints_a_write_ticket(
+        self,
+    ) -> None:
+        from keytao_bot.harness.conversation import ConversationAddress
+        from keytao_bot.harness.state import (
+            MemoryConversationStateStore,
+            PendingAdvertisedWordSets,
+        )
+        from keytao_bot.plugins import openai_chat
+        from keytao_bot.plugins.chat_adapters import ReplyReferenceInfo
+        from keytao_bot.utils.memory_store import ChatMemoryContext
+
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id="s23-unresolved",
+            space_type="group",
+            space_id="865189947",
+            speaker_name="Rea",
+        )
+        address = ConversationAddress.group("qq", "865189947", "s23-unresolved")
+        quote = ReplyReferenceInfo(
+            is_reply=True,
+            is_to_bot=True,
+            sender_id="bot-id",
+            sender_name="喵喵",
+            text=(
+                "陈旧候选：\n"
+                "- 「未知甲」 → forgeda\n"
+                "- 「未知乙」 → forgedb\n"
+                "回复「加入并提交」则加入后提交。"
+            ),
+        )
+        ctx = openai_chat.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="s23-unresolved",
+            normalized_message_text="加入并提交",
+            reply_reference=quote,
+            memory_context=memory_context,
+            conv_key=address,
+            space_key=("qq", memory_context.space_scope_id),
+            owner_label="Rea",
+        )
+        store = MemoryConversationStateStore()
+        finish = AsyncMock()
+        review = AsyncMock(
+            return_value="以下词未通过完整审词，本次没有建立写入确认：未知甲、未知乙。"
+        )
+        with (
+            patch.object(openai_chat, "conversation_state_store", store),
+            patch.object(openai_chat, "get_history", return_value=[]),
+            patch.object(openai_chat, "build_reply_context", AsyncMock(return_value="")),
+            patch.object(openai_chat, "get_ai_response_core", review),
+            patch.object(openai_chat, "remember_conversation", MagicMock()),
+            patch.object(openai_chat, "_finish_ai_chat_matcher", finish),
+        ):
+            handled = await openai_chat._stage_apply_scoped_pending_intent(ctx)
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            review.await_args.kwargs["resolved_advertised_words"],
+            ("未知甲", "未知乙"),
+        )
+        self.assertIsInstance(store.get(address), PendingAdvertisedWordSets)
+        reply = finish.await_args.args[0]
+        self.assertIn("- 「加词 未知甲 未知乙」（未知甲、未知乙）", reply)
+        self.assertNotIn("显眼包", reply)
+        self.assertNotIn("请重新", reply)
 
     async def test_s14_poison_injection_hooks_review_boundaries(self) -> None:
         from keytao_bot.utils import keytao_review as review_module

@@ -2059,7 +2059,7 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
-S22_BATCH_WORDS = S19_ADVERTISED_WORDS[:9]
+S22_BATCH_WORDS = S19_ADVERTISED_WORDS[:2]
 
 
 async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
@@ -2091,7 +2091,7 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
     require(
         len(discovery_pairs) == len(S22_BATCH_WORDS)
         and tuple(word for word, _code in discovery_pairs) == S22_BATCH_WORDS,
-        f"S22 discovery did not render the exact nine-word candidate: {discovery}",
+        f"S22 discovery did not render the exact word set: {discovery}",
     )
     require(
         not (await ctx.draft()).get("items"),
@@ -2101,9 +2101,11 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
     # Reproduce the incident's missing-state precondition, then ask a later
     # read-only turn to re-resolve every word from server review results.
     await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    word_count = len(S22_BATCH_WORDS)
     rereview_message = (
-        "喵喵 请重新复核这 9 个词的读音、编码和占用状态，"
-        "按候选列表格式逐项重列并说明可用的下一步："
+        f"喵喵 请只重新复核以下 {word_count} 个词的读音、编码和占用状态。"
+        "逐项重列，明确标出每个词当前的推荐编码，不得省略或增加词条；"
+        "末尾说明可直接回复「加入并提交」："
         + "、".join(S22_BATCH_WORDS)
     )
     messages.append(rereview_message)
@@ -2121,8 +2123,9 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
         "S22 re-review did not expose a distinct bot message id",
     )
     require(
-        rereview_pairs == discovery_pairs,
-        f"S22 re-review changed or omitted the exact candidate bindings: {rereview}",
+        len(rereview_pairs) == word_count
+        and tuple(word for word, _code in rereview_pairs) == S22_BATCH_WORDS,
+        f"S22 re-review invented, dropped, or omitted a displayed binding: {rereview}",
     )
     require(
         "加入并提交" in rereview,
@@ -2142,7 +2145,20 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
     )
     require(
         not (await ctx.draft()).get("items"),
-        "S22 re-review wrote before the quoted assent",
+        "S22 re-review wrote before the bare assent",
+    )
+    establishment_events = [
+        event
+        for event in ctx.attempt_events()
+        if event.get("kind") == "log"
+        and "branch=establish_from_server_records"
+        in str(event.get("message") or "")
+        and f"items={word_count}" in str(event.get("message") or "")
+    ]
+    require(
+        establishment_events,
+        "S22 re-review advertised executable forms without establishing the "
+        f"exact {word_count}-item server-record ticket: {rereview}",
     )
 
     write_cutoff = max(
@@ -2150,11 +2166,7 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
         default=0,
     )
     messages.append("加入并提交")
-    assent_reply = await ctx.send_group_reply(
-        "加入并提交",
-        reply_message_id=rereview_message_id,
-        to_me=True,
-    )
+    assent_reply = await ctx.send_group("加入并提交", to_me=True)
     replies.append(assent_reply)
     draft = await ctx.draft()
     completed_batch_id = _successful_submit_batch_id(
@@ -2165,7 +2177,7 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
     if not draft.get("items") and not completed_batch_id:
         require(
             "确认" in assent_reply or "确认票据" in assent_reply,
-            f"S22 quoted assent neither wrote nor reached confirmation: {assent_reply}",
+            f"S22 bare assent neither wrote nor reached confirmation: {assent_reply}",
         )
         confirmation_steps = 1
         messages.append("确认")
@@ -2234,7 +2246,7 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
 
     require(
         actual_item_keys == expected_item_keys and actual_pairs == rereview_pairs,
-        "S22 advertised path did not land the exact nine words in one batch: "
+        "S22 advertised path did not land the exact displayed bindings in one batch: "
         f"status={batch_status}, actual={actual_item_keys}",
     )
     linked_batch_ids = batch_link_ids(replies[-1])
@@ -2298,6 +2310,7 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
         "draft": draft,
         "facts": {
             "advertisedPairs": [list(pair) for pair in rereview_pairs],
+            "discoveryPairs": [list(pair) for pair in discovery_pairs],
             "discoveryMessageId": discovery_message_id,
             "rereviewMessageId": rereview_message_id,
             "forcedStateLoss": True,
@@ -2305,6 +2318,195 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
             "batchId": batch_id,
             "batchStatus": batch_status,
             "autoApproved": auto_approved,
+        },
+    }
+
+
+S23_BATCH_WORDS = S19_ADVERTISED_WORDS[:9]
+
+
+async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
+    """A stale advertised assent re-reviews in place, then its fresh ticket writes."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S23 draft cleanup failed: {cleanup}")
+    require(
+        not (await ctx.draft()).get("items"),
+        "S23 requires an empty actor draft before candidate discovery",
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    discovery_message = "喵喵 加词 " + " ".join(S23_BATCH_WORDS)
+    messages.append(discovery_message)
+    discovery = await ctx.send_group(discovery_message, to_me=True)
+    replies.append(discovery)
+    stale_message_id = ctx.last_reply_message_id
+    stale_pairs = advertised_batch_binding_pairs(discovery)
+    require(stale_message_id is not None, "S23 discovery exposed no bot message id")
+    require(
+        len(stale_pairs) == len(S23_BATCH_WORDS)
+        and tuple(word for word, _code in stale_pairs) == S23_BATCH_WORDS,
+        f"S23 discovery did not render the exact stale candidate: {discovery}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S23 discovery wrote before assent",
+    )
+
+    # Force the production incident precondition: the bot message remains
+    # quotable while every live candidate/ticket for this actor is gone.
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    write_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入并提交")
+    recovered = await ctx.send_group_reply(
+        "加入并提交",
+        reply_message_id=stale_message_id,
+        to_me=True,
+    )
+    replies.append(recovered)
+    fresh_message_id = ctx.last_reply_message_id
+    fresh_pairs = advertised_batch_binding_pairs(recovered)
+    require(
+        fresh_message_id is not None and fresh_message_id != stale_message_id,
+        "S23 same-turn recovery exposed no distinct fresh bot message",
+    )
+    require(
+        len(fresh_pairs) == len(S23_BATCH_WORDS)
+        and tuple(word for word, _code in fresh_pairs) == S23_BATCH_WORDS,
+        f"S23 recovery did not re-review the exact display-bound words: {recovered}",
+    )
+    require(
+        "已重新复核" in recovered,
+        f"S23 stale assent did not continue through re-review: {recovered}",
+    )
+    require(
+        not any(
+            marker in recovered
+            for marker in (
+                "可执行候选状态不存在",
+                "没有匹配的可执行候选状态",
+                "请重新发起",
+            )
+        ),
+        f"S23 stale assent still dead-ended: {recovered}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S23 recovery wrote before the fresh ticket was accepted",
+    )
+    recovery_writes = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > write_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(
+        not recovery_writes,
+        f"S23 same-turn recovery mutated the draft: {recovery_writes}",
+    )
+
+    # This assent deliberately carries no native quote. The fresh actor-owned
+    # ticket created above must be enough to execute exactly the new display.
+    messages.append("加入并提交")
+    assent_reply = await ctx.send_group("加入并提交", to_me=True)
+    replies.append(assent_reply)
+    draft = await ctx.draft()
+    completed_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=write_cutoff,
+    )
+    confirmation_steps = 0
+    if not draft.get("items") and not completed_batch_id:
+        require(
+            "确认" in assent_reply or "确认票据" in assent_reply,
+            f"S23 fresh bare assent neither wrote nor reached confirmation: {assent_reply}",
+        )
+        confirmation_steps = 1
+        messages.append("确认")
+        replies.append(await ctx.send_group("确认", to_me=True))
+        draft = await ctx.draft()
+        completed_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=write_cutoff,
+        )
+
+    batch_status = "Draft"
+    expected_keys = tuple(
+        ("Create", word, code)
+        for word, code in fresh_pairs
+    )
+    if completed_batch_id:
+        batch_id = completed_batch_id
+        completed_batch = await ctx.next_client.get_admin_batch(
+            batch_id=batch_id,
+            admin_token=ctx.admin_token,
+        )
+        actual_keys = tuple(
+            item_key(item)
+            for item in completed_batch.get("pullRequests", [])
+            if isinstance(item, dict)
+        )
+        batch_status = str(completed_batch.get("status") or "")
+        require(
+            batch_status in {"Submitted", "Approved"},
+            f"S23 completed batch never reached submission: {completed_batch}",
+        )
+    else:
+        batch_id = str(draft.get("batchId") or "")
+        actual_keys = tuple(
+            item_key(item)
+            for item in draft.get("items", [])
+            if isinstance(item, dict)
+        )
+        require(batch_id, f"S23 did not materialize one draft batch: {draft}")
+
+    require(
+        actual_keys == expected_keys,
+        "S23 fresh bare assent did not write exactly its displayed set: "
+        f"expected={expected_keys}, actual={actual_keys}",
+    )
+    write_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > write_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(write_events, "S23 fresh bare assent never reached the batch tool")
+    for event in write_events:
+        event_pairs = tuple(
+            (
+                str(item.get("word") or "").strip(),
+                str(item.get("code") or "").strip().lower(),
+            )
+            for item in event.get("arguments", {}).get("items", [])
+            if isinstance(item, dict)
+        )
+        require(
+            event_pairs == fresh_pairs,
+            f"S23 write escaped the recovered ticket: {event}",
+        )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "staleAdvertisedPairs": [list(pair) for pair in stale_pairs],
+            "freshAdvertisedPairs": [list(pair) for pair in fresh_pairs],
+            "staleMessageId": stale_message_id,
+            "freshMessageId": fresh_message_id,
+            "forcedStateLoss": True,
+            "recoveryWrites": len(recovery_writes),
+            "confirmationSteps": confirmation_steps,
+            "batchId": batch_id,
+            "batchStatus": batch_status,
         },
     }
 
@@ -2332,6 +2534,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S20", "native-quoted batch assent", scenario_s20),
     Scenario("S21", "assent modifier and rendered remediation closure", scenario_s21),
     Scenario("S22", "re-review advertisement state coupling", scenario_s22),
+    Scenario("S23", "stale advertised assent recovery and fresh closure", scenario_s23),
 )
 
 

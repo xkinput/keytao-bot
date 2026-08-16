@@ -94,6 +94,7 @@ from ..utils.pending_confirmation import (
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     pending_confirmation_prompt_instruction,
+    render_remediation_reply,
 )
 from ..utils.memory_store import (
     ChatMemoryContext,
@@ -1776,15 +1777,14 @@ def _enforce_advertised_reply_contract(
     )
     words = tuple(dict.fromkeys(word for word, _code in displayed_pairs))
     if words:
-        return (
-            "这份复核消息没有匹配的可执行候选状态，本次不会写入。"
-            "请重新发起这些词的审词复核："
-            + "、".join(words)
-            + "。"
+        return render_remediation_reply(
+            "这份复核消息没有匹配的可执行候选状态，本次不会写入",
+            command="加词 " + " ".join(words),
+            words=words,
         )
-    return (
-        "这条消息没有匹配的可执行候选状态，本次不会写入。"
-        "请重新发起对原候选词的审词复核。"
+    return render_remediation_reply(
+        "这条消息没有匹配的可执行候选状态，本次不会写入；"
+        "回复中没有可绑定的具体词条"
     )
 
 
@@ -1892,8 +1892,11 @@ async def _run_background_draft_operation(
         )
         result = DraftActionResult(
             _append_batch_url_if_missing(
-                "后台审词处理超时，当前操作已结束。请求可能已经到达服务器，"
-                "请先发送「查看草稿」确认实际状态，避免重复添加或提交。",
+                render_remediation_reply(
+                    "后台审词处理超时，当前操作已结束；请求可能已经到达服务器，"
+                    "需要先核对实际状态以避免重复添加或提交",
+                    command="查看草稿",
+                ),
                 operation_links,
             ),
             data=dict(operation_links),
@@ -1905,7 +1908,10 @@ async def _run_background_draft_operation(
         )
         result = DraftActionResult(
             _append_batch_url_if_missing(
-                "后台处理暂时中断；已执行结果请以链接为准，请先查看草稿核对。",
+                render_remediation_reply(
+                    "后台处理暂时中断；已执行结果以链接为准",
+                    command="查看草稿",
+                ),
                 operation_links,
             ),
             data=dict(operation_links),
@@ -2461,7 +2467,9 @@ async def _stage_handle_visual_probe_timeout(ctx: TurnContext) -> bool:
             ctx.event,
             ctx.user_id,
             ctx.memory_context,
-            "引用消息读取超时，请稍后重试。",
+            render_remediation_reply(
+                "引用消息读取超时；当前没有可绑定的引用内容"
+            ),
             ctx.QQMessageSegment,
         )
         return True
@@ -2637,6 +2645,182 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
         and live_ticket_assent is None
     ):
         current_pending = conversation_state_store.get(ctx.conv_key)
+        displayed_pairs = (
+            advertised_batch_binding_pairs(ctx.reply_reference.text)
+            if (
+                current_pending is None
+                and ctx.current_pending_record is None
+                and ctx.reply_reference.is_reply
+                and ctx.reply_reference.is_to_bot
+                and ctx.reply_reference.text
+            )
+            else ()
+        )
+        displayed_words = tuple(dict.fromkeys(
+            word for word, _code in displayed_pairs
+        ))
+        if len(displayed_words) >= 2:
+            token = conversation_state_store.add_advertised_word_set(
+                ctx.conv_key,
+                displayed_words,
+                space_key=ctx.space_key,
+                owner_label=ctx.owner_label,
+            )
+            if token:
+                set_turn_flow("pending-confirmation")
+                logger.info(
+                    "[advertised_reply_contract] branch=recover_stale_display "
+                    f"items={len(displayed_words)}"
+                )
+                if ctx.history is None:
+                    ctx.history = get_history(ctx.conv_key)
+                reply_context = await build_reply_context(
+                    ctx.bot,
+                    ctx.event,
+                    ctx.reply_reference,
+                )
+                recovered = await get_ai_response_core(
+                    ctx.normalized_message_text,
+                    ctx.platform,
+                    ctx.user_id,
+                    ctx.history,
+                    reply_context,
+                    ctx.memory_context,
+                    resolved_advertised_words=displayed_words,
+                    advertised_snapshot_token=token,
+                )
+                recovered_record = conversation_state_store.get_record(ctx.conv_key)
+                if (
+                    recovered
+                    and _advertised_reply_matches_live_record(
+                        recovered,
+                        recovered_record,
+                    )
+                    and isinstance(
+                        recovered_record.state if recovered_record else None,
+                        PendingToolConfirm,
+                    )
+                ):
+                    refreshed_pairs = advertised_batch_binding_pairs(recovered)
+                    def displayed_statuses(
+                        display_text: str,
+                        pairs: tuple[tuple[str, str], ...],
+                    ) -> dict[str, tuple[bool | None, bool | None]]:
+                        normalized = unicodedata.normalize("NFKC", display_text)
+                        statuses: dict[str, tuple[bool | None, bool | None]] = {}
+                        for status_word, status_code in pairs:
+                            match = re.search(
+                                re.escape(status_word)
+                                + r"[」”』]?\s*(?:→|->)\s*"
+                                + re.escape(status_code)
+                                + r"\s*(?:[（(](?P<annotation>[^）)\n]{0,128})[）)])?",
+                                normalized,
+                                re.IGNORECASE,
+                            )
+                            annotation = str(
+                                (match.group("annotation") or "")
+                                if match is not None
+                                else ""
+                            )
+                            occupied = (
+                                False
+                                if re.search(r"空位|未占用", annotation)
+                                else True
+                                if re.search(r"已有|已占用|占用中", annotation)
+                                else None
+                            )
+                            needs_review = (
+                                True
+                                if re.search(r"需(?:要)?管理员审核|待管理员审核", annotation)
+                                else False
+                                if re.search(r"可自动通过|无需管理员审核|自动通过", annotation)
+                                else None
+                            )
+                            statuses[status_word] = (occupied, needs_review)
+                        return statuses
+
+                    previous_statuses = displayed_statuses(
+                        ctx.reply_reference.text,
+                        displayed_pairs,
+                    )
+                    refreshed_statuses = displayed_statuses(
+                        str(recovered),
+                        refreshed_pairs,
+                    )
+                    changed = [
+                        f"「{word}」{old_code} → {new_code}"
+                        for word, old_code in displayed_pairs
+                        for fresh_word, new_code in refreshed_pairs
+                        if fresh_word == word and new_code != old_code
+                    ]
+                    for word, _old_code in displayed_pairs:
+                        old_occupied, old_review = previous_statuses.get(
+                            word, (None, None)
+                        )
+                        new_occupied, new_review = refreshed_statuses.get(
+                            word, (None, None)
+                        )
+                        if (
+                            old_occupied is not None
+                            and new_occupied is not None
+                            and old_occupied != new_occupied
+                        ):
+                            changed.append(
+                                f"「{word}」占用状态"
+                                f"{'已占用' if old_occupied else '空位'} → "
+                                f"{'已占用' if new_occupied else '空位'}"
+                            )
+                        if (
+                            old_review is not None
+                            and new_review is not None
+                            and old_review != new_review
+                        ):
+                            changed.append(
+                                f"「{word}」审核结论"
+                                f"{'需管理员审核' if old_review else '可自动通过'} → "
+                                f"{'需管理员审核' if new_review else '可自动通过'}"
+                            )
+                    ctx.response = str(recovered)
+                    if changed:
+                        ctx.response = (
+                            "⚠️ 重新复核后编码已变化："
+                            + "；".join(changed)
+                            + "。以下当前候选为准。\n"
+                            + ctx.response
+                        )
+                else:
+                    reason = re.split(
+                        r"(?:请|可复制|回复)",
+                        str(recovered or "审词流程没有返回结果"),
+                        maxsplit=1,
+                    )[0].strip().rstrip("；;。")
+                    ctx.response = render_remediation_reply(
+                        "这次重新复核未能建立可执行候选，本次未写入；"
+                        f"原因：{reason or '审词流程没有返回完整候选'}",
+                        command="加词 " + " ".join(displayed_words),
+                        words=displayed_words,
+                    )
+                remember_conversation(
+                    ctx.conv_key,
+                    ctx.memory_context,
+                    ctx.normalized_message_text,
+                    ctx.response,
+                )
+                await _finish_ai_chat_matcher(ctx.response)
+                return True
+            ctx.response = render_remediation_reply(
+                "引用中的词可以识别，但本轮无法安全建立复核快照；本次未写入",
+                command="加词 " + " ".join(displayed_words),
+                words=displayed_words,
+            )
+            remember_conversation(
+                ctx.conv_key,
+                ctx.memory_context,
+                ctx.normalized_message_text,
+                ctx.response,
+            )
+            await _finish_ai_chat_matcher(ctx.response)
+            return True
         set_turn_flow("pending-confirmation")
         ctx.response = _format_full_add_and_submit_instruction(
             current_pending if isinstance(current_pending, PendingAddWord) else None,
@@ -2756,9 +2940,9 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
                 and not active_confirmation_matches
                 and not explicit_active_reply
             ):
-                ctx.response = (
-                    "请明确当前要继续的动作。\n"
-                    f"请回复「{active_operation.confirmation_command}」继续。"
+                ctx.response = render_remediation_reply(
+                    "当前消息没有明确绑定要继续的动作",
+                    command=active_operation.confirmation_command,
                 )
                 remember_conversation(
                     ctx.conv_key,
@@ -2858,9 +3042,9 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
                         active_operation.prompt_text,
                         rotate_code=False,
                     )
-                    ctx.response = (
-                        "后台任务启动失败，当前确认仍有效。"
-                        f"请稍后回复「{active_operation.confirmation_command}」重试。"
+                    ctx.response = render_remediation_reply(
+                        "后台任务启动失败，当前确认仍有效",
+                        command=active_operation.confirmation_command,
                     )
                     remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
                     await _finish_ai_chat_matcher(ctx.response)
@@ -2874,9 +3058,9 @@ async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
     if ctx.quoted_pending_add_control:
         current_record = conversation_state_store.get_record(ctx.conv_key)
         if current_record is not None and current_record.execution_id:
-            ctx.response = (
-                "当前还有一笔草稿操作结果待核验，暂不覆盖它。"
-                "请先查看当前草稿，确认状态后再重试。"
+            ctx.response = render_remediation_reply(
+                "当前还有一笔草稿操作结果待核验，暂不覆盖它",
+                command="查看草稿",
             )
             remember_conversation(
                 ctx.conv_key,
@@ -2892,9 +3076,10 @@ async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
             ctx.user_id,
         )
         if restored_state is None:
-            ctx.response = (
-                "这条候选已不在当前可验证的审词快照中；没有执行添加。"
-                "请重新发送词条，我会生成最新候选。"
+            ctx.response = render_remediation_reply(
+                "这条候选已不在当前可验证的审词快照中；没有执行添加",
+                command=f"加词 {ctx.referenced_pending.word}",
+                words=(ctx.referenced_pending.word,),
             )
             remember_conversation(
                 ctx.conv_key,
@@ -2911,7 +3096,11 @@ async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
             owner_label=ctx.owner_label,
         )
         if not stored:
-            ctx.response = "当前候选无法安全保存；没有执行添加，请重新发送词条。"
+            ctx.response = render_remediation_reply(
+                "当前候选无法安全保存；没有执行添加",
+                command=f"加词 {restored_state.word}",
+                words=(restored_state.word,),
+            )
             remember_conversation(
                 ctx.conv_key,
                 ctx.memory_context,
@@ -2999,9 +3188,10 @@ async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
                 ctx.user_id,
             )
             if restored_state is None:
-                ctx.response = (
-                    "这条候选已不在当前可验证编码快照中；没有执行添加。"
-                    "请重新发送词条，我会生成最新候选。"
+                ctx.response = render_remediation_reply(
+                    "这条候选已不在当前可验证编码快照中；没有执行添加",
+                    command=f"加词 {ctx.referenced_pending.word}",
+                    words=(ctx.referenced_pending.word,),
                 )
                 remember_conversation(
                     ctx.conv_key,
@@ -3020,7 +3210,11 @@ async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
             if stored:
                 current_record = conversation_state_store.get_record(ctx.conv_key)
             else:
-                ctx.response = "当前候选无法安全保存；没有执行添加，请重新发送词条。"
+                ctx.response = render_remediation_reply(
+                    "当前候选无法安全保存；没有执行添加",
+                    command=f"加词 {restored_state.word}",
+                    words=(restored_state.word,),
+                )
                 remember_conversation(
                     ctx.conv_key,
                     ctx.memory_context,
@@ -3268,7 +3462,10 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                         and not 1 <= choice_index <= len(state.candidates)
                     ):
                         restore_pending_state()
-                        ctx.response = f"请选择 1-{len(state.candidates)} 之间的编号 owo"
+                        ctx.response = render_remediation_reply(
+                            f"只接受 1-{len(state.candidates)} 之间的编号；"
+                            "系统不能替你选择其中一个"
+                        )
                     else:
                         target_code = (
                             state.candidates[choice_index - 1][0]
@@ -3284,13 +3481,18 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                         )
                         if operation is None:
                             restore_pending_state()
-                            ctx.response = "当前草稿操作刚刚开始，请稍后再试。"
+                            ctx.response = render_remediation_reply(
+                                "当前草稿操作刚刚开始；此时没有安全的重复执行命令"
+                            )
                         elif not begin_pending_execution():
                             draft_operation_coordinator.finish(
                                 operation.owner_key,
                                 operation.operation_id,
                             )
-                            ctx.response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                            ctx.response = render_remediation_reply(
+                                "该确认票据已被其他请求占用",
+                                command="查看草稿",
+                            )
                         else:
                             scheduled = _schedule_background_draft_operation(
                                 operation,
@@ -3314,10 +3516,17 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                                 complete_pending_execution()
                                 return True
                             restore_pending_state()
-                            ctx.response = "后台任务启动失败，候选仍为你保留，请稍后再试。"
+                            ctx.response = render_remediation_reply(
+                                "后台任务启动失败，候选仍为你保留",
+                                command=f"添加 {state.word} {target_code} 并提交",
+                                words=(state.word,),
+                            )
                 else:
                     if not begin_pending_execution():
-                        ctx.response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                        ctx.response = render_remediation_reply(
+                            "该确认票据已被其他请求占用",
+                            command="查看草稿",
+                        )
                     else:
                         ctx.response = await _handle_pending_add_word(
                             state,
@@ -3338,9 +3547,16 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                 if _is_pending_tool_confirm_message(state, pending_command_intent):
                     if not _resolved_advertised_items_match(state):
                         complete_pending_execution()
-                        ctx.response = (
-                            "候选集合校验失败，确认票据已作废；"
-                            "本次未写入。请重新扫描后再选择。"
+                        stale_words = tuple(
+                            str(item.get("word") or "").strip()
+                            for item in state.args.get("items", [])
+                            if isinstance(item, dict)
+                            and str(item.get("word") or "").strip()
+                        )
+                        ctx.response = render_remediation_reply(
+                            "候选集合校验失败，确认票据已作废；本次未写入",
+                            command=("加词 " + " ".join(stale_words)) if stale_words else "",
+                            words=stale_words,
                         )
                         return False
                     current_operation = draft_operation_coordinator.get(ctx.conv_key)
@@ -3373,13 +3589,18 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                         )
                         if operation is None:
                             restore_pending_state()
-                            ctx.response = "当前草稿操作刚刚开始，请稍后再试。"
+                            ctx.response = render_remediation_reply(
+                                "当前草稿操作刚刚开始；此时没有安全的重复执行命令"
+                            )
                         elif not begin_pending_execution():
                             draft_operation_coordinator.finish(
                                 operation.owner_key,
                                 operation.operation_id,
                             )
-                            ctx.response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                            ctx.response = render_remediation_reply(
+                                "该确认票据已被其他请求占用",
+                                command="查看草稿",
+                            )
                         else:
                             scheduled = _schedule_background_draft_operation(
                                 operation,
@@ -3413,10 +3634,17 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                                 complete_pending_execution()
                                 return True
                             restore_pending_state()
-                            ctx.response = "后台任务启动失败，批量候选仍为你保留，请稍后再试。"
+                            ctx.response = render_remediation_reply(
+                                "后台任务启动失败，批量候选仍为你保留",
+                                command="加入并提交",
+                                words=tuple(words),
+                            )
                     else:
                         if not begin_pending_execution():
-                            ctx.response = "该确认票据已被其他请求占用，请先查看草稿后再试。"
+                            ctx.response = render_remediation_reply(
+                                "该确认票据已被其他请求占用",
+                                command="查看草稿",
+                            )
                         else:
                             ctx.response = await _execute_confirmed_tool(
                                 _pending_tool_state_with_trailing_submit(
@@ -3462,7 +3690,9 @@ async def _stage_submit_current_draft(ctx: TurnContext) -> bool:
         else:
             operation = draft_operation_coordinator.begin(ctx.conv_key, "submit")
             if operation is None:
-                ctx.response = "当前草稿操作刚刚开始，请稍后再试。"
+                ctx.response = render_remediation_reply(
+                    "当前草稿操作刚刚开始；此时没有安全的重复执行命令"
+                )
             else:
                 scheduled = _schedule_background_draft_operation(
                     operation,
@@ -3481,7 +3711,10 @@ async def _stage_submit_current_draft(ctx: TurnContext) -> bool:
                 )
                 if scheduled:
                     return True
-                ctx.response = "后台任务启动失败，请稍后重新发送「提交」。"
+                ctx.response = render_remediation_reply(
+                    "后台任务启动失败；草稿未由本次后台任务提交",
+                    command="提交",
+                )
     return False
 
 
@@ -3806,6 +4039,7 @@ _CHAT_COMPAT_NAMES = (
     "parse_pending_candidate_selection",
     "pending_confirmation_copy",
     "pending_confirmation_prompt_instruction",
+    "render_remediation_reply",
     "ChatMemoryContext",
     "MemoryGenerationToken",
     "get_memory_store",
