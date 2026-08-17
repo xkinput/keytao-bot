@@ -860,6 +860,9 @@ class ToolContext:
     # anchor a read to one of these; anything else would let injected text point
     # the bot at a stranger's batch.
     trusted_batch_ids: Optional[frozenset[str]] = None
+    # Successful draft writes from this run only.  A combined add-and-submit
+    # command may submit exactly one such batch, never an older trusted batch.
+    same_turn_write_batch_ids: Optional[frozenset[str]] = None
     mutation_confirmed: bool = False
     server_warning_confirmed: bool = False
     trusted_word_lookup_codes_by_word: Optional[
@@ -1031,6 +1034,7 @@ from .authorization_grammar import (
     front_insert_batch_warning_confirmation_binding,
     _strip_execution_result_suffix,
     _explicit_submit_command_matches,
+    explicit_combined_add_submit_item,
     _explicit_recall_command_matches,
     _extract_explicit_phrase_type,
     _extract_phrase_type_for_target,
@@ -1507,6 +1511,18 @@ class ToolExecutor:
         if not context.current_message:
             return call_args
         message = _mutation_authorization_view(context.current_message or "")
+
+        if (
+            tool_name == "keytao_submit_batch"
+            and not str(call_args.get("batch_id") or "").strip()
+            and explicit_combined_add_submit_item(
+                context.current_message or ""
+            ) is not None
+            and len(context.same_turn_write_batch_ids or frozenset()) == 1
+        ):
+            call_args["batch_id"] = next(
+                iter(context.same_turn_write_batch_ids or frozenset())
+            )
 
         def sanitize_item(item: Dict) -> Dict:
             sanitized = dict(item)

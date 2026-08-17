@@ -26,6 +26,12 @@ from .scenarios import (
     S24_NATURAL_ASSENT,
     S24_RECOMMENDED_CODE,
     S24_WORD,
+    S25_COMBINED_COMMAND,
+    S25_NATURAL_ADD,
+    S25_PREFIX_CODE,
+    S25_SELECTED_CODE,
+    S25_WORD,
+    assert_batch_link_hosts,
     same_unique_item_set,
 )
 from .run import (
@@ -36,6 +42,7 @@ from .run import (
     ensure_s9_fixture,
     ensure_s16_fixture,
     ensure_s18_fixture,
+    ensure_s25_fixture,
     ensure_scenario_zdic_fixture,
     repair_scenario_dictionary_fixture,
 )
@@ -55,6 +62,20 @@ from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_s9_zdic_cache, seed_zdic_
 
 
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_batch_link_host_guard_rejects_another_environment(self) -> None:
+        assert_batch_link_hosts(
+            "草稿地址：http://localhost:3100/batch/batch-local",
+            "http://localhost:3100",
+        )
+        with self.assertRaisesRegex(
+            AssertionError,
+            "outside the configured KEYTAO base",
+        ):
+            assert_batch_link_hosts(
+                "批次地址：https://keytao.vercel.app/batch/batch-local",
+                "http://localhost:3100",
+            )
+
     async def test_exact_item_set_ignores_order_but_rejects_duplicates(self) -> None:
         expected = (
             ("Create", "泼天富贵", "ptfg"),
@@ -274,15 +295,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S22 replays the orphaned re-review advertisement incident", readme)
         self.assertIn("S23 replays the stale advertised-assent production incident", readme)
         self.assertIn("S24 replays the single-word natural-assent incident", readme)
+        self.assertIn("S25 replays the 炒冷饭 production incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s24(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s25(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 25)],
+            [f"S{index}" for index in range(1, 26)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -614,6 +636,20 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S24"]
         self.assertEqual(fixture, ZDIC_FIXTURES_BY_SCENARIO["S18"])
         self.assertIn(S24_WORD, fixture["probe_words"])
+
+    def test_s25_owns_the_exact_flykey_incident_fixture(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S25"]
+        self.assertEqual(fixture["probe_words"], (S25_WORD,))
+        self.assertEqual(
+            {row["entry"] for row in fixture["rows"] if row["kind"] == "char"},
+            set(S25_WORD),
+        )
+        whole_word = next(
+            row
+            for row in fixture["rows"]
+            if row["kind"] == "entry" and row["entry"] == S25_WORD
+        )
+        self.assertEqual(whole_word["pinyins"], ["chǎo", "lěng", "fàn"])
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
         class FakeBuildResult:
@@ -1934,6 +1970,175 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["batchId"], "batch-s24")
         self.assertEqual(result["facts"]["batchStatus"], "Approved")
 
+    async def test_s25_offline_replays_natural_number_and_combined_submit(
+        self,
+    ) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S25")
+
+        class FakeContext:
+            admin_token = "offline-admin-token"
+
+            def __init__(self):
+                self.events = []
+                self.sequence = 0
+                self.items = []
+                self.batch_id = None
+                self.completed_batch_id = None
+                self.next_client = self
+                self.bot = self
+                self.platform_id = "3755240737"
+                self.reset_calls = 0
+                self.cleanup_calls = 0
+
+            def record(self, *, name, arguments=None, result=None):
+                self.sequence += 1
+                event = {
+                    "sequence": self.sequence,
+                    "kind": "tool",
+                    "name": name,
+                    "result": result or {},
+                }
+                if arguments is not None:
+                    event["arguments"] = arguments
+                self.events.append(event)
+
+            async def clean_draft(self, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                deleted = len(self.items)
+                self.items = []
+                self.batch_id = None
+                self.cleanup_calls += 1
+                return {"success": True, "deleted": deleted}
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                self.reset_calls += 1
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assertTrue(to_me)
+                if text == S25_NATURAL_ADD:
+                    self.record(
+                        name="keytao_create_phrase",
+                        arguments={"word": S25_WORD, "code": S25_PREFIX_CODE},
+                        result={
+                            "success": False,
+                            "requiresConfirmation": True,
+                            "warningDigest": "a" * 64,
+                            "message": "存在重码风险，请确认",
+                        },
+                    )
+                    return f"检测到 {S25_PREFIX_CODE} 已有词条，确认后可继续重码写入。"
+                if text == f"喵喵 {S25_WORD}":
+                    return (
+                        f"「{S25_WORD}」候选编码：\n"
+                        f"1. {S25_PREFIX_CODE} — 已有「窝里反」\n"
+                        "2. wlfo — 已有「晚礼服」\n"
+                        f"3. {S25_SELECTED_CODE} — 空位 ✅\n"
+                        "4. wlfoou — 空位\n"
+                        f"回复编号，或回复「用 {S25_SELECTED_CODE}」。"
+                    )
+                if text == "3":
+                    self.batch_id = "batch-s25-number"
+                    self.items = [{
+                        "action": "Create",
+                        "word": S25_WORD,
+                        "code": S25_SELECTED_CODE,
+                    }]
+                    self.record(
+                        name="keytao_create_phrase",
+                        arguments={"word": S25_WORD, "code": S25_SELECTED_CODE},
+                        result={"success": True, "batchId": self.batch_id},
+                    )
+                    return f"✅ 已将「{S25_WORD}」按 {S25_SELECTED_CODE} 加入草稿。"
+                if text == S25_COMBINED_COMMAND:
+                    self.completed_batch_id = "batch-s25-combined"
+                    self.batch_id = self.completed_batch_id
+                    self.items = [{
+                        "action": "Create",
+                        "word": S25_WORD,
+                        "code": S25_SELECTED_CODE,
+                    }]
+                    arguments = {"word": S25_WORD, "code": S25_SELECTED_CODE}
+                    self.record(
+                        name="keytao_create_phrase",
+                        arguments=arguments,
+                        result={"success": True, "batchId": self.batch_id},
+                    )
+                    self.record(
+                        name="keytao_submit_batch",
+                        arguments={"batch_id": self.batch_id},
+                        result={
+                            "success": False,
+                            "requiresConfirmation": True,
+                            "batchId": self.batch_id,
+                            "snapshotDigest": "b" * 64,
+                        },
+                    )
+                    self.record(
+                        name="keytao_submit_batch",
+                        arguments={"batch_id": self.batch_id, "confirmed": True},
+                        result={
+                            "success": True,
+                            "batchId": self.batch_id,
+                            "autoApproved": True,
+                        },
+                    )
+                    return (
+                        "✅ 本轮已完成两步：\n"
+                        f"- 已将「{S25_WORD}」 → {S25_SELECTED_CODE} "
+                        f"写入批次 {self.batch_id} 的草稿。\n"
+                        f"- 已提交批次 {self.batch_id} 审核。"
+                    )
+                if text == "确认" or text.startswith("确认票据 "):
+                    raise AssertionError("offline S25 should complete in the combined turn")
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {
+                    "batchId": self.batch_id,
+                    "contentVersion": 1 if self.items else 0,
+                    "items": list(self.items),
+                }
+
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assertEqual(batch_id, self.completed_batch_id)
+                self.assertEqual(admin_token, self.admin_token)
+                return {
+                    "status": "Approved",
+                    "pullRequests": [{
+                        "action": "Create",
+                        "word": S25_WORD,
+                        "code": S25_SELECTED_CODE,
+                    }],
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+            def assertEqual(self, left, right):
+                if left != right:
+                    raise AssertionError((left, right))
+
+            def assertTrue(self, value):
+                if not value:
+                    raise AssertionError(value)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+
+        self.assertEqual(context.cleanup_calls, 3)
+        self.assertEqual(context.reset_calls, 3)
+        self.assertEqual(
+            result["messages"],
+            [S25_NATURAL_ADD, f"喵喵 {S25_WORD}", "3", S25_COMBINED_COMMAND],
+        )
+        self.assertTrue(result["facts"]["naturalVerbReachedWriteGate"])
+        self.assertTrue(result["facts"]["bareNumberWroteFromRecord"])
+        self.assertEqual(result["facts"]["selectedIndex"], 3)
+        self.assertEqual(result["facts"]["confirmationSteps"], 0)
+        self.assertEqual(result["facts"]["batchId"], "batch-s25-combined")
+        self.assertEqual(result["facts"]["batchStatus"], "Approved")
+
     async def test_s23_unresolvable_quote_control_never_mints_a_write_ticket(
         self,
     ) -> None:
@@ -2456,6 +2661,54 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["occupantWord"], "换车")
         self.assertEqual(result["occupiedCode"], "htwe")
         self.assertEqual(result["occupant"]["weight"], 100)
+
+    async def test_s25_dictionary_fixture_seeds_flykey_occupants_and_free_slot(
+        self,
+    ) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        wlf_occupant = {
+            "word": "窝里反",
+            "code": "wlf",
+            "type": "Phrase",
+            "weight": 100,
+            "user": {"name": "keytao-e2e-llm-rig-run-seed"},
+        }
+        wlfo_occupant = {
+            "word": "晚礼服",
+            "code": "wlfo",
+            "type": "Phrase",
+            "weight": 100,
+            "user": {"name": "keytao-e2e-llm-rig-run-seed"},
+        }
+        client.phrases_by_code = AsyncMock(side_effect=[
+            [],
+            [wlf_occupant],
+            [],
+            [wlfo_occupant],
+            [],
+        ])
+        client.clean_draft = AsyncMock(return_value={"success": True})
+        client.seed_phrase = AsyncMock(return_value={"batchId": "fixture-batch"})
+
+        result = await ensure_s25_fixture(
+            client=client,
+            seed_identity={"platform_id": "7" * 32},
+        )
+
+        self.assertEqual(
+            client.clean_draft.await_args_list,
+            [call("7" * 32), call("7" * 32)],
+        )
+        self.assertEqual(
+            client.seed_phrase.await_args_list,
+            [
+                call(platform_id="7" * 32, word="窝里反", code="wlf"),
+                call(platform_id="7" * 32, word="晚礼服", code="wlfo"),
+            ],
+        )
+        self.assertEqual(result["occupants"]["wlf"]["word"], "窝里反")
+        self.assertEqual(result["occupants"]["wlfo"]["word"], "晚礼服")
+        self.assertEqual(result["emptyCode"], "wlfoo")
 
     def test_llm_endpoint_can_never_be_keytao_production(self) -> None:
         self.assertEqual(

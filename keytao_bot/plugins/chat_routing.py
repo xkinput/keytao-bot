@@ -1168,6 +1168,31 @@ def _structural_pending_add_word_intent(
     )
 
 
+def message_authorizes_live_pending_mutation(
+    message_text: str,
+    state: PendingAddWord,
+) -> bool:
+    """Treat a closed selector as write intent only for one live server record."""
+    if not (
+        isinstance(state, PendingAddWord)
+        and state.server_candidates
+        and state.server_candidates == state.candidates
+    ):
+        return False
+    intent = _structural_pending_add_word_intent(message_text, state)
+    if intent is None or intent.intent not in {
+        "pending_confirm",
+        "pending_add_and_submit",
+        "pending_recode",
+        "pending_code_request",
+        "pending_choice",
+    }:
+        return False
+    if intent.intent == "pending_choice" and intent.choice_index is not None:
+        return 1 <= intent.choice_index <= len(state.server_candidates)
+    return _message_authorizes_pending_control(message_text, intent)
+
+
 def _closed_candidate_selection(
     text: str,
 ) -> Optional[Tuple[Tuple[int, ...], Tuple[str, ...], bool]]:

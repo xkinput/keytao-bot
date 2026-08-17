@@ -1957,6 +1957,93 @@ def _merge_primary_pronunciation_group(
     return result
 
 
+async def _resolve_multi_sense_pronunciation_choice(
+    word: str,
+    groups: Sequence[Dict[str, Any]],
+    *,
+    requester: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Use meaning evidence to rank distinct readings, otherwise keep ASK state."""
+    normalized_groups = [dict(group) for group in groups]
+    sequences = {
+        tuple(group.get("normalized") or ())
+        for group in normalized_groups
+    }
+    if len(sequences) < 2:
+        return normalized_groups, {"status": "not_applicable"}
+
+    proposal = await _infer_semantic_pronunciation_for_review(
+        word,
+        requester=requester,
+    )
+    proposed_sequence = tuple(
+        normalize_pinyin_syllable(str(value or ""))
+        for value in proposal.get("pinyins") or []
+    )
+    matching_indexes = [
+        index
+        for index, group in enumerate(normalized_groups)
+        if tuple(group.get("normalized") or ()) == proposed_sequence
+    ]
+    meaning = str(proposal.get("meaning") or "").strip()
+    try:
+        confidence = float(proposal.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    resolved = bool(
+        proposal.get("accepted") is True
+        and proposal.get("commonTransparent") is True
+        and len(proposed_sequence) == len(word)
+        and len(matching_indexes) == 1
+        and _has_concrete_semantic_meaning(word, meaning)
+        and math.isfinite(confidence)
+        and confidence >= ENTITY_PRONUNCIATION_MIN_CONFIDENCE
+    )
+    if not resolved:
+        return normalized_groups, {
+            "status": "ambiguous",
+            "candidateReadings": [
+                str(group.get("pinyin") or "").strip()
+                for group in normalized_groups
+            ],
+            "reason": "现有含义与常用度证据没有唯一支持其中一个读音",
+        }
+
+    selected_index = matching_indexes[0]
+    selected = normalized_groups[selected_index]
+    selected["semanticPronunciation"] = True
+    selected["requiresManualReview"] = False
+    selected["readingEvidenceKind"] = "multi_sense_meaning_choice"
+    selected["contextPronunciation"] = {
+        "confidence": confidence,
+        "description": meaning,
+        "method": "meaning_backed_multi_sense_choice",
+        "commonTransparent": True,
+        "commonnessReason": str(
+            proposal.get("commonnessReason") or ""
+        ).strip(),
+        "usageType": str(proposal.get("usageType") or "").strip(),
+    }
+    reordered = [
+        selected,
+        *(
+            group
+            for index, group in enumerate(normalized_groups)
+            if index != selected_index
+        ),
+    ]
+    return reordered, {
+        "status": "resolved",
+        "selectedPinyin": pinyin_sequence_label(proposed_sequence),
+        "meaning": meaning,
+        "confidence": confidence,
+        "commonTransparent": True,
+        "commonnessReason": str(
+            proposal.get("commonnessReason") or ""
+        ).strip(),
+    }
+
+
 def _needs_semantic_pronunciation(encode_data: Dict, word: str) -> bool:
     if len(word) <= 1:
         return False
@@ -2536,6 +2623,12 @@ async def prepare_reviewed_word(
             "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
         }, True, "候选读音未通过逐字权威读音交叉校验"), "pronunciation_unresolved")
 
+    groups, multi_sense_choice = await _resolve_multi_sense_pronunciation_choice(
+        word,
+        groups,
+        requester=semantic_requester,
+    )
+
     all_codes: List[str] = []
     pronunciations: List[Dict] = []
     for group in groups:
@@ -2601,7 +2694,7 @@ async def prepare_reviewed_word(
     requires_manual_pronunciation_review = any(
         bool(pron.get("requiresManualReview"))
         for pron in pronunciations
-    )
+    ) or multi_sense_choice.get("status") == "ambiguous"
     auto_reviewable = (
         has_authority
         and evidence_lookup_complete
@@ -2634,6 +2727,7 @@ async def prepare_reviewed_word(
         "requiresManualPronunciationReview": requires_manual_pronunciation_review,
         "standardPronunciationStatus": standard_status,
         "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
+        "multiSenseChoice": multi_sense_choice,
     }
     if lookup_failed:
         result["lookupFailureReason"] = LOOKUP_FAILURE_REASON
@@ -2643,6 +2737,36 @@ async def prepare_reviewed_word(
     # LLM text. A resolved candidate without an authoritative page is SEAL, not
     # BLOCK: it remains writeable with needsManualReview=True.
     apply_manual_review_flag(result, not auto_reviewable, auto_review_reason)
+    if multi_sense_choice.get("status") == "ambiguous":
+        reading_lines = [
+            "- "
+            + str(pronunciation.get("pinyin") or "读音待确认")
+            + "："
+            + "、".join(
+                str(code or "")
+                for code in pronunciation.get("codes") or []
+                if str(code or "")
+            )
+            for pronunciation in pronunciations
+        ]
+        result.update({
+            "recommendedCode": "",
+            "autoReviewable": False,
+            "pronunciationUnresolved": True,
+            "requiresManualPronunciationReview": True,
+            "message": (
+                f"「{word}」存在含义不同的多个读音，当前含义与常用度证据"
+                "未能唯一支持其中一个；本次不推荐编码，也不会创建待确认加词操作。\n"
+                + "\n".join(reading_lines)
+                + "\n请明确要采用的读音或具体含义。"
+            ),
+        })
+        apply_manual_review_flag(
+            result,
+            True,
+            "多义读音未由含义证据唯一消歧",
+        )
+        return apply_review_disposition(result, "pronunciation_unresolved")
     if lookup_failed:
         return apply_review_disposition(result, "lookup_unavailable")
     if not evidence_lookup_complete:
@@ -3172,8 +3296,8 @@ async def _infer_semantic_pronunciation_proposal(word: str) -> Dict[str, Any]:
         return {"accepted": False, "word": normalized_word}
 
     system_prompt = (
-        "你是现代汉语短词和短语的语义、语境读音判定器。上游只会在没有整词权威读音、"
-        "且逐字默认读音与上下文读音冲突时调用你。判断输入在现代汉语中是否有一个常规、"
+        "你是现代汉语短词和短语的语义、语境读音判定器。上游会在没有整词权威读音，"
+        "或已有多个含义不同的候选读音需要消歧时调用你。判断输入在现代汉语中是否有一个常规、"
         "可清楚解释并足以确定逐字读音的用法。它不必是词典独立词条：动词加着、了、过等"
         "语法组合，只要整体含义和读音明确，也可以 accepted=true。meaning 必须具体解释"
         "整个表达的含义，不能只复述原词；pinyins 必须是与汉字逐字对应的无声调拼音数组。"
@@ -4943,7 +5067,11 @@ def _assess_semantic_context_auto_pass(
         for item in character_readings
     )
     non_obscurity = _semantic_context_non_obscurity(word, pronunciation)
+    multi_sense_status = str(
+        (review.get("multiSenseChoice") or {}).get("status") or ""
+    )
     checks = {
+        "multiSenseResolved": multi_sense_status != "ambiguous",
         "lookupCompleted": bool(
             review.get("pronunciationEvidenceComplete") is True
             and not review.get("lookupFailed")
@@ -4979,6 +5107,7 @@ def _assess_semantic_context_auto_pass(
             "requiresEveryKnownCharacterReading": True,
             "requiresCompletedLookups": True,
             "requiresMeaningForMultiReadingCharacters": True,
+            "requiresResolvedMultiSenseChoice": True,
         },
     }
 

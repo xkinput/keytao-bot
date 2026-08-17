@@ -23,7 +23,45 @@ PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     "执行吧",
 })
 
-PENDING_BATCH_ADD_ADVERTISED_FORMS = ("加入", "都加", "添加")
+ADD_OPERATION_VERB_FORMS = (
+    "补一个",
+    "补充",
+    "补上",
+    "加上",
+    "添上",
+    "也加",
+    "再加",
+    "加词",
+    "添加",
+    "加入",
+    "加到",
+    "新增",
+    "创建",
+    "写入",
+    "放入",
+    "收录",
+    "录入",
+    "记入",
+    "都加",
+    "补",
+)
+ADD_OPERATION_VERB_PATTERN = "(?:" + "|".join(
+    sorted(
+        (
+            r"再加(?!入|到|上|词|添)"
+            if verb == "再加"
+            else re.escape(verb)
+            for verb in ADD_OPERATION_VERB_FORMS
+        ),
+        key=len,
+        reverse=True,
+    )
+) + ")"
+
+PENDING_BATCH_ADD_ADVERTISED_FORMS = tuple(
+    verb for verb in ("加入", "都加", "添加")
+    if verb in ADD_OPERATION_VERB_FORMS
+)
 PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS = (
     "加入并提交",
     "都加并提交",
@@ -786,6 +824,81 @@ def single_word_candidate_footer(candidate_count: int) -> str:
     return "\n".join(lines)
 
 
+def advertised_single_word_candidate_codes(text: str) -> tuple[str, ...]:
+    """Read the ordered codes in a numbered one-word CODE-CHOICE display."""
+    matches = list(re.finditer(
+        r"(?m)^\s*(?P<index>[1-9]\d{0,2})[.)、]\s*"
+        r"(?P<code>[a-z]{1,12})\s*(?:—|–|-)\s*[^\n]+$",
+        unicodedata.normalize("NFKC", str(text or "")),
+        re.IGNORECASE,
+    ))
+    if len(matches) < 2:
+        return ()
+    indexes = [int(match.group("index")) for match in matches]
+    codes = tuple(match.group("code").lower() for match in matches)
+    if indexes != list(range(1, len(matches) + 1)) or len(set(codes)) != len(codes):
+        return ()
+    return codes
+
+
+def render_server_backed_single_word_candidates(
+    word: object,
+    recommended_code: object,
+    candidates: object,
+    occupied_words: object,
+) -> str:
+    """Render one candidate interface solely from trusted same-turn records."""
+    normalized_word = str(word or "").strip()
+    recommended = str(recommended_code or "").strip().lower()
+    if (
+        not normalized_word
+        or len(normalized_word) > 128
+        or any(marker in normalized_word for marker in ("\r", "\n", "「", "」"))
+        or not isinstance(candidates, (list, tuple))
+        or not isinstance(occupied_words, dict)
+    ):
+        return ""
+    normalized_candidates: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            return ""
+        code = str(raw[0] or "").strip().lower()
+        occupied = raw[1]
+        if (
+            re.fullmatch(r"[a-z]{1,12}", code) is None
+            or not isinstance(occupied, bool)
+            or code in seen
+        ):
+            return ""
+        normalized_candidates.append((code, occupied))
+        seen.add(code)
+    if len(normalized_candidates) < 2 or recommended not in seen:
+        return ""
+    lines = [f"「{normalized_word}」的服务端候选编码："]
+    for index, (code, occupied) in enumerate(normalized_candidates, start=1):
+        if occupied:
+            words = [
+                str(value or "").strip()
+                for value in occupied_words.get(code, [])
+                if str(value or "").strip()
+            ]
+            if not words:
+                return ""
+            label = "已有「" + "、".join(words) + "」"
+        else:
+            label = "空位"
+        if code == recommended:
+            label += "（推荐）"
+        lines.append(f"{index}. {code} — {label}")
+    lines.extend((
+        "",
+        f"是否以编码 {recommended} 将「{normalized_word}」加入草稿？",
+        single_word_candidate_footer(len(normalized_candidates)),
+    ))
+    return "\n".join(lines)
+
+
 def ensure_single_word_candidate_copy(text: str, candidate_count: int) -> str:
     """Normalize legacy one-word footers to the shared truthful contract."""
     response = str(text or "")
@@ -842,6 +955,7 @@ class AdvertisedReplyContract:
     generic_assent_forms: tuple[str, ...] = ()
     batch_assent_forms: tuple[str, ...] = ()
     candidate_selection: bool = False
+    code_choice_advertisement: bool = False
     deictic_batch_command: bool = False
     binding_advertisement: bool = False
     word_set_advertisement: bool = False
@@ -852,6 +966,7 @@ class AdvertisedReplyContract:
             self.generic_assent_forms
             or self.batch_assent_forms
             or self.candidate_selection
+            or self.code_choice_advertisement
             or self.deictic_batch_command
             or self.binding_advertisement
             or self.word_set_advertisement
@@ -930,6 +1045,11 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         or f" 添加2、4{right}" in normalized
         for left, right in _ADVERTISED_QUOTE_PAIRS
     )
+    displayed_binding_pairs = advertised_batch_binding_pairs(normalized)
+    code_choice_advertisement = bool(
+        advertised_single_word_candidate_codes(normalized)
+        and len(displayed_binding_pairs) <= 1
+    )
     generic_assent_forms = advertised_forms(PENDING_CONFIRM_ADVERTISED_FORMS)
     batch_assent_forms = advertised_forms((
             *PENDING_BATCH_ADD_ADVERTISED_FORMS,
@@ -938,7 +1058,7 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
     deictic_batch_command = (
         _DEICTIC_BATCH_ADVERTISEMENT_RE.search(normalized) is not None
     )
-    has_binding_pairs = bool(advertised_batch_binding_pairs(normalized))
+    has_binding_pairs = bool(displayed_binding_pairs)
     word_set_advertisement = bool(
         _WORD_SET_ADVERTISEMENT_RE.search(normalized)
         or _QUOTED_WORD_SET_COMMAND_RE.search(normalized)
@@ -957,6 +1077,7 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         generic_assent_forms=generic_assent_forms,
         batch_assent_forms=batch_assent_forms,
         candidate_selection=candidate_selection,
+        code_choice_advertisement=code_choice_advertisement,
         deictic_batch_command=deictic_batch_command,
         binding_advertisement=binding_advertisement,
         word_set_advertisement=word_set_advertisement,

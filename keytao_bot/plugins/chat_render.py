@@ -5,6 +5,7 @@ import json
 import re
 from dataclasses import asdict, is_dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from nonebot.log import logger
 
@@ -394,12 +395,12 @@ def _format_tool_encoded_add_prompt(word: str, encoding: Dict) -> Optional[str]:
     lines.append("候选编码:")
     lines.extend(
         _format_candidate_status_line(index, status, recommended_code)
-        for index, status in enumerate(statuses[:6], start=1)
+        for index, status in enumerate(statuses, start=1)
     )
     lines.extend((
         "",
         f"是否以编码 {recommended_code} 将「{word}」加入草稿？",
-        single_word_candidate_footer(len(statuses[:6])),
+        single_word_candidate_footer(len(statuses)),
     ))
     return "\n".join(lines)
 
@@ -667,7 +668,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             review_parts.append("自动审核：该词暂未完成预审（当前仅确认读音与候选编码）")
         lines.append("审词：" + "；".join(review_parts))
         lines.append("候选编码:")
-        for status in pronunciation.get("candidateStatuses", [])[:6]:
+        for status in pronunciation.get("candidateStatuses", []):
             code = str(status.get("code") or "").strip().lower()
             candidate_indexes.setdefault(code, candidate_index)
             lines.append(
@@ -694,7 +695,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         for index, pronunciation in enumerate(pronunciations, start=1):
             pinyin = str(pronunciation.get("pinyin") or "").strip()
             lines.append(f"候选编码（读音 {index}）:")
-            for status in pronunciation.get("candidateStatuses", [])[:6]:
+            for status in pronunciation.get("candidateStatuses", []):
                 code = str(status.get("code") or "").strip().lower()
                 candidate_indexes.setdefault(code, candidate_index)
                 lines.append(
@@ -737,6 +738,8 @@ def _dedupe_authoritative_link_lines(text: str) -> str:
     for line in text.splitlines():
         def replace_url(match: re.Match) -> str:
             url = match.group(0)
+            if "/batch/" in urlsplit(url).path:
+                return ""
             if url in seen_urls:
                 return ""
             seen_urls.add(url)
@@ -772,6 +775,15 @@ def _canonicalize_authoritative_result_links(
     output: List[str] = []
     for line in text.splitlines():
         cleaned = line
+        cleaned = re.sub(
+            r"https?://[^\s)\]]+",
+            lambda match: (
+                ""
+                if "/batch/" in urlsplit(match.group(0)).path
+                else match.group(0)
+            ),
+            cleaned,
+        )
         for url in urls_to_remove:
             escaped_url = re.escape(url)
             cleaned = re.sub(

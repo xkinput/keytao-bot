@@ -88,6 +88,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
     advertised_batch_binding_pairs,
+    advertised_single_word_candidate_codes,
     advertised_reply_contract,
     advertised_word_set_words,
     ensure_multi_word_candidate_copy,
@@ -97,6 +98,7 @@ from ..utils.pending_confirmation import (
     pending_confirmation_prompt_instruction,
     render_remediation_reply,
     render_server_backed_batch_candidates,
+    render_server_backed_single_word_candidates,
     render_server_backed_word_set,
     same_unique_binding_set,
 )
@@ -1473,6 +1475,21 @@ async def get_ai_response_core(
             tool_receipt_recorder=_record_agent_tool_receipt,
             deterministic_fallback_handler=deterministic_fallback_handler,
         )
+        actor_address = (
+            memory_context.conversation_address
+            if memory_context is not None
+            else ConversationAddress.private(platform, user_id)
+        )
+        live_record = conversation_state_store.get_record(actor_address)
+        live_pending_authorizes_mutation = bool(
+            live_record is not None
+            and not live_record.execution_id
+            and isinstance(live_record.state, PendingAddWord)
+            and _chat_routing.message_authorizes_live_pending_mutation(
+                message,
+                live_record.state,
+            )
+        )
         result = await orchestrator.run(
             message=message,
             context=AgentRequestContext(
@@ -1492,6 +1509,7 @@ async def get_ai_response_core(
                     not bool(visual_context)
                     and (
                         message_authorizes_mutation(message)
+                        or live_pending_authorizes_mutation
                         or bool(resolved_advertised_words)
                     )
                 ),
@@ -1776,6 +1794,18 @@ def _advertised_reply_matches_live_record(
         )
     ):
         return False
+    if contract.code_choice_advertisement:
+        if not (
+            isinstance(state, PendingAddWord)
+            and state.server_candidates
+            and state.server_candidates == state.candidates
+        ):
+            return False
+        displayed_codes = advertised_single_word_candidate_codes(response)
+        if displayed_codes != tuple(
+            code for code, _occupied in state.server_candidates
+        ):
+            return False
 
     displayed_pairs = advertised_batch_binding_pairs(response)
     sealed_pairs = _pending_state_binding_pairs(state)
@@ -1819,6 +1849,26 @@ def _render_live_word_set_record(record: Optional[PendingStateRecord]) -> str:
     return render_server_backed_word_set(record.state.snapshots[0].words)
 
 
+def _render_live_single_candidate_record(
+    record: Optional[PendingStateRecord],
+) -> str:
+    """Project one server-backed single-word candidate ticket for delivery."""
+    if (
+        record is None
+        or record.execution_id
+        or not isinstance(record.state, PendingAddWord)
+        or not record.state.server_candidates
+        or record.state.server_candidates != record.state.candidates
+    ):
+        return ""
+    return render_server_backed_single_word_candidates(
+        record.state.word,
+        record.state.recommended_code,
+        record.state.server_candidates,
+        record.state.server_occupied_words,
+    )
+
+
 def _enforce_advertised_reply_contract(
     response: str,
     conv_key: Optional[ConversationKey],
@@ -1845,6 +1895,8 @@ def _enforce_advertised_reply_contract(
         _render_live_word_set_record(record)
         if contract.word_set_advertisement
         and not contract.binding_advertisement
+        else _render_live_single_candidate_record(record)
+        if contract.code_choice_advertisement
         else _render_live_batch_record(record)
     )
     if replacement and _advertised_reply_matches_live_record(replacement, record):

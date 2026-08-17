@@ -131,6 +131,7 @@ from .chat_routing import (
     _resolve_shift_target_code,
     _should_augment_simple_word_query,
     _strip_command_message_prefixes,
+    _structural_pending_add_word_intent,
     _ticket_payload_from_command_intent,
 )
 
@@ -1504,7 +1505,7 @@ async def _revalidate_referenced_add_pending(
         ]
         reviewed_remark = "喵喵审词：" + "；".join(review_parts)
         pronunciation_codes: List[str] = []
-        for status in (pronunciation.get("candidateStatuses") or [])[:6]:
+        for status in pronunciation.get("candidateStatuses") or []:
             if not isinstance(status, dict):
                 return reject("当前审词结果包含无法验证的候选编码")
             code = str(status.get("code") or "").strip().lower()
@@ -5336,7 +5337,7 @@ async def _try_update_pending_pronunciation(
         str(code)
         for code in matching_variants[0].get("codes") or []
         if isinstance(code, str) and code in status_map
-    ][:6]
+    ]
     if not variant_codes:
         return "读音纠正已收到，但新读音的候选占用状态无法验证；旧候选没有执行。"
 
@@ -5717,8 +5718,15 @@ async def handle_pending_message_core(
         preserve_after_response = True
 
     structural_tool_intent = _pending_tool_assent_intent(state, message)
+    structural_candidate_intent = (
+        _structural_pending_add_word_intent(message, state)
+        if isinstance(state, PendingAddWord)
+        else None
+    )
     if scoped_intent is not None:
         pending_command_intent = scoped_intent
+    elif structural_candidate_intent is not None:
+        pending_command_intent = structural_candidate_intent
     elif structural_tool_intent is not None:
         pending_command_intent = structural_tool_intent
     elif not allow_intent_model:

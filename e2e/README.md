@@ -237,6 +237,18 @@ sends `加入草稿，然后就提交。`. The exact state-derived item must rea
 submitted batch with at most one server-bound confirmation. No reply may ask
 for a full word-plus-code line or claim that the selecting quote did not match.
 
+S25 replays the 炒冷饭 production incident over one flykey series. It first
+sends `补上炒冷饭的 wlf 编码` and requires the natural add verb to reach the
+occupied-code write gate. In a clean actor state it renders the numbered
+`wlf`/`wlfo`/`wlfoo` series, sends the bare index for `wlfoo`, and requires the
+exact trusted record item to reach the draft. After another explicit cleanup it
+sends `添加 炒冷饭 wlfoo 并提交`; that same-turn item must reach one submitted
+batch with at most one server-bound confirmation. No executable sub-path may
+emit read-only, no-write, impossible-to-execute, or no-safe-next-command copy.
+The rig seeds and verifies `窝里反@wlf` and `晚礼服@wlfo` as its exact occupied
+fixtures and refuses to start S25 unless `wlfoo` is empty, so every displayed
+occupancy label comes from the local server rather than scenario prose.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`

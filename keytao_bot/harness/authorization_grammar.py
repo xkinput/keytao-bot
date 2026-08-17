@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from keytao_bot.utils import review_flags
 from keytao_bot.utils.pending_confirmation import (
+    ADD_OPERATION_VERB_FORMS,
+    ADD_OPERATION_VERB_PATTERN,
     parse_pending_candidate_selection,
     render_remediation_reply,
 )
@@ -83,7 +85,7 @@ _POSITIONAL_REORDER_INTENT_PATTERN = (
 )
 _POSITIONAL_REORDER_INTENT_RE = re.compile(_POSITIONAL_REORDER_INTENT_PATTERN)
 _NON_POSITIONAL_MUTATION_INTENT_PATTERN = (
-    r"加词|添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|提交|提审|送审|发起审核|"
+    ADD_OPERATION_VERB_PATTERN + r"|提交|提审|送审|发起审核|"
     r"删除|删掉|删干净|去掉|移除|清空|清理|"
     r"撤销|撤回|召回|修改|改成|改为|替换|顺延|挪开|重新编码|保留|批量处理|"
     r"调整权重|修改权重|权重调整(?:为|到)?|权重修改(?:为|到)?|权重改(?:为|到)"
@@ -343,9 +345,7 @@ _COMMAND_PREFIX_PATTERN = rf"(?:{'|'.join(sorted(
     reverse=True,
 ))})*"
 _COMMAND_PREFIX_RE = re.compile(rf"^{_COMMAND_PREFIX_PATTERN}")
-_MULTI_ADD_VERB_RE = re.compile(
-    r"加词|添加|加入|加到|新增|创建|写入|放入|收录|录入|记入"
-)
+_MULTI_ADD_VERB_RE = re.compile(ADD_OPERATION_VERB_PATTERN)
 _MULTI_ADD_ADDRESS_CLAUSES = frozenset({"喵喵"})
 _MAX_AUTHORIZED_MULTI_ADD_ITEMS = 10
 
@@ -366,8 +366,10 @@ class _MultiAddAuthorization:
 def _parse_complete_add_clause(clause: str) -> Optional[_AuthorizedAddClause]:
     """Parse one closed add command without deriving either target or code."""
     candidate = re.sub(r"\s+", " ", str(clause or "")).strip()
-    candidate = _COMMAND_PREFIX_RE.sub("", candidate, count=1).strip()
     verb = _MULTI_ADD_VERB_RE.match(candidate)
+    if verb is None:
+        candidate = _COMMAND_PREFIX_RE.sub("", candidate, count=1).strip()
+        verb = _MULTI_ADD_VERB_RE.match(candidate)
     if verb is None:
         return None
     remainder = candidate[verb.end():].strip()
@@ -837,7 +839,7 @@ _NEGATIVE_MODAL_RE = re.compile(
 )
 _CLAUSE_BOUNDARY_RE = re.compile(r"[。！？!?;；\n]")
 _ACTION_TOKENS = {
-    "Create": re.compile(r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|加词"),
+    "Create": re.compile(ADD_OPERATION_VERB_PATTERN),
     "Change": re.compile(
         r"修改|改成|改为|替换|重新编码|顺延|挪开|"
         r"调整权重|修改权重|权重调整|权重修改|权重改|"
@@ -850,7 +852,7 @@ _ACTION_TOKENS = {
     ),
 }
 _WORD_LEFT_PREFIXES = (
-    "添加", "加入", "加到", "新增", "创建", "写入", "放入", "收录", "录入", "记入", "加词",
+    *ADD_OPERATION_VERB_FORMS,
     "修改", "改成", "替换", "删除", "删掉", "移除", "保留", "只保留", "仅保留",
     "顺延", "放在", "放到", "排在", "移到", "挪到", "提到", "提前到", "改到",
     "往前", "往后", "靠前", "靠后",
@@ -1067,7 +1069,11 @@ def _mutation_authorization_view(message: str) -> str:
         normalized = re.sub(r"\s+", " ", clause).strip()
         if not compact:
             continue
-        candidate = _COMMAND_PREFIX_RE.sub("", compact, count=1)
+        candidate = (
+            compact
+            if _MUTATION_INTENT_RE.match(compact)
+            else _COMMAND_PREFIX_RE.sub("", compact, count=1)
+        )
         has_mutation = bool(_MUTATION_INTENT_RE.search(candidate))
         mutation_at_start = _MUTATION_INTENT_RE.match(candidate)
         positional_command = bool(
@@ -1120,7 +1126,11 @@ def _has_mutation_instruction_shape(message: str) -> bool:
     # context independently.  Moving those consent checks out of this helper is
     # precautionary separation; the measured record-frame defect was limited
     # to standalone negation, not the other consent-predicate groups.
-    stripped_text = _COMMAND_PREFIX_RE.sub("", authorization_text, count=1)
+    stripped_text = (
+        authorization_text
+        if _MUTATION_INTENT_RE.match(authorization_text)
+        else _COMMAND_PREFIX_RE.sub("", authorization_text, count=1)
+    )
     stripped_match = _MUTATION_INTENT_RE.search(stripped_text)
     return bool(
         (
@@ -1168,7 +1178,11 @@ def _message_authorizes_mutation_core(message: str) -> bool:
         _NEGATED_NON_POSITIONAL_MUTATION_RE.search(clause)
         for clause in authorization_clauses
     )
-    stripped_command_text = _COMMAND_PREFIX_RE.sub("", text, count=1)
+    stripped_command_text = (
+        text
+        if _MUTATION_INTENT_RE.match(text)
+        else _COMMAND_PREFIX_RE.sub("", text, count=1)
+    )
     positional_command = _has_complete_positional_reorder_command(message)
     positional_scope = bool(
         positional_command
@@ -1523,7 +1537,7 @@ _CHANGE_VERB_RE = re.compile(
 _WEIGHT_ADJUST_VERB_RE = re.compile(
     r"调整权重|修改权重|权重(?:调整|修改|改)(?:为|到)?"
 )
-_CREATE_VERB_RE = re.compile(r"添加|加入|加到|新增|创建|写入|放入|收录|录入|记入|加词")
+_CREATE_VERB_RE = re.compile(ADD_OPERATION_VERB_PATTERN)
 _DELETE_VERB_RE = re.compile(r"删除|删掉|删干净|去掉|移除|清空|清理")
 _SUBMIT_VERB_RE = re.compile(r"提交|提审|送审|发起审核")
 _RECALL_VERB_RE = re.compile(r"撤回|撤销|召回|取消")
@@ -2202,6 +2216,31 @@ def _explicit_submit_command_matches(compact: str) -> bool:
     )
 
 
+def explicit_combined_add_submit_item(message: str) -> Optional[Dict[str, str]]:
+    """Return the one literal add authorized together with same-turn submit."""
+    if not message_authorizes_mutation(message):
+        return None
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    ).strip()
+    match = re.fullmatch(
+        r"(?P<add>.+?)\s*(?:并|并且|然后|再)\s*"
+        r"(?:提交|提审|送审)(?:审核)?(?:当前)?(?:草稿|批次)?"
+        r"(?:一下)?(?:吧|啦|了)?\s*",
+        source,
+    )
+    if match is None:
+        return None
+    clause = _parse_complete_add_clause(match.group("add"))
+    if clause is None or not clause.code:
+        return None
+    return {
+        "action": "Create",
+        "word": clause.word,
+        "code": clause.code,
+    }
+
+
 def _explicit_recall_command_matches(compact: str) -> bool:
     compact = _strip_execution_result_suffix(compact)
     prefix = (
@@ -2377,6 +2416,10 @@ def _exact_target_spans(message: str, target: str) -> List[tuple[int, int]]:
             not right_char
             or not _is_han(right_char)
             or any(after.startswith(suffix) for suffix in _WORD_RIGHT_SUFFIXES)
+            or re.match(
+                r"的\s*[A-Za-z]{1,12}\s*(?:编码|代码)",
+                after,
+            ) is not None
         )
         if left_ok and right_ok:
             spans.append((index, end))
@@ -2536,6 +2579,65 @@ def _target_clause_has_explicit_code_token(message: str, target: str) -> bool:
             target_span,
         ):
             return True
+    return False
+
+
+def _create_clause_names_second_target(
+    message: str,
+    word: str,
+    code: str,
+) -> bool:
+    """Reject one Create call when its literal clause names another target."""
+    if not word or not code:
+        return False
+    spans = _exact_target_spans(message, word)
+    if not spans:
+        return False
+    other_word = r"[\u3400-\u9fffA-Za-z0-9_-]{1,32}"
+    separator = r"(?:和|与|及|、)"
+    for span in spans:
+        clause_start, clause_end = _clause_bounds(message, *span)
+        clause = message[clause_start:clause_end]
+        if (
+            re.search(
+                rf"{re.escape(word)}\s*{separator}\s*{other_word}.{{0,24}}"
+                rf"{re.escape(code)}(?![A-Za-z])",
+                clause,
+                re.IGNORECASE,
+            )
+            or re.search(
+                rf"{other_word}\s*{separator}\s*{re.escape(word)}.{{0,24}}"
+                rf"{re.escape(code)}(?![A-Za-z])",
+                clause,
+                re.IGNORECASE,
+            )
+        ):
+            return True
+    return False
+
+
+def _create_clause_names_other_action(message: str, word: str) -> bool:
+    """Keep one Create authorization from absorbing another action."""
+    competing = re.compile(
+        rf"(?:{_CHANGE_VERB_RE.pattern}|{_DELETE_VERB_RE.pattern}|"
+        rf"{_RECALL_VERB_RE.pattern}|{_WEIGHT_ADJUST_VERB_RE.pattern})"
+    )
+    source = str(message or "")
+    target_spans = _exact_target_spans(source, word)
+    for match in competing.finditer(source):
+        if any(
+            match.start() < target_end and target_start < match.end()
+            for target_start, target_end in target_spans
+        ):
+            continue
+        clause_start, _clause_end = _clause_bounds(
+            source,
+            match.start(),
+            match.end(),
+        )
+        if _action_match_is_negated(source, match.start(), clause_start):
+            continue
+        return True
     return False
 
 
@@ -3146,10 +3248,24 @@ def _validate_current_message_binding(
     trusted_draft_items = context.trusted_draft_items_by_id or {}
     compact_message = re.sub(r"[\s，,。.!！?？~～]+", "", message)
     if tool_name == "keytao_submit_batch":
-        if not _explicit_submit_command_matches(compact_message):
+        combined_item = explicit_combined_add_submit_item(
+            context.current_message or ""
+        )
+        same_turn_batches = context.same_turn_write_batch_ids or frozenset()
+        submitted_batch = str(arguments.get("batch_id") or "").strip()
+        combined_is_bound = bool(
+            combined_item is not None
+            and len(same_turn_batches) == 1
+            and submitted_batch in same_turn_batches
+        )
+        if not (
+            _explicit_submit_command_matches(compact_message)
+            or combined_is_bound
+        ):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：提交只能由本轮明确、独立的提交指令授权。",
+                "安全拦截：提交需要独立提交指令，或绑定到本轮同一条"
+                "合并指令刚写入的唯一批次。",
                 missing=["submitCommand"],
             )
     if tool_name == "keytao_recall_batch":
@@ -3312,6 +3428,8 @@ def _validate_current_message_binding(
         explicit_create_is_bound = bool(
             create_intent_is_bound
             and code
+            and not _create_clause_names_second_target(message, word, code)
+            and not _create_clause_names_other_action(message, word)
             and _code_is_bound_to_target(
                 message,
                 word,

@@ -6,6 +6,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 from keytao_bot.utils.pending_confirmation import (
     advertised_batch_binding_pairs,
@@ -105,6 +106,22 @@ def batch_link_ids(reply: str) -> set[str]:
     return set(re.findall(r"/batch/([A-Za-z0-9_-]+)", reply))
 
 
+def assert_batch_link_hosts(reply: str, keytao_base: str) -> None:
+    """Reject model-invented batch links for another KeyTao environment."""
+    expected_host = urlsplit(str(keytao_base or "")).netloc.lower()
+    mismatched = sorted({
+        url
+        for url in re.findall(r"https?://[^\s)\]]+", reply)
+        if "/batch/" in urlsplit(url).path
+        and urlsplit(url).netloc.lower() != expected_host
+    })
+    require(
+        bool(expected_host) and not mismatched,
+        "reply exposed a batch URL outside the configured KEYTAO base: "
+        f"configured={keytao_base!r}, mismatched={mismatched}",
+    )
+
+
 def assert_only_materialized_batch_links(
     replies: list[str],
     draft: dict[str, Any],
@@ -185,19 +202,23 @@ class ScenarioContext:
         return self.bot.last_reply_message_id
 
     async def send(self, text: str) -> str:
-        return await self.bot.send(
+        reply = await self.bot.send(
             platform_id=self.platform_id,
             sender_name=self.sender_name,
             text=text,
         )
+        assert_batch_link_hosts(reply, self.next_client.base_url)
+        return reply
 
     async def send_group(self, text: str, *, to_me: bool) -> str:
-        return await self.bot.send_group(
+        reply = await self.bot.send_group(
             platform_id=self.platform_id,
             sender_name=self.sender_name,
             text=text,
             to_me=to_me,
         )
+        assert_batch_link_hosts(reply, self.next_client.base_url)
+        return reply
 
     async def send_group_reply(
         self,
@@ -206,13 +227,15 @@ class ScenarioContext:
         reply_message_id: int,
         to_me: bool,
     ) -> str:
-        return await self.bot.send_group_reply(
+        reply = await self.bot.send_group_reply(
             platform_id=self.platform_id,
             sender_name=self.sender_name,
             text=text,
             reply_message_id=reply_message_id,
             to_me=to_me,
         )
+        assert_batch_link_hosts(reply, self.next_client.base_url)
+        return reply
 
     async def draft(self) -> dict[str, Any]:
         return await self.next_client.get_draft(self.platform_id)
@@ -2710,6 +2733,246 @@ async def scenario_s24(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S25_WORD = "炒冷饭"
+S25_PREFIX_CODE = "wlf"
+S25_SELECTED_CODE = "wlfoo"
+S25_NATURAL_ADD = f"补上{S25_WORD}的 {S25_PREFIX_CODE} 编码"
+S25_COMBINED_COMMAND = f"添加 {S25_WORD} {S25_SELECTED_CODE} 并提交"
+
+
+async def scenario_s25(ctx: ScenarioContext) -> dict[str, Any]:
+    """Replay the natural-add, record-backed number, and combined-submit incident."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S25 initial cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    natural_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S25_NATURAL_ADD)
+    replies.append(await ctx.send_group(S25_NATURAL_ADD, to_me=True))
+    natural_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > natural_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_create_phrase"
+        and str(event.get("arguments", {}).get("word") or "").strip() == S25_WORD
+        and str(event.get("arguments", {}).get("code") or "").strip().lower()
+        == S25_PREFIX_CODE
+    ]
+    require(
+        natural_calls,
+        "S25 natural add verb never reached the duplicate-code write gate",
+    )
+
+    # The first request may have materialized a duplicate after its server
+    # warning. Start candidate selection from a clean actor state so that the
+    # numbered and combined-command subcases cannot pass via stale draft data.
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S25 post-natural cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    discovery_message = f"喵喵 {S25_WORD}"
+    messages.append(discovery_message)
+    discovery = await ctx.send_group(discovery_message, to_me=True)
+    replies.append(discovery)
+    selected_index = _rendered_candidate_index(discovery, S25_SELECTED_CODE)
+    require(
+        re.search(
+            rf"(?m)^\d+\.\s*{re.escape(S25_PREFIX_CODE)}\b.*已有.*$",
+            discovery,
+        )
+        is not None,
+        f"S25 did not render the occupied series prefix: {discovery}",
+    )
+    require(
+        re.search(r"(?m)^\d+\.\s*wlfo\b.*已有.*晚礼服.*$", discovery)
+        is not None,
+        f"S25 did not carry wlfo occupancy from the server record: {discovery}",
+    )
+    require(
+        re.search(
+            rf"(?m)^{selected_index}\.\s*{re.escape(S25_SELECTED_CODE)}\b.*空位.*$",
+            discovery,
+        )
+        is not None,
+        f"S25 did not render {S25_SELECTED_CODE} as the selectable empty slot: {discovery}",
+    )
+
+    number_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    number_message = str(selected_index)
+    messages.append(number_message)
+    replies.append(await ctx.send_group(number_message, to_me=True))
+    selected_draft = await ctx.draft()
+    require(
+        len(selected_draft.get("items", [])) == 1
+        and item_key(selected_draft["items"][0])
+        == ("Create", S25_WORD, S25_SELECTED_CODE),
+        f"S25 bare number did not execute the record-selected item: {selected_draft}",
+    )
+    number_writes = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > number_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_create_phrase"
+        and isinstance(event.get("result"), dict)
+        and event["result"].get("success") is True
+    ]
+    require(number_writes, "S25 bare number never reached a successful write receipt")
+    require(
+        all(
+            (
+                str(event.get("arguments", {}).get("word") or "").strip(),
+                str(event.get("arguments", {}).get("code") or "").strip().lower(),
+            )
+            == (S25_WORD, S25_SELECTED_CODE)
+            for event in number_writes
+        ),
+        f"S25 bare number escaped its trusted candidate record: {number_writes}",
+    )
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S25 pre-combined cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    combined_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S25_COMBINED_COMMAND)
+    combined_reply = await ctx.send_group(S25_COMBINED_COMMAND, to_me=True)
+    replies.append(combined_reply)
+    completed_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=combined_cutoff,
+    )
+    confirmation_steps = 0
+    if not completed_batch_id:
+        confirmation_match = re.search(r"确认票据\s+[A-F0-9]{6}", combined_reply)
+        confirmation_command = (
+            confirmation_match.group(0)
+            if confirmation_match is not None
+            else "确认"
+            if "确认" in combined_reply
+            else ""
+        )
+        require(
+            bool(confirmation_command),
+            f"S25 combined command neither submitted nor reached confirmation: {combined_reply}",
+        )
+        confirmation_steps = 1
+        messages.append(confirmation_command)
+        replies.append(await ctx.send_group(confirmation_command, to_me=True))
+        completed_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=combined_cutoff,
+        )
+
+    require(completed_batch_id, "S25 combined add-and-submit never completed")
+    require(confirmation_steps <= 1, "S25 used more than one server-bound confirmation")
+    completion_exchange = "\n".join(replies[-(confirmation_steps + 1):])
+    escaped_word = re.escape(S25_WORD)
+    escaped_code = re.escape(S25_SELECTED_CODE)
+    escaped_batch = re.escape(completed_batch_id)
+    require(
+        re.search(
+            rf"已将[「\"]?{escaped_word}[」\"]?\s*→\s*{escaped_code}"
+            rf"\s*写入批次\s*{escaped_batch}",
+            completion_exchange,
+        ) is not None
+        and re.search(
+            rf"已提交批次\s*{escaped_batch}\s*审核",
+            completion_exchange,
+        ) is not None
+        and re.search(r"未写入|未提交|提交未完成|无法执行", completion_exchange)
+        is None,
+        "S25 completion replies did not truthfully report both completed steps: "
+        f"{completion_exchange}",
+    )
+    combined_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > combined_cutoff
+        and event.get("kind") == "tool"
+    ]
+    successful_creates = [
+        event
+        for event in combined_events
+        if event.get("name") == "keytao_create_phrase"
+        and isinstance(event.get("result"), dict)
+        and event["result"].get("success") is True
+    ]
+    require(
+        successful_creates
+        and all(
+            (
+                str(event.get("arguments", {}).get("word") or "").strip(),
+                str(event.get("arguments", {}).get("code") or "").strip().lower(),
+            )
+            == (S25_WORD, S25_SELECTED_CODE)
+            for event in successful_creates
+        ),
+        f"S25 combined command did not write its exact same-turn item: {combined_events}",
+    )
+
+    completed_batch = await ctx.next_client.get_admin_batch(
+        batch_id=completed_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    batch_status = str(completed_batch.get("status") or "")
+    submitted_items = [
+        item
+        for item in completed_batch.get("pullRequests", [])
+        if isinstance(item, dict)
+    ]
+    require(
+        batch_status in {"Submitted", "Approved"}
+        and len(submitted_items) == 1
+        and item_key(submitted_items[0])
+        == ("Create", S25_WORD, S25_SELECTED_CODE),
+        f"S25 submitted batch differs from the combined command: {completed_batch}",
+    )
+
+    refusal_copy = (
+        "安全层拦截",
+        "只读轮",
+        "无法执行",
+        "本次未写入",
+        "当前没有可安全执行的后续命令",
+        "请把下面这条指令原样转述给用户",
+    )
+    require(
+        not any(marker in reply for reply in replies for marker in refusal_copy),
+        f"S25 surfaced refusal copy on an executable path: {replies}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "word": S25_WORD,
+            "prefixCode": S25_PREFIX_CODE,
+            "selectedCode": S25_SELECTED_CODE,
+            "selectedIndex": selected_index,
+            "naturalVerbReachedWriteGate": True,
+            "bareNumberWroteFromRecord": True,
+            "combinedCommand": S25_COMBINED_COMMAND,
+            "confirmationSteps": confirmation_steps,
+            "batchId": completed_batch_id,
+            "batchStatus": batch_status,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -2735,6 +2998,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S22", "re-review advertisement state coupling", scenario_s22),
     Scenario("S23", "stale advertised assent recovery and fresh closure", scenario_s23),
     Scenario("S24", "single-word natural quoted assent", scenario_s24),
+    Scenario("S25", "natural add, record-backed number, and combined submit", scenario_s25),
 )
 
 

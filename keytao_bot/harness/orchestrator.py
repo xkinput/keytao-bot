@@ -8,6 +8,7 @@ import uuid
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from nonebot.log import logger
 
@@ -38,6 +39,7 @@ from keytao_bot.utils.pending_confirmation import (
     render_executable_suggestion,
     render_remediation_reply,
     same_unique_binding_set,
+    render_server_backed_single_word_candidates,
 )
 
 from .state import (
@@ -56,6 +58,7 @@ from .tools import (
     authorized_multi_add_items,
     batch_warning_confirmation_binding,
     create_warning_confirmation_binding,
+    explicit_combined_add_submit_item,
     front_insert_batch_warning_confirmation_binding,
     project_tool_result_for_model,
     server_warning_confirmation_binding,
@@ -287,13 +290,20 @@ class AgentOrchestrator:
     ) -> Optional[str]:
         """Emit every final reply through one same-turn loop breaker."""
         failure_state: Dict[str, Any] = {}
+        successful_write_receipts: List[Dict[str, Any]] = []
         reply = await self._run_loop(
             message,
             context,
             max_iterations=max_iterations,
             failure_state=failure_state,
+            successful_write_receipts=successful_write_receipts,
         )
-        return self._finalize_reply(message, reply, failure_state)
+        return self._finalize_reply(
+            message,
+            reply,
+            failure_state,
+            successful_write_receipts,
+        )
 
     async def _run_loop(
         self,
@@ -301,6 +311,7 @@ class AgentOrchestrator:
         context: AgentRequestContext,
         max_iterations: int = 20,
         failure_state: Optional[Dict[str, Any]] = None,
+        successful_write_receipts: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         client = self._client_factory()
 
@@ -432,6 +443,11 @@ class AgentOrchestrator:
             str,
             tuple[tuple[str, bool], ...],
         ] = {}
+        trusted_candidate_statuses_by_word: Dict[
+            str,
+            tuple[Dict[str, Any], ...],
+        ] = {}
+        trusted_recommended_codes_by_word: Dict[str, str] = {}
         trusted_word_lookup_codes_by_word: Dict[str, frozenset[str]] = {}
         trusted_entries_by_code: Dict[str, tuple[tuple[str, int], ...]] = {}
         trusted_draft_words_by_id: Dict[str, str] = {}
@@ -439,6 +455,7 @@ class AgentOrchestrator:
         trusted_phrase_types_by_key: Dict[tuple[str, str], frozenset[str]] = {}
         trusted_reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
         trusted_batch_ids: set[str] = set()
+        same_turn_write_batch_ids: set[str] = set()
         trusted_absent_word_sets: List[tuple[str, ...]] = []
         unresolved_pronunciation_words: set[str] = set()
         blocked_review_words: set[str] = set()
@@ -545,14 +562,22 @@ class AgentOrchestrator:
                         error,
                     )
                     return self._append_authoritative_result_links(
-                        "呜呜，AI 服务暂时没有完成回复 qwq 已执行结果请以链接为准。",
+                        render_remediation_reply(
+                            "AI 服务暂时未能完成这轮处理；"
+                            "本轮没有成功写入任何数据",
+                            command=message,
+                        ),
                         authoritative_result_links,
                     )
 
                 if not response.choices:
                     mark_turn_outcome("error")
                     return self._append_authoritative_result_links(
-                        "呜呜，AI 好像没有回复 qwq 要不再试一次？",
+                        render_remediation_reply(
+                            "AI 服务没有返回可用回复；"
+                            "本轮没有成功写入任何数据",
+                            command=message,
+                        ),
                         authoritative_result_links,
                     )
 
@@ -799,6 +824,56 @@ class AgentOrchestrator:
                         )
                 if content.strip():
                     reply_contract = advertised_reply_contract(content)
+                    if (
+                        reply_contract.code_choice_advertisement
+                        and not context.visual_context
+                    ):
+                        pending_add = self._trusted_single_pending_add(
+                            trusted_candidate_slots_by_word,
+                            trusted_candidate_statuses_by_word,
+                            trusted_recommended_codes_by_word,
+                            trusted_reviewed_items_by_key,
+                        )
+                        rendered_single = (
+                            render_server_backed_single_word_candidates(
+                                pending_add.word,
+                                pending_add.recommended_code,
+                                pending_add.server_candidates,
+                                pending_add.server_occupied_words,
+                            )
+                            if pending_add is not None
+                            else ""
+                        )
+                        if not rendered_single or pending_add is None:
+                            return self._append_authoritative_result_links(
+                                render_remediation_reply(
+                                    "这条单词候选列表无法唯一绑定到本轮服务端"
+                                    "编码记录；本次不会写入"
+                                ),
+                                authoritative_result_links,
+                            )
+                        saved = self._state_store.set(
+                            conv_key,
+                            pending_add,
+                            space_key=context.space_key,
+                            owner_label=context.speaker_name,
+                        )
+                        if not saved:
+                            return self._append_authoritative_result_links(
+                                render_remediation_reply(
+                                    "当前单词候选无法安全保存；本次不会写入"
+                                ),
+                                authoritative_result_links,
+                            )
+                        logger.info(
+                            "[advertised_reply_contract] "
+                            "branch=establish_single_code_choice_from_records "
+                            f"owner={conv_key} word={pending_add.word}"
+                        )
+                        return self._append_authoritative_result_links(
+                            rendered_single,
+                            authoritative_result_links,
+                        )
                     matching_word_sets = [
                         absent_words
                         for absent_words in trusted_absent_word_sets
@@ -1158,6 +1233,9 @@ class AgentOrchestrator:
                     trusted_phrase_types_by_key=trusted_phrase_types_by_key,
                     trusted_reviewed_items_by_key=trusted_reviewed_items_by_key,
                     trusted_batch_ids=frozenset(trusted_batch_ids),
+                    same_turn_write_batch_ids=frozenset(
+                        same_turn_write_batch_ids
+                    ),
                     pending_candidate=_live_pending_candidate_capability(
                         self._state_store,
                         conv_key,
@@ -1225,8 +1303,22 @@ class AgentOrchestrator:
                         type(error).__name__,
                         error,
                     )
+                    if failure_state is not None:
+                        self._record_failure_for_remediation(
+                            failure_state,
+                            {
+                                "success": False,
+                                "error": type(error).__name__,
+                                "message": "后续工具处理暂时中断。",
+                            },
+                            fn_name,
+                        )
                     return self._append_authoritative_result_links(
-                        "呜呜，后续工具处理暂时中断了 qwq 已执行结果请以链接为准。",
+                        render_remediation_reply(
+                            "后续工具处理暂时中断；"
+                            "本轮没有成功写入任何数据",
+                            command=message,
+                        ),
                         authoritative_result_links,
                     )
 
@@ -1282,10 +1374,59 @@ class AgentOrchestrator:
                                 trusted_batch_ids=frozenset(trusted_batch_ids),
                             ),
                         )
+                    if auto_confirmed is None:
+                        auto_confirmed = await self._auto_confirm_combined_submit(
+                            message,
+                            fn_name,
+                            canonical_fn_args,
+                            result_data,
+                            successful_write_receipts or [],
+                            replace(
+                                tool_context,
+                                trusted_batch_ids=frozenset(trusted_batch_ids),
+                                same_turn_write_batch_ids=frozenset(
+                                    same_turn_write_batch_ids
+                                ),
+                            ),
+                        )
                     if auto_confirmed is not None:
                         # Everything downstream must describe the call that was
                         # actually executed, not the discarded preview.
                         result_data, result_str, canonical_fn_args = auto_confirmed
+                        observe_tool_result(result_data)
+                        if (
+                            result_data.get("success") is False
+                            or result_data.get("policyBlocked") is True
+                            or result_data.get("error")
+                        ):
+                            if failure_state is not None:
+                                self._record_failure_for_remediation(
+                                    failure_state,
+                                    result_data,
+                                    fn_name,
+                                )
+                        elif (
+                            result_data.get("success") is True
+                            and fn_name in MUTATING_TOOL_NAMES
+                            and failure_state is not None
+                        ):
+                            failure_state.clear()
+                    if (
+                        isinstance(result_data, dict)
+                        and result_data.get("success") is True
+                        and fn_name in MUTATING_TOOL_NAMES
+                    ):
+                        receipt = self._successful_write_receipt(
+                            fn_name,
+                            canonical_fn_args,
+                            result_data,
+                        )
+                        if receipt is not None:
+                            if successful_write_receipts is not None:
+                                successful_write_receipts.append(receipt)
+                            batch_id = str(receipt.get("batchId") or "").strip()
+                            if batch_id and fn_name != "keytao_submit_batch":
+                                same_turn_write_batch_ids.add(batch_id)
                     result_str = self._deduplicate_block_reason(
                         result_data,
                         result_str,
@@ -1345,6 +1486,8 @@ class AgentOrchestrator:
                         trusted_reviewed_items_by_key,
                         trusted_candidate_slots_by_word,
                         trusted_absent_word_sets,
+                        trusted_candidate_statuses_by_word,
+                        trusted_recommended_codes_by_word,
                     )
                     pending_tool_name = (
                         execution_route.tool_name
@@ -1530,6 +1673,79 @@ class AgentOrchestrator:
             candidate_slots_by_word,
         )
 
+    @staticmethod
+    def _trusted_single_pending_add(
+        candidate_slots_by_word: Dict[
+            str,
+            tuple[tuple[str, bool], ...],
+        ],
+        candidate_statuses_by_word: Dict[
+            str,
+            tuple[Dict[str, Any], ...],
+        ],
+        recommended_codes_by_word: Dict[str, str],
+        reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
+    ) -> Optional[PendingAddWord]:
+        """Build one single-word ticket solely from same-turn tool records."""
+        words = tuple(
+            word
+            for word in candidate_slots_by_word
+            if word in candidate_statuses_by_word
+            and word in recommended_codes_by_word
+        )
+        if len(words) != 1:
+            return None
+        word = words[0]
+        candidates = list(candidate_slots_by_word[word])
+        statuses = candidate_statuses_by_word[word]
+        recommended = recommended_codes_by_word[word]
+        if (
+            len(candidates) < 2
+            or [status.get("code") for status in statuses]
+            != [code for code, _occupied in candidates]
+        ):
+            return None
+        occupied_words: Dict[str, List[str]] = {}
+        entries_by_code: Dict[str, List[tuple[str, int]]] = {}
+        for status in statuses:
+            code = str(status.get("code") or "").strip().lower()
+            if status.get("occupied") is True:
+                words_for_code = [
+                    str(value or "").strip()
+                    for value in status.get("words") or ()
+                    if str(value or "").strip()
+                ]
+                if not words_for_code:
+                    return None
+                occupied_words[code] = words_for_code
+            entries = [
+                (str(entry_word), int(weight))
+                for entry_word, weight in status.get("entries") or ()
+            ]
+            if entries:
+                entries_by_code[code] = entries
+        reviewed = reviewed_items_by_key.get((word, recommended)) or {}
+        remark = str(reviewed.get("remark") or "").strip()
+        needs_manual_review = bool(
+            reviewed.get("needs_manual_review", True)
+        )
+        manual_reason = str(
+            reviewed.get("manual_review_reason")
+            or "当前候选尚未形成自动通过结论"
+        ).strip()
+        return PendingAddWord(
+            word=word,
+            recommended_code=recommended,
+            candidates=list(candidates),
+            occupied_words=dict(occupied_words),
+            server_candidates=list(candidates),
+            server_occupied_words=dict(occupied_words),
+            server_entries_by_code=entries_by_code,
+            code_remarks={recommended: remark} if remark else {},
+            needs_manual_review=needs_manual_review,
+            manual_review_reason=manual_reason,
+        )
+
     def _validated_resolved_advertised_words(
         self,
         message: str,
@@ -1699,16 +1915,280 @@ class AgentOrchestrator:
         if new_tool:
             selected["_failedTool"] = new_tool
 
+    @staticmethod
+    def _successful_write_receipt(
+        tool_name: str,
+        arguments: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Project one actual successful mutation into truthful reply evidence."""
+        if result.get("success") is not True:
+            return None
+        items: List[Dict[str, str]] = []
+        if tool_name == "keytao_create_phrase":
+            source_items = [arguments]
+        elif tool_name == "keytao_batch_add_to_draft":
+            source_items = arguments.get("items") or []
+        else:
+            source_items = []
+        for item in source_items:
+            if not isinstance(item, dict):
+                continue
+            word = str(item.get("word") or "").strip()
+            code = str(item.get("code") or "").strip().lower()
+            if word and code:
+                items.append({
+                    "action": str(item.get("action") or "Create").strip(),
+                    "word": word,
+                    "code": code,
+                })
+        return {
+            "tool": tool_name,
+            "batchId": str(
+                result.get("batchId") or arguments.get("batch_id") or ""
+            ).strip(),
+            "batchUrl": str(result.get("batchUrl") or "").strip(),
+            "items": items,
+        }
+
+    @staticmethod
+    def _submit_snapshot_binding(
+        preview: Dict[str, Any],
+        batch_id: str,
+        authorized_item: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """Seal a combined submit replay to its exact one-item server snapshot."""
+        content_version = preview.get("contentVersion")
+        snapshot_items = preview.get("snapshotItems")
+        expected = (
+            str(authorized_item.get("action") or "Create").strip(),
+            str(authorized_item.get("word") or "").strip(),
+            str(authorized_item.get("code") or "").strip().lower(),
+        )
+        actual: List[tuple[str, str, str]] = []
+        if isinstance(snapshot_items, list):
+            for item in snapshot_items:
+                if not isinstance(item, dict):
+                    return None
+                actual.append((
+                    str(item.get("action") or "Create").strip(),
+                    str(item.get("word") or "").strip(),
+                    str(item.get("code") or "").strip().lower(),
+                ))
+        digests = {
+            "expected_server_snapshot_digest": str(
+                preview.get("snapshotDigest") or ""
+            ).strip().lower(),
+            "expected_warning_digest": str(
+                preview.get("warningDigest") or ""
+            ).strip().lower(),
+            "expected_audit_digest": str(
+                preview.get("auditDigest") or ""
+            ).strip().lower(),
+        }
+        if (
+            preview.get("success") is not False
+            or preview.get("requiresConfirmation") is not True
+            or str(preview.get("batchId") or "").strip() != batch_id
+            or not isinstance(content_version, int)
+            or isinstance(content_version, bool)
+            or content_version < 0
+            or actual != [expected]
+            or any(
+                re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in digests.values()
+            )
+            or any(
+                preview.get(marker)
+                for marker in (
+                    "staleConfirmation",
+                    "contentVersionConflict",
+                    "batchStateChanged",
+                    "uncertain",
+                )
+            )
+        ):
+            return None
+        return {
+            "confirmed": True,
+            "batch_id": batch_id,
+            "expected_content_version": content_version,
+            **digests,
+        }
+
+    async def _auto_confirm_combined_submit(
+        self,
+        message: str,
+        fn_name: str,
+        fn_args: Dict[str, Any],
+        result_data: Dict[str, Any],
+        successful_write_receipts: List[Dict[str, Any]],
+        tool_context: ToolContext,
+    ) -> Optional[tuple[Dict[str, Any], str, Dict[str, Any]]]:
+        """Replay the exact submit ticket authorized by one combined command."""
+        authorized_item = explicit_combined_add_submit_item(message)
+        if fn_name != "keytao_submit_batch" or authorized_item is None:
+            return None
+        batch_id = str(fn_args.get("batch_id") or "").strip()
+        matching_receipts = [
+            receipt
+            for receipt in successful_write_receipts
+            if receipt.get("tool") != "keytao_submit_batch"
+            and str(receipt.get("batchId") or "").strip() == batch_id
+            and receipt.get("items") == [authorized_item]
+        ]
+        if len(matching_receipts) != 1:
+            return None
+        binding = self._submit_snapshot_binding(
+            result_data,
+            batch_id,
+            authorized_item,
+        )
+        if binding is None:
+            return None
+        confirmed_context = replace(
+            tool_context,
+            mutation_confirmed=True,
+            server_warning_confirmed=True,
+        )
+        confirmed_str = await self._tool_executor.call(
+            fn_name,
+            binding,
+            confirmed_context,
+        )
+        try:
+            confirmed_data = json.loads(confirmed_str)
+        except Exception:
+            return None
+        if not isinstance(confirmed_data, dict):
+            return None
+        return confirmed_data, confirmed_str, binding
+
     @classmethod
     def _finalize_reply(
         cls,
         current_message: str,
         reply: Optional[str],
         failure_state: Dict[str, Any],
+        successful_write_receipts: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         """Suppress requests to resend this turn's failed text at final emission."""
         if reply is None:
             return None
+        receipts = list(successful_write_receipts or [])
+        authorized_item = explicit_combined_add_submit_item(current_message)
+        if authorized_item is not None:
+            add_receipts = [
+                receipt
+                for receipt in receipts
+                if receipt.get("tool") in {
+                    "keytao_create_phrase",
+                    "keytao_batch_add_to_draft",
+                }
+                and receipt.get("items") == [authorized_item]
+                and str(receipt.get("batchId") or "").strip()
+            ]
+            submitted_receipts = [
+                receipt
+                for receipt in receipts
+                if receipt.get("tool") == "keytao_submit_batch"
+                and str(receipt.get("batchId") or "").strip()
+            ]
+            matching_pairs = [
+                (add_receipt, submit_receipt)
+                for add_receipt in add_receipts
+                for submit_receipt in submitted_receipts
+                if str(add_receipt.get("batchId") or "").strip()
+                == str(submit_receipt.get("batchId") or "").strip()
+            ]
+            if len(matching_pairs) == 1:
+                add_receipt, submit_receipt = matching_pairs[0]
+                batch_id = str(add_receipt.get("batchId") or "").strip()
+                word = str(authorized_item.get("word") or "").strip()
+                code = str(authorized_item.get("code") or "").strip().lower()
+                lines = [
+                    "✅ 本轮已完成两步：",
+                    f"- 已将「{word}」 → {code} 写入批次 {batch_id} 的草稿。",
+                    f"- 已提交批次 {batch_id} 审核。",
+                ]
+                batch_url = next((
+                    str(receipt.get("batchUrl") or "").strip()
+                    for receipt in (submit_receipt, add_receipt)
+                    if str(receipt.get("batchUrl") or "").strip()
+                ), "")
+                if batch_url:
+                    lines.extend(("", f"批次地址：{batch_url}"))
+                return "\n".join(lines)
+        reply_denies_write = bool(re.search(
+            r"(?:未|没有|并未|尚未)(?:成功)?写入|无法执行",
+            reply,
+        ))
+        if receipts and (failure_state or reply_denies_write):
+            written_items: List[tuple[str, str]] = []
+            batch_ids: List[str] = []
+            submitted_batches: List[str] = []
+            for receipt in receipts:
+                batch_id = str(receipt.get("batchId") or "").strip()
+                if batch_id and batch_id not in batch_ids:
+                    batch_ids.append(batch_id)
+                if receipt.get("tool") == "keytao_submit_batch" and batch_id:
+                    submitted_batches.append(batch_id)
+                for item in receipt.get("items") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    pair = (
+                        str(item.get("word") or "").strip(),
+                        str(item.get("code") or "").strip().lower(),
+                    )
+                    if all(pair) and pair not in written_items:
+                        written_items.append(pair)
+            lines = ["本轮已完成的写操作："]
+            lines.extend(
+                f"- 已写入草稿：「{word}」 → {code}"
+                for word, code in written_items
+            )
+            lines.extend(
+                f"- 已提交批次：{batch_id}"
+                for batch_id in submitted_batches
+            )
+            if batch_ids:
+                lines.append("关联批次：" + "、".join(batch_ids))
+            if failure_state:
+                failed_tool = str(failure_state.get("_failedTool") or "")
+                failure_label = (
+                    "提交未完成"
+                    if failed_tool == "keytao_submit_batch"
+                    else "后续操作未完成"
+                )
+                raw_reason = str(
+                    failure_state.get("message")
+                    or failure_state.get("error")
+                    or "后续工具没有成功"
+                ).strip()
+                reason = re.split(
+                    r"请把下面这条指令|请重新发送|请再次发送|请原样发送",
+                    raw_reason,
+                    maxsplit=1,
+                )[0]
+                reason = re.sub(
+                    r"(?:本次|整批|全部)?(?:均)?未写入[。；;]?",
+                    "",
+                    reason,
+                ).strip().rstrip("；;。 ")
+                lines.append(
+                    f"{failure_label}；原因：{reason or '后续工具没有成功'}。"
+                )
+            else:
+                lines.append("写入已完成；原回复中的未写入判断已按工具回执纠正。")
+            suggestion = str(
+                failure_state.get("suggestedCommand") or ""
+            ).strip()
+            if not failure_state:
+                return "\n".join(lines)
+            return render_remediation_reply(
+                "\n".join(lines),
+                command=suggestion,
+            )
         binding_reply_is_internal = bool(
             re.search(
                 r"(?:\bboundTarget\b|\bblockReason\b|\bbinding_incomplete\b|"
@@ -1967,6 +2447,15 @@ class AgentOrchestrator:
         cleaned_lines: List[str] = []
         for line in content.splitlines():
             cleaned = line
+            cleaned = re.sub(
+                r"https?://[^\s)\]]+",
+                lambda match: (
+                    ""
+                    if "/batch/" in urlsplit(match.group(0)).path
+                    else match.group(0)
+                ),
+                cleaned,
+            )
             for url in urls_to_remove:
                 escaped_url = re.escape(url)
                 cleaned = re.sub(
@@ -2024,6 +2513,10 @@ class AgentOrchestrator:
             tuple[tuple[str, bool], ...],
         ],
         absent_word_sets: Optional[List[tuple[str, ...]]] = None,
+        candidate_statuses_by_word: Optional[
+            Dict[str, tuple[Dict[str, Any], ...]]
+        ] = None,
+        recommended_codes_by_word: Optional[Dict[str, str]] = None,
     ) -> None:
         """Capture narrowly scoped capabilities from successful read-tool results."""
         if (
@@ -2090,6 +2583,34 @@ class AgentOrchestrator:
                             for value in values
                             if isinstance(value, str) and value.strip()
                         )
+                for variant in result.get("flyKeyVariants") or []:
+                    if not isinstance(variant, dict):
+                        continue
+                    codes.update(
+                        str(value).strip()
+                        for value in variant.get("codes") or []
+                        if isinstance(value, str) and value.strip()
+                    )
+                for pronunciation in result.get("pronunciations") or []:
+                    if not isinstance(pronunciation, dict):
+                        continue
+                    for key in (
+                        "candidateCodes",
+                        "altCodes",
+                        "codes",
+                    ):
+                        values = pronunciation.get(key)
+                        if isinstance(values, list):
+                            codes.update(
+                                str(value).strip()
+                                for value in values
+                                if isinstance(value, str) and value.strip()
+                            )
+                    for status in pronunciation.get("candidateStatuses") or []:
+                        if isinstance(status, dict):
+                            code = str(status.get("code") or "").strip()
+                            if code:
+                                codes.add(code)
                 recommended = result.get("recommendedCode")
                 if isinstance(recommended, str) and recommended.strip():
                     codes.add(recommended.strip())
@@ -2116,9 +2637,15 @@ class AgentOrchestrator:
                     if isinstance(pronunciation_statuses, list):
                         status_groups.append(pronunciation_statuses)
                 recommended = str(result.get("recommendedCode") or "").strip()
-                valid_slot_groups: List[tuple[tuple[str, bool], ...]] = []
+                valid_slot_groups: List[
+                    tuple[
+                        tuple[tuple[str, bool], ...],
+                        tuple[Dict[str, Any], ...],
+                    ]
+                ] = []
                 for statuses in status_groups:
                     slots: List[tuple[str, bool]] = []
+                    normalized_statuses: List[Dict[str, Any]] = []
                     seen_codes: set[str] = set()
                     valid = bool(statuses)
                     for status in statuses:
@@ -2135,15 +2662,62 @@ class AgentOrchestrator:
                             valid = False
                             break
                         slots.append((code, occupied))
+                        words = [
+                            str(value or "").strip()
+                            for value in status.get("words") or []
+                            if str(value or "").strip()
+                        ]
+                        entries: List[tuple[str, int]] = []
+                        for phrase in status.get("phrases") or []:
+                            if not isinstance(phrase, dict):
+                                continue
+                            phrase_word = str(
+                                phrase.get("word") or ""
+                            ).strip()
+                            weight = phrase.get("weight")
+                            if phrase_word and phrase_word not in words:
+                                words.append(phrase_word)
+                            if (
+                                phrase_word
+                                and isinstance(weight, int)
+                                and not isinstance(weight, bool)
+                                and weight >= 0
+                            ):
+                                entries.append((phrase_word, weight))
+                        normalized_statuses.append({
+                            "code": code,
+                            "occupied": occupied,
+                            "words": tuple(words),
+                            "entries": tuple(entries),
+                        })
                         seen_codes.add(code)
                     if valid and (
                         not recommended
                         or recommended in seen_codes
                     ):
-                        valid_slot_groups.append(tuple(slots))
-                unique_slot_groups = list(dict.fromkeys(valid_slot_groups))
+                        valid_slot_groups.append((
+                            tuple(slots),
+                            tuple(normalized_statuses),
+                        ))
+                unique_slot_groups: Dict[
+                    tuple[tuple[str, bool], ...],
+                    tuple[Dict[str, Any], ...],
+                ] = {}
+                for slots, normalized_statuses in valid_slot_groups:
+                    unique_slot_groups.setdefault(slots, normalized_statuses)
                 if len(unique_slot_groups) == 1:
-                    candidate_slots_by_word[word] = unique_slot_groups[0]
+                    slots, normalized_statuses = next(
+                        iter(unique_slot_groups.items())
+                    )
+                    candidate_slots_by_word[word] = slots
+                    if candidate_statuses_by_word is not None:
+                        candidate_statuses_by_word[word] = normalized_statuses
+                    if (
+                        recommended_codes_by_word is not None
+                        and recommended
+                        and recommended in {code for code, _occupied in slots}
+                    ):
+                        recommended_codes_by_word[word] = recommended
 
                 if tool_name == "keytao_prepare_reviewed_add":
                     recommended_code = str(result.get("recommendedCode") or "").strip()

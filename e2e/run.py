@@ -1075,6 +1075,95 @@ async def ensure_s18_fixture(
     )
 
 
+async def ensure_s25_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Ensure the exact flykey occupancy chain used by S25."""
+
+    transport_attempts: list[dict[str, Any]] = []
+    expected_occupants = (("wlf", "窝里反"), ("wlfo", "晚礼服"))
+    occupants: dict[str, dict[str, Any]] = {}
+    for code, word in expected_occupants:
+        exact_rows = [
+            row
+            for row in await _retry_fixture_client_call(
+                probe=f"S25 {code} fixture occupant lookup",
+                request=lambda code=code: client.phrases_by_code(code),
+                attempt_facts=transport_attempts,
+            )
+            if row.get("code") == code
+        ]
+        if exact_rows:
+            valid_existing = (
+                len(exact_rows) == 1
+                and exact_rows[0].get("word") == word
+                and exact_rows[0].get("type") == "Phrase"
+                and exact_rows[0].get("weight") == 100
+            )
+            if not valid_existing:
+                raise RigInfrastructureError(
+                    f"S25 cannot safely use occupied fixture code {code}: {exact_rows}"
+                )
+        else:
+            await _retry_fixture_client_call(
+                probe=f"S25 {word} fixture seed draft cleanup",
+                request=lambda: client.clean_draft(seed_identity["platform_id"]),
+                attempt_facts=transport_attempts,
+            )
+            await _retry_fixture_client_call(
+                probe=f"S25 {word} fixture seed",
+                request=lambda word=word, code=code: client.seed_phrase(
+                    platform_id=seed_identity["platform_id"],
+                    word=word,
+                    code=code,
+                ),
+                attempt_facts=transport_attempts,
+            )
+            exact_rows = [
+                row
+                for row in await _retry_fixture_client_call(
+                    probe=f"S25 {code} fixture verification lookup",
+                    request=lambda code=code: client.phrases_by_code(code),
+                    attempt_facts=transport_attempts,
+                )
+                if row.get("code") == code
+            ]
+        if not (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == word
+            and exact_rows[0].get("type") == "Phrase"
+            and exact_rows[0].get("weight") == 100
+        ):
+            raise RigInfrastructureError(
+                f"S25 fixture did not resolve to sole {word}@{code} weight 100: "
+                f"{exact_rows}"
+            )
+        occupants[code] = exact_rows[0]
+
+    free_rows = [
+        row
+        for row in await _retry_fixture_client_call(
+            probe="S25 wlfoo empty-slot lookup",
+            request=lambda: client.phrases_by_code("wlfoo"),
+            attempt_facts=transport_attempts,
+        )
+        if row.get("code") == "wlfoo"
+    ]
+    if free_rows:
+        raise RigInfrastructureError(
+            f"S25 requires wlfoo to be empty: {free_rows}"
+        )
+    return _with_transport_attempts(
+        {
+            "occupants": occupants,
+            "emptyCode": "wlfoo",
+        },
+        transport_attempts,
+    )
+
+
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
     apply_bot_environment(config)
     import nonebot
@@ -1374,6 +1463,12 @@ async def async_main(args: argparse.Namespace) -> int:
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S18":
                         fixture_facts["s18"] = await ensure_s18_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S25":
+                        fixture_facts["s25"] = await ensure_s25_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

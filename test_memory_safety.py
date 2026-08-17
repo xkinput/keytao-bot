@@ -2330,6 +2330,103 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             chat_module.conversation_state_store = old_state_store
 
+    async def test_reviewed_flykey_chain_is_rendered_and_saved_from_records(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import chat_commands as commands_module
+        from keytao_bot.plugins import chat_routing as routing_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        statuses = [
+            {"code": "jlf", "occupied": False, "words": [], "phrases": []},
+            {"code": "jlfo", "occupied": False, "words": [], "phrases": []},
+            {"code": "jlfoo", "occupied": False, "words": [], "phrases": []},
+            {"code": "jlfoou", "occupied": False, "words": [], "phrases": []},
+            {
+                "code": "wlf",
+                "occupied": True,
+                "label": "已有「窝里反」",
+                "words": ["窝里反"],
+                "phrases": [{"word": "窝里反", "weight": 100}],
+            },
+            {
+                "code": "wlfo",
+                "occupied": True,
+                "label": "已有「晚礼服」",
+                "words": ["晚礼服"],
+                "phrases": [{"word": "晚礼服", "weight": 100}],
+            },
+            {"code": "wlfoo", "occupied": False, "words": [], "phrases": []},
+            {"code": "wlfoou", "occupied": False, "words": [], "phrases": []},
+        ]
+        encoded = chat_module._format_tool_encoded_add_prompt(
+            "炒冷饭",
+            {
+                "recommendedCode": "jlf",
+                "type": "Phrase",
+                "candidateStatuses": statuses,
+            },
+        )
+        reviewed = chat_module._format_reviewed_add_prompt({
+            "success": True,
+            "word": "炒冷饭",
+            "recommendedCode": "jlf",
+            "pronunciations": [{
+                "pinyin": "chao leng fan",
+                "recommendedCode": "jlf",
+                "codes": [status["code"] for status in statuses],
+                "candidateStatuses": statuses,
+                "sources": [],
+            }],
+            "preSubmitAudit": {
+                "autoApprove": False,
+                "summary": "manual review",
+                "issues": ["manual review"],
+            },
+        })
+
+        self.assertRegex(encoded or "", r"(?m)^7\. wlfoo — 空位$")
+        self.assertIsNotNone(reviewed)
+        self.assertRegex(reviewed or "", r"(?m)^5\. wlf — 已有「窝里反」$")
+        self.assertRegex(reviewed or "", r"(?m)^6\. wlfo — 已有「晚礼服」$")
+        self.assertRegex(reviewed or "", r"(?m)^7\. wlfoo — 空位$")
+        pending = commands_module._parse_pending_add_word(reviewed or "")
+        self.assertIsNotNone(pending)
+        commands_module._attach_server_candidate_snapshot(pending, statuses)
+        self.assertEqual(
+            pending.server_candidates,
+            [(status["code"], status["occupied"]) for status in statuses],
+        )
+        self.assertEqual(pending.server_occupied_words["wlf"], ["窝里反"])
+        self.assertEqual(pending.server_occupied_words["wlfo"], ["晚礼服"])
+
+        state_store = MemoryConversationStateStore()
+        address = ConversationAddress.group(
+            "qq",
+            "flykey-record-group",
+            "flykey-record-owner",
+        )
+        self.assertTrue(state_store.set(address, pending))
+        with patch.object(
+            chat_module,
+            "conversation_state_store",
+            state_store,
+        ):
+            delivered = chat_module._enforce_advertised_reply_contract(
+                reviewed or "",
+                address,
+            )
+        self.assertEqual(delivered, reviewed)
+        self.assertTrue(
+            routing_module.message_authorizes_live_pending_mutation("7", pending)
+        )
+        self.assertTrue(
+            routing_module.message_authorizes_live_pending_mutation(
+                "用 wlfoo",
+                pending,
+            )
+        )
+
     async def test_multi_number_selection_consumes_one_actor_snapshot_once(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
@@ -5819,6 +5916,85 @@ def iter_record_frame_no_negator_control():
 
 
 class MutationAuthorizationTests(unittest.TestCase):
+    def test_natural_add_verbs_authorize_exact_word_code_and_keep_gates(self) -> None:
+        from keytao_bot.utils.pending_confirmation import (
+            ADD_OPERATION_VERB_FORMS,
+            PENDING_BATCH_ADD_ADVERTISED_FORMS,
+        )
+
+        messages = (
+            "补 炒冷饭 wlf",
+            "补上炒冷饭的 wlf 编码",
+            "补一个炒冷饭的 wlf 编码",
+            "补充炒冷饭的 wlf 编码",
+            "加上炒冷饭的 wlf 编码",
+            "添上炒冷饭的 wlf 编码",
+            "也加炒冷饭的 wlf 编码",
+            "再加炒冷饭的 wlf 编码",
+        )
+        self.assertTrue(set(PENDING_BATCH_ADD_ADVERTISED_FORMS) <= set(
+            ADD_OPERATION_VERB_FORMS
+        ))
+        self.assertTrue(all(message_authorizes_mutation(item) for item in messages))
+
+        blocked = (
+            "不要补上炒冷饭的 wlf 编码",
+            "怎么补上炒冷饭的 wlf 编码？",
+            "他说「补上炒冷饭的 wlf 编码」",
+            "补上炒冷饭的 wlf 编码，再加回锅肉 hgr",
+        )
+        self.assertTrue(all(not message_authorizes_mutation(item) for item in blocked))
+
+        async def exercise() -> None:
+            calls = []
+
+            async def create(**kwargs):
+                calls.append(kwargs)
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warningDigest": "a" * 64,
+                    "message": "duplicate code",
+                }
+
+            executor = ToolExecutor(
+                lambda name: create if name == "keytao_create_phrase" else None,
+                frozenset({"keytao_create_phrase"}),
+            )
+            result = json.loads(await executor.call(
+                "keytao_create_phrase",
+                {"word": "炒冷饭", "code": "wlf"},
+                ToolContext(
+                    platform="qq",
+                    user_id="natural-add-user",
+                    current_message="补上炒冷饭的 wlf 编码",
+                    writes_allowed=True,
+                ),
+            ))
+            self.assertTrue(result.get("requiresConfirmation"), result)
+            self.assertEqual(calls[0]["word"], "炒冷饭")
+            self.assertEqual(calls[0]["code"], "wlf")
+
+            calls.clear()
+            for unsafe in (
+                "补上炒冷饭的 wlf 编码，再删除草稿项 1",
+                "补上炒冷饭和回锅肉的 wlf 编码",
+            ):
+                blocked_result = json.loads(await executor.call(
+                    "keytao_create_phrase",
+                    {"word": "炒冷饭", "code": "wlf"},
+                    ToolContext(
+                        platform="qq",
+                        user_id="natural-add-user",
+                        current_message=unsafe,
+                        writes_allowed=message_authorizes_mutation(unsafe),
+                    ),
+                ))
+                self.assertTrue(blocked_result.get("policyBlocked"), unsafe)
+            self.assertEqual(calls, [])
+
+        asyncio.run(exercise())
+
     def test_whole_message_quote_authorization_matrix(self) -> None:
         create_arguments = {
             "word": "安全词",
@@ -9389,6 +9565,150 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_single_word_code_choice_is_redrawn_and_executes_from_record(self) -> None:
+        from keytao_bot.plugins import chat_routing as routing_module
+        from keytao_bot.plugins import chat_commands as commands_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        statuses = [
+            {
+                "code": "wlf",
+                "occupied": True,
+                "words": ["窝里反"],
+                "phrases": [{"word": "窝里反", "weight": 100}],
+            },
+            {
+                "code": "wlfo",
+                "occupied": True,
+                "words": ["晚礼服"],
+                "phrases": [{"word": "晚礼服", "weight": 100}],
+            },
+            {"code": "wlfoo", "occupied": False, "words": [], "phrases": []},
+            {"code": "wlfoou", "occupied": False, "words": [], "phrases": []},
+        ]
+
+        async def review(**_kwargs):
+            return {
+                "success": True,
+                "word": "炒冷饭",
+                "type": "Phrase",
+                "recommendedCode": "wlfoo",
+                "codes": ["jlf", "jlfo", "jlfoo", "jlfoou"],
+                "altCodes": [status["code"] for status in statuses],
+                "flyKeyVariants": [{
+                    "baseCode": "wlf",
+                    "codes": [status["code"] for status in statuses],
+                }],
+                "candidateStatuses": statuses,
+                "preSubmitAudit": {
+                    "success": True,
+                    "autoApprove": False,
+                    "summary": "manual review",
+                    "issues": ["manual review"],
+                },
+            }
+
+        model_reply = (
+            "1. wlf — 已有「窝里反」\n"
+            "2. wlfo — 已有「晚礼服」\n"
+            "3. wlfoo — 空位 ✅\n"
+            "4. wlfoou — 空位\n"
+            "回复「添加 炒冷饭 wlfoo」或直接说「用 wlfoo」就行"
+        )
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-review-fried-rice",
+                    "keytao_prepare_reviewed_add",
+                    {"word": "炒冷饭"},
+                )],
+            ),
+            _fake_response("stop", model_reply),
+        ])
+        state_store = MemoryConversationStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_ReviewedCreateSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: review if name == "keytao_prepare_reviewed_add" else None,
+                frozenset({"keytao_prepare_reviewed_add"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="single-code-owner",
+            space_type="group",
+            space_id="single-code-group",
+            speaker_name="Rea",
+        )
+
+        rendered = await orchestrator.run("炒冷饭怎么编码", context)
+        record = state_store.get_record(context.conversation_address)
+
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingAddWord)
+        self.assertEqual(record.state.server_candidates, [
+            ("wlf", True),
+            ("wlfo", True),
+            ("wlfoo", False),
+            ("wlfoou", False),
+        ])
+        self.assertEqual(record.state.server_occupied_words["wlf"], ["窝里反"])
+        self.assertIn("是否以编码 wlfoo 将「炒冷饭」加入草稿", rendered)
+        self.assertNotEqual(rendered, model_reply)
+        with patch.object(
+            chat_module,
+            "conversation_state_store",
+            state_store,
+        ):
+            self.assertEqual(
+                chat_module._enforce_advertised_reply_contract(
+                    rendered,
+                    context.conversation_address,
+                ),
+                rendered,
+            )
+        self.assertTrue(
+            routing_module.message_authorizes_live_pending_mutation(
+                "3", record.state
+            )
+        )
+        self.assertTrue(
+            routing_module.message_authorizes_live_pending_mutation(
+                "用 wlfoo", record.state
+            )
+        )
+        self.assertFalse(
+            routing_module.message_authorizes_live_pending_mutation(
+                "他说用 wlfoo", record.state
+            )
+        )
+
+        add = AsyncMock(return_value="✅ 已加入草稿")
+        with (
+            patch.object(commands_module, "conversation_state_store", state_store),
+            patch.object(commands_module, "_execute_add_to_draft", add),
+        ):
+            response = await chat_module.handle_pending_message_core(
+                "3",
+                "qq",
+                "single-code-owner",
+                context.conversation_address,
+                history=[],
+                space_key=context.space_key,
+                owner_label="Rea",
+                allow_intent_model=False,
+            )
+
+        self.assertIn("已加入草稿", response)
+        add.assert_awaited_once()
+        self.assertEqual(add.await_args.args[:2], ("炒冷饭", "wlfoo"))
+
     async def test_binding_advertisement_uses_only_same_turn_review_records(
         self,
     ) -> None:
@@ -12714,6 +13034,272 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_combined_add_submit_binds_submit_to_same_turn_written_batch(self) -> None:
+        calls = []
+        snapshot_digest = "a" * 64
+        warning_digest = "b" * 64
+        audit_digest = "c" * 64
+
+        async def create(**kwargs):
+            calls.append(("keytao_create_phrase", kwargs))
+            return {
+                "success": True,
+                "batchId": "batch-combined",
+                "batchUrl": "http://localhost:3100/batch/batch-combined",
+                "contentVersion": 5,
+                "draft_snapshot": {
+                    "items": [{
+                        "action": "Create",
+                        "word": "炒冷饭",
+                        "code": "wlfoo",
+                    }],
+                },
+            }
+
+        async def submit(**kwargs):
+            calls.append(("keytao_submit_batch", kwargs))
+            if kwargs.get("confirmed"):
+                return {
+                    "success": True,
+                    "batchId": "batch-combined",
+                    "batchUrl": "http://localhost:3100/batch/batch-combined",
+                }
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "batch-combined",
+                "contentVersion": 5,
+                "snapshotDigest": snapshot_digest,
+                "warningDigest": warning_digest,
+                "auditDigest": audit_digest,
+                "snapshotItems": [{
+                    "action": "Create",
+                    "word": "炒冷饭",
+                    "code": "wlfoo",
+                }],
+                "warnings": [],
+            }
+
+        class CombinedSkills:
+            @staticmethod
+            def get_skill_instructions():
+                return ""
+
+            @staticmethod
+            def has_tools():
+                return True
+
+            @staticmethod
+            def get_tools():
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": name,
+                            "parameters": {
+                                "type": "object",
+                                "properties": (
+                                    {
+                                        "word": {"type": "string"},
+                                        "code": {"type": "string"},
+                                    }
+                                    if name == "keytao_create_phrase"
+                                    else {}
+                                ),
+                            },
+                        },
+                    }
+                    for name in ("keytao_create_phrase", "keytao_submit_batch")
+                ]
+
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-create-combined",
+                    "keytao_create_phrase",
+                    {"word": "炒冷饭", "code": "wlfoo"},
+                )],
+            ),
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-submit-combined",
+                    "keytao_submit_batch",
+                    {},
+                )],
+            ),
+            _fake_response(
+                "stop",
+                "✅ 批次已提交审核！\n"
+                "批次地址：https://keytao.vercel.app/batch/batch-combined",
+            ),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=CombinedSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: {
+                    "keytao_create_phrase": create,
+                    "keytao_submit_batch": submit,
+                }.get(name),
+                frozenset({"keytao_create_phrase", "keytao_submit_batch"}),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        reply = await orchestrator.run(
+            "添加 炒冷饭 wlfoo 并提交",
+            AgentRequestContext(
+                platform="qq",
+                user_id="combined-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            [
+                "keytao_create_phrase",
+                "keytao_submit_batch",
+                "keytao_submit_batch",
+            ],
+        )
+        self.assertEqual(calls[1][1]["batch_id"], "batch-combined")
+        self.assertTrue(calls[2][1]["confirmed"])
+        self.assertEqual(calls[2][1]["batch_id"], "batch-combined")
+        self.assertEqual(
+            calls[2][1]["expected_server_snapshot_digest"],
+            snapshot_digest,
+        )
+        self.assertIn("已将「炒冷饭」 → wlfoo 写入批次 batch-combined", reply)
+        self.assertIn("已提交批次 batch-combined 审核", reply)
+        self.assertEqual(reply.count("http://localhost:3100/batch/batch-combined"), 1)
+        self.assertNotIn("https://keytao.vercel.app/batch/", reply)
+        self.assertNotRegex(reply, r"未写入|无法执行|安全拦截")
+
+    async def test_model_service_failure_reports_no_write_and_exact_retry_command(self) -> None:
+        command = "添加「吃席」 wkxk，同码即可"
+        read_calls = []
+
+        class ReadOnlySkills:
+            @staticmethod
+            def get_skill_instructions():
+                return ""
+
+            @staticmethod
+            def has_tools():
+                return True
+
+            @staticmethod
+            def get_tools():
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": name,
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    key: {"type": "string"},
+                                },
+                                "required": [key],
+                            },
+                        },
+                    }
+                    for name, key in (
+                        ("keytao_prepare_reviewed_add", "word"),
+                        ("keytao_lookup_by_word", "word"),
+                        ("keytao_lookup_by_code", "code"),
+                    )
+                ]
+
+        async def read_dispatch(**kwargs):
+            read_calls.append(dict(kwargs))
+            return {"success": True, **kwargs}
+
+        class FailingCompletions:
+            def __init__(self):
+                self.calls = []
+                self.responses = iter([
+                    _fake_response(
+                        "tool_calls",
+                        tool_calls=[
+                            _named_tool_call(
+                                "call-review-service-failure",
+                                "keytao_prepare_reviewed_add",
+                                {"word": "吃席"},
+                            ),
+                            _named_tool_call(
+                                "call-word-service-failure",
+                                "keytao_lookup_by_word",
+                                {"word": "吃席"},
+                            ),
+                            _named_tool_call(
+                                "call-code-service-failure",
+                                "keytao_lookup_by_code",
+                                {"code": "wkxk"},
+                            ),
+                        ],
+                    ),
+                    ConnectionError("upstream unavailable"),
+                ])
+
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                response = next(self.responses)
+                if isinstance(response, BaseException):
+                    raise response
+                return response
+
+        completions = FailingCompletions()
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions),
+        )
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=ReadOnlySkills(),
+            tool_executor=ToolExecutor(
+                lambda name: read_dispatch,
+                frozenset(),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        reply = await orchestrator.run(
+            command,
+            AgentRequestContext(
+                platform="qq",
+                user_id="service-failure-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertIn("没有成功写入任何数据", reply)
+        self.assertIn("可执行命令", reply)
+        self.assertIn(command, reply)
+        self.assertNotIn("已执行结果请以链接为准", reply)
+        self.assertNotIn("链接为准", reply)
+        self.assertEqual(len(read_calls), 3)
+
     async def test_reasoning_only_cap_attempts_deterministic_fallback_first(self) -> None:
         responses = [
             _fake_response("length", None),
@@ -12977,6 +13563,115 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalReplyLoopBreakerTests(unittest.TestCase):
+    def test_result_link_renderer_replaces_model_batch_url_with_record_url(self) -> None:
+        from keytao_bot.plugins.openai_chat import _append_batch_url_if_missing
+
+        reply = _append_batch_url_if_missing(
+            "批次地址：https://keytao.vercel.app/batch/batch-local",
+            {
+                "batchId": "batch-local",
+                "batchUrl": "http://localhost:3100/batch/batch-local",
+            },
+        )
+
+        self.assertNotIn("https://keytao.vercel.app/batch/", reply)
+        self.assertEqual(reply.count("http://localhost:3100/batch/batch-local"), 1)
+
+    def test_success_receipt_overrides_any_model_no_write_claim(self) -> None:
+        finalized = AgentOrchestrator._finalize_reply(
+            "添加 炒冷饭 wlfoo",
+            "这条指令无法执行，本次未写入。",
+            {},
+            [{
+                "tool": "keytao_create_phrase",
+                "batchId": "batch-written",
+                "items": [{
+                    "action": "Create",
+                    "word": "炒冷饭",
+                    "code": "wlfoo",
+                }],
+            }],
+        )
+
+        self.assertIn("已写入草稿", finalized)
+        self.assertIn("batch-written", finalized)
+        self.assertIn("按工具回执纠正", finalized)
+        self.assertNotIn("本次未写入", finalized)
+        self.assertNotIn("无法执行", finalized)
+
+    def test_successful_add_then_submit_block_reports_partial_success(self) -> None:
+        finalized = AgentOrchestrator._finalize_reply(
+            "添加 炒冷饭 wlfoo 并提交",
+            "请重新发送提交指令。",
+            {
+                "success": False,
+                "policyBlocked": True,
+                "blockReason": "binding_incomplete",
+                "message": "安全拦截：提交未获本轮授权。",
+                "suggestedCommand": "@我 提交草稿",
+                "_failedTool": "keytao_submit_batch",
+            },
+            [{
+                "tool": "keytao_create_phrase",
+                "batchId": "batch-incident",
+                "items": [{
+                    "action": "Create",
+                    "word": "炒冷饭",
+                    "code": "wlfoo",
+                }],
+            }],
+        )
+
+        self.assertIn("已写入草稿", finalized)
+        self.assertIn("炒冷饭", finalized)
+        self.assertIn("wlfoo", finalized)
+        self.assertIn("batch-incident", finalized)
+        self.assertIn("提交未完成", finalized)
+        self.assertIn("@我 提交草稿", finalized)
+        self.assertNotIn("本次未写入", finalized)
+        self.assertNotIn("无法执行", finalized)
+
+    def test_successful_add_then_later_tool_error_preserves_write_receipt(self) -> None:
+        finalized = AgentOrchestrator._finalize_reply(
+            "添加 炒冷饭 wlfoo 并提交",
+            "后续工具处理失败，请重新发送。",
+            {
+                "success": False,
+                "error": "temporary tool failure",
+                "message": "提交服务暂时不可用。",
+                "_failedTool": "keytao_submit_batch",
+            },
+            [{
+                "tool": "keytao_create_phrase",
+                "batchId": "batch-incident",
+                "items": [{
+                    "action": "Create",
+                    "word": "炒冷饭",
+                    "code": "wlfoo",
+                }],
+            }],
+        )
+
+        self.assertIn("已写入草稿", finalized)
+        self.assertIn("提交服务暂时不可用", finalized)
+        self.assertNotIn("本次未写入", finalized)
+
+    def test_confirmation_preview_then_abandon_still_reports_no_write(self) -> None:
+        finalized = AgentOrchestrator._finalize_reply(
+            "添加 炒冷饭 wlf",
+            "请重新发送同一条消息。",
+            {
+                "success": False,
+                "requiresConfirmation": True,
+                "message": "存在重码风险，用户已放弃确认。",
+                "_failedTool": "keytao_create_phrase",
+            },
+            [],
+        )
+
+        self.assertIn("本次未写入", finalized)
+        self.assertNotIn("已写入草稿", finalized)
+
     def test_live_candidate_binding_failure_never_demands_full_operands(self) -> None:
         calls = []
 
