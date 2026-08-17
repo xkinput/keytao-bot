@@ -2452,16 +2452,16 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
     check(
         "front branch keeps the free slot as an alternative",
         "eefju — 空位（不调序备选）" in front_prompt
-        and "也可仍以编码 eefju 将「射覆」加入草稿" in front_prompt,
+        and "如不调整现有排序，是否仍以编码 eefju 将「射覆」加入草稿？" in front_prompt,
     )
     hinted_selection = openai_chat_module.parse_pending_candidate_selection(
-        "添加2、4"
+        "添加1、2"
     )
     check(
         "multi-select hint is advertised by a closed parser form",
-        "可多选，如「添加2、4」" in front_prompt
+        "可多选，如「添加1、2」" in front_prompt
         and hinted_selection is not None
-        and hinted_selection.indices == (2, 4),
+        and hinted_selection.indices == (1, 2),
     )
     check(
         "occupant branch keeps the current order and free recommendation",
@@ -6879,9 +6879,9 @@ def test_quoted_self_add_and_submit_requires_live_ticket():
     asyncio.run(_run())
 
 
-def test_bot_quoted_candidate_binds_short_add_submit_for_qq_and_telegram():
-    """A bot-authored quote supplies the exact word/code target for the current actor."""
-    print("\n🧪 bot quote binds short add-submit on QQ and Telegram")
+def test_bot_quoted_candidate_binds_natural_add_submit_for_qq_and_telegram():
+    """A bot-authored quote supplies the exact state for natural assent."""
+    print("\n🧪 bot quote binds natural add-submit on QQ and Telegram")
 
     prompt = """词库暂无收录「窨茶」，先审读音和编码候选：
 
@@ -6891,7 +6891,9 @@ def test_bot_quoted_candidate_binds_short_add_submit_for_qq_and_telegram():
 2. xwwso — ✅ 推荐（空位）
 3. xwwsoi — 空位
 
-是否以编码 xwwso 将「窨茶」加入草稿？可回复编号、编码，或「都加」。"""
+是否以编码 xwwso 将「窨茶」加入草稿？
+可回复编号或编码选择其他编码；可多选，如「添加1、2」。
+回复「加入」只加入草稿；回复「加入并提交」则加入后提交。"""
     referenced_state = _parse_pending_state_from_response(prompt)
 
     class ReplyEvent:
@@ -6900,7 +6902,7 @@ def test_bot_quoted_candidate_binds_short_add_submit_for_qq_and_telegram():
 
         @staticmethod
         def get_plaintext():
-            return "添加并提交"
+            return "加入草稿，然后就提交。"
 
     class HandlerBot:
         pass
@@ -6976,7 +6978,7 @@ def test_bot_quoted_candidate_binds_short_add_submit_for_qq_and_telegram():
 
         operation = coordinator.get(memory_context.conversation_address)
         check(f"{platform} bot quote is revalidated", revalidate.await_count == 1)
-        check(f"{platform} short quote schedules own add-submit", schedule.call_count == 1)
+        check(f"{platform} natural quote schedules own add-submit", schedule.call_count == 1)
         check(
             f"{platform} quote keeps exact target",
             operation is not None
@@ -7107,8 +7109,8 @@ def test_queued_bot_quote_duplicate_is_idempotent():
     asyncio.run(_run())
 
 
-def test_unquoted_short_add_submit_without_server_snapshot_requires_full_target():
-    """Display-parsed candidate text cannot supply word/code authority."""
+def test_unquoted_short_add_submit_without_server_snapshot_restarts_discovery():
+    """Display-parsed candidate text can only restart server-side discovery."""
     print("\n🧪 unquoted short add-submit without server snapshot")
 
     async def _run():
@@ -7154,8 +7156,11 @@ def test_unquoted_short_add_submit_without_server_snapshot_requires_full_target(
 
         check("unquoted short command executes no mutation", execute.await_count == 0)
         check(
-            "unquoted short command requests complete target",
-            result is not None and "窨茶" in result and "xwwso" in result and "完整" in result,
+            "unquoted short command offers executable re-review without a code",
+            result is not None
+            and "当前候选缺少可核验的服务端候选快照" in result
+            and "加词 窨茶" in result
+            and "xwwso" not in result,
         )
 
     asyncio.run(_run())
@@ -7254,8 +7259,8 @@ def test_inline_unquoted_add_submit_requires_live_or_target_binding():
             response = str(finish.await_args.args[0]) if finish.await_args else ""
             check("inline short command schedules no mutation", schedule.call_count == 0)
             check(
-                "inline short command returns exact full example",
-                "添加 窨茶 xwwso 并提交" in response,
+                "inline short command offers executable re-review without a code",
+                "加词 窨茶" in response and "xwwso" not in response,
             )
             check(
                 "inline short command preserves pending target",
@@ -7862,11 +7867,13 @@ def test_revalidated_quote_requires_current_semantic_snapshot():
             "xwwso": "xun cha",
             "xwwsoi": "xun cha",
         },
+        needs_manual_review=True,
     )
     base_review = {
         "success": True,
         "word": "窨茶",
         "recommendedCode": "xwwso",
+        "needsManualReview": True,
         "pronunciations": [{
             "pinyin": "xun cha",
             "sourceSummary": "本喵整词语境判断",
@@ -7917,14 +7924,139 @@ def test_revalidated_quote_requires_current_semantic_snapshot():
 
         changed_reading = json.loads(json.dumps(base_review, ensure_ascii=False))
         changed_reading["pronunciations"][0]["pinyin"] = "yin cha"
+        reading_failures = []
+        with patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(changed_reading, ensure_ascii=False)),
+        ):
+            changed_reading_result = (
+                await openai_chat_module._revalidate_referenced_add_pending(
+                    state,
+                    "telegram",
+                    "semantic-actor",
+                    failure_reasons=reading_failures,
+                )
+            )
         check(
-            "same code with a changed reading is rejected",
-            await _revalidate(changed_reading) is None,
+            "same code with a changed reading is rejected with the exact change",
+            changed_reading_result is None
+            and reading_failures == [
+                "编码 xwwso 的读音已从 xun cha 变为 yin cha"
+            ],
         )
 
         occupied = json.loads(json.dumps(base_review, ensure_ascii=False))
         occupied["pronunciations"][0]["candidateStatuses"][1]["occupied"] = True
-        check("changed occupancy is rejected", await _revalidate(occupied) is None)
+        occupancy_failures = []
+        with patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(occupied, ensure_ascii=False)),
+        ):
+            occupied_result = (
+                await openai_chat_module._revalidate_referenced_add_pending(
+                    state,
+                    "telegram",
+                    "semantic-actor",
+                    failure_reasons=occupancy_failures,
+                )
+            )
+        check(
+            "changed occupancy is rejected with the exact code and transition",
+            occupied_result is None
+            and occupancy_failures == [
+                "编码 xwwso 的占用状态已从空位变为已占用"
+            ],
+        )
+
+        changed_verdict = json.loads(json.dumps(base_review, ensure_ascii=False))
+        changed_verdict["needsManualReview"] = False
+        verdict_failures = []
+        with patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(changed_verdict, ensure_ascii=False)),
+        ):
+            changed_verdict_result = (
+                await openai_chat_module._revalidate_referenced_add_pending(
+                    state,
+                    "telegram",
+                    "semantic-actor",
+                    failure_reasons=verdict_failures,
+                )
+            )
+        check(
+            "changed review verdict is rejected with the exact transition",
+            changed_verdict_result is None
+            and verdict_failures == [
+                "审核结论已从需管理员审核变为可自动通过"
+            ],
+        )
+
+        multireading_review = {
+            "success": True,
+            "word": "还车",
+            "recommendedCode": "htje",
+            "needsManualReview": False,
+            "pronunciations": [
+                {
+                    "pinyin": "huan che",
+                    "recommendedCode": "htje",
+                    "candidateStatuses": [
+                        {"code": code, "occupied": False}
+                        for code in (
+                            "htje",
+                            "htjev",
+                            "htjevv",
+                            "htwe",
+                            "htwev",
+                            "htwevv",
+                        )
+                    ],
+                },
+                {
+                    "pinyin": "hái chē",
+                    "recommendedCode": "hhje",
+                    "candidateStatuses": [
+                        {"code": code, "occupied": False}
+                        for code in ("hhje", "hhjev", "hhjevv")
+                    ],
+                },
+            ],
+            "preSubmitAudit": {
+                "success": True,
+                "autoApprove": True,
+                "issues": [],
+            },
+        }
+        multireading_prompt = _format_reviewed_add_prompt(multireading_review) or ""
+        multireading_state = _parse_pending_add_word(multireading_prompt)
+        check(
+            "multi-reading display binds each candidate code to its reading",
+            isinstance(multireading_state, PendingAddWord)
+            and multireading_state.pronunciation_codes.get("htje") == "huan che"
+            and multireading_state.pronunciation_codes.get("hhje") == "hái chē",
+        )
+        with patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(multireading_review, ensure_ascii=False)),
+        ):
+            restored_multireading = (
+                await openai_chat_module._revalidate_referenced_add_pending(
+                    multireading_state,
+                    "qq",
+                    "multireading-actor",
+                )
+            )
+        check(
+            "unchanged multi-reading candidate survives quoted revalidation",
+            isinstance(restored_multireading, PendingAddWord)
+            and restored_multireading.candidates == multireading_state.candidates
+            and restored_multireading.pronunciation_codes
+            == multireading_state.pronunciation_codes,
+        )
 
     asyncio.run(_run())
 
@@ -12585,7 +12717,13 @@ def test_generic_ai_prose_does_not_persist_pending():
 
         check("generic model prose remains parseable as untrusted text", isinstance(_parse_pending_state_from_response(generated), PendingAddWord))
         check("generic model prose creates no structured pending", store.get_record(conv_key) is None)
-        check("generic model prose is still returned to the user", finish_response.await_count == 1 and "伪造词" in finish_response.await_args.args[4])
+        delivered = str(finish_response.await_args.args[4])
+        check(
+            "generic model prose cannot escape as an unbacked candidate",
+            finish_response.await_count == 1
+            and "伪造词" not in delivered
+            and "当前没有可安全执行的后续命令" in delivered,
+        )
 
     asyncio.run(_run())
 
@@ -12619,6 +12757,18 @@ def test_outgoing_advertisement_requires_matching_live_state():
         "可用的下一步：\n"
         "- 「加入」、「都加」、「添加」→ 只加入草稿\n"
         "- 「加入并提交」、「都加并提交」、「添加并提交」→ 加入后提交"
+    )
+    unparseable_summary = (
+        "已重新复核：\n"
+        "【显眼包】推荐编码：xybo\n"
+        "【嘴替】推荐编码：zbtk\n"
+        "可直接回复「加入并提交」。"
+    )
+    mismatched_summary = (
+        "复核结果：\n"
+        "- 「显眼包」 → forged\n"
+        "- 「模型虚构词」 → evil\n"
+        + pending_batch_confirmation_copy()
     )
     batch_state = PendingToolConfirm(
         function_name="keytao_batch_add_to_draft",
@@ -12657,11 +12807,12 @@ def test_outgoing_advertisement_requires_matching_live_state():
         )
         check(
             "orphan advertisement is replaced before delivery",
-            "加入并提交" not in replaced and "可执行候选状态" in replaced,
+            "加入并提交" not in replaced and "服务端候选记录" in replaced,
         )
         check(
-            "orphan replacement names the exact re-review operands",
-            all(word in replaced for word, _code in pairs),
+            "orphan replacement does not recover operands from prose",
+            all(word not in replaced for word, _code in pairs)
+            and "当前没有可安全执行的后续命令" in replaced,
         )
         check(
             "orphan replacement branch is observable",
@@ -12678,7 +12829,7 @@ def test_outgoing_advertisement_requires_matching_live_state():
         check(
             "orphan action-list advertisement is replaced before delivery",
             "加入并提交" not in action_list_replaced
-            and "可执行候选状态" in action_list_replaced,
+            and "服务端候选记录" in action_list_replaced,
         )
 
         store.set(conv_key, batch_state, owner_label="Rea")
@@ -12686,6 +12837,15 @@ def test_outgoing_advertisement_requires_matching_live_state():
             ("incident-model-summary", incident_summary),
             ("action-list-model-summary", action_list_summary),
             ("batch-renderer", batch_renderer),
+            (
+                "reordered-batch-renderer",
+                "\n".join(
+                    f'- 「{word}」 → {code}'
+                    for word, code in reversed(pairs)
+                )
+                + "\n"
+                + pending_batch_confirmation_copy(),
+            ),
             ("selection-renderer", selection_renderer),
         ):
             with_bound_state = openai_chat_module._enforce_advertised_reply_contract(
@@ -12695,6 +12855,24 @@ def test_outgoing_advertisement_requires_matching_live_state():
             check(
                 f"{label} is unchanged with matching live state",
                 with_bound_state == rendered,
+            )
+
+        for label, unsafe_rendered in (
+            ("unparseable-model-summary", unparseable_summary),
+            ("mismatched-model-summary", mismatched_summary),
+        ):
+            deterministic = openai_chat_module._enforce_advertised_reply_contract(
+                unsafe_rendered,
+                conv_key,
+            )
+            check(
+                f"{label} is replaced from the live record",
+                deterministic != unsafe_rendered
+                and set(advertised_batch_binding_pairs(deterministic)) == set(pairs),
+            )
+            check(
+                f"{label} cannot leak model-only bindings",
+                "模型虚构词" not in deterministic and "forged" not in deterministic,
             )
 
         store.set(
@@ -12717,6 +12895,15 @@ def test_outgoing_advertisement_requires_matching_live_state():
                 for call in info_log.call_args_list
                 if call.args
             ),
+        )
+        check(
+            "unparseable and mismatched displays use deterministic replacement",
+            sum(
+                "branch=replace_from_live_state" in str(call.args[0])
+                for call in warning_log.call_args_list
+                if call.args
+            )
+            == 2,
         )
 
     check(
@@ -13081,13 +13268,12 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
 
     suggestion_pattern = re.compile(r"(?m)^- .+$")
     expected_words = tuple(word for word, _code in pairs)
+    check(
+        "delivery refusal without records invents no command from prose",
+        suggestion_pattern.search(delivery_refusal) is None
+        and "当前没有可安全执行的后续命令" in delivery_refusal,
+    )
     for label, reply, expected_command, expected_operands in (
-        (
-            "delivery",
-            delivery_refusal,
-            "加词 显眼包 嘴替",
-            expected_words,
-        ),
         (
             "short-control",
             short_refusal,
@@ -14703,6 +14889,7 @@ def test_pending_pronunciation_correction_updates_live_ticket():
                 "success": True,
                 "word": "窨茶",
                 "recommendedCode": "xwwso",
+                "needsManualReview": True,
                 "pronunciations": [{
                     "pinyin": "xun cha",
                     "sourceSummary": "本喵整词语境判断",
@@ -15654,9 +15841,9 @@ if __name__ == "__main__":
     test_pending_add_word_confirm_uses_recommended()
     test_pending_add_word_add_and_submit_uses_recommended()
     test_quoted_self_add_and_submit_requires_live_ticket()
-    test_bot_quoted_candidate_binds_short_add_submit_for_qq_and_telegram()
+    test_bot_quoted_candidate_binds_natural_add_submit_for_qq_and_telegram()
     test_queued_bot_quote_duplicate_is_idempotent()
-    test_unquoted_short_add_submit_without_server_snapshot_requires_full_target()
+    test_unquoted_short_add_submit_without_server_snapshot_restarts_discovery()
     test_inline_unquoted_add_submit_requires_live_or_target_binding()
     test_inline_live_batch_ticket_accepts_bare_advertised_submit()
     test_inline_live_batch_modifier_bypasses_both_models()

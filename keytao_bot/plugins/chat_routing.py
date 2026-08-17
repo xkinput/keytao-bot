@@ -17,6 +17,7 @@ from ..harness.state import (
     PendingState,
     PendingStateRecord,
     PendingToolConfirm,
+    pending_batch_display_pairs,
 )
 from ..harness.tools import (
     _COMMAND_PREFIX_PATTERN,
@@ -32,6 +33,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
     parse_advertised_set_reference,
+    parse_pending_assent_phrase,
     parse_pending_candidate_selection,
     render_executable_suggestion,
     render_remediation_reply,
@@ -371,10 +373,10 @@ def _pending_tool_assent_intent(
     state: PendingState,
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
-    """Resolve closed assent against one server-backed live state."""
-    if re.search(r"[?？]", message_text):
+    """Resolve shared natural assent against one server-backed live state."""
+    assent = _pending_assent_phrase_for_state(state, message_text)
+    if not assent.matched:
         return None
-    compact = _compact_command_text(message_text)
     if isinstance(state, PendingAddWord):
         server_backed = bool(
             state.server_candidates
@@ -384,32 +386,28 @@ def _pending_tool_assent_intent(
         )
         if not server_backed:
             return None
-        if compact in PENDING_BATCH_ADD_ASSENT_TEXTS:
-            return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
-        if compact in PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS:
+        if assent.submit_after:
             return MessageCommandIntent(
                 intent="pending_add_and_submit",
                 confidence=1.0,
                 submit_after=True,
             )
-        return None
+        return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     if not isinstance(state, PendingToolConfirm):
         return None
     add_confirmation_tool = state.function_name in {
         "keytao_create_phrase",
         "keytao_batch_add_to_draft",
     }
-    if add_confirmation_tool and compact in PENDING_BATCH_ADD_ASSENT_TEXTS:
-        return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
-    if (
-        add_confirmation_tool
-        and compact in PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS
-    ):
+    if add_confirmation_tool and assent.submit_after:
         return MessageCommandIntent(
             intent="pending_add_and_submit",
             confidence=1.0,
             submit_after=True,
         )
+    if add_confirmation_tool:
+        return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+    compact = _compact_command_text(message_text)
     if compact in _PENDING_CONFIRM_ASSENT_TEXTS:
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     if not re.fullmatch(
@@ -425,6 +423,104 @@ def _pending_tool_assent_intent(
             submit_after=True,
         )
     return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+
+
+def _pending_assent_state_operands(state: PendingState) -> Tuple[str, ...]:
+    """Allow text to repeat only one state's exact display, never select a subset."""
+    if isinstance(state, PendingAddWord):
+        return tuple(
+            value
+            for value in (state.word, state.recommended_code)
+            if str(value or "").strip()
+        )
+    if not isinstance(state, PendingToolConfirm):
+        return ()
+    if state.function_name == "keytao_create_phrase":
+        return tuple(
+            value
+            for value in (
+                str(state.args.get("word") or "").strip(),
+                str(state.args.get("code") or "").strip().lower(),
+            )
+            if value
+        )
+    pairs = pending_batch_display_pairs(state)
+    if len(pairs) == 1:
+        return pairs[0]
+    return ()
+
+
+def _pending_assent_phrase_for_state(
+    state: PendingState,
+    message_text: str,
+):
+    operands = _pending_assent_state_operands(state)
+    live_words = tuple(
+        value
+        for value in operands
+        if not re.fullmatch(r"[a-z]{1,12}", value, re.IGNORECASE)
+    )
+    unwrapped = _whole_message_unquoted_source(message_text, live_words)
+    source = unwrapped if unwrapped is not None else message_text
+    return parse_pending_assent_phrase(source, allowed_operands=operands)
+
+
+def _pending_assent_rejection_response(
+    state: PendingState,
+    message_text: str,
+) -> Optional[str]:
+    """Explain why assent-like text did not authorize the one live state."""
+    add_candidate = bool(
+        isinstance(state, PendingAddWord)
+        or (
+            isinstance(state, PendingToolConfirm)
+            and state.function_name in {
+                "keytao_create_phrase",
+                "keytao_batch_add_to_draft",
+            }
+        )
+    )
+    if not add_candidate:
+        return None
+    compact = _compact_command_text(message_text)
+    exact_rereview = bool(
+        isinstance(state, PendingAddWord)
+        and compact == _compact_command_text(f"加词 {state.word}")
+    )
+    if (
+        compact.startswith(("确认票据", "确认操作"))
+        or exact_rereview
+        or parse_pending_candidate_selection(message_text) is not None
+        or (
+            isinstance(state, PendingAddWord)
+            and _structural_pending_add_word_intent(message_text, state)
+            is not None
+        )
+    ):
+        return None
+    assent = _pending_assent_phrase_for_state(state, message_text)
+    if not assent.recognized or assent.matched:
+        return None
+    reasons = {
+        "question": "这条回复是问句，不能作为当前候选的执行确认；本次未写入",
+        "negation": "这条回复含有否定，不能作为当前候选的执行确认；本次未写入",
+        "framed": "这条回复是引用或转述，不是当前发送者的直接确认；本次未写入",
+        "other_action": "这条回复还包含加入候选之外的其他动作；本次未写入",
+        "extra_content": (
+            "这条回复还包含当前候选之外的词条、编码或第二目标；"
+            "系统不会用这些文字改写候选；本次未写入"
+        ),
+    }
+    command = (
+        "加入并提交" if assent.submit_after else "加入"
+    ) if assent.rejection == "extra_content" else ""
+    return render_remediation_reply(
+        reasons.get(
+            assent.rejection,
+            "这条回复不是仅针对当前候选的同意；本次未写入",
+        ),
+        command=command,
+    )
 
 
 def _format_live_ticket_precedence_message(state: PendingToolConfirm) -> str:
@@ -507,10 +603,16 @@ def _quoted_pending_add_control_intent(
     state: PendingAddWord,
 ) -> Optional[MessageCommandIntent]:
     """Resolve controls carried by a verified native reply to a bot candidate."""
-    if _is_short_add_and_submit_request(message_text):
+    assent = _pending_assent_phrase_for_state(state, message_text)
+    if assent.matched:
         return MessageCommandIntent(
-            intent="pending_add_and_submit",
+            intent=(
+                "pending_add_and_submit"
+                if assent.submit_after
+                else "pending_confirm"
+            ),
             confidence=1.0,
+            submit_after=assent.submit_after,
         )
     structural = _structural_pending_add_word_intent(message_text, state)
     if structural is not None:

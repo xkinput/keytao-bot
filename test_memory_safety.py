@@ -68,6 +68,7 @@ from keytao_bot.utils.pending_confirmation import (
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     render_executable_suggestion,
+    render_server_backed_word_set,
 )
 from keytao_bot.utils.web_identity import (
     WebIdentityConfigError,
@@ -783,6 +784,27 @@ class AdvertisedWordSetSelectionTests(unittest.TestCase):
         )
         self.assertIn("没有剩余", empty.ask)
         self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 1)
+
+    def test_natural_assent_resolves_one_live_set_and_asks_for_two(self) -> None:
+        token = self.seed()
+
+        selected = self.resolve("加入草稿，然后就提交。")
+
+        self.assertTrue(selected.matched)
+        self.assertEqual(selected.snapshot_token, token)
+        self.assertEqual(selected.resolved_words, self.WORDS)
+        self.assertEqual(selected.ask, "")
+
+        second_words = ("电子榨菜", "情绪价值", "班味")
+        self.seed(second_words)
+        ambiguous = self.resolve("加入草稿，然后就提交。")
+
+        self.assertTrue(ambiguous.matched)
+        self.assertEqual(ambiguous.resolved_words, ())
+        self.assertIn("两组", ambiguous.ask)
+        self.assertIn("显眼包", ambiguous.ask)
+        self.assertIn("电子榨菜", ambiguous.ask)
+        self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 2)
 
     def test_snapshot_is_actor_owned_ttl_bound_and_one_shot(self) -> None:
         token = self.seed()
@@ -1980,13 +2002,31 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         from keytao_bot.plugins import openai_chat as chat_module
 
         single_word = (
+            "候选编码:\n"
+            "1. htje — 已有「幻觉」\n"
+            "2. htjev — 空位\n"
+            "3. htjevu — 空位\n"
+            "4. htwe — 已有「换车」\n\n"
             "是否以编码 htjev 将「还车」加入草稿？"
             "可回复编号、编码，或「都加」；可多选，如「添加2、4」。"
         )
-        self.assertIn(
-            "可多选，如「添加2、4」",
-            chat_module._ensure_pending_add_word_guidance(single_word),
+        rendered_single = chat_module._ensure_pending_add_word_guidance(single_word)
+        self.assertIn("回复「加入」只加入草稿", rendered_single)
+        self.assertIn("回复「加入并提交」则加入后提交", rendered_single)
+        self.assertNotIn("「都加」", rendered_single)
+        self.assertIn("可多选，如「添加2、4」", rendered_single)
+
+        one_slot = (
+            "候选编码:\n"
+            "1. dsfkv — ✅ 推荐（空位）\n\n"
+            "是否以编码 dsfkv 将「达致」加入草稿？"
+            "可回复编号、编码，或「都加」；可多选，如「添加2、4」。"
         )
+        rendered_one_slot = chat_module._ensure_pending_add_word_guidance(one_slot)
+        self.assertIn("回复「加入」只加入草稿", rendered_one_slot)
+        self.assertIn("回复「加入并提交」则加入后提交", rendered_one_slot)
+        self.assertNotIn("「都加」", rendered_one_slot)
+        self.assertNotIn("添加2、4", rendered_one_slot)
 
         multi_word = (
             "是否以编码 zhlq 将「载流」加入草稿？\n"
@@ -2001,6 +2041,294 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("载流子 添加2、4", rendered)
         self.assertNotIn("可多选，如「添加2、4」", rendered)
         self.assertNotIn("直接回复该编号表示添加重码", rendered)
+
+    async def test_natural_single_candidate_assent_is_state_derived_and_fail_closed(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        old_state_store = chat_module.conversation_state_store
+        state_store = MemoryConversationStateStore()
+        chat_module.conversation_state_store = state_store
+        conv_key = ConversationAddress.group(
+            "qq",
+            "natural-assent-group",
+            "3755240737",
+        )
+        space_key = conv_key.space_key
+
+        def seed_state() -> PendingAddWord:
+            state = PendingAddWord(
+                word="达致",
+                recommended_code="dsfkv",
+                candidates=[("dsfk", True), ("dsfkv", False)],
+                occupied_words={"dsfk": ["大致"]},
+                server_candidates=[("dsfk", True), ("dsfkv", False)],
+                server_occupied_words={"dsfk": ["大致"]},
+            )
+            state_store.set(
+                conv_key,
+                state,
+                space_key=space_key,
+                owner_label="阿邦",
+            )
+            return state
+
+        classifier = AsyncMock(return_value=chat_module.MessageCommandIntent())
+        add_only = AsyncMock(return_value="✅ 已加入草稿")
+        add_submit = AsyncMock(return_value="✅ 已加入草稿并提交审核")
+        try:
+            with (
+                patch.object(
+                    chat_module,
+                    "_classify_message_command_intent",
+                    classifier,
+                ),
+                patch.object(chat_module, "_execute_add_to_draft", add_only),
+                patch.object(
+                    chat_module,
+                    "_execute_add_to_draft_and_submit",
+                    add_submit,
+                ),
+            ):
+                accepted = {
+                    "麻烦加入草稿吧。": False,
+                    "麻烦帮我把当前候选加入草稿。": False,
+                    "确认写入草稿。": False,
+                    "加入草稿，然后就提交。": True,
+                    "加完提交。": True,
+                    "加入达致 dsfkv，然后提交。": True,
+                }
+                for message, submit_after in accepted.items():
+                    with self.subTest(message=message):
+                        seed_state()
+                        response = await chat_module.handle_pending_message_core(
+                            message,
+                            "qq",
+                            "3755240737",
+                            conv_key,
+                            history=[],
+                            space_key=space_key,
+                            owner_label="阿邦",
+                        )
+                        self.assertIn("已加入草稿", response)
+                        called = add_submit if submit_after else add_only
+                        called.assert_awaited_once()
+                        self.assertEqual(called.await_args.args[:2], ("达致", "dsfkv"))
+                        add_only.reset_mock()
+                        add_submit.reset_mock()
+
+                rejected = {
+                    "加入别词，然后就提交。": "候选之外",
+                    "加入好。": "候选之外",
+                    "加入行。": "候选之外",
+                    "加入达致 zzzzz，然后就提交。": "候选之外",
+                    "加入草稿，然后删除大致。": "其他动作",
+                    "先别加入。": "否定",
+                    "加入草稿然后提交吗？": "问句",
+                    "他说「加入草稿，然后就提交」。": "转述",
+                }
+                for message, marker in rejected.items():
+                    with self.subTest(message=message):
+                        seed_state()
+                        response = await chat_module.handle_pending_message_core(
+                            message,
+                            "qq",
+                            "3755240737",
+                            conv_key,
+                            history=[],
+                            space_key=space_key,
+                            owner_label="阿邦",
+                        )
+                        self.assertIn("本次未写入", response)
+                        self.assertIn(marker, response)
+                        self.assertNotIn("完整", response)
+                        self.assertIsNotNone(state_store.get_record(conv_key))
+                        add_only.assert_not_awaited()
+                        add_submit.assert_not_awaited()
+
+                classifier.assert_not_awaited()
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+    async def test_every_single_candidate_shape_advertises_executable_forms(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        statuses = [
+            {
+                "code": "dsfk",
+                "occupied": True,
+                "label": "已有「大致」",
+                "words": ["大致"],
+                "phrases": [{"word": "大致", "weight": 100}],
+            },
+            {
+                "code": "dsfkv",
+                "occupied": False,
+                "label": "空位",
+                "words": [],
+                "phrases": [],
+            },
+        ]
+        encoded = chat_module._format_tool_encoded_add_prompt(
+            "达致",
+            {
+                "recommendedCode": "dsfkv",
+                "type": "Phrase",
+                "candidateStatuses": statuses,
+            },
+        )
+        reviewed = chat_module._format_reviewed_add_prompt({
+            "success": True,
+            "word": "达致",
+            "recommendedCode": "dsfkv",
+            "pronunciations": [{
+                "pinyin": "da zhi",
+                "recommendedCode": "dsfkv",
+                "candidateStatuses": statuses,
+                "sources": [],
+            }],
+            "preSubmitAudit": {
+                "autoApprove": False,
+                "summary": "证据不足",
+                "issues": [],
+            },
+        })
+
+        old_state_store = chat_module.conversation_state_store
+        state_store = MemoryConversationStateStore()
+        chat_module.conversation_state_store = state_store
+        correction_state = PendingAddWord(
+            word="达致",
+            recommended_code="dsfkv",
+            candidates=[("dsfk", True), ("dsfkv", False)],
+            server_candidates=[("dsfk", True), ("dsfkv", False)],
+        )
+        correction_encoding = {
+            "success": True,
+            "alternatePronunciationCodes": [{
+                "char": "达",
+                "charIndex": 0,
+                "pinyin": "da",
+                "codes": ["dsfk", "dsfkv"],
+            }],
+            "chars": [
+                {"char": "达", "pinyin": "da"},
+                {"char": "致", "pinyin": "zhi"},
+            ],
+            "contextPhrasePinyins": ["da", "zhi"],
+            "candidateStatuses": statuses,
+        }
+        try:
+            with patch.object(
+                chat_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps(correction_encoding, ensure_ascii=False)),
+            ):
+                corrected = await chat_module._try_update_pending_pronunciation(
+                    correction_state,
+                    "达读da",
+                    "qq",
+                    "candidate-shape-correction",
+                    None,
+                    "阿邦",
+                )
+
+            rendered_shapes = {
+                "tool-encoded": encoded,
+                "reviewed": reviewed,
+                "pronunciation-corrected": corrected,
+            }
+            add_only = AsyncMock(return_value="✅ 已加入草稿")
+            add_submit = AsyncMock(return_value="✅ 已加入草稿并提交审核")
+            batch_add = AsyncMock(return_value="✅ 已按选择加入草稿")
+            with (
+                patch.object(chat_module, "_execute_add_to_draft", add_only),
+                patch.object(
+                    chat_module,
+                    "_execute_add_to_draft_and_submit",
+                    add_submit,
+                ),
+                patch.object(chat_module, "_execute_confirmed_tool", batch_add),
+            ):
+                for shape, rendered in rendered_shapes.items():
+                    with self.subTest(shape=shape):
+                        self.assertIsNotNone(rendered)
+                        contract = chat_module.advertised_reply_contract(rendered)
+                        self.assertEqual(
+                            contract.batch_assent_forms,
+                            ("加入", "加入并提交"),
+                        )
+                        self.assertTrue(contract.candidate_selection)
+                        self.assertNotIn("「都加」", rendered)
+                        state = chat_module._parse_pending_add_word(rendered)
+                        self.assertIsInstance(state, PendingAddWord)
+                        state.server_candidates = list(state.candidates)
+                        state.server_occupied_words = dict(state.occupied_words)
+                        conv_key = ConversationAddress.private(
+                            "qq",
+                            f"candidate-shape-{shape}",
+                        )
+
+                        for form, submit_after in (
+                            ("加入", False),
+                            ("加入并提交", True),
+                        ):
+                            state_store.set(conv_key, state, owner_label="阿邦")
+                            response = await chat_module.handle_pending_message_core(
+                                form,
+                                "qq",
+                                conv_key.actor_id,
+                                conv_key,
+                                history=[],
+                                owner_label="阿邦",
+                            )
+                            self.assertIn("已加入草稿", response)
+                            called = add_submit if submit_after else add_only
+                            called.assert_awaited_once()
+                            self.assertEqual(
+                                called.await_args.args[:2],
+                                ("达致", "dsfkv"),
+                            )
+                            add_only.reset_mock()
+                            add_submit.reset_mock()
+
+                        selection_match = re.search(
+                            r"「(添加\d+(?:、\d+)+)」",
+                            rendered,
+                        )
+                        self.assertIsNotNone(selection_match)
+                        selection_command = selection_match.group(1)
+                        self.assertIsNotNone(
+                            chat_module.parse_pending_candidate_selection(
+                                selection_command,
+                            )
+                        )
+                        state_store.set(conv_key, state, owner_label="阿邦")
+                        selected = await chat_module.handle_pending_message_core(
+                            selection_command,
+                            "qq",
+                            conv_key.actor_id,
+                            conv_key,
+                            history=[],
+                            owner_label="阿邦",
+                        )
+                        self.assertIn("已按选择加入草稿", selected)
+                        batch_add.assert_awaited_once()
+                        selected_state = batch_add.await_args.args[0]
+                        self.assertEqual(
+                            [
+                                (item["word"], item["code"])
+                                for item in selected_state.args["items"]
+                            ],
+                            [("达致", "dsfk"), ("达致", "dsfkv")],
+                        )
+                        batch_add.reset_mock()
+
+        finally:
+            chat_module.conversation_state_store = old_state_store
 
     async def test_multi_number_selection_consumes_one_actor_snapshot_once(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
@@ -2242,7 +2570,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "重码添加需管理员审核",
         )
 
-    async def test_numbered_and_rendered_quoted_add_submit_execute_end_to_end(self) -> None:
+    async def test_numbered_add_submit_and_unverified_remediation_end_to_end(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
         async def exercise(message: str, *, request_suggestion: bool = False):
@@ -2349,6 +2677,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     history=[],
                     space_key=conv_key.space_key,
                     owner_label="S15",
+                    allow_intent_model=not request_suggestion,
                 )
                 return calls, reply, rendered
             finally:
@@ -2387,11 +2716,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             rendered,
-            "- 「添加 会比 hbbkiv 并提交」（会比）",
+            "- 「加词 会比」（会比）",
         )
-        self.assertEqual(quoted_calls[0][1]["code"], "hbbkiv")
-        self.assertIn("已加入草稿并提交审核", quoted_reply)
-        self.assertNotIn("没有可执行的已绑定写操作", quoted_reply)
+        self.assertEqual(quoted_calls, [])
+        self.assertIsNone(quoted_reply)
 
     async def test_owner_duplicate_add_and_submit_authorizes_exact_preview_chain(self) -> None:
         """One owner command accepts an exact duplicate warning and submit snapshot."""
@@ -2663,7 +2991,15 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                         after = state_store.get_record(conv_key)
 
                         self.assertEqual(calls, [])
-                        self.assertIsNone(reply)
+                        if command == "1？":
+                            self.assertIsNone(reply)
+                        else:
+                            self.assertIn("问句", reply)
+                            self.assertIn("本次未写入", reply)
+                            self.assertIn(
+                                "当前没有可安全执行的后续命令",
+                                reply,
+                            )
                         self.assertIs(after.state, pending)
                         self.assertEqual(
                             after.reconfirmation_code,
@@ -9053,61 +9389,47 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_read_only_rereview_advertisement_reestablishes_live_ticket(
+    async def test_binding_advertisement_uses_only_same_turn_review_records(
         self,
     ) -> None:
-        """A later record-derived review cannot advertise an unbacked assent."""
-        from keytao_bot.harness import orchestrator as orchestrator_module
+        """A word/code assent offer cannot add a model-only word to its ticket."""
         from keytao_bot.plugins import openai_chat as chat_module
 
-        codes = {"显眼包": "xybo", "嘴替": "zbtk"}
-        review_calls = []
+        codes = {"载流": "zhlq", "载流子": "zlzu"}
+        model_only_word = "模型虚构词"
 
-        async def dispatch(word=None, items=None, **_kwargs):
-            if items is not None:
-                self.fail("re-review must not write before the advertised assent")
-            review_calls.append(word)
+        async def dispatch(word=None, **_kwargs):
             return self._reviewed_candidate(
                 word,
                 codes[word],
                 needs_review=False,
             )
 
-        model_reply = (
-            "2 个词已全部重新复核完毕。以下按候选列表格式逐项重列：\n\n"
-            "1. 「显眼包」\n"
-            "   候选：\n"
-            "   1. xybo — 空位（推荐）\n"
-            "   2. xyboi — 空位\n\n"
-            "2. 「嘴替」\n"
-            "   候选：1. zbtk — 空位（推荐）｜2. zbtko — 空位\n\n"
-            "可用的下一步：\n"
-            "- 「加入」、「都加」、「添加」→ 只加入草稿\n"
-            "- 「加入并提交」、「都加并提交」、「添加并提交」→ 加入后提交"
+        forged_reply = (
+            "是否将这些词一起加入草稿？\n"
+            "- 「载流」 → zhlq\n"
+            "- 「载流子」 → zlzu\n"
+            f"- 「{model_only_word}」 → evil\n"
+            + pending_batch_confirmation_copy()
         )
         client = _FakeClient([
             _fake_response(
                 "tool_calls",
                 tool_calls=[
                     _named_tool_call(
-                        f"call-rereview-{index}",
+                        f"call-kind-aware-binding-{index}",
                         "keytao_prepare_reviewed_add",
                         {"word": word},
                     )
                     for index, word in enumerate(codes)
                 ],
             ),
-            _fake_response("stop", model_reply),
+            _fake_response("stop", forged_reply),
         ])
-        state_store = self._CountingStateStore()
+        state_store = MemoryConversationStateStore()
         orchestrator = AgentOrchestrator(
             client_factory=lambda: client,
-            runtime=AgentRuntimeConfig(
-                model="fake-model",
-                max_tokens=500,
-                temperature=0.0,
-                timeout=10.0,
-            ),
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
             skills_manager=_ReviewedBatchAddSkills(),
             tool_executor=ToolExecutor(
                 lambda _name: dispatch,
@@ -9122,71 +9444,441 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         )
         context = AgentRequestContext(
             platform="qq",
-            user_id="739497722",
-            space_type="group",
-            space_id="865189947",
-            speaker_name="Rea",
-            mutations_allowed=False,
+            user_id="binding-kind-owner",
         )
 
-        with patch.object(orchestrator_module.logger, "info") as info_log:
-            result = await orchestrator.run(
-                "请重新复核显眼包和嘴替，确认读音、编码与占用状态",
-                context,
-            )
-
+        result = await orchestrator.run("复核载流和载流子", context)
         record = state_store.get_record(context.conversation_address)
-        self.assertIsNotNone(record)
-        nonce = record.nonce
-        with (
-            patch.object(
-                chat_module,
-                "conversation_state_store",
-                state_store,
-            ),
-            patch.object(chat_module.logger, "info") as delivery_log,
+        with patch.object(
+            chat_module,
+            "conversation_state_store",
+            state_store,
         ):
             delivered = chat_module._enforce_advertised_reply_contract(
                 result,
                 context.conversation_address,
             )
-        self.assertEqual(delivered, result)
-        self.assertEqual(state_store.set_count, 1)
-        self.assertEqual(
-            state_store.get_record(context.conversation_address).nonce,
-            nonce,
-        )
-        establishment_logs = [
-            str(call.args[0])
-            for call in info_log.call_args_list
-            if call.args
-            and "branch=establish_from_server_records" in str(call.args[0])
-        ]
-        self.assertEqual(len(establishment_logs), 1)
-        self.assertIn(
-            "Saved advertised reviewed batch candidate",
-            establishment_logs[0],
-        )
-        self.assertTrue(any(
-            call.args
-            and "branch=send_backed" in str(call.args[0])
-            for call in delivery_log.call_args_list
-        ))
-        self.assertEqual(review_calls, ["显眼包", "嘴替"])
-        self.assertEqual(
-            advertised_batch_binding_pairs(result),
-            (("显眼包", "xybo"), ("嘴替", "zbtk")),
-        )
-        self.assertEqual(record.owner_key, context.conversation_address)
+
+        self.assertIsNotNone(record)
         self.assertIsInstance(record.state, PendingToolConfirm)
-        self.assertEqual(record.state.function_name, "keytao_batch_add_to_draft")
         self.assertEqual(
-            [
+            {
                 (item["word"], item["code"])
                 for item in record.state.args["items"]
-            ],
-            [("显眼包", "xybo"), ("嘴替", "zbtk")],
+            },
+            set(codes.items()),
         )
+        self.assertEqual(delivered, result)
+        self.assertNotIn(model_only_word, delivered)
+
+    async def test_read_only_rereview_advertisement_reestablishes_live_ticket(
+        self,
+    ) -> None:
+        """Every observed layout is backed or replaced from the same records."""
+        from keytao_bot.harness import orchestrator as orchestrator_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        codes = {"显眼包": "xybo", "嘴替": "zbtk"}
+        expected_pairs = tuple(codes.items())
+        action_copy = (
+            "可用的下一步：\n"
+            "- 「加入」、「都加」、「添加」→ 只加入草稿\n"
+            "- 「加入并提交」、「都加并提交」、「添加并提交」→ 加入后提交"
+        )
+        layouts = (
+            (
+                "numbered-multiline",
+                "2 个词已全部重新复核完毕：\n\n"
+                "1. 「显眼包」\n   候选：\n"
+                "   1. xybo — 空位（推荐）\n   2. xyboo — 空位\n\n"
+                "2. 「嘴替」\n   候选：\n"
+                "   1. zbtk — 空位（推荐）\n   2. zbtko — 空位\n\n"
+                + action_copy,
+                False,
+            ),
+            (
+                "numbered-inline",
+                "2 个词已全部重新复核完毕：\n\n"
+                "1. 「嘴替」\n   候选：1. zbtk — 空位（推荐）｜"
+                "2. zbtko — 空位\n\n"
+                "2. 「显眼包」\n   候选：1. xybo — 空位（推荐）｜"
+                "2. xyboo — 空位\n\n"
+                + action_copy,
+                False,
+            ),
+            (
+                "live-bracketed-recommendation",
+                "已重新复核这两个词，结果如下：\n\n"
+                "【显眼包】\n推荐编码：xybo\n候选（全部为空位）：\n"
+                "1. xybo — 空位\n2. xyboo — 空位\n\n"
+                "【嘴替】\n推荐编码：zbtk\n候选（全部为空位）：\n"
+                "1. zbtk — 空位\n2. zbtko — 空位\n\n"
+                "可继续之前确认的写入计划：显眼包 → xybo，嘴替 → zbtk。"
+                "你可直接回复「加入并提交」完成加入并提交。",
+                True,
+            ),
+            (
+                "garbled-unparseable",
+                "复核记录输出损坏：@@候选块不可解析@@。"
+                "你可直接回复「加入并提交」完成加入并提交。",
+                True,
+            ),
+        )
+
+        for case_index, (label, model_reply, expects_replacement) in enumerate(layouts):
+            with self.subTest(layout=label):
+                review_calls = []
+
+                async def dispatch(word=None, items=None, **_kwargs):
+                    if items is not None:
+                        self.fail("re-review must not write before the advertised assent")
+                    review_calls.append(word)
+                    reviewed = self._reviewed_candidate(
+                        word,
+                        codes[word],
+                        needs_review=False,
+                    )
+                    alternate = codes[word] + "o"
+                    reviewed["candidateCodes"] = [codes[word], alternate]
+                    reviewed["candidateStatuses"] = [
+                        {"code": codes[word], "occupied": False},
+                        {"code": alternate, "occupied": False},
+                    ]
+                    return reviewed
+
+                client = _FakeClient([
+                    _fake_response(
+                        "tool_calls",
+                        tool_calls=[
+                            _named_tool_call(
+                                f"call-rereview-{case_index}-{index}",
+                                "keytao_prepare_reviewed_add",
+                                {"word": word},
+                            )
+                            for index, word in enumerate(codes)
+                        ],
+                    ),
+                    _fake_response("stop", model_reply),
+                ])
+                state_store = self._CountingStateStore()
+                orchestrator = AgentOrchestrator(
+                    client_factory=lambda: client,
+                    runtime=AgentRuntimeConfig(
+                        model="fake-model",
+                        max_tokens=500,
+                        temperature=0.0,
+                        timeout=10.0,
+                    ),
+                    skills_manager=_ReviewedBatchAddSkills(),
+                    tool_executor=ToolExecutor(
+                        lambda _name: dispatch,
+                        frozenset({
+                            "keytao_prepare_reviewed_add",
+                            "keytao_batch_add_to_draft",
+                        }),
+                    ),
+                    state_store=state_store,
+                    bind_help_text="bind help",
+                    system_prompt_core="system",
+                )
+                context = AgentRequestContext(
+                    platform="qq",
+                    user_id=f"rereview-owner-{case_index}",
+                    space_type="group",
+                    space_id="865189947",
+                    speaker_name="Rea",
+                    mutations_allowed=False,
+                )
+
+                with patch.object(orchestrator_module.logger, "info") as info_log:
+                    result = await orchestrator.run(
+                        "请重新复核显眼包和嘴替，确认读音、编码与占用状态",
+                        context,
+                    )
+
+                record = state_store.get_record(context.conversation_address)
+                self.assertIsNotNone(record)
+                nonce = record.nonce
+                with (
+                    patch.object(
+                        chat_module,
+                        "conversation_state_store",
+                        state_store,
+                    ),
+                    patch.object(chat_module.logger, "info") as delivery_log,
+                ):
+                    delivered = chat_module._enforce_advertised_reply_contract(
+                        result,
+                        context.conversation_address,
+                    )
+                self.assertEqual(delivered, result)
+                self.assertEqual(state_store.set_count, 1)
+                self.assertEqual(
+                    state_store.get_record(context.conversation_address).nonce,
+                    nonce,
+                )
+                establishment_logs = [
+                    str(call.args[0])
+                    for call in info_log.call_args_list
+                    if call.args
+                    and "branch=establish_from_server_records" in str(call.args[0])
+                ]
+                self.assertEqual(len(establishment_logs), 1)
+                self.assertIn(
+                    "display=replace_from_server_records"
+                    if expects_replacement
+                    else "display=send_backed",
+                    establishment_logs[0],
+                )
+                self.assertTrue(any(
+                    call.args
+                    and "branch=send_backed" in str(call.args[0])
+                    for call in delivery_log.call_args_list
+                ))
+                self.assertEqual(review_calls, ["显眼包", "嘴替"])
+                self.assertEqual(
+                    set(advertised_batch_binding_pairs(result)),
+                    set(expected_pairs),
+                )
+                self.assertEqual(result == model_reply, not expects_replacement)
+                if expects_replacement:
+                    self.assertIn("当前服务端审词记录", result)
+                self.assertEqual(record.owner_key, context.conversation_address)
+                self.assertIsInstance(record.state, PendingToolConfirm)
+                self.assertEqual(
+                    record.state.function_name,
+                    "keytao_batch_add_to_draft",
+                )
+                self.assertEqual(
+                    {
+                        (item["word"], item["code"])
+                        for item in record.state.args["items"]
+                    },
+                    set(expected_pairs),
+                )
+
+    async def test_scan_advertisement_uses_only_same_turn_absent_lookup_records(
+        self,
+    ) -> None:
+        """A no-code inventory offer is backed by the exact absent lookup set."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        words = ("显眼包", "嘴替", "松弛感")
+        model_only_word = "模型虚构词"
+
+        async def dispatch(words=None, **_kwargs):
+            return {
+                "success": True,
+                "count": len(words),
+                "results": [
+                    {"success": True, "word": word, "phrases": []}
+                    for word in words
+                ],
+            }
+
+        model_reply = (
+            "未收录词：\n"
+            + "\n".join(f"- {word}" for word in (*words, model_only_word))
+            + "\n可以把这 4 个词加入草稿。"
+        )
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-kind-aware-scan",
+                    "keytao_lookup_by_words_batch",
+                    {"words": list(words)},
+                )],
+            ),
+            _fake_response("stop", model_reply),
+        ])
+        state_store = MemoryConversationStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_AdvertisedSetSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: dispatch
+                if name == "keytao_lookup_by_words_batch"
+                else None,
+                frozenset({"keytao_lookup_by_words_batch"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="scan-kind-owner",
+            space_type="group",
+            space_id="scan-kind-group",
+            speaker_name="Owner",
+        )
+
+        result = await orchestrator.run("扫描这些常用词", context)
+        record = state_store.get_record(context.conversation_address)
+        with patch.object(
+            chat_module,
+            "conversation_state_store",
+            state_store,
+        ):
+            delivered = chat_module._enforce_advertised_reply_contract(
+                result,
+                context.conversation_address,
+            )
+
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingAdvertisedWordSets)
+        self.assertEqual(len(record.state.snapshots), 1)
+        self.assertEqual(record.state.snapshots[0].words, words)
+        self.assertEqual(delivered, result)
+        self.assertTrue(all(word in delivered for word in words))
+        self.assertNotIn(model_only_word, delivered)
+
+    async def test_mixed_advertisement_prefers_specific_review_bindings(
+        self,
+    ) -> None:
+        """A mixed reply is normalized to one candidate ticket, never two authorities."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        candidate_codes = {"载流": "zhlq", "载流子": "zlzu"}
+        absent_words = ("显眼包", "嘴替")
+        model_only_word = "模型虚构词"
+
+        async def dispatch(word=None, words=None, **_kwargs):
+            if words is not None:
+                return {
+                    "success": True,
+                    "count": len(words),
+                    "results": [
+                        {"success": True, "word": item, "phrases": []}
+                        for item in words
+                    ],
+                }
+            return self._reviewed_candidate(
+                word,
+                candidate_codes[word],
+                needs_review=False,
+            )
+
+        mixed_reply = (
+            "复核候选：\n"
+            "- 「载流」 → zhlq\n"
+            "- 「载流子」 → zlzu\n"
+            + pending_batch_confirmation_copy()
+            + "\n另一个未收录列表："
+            + "、".join((*absent_words, model_only_word))
+            + "。可以把列表中的词加入草稿。"
+        )
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[
+                    _named_tool_call(
+                        "call-kind-aware-mixed-lookup",
+                        "keytao_lookup_by_words_batch",
+                        {"words": list(absent_words)},
+                    ),
+                    *[
+                        _named_tool_call(
+                            f"call-kind-aware-mixed-review-{index}",
+                            "keytao_prepare_reviewed_add",
+                            {"word": word},
+                        )
+                        for index, word in enumerate(candidate_codes)
+                    ],
+                ],
+            ),
+            _fake_response("stop", mixed_reply),
+        ])
+        state_store = MemoryConversationStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_AdvertisedSetSkills(),
+            tool_executor=ToolExecutor(
+                lambda _name: dispatch,
+                frozenset({
+                    "keytao_lookup_by_words_batch",
+                    "keytao_prepare_reviewed_add",
+                    "keytao_batch_add_to_draft",
+                }),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="mixed-kind-owner",
+        )
+
+        result = await orchestrator.run("扫描并复核", context)
+        record = state_store.get_record(context.conversation_address)
+        with patch.object(
+            chat_module,
+            "conversation_state_store",
+            state_store,
+        ):
+            delivered = chat_module._enforce_advertised_reply_contract(
+                result,
+                context.conversation_address,
+            )
+
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(
+            {
+                (item["word"], item["code"])
+                for item in record.state.args["items"]
+            },
+            set(candidate_codes.items()),
+        )
+        self.assertEqual(delivered, result)
+        self.assertNotIn(model_only_word, delivered)
+        self.assertTrue(all(word not in delivered for word in absent_words))
+
+    async def test_advertisement_without_either_record_kind_has_no_command(
+        self,
+    ) -> None:
+        """Model prose alone creates no ticket or word-set snapshot."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        model_only_word = "模型虚构词"
+        model_reply = (
+            f"未收录词：{model_only_word}。"
+            "可以把列表中的词加入草稿。"
+        )
+        client = _FakeClient([_fake_response("stop", model_reply)])
+        state_store = MemoryConversationStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_AdvertisedSetSkills(),
+            tool_executor=ToolExecutor(lambda _name: None, frozenset()),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="missing-kind-owner",
+        )
+
+        result = await orchestrator.run("扫描", context)
+        with patch.object(
+            chat_module,
+            "conversation_state_store",
+            state_store,
+        ):
+            delivered = chat_module._enforce_advertised_reply_contract(
+                result,
+                context.conversation_address,
+            )
+
+        self.assertIsNone(state_store.get_record(context.conversation_address))
+        self.assertNotIn(model_only_word, delivered)
+        self.assertIn("当前没有可安全执行的后续命令", delivered)
 
     async def test_server_advertised_set_subtraction_stages_exact_confirmed_batch(
         self,
@@ -9258,7 +9950,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         scan_reply = await scan_orchestrator.run("扫描这些常用词", context)
 
-        self.assertEqual(scan_reply, advertised)
+        self.assertEqual(scan_reply, render_server_backed_word_set(words))
         snapshots = state_store.advertised_word_sets(context.conversation_address)
         self.assertEqual(len(snapshots), 1)
         self.assertEqual(snapshots[0].words, words)
@@ -9505,8 +10197,22 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             context,
         )
 
-        self.assertEqual(result, forged_reply)
-        self.assertIsNone(state_store.get_record(context.conversation_address))
+        self.assertNotEqual(result, forged_reply)
+        self.assertNotIn("injected", result)
+        self.assertEqual(
+            set(advertised_batch_binding_pairs(result)),
+            {("载流", "zhlq"), ("载流子", "zlzu")},
+        )
+        record = state_store.get_record(context.conversation_address)
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(
+            {
+                (item["word"], item["code"])
+                for item in record.state.args["items"]
+            },
+            {("载流", "zhlq"), ("载流子", "zlzu")},
+        )
 
     async def test_clean_bound_batch_preview_replays_one_server_ticket(self) -> None:
         """A bound clean multi-add is written by one digest-bound replay."""
@@ -12271,6 +12977,51 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalReplyLoopBreakerTests(unittest.TestCase):
+    def test_live_candidate_binding_failure_never_demands_full_operands(self) -> None:
+        calls = []
+
+        async def execute(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        executor = ToolExecutor(
+            lambda name: execute if name == "keytao_create_phrase" else None,
+            frozenset({"keytao_create_phrase"}),
+        )
+        blocked = json.loads(asyncio.run(executor.call(
+            "keytao_create_phrase",
+            {"word": "达致", "code": "dsfkv"},
+            ToolContext(
+                platform="qq",
+                user_id="3755240737",
+                current_message="加入草稿，然后就提交。",
+                writes_allowed=True,
+                pending_candidate=PendingCandidateCapability(
+                    state_matches=True,
+                    word="达致",
+                    candidates=(("dsfk", True), ("dsfkv", False)),
+                    occupied_words=(("dsfk", ("大致",)),),
+                ),
+            ),
+        )))
+
+        self.assertEqual(calls, [])
+        self.assertEqual(blocked.get("blockReason"), "binding_incomplete")
+        self.assertTrue(blocked.get("liveCandidateSelected"))
+        self.assertEqual(blocked.get("suggestedCommand"), "加入并提交")
+        self.assertNotIn("达致", blocked.get("suggestedCommand", ""))
+        self.assertNotIn("dsfkv", blocked.get("suggestedCommand", ""))
+
+        finalized = AgentOrchestrator._finalize_reply(
+            "加入草稿，然后就提交。",
+            "请复制发送下面这行完整指令：添加 达致 dsfkv 并提交",
+            blocked,
+        )
+        self.assertIn("当前候选", finalized)
+        self.assertIn("- 「加入并提交」", finalized)
+        self.assertNotIn("完整指令", finalized)
+        self.assertNotIn("添加 达致 dsfkv", finalized)
+
     def test_binding_failure_copy_hides_internal_fields_and_closes_retry(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 

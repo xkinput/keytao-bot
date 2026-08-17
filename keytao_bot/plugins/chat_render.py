@@ -14,6 +14,7 @@ from ..utils.pending_confirmation import (
     pending_confirmation_copy,
     render_executable_suggestion,
     render_remediation_reply,
+    single_word_candidate_footer,
 )
 
 
@@ -186,25 +187,20 @@ def _format_full_add_and_submit_instruction(
             "这条消息也没有提供可绑定的具体词条"
         )
 
-    example = f"添加 {state.word} {state.recommended_code} 并提交"
-    suggestion = render_executable_suggestion(
-        example,
-        words=(state.word,),
-    )
     if quoted:
-        lead = (
-            "已检测到你引用了机器人消息，但引用内容没有匹配当前可执行候选。"
-            "当前候选仍有效，请复制发送下面完整一行：\n"
+        reason = (
+            "引用已经选中了当前候选，但它缺少可核验的服务端候选快照；"
+            "系统不能把引用文字当作词条或编码，本次未写入"
         )
     else:
-        lead = (
-            "没有引用机器人给出的候选消息时，需要把词条和编码写完整，"
-            "请复制发送下面完整一行：\n"
+        reason = (
+            "当前候选缺少可核验的服务端候选快照；"
+            "系统不能用这条回复补造词条或编码，本次未写入"
         )
-    return (
-        lead
-        + suggestion
-        + ("" if quoted else "\n也可以直接引用那条候选消息回复「添加并提交」。")
+    return render_remediation_reply(
+        reason,
+        command=f"加词 {state.word}",
+        words=(state.word,),
     )
 
 
@@ -400,10 +396,11 @@ def _format_tool_encoded_add_prompt(word: str, encoding: Dict) -> Optional[str]:
         _format_candidate_status_line(index, status, recommended_code)
         for index, status in enumerate(statuses[:6], start=1)
     )
-    lines.extend([
+    lines.extend((
         "",
-        f"是否以编码 {recommended_code} 将「{word}」加入草稿？也可回复编号选其他编码。",
-    ])
+        f"是否以编码 {recommended_code} 将「{word}」加入草稿？",
+        single_word_candidate_footer(len(statuses[:6])),
+    ))
     return "\n".join(lines)
 
 
@@ -722,14 +719,13 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
     lines.append("")
     if ordering_recommended_code:
         lines.append(
-            f"如不调整现有排序，也可仍以编码 {recommended_code} 将「{word}」加入草稿；"
-            "回复对应编号或编码即可。可多选，如「添加2、4」。"
+            f"如不调整现有排序，是否仍以编码 {recommended_code} 将「{word}」加入草稿？"
         )
     else:
         lines.append(
             f"是否以编码 {recommended_code} 将「{word}」加入草稿？"
-            "可回复编号、编码，或「都加」；可多选，如「添加2、4」。"
         )
+    lines.append(single_word_candidate_footer(candidate_index - 1))
     lines.append("若选的是已有词编码，回复“编号 重新编码”可挪开原词。")
     return "\n".join(lines).strip()
 

@@ -9,6 +9,7 @@ from nonebot.log import logger
 from keytao_bot.utils.observability import observe_tool_call
 from keytao_bot.utils.pending_confirmation import (
     advertised_batch_assent_verb,
+    parse_pending_assent_phrase,
     pending_confirmation_copy,
     render_remediation_reply,
 )
@@ -1721,18 +1722,41 @@ class ToolExecutor:
             )
             if binding_error:
                 if binding_error.get("blockReason") == BLOCK_REASON_BINDING_INCOMPLETE:
-                    suggestion = self_checked_suggested_command(
-                        tool_name,
-                        arguments,
-                        context,
+                    capability = context.pending_candidate
+                    live_candidate_selected = bool(
+                        tool_name == "keytao_create_phrase"
+                        and capability is not None
+                        and capability.state_matches
+                        and str(arguments.get("word") or "").strip()
+                        == capability.word
+                        and str(arguments.get("code") or "").strip().lower()
+                        in {code for code, _occupied in capability.candidates}
                     )
-                    if suggestion:
-                        binding_error["suggestedCommand"] = suggestion
+                    assent = parse_pending_assent_phrase(message)
+                    if live_candidate_selected and assent.recognized:
+                        binding_error["liveCandidateSelected"] = True
                         binding_error["message"] = (
-                            f"{binding_error['message']}"
-                            "请把下面这条指令原样转述给用户，不要自创格式："
-                            f"{suggestion}"
+                            "当前候选状态仍有效，但这次模型工具调用没有通过"
+                            "受信的候选确认路由；系统不会从消息文字补造或改写"
+                            "词条和编码，本次未写入。"
                         )
+                        if assent.rejection in {"", "extra_content"}:
+                            binding_error["suggestedCommand"] = (
+                                "加入并提交" if assent.submit_after else "加入"
+                            )
+                    else:
+                        suggestion = self_checked_suggested_command(
+                            tool_name,
+                            arguments,
+                            context,
+                        )
+                        if suggestion:
+                            binding_error["suggestedCommand"] = suggestion
+                            binding_error["message"] = (
+                                f"{binding_error['message']}"
+                                "请把下面这条指令原样转述给用户，不要自创格式："
+                                f"{suggestion}"
+                            )
                 return binding_error
         if tool_name == "keytao_batch_remove_draft_items" and message:
             ids = arguments.get("ids")

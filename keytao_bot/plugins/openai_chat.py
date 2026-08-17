@@ -89,12 +89,16 @@ from ..utils.pending_confirmation import (
     PENDING_CONFIRM_ASSENT_TEXTS,
     advertised_batch_binding_pairs,
     advertised_reply_contract,
+    advertised_word_set_words,
     ensure_multi_word_candidate_copy,
     parse_pending_candidate_selection,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     pending_confirmation_prompt_instruction,
     render_remediation_reply,
+    render_server_backed_batch_candidates,
+    render_server_backed_word_set,
+    same_unique_binding_set,
 )
 from ..utils.memory_store import (
     ChatMemoryContext,
@@ -423,6 +427,7 @@ from .chat_routing import (
     _parse_simple_word_query_intent_payload,
     _pending_context_for_command_intent,
     _pending_owner_label,
+    _pending_assent_rejection_response,
     _pending_tool_assent_intent,
     _pending_tool_confirmation_command,
     _pending_tool_confirmation_matches,
@@ -1718,6 +1723,37 @@ def _advertised_reply_matches_live_record(
         return False
 
     state = record.state
+    if (
+        contract.deictic_batch_command
+        and isinstance(state, PendingToolConfirm)
+        and state.function_name == "keytao_batch_add_to_draft"
+    ):
+        live_pairs = _pending_state_binding_pairs(state)
+        live_words = tuple(word for word, _code in live_pairs)
+        exact_live_command = _chat_commands.render_executable_suggestion(
+            f"将这 {len(live_words)} 个词加入草稿",
+            words=live_words,
+        ) if live_words else ""
+        if exact_live_command and exact_live_command in response:
+            return True
+
+    if contract.word_set_advertisement:
+        if (
+            contract.binding_advertisement
+            or not isinstance(state, PendingAdvertisedWordSets)
+        ):
+            return False
+        displayed_words = advertised_word_set_words(response)
+        return bool(
+            displayed_words
+            and sum(
+                1
+                for snapshot in state.snapshots
+                if snapshot.words == displayed_words
+            )
+            == 1
+        )
+
     advertises_batch_action = bool(
         contract.batch_assent_forms or contract.deictic_batch_command
     )
@@ -1742,10 +1778,45 @@ def _advertised_reply_matches_live_record(
         return False
 
     displayed_pairs = advertised_batch_binding_pairs(response)
-    return (
-        not displayed_pairs
-        or displayed_pairs == _pending_state_binding_pairs(state)
+    sealed_pairs = _pending_state_binding_pairs(state)
+    if advertises_batch_action or contract.candidate_selection:
+        return same_unique_binding_set(
+            displayed_pairs,
+            sealed_pairs,
+        )
+    if displayed_pairs:
+        return same_unique_binding_set(
+            displayed_pairs,
+            sealed_pairs,
+        )
+    return True
+
+
+def _render_live_batch_record(record: Optional[PendingStateRecord]) -> str:
+    """Project a sealed batch ticket into the deterministic display interface."""
+    if (
+        record is None
+        or record.execution_id
+        or not isinstance(record.state, PendingToolConfirm)
+        or record.state.function_name != "keytao_batch_add_to_draft"
+    ):
+        return ""
+    return render_server_backed_batch_candidates(
+        record.state.args.get("items"),
+        record.state.args.get("_candidate_scopes"),
     )
+
+
+def _render_live_word_set_record(record: Optional[PendingStateRecord]) -> str:
+    """Project one unambiguous actor-owned lookup snapshot for delivery."""
+    if (
+        record is None
+        or record.execution_id
+        or not isinstance(record.state, PendingAdvertisedWordSets)
+        or len(record.state.snapshots) != 1
+    ):
+        return ""
+    return render_server_backed_word_set(record.state.snapshots[0].words)
 
 
 def _enforce_advertised_reply_contract(
@@ -1770,21 +1841,28 @@ def _enforce_advertised_reply_contract(
         )
         return text
 
+    replacement = (
+        _render_live_word_set_record(record)
+        if contract.word_set_advertisement
+        and not contract.binding_advertisement
+        else _render_live_batch_record(record)
+    )
+    if replacement and _advertised_reply_matches_live_record(replacement, record):
+        logger.warning(
+            "[advertised_reply_contract] branch=replace_from_live_state "
+            f"state={record.state.__class__.__name__} "
+            f"displayed_bindings={len(displayed_pairs)} "
+            f"record_bindings={len(_pending_state_binding_pairs(record.state))}"
+        )
+        return replacement
+
     logger.warning(
         "[advertised_reply_contract] branch=replace_missing_state "
         f"state={record.state.__class__.__name__ if record is not None else 'none'} "
         f"bindings={len(displayed_pairs)}"
     )
-    words = tuple(dict.fromkeys(word for word, _code in displayed_pairs))
-    if words:
-        return render_remediation_reply(
-            "这份复核消息没有匹配的可执行候选状态，本次不会写入",
-            command="加词 " + " ".join(words),
-            words=words,
-        )
     return render_remediation_reply(
-        "这条消息没有匹配的可执行候选状态，本次不会写入；"
-        "回复中没有可绑定的具体词条"
+        "这条消息没有可用的服务端候选记录，本次不会写入"
     )
 
 
@@ -2554,6 +2632,14 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
                 ctx.current_pending_record.state,
                 ctx.normalized_message_text,
             )
+            if (
+                ctx.scoped_pending_response is None
+                and ctx.scoped_pending_intent is None
+            ):
+                ctx.scoped_pending_response = _pending_assent_rejection_response(
+                    ctx.current_pending_record.state,
+                    ctx.normalized_message_text,
+                )
     return False
 
 
@@ -3070,14 +3156,18 @@ async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
             )
             await _finish_ai_chat_matcher(ctx.response)
             return True
+        revalidation_failures: List[str] = []
         restored_state = await _revalidate_referenced_add_pending(
             ctx.referenced_pending,
             ctx.platform,
             ctx.user_id,
+            failure_reasons=revalidation_failures,
         )
         if restored_state is None:
             ctx.response = render_remediation_reply(
-                "这条候选已不在当前可验证的审词快照中；没有执行添加",
+                (revalidation_failures[0] if revalidation_failures else
+                 "当前候选无法完成安全复核")
+                + "；没有执行添加",
                 command=f"加词 {ctx.referenced_pending.word}",
                 words=(ctx.referenced_pending.word,),
             )
@@ -3182,14 +3272,18 @@ async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
             and isinstance(ctx.referenced_pending, PendingAddWord)
             and referenced_command_intent.intent == "pending_add_and_submit"
         ):
+            revalidation_failures: List[str] = []
             restored_state = await _revalidate_referenced_add_pending(
                 ctx.referenced_pending,
                 ctx.platform,
                 ctx.user_id,
+                failure_reasons=revalidation_failures,
             )
             if restored_state is None:
                 ctx.response = render_remediation_reply(
-                    "这条候选已不在当前可验证编码快照中；没有执行添加",
+                    (revalidation_failures[0] if revalidation_failures else
+                     "当前候选无法完成安全复核")
+                    + "；没有执行添加",
                     command=f"加词 {ctx.referenced_pending.word}",
                     words=(ctx.referenced_pending.word,),
                 )
@@ -4249,6 +4343,7 @@ _CHAT_COMPAT_NAMES = (
     "_parse_pending_state_from_response",
     "_parse_simple_word_query_intent_payload",
     "_pending_add_ordering_summary",
+    "_pending_assent_rejection_response",
     "_pending_context_for_command_intent",
     "_pending_owner_label",
     "_pending_pronunciation_correction",

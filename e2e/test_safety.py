@@ -23,6 +23,10 @@ from .scenarios import (
     S21_BATCH_WORDS,
     S22_BATCH_WORDS,
     S23_BATCH_WORDS,
+    S24_NATURAL_ASSENT,
+    S24_RECOMMENDED_CODE,
+    S24_WORD,
+    same_unique_item_set,
 )
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
@@ -51,6 +55,16 @@ from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_s9_zdic_cache, seed_zdic_
 
 
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_exact_item_set_ignores_order_but_rejects_duplicates(self) -> None:
+        expected = (
+            ("Create", "泼天富贵", "ptfg"),
+            ("Create", "精神状态", "jeft"),
+        )
+        self.assertTrue(same_unique_item_set(tuple(reversed(expected)), expected))
+        self.assertFalse(
+            same_unique_item_set((expected[0], expected[0]), expected)
+        )
+
     async def test_e2e_harness_builds_a_native_onebot_group_reply_segment(
         self,
     ) -> None:
@@ -259,15 +273,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S21 replays the 2026-08-16 advertised-contract incidents", readme)
         self.assertIn("S22 replays the orphaned re-review advertisement incident", readme)
         self.assertIn("S23 replays the stale advertised-assent production incident", readme)
+        self.assertIn("S24 replays the single-word natural-assent incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s23(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s24(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 24)],
+            [f"S{index}" for index in range(1, 25)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -594,6 +609,11 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             {row["entry"] for row in fixture["rows"] if row["kind"] == "entry"},
             set(S23_BATCH_WORDS),
         )
+
+    def test_s24_reuses_the_s18_single_word_fixture(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S24"]
+        self.assertEqual(fixture, ZDIC_FIXTURES_BY_SCENARIO["S18"])
+        self.assertIn(S24_WORD, fixture["probe_words"])
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
         class FakeBuildResult:
@@ -1596,7 +1616,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                             f"   候选：1. {code} — 空位（推荐）｜"
                             f"2. {code}o — 空位"
                             for index, (word, code) in enumerate(
-                                expected_pairs,
+                                reversed(expected_pairs),
                                 start=1,
                             )
                         )
@@ -1638,12 +1658,12 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["confirmationSteps"], 0)
         self.assertEqual(result["facts"]["batchStatus"], "Approved")
         self.assertEqual(
-            result["facts"]["advertisedPairs"],
-            [list(pair) for pair in expected_pairs],
+            {tuple(pair) for pair in result["facts"]["advertisedPairs"]},
+            set(expected_pairs),
         )
         self.assertEqual(
-            result["facts"]["discoveryPairs"],
-            [list(pair) for pair in discovery_pairs],
+            {tuple(pair) for pair in result["facts"]["discoveryPairs"]},
+            set(discovery_pairs),
         )
         self.assertEqual(result["facts"]["batchId"], "batch-s22")
 
@@ -1654,6 +1674,12 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         expected_pairs = tuple(
             (word, f"b{chr(ord('a') + index)}")
             for index, word in enumerate(S23_BATCH_WORDS)
+        )
+        persisted_pairs = (
+            *expected_pairs[:6],
+            expected_pairs[7],
+            expected_pairs[6],
+            *expected_pairs[8:],
         )
 
         class FakeContext:
@@ -1705,7 +1731,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 if text == "加入并提交":
                     items = [
                         {"action": "Create", "word": word, "code": code}
-                        for word, code in expected_pairs
+                        for word, code in persisted_pairs
                     ]
                     self.completed_batch_id = "batch-s23"
                     self.record(
@@ -1756,7 +1782,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     "status": "Approved",
                     "pullRequests": [
                         {"action": "Create", "word": word, "code": code}
-                        for word, code in expected_pairs
+                        for word, code in persisted_pairs
                     ],
                 }
 
@@ -1784,6 +1810,129 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             result["facts"]["freshAdvertisedPairs"],
             [list(pair) for pair in expected_pairs],
         )
+
+    async def test_s24_offline_quotes_single_candidate_and_submits_natural_assent(
+        self,
+    ) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S24")
+
+        class FakeContext:
+            admin_token = "offline-admin-token"
+
+            def __init__(self):
+                self.events = []
+                self.sequence = 0
+                self.completed_batch_id = None
+                self.next_client = self
+                self.bot = self
+                self.platform_id = "3755240737"
+                self.last_reply_message_id = None
+                self.reset_calls = 0
+                self.reply_requests = []
+
+            def record(self, *, name, arguments=None, result=None):
+                self.sequence += 1
+                event = {
+                    "sequence": self.sequence,
+                    "kind": "tool",
+                    "name": name,
+                    "result": result or {},
+                }
+                if arguments is not None:
+                    event["arguments"] = arguments
+                self.events.append(event)
+
+            async def clean_draft(self, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                return {"success": True, "deleted": 0}
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                self.reset_calls += 1
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assertTrue(to_me)
+                if text == f"喵喵 {S24_WORD}":
+                    self.last_reply_message_id = 701
+                    return (
+                        f"词库暂无收录「{S24_WORD}」，先审读音和编码候选：\n\n"
+                        "候选编码:\n"
+                        f"1. {S24_RECOMMENDED_CODE} — ✅ 推荐（空位）\n"
+                        "2. htjev — 空位\n\n"
+                        f"是否以编码 {S24_RECOMMENDED_CODE} 将「{S24_WORD}」加入草稿？\n"
+                        "可回复编号或编码选择其他编码；可多选，如「添加1、2」。\n"
+                        "回复「加入」只加入草稿；回复「加入并提交」则加入后提交。"
+                    )
+                if text == "确认" or text.startswith("确认票据 "):
+                    raise AssertionError("offline S24 should not need extra confirmation")
+                raise AssertionError(text)
+
+            async def send_group_reply(
+                self,
+                text: str,
+                *,
+                reply_message_id: int,
+                to_me: bool,
+            ) -> str:
+                self.assertTrue(to_me)
+                self.reply_requests.append((text, reply_message_id))
+                self.assertEqual((text, reply_message_id), (S24_NATURAL_ASSENT, 701))
+                self.completed_batch_id = "batch-s24"
+                arguments = {
+                    "word": S24_WORD,
+                    "code": S24_RECOMMENDED_CODE,
+                    "confirmed": True,
+                }
+                self.record(
+                    name="keytao_create_phrase",
+                    arguments=arguments,
+                    result={"success": True, "batchId": self.completed_batch_id},
+                )
+                self.record(
+                    name="keytao_submit_batch",
+                    result={
+                        "success": True,
+                        "batchId": self.completed_batch_id,
+                        "autoApproved": True,
+                    },
+                )
+                return "✅ 已加入草稿并提交审核"
+
+            async def draft(self):
+                return {"batchId": None, "contentVersion": 0, "items": []}
+
+            async def get_admin_batch(self, *, batch_id: str, admin_token: str):
+                self.assertEqual(batch_id, self.completed_batch_id)
+                self.assertEqual(admin_token, self.admin_token)
+                return {
+                    "status": "Approved",
+                    "pullRequests": [{
+                        "action": "Create",
+                        "word": S24_WORD,
+                        "code": S24_RECOMMENDED_CODE,
+                    }],
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+            def assertEqual(self, left, right):
+                if left != right:
+                    raise AssertionError((left, right))
+
+            def assertTrue(self, value):
+                if not value:
+                    raise AssertionError(value)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+
+        self.assertEqual(context.reset_calls, 1)
+        self.assertEqual(context.reply_requests, [(S24_NATURAL_ASSENT, 701)])
+        self.assertEqual(result["facts"]["advertisedForms"], ["加入", "加入并提交"])
+        self.assertEqual(result["facts"]["confirmationSteps"], 0)
+        self.assertEqual(result["facts"]["batchId"], "batch-s24")
+        self.assertEqual(result["facts"]["batchStatus"], "Approved")
 
     async def test_s23_unresolvable_quote_control_never_mints_a_write_ticket(
         self,

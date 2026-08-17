@@ -229,6 +229,10 @@ def _s19_subset_fixture(word_count: int) -> dict[str, object]:
 
 ZDIC_FIXTURES_BY_SCENARIO["S22"] = _s19_subset_fixture(2)
 ZDIC_FIXTURES_BY_SCENARIO["S23"] = _s19_subset_fixture(9)
+ZDIC_FIXTURES_BY_SCENARIO["S24"] = {
+    "probe_words": tuple(ZDIC_FIXTURES_BY_SCENARIO["S18"]["probe_words"]),
+    "rows": tuple(ZDIC_FIXTURES_BY_SCENARIO["S18"]["rows"]),
+}
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 

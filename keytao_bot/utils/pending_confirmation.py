@@ -29,6 +29,8 @@ PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS = (
     "都加并提交",
     "添加并提交",
 )
+PENDING_SINGLE_ADD_ADVERTISED_FORMS = ("加入",)
+PENDING_SINGLE_ADD_AND_SUBMIT_ADVERTISED_FORMS = ("加入并提交",)
 PENDING_BATCH_ADD_ASSENT_TEXTS = frozenset({
     *PENDING_BATCH_ADD_ADVERTISED_FORMS,
     "加",
@@ -125,6 +127,20 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
     return tuple(pairs)
 
 
+def same_unique_binding_set(
+    displayed: tuple[tuple[str, str], ...],
+    recorded: tuple[tuple[str, str], ...],
+) -> bool:
+    """Compare complete bindings as a set while rejecting duplicates/omissions."""
+    return bool(
+        displayed
+        and len(displayed) == len(recorded)
+        and len(displayed) == len(set(displayed))
+        and len(recorded) == len(set(recorded))
+        and set(displayed) == set(recorded)
+    )
+
+
 @dataclass(frozen=True)
 class PendingCandidateSelection:
     """A closed multi-slot selection parsed without model interpretation."""
@@ -132,6 +148,16 @@ class PendingCandidateSelection:
     indices: tuple[int, ...] = ()
     codes: tuple[str, ...] = ()
     submit_after: bool = False
+
+
+@dataclass(frozen=True)
+class PendingAssentPhrase:
+    """A whole-message assent decision that never contributes operands."""
+
+    recognized: bool = False
+    matched: bool = False
+    submit_after: bool = False
+    rejection: str = ""
 
 
 @dataclass(frozen=True)
@@ -201,6 +227,150 @@ def advertised_batch_assent_verb(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", str(text or "")).strip()
     match = _BATCH_ADVERTISED_VERB_RE.match(normalized)
     return match.group("verb") if match is not None else ""
+
+
+_NATURAL_ASSENT_FORMS = tuple(sorted(
+    {
+        *PENDING_ASSENT_TEXTS,
+        "写入草稿",
+        "写入",
+    },
+    key=lambda value: (-len(value), value),
+))
+_NATURAL_ASSENT_FORM_RE = re.compile(
+    "|".join(re.escape(value) for value in _NATURAL_ASSENT_FORMS)
+)
+_NATURAL_ACTION_ASSENT_FORMS = tuple(sorted(
+    {
+        *PENDING_BATCH_ASSENT_TEXTS,
+        "确认",
+        "执行",
+        "确定",
+        "同意",
+        "写入草稿",
+        "写入",
+    },
+    key=lambda value: (-len(value), value),
+))
+_NATURAL_ACTION_ASSENT_RE = re.compile(
+    "|".join(re.escape(value) for value in _NATURAL_ACTION_ASSENT_FORMS)
+)
+_NATURAL_SUBMIT_RE = re.compile(
+    r"(?:(?:并且?|然后(?:就)?|再|接着|随后|完成后|加入后|添加后|"
+    r"写入后|加好后|加完|后|完)?(?:就)?)"
+    r"(?:提交|提审|送审)(?:草稿|批次|审核)?"
+)
+_NATURAL_QUESTION_RE = re.compile(
+    r"[?？]|(?:吗|么|嘛|呢|好不好|行不行)\s*[。.!！]*$|"
+    r"^\s*(?:是否|能否|能不能|可否|可不可以|要不要|怎么|如何|为什么|是不是)"
+)
+_NATURAL_NEGATION_RE = re.compile(
+    r"(?:(?:先|暂时)\s*)?(?:不要|别|不用|无需|不必|不再|不)\s*"
+    r"(?:加入|添加|加|写入|确认|执行|提交|提审|送审)|取消|停止"
+)
+_NATURAL_UNSAFE_FRAME_RE = re.compile(
+    r"(?:他说|她说|他们说|有人说|他让|她让|他们让|叫你|让你|要求你|"
+    r"引用|转述|复述|解释|举例|例子|假设|如果|原话|不是让你|并非让你)"
+)
+_NATURAL_OTHER_ACTION_RE = re.compile(
+    r"(?:删除|删掉|移除|修改|改成|改为|换成|替换|移动|挪开|挪到|"
+    r"顺延|重排|排序|调码|重新编码|放在|放到|排在|提前|靠前|靠后|撤回)"
+)
+_NATURAL_ASSENT_PREFIX_RE = (
+    r"(?:(?:好的|好|可以|行|嗯|麻烦|劳驾|请|我确认|我想|我要|"
+    r"直接|现在|马上|立刻)){0,4}"
+)
+_NATURAL_ASSENT_ACTOR_RE = r"(?:(?:帮我|帮忙))?"
+_NATURAL_ASSENT_OBJECT_RE = (
+    r"(?:当前候选|这些候选|全部候选|这个候选|这些|这个|它们|候选|"
+    r"全部|所有)"
+)
+_NATURAL_ASSENT_TARGET_RE = (
+    rf"(?:(?:把|将){_NATURAL_ASSENT_OBJECT_RE}|"
+    rf"{_NATURAL_ASSENT_OBJECT_RE})?"
+)
+_NATURAL_ASSENT_DESTINATION_RE = (
+    rf"(?:{_NATURAL_ASSENT_OBJECT_RE}|(?:到|入)?草稿)?"
+)
+_NATURAL_ASSENT_BRIDGE_RE = (
+    r"(?:(?:确认|执行)(?=(?:加入|添加|加|都加|写入)))?"
+)
+_NATURAL_ASSENT_SUFFIX_RE = r"(?:(?:一下|吧|啦|了|呀|哦)){0,3}"
+_NATURAL_ASSENT_WHOLE_RE = re.compile(
+    rf"{_NATURAL_ASSENT_PREFIX_RE}"
+    rf"{_NATURAL_ASSENT_ACTOR_RE}"
+    rf"{_NATURAL_ASSENT_TARGET_RE}"
+    rf"{_NATURAL_ASSENT_BRIDGE_RE}"
+    rf"(?:{_NATURAL_ASSENT_FORM_RE.pattern})"
+    rf"{_NATURAL_ASSENT_DESTINATION_RE}"
+    rf"(?:{_NATURAL_SUBMIT_RE.pattern})?"
+    rf"{_NATURAL_ASSENT_SUFFIX_RE}"
+)
+_NATURAL_ASSENT_ACTION_START_RE = re.compile(
+    rf"^{_NATURAL_ASSENT_PREFIX_RE}"
+    rf"{_NATURAL_ASSENT_ACTOR_RE}"
+    rf"{_NATURAL_ASSENT_TARGET_RE}"
+    rf"{_NATURAL_ASSENT_BRIDGE_RE}"
+    rf"(?:{_NATURAL_ACTION_ASSENT_RE.pattern})"
+)
+
+
+def parse_pending_assent_phrase(
+    text: str,
+    *,
+    allowed_operands: tuple[str, ...] = (),
+) -> PendingAssentPhrase:
+    """Parse natural whole-state assent while deriving zero operands from text."""
+    source = unicodedata.normalize("NFKC", str(text or "")).strip()
+    source = re.sub(r"^\s*@\S+\s*", "", source, count=1)
+    source = re.sub(r"^\s*(?:喵喵|键道)\s*", "", source, count=1)
+    submit_after = bool(
+        _NATURAL_SUBMIT_RE.search(source)
+        or any(
+            form in source
+            for form in PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS
+        )
+    )
+    question = _NATURAL_QUESTION_RE.search(source) is not None
+    negation = _NATURAL_NEGATION_RE.search(source) is not None
+    framed = bool(
+        re.search(r"[\"'`“”‘’「」『』]", source)
+        or _NATURAL_UNSAFE_FRAME_RE.search(source)
+    )
+
+    residual = re.sub(r"[\s，,。.!！、;；:：~～…（）()【】\[\]<>《》]+", "", source)
+    for operand in sorted(
+        {
+            unicodedata.normalize("NFKC", str(value or "")).strip()
+            for value in allowed_operands
+            if str(value or "").strip()
+        },
+        key=lambda value: (-len(value), value),
+    ):
+        residual = residual.replace(operand, "")
+    whole_match = _NATURAL_ASSENT_WHOLE_RE.fullmatch(residual) is not None
+    action_start = _NATURAL_ASSENT_ACTION_START_RE.search(residual) is not None
+    action_anywhere = _NATURAL_ACTION_ASSENT_RE.search(residual) is not None
+    other_action = _NATURAL_OTHER_ACTION_RE.search(residual) is not None
+    recognized = bool(
+        whole_match
+        or action_start
+        or negation
+        or ((framed or other_action) and action_anywhere)
+    )
+    if not recognized:
+        return PendingAssentPhrase(submit_after=submit_after)
+    if question:
+        return PendingAssentPhrase(True, False, submit_after, "question")
+    if negation:
+        return PendingAssentPhrase(True, False, submit_after, "negation")
+    if framed:
+        return PendingAssentPhrase(True, False, submit_after, "framed")
+    if other_action:
+        return PendingAssentPhrase(True, False, submit_after, "other_action")
+    if not whole_match:
+        return PendingAssentPhrase(True, False, submit_after, "extra_content")
+    return PendingAssentPhrase(True, True, submit_after)
 
 
 _PLACEHOLDER_OPERAND_RE = re.compile(
@@ -316,13 +486,20 @@ def parse_advertised_set_reference(text: str) -> AdvertisedSetReference:
                 body = match.group("body")
                 break
         exclusions = _split_set_reference_words(body)
-        if not exclusions:
-            return AdvertisedSetReference()
+        if exclusions:
+            return AdvertisedSetReference(
+                matched=True,
+                exclusions=exclusions,
+                submit_after=verb in PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS,
+                advertised_verb=verb,
+            )
+
+    natural_assent = parse_pending_assent_phrase(source)
+    if natural_assent.matched:
         return AdvertisedSetReference(
             matched=True,
-            exclusions=exclusions,
-            submit_after=verb in PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS,
-            advertised_verb=verb,
+            submit_after=natural_assent.submit_after,
+            advertised_verb=source.strip(),
         )
 
     if _SET_REFERENCE_REMAINDER_ACTION_RE.search(source) is None:
@@ -428,6 +605,220 @@ def pending_batch_confirmation_copy() -> str:
     )
 
 
+_SERVER_BACKED_WORD_SET_HEADER = "本轮服务端查询确认未收录的词："
+_SERVER_BACKED_WORD_SET_FOOTER = "可以把列表中的词加入草稿。"
+
+
+def render_server_backed_word_set(words: object) -> str:
+    """Render one no-code inventory solely from a trusted absent-word set."""
+    if not isinstance(words, (list, tuple)):
+        return ""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_word in words:
+        word = str(raw_word or "").strip()
+        if (
+            not word
+            or len(word) > 128
+            or any(marker in word for marker in ("\r", "\n", "「", "」"))
+            or word in seen
+        ):
+            return ""
+        normalized.append(word)
+        seen.add(word)
+    if len(normalized) < 2:
+        return ""
+    return "\n".join((
+        _SERVER_BACKED_WORD_SET_HEADER,
+        *(f"- 「{word}」" for word in normalized),
+        _SERVER_BACKED_WORD_SET_FOOTER,
+    ))
+
+
+def advertised_word_set_words(text: str) -> tuple[str, ...]:
+    """Parse only the deterministic server-backed no-code inventory shape."""
+    lines = str(text or "").strip().splitlines()
+    if (
+        len(lines) < 4
+        or lines[0] != _SERVER_BACKED_WORD_SET_HEADER
+        or lines[-1] != _SERVER_BACKED_WORD_SET_FOOTER
+    ):
+        return ()
+    words: list[str] = []
+    seen: set[str] = set()
+    for line in lines[1:-1]:
+        match = re.fullmatch(r"- 「([^」\n]{1,128})」", line)
+        if match is None:
+            return ()
+        word = match.group(1).strip()
+        if not word or word in seen:
+            return ()
+        words.append(word)
+        seen.add(word)
+    return tuple(words) if len(words) >= 2 else ()
+
+
+def render_server_backed_batch_candidates(
+    items: object,
+    candidate_scopes: object,
+) -> str:
+    """Render one complete batch solely from sealed server-record fields."""
+    if (
+        not isinstance(items, list)
+        or len(items) < 2
+        or not isinstance(candidate_scopes, list)
+    ):
+        return ""
+
+    scopes_by_word: dict[str, tuple[tuple[str, bool], ...]] = {}
+    for raw_scope in candidate_scopes:
+        if not isinstance(raw_scope, dict):
+            return ""
+        word = unicodedata.normalize(
+            "NFKC",
+            str(raw_scope.get("word") or ""),
+        ).strip()
+        raw_candidates = raw_scope.get("candidates")
+        if (
+            not word
+            or word in scopes_by_word
+            or not isinstance(raw_candidates, list)
+            or not raw_candidates
+        ):
+            return ""
+        candidates: list[tuple[str, bool]] = []
+        seen_codes: set[str] = set()
+        for raw_candidate in raw_candidates:
+            if not isinstance(raw_candidate, (list, tuple)) or len(raw_candidate) != 2:
+                return ""
+            code = unicodedata.normalize(
+                "NFKC",
+                str(raw_candidate[0] or ""),
+            ).strip().lower()
+            occupied = raw_candidate[1]
+            if (
+                re.fullmatch(r"[a-z]{1,12}", code) is None
+                or not isinstance(occupied, bool)
+                or code in seen_codes
+            ):
+                return ""
+            candidates.append((code, occupied))
+            seen_codes.add(code)
+        scopes_by_word[word] = tuple(candidates)
+
+    normalized_items: list[tuple[str, str, bool]] = []
+    seen_words: set[str] = set()
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            return ""
+        word = unicodedata.normalize(
+            "NFKC",
+            str(raw_item.get("word") or ""),
+        ).strip()
+        code = unicodedata.normalize(
+            "NFKC",
+            str(raw_item.get("code") or ""),
+        ).strip().lower()
+        if (
+            not word
+            or len(word) > 128
+            or any(marker in word for marker in ("\r", "\n", "「", "」"))
+            or word in seen_words
+            or re.fullmatch(r"[a-z]{1,12}", code) is None
+            or word not in scopes_by_word
+            or code not in {candidate for candidate, _occupied in scopes_by_word[word]}
+        ):
+            return ""
+        normalized_items.append(
+            (word, code, bool(raw_item.get("needsManualReview", True)))
+        )
+        seen_words.add(word)
+    if seen_words != set(scopes_by_word):
+        return ""
+
+    lines = [
+        f"已根据当前服务端审词记录重列以下 {len(normalized_items)} 个词的候选："
+    ]
+    for word_index, (word, recommended_code, needs_review) in enumerate(
+        normalized_items,
+        start=1,
+    ):
+        lines.extend(("", f"{word_index}. 「{word}」", "   候选："))
+        for candidate_index, (code, occupied) in enumerate(
+            scopes_by_word[word],
+            start=1,
+        ):
+            occupancy_copy = "已占用" if occupied else "空位"
+            recommended_copy = "（推荐）" if code == recommended_code else ""
+            lines.append(
+                f"   {candidate_index}. {code} — {occupancy_copy}{recommended_copy}"
+            )
+        review_copy = "需管理员审核" if needs_review else "可自动通过"
+        lines.append(f"   审核结论：{review_copy}")
+
+    lines.extend((
+        "",
+        "确认后才会写入草稿。",
+        pending_batch_confirmation_copy(),
+    ))
+    return "\n".join(lines)
+
+
+def pending_single_candidate_confirmation_copy() -> str:
+    """Render the only whole-state assent forms for one-word candidates."""
+    return (
+        f"回复{_quoted_choices(PENDING_SINGLE_ADD_ADVERTISED_FORMS)}只加入草稿；"
+        f"回复{_quoted_choices(PENDING_SINGLE_ADD_AND_SUBMIT_ADVERTISED_FORMS)}"
+        "则加入后提交。"
+    )
+
+
+def single_word_candidate_footer(candidate_count: int) -> str:
+    """Render truthful selection and whole-state actions for one word."""
+    lines = []
+    if candidate_count > 1:
+        example = "2、4" if candidate_count >= 4 else "1、2"
+        lines.append(
+            "可回复编号或编码选择其他编码；"
+            f"可多选，如「添加{example}」。"
+        )
+    lines.append(pending_single_candidate_confirmation_copy())
+    return "\n".join(lines)
+
+
+def ensure_single_word_candidate_copy(text: str, candidate_count: int) -> str:
+    """Normalize legacy one-word footers to the shared truthful contract."""
+    response = str(text or "")
+    selection_copy = ""
+    if candidate_count > 1:
+        example = "2、4" if candidate_count >= 4 else "1、2"
+        selection_copy = (
+            "可回复编号或编码选择其他编码；"
+            f"可多选，如「添加{example}」。"
+        )
+    for old in (
+        "可回复编号、编码，或「都加」；可多选，如「添加2、4」。",
+        "可回复编号、编码，或「都加」；",
+        "可回复编号、编码，或「都加」。",
+        "也可回复编号选其他编码。",
+    ):
+        response = response.replace(old, selection_copy)
+    if candidate_count <= 1:
+        response = re.sub(
+            r"可多选，如[「“『]添加\d+(?:、\d+)+[」”』][。.]?",
+            "",
+            response,
+        )
+    elif "可回复编号或编码选择其他编码" not in response:
+        response = response.rstrip() + "\n" + selection_copy
+    confirmation_copy = pending_single_candidate_confirmation_copy()
+    if confirmation_copy not in response:
+        response = response.rstrip() + "\n" + confirmation_copy
+    response = re.sub(r"[ \t]+(?=\n|$)", "", response)
+    response = re.sub(r"\n{3,}", "\n\n", response)
+    return response.strip()
+
+
 def scoped_multi_word_candidate_copy(words: tuple[str, ...]) -> str:
     """Advertise only word-scoped numbered selection for repeated lists."""
     clean_words = tuple(dict.fromkeys(
@@ -452,6 +843,8 @@ class AdvertisedReplyContract:
     batch_assent_forms: tuple[str, ...] = ()
     candidate_selection: bool = False
     deictic_batch_command: bool = False
+    binding_advertisement: bool = False
+    word_set_advertisement: bool = False
 
     @property
     def requires_live_state(self) -> bool:
@@ -460,6 +853,8 @@ class AdvertisedReplyContract:
             or self.batch_assent_forms
             or self.candidate_selection
             or self.deictic_batch_command
+            or self.binding_advertisement
+            or self.word_set_advertisement
         )
 
 
@@ -472,6 +867,17 @@ _DEICTIC_BATCH_ADVERTISEMENT_RE = re.compile(
     r"(?<!已)(?:将|把)这\s*[1-9]\d{0,2}\s*个词"
     r"(?:都|全部)?(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿"
     r"(?:(?:并|然后|再)提交)?"
+)
+_WORD_SET_ADVERTISEMENT_RE = re.compile(
+    r"(?:可以|可|能够|能)?(?:把|将)?"
+    r"(?:列表中(?:的)?|上述|以上|这些|这批|其余|剩下(?:的)?)"
+    r"(?:词|词条)?(?:都|全部)?"
+    r"(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿"
+)
+_QUOTED_WORD_SET_COMMAND_RE = re.compile(
+    r"(?:回复|发送|直接发|可直接发)[^\n]{0,32}"
+    r"[「“『](?:把|将)[^→\n]{1,512}?"
+    r"(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿[」”』]"
 )
 
 
@@ -515,20 +921,45 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         return tuple(found)
 
     candidate_selection = any(
-        f" 添加1{right}" in normalized
+        re.search(
+            re.escape(left) + r"添加[1-9]\d*(?:[、,，][1-9]\d*)*" + re.escape(right),
+            normalized,
+        )
+        is not None
+        or f" 添加1{right}" in normalized
         or f" 添加2、4{right}" in normalized
-        for _left, right in _ADVERTISED_QUOTE_PAIRS
+        for left, right in _ADVERTISED_QUOTE_PAIRS
     )
-    return AdvertisedReplyContract(
-        generic_assent_forms=advertised_forms(PENDING_CONFIRM_ADVERTISED_FORMS),
-        batch_assent_forms=advertised_forms((
+    generic_assent_forms = advertised_forms(PENDING_CONFIRM_ADVERTISED_FORMS)
+    batch_assent_forms = advertised_forms((
             *PENDING_BATCH_ADD_ADVERTISED_FORMS,
             *PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS,
-        )),
+        ))
+    deictic_batch_command = (
+        _DEICTIC_BATCH_ADVERTISEMENT_RE.search(normalized) is not None
+    )
+    has_binding_pairs = bool(advertised_batch_binding_pairs(normalized))
+    word_set_advertisement = bool(
+        _WORD_SET_ADVERTISEMENT_RE.search(normalized)
+        or _QUOTED_WORD_SET_COMMAND_RE.search(normalized)
+        or (deictic_batch_command and not has_binding_pairs)
+    )
+    binding_advertisement = bool(
+        generic_assent_forms
+        or candidate_selection
+        or (
+            batch_assent_forms
+            and (has_binding_pairs or not word_set_advertisement)
+        )
+        or (deictic_batch_command and has_binding_pairs)
+    )
+    return AdvertisedReplyContract(
+        generic_assent_forms=generic_assent_forms,
+        batch_assent_forms=batch_assent_forms,
         candidate_selection=candidate_selection,
-        deictic_batch_command=(
-            _DEICTIC_BATCH_ADVERTISEMENT_RE.search(normalized) is not None
-        ),
+        deictic_batch_command=deictic_batch_command,
+        binding_advertisement=binding_advertisement,
+        word_set_advertisement=word_set_advertisement,
     )
 
 

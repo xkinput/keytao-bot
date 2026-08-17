@@ -61,6 +61,8 @@ S22 reuses the first two S19 word/character declarations for the orphaned
 re-review advertisement replay and applies the same rig-owned cleanup.
 S23 keeps the first nine S19 declarations for stale advertised-assent recovery;
 the forced state loss is rig-owned and does not touch the dictionary.
+S24 reuses the S18 `还车` pronunciation fixture for one single-word candidate;
+it does not reuse S18's multi-selection action and adds no new dictionary fact.
 
 ## Prerequisites
 
@@ -227,6 +229,13 @@ draft writes. A following unquoted `加入并提交` must write exactly the fres
 displayed set to one batch. Offline safety coverage also forces an unresolvable
 quoted display and requires an honest renderer-backed `加词 ...` alternative
 without minting a write ticket or inventing any word.
+
+S24 replays the single-word natural-assent incident. It establishes the exact
+`还车@htje` live candidate, verifies that this shape advertises only `加入` and
+`加入并提交` as whole-state assent, then natively quotes that bot message and
+sends `加入草稿，然后就提交。`. The exact state-derived item must reach one
+submitted batch with at most one server-bound confirmation. No reply may ask
+for a full word-plus-code line or claim that the selecting quote did not match.
 
 Optional overrides:
 

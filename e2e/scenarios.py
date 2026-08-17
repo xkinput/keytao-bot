@@ -7,7 +7,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from keytao_bot.utils.pending_confirmation import advertised_batch_binding_pairs
+from keytao_bot.utils.pending_confirmation import (
+    advertised_batch_binding_pairs,
+    advertised_reply_contract,
+)
 
 from .recording import ArtifactRecorder
 from .runtime import E2EBotHarness, LocalNextClient
@@ -44,6 +47,20 @@ def item_key(item: dict[str, Any]) -> tuple[str, str, str]:
         str(item.get("action") or ""),
         str(item.get("word") or ""),
         str(item.get("code") or ""),
+    )
+
+
+def same_unique_item_set(actual: object, expected: object) -> bool:
+    """Compare complete item collections without treating insertion order as data."""
+    if not isinstance(actual, (list, tuple)) or not isinstance(expected, (list, tuple)):
+        return False
+    actual_items = tuple(actual)
+    expected_items = tuple(expected)
+    return bool(
+        len(actual_items) == len(expected_items)
+        and len(actual_items) == len(set(actual_items))
+        and len(expected_items) == len(set(expected_items))
+        and set(actual_items) == set(expected_items)
     )
 
 
@@ -1651,14 +1668,13 @@ async def scenario_s19(ctx: ScenarioContext) -> dict[str, Any]:
     messages.append("确认")
     replies.append(await ctx.send(messages[-1]))
     draft = await ctx.draft()
-    actual_words = [
+    actual_words = tuple(
         str(item.get("word") or "")
         for item in draft.get("items", [])
         if isinstance(item, dict)
-    ]
+    )
     require(
-        len(actual_words) == len(expected_words)
-        and set(actual_words) == set(expected_words)
+        same_unique_item_set(actual_words, expected_words)
         and all(
             item.get("action") == "Create"
             for item in draft.get("items", [])
@@ -1680,10 +1696,14 @@ async def scenario_s19(ctx: ScenarioContext) -> dict[str, Any]:
     require(write_calls, "S19 confirmation did not invoke the batch draft tool")
     for event in write_calls:
         tool_items = event.get("arguments", {}).get("items", [])
+        tool_words = tuple(
+            str(item.get("word") or "")
+            for item in tool_items
+            if isinstance(item, dict)
+        )
         require(
             isinstance(tool_items, list)
-            and [str(item.get("word") or "") for item in tool_items]
-            == list(expected_words),
+            and same_unique_item_set(tool_words, expected_words),
             f"S19 tool call was not bound to the complete resolved set: {event}",
         )
     all_reply_text = [
@@ -1782,8 +1802,7 @@ async def scenario_s20(ctx: ScenarioContext) -> dict[str, Any]:
         for item in actual_items
     )
     require(
-        len(actual_items) == len(advertised_pairs)
-        and actual_pairs == advertised_pairs
+        same_unique_item_set(actual_pairs, advertised_pairs)
         and all(item.get("action") == "Create" for item in actual_items),
         f"S20 draft differs from the native-quoted advertised batch: {draft}",
     )
@@ -1810,8 +1829,8 @@ async def scenario_s20(ctx: ScenarioContext) -> dict[str, Any]:
             if isinstance(item, dict)
         )
         require(
-            len(tool_items) == len(advertised_pairs)
-            and tool_pairs == advertised_pairs,
+            isinstance(tool_items, list)
+            and same_unique_item_set(tool_pairs, advertised_pairs),
             f"S20 tool call was not bound to the complete displayed set: {event}",
         )
 
@@ -1929,9 +1948,9 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     first_items = [
         item for item in first_draft.get("items", []) if isinstance(item, dict)
     ]
+    first_words = tuple(str(item.get("word") or "") for item in first_items)
     require(
-        [str(item.get("word") or "") for item in first_items]
-        == list(expected_remaining),
+        same_unique_item_set(first_words, expected_remaining),
         f"S21 modifier did not write ticket minus {excluded_word}: {first_draft}",
     )
     require(
@@ -1947,7 +1966,7 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
             if isinstance(item, dict)
         ]
         require(
-            tool_words == list(expected_remaining),
+            same_unique_item_set(tool_words, expected_remaining),
             f"S21 modifier tool call escaped the resolved exact set: {event}",
         )
     first_batch_id = str(first_draft.get("batchId") or "")
@@ -2009,15 +2028,15 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     rendered_items = [
         item for item in rendered_draft.get("items", []) if isinstance(item, dict)
     ]
-    require(
-        tuple(
-            (
-                str(item.get("word") or "").strip(),
-                str(item.get("code") or "").strip().lower(),
-            )
-            for item in rendered_items
+    rendered_pairs = tuple(
+        (
+            str(item.get("word") or "").strip(),
+            str(item.get("code") or "").strip().lower(),
         )
-        == second_pairs,
+        for item in rendered_items
+    )
+    require(
+        same_unique_item_set(rendered_pairs, second_pairs),
         f"S21 rendered remediation did not execute the record exact set: {rendered_draft}",
     )
     rendered_writes = batch_write_events(rendered_cutoff)
@@ -2032,7 +2051,7 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
             if isinstance(item, dict)
         )
         require(
-            tool_pairs == second_pairs,
+            same_unique_item_set(tool_pairs, second_pairs),
             f"S21 rendered remediation tool call escaped the live ticket: {event}",
         )
 
@@ -2090,7 +2109,10 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
     )
     require(
         len(discovery_pairs) == len(S22_BATCH_WORDS)
-        and tuple(word for word, _code in discovery_pairs) == S22_BATCH_WORDS,
+        and same_unique_item_set(
+            tuple(word for word, _code in discovery_pairs),
+            S22_BATCH_WORDS,
+        ),
         f"S22 discovery did not render the exact word set: {discovery}",
     )
     require(
@@ -2124,7 +2146,10 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
     )
     require(
         len(rereview_pairs) == word_count
-        and tuple(word for word, _code in rereview_pairs) == S22_BATCH_WORDS,
+        and same_unique_item_set(
+            tuple(word for word, _code in rereview_pairs),
+            S22_BATCH_WORDS,
+        ),
         f"S22 re-review invented, dropped, or omitted a displayed binding: {rereview}",
     )
     require(
@@ -2231,7 +2256,10 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
                 f"S22 claimed completed approval without an approved batch: {completed_batch}",
             )
         require(
-            advertised_batch_binding_pairs(replies[-1]) == rereview_pairs,
+            same_unique_item_set(
+                advertised_batch_binding_pairs(replies[-1]),
+                rereview_pairs,
+            ),
             f"S22 completion copy did not honestly render the exact batch: {replies[-1]}",
         )
     else:
@@ -2245,7 +2273,8 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
         require(batch_id, f"S22 did not materialize a draft batch: {draft}")
 
     require(
-        actual_item_keys == expected_item_keys and actual_pairs == rereview_pairs,
+        same_unique_item_set(actual_item_keys, expected_item_keys)
+        and same_unique_item_set(actual_pairs, rereview_pairs),
         "S22 advertised path did not land the exact displayed bindings in one batch: "
         f"status={batch_status}, actual={actual_item_keys}",
     )
@@ -2283,7 +2312,7 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
             if isinstance(item, dict)
         )
         require(
-            event_pairs == rereview_pairs,
+            same_unique_item_set(event_pairs, rereview_pairs),
             f"S22 batch tool escaped the re-established ticket: {event}",
         )
 
@@ -2467,7 +2496,7 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
         require(batch_id, f"S23 did not materialize one draft batch: {draft}")
 
     require(
-        actual_keys == expected_keys,
+        same_unique_item_set(actual_keys, expected_keys),
         "S23 fresh bare assent did not write exactly its displayed set: "
         f"expected={expected_keys}, actual={actual_keys}",
     )
@@ -2489,7 +2518,7 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
             if isinstance(item, dict)
         )
         require(
-            event_pairs == fresh_pairs,
+            same_unique_item_set(event_pairs, fresh_pairs),
             f"S23 write escaped the recovered ticket: {event}",
         )
 
@@ -2506,6 +2535,176 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
             "recoveryWrites": len(recovery_writes),
             "confirmationSteps": confirmation_steps,
             "batchId": batch_id,
+            "batchStatus": batch_status,
+        },
+    }
+
+
+S24_WORD = "还车"
+S24_RECOMMENDED_CODE = "htje"
+S24_NATURAL_ASSENT = "加入草稿，然后就提交。"
+
+
+async def scenario_s24(ctx: ScenarioContext) -> dict[str, Any]:
+    """A native quote plus natural assent consumes one exact live candidate."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S24 draft cleanup failed: {cleanup}")
+    require(
+        not (await ctx.draft()).get("items"),
+        "S24 requires an empty actor draft before candidate discovery",
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    discovery_message = f"喵喵 {S24_WORD}"
+    messages.append(discovery_message)
+    discovery = await ctx.send_group(discovery_message, to_me=True)
+    replies.append(discovery)
+    discovery_message_id = ctx.last_reply_message_id
+    require(
+        isinstance(discovery_message_id, int) and discovery_message_id > 0,
+        "S24 discovery exposed no bot message id",
+    )
+    binding = re.search(
+        rf"是否以编码\s+(?P<code>[a-z]{{1,12}})\s+将「{re.escape(S24_WORD)}」加入草稿",
+        discovery,
+    )
+    require(binding is not None, f"S24 discovery omitted its exact candidate: {discovery}")
+    recommended_code = binding.group("code")
+    require(
+        recommended_code == S24_RECOMMENDED_CODE,
+        f"S24 fixture drifted from {S24_RECOMMENDED_CODE}: {discovery}",
+    )
+    advertised_forms = advertised_reply_contract(discovery).batch_assent_forms
+    require(
+        advertised_forms == ("加入", "加入并提交"),
+        f"S24 single-word copy advertised the wrong forms: {advertised_forms}; {discovery}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        "S24 discovery wrote before assent",
+    )
+
+    cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S24_NATURAL_ASSENT)
+    assent_reply = await ctx.send_group_reply(
+        S24_NATURAL_ASSENT,
+        reply_message_id=discovery_message_id,
+        to_me=True,
+    )
+    replies.append(assent_reply)
+
+    completed_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=cutoff,
+    )
+    confirmation_steps = 0
+    if not completed_batch_id:
+        confirmation_match = re.search(r"确认票据\s+[A-F0-9]{6}", assent_reply)
+        confirmation_command = (
+            confirmation_match.group(0)
+            if confirmation_match is not None
+            else "确认"
+            if "确认" in assent_reply
+            else ""
+        )
+        require(
+            bool(confirmation_command),
+            f"S24 natural assent neither submitted nor reached one bound confirmation: {assent_reply}",
+        )
+        confirmation_steps = 1
+        messages.append(confirmation_command)
+        replies.append(await ctx.send_group(confirmation_command, to_me=True))
+        completed_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=cutoff,
+        )
+
+    require(completed_batch_id, "S24 natural assent never completed submission")
+    require(confirmation_steps <= 1, "S24 used more than one server-bound confirmation")
+    completed_batch = await ctx.next_client.get_admin_batch(
+        batch_id=completed_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    batch_status = str(completed_batch.get("status") or "")
+    require(
+        batch_status in {"Submitted", "Approved"},
+        f"S24 batch never reached submission: {completed_batch}",
+    )
+    submitted_items = [
+        item
+        for item in completed_batch.get("pullRequests", [])
+        if isinstance(item, dict)
+    ]
+    require(
+        len(submitted_items) == 1
+        and item_key(submitted_items[0])
+        == ("Create", S24_WORD, S24_RECOMMENDED_CODE),
+        f"S24 submitted a target outside the live candidate: {completed_batch}",
+    )
+
+    post_assent_replies = replies[1:]
+    forbidden_copy = (
+        "把词条和编码写完整",
+        "完整指令",
+        "未能匹配",
+        "没有匹配当前可执行候选",
+    )
+    require(
+        not any(
+            marker in reply
+            for reply in post_assent_replies
+            for marker in forbidden_copy
+        ),
+        f"S24 natural assent hit dishonest full-operand remediation: {post_assent_replies}",
+    )
+    write_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") in {"keytao_create_phrase", "keytao_batch_add_to_draft"}
+    ]
+    require(write_events, "S24 natural assent never reached a draft write tool")
+    for event in write_events:
+        arguments = event.get("arguments", {})
+        event_pairs = (
+            tuple(
+                (
+                    str(item.get("word") or "").strip(),
+                    str(item.get("code") or "").strip().lower(),
+                )
+                for item in arguments.get("items", [])
+                if isinstance(item, dict)
+            )
+            if event.get("name") == "keytao_batch_add_to_draft"
+            else ((
+                str(arguments.get("word") or "").strip(),
+                str(arguments.get("code") or "").strip().lower(),
+            ),)
+        )
+        require(
+            event_pairs == ((S24_WORD, S24_RECOMMENDED_CODE),),
+            f"S24 write escaped the live candidate state: {event}",
+        )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "word": S24_WORD,
+            "code": S24_RECOMMENDED_CODE,
+            "naturalAssent": S24_NATURAL_ASSENT,
+            "advertisedForms": list(advertised_forms),
+            "discoveryMessageId": discovery_message_id,
+            "confirmationSteps": confirmation_steps,
+            "batchId": completed_batch_id,
             "batchStatus": batch_status,
         },
     }
@@ -2535,6 +2734,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S21", "assent modifier and rendered remediation closure", scenario_s21),
     Scenario("S22", "re-review advertisement state coupling", scenario_s22),
     Scenario("S23", "stale advertised assent recovery and fresh closure", scenario_s23),
+    Scenario("S24", "single-word natural quoted assent", scenario_s24),
 )
 
 

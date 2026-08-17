@@ -45,11 +45,13 @@ from ..utils import keytao_review, review_flags
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     advertised_batch_binding_pairs,
+    ensure_single_word_candidate_copy,
     ensure_multi_word_candidate_copy,
     parse_pending_candidate_selection,
     pending_confirmation_copy,
     render_executable_suggestion,
     render_remediation_reply,
+    single_word_candidate_footer,
 )
 from ..utils.memory_store import (
     ChatMemoryContext,
@@ -118,6 +120,7 @@ from .chat_routing import (
     _message_authorizes_replace_char,
     _parse_pending_choice_index,
     _pending_owner_label,
+    _pending_assent_rejection_response,
     _pending_tool_assent_intent,
     _pending_tool_confirmation_command,
     _pending_tool_confirmation_matches,
@@ -305,6 +308,41 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
 
     if not candidates:
         candidates = [(recommended_code, False)]
+
+    reading_pinyins = {
+        int(match.group("index")): re.sub(
+            r"\s+",
+            " ",
+            match.group("pinyin"),
+        ).strip()
+        for match in re.finditer(
+            r"(?m)^\s*(?P<index>\d+)\.\s*"
+            r"(?P<pinyin>[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ\s]+?)"
+            r"\s*[；;]\s*来源(?:\s|$)",
+            response,
+        )
+    }
+    group_headings = list(re.finditer(
+        r"(?m)^\s*候选编码[（(]读音\s*(?P<index>\d+)[）)]\s*[:：]\s*$",
+        response,
+    ))
+    for heading_index, heading in enumerate(group_headings):
+        pinyin = reading_pinyins.get(int(heading.group("index")), "")
+        if not pinyin:
+            continue
+        section_end = (
+            group_headings[heading_index + 1].start()
+            if heading_index + 1 < len(group_headings)
+            else len(response)
+        )
+        section = response[heading.end():section_end]
+        for match in re.finditer(
+            r"(?m)^\s*(?:\d+\.\s*)?(?P<code>[a-z]+)\s*[-—–]\s*.+$",
+            section,
+        ):
+            code = match.group("code")
+            if code in seen_codes:
+                pronunciation_codes[code] = pinyin
 
     review_line_match = re.search(
         r'(?m)^\s*(?:喵喵)?审词：(.+?)\s*$',
@@ -1395,8 +1433,21 @@ async def _revalidate_referenced_add_pending(
     referenced_state: PendingAddWord,
     platform: str,
     user_id: str,
+    *,
+    failure_reasons: Optional[List[str]] = None,
 ) -> Optional[PendingAddWord]:
     """Rebuild a bot-authored quoted candidate from the current reviewed reading."""
+    def reject(reason: str) -> None:
+        if failure_reasons is not None:
+            failure_reasons.append(reason)
+        logger.info(
+            "[pending_add_revalidation] rejected word=%s code=%s reason=%s",
+            referenced_state.word,
+            referenced_state.recommended_code,
+            reason,
+        )
+        return None
+
     review_json = await call_tool_function(
         "keytao_prepare_reviewed_add",
         {"word": referenced_state.word},
@@ -1406,47 +1457,120 @@ async def _revalidate_referenced_add_pending(
     try:
         review = json.loads(review_json)
     except Exception:
-        return None
-    if (
-        not isinstance(review, dict)
-        or not review.get("success")
-        or review.get("pronunciationUnresolved")
-        or str(review.get("word") or "").strip() != referenced_state.word
-    ):
-        return None
+        return reject("当前审词服务没有返回可验证结果")
+    if not isinstance(review, dict) or not review.get("success"):
+        return reject("当前审词服务没有返回可验证结果")
+    if review.get("pronunciationUnresolved"):
+        return reject(f"「{referenced_state.word}」当前读音无法确定")
+    current_word = str(review.get("word") or "").strip()
+    if current_word != referenced_state.word:
+        return reject(
+            f"当前审词结果指向「{current_word or '未知词条'}」，"
+            f"不再是「{referenced_state.word}」"
+        )
 
     recommended_code = str(referenced_state.recommended_code or "").strip().lower()
-    referenced_occupancy = {
-        str(code).strip().lower(): bool(occupied)
+    referenced_candidates = [
+        (str(code).strip().lower(), bool(occupied))
         for code, occupied in referenced_state.candidates
-    }
-    if not recommended_code or recommended_code not in referenced_occupancy:
-        return None
+    ]
+    referenced_codes = [code for code, _occupied in referenced_candidates]
+    if (
+        not recommended_code
+        or recommended_code not in referenced_codes
+        or len(referenced_codes) != len(set(referenced_codes))
+    ):
+        return reject("引用候选缺少唯一、可验证的推荐编码")
+    referenced_occupancy = dict(referenced_candidates)
 
     matching_pronunciation: Optional[Dict] = None
-    status_map: Dict[str, Dict] = {}
+    current_statuses: List[Dict] = []
+    current_candidates: List[Tuple[str, bool]] = []
+    current_pronunciation_codes: Dict[str, str] = {}
+    current_pronunciation_recommended_codes: List[str] = []
+    code_remarks: Dict[str, str] = {}
+    audit_preview = _format_pre_submit_audit_preview(review, recommended_code)
+    if not audit_preview:
+        audit_preview = "自动审核：该词需管理员审核（当前审词证据不足）"
     for pronunciation in review.get("pronunciations") or []:
         if not isinstance(pronunciation, dict):
             continue
-        pronunciation_statuses = {
-            str(status.get("code") or "").strip().lower(): status
-            for status in pronunciation.get("candidateStatuses") or []
-            if isinstance(status, dict) and status.get("code")
-        }
-        if recommended_code in pronunciation_statuses:
+        pinyin = str(pronunciation.get("pinyin") or "").strip()
+        source = _format_pronunciation_source(pronunciation)
+        review_parts = [
+            f"读音 {pinyin}" if pinyin else "读音待确认",
+            f"来源 {source}",
+            audit_preview,
+        ]
+        reviewed_remark = "喵喵审词：" + "；".join(review_parts)
+        pronunciation_codes: List[str] = []
+        for status in (pronunciation.get("candidateStatuses") or [])[:6]:
+            if not isinstance(status, dict):
+                return reject("当前审词结果包含无法验证的候选编码")
+            code = str(status.get("code") or "").strip().lower()
+            occupied = status.get("occupied")
+            if (
+                not re.fullmatch(r"[a-z]{1,6}", code)
+                or not isinstance(occupied, bool)
+                or code in current_pronunciation_codes
+            ):
+                return reject("当前审词结果包含重复或无法验证的候选编码")
+            pronunciation_codes.append(code)
+            current_statuses.append(status)
+            current_candidates.append((code, occupied))
+            current_pronunciation_codes[code] = pinyin
+            code_remarks[code] = reviewed_remark
+        pronunciation_recommended = str(
+            pronunciation.get("recommendedCode") or ""
+        ).strip().lower()
+        if pronunciation_recommended:
+            current_pronunciation_recommended_codes.append(
+                pronunciation_recommended
+            )
+        if recommended_code in pronunciation_codes:
             matching_pronunciation = pronunciation
-            status_map = pronunciation_statuses
-            break
 
     if matching_pronunciation is None:
-        return None
+        return reject(
+            f"编码 {recommended_code} 已不在「{referenced_state.word}」的当前候选中"
+        )
     current_recommended = str(
         matching_pronunciation.get("recommendedCode") or ""
     ).strip().lower()
     global_recommended = str(review.get("recommendedCode") or "").strip().lower()
-    if current_recommended != recommended_code or global_recommended != recommended_code:
-        return None
-    pinyin = str(matching_pronunciation.get("pinyin") or "").strip()
+    if global_recommended != recommended_code:
+        return reject(
+            f"「{referenced_state.word}」的推荐编码已从 {recommended_code} "
+            f"变为 {global_recommended or '不可解析'}"
+        )
+    if current_recommended != recommended_code:
+        return reject(
+            f"编码 {recommended_code} 已不再是其当前读音组的推荐编码"
+        )
+
+    current_codes = [code for code, _occupied in current_candidates]
+    current_code_set = set(current_codes)
+    referenced_code_set = set(referenced_codes)
+    if current_code_set != referenced_code_set:
+        added = [code for code in current_codes if code not in referenced_code_set]
+        removed = [code for code in referenced_codes if code not in current_code_set]
+        details = []
+        if added:
+            details.append("新增 " + "、".join(added))
+        if removed:
+            details.append("移除 " + "、".join(removed))
+        return reject("候选编码集合已变化（" + "；".join(details) + "）")
+
+    current_occupancy = dict(current_candidates)
+    for code in referenced_codes:
+        if current_occupancy[code] != referenced_occupancy[code]:
+            before = "已占用" if referenced_occupancy[code] else "空位"
+            after = "已占用" if current_occupancy[code] else "空位"
+            return reject(f"编码 {code} 的占用状态已从{before}变为{after}")
+    if current_codes != referenced_codes:
+        return reject("候选编号顺序已变化，原编号不再安全")
+
+    pinyin = current_pronunciation_codes.get(recommended_code, "")
     referenced_pinyin = str(
         referenced_state.pronunciation_codes.get(recommended_code) or ""
     ).strip()
@@ -1456,38 +1580,39 @@ async def _revalidate_referenced_add_pending(
         " ",
         _plain_pinyin(referenced_pinyin),
     ).strip()
-    if (
-        not normalized_pinyin
-        or not normalized_referenced_pinyin
-        or normalized_pinyin != normalized_referenced_pinyin
-    ):
-        return None
-    if (
-        bool(status_map[recommended_code].get("occupied"))
-        != referenced_occupancy[recommended_code]
-    ):
-        return None
+    if not normalized_referenced_pinyin:
+        return reject(
+            f"引用候选没有保留编码 {recommended_code} 对应的读音"
+        )
+    if not normalized_pinyin:
+        return reject(f"编码 {recommended_code} 的当前读音无法解析")
+    if normalized_pinyin != normalized_referenced_pinyin:
+        return reject(
+            f"编码 {recommended_code} 的读音已从 {referenced_pinyin} 变为 {pinyin}"
+        )
 
-    candidates = [
-        (code, bool(status.get("occupied")))
-        for code, status in status_map.items()
-    ]
-    if not candidates:
-        return None
-
-    source = _format_pronunciation_source(matching_pronunciation)
-    audit_preview = _format_pre_submit_audit_preview(review, recommended_code)
-    if not audit_preview:
-        audit_preview = "自动审核：该词需管理员审核（当前审词证据不足）"
-    review_parts = [
-        f"读音 {pinyin}" if pinyin else "读音待确认",
-        f"来源 {source}",
-        audit_preview,
-    ]
-    reviewed_remark = "喵喵审词：" + "；".join(review_parts)
+    current_needs_manual_review = review_flags.read_manual_review_flag(review)
+    if current_needs_manual_review is None:
+        return reject("当前审词结果缺少可验证的审核结论")
+    if (
+        referenced_state.needs_manual_review is not None
+        and bool(referenced_state.needs_manual_review)
+        != bool(current_needs_manual_review)
+    ):
+        before = (
+            "需管理员审核"
+            if referenced_state.needs_manual_review
+            else "可自动通过"
+        )
+        after = "需管理员审核" if current_needs_manual_review else "可自动通过"
+        return reject(f"审核结论已从{before}变为{after}")
 
     occupied_words: Dict[str, List[str]] = {}
-    for code, occupied in candidates:
+    status_map = {
+        str(status.get("code") or "").strip().lower(): status
+        for status in current_statuses
+    }
+    for code, occupied in current_candidates:
         if not occupied:
             continue
         status = status_map[code]
@@ -1504,26 +1629,30 @@ async def _revalidate_referenced_add_pending(
             ]
         occupied_words[code] = words
 
-    pronunciation_codes = (
-        {code: pinyin for code, _occupied in candidates}
-        if pinyin
-        else {}
-    )
     return _attach_server_candidate_snapshot(PendingAddWord(
         word=referenced_state.word,
         recommended_code=recommended_code,
-        candidates=candidates,
+        candidates=current_candidates,
         occupied_words=occupied_words,
-        code_remarks={code: reviewed_remark for code, _occupied in candidates},
-        pronunciation_codes=pronunciation_codes,
-        pronunciation_recommended_codes=[recommended_code],
-    ), list(status_map.values()), review.get("candidateOrderingAssessments"))
+        code_remarks=code_remarks,
+        pronunciation_codes=current_pronunciation_codes,
+        pronunciation_recommended_codes=current_pronunciation_recommended_codes,
+        needs_manual_review=bool(current_needs_manual_review),
+        manual_review_reason=review_flags.manual_review_reason(review),
+    ), current_statuses, review.get("candidateOrderingAssessments"))
 
 
 def _ensure_pending_add_word_guidance(response: str) -> str:
     """Append deterministic guidance for occupied candidate choices."""
     if _parse_pending_batch_add(response) is not None:
         return ensure_multi_word_candidate_copy(response)
+
+    pending = _parse_pending_add_word(response)
+    if pending is not None:
+        response = ensure_single_word_candidate_copy(
+            response,
+            len(pending.candidates),
+        )
 
     guidance = "若所选编号显示“已有…”，直接回复该编号表示添加重码；回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
     if "重新编码" in response and "添加重码" in response:
@@ -1535,7 +1664,6 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
         logger.info("🧭 Appending occupied-choice guidance via fallback matcher")
         return response.rstrip() + f"\n{guidance}"
 
-    pending = _parse_pending_add_word(response)
     if pending is None:
         return response
     if not any(occupied for _, occupied in pending.candidates):
@@ -5278,8 +5406,8 @@ async def _try_update_pending_pronunciation(
         lines.append(f"{index}. {code} — {label}{marker}")
     lines.extend((
         "",
-        f"是否以编码 {recommended_code} 将「{state.word}」加入草稿？"
-        "可回复编号、编码，或「都加」。",
+        f"是否以编码 {recommended_code} 将「{state.word}」加入草稿？",
+        single_word_candidate_footer(len(variant_codes)),
     ))
     response = "\n".join(lines)
     updated_state = _parse_pending_add_word(response)
@@ -5566,6 +5694,14 @@ async def handle_pending_message_core(
         return scoped_response
     if scoped_state is not None:
         state = scoped_state
+
+    assent_rejection = (
+        _pending_assent_rejection_response(state, message)
+        if scoped_intent is None
+        else None
+    )
+    if assent_rejection is not None:
+        return assent_rejection
 
     if (
         isinstance(state, PendingAddWord)

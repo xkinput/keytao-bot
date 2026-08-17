@@ -33,8 +33,11 @@ from keytao_bot.utils.pending_confirmation import (
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
+    render_server_backed_batch_candidates,
+    render_server_backed_word_set,
     render_executable_suggestion,
     render_remediation_reply,
+    same_unique_binding_set,
 )
 
 from .state import (
@@ -796,23 +799,81 @@ class AgentOrchestrator:
                         )
                 if content.strip():
                     reply_contract = advertised_reply_contract(content)
-                    pending_items = (
-                        self._advertised_pending_batch_items(
+                    matching_word_sets = [
+                        absent_words
+                        for absent_words in trusted_absent_word_sets
+                        if self._content_advertises_word_set(
                             content,
+                            absent_words,
+                        )
+                    ]
+                    advertises_word_set_from_records = bool(
+                        reply_contract.word_set_advertisement
+                        or matching_word_sets
+                    )
+                    if (
+                        advertises_word_set_from_records
+                        and not reply_contract.binding_advertisement
+                        and trusted_absent_word_sets
+                    ):
+                        trusted_word_set = (
+                            trusted_absent_word_sets[0]
+                            if len(trusted_absent_word_sets) == 1
+                            else matching_word_sets[0]
+                            if len(matching_word_sets) == 1
+                            else ()
+                        )
+                        rendered_word_set = render_server_backed_word_set(
+                            trusted_word_set,
+                        )
+                        if not rendered_word_set:
+                            return self._append_authoritative_result_links(
+                                render_remediation_reply(
+                                    "本轮有多组服务端查询结果，无法把这条列表广告"
+                                    "唯一绑定到其中一组；本次不会写入"
+                                ),
+                                authoritative_result_links,
+                            )
+                        token = self._state_store.add_advertised_word_set(
+                            conv_key,
+                            trusted_word_set,
+                            space_key=context.space_key,
+                            owner_label=context.speaker_name,
+                        )
+                        if not token:
+                            return self._append_authoritative_result_links(
+                                render_remediation_reply(
+                                    "本轮未收录词记录无法安全保存为候选快照；"
+                                    "本次不会写入"
+                                ),
+                                authoritative_result_links,
+                            )
+                        logger.info(
+                            "[advertised_reply_contract] "
+                            "branch=establish_word_set_from_lookup_records "
+                            f"owner={conv_key} items={len(trusted_word_set)}"
+                        )
+                        return self._append_authoritative_result_links(
+                            rendered_word_set,
+                            authoritative_result_links,
+                        )
+                    record_backed_items = (
+                        self._trusted_review_pending_items(
                             trusted_reviewed_items_by_key,
                             trusted_candidate_slots_by_word,
                         )
                         if (
                             not context.visual_context
+                            and not multi_add_write_attempted
                             and (
-                                context.mutations_allowed
-                                or reply_contract.requires_live_state
+                                reply_contract.requires_live_state
+                                or context.mutations_allowed
                             )
                         )
                         else None
                     )
+                    pending_items = record_backed_items
                     if pending_items is not None:
-                        content = ensure_multi_word_candidate_copy(content)
                         candidate_scopes = [
                             {
                                 "word": item["word"],
@@ -825,6 +886,44 @@ class AgentOrchestrator:
                             }
                             for item in pending_items
                         ]
+                        display_pairs = advertised_batch_binding_pairs(content)
+                        record_pairs = tuple(
+                            (
+                                str(item.get("word") or "").strip(),
+                                str(item.get("code") or "").strip().lower(),
+                            )
+                            for item in pending_items
+                        )
+                        display_matches_records = same_unique_binding_set(
+                            display_pairs,
+                            record_pairs,
+                        )
+                        if (
+                            reply_contract.binding_advertisement
+                            and advertises_word_set_from_records
+                        ):
+                            content = render_server_backed_batch_candidates(
+                                pending_items,
+                                candidate_scopes,
+                            )
+                            display_action = "replace_mixed_from_server_records"
+                            if not content:
+                                pending_items = None
+                        elif not display_matches_records:
+                            content = render_server_backed_batch_candidates(
+                                pending_items,
+                                candidate_scopes,
+                            )
+                            display_action = "replace_from_server_records"
+                            if not content:
+                                pending_items = None
+                        elif not reply_contract.requires_live_state:
+                            content = ensure_multi_word_candidate_copy(content)
+                            display_action = "append_backed_contract"
+                        else:
+                            display_action = "send_backed"
+
+                    if pending_items is not None:
                         saved = self._state_store.set(
                             conv_key,
                             PendingToolConfirm(
@@ -865,6 +964,7 @@ class AgentOrchestrator:
                         logger.info(
                             "[advertised_reply_contract] "
                             f"branch={branch} "
+                            f"display={display_action} "
                             "Saved advertised reviewed batch candidate: "
                             f"owner={conv_key} items={len(pending_items)}"
                         )
@@ -1409,47 +1509,26 @@ class AgentOrchestrator:
         )
 
     @staticmethod
-    def _advertised_pending_batch_items(
-        content: str,
+    def _trusted_review_pending_items(
         reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
         candidate_slots_by_word: Dict[
             str,
             tuple[tuple[str, bool], ...],
         ],
     ) -> Optional[List[Dict[str, Any]]]:
-        """Bind displayed batch choices to this run's structured review results."""
-        pairs = list(advertised_batch_binding_pairs(content))
-        if len(pairs) < 2 or len({word for word, _code in pairs}) != len(pairs):
+        """Seal the complete same-turn review set without consulting reply prose."""
+        words = tuple(dict.fromkeys(
+            str(word or "").strip()
+            for word, _code in reviewed_items_by_key
+            if str(word or "").strip()
+        ))
+        if len(words) < 2:
             return None
-
-        items: List[Dict[str, Any]] = []
-        for word, code in pairs:
-            reviewed = reviewed_items_by_key.get((word, code))
-            slots = candidate_slots_by_word.get(word, ())
-            if reviewed is None or code not in {slot for slot, _occupied in slots}:
-                return None
-            phrase_type = str(reviewed.get("type") or "").strip()
-            if not phrase_type:
-                return None
-            item: Dict[str, Any] = {
-                "action": "Create",
-                "word": word,
-                "code": code,
-                "type": phrase_type,
-                "needsManualReview": bool(
-                    reviewed.get("needs_manual_review", True)
-                ),
-            }
-            review_reason = str(
-                reviewed.get("manual_review_reason") or ""
-            ).strip()
-            if review_reason:
-                item["manualReviewReason"] = review_reason
-            remark = str(reviewed.get("remark") or "").strip()
-            if remark:
-                item["remark"] = remark
-            items.append(item)
-        return items
+        return AgentOrchestrator._resolved_advertised_pending_items(
+            words,
+            reviewed_items_by_key,
+            candidate_slots_by_word,
+        )
 
     def _validated_resolved_advertised_words(
         self,
@@ -1644,6 +1723,21 @@ class AgentOrchestrator:
                 reply,
             )
         )
+        if (
+            failure_state.get("blockReason") == "binding_incomplete"
+            and failure_state.get("liveCandidateSelected") is True
+        ):
+            raw_reason = str(
+                failure_state.get("message")
+                or "当前候选状态仍有效，但本次确认没有通过受信路由；本次未写入"
+            ).strip()
+            suggestion = str(
+                failure_state.get("suggestedCommand") or ""
+            ).strip()
+            return render_remediation_reply(
+                raw_reason.rstrip("；;。 "),
+                command=suggestion,
+            )
         if (
             failure_state.get("blockReason") == "binding_incomplete"
             and (binding_reply_is_internal or binding_reply_retries_same_turn)
