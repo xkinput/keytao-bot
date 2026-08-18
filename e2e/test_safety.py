@@ -31,6 +31,10 @@ from .scenarios import (
     S25_PREFIX_CODE,
     S25_SELECTED_CODE,
     S25_WORD,
+    S26_CODE,
+    S26_COMMAND,
+    S26_OCCUPANT,
+    S26_WORD,
     assert_batch_link_hosts,
     same_unique_item_set,
 )
@@ -296,15 +300,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S23 replays the stale advertised-assent production incident", readme)
         self.assertIn("S24 replays the single-word natural-assent incident", readme)
         self.assertIn("S25 replays the 炒冷饭 production incident", readme)
+        self.assertIn("S26 replays the add-plus-eviction incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s25(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s26(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 26)],
+            [f"S{index}" for index in range(1, 27)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -2138,6 +2143,102 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["confirmationSteps"], 0)
         self.assertEqual(result["facts"]["batchId"], "batch-s25-combined")
         self.assertEqual(result["facts"]["batchStatus"], "Approved")
+
+    async def test_s26_offline_replays_atomic_add_and_eviction(self) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S26")
+
+        class FakeContext:
+            def __init__(self):
+                self.events = []
+                self.items = []
+                self.sequence = 0
+                self.batch_id = ""
+                self.platform_id = "s26-user"
+                self.next_client = self
+                self.bot = self
+                self.fixture_facts = {"chixi_next_code": "wkxko"}
+                self.cleanup_calls = 0
+                self.reset_calls = 0
+
+            async def clean_draft(self, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                self.items = []
+                self.batch_id = ""
+                self.cleanup_calls += 1
+                return {"success": True}
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.assertEqual(platform_id, self.platform_id)
+                self.reset_calls += 1
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assertTrue(to_me)
+                self.assertEqual(text, S26_COMMAND)
+                self.batch_id = "batch-s26"
+                self.items = [
+                    {"action": "Delete", "word": S26_OCCUPANT, "code": S26_CODE},
+                    {"action": "Create", "word": S26_WORD, "code": S26_CODE},
+                    {
+                        "action": "Create",
+                        "word": S26_OCCUPANT,
+                        "code": self.fixture_facts["chixi_next_code"],
+                    },
+                ]
+                self.sequence += 1
+                self.events.append({
+                    "sequence": self.sequence,
+                    "kind": "tool",
+                    "name": "keytao_shift_phrase_code",
+                    "arguments": {"word": S26_WORD, "target_code": S26_CODE},
+                    "result": {
+                        "success": True,
+                        "batchId": self.batch_id,
+                        "shiftPlan": {
+                            "word": S26_WORD,
+                            "targetCode": S26_CODE,
+                            "shifted": [{
+                                "word": S26_OCCUPANT,
+                                "fromCode": S26_CODE,
+                                "toCode": self.fixture_facts["chixi_next_code"],
+                            }],
+                        },
+                    },
+                })
+                return (
+                    "本轮已完成的写操作：\n"
+                    f"- 已写入草稿：「{S26_WORD}」 → {S26_CODE}\n"
+                    f"- 已顺延：「{S26_OCCUPANT}」 {S26_CODE} → "
+                    f"{self.fixture_facts['chixi_next_code']}\n"
+                    f"关联批次：{self.batch_id}"
+                )
+
+            async def draft(self):
+                return {
+                    "batchId": self.batch_id,
+                    "contentVersion": 1,
+                    "items": list(self.items),
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+            def assertEqual(self, left, right):
+                if left != right:
+                    raise AssertionError((left, right))
+
+            def assertTrue(self, value):
+                if not value:
+                    raise AssertionError(value)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+
+        self.assertEqual(context.cleanup_calls, 1)
+        self.assertEqual(context.reset_calls, 1)
+        self.assertEqual(result["messages"], [S26_COMMAND])
+        self.assertEqual(result["facts"]["confirmationSteps"], 0)
+        self.assertEqual(result["facts"]["batchId"], "batch-s26")
+        self.assertEqual(result["facts"]["nextCode"], "wkxko")
 
     async def test_s23_unresolvable_quote_control_never_mints_a_write_ticket(
         self,

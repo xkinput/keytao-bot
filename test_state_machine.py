@@ -14357,6 +14357,79 @@ def test_advertised_set_selection_enters_the_production_stage_pipeline():
     asyncio.run(_run())
 
 
+def test_eviction_modified_add_bypasses_pending_assent_classifier():
+    """An add plus occupant shift is one fresh operation in the staged path."""
+    print("\n🧪 eviction-modified add production routing")
+
+    async def _run():
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.group("qq", "865189947", "s26-user")
+        store.set(
+            address,
+            PendingAddWord(
+                word="幂等",
+                recommended_code="mkdr",
+                candidates=[("mkdr", True), ("mkdro", False)],
+                occupied_words={"mkdr": ["米等"]},
+                server_candidates=[("mkdr", True), ("mkdro", False)],
+                server_occupied_words={"mkdr": ["米等"]},
+                server_entries_by_code={"mkdr": [("米等", 100)]},
+                needs_manual_review=True,
+            ),
+        )
+        classifier = AsyncMock(
+            side_effect=AssertionError("eviction add must not use intent model")
+        )
+        ctx = openai_chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="s26-user",
+            normalized_message_text="添加 幂等 mkdr，米等顺延",
+            conv_key=address,
+            space_key=("qq", "qq:group:865189947"),
+            command_intent_for=classifier,
+        )
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(
+                openai_chat_module,
+                "draft_operation_coordinator",
+                DraftOperationCoordinator(),
+            ),
+        ):
+            await openai_chat_module._stage_resolve_current_pending_scope(ctx)
+            await openai_chat_module._stage_apply_scoped_pending_intent(ctx)
+            await openai_chat_module._stage_arbitrate_active_operation(ctx)
+
+        live_state = store.get(address)
+        check(
+            "pending assent guard recognizes the shift clause as part of the add",
+            openai_chat_module._pending_assent_rejection_response(
+                live_state,
+                ctx.normalized_message_text,
+            ) is None,
+        )
+        check(
+            "shift modifier is parsed before pending assent rejection",
+            ctx.eviction_modified_add is not None,
+        )
+        check(
+            "shift modifier does not emit other-action rejection",
+            ctx.scoped_pending_response is None,
+        )
+        check(
+            "shift modifier never invokes the intent classifier",
+            classifier.await_count == 0,
+        )
+        check(
+            "shift modifier is a fresh command and bypasses old pending execution",
+            ctx.generic_intent_is_fresh_command is True,
+        )
+
+    asyncio.run(_run())
+
+
 def test_orchestrator_empty_response_retry():
     """Verify empty final model content does not become a generic request failure."""
     print("\n🧪 AgentOrchestrator empty response retry")
@@ -15948,6 +16021,7 @@ if __name__ == "__main__":
     test_orchestrator_tool_batch_validation()
     test_agent_chunk_progress_uses_existing_event_delivery()
     test_advertised_set_selection_enters_the_production_stage_pipeline()
+    test_eviction_modified_add_bypasses_pending_assent_classifier()
     test_normalize_encode_response_codes_first()
     test_keytao_encode_forwards_meaning_gated_pronunciation()
     test_normalize_encode_response_infer_fallback()

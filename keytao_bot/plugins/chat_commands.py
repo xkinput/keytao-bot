@@ -20,6 +20,7 @@ from ..harness.conversation import (
     ConversationKey,
     normalize_conversation_key,
 )
+from ..harness.authorization_grammar import parse_eviction_modified_add
 from ..harness.state import (
     ActiveDraftOperation,
     ConversationLockStore,
@@ -5675,6 +5676,8 @@ async def handle_pending_message_core(
     allow_intent_model: bool = True,
 ) -> Optional[str]:
     """Consume or re-arm one pending ticket outside an adapter-specific handler."""
+    if parse_eviction_modified_add(message) is not None:
+        return None
     state_record = conversation_state_store.get_record(conv_key)
     if state_record is None or state_record.state is None:
         return None

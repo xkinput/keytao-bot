@@ -1058,6 +1058,7 @@ from .authorization_grammar import (
     _positional_phrase_type,
     _same_type_positional_entries,
     _pending_positional_create_binding,
+    _eviction_modified_create_binding,
     _pending_create_is_bound,
     _pending_batch_selected_items,
     _pending_batch_items_match_selection,
@@ -1129,6 +1130,10 @@ class ToolExecutor:
             _mutation_authorization_view(context.current_message or ""),
             arguments,
             context,
+        ) or _eviction_modified_create_binding(
+            context.current_message or "",
+            arguments,
+            context,
         )
         return binding is not None
 
@@ -1145,6 +1150,11 @@ class ToolExecutor:
         message = _mutation_authorization_view(context.current_message or "")
         binding = (
             _pending_positional_create_binding(message, arguments, context)
+            or _eviction_modified_create_binding(
+                message,
+                arguments,
+                context,
+            )
             or _destination_derived_positional_create_binding(
                 message,
                 arguments,
@@ -1563,6 +1573,11 @@ class ToolExecutor:
                     sanitized["needs_manual_review"] = True
                 positional_create = (
                     _pending_positional_create_binding(
+                        message,
+                        arguments,
+                        context,
+                    )
+                    or _eviction_modified_create_binding(
                         message,
                         arguments,
                         context,

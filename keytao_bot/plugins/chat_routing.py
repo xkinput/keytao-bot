@@ -19,6 +19,7 @@ from ..harness.state import (
     PendingToolConfirm,
     pending_batch_display_pairs,
 )
+from ..harness.authorization_grammar import parse_eviction_modified_add
 from ..harness.tools import (
     _COMMAND_PREFIX_PATTERN,
     _whole_message_unquoted_source,
@@ -470,6 +471,8 @@ def _pending_assent_rejection_response(
     message_text: str,
 ) -> Optional[str]:
     """Explain why assent-like text did not authorize the one live state."""
+    if parse_eviction_modified_add(message_text) is not None:
+        return None
     add_candidate = bool(
         isinstance(state, PendingAddWord)
         or (

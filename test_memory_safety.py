@@ -49,6 +49,7 @@ from keytao_bot.plugins.chat_routing import (
 from keytao_bot.harness.tools import (
     PendingCandidateCapability,
     ToolContext,
+    ToolExecutionRoute,
     ToolExecutor,
     _RECORD_FRAME_RE,
     _mutation_authorization_view,
@@ -60,6 +61,7 @@ from keytao_bot.harness.tools import (
     message_requests_change,
     self_checked_suggested_command,
 )
+from keytao_bot.harness.authorization_grammar import parse_eviction_modified_add
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 from keytao_bot.utils.llm_request_gate import RequestWindowGate
@@ -5916,6 +5918,42 @@ def iter_record_frame_no_negator_control():
 
 
 class MutationAuthorizationTests(unittest.TestCase):
+    def test_eviction_modified_add_is_one_closed_operation(self) -> None:
+        expected = {
+            "添加 幂等 mkdr，米等顺延": "顺延",
+            "添加 幂等 mkdr，米等挪开": "挪开",
+            "添加 幂等 mkdr，挪开米等": "挪开",
+            "添加 幂等 mkdr，把米等挪开": "挪开",
+            "添加 幂等 mkdr，米等往后排": "往后排",
+            "添加 幂等 mkdr，米等重新编码": "重新编码",
+            "添加 幂等 mkdr，让米等顺延": "顺延",
+        }
+        for message, modifier in expected.items():
+            with self.subTest(message=message):
+                parsed = parse_eviction_modified_add(message)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed.word, "幂等")
+                self.assertEqual(parsed.code, "mkdr")
+                self.assertEqual(parsed.named_occupant, "米等")
+                self.assertEqual(parsed.modifier, modifier)
+                self.assertTrue(message_authorizes_mutation(message))
+
+        blocked = (
+            "不要添加 幂等 mkdr，米等顺延",
+            "他说添加 幂等 mkdr，米等顺延",
+            "添加 幂等 mkdr，米等顺延？",
+            "添加 幂等 mkdr，米等顺延，再删除草稿",
+            "添加 幂等 mkdr，迷瞪顺延",
+        )
+        for message in blocked[:-1]:
+            with self.subTest(blocked=message):
+                self.assertIsNone(parse_eviction_modified_add(message))
+
+        # Naming a different occupant remains syntactically valid. The route
+        # must later compare it with the server lookup and fail closed.
+        parsed = parse_eviction_modified_add(blocked[-1])
+        self.assertEqual(parsed.named_occupant, "迷瞪")
+
     def test_natural_add_verbs_authorize_exact_word_code_and_keep_gates(self) -> None:
         from keytao_bot.utils.pending_confirmation import (
             ADD_OPERATION_VERB_FORMS,
@@ -9110,6 +9148,36 @@ class _DestinationDerivedCreateSkills:
         ]
 
 
+class _EvictionAddSkills:
+    @staticmethod
+    def get_skill_instructions():
+        return ""
+
+    @staticmethod
+    def has_tools():
+        return True
+
+    @staticmethod
+    def get_tools():
+        return [
+            _ReviewedCreateSkills.get_tools()[0],
+            {
+                "type": "function",
+                "function": {
+                    "name": "keytao_lookup_by_code",
+                    "description": "Look up the current code occupant",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"code": {"type": "string"}},
+                        "required": ["code"],
+                    },
+                },
+            },
+            _ReviewedCreateSkills.get_tools()[1],
+            _DestinationDerivedCreateSkills.get_tools()[-1],
+        ]
+
+
 def _fake_response(finish_reason, content="", tool_calls=None):
     message = types.SimpleNamespace(
         content=content,
@@ -10940,6 +11008,283 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             system_prompt_core="system",
         )
 
+    @staticmethod
+    def _eviction_orchestrator(client, dispatch, state_store=None):
+        return AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=_EvictionAddSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: lambda **kwargs: dispatch(name, **kwargs),
+                frozenset(),
+            ),
+            state_store=state_store or MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+    async def test_eviction_add_is_server_resolved_without_model_planning(self) -> None:
+        calls = []
+        shift_plan = {
+            "word": "幂等",
+            "targetCode": "mkdr",
+            "items": [
+                {
+                    "action": "Create",
+                    "word": "幂等",
+                    "code": "mkdr",
+                    "type": "Phrase",
+                },
+                {
+                    "action": "Create",
+                    "word": "米等",
+                    "code": "mkdro",
+                    "type": "Phrase",
+                },
+            ],
+            "shifted": [{
+                "word": "米等",
+                "fromCode": "mkdr",
+                "toCode": "mkdro",
+            }],
+        }
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if name == "keytao_prepare_reviewed_add":
+                return {
+                    "success": True,
+                    "word": "幂等",
+                    "recommendedCode": "mkdro",
+                    "candidateCodes": ["mkdr", "mkdro", "mkdrou"],
+                    "candidateStatuses": [
+                        {
+                            "code": "mkdr",
+                            "occupied": True,
+                            "words": ["米等"],
+                            "phrases": [{"word": "米等", "weight": 100}],
+                        },
+                        {"code": "mkdro", "occupied": False, "words": []},
+                        {"code": "mkdrou", "occupied": False, "words": []},
+                    ],
+                    "type": "Phrase",
+                    "preSubmitAudit": {
+                        "autoApprove": False,
+                        "issues": ["manual review"],
+                    },
+                }
+            if name == "keytao_lookup_by_code":
+                return {
+                    "success": True,
+                    "code": "mkdr",
+                    "phrases": [{
+                        "word": "米等",
+                        "code": "mkdr",
+                        "type": "Phrase",
+                        "weight": 100,
+                    }],
+                }
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "planDigest": "a" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            if not kwargs.get("expected_warning_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warnings": [],
+                    "batchId": "s26-provisional",
+                    "contentVersion": 0,
+                    "planDigest": "a" * 64,
+                    "warningDigest": "b" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            return {
+                "success": True,
+                "batchId": "s26-materialized",
+                "batchUrl": "https://trusted.example/batch/s26-materialized",
+                "contentVersion": 1,
+                "shiftPlan": shift_plan,
+            }
+
+        client = _FakeClient([])
+        result = await self._eviction_orchestrator(client, dispatch).run(
+            "添加 幂等 mkdr，米等顺延",
+            AgentRequestContext(
+                platform="qq",
+                user_id="s26-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            [
+                "keytao_prepare_reviewed_add",
+                "keytao_lookup_by_code",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+            ],
+        )
+        self.assertEqual(calls[2][1]["word"], "幂等")
+        self.assertEqual(calls[2][1]["target_code"], "mkdr")
+        self.assertIn("「幂等」 → mkdr", result)
+        self.assertIn("「米等」 mkdr → mkdro", result)
+        self.assertIn("s26-materialized", result)
+        self.assertNotIn("重码", result)
+
+    async def test_eviction_add_rejects_text_occupant_not_confirmed_by_server(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if name == "keytao_prepare_reviewed_add":
+                return {
+                    "success": True,
+                    "word": "幂等",
+                    "recommendedCode": "mkdr",
+                    "candidateStatuses": [{
+                        "code": "mkdr",
+                        "occupied": True,
+                        "words": ["迷瞪"],
+                    }],
+                    "type": "Phrase",
+                    "preSubmitAudit": {
+                        "autoApprove": False,
+                        "issues": ["manual review"],
+                    },
+                }
+            if name == "keytao_lookup_by_code":
+                return {
+                    "success": True,
+                    "code": "mkdr",
+                    "phrases": [{
+                        "word": "迷瞪",
+                        "code": "mkdr",
+                        "type": "Phrase",
+                        "weight": 100,
+                    }],
+                }
+            return {"success": True, "unexpectedWrite": True}
+
+        client = _FakeClient([])
+        result = await self._eviction_orchestrator(client, dispatch).run(
+            "添加 幂等 mkdr，米等顺延",
+            AgentRequestContext(
+                platform="qq",
+                user_id="s26-user",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            ["keytao_prepare_reviewed_add", "keytao_lookup_by_code"],
+        )
+        self.assertIn("与指令中的“米等”不一致", result)
+        self.assertIn("本次未写入", result)
+
+    async def test_eviction_add_cascade_requires_one_explicit_confirmation(self) -> None:
+        calls = []
+        shift_plan = {
+            "word": "幂等",
+            "targetCode": "mkdr",
+            "items": [],
+            "shifted": [
+                {"word": "米等", "fromCode": "mkdr", "toCode": "mkdro"},
+                {"word": "迷瞪", "fromCode": "mkdro", "toCode": "mkdrou"},
+            ],
+        }
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if name == "keytao_prepare_reviewed_add":
+                return {
+                    "success": True,
+                    "word": "幂等",
+                    "recommendedCode": "mkdr",
+                    "candidateStatuses": [{
+                        "code": "mkdr",
+                        "occupied": True,
+                        "words": ["米等"],
+                    }],
+                    "type": "Phrase",
+                    "preSubmitAudit": {
+                        "autoApprove": False,
+                        "issues": ["manual review"],
+                    },
+                }
+            if name == "keytao_lookup_by_code":
+                return {
+                    "success": True,
+                    "code": "mkdr",
+                    "phrases": [{
+                        "word": "米等",
+                        "code": "mkdr",
+                        "type": "Phrase",
+                        "weight": 100,
+                    }],
+                }
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "confirmationKind": "shiftPlan",
+                "batchId": "cascade-batch",
+                "contentVersion": 3,
+                "planDigest": "c" * 64,
+                "shiftPlan": shift_plan,
+                "message": "顺延还会移动迷瞪，请确认完整级联计划。",
+            }
+
+        client = _FakeClient([])
+        store = MemoryConversationStateStore()
+        result = await self._eviction_orchestrator(
+            client,
+            dispatch,
+            store,
+        ).run(
+            "添加 幂等 mkdr，米等顺延",
+            AgentRequestContext(
+                platform="qq",
+                user_id="s26-cascade",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            [
+                "keytao_prepare_reviewed_add",
+                "keytao_lookup_by_code",
+                "keytao_shift_phrase_code",
+            ],
+        )
+        self.assertEqual(result.count("确认"), 1)
+        self.assertIn("完整级联计划", result)
+        pending = store.get_record(
+            ConversationAddress.private("qq", "s26-cascade")
+        )
+        self.assertIsNotNone(pending)
+        self.assertEqual(
+            pending.state.function_name,
+            "keytao_shift_phrase_code",
+        )
+
     async def test_front_relation_reencodes_occupant_with_sealed_target(self) -> None:
         calls = []
         shift_plan = {
@@ -12049,6 +12394,66 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertIsNone(store.get_record(address))
         self.assertIn("added with warning", result)
         self.assertIn("⚠️ wkxk already contains 赤溪", result)
+
+    async def test_eviction_add_never_auto_confirms_duplicate_creation(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            return {"success": True, "unexpectedWrite": True}
+
+        orchestrator = self._orchestrator(
+            _FakeClient([]),
+            dispatch,
+            MemoryConversationStateStore(),
+        )
+        arguments = {"word": "幂等", "code": "mkdr"}
+        preview = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "duplicate-preview",
+            "contentVersion": 0,
+            "warningDigest": "d" * 64,
+            "warnedCount": 1,
+            "warnings": [{
+                "warningType": "duplicate_code",
+                "item": {
+                    "action": "Create",
+                    "word": "幂等",
+                    "code": "mkdr",
+                },
+            }],
+        }
+
+        context = ToolContext(
+            platform="qq",
+            user_id="s26-user",
+            current_message="添加 幂等 mkdr，米等顺延",
+            writes_allowed=True,
+        )
+        for label, warnings in (
+            ("duplicate", preview["warnings"]),
+            ("priority", [{
+                **preview["warnings"][0],
+                "warningType": "code_chain_priority",
+            }]),
+            ("clean", []),
+        ):
+            with self.subTest(label=label):
+                candidate = {
+                    **preview,
+                    "warnings": warnings,
+                    "warnedCount": len(warnings),
+                }
+                confirmed = await orchestrator._auto_confirm_create_warning(
+                    "keytao_create_phrase",
+                    arguments,
+                    ToolExecutionRoute("keytao_create_phrase", arguments),
+                    candidate,
+                    context,
+                )
+                self.assertIsNone(confirmed)
+        self.assertEqual(calls, [])
 
     async def test_noninformational_warning_and_version_conflict_never_auto_confirm(self) -> None:
         cases = (
@@ -13562,6 +13967,258 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [])
 
 
+class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _create_orchestrator(client, create):
+        return AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=500,
+                temperature=0.0,
+                timeout=10.0,
+                max_tokens_cap=2000,
+            ),
+            skills_manager=_ReviewedCreateSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: create if name == "keytao_create_phrase" else None,
+                frozenset({"keytao_create_phrase"}),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+    async def test_reasoning_runaway_after_write_reports_receipt(self) -> None:
+        async def create(**_kwargs):
+            return {
+                "success": True,
+                "batchId": "batch-runaway",
+                "batchUrl": "http://localhost:3100/batch/batch-runaway",
+            }
+
+        first_empty = _fake_response("length", None)
+        first_empty.choices[0].message.reasoning_content = "first reasoning"
+        second_empty = _fake_response("length", None)
+        second_empty.choices[0].message.reasoning_content = "second reasoning"
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_create_tool_call(
+                    arguments='{"word":"炒冷饭","code":"wlfoo"}',
+                )],
+            ),
+            first_empty,
+            second_empty,
+        ])
+
+        reply = await self._create_orchestrator(client, create).run(
+            "添加 炒冷饭 wlfoo",
+            AgentRequestContext(
+                platform="qq",
+                user_id="receipt-runaway",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertIn("已写入草稿", reply)
+        self.assertIn("炒冷饭", reply)
+        self.assertIn("wlfoo", reply)
+        self.assertIn("batch-runaway", reply)
+        self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
+
+    async def test_iteration_cap_after_write_reports_receipt(self) -> None:
+        async def create(**_kwargs):
+            return {"success": True, "batchId": "batch-iteration"}
+
+        client = _FakeClient([_fake_response(
+            "tool_calls",
+            tool_calls=[_create_tool_call(
+                arguments='{"word":"炒冷饭","code":"wlfoo"}',
+            )],
+        )])
+
+        reply = await self._create_orchestrator(client, create).run(
+            "添加 炒冷饭 wlfoo",
+            AgentRequestContext(
+                platform="qq",
+                user_id="receipt-iteration",
+                mutations_allowed=True,
+            ),
+            max_iterations=1,
+        )
+
+        self.assertIn("已写入草稿", reply)
+        self.assertIn("batch-iteration", reply)
+        self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
+
+    async def test_transport_failure_after_write_reports_receipt(self) -> None:
+        async def create(**_kwargs):
+            return {"success": True, "batchId": "batch-transport"}
+
+        class FailingCompletions:
+            def __init__(self):
+                self.calls = []
+
+            async def create(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    return _fake_response(
+                        "tool_calls",
+                        tool_calls=[_create_tool_call(
+                            arguments='{"word":"炒冷饭","code":"wlfoo"}',
+                        )],
+                    )
+                raise ConnectionError("model transport failed")
+
+        completions = FailingCompletions()
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=completions),
+        )
+
+        reply = await self._create_orchestrator(client, create).run(
+            "添加 炒冷饭 wlfoo",
+            AgentRequestContext(
+                platform="qq",
+                user_id="receipt-transport",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertIn("已写入草稿", reply)
+        self.assertIn("batch-transport", reply)
+        self.assertIn("后续 AI 服务调用失败", reply)
+        self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
+
+    async def test_tool_budget_exhaustion_after_write_reports_receipt(self) -> None:
+        class CreateAndEchoSkills:
+            @staticmethod
+            def get_skill_instructions():
+                return ""
+
+            @staticmethod
+            def has_tools():
+                return True
+
+            @staticmethod
+            def get_tools():
+                return [
+                    _ReviewedCreateSkills.get_tools()[1],
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "echo",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"value": {"type": "string"}},
+                                "required": ["value"],
+                            },
+                        },
+                    },
+                ]
+
+        async def dispatch(name, **kwargs):
+            if name == "keytao_create_phrase":
+                return {"success": True, "batchId": "batch-budget"}
+            return {"success": True, "value": kwargs["value"]}
+
+        echo_calls = [
+            _named_tool_call(f"echo-{index}", "echo", {"value": str(index)})
+            for index in range(40)
+        ]
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_create_tool_call(
+                    arguments='{"word":"炒冷饭","code":"wlfoo"}',
+                )],
+            ),
+            _fake_response("tool_calls", tool_calls=echo_calls),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=CreateAndEchoSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: lambda **kwargs: dispatch(name, **kwargs),
+                frozenset({"keytao_create_phrase"}),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        reply = await orchestrator.run(
+            "添加 炒冷饭 wlfoo",
+            AgentRequestContext(
+                platform="qq",
+                user_id="receipt-budget",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertIn("已写入草稿", reply)
+        self.assertIn("batch-budget", reply)
+        self.assertIn("工具调用预算上限", reply)
+        self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
+
+    async def test_outer_exception_after_write_reports_receipt(self) -> None:
+        async def create(**_kwargs):
+            return {"success": True, "batchId": "batch-exception"}
+
+        first_empty = _fake_response("length", None)
+        first_empty.choices[0].message.reasoning_content = "first reasoning"
+        second_empty = _fake_response("length", None)
+        second_empty.choices[0].message.reasoning_content = "second reasoning"
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_create_tool_call(
+                    arguments='{"word":"炒冷饭","code":"wlfoo"}',
+                )],
+            ),
+            first_empty,
+            second_empty,
+        ])
+
+        async def fail_fallback(_message, _context):
+            raise RuntimeError("deterministic fallback failed")
+
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                "fake-model",
+                500,
+                0.0,
+                10.0,
+                max_tokens_cap=2000,
+            ),
+            skills_manager=_ReviewedCreateSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: create if name == "keytao_create_phrase" else None,
+                frozenset({"keytao_create_phrase"}),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+            deterministic_fallback_handler=fail_fallback,
+        )
+
+        reply = await orchestrator.run(
+            "添加 炒冷饭 wlfoo",
+            AgentRequestContext(
+                platform="qq",
+                user_id="receipt-exception",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertIn("已写入草稿", reply)
+        self.assertIn("batch-exception", reply)
+        self.assertIn("后续处理发生异常", reply)
+        self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
+
+
 class FinalReplyLoopBreakerTests(unittest.TestCase):
     def test_result_link_renderer_replaces_model_batch_url_with_record_url(self) -> None:
         from keytao_bot.plugins.openai_chat import _append_batch_url_if_missing
@@ -13598,6 +14255,52 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertIn("按工具回执纠正", finalized)
         self.assertNotIn("本次未写入", finalized)
         self.assertNotIn("无法执行", finalized)
+
+    def test_every_declared_abort_exit_reports_prior_write_receipt(self) -> None:
+        termination_reasons = (
+            "transport_failure",
+            "empty_model_response",
+            "reasoning_runaway",
+            "response_budget_exhausted",
+            "incomplete_model_response",
+            "incomplete_tool_request",
+            "empty_final_response",
+            "tool_budget_exhausted",
+            "invalid_tool_request",
+            "duplicate_tool_runaway",
+            "tool_dispatch_exception",
+            "confirmation_save_failure",
+            "iteration_cap",
+            "exception",
+        )
+        receipt = {
+            "tool": "keytao_create_phrase",
+            "batchId": "batch-prior-write",
+            "items": [{
+                "action": "Create",
+                "word": "炒冷饭",
+                "code": "wlfoo",
+            }],
+        }
+
+        for reason in termination_reasons:
+            with self.subTest(reason=reason):
+                finalized = AgentOrchestrator._finalize_reply(
+                    "添加 炒冷饭 wlfoo",
+                    "后续处理已停止。",
+                    {},
+                    [receipt],
+                    {"reason": reason},
+                )
+
+                self.assertIn("已写入草稿", finalized)
+                self.assertIn("炒冷饭", finalized)
+                self.assertIn("wlfoo", finalized)
+                self.assertIn("batch-prior-write", finalized)
+                self.assertNotRegex(
+                    finalized,
+                    r"未执行任何新写入|没有成功写入|本次未写入",
+                )
 
     def test_successful_add_then_submit_block_reports_partial_success(self) -> None:
         finalized = AgentOrchestrator._finalize_reply(

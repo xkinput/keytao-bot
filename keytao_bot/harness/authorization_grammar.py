@@ -545,6 +545,78 @@ class _PositionalCreateBinding:
     resulting_words: Tuple[str, ...] = ()
     bumped_entries: Tuple[Tuple[str, int, int], ...] = ()
 
+
+@dataclass(frozen=True)
+class EvictionModifiedAdd:
+    """One exact add whose named occupant must be shifted, not duplicated."""
+
+    word: str
+    code: str
+    named_occupant: str
+    modifier: str
+
+
+_EVICTION_ADD_HEAD_RE = re.compile(
+    rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
+    rf"{ADD_OPERATION_VERB_PATTERN}\s*(?:词组\s*)?"
+    r"[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
+    r"(?:的\s*)?(?:编码|代码)?\s*"
+    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*"
+    r"[，,；;]\s*(?P<tail>.+?)\s*$",
+    re.IGNORECASE,
+)
+_EVICTION_ADD_OCCUPANT_PATTERN = r"(?![把将])[\u3400-\u9fff]{1,16}"
+_EVICTION_ADD_TAIL_RES = (
+    re.compile(
+        rf"^(?:让\s*)?(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})\s*"
+        r"(?P<modifier>顺延|挪开|往后排|重新编码)$"
+    ),
+    re.compile(
+        rf"^(?:把|将)\s*(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})\s*"
+        r"(?P<modifier>顺延|挪开|往后排|重新编码)$"
+    ),
+    re.compile(
+        rf"^(?P<modifier>挪开)\s*"
+        rf"(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})$"
+    ),
+)
+_EVICTION_ADD_TRAILING_FILLER_RE = re.compile(
+    r"(?:一下|吧|了|谢谢|谢谢你|辛苦了|麻烦了|拜托了)[。.!！]?$"
+)
+
+
+def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
+    """Parse only a closed ``add W C, shift X`` command from current text."""
+    source = _LEADING_MENTION_RE.sub(
+        "",
+        trusted_mutation_source(message),
+        count=1,
+    ).strip()
+    if not source or re.search(r"[?？]", source):
+        return None
+    source = _EVICTION_ADD_TRAILING_FILLER_RE.sub("", source).strip()
+    source = source.rstrip("。.!！").strip()
+    match = _EVICTION_ADD_HEAD_RE.fullmatch(source)
+    if match is None:
+        return None
+    tail = re.sub(r"\s+", "", match.group("tail"))
+    tail_match = next(
+        (candidate.fullmatch(tail) for candidate in _EVICTION_ADD_TAIL_RES
+         if candidate.fullmatch(tail) is not None),
+        None,
+    )
+    if tail_match is None:
+        return None
+    parsed = EvictionModifiedAdd(
+        word=match.group("word").strip(),
+        code=match.group("code").strip().lower(),
+        named_occupant=tail_match.group("occupant").strip(),
+        modifier=tail_match.group("modifier").strip(),
+    )
+    if parsed.word == parsed.named_occupant:
+        return None
+    return parsed
+
 def _unquote_positional_entry(value: str) -> Optional[str]:
     pairs = {"「": "」", "“": "”", "‘": "’"}
     if len(value) >= 3 and pairs.get(value[0]) == value[-1]:
@@ -2870,6 +2942,73 @@ def _pending_positional_create_binding(
     )
 
 
+def _eviction_modified_create_binding(
+    message: str,
+    arguments: Dict,
+    context: ToolContext,
+) -> Optional[_PositionalCreateBinding]:
+    """Bind an eviction add only to the occupant read from its target code."""
+    parsed = parse_eviction_modified_add(context.current_message or message)
+    if parsed is None:
+        return None
+    word = str(arguments.get("word") or "").strip()
+    code = str(arguments.get("code") or "").strip().lower()
+    action = str(arguments.get("action") or "Create").strip()
+    if (
+        action != "Create"
+        or arguments.get("old_word")
+        or word != parsed.word
+        or code != parsed.code
+        or (word, code) not in (context.trusted_reviewed_items_by_key or {})
+    ):
+        return None
+
+    slots = (context.trusted_candidate_slots_by_word or {}).get(word, ())
+    matching_slots = [
+        occupied for slot_code, occupied in slots if slot_code == code
+    ]
+    entries = (context.trusted_entries_by_code or {}).get(code, ())
+    if (
+        matching_slots != [True]
+        or sum(
+            entry_word == parsed.named_occupant
+            for entry_word, _entry_weight in entries
+        ) != 1
+    ):
+        return None
+
+    destination_word = parsed.named_occupant
+    phrase_type = _positional_phrase_type(
+        arguments,
+        context,
+        word,
+        code,
+        destination_word,
+    )
+    same_type_entries = _same_type_positional_entries(
+        entries,
+        code,
+        phrase_type,
+        context,
+    )
+    weight, resulting_words, bumped_entries = _positional_create_order(
+        same_type_entries,
+        word,
+        destination_word,
+        "前面",
+        _PHRASE_TYPE_BASE_WEIGHTS[phrase_type],
+    )
+    return _PositionalCreateBinding(
+        code=code,
+        destination_word=destination_word,
+        relation="前面",
+        phrase_type=phrase_type,
+        weight=weight,
+        resulting_words=resulting_words,
+        bumped_entries=bumped_entries,
+    )
+
+
 def _pending_create_is_bound(
     message: str,
     arguments: Dict,
@@ -3380,6 +3519,11 @@ def _validate_current_message_binding(
             arguments,
             context,
         )
+        eviction_positional_create = _eviction_modified_create_binding(
+            message,
+            arguments,
+            context,
+        )
         destination_positional_create = (
             _destination_derived_positional_create_binding(
                 message,
@@ -3388,7 +3532,9 @@ def _validate_current_message_binding(
             )
         )
         positional_create = (
-            pending_positional_create or destination_positional_create
+            pending_positional_create
+            or eviction_positional_create
+            or destination_positional_create
         )
         if (
             positional_create is not None

@@ -32,6 +32,7 @@ from ..harness.conversation import (
     ConversationKey,
     normalize_conversation_key,
 )
+from ..harness import authorization_grammar as _authorization_grammar
 from ..harness.state import (
     ActiveDraftOperation,
     ConversationLockStore,
@@ -2402,6 +2403,9 @@ class TurnContext:
     vision_error: Optional[Exception] = None
     visual_probe_timed_out: bool = False
     normalized_message_text: str = ""
+    eviction_modified_add: Optional[
+        _authorization_grammar.EvictionModifiedAdd
+    ] = None
     message_is_prefixed_fresh_word_query: bool = False
     memory_context: Optional[ChatMemoryContext] = None
     conv_key: Optional[ConversationKey] = None
@@ -2656,12 +2660,19 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
         and ctx.quoted_pending_add_intent is not None
     )
     ctx.current_pending_record = conversation_state_store.get_record(ctx.conv_key)
+    ctx.eviction_modified_add = _authorization_grammar.parse_eviction_modified_add(
+        ctx.normalized_message_text
+    )
     ctx.scoped_pending_state: Optional[PendingToolConfirm] = None
     ctx.scoped_pending_intent: Optional[MessageCommandIntent] = None
     ctx.scoped_pending_response: Optional[str] = None
     ctx.resolved_advertised_words = ()
     ctx.advertised_snapshot_token = ""
-    if ctx.current_pending_record is not None and not ctx.current_pending_record.execution_id:
+    if (
+        ctx.eviction_modified_add is None
+        and ctx.current_pending_record is not None
+        and not ctx.current_pending_record.execution_id
+    ):
         if isinstance(
             ctx.current_pending_record.state,
             PendingAdvertisedWordSets,
@@ -2772,7 +2783,12 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
         ctx.current_pending_record.state if ctx.current_pending_record is not None else None,
         ctx.normalized_message_text,
     )
-    if ctx.scoped_pending_intent is not None:
+    if ctx.eviction_modified_add is not None:
+        # This is a complete fresh mutation command. Its second clause is the
+        # positional modifier for the add, not assent to an older ticket and
+        # not a second independent action requiring model classification.
+        ctx.generic_command_intent = MessageCommandIntent()
+    elif ctx.scoped_pending_intent is not None:
         ctx.generic_command_intent = ctx.scoped_pending_intent
     elif ctx.resolved_advertised_words:
         ctx.generic_command_intent = MessageCommandIntent()
@@ -3013,6 +3029,8 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
         ctx.normalized_message_text,
     ) or ctx.message_is_prefixed_fresh_word_query
     if ctx.resolved_advertised_words:
+        ctx.generic_intent_is_fresh_command = True
+    if ctx.eviction_modified_add is not None:
         ctx.generic_intent_is_fresh_command = True
     if (
         ctx.current_pending_record is not None

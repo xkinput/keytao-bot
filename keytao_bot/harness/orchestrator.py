@@ -49,6 +49,7 @@ from .state import (
     PendingToolConfirm,
 )
 from .conversation import ConversationAddress
+from .authorization_grammar import parse_eviction_modified_add
 from .tools import (
     MUTATING_TOOL_NAMES,
     PendingCandidateCapability,
@@ -290,19 +291,34 @@ class AgentOrchestrator:
     ) -> Optional[str]:
         """Emit every final reply through one same-turn loop breaker."""
         failure_state: Dict[str, Any] = {}
+        termination_state: Dict[str, Any] = {}
         successful_write_receipts: List[Dict[str, Any]] = []
-        reply = await self._run_loop(
-            message,
-            context,
-            max_iterations=max_iterations,
-            failure_state=failure_state,
-            successful_write_receipts=successful_write_receipts,
-        )
+        try:
+            reply = await self._run_loop(
+                message,
+                context,
+                max_iterations=max_iterations,
+                failure_state=failure_state,
+                successful_write_receipts=successful_write_receipts,
+                termination_state=termination_state,
+            )
+        except Exception as error:
+            termination_state.update({
+                "reason": "exception",
+                "error": type(error).__name__,
+            })
+            logger.exception("Agent turn failed after loop entry")
+            reply = render_remediation_reply(
+                "后续处理发生异常，已停止本轮剩余步骤；"
+                "本轮没有成功写入任何数据",
+                command=message,
+            )
         return self._finalize_reply(
             message,
             reply,
             failure_state,
             successful_write_receipts,
+            termination_state,
         )
 
     async def _run_loop(
@@ -312,6 +328,7 @@ class AgentOrchestrator:
         max_iterations: int = 20,
         failure_state: Optional[Dict[str, Any]] = None,
         successful_write_receipts: Optional[List[Dict[str, Any]]] = None,
+        termination_state: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         client = self._client_factory()
 
@@ -416,6 +433,7 @@ class AgentOrchestrator:
             if isinstance(function, dict):
                 tool_schemas[str(function.get("name") or "")] = function.get("parameters", {})
         exact_multi_add_items = authorized_multi_add_items(message)
+        eviction_add = parse_eviction_modified_add(message)
         if resolved_advertised_words:
             messages.append({
                 "role": "system",
@@ -428,6 +446,8 @@ class AgentOrchestrator:
             })
         if exact_multi_add_items:
             set_turn_flow("multi-add")
+        if eviction_add is not None:
+            set_turn_flow("eviction-add")
         # One (reason, tool, arguments) gets one full explanation per turn.
         reported_block_reasons: set[tuple] = set()
         conv_key = context.conversation_address
@@ -461,6 +481,9 @@ class AgentOrchestrator:
         blocked_review_words: set[str] = set()
         attempted_review_words: set[str] = set()
         multi_add_write_attempted = False
+        eviction_lookup_attempted = False
+        eviction_write_attempted = False
+        eviction_terminal_reply: Optional[str] = None
         authoritative_result_links: Dict[str, str] = {}
         receipt_run_id = uuid.uuid4().hex
         queued_tool_calls: List[Any] = []
@@ -474,6 +497,11 @@ class AgentOrchestrator:
         while True:
             replaying_queued_calls = bool(queued_tool_calls)
             response_reasoning_content = None
+            if eviction_terminal_reply is not None:
+                return self._append_authoritative_result_links(
+                    eviction_terminal_reply,
+                    authoritative_result_links,
+                )
             if replaying_queued_calls:
                 response_tool_calls = queued_tool_calls[:_MAX_TOOL_CALLS_PER_RESPONSE]
                 del queued_tool_calls[:_MAX_TOOL_CALLS_PER_RESPONSE]
@@ -484,6 +512,150 @@ class AgentOrchestrator:
                     "Replaying queued tool-call chunk: "
                     f"size={len(response_tool_calls)} remaining={len(queued_tool_calls)}"
                 )
+            elif (
+                eviction_add is not None
+                and context.mutations_allowed
+                and not context.visual_context
+            ):
+                recommended_code = trusted_recommended_codes_by_word.get(
+                    eviction_add.word,
+                    "",
+                )
+                requested_key = (eviction_add.word, eviction_add.code)
+                recommended_review = trusted_reviewed_items_by_key.get(
+                    (eviction_add.word, recommended_code)
+                )
+                served_codes = {
+                    code
+                    for code, _occupied
+                    in trusted_candidate_slots_by_word.get(
+                        eviction_add.word,
+                        (),
+                    )
+                }
+                if (
+                    requested_key not in trusted_reviewed_items_by_key
+                    and eviction_add.code in served_codes
+                    and recommended_review is not None
+                ):
+                    # The audit is word-level; the requested code remains
+                    # separately bound to the server-served candidate chain.
+                    trusted_reviewed_items_by_key[requested_key] = dict(
+                        recommended_review
+                    )
+                reviewed = (
+                    eviction_add.word,
+                    eviction_add.code,
+                ) in trusted_reviewed_items_by_key
+                internal_calls: List[_InternalToolCall] = []
+                if (
+                    not reviewed
+                    and eviction_add.word not in attempted_review_words
+                    and "keytao_prepare_reviewed_add" in tool_schemas
+                ):
+                    internal_calls.append(_InternalToolCall(
+                        id=f"internal-eviction-review-{uuid.uuid4().hex}",
+                        function=_InternalFunctionCall(
+                            name="keytao_prepare_reviewed_add",
+                            arguments=json.dumps(
+                                {"word": eviction_add.word},
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    ))
+                if (
+                    not eviction_lookup_attempted
+                    and "keytao_lookup_by_code" in tool_schemas
+                ):
+                    internal_calls.append(_InternalToolCall(
+                        id=f"internal-eviction-lookup-{uuid.uuid4().hex}",
+                        function=_InternalFunctionCall(
+                            name="keytao_lookup_by_code",
+                            arguments=json.dumps(
+                                {"code": eviction_add.code},
+                                ensure_ascii=False,
+                            ),
+                        ),
+                    ))
+                    eviction_lookup_attempted = True
+                if internal_calls:
+                    response_tool_calls = internal_calls
+                    content = ""
+                    finish_reason = "tool_calls"
+                    elapsed = 0.0
+                    logger.info(
+                        "Resolving eviction add from server evidence: tools="
+                        + str([
+                            call.function.name for call in internal_calls
+                        ]),
+                    )
+                else:
+                    slots = trusted_candidate_slots_by_word.get(
+                        eviction_add.word,
+                        (),
+                    )
+                    entries = trusted_entries_by_code.get(
+                        eviction_add.code,
+                        (),
+                    )
+                    occupant_matches = bool(
+                        sum(
+                            entry_word == eviction_add.named_occupant
+                            for entry_word, _weight in entries
+                        ) == 1
+                    )
+                    target_is_occupied_candidate = (
+                        [
+                            occupied
+                            for code, occupied in slots
+                            if code == eviction_add.code
+                        ]
+                        == [True]
+                    )
+                    reviewed = (
+                        eviction_add.word,
+                        eviction_add.code,
+                    ) in trusted_reviewed_items_by_key
+                    if (
+                        reviewed
+                        and occupant_matches
+                        and target_is_occupied_candidate
+                        and not eviction_write_attempted
+                        and "keytao_create_phrase" in tool_schemas
+                    ):
+                        response_tool_calls = [_InternalToolCall(
+                            id=f"internal-eviction-create-{uuid.uuid4().hex}",
+                            function=_InternalFunctionCall(
+                                name="keytao_create_phrase",
+                                arguments=json.dumps({
+                                    "word": eviction_add.word,
+                                    "code": eviction_add.code,
+                                }, ensure_ascii=False),
+                            ),
+                        )]
+                        eviction_write_attempted = True
+                        content = ""
+                        finish_reason = "tool_calls"
+                        elapsed = 0.0
+                        logger.info(
+                            "Routing exact eviction add through sealed shift: "
+                            f"word={eviction_add.word} "
+                            f"code={eviction_add.code} "
+                            f"occupant={eviction_add.named_occupant}"
+                        )
+                    else:
+                        return render_remediation_reply(
+                            (
+                                f"当前服务端编码 {eviction_add.code} 的占位词"
+                                f"与指令中的“{eviction_add.named_occupant}”不一致，"
+                                "或该编码不在新词的已核验候选链中；"
+                                "为避免创建重码，本次未写入"
+                                if eviction_lookup_attempted
+                                else
+                                "无法取得本次顺延所需的服务端占位信息；"
+                                "为避免创建重码，本次未写入"
+                            ),
+                        )
             elif resolved_advertised_words:
                 reviewed_words = {
                     word for word, _code in trusted_reviewed_items_by_key
@@ -554,6 +726,8 @@ class AgentOrchestrator:
                     elapsed = time.monotonic() - started_at
                     self._log_usage(response)
                 except Exception as error:
+                    if termination_state is not None:
+                        termination_state["reason"] = "transport_failure"
                     mark_turn_outcome("error")
                     logger.error(
                         "Agent model call failed after %.1fs: %s: %s",
@@ -571,6 +745,8 @@ class AgentOrchestrator:
                     )
 
                 if not response.choices:
+                    if termination_state is not None:
+                        termination_state["reason"] = "empty_model_response"
                     mark_turn_outcome("error")
                     return self._append_authoritative_result_links(
                         render_remediation_reply(
@@ -678,6 +854,8 @@ class AgentOrchestrator:
                             context,
                         )
                         if deterministic_reply:
+                            if termination_state is not None:
+                                termination_state["reason"] = "reasoning_runaway"
                             logger.info(
                                 "Resolved reasoning-only empty response through "
                                 "the deterministic fallback handler"
@@ -691,6 +869,8 @@ class AgentOrchestrator:
                         f"count={reasoning_only_empty_responses} "
                         f"max_tokens={current_max_tokens}"
                     )
+                    if termination_state is not None:
+                        termination_state["reason"] = "reasoning_runaway"
                     return self._append_authoritative_result_links(
                         render_remediation_reply(
                             "连续两次没有生成可见回复或工具调用，已停止扩大处理预算；"
@@ -711,6 +891,8 @@ class AgentOrchestrator:
                     })
                     continue
                 logger.warning("Response truncated even at max cap")
+                if termination_state is not None:
+                    termination_state["reason"] = "response_budget_exhausted"
                 return self._append_authoritative_result_links(
                     render_remediation_reply(
                         "回复太长且已达到处理预算上限，本轮不能生成安全的拆分命令"
@@ -719,6 +901,8 @@ class AgentOrchestrator:
                 )
 
             if finish_reason not in {"stop", "tool_calls"}:
+                if termination_state is not None:
+                    termination_state["reason"] = "incomplete_model_response"
                 logger.error(
                     "Refusing incomplete model response before tool execution: "
                     f"finish_reason={finish_reason}"
@@ -731,6 +915,8 @@ class AgentOrchestrator:
                 )
 
             if response_tool_calls and finish_reason != "tool_calls":
+                if termination_state is not None:
+                    termination_state["reason"] = "incomplete_tool_request"
                 logger.error(
                     "Refusing tool calls with mismatched finish reason: "
                     f"finish_reason={finish_reason} tool_calls={tool_call_count}"
@@ -743,6 +929,8 @@ class AgentOrchestrator:
                 )
 
             if finish_reason == "tool_calls" and not response_tool_calls:
+                if termination_state is not None:
+                    termination_state["reason"] = "incomplete_tool_request"
                 logger.error("Model returned finish_reason=tool_calls without any tool calls")
                 return self._append_authoritative_result_links(
                     render_remediation_reply(
@@ -1073,6 +1261,8 @@ class AgentOrchestrator:
                     })
                     continue
                 logger.error("Model returned empty final content twice")
+                if termination_state is not None:
+                    termination_state["reason"] = "empty_final_response"
                 return self._append_authoritative_result_links(
                     render_remediation_reply(
                         "AI 连续返回空回复；本轮没有取得可绑定的操作目标"
@@ -1108,6 +1298,8 @@ class AgentOrchestrator:
                         remaining_run_budget,
                     )
                     if executable_count == 0:
+                        if termination_state is not None:
+                            termination_state["reason"] = "tool_budget_exhausted"
                         labels = [
                             self._tool_call_label(tc, fn_args)
                             for tc, fn_args in complete_batch
@@ -1162,6 +1354,8 @@ class AgentOrchestrator:
                     })
                     continue
                 logger.error(f"Refusing invalid tool-call batch: {error}")
+                if termination_state is not None:
+                    termination_state["reason"] = "invalid_tool_request"
                 return self._append_authoritative_result_links(
                     self._tool_call_validation_reply(error),
                     authoritative_result_links,
@@ -1293,11 +1487,15 @@ class AgentOrchestrator:
                             seen_tool_calls,
                         )
                 except DuplicateToolCallAbort:
+                    if termination_state is not None:
+                        termination_state["reason"] = "duplicate_tool_runaway"
                     return self._append_authoritative_result_links(
                         "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～",
                         authoritative_result_links,
                     )
                 except Exception as error:
+                    if termination_state is not None:
+                        termination_state["reason"] = "tool_dispatch_exception"
                     logger.error(
                         "Agent tool dispatch failed: %s: %s",
                         type(error).__name__,
@@ -1536,6 +1734,8 @@ class AgentOrchestrator:
                     if result_data.get("localConfirmationRequired") and pending_saved:
                         confirmation_code = self._state_store.arm_reconfirmation(conv_key)
                         if not confirmation_code:
+                            if termination_state is not None:
+                                termination_state["reason"] = "confirmation_save_failure"
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
                                     "待确认操作未能安全保存；"
@@ -1564,6 +1764,32 @@ class AgentOrchestrator:
                         )
                         if inspect.isawaitable(recorded):
                             await recorded
+                    if (
+                        eviction_add is not None
+                        and fn_name == "keytao_create_phrase"
+                    ):
+                        if (
+                            result_data.get("success") is True
+                            and successful_write_receipts
+                        ):
+                            eviction_terminal_reply = (
+                                self._receipt_completion_reply(
+                                    successful_write_receipts
+                                )
+                            )
+                        elif result_data.get("requiresConfirmation") is True:
+                            eviction_terminal_reply = str(
+                                result_data.get("message")
+                                or "顺延计划已由服务端生成，请核对后确认。"
+                            ).strip()
+                        else:
+                            eviction_terminal_reply = render_remediation_reply(
+                                str(
+                                    result_data.get("message")
+                                    or result_data.get("error")
+                                    or "顺延操作未完成；本次未写入"
+                                ).strip()
+                            )
                 except Exception:
                     pass
 
@@ -1617,6 +1843,8 @@ class AgentOrchestrator:
                     })
                     continue
                 if queued_budget_omitted:
+                    if termination_state is not None:
+                        termination_state["reason"] = "tool_budget_exhausted"
                     return self._append_authoritative_result_links(
                         self._run_budget_reply(
                             completed=total_tool_calls,
@@ -1643,6 +1871,8 @@ class AgentOrchestrator:
             continue
 
         completed_text = "、".join(completed_run_labels) or "无工具调用"
+        if termination_state is not None:
+            termination_state["reason"] = "iteration_cap"
         return self._append_authoritative_result_links(
             f"本轮已完成 {total_tool_calls} 项：{completed_text}。"
             f"但模型处理已达到 {max_iterations} 轮上限，最终汇总尚未完成；"
@@ -1925,8 +2155,16 @@ class AgentOrchestrator:
         if result.get("success") is not True:
             return None
         items: List[Dict[str, str]] = []
+        shift_plan = result.get("shiftPlan")
         if tool_name == "keytao_create_phrase":
-            source_items = [arguments]
+            if isinstance(shift_plan, dict):
+                source_items = [{
+                    "word": shift_plan.get("word"),
+                    "code": shift_plan.get("targetCode"),
+                    "action": "Create",
+                }]
+            else:
+                source_items = [arguments]
         elif tool_name == "keytao_batch_add_to_draft":
             source_items = arguments.get("items") or []
         else:
@@ -1942,6 +2180,24 @@ class AgentOrchestrator:
                     "word": word,
                     "code": code,
                 })
+        shifted: List[Dict[str, str]] = []
+        for move in (
+            shift_plan.get("shifted")
+            if isinstance(shift_plan, dict)
+            and isinstance(shift_plan.get("shifted"), list)
+            else []
+        ):
+            if not isinstance(move, dict):
+                continue
+            word = str(move.get("word") or "").strip()
+            from_code = str(move.get("fromCode") or "").strip().lower()
+            to_code = str(move.get("toCode") or "").strip().lower()
+            if word and from_code and to_code:
+                shifted.append({
+                    "word": word,
+                    "fromCode": from_code,
+                    "toCode": to_code,
+                })
         return {
             "tool": tool_name,
             "batchId": str(
@@ -1949,7 +2205,55 @@ class AgentOrchestrator:
             ).strip(),
             "batchUrl": str(result.get("batchUrl") or "").strip(),
             "items": items,
+            "shifted": shifted,
         }
+
+    @staticmethod
+    def _receipt_completion_reply(receipts: List[Dict[str, Any]]) -> str:
+        """Render completed writes only from authoritative same-turn receipts."""
+        written: List[tuple[str, str]] = []
+        shifted: List[tuple[str, str, str]] = []
+        batch_ids: List[str] = []
+        batch_urls: List[str] = []
+        for receipt in receipts:
+            batch_id = str(receipt.get("batchId") or "").strip()
+            batch_url = str(receipt.get("batchUrl") or "").strip()
+            if batch_id and batch_id not in batch_ids:
+                batch_ids.append(batch_id)
+            if batch_url and batch_url not in batch_urls:
+                batch_urls.append(batch_url)
+            for item in receipt.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                pair = (
+                    str(item.get("word") or "").strip(),
+                    str(item.get("code") or "").strip().lower(),
+                )
+                if all(pair) and pair not in written:
+                    written.append(pair)
+            for move in receipt.get("shifted") or []:
+                if not isinstance(move, dict):
+                    continue
+                triple = (
+                    str(move.get("word") or "").strip(),
+                    str(move.get("fromCode") or "").strip().lower(),
+                    str(move.get("toCode") or "").strip().lower(),
+                )
+                if all(triple) and triple not in shifted:
+                    shifted.append(triple)
+        lines = ["本轮已完成的写操作："]
+        lines.extend(
+            f"- 已写入草稿：「{word}」 → {code}"
+            for word, code in written
+        )
+        lines.extend(
+            f"- 已顺延：「{word}」 {from_code} → {to_code}"
+            for word, from_code, to_code in shifted
+        )
+        if batch_ids:
+            lines.append("关联批次：" + "、".join(batch_ids))
+        lines.extend(f"草稿/批次地址：{url}" for url in batch_urls)
+        return "\n".join(lines)
 
     @staticmethod
     def _submit_snapshot_binding(
@@ -2071,11 +2375,12 @@ class AgentOrchestrator:
         reply: Optional[str],
         failure_state: Dict[str, Any],
         successful_write_receipts: Optional[List[Dict[str, Any]]] = None,
+        termination_state: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Suppress requests to resend this turn's failed text at final emission."""
-        if reply is None:
-            return None
         receipts = list(successful_write_receipts or [])
+        if reply is None:
+            return cls._receipt_completion_reply(receipts) if receipts else None
         authorized_item = explicit_combined_add_submit_item(current_message)
         if authorized_item is not None:
             add_receipts = [
@@ -2120,39 +2425,20 @@ class AgentOrchestrator:
                     lines.extend(("", f"批次地址：{batch_url}"))
                 return "\n".join(lines)
         reply_denies_write = bool(re.search(
-            r"(?:未|没有|并未|尚未)(?:成功)?写入|无法执行",
+            r"(?:未|没有|并未|尚未)(?:(?:成功)?写入|执行(?:任何)?(?:新)?写入)|无法执行",
             reply,
         ))
-        if receipts and (failure_state or reply_denies_write):
-            written_items: List[tuple[str, str]] = []
-            batch_ids: List[str] = []
+        if receipts and (failure_state or termination_state or reply_denies_write):
             submitted_batches: List[str] = []
             for receipt in receipts:
                 batch_id = str(receipt.get("batchId") or "").strip()
-                if batch_id and batch_id not in batch_ids:
-                    batch_ids.append(batch_id)
                 if receipt.get("tool") == "keytao_submit_batch" and batch_id:
                     submitted_batches.append(batch_id)
-                for item in receipt.get("items") or []:
-                    if not isinstance(item, dict):
-                        continue
-                    pair = (
-                        str(item.get("word") or "").strip(),
-                        str(item.get("code") or "").strip().lower(),
-                    )
-                    if all(pair) and pair not in written_items:
-                        written_items.append(pair)
-            lines = ["本轮已完成的写操作："]
-            lines.extend(
-                f"- 已写入草稿：「{word}」 → {code}"
-                for word, code in written_items
-            )
+            lines = cls._receipt_completion_reply(receipts).splitlines()
             lines.extend(
                 f"- 已提交批次：{batch_id}"
                 for batch_id in submitted_batches
             )
-            if batch_ids:
-                lines.append("关联批次：" + "、".join(batch_ids))
             if failure_state:
                 failed_tool = str(failure_state.get("_failedTool") or "")
                 failure_label = (
@@ -2177,6 +2463,28 @@ class AgentOrchestrator:
                 ).strip().rstrip("；;。 ")
                 lines.append(
                     f"{failure_label}；原因：{reason or '后续工具没有成功'}。"
+                )
+            elif termination_state:
+                termination_labels = {
+                    "transport_failure": "后续 AI 服务调用失败",
+                    "empty_model_response": "后续 AI 服务没有返回可用回复",
+                    "reasoning_runaway": "后续汇总因连续空回复而停止",
+                    "response_budget_exhausted": "后续汇总达到回复预算上限",
+                    "incomplete_model_response": "后续 AI 回复不完整",
+                    "incomplete_tool_request": "后续工具请求不完整",
+                    "empty_final_response": "后续 AI 汇总连续为空",
+                    "tool_budget_exhausted": "后续处理达到工具调用预算上限",
+                    "invalid_tool_request": "后续工具请求未通过校验",
+                    "duplicate_tool_runaway": "后续处理因重复工具调用而停止",
+                    "tool_dispatch_exception": "后续工具分发发生异常",
+                    "confirmation_save_failure": "后续确认票据未能安全保存",
+                    "iteration_cap": "后续处理达到模型轮次上限",
+                    "exception": "后续处理发生异常",
+                }
+                reason = str(termination_state.get("reason") or "").strip()
+                lines.append(
+                    termination_labels.get(reason, "后续处理已停止")
+                    + "；以上已完成写入以工具回执为准。"
                 )
             else:
                 lines.append("写入已完成；原回复中的未写入判断已按工具回执纠正。")
@@ -3450,6 +3758,15 @@ class AgentOrchestrator:
             }
             or not tool_context.writes_allowed
         ):
+            return None
+        if (
+            parse_eviction_modified_add(tool_context.current_message or "")
+            is not None
+        ):
+            logger.warning(
+                "Refusing add-preview auto-confirm because the current "
+                "instruction requires the sealed eviction/reordering route"
+            )
             return None
         routed_front_insert = (
             fn_name == "keytao_create_phrase"

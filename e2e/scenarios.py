@@ -2973,6 +2973,115 @@ async def scenario_s25(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S26_WORD = "吃席"
+S26_CODE = "wkxk"
+S26_OCCUPANT = "赤溪"
+S26_COMMAND = f"添加 {S26_WORD} {S26_CODE}，{S26_OCCUPANT}顺延"
+
+
+async def scenario_s26(ctx: ScenarioContext) -> dict[str, Any]:
+    """Replay one server-resolved add plus named-occupant eviction."""
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S26 cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages = [S26_COMMAND]
+    replies = [await ctx.send_group(S26_COMMAND, to_me=True)]
+    next_code = ctx.fixture_facts["chixi_next_code"]
+    expected = {
+        ("Delete", S26_OCCUPANT, S26_CODE),
+        ("Create", S26_WORD, S26_CODE),
+        ("Create", S26_OCCUPANT, next_code),
+    }
+    draft = await ctx.draft()
+    confirmation_steps = 0
+    if {item_key(item) for item in draft.get("items", [])} != expected:
+        confirmation_match = re.search(r"确认票据\s+[A-F0-9]{6}", replies[-1])
+        confirmation_command = (
+            confirmation_match.group(0)
+            if confirmation_match is not None
+            else "确认" if "确认" in replies[-1] else ""
+        )
+        require(
+            bool(confirmation_command),
+            f"S26 neither completed nor returned one confirmation: {replies[-1]}",
+        )
+        confirmation_steps = 1
+        messages.append(confirmation_command)
+        replies.append(await ctx.send_group(confirmation_command, to_me=True))
+        draft = await ctx.draft()
+
+    actual = {item_key(item) for item in draft.get("items", [])}
+    require(
+        len(draft.get("items", [])) == 3 and actual == expected,
+        f"S26 did not atomically add and evict: {draft}",
+    )
+    require(
+        confirmation_steps <= 1,
+        "S26 used more than one confirmation",
+    )
+    completion = "\n".join(replies[-(confirmation_steps + 1):])
+    assert_reply_mentions(
+        completion,
+        S26_WORD,
+        S26_CODE,
+        S26_OCCUPANT,
+        next_code,
+    )
+    require(
+        re.search(r"未执行任何新写入|没有成功写入|本次未写入", completion)
+        is None,
+        f"S26 denied its completed write: {completion}",
+    )
+    events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > cutoff
+        and event.get("kind") == "tool"
+    ]
+    materialized_batches = {
+        str(event.get("result", {}).get("batchId") or "").strip()
+        for event in events
+        if isinstance(event.get("result"), dict)
+        and event["result"].get("success") is True
+        and str(event["result"].get("batchId") or "").strip()
+    }
+    require(
+        len(materialized_batches) == 1,
+        f"S26 did not materialize exactly one batch: {events}",
+    )
+    duplicate_auto_confirms = [
+        event
+        for event in events
+        if isinstance(event.get("result"), dict)
+        and event["result"].get("autoConfirmedWarnings") is True
+        and any(
+            isinstance(warning, dict)
+            and warning.get("warningType") == "duplicate_code"
+            for warning in event["result"].get("warnings") or []
+        )
+    ]
+    require(
+        not duplicate_auto_confirms,
+        f"S26 auto-confirmed duplicate creation: {duplicate_auto_confirms}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "command": S26_COMMAND,
+            "nextCode": next_code,
+            "confirmationSteps": confirmation_steps,
+            "batchId": next(iter(materialized_batches)),
+            "actualItems": sorted(actual),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -2999,6 +3108,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S23", "stale advertised assent recovery and fresh closure", scenario_s23),
     Scenario("S24", "single-word natural quoted assent", scenario_s24),
     Scenario("S25", "natural add, record-backed number, and combined submit", scenario_s25),
+    Scenario("S26", "server-resolved add with occupant eviction", scenario_s26),
 )
 
 

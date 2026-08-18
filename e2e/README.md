@@ -249,6 +249,13 @@ The rig seeds and verifies `窝里反@wlf` and `晚礼服@wlfo` as its exact occ
 fixtures and refuses to start S25 unless `wlfoo` is empty, so every displayed
 occupancy label comes from the local server rather than scenario prose.
 
+S26 replays the add-plus-eviction incident with
+`添加 吃席 wkxk，赤溪顺延`. It requires one atomic draft batch containing the
+newcomer at `wkxk` and the server-resolved occupant moved to its next free
+candidate, with at most one confirmation. The completion must name both
+outcomes, may not deny a completed write, and may never auto-confirm a
+`duplicate_code` creation in place of the requested eviction.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`
