@@ -18,8 +18,6 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from .pending_confirmation import render_remediation_reply
-
 # Structured field carried on draft items / review results.
 MANUAL_REVIEW_FIELD = "needsManualReview"
 MANUAL_REVIEW_FIELD_SNAKE = "needs_manual_review"
@@ -197,9 +195,7 @@ def audit_allows_batch_auto_approve(auto_review: Any) -> bool:
 def batch_auto_approve_block_reason(auto_review: Any) -> str:
     """Explain why the canonical batch predicate refuses auto-approval."""
     if not isinstance(auto_review, dict) or auto_review.get("success") is not True:
-        return render_remediation_reply(
-            "自动审核未完整完成；转交管理员属于站外处理"
-        )
+        return "自动审核未完整完成"
     if auto_review.get("manualReviewLocked"):
         return "批次包含已锁定的人工复核项"
     if auto_review.get("encodeOnly"):

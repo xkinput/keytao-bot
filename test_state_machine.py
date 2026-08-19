@@ -6,6 +6,7 @@ Does NOT require NoneBot runtime — only tests pure functions.
 import sys
 import os
 import asyncio
+import copy
 import importlib.util
 import json
 import re
@@ -175,6 +176,7 @@ from keytao_bot.plugins.openai_chat import (
     SimpleWordQueryIntent,
     SYSTEM_PROMPT_CORE,
 )
+from keytao_bot.plugins import chat_routing as chat_routing_module
 from keytao_bot.utils.draft_mutation_store import DraftMutationClaimStore
 from keytao_bot.plugins.account_bind import (
     _extract_bind_key,
@@ -224,6 +226,8 @@ from keytao_bot.utils.observability import (
     set_turn_flow,
 )
 from keytao_bot.utils.pending_confirmation import (
+    SYSTEM_REPLY_TEMPLATE_MARKERS,
+    advertised_command_has_placeholder,
     advertised_batch_binding_pairs,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
@@ -231,6 +235,7 @@ from keytao_bot.utils.pending_confirmation import (
     scoped_multi_word_candidate_copy,
 )
 import keytao_bot.plugins.openai_chat as openai_chat_module
+import keytao_bot.plugins.chat_commands as chat_commands_module
 
 _lookup_tools_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -263,6 +268,7 @@ _infer_phrase_type = _draft_tools._infer_phrase_type
 _normalize_draft_item_for_request = _draft_tools._normalize_draft_item_for_request
 _split_items_by_code_validation = _draft_tools._split_items_by_code_validation
 _validate_draft_item_code = _draft_tools._validate_draft_item_code
+_format_code_validation_failure = _draft_tools._format_code_validation_failure
 
 _review_tools_path = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -1232,8 +1238,11 @@ def test_referenced_pending_mention_blocks_other_user_direct_action():
         check("other mentioned prompt is blocked", response is not None and "不能替" in response)
         check("other user's ticket is never copied", store.get_record(current_key) is None)
         check(
-            "response admits there is no bound own command",
-            response is not None and "没有可安全执行的后续命令" in response,
+            "response offers an actor-owned review command",
+            response is not None
+            and "加词 接片" in response
+            and "（接片）" in response
+            and "没有可安全执行的后续命令" not in response,
         )
     finally:
         openai_chat_module.conversation_state_store = old_store
@@ -1444,8 +1453,9 @@ def test_pending_add_word_guidance_appended_for_occupied_candidates():
 是否以编码 zrxxv 将「增香」加入草稿？也可回复编号选其他编码。"""
 
     guided = _ensure_pending_add_word_guidance(response)
-    check("guidance mentions duplicate reply", "直接回复该编号表示添加重码" in guided)
-    check("guidance mentions recode reply", "编号 重新编码" in guided)
+    check("guidance binds the duplicate reply", "直接回复“1”表示添加重码" in guided)
+    check("guidance binds the recode reply", "已有词「增翔」" in guided and "1 重新编码" in guided)
+    check("guidance contains no recode placeholder", not advertised_command_has_placeholder(guided))
 
 
 def test_pending_add_word_guidance_fallback_matcher():
@@ -1459,10 +1469,11 @@ def test_pending_add_word_guidance_fallback_matcher():
 是否以编码 zrxxv 将「增香」加入草稿？也可回复编号选其他编码。"""
 
     guided = _ensure_pending_add_word_guidance(response)
-    check("fallback appends guidance", "原词 重新编码" in guided)
+    check("fallback appends bound guidance", "已有词「增翔」" in guided and "1 重新编码" in guided)
+    check("fallback contains no recode placeholder", not advertised_command_has_placeholder(guided))
 
 
-# Measured representative assembled prompt: 35,891 chars on 2026-08-15.
+# Measured representative assembled prompt: 35,971 chars on 2026-08-19.
 # Raise this only after reviewing the prompt/skill diff; update the measured
 # value and date here, then preserve roughly 10 percent intentional headroom.
 SYSTEM_PROMPT_GROWTH_LIMIT_CHARS = 39_300
@@ -2614,6 +2625,108 @@ def test_explicit_add_word_query_uses_review_tool_before_ai():
         check("pending recommended code", pending.recommended_code == "pgtk")
         check("explicit add stores a structured pending", stored_pending is not None and isinstance(stored_pending.state, PendingAddWord))
         check("explicit add pending stays in private address", stored_pending is not None and stored_pending.owner_key == conv_key)
+
+    asyncio.run(_run())
+
+
+def test_word_discovery_prechecks_binding_without_blocking_review():
+    """Unbound candidate copy warns early while bound copy stays unchanged."""
+    print("\n🧪 word discovery binding precheck notice")
+
+    async def _run():
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({
+                    "success": True,
+                    "word": "来都来了",
+                    "phrases": [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_prepare_reviewed_add":
+                return json.dumps({
+                    "success": True,
+                    "word": "来都来了",
+                    "recommendedCode": "ldll",
+                    "preSubmitAudit": {
+                        "success": True,
+                        "verdict": "pass",
+                        "autoApprove": True,
+                        "summary": "读音和编码候选链一致",
+                        "issues": [],
+                    },
+                    "pronunciations": [{
+                        "pinyin": "lai dou lai le",
+                        "recommendedCode": "ldll",
+                        "sources": [{"source": "汉典"}],
+                        "candidateStatuses": [
+                            {"code": "ldll", "occupied": False, "label": "空位"},
+                            {"code": "ldllo", "occupied": False, "label": "空位"},
+                        ],
+                    }],
+                }, ensure_ascii=False)
+            raise AssertionError(tool_name)
+
+        from keytao_bot.plugins import chat_commands as chat_commands_module
+
+        old_store = openai_chat_module.conversation_state_store
+        openai_chat_module.conversation_state_store = MemoryConversationStateStore()
+        try:
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    new=AsyncMock(return_value=SimpleWordQueryIntent(
+                        True,
+                        ("来都来了",),
+                        "word_lookup",
+                        0.99,
+                    )),
+                ),
+                patch.object(chat_commands_module, "call_tool_function", side_effect=fake_call),
+                patch.object(
+                    chat_commands_module.user_resolver,
+                    "resolve_actor_binding",
+                    new=AsyncMock(return_value=False),
+                ),
+            ):
+                unbound = await _try_handle_simple_single_word_query(
+                    "来都来了",
+                    "qq",
+                    "unbound-actor",
+                )
+
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    new=AsyncMock(return_value=SimpleWordQueryIntent(
+                        True,
+                        ("来都来了",),
+                        "word_lookup",
+                        0.99,
+                    )),
+                ),
+                patch.object(chat_commands_module, "call_tool_function", side_effect=fake_call),
+                patch.object(
+                    chat_commands_module.user_resolver,
+                    "resolve_actor_binding",
+                    new=AsyncMock(return_value=True),
+                ),
+            ):
+                bound = await _try_handle_simple_single_word_query(
+                    "来都来了",
+                    "qq",
+                    "bound-actor",
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        notice = (
+            "提示：你还未绑定键道账号，提交前请先绑定"
+            "（发送 /bind 绑定码，详见 https://keytao.vercel.app/profile）。"
+        )
+        check("unbound review still renders candidates", unbound is not None and "候选编码" in unbound)
+        check("unbound first candidate reply carries one short notice", unbound is not None and unbound.count(notice) == 1)
+        check("bound candidate reply carries no binding notice", bound is not None and notice not in bound)
 
     asyncio.run(_run())
 
@@ -6267,7 +6380,7 @@ def test_referenced_word_presence_query_explains_missing_quote_text():
         check(
             "missing operands advertise no invented query command",
             result is not None
-            and "当前没有可绑定的查询词" in result
+            and "无法确定查询目标" in result
             and "没有可安全执行的后续命令" in result,
         )
 
@@ -6595,7 +6708,9 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
             "out-of-range number explains range without choosing for the user",
             invalid_response is not None
             and "1-3" in invalid_response
-            and "没有可安全执行的后续命令" in invalid_response,
+            and "加入" in invalid_response
+            and "（母版）" in invalid_response
+            and "没有可安全执行的后续命令" not in invalid_response,
         )
         check("question does not execute a pending mutation", question_response is None)
         check("unsafe selectors add no extra writes", add_mock.await_count == 1 and duplicate_mock.await_count == 1 and shift_mock.await_count == 2 and multi_mock.await_count == 1)
@@ -7183,7 +7298,13 @@ def test_inline_unquoted_add_submit_requires_live_or_target_binding():
         def get_plaintext(self):
             return self.text
 
-    async def _run_case(text, should_schedule, *, server_backed=False):
+    async def _run_case(
+        text,
+        should_schedule,
+        *,
+        server_backed=False,
+        should_replace=False,
+    ):
         user_id = "inline-target-actor"
         memory_context = ChatMemoryContext(
             platform="qq",
@@ -7210,6 +7331,9 @@ def test_inline_unquoted_add_submit_requires_live_or_target_binding():
         coordinator = DraftOperationCoordinator()
         schedule = MagicMock(return_value=True)
         main_model = AsyncMock(return_value="unexpected main-model fallback")
+        replace = AsyncMock(
+            return_value="completed replacement" if should_replace else None
+        )
         finish = AsyncMock(side_effect=FinishedException())
 
         with (
@@ -7234,6 +7358,11 @@ def test_inline_unquoted_add_submit_requires_live_or_target_binding():
             ),
             patch.object(openai_chat_module, "get_history", return_value=[]),
             patch.object(openai_chat_module, "get_ai_response_core", main_model),
+            patch.object(
+                openai_chat_module,
+                "_try_handle_explicit_pending_replacement",
+                replace,
+            ),
             patch.object(openai_chat_module, "remember_conversation", MagicMock()),
         ):
             try:
@@ -7247,7 +7376,10 @@ def test_inline_unquoted_add_submit_requires_live_or_target_binding():
                 pass
 
         operation = coordinator.get(memory_context.conversation_address)
-        if should_schedule:
+        if should_replace:
+            check("full target command validates as a replacement", replace.await_count == 1)
+            check("full target replacement bypasses the stale operation", schedule.call_count == 0 and operation is None)
+        elif should_schedule:
             check("full target command schedules mutation", schedule.call_count == 1)
             check(
                 "full target command keeps exact operation",
@@ -7271,7 +7403,7 @@ def test_inline_unquoted_add_submit_requires_live_or_target_binding():
     async def _run():
         await _run_case("添加并提交", False, server_backed=False)
         await _run_case("添加并提交", True, server_backed=True)
-        await _run_case("添加 窨茶 xwwso 并提交", True)
+        await _run_case("添加 窨茶 xwwso 并提交", False, should_replace=True)
 
     asyncio.run(_run())
 
@@ -12400,7 +12532,7 @@ async def _run_orchestrator_visual_context_checks():
         ),
     )
     check("visual injection cannot execute a real write tool", mutation_calls == [])
-    check("visual injection tool call is rejected before execution", "未开放的工具" in mutation_result)
+    check("visual injection tool call is rejected before execution", "未开放的操作" in mutation_result)
     check("unknown-tool copy does not blame argument format", "参数格式错误" not in mutation_result)
     check("visual injection cannot trigger a second model turn", len(mutation_client.completions.calls) == 1)
 
@@ -12719,10 +12851,11 @@ def test_generic_ai_prose_does_not_persist_pending():
         check("generic model prose creates no structured pending", store.get_record(conv_key) is None)
         delivered = str(finish_response.await_args.args[4])
         check(
-            "generic model prose cannot escape as an unbacked candidate",
+            "generic model prose is reduced to an explicit rereview command",
             finish_response.await_count == 1
-            and "伪造词" not in delivered
-            and "当前没有可安全执行的后续命令" in delivered,
+            and "加词 伪造词" in delivered
+            and "（伪造词）" in delivered
+            and "当前没有可安全执行的后续命令" not in delivered,
         )
 
     asyncio.run(_run())
@@ -12810,9 +12943,10 @@ def test_outgoing_advertisement_requires_matching_live_state():
             "加入并提交" not in replaced and "服务端候选记录" in replaced,
         )
         check(
-            "orphan replacement does not recover operands from prose",
-            all(word not in replaced for word, _code in pairs)
-            and "当前没有可安全执行的后续命令" in replaced,
+            "orphan replacement re-reviews only displayed operands",
+            all(word in replaced for word, _code in pairs)
+            and "加词 显眼包 嘴替" in replaced
+            and "当前没有可安全执行的后续命令" not in replaced,
         )
         check(
             "orphan replacement branch is observable",
@@ -13268,12 +13402,42 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
 
     suggestion_pattern = re.compile(r"(?m)^- .+$")
     expected_words = tuple(word for word, _code in pairs)
-    check(
-        "delivery refusal without records invents no command from prose",
-        suggestion_pattern.search(delivery_refusal) is None
-        and "当前没有可安全执行的后续命令" in delivery_refusal,
+    pending_word = PendingAddWord(
+        word="增香",
+        recommended_code="zrxx",
+        candidates=[("zrxx", False)],
     )
-    for label, reply, expected_command, expected_operands in (
+    question_rejection = openai_chat_module._pending_assent_rejection_response(
+        pending_word,
+        "加入？",
+    )
+    submit_question_rejection = openai_chat_module._pending_assent_rejection_response(
+        pending_word,
+        "加入并提交？",
+    )
+    other_owner_rejection = openai_chat_module._format_other_owner_pending_message(
+        "EVO",
+        PendingAddWord(
+            word="显眼包",
+            recommended_code="xybo",
+            candidates=[("xybo", False)],
+        ),
+    )
+    internal_detail = "ConnectError https://internal.example/private"
+    draft_failure = _draft_tools._draft_tool_failure(
+        "草稿读取超时",
+        command="查看草稿",
+        error=RuntimeError(internal_detail),
+        log_context="closure_test",
+    )
+    check("draft failure helper hides exception details", internal_detail not in draft_failure)
+    converted_template_cases = (
+        (
+            "delivery-contract-rereview",
+            delivery_refusal,
+            "加词 显眼包 嘴替",
+            expected_words,
+        ),
         (
             "short-control",
             short_refusal,
@@ -13299,7 +13463,106 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
             "顺延「显眼包」到 xybo",
             ("显眼包",),
         ),
-    ):
+        (
+            "live-single-assent-rejection",
+            question_rejection or "",
+            "加入",
+            ("增香",),
+        ),
+        (
+            "live-single-submit-rejection",
+            submit_question_rejection or "",
+            "加入并提交",
+            ("增香",),
+        ),
+        (
+            "live-candidate-rereview",
+            render_remediation_reply("候选编码不匹配", command="加词 增香", words=("增香",)),
+            "加词 增香",
+            ("增香",),
+        ),
+        (
+            "multi-ticket-retry",
+            render_remediation_reply(
+                "多词选择不匹配",
+                command="将这 2 个词加入草稿",
+                words=expected_words,
+            ),
+            "将这 2 个词加入草稿",
+            expected_words,
+        ),
+        (
+            "scoped-candidate-retry",
+            render_remediation_reply(
+                "作用域编号不匹配",
+                command="显眼包 添加1",
+                words=("显眼包",),
+            ),
+            "显眼包 添加1",
+            ("显眼包",),
+        ),
+        (
+            "other-owner-rereview",
+            other_owner_rejection,
+            "加词 显眼包",
+            ("显眼包",),
+        ),
+        (
+            "draft-read-retry",
+            draft_failure,
+            "查看草稿",
+            (),
+        ),
+        (
+            "draft-ticket-shape-retry",
+            render_remediation_reply("票据快照不完整", command="查看草稿"),
+            "查看草稿",
+            (),
+        ),
+        (
+            "draft-background-retry",
+            render_remediation_reply("后台状态缺失", command="查看草稿"),
+            "查看草稿",
+            (),
+        ),
+        (
+            "draft-shift-blocked-retry",
+            render_remediation_reply("草稿条目阻止顺延", command="查看草稿"),
+            "查看草稿",
+            (),
+        ),
+        (
+            "pronunciation-rereview",
+            render_remediation_reply(
+                "读音候选无法唯一定位",
+                command="加词 增香",
+                words=("增香",),
+            ),
+            "加词 增香",
+            ("增香",),
+        ),
+        (
+            "advertised-group-one",
+            render_remediation_reply(
+                "请选择候选组",
+                command="加词 显眼包 嘴替",
+                words=expected_words,
+            ),
+            "加词 显眼包 嘴替",
+            expected_words,
+        ),
+        (
+            "advertised-group-two",
+            render_remediation_reply(
+                "请选择候选组",
+                command="加词 未知甲 未知乙",
+                words=("未知甲", "未知乙"),
+            ),
+            "加词 未知甲 未知乙",
+            ("未知甲", "未知乙"),
+        ),
+    )
+    for label, reply, expected_command, expected_operands in converted_template_cases:
         matches = tuple(suggestion_pattern.finditer(reply))
         match = matches[0] if matches else None
         check(f"{label} refusal has one rendered executable command", match is not None)
@@ -13324,12 +13587,20 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
             len(matches) == 1,
         )
         check(
+            f"{label} refusal never mixes command and no-command copy",
+            "当前没有可安全执行的后续命令" not in reply,
+        )
+        check(
+            f"{label} refusal contains no placeholder operand",
+            not advertised_command_has_placeholder(rendered_line),
+        )
+        check(
             f"{label} refusal contains no prose-only retry step",
             not re.search(r"请(?:重新|再次|先).{0,16}(?:发送|发起|复核|重试)", reply),
         )
 
     no_command_reply = render_remediation_reply(
-        "候选组不唯一，系统不能替用户选择"
+        "候选组不唯一，系统不能替你选择"
     )
     check(
         "operandless refusal invents no advertised command",
@@ -13339,6 +13610,61 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
         "operandless refusal says no executable command exists",
         "当前没有可安全执行的后续命令" in no_command_reply,
     )
+
+
+def test_partial_batch_add_never_uses_success_header():
+    """A partial write must not be announced as a complete draft add."""
+    print("\n🧪 partial batch add uses a truthful header")
+
+    async def _run():
+        items = [
+            {"action": "Create", "word": "显眼包", "code": "xybo"},
+            {"action": "Create", "word": "嘴替", "code": "zbtk"},
+        ]
+        state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": items,
+                "batch_id": "batch-partial",
+                "expected_content_version": 7,
+                "expected_warning_digest": "a" * 64,
+            },
+            confirmation_source="server_warning",
+        )
+        partial_data = {
+            "success": True,
+            "successCount": 1,
+            "failedCount": 1,
+            "batchId": "batch-partial",
+            "draft_snapshot": {
+                "count": 1,
+                "items": items[:1],
+                "summary": {"added": 1, "modified": 0, "deleted": 0},
+            },
+        }
+        with (
+            patch.object(
+                openai_chat_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps(partial_data, ensure_ascii=False)),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_format_draft_response",
+                AsyncMock(return_value="草稿快照"),
+            ),
+        ):
+            reply = await openai_chat_module._execute_confirmed_tool(
+                state,
+                "qq",
+                "partial-owner",
+            )
+
+        check("partial batch uses warning header", reply.startswith("⚠️ 仅部分加入草稿"))
+        check("partial batch never uses complete-success header", "✅ 已加入草稿" not in reply)
+        check("partial batch reports exact ratio", "仅成功加入 1/2 条" in reply)
+
+    asyncio.run(_run())
 
 
 def test_stale_confirmation_short_circuits_only_without_live_state():
@@ -13451,8 +13777,8 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
             "stale reply explains expiry or loss",
             "过期" in bare["response"] and "丢失" in bare["response"],
         )
-        check("stale reply explains the ticket lifetime", "4 小时" in bare["response"])
-        check("stale reply explains restart loss", "重启" in bare["response"])
+        check("stale reply explains ticket expiry or one-shot use", "过期或被使用" in bare["response"])
+        check("stale reply limits restart loss to candidate state", "候选状态会在机器人重启后丢失" in bare["response"])
         check(
             "stale reply admits no command exists without bound operands",
             "没有可安全执行的后续命令" in bare["response"],
@@ -15787,8 +16113,388 @@ def test_state_metrics_startup_log():
             check("state line includes database size", "db_bytes=sample.db:" in line)
             check("state line includes main-table rows", "db_rows=sample.db.sample_rows:2" in line)
             check("state line includes cache counts", "cache_entries=" in line and "review:" in line and "reviewed_add:" in line and "semantic_review:" in line and "zdic:0" in line)
-            check("state line includes pending and prompt sizes", "pending_live=" in line and "system_prompt_chars=35891" in line)
+            check(
+                "state line includes pending and prompt sizes",
+                "pending_live=" in line
+                and f"system_prompt_chars={openai_chat_module.representative_system_prompt_chars()}" in line,
+            )
             check("state line is bounded to one line", bool(line) and "\n" not in line)
+
+    asyncio.run(_run())
+
+
+def _s28_review_fixture() -> Dict:
+    def statuses(prefix: str) -> List[Dict]:
+        return [
+            {"code": prefix + ("o" * index), "occupied": False, "words": []}
+            for index in range(4)
+        ]
+
+    return {
+        "success": True,
+        "word": "呵呵呵",
+        "recommendedCode": "hhhooo",
+        "type": "Phrase",
+        "pronunciations": [
+            {
+                "pinyin": "he he he",
+                "recommendedCode": "hhhooo",
+                "candidateStatuses": statuses("hhh"),
+            },
+            {
+                "pinyin": "ke ke ke",
+                "recommendedCode": "kkkooo",
+                "candidateStatuses": statuses("kkk"),
+            },
+        ],
+        "preSubmitAudit": {
+            "autoApprove": False,
+            "summary": "多音词需管理员审核",
+            "issues": ["多音词需管理员审核"],
+        },
+    }
+
+
+def test_s28_reviewed_reading_is_the_write_validator_truth():
+    """The write validator must consume, not independently rederive, reviewed codes."""
+    print("\n🧪 S28 reviewed reading seals write validation")
+
+    async def _run():
+        captured = []
+
+        async def create(**kwargs):
+            captured.append(kwargs)
+            return {"success": True}
+
+        executor = ToolExecutor(
+            lambda name: create if name == "keytao_create_phrase" else None,
+            frozenset({"keytao_create_phrase"}),
+        )
+        trusted = {
+            ("呵呵呵", "hhhooo"): {
+                "type": "Phrase",
+                "remark": "喵喵审词：读音 he he he",
+                "needs_manual_review": True,
+                "pinyin": "he he he",
+                "candidate_codes": ("hhh", "hhho", "hhhoo", "hhhooo"),
+            },
+        }
+        result = json.loads(await executor.call(
+            "keytao_create_phrase",
+            {
+                "word": "呵呵呵",
+                "code": "hhhooo",
+                "_reviewed_pinyin": "forged",
+                "_reviewed_candidate_codes": ["forged"],
+            },
+            ToolContext(
+                platform="qq",
+                user_id="s28",
+                current_message="添加 呵呵呵 hhhooo 并提交",
+                writes_allowed=True,
+                trusted_codes_by_word={"呵呵呵": frozenset({"hhhooo"})},
+                trusted_reviewed_items_by_key=trusted,
+            ),
+        ))
+        check("trusted reviewed create executes", result.get("success") is True)
+        check("one reviewed create reaches the tool", len(captured) == 1)
+        check(
+            "model-authored reading is replaced by the reviewed reading",
+            captured[0].get("_reviewed_pinyin") == "he he he",
+        )
+        check(
+            "model-authored chain is replaced by the reviewed chain",
+            captured[0].get("_reviewed_candidate_codes")
+            == ["hhh", "hhho", "hhhoo", "hhhooo"],
+        )
+
+        with patch.object(
+            _draft_tools,
+            "_fetch_encode_candidates",
+            AsyncMock(side_effect=AssertionError("must not rederive reviewed chain")),
+        ):
+            validation = await _validate_draft_item_code(
+                {"action": "Create", "word": "呵呵呵", "code": "hhhooo", "type": "Phrase"},
+                reviewed_pinyin="he he he",
+                reviewed_candidate_codes=["hhh", "hhho", "hhhoo", "hhhooo"],
+            )
+        check("review-advertised code is write-valid", validation.get("success") is True)
+        check("validation records reviewed-reading source", validation.get("validationSource") == "reviewed-reading")
+
+    asyncio.run(_run())
+
+
+def test_s28_full_add_replaces_live_candidate_and_fresh_state_keeps_readings():
+    """A complete add is fresh authority; record-first candidates retain readings."""
+    print("\n🧪 S28 live replacement precedence and fresh reading bindings")
+    state = PendingAddWord(
+        word="呵呵呵",
+        recommended_code="hhhooo",
+        candidates=[("hhh", False), ("hhho", False), ("hhhoo", False), ("hhhooo", False)],
+        server_candidates=[("hhh", False), ("hhho", False), ("hhhoo", False), ("hhhooo", False)],
+    )
+    message = "添加 呵呵呵 kkkooo 并提交"
+    intent = MessageCommandIntent(
+        intent="pending_add_and_submit",
+        confidence=1.0,
+        submit_after=True,
+    )
+    check(
+        "complete same-word add is not rejected as extra content",
+        chat_routing_module._pending_assent_rejection_response(state, message) is None,
+    )
+    check(
+        "complete add supersedes live-state arbitration",
+        _is_fresh_current_user_command_intent(intent, message),
+    )
+
+    review = _s28_review_fixture()
+    codes_by_word = {}
+    lookup_codes = {}
+    entries = {}
+    draft_words = {}
+    draft_items = {}
+    phrase_types = {}
+    reviewed = {}
+    slots = {}
+    statuses = {}
+    recommended = {}
+    readings = {}
+    AgentOrchestrator._update_trusted_capabilities(
+        "keytao_prepare_reviewed_add",
+        {"word": "呵呵呵"},
+        review,
+        codes_by_word,
+        lookup_codes,
+        entries,
+        draft_words,
+        draft_items,
+        phrase_types,
+        reviewed,
+        slots,
+        [],
+        statuses,
+        recommended,
+        readings,
+    )
+    pending = AgentOrchestrator._trusted_single_pending_add(
+        slots,
+        statuses,
+        recommended,
+        reviewed,
+        readings,
+    )
+    check("record-first multi-reading review produces one pending state", pending is not None)
+    check(
+        "fresh pending state keeps reading for every advertised code",
+        pending is not None
+        and pending.pronunciation_codes
+        == {
+            "hhh": "he he he",
+            "hhho": "he he he",
+            "hhhoo": "he he he",
+            "hhhooo": "he he he",
+        },
+    )
+
+    async def _run_replacement():
+        tool_calls = []
+
+        async def fake_call(tool_name, arguments, platform, user_id, **_kwargs):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_prepare_reviewed_add":
+                return json.dumps(review, ensure_ascii=False)
+            check("invalid replacement is checked by encode service", tool_name == "keytao_encode")
+            return json.dumps({"success": False, "message": "invalid requested code"})
+
+        execute = AsyncMock(return_value="completed replacement")
+        with (
+            patch.object(chat_commands_module, "call_tool_function", fake_call),
+            patch.object(chat_commands_module, "_execute_add_to_draft_and_submit", execute),
+        ):
+            response = await chat_commands_module._try_handle_explicit_pending_replacement(
+                state,
+                message,
+                "qq",
+                "s28",
+                ConversationAddress.private("qq", "s28"),
+            )
+            invalid = await chat_commands_module._try_handle_explicit_pending_replacement(
+                state,
+                "添加 呵呵呵 invalid 并提交",
+                "qq",
+                "s28",
+                ConversationAddress.private("qq", "s28"),
+            )
+        check("same-word full add completes replacement path", response == "completed replacement")
+        check("replacement re-runs reviewed encode service", tool_calls[0][0] == "keytao_prepare_reviewed_add")
+        check("replacement selects the literal new code", execute.await_args.args[:2] == ("呵呵呵", "kkkooo"))
+        check("replacement carries selected reading", execute.await_args.kwargs.get("reviewed_pinyin") == "ke ke ke")
+        check("invalid replacement is rejected before create", execute.await_count == 1)
+        check("invalid replacement names compact per-reading chains", "可选读音链" in invalid and ", " not in invalid)
+        check("invalid replacement has no bogus URL", "https://keytao.vercel.app" not in invalid)
+
+        h_only_review = copy.deepcopy(review)
+        h_only_review["pronunciations"] = h_only_review["pronunciations"][:1]
+        requested_encode = {
+            "success": True,
+            "word": "呵呵呵",
+            "chars": [
+                {"char": "呵", "pinyin": "ke"},
+                {"char": "呵", "pinyin": "ke"},
+                {"char": "呵", "pinyin": "ke"},
+            ],
+            "requestedCandidateCodes": ["kkk", "kkko", "kkkoo", "kkkooo"],
+            "candidateStatuses": [
+                {"code": candidate_code, "occupied": False, "words": []}
+                for candidate_code in ("kkk", "kkko", "kkkoo", "kkkooo")
+            ],
+        }
+
+        async def fallback_call(tool_name, arguments, platform, user_id, **_kwargs):
+            if tool_name == "keytao_prepare_reviewed_add":
+                return json.dumps(h_only_review, ensure_ascii=False)
+            check("requested-code fallback calls encode", tool_name == "keytao_encode")
+            check(
+                "requested-code fallback binds literal code",
+                arguments == {"word": "呵呵呵", "requested_code": "kkkooo"},
+            )
+            return json.dumps(requested_encode, ensure_ascii=False)
+
+        fallback_execute = AsyncMock(return_value="completed requested-code replacement")
+        with (
+            patch.object(chat_commands_module, "call_tool_function", fallback_call),
+            patch.object(chat_commands_module, "_execute_add_to_draft_and_submit", fallback_execute),
+        ):
+            fallback_response = await chat_commands_module._try_handle_explicit_pending_replacement(
+                state,
+                message,
+                "qq",
+                "s28",
+                ConversationAddress.private("qq", "s28"),
+            )
+        check("requested-code encode fallback completes", fallback_response == "completed requested-code replacement")
+        check("requested-code fallback seals reading", fallback_execute.await_args.kwargs.get("reviewed_pinyin") == "ke ke ke")
+        check("requested-code fallback preserves manual review", fallback_execute.await_args.args[7] is True)
+
+    asyncio.run(_run_replacement())
+
+
+def test_s28_invalid_code_copy_and_authoritative_url_guard_are_compact():
+    """Invalid code failures summarize chains and never advertise a root URL."""
+    print("\n🧪 S28 compact invalid-code failure and URL guard")
+    candidates = [
+        prefix + ("o" * suffix)
+        for prefix in ("xxx", "hxx", "kxx", "xhx", "xkx", "xxh", "xxk")
+        for suffix in range(4)
+    ]
+    failure = _format_code_validation_failure({
+        "word": "呵呵呵",
+        "code": "invalid",
+        "reason": "编码 invalid 不是「呵呵呵」的有效候选编码",
+        "candidateCodes": candidates,
+    })
+    reason = failure["reason"]
+    check("invalid failure identifies the requested code", "invalid" in reason)
+    check("invalid failure uses compact reading-chain summary", "可选读音链" in reason)
+    check(
+        "invalid failure does not dump all 28 candidates",
+        ", " not in reason and len(reason) < 180,
+    )
+
+    cleaned = AgentOrchestrator._append_authoritative_result_links(
+        "添加失败：编码无效\n草稿地址：https://keytao.vercel.app",
+        {},
+    )
+    check("bare draft root URL is removed", "https://keytao.vercel.app" not in cleaned)
+    check("dangling draft label is removed", "草稿地址" not in cleaned)
+
+
+def test_s28_rule_question_fallback_uses_encode_facts():
+    """Two empty model turns can still explain concrete code chains honestly."""
+    print("\n🧪 S28 encoding-rule deterministic fallback")
+
+    async def _run():
+        encode = {
+            "success": True,
+            "word": "呵呵呵",
+            "chars": [
+                {"char": "呵", "pinyin": "a", "phoneticCode": "x"},
+                {"char": "呵", "pinyin": "a", "phoneticCode": "x"},
+                {"char": "呵", "pinyin": "a", "phoneticCode": "x"},
+            ],
+            "candidateCodes": ["xxx", "hxx", "kxx", "hxxo", "kxxo"],
+            "alternatePhrasePronunciationCodes": [
+                {"char": "呵", "charIndex": 0, "pinyin": "he", "phoneticCode": "h", "codes": ["hxx", "hxxo"]},
+                {"char": "呵", "charIndex": 0, "pinyin": "ke", "phoneticCode": "k", "codes": ["kxx", "kxxo"]},
+            ],
+        }
+
+        async def fake_call(tool_name, arguments, platform, user_id):
+            if tool_name == "keytao_fetch_docs":
+                return json.dumps({
+                    "success": True,
+                    "content": "三字词编码采用逐字音码形成前缀。",
+                    "sources": ["https://keytao-docs.vercel.app/guide/code"],
+                }, ensure_ascii=False)
+            check("rule fallback queries the encode service", tool_name == "keytao_encode")
+            check("rule fallback binds the concrete word", arguments == {"word": "呵呵呵"})
+            return json.dumps(encode, ensure_ascii=False)
+
+        with patch.object(openai_chat_module, "call_tool_function", fake_call):
+            answer = await openai_chat_module._try_handle_encoding_rule_question(
+                "根据编码规则，为什么呵呵呵是hxxooo或kxxooo？",
+                "qq",
+                "s28",
+            )
+            client = _FakeClient([
+                _FakeAIResponse("length", None, reasoning_content="first"),
+                _FakeAIResponse("length", None, reasoning_content="second"),
+            ])
+            orchestrator = AgentOrchestrator(
+                client_factory=lambda: client,
+                runtime=AgentRuntimeConfig(
+                    model="fake-model",
+                    max_tokens=1800,
+                    temperature=0.0,
+                    timeout=10.0,
+                    max_tokens_cap=7200,
+                ),
+                skills_manager=_FakeSkillsManager(),
+                tool_executor=ToolExecutor(lambda name: None, frozenset()),
+                state_store=MemoryConversationStateStore(),
+                bind_help_text="bind help",
+                system_prompt_core="system",
+                deterministic_fallback_handler=lambda fallback_message, context: (
+                    openai_chat_module._try_handle_encoding_rule_question(
+                        fallback_message,
+                        context.platform,
+                        context.user_id,
+                    )
+                ),
+            )
+            runaway_answer = await orchestrator.run(
+                "根据编码规则，为什么呵呵呵是hxxooo或kxxooo？",
+                AgentRequestContext(platform="qq", user_id="s28"),
+            )
+        check("rule fallback returns a visible explanation", bool(answer))
+        check("rule fallback explains both requested reading chains", "he a a" in answer and "ke a a" in answer)
+        check("rule fallback cites fetched docs", "https://keytao-docs.vercel.app/guide/code" in answer)
+        check("rule fallback is not a write/runaway template", "本次未执行" not in answer and "安全拦截" not in answer)
+        check("two reasoning-only rounds stop at the configured cap", len(client.completions.calls) == 2)
+        check("runaway path returns the same honest explanation", "he a a" in runaway_answer and "ke a a" in runaway_answer)
+        check("runaway path does not emit the dead template", "本次未执行" not in runaway_answer)
+        impersonation_cleaned = AgentOrchestrator._replace_model_authored_system_template(
+            "根据编码规则，为什么呵呵呵是hxxooo或kxxooo？",
+            "安全拦截：本次未执行任何新写入。",
+        )
+        check(
+            "rule-question impersonation guard strips system templates",
+            not any(
+                marker in impersonation_cleaned
+                for marker in SYSTEM_REPLY_TEMPLATE_MARKERS
+            ),
+        )
 
     asyncio.run(_run())
 
@@ -15847,6 +16553,7 @@ if __name__ == "__main__":
     test_simple_single_word_query_uses_review_tool_before_ai()
     test_candidate_commonness_copy_snapshot_and_zero_writes()
     test_explicit_add_word_query_uses_review_tool_before_ai()
+    test_word_discovery_prechecks_binding_without_blocking_review()
     test_reviewed_add_prompt_explains_fallback_review_policy()
     test_reviewed_add_prompt_shows_pre_submit_audit_result()
     test_reviewed_add_prompt_explains_entity_common_knowledge()
@@ -16012,6 +16719,7 @@ if __name__ == "__main__":
     test_outgoing_advertisement_requires_matching_live_state()
     test_short_add_submit_copy_distinguishes_quote_without_live_state()
     test_refusal_remediation_copy_uses_bound_executable_suggestions()
+    test_partial_batch_add_never_uses_success_header()
     test_stale_confirmation_short_circuits_only_without_live_state()
     test_pending_replay_transport_failure_retains_exact_ticket()
     test_orchestrator_reasoning_round_trip()
@@ -16041,6 +16749,10 @@ if __name__ == "__main__":
     test_turn_metrics_normal_mocked_turn()
     test_turn_metrics_policy_blocked_mocked_turn()
     test_state_metrics_startup_log()
+    test_s28_reviewed_reading_is_the_write_validator_truth()
+    test_s28_full_add_replaces_live_candidate_and_fresh_state_keeps_readings()
+    test_s28_invalid_code_copy_and_authoritative_url_guard_are_compact()
+    test_s28_rule_question_fallback_uses_encode_facts()
 
     print("\n" + "=" * 60)
     total = passed + failed

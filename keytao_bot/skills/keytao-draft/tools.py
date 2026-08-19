@@ -37,7 +37,7 @@ from keytao_bot.utils.keytao_review import (
     manual_preaudit_issue_for_item,
     prepare_reviewed_word,
 )
-from keytao_bot.utils.pending_confirmation import render_remediation_reply
+from keytao_bot.utils.pending_confirmation import _BIND_HELP_TEXT, render_remediation_reply
 
 
 ACTION_LABELS = {
@@ -67,6 +67,21 @@ PHRASE_TYPE_BASE_WEIGHTS = {
     "CSSSingle": 10,
     "English": 100,
 }
+
+
+def _draft_tool_failure(
+    reason: str,
+    *,
+    command: str = "",
+    error: Optional[Exception] = None,
+    log_context: str = "draft_tool",
+) -> str:
+    """Render stable user copy while keeping exception details in logs only."""
+    if error is not None:
+        logger.error(
+            f"[{log_context}] {type(error).__name__}: {error}"
+        )
+    return render_remediation_reply(reason, command=command)
 
 
 class _SubmitAuditTicketStore:
@@ -684,10 +699,7 @@ def _not_bound_message(platform: str) -> str:
         return render_remediation_reply(
             "当前未登录 KeyTao；登录属于站外操作"
         )
-    return render_remediation_reply(
-        "未找到绑定账号",
-        command="/bind",
-    )
+    return _BIND_HELP_TEXT
 
 
 def get_keytao_url() -> str:
@@ -990,13 +1002,30 @@ async def _fetch_encode_candidates(word: str, requested_code: Optional[str] = No
                     requested_code=requested_code,
                 )
     except httpx.TimeoutException:
-        return {"success": False, "message": f"计算「{word}」编码超时"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                f"计算「{word}」编码超时",
+                command="查看草稿",
+            ),
+        }
     except Exception as e:
-        logger.error(f"[shift_encode] Error for {word}: {e}")
-        return {"success": False, "message": f"计算「{word}」编码失败: {str(e)}"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                f"无法计算「{word}」的编码",
+                error=e,
+                log_context="shift_encode",
+            ),
+        }
 
 
-async def _validate_draft_item_code(item: Dict) -> Dict:
+async def _validate_draft_item_code(
+    item: Dict,
+    *,
+    reviewed_pinyin: str = "",
+    reviewed_candidate_codes: Optional[List[str]] = None,
+) -> Dict:
     """Validate every code-writing item; unverifiable types require review."""
     if not _should_validate_item_code(item):
         return {"success": True, "skipped": True}
@@ -1029,6 +1058,25 @@ async def _validate_draft_item_code(item: Dict) -> Dict:
             "needsManualReview": True,
             "manualReviewReason": f"{phrase_type} 类型没有确定性编码校验规则，需管理员人工确认",
         }, "unvalidated_type")
+    trusted_reviewed_codes = _clean_code_list(reviewed_candidate_codes)
+    reviewed_syllables = [
+        value
+        for value in re.split(r"\s+", str(reviewed_pinyin or "").strip())
+        if value
+    ]
+    if (
+        trusted_reviewed_codes
+        and code in trusted_reviewed_codes
+        and len(reviewed_syllables) == len(word)
+    ):
+        return {
+            "success": True,
+            "word": word,
+            "code": code,
+            "candidateCodes": trusted_reviewed_codes,
+            "reviewedPinyin": " ".join(reviewed_syllables),
+            "validationSource": "reviewed-reading",
+        }
     encoding = await _fetch_encode_candidates(word, code)
     if not encoding.get("success"):
         return review_flags.apply_review_disposition({
@@ -1058,13 +1106,36 @@ async def _validate_draft_item_code(item: Dict) -> Dict:
     }, "invalid_code")
 
 
+def _compact_candidate_chain_summary(candidate_codes: List[str]) -> str:
+    """Summarize code families without dumping every expansion slot."""
+    groups: Dict[str, List[str]] = {}
+    for raw_code in candidate_codes:
+        code = str(raw_code or "").strip().lower()
+        if not code:
+            continue
+        base = code.rstrip("o") or code
+        groups.setdefault(base, []).append(code)
+    summaries = []
+    for base, codes in list(groups.items())[:4]:
+        ordered = sorted(set(codes), key=lambda value: (len(value), value))
+        summaries.append(
+            ordered[0]
+            if len(ordered) == 1
+            else f"{ordered[0]}–{ordered[-1]}"
+        )
+    if not summaries:
+        return ""
+    suffix = f"（共 {len(groups)} 组）" if len(groups) > len(summaries) else ""
+    return "；".join(summaries) + suffix
+
+
 def _format_code_validation_failure(validation: Dict, index: int = 0) -> Dict:
     candidate_codes = validation.get("candidateCodes") or []
     reason = validation.get("reason", "编码校验失败")
     if candidate_codes:
-        reason += f"；可选：{', '.join(candidate_codes[:8])}"
-        if len(candidate_codes) > 8:
-            reason += f" 等 {len(candidate_codes)} 个"
+        compact = _compact_candidate_chain_summary(candidate_codes)
+        if compact:
+            reason += f"；可选读音链：{compact}"
     failed = {
         "index": index,
         "word": validation.get("word", ""),
@@ -1093,7 +1164,11 @@ async def _split_items_by_code_validation(items: List[Dict]) -> tuple[List[Dict]
 
     async def validate(index: int, item: Dict) -> tuple[int, Dict, Dict]:
         async with semaphore:
-            return index, item, await _validate_draft_item_code(item)
+            return index, item, await _validate_draft_item_code(
+                item,
+                reviewed_pinyin=str(item.get("_reviewed_pinyin") or ""),
+                reviewed_candidate_codes=item.get("_reviewed_candidate_codes"),
+            )
 
     checked = await asyncio.gather(
         *(validate(index, item) for index, item in enumerate(normalized_items))
@@ -1102,6 +1177,8 @@ async def _split_items_by_code_validation(items: List[Dict]) -> tuple[List[Dict]
     valid_items: List[Dict] = []
     failed_items: List[Dict] = []
     for index, item, validation in checked:
+        item.pop("_reviewed_pinyin", None)
+        item.pop("_reviewed_candidate_codes", None)
         if validation.get("success"):
             valid_items.append(_stamp_item_review_flag(item, validation))
         else:
@@ -1132,9 +1209,19 @@ async def _lookup_words_raw(words: List[str]) -> Dict:
                 return {"success": False, "message": data.get("message", "按词查询失败")}
             return {"success": True, "results": data.get("results", [])}
     except httpx.TimeoutException:
-        return {"success": False, "message": "按词查询超时"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure("按词查询超时", command="查看草稿"),
+        }
     except Exception as e:
-        return {"success": False, "message": f"按词查询失败: {str(e)}"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                "按词查询暂时不可用",
+                error=e,
+                log_context="lookup_words",
+            ),
+        }
 
 
 async def _lookup_codes_raw(codes: List[str]) -> Dict:
@@ -1160,9 +1247,19 @@ async def _lookup_codes_raw(codes: List[str]) -> Dict:
                 return {"success": False, "message": data.get("message", "按编码查询失败")}
             return {"success": True, "results": data.get("results", [])}
     except httpx.TimeoutException:
-        return {"success": False, "message": "按编码查询超时"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure("按编码查询超时", command="查看草稿"),
+        }
     except Exception as e:
-        return {"success": False, "message": f"按编码查询失败: {str(e)}"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                "按编码查询暂时不可用",
+                error=e,
+                log_context="lookup_codes",
+            ),
+        }
 
 
 async def keytao_create_phrase(
@@ -1181,6 +1278,8 @@ async def keytao_create_phrase(
     expected_warning_digest: str = "",
     preview_only: bool = False,
     weight: Optional[int] = None,
+    _reviewed_pinyin: str = "",
+    _reviewed_candidate_codes: Optional[List[str]] = None,
 ) -> Dict:
     """
     Create, modify or delete a phrase entry via bot API
@@ -1257,17 +1356,23 @@ async def keytao_create_phrase(
         review_flags.apply_manual_review_flag(item, bool(needs_manual_review))
     if weight is not None:
         item["weight"] = weight
-    validation = await _validate_draft_item_code(item)
+    validation = await _validate_draft_item_code(
+        item,
+        reviewed_pinyin=_reviewed_pinyin,
+        reviewed_candidate_codes=_reviewed_candidate_codes,
+    )
     if not validation.get("success"):
         failed = _format_code_validation_failure(validation)
-        return {
+        result = {
             "success": False,
             "message": failed["reason"],
             "failed": [failed],
             "failedCount": 1,
-            "batchId": batch_id,
-            "batchUrl": make_batch_url(batch_id),
         }
+        if batch_id:
+            result["batchId"] = batch_id
+            result["batchUrl"] = make_batch_url(batch_id)
+        return result
     _stamp_item_review_flag(item, validation)
 
     url = f"{KEYTAO_API_BASE}/api/bot/pull-requests/batch"
@@ -1371,7 +1476,10 @@ async def keytao_create_phrase(
         if preview_only:
             return _inject_known_batch_url({
                 "success": False,
-                "message": render_remediation_reply("添加预检超时"),
+                "message": _draft_tool_failure(
+                    "添加预检超时",
+                    command="查看草稿",
+                ),
             }, batch_id)
         result = {
             "success": False,
@@ -1383,7 +1491,6 @@ async def keytao_create_phrase(
         }
         return _inject_known_batch_url(result, batch_id)
     except Exception as e:
-        logger.error(f"Create phrase error: {e}")
         result = {
             "success": False,
             "message": (
@@ -1392,7 +1499,12 @@ async def keytao_create_phrase(
                     command="查看草稿",
                 )
                 if confirmed
-                else f"创建失败: {str(e)}"
+                else _draft_tool_failure(
+                    "添加服务暂时不可用",
+                    command="查看草稿",
+                    error=e,
+                    log_context="create_phrase",
+                )
             ),
         }
         if confirmed:
@@ -2167,7 +2279,10 @@ async def keytao_submit_batch(
             return _inject_known_batch_url({
                 "success": False,
                 "error": "submit_preview_timeout",
-                "message": render_remediation_reply("提交预检超时"),
+                "message": _draft_tool_failure(
+                    "提交预检超时",
+                    command="查看草稿",
+                ),
             }, batch_id)
         if confirmed:
             mark_confirmation_uncertain()
@@ -2191,7 +2306,6 @@ async def keytao_submit_batch(
             ),
         }, batch_id)
     except Exception as e:
-        logger.error(f"Submit batch error: {e}")
         if confirmed:
             mark_confirmation_uncertain()
             return _inject_known_batch_url({
@@ -2207,7 +2321,12 @@ async def keytao_submit_batch(
         return _inject_known_batch_url({
             "success": False,
             "error": "submit_failed",
-            "message": f"提交失败: {str(e)}",
+            "message": _draft_tool_failure(
+                "提交服务暂时不可用",
+                command="查看草稿",
+                error=e,
+                log_context="submit_batch",
+            ),
         }, batch_id)
 
 
@@ -2275,10 +2394,23 @@ async def keytao_get_batch_preview(
         }
 
     except httpx.TimeoutException:
-        return {"success": False, "message": render_remediation_reply("请求超时")}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                "草稿预览请求超时",
+                command="查看草稿",
+            ),
+        }
     except Exception as e:
-        logger.error(f"[keytao_get_batch_preview] Error: {e}")
-        return {"success": False, "message": f"获取预览失败: {str(e)}"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                "草稿预览暂时不可用",
+                command="查看草稿",
+                error=e,
+                log_context="get_batch_preview",
+            ),
+        }
 
 
 async def keytao_recall_batch(
@@ -2613,10 +2745,12 @@ async def keytao_recall_batch(
             )
         return {
             "success": False,
-            "message": render_remediation_reply("撤回预检请求超时"),
+            "message": _draft_tool_failure(
+                "撤回预检请求超时",
+                command="查看草稿",
+            ),
         }
     except Exception as e:
-        logger.error(f"[keytao_recall_batch] Error: {e}")
         if batch_id:
             uncertain = {
                 "success": False,
@@ -2634,7 +2768,15 @@ async def keytao_recall_batch(
                 str(existing_recall_payload.get("batchId") or ""),
                 "撤回核验失败；已锁定原批次，不会选择新的提交批次。",
             )
-        return {"success": False, "message": f"撤回失败: {str(e)}"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                "撤回核验暂时不可用",
+                command="查看草稿",
+                error=e,
+                log_context="recall_batch",
+            ),
+        }
 
 
 async def keytao_list_draft_items(
@@ -2699,14 +2841,31 @@ async def keytao_list_draft_items(
     except httpx.TimeoutException:
         return {
             "success": False,
-            "message": render_remediation_reply("查看草稿请求超时"),
+            "message": _draft_tool_failure(
+                "查看草稿请求超时",
+                command="查看草稿",
+            ),
         }
     except httpx.TransportError as e:
-        logger.error(f"List draft items network error: {type(e).__name__}: {e!r}")
-        return {"success": False, "message": f"网络错误: {type(e).__name__}"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                "查看草稿时网络暂时不可用",
+                command="查看草稿",
+                error=e,
+                log_context="list_draft_items",
+            ),
+        }
     except Exception as e:
-        logger.error(f"List draft items error: {type(e).__name__}: {e!r}")
-        return {"success": False, "message": f"获取失败: {type(e).__name__}: {e}"}
+        return {
+            "success": False,
+            "message": _draft_tool_failure(
+                "查看草稿暂时不可用",
+                command="查看草稿",
+                error=e,
+                log_context="list_draft_items",
+            ),
+        }
 
 
 async def keytao_update_draft_item_weight(
@@ -3744,7 +3903,10 @@ async def keytao_batch_add_to_draft(
         if preview_only:
             return _inject_known_batch_url({
                 "success": False,
-                "message": render_remediation_reply("批量添加预检超时"),
+                "message": _draft_tool_failure(
+                    "批量添加预检超时",
+                    command="查看草稿",
+                ),
             }, batch_id)
         result = {
             "success": False,
@@ -3756,7 +3918,6 @@ async def keytao_batch_add_to_draft(
         }
         return _inject_known_batch_url(result, batch_id)
     except Exception as e:
-        logger.error(f"[keytao_batch_add_to_draft] Error: {e}")
         result = {
             "success": False,
             "message": (
@@ -3765,7 +3926,12 @@ async def keytao_batch_add_to_draft(
                     command="查看草稿",
                 )
                 if confirmed
-                else f"批量添加失败: {str(e)}"
+                else _draft_tool_failure(
+                    "批量添加服务暂时不可用",
+                    command="查看草稿",
+                    error=e,
+                    log_context="batch_add_to_draft",
+                )
             ),
         }
         if confirmed:
@@ -4302,7 +4468,8 @@ async def keytao_shift_phrase_code(
             "requiresDraftCleanup": True,
             "message": render_remediation_reply(
                 "相关词条已存在于草稿中；为避免非原子地先删后写，"
-                "本次顺延未修改草稿；必须由用户决定如何处理旧草稿条目"
+                "本次顺延未修改草稿；必须由你决定如何处理旧草稿条目",
+                command="查看草稿",
             ),
             "relatedDraftItems": related_draft_items[:20],
             "shiftPlan": {

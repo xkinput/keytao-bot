@@ -35,6 +35,11 @@ from .scenarios import (
     S26_COMMAND,
     S26_OCCUPANT,
     S26_WORD,
+    S27_ASSENT,
+    S27_META_QUESTION,
+    S27_WORD,
+    S28_INVALID_CODE,
+    S28_WORD,
     assert_batch_link_hosts,
     same_unique_item_set,
 )
@@ -301,15 +306,17 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S24 replays the single-word natural-assent incident", readme)
         self.assertIn("S25 replays the 炒冷饭 production incident", readme)
         self.assertIn("S26 replays the add-plus-eviction incident", readme)
+        self.assertIn("S27 replays the binding-precheck incident", readme)
+        self.assertIn("S28 replays the multi-reading candidate cascade", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s26(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s28(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 27)],
+            [f"S{index}" for index in range(1, 29)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -655,6 +662,27 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             if row["kind"] == "entry" and row["entry"] == S25_WORD
         )
         self.assertEqual(whole_word["pinyins"], ["chǎo", "lěng", "fàn"])
+
+    def test_s27_owns_the_exact_binding_precheck_word_fixture(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S27"]
+        self.assertEqual(fixture["probe_words"], (S27_WORD,))
+        self.assertEqual(
+            {row["entry"] for row in fixture["rows"] if row["kind"] == "char"},
+            set(S27_WORD),
+        )
+        whole_word = next(
+            row
+            for row in fixture["rows"]
+            if row["kind"] == "entry" and row["entry"] == S27_WORD
+        )
+        self.assertEqual(whole_word["pinyins"], ["lái", "dōu", "lái", "le"])
+
+    def test_s28_reuses_the_seeded_multi_reading_fixture(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S28"]
+        self.assertEqual(fixture, ZDIC_FIXTURES_BY_SCENARIO["S18"])
+        self.assertEqual(S28_WORD, "还车")
+        self.assertEqual(S28_INVALID_CODE, "zzzzzz")
+        self.assertIn("S28", {scenario.scenario_id for scenario in SCENARIOS})
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
         class FakeBuildResult:
@@ -2240,6 +2268,118 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["batchId"], "batch-s26")
         self.assertEqual(result["facts"]["nextCode"], "wkxko")
 
+    async def test_s27_offline_replays_binding_precheck_and_meta_answer(self) -> None:
+        from keytao_bot.utils.pending_confirmation import (
+            SYSTEM_REPLY_TEMPLATE_MARKERS,
+            UNBOUND_BINDING_PRECHECK_NOTICE,
+            single_word_candidate_footer,
+        )
+
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S27")
+
+        class FakeContext:
+            def __init__(self):
+                self.platform_id = "9" * 32
+                self.sender_name = "S27-bound"
+                self.identity = {
+                    "platform_id": self.platform_id,
+                    "name": self.sender_name,
+                }
+                self.next_client = self
+                self.bot = self
+                self.base_url = "http://localhost:3100"
+                self.events = []
+                self.sequence = 0
+                self.reset_ids = []
+
+            async def find_user(self, platform_id: str):
+                if platform_id == self.platform_id:
+                    return {"id": "bound-user", "name": self.sender_name}
+                return None
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.reset_ids.append(platform_id)
+
+            async def send_group(
+                self,
+                *,
+                platform_id: str,
+                sender_name: str,
+                text: str,
+                to_me: bool,
+            ) -> str:
+                self.assertTrue(to_me)
+                if text == S27_WORD:
+                    candidate = (
+                        f"「{S27_WORD}」候选编码：\n"
+                        "1. ldll — 空位 ✅\n\n"
+                        f"是否以编码 ldll 将「{S27_WORD}」加入草稿？\n"
+                        + single_word_candidate_footer(1)
+                    )
+                    return (
+                        f"{UNBOUND_BINDING_PRECHECK_NOTICE}\n{candidate}"
+                        if platform_id.startswith("8")
+                        else candidate
+                    )
+                if text == S27_ASSENT:
+                    self.assertTrue(platform_id.startswith("8"))
+                    self.sequence += 1
+                    self.events.append({
+                        "sequence": self.sequence,
+                        "kind": "tool",
+                        "name": "keytao_create_phrase",
+                        "result": {"success": False, "not_bound": True},
+                    })
+                    return (
+                        "你还没有绑定键道账号哦～\n"
+                        "请发送 /bind 绑定码，详见 "
+                        "https://keytao.vercel.app/profile"
+                    )
+                if text == S27_META_QUESTION:
+                    self.assertTrue(platform_id.startswith("8"))
+                    return (
+                        "会的～简单说下我的实际流程：\n\n"
+                        "• 查词、查编码、问规则这类只读操作：不需要绑定，谁都能用\n"
+                        "• 加词、改词、提交草稿这类写操作：必须先绑定键道账号。"
+                        "如果没绑定，工具层会直接拦截，词条根本进不了草稿，所以也就谈不上提交\n\n"
+                        "之前你发「加入并提交」时就是这种情况：候选和确认都正常出来了，"
+                        "但写入这一步被拦下了，所以我只能给你绑定指引。\n\n"
+                        "绑定后同一句「加入并提交」就能正常执行了。"
+                        "需要的话现在就可以 /bind 绑定～"
+                    )
+                raise AssertionError((platform_id, sender_name, text))
+
+            async def draft(self):
+                return {"batchId": None, "items": []}
+
+            def attempt_events(self):
+                return list(self.events)
+
+            def assertTrue(self, value):
+                if not value:
+                    raise AssertionError(value)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+
+        self.assertEqual(
+            result["messages"],
+            [S27_WORD, S27_ASSENT, S27_META_QUESTION, S27_WORD],
+        )
+        self.assertEqual(result["facts"]["bindingNoticeCount"], 1)
+        self.assertEqual(result["facts"]["metaQuestionToolCalls"], 0)
+        self.assertTrue(result["facts"]["boundControlNoticeAbsent"])
+        self.assertFalse(
+            any(
+                marker in result["replies"][2]
+                for marker in SYSTEM_REPLY_TEMPLATE_MARKERS
+            )
+        )
+        self.assertEqual(
+            context.reset_ids,
+            ["8" + context.platform_id[1:], context.platform_id],
+        )
+
     async def test_s23_unresolvable_quote_control_never_mints_a_write_ticket(
         self,
     ) -> None:
@@ -2318,6 +2458,15 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         controller.arm("S14")
         try:
             with (
+                patch.object(
+                    review_module,
+                    "_request_bot_evidence_proxy",
+                    AsyncMock(
+                        return_value=review_module._BotEvidenceProxyResult(
+                            "unavailable"
+                        )
+                    ),
+                ),
                 patch.object(
                     review_module,
                     "_search_web",
@@ -2490,6 +2639,77 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 "pronunciationSource": "zdic-phrase",
                 "standardPronunciationStatus": "found",
                 "characterLookupStatuses": {"还": "found", "车": "found"},
+                "seededRealityMatches": True,
+            },
+        )
+        self.assertEqual(artifact["finalAssertionResult"], "passed")
+
+    async def test_s27_zdic_preflight_accepts_seeded_local_entry_shape(self) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        seeded = {
+            "input": S27_WORD,
+            "pronunciationSource": "zdic-phrase",
+            "standardPronunciationStatus": "found",
+            "semanticPronunciationNeeded": False,
+            "chars": [
+                {
+                    "char": "来",
+                    "pinyin": "lái",
+                    "pinyins": ["lái"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "都",
+                    "pinyin": "dōu",
+                    "pinyins": ["dōu", "dū"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "来",
+                    "pinyin": "lái",
+                    "pinyins": ["lái"],
+                    "pronunciationLookupStatus": "found",
+                },
+                {
+                    "char": "了",
+                    "pinyin": "le",
+                    "pinyins": ["le", "liǎo"],
+                    "pronunciationLookupStatus": "found",
+                },
+            ],
+        }
+        client.encode = AsyncMock(side_effect=[seeded] * 4)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = ArtifactRecorder(Path(temp_dir) / "artifacts")
+            with (
+                recorder.scope("S27", 1),
+                patch("e2e.run.asyncio.sleep", new_callable=AsyncMock),
+                patch("builtins.print"),
+            ):
+                result = await ensure_scenario_zdic_fixture(
+                    client=client,
+                    scenario_id="S27",
+                    recorder=recorder,
+                )
+            artifact = json.loads(
+                (recorder.artifact_dir / "S27-zdic-warmup-attempt-1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertTrue(result["seededRealityMatches"])
+        self.assertEqual(client.encode.await_count, 4)
+        self.assertEqual(
+            artifact["attempts"][-1]["words"][S27_WORD],
+            {
+                "pronunciationSource": "zdic-phrase",
+                "standardPronunciationStatus": "found",
+                "characterLookupStatuses": {
+                    "来": "found",
+                    "都": "found",
+                    "了": "found",
+                },
                 "seededRealityMatches": True,
             },
         )

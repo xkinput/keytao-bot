@@ -1645,7 +1645,15 @@ async def fetch_keytao_encode(
             }
         return {"success": False, "message": f"编码服务返回错误: {error.message}"}
     except Exception as error:
-        return {"success": False, "message": f"编码服务暂时不可用: {error}"}
+        logger.warning(
+            "Encoding service failed unexpectedly for %s: %s",
+            word,
+            type(error).__name__,
+        )
+        return {
+            "success": False,
+            "message": render_remediation_reply("编码服务暂时不可用"),
+        }
     return normalize_contextual_phrase_encoding(word, data)
 
 

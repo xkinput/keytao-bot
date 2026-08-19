@@ -22,16 +22,10 @@ logger.info(f"[user_resolver] KEYTAO_API_BASE: {http_client.get_keytao_url()}")
 logger.info(f"[user_resolver] BOT_API_TOKEN loaded: {bool(http_client.get_bot_token())}")
 
 
-async def find_user_by_platform(platform: str, platform_id: str) -> Optional[Dict[str, Any]]:
-    """Find user by platform ID.
-
-    Args:
-        platform: 'qq' or 'telegram'
-        platform_id: Platform user ID
-
-    Returns:
-        User info dict, or ``None`` when the user is unknown or the lookup failed.
-    """
+async def _find_user_payload(
+    platform: str,
+    platform_id: str,
+) -> Optional[Dict[str, Any]]:
     if not http_client.get_bot_token():
         logger.error("BOT_API_TOKEN not configured")
         return None
@@ -45,15 +39,41 @@ async def find_user_by_platform(platform: str, platform_id: str) -> Optional[Dic
                 "platformId": platform_id,
             },
             timeout=10.0,
+            allow_status=(404,),
             # Read-only lookup despite the POST verb: safe to replay.
             idempotent=True,
         )
     except Exception as error:
         logger.error(f"Find user error: {error}")
         return None
+    return data
+
+
+async def find_user_by_platform(platform: str, platform_id: str) -> Optional[Dict[str, Any]]:
+    """Return user info, or ``None`` when unbound or lookup fails."""
+    data = await _find_user_payload(platform, platform_id)
+    if data is None:
+        return None
 
     if data.get("found"):
         return data.get("user")
+    return None
+
+
+async def resolve_actor_binding(platform: str, platform_id: str) -> Optional[bool]:
+    """Resolve account binding without treating lookup failure as unbound."""
+    if platform == "web-anon":
+        return False
+    if platform not in {"qq", "telegram"} or not platform_id:
+        return None
+    data = await _find_user_payload(platform, platform_id)
+    if data is None:
+        return None
+
+    if data.get("found") is True and isinstance(data.get("user"), dict):
+        return True
+    if data.get("found") is False:
+        return False
     return None
 
 

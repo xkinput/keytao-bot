@@ -28,6 +28,10 @@ from keytao_bot.utils.observability import (
     set_turn_flow,
 )
 from keytao_bot.utils.pending_confirmation import (
+    FAILED_WRITE_TEMPLATE_MARKER,
+    FAILED_WRITE_TEMPLATE_PREFIX,
+    SYSTEM_REPLY_TEMPLATE_MARKERS,
+    append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_reply_contract,
     ensure_multi_word_candidate_copy,
@@ -40,6 +44,7 @@ from keytao_bot.utils.pending_confirmation import (
     render_remediation_reply,
     same_unique_binding_set,
     render_server_backed_single_word_candidates,
+    system_reply_template_marker,
 )
 
 from .state import (
@@ -78,6 +83,18 @@ AUTHORITATIVE_LINK_TOOLS = frozenset({
     "keytao_recall_batch",
     "keytao_get_batch_preview",
 })
+
+_BLOCK_REASON_USER_LABELS = {
+    "source_untrusted": "消息来源不受信任",
+    "verb_not_matched": "未识别到明确执行动作",
+    "binding_incomplete": "操作目标绑定不完整",
+    "ticket_required": "缺少有效确认票据",
+    "bulk_delete_not_requested": "未明确授权批量删除",
+    "manual_shift_forbidden": "不允许手工指定顺延计划",
+    "ordering_not_expressible": "当前排序要求无法精确表达",
+    "batch_too_large": "待处理批次过大",
+    "untrusted_batch_reference": "批次引用未经可信记录核验",
+}
 
 
 def build_system_prompt(
@@ -238,6 +255,7 @@ class AgentRequestContext:
     progress_reporter: Optional[Callable[[str], Any]] = None
     resolved_advertised_words: tuple[str, ...] = ()
     advertised_snapshot_token: str = ""
+    actor_is_bound: Optional[bool] = None
 
     @property
     def actor_key(self) -> tuple:
@@ -451,6 +469,16 @@ class AgentOrchestrator:
         # One (reason, tool, arguments) gets one full explanation per turn.
         reported_block_reasons: set[tuple] = set()
         conv_key = context.conversation_address
+
+        def candidate_reply(text: str) -> str:
+            rendered = str(text or "")
+            if not advertised_reply_contract(rendered).requires_live_state:
+                return rendered
+            return append_unbound_binding_notice(
+                rendered,
+                context.actor_is_bound,
+            )
+
         current_max_tokens = self._initial_max_tokens(message)
         seen_tool_calls: Dict[tuple, tuple[int, bool]] = {}
         seen_tool_call_ids: set[str] = set()
@@ -468,6 +496,7 @@ class AgentOrchestrator:
             tuple[Dict[str, Any], ...],
         ] = {}
         trusted_recommended_codes_by_word: Dict[str, str] = {}
+        trusted_candidate_readings_by_word: Dict[str, Dict[str, str]] = {}
         trusted_word_lookup_codes_by_word: Dict[str, frozenset[str]] = {}
         trusted_entries_by_code: Dict[str, tuple[tuple[str, int], ...]] = {}
         trusted_draft_words_by_id: Dict[str, str] = {}
@@ -909,7 +938,7 @@ class AgentOrchestrator:
                 )
                 return self._append_authoritative_result_links(
                     render_remediation_reply(
-                        "AI 返回了未完成的结果；本轮没有可安全执行的后续命令"
+                        "AI 返回了未完成的结果；本批没有执行"
                     ),
                     authoritative_result_links,
                 )
@@ -1007,7 +1036,7 @@ class AgentOrchestrator:
                             f"owner={conv_key} items={len(pending_items)}"
                         )
                         return self._append_authoritative_result_links(
-                            content,
+                            candidate_reply(content),
                             authoritative_result_links,
                         )
                 if content.strip():
@@ -1021,6 +1050,7 @@ class AgentOrchestrator:
                             trusted_candidate_statuses_by_word,
                             trusted_recommended_codes_by_word,
                             trusted_reviewed_items_by_key,
+                            trusted_candidate_readings_by_word,
                         )
                         rendered_single = (
                             render_server_backed_single_word_candidates(
@@ -1059,7 +1089,7 @@ class AgentOrchestrator:
                             f"owner={conv_key} word={pending_add.word}"
                         )
                         return self._append_authoritative_result_links(
-                            rendered_single,
+                            candidate_reply(rendered_single),
                             authoritative_result_links,
                         )
                     matching_word_sets = [
@@ -1117,7 +1147,7 @@ class AgentOrchestrator:
                             f"owner={conv_key} items={len(trusted_word_set)}"
                         )
                         return self._append_authoritative_result_links(
-                            rendered_word_set,
+                            candidate_reply(rendered_word_set),
                             authoritative_result_links,
                         )
                     record_backed_items = (
@@ -1248,8 +1278,10 @@ class AgentOrchestrator:
                                 "Saved server-derived advertised word set: "
                                 f"owner={conv_key} items={len(absent_words)}"
                             )
+                    if termination_state is not None:
+                        termination_state["model_authored_reply"] = True
                     return self._append_authoritative_result_links(
-                        content,
+                        candidate_reply(content),
                         authoritative_result_links,
                     )
                 if empty_response_retries < 1:
@@ -1525,6 +1557,14 @@ class AgentOrchestrator:
                     if isinstance(result_data, dict):
                         observe_tool_result(result_data)
                         if (
+                            termination_state is not None
+                            and (
+                                result_data.get("policyBlocked") is True
+                                or review_flags.review_blocks_write(result_data)
+                            )
+                        ):
+                            termination_state["blocked_write_or_policy"] = True
+                        if (
                             result_data.get("success") is False
                             or result_data.get("policyBlocked") is True
                             or result_data.get("error")
@@ -1592,6 +1632,14 @@ class AgentOrchestrator:
                         # actually executed, not the discarded preview.
                         result_data, result_str, canonical_fn_args = auto_confirmed
                         observe_tool_result(result_data)
+                        if (
+                            termination_state is not None
+                            and (
+                                result_data.get("policyBlocked") is True
+                                or review_flags.review_blocks_write(result_data)
+                            )
+                        ):
+                            termination_state["blocked_write_or_policy"] = True
                         if (
                             result_data.get("success") is False
                             or result_data.get("policyBlocked") is True
@@ -1686,6 +1734,7 @@ class AgentOrchestrator:
                         trusted_absent_word_sets,
                         trusted_candidate_statuses_by_word,
                         trusted_recommended_codes_by_word,
+                        trusted_candidate_readings_by_word,
                     )
                     pending_tool_name = (
                         execution_route.tool_name
@@ -1727,7 +1776,7 @@ class AgentOrchestrator:
                             "policyBlocked": True,
                             "message": render_remediation_reply(
                                 "待确认操作过大，未保存确认票据；"
-                                "系统无法替用户决定如何拆分本批"
+                                "系统无法替你决定如何拆分本批"
                             ),
                         }
                         result_str = json.dumps(result_data, ensure_ascii=False)
@@ -1915,6 +1964,7 @@ class AgentOrchestrator:
         ],
         recommended_codes_by_word: Dict[str, str],
         reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
+        candidate_readings_by_word: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Optional[PendingAddWord]:
         """Build one single-word ticket solely from same-turn tool records."""
         words = tuple(
@@ -1972,6 +2022,16 @@ class AgentOrchestrator:
             server_occupied_words=dict(occupied_words),
             server_entries_by_code=entries_by_code,
             code_remarks={recommended: remark} if remark else {},
+            pronunciation_codes={
+                code: pinyin
+                for code, _occupied in candidates
+                if (
+                    pinyin := str(
+                        (candidate_readings_by_word or {}).get(word, {}).get(code) or ""
+                    ).strip()
+                )
+            },
+            pronunciation_recommended_codes=[recommended],
             needs_manual_review=needs_manual_review,
             manual_review_reason=manual_reason,
         )
@@ -2034,8 +2094,18 @@ class AgentOrchestrator:
             reviewed_matches = [
                 (code, reviewed)
                 for (reviewed_word, code), reviewed in reviewed_items_by_key.items()
-                if reviewed_word == word and code in allowed_codes
+                if (
+                    reviewed_word == word
+                    and code in allowed_codes
+                    and reviewed.get("recommended") is True
+                )
             ]
+            if not reviewed_matches:
+                reviewed_matches = [
+                    (code, reviewed)
+                    for (reviewed_word, code), reviewed in reviewed_items_by_key.items()
+                    if reviewed_word == word and code in allowed_codes
+                ]
             if len(reviewed_matches) != 1:
                 return None
             code, reviewed = reviewed_matches[0]
@@ -2241,15 +2311,17 @@ class AgentOrchestrator:
                 )
                 if all(triple) and triple not in shifted:
                     shifted.append(triple)
-        lines = ["本轮已完成的写操作："]
-        lines.extend(
-            f"- 已写入草稿：「{word}」 → {code}"
-            for word, code in written
-        )
-        lines.extend(
-            f"- 已顺延：「{word}」 {from_code} → {to_code}"
-            for word, from_code, to_code in shifted
-        )
+        lines: List[str] = []
+        if written or shifted:
+            lines.append("本轮已完成的写操作：")
+            lines.extend(
+                f"- 已写入草稿：「{word}」 → {code}"
+                for word, code in written
+            )
+            lines.extend(
+                f"- 已顺延：「{word}」 {from_code} → {to_code}"
+                for word, from_code, to_code in shifted
+            )
         if batch_ids:
             lines.append("关联批次：" + "、".join(batch_ids))
         lines.extend(f"草稿/批次地址：{url}" for url in batch_urls)
@@ -2381,6 +2453,17 @@ class AgentOrchestrator:
         receipts = list(successful_write_receipts or [])
         if reply is None:
             return cls._receipt_completion_reply(receipts) if receipts else None
+        if (
+            bool((termination_state or {}).get("model_authored_reply"))
+            and not failure_state
+            and not receipts
+            and not bool((termination_state or {}).get("blocked_write_or_policy"))
+            and system_reply_template_marker(reply)
+        ):
+            reply = cls._replace_model_authored_system_template(
+                current_message,
+                reply,
+            )
         authorized_item = explicit_combined_add_submit_item(current_message)
         if authorized_item is not None:
             add_receipts = [
@@ -2428,7 +2511,10 @@ class AgentOrchestrator:
             r"(?:未|没有|并未|尚未)(?:(?:成功)?写入|执行(?:任何)?(?:新)?写入)|无法执行",
             reply,
         ))
-        if receipts and (failure_state or termination_state or reply_denies_write):
+        termination_reason = str(
+            (termination_state or {}).get("reason") or ""
+        ).strip()
+        if receipts and (failure_state or termination_reason or reply_denies_write):
             submitted_batches: List[str] = []
             for receipt in receipts:
                 batch_id = str(receipt.get("batchId") or "").strip()
@@ -2452,7 +2538,8 @@ class AgentOrchestrator:
                     or "后续工具没有成功"
                 ).strip()
                 reason = re.split(
-                    r"请把下面这条指令|请重新发送|请再次发送|请原样发送",
+                    r"请把下面这条指令|请在下一条消息中|"
+                    r"请重新发送|请再次发送|请原样发送",
                     raw_reason,
                     maxsplit=1,
                 )[0]
@@ -2464,7 +2551,7 @@ class AgentOrchestrator:
                 lines.append(
                     f"{failure_label}；原因：{reason or '后续工具没有成功'}。"
                 )
-            elif termination_state:
+            elif termination_reason:
                 termination_labels = {
                     "transport_failure": "后续 AI 服务调用失败",
                     "empty_model_response": "后续 AI 服务没有返回可用回复",
@@ -2481,9 +2568,8 @@ class AgentOrchestrator:
                     "iteration_cap": "后续处理达到模型轮次上限",
                     "exception": "后续处理发生异常",
                 }
-                reason = str(termination_state.get("reason") or "").strip()
                 lines.append(
-                    termination_labels.get(reason, "后续处理已停止")
+                    termination_labels.get(termination_reason, "后续处理已停止")
                     + "；以上已完成写入以工具回执为准。"
                 )
             else:
@@ -2535,7 +2621,8 @@ class AgentOrchestrator:
                 or "无法把本次操作与消息中的完整目标逐项对应；整批均未写入"
             ).strip()
             reason = re.split(
-                r"请把下面这条指令|请重新发送|请再次发送|请原样发送",
+                r"请把下面这条指令|请在下一条消息中|"
+                r"请重新发送|请再次发送|请原样发送",
                 raw_reason,
                 maxsplit=1,
             )[0].rstrip("；;。 ")
@@ -2543,7 +2630,7 @@ class AgentOrchestrator:
                 failure_state.get("suggestedCommand") or ""
             ).strip()
             return render_remediation_reply(
-                f"这条指令按当前表述无法执行，本次未写入；原因：{reason}",
+                f"{FAILED_WRITE_TEMPLATE_PREFIX}，{FAILED_WRITE_TEMPLATE_MARKER}；原因：{reason}",
                 command=suggestion,
             )
         resend = re.search(
@@ -2552,9 +2639,15 @@ class AgentOrchestrator:
         )
         if not resend:
             return reply
-        same_reference = re.search(
-            r"(?:同样|相同|同一|原样|这条|当前|刚才|本条).{0,8}(?:消息|指令|请求|内容|说法)?",
+        reference_matches = list(re.finditer(
+            r"(?:同样|相同|同一|原样|这条|当前|刚才|本条)"
+            r".{0,8}(?:消息|指令|请求|内容|说法)?",
             reply,
+        ))
+        same_reference = any(
+            reference.start() <= resend.end() + 12
+            and resend.start() <= reference.end() + 12
+            for reference in reference_matches
         )
         normalized_message = cls._normalize_loop_text(current_message)
         normalized_reply = cls._normalize_loop_text(reply)
@@ -2572,7 +2665,8 @@ class AgentOrchestrator:
             or "本轮没有可执行的已绑定写操作"
         ).strip()
         reason = re.split(
-            r"请把下面这条指令|请重新发送|请再次发送|请原样发送",
+            r"请把下面这条指令|请在下一条消息中|"
+            r"请重新发送|请再次发送|请原样发送",
             raw_reason,
             maxsplit=1,
         )[0].rstrip("；;。 ")
@@ -2582,12 +2676,52 @@ class AgentOrchestrator:
             and cls._normalize_loop_text(suggestion) != normalized_message
         ):
             return render_remediation_reply(
-                f"这条指令按当前表述无法执行，本次未写入；原因：{reason}",
+                f"{FAILED_WRITE_TEMPLATE_PREFIX}，{FAILED_WRITE_TEMPLATE_MARKER}；原因：{reason}",
                 command=suggestion,
             )
         return render_remediation_reply(
-            f"这条指令按当前表述无法执行，本次未写入；原因：{reason}"
+            f"{FAILED_WRITE_TEMPLATE_PREFIX}，{FAILED_WRITE_TEMPLATE_MARKER}；原因：{reason}"
         )
+
+    @classmethod
+    def _replace_model_authored_system_template(
+        cls,
+        current_message: str,
+        reply: str,
+    ) -> str:
+        """Remove model-written deterministic templates from ordinary turns."""
+        normalized_question = cls._normalize_loop_text(current_message)
+        if (
+            "绑定" in normalized_question
+            and any(
+                marker in normalized_question
+                for marker in (
+                    "是否",
+                    "会不会",
+                    "有没有",
+                    "会先",
+                    "先确认",
+                    "先检查",
+                    "先校验",
+                )
+            )
+        ):
+            logger.warning(
+                "[system_template_impersonation] replaced binding meta answer"
+            )
+            return "会的：写入前会校验绑定；未绑定会给出绑定引导。"
+
+        clean_segments = [
+            segment
+            for segment in re.split(r"(?<=[。！？!?])|\n+", str(reply or ""))
+            if segment.strip()
+            and not any(marker in segment for marker in SYSTEM_REPLY_TEMPLATE_MARKERS)
+        ]
+        cleaned = "".join(clean_segments).strip()
+        logger.warning(
+            "[system_template_impersonation] stripped model-authored marker"
+        )
+        return cleaned or "这轮是普通问答，没有触发写入或安全拦截。"
 
     @staticmethod
     def _capture_authoritative_result_links(
@@ -2755,6 +2889,15 @@ class AgentOrchestrator:
         cleaned_lines: List[str] = []
         for line in content.splitlines():
             cleaned = line
+            if re.search(
+                r"(?:草稿地址|批次地址|草稿/批次地址|PR|"
+                r"旧\s*PR(?:地址|可见于)?|查看旧\s*PR)[：:]?",
+                cleaned,
+            ):
+                # Link labels are authoritative-record surfaces.  Remove every
+                # model/failure-path URL here; the exact trusted record URL is
+                # appended below from ``links``.
+                cleaned = re.sub(r"https?://[^\s)\]]+", "", cleaned)
             cleaned = re.sub(
                 r"https?://[^\s)\]]+",
                 lambda match: (
@@ -2825,6 +2968,7 @@ class AgentOrchestrator:
             Dict[str, tuple[Dict[str, Any], ...]]
         ] = None,
         recommended_codes_by_word: Optional[Dict[str, str]] = None,
+        candidate_readings_by_word: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> None:
         """Capture narrowly scoped capabilities from successful read-tool results."""
         if (
@@ -2932,10 +3076,10 @@ class AgentOrchestrator:
                         set(codes_by_word.get(word, frozenset())) | codes
                     )
 
-                status_groups: List[List[Dict[str, Any]]] = []
+                status_groups: List[tuple[str, str, List[Dict[str, Any]]]] = []
                 top_level_statuses = result.get("candidateStatuses")
                 if isinstance(top_level_statuses, list):
-                    status_groups.append(top_level_statuses)
+                    status_groups.append(("", "", top_level_statuses))
                 for pronunciation in result.get("pronunciations") or []:
                     if not isinstance(pronunciation, dict):
                         continue
@@ -2943,15 +3087,22 @@ class AgentOrchestrator:
                         "candidateStatuses"
                     )
                     if isinstance(pronunciation_statuses, list):
-                        status_groups.append(pronunciation_statuses)
+                        status_groups.append((
+                            str(pronunciation.get("pinyin") or "").strip(),
+                            str(pronunciation.get("recommendedCode") or "").strip().lower(),
+                            pronunciation_statuses,
+                        ))
                 recommended = str(result.get("recommendedCode") or "").strip()
                 valid_slot_groups: List[
                     tuple[
                         tuple[tuple[str, bool], ...],
                         tuple[Dict[str, Any], ...],
+                        str,
+                        str,
                     ]
                 ] = []
-                for statuses in status_groups:
+                reading_sets_by_code: Dict[str, set[str]] = {}
+                for group_pinyin, group_recommended, statuses in status_groups:
                     slots: List[tuple[str, bool]] = []
                     normalized_statuses: List[Dict[str, Any]] = []
                     seen_codes: set[str] = set()
@@ -2999,6 +3150,10 @@ class AgentOrchestrator:
                             "entries": tuple(entries),
                         })
                         seen_codes.add(code)
+                        if group_pinyin:
+                            reading_sets_by_code.setdefault(code, set()).add(
+                                group_pinyin
+                            )
                     if valid and (
                         not recommended
                         or recommended in seen_codes
@@ -3006,12 +3161,20 @@ class AgentOrchestrator:
                         valid_slot_groups.append((
                             tuple(slots),
                             tuple(normalized_statuses),
+                            group_pinyin,
+                            group_recommended,
                         ))
                 unique_slot_groups: Dict[
                     tuple[tuple[str, bool], ...],
                     tuple[Dict[str, Any], ...],
                 ] = {}
-                for slots, normalized_statuses in valid_slot_groups:
+                preferred_slot_groups = [
+                    group
+                    for group in valid_slot_groups
+                    if group[2] and group[3] == recommended
+                ]
+                selected_slot_groups = preferred_slot_groups or valid_slot_groups
+                for slots, normalized_statuses, _pinyin, _group_recommended in selected_slot_groups:
                     unique_slot_groups.setdefault(slots, normalized_statuses)
                 if len(unique_slot_groups) == 1:
                     slots, normalized_statuses = next(
@@ -3026,6 +3189,12 @@ class AgentOrchestrator:
                         and recommended in {code for code, _occupied in slots}
                     ):
                         recommended_codes_by_word[word] = recommended
+                    if candidate_readings_by_word is not None:
+                        candidate_readings_by_word[word] = {
+                            code: next(iter(readings))
+                            for code, readings in reading_sets_by_code.items()
+                            if len(readings) == 1
+                        }
 
                 if tool_name == "keytao_prepare_reviewed_add":
                     recommended_code = str(result.get("recommendedCode") or "").strip()
@@ -3065,12 +3234,40 @@ class AgentOrchestrator:
                             verdict = f"自动审核：{reason}"
                         else:
                             verdict = f"自动审核：该词可自动通过（{reason}）"
-                        reviewed_items_by_key[(word, recommended_code)] = {
+                        base_reviewed = {
                             "type": phrase_type,
                             "remark": f"喵喵审词：{verdict}",
                             "needs_manual_review": needs_manual_review,
                             "manual_review_reason": reason,
                         }
+                        reviewed_items_by_key[(word, recommended_code)] = {
+                            **base_reviewed,
+                            "recommended": True,
+                        }
+                        for pronunciation in result.get("pronunciations") or []:
+                            if not isinstance(pronunciation, dict):
+                                continue
+                            pinyin = str(pronunciation.get("pinyin") or "").strip()
+                            group_codes = tuple(dict.fromkeys(
+                                str(status.get("code") or "").strip().lower()
+                                for status in pronunciation.get("candidateStatuses") or []
+                                if (
+                                    isinstance(status, dict)
+                                    and re.fullmatch(
+                                        r"[a-z]{1,12}",
+                                        str(status.get("code") or "").strip().lower(),
+                                    )
+                                )
+                            ))
+                            if not pinyin or not group_codes:
+                                continue
+                            for candidate_code in group_codes:
+                                reviewed_items_by_key[(word, candidate_code)] = {
+                                    **base_reviewed,
+                                    "recommended": candidate_code == recommended_code,
+                                    "pinyin": pinyin,
+                                    "candidate_codes": group_codes,
+                                }
 
         if tool_name in {
             "keytao_lookup_by_codes_batch",
@@ -3193,6 +3390,11 @@ class AgentOrchestrator:
         for msg in history:
             role = msg.get("role")
             content = msg.get("content", "")
+            if role == "assistant" and system_reply_template_marker(content):
+                content = (
+                    "[历史系统模板回执，不是当前请求的回答样式]\n"
+                    + str(content)
+                )
             messages.append({"role": role, "content": content})
 
     @staticmethod
@@ -3330,18 +3532,22 @@ class AgentOrchestrator:
 
     @staticmethod
     def _tool_call_validation_reply(error: ToolCallValidationError) -> str:
-        detail = str(error)
         if error.cause == "unknown_tool":
-            name = detail.partition(":")[2].strip() or "未命名工具"
-            return f"AI 请求了未开放的工具「{name}」；本批没有执行。"
+            return render_remediation_reply(
+                "AI 请求了未开放的操作；本批没有执行"
+            )
         if error.cause == "duplicate_id":
-            return "AI 返回了重复的工具调用编号；本批没有执行。"
+            return render_remediation_reply(
+                "AI 返回了重复的工具调用编号；本批没有执行"
+            )
         if error.cause == "invalid_json":
             return render_remediation_reply(
                 "AI 返回的工具参数不是完整 JSON；本批没有执行"
             )
         if error.cause == "invalid_schema":
-            return "AI 返回的工具参数不符合该工具的字段要求；本批没有执行。"
+            return render_remediation_reply(
+                "AI 返回的工具参数不符合该操作的字段要求；本批没有执行"
+            )
         return render_remediation_reply(
             "AI 返回了不完整的工具调用；本批没有执行"
         )
@@ -3872,10 +4078,13 @@ class AgentOrchestrator:
         suggestion = str(result_data.get("suggestedCommand") or "")
         result_data.pop("suggestedCommand", None)
         result_data["repeatedBlock"] = True
-        result_data["message"] = (
-            f"安全拦截（{reason}，本轮已说明过）："
-            + (f"仍然只有这条指令可行：{suggestion}" if suggestion else "换写法没有用")
-            + "。请直接回复用户，不要再重试。"
+        reason_label = _BLOCK_REASON_USER_LABELS.get(
+            reason,
+            "当前操作未通过安全校验",
+        )
+        result_data["message"] = render_remediation_reply(
+            f"安全拦截（{reason_label}，本轮已说明过）；本次未写入",
+            command=suggestion,
         )
         return json.dumps(result_data, ensure_ascii=False)
 

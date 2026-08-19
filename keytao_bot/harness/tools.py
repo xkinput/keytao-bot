@@ -1,6 +1,7 @@
 """Tool execution adapter for the agent harness."""
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
@@ -583,18 +584,31 @@ _STAGED_ACTION_LABELS = {
     "Delete": "删除",
 }
 
+_STAGED_TOOL_LABELS = {
+    "keytao_create_phrase": "加入词条草稿",
+    "keytao_remove_draft_item": "删除草稿条目",
+    "keytao_update_draft_item_weight": "调整草稿权重",
+    "keytao_batch_add_to_draft": "批量加入词条草稿",
+    "keytao_batch_remove_draft_items": "批量删除草稿条目",
+    "keytao_shift_phrase_code": "顺延词条编码",
+    "keytao_recall_batch": "撤回提审批次",
+    "keytao_submit_batch": "提交草稿批次",
+}
+
 
 def _staged_argument_label(key: Any) -> str:
     key_text = str(key)
-    return _STAGED_ARGUMENT_LABELS.get(key_text, f"字段 {key_text}")
+    return _STAGED_ARGUMENT_LABELS.get(key_text, "")
 
 
 def _staged_argument_value(value: Any) -> str:
     if isinstance(value, dict):
-        return "；".join(
-            f"{_staged_argument_label(key)}：{_staged_argument_value(item)}"
-            for key, item in value.items()
-        ) or "空"
+        parts = []
+        for key, item in value.items():
+            label = _staged_argument_label(key)
+            if label:
+                parts.append(f"{label}：{_staged_argument_value(item)}")
+        return "；".join(parts) or "无可展示内容"
     if isinstance(value, (list, tuple)):
         return "、".join(_staged_argument_value(item) for item in value) or "空"
     if isinstance(value, bool):
@@ -606,9 +620,12 @@ def _staged_argument_value(value: Any) -> str:
 
 
 def _describe_staged_mutation(tool_name: str, arguments: Dict) -> str:
-    lines = [f"拟执行 {tool_name}，已锁定以下内容："]
+    action_label = _STAGED_TOOL_LABELS.get(tool_name, "待确认操作")
+    lines = [f"拟执行{action_label}，已锁定以下内容："]
     for key, value in arguments.items():
         label = _staged_argument_label(key)
+        if not label:
+            continue
         if isinstance(value, (list, tuple)):
             lines.append(f"• {label}（{len(value)} 项）：")
             lines.extend(
@@ -1248,7 +1265,7 @@ class ToolExecutor:
                         (
                             f"“{word}”在 {binding.code} 之后没有本轮已核验的空闲候选编码，"
                             + render_remediation_reply(
-                                "本轮没有唯一安全的后续命令；本次未写入"
+                                "本轮无法唯一确定后续操作；本次未写入"
                             )
                         ),
                         word=word,
@@ -1518,7 +1535,38 @@ class ToolExecutor:
         context: ToolContext,
     ) -> Dict:
         call_args = dict(arguments)
+        # These fields are an internal capability minted from a successful
+        # reviewed-add response.  A model may name them, but can never supply
+        # their value.
+        call_args.pop("_reviewed_pinyin", None)
+        call_args.pop("_reviewed_candidate_codes", None)
+
+        def inject_reviewed_validation(
+            target: Dict,
+            capability: Optional[Dict[str, Any]],
+            code: str,
+        ) -> None:
+            pinyin = str((capability or {}).get("pinyin") or "").strip()
+            raw_codes = (capability or {}).get("candidate_codes")
+            candidate_codes = []
+            if isinstance(raw_codes, (list, tuple)):
+                candidate_codes = list(dict.fromkeys(
+                    str(value or "").strip().lower()
+                    for value in raw_codes
+                    if re.fullmatch(r"[a-z]{1,12}", str(value or "").strip().lower())
+                ))
+            if pinyin and code in candidate_codes:
+                target["_reviewed_pinyin"] = pinyin
+                target["_reviewed_candidate_codes"] = candidate_codes
+
         if not context.current_message:
+            if tool_name == "keytao_create_phrase":
+                word = str(call_args.get("word") or "").strip()
+                code = str(call_args.get("code") or "").strip().lower()
+                capability = (context.trusted_reviewed_items_by_key or {}).get(
+                    (word, code)
+                )
+                inject_reviewed_validation(call_args, capability, code)
             return call_args
         message = _mutation_authorization_view(context.current_message or "")
 
@@ -1536,6 +1584,8 @@ class ToolExecutor:
 
         def sanitize_item(item: Dict) -> Dict:
             sanitized = dict(item)
+            sanitized.pop("_reviewed_pinyin", None)
+            sanitized.pop("_reviewed_candidate_codes", None)
             word = str(sanitized.get("word") or "").strip()
             code = str(sanitized.get("code") or "").strip()
             action = str(sanitized.get("action") or "Create")
@@ -1565,6 +1615,7 @@ class ToolExecutor:
                     sanitized["needs_manual_review"] = bool(
                         capability.get("needs_manual_review", True)
                     )
+                    inject_reviewed_validation(sanitized, capability, code)
                 else:
                     if explicit_type:
                         sanitized["type"] = explicit_type
@@ -1653,7 +1704,7 @@ class ToolExecutor:
                 render_remediation_reply(
                     f"本次点名了 {len(refused)} 条加词，超过单次上限 "
                     f"{_MAX_AUTHORIZED_MULTI_ADD_ITEMS} 条；本次未截断、未写入；"
-                    "系统不能替用户决定批次拆分边界"
+                    "系统不能替你决定批次拆分边界"
                 ),
                 refusedItems=refused,
                 limit=_MAX_AUTHORIZED_MULTI_ADD_ITEMS,
@@ -1783,10 +1834,9 @@ class ToolExecutor:
                         )
                         if suggestion:
                             binding_error["suggestedCommand"] = suggestion
-                            binding_error["message"] = (
-                                f"{binding_error['message']}"
-                                "请把下面这条指令原样转述给用户，不要自创格式："
-                                f"{suggestion}"
+                            binding_error["modelInstruction"] = (
+                                "使用 suggestedCommand 字段向用户提供可执行命令，"
+                                "不要改写命令内容。"
                             )
                 return binding_error
         if tool_name == "keytao_batch_remove_draft_items" and message:
@@ -1798,7 +1848,7 @@ class ToolExecutor:
                     "blockReason": BLOCK_REASON_BULK_DELETE_NOT_REQUESTED,
                     "message": render_remediation_reply(
                         "安全拦截：当前消息不是批量删除请求，禁止一次删除多个草稿条目；"
-                        "系统不能替用户选择要删除的目标"
+                        "系统不能替你选择要删除的目标"
                     ),
                     "blockedIds": ids,
                 }
@@ -1859,7 +1909,7 @@ class ToolExecutor:
                 "message": (
                     render_remediation_reply(
                         "安全拦截：拟执行内容过大，无法在一条确认消息中完整展示；"
-                        "本次未保存票据，也未写入；系统不能替用户决定批次拆分边界"
+                        "本次未保存票据，也未写入；系统不能替你决定批次拆分边界"
                     )
                 ),
                 "previewCharacters": len(preview),
@@ -1873,7 +1923,6 @@ class ToolExecutor:
             "message": (
                 f"{_describe_staged_mutation(tool_name, arguments)}\n"
                 f"尚未写入。{pending_confirmation_copy()}"
-                "也可使用机器人给出的确认票据。"
             ),
         }
 

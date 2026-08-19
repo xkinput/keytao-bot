@@ -9,6 +9,7 @@ from keytao_bot.utils import review_flags
 from keytao_bot.utils.pending_confirmation import (
     ADD_OPERATION_VERB_FORMS,
     ADD_OPERATION_VERB_PATTERN,
+    POLICY_BLOCK_TEMPLATE_PREFIX,
     parse_pending_candidate_selection,
     render_remediation_reply,
 )
@@ -2008,8 +2009,9 @@ def policy_block(
         payload["missing"] = list(missing)
     if suggestion:
         payload["suggestedCommand"] = suggestion
-        payload["message"] = (
-            f"{message}请把下面这条指令原样转述给用户，不要自创格式：{suggestion}"
+        payload["modelInstruction"] = (
+            "使用 suggestedCommand 字段向用户提供可执行命令，"
+            "不要改写命令内容。"
         )
     payload.update(extra)
     if reason == BLOCK_REASON_SOURCE_UNTRUSTED:
@@ -2310,6 +2312,27 @@ def explicit_combined_add_submit_item(message: str) -> Optional[Dict[str, str]]:
         "action": "Create",
         "word": clause.word,
         "code": clause.code,
+    }
+
+
+def explicit_complete_add_item(message: str) -> Optional[Dict[str, object]]:
+    """Return one closed word+code add, with optional same-turn submit."""
+    combined = explicit_combined_add_submit_item(message)
+    if combined is not None:
+        return {**combined, "submitAfter": True}
+    if not message_authorizes_mutation(message):
+        return None
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    ).strip()
+    clause = _parse_complete_add_clause(source)
+    if clause is None or not clause.code:
+        return None
+    return {
+        "action": "Create",
+        "word": clause.word,
+        "code": clause.code,
+        "submitAfter": False,
     }
 
 
@@ -3403,7 +3426,7 @@ def _validate_current_message_binding(
         ):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：提交需要独立提交指令，或绑定到本轮同一条"
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}提交需要独立提交指令，或绑定到本轮同一条"
                 "合并指令刚写入的唯一批次。",
                 missing=["submitCommand"],
             )
@@ -3411,7 +3434,7 @@ def _validate_current_message_binding(
         if not _explicit_recall_command_matches(compact_message):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：撤回只能由本轮明确、独立的撤回指令授权。",
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}撤回只能由本轮明确、独立的撤回指令授权。",
                 missing=["recallCommand"],
             )
     if tool_name == "keytao_update_draft_item_weight":
@@ -3449,7 +3472,7 @@ def _validate_current_message_binding(
         ):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：权重调整必须把词条、编码、整数权重与本轮读取到的唯一草稿条目完整绑定。",
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}权重调整必须把词条、编码、整数权重与本轮读取到的唯一草稿条目完整绑定。",
                 missing=["draftItemWord", "draftItemCode", "weight"],
             )
     if tool_name == "keytao_remove_draft_item":
@@ -3472,7 +3495,7 @@ def _validate_current_message_binding(
         ):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：删除条目的 ID 或词条未精确出现在用户本轮原始文字中。",
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}删除条目的 ID 或词条未精确出现在用户本轮原始文字中。",
                 missing=["draftItemId"],
             )
     if tool_name == "keytao_batch_remove_draft_items":
@@ -3502,7 +3525,7 @@ def _validate_current_message_binding(
         if missing_ids or not re.search(r"(?:删除|删掉|移除|只保留|仅保留)", message):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：批量删除 ID 未全部出现在用户本轮原始文字中。",
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}批量删除 ID 未全部出现在用户本轮原始文字中。",
                 missing=["draftItemId"],
                 unboundIds=missing_ids[:12],
             )
@@ -3545,7 +3568,7 @@ def _validate_current_message_binding(
                 BLOCK_REASON_ORDERING_NOT_EXPRESSIBLE,
                 render_remediation_reply(
                     "当前已有权重之间没有可用的整数位置，"
-                    "无法精确保持这条排序指令；系统不能替用户选择调整优先级或重码"
+                    "无法精确保持这条排序指令；系统不能替你选择调整优先级或重码"
                 ),
                 word=word,
                 destinationWord=positional_create.destination_word,
@@ -3693,7 +3716,7 @@ def _validate_current_message_binding(
         )):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                f"安全拦截：{action} 操作的动作、词条或编码"
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}{action} 操作的动作、词条或编码"
                 "未与用户本轮原始文字中的完整目标绑定。",
                 missing=["boundTarget"],
                 unboundTargets=missing_targets[:12],
@@ -3703,7 +3726,7 @@ def _validate_current_message_binding(
         if not isinstance(items, list) or not items:
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：批量操作缺少可绑定的词条。",
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}批量操作缺少可绑定的词条。",
                 missing=["items"],
             )
         pending_selected_items = _pending_batch_selected_items(
@@ -3729,7 +3752,7 @@ def _validate_current_message_binding(
             )
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：本次批量写入无法与候选快照中选中的"
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}本次批量写入无法与候选快照中选中的"
                 f"{expected_labels}精确对应；整批均未写入。",
                 missing=["exactAuthorizedItemSet"],
                 suggestion=(SUGGESTION_MENTION_PREFIX + retry) if retry else "",
@@ -3748,7 +3771,7 @@ def _validate_current_message_binding(
             ]
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：批量加词工具的完整条目集合必须与用户本轮"
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}批量加词工具的完整条目集合必须与用户本轮"
                 "逐句授权的条目集合完全一致，不能遗漏、调换编码或夹带未点名条目。",
                 missing=["exactAuthorizedItemSet"],
                 authorizedItems=authorized_items,
@@ -3808,14 +3831,34 @@ def _validate_current_message_binding(
                     f"{visible_word}（{visible_code}）"
                 )
         if blocked_items:
+            safe_retry_items = [
+                {
+                    "action": "Create",
+                    "word": str(item.get("word") or "").strip(),
+                    "code": str(item.get("code") or "").strip(),
+                }
+                for item in items
+                if isinstance(item, dict)
+                and str(item.get("action") or "Create") == "Create"
+            ]
+            retry = (
+                _suggested_command_text(
+                    "keytao_batch_add_to_draft",
+                    {"items": safe_retry_items},
+                )
+                if len(safe_retry_items) == len(items)
+                and _operands_are_present(message, tool_name, arguments)
+                else ""
+            )
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：无法把以下条目与本轮消息逐项对应："
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}无法把以下条目与本轮消息逐项对应："
                 + "、".join(blocked_items[:12])
                 + "；整批均未写入。请在下一条消息中逐项写全动作、"
                 "词条和编码后重试。",
                 missing=["boundTarget"],
                 unboundItems=blocked_items[:12],
+                suggestion=(SUGGESTION_MENTION_PREFIX + retry) if retry else "",
             )
     elif tool_name == "keytao_shift_phrase_code":
         word = str(arguments.get("word") or "").strip()
@@ -3843,7 +3886,7 @@ def _validate_current_message_binding(
         ):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                "安全拦截：顺延操作的词条或目标编码未精确绑定。",
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}顺延操作的词条或目标编码未精确绑定。",
                 missing=["boundWord", "boundCode"],
             )
     return None

@@ -1,9 +1,14 @@
 """
 Keytao Bot utilities
 """
-from .user_resolver import find_user_by_platform, get_not_bound_message
+from .user_resolver import (
+    find_user_by_platform,
+    get_not_bound_message,
+    resolve_actor_binding,
+)
 
 __all__ = [
     'find_user_by_platform',
     'get_not_bound_message',
+    'resolve_actor_binding',
 ]

@@ -19,7 +19,10 @@ from ..harness.state import (
     PendingToolConfirm,
     pending_batch_display_pairs,
 )
-from ..harness.authorization_grammar import parse_eviction_modified_add
+from ..harness.authorization_grammar import (
+    explicit_complete_add_item,
+    parse_eviction_modified_add,
+)
 from ..harness.tools import (
     _COMMAND_PREFIX_PATTERN,
     _whole_message_unquoted_source,
@@ -109,11 +112,20 @@ def _resolve_advertised_word_set_selection(
             f"第{index}组：" + "、".join(snapshot.words)
             for index, snapshot in enumerate(snapshots, start=1)
         )
+        suggestions = tuple(
+            render_executable_suggestion(
+                "加词 " + " ".join(snapshot.words),
+                words=tuple(snapshot.words),
+            )
+            for snapshot in snapshots
+        )
         return AdvertisedWordSetSelection(
             matched=True,
-            ask=render_remediation_reply(
+            ask=(
                 f"当前有两组仍有效的候选（{groups}）；"
-                "系统不能替用户选择其中一组，本次未写入"
+                "系统不能替你选择其中一组，本次未写入。\n"
+                "请复制其中一组对应的命令：\n"
+                + "\n".join(suggestion for suggestion in suggestions if suggestion)
             ),
         )
     snapshot: AdvertisedWordSetSnapshot = snapshots[0]
@@ -135,12 +147,14 @@ def _resolve_advertised_word_set_selection(
             matched=True,
             snapshot_token=snapshot.token,
             exclusions=exclusions,
-            ask=(
+            ask=render_remediation_reply(
                 "以下暂不添加的词不在刚才的候选中："
                 + "、".join(f"「{word}」" for word in unknown)
                 + "。请只从「"
                 + "、".join(snapshot.words)
-                + "」中选择；本次未写入。"
+                + "」中选择；本次未写入",
+                command="加词 " + " ".join(snapshot.words),
+                words=tuple(snapshot.words),
             ),
         )
     resolved = tuple(word for word in snapshot.words if word not in exclusions)
@@ -152,7 +166,9 @@ def _resolve_advertised_word_set_selection(
             ask=render_remediation_reply(
                 "按这些排除项计算后没有剩余词；当前有效候选为「"
                 + "、".join(snapshot.words)
-                + "」；必须由用户重新选择至少一个词，本次未写入"
+                + "」；必须由你重新选择至少一个词，本次未写入",
+                command="加词 " + " ".join(snapshot.words),
+                words=tuple(snapshot.words),
             ),
         )
     return AdvertisedWordSetSelection(
@@ -471,7 +487,10 @@ def _pending_assent_rejection_response(
     message_text: str,
 ) -> Optional[str]:
     """Explain why assent-like text did not authorize the one live state."""
-    if parse_eviction_modified_add(message_text) is not None:
+    if (
+        parse_eviction_modified_add(message_text) is not None
+        or explicit_complete_add_item(message_text) is not None
+    ):
         return None
     add_candidate = bool(
         isinstance(state, PendingAddWord)
@@ -514,15 +533,24 @@ def _pending_assent_rejection_response(
             "系统不会用这些文字改写候选；本次未写入"
         ),
     }
+    live_words = (
+        (state.word,)
+        if isinstance(state, PendingAddWord)
+        else tuple(word for word, _code in pending_batch_display_pairs(state))
+    )
+    if not live_words and isinstance(state, PendingToolConfirm):
+        word = str(state.args.get("word") or "").strip()
+        live_words = (word,) if word else ()
     command = (
         "加入并提交" if assent.submit_after else "加入"
-    ) if assent.rejection == "extra_content" else ""
+    ) if live_words else ""
     return render_remediation_reply(
         reasons.get(
             assent.rejection,
             "这条回复不是仅针对当前候选的同意；本次未写入",
         ),
         command=command,
+        words=live_words,
     )
 
 
@@ -987,8 +1015,9 @@ def _format_stale_confirmation_response(
         return None
     original_command = _recover_original_command_from_confirmation_quote(reply_reference)
     return render_remediation_reply(
-        "之前等待确认的计划或票据已经过期，或因机器人重启而丢失。"
-        "旧票据通常只保留约 4 小时，而且机器人重启后不会保留",
+        "之前等待确认的候选状态或票据已经过期。"
+        "候选状态会在机器人重启后丢失；已保存的确认票据会持久保留，"
+        "直到过期或被使用",
         command=original_command,
     )
 
@@ -1309,7 +1338,9 @@ def _resolve_multi_word_pending_candidate_selection(
                 f"当前有效候选共有 {len(words)} 个，不是指令中的 "
                 f"{set_reference.expected_count} 个；只能从「"
                 + "、".join(words)
-                + "」中选择；本次未写入"
+                + "」中选择；本次未写入",
+                command=f"将这 {len(words)} 个词加入草稿",
+                words=words,
             )
         unknown = tuple(
             word for word in set_reference.exclusions if word not in words
@@ -1320,7 +1351,9 @@ def _resolve_multi_word_pending_candidate_selection(
                 + "、".join(f"「{word}」" for word in unknown)
                 + "。当前有效候选为「"
                 + "、".join(words)
-                + "」；本次未写入"
+                + "」；本次未写入",
+                command=f"将这 {len(words)} 个词加入草稿",
+                words=words,
             )
         resolved_words = tuple(
             word for word in words if word not in set_reference.exclusions
@@ -1329,7 +1362,9 @@ def _resolve_multi_word_pending_candidate_selection(
             return None, None, render_remediation_reply(
                 "按这些排除项计算后没有剩余词；当前有效候选为「"
                 + "、".join(words)
-                + "」；本次未写入；系统不能替你决定至少保留哪个词"
+                + "」；本次未写入；系统不能替你决定至少保留哪个词",
+                command=f"将这 {len(words)} 个词加入草稿",
+                words=words,
             )
         resolved_set = set(resolved_words)
         derived_args = dict(state.args)
@@ -1421,7 +1456,9 @@ def _resolve_multi_word_pending_candidate_selection(
         ):
             return None, None, render_remediation_reply(
                 f"「{target_word}」只接受 1-{len(candidates)} 之间的编号；"
-                "系统不能替你选择其中一个"
+                "系统不能替你选择其中一个",
+                command=f"{target_word} 添加1",
+                words=(target_word,),
             )
         selected_codes = tuple(candidates[index - 1][0] for index in indices)
     else:
@@ -1433,7 +1470,9 @@ def _resolve_multi_word_pending_candidate_selection(
         ):
             return None, None, render_remediation_reply(
                 f"所选编码不全在「{target_word}」当前候选中；"
-                "系统不能替你选择另一个编码"
+                "系统不能替你选择另一个编码",
+                command=f"{target_word} 添加1",
+                words=(target_word,),
             )
         selected_codes = requested_codes
 
@@ -1481,6 +1520,8 @@ def _is_fresh_current_user_command_intent(
     command_intent: MessageCommandIntent,
     message_text: str = "",
 ) -> bool:
+    if explicit_complete_add_item(message_text) is not None:
+        return True
     if command_intent.intent == "draft_submit":
         return _is_explicit_draft_submit_request(message_text)
     if command_intent.intent == "clear_history":
@@ -2128,7 +2169,7 @@ def _describe_pending_state(state: PendingState) -> str:
 
         if state.function_name == "keytao_recall_batch":
             batch_id = str(state.args.get("batch_id") or state.args.get("batchId") or "")
-            return f"召回批次 {batch_id}" if batch_id else "召回批次"
+            return f"撤回批次 {batch_id}" if batch_id else "撤回批次"
 
         if state.function_name == "keytao_create_phrase":
             word = state.args.get("word", "")

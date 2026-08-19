@@ -63,6 +63,11 @@ S23 keeps the first nine S19 declarations for stale advertised-assent recovery;
 the forced state loss is rig-owned and does not touch the dictionary.
 S24 reuses the S18 `还车` pronunciation fixture for one single-word candidate;
 it does not reuse S18's multi-selection action and adds no new dictionary fact.
+S27 seeds the local Next ZDIC cache with the authoritative `lái dōu lái le`
+whole-word reading and its three unique character rows, while user-dictionary
+repair keeps `来都来了` absent. The separately built vendored bot reference DB
+has no exact whole-word reading; the scenario follows the seeded local encode
+reality.
 
 ## Prerequisites
 
@@ -255,6 +260,23 @@ newcomer at `wkxk` and the server-resolved occupant moved to its next free
 candidate, with at most one confirmation. The completion must name both
 outcomes, may not deny a completed write, and may never auto-confirm a
 `duplicate_code` creation in place of the requested eviction.
+
+S27 replays the binding-precheck incident with an intentionally unprovisioned
+synthetic actor and the scenario's provisioned bound control. The unbound actor
+asks for `来都来了`: the first deterministic candidate reply must include one
+short binding notice without blocking the read-only review. `加入并提交` must then
+retain the existing binding guidance. A following binding-process question must
+receive a direct answer, call no tool, and contain none of the registered system
+refusal markers. The bound control asks for the same word and must not receive
+the notice.
+
+S28 replays the multi-reading candidate cascade. It first proves that the exact
+review-advertised recommendation survives write-side validation, then rebuilds
+a live state and sends a complete same-word word+code command selecting a
+different valid reading chain. A third clean state sends `添加4并提交` and must
+retain the fourth candidate's code-to-reading binding through submission. The
+invalid-code control must name compact per-reading chains, call no write tool,
+and expose neither a raw candidate dump nor a root-only draft URL.
 
 Optional overrides:
 

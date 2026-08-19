@@ -70,7 +70,7 @@ from ..utils.image_input import (
     request_vision_description,
 )
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
-from ..utils import keytao_review, review_flags
+from ..utils import keytao_review, review_flags, user_resolver as _user_resolver
 from ..utils.observability import (
     begin_turn_metrics,
     emit_turn_metrics,
@@ -88,6 +88,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
+    append_unbound_binding_notice as _append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_single_word_candidate_codes,
     advertised_reply_contract,
@@ -262,6 +263,7 @@ from .chat_commands import (
     _take_reviewed_add_verdict,
     _try_handle_draft_clear_command,
     _try_handle_draft_management_command,
+    _try_handle_explicit_pending_replacement,
     _try_handle_draft_recall_command,
     _try_handle_draft_submit_command,
     _try_handle_draft_view_command,
@@ -1407,6 +1409,155 @@ def _memory_scope_key(memory_context: ChatMemoryContext) -> Tuple[str, str]:
     )
 
 
+def _encoding_rule_question_word(message: str) -> str:
+    source = unicodedata.normalize("NFKC", str(message or ""))
+    if not re.search(r"(?:编码规则|为什么|为何).*(?:编码|[a-z]{2,})", source, re.IGNORECASE):
+        return ""
+    for pattern in (
+        r"为什么\s*[「“]?([\u3400-\u9fff]{1,16})[」”]?\s*(?:是|的编码)",
+        r"[「“]([\u3400-\u9fff]{1,16})[」”]",
+    ):
+        match = re.search(pattern, source)
+        if match is not None:
+            return match.group(1)
+    return ""
+
+
+def _encoding_variant_sequence(
+    encode: Dict[str, Any],
+    requested_code: str,
+) -> Optional[Tuple[List[str], str]]:
+    chars = encode.get("chars")
+    if not isinstance(chars, list) or not chars:
+        return None
+    sequence = [
+        str(item.get("pinyin") or "").strip()
+        if isinstance(item, dict)
+        else ""
+        for item in chars
+    ]
+    if any(not value for value in sequence):
+        return None
+    requested_base = requested_code.rstrip("o") or requested_code
+    variants = encode.get("alternatePhrasePronunciationCodes") or []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        codes = [
+            str(value or "").strip().lower()
+            for value in variant.get("codes") or []
+            if str(value or "").strip()
+        ]
+        if not any((code.rstrip("o") or code) == requested_base for code in codes):
+            continue
+        index = variant.get("charIndex")
+        pinyin = str(variant.get("pinyin") or "").strip()
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or not 0 <= index < len(sequence)
+            or not pinyin
+        ):
+            continue
+        resolved = list(sequence)
+        resolved[index] = pinyin
+        prefix = min(codes, key=lambda value: (len(value), value))
+        return resolved, prefix
+    default_codes = [
+        str(value or "").strip().lower()
+        for value in encode.get("candidateCodes") or []
+        if str(value or "").strip()
+    ]
+    if any((code.rstrip("o") or code) == requested_base for code in default_codes):
+        prefix = min(
+            (
+                code for code in default_codes
+                if (code.rstrip("o") or code) == requested_base
+            ),
+            key=lambda value: (len(value), value),
+        )
+        return sequence, prefix
+    return None
+
+
+async def _try_handle_encoding_rule_question(
+    message: str,
+    platform: str,
+    user_id: str,
+) -> Optional[str]:
+    """Explain a concrete code question from docs and current encode facts."""
+    word = _encoding_rule_question_word(message)
+    if not word:
+        return None
+    requested_codes = tuple(dict.fromkeys(
+        value.lower()
+        for value in re.findall(
+            r"(?<![A-Za-z])[A-Za-z]{2,12}(?![A-Za-z])",
+            unicodedata.normalize("NFKC", message),
+        )
+    ))
+    docs_json = await call_tool_function(
+        "keytao_fetch_docs",
+        {"query": "三字词 编码规则 声母 音码 候选链"},
+        platform,
+        user_id,
+    )
+    encode_json = await call_tool_function(
+        "keytao_encode",
+        {"word": word},
+        platform,
+        user_id,
+    )
+    try:
+        docs = json.loads(docs_json)
+    except Exception:
+        docs = {}
+    try:
+        encode = json.loads(encode_json)
+    except Exception:
+        encode = {}
+    if not isinstance(encode, dict) or encode.get("success") is not True:
+        return (
+            f"目前无法从编码服务取得「{word}」的逐字读音和候选链，"
+            "所以不能可靠解释这些编码；我不会按字面猜规则。"
+        )
+
+    explanations: List[str] = []
+    for requested_code in requested_codes[:4]:
+        resolved = _encoding_variant_sequence(encode, requested_code)
+        if resolved is None:
+            continue
+        sequence, prefix = resolved
+        explanations.append(
+            f"{requested_code}：读音链 {' '.join(sequence)}，"
+            f"编码服务给出的音码前缀是 {prefix}；"
+            "末尾连续的 o 是同一前缀下的后续候选位。"
+        )
+    if not explanations:
+        return (
+            f"编码服务返回了「{word}」的结果，但没有把问题中的编码"
+            "绑定到可核验的逐字读音链；目前无法可靠解释，我不会补猜。"
+        )
+    lines = [
+        f"按当前编码服务结果，「{word}」的差异来自多音读法改变了逐字音码前缀：",
+        *explanations,
+    ]
+    sources = (
+        docs.get("sources")
+        if isinstance(docs, dict) and docs.get("success") is True
+        else []
+    )
+    if isinstance(sources, list):
+        safe_sources = [
+            str(value).strip()
+            for value in sources[:3]
+            if str(value).strip().startswith("https://keytao-docs.vercel.app/")
+        ]
+        if safe_sources:
+            lines.append("规则文档：" + "、".join(safe_sources))
+    return "\n".join(lines)
+
+
 async def get_ai_response_core(
     message: str,
     platform: str,
@@ -1448,8 +1599,8 @@ async def get_ai_response_core(
             fallback_message: str,
             fallback_context: AgentRequestContext,
         ) -> Optional[str]:
-            """Retry only closed structural pending controls; never invoke a router."""
-            return await handle_pending_message_core(
+            """Resolve closed controls or an evidence-backed encoding question."""
+            pending_reply = await handle_pending_message_core(
                 fallback_message,
                 fallback_context.platform,
                 fallback_context.user_id,
@@ -1458,6 +1609,13 @@ async def get_ai_response_core(
                 space_key=fallback_context.space_key,
                 owner_label=fallback_context.speaker_name,
                 allow_intent_model=False,
+            )
+            if pending_reply is not None:
+                return pending_reply
+            return await _try_handle_encoding_rule_question(
+                fallback_message,
+                fallback_context.platform,
+                fallback_context.user_id,
             )
 
         orchestrator = AgentOrchestrator(
@@ -1520,6 +1678,12 @@ async def get_ai_response_core(
             ),
             max_iterations=max_iterations,
         )
+        if result and advertised_reply_contract(result).requires_live_state:
+            actor_is_bound = await _user_resolver.resolve_actor_binding(
+                platform,
+                user_id,
+            )
+            result = _append_unbound_binding_notice(result, actor_is_bound)
         return _normalize_generated_review_copy(result) if result else result
 
     except Exception as e:
@@ -1914,8 +2078,11 @@ def _enforce_advertised_reply_contract(
         f"state={record.state.__class__.__name__ if record is not None else 'none'} "
         f"bindings={len(displayed_pairs)}"
     )
+    displayed_words = tuple(word for word, _code in displayed_pairs)
     return render_remediation_reply(
-        "这条消息没有可用的服务端候选记录，本次不会写入"
+        "这条消息没有可用的服务端候选记录，本次不会写入",
+        command=("加词 " + " ".join(displayed_words)) if displayed_words else "",
+        words=displayed_words,
     )
 
 
@@ -2687,6 +2854,22 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
                 ctx.resolved_advertised_words = selection.resolved_words
                 ctx.advertised_snapshot_token = selection.snapshot_token
         else:
+            if (
+                isinstance(ctx.current_pending_record.state, PendingAddWord)
+                and draft_operation_coordinator.get(ctx.conv_key) is None
+            ):
+                replacement_response = await _try_handle_explicit_pending_replacement(
+                    ctx.current_pending_record.state,
+                    ctx.normalized_message_text,
+                    ctx.platform,
+                    ctx.user_id,
+                    ctx.conv_key,
+                    ctx.space_key,
+                    ctx.owner_label,
+                )
+                if replacement_response is not None:
+                    ctx.scoped_pending_response = replacement_response
+                    return False
             (
                 ctx.scoped_pending_state,
                 ctx.scoped_pending_intent,
@@ -3628,7 +3811,9 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                         restore_pending_state()
                         ctx.response = render_remediation_reply(
                             f"只接受 1-{len(state.candidates)} 之间的编号；"
-                            "系统不能替你选择其中一个"
+                            "系统不能替你选择其中一个",
+                            command="加入",
+                            words=(state.word,),
                         )
                     else:
                         target_code = (
@@ -3646,7 +3831,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                         if operation is None:
                             restore_pending_state()
                             ctx.response = render_remediation_reply(
-                                "当前草稿操作刚刚开始；此时没有安全的重复执行命令"
+                                "当前草稿操作刚刚开始；为避免重复写入，本次未再次执行"
                             )
                         elif not begin_pending_execution():
                             draft_operation_coordinator.finish(
@@ -3754,7 +3939,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                         if operation is None:
                             restore_pending_state()
                             ctx.response = render_remediation_reply(
-                                "当前草稿操作刚刚开始；此时没有安全的重复执行命令"
+                                "当前草稿操作刚刚开始；为避免重复写入，本次未再次执行"
                             )
                         elif not begin_pending_execution():
                             draft_operation_coordinator.finish(
@@ -3855,7 +4040,7 @@ async def _stage_submit_current_draft(ctx: TurnContext) -> bool:
             operation = draft_operation_coordinator.begin(ctx.conv_key, "submit")
             if operation is None:
                 ctx.response = render_remediation_reply(
-                    "当前草稿操作刚刚开始；此时没有安全的重复执行命令"
+                    "当前草稿操作刚刚开始；为避免重复写入，本次未再次执行"
                 )
             else:
                 scheduled = _schedule_background_draft_operation(
@@ -4491,6 +4676,7 @@ _CHAT_COMPAT_NAMES = (
     "_trusted_result_url",
     "_try_handle_draft_clear_command",
     "_try_handle_draft_management_command",
+    "_try_handle_explicit_pending_replacement",
     "_try_handle_draft_recall_command",
     "_try_handle_draft_submit_command",
     "_try_handle_draft_view_command",

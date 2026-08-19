@@ -20,7 +20,10 @@ from ..harness.conversation import (
     ConversationKey,
     normalize_conversation_key,
 )
-from ..harness.authorization_grammar import parse_eviction_modified_add
+from ..harness.authorization_grammar import (
+    explicit_complete_add_item,
+    parse_eviction_modified_add,
+)
 from ..harness.state import (
     ActiveDraftOperation,
     ConversationLockStore,
@@ -42,9 +45,10 @@ from ..harness.tools import (
 from ..utils.history_store import HistoryGenerationToken, get_history_store
 from ..utils.draft_mutation_store import get_default_draft_mutation_claim_store
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
-from ..utils import keytao_review, review_flags
+from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
+    append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     ensure_single_word_candidate_copy,
     ensure_multi_word_candidate_copy,
@@ -560,7 +564,48 @@ def _create_phrase_args(state: PendingAddWord, code: str) -> Dict:
     ordering_summary = _pending_add_ordering_summary(state, code)
     if ordering_summary:
         args["_ordering_summary"] = ordering_summary
+    reviewed_pinyin, reviewed_candidate_codes = _pending_reviewed_reading(
+        state,
+        code,
+    )
+    if reviewed_pinyin and reviewed_candidate_codes:
+        args["_reviewed_pinyin"] = reviewed_pinyin
+        args["_reviewed_candidate_codes"] = list(reviewed_candidate_codes)
     return args
+
+
+def _pending_reviewed_reading(
+    state: PendingAddWord,
+    code: str,
+) -> Tuple[str, Tuple[str, ...]]:
+    """Return the one reviewed reading group containing ``code``."""
+    pinyin = str(state.pronunciation_codes.get(code) or "").strip()
+    if not pinyin:
+        return "", ()
+    codes = tuple(
+        candidate_code
+        for candidate_code, _occupied in state.candidates
+        if str(state.pronunciation_codes.get(candidate_code) or "").strip()
+        == pinyin
+    )
+    return (pinyin, codes) if code in codes else ("", ())
+
+
+def _reviewed_create_capability(
+    word: str,
+    code: str,
+    pinyin: str,
+    candidate_codes: Tuple[str, ...],
+) -> Optional[Dict[Tuple[str, str], Dict[str, Any]]]:
+    if not pinyin or code not in candidate_codes:
+        return None
+    return {
+        (word, code): {
+            "type": "Phrase",
+            "pinyin": pinyin,
+            "candidate_codes": candidate_codes,
+        },
+    }
 
 
 def _batch_review_remark(response: str, word: str) -> str:
@@ -957,7 +1002,9 @@ async def _canonicalize_pending_ticket_intent(
             ):
                 return None, render_remediation_reply(
                     f"只接受 1-{len(state.candidates)} 之间的编号；"
-                    "系统不能替你选择其中一个"
+                    "系统不能替你选择其中一个",
+                    command="加入",
+                    words=(state.word,),
                 )
             requested_codes = tuple(
                 state.candidates[index - 1][0]
@@ -970,7 +1017,9 @@ async def _canonicalize_pending_ticket_intent(
                 or any(code not in candidate_codes for code in multi_selection.codes)
             ):
                 return None, render_remediation_reply(
-                    "所选编码不全在当前候选中；系统不能替你选择另一个编码"
+                    "所选编码不全在当前候选中；系统不能替你选择另一个编码",
+                    command="加入",
+                    words=(state.word,),
                 )
             requested_codes = multi_selection.codes
         return replace(
@@ -1003,7 +1052,9 @@ async def _canonicalize_pending_ticket_intent(
         if not 1 <= command_intent.choice_index <= len(state.candidates):
             return None, render_remediation_reply(
                 f"只接受 1-{len(state.candidates)} 之间的编号；"
-                "系统不能替你选择其中一个"
+                "系统不能替你选择其中一个",
+                command="加入",
+                words=(state.word,),
             )
         return command_intent, None
 
@@ -1012,7 +1063,9 @@ async def _canonicalize_pending_ticket_intent(
         if choice_index is None or not 1 <= choice_index <= len(state.candidates):
             return None, render_remediation_reply(
                 f"只接受 1-{len(state.candidates)} 之间的编号；"
-                "系统不能替你选择其中一个"
+                "系统不能替你选择其中一个",
+                command="加入",
+                words=(state.word,),
             )
         return replace(command_intent, choice_index=choice_index), None
 
@@ -1027,7 +1080,9 @@ async def _canonicalize_pending_ticket_intent(
         target_code = _resolve_shift_target_code(state, canonical_intent)
         if target_code is None:
             return None, render_remediation_reply(
-                "无法唯一确定要顺延的占用编码；系统不能替你选择候选编号"
+                "无法唯一确定要顺延的占用编码；系统不能替你选择候选编号",
+                command=f"加词 {state.word}",
+                words=(state.word,),
             )
         target_index = next(
             (
@@ -1061,7 +1116,9 @@ async def _canonicalize_pending_ticket_intent(
         )
         if requested_target is None:
             return None, render_remediation_reply(
-                "无法把该编码绑定到当前候选；系统不能替你选择另一个编码"
+                "无法把该编码绑定到当前候选；系统不能替你选择另一个编码",
+                command=f"加词 {state.word}",
+                words=(state.word,),
             )
         target_code, _occupied = requested_target
         return replace(command_intent, requested_code=target_code), None
@@ -1315,10 +1372,16 @@ def _format_other_owner_pending_message(
     state: PendingState,
 ) -> str:
     description = _describe_pending_state(state)
-    return (
+    words = (
+        (state.word,)
+        if isinstance(state, PendingAddWord)
+        else tuple(word for word, _code in pending_batch_display_pairs(state))
+    )
+    return render_remediation_reply(
         f"这条是 {owner_label} 的待确认操作：{description}。\n"
-        f"你不能替 {owner_label} 确认。"
-        "当前回复里没有可绑定到你自己草稿的具体目标，因而没有可安全执行的后续命令。"
+        f"你不能替 {owner_label} 确认；如需处理这些词，应为你自己重新审词",
+        command=("加词 " + " ".join(words)) if words else "",
+        words=words,
     )
 
 
@@ -1649,6 +1712,17 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
     if _parse_pending_batch_add(response) is not None:
         return ensure_multi_word_candidate_copy(response)
 
+    response = re.sub(
+        r"(?m)^若所选编号显示[“\"]已有…[”\"]，直接回复该编号表示添加重码；"
+        r"回复[“\"]编号 重新编码[”\"]或[“\"]原词 重新编码[”\"]则挪开原词。\s*$",
+        "",
+        response,
+    )
+    response = re.sub(
+        r"(?m)^若选的是已有词编码，回复[“\"]编号 重新编码[”\"]可挪开原词。\s*$",
+        "",
+        response,
+    )
     pending = _parse_pending_add_word(response)
     if pending is not None:
         response = ensure_single_word_candidate_copy(
@@ -1656,21 +1730,47 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
             len(pending.candidates),
         )
 
-    guidance = "若所选编号显示“已有…”，直接回复该编号表示添加重码；回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
-    if "重新编码" in response and "添加重码" in response:
-        return response
-
-    # Robust fallback: if the visible reply already contains numbered-choice wording
-    # and at least one occupied slot, append guidance even when regex parsing misses.
-    if "也可回复编号选其他编码" in response and "已有「" in response:
-        logger.info("🧭 Appending occupied-choice guidance via fallback matcher")
-        return response.rstrip() + f"\n{guidance}"
-
     if pending is None:
+        fallback_occupied = re.search(
+            r"(?m)^\s*(?P<index>[1-9]\d{0,2})[.)、]\s*[a-z]{1,12}\s*"
+            r"(?:—|–|-)\s*[^\n]*已有「(?P<words>[^」]+)」",
+            response,
+            re.IGNORECASE,
+        )
+        if fallback_occupied is None:
+            return response
+        occupied_index = int(fallback_occupied.group("index"))
+        occupied_word = fallback_occupied.group("words").split("、", 1)[0].strip()
+        logger.info("🧭 Appending bound occupied-choice guidance via fallback matcher")
+    else:
+        occupied_choice = next(
+            (
+                (index, code)
+                for index, (code, occupied) in enumerate(pending.candidates, start=1)
+                if occupied
+            ),
+            None,
+        )
+        if occupied_choice is None:
+            return response
+        occupied_index, occupied_code = occupied_choice
+        occupied_word = next(
+            (
+                str(word or "").strip()
+                for word in pending.occupied_words.get(occupied_code, [])
+                if str(word or "").strip()
+            ),
+            "",
+        )
+    target_copy = f"已有词「{occupied_word}」" if occupied_word else "该已有词"
+    guidance = (
+        f"第 {occupied_index} 项已被占用；直接回复“{occupied_index}”表示添加重码；"
+        f"若要挪开{target_copy}，回复“{occupied_index} 重新编码”。"
+    )
+    if guidance in response:
         return response
-    if not any(occupied for _, occupied in pending.candidates):
-        return response
-    logger.info("🧭 Appending occupied-choice guidance via parsed pending-add matcher")
+    if pending is not None:
+        logger.info("🧭 Appending occupied-choice guidance via parsed pending-add matcher")
     return response.rstrip() + f"\n{guidance}"
 
 
@@ -1920,7 +2020,7 @@ async def _try_handle_referenced_word_presence_query(
         return render_remediation_reply(
             "本喵看见你是在回复一条消息，但平台没有把被引用的原文给到本喵。"
             "可能是消息过期、权限不足，或适配器没返回引用内容；"
-            "当前没有可绑定的查询词"
+            "因此无法确定查询目标"
         )
 
     expected_count = 2 if re.search(r"(两个|俩)", message_text) else 6
@@ -1928,7 +2028,7 @@ async def _try_handle_referenced_word_presence_query(
     if not words:
         return render_remediation_reply(
             "本喵拿到了被引用消息，但没能稳定识别出里面要查的词。"
-            "为避免把旧聊天记录里的词拿来误答，当前没有可绑定的查询词"
+            "为避免把旧聊天记录里的词拿来误答，本次没有查询"
         )
 
     lookup_json = await call_tool_function(
@@ -2013,7 +2113,8 @@ async def _try_handle_simple_single_word_query(
                 space_key=space_key,
                 owner_label=owner_label,
             )
-        return reviewed_prompt
+        actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
+        return append_unbound_binding_notice(reviewed_prompt, actor_is_bound)
 
     review_message = str(
         review.get("message")
@@ -2267,6 +2368,10 @@ async def call_tool_function(
     arguments: Dict,
     platform: Optional[str] = None,
     user_id: Optional[str] = None,
+    *,
+    trusted_reviewed_items_by_key: Optional[
+        Dict[Tuple[str, str], Dict[str, Any]]
+    ] = None,
 ) -> str:
     """Call a tool function and return result as JSON string."""
     if platform and user_id and tool_name in _DRAFT_MUTATION_TOOLS:
@@ -2288,7 +2393,15 @@ async def call_tool_function(
                     user_id,
                 ),
             }, ensure_ascii=False)
-    result_json = await tool_executor.call(tool_name, arguments, ToolContext(platform, user_id))
+    result_json = await tool_executor.call(
+        tool_name,
+        arguments,
+        ToolContext(
+            platform,
+            user_id,
+            trusted_reviewed_items_by_key=trusted_reviewed_items_by_key,
+        ),
+    )
     _record_reviewed_add_verdict(tool_name, arguments, result_json)
     result_data: Optional[Dict[str, Any]] = None
     try:
@@ -2379,6 +2492,8 @@ async def _execute_add_to_draft(
     remark: str = "",
     needs_manual_review: Optional[bool] = None,
     auto_confirm: bool = True,
+    reviewed_pinyin: str = "",
+    reviewed_candidate_codes: Tuple[str, ...] = (),
 ) -> str:
     """Directly add a word to draft and return formatted response."""
     args = {"word": word, "code": code, "preview_only": True}
@@ -2386,9 +2501,24 @@ async def _execute_add_to_draft(
         args["remark"] = remark
     if needs_manual_review is not None:
         args["needs_manual_review"] = bool(needs_manual_review)
-    result_json = await call_tool_function(
-        "keytao_create_phrase", args, platform, user_id,
+    reviewed_capability = _reviewed_create_capability(
+        word,
+        code,
+        reviewed_pinyin,
+        reviewed_candidate_codes,
     )
+    if reviewed_capability is not None:
+        result_json = await call_tool_function(
+            "keytao_create_phrase",
+            args,
+            platform,
+            user_id,
+            trusted_reviewed_items_by_key=reviewed_capability,
+        )
+    else:
+        result_json = await call_tool_function(
+            "keytao_create_phrase", args, platform, user_id,
+        )
     data = json.loads(result_json)
 
     if data.get("not_bound"):
@@ -2396,10 +2526,16 @@ async def _execute_add_to_draft(
 
     if data.get("requiresConfirmation"):
         conv_key = (platform, user_id)
+        pending_args = dict(args)
+        if reviewed_pinyin and reviewed_candidate_codes:
+            pending_args["_reviewed_pinyin"] = reviewed_pinyin
+            pending_args["_reviewed_candidate_codes"] = list(
+                reviewed_candidate_codes
+            )
         pending_state = _pending_state_from_server_warning(
             PendingToolConfirm(
                 function_name="keytao_create_phrase",
-                args=args,
+                args=pending_args,
             ),
             data,
         )
@@ -2430,7 +2566,7 @@ async def _execute_add_to_draft(
         ) if warnings else data.get("message", "存在重码警告")
         return _append_batch_url_if_missing((
             f"{warn_text}\n\n确认添加吗？"
-            f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。"
+            f"{pending_confirmation_copy()}或回复「取消」放弃。"
         ), data)
 
     if not data.get("success"):
@@ -2453,6 +2589,8 @@ async def _execute_add_to_draft_and_submit(
     remark: str = "",
     needs_manual_review: Optional[bool] = None,
     ordering_summary: str = "",
+    reviewed_pinyin: str = "",
+    reviewed_candidate_codes: Tuple[str, ...] = (),
 ) -> str:
     """Add a word to the draft, then submit the resulting batch."""
     result = await _perform_add_to_draft_and_submit(
@@ -2464,6 +2602,8 @@ async def _execute_add_to_draft_and_submit(
         needs_manual_review=needs_manual_review,
         auto_confirm=True,
         ordering_summary=ordering_summary,
+        reviewed_pinyin=reviewed_pinyin,
+        reviewed_candidate_codes=reviewed_candidate_codes,
     )
     if result.pending_state is not None:
         conversation_state_store.set(
@@ -2554,6 +2694,8 @@ async def _perform_add_to_draft_and_submit(
     auto_confirm: bool = False,
     informational_warnings: Optional[List[Any]] = None,
     ordering_summary: str = "",
+    reviewed_pinyin: str = "",
+    reviewed_candidate_codes: Tuple[str, ...] = (),
 ) -> DraftActionResult:
     """Run add-and-submit without mutating conversational pending state."""
     args = {"word": word, "code": code}
@@ -2572,9 +2714,24 @@ async def _perform_add_to_draft_and_submit(
         create_args["preview_only"] = True
     if batch_id:
         create_args["batch_id"] = batch_id
-    create_json = await call_tool_function(
-        "keytao_create_phrase", create_args, platform, user_id,
+    reviewed_capability = _reviewed_create_capability(
+        word,
+        code,
+        reviewed_pinyin,
+        reviewed_candidate_codes,
     )
+    if reviewed_capability is not None:
+        create_json = await call_tool_function(
+            "keytao_create_phrase",
+            create_args,
+            platform,
+            user_id,
+            trusted_reviewed_items_by_key=reviewed_capability,
+        )
+    else:
+        create_json = await call_tool_function(
+            "keytao_create_phrase", create_args, platform, user_id,
+        )
     create_data = json.loads(create_json)
     if create_data.get("success") is True and informational_warnings:
         create_data["warnings"] = list(informational_warnings)
@@ -2591,10 +2748,16 @@ async def _perform_add_to_draft_and_submit(
             ordering_summary
             or _create_warning_ordering_summary(create_data, args)
         )
+        pending_args = {**args, "_submit_after": True}
+        if reviewed_pinyin and reviewed_candidate_codes:
+            pending_args["_reviewed_pinyin"] = reviewed_pinyin
+            pending_args["_reviewed_candidate_codes"] = list(
+                reviewed_candidate_codes
+            )
         pending_state = _pending_state_from_server_warning(
             PendingToolConfirm(
                 function_name="keytao_create_phrase",
-                args={**args, "_submit_after": True},
+                args=pending_args,
             ),
             create_data,
         )
@@ -2622,6 +2785,8 @@ async def _perform_add_to_draft_and_submit(
                 auto_confirm=True,
                 informational_warnings=list(create_data.get("warnings") or []),
                 ordering_summary=warning_ordering_summary,
+                reviewed_pinyin=reviewed_pinyin,
+                reviewed_candidate_codes=reviewed_candidate_codes,
             )
             return _preserve_action_result_link(
                 confirmed_result,
@@ -2634,7 +2799,7 @@ async def _perform_add_to_draft_and_submit(
         ) if warnings else create_data.get("message", "存在重码警告")
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warn_text}\n\n确认添加吗？"
-            f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。",
+            f"{pending_confirmation_copy()}或回复「取消」放弃。",
             create_data,
         ), pending_state=pending_state, data=create_data)
 
@@ -2685,7 +2850,8 @@ async def _perform_add_to_draft_and_submit(
         ]
         final_status = (
             f"✅ 搞定！「{word}」→ {code} 已加入草稿并自动审核入库。"
-            if "已加入词库" in submit_result.text
+            if isinstance(submit_result.data, dict)
+            and submit_result.data.get("autoApproved") is True
             else f"✅ 搞定！「{word}」→ {code} 已加入草稿并提交审核。"
         )
         return DraftActionResult(
@@ -2731,7 +2897,9 @@ async def _perform_batch_add_to_draft_and_submit(
     """Add every confirmed reviewed item, then submit exactly that batch."""
     requested_items = [dict(item) for item in items if isinstance(item, dict)]
     if not requested_items:
-        return DraftActionResult("没有找到可添加的词条 qwq")
+        return DraftActionResult(render_remediation_reply(
+            "没有找到可添加的词条"
+        ))
 
     add_arguments: Dict[str, Any] = {"items": requested_items}
     if batch_id:
@@ -2796,7 +2964,7 @@ async def _perform_batch_add_to_draft_and_submit(
         ) if warnings else add_data.get("message", "批量添加前需要确认")
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warning_text}\n\n确认继续添加吗？"
-            f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。",
+            f"{pending_confirmation_copy()}或回复「取消」放弃。",
             add_data,
         ), pending_state=pending_state, data=add_data)
 
@@ -2976,7 +3144,11 @@ async def _execute_add_multiple_codes_to_draft(
             item["needsManualReview"] = bool(state.needs_manual_review)
         items.append(item)
     if not items:
-        return "没有找到可添加的编码 qwq"
+        return render_remediation_reply(
+            "没有找到可添加的编码",
+            command=f"加词 {state.word}",
+            words=(state.word,),
+        )
 
     return await _execute_confirmed_tool(
         PendingToolConfirm(
@@ -3221,22 +3393,20 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 if data.get("submitAfter")
                 else "确认删除这些精确条目吗？"
             ) + pending_confirmation_copy()
-            + "也可使用确认票据，或回复「取消」放弃。",
+            + "或回复「取消」放弃。",
         ))
         return _assert_plain_user_facing_reply("\n".join(lines))
 
     if function_name == "keytao_recall_batch":
         batch_id = str(data.get("batchId") or "")
-        version = data.get("contentVersion")
         batch_url = _trusted_batch_url(data)
         link_line = f"\n• 草稿地址：{batch_url}" if batch_url else ""
         return _assert_plain_user_facing_reply(
             "↩️ 服务端已锁定待撤回批次：\n"
             f"• 批次：{batch_id}\n"
-            f"• 内容版本：{version}"
             f"{link_line}\n\n"
             "确认把这个精确批次恢复为草稿吗？"
-            f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。"
+            f"{pending_confirmation_copy()}或回复「取消」放弃。"
         )
 
     if function_name == "keytao_shift_phrase_code":
@@ -3267,7 +3437,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             "",
             "以上每一项都将由服务端按同一批次版本校验。"
             f"确认执行吗？{pending_confirmation_copy()}"
-            "也可使用确认票据，或回复「取消」放弃。",
+            "或回复「取消」放弃。",
         ))
         return _assert_plain_user_facing_reply("\n".join(lines))
 
@@ -3293,7 +3463,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     return _assert_plain_user_facing_reply(
         f"{warning_text}{review_text}{link_text}\n\n"
         f"这是服务端在实际校验后返回的风险。确认{action_text}吗？"
-        f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。"
+        f"{pending_confirmation_copy()}或回复「取消」放弃。"
     )
 
 
@@ -3330,6 +3500,12 @@ async def _execute_confirmed_tool(
         or carried_ordering_summary
         or ""
     ).strip()
+    reviewed_pinyin = str(args.pop("_reviewed_pinyin", "") or "").strip()
+    reviewed_candidate_codes = tuple(
+        str(value or "").strip().lower()
+        for value in args.pop("_reviewed_candidate_codes", [])
+        if str(value or "").strip()
+    )
     submit_after = bool(args.pop("_submit_after", False))
     expected_keep_words = tuple(
         str(word)
@@ -3398,7 +3574,8 @@ async def _execute_confirmed_tool(
             or (not args.get("batch_id") and args["expected_content_version"] != 0)
         ):
             return render_remediation_reply(
-                "顺延确认票据缺少完整计划版本，已安全拒绝"
+                "顺延确认票据缺少完整计划版本，已安全拒绝",
+                command="查看草稿",
             )
     if state.confirmation_source == "server_warning" and state.function_name == "keytao_recall_batch":
         if (
@@ -3408,7 +3585,8 @@ async def _execute_confirmed_tool(
             or args["expected_content_version"] < 0
         ):
             return render_remediation_reply(
-                "撤回确认票据缺少精确批次版本，已安全拒绝"
+                "撤回确认票据缺少精确批次版本，已安全拒绝",
+                command="查看草稿",
             )
     if state.confirmation_source == "server_warning" and state.function_name in {
         "keytao_remove_draft_item",
@@ -3423,9 +3601,31 @@ async def _execute_confirmed_tool(
             or args["expected_content_version"] < 0
         ):
             return render_remediation_reply(
-                "删除确认票据缺少精确实体快照，已安全拒绝"
+                "删除确认票据缺少精确实体快照，已安全拒绝",
+                command="查看草稿",
             )
-    result_json = await call_tool_function(state.function_name, args, platform, user_id)
+    reviewed_capability = (
+        _reviewed_create_capability(
+            str(args.get("word") or "").strip(),
+            str(args.get("code") or "").strip().lower(),
+            reviewed_pinyin,
+            reviewed_candidate_codes,
+        )
+        if state.function_name == "keytao_create_phrase"
+        else None
+    )
+    if reviewed_capability is not None:
+        result_json = await call_tool_function(
+            state.function_name,
+            args,
+            platform,
+            user_id,
+            trusted_reviewed_items_by_key=reviewed_capability,
+        )
+    else:
+        result_json = await call_tool_function(
+            state.function_name, args, platform, user_id,
+        )
     data = json.loads(result_json)
 
     if data.get("transportError") is True:
@@ -3486,7 +3686,7 @@ async def _execute_confirmed_tool(
             return _append_batch_url_if_missing(
                 render_remediation_reply(
                     "服务端风险计划过大，无法在一条消息中完整展示；"
-                    "本次未保存票据、未执行；系统不能替用户决定如何缩小范围"
+                    "本次未保存票据、未执行；系统不能替你决定如何缩小范围"
                 ),
                 display_data,
             )
@@ -3501,7 +3701,7 @@ async def _execute_confirmed_tool(
             return _append_batch_url_if_missing(
                 render_remediation_reply(
                     "服务端风险详情过大，无法安全保存确认票据；"
-                    "本次未执行；系统不能替用户决定如何缩小范围"
+                    "本次未执行；系统不能替你决定如何缩小范围"
                 ),
                 display_data,
             )
@@ -3510,7 +3710,10 @@ async def _execute_confirmed_tool(
     async def continue_with_submit_preview(response: str) -> str:
         batch_id = str(data.get("batchId") or args.get("batch_id") or "").strip()
         if not batch_id:
-            return response + "\n操作完成，但响应缺少精确批次，已停止后续提交。"
+            return response + "\n" + render_remediation_reply(
+                "操作完成，但响应缺少精确批次，已停止后续提交",
+                command="查看草稿",
+            )
         submit_response = await _execute_confirmed_tool(
             PendingToolConfirm(
                 function_name="keytao_submit_batch",
@@ -3560,17 +3763,18 @@ async def _execute_confirmed_tool(
         if data.get("not_bound"):
             return _BIND_HELP_TEXT
         if data.get("success") or data.get("successCount", 0) > 0:
-            header = "✅ 已加入草稿\n"
+            expected_count = len(state.args.get("items", []))
+            success_count = int(data.get("successCount") or 0)
+            failed_count = int(data.get("failedCount") or 0)
+            partial = failed_count > 0 or success_count != expected_count
+            header = "⚠️ 仅部分加入草稿\n" if partial else "✅ 已加入草稿\n"
             response = header + await _format_draft_response(data, platform, user_id)
+            if partial:
+                suffix = f"\n仅成功加入 {success_count}/{expected_count} 条"
+                if submit_after:
+                    suffix += "，已停止后续提交"
+                return response + suffix + "。"
             if submit_after:
-                expected_count = len(state.args.get("items", []))
-                success_count = int(data.get("successCount") or 0)
-                failed_count = int(data.get("failedCount") or 0)
-                if failed_count > 0 or success_count != expected_count:
-                    return (
-                        response
-                        + f"\n仅成功加入 {success_count}/{expected_count} 条，已停止后续提交。"
-                    )
                 return await continue_with_submit_preview(response)
             return response
         return _append_batch_url_if_missing(
@@ -3631,15 +3835,13 @@ async def _execute_confirmed_tool(
             if submit_after:
                 return await continue_with_submit_preview(response)
             return response
+        uncertain_message = str(data.get("message") or "").strip()
         return _append_batch_url_if_missing(
             (
-                "操作结果不确定："
-                + str(
-                    data.get("message")
-                    or render_remediation_reply(
-                        "操作结果不确定",
-                        command="查看草稿",
-                    )
+                uncertain_message
+                or render_remediation_reply(
+                    "操作结果不确定",
+                    command="查看草稿",
                 )
                 if data.get("uncertain")
                 else f"操作失败：{data.get('message', '未知错误')} qwq"
@@ -3962,7 +4164,8 @@ async def _perform_active_operation_confirmation(
     pending_state = operation.pending_state
     if not isinstance(pending_state, PendingToolConfirm):
         return DraftActionResult(render_remediation_reply(
-            "这次后台操作没有可确认的步骤"
+            "这次后台操作没有可确认的步骤",
+            command="查看草稿",
         ))
 
     if pending_state.function_name == "keytao_submit_batch":
@@ -4015,7 +4218,8 @@ async def _perform_active_operation_confirmation(
         )
 
     return DraftActionResult(render_remediation_reply(
-        "这次后台操作无法继续"
+        "这次后台操作无法继续",
+        command="查看草稿",
     ))
 
 
@@ -4571,7 +4775,10 @@ async def _try_handle_quoted_draft_selection(
         )
     items = list_data.get("items")
     if not isinstance(items, list):
-        return "当前草稿快照缺少条目列表，没有执行操作。"
+        return render_remediation_reply(
+            "当前草稿快照缺少条目列表，没有执行操作",
+            command="查看草稿",
+        )
 
     selection = _quoted_draft_selection_request(message_text, items)
     if selection is None:
@@ -4601,16 +4808,22 @@ async def _try_handle_quoted_draft_selection(
             if index < 1 or index > len(items):
                 return render_remediation_reply(
                     f"只接受 1-{len(items)} 之间的草稿编号；"
-                    "系统不能替你选择其中一个"
+                    "系统不能替你选择其中一个",
+                    command="查看草稿",
                 )
             selected_items = [items[index - 1]]
         else:
             keep_matches = [item for item in items if _draft_item_word(item) == value]
             if len(keep_matches) != 1:
-                return "无法唯一确定要保留的词条；没有执行删除。"
+                return render_remediation_reply(
+                    "无法唯一确定要保留的词条；没有执行删除",
+                    command="查看草稿",
+                )
             selected_items = [item for item in items if item is not keep_matches[0]]
             if not selected_items:
-                return f"当前草稿只剩「{value}」，不需要删除。"
+                return render_remediation_reply(
+                    f"当前草稿只剩「{value}」，不需要删除"
+                )
 
         source_targets = [
             _canonical_draft_delete_target(item)
@@ -4627,7 +4840,10 @@ async def _try_handle_quoted_draft_selection(
             or any(target is None for target in source_targets)
             or len(ids) != len(selected_items)
         ):
-            return "当前草稿缺少完整 ID 或版本；没有执行删除。"
+            return render_remediation_reply(
+                "当前草稿缺少完整 ID 或版本；没有执行删除",
+                command="查看草稿",
+            )
         result = await _perform_exact_batch_remove(
             [int(item_id) for item_id in ids],
             platform,
@@ -5326,7 +5542,9 @@ async def _try_update_pending_pronunciation(
     if len(matching_variants) != 1:
         return render_remediation_reply(
             f"读音纠正已收到，但编码服务无法唯一定位「{character}」的 "
-            f"{corrected_pinyin} 候选；旧候选没有执行"
+            f"{corrected_pinyin} 候选；旧候选没有执行",
+            command=f"加词 {state.word}",
+            words=(state.word,),
         )
 
     status_map = {
@@ -5340,7 +5558,11 @@ async def _try_update_pending_pronunciation(
         if isinstance(code, str) and code in status_map
     ]
     if not variant_codes:
-        return "读音纠正已收到，但新读音的候选占用状态无法验证；旧候选没有执行。"
+        return render_remediation_reply(
+            "读音纠正已收到，但新读音的候选占用状态无法验证；旧候选没有执行",
+            command=f"加词 {state.word}",
+            words=(state.word,),
+        )
 
     recommended_code = next(
         (
@@ -5432,7 +5654,9 @@ async def _try_update_pending_pronunciation(
     if not stored:
         return render_remediation_reply(
             "新读音候选过大，未保存也未执行；"
-            "系统不能替用户决定如何缩小候选范围"
+            "系统不能替你决定如何缩小候选范围",
+            command=f"加词 {state.word}",
+            words=(state.word,),
         )
     return response
 
@@ -5476,6 +5700,14 @@ async def _handle_pending_add_word(
         command_intent = MessageCommandIntent()
 
     submit_after_add = command_intent.intent == "pending_add_and_submit"
+
+    def reviewed_validation(code: str) -> Dict[str, Any]:
+        pinyin, candidate_codes = _pending_reviewed_reading(state, code)
+        return {
+            "reviewed_pinyin": pinyin,
+            "reviewed_candidate_codes": candidate_codes,
+        }
+
     requested_codes = list(command_intent.requested_codes)
     if not requested_codes and _is_sensitive_pending_control_intent(command_intent):
         requested_codes = _requested_codes_from_pending_message(msg, state)
@@ -5517,6 +5749,7 @@ async def _handle_pending_add_word(
                         owner_label,
                         state.code_remarks.get(direct_code, ""),
                         state.needs_manual_review,
+                        **reviewed_validation(direct_code),
                     )
                 return await _execute_add_to_draft(
                     state.word,
@@ -5527,6 +5760,7 @@ async def _handle_pending_add_word(
                     owner_label,
                     state.code_remarks.get(direct_code, ""),
                     state.needs_manual_review,
+                    **reviewed_validation(direct_code),
                 )
             return await _execute_confirmed_tool(
                 PendingToolConfirm(
@@ -5559,6 +5793,7 @@ async def _handle_pending_add_word(
                     owner_label,
                     state.code_remarks.get(target_code, ""),
                     state.needs_manual_review,
+                    **reviewed_validation(target_code),
                 )
             return await _execute_add_to_draft(
                 state.word,
@@ -5569,6 +5804,7 @@ async def _handle_pending_add_word(
                 owner_label,
                 state.code_remarks.get(target_code, ""),
                 state.needs_manual_review,
+                **reviewed_validation(target_code),
             )
         return await _execute_confirmed_tool(
             PendingToolConfirm(
@@ -5601,7 +5837,9 @@ async def _handle_pending_add_word(
                 )
             return render_remediation_reply(
                 f"候选编号超出范围；有效范围为 1-{len(state.candidates)}，"
-                "系统不能替用户选择其中一个"
+                "系统不能替你选择其中一个",
+                command="加入",
+                words=(state.word,),
             )
 
     elif command_intent.intent == "pending_confirm" or submit_after_add:
@@ -5626,6 +5864,7 @@ async def _handle_pending_add_word(
                 owner_label,
                 state.code_remarks.get(target_code, ""),
                 state.needs_manual_review,
+                **reviewed_validation(target_code),
             )
         return await _execute_add_to_draft(
             state.word,
@@ -5636,6 +5875,7 @@ async def _handle_pending_add_word(
             owner_label,
             state.code_remarks.get(target_code, ""),
             state.needs_manual_review,
+            **reviewed_validation(target_code),
         )
 
     if submit_after_add:
@@ -5649,6 +5889,7 @@ async def _handle_pending_add_word(
             state.code_remarks.get(target_code, ""),
             state.needs_manual_review,
             _pending_add_ordering_summary(state, target_code),
+            **reviewed_validation(target_code),
         )
 
     return await _execute_confirmed_tool(
@@ -5661,6 +5902,294 @@ async def _handle_pending_add_word(
         (platform, user_id),
         space_key,
         owner_label,
+    )
+
+
+def _compact_reviewed_reading_options(review: Dict) -> str:
+    """Render one bounded code-chain summary per reviewed pronunciation."""
+    summaries: List[str] = []
+    pronunciations = [
+        value
+        for value in review.get("pronunciations") or []
+        if isinstance(value, dict)
+    ]
+    for pronunciation in pronunciations[:4]:
+        pinyin = str(pronunciation.get("pinyin") or "读音待核对").strip()
+        codes = list(dict.fromkeys(
+            str(status.get("code") or "").strip().lower()
+            for status in pronunciation.get("candidateStatuses") or []
+            if isinstance(status, dict) and str(status.get("code") or "").strip()
+        ))
+        if not codes:
+            continue
+        chain = codes[0] if len(codes) == 1 else f"{codes[0]}–{codes[-1]}"
+        summaries.append(f"{pinyin}：{chain}")
+    if not summaries:
+        return ""
+    if len(pronunciations) > len(summaries):
+        summaries.append(f"另 {len(pronunciations) - len(summaries)} 组")
+    return "；".join(summaries)
+
+
+def _pending_from_requested_encode(
+    word: str,
+    code: str,
+    encoding: Dict,
+) -> Optional[PendingAddWord]:
+    """Build a sealed one-reading state from requested-code encode facts."""
+    requested_base = code.rstrip("o") or code
+    variants = [
+        value
+        for key in (
+            "alternatePronunciationCodes",
+            "alternatePhrasePronunciationCodes",
+        )
+        for value in encoding.get(key) or []
+        if isinstance(value, dict)
+    ]
+    group_codes: List[str] = []
+    matched_variant: Optional[Dict] = None
+    for variant in variants:
+        codes = list(dict.fromkeys(
+            str(value or "").strip().lower()
+            for value in variant.get("codes") or []
+            if str(value or "").strip()
+        ))
+        if code in codes:
+            group_codes = codes
+            matched_variant = variant
+            break
+    if not group_codes:
+        all_codes = list(dict.fromkeys(
+            str(value or "").strip().lower()
+            for key in (
+                "requestedCandidateCodes",
+                "candidateCodes",
+                "codes",
+                "altCodes",
+            )
+            for value in encoding.get(key) or []
+            if str(value or "").strip()
+        ))
+        group_codes = [
+            value
+            for value in all_codes
+            if (value.rstrip("o") or value) == requested_base
+        ]
+    if code not in group_codes:
+        return None
+
+    chars = encoding.get("chars")
+    if not isinstance(chars, list) or not chars:
+        return None
+    pinyins = [
+        str(value.get("pinyin") or "").strip()
+        if isinstance(value, dict)
+        else ""
+        for value in chars
+    ]
+    if any(not value for value in pinyins):
+        return None
+    if matched_variant is not None:
+        variant_pinyin = str(matched_variant.get("pinyin") or "").strip()
+        char_index = matched_variant.get("charIndex")
+        if len(pinyins) == 1 and variant_pinyin:
+            pinyins[0] = variant_pinyin
+        elif (
+            isinstance(char_index, int)
+            and not isinstance(char_index, bool)
+            and 0 <= char_index < len(pinyins)
+            and variant_pinyin
+        ):
+            pinyins[char_index] = variant_pinyin
+    pinyin = " ".join(_plain_pinyin(value) for value in pinyins)
+    if not pinyin.strip():
+        return None
+
+    status_map = {
+        str(status.get("code") or "").strip().lower(): status
+        for status in encoding.get("candidateStatuses") or []
+        if isinstance(status, dict)
+    }
+    group_statuses = [status_map.get(candidate_code) for candidate_code in group_codes]
+    if any(
+        not isinstance(status, dict)
+        or not isinstance(status.get("occupied"), bool)
+        for status in group_statuses
+    ):
+        return None
+    candidates = [
+        (candidate_code, bool(status_map[candidate_code]["occupied"]))
+        for candidate_code in group_codes
+    ]
+    occupied_words = {
+        candidate_code: [
+            str(value or "").strip()
+            for value in status_map[candidate_code].get("words") or []
+            if str(value or "").strip()
+        ]
+        for candidate_code, occupied in candidates
+        if occupied
+    }
+    state = PendingAddWord(
+        word=word,
+        recommended_code=code,
+        candidates=candidates,
+        occupied_words=occupied_words,
+        pronunciation_codes={candidate_code: pinyin for candidate_code in group_codes},
+        pronunciation_recommended_codes=[code],
+        needs_manual_review=True,
+        manual_review_reason="用户显式选择了多音候选，需管理员审核",
+    )
+    return _attach_server_candidate_snapshot(
+        state,
+        [status for status in group_statuses if isinstance(status, dict)],
+    )
+
+
+async def _try_handle_explicit_pending_replacement(
+    state: PendingAddWord,
+    message: str,
+    platform: str,
+    user_id: str,
+    conv_key: ConversationKey,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    """Replace one live selection from an exact same-word word+code command."""
+    command = explicit_complete_add_item(message)
+    if command is None:
+        return None
+    word = str(command.get("word") or "").strip()
+    code = str(command.get("code") or "").strip().lower()
+    if word != state.word:
+        return None
+
+    review_json = await call_tool_function(
+        "keytao_prepare_reviewed_add",
+        {"word": word},
+        platform,
+        user_id,
+    )
+    try:
+        review = json.loads(review_json)
+    except Exception:
+        review = {}
+    if not isinstance(review, dict) or review.get("success") is not True:
+        message_text = str(
+            review.get("message") if isinstance(review, dict) else ""
+        ).strip()
+        return (
+            f"无法重新核验「{word}」的编码；"
+            f"{message_text or '编码服务没有返回可验证结果'}。没有执行添加"
+        )
+    if review.get("pronunciationUnresolved") is True:
+        return str(
+            review.get("message")
+            or f"「{word}」当前读音无法确定；没有执行添加"
+        )
+
+    reviewed_prompt = _format_reviewed_add_prompt(review)
+    replacement = (
+        _parse_pending_add_word(reviewed_prompt)
+        if reviewed_prompt
+        else None
+    )
+    statuses = [
+        status
+        for pronunciation in review.get("pronunciations") or []
+        if isinstance(pronunciation, dict)
+        for status in pronunciation.get("candidateStatuses") or []
+        if isinstance(status, dict)
+    ]
+    if replacement is not None:
+        _attach_server_candidate_snapshot(
+            replacement,
+            statuses,
+            review.get("candidateOrderingAssessments"),
+        )
+    candidate_codes = {
+        candidate_code
+        for candidate_code, _occupied in (replacement.candidates if replacement else [])
+    }
+    used_requested_encode = False
+    if replacement is None or code not in candidate_codes:
+        encode_json = await call_tool_function(
+            "keytao_encode",
+            {"word": word, "requested_code": code},
+            platform,
+            user_id,
+        )
+        try:
+            encoding = json.loads(encode_json)
+        except Exception:
+            encoding = {}
+        if isinstance(encoding, dict) and encoding.get("success") is True:
+            requested_replacement = _pending_from_requested_encode(
+                word,
+                code,
+                encoding,
+            )
+            if requested_replacement is not None:
+                replacement = requested_replacement
+                used_requested_encode = True
+                candidate_codes = {
+                    candidate_code
+                    for candidate_code, _occupied in replacement.candidates
+                }
+    if replacement is None or code not in candidate_codes:
+        options = _compact_reviewed_reading_options(review)
+        suffix = f"；可选读音链：{options}" if options else ""
+        return (
+            f"编码 {code} 不是「{word}」当前审词结果中的有效候选编码"
+            f"{suffix}；没有执行添加"
+        )
+
+    replacement.recommended_code = code
+    review_flag = review_flags.read_manual_review_flag(review)
+    if review_flag is None:
+        audit = review.get("preSubmitAudit")
+        if isinstance(audit, dict):
+            review_flag = audit.get("autoApprove") is not True
+    if review_flag is not None and not used_requested_encode:
+        replacement.needs_manual_review = bool(review_flag)
+        replacement.manual_review_reason = review_flags.manual_review_reason(
+            review
+        ) or str(
+            (review.get("preSubmitAudit") or {}).get("summary")
+            if isinstance(review.get("preSubmitAudit"), dict)
+            else ""
+        ).strip()
+    conversation_state_store.delete(conv_key)
+    pinyin, reviewed_codes = _pending_reviewed_reading(replacement, code)
+    kwargs = {
+        "reviewed_pinyin": pinyin,
+        "reviewed_candidate_codes": reviewed_codes,
+    }
+    if command.get("submitAfter") is True:
+        return await _execute_add_to_draft_and_submit(
+            word,
+            code,
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+            replacement.code_remarks.get(code, ""),
+            replacement.needs_manual_review,
+            _pending_add_ordering_summary(replacement, code),
+            **kwargs,
+        )
+    return await _execute_add_to_draft(
+        word,
+        code,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+        replacement.code_remarks.get(code, ""),
+        replacement.needs_manual_review,
+        reviewed_pinyin=pinyin,
+        reviewed_candidate_codes=reviewed_codes,
     )
 
 
@@ -6000,14 +6529,14 @@ async def _try_handle_replace_char(
             f"[replace_char] Refused '{old_char}'→'{new_char}': "
             f"{len(items)} items exceed the {MAX_REPLACE_CHAR_ITEMS}-item limit"
         )
-        return (
+        return render_remediation_reply(
             f"这次要替换 {len(items)} 条，一次最多只能处理 {MAX_REPLACE_CHAR_ITEMS} 条哦 qwq\n"
             f"请把词条分批发给我，每批不超过 {MAX_REPLACE_CHAR_ITEMS} 条，我再逐批处理。"
         )
 
     confirmation = _format_replace_char_confirmation(items, old_char, new_char)
     if len(confirmation) > MAX_REPLACE_CONFIRMATION_CHARS:
-        return (
+        return render_remediation_reply(
             "这批替换无法在一条确认消息中完整展示，因此未保存票据、未写入。"
             "请拆成更小批次后重试。"
         )
@@ -6045,7 +6574,9 @@ def _try_handle_operation_recall(
         limit=8,
     )
     if not operations:
-        return "当前会话里没有可由工具回执验证的词库操作记录。"
+        return render_remediation_reply(
+            "当前会话里没有可由工具回执验证的词库操作记录"
+        )
 
     lines = [
         "最近通过喵喵经手的词库操作："

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+from typing import Optional
 import unicodedata
 
 
@@ -92,6 +93,57 @@ PENDING_ASSENT_TEXTS = frozenset({
     *PENDING_BATCH_ASSENT_TEXTS,
 })
 PENDING_BATCH_CONFIRMATION_COPY_TOKEN = "{{PENDING_BATCH_CONFIRMATION_COPY}}"
+
+
+_BIND_HELP_TEXT = (
+    "你还没有绑定键道账号哦～\n\n"
+    "📝 绑定步骤：\n\n"
+    "1. 登录键道网站：https://keytao.vercel.app\n"
+    "2. 点击右上角用户名，进入【我的资料】\n"
+    "   （或直接访问：https://keytao.vercel.app/profile ）\n"
+    "3. 在【机器人账号绑定】区域点击【生成绑定码】\n"
+    "4. 复制绑定码\n"
+    "5. 在这里发送：/bind [你的绑定码]\n\n"
+    "示例：/bind AB12CD\n\n"
+    "💡 群聊中需要 @我 或回复我的消息才能触发绑定"
+)
+
+
+REMEDIATION_NO_SAFE_FOLLOWUP_MARKER = "当前没有可安全执行的后续命令"
+FAILED_WRITE_TEMPLATE_PREFIX = "这条指令按当前表述无法执行"
+FAILED_WRITE_TEMPLATE_MARKER = "本次未写入"
+POLICY_BLOCK_TEMPLATE_PREFIX = "安全拦截："
+SYSTEM_REPLY_TEMPLATE_MARKERS = (
+    FAILED_WRITE_TEMPLATE_PREFIX,
+    FAILED_WRITE_TEMPLATE_MARKER,
+    REMEDIATION_NO_SAFE_FOLLOWUP_MARKER,
+    POLICY_BLOCK_TEMPLATE_PREFIX,
+)
+
+
+UNBOUND_BINDING_PRECHECK_NOTICE = (
+    "提示：你还未绑定键道账号，提交前请先绑定"
+    "（发送 /bind 绑定码，详见 https://keytao.vercel.app/profile）。"
+)
+
+
+def system_reply_template_marker(text: str) -> str:
+    """Return the first registered deterministic-template marker in text."""
+    rendered = str(text or "")
+    return next(
+        (marker for marker in SYSTEM_REPLY_TEMPLATE_MARKERS if marker in rendered),
+        "",
+    )
+
+
+def append_unbound_binding_notice(text: str, actor_is_bound: Optional[bool]) -> str:
+    """Prepend one short binding notice without blocking a useful review."""
+    rendered = str(text or "").strip()
+    if actor_is_bound is not False or not rendered:
+        return rendered
+    if UNBOUND_BINDING_PRECHECK_NOTICE in rendered:
+        return rendered
+    return f"{UNBOUND_BINDING_PRECHECK_NOTICE}\n{rendered}"
 
 
 def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
@@ -413,7 +465,7 @@ def parse_pending_assent_phrase(
 
 _PLACEHOLDER_OPERAND_RE = re.compile(
     r"(?<![\u3400-\u9fffA-Za-z0-9_])"
-    r"(?:词条|编码|x{2,}|…|\.{3,})"
+    r"(?:词条|编码|编号|原词|x{2,}|…|\.{3,})"
     r"(?![\u3400-\u9fffA-Za-z0-9_])",
     re.IGNORECASE,
 )
@@ -462,7 +514,7 @@ def render_remediation_reply(
     suggestion = render_executable_suggestion(command, words=words)
     if suggestion:
         return f"{clean_reason}。\n可执行命令：\n{suggestion}"
-    return f"{clean_reason}。当前没有可安全执行的后续命令。"
+    return f"{clean_reason}。{REMEDIATION_NO_SAFE_FOLLOWUP_MARKER}。"
 
 
 def _mask_set_reference_quotes(text: str) -> str:
@@ -1123,7 +1175,8 @@ def pending_confirmation_prompt_instruction() -> str:
         "多词候选消息末尾必须逐字使用以下确认文案：\n"
         + pending_batch_confirmation_copy()
         + "\n多词的每个候选列表都从 1 开始，禁止广告或接受不带词条的编号选择；"
-        "只能提示词条作用域形式，例如「词条 添加1」或「词条 添加2、4」。"
+        "必须把当前候选消息里的真实词语逐一代入作用域命令，"
+        "禁止输出“词条”“编号”“原词”等占位词。"
         "单词候选才可提示裸编号及「添加2、4」。"
     )
 

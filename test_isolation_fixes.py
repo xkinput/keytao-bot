@@ -572,7 +572,10 @@ def test_replace_char_requires_confirmation():
         record = openai_chat_module.conversation_state_store.get_record(conv_key)
         openai_chat_module.conversation_state_store.delete(conv_key)
 
-        check("replace-char asks for confirmation", response is not None and "确认票据" in response)
+        check(
+            "replace-char asks for confirmation",
+            response is not None and "回复「确认」、「执行」继续" in response,
+        )
         check("replace-char previews the rewrite", response is not None and "防粘 → 防黏" in response)
         check("replace-char stores a pending tool confirm", isinstance(pending, PendingToolConfirm))
         check("pending targets the batch draft tool", pending.function_name == "keytao_batch_add_to_draft")

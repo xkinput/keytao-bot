@@ -9,6 +9,8 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
 from keytao_bot.utils.pending_confirmation import (
+    SYSTEM_REPLY_TEMPLATE_MARKERS,
+    UNBOUND_BINDING_PRECHECK_NOTICE,
     advertised_batch_binding_pairs,
     advertised_reply_contract,
 )
@@ -3082,6 +3084,345 @@ async def scenario_s26(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S27_WORD = "来都来了"
+S27_ASSENT = "加入并提交"
+S27_META_QUESTION = "你是否会先确认对方有没有绑定账号？"
+
+
+async def scenario_s27(ctx: ScenarioContext) -> dict[str, Any]:
+    """Warn an unbound actor at discovery, then keep meta chat conversational."""
+    unbound_platform_id = "8" + ctx.platform_id[1:]
+    require(
+        await ctx.next_client.find_user(unbound_platform_id) is None,
+        "S27 synthetic unbound actor unexpectedly resolved to a local user",
+    )
+    require(
+        await ctx.next_client.find_user(ctx.platform_id) is not None,
+        "S27 bound control actor did not resolve to its provisioned local user",
+    )
+
+    async def send_as(platform_id: str, sender_name: str, text: str) -> str:
+        reply = await ctx.bot.send_group(
+            platform_id=platform_id,
+            sender_name=sender_name,
+            text=text,
+            to_me=True,
+        )
+        assert_batch_link_hosts(reply, ctx.next_client.base_url)
+        return reply
+
+    await ctx.bot.reset_conversation(platform_id=unbound_platform_id)
+    first_reply = await send_as(unbound_platform_id, "S27-unbound", S27_WORD)
+    require(S27_WORD in first_reply, f"S27 unbound review omitted the word: {first_reply}")
+    require(
+        advertised_reply_contract(first_reply).requires_live_state,
+        f"S27 unbound review did not render a candidate contract: {first_reply}",
+    )
+    require(
+        first_reply.count(UNBOUND_BINDING_PRECHECK_NOTICE) == 1,
+        f"S27 unbound first candidate reply did not carry exactly one notice: {first_reply}",
+    )
+
+    bind_reply = await send_as(unbound_platform_id, "S27-unbound", S27_ASSENT)
+    assert_reply_mentions(bind_reply, "你还没有绑定键道账号", "/bind", "/profile")
+
+    cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    meta_reply = await send_as(
+        unbound_platform_id,
+        "S27-unbound",
+        S27_META_QUESTION,
+    )
+    stance = re.search(
+        r"(?:^|[\s，,。；;：:！!？?～~])"
+        r"(?:会(?:的|先|在|于|检查|确认|校验)?|不会|是的|不是|有的|没有|否)",
+        meta_reply,
+    )
+    require(
+        "绑定" in meta_reply and stance is not None,
+        f"S27 meta turn was not answered directly: {meta_reply}",
+    )
+    require(
+        not any(marker in meta_reply for marker in SYSTEM_REPLY_TEMPLATE_MARKERS),
+        f"S27 meta answer impersonated a system template: {meta_reply}",
+    )
+    require(
+        "可执行命令：" not in meta_reply,
+        f"S27 meta answer was a remediation reply: {meta_reply}",
+    )
+    meta_tools = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > cutoff
+        and event.get("kind") == "tool"
+    ]
+    require(not meta_tools, f"S27 pure meta question called tools: {meta_tools}")
+
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    bound_reply = await send_as(ctx.platform_id, ctx.sender_name, S27_WORD)
+    require(
+        advertised_reply_contract(bound_reply).requires_live_state,
+        f"S27 bound control did not render candidates: {bound_reply}",
+    )
+    require(
+        UNBOUND_BINDING_PRECHECK_NOTICE not in bound_reply,
+        f"S27 bound control received the unbound notice: {bound_reply}",
+    )
+    draft = await ctx.draft()
+    require(not draft.get("items"), f"S27 read-only flow changed the bound draft: {draft}")
+
+    return {
+        "messages": [S27_WORD, S27_ASSENT, S27_META_QUESTION, S27_WORD],
+        "replies": [first_reply, bind_reply, meta_reply, bound_reply],
+        "draft": draft,
+        "facts": {
+            "unboundPlatformId": unbound_platform_id,
+            "bindingNoticeCount": first_reply.count(UNBOUND_BINDING_PRECHECK_NOTICE),
+            "bindingGuidanceAfterAssent": True,
+            "metaQuestionToolCalls": len(meta_tools),
+            "systemTemplateMarkersAbsent": True,
+            "boundControlNoticeAbsent": True,
+        },
+    }
+
+
+S28_WORD = "还车"
+S28_DISCOVERY = f"喵喵 {S28_WORD}"
+S28_INVALID_CODE = "zzzzzz"
+
+
+def _rendered_candidate_rows(reply: str) -> list[tuple[int, str]]:
+    return [
+        (int(match.group("index")), match.group("code").lower())
+        for match in re.finditer(
+            r"(?m)^(?P<index>\d+)\.\s*(?P<code>[a-z]{1,12})\s+(?:—|–|-).*$",
+            reply,
+            re.IGNORECASE,
+        )
+    ]
+
+
+def _rendered_recommended_code(reply: str) -> str:
+    match = re.search(
+        r"是否以编码\s+(?P<code>[a-z]{1,12})\s+将",
+        reply,
+        re.IGNORECASE,
+    )
+    require(match is not None, f"candidate reply omitted its recommendation: {reply}")
+    return match.group("code").lower()
+
+
+async def scenario_s28(ctx: ScenarioContext) -> dict[str, Any]:
+    """Replay reviewed-write parity, live replacement, fresh number, and failure copy."""
+    messages: list[str] = []
+    replies: list[str] = []
+    dictionary_cleanups: list[dict[str, Any]] = []
+
+    async def reset_case(label: str) -> None:
+        dictionary_cleanup = await ctx.next_client.remove_rig_owned_dictionary_words(
+            platform_id=ctx.platform_id,
+            admin_token=ctx.admin_token,
+            scenario_id="S28",
+            fixture_words=(S28_WORD,),
+        )
+        require(
+            dictionary_cleanup.get("verified") is True,
+            f"S28 {label} dictionary cleanup was not verified: {dictionary_cleanup}",
+        )
+        dictionary_cleanups.append(dictionary_cleanup)
+        cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(cleanup.get("success") is True, f"S28 {label} cleanup failed: {cleanup}")
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    async def discover(label: str) -> tuple[str, list[tuple[int, str]], str]:
+        messages.append(S28_DISCOVERY)
+        reply = await ctx.send_group(S28_DISCOVERY, to_me=True)
+        replies.append(reply)
+        readings = _rendered_candidate_reading_rows(reply)
+        rows = _rendered_candidate_rows(reply)
+        recommended = _rendered_recommended_code(reply)
+        require(len(readings) >= 2, f"S28 {label} did not render a multi-reading list: {reply}")
+        require(len(rows) >= 4, f"S28 {label} rendered fewer than four candidates: {reply}")
+        require(recommended in {code for _index, code in rows}, f"S28 {label} recommendation was not listed: {reply}")
+        return reply, rows, recommended
+
+    async def finish_submission(
+        *,
+        cutoff: int,
+        first_reply: str,
+        label: str,
+        word: str,
+        code: str,
+    ) -> tuple[str, int, dict[str, Any]]:
+        batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=cutoff,
+        )
+        confirmation_steps = 0
+        if not batch_id:
+            match = re.search(r"确认票据\s+[A-F0-9]{6}", first_reply)
+            command = match.group(0) if match is not None else "确认" if "确认" in first_reply else ""
+            require(command, f"S28 {label} neither submitted nor returned a confirmation: {first_reply}")
+            confirmation_steps = 1
+            messages.append(command)
+            confirmation_reply = await ctx.send_group(command, to_me=True)
+            replies.append(confirmation_reply)
+            batch_id = _successful_submit_batch_id(
+                ctx.attempt_events(),
+                after_sequence=cutoff,
+            )
+        require(batch_id, f"S28 {label} never completed submission")
+        batch = await ctx.next_client.get_admin_batch(
+            batch_id=batch_id,
+            admin_token=ctx.admin_token,
+        )
+        require(
+            str(batch.get("status") or "") in {"Submitted", "Approved"}
+            and _submitted_item(batch, word=word, code=code) is not None,
+            f"S28 {label} submitted the wrong item: {batch}",
+        )
+        return batch_id, confirmation_steps, batch
+
+    # R1: the exact reviewed recommendation must remain writable.
+    await reset_case("reviewed-assent")
+    _first, _rows, advertised_code = await discover("reviewed-assent")
+    assent_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入")
+    assent_reply = await ctx.send_group("加入", to_me=True)
+    replies.append(assent_reply)
+    assent_draft = await ctx.draft()
+    require(
+        len(assent_draft.get("items", [])) == 1
+        and item_key(assent_draft["items"][0])
+        == ("Create", S28_WORD, advertised_code),
+        f"S28 reviewed recommendation was not write-valid: {assent_draft}; reply={assent_reply}",
+    )
+    require(
+        any(
+            int(event.get("sequence") or 0) > assent_cutoff
+            and event.get("kind") == "tool"
+            and event.get("name") == "keytao_create_phrase"
+            and isinstance(event.get("result"), dict)
+            and event["result"].get("success") is True
+            for event in ctx.attempt_events()
+        ),
+        "S28 reviewed assent had no successful create receipt",
+    )
+
+    # R2: a complete same-word command replaces, rather than mutates, live state.
+    await reset_case("explicit-replacement")
+    _replacement_discovery, replacement_rows, replacement_recommended = await discover("explicit-replacement")
+    replacement_code = next(
+        code for _index, code in reversed(replacement_rows)
+        if code != replacement_recommended
+    )
+    replacement_command = f"添加 {S28_WORD} {replacement_code} 并提交"
+    replacement_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(replacement_command)
+    replacement_reply = await ctx.send_group(replacement_command, to_me=True)
+    replies.append(replacement_reply)
+    replacement_batch_id, replacement_confirmations, _replacement_batch = await finish_submission(
+        cutoff=replacement_cutoff,
+        first_reply=replacement_reply,
+        label="explicit replacement",
+        word=S28_WORD,
+        code=replacement_code,
+    )
+    require(
+        "可执行命令：\n加入并提交" not in replacement_reply,
+        f"S28 replacement contradicted the explicit code choice: {replacement_reply}",
+    )
+
+    # R3: a freshly rendered multi-reading state binds number 4 to its reading.
+    await reset_case("fresh-number")
+    _number_discovery, number_rows, _number_recommended = await discover("fresh-number")
+    number_code = next(code for index, code in number_rows if index == 4)
+    number_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    number_command = "添加4并提交"
+    messages.append(number_command)
+    number_reply = await ctx.send_group(number_command, to_me=True)
+    replies.append(number_reply)
+    number_batch_id, number_confirmations, _number_batch = await finish_submission(
+        cutoff=number_cutoff,
+        first_reply=number_reply,
+        label="fresh number",
+        word=S28_WORD,
+        code=number_code,
+    )
+    require(
+        "没有保留编码" not in "\n".join(replies[-(number_confirmations + 1):]),
+        f"S28 fresh number lost its reading binding: {replies[-(number_confirmations + 1):]}",
+    )
+
+    # Control: invalid literal code is compact, honest, and side-effect free.
+    await reset_case("invalid-control")
+    invalid_discovery, invalid_rows, _invalid_recommended = await discover("invalid-control")
+    invalid_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    invalid_command = f"添加 {S28_WORD} {S28_INVALID_CODE} 并提交"
+    messages.append(invalid_command)
+    invalid_reply = await ctx.send_group(invalid_command, to_me=True)
+    replies.append(invalid_reply)
+    invalid_draft = await ctx.draft()
+    require(not invalid_draft.get("items"), f"S28 invalid control wrote a draft: {invalid_draft}")
+    assert_reply_mentions(invalid_reply, S28_INVALID_CODE, "可选读音链", "没有执行添加")
+    require(
+        "草稿地址：https://keytao.vercel.app" not in invalid_reply
+        and "草稿地址：http://localhost" not in invalid_reply,
+        f"S28 invalid control exposed a bogus draft URL: {invalid_reply}",
+    )
+    mentioned_candidates = {
+        code
+        for _index, code in invalid_rows
+        if re.search(rf"\b{re.escape(code)}\b", invalid_reply)
+    }
+    require(
+        len(mentioned_candidates) < len(invalid_rows),
+        f"S28 invalid control dumped the raw candidate list: {invalid_reply}",
+    )
+    invalid_writes = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > invalid_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") in {"keytao_create_phrase", "keytao_submit_batch"}
+    ]
+    require(not invalid_writes, f"S28 invalid control reached a write tool: {invalid_writes}")
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": invalid_draft,
+        "facts": {
+            "word": S28_WORD,
+            "advertisedWriteCode": advertised_code,
+            "replacementCode": replacement_code,
+            "replacementBatchId": replacement_batch_id,
+            "replacementConfirmationSteps": replacement_confirmations,
+            "freshNumber": 4,
+            "freshNumberCode": number_code,
+            "freshNumberBatchId": number_batch_id,
+            "freshNumberConfirmationSteps": number_confirmations,
+            "invalidCode": S28_INVALID_CODE,
+            "invalidWriteCalls": len(invalid_writes),
+            "verifiedDictionaryCleanups": len(dictionary_cleanups),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -3109,6 +3450,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S24", "single-word natural quoted assent", scenario_s24),
     Scenario("S25", "natural add, record-backed number, and combined submit", scenario_s25),
     Scenario("S26", "server-resolved add with occupant eviction", scenario_s26),
+    Scenario("S27", "binding precheck and question-turn reply", scenario_s27),
+    Scenario("S28", "reviewed multi-reading cascade closure", scenario_s28),
 )
 
 

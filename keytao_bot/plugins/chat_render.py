@@ -1,6 +1,5 @@
 """Render deterministic chat replies and post-process platform-safe text."""
 
-import hashlib
 import json
 import re
 from dataclasses import asdict, is_dataclass
@@ -12,6 +11,7 @@ from nonebot.log import logger
 from ..harness.state import ActiveDraftOperation, PendingAddWord, PendingState
 from ..utils import review_flags
 from ..utils.pending_confirmation import (
+    _BIND_HELP_TEXT,
     pending_confirmation_copy,
     render_executable_suggestion,
     render_remediation_reply,
@@ -90,20 +90,6 @@ def _split_telegram_text(text: str, limit: int = 4000) -> List[str]:
     if current:
         chunks.append("".join(current).rstrip())
     return [chunk for chunk in chunks if chunk] or [""]
-
-
-_BIND_HELP_TEXT = (
-    "你还没有绑定键道账号哦～\n\n"
-    "📝 绑定步骤：\n\n"
-    "1. 登录键道网站：https://keytao.vercel.app\n"
-    "2. 点击右上角用户名，进入【我的资料】\n"
-    "   （或直接访问：https://keytao.vercel.app/profile ）\n"
-    "3. 在【机器人账号绑定】区域点击【生成绑定码】\n"
-    "4. 复制绑定码\n"
-    "5. 在这里发送：/bind [你的绑定码]\n\n"
-    "示例：/bind AB12CD\n\n"
-    "💡 群聊中需要 @我 或回复我的消息才能触发绑定"
-)
 
 
 _RAW_PYTHON_REPLY_MARKERS = ("{'", "': '", "dataclass(")
@@ -727,7 +713,32 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             f"是否以编码 {recommended_code} 将「{word}」加入草稿？"
         )
     lines.append(single_word_candidate_footer(candidate_index - 1))
-    lines.append("若选的是已有词编码，回复“编号 重新编码”可挪开原词。")
+    occupied_choice = next(
+        (
+            (
+                candidate_indexes.get(str(status.get("code") or "").strip().lower()),
+                next(
+                    (
+                        str(phrase.get("word") or "").strip()
+                        for phrase in status.get("phrases") or []
+                        if isinstance(phrase, dict)
+                        and str(phrase.get("word") or "").strip()
+                    ),
+                    "",
+                ),
+            )
+            for pronunciation in pronunciations
+            for status in pronunciation.get("candidateStatuses", [])
+            if isinstance(status, dict) and status.get("occupied") is True
+        ),
+        None,
+    )
+    if occupied_choice and occupied_choice[0]:
+        occupied_index, occupied_word = occupied_choice
+        target_copy = f"已有词「{occupied_word}」" if occupied_word else "该已有词"
+        lines.append(
+            f"若要挪开{target_copy}，回复“{occupied_index} 重新编码”。"
+        )
     return "\n".join(lines).strip()
 
 
@@ -1038,17 +1049,10 @@ def _format_replace_char_confirmation(
     parts = [f"🔁 准备把 {len(items)} 条词条里的「{old_char}」替换为「{new_char}」："]
     for item in items:
         parts.append(f"• {item['old_word']} → {item['word']}（{item['code']}）")
-    canonical_payload = json.dumps(
-        items,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    digest = hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()[:16]
     parts.extend((
         "",
         "确认后我才会把这批修改加入草稿。"
-        f"{pending_confirmation_copy()}也可使用确认票据，或回复「取消」放弃。",
+        f"{pending_confirmation_copy()}或回复「取消」放弃。",
     ))
     return _assert_plain_user_facing_reply("\n".join(parts))
 

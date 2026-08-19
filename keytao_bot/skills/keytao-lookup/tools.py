@@ -232,7 +232,11 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
             result[key] = encode_data[key]
 
     if not result["success"]:
-        result["message"] = "编码服务未能返回有效候选编码，请让用户手动指定编码"
+        result["message"] = render_remediation_reply(
+            "编码服务未能返回有效候选编码",
+            command=f"加词 {word}",
+            words=(word,),
+        )
     return result
 
 
@@ -398,7 +402,9 @@ async def _call_bot_lookup_api(path: str, payload: Dict) -> Dict:
     if not bot_api_token:
         return {
             "success": False,
-            "message": "喵喵配置错误：缺少API token"
+            "message": render_remediation_reply(
+                "词库服务配置异常，请联系管理员"
+            ),
         }
 
     url = f"{keytao_api_base}{path}"
@@ -756,7 +762,9 @@ async def keytao_encode(
     if not bot_api_token:
         return {
             "success": False,
-            "message": "喵喵配置错误：缺少API token",
+            "message": render_remediation_reply(
+                "编码服务配置异常，请联系管理员"
+            ),
         }
 
     try:
@@ -795,14 +803,16 @@ async def keytao_encode(
                 return _apply_candidate_occupancy(encoding, lookup_result)
             return {
                 "success": False,
-                "message": f"编码服务返回错误: {response.status_code}"
+                "message": render_remediation_reply(
+                    "编码服务暂时不可用，请联系管理员"
+                ),
             }
     except Exception as error:
         logger.error(f"[keytao_encode] error: {error}")
         return {
             "success": False,
             "message": render_remediation_reply(
-                "编码服务暂时不可用；当前没有服务端可绑定的候选"
+                "编码服务暂时不可用；暂未取得服务端候选"
             )
         }
 

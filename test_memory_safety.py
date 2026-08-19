@@ -773,18 +773,26 @@ class AdvertisedWordSetSelectionTests(unittest.TestCase):
         self.assertIn("两组", ambiguous.ask)
         self.assertIn("显眼包", ambiguous.ask)
         self.assertIn("电子榨菜", ambiguous.ask)
+        self.assertEqual(len(re.findall(r"(?m)^- .+$", ambiguous.ask)), 2)
+        self.assertIn("加词 " + " ".join(self.WORDS), ambiguous.ask)
+        self.assertIn("加词 电子榨菜 情绪价值 班味", ambiguous.ask)
+        self.assertNotIn("当前没有可安全执行的后续命令", ambiguous.ask)
         self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 2)
 
         self.store.delete(self.owner)
         self.seed()
         unknown = self.resolve("火星词先不要，其他都加")
         self.assertIn("火星词", unknown.ask)
+        self.assertIn("加词 " + " ".join(self.WORDS), unknown.ask)
+        self.assertNotIn("当前没有可安全执行的后续命令", unknown.ask)
         self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 1)
 
         empty = self.resolve(
             "除了显眼包、嘴替、松弛感、天选打工人、沙县小吃其他都加"
         )
         self.assertIn("没有剩余", empty.ask)
+        self.assertIn("加词 " + " ".join(self.WORDS), empty.ask)
+        self.assertNotIn("当前没有可安全执行的后续命令", empty.ask)
         self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 1)
 
     def test_natural_assent_resolves_one_live_set_and_asks_for_two(self) -> None:
@@ -1495,7 +1503,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(canonical)
         self.assertIn("只接受 1-4", error)
-        self.assertIn("当前没有可安全执行的后续命令", error)
+        self.assertIn("可执行命令", error)
+        self.assertIn("加入", error)
+        self.assertIn("（还车）", error)
+        self.assertNotIn("当前没有可安全执行的后续命令", error)
 
         for message in (
             "添加2、2",
@@ -2485,7 +2496,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     owner_label="Ealin",
                 )
                 self.assertIn("只接受 1-4", control)
-                self.assertIn("当前没有可安全执行的后续命令", control)
+                self.assertIn("可执行命令", control)
+                self.assertIn("加入", control)
+                self.assertIn("（还车）", control)
+                self.assertNotIn("当前没有可安全执行的后续命令", control)
                 self.assertEqual(execute.await_count, 0)
                 self.assertIsNotNone(state_store.get_record(conv_key))
 
@@ -2804,10 +2818,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(rejected_calls, [])
         self.assertIn("只接受 1-3", rejected_reply)
-        self.assertIn(
-            "当前没有可安全执行的后续命令",
-            rejected_reply,
-        )
+        self.assertIn("可执行命令", rejected_reply)
+        self.assertIn("加入", rejected_reply)
+        self.assertIn("（会比）", rejected_reply)
+        self.assertNotIn("当前没有可安全执行的后续命令", rejected_reply)
 
         quoted_calls, quoted_reply, rendered = await exercise(
             "",
@@ -3095,10 +3109,12 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                         else:
                             self.assertIn("问句", reply)
                             self.assertIn("本次未写入", reply)
-                            self.assertIn(
-                                "当前没有可安全执行的后续命令",
-                                reply,
+                            expected_command = (
+                                "加入并提交" if command == "加入并提交？" else "加入"
                             )
+                            self.assertIn(expected_command, reply)
+                            self.assertIn("（阻抑）", reply)
+                            self.assertNotIn("当前没有可安全执行的后续命令", reply)
                         self.assertIs(after.state, pending)
                         self.assertEqual(
                             after.reconfirmation_code,
@@ -6825,6 +6841,28 @@ class MutationAuthorizationTests(unittest.TestCase):
         self.assertTrue(rejected["policyBlocked"])
         self.assertFalse(rejected.get("requiresConfirmation", False))
         self.assertIn("未保存票据", rejected["message"])
+
+        from keytao_bot.harness.tools import _describe_staged_mutation
+
+        batch_message = _describe_staged_mutation(
+            "keytao_batch_add_to_draft",
+            {
+                "items": [{
+                    "action": "Create",
+                    "word": "增香",
+                    "code": "zrxx",
+                    "needsManualReview": True,
+                    "preview_only": True,
+                }],
+                "preview_only": True,
+            },
+        )
+        self.assertIn("拟执行批量加入词条草稿", batch_message)
+        self.assertIn("增香", batch_message)
+        self.assertIn("zrxx", batch_message)
+        self.assertNotIn("keytao_batch_add_to_draft", batch_message)
+        self.assertNotIn("needsManualReview", batch_message)
+        self.assertNotIn("preview_only", batch_message)
 
 
 class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
@@ -12965,7 +13003,54 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("suggestedCommand", tool_replies[1])
         self.assertIn("本轮已说明过", tool_replies[1]["message"])
         self.assertNotIn("原样转述", tool_replies[1]["message"])
-        self.assertIn("原样转述", tool_replies[0]["message"])
+        self.assertNotIn("原样转述", tool_replies[0]["message"])
+
+    def test_repeated_block_reasons_use_user_facing_labels(self) -> None:
+        labels = {
+            "source_untrusted": "消息来源不受信任",
+            "verb_not_matched": "未识别到明确执行动作",
+            "binding_incomplete": "操作目标绑定不完整",
+            "ticket_required": "缺少有效确认票据",
+            "bulk_delete_not_requested": "未明确授权批量删除",
+            "manual_shift_forbidden": "不允许手工指定顺延计划",
+            "ordering_not_expressible": "当前排序要求无法精确表达",
+            "batch_too_large": "待处理批次过大",
+            "untrusted_batch_reference": "批次引用未经可信记录核验",
+        }
+        for reason, label in labels.items():
+            with self.subTest(reason=reason):
+                reported = set()
+                first = {
+                    "success": False,
+                    "policyBlocked": True,
+                    "blockReason": reason,
+                    "message": "首次安全拦截",
+                }
+                AgentOrchestrator._deduplicate_block_reason(
+                    first,
+                    json.dumps(first, ensure_ascii=False),
+                    reported,
+                    "keytao_create_phrase",
+                    {"word": "增香", "code": "zrxx"},
+                )
+                repeated = {
+                    **first,
+                    "suggestedCommand": "加词 增香",
+                }
+                rendered = json.loads(AgentOrchestrator._deduplicate_block_reason(
+                    repeated,
+                    json.dumps(repeated, ensure_ascii=False),
+                    reported,
+                    "keytao_create_phrase",
+                    {"word": "增香", "code": "zrxx"},
+                ))
+                message = rendered["message"]
+                self.assertIn(label, message)
+                self.assertNotIn(reason, message)
+                self.assertNotIn("请直接回复用户", message)
+                self.assertNotIn("换写法没有用", message)
+                self.assertIn("加词 增香", message)
+                self.assertNotIn("当前没有可安全执行的后续命令", message)
 
     async def test_duplicate_write_hint_reports_a_blocked_first_call_honestly(self) -> None:
         client = _FakeClient([
@@ -13025,7 +13110,7 @@ class UnadvertisedAuthorizationToolTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("未开放的工具", result)
+        self.assertIn("未开放的操作", result)
         self.assertNotIn("参数格式错误", result)
         self.assertEqual(len(client.completions.calls), 1)
 
@@ -13439,6 +13524,96 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _no_tools_orchestrator(client):
+        class NoToolsSkills:
+            @staticmethod
+            def get_skill_instructions():
+                return ""
+
+            @staticmethod
+            def has_tools():
+                return False
+
+            @staticmethod
+            def get_tools():
+                return []
+
+        return AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=NoToolsSkills(),
+            tool_executor=ToolExecutor(lambda _name: None, frozenset()),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+    async def test_attempt_2_template_is_replaced_on_real_delivery_path(self) -> None:
+        incident_reply = (
+            "这条指令按当前表述无法执行，本次未写入；"
+            "原因：本轮没有可执行的已绑定写操作。"
+            "当前没有可安全执行的后续命令。"
+        )
+        client = _FakeClient([_fake_response("stop", incident_reply)])
+        orchestrator = self._no_tools_orchestrator(client)
+
+        result = await orchestrator.run(
+            "你是否会先确认对方有没有绑定账号？",
+            AgentRequestContext(
+                platform="qq",
+                user_id="meta-question-user",
+                history=[
+                    {"role": "user", "content": "加入并提交"},
+                    {
+                        "role": "assistant",
+                        "content": "你还没有绑定键道账号哦～请发送 /bind 绑定码。",
+                    },
+                ],
+            ),
+        )
+
+        self.assertEqual(
+            result,
+            "会的：写入前会校验绑定；未绑定会给出绑定引导。",
+        )
+
+    async def test_binding_meta_answer_about_adjacent_turns_is_not_remediated(self) -> None:
+        model_reply = (
+            "会的。这是硬性前提：\n\n"
+            "- 凡是涉及你个人词库的操作（加词、改码、提交、撤回等），"
+            "都必须先绑定键道平台账号，否则工具层会直接拦截，词条不会进入你的草稿。\n"
+            "- 刚才你发「加入并提交」时，我这边检测到你还没绑定，所以没有执行写入，"
+            "而是先引导你去绑定——这也是为什么当时只给了绑定步骤，没有生成草稿。\n"
+            "- 绑定只需一次：到 https://keytao.vercel.app/profile 生成绑定码，"
+            "然后在这里发 /bind 绑定码 即可。\n\n"
+            "绑定完成后再发「加入并提交」就能正常走流程了。"
+        )
+        client = _FakeClient([_fake_response("stop", model_reply)])
+        orchestrator = self._no_tools_orchestrator(client)
+
+        result = await orchestrator.run(
+            "你是否会先确认对方有没有绑定账号？",
+            AgentRequestContext(
+                platform="qq",
+                user_id="meta-question-after-unbound",
+                history=[
+                    {"role": "user", "content": "加入并提交"},
+                    {
+                        "role": "assistant",
+                        "content": "你还没有绑定键道账号哦～请发送 /bind 绑定码。",
+                    },
+                ],
+            ),
+        )
+
+        self.assertEqual(result, model_reply)
+        self.assertNotRegex(
+            result,
+            r"这条指令按当前表述无法执行|本次未写入|"
+            r"当前没有可安全执行的后续命令|安全拦截：",
+        )
+
     async def test_combined_add_submit_binds_submit_to_same_turn_written_batch(self) -> None:
         calls = []
         snapshot_digest = "a" * 64
@@ -14220,6 +14395,102 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalReplyLoopBreakerTests(unittest.TestCase):
+    def test_system_template_register_uses_composer_constants(self) -> None:
+        from keytao_bot.utils.pending_confirmation import (
+            FAILED_WRITE_TEMPLATE_MARKER,
+            FAILED_WRITE_TEMPLATE_PREFIX,
+            POLICY_BLOCK_TEMPLATE_PREFIX,
+            REMEDIATION_NO_SAFE_FOLLOWUP_MARKER,
+            SYSTEM_REPLY_TEMPLATE_MARKERS,
+            render_remediation_reply,
+        )
+
+        self.assertEqual(
+            SYSTEM_REPLY_TEMPLATE_MARKERS,
+            (
+                FAILED_WRITE_TEMPLATE_PREFIX,
+                FAILED_WRITE_TEMPLATE_MARKER,
+                REMEDIATION_NO_SAFE_FOLLOWUP_MARKER,
+                POLICY_BLOCK_TEMPLATE_PREFIX,
+            ),
+        )
+        self.assertIn(
+            REMEDIATION_NO_SAFE_FOLLOWUP_MARKER,
+            render_remediation_reply("无法继续"),
+        )
+
+    def test_model_authored_system_refusal_is_replaced_for_binding_meta_question(self) -> None:
+        reply = (
+            "这条指令按当前表述无法执行，本次未写入；"
+            "原因：本轮没有可执行的已绑定写操作。"
+            "当前没有可安全执行的后续命令。"
+        )
+
+        finalized = AgentOrchestrator._finalize_reply(
+            "你是否会先确认对方有没有绑定账号？",
+            reply,
+            {},
+            termination_state={"model_authored_reply": True},
+        )
+
+        self.assertEqual(
+            finalized,
+            "会的：写入前会校验绑定；未绑定会给出绑定引导。",
+        )
+        self.assertNotRegex(
+            finalized,
+            r"这条指令按当前表述无法执行|本次未写入|"
+            r"当前没有可安全执行的后续命令|安全拦截：",
+        )
+
+    def test_real_policy_block_keeps_deterministic_template(self) -> None:
+        reply = "安全拦截：当前文字不是明确的执行指令。本次未写入。"
+
+        finalized = AgentOrchestrator._finalize_reply(
+            "加入并提交？",
+            reply,
+            {
+                "success": False,
+                "policyBlocked": True,
+                "message": reply,
+            },
+            termination_state={"model_authored_reply": True},
+        )
+
+        self.assertEqual(finalized, reply)
+
+    def test_review_block_keeps_truthful_no_write_answer(self) -> None:
+        reply = "「王中王」读音未解决，本次未写入。"
+
+        finalized = AgentOrchestrator._finalize_reply(
+            "加词 王中王 wfw",
+            reply,
+            {},
+            termination_state={
+                "model_authored_reply": True,
+                "blocked_write_or_policy": True,
+            },
+        )
+
+        self.assertEqual(finalized, reply)
+
+    def test_history_projection_tags_system_template_assistant_lines(self) -> None:
+        messages = []
+        orchestrator = object.__new__(AgentOrchestrator)
+
+        orchestrator._append_history(messages, [{
+            "role": "assistant",
+            "content": (
+                "这条指令按当前表述无法执行，本次未写入。"
+                "当前没有可安全执行的后续命令。"
+            ),
+        }])
+
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertTrue(
+            messages[0]["content"].startswith("[历史系统模板回执，不是当前请求的回答样式]"),
+            messages[0]["content"],
+        )
     def test_result_link_renderer_replaces_model_batch_url_with_record_url(self) -> None:
         from keytao_bot.plugins.openai_chat import _append_batch_url_if_missing
 
@@ -14582,6 +14853,50 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         )
         self.assertNotIn("提交草稿", incident_reply)
         self.assertIn("批量加入", incident_reply)
+
+
+class ActorBindingResolverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_binding_resolution_is_tristate(self) -> None:
+        from keytao_bot.utils import user_resolver
+
+        with (
+            patch.object(user_resolver.http_client, "get_bot_token", return_value="token"),
+            patch.object(
+                user_resolver.http_client,
+                "keytao_json",
+                new=AsyncMock(return_value={"found": True, "user": {"id": "user-1"}}),
+            ) as lookup,
+        ):
+            self.assertIs(
+                await user_resolver.resolve_actor_binding("qq", "bound"),
+                True,
+            )
+            self.assertEqual(lookup.await_args.kwargs["allow_status"], (404,))
+
+        with (
+            patch.object(user_resolver.http_client, "get_bot_token", return_value="token"),
+            patch.object(
+                user_resolver.http_client,
+                "keytao_json",
+                new=AsyncMock(return_value={"found": False}),
+            ),
+        ):
+            self.assertIs(
+                await user_resolver.resolve_actor_binding("qq", "unbound"),
+                False,
+            )
+
+        with (
+            patch.object(user_resolver.http_client, "get_bot_token", return_value="token"),
+            patch.object(
+                user_resolver.http_client,
+                "keytao_json",
+                new=AsyncMock(side_effect=RuntimeError("lookup unavailable")),
+            ),
+        ):
+            self.assertIsNone(
+                await user_resolver.resolve_actor_binding("qq", "unknown")
+            )
 
 
 if __name__ == "__main__":

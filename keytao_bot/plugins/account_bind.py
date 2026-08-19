@@ -13,7 +13,7 @@ from nonebot.rule import Rule
 
 from keytao_bot.utils import http_client
 from keytao_bot.utils.http_client import KeytaoApiError
-from keytao_bot.utils.pending_confirmation import render_remediation_reply
+from keytao_bot.utils.pending_confirmation import _BIND_HELP_TEXT, render_remediation_reply
 
 # Configuration is read through the shared HTTP layer at call time, so a value
 # changed after startup is picked up and there is no local silent fallback.
@@ -199,18 +199,7 @@ async def _handle_bind(bot: Bot, event: Event, matcher):
     key = _extract_bind_key(message_text)
     
     if key is None or not key:
-        help_text = (
-            "📝 如何绑定机器人账号：\n\n"
-            "1. 登录键道网站：https://keytao.vercel.app\n"
-            "2. 点击网站右上角的用户名，进入【我的资料】页面\n"
-            "   （ 或直接访问：https://keytao.vercel.app/profile ）\n"
-            "3. 在【机器人账号绑定】区域点击【生成绑定码】\n"
-            "4. 复制生成的绑定码\n"
-            "5. 在这里发送：/bind [你的绑定码]\n\n"
-            "示例：/bind AB12CD\n\n"
-            "💡 提示：如果在群聊中，需要 @我 或回复我的消息"
-        )
-        await matcher.finish(help_text)
+        await matcher.finish(_BIND_HELP_TEXT)
         return
 
     # Check if the bot token is configured
@@ -243,14 +232,16 @@ async def _handle_bind(bot: Bot, event: Event, matcher):
                     f"现在你可以使用机器人创建词条了～ >w<"
                 )
             else:
-                await matcher.finish(f"❌ {data.get('message', '绑定失败')}")
+                await matcher.finish(
+                    f"❌ {data.get('message', '绑定失败')}\n\n{_BIND_HELP_TEXT}"
+                )
         else:
             try:
                 error_data = response.json()
                 message = error_data.get("message", "绑定失败")
             except ValueError:
                 message = "绑定失败"
-            await matcher.finish(f"❌ {message}")
+            await matcher.finish(f"❌ {message}\n\n{_BIND_HELP_TEXT}")
 
     except FinishedException:
         raise  # Let NoneBot handle this, don't catch it
@@ -263,7 +254,7 @@ async def _handle_bind(bot: Bot, event: Event, matcher):
         await matcher.finish(
             render_remediation_reply(
                 "❌ 绑定请求没有得到确认，可能已经生效；"
-                "绑定核对与重新生成绑定码都需要站外状态，当前没有可绑定的聊天命令"
+                "请先在网站核对绑定状态，必要时重新生成绑定码"
             )
         )
     except Exception as e:
