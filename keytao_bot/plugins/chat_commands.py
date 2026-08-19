@@ -1678,6 +1678,16 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
         "",
         response,
     )
+    # The reviewed-candidate renderer already knows the first occupied word,
+    # while this delivery normalizer adds the full duplicate-vs-shift choice.
+    # Remove the shorter line before appending so the advertised recode footer
+    # is emitted exactly once.
+    response = re.sub(
+        r"(?m)^若要挪开(?:已有词「[^」\n]+」|该已有词)，"
+        r"回复[“\"][1-9]\d{0,2} 重新编码[”\"]。\s*$",
+        "",
+        response,
+    )
     pending = _parse_pending_add_word(response)
     if pending is not None:
         response = ensure_single_word_candidate_copy(
@@ -1902,7 +1912,7 @@ async def _augment_simple_word_query_response(
         return response
 
     lookup_json = await call_tool_function(
-        "keytao_lookup_by_words_batch", {"words": words}, platform, user_id,
+        "keytao_lookup_by_words_batch", {"words": list(words)}, platform, user_id,
     )
     try:
         lookup_data = json.loads(lookup_json)
@@ -3157,6 +3167,46 @@ async def _resolve_requested_code_for_pending_add(
     )
 
 
+def _pending_display_from_server_warning(data: Dict) -> Dict:
+    """Keep only structured facts needed to re-render a live warning ticket."""
+    display: Dict[str, Any] = {}
+    batch_url = _trusted_batch_url(data)
+    if batch_url:
+        display["batchUrl"] = batch_url
+
+    for key in ("warnings", "snapshotItems", "targets", "items"):
+        value = data.get(key)
+        if not isinstance(value, list):
+            continue
+        try:
+            display[key] = json.loads(json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+            ))
+        except (TypeError, ValueError):
+            continue
+
+    shift_plan = data.get("shiftPlan")
+    if isinstance(shift_plan, dict):
+        try:
+            display["shiftPlan"] = json.loads(json.dumps(
+                shift_plan,
+                ensure_ascii=False,
+                allow_nan=False,
+            ))
+        except (TypeError, ValueError):
+            pass
+    return display
+
+
+def _pending_execution_args(state: PendingToolConfirm) -> Dict:
+    """Return tool arguments without record-only display metadata."""
+    args = dict(state.args)
+    args.pop("_pending_display", None)
+    return args
+
+
 def _pending_state_from_server_warning(
     state: PendingToolConfirm,
     data: Dict,
@@ -3245,6 +3295,11 @@ def _pending_state_from_server_warning(
         if re.fullmatch(r"[0-9a-f]{64}", target_digest) and isinstance(targets, list):
             args["expected_target_digest"] = target_digest
             args["expected_targets"] = targets
+    pending_display = _pending_display_from_server_warning(data)
+    if pending_display:
+        args["_pending_display"] = pending_display
+    else:
+        args.pop("_pending_display", None)
     return PendingToolConfirm(
         function_name=state.function_name,
         args=args,
@@ -3443,7 +3498,7 @@ async def _execute_confirmed_tool(
             words=invalid_words,
         )
 
-    args = dict(state.args)
+    args = _pending_execution_args(state)
     args.pop("preview_only", None)
     args.pop("_candidate_scopes", None)
     args.pop("_resolved_advertised_words", None)
@@ -4360,7 +4415,7 @@ async def _perform_exact_batch_remove(
         ),
         preview_data,
     )
-    exact_args = dict(pending_state.args)
+    exact_args = _pending_execution_args(pending_state)
     expected_batch_id = str(exact_args.get("batch_id") or "")
     expected_version = exact_args.get("expected_content_version")
     expected_digest = str(exact_args.get("expected_target_digest") or "")
@@ -4974,7 +5029,7 @@ async def _perform_recall_latest_batch(
             PendingToolConfirm(function_name="keytao_recall_batch", args={}),
             preview_data,
         )
-        exact_args = dict(pending_state.args)
+        exact_args = _pending_execution_args(pending_state)
         exact_batch_id = str(exact_args.get("batch_id") or "")
         exact_version = exact_args.get("expected_content_version")
         if (

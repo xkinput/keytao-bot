@@ -2017,19 +2017,23 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     messages.append("提交草稿")
     guidance = await ctx.send_group("提交草稿", to_me=True)
     replies.append(guidance)
-    rendered_match = re.search(
-        r"(?m)^-\s*[「“『].+[」”』](?:（[^）]+）)?$",
-        guidance,
+    require(
+        "回复「确认」执行，或「取消」放弃。" in guidance
+        and "请引用本条消息回复「确认」或「取消」" in guidance,
+        f"S21 precedence refusal did not render one coherent option block: {guidance}",
     )
     require(
-        rendered_match is not None,
-        f"S21 failed instruction did not render a copyable full line: {guidance}",
+        all(
+            f"「{word}」→ {code}" in guidance
+            for word, code in second_pairs
+        ),
+        f"S21 precedence refusal did not enumerate the live record: {guidance}",
     )
-    rendered_line = rendered_match.group(0)
     require(
-        all(word in rendered_line for word in S21_BATCH_WORDS),
-        f"S21 rendered remediation did not enumerate the live record: {rendered_line}",
+        "或取消当前票据" not in guidance,
+        f"S21 precedence refusal retained the broken cancel-only block: {guidance}",
     )
+    rendered_line = "确认"
 
     unrelated = "请阅读" + rendered_line
     unrelated_cutoff = max(

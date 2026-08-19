@@ -34,6 +34,7 @@ from keytao_bot.utils.pending_confirmation import (
     append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_reply_contract,
+    command_suggestions_are_closed_candidate_selections,
     ensure_multi_word_candidate_copy,
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
@@ -318,6 +319,7 @@ class AgentOrchestrator:
             failure_state,
             successful_write_receipts,
             termination_state,
+            history=context.history,
         )
 
     async def _run_loop(
@@ -453,7 +455,22 @@ class AgentOrchestrator:
 
         def candidate_reply(text: str) -> str:
             rendered = str(text or "")
-            if not advertised_reply_contract(rendered).requires_live_state:
+            contract = advertised_reply_contract(rendered)
+            if (
+                contract.command_suggestions
+                and not command_suggestions_are_closed_candidate_selections(
+                    contract.command_suggestions
+                )
+            ):
+                logger.warning(
+                    "[advertised_reply_contract] branch=strip_model_command "
+                    f"count={len(contract.command_suggestions)}"
+                )
+                return render_remediation_reply(
+                    "回复中的操作说法没有可验证的服务端绑定记录，已移除；"
+                    "本次不会写入"
+                )
+            if not contract.requires_live_state:
                 return rendered
             return append_unbound_binding_notice(
                 rendered,
@@ -2419,11 +2436,48 @@ class AgentOrchestrator:
         failure_state: Dict[str, Any],
         successful_write_receipts: Optional[List[Dict[str, Any]]] = None,
         termination_state: Optional[Dict[str, Any]] = None,
+        history: Optional[List[Dict[str, Any]]] = None,
     ) -> Optional[str]:
         """Suppress requests to resend this turn's failed text at final emission."""
         receipts = list(successful_write_receipts or [])
         if reply is None:
             return cls._receipt_completion_reply(receipts) if receipts else None
+        if failure_state and parse_eviction_modified_add(current_message) is not None:
+            # A failed echoed front-insert must never degrade to the pending
+            # candidate's recommended (and possibly occupied) bare add. Keep
+            # every operand of the operation the user actually expressed.
+            failure_state = dict(failure_state)
+            clean_command = re.sub(
+                r"^\s*@[^\s]+\s*",
+                "",
+                str(current_message or "").strip(),
+                count=1,
+            )
+            failure_state["suggestedCommand"] = (
+                f"@我 {clean_command}" if clean_command else ""
+            )
+        if not receipts and history:
+            previous_user = next((
+                str(item.get("content") or "")
+                for item in reversed(history)
+                if isinstance(item, dict) and item.get("role") == "user"
+            ), "")
+            previous_assistant = next((
+                str(item.get("content") or "")
+                for item in reversed(history)
+                if isinstance(item, dict) and item.get("role") == "assistant"
+            ), "")
+            if (
+                cls._normalize_loop_text(previous_user)
+                == cls._normalize_loop_text(current_message)
+                and cls._normalize_loop_text(previous_assistant)
+                == cls._normalize_loop_text(reply)
+                and re.search(r"(?:无法执行|未写入|安全拦截|没有识别到)", reply)
+            ):
+                return (
+                    "同一指令再次进入相同拒绝路径，已停止重复建议；"
+                    "本次未写入。请发「查看草稿」核对现状。"
+                )
         if (
             bool((termination_state or {}).get("model_authored_reply"))
             and not failure_state

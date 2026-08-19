@@ -1536,9 +1536,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                         },
                     )
                     guidance = _format_live_ticket_precedence_message(state)
-                    self.rendered_line = next(
-                        line for line in guidance.splitlines() if line.startswith("- ")
-                    )
+                    self.rendered_line = "确认"
                     return guidance
                 if text == "请阅读" + self.rendered_line:
                     return "这段引用不会授权写入。"
@@ -1585,8 +1583,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             result["facts"]["renderedRemediationLine"],
             context.rendered_line,
         )
-        self.assertTrue(context.rendered_line.startswith("- 「将这 2 个词加入草稿」"))
-        self.assertIn("（" + "、".join(S21_BATCH_WORDS) + "）", context.rendered_line)
+        self.assertEqual(context.rendered_line, "确认")
         self.assertEqual(result["facts"]["outOfTicketControl"], "ASK-without-write")
         self.assertEqual(
             result["facts"]["unrelatedQuoteControl"],

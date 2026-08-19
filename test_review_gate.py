@@ -4346,6 +4346,163 @@ def test_candidate_commonness_wiring_and_timeout():
     asyncio.run(_run())
 
 
+def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
+    """Only the confident-modern/weak-classical asymmetry overrides baseline."""
+    print("\n🧪 modern semantic vs dictionary-dominated commonness matrix")
+
+    def review(*, modern=True):
+        semantic_items = []
+        if modern:
+            semantic_items = [{
+                "word": "冒菜",
+                "code": "mzchi",
+                "assessment": {
+                    "accepted": True,
+                    "confidence": 0.96,
+                    "meaning": "现代常用饮食词",
+                    "nonObscurity": {
+                        "route": "common_characters_and_llm",
+                        "characterReferences": [
+                            {"char": "冒", "corpusFrequency": 5231},
+                            {"char": "菜", "corpusFrequency": 8544},
+                        ],
+                    },
+                },
+            }]
+        return {
+            "success": True,
+            "word": "冒菜",
+            "recommendedCode": "mzchi",
+            "preSubmitAudit": {
+                "semanticContextAutoPassItems": semantic_items,
+            },
+            "pronunciations": [{
+                "recommendedCode": "mzchi",
+                "candidateStatuses": [
+                    {
+                        "code": "mzch",
+                        "occupied": True,
+                        "words": ["茂才"],
+                        "phrases": [{
+                            "word": "茂才",
+                            "code": "mzch",
+                            "type": "Phrase",
+                        }],
+                    },
+                    {"code": "mzchi", "occupied": False, "words": []},
+                ],
+            }],
+        }
+
+    def comparison(
+        verdict,
+        *,
+        candidate_frequency=None,
+        candidate_presence=0,
+        occupant_frequency=None,
+        occupant_presence=2,
+    ):
+        return {
+            "success": True,
+            "verdict": verdict,
+            "summary": "baseline comparison",
+            "decisionReason": "baseline",
+            "front": {"reference": {
+                "available": True,
+                "attested": candidate_frequency is not None or candidate_presence > 0,
+                "corpusFrequency": candidate_frequency,
+                "dictionaryPresenceCount": candidate_presence,
+            }},
+            "behind": {"reference": {
+                "available": True,
+                "attested": occupant_frequency is not None or occupant_presence > 0,
+                "corpusFrequency": occupant_frequency,
+                "dictionaryPresenceCount": occupant_presence,
+            }},
+        }
+
+    async def assess(subject, baseline):
+        with patch.object(
+            review_module,
+            "compare_word_commonness",
+            AsyncMock(return_value=baseline),
+        ):
+            return (await review_module.assess_candidate_chain_commonness(subject))[0]
+
+    async def _run():
+        archaic_asymmetry = await assess(
+            review(),
+            comparison("behind_more_common", occupant_frequency=None),
+        )
+        equal_modern = await assess(
+            review(),
+            comparison(
+                "behind_more_common",
+                candidate_frequency=40,
+                candidate_presence=1,
+                occupant_frequency=80,
+                occupant_presence=1,
+            ),
+        )
+        equal_classical = await assess(
+            review(modern=False),
+            comparison(
+                "close",
+                candidate_presence=2,
+                occupant_presence=2,
+            ),
+        )
+        conflicting = await assess(
+            review(),
+            comparison(
+                "behind_more_common",
+                occupant_frequency=30,
+                occupant_presence=2,
+            ),
+        )
+
+        check(
+            "modern food word outranks dictionary-dominated archaic incumbent",
+            archaic_asymmetry.get("verdict") == "front_more_common"
+            and archaic_asymmetry.get("newCode") == "mzch"
+            and archaic_asymmetry.get("decisionReason")
+            == "modern_semantic_vs_dictionary_dominated"
+            and archaic_asymmetry.get("summary")
+            == "冒菜：现代常用饮食词（语义判断）；茂才：古语，词典收录但语料频次低",
+        )
+        check(
+            "equal-modern comparison keeps baseline thresholds",
+            equal_modern.get("verdict") == "behind_more_common"
+            and equal_modern.get("decisionReason") == "baseline",
+        )
+        check(
+            "equal-classical comparison keeps baseline thresholds",
+            equal_classical.get("verdict") == "close"
+            and equal_classical.get("decisionReason") == "baseline",
+        )
+        check(
+            "genuine modern corpus conflict stays conservative",
+            conflicting.get("verdict") == "behind_more_common"
+            and conflicting.get("decisionReason") == "baseline",
+        )
+
+        import keytao_bot.plugins.openai_chat as chat
+
+        rendered = chat._format_candidate_ordering_assessment(
+            archaic_asymmetry,
+            {"mzch": 1, "mzchi": 2},
+        )
+        check(
+            "ordering copy cites both semantic and dictionary/corpus evidence",
+            "冒菜：现代常用饮食词（语义判断）" in rendered
+            and "茂才：古语，词典收录但语料频次低" in rendered
+            and "建议「冒菜」占 mzch、「茂才」顺延" in rendered
+            and "回复「1 重新编码」执行" in rendered,
+        )
+
+    asyncio.run(_run())
+
+
 def test_audit_budget_nesting_and_timeout_retains_review():
     print("\n🧪 audit budget nesting and partial-result retention")
 
@@ -4711,6 +4868,7 @@ def main():
     test_every_add_branch_carries_the_verdict()
     test_batch_add_uses_structured_verdict_not_prose()
     test_candidate_commonness_wiring_and_timeout()
+    test_modern_semantic_vs_dictionary_dominated_commonness_matrix()
     test_audit_budget_nesting_and_timeout_retains_review()
     test_multi_sense_recommendation_follows_meaning_or_asks()
 

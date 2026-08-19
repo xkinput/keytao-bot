@@ -7,7 +7,14 @@ from urllib.parse import urlsplit, urlunsplit
 
 from nonebot.log import logger
 
-from ..harness.state import ActiveDraftOperation, PendingAddWord, PendingState
+from ..harness.state import (
+    ActiveDraftOperation,
+    PendingAddWord,
+    PendingAdvertisedWordSets,
+    PendingState,
+    PendingToolConfirm,
+    pending_batch_display_pairs,
+)
 from ..utils import review_flags
 from ..utils import http_client
 from ..utils.pending_confirmation import (
@@ -219,6 +226,142 @@ def _plain_warning_message(warning: Any) -> str:
 
 def _plain_warning_line(warning: Any) -> str:
     return _assert_plain_user_facing_reply(f"⚠️ {_plain_warning_message(warning)}")
+
+
+def _format_pending_item_line(item: Any, *, include_id: bool = False) -> str:
+    """Render one word/code fact from a trusted pending-record item."""
+    if not isinstance(item, dict):
+        return ""
+    word = str(item.get("word") or "").strip()
+    code = str(item.get("code") or "").strip().lower()
+    if not word or not code:
+        return ""
+    item_id = item.get("id")
+    prefix = f"PR#{item_id}：" if include_id and item_id is not None else ""
+    return f"- {prefix}「{word}」→ {code}"
+
+
+def _format_pending_state_details(state: PendingState) -> str:
+    """Verbalize only facts persisted in one live pending record."""
+    if isinstance(state, PendingAddWord):
+        return f"加词「{state.word}」→ {state.recommended_code}"
+
+    if isinstance(state, PendingAdvertisedWordSets):
+        groups = [
+            "、".join(f"「{word}」" for word in snapshot.words)
+            for snapshot in state.snapshots
+            if snapshot.words
+        ]
+        return "待筛选候选词：" + "；".join(groups) if groups else "待筛选候选词"
+
+    if not isinstance(state, PendingToolConfirm):
+        return "待确认操作"
+
+    args = state.args if isinstance(state.args, dict) else {}
+    display = (
+        args.get("_pending_display")
+        if isinstance(args.get("_pending_display"), dict)
+        else {}
+    )
+    function_name = state.function_name
+    lines: List[str] = []
+    items: List[Any] = []
+    include_ids = False
+
+    if function_name == "keytao_batch_add_to_draft":
+        lines.append("批量加词，内容如下：")
+        pairs = pending_batch_display_pairs(state)
+        items = [{"word": word, "code": code} for word, code in pairs]
+    elif function_name == "keytao_create_phrase":
+        action_label = {
+            "Create": "加词",
+            "Change": "修改",
+            "Delete": "删除",
+        }.get(str(args.get("action") or "Create"), "加词")
+        word = str(args.get("word") or "").strip()
+        code = str(args.get("code") or "").strip().lower()
+        lines.append(
+            f"{action_label}「{word}」→ {code}"
+            if word and code
+            else action_label
+        )
+    elif function_name == "keytao_submit_batch":
+        lines.append("提交草稿，内容如下：")
+        items = (
+            display.get("snapshotItems")
+            if isinstance(display.get("snapshotItems"), list)
+            else []
+        )
+        if not items:
+            lines[0] = "提交草稿"
+    elif function_name == "keytao_shift_phrase_code":
+        lines.append("顺延调码，完整计划如下：")
+        shift_plan = (
+            display.get("shiftPlan")
+            if isinstance(display.get("shiftPlan"), dict)
+            else {}
+        )
+        items = (
+            shift_plan.get("items")
+            if isinstance(shift_plan.get("items"), list)
+            else []
+        )
+        if not items:
+            word = str(args.get("word") or "").strip()
+            code = str(args.get("target_code") or "").strip().lower()
+            items = [{"word": word, "code": code}] if word and code else []
+    elif function_name in {
+        "keytao_remove_draft_item",
+        "keytao_batch_remove_draft_items",
+    }:
+        lines.append("删除草稿条目，目标如下：")
+        items = (
+            args.get("expected_targets")
+            if isinstance(args.get("expected_targets"), list)
+            else display.get("targets")
+            if isinstance(display.get("targets"), list)
+            else []
+        )
+        include_ids = True
+        if not items:
+            draft_id = str(args.get("draft_id") or args.get("id") or "").strip()
+            lines[0] = f"删除草稿条目 {draft_id}" if draft_id else "删除草稿条目"
+    elif function_name == "keytao_recall_batch":
+        lines.append("撤回当前批次")
+        items = (
+            display.get("items")
+            if isinstance(display.get("items"), list)
+            else []
+        )
+    else:
+        lines.append("待确认操作")
+
+    rendered_items = [
+        line
+        for line in (
+            _format_pending_item_line(item, include_id=include_ids)
+            for item in items
+        )
+        if line
+    ]
+    lines.extend(rendered_items)
+
+    warnings = (
+        display.get("warnings")
+        if isinstance(display.get("warnings"), list)
+        else []
+    )
+    if warnings:
+        lines.append("待确认风险：")
+        lines.extend(
+            f"- {_plain_warning_message(warning)}"
+            for warning in warnings
+        )
+
+    batch_url = str(display.get("batchUrl") or "").strip()
+    if batch_url:
+        lines.append(f"草稿地址：{batch_url}")
+    return "\n".join(lines)
 
 
 def _format_full_add_and_submit_instruction(
@@ -616,8 +759,14 @@ def _format_candidate_ordering_assessment(
     if verdict == "front_more_common":
         selector = candidate_indexes.get(occupant_code)
         command = f"{selector} 重新编码" if selector is not None else f"{occupant_code} 重新编码"
+        summary = str(assessment.get("summary") or "").strip()
+        comparison_copy = (
+            summary
+            if summary
+            else f"「{word}」较「{occupant}」更常用"
+        )
         return (
-            f"常用度评估：「{word}」较「{occupant}」更常用 → "
+            f"常用度评估：{comparison_copy} → "
             f"建议「{word}」占 {occupant_code}、「{occupant}」顺延"
             f"（回复「{command}」执行）"
         )

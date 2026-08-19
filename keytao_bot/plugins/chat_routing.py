@@ -39,6 +39,7 @@ from ..utils.pending_confirmation import (
     parse_advertised_set_reference,
     parse_pending_assent_phrase,
     parse_pending_candidate_selection,
+    pending_confirmation_copy,
     render_executable_suggestion,
     render_remediation_reply,
 )
@@ -51,6 +52,7 @@ from .chat_adapters import (
     ReplyReferenceInfo,
     config,
 )
+from .chat_render import _format_pending_state_details
 
 
 GROUP_TRIGGER_KEYWORD_START = "键道"
@@ -551,28 +553,14 @@ def _pending_assent_rejection_response(
     )
 
 
-def _format_live_ticket_precedence_message(state: PendingToolConfirm) -> str:
-    response = (
-        f"当前还有一项待确认操作：{_describe_pending_state(state)}。"
-        "为避免跳过这张票据，本次没有执行其他写入或提交。"
+def _format_live_ticket_precedence_message(state: PendingState) -> str:
+    details = _describe_pending_state(state)
+    return (
+        "当前还有一项待确认操作，内容如下：\n"
+        f"{details}\n"
+        "为避免跳过这张票据，本次没有执行其他写入或提交。\n\n"
+        f"{pending_confirmation_copy()}"
     )
-    items, _scopes = _multi_word_candidate_scope_rows(state)
-    words = tuple(
-        str(item.get("word") or "").strip()
-        for item in items
-        if str(item.get("word") or "").strip()
-    )
-    if len(words) >= 2:
-        suggestion = render_executable_suggestion(
-            f"将这 {len(words)} 个词加入草稿",
-            words=words,
-        )
-        if suggestion:
-            response += "\n可执行命令：\n" + suggestion
-    cancel = render_executable_suggestion("取消")
-    if cancel:
-        response += "\n或取消当前票据：\n" + cancel
-    return response
 
 
 def _compact_command_text(message_text: str) -> str:
@@ -2106,63 +2094,7 @@ def _pending_owner_label(record: PendingStateRecord) -> str:
 
 
 def _describe_pending_state(state: PendingState) -> str:
-    if isinstance(state, PendingAddWord):
-        return f"加词「{state.word}」→ {state.recommended_code}"
-
-    if isinstance(state, PendingAdvertisedWordSets):
-        total_words = sum(len(snapshot.words) for snapshot in state.snapshots)
-        return f"待筛选候选词（{total_words} 个）"
-
-    if isinstance(state, PendingToolConfirm):
-        if state.function_name == "keytao_batch_add_to_draft":
-            items = state.args.get("items", [])
-            words = [
-                f"「{item.get('word')}」→ {item.get('code')}"
-                for item in items
-                if isinstance(item, dict) and item.get("word") and item.get("code")
-            ]
-            preview = "、".join(words[:3])
-            if len(words) > 3:
-                preview += f" 等 {len(words)} 条"
-            return f"批量加词：{preview}" if preview else "批量加词"
-
-        if state.function_name == "keytao_remove_draft_item":
-            draft_id = str(state.args.get("draft_id") or state.args.get("id") or "")
-            return f"删除草稿条目 {draft_id}" if draft_id else "删除草稿条目"
-
-        if state.function_name == "keytao_batch_remove_draft_items":
-            ids = [str(item) for item in state.args.get("ids", []) if str(item)]
-            return (
-                f"批量删除 {len(ids)} 条草稿：" + "、".join(ids)
-                if ids
-                else "批量删除草稿条目"
-            )
-
-        if state.function_name == "keytao_shift_phrase_code":
-            word = str(state.args.get("word") or "")
-            target_code = str(state.args.get("target_code") or "")
-            return f"顺延调码「{word}」→ {target_code}" if word or target_code else "顺延调码"
-
-        if state.function_name == "keytao_recall_batch":
-            return "撤回当前批次"
-
-        if state.function_name == "keytao_create_phrase":
-            word = state.args.get("word", "")
-            code = state.args.get("code", "")
-            action = state.args.get("action", "Create")
-            action_label = {
-                "Create": "加词",
-                "Change": "修改",
-                "Delete": "删除",
-            }.get(action, action)
-            if word and code:
-                return f"{action_label}「{word}」→ {code}"
-            return action_label
-
-        if state.function_name == "keytao_submit_batch":
-            return "提交草稿"
-
-    return "待确认操作"
+    return _format_pending_state_details(state)
 
 
 _DIRECT_OWNER_PENDING_ADD_INTENTS = {

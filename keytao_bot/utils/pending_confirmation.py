@@ -781,6 +781,7 @@ def _quoted_choices(forms: tuple[str, ...]) -> str:
 def pending_confirmation_copy() -> str:
     """Render the generic forms accepted by a single actor-owned ticket."""
     return (
+        "回复「确认」执行，或「取消」放弃。\n"
         "请引用本条消息回复「确认」或「取消」；"
         "当前只有这一项待确认时，也可直接回复确认。"
     )
@@ -1111,6 +1112,7 @@ class AdvertisedReplyContract:
     deictic_batch_command: bool = False
     binding_advertisement: bool = False
     word_set_advertisement: bool = False
+    command_suggestions: tuple[str, ...] = ()
 
     @property
     def requires_live_state(self) -> bool:
@@ -1122,6 +1124,7 @@ class AdvertisedReplyContract:
             or self.deictic_batch_command
             or self.binding_advertisement
             or self.word_set_advertisement
+            or self.command_suggestions
         )
 
 
@@ -1146,6 +1149,67 @@ _QUOTED_WORD_SET_COMMAND_RE = re.compile(
     r"[「“『](?:把|将)[^→\n]{1,512}?"
     r"(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿[」”』]"
 )
+_COMMAND_SUGGESTION_LEAD_RE = re.compile(
+    r"(?:确认执行)?请发|请发送|发送下面|比如|例如"
+)
+_COMMAND_SUGGESTION_VERB_RE = re.compile(
+    rf"(?:{ADD_OPERATION_VERB_PATTERN}|提交|删除|移除|修改|改成|改为|"
+    r"改到|调整到|移到|挪到|换到|顺延|重新编码|调整权重)"
+)
+
+
+def advertised_command_suggestions(text: str) -> tuple[str, ...]:
+    """Extract copyable model suggestions from explicit advertisement frames."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    positioned: list[tuple[int, str]] = []
+    for left, right in _ADVERTISED_QUOTE_PAIRS:
+        depth = 0
+        start = -1
+        for index, character in enumerate(normalized):
+            if character == left:
+                if depth == 0:
+                    start = index
+                depth += 1
+                continue
+            if character != right or depth == 0:
+                continue
+            depth -= 1
+            if depth != 0 or start < 0:
+                continue
+            command = normalized[start + 1:index].strip()
+            prefix = normalized[max(0, start - 120):start]
+            if (
+                0 < len(command) <= 256
+                and "\n" not in command
+                and _COMMAND_SUGGESTION_LEAD_RE.search(prefix) is not None
+                and _COMMAND_SUGGESTION_VERB_RE.search(command) is not None
+                and re.search(r"[\u3400-\u9fff]", command)
+            ):
+                positioned.append((start, command))
+    suggestions: list[str] = []
+    seen: set[str] = set()
+    for _position, command in sorted(positioned):
+        if command not in seen:
+            suggestions.append(command)
+            seen.add(command)
+    return tuple(suggestions)
+
+
+def command_suggestions_are_closed_candidate_selections(
+    suggestions: tuple[str, ...],
+) -> bool:
+    """Return whether every suggestion belongs to the closed selection grammar."""
+    if not suggestions:
+        return False
+    return all(
+        re.fullmatch(
+            r"(?:[\u3400-\u9fff]{1,32}\s+)?"
+            r"添加[1-9]\d*(?:[、,][1-9]\d*)*",
+            suggestion,
+        )
+        is not None
+        for suggestion in suggestions
+    )
 
 
 def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
@@ -1233,6 +1297,7 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         deictic_batch_command=deictic_batch_command,
         binding_advertisement=binding_advertisement,
         word_set_advertisement=word_set_advertisement,
+        command_suggestions=advertised_command_suggestions(normalized),
     )
 
 

@@ -4431,7 +4431,101 @@ def _candidate_commonness_assessment(
         "newCode": recommended_code,
         "recommendedCode": recommended_code,
         "summary": str((comparison or {}).get("summary") or "").strip(),
+        "decisionReason": str(
+            (comparison or {}).get("decisionReason") or ""
+        ).strip(),
         "degradation": degradation,
+    }
+
+
+def _confident_modern_semantic_label(review: Dict, word: str) -> str:
+    """Return a narrow modern-use label from the already-computed audit."""
+    audit = review.get("preSubmitAudit") if isinstance(review, dict) else None
+    if not isinstance(audit, dict):
+        return ""
+    for item in audit.get("semanticContextAutoPassItems") or []:
+        if (
+            not isinstance(item, dict)
+            or str(item.get("word") or "").strip() != word
+        ):
+            continue
+        assessment = item.get("assessment")
+        if not isinstance(assessment, dict):
+            continue
+        non_obscurity = assessment.get("nonObscurity")
+        if not isinstance(non_obscurity, dict):
+            continue
+        references = non_obscurity.get("characterReferences")
+        if (
+            assessment.get("accepted") is not True
+            or float(assessment.get("confidence") or 0.0)
+            < ENTITY_PRONUNCIATION_MIN_CONFIDENCE
+            or non_obscurity.get("route") != "common_characters_and_llm"
+            or not isinstance(references, list)
+            or len(references) != len(word)
+            or not all(
+                isinstance(reference, dict)
+                and isinstance(reference.get("corpusFrequency"), int)
+                and not isinstance(reference.get("corpusFrequency"), bool)
+                and reference["corpusFrequency"]
+                >= SEMANTIC_CONTEXT_CHARACTER_FREQUENCY_MIN_COUNT
+                for reference in references
+            )
+        ):
+            continue
+        meaning = str(assessment.get("meaning") or "").strip()
+        food_markers = ("饮食", "菜品", "小吃", "食物", "餐饮", "火锅")
+        return (
+            "现代常用饮食词"
+            if any(marker in meaning for marker in food_markers)
+            else "现代常用词"
+        )
+    return ""
+
+
+def _modern_semantic_commonness_override(
+    review: Dict,
+    pair: Dict[str, str],
+    comparison: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Correct only confident-modern vs dictionary-dominated asymmetry.
+
+    Equal-class comparisons and any incumbent with a modern corpus frequency
+    at or above the established single-word floor stay on the existing
+    comparator unchanged.
+    """
+    label = _confident_modern_semantic_label(review, pair["newWord"])
+    behind = comparison.get("behind")
+    reference = (
+        behind.get("reference")
+        if isinstance(behind, dict)
+        and isinstance(behind.get("reference"), dict)
+        else {}
+    )
+    frequency = reference.get("corpusFrequency")
+    presence = int(reference.get("dictionaryPresenceCount") or 0)
+    dictionary_dominated = bool(
+        presence > 0
+        and (
+            frequency is None
+            or (
+                isinstance(frequency, int)
+                and not isinstance(frequency, bool)
+                and frequency < COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT
+            )
+        )
+    )
+    if not label or not dictionary_dominated:
+        return comparison
+    return {
+        **comparison,
+        "success": True,
+        "verdict": "front_more_common",
+        "summary": (
+            f"{pair['newWord']}：{label}（语义判断）；"
+            f"{pair['occupantWord']}：古语，词典收录但语料频次低"
+        ),
+        "decisionReason": "modern_semantic_vs_dictionary_dominated",
     }
 
 
@@ -4489,7 +4583,14 @@ async def assess_candidate_chain_commonness(
                 )
             )
         else:
-            assessments.append(_candidate_commonness_assessment(pair, comparison))
+            assessments.append(_candidate_commonness_assessment(
+                pair,
+                _modern_semantic_commonness_override(
+                    review,
+                    pair,
+                    comparison,
+                ),
+            ))
     return assessments
 
 

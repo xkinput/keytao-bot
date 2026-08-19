@@ -6259,6 +6259,15 @@ def test_augment_simple_word_query_response_handles_multiple_words():
                     )
 
         check("batch lookup called once", sum(1 for name, _ in tool_calls if name == "keytao_lookup_by_words_batch") == 1)
+        batch_arguments = next(
+            arguments
+            for name, arguments in tool_calls
+            if name == "keytao_lookup_by_words_batch"
+        )
+        check(
+            "batch lookup receives a JSON-array word list",
+            isinstance(batch_arguments.get("words"), list),
+        )
         check("encode called for each existing word", sum(1 for name, _ in tool_calls if name == "keytao_encode") == 2)
         check("first word block included", "寿司郎 的编码位置说明：" in result)
         check("second word block included", "卧龙凤雏 的编码位置说明：" in result)
@@ -14741,6 +14750,79 @@ def test_eviction_modified_add_bypasses_pending_assent_classifier():
             ctx.generic_intent_is_fresh_command is True,
         )
 
+        echo_address = ConversationAddress.group(
+            "qq", "865189947", "echo-owner"
+        )
+        store.set(
+            echo_address,
+            PendingAddWord(
+                word="亮面",
+                recommended_code="lxmm",
+                candidates=[("lxmm", True), ("lxmmo", True), ("lxmmov", True)],
+                occupied_words={
+                    "lxmm": ["两面"],
+                    "lxmmo": ["凉面"],
+                    "lxmmov": ["粮棉"],
+                },
+                server_candidates=[
+                    ("lxmm", True),
+                    ("lxmmo", True),
+                    ("lxmmov", True),
+                ],
+                server_occupied_words={
+                    "lxmm": ["两面"],
+                    "lxmmo": ["凉面"],
+                    "lxmmov": ["粮棉"],
+                },
+                server_entries_by_code={"lxmmov": [("粮棉", 100)]},
+                needs_manual_review=True,
+            ),
+        )
+        echo_classifier = AsyncMock(
+            side_effect=AssertionError("echoed command must not use intent model")
+        )
+        echo_ctx = openai_chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="echo-owner",
+            normalized_message_text=(
+                "以编码 lxmmov 将「亮面」加入草稿，排在「粮棉」前面。"
+            ),
+            conv_key=echo_address,
+            space_key=("qq", "qq:group:865189947"),
+            command_intent_for=echo_classifier,
+        )
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(
+                openai_chat_module,
+                "draft_operation_coordinator",
+                DraftOperationCoordinator(),
+            ),
+        ):
+            await openai_chat_module._stage_resolve_current_pending_scope(echo_ctx)
+            await openai_chat_module._stage_apply_scoped_pending_intent(echo_ctx)
+            await openai_chat_module._stage_arbitrate_active_operation(echo_ctx)
+
+        check(
+            "bot-echoed first-person instruction bypasses quotation rejection",
+            echo_ctx.eviction_modified_add is not None
+            and echo_ctx.scoped_pending_response is None,
+        )
+        check(
+            "bot-echoed instruction preserves exact front-insert operands",
+            (
+                echo_ctx.eviction_modified_add.word,
+                echo_ctx.eviction_modified_add.code,
+                echo_ctx.eviction_modified_add.named_occupant,
+            ) == ("亮面", "lxmmov", "粮棉"),
+        )
+        check(
+            "bot-echoed instruction never invokes the intent classifier",
+            echo_classifier.await_count == 0,
+        )
+
     asyncio.run(_run())
 
 
@@ -15520,6 +15602,57 @@ def test_build_code_shift_plan_cascades_until_empty():
     check("first shifted word", result["shifted"][0]["word"] == "换言之")
     check("second shifted word", result["shifted"][1]["word"] == "候选词")
     check("second word shifts by own chain", result["shifted"][1]["toCode"] == "hxci")
+
+
+def test_build_code_shift_plan_reuses_vacated_slot_for_circular_swap():
+    """冒菜 mzchi -> mzch lets 茂才 reuse the target's vacated mzchi slot."""
+    print("\n🧪 circular shift reuses the target's vacated slot")
+
+    result = _build_code_shift_plan(
+        word="冒菜",
+        target_code="mzch",
+        target_candidate_codes=["mzch", "mzchi"],
+        current_phrase={"word": "冒菜", "code": "mzchi", "type": "Phrase"},
+        code_phrase_map={
+            "mzch": [{
+                "word": "茂才",
+                "code": "mzch",
+                "type": "Phrase",
+                "weight": 100,
+            }],
+            "mzchi": [{
+                "word": "冒菜",
+                "code": "mzchi",
+                "type": "Phrase",
+                "weight": 100,
+            }],
+        },
+        word_candidate_code_map={
+            "冒菜": ["mzch", "mzchi"],
+            "茂才": ["mzch", "mzchi"],
+        },
+    )
+
+    check("circular plan succeeds", result.get("success") is True)
+    check(
+        "target and incumbent form one exact swap",
+        result.get("shifted") == [{
+            "word": "茂才",
+            "fromCode": "mzch",
+            "toCode": "mzchi",
+            "candidateCodes": ["mzch", "mzchi"],
+        }],
+    )
+    check(
+        "swap deletes both old rows before recreating both destinations",
+        {tuple(sorted(item.items())) for item in result.get("items", [])}
+        == {
+            tuple(sorted({"action": "Delete", "word": "冒菜", "code": "mzchi", "type": "Phrase"}.items())),
+            tuple(sorted({"action": "Delete", "word": "茂才", "code": "mzch", "type": "Phrase"}.items())),
+            tuple(sorted({"action": "Create", "word": "冒菜", "code": "mzch", "type": "Phrase"}.items())),
+            tuple(sorted({"action": "Create", "word": "茂才", "code": "mzchi", "type": "Phrase"}.items())),
+        },
+    )
 
 
 def test_build_code_shift_plan_rejects_invalid_occupant_code():
@@ -16728,6 +16861,7 @@ if __name__ == "__main__":
     test_pending_pronunciation_correction_updates_live_ticket()
     test_build_code_shift_plan_uses_occupant_encode_chain()
     test_build_code_shift_plan_cascades_until_empty()
+    test_build_code_shift_plan_reuses_vacated_slot_for_circular_swap()
     test_build_code_shift_plan_rejects_invalid_occupant_code()
     test_shift_phrase_code_works_with_no_draft_batch()
     test_shift_phrase_code_plans_real_occupant_move()

@@ -88,7 +88,7 @@ _POSITIONAL_REORDER_INTENT_RE = re.compile(_POSITIONAL_REORDER_INTENT_PATTERN)
 _NON_POSITIONAL_MUTATION_INTENT_PATTERN = (
     ADD_OPERATION_VERB_PATTERN + r"|提交|提审|送审|发起审核|"
     r"删除|删掉|删干净|去掉|移除|清空|清理|"
-    r"撤销|撤回|召回|修改|改成|改为|替换|顺延|挪开|重新编码|保留|批量处理|"
+    r"撤销|撤回|召回|修改|改成|改为|改到|换到|调整到|替换|顺延|挪开|重新编码|保留|批量处理|"
     r"调整权重|修改权重|权重调整(?:为|到)?|权重修改(?:为|到)?|权重改(?:为|到)"
     r"|都删|其余删|其他删"
 )
@@ -557,6 +557,16 @@ class EvictionModifiedAdd:
     modifier: str
 
 
+@dataclass(frozen=True)
+class ExistingEntryMove:
+    """One existing entry moved to a literal code, with an optional occupant."""
+
+    word: str
+    target_code: str
+    named_occupant: str = ""
+    verb: str = ""
+
+
 _EVICTION_ADD_HEAD_RE = re.compile(
     rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
     rf"{ADD_OPERATION_VERB_PATTERN}\s*(?:词组\s*)?"
@@ -564,6 +574,15 @@ _EVICTION_ADD_HEAD_RE = re.compile(
     r"(?:的\s*)?(?:编码|代码)?\s*"
     rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*"
     r"[，,；;]\s*(?P<tail>.+?)\s*$",
+    re.IGNORECASE,
+)
+_ECHOED_EVICTION_ADD_RE = re.compile(
+    rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
+    rf"以\s*(?:编码|代码)\s*(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*"
+    r"将\s*[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
+    rf"{ADD_OPERATION_VERB_PATTERN}(?:到|进|入)?(?:当前)?草稿\s*"
+    r"[，,；;]\s*排在\s*[「“]?\s*"
+    r"(?P<occupant>[\u3400-\u9fff]{1,16})\s*[」”]?\s*前面\s*$",
     re.IGNORECASE,
 )
 _EVICTION_ADD_OCCUPANT_PATTERN = r"(?![把将])[\u3400-\u9fff]{1,16}"
@@ -597,6 +616,16 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
         return None
     source = _EVICTION_ADD_TRAILING_FILLER_RE.sub("", source).strip()
     source = source.rstrip("。.!！").strip()
+    echoed_match = _ECHOED_EVICTION_ADD_RE.fullmatch(source)
+    if echoed_match is not None:
+        parsed = EvictionModifiedAdd(
+            word=echoed_match.group("word").strip(),
+            code=echoed_match.group("code").strip().lower(),
+            named_occupant=echoed_match.group("occupant").strip(),
+            modifier="排在前面",
+        )
+        return parsed if parsed.word != parsed.named_occupant else None
+
     match = _EVICTION_ADD_HEAD_RE.fullmatch(source)
     if match is None:
         return None
@@ -617,6 +646,43 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
     if parsed.word == parsed.named_occupant:
         return None
     return parsed
+
+
+_EXISTING_ENTRY_MOVE_RE = re.compile(
+    rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
+    r"(?:把|将)\s*[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
+    r"(?P<verb>调整到|改到|移到|挪到|换到)\s*"
+    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})"
+    r"(?:\s*[，,；;]\s*[「“]?\s*"
+    r"(?P<occupant>[\u3400-\u9fff]{1,16})\s*[」”]?\s*顺延)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_existing_entry_move(message: str) -> Optional[ExistingEntryMove]:
+    """Parse the closed existing-entry move family advertised to users."""
+    source = _LEADING_MENTION_RE.sub(
+        "",
+        trusted_mutation_source(message),
+        count=1,
+    ).strip()
+    if not source or re.search(r"[?？]", source):
+        return None
+    source = _EVICTION_ADD_TRAILING_FILLER_RE.sub("", source).strip()
+    source = source.rstrip("。.!！").strip()
+    match = _EXISTING_ENTRY_MOVE_RE.fullmatch(source)
+    if match is None:
+        return None
+    word = match.group("word").strip()
+    occupant = str(match.group("occupant") or "").strip()
+    if occupant and occupant == word:
+        return None
+    return ExistingEntryMove(
+        word=word,
+        target_code=match.group("code").strip().lower(),
+        named_occupant=occupant,
+        verb=match.group("verb").strip(),
+    )
 
 def _unquote_positional_entry(value: str) -> Optional[str]:
     pairs = {"「": "」", "“": "”", "‘": "’"}
@@ -914,7 +980,7 @@ _CLAUSE_BOUNDARY_RE = re.compile(r"[。！？!?;；\n]")
 _ACTION_TOKENS = {
     "Create": re.compile(ADD_OPERATION_VERB_PATTERN),
     "Change": re.compile(
-        r"修改|改成|改为|替换|重新编码|顺延|挪开|"
+        r"修改|改成|改为|改到|换到|调整到|替换|重新编码|顺延|挪开|"
         r"调整权重|修改权重|权重调整|权重修改|权重改|"
         r"放在|放到|排在|挪到|移到|提到|提前到|往前|往后|靠前|靠后"
     ),
@@ -928,6 +994,7 @@ _WORD_LEFT_PREFIXES = (
     *ADD_OPERATION_VERB_FORMS,
     "修改", "改成", "替换", "删除", "删掉", "移除", "保留", "只保留", "仅保留",
     "顺延", "放在", "放到", "排在", "移到", "挪到", "提到", "提前到", "改到",
+    "换到", "调整到",
     "往前", "往后", "靠前", "靠后",
     "把", "将", "词条", "词语", "提到的",
 )
@@ -935,7 +1002,7 @@ _WORD_RIGHT_SUFFIXES = (
     "编码", "代码", "改成", "改为", "修改为", "替换为", "加入", "添加",
     "加到草稿", "加入草稿", "删除", "删掉", "移除", "到草稿", "放入草稿",
     "顺延", "的编码", "的代码", "到", "放在", "放到", "排在", "移到", "挪到",
-    "提到", "提前到", "改到", "往前", "往后", "靠前", "靠后",
+    "提到", "提前到", "改到", "换到", "调整到", "往前", "往后", "靠前", "靠后",
     "和", "与", "及", "、", "都", "并", "以", "为",
 )
 # Machine-readable block reasons.  The model is only allowed to relay the
@@ -1586,6 +1653,14 @@ def message_authorizes_mutation(message: str) -> bool:
         return False
     if _record_frame_wraps_complete_mutation(message):
         return False
+    # The bot advertises this exact first-person shape. Its inner corner
+    # quotes delimit live word operands; they are not a quotation frame around
+    # the command. The closed parser has already rejected report prefixes,
+    # questions, negation, extra actions, and malformed operands.
+    if parse_eviction_modified_add(message) is not None:
+        return True
+    if parse_existing_entry_move(message) is not None:
+        return True
     if not _message_authorizes_mutation_core(message):
         return False
     multi_add = _multi_add_authorization_contract(message)
@@ -1599,11 +1674,11 @@ def message_authorizes_mutation(message: str) -> bool:
 _POSITIONAL_CHANGE_RE = re.compile(
     # Deliberately excludes bare position words ("占用|提前|前面|后面|位置"):
     # they carry no request by themselves and appear constantly in small talk.
-    r"放在|放到|调到|调整到|挪到|挪开|排在|插到|插入|抢占|移到|改到|"
+    r"放在|放到|调到|调整到|挪到|挪开|排在|插到|插入|抢占|移到|改到|换到|"
     r"提到|提前到|往前|往后|靠前|靠后"
 )
 _CHANGE_VERB_RE = re.compile(
-    r"修改|改成|改为|改到|替换|重新编码|顺延|挪开|移到|"
+    r"修改|改成|改为|改到|换到|替换|重新编码|顺延|挪开|移到|"
     r"调整权重|修改权重|权重调整|权重修改|权重改|"
     + _POSITIONAL_CHANGE_RE.pattern
 )
@@ -3863,6 +3938,34 @@ def _validate_current_message_binding(
     elif tool_name == "keytao_shift_phrase_code":
         word = str(arguments.get("word") or "").strip()
         target_code = str(arguments.get("target_code") or "").strip()
+        existing_move = parse_existing_entry_move(
+            context.current_message or ""
+        )
+        existing_move_bound = False
+        if (
+            existing_move is not None
+            and existing_move.word == word
+            and existing_move.target_code == target_code
+        ):
+            target_known = bool(
+                (context.trusted_word_lookup_codes_by_word or {}).get(word)
+                or any(
+                    known_word == word
+                    for known_word, _known_code
+                    in (context.trusted_phrase_types_by_key or {})
+                )
+            )
+            target_entries = (
+                context.trusted_entries_by_code or {}
+            ).get(target_code, ())
+            occupant_bound = bool(
+                not existing_move.named_occupant
+                or sum(
+                    entry_word == existing_move.named_occupant
+                    for entry_word, _entry_weight in target_entries
+                ) == 1
+            )
+            existing_move_bound = target_known and occupant_bound
         if (
             not word
             or not _contains_exact_target(message, word)
@@ -3871,11 +3974,14 @@ def _validate_current_message_binding(
             # A protection word anywhere else in the message still stops the
             # shift; one that *is* the entry being moved does not.
             or _has_protection_outside_target(message, word)
-            or not _positional_destination_is_bound(
-                message,
-                word,
-                target_code,
-                context,
+            or not (
+                existing_move_bound
+                or _positional_destination_is_bound(
+                    message,
+                    word,
+                    target_code,
+                    context,
+                )
             )
             or not _code_is_bound_to_target(
                 message,

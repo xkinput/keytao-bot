@@ -93,6 +93,7 @@ from ..utils.pending_confirmation import (
     advertised_single_word_candidate_codes,
     advertised_reply_contract,
     advertised_word_set_words,
+    command_suggestions_are_closed_candidate_selections,
     ensure_multi_word_candidate_copy,
     parse_pending_candidate_selection,
     pending_batch_confirmation_copy,
@@ -1900,6 +1901,17 @@ def _advertised_reply_matches_live_record(
     contract = advertised_reply_contract(response)
     if not contract.requires_live_state:
         return True
+    # Arbitrary model-authored command prose has no durable source marker at
+    # the final delivery boundary. It must therefore be replaced or stripped;
+    # executable remediation is emitted separately by the deterministic
+    # renderer after the real parser/binding checks.
+    if (
+        contract.command_suggestions
+        and not command_suggestions_are_closed_candidate_selections(
+            contract.command_suggestions
+        )
+    ):
+        return False
     if record is None or record.execution_id or record.state is None:
         return False
 

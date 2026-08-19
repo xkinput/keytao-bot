@@ -61,7 +61,10 @@ from keytao_bot.harness.tools import (
     message_requests_change,
     self_checked_suggested_command,
 )
-from keytao_bot.harness.authorization_grammar import parse_eviction_modified_add
+from keytao_bot.harness.authorization_grammar import (
+    parse_eviction_modified_add,
+    parse_existing_entry_move,
+)
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 from keytao_bot.utils.llm_request_gate import RequestWindowGate
@@ -1929,7 +1932,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             chat_module.conversation_state_store = old_state_store
 
-    async def test_rendered_live_batch_remediation_executes_as_a_full_line(self) -> None:
+    async def test_live_batch_precedence_confirmation_executes_record_items(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
         words = ("和平", "嘴替", "松弛感")
@@ -1948,11 +1951,9 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         guidance = chat_module._format_live_ticket_precedence_message(state)
-        rendered_match = re.search(r"(?m)^- .+$", guidance)
-        self.assertIsNotNone(rendered_match, guidance)
-        rendered_line = rendered_match.group(0)
-        self.assertIn("「", rendered_line)
-        self.assertIn("（和平、嘴替、松弛感）", rendered_line)
+        self.assertIn("回复「确认」执行，或「取消」放弃。", guidance)
+        for index, word in enumerate(words):
+            self.assertIn(f"「{word}」→ a{index}", guidance)
 
         state_store = MemoryConversationStateStore()
         conv_key = ConversationAddress.group("qq", "865189947", "739497722")
@@ -1963,7 +1964,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         try:
             with patch.object(chat_module, "_execute_confirmed_tool", execute):
                 response = await chat_module.handle_pending_message_core(
-                    rendered_line,
+                    "确认",
                     "qq",
                     "739497722",
                     conv_key,
@@ -1974,10 +1975,150 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             chat_module.conversation_state_store = old_state_store
 
         execute.assert_awaited_once()
-        self.assertIn("和平、嘴替、松弛感", response)
+        self.assertEqual(execute.await_args.args[0].args["items"], state.args["items"])
+        self.assertIn("已加入草稿", response)
+
+    def test_pending_precedence_copy_is_record_first_for_every_ticket_kind(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+        from keytao_bot.plugins.chat_render import render_platform_public_links
+
+        batch_id = "pending-detail"
+        batch_url = f"https://keytao.vercel.app/batch/{batch_id}"
+        duplicate_warning = {
+            "warningType": "duplicate_code",
+            "item": {"word": "呵呵呵", "code": "hhhooo"},
+            "existing": [{"word": "哈哈哈", "code": "hhhooo"}],
+        }
+        cases = (
+            (
+                "submit",
+                PendingToolConfirm("keytao_submit_batch", {}),
+                {
+                    "batchId": batch_id,
+                    "batchUrl": batch_url,
+                    "contentVersion": 7,
+                    "snapshotDigest": "a" * 64,
+                    "warningDigest": "b" * 64,
+                    "auditDigest": "c" * 64,
+                    "snapshotItems": [
+                        {"action": "Create", "word": "呵呵呵", "code": "hhhooo"},
+                    ],
+                    "warnings": [duplicate_warning],
+                },
+                ("「呵呵呵」→ hhhooo", "hhhooo 与「哈哈哈」同码"),
+            ),
+            (
+                "batch-add",
+                PendingToolConfirm(
+                    "keytao_batch_add_to_draft",
+                    {"items": [
+                        {"action": "Create", "word": "显眼包", "code": "xybo"},
+                        {"action": "Create", "word": "嘴替", "code": "zbtk"},
+                    ]},
+                ),
+                {
+                    "batchId": batch_id,
+                    "batchUrl": batch_url,
+                    "contentVersion": 7,
+                    "warningDigest": "b" * 64,
+                    "warnings": [],
+                },
+                ("「显眼包」→ xybo", "「嘴替」→ zbtk"),
+            ),
+            (
+                "add",
+                PendingToolConfirm(
+                    "keytao_create_phrase",
+                    {"word": "呵呵呵", "code": "hhhooo"},
+                ),
+                {
+                    "batchId": batch_id,
+                    "batchUrl": batch_url,
+                    "contentVersion": 7,
+                    "warningDigest": "b" * 64,
+                    "warnings": [duplicate_warning],
+                },
+                ("「呵呵呵」→ hhhooo", "hhhooo 与「哈哈哈」同码"),
+            ),
+            (
+                "shift",
+                PendingToolConfirm(
+                    "keytao_shift_phrase_code",
+                    {"word": "呵呵呵", "target_code": "hhhooo"},
+                ),
+                {
+                    "batchId": batch_id,
+                    "batchUrl": batch_url,
+                    "contentVersion": 7,
+                    "planDigest": "d" * 64,
+                    "shiftPlan": {"items": [
+                        {"action": "Create", "word": "呵呵呵", "code": "hhhooo"},
+                        {"action": "Change", "old_word": "哈哈哈", "word": "哈哈哈", "code": "hhhoo"},
+                    ]},
+                    "warnings": [],
+                },
+                ("「呵呵呵」→ hhhooo", "「哈哈哈」→ hhhoo"),
+            ),
+            (
+                "delete",
+                PendingToolConfirm("keytao_remove_draft_item", {"draft_id": 42}),
+                {
+                    "batchId": batch_id,
+                    "batchUrl": batch_url,
+                    "contentVersion": 7,
+                    "targetDigest": "e" * 64,
+                    "targets": [
+                        {"id": 42, "action": "Create", "word": "呵呵呵", "code": "hhhooo"},
+                    ],
+                },
+                ("「呵呵呵」→ hhhooo",),
+            ),
+            (
+                "recall",
+                PendingToolConfirm("keytao_recall_batch", {}),
+                {
+                    "batchId": batch_id,
+                    "batchUrl": batch_url,
+                    "contentVersion": 7,
+                },
+                (batch_url,),
+            ),
+        )
+
+        for label, initial_state, server_data, expected_facts in cases:
+            with self.subTest(label=label):
+                state = chat_module._pending_state_from_server_warning(
+                    initial_state,
+                    server_data,
+                )
+                reply = chat_module._format_live_ticket_precedence_message(state)
+                action_at = reply.index("回复「确认」执行，或「取消」放弃。")
+                quote_at = reply.index("请引用本条消息回复", action_at)
+                for fact in expected_facts:
+                    self.assertIn(fact, reply[:action_at])
+                self.assertLess(action_at, quote_at)
+                self.assertNotIn("或取消当前票据", reply)
+                self.assertNotIn("当前还有一项待确认操作：提交草稿。", reply)
+
+                qq_reply = render_platform_public_links(reply, "qq")
+                if batch_url in expected_facts:
+                    self.assertIn(
+                        f"https://keytao.rea.ink/batch/{batch_id}",
+                        qq_reply,
+                    )
+
+        candidate = PendingAddWord(
+            word="候选词",
+            recommended_code="hxc",
+            candidates=[("hxc", False)],
+        )
+        candidate_reply = chat_module._format_live_ticket_precedence_message(candidate)
+        self.assertIn("「候选词」→ hxc", candidate_reply)
+        self.assertIn("回复「确认」执行，或「取消」放弃。", candidate_reply)
 
     async def test_rendered_batch_command_envelope_is_allowlisted_at_sink(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
+        from keytao_bot.utils.pending_confirmation import render_executable_suggestion
 
         state = PendingToolConfirm(
             function_name="keytao_batch_add_to_draft",
@@ -1988,9 +2129,9 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 ],
             },
         )
-        guidance = chat_module._format_live_ticket_precedence_message(state)
-        rendered = next(
-            line for line in guidance.splitlines() if line.startswith("- ")
+        rendered = render_executable_suggestion(
+            "将这 2 个词加入草稿",
+            words=("显眼包", "嘴替"),
         )
         unbulleted = rendered.removeprefix("- ")
         cases = (
@@ -2115,6 +2256,48 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("载流子 添加2、4", rendered)
         self.assertNotIn("可多选，如「添加2、4」", rendered)
         self.assertNotIn("直接回复该编号表示添加重码", rendered)
+
+    def test_reviewed_candidate_deduplicates_occupied_recode_footer(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        statuses = [
+            {
+                "code": "lxmm",
+                "occupied": True,
+                "label": "已有「两面」",
+                "words": ["两面"],
+                "phrases": [{"word": "两面", "code": "lxmm", "weight": 100}],
+            },
+            {
+                "code": "lxmmo",
+                "occupied": True,
+                "label": "已有「凉面」",
+                "words": ["凉面"],
+                "phrases": [{"word": "凉面", "code": "lxmmo", "weight": 100}],
+            },
+            {
+                "code": "lxmmov",
+                "occupied": True,
+                "label": "已有「粮棉」",
+                "words": ["粮棉"],
+                "phrases": [{"word": "粮棉", "code": "lxmmov", "weight": 100}],
+            },
+        ]
+        prompt = chat_module._format_reviewed_add_prompt({
+            "success": True,
+            "word": "亮面",
+            "recommendedCode": "lxmm",
+            "pronunciations": [{
+                "pinyin": "liang mian",
+                "recommendedCode": "lxmm",
+                "candidateStatuses": statuses,
+                "sources": [],
+            }],
+            "preSubmitAudit": {"autoApprove": False, "issues": ["manual"]},
+        })
+        rendered = chat_module._ensure_pending_add_word_guidance(prompt)
+        self.assertEqual(rendered.count("若要挪开已有词「两面」"), 1)
+        self.assertEqual(rendered.count("1 重新编码"), 1)
 
     async def test_natural_single_candidate_assent_is_state_derived_and_fail_closed(
         self,
@@ -3714,6 +3897,36 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("需要把词条和编码写完整", reply)
                 self.assertNotIn("提交草稿", reply)
                 self.assertIsNone(remaining)
+
+    def test_model_command_advertisements_are_detected_and_fail_closed_without_records(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        incident = (
+            "建议冒菜排在茂才前。确认执行请发："
+            "「将冒菜调整到 mzch，茂才顺延」\n"
+            "比如：\n- 「把冒菜改到 mzch，茂才顺延」"
+        )
+        contract = chat_module.advertised_reply_contract(incident)
+        self.assertEqual(
+            contract.command_suggestions,
+            (
+                "将冒菜调整到 mzch,茂才顺延",
+                "把冒菜改到 mzch,茂才顺延",
+            ),
+        )
+        delivered = chat_module._enforce_advertised_reply_contract(
+            incident,
+            ConversationAddress.private("qq", "d3-no-record"),
+        )
+        self.assertNotIn("将冒菜调整到 mzch", delivered)
+        self.assertNotIn("把冒菜改到 mzch", delivered)
+        self.assertIn("本次不会写入", delivered)
+
+        code_less = "比如：\n- 「提交草稿」\n- 「删除「冒菜」」"
+        self.assertEqual(
+            chat_module.advertised_reply_contract(code_less).command_suggestions,
+            ("提交草稿", "删除「冒菜」"),
+        )
 
     def test_provisional_batch_preview_renders_no_dead_link(self) -> None:
         """Both reply renderers suppress the same provisional result payload."""
@@ -6037,6 +6250,55 @@ class MutationAuthorizationTests(unittest.TestCase):
         parsed = parse_eviction_modified_add(blocked[-1])
         self.assertEqual(parsed.named_occupant, "迷瞪")
 
+    def test_bot_echoed_add_shape_keeps_operand_quotes_but_blocks_real_framing(self) -> None:
+        direct = "以编码 lxmmov 将「亮面」加入草稿，排在「粮棉」前面。"
+        parsed = parse_eviction_modified_add(direct)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(
+            (parsed.word, parsed.code, parsed.named_occupant),
+            ("亮面", "lxmmov", "粮棉"),
+        )
+        self.assertTrue(message_authorizes_mutation(direct))
+
+        framed = (
+            "他说：「以编码 lxmmov 将「亮面」加入草稿，排在「粮棉」前面。」",
+            "转发：以编码 lxmmov 将「亮面」加入草稿，排在「粮棉」前面。",
+            "会议纪要：以编码 lxmmov 将「亮面」加入草稿，排在「粮棉」前面。",
+        )
+        for message in framed:
+            with self.subTest(message=message):
+                self.assertIsNone(parse_eviction_modified_add(message))
+                self.assertFalse(message_authorizes_mutation(message))
+
+    def test_existing_entry_move_family_parses_incident_and_blocks_reported_speech(self) -> None:
+        commands = (
+            "将冒菜调整到 mzch，茂才顺延",
+            "把冒菜改到 mzch，茂才顺延",
+            "将冒菜移到 mzch，茂才顺延",
+            "把冒菜挪到 mzch，茂才顺延",
+            "把冒菜换到 mzch，茂才顺延",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                parsed = parse_existing_entry_move(command)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(
+                    (parsed.word, parsed.target_code, parsed.named_occupant),
+                    ("冒菜", "mzch", "茂才"),
+                )
+                self.assertTrue(message_authorizes_mutation(command))
+
+        for framed in (
+            "他说「将冒菜调整到 mzch，茂才顺延」",
+            "转发：把冒菜改到 mzch，茂才顺延",
+            "会议纪要：将冒菜移到 mzch，茂才顺延",
+            "媒体称把冒菜挪到 mzch，茂才顺延",
+            "不要把冒菜换到 mzch，茂才顺延",
+        ):
+            with self.subTest(framed=framed):
+                self.assertIsNone(parse_existing_entry_move(framed))
+                self.assertFalse(message_authorizes_mutation(framed))
+
     def test_natural_add_verbs_authorize_exact_word_code_and_keep_gates(self) -> None:
         from keytao_bot.utils.pending_confirmation import (
             ADD_OPERATION_VERB_FORMS,
@@ -7298,7 +7560,28 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(phrasing=phrasing):
                 result = await self._shift(phrasing)
                 self.assertTrue(result.get("success"), phrasing)
-        self.assertEqual(len(self.calls), len(phrasings))
+        move_family = (
+            "将冒菜调整到 mzch，茂才顺延",
+            "把冒菜改到 mzch，茂才顺延",
+            "将冒菜移到 mzch，茂才顺延",
+            "把冒菜挪到 mzch，茂才顺延",
+            "把冒菜换到 mzch，茂才顺延",
+        )
+        for phrasing in move_family:
+            with self.subTest(phrasing=phrasing):
+                result = await self._shift(
+                    phrasing,
+                    word="冒菜",
+                    code="mzch",
+                    trusted_word_lookup_codes_by_word={
+                        "冒菜": frozenset({"mzchi"}),
+                    },
+                    trusted_entries_by_code={
+                        "mzch": (("茂才", 100),),
+                    },
+                )
+                self.assertTrue(result.get("success"), (phrasing, result))
+        self.assertEqual(len(self.calls), len(phrasings) + len(move_family))
 
     async def test_reported_positional_phrasings_authorize_and_reach_the_bound_request_path(self) -> None:
         phrasings = (
@@ -11251,6 +11534,225 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertIn("s26-materialized", result)
         self.assertNotIn("重码", result)
 
+    async def test_echoed_incident_front_insert_uses_exact_code_and_live_occupant(self) -> None:
+        calls = []
+        shift_plan = {
+            "word": "亮面",
+            "targetCode": "lxmmov",
+            "items": [
+                {"action": "Create", "word": "亮面", "code": "lxmmov", "type": "Phrase"},
+                {"action": "Create", "word": "粮棉", "code": "lxmmova", "type": "Phrase"},
+            ],
+            "shifted": [{
+                "word": "粮棉",
+                "fromCode": "lxmmov",
+                "toCode": "lxmmova",
+            }],
+        }
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if name == "keytao_prepare_reviewed_add":
+                return {
+                    "success": True,
+                    "word": "亮面",
+                    "recommendedCode": "lxmm",
+                    "candidateCodes": ["lxmm", "lxmmo", "lxmmov"],
+                    "candidateStatuses": [
+                        {"code": "lxmm", "occupied": True, "words": ["两面"]},
+                        {"code": "lxmmo", "occupied": True, "words": ["凉面"]},
+                        {
+                            "code": "lxmmov",
+                            "occupied": True,
+                            "words": ["粮棉"],
+                            "phrases": [{"word": "粮棉", "weight": 100}],
+                        },
+                    ],
+                    "type": "Phrase",
+                    "preSubmitAudit": {"autoApprove": False, "issues": ["manual"]},
+                }
+            if name == "keytao_lookup_by_code":
+                return {
+                    "success": True,
+                    "code": "lxmmov",
+                    "phrases": [{
+                        "word": "粮棉",
+                        "code": "lxmmov",
+                        "type": "Phrase",
+                        "weight": 100,
+                    }],
+                }
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "planDigest": "d" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            if not kwargs.get("expected_warning_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warnings": [],
+                    "batchId": "echo-provisional",
+                    "contentVersion": 0,
+                    "planDigest": "d" * 64,
+                    "warningDigest": "e" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            return {
+                "success": True,
+                "batchId": "echo-materialized",
+                "contentVersion": 1,
+                "shiftPlan": shift_plan,
+            }
+
+        client = _FakeClient([])
+        result = await self._eviction_orchestrator(client, dispatch).run(
+            "以编码 lxmmov 将「亮面」加入草稿，排在「粮棉」前面。",
+            AgentRequestContext(
+                platform="qq",
+                user_id="echo-owner",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            [
+                "keytao_prepare_reviewed_add",
+                "keytao_lookup_by_code",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+            ],
+        )
+        self.assertEqual(calls[2][1]["target_code"], "lxmmov")
+        self.assertIn("「亮面」 → lxmmov", result)
+        self.assertIn("「粮棉」 lxmmov → lxmmova", result)
+
+    async def test_existing_move_incident_executes_one_circular_swap_without_resend(self) -> None:
+        calls = []
+        shift_plan = {
+            "word": "冒菜",
+            "targetCode": "mzch",
+            "items": [
+                {"action": "Delete", "word": "冒菜", "code": "mzchi", "type": "Phrase"},
+                {"action": "Delete", "word": "茂才", "code": "mzch", "type": "Phrase"},
+                {"action": "Create", "word": "冒菜", "code": "mzch", "type": "Phrase"},
+                {"action": "Create", "word": "茂才", "code": "mzchi", "type": "Phrase"},
+            ],
+            "shifted": [{
+                "word": "茂才",
+                "fromCode": "mzch",
+                "toCode": "mzchi",
+            }],
+        }
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if name == "keytao_lookup_by_word":
+                return {
+                    "success": True,
+                    "word": "冒菜",
+                    "phrases": [{
+                        "word": "冒菜",
+                        "code": "mzchi",
+                        "type": "Phrase",
+                        "weight": 100,
+                    }],
+                }
+            if name == "keytao_lookup_by_codes_batch":
+                return {
+                    "success": True,
+                    "results": [{
+                        "success": True,
+                        "code": "mzch",
+                        "phrases": [{
+                            "word": "茂才",
+                            "code": "mzch",
+                            "type": "Phrase",
+                            "weight": 100,
+                        }],
+                    }],
+                }
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "planDigest": "f" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            if not kwargs.get("expected_warning_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warnings": [],
+                    "batchId": "swap-provisional",
+                    "contentVersion": 0,
+                    "planDigest": "f" * 64,
+                    "warningDigest": "a" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            return {
+                "success": True,
+                "batchId": "swap-materialized",
+                "contentVersion": 1,
+                "shiftPlan": shift_plan,
+            }
+
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[
+                _named_tool_call(
+                    "lookup-mc",
+                    "keytao_lookup_by_word",
+                    {"word": "冒菜"},
+                ),
+                _named_tool_call(
+                    "lookup-mzch",
+                    "keytao_lookup_by_codes_batch",
+                    {"codes": ["mzch"]},
+                ),
+            ]),
+            _fake_response("tool_calls", tool_calls=[
+                _named_tool_call(
+                    "shift-mc",
+                    "keytao_shift_phrase_code",
+                    {"word": "冒菜", "target_code": "mzch"},
+                ),
+            ]),
+            _fake_response("stop", "已按计划完成。"),
+        ])
+        result = await self._lookup_orchestrator(client, dispatch).run(
+            "将冒菜调整到 mzch，茂才顺延",
+            AgentRequestContext(
+                platform="qq",
+                user_id="swap-owner",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            [
+                "keytao_lookup_by_word",
+                "keytao_lookup_by_codes_batch",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+            ],
+        )
+        self.assertIn("顺延结果：冒菜 → mzch，茂才 → mzchi", result)
+        self.assertNotIn("回复「确认」", result)
+        self.assertNotRegex(result, r"重新发送|原样发送")
+
     async def test_eviction_add_rejects_text_occupant_not_confirmed_by_server(self) -> None:
         calls = []
 
@@ -14881,6 +15383,43 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertIn("没有找到", finalized)
         self.assertNotRegex(finalized, r"重新|再次|原样")
         self.assertNotIn("可以改为", finalized)
+
+    def test_eviction_failure_remediation_keeps_the_expressed_shift_operation(self) -> None:
+        command = "以编码 lxmmov 将「亮面」加入草稿，排在「粮棉」前面。"
+        finalized = AgentOrchestrator._finalize_reply(
+            command,
+            "这条回复是引用或转述，不是当前发送者的直接确认；本次未写入。",
+            {
+                "success": False,
+                "blockReason": "binding_incomplete",
+                "liveCandidateSelected": True,
+                "message": "本次写入未通过绑定校验。",
+                "suggestedCommand": "加入",
+            },
+        )
+        self.assertIn("lxmmov", finalized)
+        self.assertIn("亮面", finalized)
+        self.assertIn("粮棉", finalized)
+        self.assertNotIn('- 「加入」', finalized)
+
+    def test_second_identical_rejection_does_not_repeat_the_same_advice(self) -> None:
+        message = "把冒菜改到 mzch，茂才顺延"
+        reply = (
+            "这条指令按当前表述无法执行，本次未写入；"
+            "原因：这条消息里没有识别到明确的执行指令。"
+            "可执行命令：\n- 「@我 顺延「冒菜」到 mzch」"
+        )
+        finalized = AgentOrchestrator._finalize_reply(
+            message,
+            reply,
+            {},
+            history=[
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": reply},
+            ],
+        )
+        self.assertIn("已停止重复建议", finalized)
+        self.assertNotIn("顺延「冒菜」", finalized)
 
     def test_only_genuinely_different_validated_suggestion_is_offered(self) -> None:
         finalized = AgentOrchestrator._finalize_reply(
