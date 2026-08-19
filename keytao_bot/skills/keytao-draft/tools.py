@@ -3439,7 +3439,7 @@ async def keytao_remove_draft_item(
         return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
-            "message": "删除目标或草稿版本已变化，旧确认票据已作废",
+            "message": "删除目标或草稿版本已变化，旧确认已失效",
         }, str(preview.get("batchId") or batch_id or ""))
 
     claim_fingerprint = reusable_claim_fingerprint or _begin_delete_claim(
@@ -3638,7 +3638,7 @@ TOOLS = [
                     },
                     "confirmed": {
                         "type": "boolean",
-                        "description": "仅供程序回放已保存的精确服务端确认票据；模型不得设置。默认false"
+                        "description": "仅供程序回放已保存的精确服务端确认状态；模型不得设置。默认false"
                     }
                 },
                 "required": ["word", "code"]
@@ -4008,7 +4008,7 @@ async def keytao_batch_remove_draft_items(
         return _inject_known_batch_url({
             "success": False,
             "staleConfirmation": True,
-            "message": "批量删除目标或草稿版本已变化，旧确认票据已作废",
+            "message": "批量删除目标或草稿版本已变化，旧确认已失效",
         }, str(preview.get("batchId") or batch_id or ""))
 
     claim_fingerprint = reusable_claim_fingerprint or _begin_delete_claim(
@@ -4542,7 +4542,7 @@ async def keytao_shift_phrase_code(
             "success": False,
             "staleConfirmation": True,
             "message": render_remediation_reply(
-                "顺延计划或草稿内容已变化，旧确认票据已作废",
+                "顺延计划或草稿内容已变化，旧确认已失效",
                 command=f"顺延「{word}」到 {target_code}",
                 words=(word,),
             ),
@@ -4579,7 +4579,7 @@ TOOLS += [
             "name": "keytao_batch_add_to_draft",
             "description": (
                 "批量将词条加入草稿。适合用户一次提交大量词条时使用。"
-                "首次调用只返回完整预览，不写入；所有条目和风险（包括重码、跳过更短空位）都必须由用户确认票据。"
+                "首次调用只返回完整预览，不写入；所有条目和风险（包括重码、跳过更短空位）都必须由用户明确确认。"
                 "确认时必须原样携带服务端返回的 batchId、contentVersion 和 warningDigest，快照变化会拒绝写入。"
                 "如需把词插入已占用编码并顺延后续词，必须先使用 keytao_shift_phrase_code，不要手工计算顺延。"
                 "操作完成后返回成功数、失败数及当前草稿快照。"

@@ -574,7 +574,7 @@ def test_replace_char_requires_confirmation():
 
         check(
             "replace-char asks for confirmation",
-            response is not None and "回复「确认」、「执行」继续" in response,
+            response is not None and "请引用本条消息回复「确认」或「取消」" in response,
         )
         check("replace-char previews the rewrite", response is not None and "防粘 → 防黏" in response)
         check("replace-char stores a pending tool confirm", isinstance(pending, PendingToolConfirm))

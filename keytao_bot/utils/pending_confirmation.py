@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 import re
-from typing import Optional
+from typing import Any, Optional
 import unicodedata
 
 
-PENDING_CONFIRM_ADVERTISED_FORMS = ("确认", "执行")
+PENDING_CONFIRM_ADVERTISED_FORMS = ("确认",)
 PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     *PENDING_CONFIRM_ADVERTISED_FORMS,
+    "执行",
     "确定",
     "好的",
     "好",
@@ -22,6 +23,7 @@ PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     "就这样",
     "按这个",
     "执行吧",
+    "确认并提交",
 })
 
 ADD_OPERATION_VERB_FORMS = (
@@ -109,14 +111,16 @@ _BIND_HELP_TEXT = (
 )
 
 
-REMEDIATION_NO_SAFE_FOLLOWUP_MARKER = "当前没有可安全执行的后续命令"
+REMEDIATION_FALLBACK_GUIDANCE = (
+    "这一步我做不了，请换一种说法，或发「查看草稿」看看现状"
+)
 FAILED_WRITE_TEMPLATE_PREFIX = "这条指令按当前表述无法执行"
 FAILED_WRITE_TEMPLATE_MARKER = "本次未写入"
 POLICY_BLOCK_TEMPLATE_PREFIX = "安全拦截："
 SYSTEM_REPLY_TEMPLATE_MARKERS = (
     FAILED_WRITE_TEMPLATE_PREFIX,
     FAILED_WRITE_TEMPLATE_MARKER,
-    REMEDIATION_NO_SAFE_FOLLOWUP_MARKER,
+    REMEDIATION_FALLBACK_GUIDANCE,
     POLICY_BLOCK_TEMPLATE_PREFIX,
 )
 
@@ -509,12 +513,105 @@ def render_remediation_reply(
     command: str = "",
     words: tuple[str, ...] = (),
 ) -> str:
-    """Render a refusal with one executable command, or state that none exists."""
+    """Render a refusal with one concrete next step or short fallback guidance."""
     clean_reason = str(reason or "").strip().rstrip("；;。")
     suggestion = render_executable_suggestion(command, words=words)
     if suggestion:
         return f"{clean_reason}。\n可执行命令：\n{suggestion}"
-    return f"{clean_reason}。{REMEDIATION_NO_SAFE_FOLLOWUP_MARKER}。"
+    if advertised_reply_contract(clean_reason).requires_live_state:
+        return clean_reason + "。"
+    return f"{clean_reason}。{REMEDIATION_FALLBACK_GUIDANCE}。"
+
+
+def _humanize_warning_text(text: str) -> str:
+    rendered = re.sub(r"\s+", " ", str(text or "")).strip()
+    rendered = re.sub(r'词条\s*["“]([^"”]+)["”]\s*', r'「\1」', rendered)
+    rendered = re.sub(r'编码\s*["“]([A-Za-z]+)["”]', r'编码 \1', rendered)
+    return rendered.replace("将创建多编码词条", "这次会形成多编码词条")
+
+
+def plain_warning_message(warning: Any) -> str:
+    """Verbalize one structured server warning without reducing it to a count."""
+    if is_dataclass(warning) and not isinstance(warning, type):
+        warning = asdict(warning)
+    if isinstance(warning, (list, tuple)):
+        messages = [plain_warning_message(item) for item in warning]
+        return "；".join(message for message in messages if message)
+    if not isinstance(warning, dict):
+        return _humanize_warning_text(
+            str(warning or "服务端返回了一项需要确认的风险")
+        )
+
+    item = warning.get("item")
+    source = item if isinstance(item, dict) else warning
+    warning_type = str(warning.get("warningType") or "").strip()
+    word = str(source.get("word") or warning.get("word") or "").strip()
+    code = str(source.get("code") or warning.get("code") or "").strip().lower()
+    weight = source.get("weight", warning.get("weight"))
+    weight_copy = (
+        f"（权重 {weight}）"
+        if isinstance(weight, int) and not isinstance(weight, bool)
+        else ""
+    )
+
+    if warning_type == "duplicate_code" and code:
+        raw_existing = warning.get("existing")
+        existing_rows = (
+            raw_existing
+            if isinstance(raw_existing, list)
+            else [raw_existing]
+            if isinstance(raw_existing, dict)
+            else []
+        )
+        existing_words = tuple(dict.fromkeys(
+            str(row.get("word") or "").strip()
+            for row in existing_rows
+            if isinstance(row, dict)
+            and str(row.get("word") or "").strip()
+            and str(row.get("code") or code).strip().lower() == code
+        ))
+        if existing_words:
+            target_copy = f"「{word}」" if word else "该词"
+            return (
+                f"{code} 与「{'、'.join(existing_words)}」同码，"
+                f"确认后{target_copy}将作为重码写入{weight_copy}"
+            )
+
+    for field in ("message", "impact", "reason", "summary"):
+        value = warning.get(field)
+        if isinstance(value, str) and value.strip():
+            return _humanize_warning_text(value)
+
+    if warning_type == "code_chain_priority" and word and code:
+        return f"「{word}」写入 {code} 后会改变同码顺序{weight_copy}"
+    if warning_type == "skipped_candidate_slot" and word and code:
+        return f"「{word}」将写入 {code}，并跳过更短的空位{weight_copy}"
+    if warning_type == "multiple_code" and word and code:
+        return f"「{word}」将以 {code} 形成多编码词条{weight_copy}"
+    if word and code:
+        return f"「{word}」写入编码 {code} 前需要确认{weight_copy}"
+    if word:
+        return f"「{word}」写入前需要确认{weight_copy}"
+    return "服务端返回了一项需要确认的风险"
+
+
+_WARNING_COUNT_COPY_RE = re.compile(
+    r"(?:(?:存在|有|发现|共有)\s*)?"
+    r"(?:\d+|[一二两三四五六七八九十]+)\s*个警告"
+    r"(?:需要(?:你)?确认)?[。；;，,：:]?"
+)
+
+
+def strip_warning_count_copy(text: str) -> str:
+    """Remove model-authored warning counts; authoritative details are appended elsewhere."""
+    lines = []
+    for raw_line in str(text or "").splitlines():
+        cleaned = _WARNING_COUNT_COPY_RE.sub("", raw_line)
+        cleaned = re.sub(r"[，,；;]\s*[。.]", "。", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines)
 
 
 def _mask_set_reference_quotes(text: str) -> str:
@@ -683,7 +780,10 @@ def _quoted_choices(forms: tuple[str, ...]) -> str:
 
 def pending_confirmation_copy() -> str:
     """Render the generic forms accepted by a single actor-owned ticket."""
-    return f"回复{_quoted_choices(PENDING_CONFIRM_ADVERTISED_FORMS)}继续。"
+    return (
+        "请引用本条消息回复「确认」或「取消」；"
+        "当前只有这一项待确认时，也可直接回复确认。"
+    )
 
 
 def pending_batch_confirmation_copy() -> str:

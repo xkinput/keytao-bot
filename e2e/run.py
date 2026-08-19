@@ -281,6 +281,7 @@ def load_configuration(args: argparse.Namespace) -> dict[str, Any]:
     child_env["BOT_API_TOKEN"] = bot_token
     child_env["NODE_ENV"] = "development"
     child_env["NEXT_TELEMETRY_DISABLED"] = "1"
+    child_env["WATCHPACK_POLLING"] = "true"
     child_env["NODE_USE_ENV_PROXY"] = "1"
     child_env["HTTP_PROXY"] = "http://127.0.0.1:9"
     child_env["HTTPS_PROXY"] = "http://127.0.0.1:9"

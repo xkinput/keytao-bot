@@ -103,6 +103,7 @@ from ..utils.pending_confirmation import (
     render_server_backed_single_word_candidates,
     render_server_backed_word_set,
     same_unique_binding_set,
+    strip_warning_count_copy,
 )
 from ..utils.memory_store import (
     ChatMemoryContext,
@@ -344,6 +345,8 @@ from .chat_render import (
     _normalize_generated_review_copy,
     _plain_warning_line,
     _plain_warning_message,
+    render_platform_public_links,
+    strip_bare_batch_ids,
     _review_source_label,
     _split_telegram_text,
     _strip_markdown,
@@ -381,8 +384,6 @@ from .chat_routing import (
     _QUOTED_PENDING_ADD_CONFIRM_TEXTS,
     _REFERENCED_WORD_QUERY_HINTS,
     _STALE_CONFIRMATION_ONLY_TEXTS,
-    _STALE_TICKET_CONFIRMATION_RE,
-    _TICKET_PENDING_INTENTS,
     _WORD_LIBRARY_QUERY_HINTS,
     _active_operation_confirmation_matches,
     _canonical_draft_management_command,
@@ -391,13 +392,11 @@ from .chat_routing import (
     _classify_simple_word_query_intent,
     _clean_reference_heading_line,
     _closed_candidate_selection,
-    _command_intent_from_ticket_payload,
     _compact_command_text,
     _compact_requests_draft_clear_all,
     _dedupe_words,
     _describe_pending_state,
     _describe_pending_ticket_choice,
-    _exact_nonce_command_matches,
     _extract_explicit_reviewed_add_word,
     _extract_pure_chinese_words,
     _extract_referenced_word_targets,
@@ -434,7 +433,6 @@ from .chat_routing import (
     _pending_owner_label,
     _pending_assent_rejection_response,
     _pending_tool_assent_intent,
-    _pending_tool_confirmation_command,
     _pending_tool_confirmation_matches,
     _pending_tool_state_with_trailing_submit,
     _prompt_capability_digest,
@@ -2086,6 +2084,20 @@ def _enforce_advertised_reply_contract(
     )
 
 
+def _prepare_user_facing_reply(
+    response: str,
+    memory_context: Optional[ChatMemoryContext],
+) -> str:
+    """Apply the final copy and platform policy at every delivery boundary."""
+    conv_key = memory_context.conversation_address if memory_context else None
+    platform = memory_context.platform if memory_context else "web"
+    prepared = _enforce_advertised_reply_contract(response, conv_key)
+    prepared = strip_warning_count_copy(prepared)
+    prepared = render_platform_public_links(prepared, platform)
+    prepared = strip_bare_batch_ids(prepared)
+    return _assert_plain_user_facing_reply(prepared)
+
+
 async def _send_event_response(
     bot: Bot,
     event: Event,
@@ -2096,11 +2108,7 @@ async def _send_event_response(
     *,
     emit_metrics: bool = True,
 ) -> bool:
-    text = _enforce_advertised_reply_contract(
-        text,
-        memory_context.conversation_address,
-    )
-    text = _assert_plain_user_facing_reply(text)
+    text = _prepare_user_facing_reply(text, memory_context)
     try:
         bot_module = bot.__class__.__module__
         if (
@@ -2458,10 +2466,7 @@ ai_chat = on_message(rule=should_handle, priority=99, block=True)
 async def _finish_ai_chat_matcher(response: str) -> None:
     """Dispatch a matcher reply and close metrics at the same boundary."""
     memory_context = current_memory_context.get()
-    response = _enforce_advertised_reply_contract(
-        response,
-        memory_context.conversation_address if memory_context is not None else None,
-    )
+    response = _prepare_user_facing_reply(response, memory_context)
     try:
         await ai_chat.finish(response)
     finally:
@@ -2478,11 +2483,7 @@ async def _finish_ai_chat_response(
 ) -> None:
     """Send one foreground reply with the existing platform formatting."""
 
-    response = _enforce_advertised_reply_contract(
-        response,
-        memory_context.conversation_address,
-    )
-    response = _assert_plain_user_facing_reply(response)
+    response = _prepare_user_facing_reply(response, memory_context)
     bot_module = bot.__class__.__module__
     if "telegram" in bot_module.lower():
         tg_text = _to_markdownv2(response)
@@ -3839,7 +3840,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                                 operation.operation_id,
                             )
                             ctx.response = render_remediation_reply(
-                                "该确认票据已被其他请求占用",
+                                "当前确认请求已被其他处理占用",
                                 command="查看草稿",
                             )
                         else:
@@ -3873,7 +3874,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                 else:
                     if not begin_pending_execution():
                         ctx.response = render_remediation_reply(
-                            "该确认票据已被其他请求占用",
+                            "当前确认请求已被其他处理占用",
                             command="查看草稿",
                         )
                     else:
@@ -3903,7 +3904,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                             and str(item.get("word") or "").strip()
                         )
                         ctx.response = render_remediation_reply(
-                            "候选集合校验失败，确认票据已作废；本次未写入",
+                            "候选集合校验失败，当前确认已失效；本次未写入",
                             command=("加词 " + " ".join(stale_words)) if stale_words else "",
                             words=stale_words,
                         )
@@ -3947,7 +3948,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                                 operation.operation_id,
                             )
                             ctx.response = render_remediation_reply(
-                                "该确认票据已被其他请求占用",
+                                "当前确认请求已被其他处理占用",
                                 command="查看草稿",
                             )
                         else:
@@ -3991,7 +3992,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                     else:
                         if not begin_pending_execution():
                             ctx.response = render_remediation_reply(
-                                "该确认票据已被其他请求占用",
+                                "当前确认请求已被其他处理占用",
                                 command="查看草稿",
                             )
                         else:
@@ -4389,6 +4390,8 @@ _CHAT_COMPAT_NAMES = (
     "pending_confirmation_copy",
     "pending_confirmation_prompt_instruction",
     "render_remediation_reply",
+    "render_platform_public_links",
+    "strip_bare_batch_ids",
     "ChatMemoryContext",
     "MemoryGenerationToken",
     "get_memory_store",
@@ -4451,8 +4454,6 @@ _CHAT_COMPAT_NAMES = (
     "_REVIEWED_ADD_VERDICT_TTL_SECONDS",
     "_RE_WORD_CODE_LINE",
     "_STALE_CONFIRMATION_ONLY_TEXTS",
-    "_STALE_TICKET_CONFIRMATION_RE",
-    "_TICKET_PENDING_INTENTS",
     "_TYPE_HINTS",
     "_UNCERTAIN_TICKET_READ_COMMANDS",
     "_WORD_LIBRARY_QUERY_HINTS",
@@ -4488,7 +4489,6 @@ _CHAT_COMPAT_NAMES = (
     "_clean_reference_heading_line",
     "_clean_review_audit_reason",
     "_closed_candidate_selection",
-    "_command_intent_from_ticket_payload",
     "_common_known_item_for_code",
     "_common_known_item_label",
     "_compact_command_text",
@@ -4516,7 +4516,6 @@ _CHAT_COMPAT_NAMES = (
     "_ensure_pending_add_word_guidance",
     "_entity_identity_label",
     "_escape_mv2_segment",
-    "_exact_nonce_command_matches",
     "_execute_add_multiple_codes_to_draft",
     "_execute_add_to_draft",
     "_execute_add_to_draft_and_submit",
@@ -4604,7 +4603,6 @@ _CHAT_COMPAT_NAMES = (
     "_pending_pronunciation_correction",
     "_pending_state_from_server_warning",
     "_pending_tool_assent_intent",
-    "_pending_tool_confirmation_command",
     "_pending_tool_confirmation_matches",
     "_pending_tool_state_with_trailing_submit",
     "_perform_active_operation_confirmation",

@@ -2,17 +2,19 @@
 
 import json
 import re
-from dataclasses import asdict, is_dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from nonebot.log import logger
 
 from ..harness.state import ActiveDraftOperation, PendingAddWord, PendingState
 from ..utils import review_flags
+from ..utils import http_client
 from ..utils.pending_confirmation import (
     _BIND_HELP_TEXT,
+    _humanize_warning_text,
     pending_confirmation_copy,
+    plain_warning_message,
     render_executable_suggestion,
     render_remediation_reply,
     single_word_candidate_footer,
@@ -93,6 +95,97 @@ def _split_telegram_text(text: str, limit: int = 4000) -> List[str]:
 
 
 _RAW_PYTHON_REPLY_MARKERS = ("{'", "': '", "dataclass(")
+_RETIRED_NO_COMMAND_COPY = "当前没有可安全执行" + "的后续命令"
+
+_DEFAULT_PUBLIC_BASE_BY_PLATFORM = {
+    "qq": "https://keytao.rea.ink",
+    "telegram": "https://keytao.vercel.app",
+    "web": "https://keytao.vercel.app",
+    "web-anon": "https://keytao.vercel.app",
+}
+_PUBLIC_BASE_CONFIG_BY_PLATFORM = {
+    "qq": ("keytao_public_base_qq", "KEYTAO_PUBLIC_BASE_QQ"),
+    "telegram": (
+        "keytao_public_base_telegram",
+        "KEYTAO_PUBLIC_BASE_TELEGRAM",
+    ),
+    "web": ("keytao_public_base_web", "KEYTAO_PUBLIC_BASE_WEB"),
+    "web-anon": ("keytao_public_base_web", "KEYTAO_PUBLIC_BASE_WEB"),
+}
+
+
+def public_base_for_platform(platform: str) -> str:
+    """Return the configured public KeyTao base for one reply platform."""
+    normalized = str(platform or "").strip().lower()
+    default = _DEFAULT_PUBLIC_BASE_BY_PLATFORM.get(
+        normalized,
+        _DEFAULT_PUBLIC_BASE_BY_PLATFORM["web"],
+    )
+    attr_name, env_name = _PUBLIC_BASE_CONFIG_BY_PLATFORM.get(
+        normalized,
+        _PUBLIC_BASE_CONFIG_BY_PLATFORM["web"],
+    )
+    configured = str(http_client.config_value(attr_name, env_name, default) or "").strip()
+    parsed = urlsplit(configured)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return default
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def render_platform_public_links(text: str, platform: str) -> str:
+    """Render KeyTao public links on the configured host for one platform."""
+    public_base = urlsplit(public_base_for_platform(platform))
+    public_hosts = {
+        "keytao.rea.ink",
+        "www.keytao.rea.ink",
+        "keytao.vercel.app",
+        "www.keytao.vercel.app",
+    }
+
+    def replace_url(match: re.Match) -> str:
+        source = urlsplit(match.group(0))
+        if source.hostname not in public_hosts and "/batch/" not in source.path:
+            return match.group(0)
+        return urlunsplit((
+            public_base.scheme,
+            public_base.netloc,
+            source.path,
+            source.query,
+            source.fragment,
+        ))
+
+    return re.sub(r"https?://[^\s)\]]+", replace_url, str(text or ""))
+
+
+_BARE_BATCH_UUID_RE = re.compile(
+    r"(?<![0-9A-Fa-f])"
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+    r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+    r"(?![0-9A-Fa-f])"
+)
+
+
+def strip_bare_batch_ids(text: str) -> str:
+    """Hide UUID-shaped batch identifiers everywhere except inside links."""
+    urls: List[str] = []
+
+    def stash_url(match: re.Match) -> str:
+        urls.append(match.group(0))
+        return f"\x00KEYTAO_URL_{len(urls) - 1}\x00"
+
+    stashed = re.sub(r"https?://[^\s)\]]+", stash_url, str(text or ""))
+    lines: List[str] = []
+    for line in stashed.splitlines():
+        cleaned = _BARE_BATCH_UUID_RE.sub("", line)
+        cleaned = re.sub(r"(?:关联批次|批次(?:ID|编号)?)[：:]\s*$", "", cleaned)
+        cleaned = re.sub(r"批次\s+的", "批次的", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).rstrip()
+        if cleaned.strip(" \t-•，,。；;：:"):
+            lines.append(cleaned)
+    rendered = "\n".join(lines)
+    for index, url in enumerate(urls):
+        rendered = rendered.replace(f"\x00KEYTAO_URL_{index}\x00", url)
+    return rendered
 
 
 _INTERNAL_REPLY_FRAGMENT_RE = re.compile(
@@ -104,6 +197,9 @@ _INTERNAL_REPLY_FRAGMENT_RE = re.compile(
 
 def _assert_plain_user_facing_reply(text: str) -> str:
     reply = str(text or "")
+    if _RETIRED_NO_COMMAND_COPY in reply:
+        logger.error("Refusing retired user-facing copy")
+        raise ValueError("User-facing reply contains retired user-facing copy")
     marker = next(
         (candidate for candidate in _RAW_PYTHON_REPLY_MARKERS if candidate in reply),
         "",
@@ -117,32 +213,8 @@ def _assert_plain_user_facing_reply(text: str) -> str:
     return reply
 
 
-def _humanize_warning_text(text: str) -> str:
-    rendered = re.sub(r"\s+", " ", str(text or "")).strip()
-    rendered = re.sub(r'词条\s*["“]([^"”]+)["”]\s*', r'「\1」', rendered)
-    rendered = re.sub(r'编码\s*["“]([A-Za-z]+)["”]', r'编码 \1', rendered)
-    return rendered.replace("将创建多编码词条", "这次会形成多编码词条")
-
-
 def _plain_warning_message(warning: Any) -> str:
-    if is_dataclass(warning) and not isinstance(warning, type):
-        warning = asdict(warning)
-    if isinstance(warning, dict):
-        for field in ("message", "impact", "reason", "summary"):
-            value = warning.get(field)
-            if isinstance(value, str) and value.strip():
-                return _humanize_warning_text(value)
-        word = str(warning.get("word") or "").strip()
-        code = str(warning.get("code") or "").strip().lower()
-        if word and code:
-            return f"「{word}」在编码 {code} 上有一项需要确认的风险"
-        if word:
-            return f"「{word}」有一项需要确认的风险"
-        return "服务端返回了一项需要确认的风险"
-    if isinstance(warning, (list, tuple)):
-        messages = [_plain_warning_message(item) for item in warning]
-        return "；".join(message for message in messages if message)
-    return _humanize_warning_text(str(warning or "服务端返回了一项需要确认的风险"))
+    return plain_warning_message(warning)
 
 
 def _plain_warning_line(warning: Any) -> str:
@@ -235,11 +307,8 @@ def _format_active_draft_operation_message(
         f"{operation.description} {phase}，不用重复发送。"
         "本喵完成后会直接回复最终结果。"
     )
-    if operation.status == "awaiting_confirmation" and operation.confirmation_code:
-        message += (
-            f"\n{pending_confirmation_copy()}"
-            f"也可发送「{operation.confirmation_command}」作为备用。"
-        )
+    if operation.status == "awaiting_confirmation":
+        message += f"\n{pending_confirmation_copy()}"
     return message
 
 
@@ -1052,7 +1121,7 @@ def _format_replace_char_confirmation(
     parts.extend((
         "",
         "确认后我才会把这批修改加入草稿。"
-        f"{pending_confirmation_copy()}或回复「取消」放弃。",
+        f"{pending_confirmation_copy()}",
     ))
     return _assert_plain_user_facing_reply("\n".join(parts))
 

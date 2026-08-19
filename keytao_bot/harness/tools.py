@@ -1404,7 +1404,7 @@ class ToolExecutor:
             return json.dumps(
                 policy_block(
                     BLOCK_REASON_BINDING_INCOMPLETE,
-                    "安全拦截：确认票据已不再对应原始位置指令。",
+                    "安全拦截：当前确认已不再对应原始位置指令。",
                     missing=["boundFrontInsertPlan"],
                 ),
                 ensure_ascii=False,
@@ -1745,7 +1745,7 @@ class ToolExecutor:
                     BLOCK_REASON_VERB_NOT_MATCHED,
                     f"安全拦截：识别到了已公示执行动词「{advertised_verb}」，"
                     "但附带的排除条件未通过确定性解析，或没有绑定到当前"
-                    "发送者仍有效的批量确认票据；本次未写入。",
+                    "发送者仍有效的批量确认请求；本次未写入。",
                     missing=["liveBatchTicketModifierBinding"],
                 )
             return policy_block(
@@ -1772,7 +1772,7 @@ class ToolExecutor:
                     BLOCK_REASON_VERB_NOT_MATCHED,
                     f"安全拦截：识别到了已公示执行动词「{advertised_verb}」，"
                     "但附带的排除条件未通过确定性解析，或没有绑定到当前"
-                    "发送者仍有效的批量确认票据；本次未写入。",
+                    "发送者仍有效的批量确认请求；本次未写入。",
                     missing=["liveBatchTicketModifierBinding"],
                 )
             return policy_block(
@@ -1793,7 +1793,7 @@ class ToolExecutor:
             return policy_block(
                 BLOCK_REASON_TICKET_REQUIRED,
                 "安全拦截：模型不能自行声明 confirmed=true。"
-                "只有服务端保存的待确认票据才能进入确认执行流程。",
+                "只有服务端保存的待确认请求才能进入确认执行流程。",
                 missing=["serverTicket"],
             )
         if message and tool_name in MUTATING_TOOL_NAMES:

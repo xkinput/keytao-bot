@@ -55,7 +55,7 @@ from .run import (
     ensure_scenario_zdic_fixture,
     repair_scenario_dictionary_fixture,
 )
-from .runtime import E2EBotHarness, LocalNextClient, RigInfrastructureError
+from .runtime import E2EBotHarness, LocalNextClient, NextServer, RigInfrastructureError
 from .safety import (
     BLOCKED_EXTERNAL_DOMAINS,
     NetworkAllowlist,
@@ -70,19 +70,76 @@ from .safety import (
 from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_s9_zdic_cache, seed_zdic_cache
 
 
+class NextServerRuntimeTests(unittest.TestCase):
+    def test_runtime_dir_keeps_read_only_source_and_owns_next_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            artifact = root / "artifact"
+            (source / ".next" / "dev").mkdir(parents=True)
+            (source / "app").mkdir()
+            (source / "node_modules").mkdir()
+            (source / ".next" / "dev" / "lock").write_text("stale")
+            (source / "app" / "page.tsx").write_text("export default null")
+            (source / ".env").write_text("SECRET=not-copied")
+
+            server = NextServer(
+                next_dir=source,
+                base_url="http://localhost:3100",
+                artifact_dir=artifact,
+                start_timeout=1,
+                child_env={},
+            )
+            runtime = server._prepare_runtime_dir()
+
+            self.assertFalse((runtime / "app").is_symlink())
+            self.assertEqual(
+                (runtime / "app" / "page.tsx").read_text(),
+                "export default null",
+            )
+            self.assertTrue((runtime / "node_modules").is_symlink())
+            self.assertTrue((runtime / ".env").is_symlink())
+            self.assertFalse((runtime / ".next").exists())
+            (runtime / ".next" / "dev").mkdir(parents=True)
+            (runtime / ".next" / "dev" / "lock").write_text("live")
+            self.assertEqual(
+                (source / ".next" / "dev" / "lock").read_text(),
+                "stale",
+            )
+
+
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
-    async def test_batch_link_host_guard_rejects_another_environment(self) -> None:
+    async def test_batch_link_host_guard_enforces_platform_public_host(self) -> None:
         assert_batch_link_hosts(
-            "草稿地址：http://localhost:3100/batch/batch-local",
-            "http://localhost:3100",
+            "草稿地址：https://keytao.rea.ink/batch/batch-local",
+            "qq",
         )
         with self.assertRaisesRegex(
             AssertionError,
-            "outside the configured KEYTAO base",
+            "wrong public host for qq",
         ):
             assert_batch_link_hosts(
                 "批次地址：https://keytao.vercel.app/batch/batch-local",
-                "http://localhost:3100",
+                "qq",
+            )
+        assert_batch_link_hosts(
+            "草稿地址：https://keytao.vercel.app/batch/batch-local",
+            "telegram",
+        )
+        with self.assertRaisesRegex(AssertionError, "wrong public host for telegram"):
+            assert_batch_link_hosts(
+                "草稿地址：https://keytao.rea.ink/batch/batch-local",
+                "telegram",
+            )
+        with self.assertRaisesRegex(AssertionError, "wrong public host for qq"):
+            assert_batch_link_hosts(
+                "绑定地址：https://keytao.vercel.app/profile",
+                "qq",
+            )
+        with self.assertRaisesRegex(AssertionError, "wrong public host for telegram"):
+            assert_batch_link_hosts(
+                "绑定地址：https://keytao.rea.ink/profile",
+                "telegram",
             )
 
     async def test_exact_item_set_ignores_order_but_rejects_duplicates(self) -> None:
@@ -869,7 +926,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     )
                 if text == "添加并提交":
                     if self.require_confirmation:
-                        return "提交前请核对服务端快照。\n\n回复「确认」、「执行」继续。"
+                        return "提交前请核对服务端快照。\n\n请引用本条消息回复「确认」或「取消」；当前只有这一项待确认时，也可直接回复确认。"
                     return self.complete_submit()
                 if text == "确认" and self.require_confirmation:
                     return self.complete_submit()
@@ -985,7 +1042,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     if self.require_confirmation:
                         return (
                             "提交前请核对服务端快照。\n\n"
-                            "回复「确认」、「执行」继续。"
+                            "请引用本条消息回复「确认」或「取消」；当前只有这一项待确认时，也可直接回复确认。"
                         )
                     self.events.append({
                         "sequence": 10,
@@ -1211,7 +1268,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                             }],
                         },
                     })
-                    return "发现重码，回复「确认」、「执行」继续。"
+                    return "发现重码，请引用本条消息回复「确认」或「取消」；当前只有这一项待确认时，也可直接回复确认。"
                 if text == "确认":
                     self.items = [
                         {
@@ -1291,7 +1348,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     return (
                         "已解析为以下 9 个词："
                         + "、".join(S19_ADVERTISED_WORDS[:-2])
-                        + "\n确认后才会写入草稿。回复「确认」、「执行」继续。"
+                        + "\n确认后才会写入草稿。请引用本条消息回复「确认」或「取消」；当前只有这一项待确认时，也可直接回复确认。"
                     )
                 if text == "确认":
                     self.items = [
@@ -1459,13 +1516,13 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     )
                 if text == "都加 跳过火星词":
                     return (
-                        "「火星词」不在当前确认票据中；当前有效候选为「"
+                        "「火星词」不在当前确认范围中；当前有效候选为「"
                         + "、".join(S21_BATCH_WORDS)
                         + "」；本次未写入。"
                     )
                 if text == "都加 跳过嘴替":
                     self.add_write(expected_pairs[:-1], "batch-s21-modifier")
-                    return "已按当前确认票据解析为以下 1 个词：" + "、".join(
+                    return "已按当前确认请求解析为以下 1 个词：" + "、".join(
                         S21_BATCH_WORDS[:-1]
                     )
                 if text == "提交草稿":
@@ -1816,7 +1873,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                             "autoApproved": True,
                         },
                     )
-                    return "✅ 已按新确认票据加入并提交"
+                    return "✅ 已按新确认请求加入并提交"
                 if text == "确认":
                     raise AssertionError("offline S23 should not need extra confirmation")
                 raise AssertionError(text)
@@ -1932,7 +1989,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                         "可回复编号或编码选择其他编码；可多选，如「添加1、2」。\n"
                         "回复「加入」只加入草稿；回复「加入并提交」则加入后提交。"
                     )
-                if text == "确认" or text.startswith("确认票据 "):
+                if text == "确认":
                     raise AssertionError("offline S24 should not need extra confirmation")
                 raise AssertionError(text)
 
@@ -2119,10 +2176,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     return (
                         "✅ 本轮已完成两步：\n"
                         f"- 已将「{S25_WORD}」 → {S25_SELECTED_CODE} "
-                        f"写入批次 {self.batch_id} 的草稿。\n"
-                        f"- 已提交批次 {self.batch_id} 审核。"
+                        "写入草稿。\n"
+                        "- 已提交审核。"
                     )
-                if text == "确认" or text.startswith("确认票据 "):
+                if text == "确认":
                     raise AssertionError("offline S25 should complete in the combined turn")
                 raise AssertionError(text)
 
@@ -2237,7 +2294,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     f"- 已写入草稿：「{S26_WORD}」 → {S26_CODE}\n"
                     f"- 已顺延：「{S26_OCCUPANT}」 {S26_CODE} → "
                     f"{self.fixture_facts['chixi_next_code']}\n"
-                    f"关联批次：{self.batch_id}"
+                    f"草稿/批次地址：http://localhost:3100/batch/{self.batch_id}"
                 )
 
             async def draft(self):
@@ -2317,7 +2374,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                         + single_word_candidate_footer(1)
                     )
                     return (
-                        f"{UNBOUND_BINDING_PRECHECK_NOTICE}\n{candidate}"
+                        f"{UNBOUND_BINDING_PRECHECK_NOTICE.replace('keytao.vercel.app', 'keytao.rea.ink')}\n{candidate}"
                         if platform_id.startswith("8")
                         else candidate
                     )
@@ -2333,7 +2390,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     return (
                         "你还没有绑定键道账号哦～\n"
                         "请发送 /bind 绑定码，详见 "
-                        "https://keytao.vercel.app/profile"
+                        "https://keytao.rea.ink/profile"
                     )
                 if text == S27_META_QUESTION:
                     self.assertTrue(platform_id.startswith("8"))

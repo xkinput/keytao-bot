@@ -776,7 +776,7 @@ class AdvertisedWordSetSelectionTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"(?m)^- .+$", ambiguous.ask)), 2)
         self.assertIn("加词 " + " ".join(self.WORDS), ambiguous.ask)
         self.assertIn("加词 电子榨菜 情绪价值 班味", ambiguous.ask)
-        self.assertNotIn("当前没有可安全执行的后续命令", ambiguous.ask)
+        self.assertNotIn("当前没有可安全执行" + "的后续命令", ambiguous.ask)
         self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 2)
 
         self.store.delete(self.owner)
@@ -784,7 +784,7 @@ class AdvertisedWordSetSelectionTests(unittest.TestCase):
         unknown = self.resolve("火星词先不要，其他都加")
         self.assertIn("火星词", unknown.ask)
         self.assertIn("加词 " + " ".join(self.WORDS), unknown.ask)
-        self.assertNotIn("当前没有可安全执行的后续命令", unknown.ask)
+        self.assertNotIn("当前没有可安全执行" + "的后续命令", unknown.ask)
         self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 1)
 
         empty = self.resolve(
@@ -792,7 +792,7 @@ class AdvertisedWordSetSelectionTests(unittest.TestCase):
         )
         self.assertIn("没有剩余", empty.ask)
         self.assertIn("加词 " + " ".join(self.WORDS), empty.ask)
-        self.assertNotIn("当前没有可安全执行的后续命令", empty.ask)
+        self.assertNotIn("当前没有可安全执行" + "的后续命令", empty.ask)
         self.assertEqual(len(self.store.advertised_word_sets(self.owner)), 1)
 
     def test_natural_assent_resolves_one_live_set_and_asks_for_two(self) -> None:
@@ -1333,6 +1333,36 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rendered_dataclass, rendered)
         self.assertEqual(rendered_list, rendered)
         self.assertEqual(orchestrator_rendered, rendered.removeprefix("⚠️ "))
+        duplicate_warning = {
+            "warningType": "duplicate_code",
+            "item": {
+                "action": "Create",
+                "word": "新词",
+                "code": "hhhooo",
+                "weight": 101,
+            },
+            "existing": {
+                "word": "哈哈哈",
+                "code": "hhhooo",
+                "weight": 100,
+            },
+        }
+        duplicate_copy = chat_module._plain_warning_line(duplicate_warning)
+        self.assertEqual(
+            duplicate_copy,
+            "⚠️ hhhooo 与「哈哈哈」同码，确认后「新词」将作为重码写入（权重 101）",
+        )
+        self.assertEqual(
+            orchestrator_module._plain_authoritative_warning(duplicate_warning),
+            duplicate_copy.removeprefix("⚠️ "),
+        )
+        self.assertNotRegex(duplicate_copy, r"\d+\s*个警告")
+        self.assertEqual(
+            chat_module.strip_warning_count_copy(
+                "存在 1 个警告。\n" + duplicate_copy
+            ),
+            duplicate_copy,
+        )
         for raw_fragment in (
             "⚠️ {'id': '2933'}",
             "raw ': ' fragment",
@@ -1370,6 +1400,37 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("确认票据", prompt)
         self.assertNotIn(state_store.get_record(conv_key).reconfirmation_code, prompt)
+
+    async def test_retired_ticket_code_does_not_authorize_live_state(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("qq", "retired-ticket-user")
+        state_store.set(
+            conv_key,
+            PendingToolConfirm(
+                function_name="keytao_submit_batch",
+                args={"batch_id": "internal-batch"},
+            ),
+        )
+        record = state_store.get_record(conv_key)
+        old_state_store = chat_module.conversation_state_store
+        try:
+            chat_module.conversation_state_store = state_store
+            resolved, response = await chat_module._resolve_pending_ticket_control(
+                record,
+                f"确认票据 {record.reconfirmation_code}",
+                chat_module.MessageCommandIntent(),
+                "qq",
+                "retired-ticket-user",
+            )
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+        self.assertEqual(resolved.intent, "none")
+        self.assertIn("请引用当前确认消息", response)
+        self.assertNotIn(record.reconfirmation_code, response)
+        self.assertIs(state_store.get_record(conv_key), record)
 
     async def test_numbered_add_verbs_bind_the_selected_live_candidate(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
@@ -1506,7 +1567,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("可执行命令", error)
         self.assertIn("加入", error)
         self.assertIn("（还车）", error)
-        self.assertNotIn("当前没有可安全执行的后续命令", error)
+        self.assertNotIn("当前没有可安全执行" + "的后续命令", error)
 
         for message in (
             "添加2、2",
@@ -2499,7 +2560,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("可执行命令", control)
                 self.assertIn("加入", control)
                 self.assertIn("（还车）", control)
-                self.assertNotIn("当前没有可安全执行的后续命令", control)
+                self.assertNotIn("当前没有可安全执行" + "的后续命令", control)
                 self.assertEqual(execute.await_count, 0)
                 self.assertIsNotNone(state_store.get_record(conv_key))
 
@@ -2821,7 +2882,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("可执行命令", rejected_reply)
         self.assertIn("加入", rejected_reply)
         self.assertIn("（会比）", rejected_reply)
-        self.assertNotIn("当前没有可安全执行的后续命令", rejected_reply)
+        self.assertNotIn("当前没有可安全执行" + "的后续命令", rejected_reply)
 
         quoted_calls, quoted_reply, rendered = await exercise(
             "",
@@ -2961,7 +3022,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 snapshot_digest,
             )
             self.assertIn("已加入草稿并提交审核", reply)
-            self.assertIn("zjyka already contains 已有词", reply)
+            self.assertIn("zjyka 与「已有词」同码", reply)
             self.assertIn("同码顺序：zjyka：已有词 → 阻抑", reply)
             self.assertNotIn("确认票据", reply)
             self.assertNotIn("确认操作", reply)
@@ -3030,7 +3091,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             reply = await chat_module.handle_pending_message_core(
-                "确认加入 阻抑 zjyka",
+                "确认",
                 "web",
                 "user-natural-confirm",
                 conv_key,
@@ -3114,7 +3175,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                             )
                             self.assertIn(expected_command, reply)
                             self.assertIn("（阻抑）", reply)
-                            self.assertNotIn("当前没有可安全执行的后续命令", reply)
+                            self.assertNotIn("当前没有可安全执行" + "的后续命令", reply)
                         self.assertIs(after.state, pending)
                         self.assertEqual(
                             after.reconfirmation_code,
@@ -3253,8 +3314,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(saved, PendingToolConfirm)
             self.assertEqual(saved.args["expected_warning_digest"], "e" * 64)
             record = state_store.get_record(conv_key)
-            self.assertIn(f"确认票据 {record.reconfirmation_code}", reply)
-            self.assertEqual(reply.count("确认票据 "), 1)
+            self.assertIn("请引用本条消息回复「确认」或「取消」", reply)
+            self.assertNotIn(record.reconfirmation_code, reply)
             self.assertNotIn("「确认加入」", reply)
             self.assertNotIn("「确认提交」", reply)
         finally:
@@ -3492,8 +3553,11 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         generic_copy = chat_module.pending_confirmation_copy()
-        generic_forms = tuple(re.findall(r"「([^」]+)」", generic_copy))
-        self.assertEqual(generic_forms, ("确认", "执行"))
+        generic_forms = chat_module.advertised_reply_contract(
+            generic_copy
+        ).generic_assent_forms
+        self.assertEqual(generic_forms, ("确认",))
+        self.assertIn("「取消」", generic_copy)
 
         model_candidate = (
             "这些词是否一起加入草稿并提交？\n"
@@ -3787,14 +3851,14 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             first_code = state_store.get_record(conv_key).reconfirmation_code
 
             first_reply = await chat_module.handle_pending_message_core(
-                f"确认票据 {first_code}",
+                "确认",
                 "web",
                 "42",
                 conv_key,
             )
 
             self.assertIn("提交前请核对快照", first_reply)
-            self.assertIn("回复「确认」、「执行」继续", first_reply)
+            self.assertIn("请引用本条消息回复「确认」或「取消」", first_reply)
             self.assertNotIn("参数摘要", first_reply)
             self.assertNotIn("风险摘要", first_reply)
             self.assertNotIn("复审摘要", first_reply)
@@ -3810,9 +3874,9 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bound_state.args["expected_warning_digest"], "b" * 64)
             self.assertEqual(bound_state.args["expected_audit_digest"], "c" * 64)
             server_code = state_store.get_record(conv_key).reconfirmation_code
-            self.assertIn(f"确认票据 {server_code}", first_reply)
+            self.assertNotIn(server_code, first_reply)
             server_reply = await chat_module.handle_pending_message_core(
-                f"确认票据 {server_code}",
+                "确认",
                 "web",
                 "42",
                 conv_key,
@@ -3847,7 +3911,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(calls), 3)
             self.assertTrue(calls[2]["preview_only"])
             self.assertNotEqual(current_code, second_code)
-            self.assertIn(current_code, bare_reply)
+            self.assertNotIn(current_code, bare_reply)
+            self.assertIn("请引用本条消息回复「确认」或「取消」", bare_reply)
 
             stale_reply = await chat_module.handle_pending_message_core(
                 f"确认票据 {first_code}",
@@ -3856,10 +3921,11 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 conv_key,
             )
             self.assertEqual(len(calls), 3)
-            self.assertIn(current_code, stale_reply)
+            self.assertIn("确认码已经停用", stale_reply)
+            self.assertNotIn(current_code, stale_reply)
 
             await chat_module.handle_pending_message_core(
-                f"确认票据 {current_code}",
+                "确认",
                 "web",
                 "42",
                 conv_key,
@@ -3899,7 +3965,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
 
             task = asyncio.create_task(
                 chat_module.handle_pending_message_core(
-                    f"确认票据 {ticket_code}",
+                    "确认",
                     "web",
                     "42",
                     conv_key,
@@ -3914,14 +3980,15 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(uncertain_record)
             self.assertTrue(uncertain_record.execution_id)
             blocked_reply = await chat_module.handle_pending_message_core(
-                f"确认票据 {ticket_code}",
+                "确认",
                 "web",
                 "42",
                 conv_key,
             )
             self.assertEqual(len(calls), 1)
             self.assertIn("不会再次执行", blocked_reply)
-            self.assertIn(f"放弃票据 {ticket_code}", blocked_reply)
+            self.assertIn("引用当前消息回复「取消」", blocked_reply)
+            self.assertNotIn(ticket_code, blocked_reply)
             self.assertIsNone(
                 await chat_module.handle_pending_message_core(
                     "查看草稿",
@@ -3931,7 +3998,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             discard_reply = await chat_module.handle_pending_message_core(
-                f"放弃票据 {ticket_code}",
+                "取消",
                 "web",
                 "42",
                 conv_key,
@@ -10304,7 +10371,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(state_store.get_record(context.conversation_address))
         self.assertNotIn(model_only_word, delivered)
-        self.assertIn("当前没有可安全执行的后续命令", delivered)
+        self.assertIn("查看草稿", delivered)
 
     async def test_server_advertised_set_subtraction_stages_exact_confirmed_batch(
         self,
@@ -13010,7 +13077,7 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
             "source_untrusted": "消息来源不受信任",
             "verb_not_matched": "未识别到明确执行动作",
             "binding_incomplete": "操作目标绑定不完整",
-            "ticket_required": "缺少有效确认票据",
+            "ticket_required": "缺少有效确认",
             "bulk_delete_not_requested": "未明确授权批量删除",
             "manual_shift_forbidden": "不允许手工指定顺延计划",
             "ordering_not_expressible": "当前排序要求无法精确表达",
@@ -13050,7 +13117,7 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("请直接回复用户", message)
                 self.assertNotIn("换写法没有用", message)
                 self.assertIn("加词 增香", message)
-                self.assertNotIn("当前没有可安全执行的后续命令", message)
+                self.assertNotIn("当前没有可安全执行" + "的后续命令", message)
 
     async def test_duplicate_write_hint_reports_a_blocked_first_call_honestly(self) -> None:
         client = _FakeClient([
@@ -13553,7 +13620,7 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         incident_reply = (
             "这条指令按当前表述无法执行，本次未写入；"
             "原因：本轮没有可执行的已绑定写操作。"
-            "当前没有可安全执行的后续命令。"
+            "当前没有可安全执行" + "的后续命令。"
         )
         client = _FakeClient([_fake_response("stop", incident_reply)])
         orchestrator = self._no_tools_orchestrator(client)
@@ -13611,7 +13678,7 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotRegex(
             result,
             r"这条指令按当前表述无法执行|本次未写入|"
-            r"当前没有可安全执行的后续命令|安全拦截：",
+            r"当前没有可安全执行" + r"的后续命令|安全拦截：",
         )
 
     async def test_combined_add_submit_binds_submit_to_same_turn_written_batch(self) -> None:
@@ -13761,8 +13828,12 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
             calls[2][1]["expected_server_snapshot_digest"],
             snapshot_digest,
         )
-        self.assertIn("已将「炒冷饭」 → wlfoo 写入批次 batch-combined", reply)
-        self.assertIn("已提交批次 batch-combined 审核", reply)
+        self.assertIn("已将「炒冷饭」 → wlfoo 写入草稿", reply)
+        self.assertIn("已提交审核", reply)
+        self.assertNotIn("batch-combined", reply.replace(
+            "http://localhost:3100/batch/batch-combined",
+            "",
+        ))
         self.assertEqual(reply.count("http://localhost:3100/batch/batch-combined"), 1)
         self.assertNotIn("https://keytao.vercel.app/batch/", reply)
         self.assertNotRegex(reply, r"未写入|无法执行|安全拦截")
@@ -14199,7 +14270,13 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("已写入草稿", reply)
         self.assertIn("炒冷饭", reply)
         self.assertIn("wlfoo", reply)
-        self.assertIn("batch-runaway", reply)
+        self.assertNotIn(
+            "batch-runaway",
+            reply.replace(
+                "http://localhost:3100/batch/batch-runaway",
+                "",
+            ),
+        )
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
 
     async def test_iteration_cap_after_write_reports_receipt(self) -> None:
@@ -14224,7 +14301,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("已写入草稿", reply)
-        self.assertIn("batch-iteration", reply)
+        self.assertNotIn("batch-iteration", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
 
     async def test_transport_failure_after_write_reports_receipt(self) -> None:
@@ -14261,7 +14338,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("已写入草稿", reply)
-        self.assertIn("batch-transport", reply)
+        self.assertNotIn("batch-transport", reply)
         self.assertIn("后续 AI 服务调用失败", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
 
@@ -14333,7 +14410,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("已写入草稿", reply)
-        self.assertIn("batch-budget", reply)
+        self.assertNotIn("batch-budget", reply)
         self.assertIn("工具调用预算上限", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
 
@@ -14389,7 +14466,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("已写入草稿", reply)
-        self.assertIn("batch-exception", reply)
+        self.assertNotIn("batch-exception", reply)
         self.assertIn("后续处理发生异常", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
 
@@ -14400,8 +14477,9 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             FAILED_WRITE_TEMPLATE_MARKER,
             FAILED_WRITE_TEMPLATE_PREFIX,
             POLICY_BLOCK_TEMPLATE_PREFIX,
-            REMEDIATION_NO_SAFE_FOLLOWUP_MARKER,
+            REMEDIATION_FALLBACK_GUIDANCE,
             SYSTEM_REPLY_TEMPLATE_MARKERS,
+            pending_confirmation_copy,
             render_remediation_reply,
         )
 
@@ -14410,20 +14488,29 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             (
                 FAILED_WRITE_TEMPLATE_PREFIX,
                 FAILED_WRITE_TEMPLATE_MARKER,
-                REMEDIATION_NO_SAFE_FOLLOWUP_MARKER,
+                REMEDIATION_FALLBACK_GUIDANCE,
                 POLICY_BLOCK_TEMPLATE_PREFIX,
             ),
         )
         self.assertIn(
-            REMEDIATION_NO_SAFE_FOLLOWUP_MARKER,
+            REMEDIATION_FALLBACK_GUIDANCE,
             render_remediation_reply("无法继续"),
         )
+        advertised = "服务端风险待确认。" + pending_confirmation_copy()
+        self.assertEqual(render_remediation_reply(advertised), advertised)
+
+    def test_user_facing_guard_rejects_retired_no_command_phrase(self) -> None:
+        from keytao_bot.plugins.chat_render import _assert_plain_user_facing_reply
+
+        retired = "当前没有可安全执行" + "的后续命令"
+        with self.assertRaisesRegex(ValueError, "retired user-facing copy"):
+            _assert_plain_user_facing_reply(retired)
 
     def test_model_authored_system_refusal_is_replaced_for_binding_meta_question(self) -> None:
         reply = (
             "这条指令按当前表述无法执行，本次未写入；"
             "原因：本轮没有可执行的已绑定写操作。"
-            "当前没有可安全执行的后续命令。"
+            "当前没有可安全执行" + "的后续命令。"
         )
 
         finalized = AgentOrchestrator._finalize_reply(
@@ -14440,7 +14527,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertNotRegex(
             finalized,
             r"这条指令按当前表述无法执行|本次未写入|"
-            r"当前没有可安全执行的后续命令|安全拦截：",
+            r"当前没有可安全执行" + r"的后续命令|安全拦截：",
         )
 
     def test_real_policy_block_keeps_deterministic_template(self) -> None:
@@ -14482,7 +14569,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             "role": "assistant",
             "content": (
                 "这条指令按当前表述无法执行，本次未写入。"
-                "当前没有可安全执行的后续命令。"
+                "当前没有可安全执行" + "的后续命令。"
             ),
         }])
 
@@ -14492,6 +14579,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             messages[0]["content"],
         )
     def test_result_link_renderer_replaces_model_batch_url_with_record_url(self) -> None:
+        from keytao_bot.plugins.chat_render import render_platform_public_links
         from keytao_bot.plugins.openai_chat import _append_batch_url_if_missing
 
         reply = _append_batch_url_if_missing(
@@ -14504,6 +14592,32 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
 
         self.assertNotIn("https://keytao.vercel.app/batch/", reply)
         self.assertEqual(reply.count("http://localhost:3100/batch/batch-local"), 1)
+        qq_reply = render_platform_public_links(reply, "qq")
+        telegram_reply = render_platform_public_links(reply, "telegram")
+        self.assertIn("https://keytao.rea.ink/batch/batch-local", qq_reply)
+        self.assertNotIn("keytao.vercel.app", qq_reply)
+        self.assertIn("https://keytao.vercel.app/batch/batch-local", telegram_reply)
+        self.assertNotIn("keytao.rea.ink", telegram_reply)
+
+    def test_receipt_copy_hides_batch_id_outside_its_link(self) -> None:
+        from keytao_bot.plugins.chat_render import strip_bare_batch_ids
+
+        batch_id = "bc32871a-1111-2222-3333-444444444444"
+        batch_url = f"http://localhost:3100/batch/{batch_id}"
+        reply = AgentOrchestrator._receipt_completion_reply([{
+            "tool": "keytao_create_phrase",
+            "batchId": batch_id,
+            "batchUrl": batch_url,
+            "items": [{"action": "Create", "word": "新词", "code": "xco"}],
+        }])
+
+        self.assertIn(f"草稿/批次地址：{batch_url}", reply)
+        self.assertNotIn("关联批次", reply)
+        self.assertNotIn(batch_id, reply.replace(batch_url, ""))
+        guarded = strip_bare_batch_ids(
+            f"关联批次：{batch_id}\n草稿/批次地址：{batch_url}"
+        )
+        self.assertEqual(guarded, f"草稿/批次地址：{batch_url}")
 
     def test_success_receipt_overrides_any_model_no_write_claim(self) -> None:
         finalized = AgentOrchestrator._finalize_reply(
@@ -14522,7 +14636,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         )
 
         self.assertIn("已写入草稿", finalized)
-        self.assertIn("batch-written", finalized)
+        self.assertNotIn("batch-written", finalized)
         self.assertIn("按工具回执纠正", finalized)
         self.assertNotIn("本次未写入", finalized)
         self.assertNotIn("无法执行", finalized)
@@ -14567,7 +14681,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
                 self.assertIn("已写入草稿", finalized)
                 self.assertIn("炒冷饭", finalized)
                 self.assertIn("wlfoo", finalized)
-                self.assertIn("batch-prior-write", finalized)
+                self.assertNotIn("batch-prior-write", finalized)
                 self.assertNotRegex(
                     finalized,
                     r"未执行任何新写入|没有成功写入|本次未写入",
@@ -14599,7 +14713,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertIn("已写入草稿", finalized)
         self.assertIn("炒冷饭", finalized)
         self.assertIn("wlfoo", finalized)
-        self.assertIn("batch-incident", finalized)
+        self.assertNotIn("batch-incident", finalized)
         self.assertIn("提交未完成", finalized)
         self.assertIn("@我 提交草稿", finalized)
         self.assertNotIn("本次未写入", finalized)
@@ -14782,11 +14896,10 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertNotIn("重新发送", finalized)
 
     def test_confirmation_can_still_request_original_operation(self) -> None:
-        reply = "确认票据已失效，请重新发送原始操作指令。"
-        self.assertEqual(
-            AgentOrchestrator._finalize_reply("确认", reply, {}),
-            reply,
-        )
+        reply = "当前确认已失效，请重新发送原始操作指令。"
+        finalized = AgentOrchestrator._finalize_reply("确认", reply, {})
+        self.assertIn("查看草稿", finalized)
+        self.assertNotIn("重新发送", finalized)
 
     def test_batch_add_failure_never_degrades_to_submit_only_remediation(self) -> None:
         items = [

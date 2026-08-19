@@ -55,6 +55,34 @@ class NextServer:
         self.log_handle: Any = None
         self.reused_existing = False
 
+    def _prepare_runtime_dir(self) -> Path:
+        """Create a writable Next workspace around the read-only source tree."""
+        runtime_dir = self.artifact_dir / "keytao-next-runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        for source in self.next_dir.iterdir():
+            if source.name in {
+                ".DS_Store",
+                ".cache",
+                ".claude",
+                ".direnv",
+                ".next",
+                ".vercel",
+                "test-results",
+            }:
+                continue
+            destination = runtime_dir / source.name
+            if destination.exists() or destination.is_symlink():
+                continue
+            if source.name in {".git", "node_modules"} or source.name.startswith(
+                ".env"
+            ):
+                destination.symlink_to(source, target_is_directory=source.is_dir())
+            elif source.is_dir():
+                shutil.copytree(source, destination, symlinks=True)
+            else:
+                shutil.copy2(source, destination)
+        return runtime_dir
+
     async def _probe(self) -> bool:
         try:
             async with httpx.AsyncClient(timeout=2.0, follow_redirects=False) as client:
@@ -91,9 +119,10 @@ class NextServer:
             "--port",
             self.base_url.rsplit(":", 1)[-1],
         ]
+        runtime_dir = self._prepare_runtime_dir()
         self.process = subprocess.Popen(
             command,
-            cwd=self.next_dir,
+            cwd=runtime_dir,
             env=self.child_env,
             stdout=self.log_handle,
             stderr=subprocess.STDOUT,

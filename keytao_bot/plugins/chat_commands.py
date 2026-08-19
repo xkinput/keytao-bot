@@ -101,15 +101,12 @@ from .chat_routing import (
     KeepOnlyDraftCommand,
     MessageCommandIntent,
     _DIRECT_OWNER_PENDING_ADD_INTENTS,
-    _TICKET_PENDING_INTENTS,
     _canonical_draft_management_command,
     _canonical_keep_only_command,
     _classify_message_command_intent,
-    _command_intent_from_ticket_payload,
     _compact_command_text,
     _describe_pending_state,
     _describe_pending_ticket_choice,
-    _exact_nonce_command_matches,
     _extract_explicit_reviewed_add_word,
     _extract_referenced_word_targets,
     _format_live_ticket_precedence_message,
@@ -127,7 +124,6 @@ from .chat_routing import (
     _pending_owner_label,
     _pending_assent_rejection_response,
     _pending_tool_assent_intent,
-    _pending_tool_confirmation_command,
     _pending_tool_confirmation_matches,
     _pending_tool_state_with_trailing_submit,
     _prompt_capability_digest,
@@ -1135,7 +1131,7 @@ async def _resolve_pending_ticket_control(
     *,
     verified_bot_reply: bool = False,
 ) -> Tuple[MessageCommandIntent, Optional[str]]:
-    """Resolve an exact ticket or stage a new choice without executing it."""
+    """Resolve one actor-owned pending choice without exposing its internal nonce."""
     if not state_record.requires_reconfirmation:
         return command_intent, None
     if command_intent.intent == "pending_cancel":
@@ -1153,25 +1149,10 @@ async def _resolve_pending_ticket_control(
         return structural_tool_intent, None
 
     compact_control = _compact_command_text(message_text)
-    if _exact_nonce_command_matches(
-        message_text,
-        "确认票据",
-        state_record.reconfirmation_code,
-    ):
-        replayed_intent = _command_intent_from_ticket_payload(
-            state_record.reconfirmation_intent
-        )
-        if replayed_intent.intent in _TICKET_PENDING_INTENTS:
-            return replayed_intent, None
-        return MessageCommandIntent(), render_remediation_reply(
-            "待确认票据的原始选择已无法安全识别"
-        )
-
     if compact_control.startswith("确认票据"):
         return MessageCommandIntent(), (
-            f"当前待确认内容是：{_describe_pending_state(state_record.state)}。\n"
-            f"{pending_confirmation_copy()}"
-            f"也可发送完整挑战码「确认票据 {state_record.reconfirmation_code}」。"
+            "这种确认码已经停用；请引用当前确认消息回复「确认」或「取消」。\n"
+            f"当前待确认内容是：{_describe_pending_state(state_record.state)}。"
         )
 
     if (
@@ -1237,7 +1218,7 @@ async def _resolve_pending_ticket_control(
             )
             if confirmation_code is None:
                 return MessageCommandIntent(), render_remediation_reply(
-                    "确认票据暂时无法安全保存"
+                    "当前确认请求暂时无法安全保存"
                 )
         else:
             # Compatibility for isolated helpers that intentionally pass a
@@ -1255,7 +1236,6 @@ async def _resolve_pending_ticket_control(
             f"当前待确认内容已更新为：{description}。\n"
             "为避免把延迟的旧回复误当成新操作的确认，"
             f"{pending_confirmation_copy()}"
-            f"也可发送「确认票据 {confirmation_code}」。"
         )
 
     return command_intent, None
@@ -1265,13 +1245,12 @@ def _append_pending_ticket_challenge(
     response: str,
     conv_key: ConversationKey,
 ) -> str:
-    """Expose the exact challenge for the current mutating tool ticket."""
+    """Bind the displayed prompt while keeping the internal nonce invisible."""
     record = conversation_state_store.get_record(conv_key)
     if (
         record is None
         or not isinstance(record.state, (PendingAddWord, PendingToolConfirm))
         or not record.requires_reconfirmation
-        or not record.reconfirmation_code
     ):
         return response
 
@@ -1284,24 +1263,9 @@ def _append_pending_ticket_challenge(
 
     if isinstance(record.state, PendingAddWord):
         return bind_prompt(response)
-    natural_command = _pending_tool_confirmation_command(record.state)
-    if natural_command:
-        if (
-            pending_confirmation_copy() in response
-            and _compact_command_text(natural_command) in _compact_command_text(response)
-        ):
-            return bind_prompt(response)
-        return bind_prompt(
-            response.rstrip()
-            + f"\n\n{pending_confirmation_copy()}"
-            + f"也可回复「{natural_command}」继续。"
-        )
-
-    challenge = f"确认票据 {record.reconfirmation_code}"
-    if challenge.lower() in response.lower():
+    if pending_confirmation_copy() in response:
         return bind_prompt(response)
-    guidance = pending_confirmation_copy() + f"也可发送「{challenge}」。"
-    return bind_prompt(response.rstrip() + "\n\n" + guidance)
+    return bind_prompt(response.rstrip() + "\n\n" + pending_confirmation_copy())
 
 
 def _active_operation_message_for_request(
@@ -1339,31 +1303,22 @@ def _resolve_uncertain_ticket_action(
     record: PendingStateRecord,
     message_text: str,
 ) -> Tuple[str, str]:
-    """Allow read-only reconciliation or exact disposal of an uncertain ticket."""
+    """Allow read-only reconciliation or cancellation of one uncertain operation."""
     compact_message = re.sub(r"\s+", "", str(message_text or "")).strip()
     if compact_message in _UNCERTAIN_TICKET_READ_COMMANDS:
         return "read", ""
 
-    challenge_code = str(record.reconfirmation_code or "").upper()
-    if challenge_code and compact_message.upper() in {
-        f"放弃票据{challenge_code}",
-        f"取消票据{challenge_code}",
-    }:
+    if compact_message in {"取消", "放弃", "不用了", "算了"}:
         conversation_state_store.complete_execution(record)
-        return "discard", "已放弃这张结果不确定的旧票据；不会重放该操作。"
+        return "discard", "已放弃这项结果不确定的旧操作；不会重放。"
 
     view_command = render_executable_suggestion("查看草稿")
-    discard_command = (
-        render_executable_suggestion(f"放弃票据 {challenge_code}")
-        if challenge_code
-        else ""
-    )
     return (
         "block",
-        "上一次确认操作正在执行或结果不确定。为避免重复写入，本票据不会再次执行；"
+        "上一次确认操作正在执行或结果不确定。为避免重复写入，这项操作不会再次执行；"
         "可执行核对命令：\n"
         + view_command
-        + (("\n核对后可放弃旧票据：\n" + discard_command) if discard_command else "")
+        + "\n如需放弃，请引用当前消息回复「取消」。"
     )
 
 
@@ -2566,7 +2521,7 @@ async def _execute_add_to_draft(
         ) if warnings else data.get("message", "存在重码警告")
         return _append_batch_url_if_missing((
             f"{warn_text}\n\n确认添加吗？"
-            f"{pending_confirmation_copy()}或回复「取消」放弃。"
+            f"{pending_confirmation_copy()}"
         ), data)
 
     if not data.get("success"):
@@ -2799,7 +2754,7 @@ async def _perform_add_to_draft_and_submit(
         ) if warnings else create_data.get("message", "存在重码警告")
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warn_text}\n\n确认添加吗？"
-            f"{pending_confirmation_copy()}或回复「取消」放弃。",
+            f"{pending_confirmation_copy()}",
             create_data,
         ), pending_state=pending_state, data=create_data)
 
@@ -2964,7 +2919,7 @@ async def _perform_batch_add_to_draft_and_submit(
         ) if warnings else add_data.get("message", "批量添加前需要确认")
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warning_text}\n\n确认继续添加吗？"
-            f"{pending_confirmation_copy()}或回复「取消」放弃。",
+            f"{pending_confirmation_copy()}",
             add_data,
         ), pending_state=pending_state, data=add_data)
 
@@ -3340,7 +3295,7 @@ def _prepend_resolved_advertised_words(
     if len(words) != len(expected):
         return response
     return (
-        f"已按当前确认票据解析为以下 {len(words)} 个词："
+        f"已按当前确认请求解析为以下 {len(words)} 个词："
         + "、".join(words)
         + "。\n"
         + str(response or "")
@@ -3392,22 +3347,20 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 "确认删除这些精确条目并随后核对提交快照吗？"
                 if data.get("submitAfter")
                 else "确认删除这些精确条目吗？"
-            ) + pending_confirmation_copy()
-            + "或回复「取消」放弃。",
+            ) + pending_confirmation_copy(),
         ))
         return _assert_plain_user_facing_reply("\n".join(lines))
 
     if function_name == "keytao_recall_batch":
-        batch_id = str(data.get("batchId") or "")
         batch_url = _trusted_batch_url(data)
-        link_line = f"\n• 草稿地址：{batch_url}" if batch_url else ""
-        return _assert_plain_user_facing_reply(
-            "↩️ 服务端已锁定待撤回批次：\n"
-            f"• 批次：{batch_id}\n"
-            f"{link_line}\n\n"
-            "确认把这个精确批次恢复为草稿吗？"
-            f"{pending_confirmation_copy()}或回复「取消」放弃。"
-        )
+        lines = ["↩️ 服务端已锁定待撤回批次。"]
+        if batch_url:
+            lines.append(f"草稿地址：{batch_url}")
+        lines.extend((
+            "",
+            "确认把这个批次恢复为草稿吗？" + pending_confirmation_copy(),
+        ))
+        return _assert_plain_user_facing_reply("\n".join(lines))
 
     if function_name == "keytao_shift_phrase_code":
         shift_plan = data.get("shiftPlan") if isinstance(data.get("shiftPlan"), dict) else {}
@@ -3436,8 +3389,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         lines.extend((
             "",
             "以上每一项都将由服务端按同一批次版本校验。"
-            f"确认执行吗？{pending_confirmation_copy()}"
-            "或回复「取消」放弃。",
+            f"确认执行吗？{pending_confirmation_copy()}",
         ))
         return _assert_plain_user_facing_reply("\n".join(lines))
 
@@ -3463,7 +3415,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     return _assert_plain_user_facing_reply(
         f"{warning_text}{review_text}{link_text}\n\n"
         f"这是服务端在实际校验后返回的风险。确认{action_text}吗？"
-        f"{pending_confirmation_copy()}或回复「取消」放弃。"
+        f"{pending_confirmation_copy()}"
     )
 
 
@@ -3480,13 +3432,13 @@ async def _execute_confirmed_tool(
 ) -> str:
     """Execute one staged step without bypassing unseen server warnings."""
     if state.confirmation_source not in {"local_preview", "server_warning"}:
-        return render_remediation_reply("确认票据来源无效，已拒绝执行")
+        return render_remediation_reply("确认请求来源无效，已拒绝执行")
     if not _resolved_advertised_items_match(state):
         invalid_words = tuple(
             word for word, _code in pending_batch_display_pairs(state)
         )
         return render_remediation_reply(
-            "候选集合校验失败，确认票据已作废；本次未写入",
+            "候选集合校验失败，当前确认已失效；本次未写入",
             command=("加词 " + " ".join(invalid_words)) if invalid_words else "",
             words=invalid_words,
         )
@@ -3545,7 +3497,7 @@ async def _execute_confirmed_tool(
             )
         ):
             return render_remediation_reply(
-                "提交确认票据缺少完整批次快照，已安全拒绝",
+                "提交确认请求缺少完整批次快照，已安全拒绝",
                 command="提交",
             )
         if state.function_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"} and (
@@ -3559,7 +3511,7 @@ async def _execute_confirmed_tool(
                 word for word, _code in pending_batch_display_pairs(state)
             )
             return render_remediation_reply(
-                "添加确认票据缺少服务端风险快照，已安全拒绝",
+                "添加确认请求缺少服务端风险快照，已安全拒绝",
                 command=("加词 " + " ".join(invalid_words)) if invalid_words else "",
                 words=invalid_words,
             )
@@ -3574,7 +3526,7 @@ async def _execute_confirmed_tool(
             or (not args.get("batch_id") and args["expected_content_version"] != 0)
         ):
             return render_remediation_reply(
-                "顺延确认票据缺少完整计划版本，已安全拒绝",
+                "顺延确认请求缺少完整计划版本，已安全拒绝",
                 command="查看草稿",
             )
     if state.confirmation_source == "server_warning" and state.function_name == "keytao_recall_batch":
@@ -3585,7 +3537,7 @@ async def _execute_confirmed_tool(
             or args["expected_content_version"] < 0
         ):
             return render_remediation_reply(
-                "撤回确认票据缺少精确批次版本，已安全拒绝",
+                "撤回确认请求缺少精确批次版本，已安全拒绝",
                 command="查看草稿",
             )
     if state.confirmation_source == "server_warning" and state.function_name in {
@@ -3601,7 +3553,7 @@ async def _execute_confirmed_tool(
             or args["expected_content_version"] < 0
         ):
             return render_remediation_reply(
-                "删除确认票据缺少精确实体快照，已安全拒绝",
+                "删除确认请求缺少精确实体快照，已安全拒绝",
                 command="查看草稿",
             )
     reviewed_capability = (
@@ -3633,7 +3585,7 @@ async def _execute_confirmed_tool(
             on_transport_failure()
         return render_remediation_reply(
             "连接服务时发生超时或网络错误，本次没有取得确定结果；"
-            "当前确认票据仍有效",
+            "当前确认请求仍有效",
             command="确认",
         )
 
@@ -3700,7 +3652,7 @@ async def _execute_confirmed_tool(
         if not saved:
             return _append_batch_url_if_missing(
                 render_remediation_reply(
-                    "服务端风险详情过大，无法安全保存确认票据；"
+                    "服务端风险详情过大，无法安全保存确认请求；"
                     "本次未执行；系统不能替你决定如何缩小范围"
                 ),
                 display_data,
@@ -3910,9 +3862,8 @@ async def _format_draft_response(
     parts: List[str] = []
     if pointer_batch_id:
         parts.append(
-            "⚠️ 当前草稿指针与上次操作的批次不一致："
-            f"指针指向 {pointer_batch_id}，本次批次是 {anchor}。"
-            "下面显示的是本次批次的内容。"
+            "⚠️ 当前草稿已切换到另一批；"
+            "下面显示的是本次操作对应的内容。"
         )
 
     parts.extend(_create_notice_lines(data))
@@ -6330,7 +6281,7 @@ async def handle_pending_message_core(
             return _append_pending_ticket_challenge(response, conv_key)
         if not conversation_state_store.begin_execution(state_record):
             return render_remediation_reply(
-                "该确认票据已被其他请求占用",
+                "当前确认请求已被其他处理占用",
                 command="查看草稿",
             )
         try:
@@ -6368,13 +6319,13 @@ async def handle_pending_message_core(
                 word for word, _code in pending_batch_display_pairs(state)
             )
             return render_remediation_reply(
-                "候选集合校验失败，确认票据已作废；本次未写入",
+                "候选集合校验失败，当前确认已失效；本次未写入",
                 command=("加词 " + " ".join(invalid_words)) if invalid_words else "",
                 words=invalid_words,
             )
         if not conversation_state_store.begin_execution(state_record):
             return render_remediation_reply(
-                "该确认票据已被其他请求占用",
+                "当前确认请求已被其他处理占用",
                 command="查看草稿",
             )
         if (

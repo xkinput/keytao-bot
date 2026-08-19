@@ -152,23 +152,7 @@ class ActiveDraftOperation:
 
     @property
     def confirmation_command(self) -> str:
-        target = " ".join(part for part in (self.word, self.code) if part)
-        if (
-            isinstance(self.pending_state, PendingToolConfirm)
-            and self.pending_state.confirmation_source != "server_warning"
-        ):
-            if self.pending_state.function_name == "keytao_submit_batch":
-                if target:
-                    return f"确认提交 {target}"
-            if self.pending_state.function_name in {
-                "keytao_create_phrase",
-                "keytao_batch_add_to_draft",
-            }:
-                if target:
-                    return f"确认加入 {target}"
-        if self.confirmation_code:
-            return f"确认操作 {self.confirmation_code}"
-        return ""
+        return "确认" if isinstance(self.pending_state, PendingToolConfirm) else ""
 
 
 class ConversationLockStore:
@@ -282,13 +266,9 @@ class DraftOperationCoordinator:
         operation.pending_state = pending_state
         if rotate_code or not operation.confirmation_code:
             operation.confirmation_code = uuid.uuid4().hex[:6].upper()
-            confirmation_command = operation.confirmation_command
-            operation.prompt_text = (
-                prompt_text.rstrip()
-                + "\n\n"
-                + pending_confirmation_copy()
-                + f"也可发送「{confirmation_command}」作为备用。"
-            )
+            operation.prompt_text = prompt_text.rstrip()
+            if pending_confirmation_copy() not in operation.prompt_text:
+                operation.prompt_text += "\n\n" + pending_confirmation_copy()
         elif not operation.prompt_text:
             operation.prompt_text = prompt_text.rstrip()
         operation.updated_at = time.monotonic()

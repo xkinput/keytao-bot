@@ -131,7 +131,6 @@ from keytao_bot.plugins.openai_chat import (
     _format_reviewed_add_prompt,
     _format_active_draft_operation_message,
     _active_operation_confirmation_matches,
-    _exact_nonce_command_matches,
     _is_plain_draft_submit_request,
     _message_authorizes_clear_history,
     _message_authorizes_keep_only,
@@ -4378,10 +4377,10 @@ def test_add_submit_extra_snapshot_shows_one_exact_confirmation():
             and result.pending_state.args.get("expected_content_version") == 17
         ))
         check("risk prompt does not advertise unusable natural command", "「确认提交」" not in result.text and "「确认加入」" not in result.text)
-        check("risk prompt exposes one executable nonce", operation.prompt_text.count("确认操作 ") == 1)
+        check("risk prompt hides the internal nonce", operation.confirmation_code not in operation.prompt_text)
         check(
             "risk prompt advertises bare shared confirmation",
-            "回复「确认」、「执行」继续" in operation.prompt_text,
+            "请引用本条消息回复「确认」或「取消」" in operation.prompt_text,
         )
 
     asyncio.run(_run())
@@ -5377,7 +5376,7 @@ def test_recall_batch_requires_exact_server_ticket():
         check("recall preview makes no write", calls[0] == (
             "keytao_recall_batch", {}, "qq", "recall-123",
         ))
-        check("recall preview names exact batch", "submitted-42" in preview)
+        check("recall preview hides the bare batch id", "submitted-42" not in preview)
         check("recall ticket is server-derived", record is not None and record.state.confirmation_source == "server_warning")
         check("recall ticket binds exact batch version", record is not None and record.state.args == {
             "batch_id": "submitted-42",
@@ -5968,8 +5967,8 @@ def test_recall_shows_items_from_the_recalled_batch():
         check("empty draft is not reported", "共 0 条" not in result.text)
         check(
             "pointer drift is disclosed",
-            "当前草稿指针与上次操作的批次不一致" in result.text
-            and "drifted-99" in result.text,
+            "当前草稿已切换到另一批" in result.text
+            and "drifted-99" not in result.text,
         )
         check(
             "preview is anchored to the recalled batch",
@@ -6062,7 +6061,7 @@ def test_command_result_never_gets_word_priority_appendix():
             calls.append((args, kwargs))
             raise AssertionError("word tools must not run")
 
-        response = "拟执行 keytao_recall_batch：{}\n确认票据 ABC123"
+        response = "拟执行 keytao_recall_batch：{}\n请引用本条消息回复「确认」或「取消」"
         with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
             result = await _augment_simple_word_query_response(
                 "撤回",
@@ -6381,7 +6380,7 @@ def test_referenced_word_presence_query_explains_missing_quote_text():
             "missing operands advertise no invented query command",
             result is not None
             and "无法确定查询目标" in result
-            and "没有可安全执行的后续命令" in result,
+            and "查看草稿" in result,
         )
 
     asyncio.run(_run())
@@ -8281,9 +8280,9 @@ def test_draft_operation_confirmation_lease_expires():
     check("new operation can start after expiry", coordinator.begin(owner_key, "submit") is not None)
 
 
-def test_active_confirmation_nonce_rejects_bare_and_stale_replies():
-    """Verify a delayed confirmation cannot authorize a replacement operation."""
-    print("\n🧪 active confirmation nonce binds one operation")
+def test_active_confirmation_uses_bare_assent_without_exposing_nonce():
+    """Exactly one active operation accepts bare assent and never exposes its nonce."""
+    print("\n🧪 active confirmation keeps nonce internal")
     coordinator = DraftOperationCoordinator()
     owner_key = ("qq", "nonce-2002")
     pending = PendingToolConfirm(function_name="keytao_submit_batch", args={})
@@ -8296,19 +8295,17 @@ def test_active_confirmation_nonce_rejects_bare_and_stale_replies():
         "是否继续提交？",
     )
     first_code = first.confirmation_code
-    check("bare confirmation is rejected", not _active_operation_confirmation_matches(first, "确认"))
+    check("bare confirmation is accepted", _active_operation_confirmation_matches(first, "确认"))
     check("targetless submit rejects semantic shortcut", not _active_operation_confirmation_matches(first, "确认提交"))
-    check("targetless submit retains exact nonce", first.confirmation_command == f"确认操作 {first_code}" and first_code in first.prompt_text)
+    check("targetless submit advertises bare confirmation", first.confirmation_command == "确认")
+    check("targetless submit hides its internal nonce", first_code not in first.prompt_text)
     check(
-        "question-marked nonce is rejected",
-        not _active_operation_confirmation_matches(
-            first,
-            f"确认操作 {first_code}？",
-        ),
+        "question-marked confirmation is rejected",
+        not _active_operation_confirmation_matches(first, "确认？"),
     )
     check(
-        "current nonce is accepted",
-        _active_operation_confirmation_matches(first, f"确认操作 {first_code}"),
+        "code-shaped confirmation is rejected",
+        not _active_operation_confirmation_matches(first, f"确认操作 {first_code}"),
     )
 
     coordinator.finish(owner_key, first.operation_id)
@@ -8321,15 +8318,12 @@ def test_active_confirmation_nonce_rejects_bare_and_stale_replies():
     )
     check("replacement gets a different nonce", second.confirmation_code != first_code)
     check(
-        "stale nonce is rejected",
+        "old code-shaped confirmation is rejected",
         not _active_operation_confirmation_matches(second, f"确认操作 {first_code}"),
     )
     check(
-        "replacement nonce is accepted",
-        _active_operation_confirmation_matches(
-            second,
-            f"确认操作 {second.confirmation_code}",
-        ),
+        "new code-shaped confirmation is also rejected",
+        not _active_operation_confirmation_matches(second, f"确认操作 {second.confirmation_code}"),
     )
 
     coordinator.finish(owner_key, second.operation_id)
@@ -8346,8 +8340,8 @@ def test_active_confirmation_nonce_rejects_bare_and_stale_replies():
     )
     check("generic add confirmation is rejected", not _active_operation_confirmation_matches(add_operation, "确认加入"))
     check("target-only add confirmation is rejected", not _active_operation_confirmation_matches(add_operation, "确认加入 阻抑 zjyka"))
-    check("server warning keeps exact nonce", _active_operation_confirmation_matches(add_operation, f"确认操作 {add_operation.confirmation_code}"))
-    check("server warning prompt exposes current nonce", add_operation.confirmation_code in add_operation.prompt_text)
+    check("server warning accepts bare confirmation", _active_operation_confirmation_matches(add_operation, "确认"))
+    check("server warning hides current nonce", add_operation.confirmation_code not in add_operation.prompt_text)
 
     add_code = add_operation.confirmation_code
     coordinator.finish(owner_key, add_operation.operation_id)
@@ -8363,18 +8357,15 @@ def test_active_confirmation_nonce_rejects_bare_and_stale_replies():
         "是否继续加入？",
     )
     check("replacement warning rotates nonce", replacement.confirmation_code != add_code)
-    check("stale warning nonce is rejected", not _active_operation_confirmation_matches(replacement, f"确认操作 {add_code}"))
-    check("replacement warning nonce is accepted", _active_operation_confirmation_matches(replacement, f"确认操作 {replacement.confirmation_code}"))
+    check("stale warning code is rejected", not _active_operation_confirmation_matches(replacement, f"确认操作 {add_code}"))
+    check("replacement warning code is rejected", not _active_operation_confirmation_matches(replacement, f"确认操作 {replacement.confirmation_code}"))
+    check("replacement warning still accepts bare confirmation", _active_operation_confirmation_matches(replacement, "确认"))
 
 
 def test_question_and_meta_text_never_authorize_deterministic_mutations():
     """Verify deterministic fast paths reject question and quoted examples."""
     print("\n🧪 deterministic mutation gates reject meta text")
     check("submit question is not an execution request", not _is_plain_draft_submit_request("提交？"))
-    check(
-        "ticket question is not exact confirmation",
-        not _exact_nonce_command_matches("确认票据 ABC123？", "确认票据", "ABC123"),
-    )
     check(
         "clear-history question is rejected",
         not _message_authorizes_clear_history(
@@ -8483,7 +8474,7 @@ def test_verified_bot_reply_is_a_single_prompt_capability():
             check("verified reply confirms without nonce", resolved.intent == "pending_confirm" and response is None)
             check(
                 "prompt explains bare single-ticket confirmation",
-                "回复「确认」、「执行」继续" in prompt,
+                "请引用本条消息回复「确认」或「取消」" in prompt,
             )
         finally:
             openai_chat_module.conversation_state_store = old_store
@@ -8817,7 +8808,7 @@ def test_background_confirmation_isolated_from_second_word():
         check(
             "second-stage timeout keeps the first-stage batch link",
             len(bot.messages) == 2
-            and "https://keytao.test/batch/background-link" in bot.messages[1],
+            and "https://keytao.rea.ink/batch/background-link" in bot.messages[1],
         )
         openai_chat_module.conversation_state_store.delete(conv_key)
         openai_chat_module.draft_operation_coordinator.clear(conv_key)
@@ -12855,7 +12846,7 @@ def test_generic_ai_prose_does_not_persist_pending():
             finish_response.await_count == 1
             and "加词 伪造词" in delivered
             and "（伪造词）" in delivered
-            and "当前没有可安全执行的后续命令" not in delivered,
+            and "当前没有可安全执行" + "的后续命令" not in delivered,
         )
 
     asyncio.run(_run())
@@ -12946,7 +12937,7 @@ def test_outgoing_advertisement_requires_matching_live_state():
             "orphan replacement re-reviews only displayed operands",
             all(word in replaced for word, _code in pairs)
             and "加词 显眼包 嘴替" in replaced
-            and "当前没有可安全执行的后续命令" not in replaced,
+            and "当前没有可安全执行" + "的后续命令" not in replaced,
         )
         check(
             "orphan replacement branch is observable",
@@ -13588,7 +13579,7 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
         )
         check(
             f"{label} refusal never mixes command and no-command copy",
-            "当前没有可安全执行的后续命令" not in reply,
+            "当前没有可安全执行" + "的后续命令" not in reply,
         )
         check(
             f"{label} refusal contains no placeholder operand",
@@ -13607,8 +13598,8 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
         suggestion_pattern.search(no_command_reply) is None,
     )
     check(
-        "operandless refusal says no executable command exists",
-        "当前没有可安全执行的后续命令" in no_command_reply,
+        "operandless refusal offers plain recovery guidance",
+        "查看草稿" in no_command_reply,
     )
 
 
@@ -13697,8 +13688,7 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
         if live_state is not None:
             store.set(context.conversation_address, live_state)
             if message == "__LIVE_TICKET__":
-                live_record = store.get_record(context.conversation_address)
-                message = f"确认票据 {live_record.reconfirmation_code}"
+                message = "确认"
         classifier = AsyncMock(return_value=MessageCommandIntent())
         main_model = AsyncMock(return_value="normal pipeline response")
         tool_call = AsyncMock(
@@ -13774,14 +13764,12 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
         check("bare stale confirm bypasses main model", bare["main_calls"] == 0)
         check("bare stale confirm reaches no tool sink", bare["tool_calls"] == 0)
         check(
-            "stale reply explains expiry or loss",
-            "过期" in bare["response"] and "丢失" in bare["response"],
+            "stale reply explains expiry or absence",
+            "过期或不存在" in bare["response"],
         )
-        check("stale reply explains ticket expiry or one-shot use", "过期或被使用" in bare["response"])
-        check("stale reply limits restart loss to candidate state", "候选状态会在机器人重启后丢失" in bare["response"])
         check(
-            "stale reply admits no command exists without bound operands",
-            "没有可安全执行的后续命令" in bare["response"],
+            "stale reply offers plain recovery guidance",
+            "查看草稿" in bare["response"],
         )
         check(
             "stale reply never recommends confirming again",
@@ -13790,7 +13778,8 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
         )
 
         ticket = await run_case("确认票据 E8CA23", ReplyReferenceInfo())
-        check("stale ticket shape is deterministic", ticket["classifier_calls"] == 0 and ticket["main_calls"] == 0)
+        check("retired ticket syntax is not parsed", ticket["classifier_calls"] == 1 and ticket["main_calls"] == 1)
+        check("retired ticket syntax reaches normal text flow", ticket["response"] == "normal pipeline response")
         check("stale ticket shape reaches no sink", ticket["tool_calls"] == 0)
 
         quoted = await run_case(
@@ -13886,7 +13875,6 @@ def test_pending_replay_transport_failure_retains_exact_ticket():
         conv_key = ConversationAddress.private("qq", "transport-retry")
         store.set(conv_key, pending_submit_state("retry-batch"))
         record = store.get_record(conv_key)
-        code = record.reconfirmation_code
         results = [
             json.dumps(
                 {
@@ -13904,7 +13892,7 @@ def test_pending_replay_transport_failure_retains_exact_ticket():
         try:
             with patch.object(openai_chat_module, "call_tool_function", AsyncMock(side_effect=results)) as tool_call:
                 failed = await openai_chat_module.handle_pending_message_core(
-                    f"确认票据 {code}",
+                    "确认",
                     "qq",
                     "transport-retry",
                     conv_key,
@@ -13914,7 +13902,7 @@ def test_pending_replay_transport_failure_retains_exact_ticket():
                     retained is not None and not retained.execution_id
                 )
                 retried = await openai_chat_module.handle_pending_message_core(
-                    f"确认票据 {code}",
+                    "确认",
                     "qq",
                     "transport-retry",
                     conv_key,
@@ -13950,7 +13938,7 @@ def test_pending_replay_transport_failure_retains_exact_ticket():
                 ),
             ):
                 conflict = await openai_chat_module.handle_pending_message_core(
-                    f"确认票据 {conflict_record.reconfirmation_code}",
+                    "确认",
                     "qq",
                     "transport-conflict",
                     conflict_key,
@@ -16635,7 +16623,7 @@ if __name__ == "__main__":
     test_conversation_lock_serializes_same_actor_messages()
     test_draft_operation_coordinator_guards_lifecycle()
     test_draft_operation_confirmation_lease_expires()
-    test_active_confirmation_nonce_rejects_bare_and_stale_replies()
+    test_active_confirmation_uses_bare_assent_without_exposing_nonce()
     test_question_and_meta_text_never_authorize_deterministic_mutations()
     test_polite_execution_requests_are_commands_but_information_questions_are_not()
     test_verified_bot_reply_is_a_single_prompt_capability()

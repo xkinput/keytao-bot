@@ -30,6 +30,7 @@ from .openai_chat import (
     handle_pending_message_core,
     history_store,
     memory_store,
+    _prepare_user_facing_reply,
     remember_conversation,
     schedule_memory_compaction,
 )
@@ -233,6 +234,7 @@ try:
                             memory_context=memory_context,
                         )
                     if reply:
+                        reply = _prepare_user_facing_reply(reply, memory_context)
                         remember_conversation(
                             conv_key,
                             memory_context,
@@ -245,9 +247,8 @@ try:
                     current_history_generation.reset(history_token)
                     current_memory_generation.reset(memory_token)
             emit_turn_metrics(logger)
-            return {"reply": reply or render_remediation_reply(
-                "AI 暂时无法响应；本轮没有生成可绑定的后续命令"
-            )}
+            fallback = reply or render_remediation_reply("AI 暂时无法响应")
+            return {"reply": _prepare_user_facing_reply(fallback, memory_context)}
         except BaseException:
             if not turn_metrics_emitted():
                 mark_turn_outcome("error")

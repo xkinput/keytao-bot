@@ -14,6 +14,10 @@ from keytao_bot.utils.pending_confirmation import (
     advertised_batch_binding_pairs,
     advertised_reply_contract,
 )
+from keytao_bot.plugins.chat_render import (
+    public_base_for_platform,
+    render_platform_public_links,
+)
 
 from .recording import ArtifactRecorder
 from .runtime import E2EBotHarness, LocalNextClient
@@ -108,19 +112,29 @@ def batch_link_ids(reply: str) -> set[str]:
     return set(re.findall(r"/batch/([A-Za-z0-9_-]+)", reply))
 
 
-def assert_batch_link_hosts(reply: str, keytao_base: str) -> None:
-    """Reject model-invented batch links for another KeyTao environment."""
-    expected_host = urlsplit(str(keytao_base or "")).netloc.lower()
+def assert_batch_link_hosts(reply: str, platform: str) -> None:
+    """Reject any KeyTao public link rendered for the wrong chat platform."""
+    expected_base = public_base_for_platform(platform)
+    expected_host = urlsplit(expected_base).netloc.lower()
+    public_hosts = {
+        "keytao.rea.ink",
+        "www.keytao.rea.ink",
+        "keytao.vercel.app",
+        "www.keytao.vercel.app",
+    }
     mismatched = sorted({
         url
         for url in re.findall(r"https?://[^\s)\]]+", reply)
-        if "/batch/" in urlsplit(url).path
+        if (
+            "/batch/" in urlsplit(url).path
+            or (urlsplit(url).hostname or "").lower() in public_hosts
+        )
         and urlsplit(url).netloc.lower() != expected_host
     })
     require(
         bool(expected_host) and not mismatched,
-        "reply exposed a batch URL outside the configured KEYTAO base: "
-        f"configured={keytao_base!r}, mismatched={mismatched}",
+        f"reply used the wrong public host for {platform}: "
+        f"configured={expected_base!r}, mismatched={mismatched}",
     )
 
 
@@ -209,7 +223,7 @@ class ScenarioContext:
             sender_name=self.sender_name,
             text=text,
         )
-        assert_batch_link_hosts(reply, self.next_client.base_url)
+        assert_batch_link_hosts(reply, "qq")
         return reply
 
     async def send_group(self, text: str, *, to_me: bool) -> str:
@@ -219,7 +233,7 @@ class ScenarioContext:
             text=text,
             to_me=to_me,
         )
-        assert_batch_link_hosts(reply, self.next_client.base_url)
+        assert_batch_link_hosts(reply, "qq")
         return reply
 
     async def send_group_reply(
@@ -236,7 +250,7 @@ class ScenarioContext:
             reply_message_id=reply_message_id,
             to_me=to_me,
         )
-        assert_batch_link_hosts(reply, self.next_client.base_url)
+        assert_batch_link_hosts(reply, "qq")
         return reply
 
     async def draft(self) -> dict[str, Any]:
@@ -645,7 +659,7 @@ async def scenario_s10(ctx: ScenarioContext) -> dict[str, Any]:
             not batch_link_ids(replies[0]),
             f"S10 preview exposed a provisional batch URL: {replies[0]}",
         )
-        confirmation = "确认加入 王中王 wfw 微服务 wfwu"
+        confirmation = "确认"
         messages.append(confirmation)
         replies.append(await ctx.send_group(confirmation, to_me=True))
         confirmation_turns = 1
@@ -1018,7 +1032,7 @@ async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
         after_sequence=second_cutoff,
     )
     additional_confirmation_steps = 0
-    if not second_batch_id and "回复「确认」、「执行」继续" in guidance:
+    if not second_batch_id and "请引用本条消息回复「确认」或「取消」" in guidance:
         messages.append("确认")
         replies.append(await ctx.send(messages[-1]))
         additional_confirmation_steps = 1
@@ -1210,7 +1224,7 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
     )
     if not batch_id:
         require(
-            "回复「确认」、「执行」继续" in replies[-1],
+            "请引用本条消息回复「确认」或「取消」" in replies[-1],
             f"S16 bare assent neither submitted nor reached one bound confirmation: {replies[-1]}",
         )
         messages.append("确认")
@@ -1296,7 +1310,7 @@ async def scenario_s17(ctx: ScenarioContext) -> dict[str, Any]:
         ctx.attempt_events(),
         after_sequence=semantic_cutoff,
     )
-    if not semantic_batch_id and "回复「确认」、「执行」继续" in replies[-1]:
+    if not semantic_batch_id and "请引用本条消息回复「确认」或「取消」" in replies[-1]:
         messages.append("确认")
         replies.append(await ctx.send(messages[-1]))
         semantic_batch_id = _successful_submit_batch_id(
@@ -1338,7 +1352,7 @@ async def scenario_s17(ctx: ScenarioContext) -> dict[str, Any]:
         ctx.attempt_events(),
         after_sequence=obscure_cutoff,
     )
-    if not obscure_batch_id and "回复「确认」、「执行」继续" in replies[-1]:
+    if not obscure_batch_id and "请引用本条消息回复「确认」或「取消」" in replies[-1]:
         messages.append("确认")
         replies.append(await ctx.send(messages[-1]))
         obscure_batch_id = _successful_submit_batch_id(
@@ -1805,8 +1819,8 @@ async def scenario_s20(ctx: ScenarioContext) -> dict[str, Any]:
     draft = await ctx.draft()
     if not draft.get("items"):
         require(
-            "回复「确认」、「执行」继续" in replies[-1]
-            or "确认票据" in replies[-1],
+            "请引用本条消息回复「确认」或「取消」" in replies[-1]
+            or "确认" in replies[-1],
             f"S20 quoted assent neither wrote nor reached one bound confirmation: {replies[-1]}",
         )
         additional_confirmation_steps = 1
@@ -1963,7 +1977,7 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     modifier_confirmation_steps = 0
     if not first_draft.get("items"):
         require(
-            "确认" in replies[-1] or "确认票据" in replies[-1],
+            "确认" in replies[-1],
             f"S21 modifier neither wrote nor reached one bound confirmation: {replies[-1]}",
         )
         modifier_confirmation_steps = 1
@@ -2043,7 +2057,7 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     rendered_confirmation_steps = 0
     if not rendered_draft.get("items"):
         require(
-            "确认" in replies[-1] or "确认票据" in replies[-1],
+            "确认" in replies[-1],
             f"S21 rendered line neither wrote nor reached confirmation: {replies[-1]}",
         )
         rendered_confirmation_steps = 1
@@ -2226,7 +2240,7 @@ async def scenario_s22(ctx: ScenarioContext) -> dict[str, Any]:
     confirmation_steps = 0
     if not draft.get("items") and not completed_batch_id:
         require(
-            "确认" in assent_reply or "确认票据" in assent_reply,
+            "确认" in assent_reply,
             f"S22 bare assent neither wrote nor reached confirmation: {assent_reply}",
         )
         confirmation_steps = 1
@@ -2478,7 +2492,7 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
     confirmation_steps = 0
     if not draft.get("items") and not completed_batch_id:
         require(
-            "确认" in assent_reply or "确认票据" in assent_reply,
+            "确认" in assent_reply,
             f"S23 fresh bare assent neither wrote nor reached confirmation: {assent_reply}",
         )
         confirmation_steps = 1
@@ -2630,14 +2644,7 @@ async def scenario_s24(ctx: ScenarioContext) -> dict[str, Any]:
     )
     confirmation_steps = 0
     if not completed_batch_id:
-        confirmation_match = re.search(r"确认票据\s+[A-F0-9]{6}", assent_reply)
-        confirmation_command = (
-            confirmation_match.group(0)
-            if confirmation_match is not None
-            else "确认"
-            if "确认" in assent_reply
-            else ""
-        )
+        confirmation_command = "确认" if "确认" in assent_reply else ""
         require(
             bool(confirmation_command),
             f"S24 natural assent neither submitted nor reached one bound confirmation: {assent_reply}",
@@ -2859,14 +2866,7 @@ async def scenario_s25(ctx: ScenarioContext) -> dict[str, Any]:
     )
     confirmation_steps = 0
     if not completed_batch_id:
-        confirmation_match = re.search(r"确认票据\s+[A-F0-9]{6}", combined_reply)
-        confirmation_command = (
-            confirmation_match.group(0)
-            if confirmation_match is not None
-            else "确认"
-            if "确认" in combined_reply
-            else ""
-        )
+        confirmation_command = "确认" if "确认" in combined_reply else ""
         require(
             bool(confirmation_command),
             f"S25 combined command neither submitted nor reached confirmation: {combined_reply}",
@@ -2884,17 +2884,20 @@ async def scenario_s25(ctx: ScenarioContext) -> dict[str, Any]:
     completion_exchange = "\n".join(replies[-(confirmation_steps + 1):])
     escaped_word = re.escape(S25_WORD)
     escaped_code = re.escape(S25_SELECTED_CODE)
-    escaped_batch = re.escape(completed_batch_id)
     require(
         re.search(
             rf"已将[「\"]?{escaped_word}[」\"]?\s*→\s*{escaped_code}"
-            rf"\s*写入批次\s*{escaped_batch}",
+            r"\s*写入草稿",
             completion_exchange,
         ) is not None
         and re.search(
-            rf"已提交批次\s*{escaped_batch}\s*审核",
+            r"已提交审核",
             completion_exchange,
         ) is not None
+        and completed_batch_id not in completion_exchange.replace(
+            f"/batch/{completed_batch_id}",
+            "",
+        )
         and re.search(r"未写入|未提交|提交未完成|无法执行", completion_exchange)
         is None,
         "S25 completion replies did not truthfully report both completed steps: "
@@ -2949,7 +2952,7 @@ async def scenario_s25(ctx: ScenarioContext) -> dict[str, Any]:
         "只读轮",
         "无法执行",
         "本次未写入",
-        "当前没有可安全执行的后续命令",
+        "当前没有可安全执行" + "的后续命令",
         "请把下面这条指令原样转述给用户",
     )
     require(
@@ -3001,12 +3004,7 @@ async def scenario_s26(ctx: ScenarioContext) -> dict[str, Any]:
     draft = await ctx.draft()
     confirmation_steps = 0
     if {item_key(item) for item in draft.get("items", [])} != expected:
-        confirmation_match = re.search(r"确认票据\s+[A-F0-9]{6}", replies[-1])
-        confirmation_command = (
-            confirmation_match.group(0)
-            if confirmation_match is not None
-            else "确认" if "确认" in replies[-1] else ""
-        )
+        confirmation_command = "确认" if "确认" in replies[-1] else ""
         require(
             bool(confirmation_command),
             f"S26 neither completed nor returned one confirmation: {replies[-1]}",
@@ -3108,10 +3106,14 @@ async def scenario_s27(ctx: ScenarioContext) -> dict[str, Any]:
             text=text,
             to_me=True,
         )
-        assert_batch_link_hosts(reply, ctx.next_client.base_url)
+        assert_batch_link_hosts(reply, "qq")
         return reply
 
     await ctx.bot.reset_conversation(platform_id=unbound_platform_id)
+    qq_unbound_notice = render_platform_public_links(
+        UNBOUND_BINDING_PRECHECK_NOTICE,
+        "qq",
+    )
     first_reply = await send_as(unbound_platform_id, "S27-unbound", S27_WORD)
     require(S27_WORD in first_reply, f"S27 unbound review omitted the word: {first_reply}")
     require(
@@ -3119,7 +3121,7 @@ async def scenario_s27(ctx: ScenarioContext) -> dict[str, Any]:
         f"S27 unbound review did not render a candidate contract: {first_reply}",
     )
     require(
-        first_reply.count(UNBOUND_BINDING_PRECHECK_NOTICE) == 1,
+        first_reply.count(qq_unbound_notice) == 1,
         f"S27 unbound first candidate reply did not carry exactly one notice: {first_reply}",
     )
 
@@ -3167,7 +3169,7 @@ async def scenario_s27(ctx: ScenarioContext) -> dict[str, Any]:
         f"S27 bound control did not render candidates: {bound_reply}",
     )
     require(
-        UNBOUND_BINDING_PRECHECK_NOTICE not in bound_reply,
+        qq_unbound_notice not in bound_reply,
         f"S27 bound control received the unbound notice: {bound_reply}",
     )
     draft = await ctx.draft()
@@ -3179,7 +3181,7 @@ async def scenario_s27(ctx: ScenarioContext) -> dict[str, Any]:
         "draft": draft,
         "facts": {
             "unboundPlatformId": unbound_platform_id,
-            "bindingNoticeCount": first_reply.count(UNBOUND_BINDING_PRECHECK_NOTICE),
+            "bindingNoticeCount": first_reply.count(qq_unbound_notice),
             "bindingGuidanceAfterAssent": True,
             "metaQuestionToolCalls": len(meta_tools),
             "systemTemplateMarkersAbsent": True,
@@ -3262,8 +3264,7 @@ async def scenario_s28(ctx: ScenarioContext) -> dict[str, Any]:
         )
         confirmation_steps = 0
         if not batch_id:
-            match = re.search(r"确认票据\s+[A-F0-9]{6}", first_reply)
-            command = match.group(0) if match is not None else "确认" if "确认" in first_reply else ""
+            command = "确认" if "确认" in first_reply else ""
             require(command, f"S28 {label} neither submitted nor returned a confirmation: {first_reply}")
             confirmation_steps = 1
             messages.append(command)

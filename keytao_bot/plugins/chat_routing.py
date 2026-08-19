@@ -391,6 +391,17 @@ def _pending_tool_assent_intent(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Resolve shared natural assent against one server-backed live state."""
+    compact = _compact_command_text(message_text)
+    if isinstance(state, PendingToolConfirm):
+        allowed_forms = set(PENDING_CONFIRM_ASSENT_TEXTS)
+        if (
+            state.function_name == "keytao_batch_add_to_draft"
+            and state.confirmation_source != "server_warning"
+        ):
+            allowed_forms.update(PENDING_BATCH_ADD_ASSENT_TEXTS)
+            allowed_forms.update(PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS)
+        if compact not in allowed_forms:
+            return None
     assent = _pending_assent_phrase_for_state(state, message_text)
     if not assent.matched:
         return None
@@ -424,22 +435,9 @@ def _pending_tool_assent_intent(
         )
     if add_confirmation_tool:
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
-    compact = _compact_command_text(message_text)
     if compact in _PENDING_CONFIRM_ASSENT_TEXTS:
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
-    if not re.fullmatch(
-        r"(?:确认|确定)(?:(?:并|并且|然后|再|同时|以及))?"
-        r"(?:提交|提审|送审)(?:审核|草稿|批次)?(?:一下)?(?:吧|啦|了)?",
-        compact,
-    ):
-        return None
-    if state.function_name != "keytao_submit_batch":
-        return MessageCommandIntent(
-            intent="pending_add_and_submit",
-            confidence=1.0,
-            submit_after=True,
-        )
-    return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+    return None
 
 
 def _pending_assent_state_operands(state: PendingState) -> Tuple[str, ...]:
@@ -510,8 +508,7 @@ def _pending_assent_rejection_response(
         and compact == _compact_command_text(f"加词 {state.word}")
     )
     if (
-        compact.startswith(("确认票据", "确认操作"))
-        or exact_rereview
+        exact_rereview
         or parse_pending_candidate_selection(message_text) is not None
         or (
             isinstance(state, PendingAddWord)
@@ -657,20 +654,6 @@ def _quoted_pending_add_control_intent(
         if _message_authorizes_pending_state_control(state, message_text, intent)
         else None
     )
-
-
-def _exact_nonce_command_matches(
-    message_text: str,
-    command_prefix: str,
-    nonce: str,
-) -> bool:
-    """Normalize whitespace only; punctuation changes command semantics."""
-    candidate = re.sub(
-        r"\s+",
-        "",
-        _strip_command_message_prefixes(message_text).strip(),
-    )
-    return bool(nonce and candidate.upper() == f"{command_prefix}{nonce}".upper())
 
 
 def _message_authorizes_clear_history(
@@ -963,9 +946,6 @@ def _message_authorizes_pending_control(
 _STALE_CONFIRMATION_ONLY_TEXTS = _PENDING_CONFIRM_ASSENT_TEXTS
 
 
-_STALE_TICKET_CONFIRMATION_RE = re.compile(r"确认票据[A-Z0-9]{4,64}", re.IGNORECASE)
-
-
 _ORIGINAL_COMMAND_LINE_RE = re.compile(
     r"^(?:原始操作指令|原始指令|原指令)\s*[：:]\s*[「“\"]?(.+?)[」”\"]?$"
 )
@@ -983,7 +963,7 @@ def _is_unambiguous_stale_confirmation(message_text: str) -> bool:
         return True
     if compact in _STALE_CONFIRMATION_ONLY_TEXTS:
         return True
-    return bool(_STALE_TICKET_CONFIRMATION_RE.fullmatch(compact))
+    return False
 
 
 def _recover_original_command_from_confirmation_quote(
@@ -1015,9 +995,7 @@ def _format_stale_confirmation_response(
         return None
     original_command = _recover_original_command_from_confirmation_quote(reply_reference)
     return render_remediation_reply(
-        "之前等待确认的候选状态或票据已经过期。"
-        "候选状态会在机器人重启后丢失；已保存的确认票据会持久保留，"
-        "直到过期或被使用",
+        "之前等待确认的内容已经过期或不存在；本次不会执行",
         command=original_command,
     )
 
@@ -1324,7 +1302,7 @@ def _resolve_multi_word_pending_candidate_selection(
         words,
     ):
         return None, None, render_remediation_reply(
-            "命令引号外含有非允许内容；当前确认票据仍保留，本次未写入",
+            "命令引号外含有非允许内容；当前确认请求仍保留，本次未写入",
             command=f"将这 {len(words)} 个词加入草稿",
             words=words,
         )
@@ -1347,7 +1325,7 @@ def _resolve_multi_word_pending_candidate_selection(
         )
         if unknown:
             return None, None, render_remediation_reply(
-                "以下暂不添加的词不在当前确认票据中："
+                "以下暂不添加的词不在当前确认范围中："
                 + "、".join(f"「{word}」" for word in unknown)
                 + "。当前有效候选为「"
                 + "、".join(words)
@@ -1835,8 +1813,7 @@ async def _classify_message_command_intent(
     ):
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     if pending_state is not None and compact_message.startswith("确认票据"):
-        # The structured ticket resolver validates the exact nonce.  Never
-        # spend an LLM call interpreting a credential-bearing command.
+        # The retired code form is handled deterministically as non-executable.
         return MessageCommandIntent()
     if pending_state is not None and compact_message in {
         "取消", "不用", "不要", "不了", "算了", "不加", "不改",
@@ -2101,8 +2078,7 @@ def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
         "插入编码",
         "调整到编码",
         "拟执行 ",
-        "确认票据",
-        "确认操作",
+        "待确认",
         "安全拦截",
         "尚未写入",
     )
@@ -2168,8 +2144,7 @@ def _describe_pending_state(state: PendingState) -> str:
             return f"顺延调码「{word}」→ {target_code}" if word or target_code else "顺延调码"
 
         if state.function_name == "keytao_recall_batch":
-            batch_id = str(state.args.get("batch_id") or state.args.get("batchId") or "")
-            return f"撤回批次 {batch_id}" if batch_id else "撤回批次"
+            return "撤回当前批次"
 
         if state.function_name == "keytao_create_phrase":
             word = state.args.get("word", "")
@@ -2190,15 +2165,6 @@ def _describe_pending_state(state: PendingState) -> str:
     return "待确认操作"
 
 
-_TICKET_PENDING_INTENTS = {
-    "pending_confirm",
-    "pending_add_and_submit",
-    "pending_recode",
-    "pending_code_request",
-    "pending_choice",
-}
-
-
 _DIRECT_OWNER_PENDING_ADD_INTENTS = {
     "pending_confirm",
     "pending_add_and_submit",
@@ -2208,43 +2174,12 @@ _DIRECT_OWNER_PENDING_ADD_INTENTS = {
 }
 
 
-def _pending_tool_confirmation_command(state: PendingToolConfirm) -> str:
-    """Build a natural command bound to every authorized create target."""
-    if state.confirmation_source == "server_warning":
-        return ""
-    if state.function_name == "keytao_create_phrase":
-        action = str(state.args.get("action") or "Create")
-        word = str(state.args.get("word") or "").strip()
-        code = str(state.args.get("code") or "").strip().lower()
-        if action == "Create" and word and code:
-            return f"确认加入 {word} {code}"
-        return ""
-    if state.function_name != "keytao_batch_add_to_draft":
-        return ""
-    targets = []
-    for item in state.args.get("items", []):
-        if not isinstance(item, dict) or str(item.get("action") or "Create") != "Create":
-            return ""
-        word = str(item.get("word") or "").strip()
-        code = str(item.get("code") or "").strip().lower()
-        if not word or not code:
-            return ""
-        targets.append(f"{word} {code}")
-    command = "确认加入 " + " ".join(targets) if targets else ""
-    return command if len(command) <= 160 else ""
-
-
 def _pending_tool_confirmation_matches(
-    state: PendingToolConfirm,
-    message_text: str,
+    _state: PendingToolConfirm,
+    _message_text: str,
 ) -> bool:
-    if re.search(r"[?？]", message_text):
-        return False
-    command = _pending_tool_confirmation_command(state)
-    return bool(
-        command
-        and _compact_command_text(message_text) == _compact_command_text(command)
-    )
+    """Retired: target-bearing confirmation commands are no longer accepted."""
+    return False
 
 
 def _message_authorizes_pending_state_control(
@@ -2302,11 +2237,7 @@ def _message_authorizes_pending_state_control(
             return True
     if _message_authorizes_pending_control(message_text, command_intent):
         return True
-    return bool(
-        isinstance(state, PendingToolConfirm)
-        and command_intent.intent == "pending_confirm"
-        and _pending_tool_confirmation_matches(state, message_text)
-    )
+    return False
 
 
 def _ticket_payload_from_command_intent(
@@ -2323,36 +2254,6 @@ def _ticket_payload_from_command_intent(
         "requested_codes": list(command_intent.requested_codes),
         "target_word": command_intent.target_word,
     }
-
-
-def _command_intent_from_ticket_payload(
-    payload: Dict[str, object],
-) -> MessageCommandIntent:
-    intent = str(payload.get("intent") or "")
-    if intent not in _TICKET_PENDING_INTENTS:
-        return MessageCommandIntent()
-    raw_choice_index = payload.get("choice_index")
-    choice_index = (
-        raw_choice_index
-        if isinstance(raw_choice_index, int) and not isinstance(raw_choice_index, bool)
-        else None
-    )
-    return MessageCommandIntent(
-        intent=intent,
-        confidence=1.0,
-        submit_after=bool(payload.get("submit_after")),
-        choice_index=choice_index,
-        choice_indices=tuple(
-            value
-            for value in payload.get("choice_indices", [])
-            if isinstance(value, int)
-            and not isinstance(value, bool)
-            and value > 0
-        ) if isinstance(payload.get("choice_indices"), list) else (),
-        requested_code=str(payload.get("requested_code") or "")[:32],
-        requested_codes=_sanitize_optional_codes(payload.get("requested_codes")),
-        target_word=str(payload.get("target_word") or "")[:128],
-    )
 
 
 def _describe_pending_ticket_choice(
@@ -2404,29 +2305,17 @@ def _active_operation_confirmation_matches(
     operation: ActiveDraftOperation,
     message_text: str,
 ) -> bool:
-    """Match a legacy nonce or the current operation's target-bound command."""
+    """Accept assent only for the one current actor-owned active operation."""
     if operation.status != "awaiting_confirmation":
         return False
     if re.search(r"[?？]", message_text):
         return False
-    if (
-        operation.confirmation_code
-        and _exact_nonce_command_matches(
-            message_text,
-            "确认操作",
-            operation.confirmation_code,
-        )
-    ):
-        return True
-    compact = _compact_command_text(message_text)
     if not isinstance(operation.pending_state, PendingToolConfirm):
         return False
-    if operation.confirmation_command.startswith("确认操作 "):
+    if _compact_command_text(message_text) not in PENDING_CONFIRM_ASSENT_TEXTS:
         return False
-    return bool(
-        operation.confirmation_command
-        and compact == _compact_command_text(operation.confirmation_command)
-    )
+    intent = _pending_tool_assent_intent(operation.pending_state, message_text)
+    return bool(intent is not None and intent.intent == "pending_confirm")
 
 
 def _is_referenced_word_presence_query(message_text: str) -> bool:

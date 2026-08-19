@@ -1019,6 +1019,7 @@ def _load_web_api():
     openai_chat.handle_pending_message_core = None
     openai_chat.history_store = None
     openai_chat.memory_store = None
+    openai_chat._prepare_user_facing_reply = lambda reply, _context: reply
     openai_chat.remember_conversation = None
     openai_chat.schedule_memory_compaction = None
     sys.modules.setdefault("keytao_bot.plugins.openai_chat", openai_chat)

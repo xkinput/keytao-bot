@@ -53,7 +53,7 @@ description: 键道输入法草稿批次管理工具。添加词条、查看草�
 - 草稿中已存在的相同操作 → 跳过，记入 `skipped`
 - 最终返回 `successCount`、`failedCount`、`skippedCount`、`warnedCount`、`failed[]`、`skipped[]`、`warned[]`、`draftItems[]`
 
-返回 `success/message/batchId`、四类计数 `successCount/failedCount/skippedCount/warnedCount`、对应的 `failed/skipped/warned` 明细及 `draftItems/draftTotal`。逐条转述失败和警告原因，不得把警告项说成失败项。
+返回 `success/message/batchId`、四类计数 `successCount/failedCount/skippedCount/warnedCount`、对应的 `failed/skipped/warned` 明细及 `draftItems/draftTotal`。逐条转述失败和警告原因，不得把警告项说成失败项；面向用户不得说“存在 N 个警告”，必须逐条说明实际影响。
 
 **`warnedCount > 0` 时：执行「编码警告确认协议」**（见下方独立章节）。不得静默删除、改码或重写用户已经选择的词条；如条目已写入，展示重码事实即可。`failed[]` 非空时，在回复中追加「❌ 冲突条目（未写入）」段落。
 
@@ -184,7 +184,7 @@ summary 格式规则：
 
 ### keytao_recall_batch
 
-撤回最近一次提审，将批次从"审核中"状态恢复为草稿。首次调用无需参数，由程序获取精确批次和版本的只读快照，再在同一条当前明确指令内回放该快照；用户无需抄写确认票据。若批次或版本已经变化，必须停止并报告，不得改用新的目标重试。
+撤回最近一次提审，将批次从"审核中"状态恢复为草稿。首次调用无需参数，由程序获取精确批次和版本的只读快照，再在同一条当前明确指令内回放该快照；用户只需引用确认消息回复确认或取消。若批次或版本已经变化，必须停止并报告，不得改用新的目标重试。
 
 ⚠️ **仅当用户明确说"撤回"、"撤销提交"、"取消提审" 时才调用。**
 

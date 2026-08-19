@@ -38,6 +38,7 @@ from keytao_bot.utils.pending_confirmation import (
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
+    plain_warning_message,
     render_server_backed_batch_candidates,
     render_server_backed_word_set,
     render_executable_suggestion,
@@ -88,7 +89,7 @@ _BLOCK_REASON_USER_LABELS = {
     "source_untrusted": "消息来源不受信任",
     "verb_not_matched": "未识别到明确执行动作",
     "binding_incomplete": "操作目标绑定不完整",
-    "ticket_required": "缺少有效确认票据",
+    "ticket_required": "缺少有效确认",
     "bulk_delete_not_requested": "未明确授权批量删除",
     "manual_shift_forbidden": "不允许手工指定顺延计划",
     "ordering_not_expressible": "当前排序要求无法精确表达",
@@ -112,27 +113,7 @@ def _tool_function_name(tool: Any) -> str:
 
 
 def _plain_authoritative_warning(warning: Any) -> str:
-    if is_dataclass(warning) and not isinstance(warning, type):
-        warning = asdict(warning)
-    if isinstance(warning, dict):
-        for field in ("message", "impact", "reason", "summary"):
-            value = warning.get(field)
-            if isinstance(value, str) and value.strip():
-                text = value.strip()
-                text = re.sub(r'词条\s*["“]([^"”]+)["”]\s*', r'「\1」', text)
-                text = re.sub(r'编码\s*["“]([A-Za-z]+)["”]', r'编码 \1', text)
-                return text.replace("将创建多编码词条", "这次会形成多编码词条")
-        word = str(warning.get("word") or "").strip()
-        code = str(warning.get("code") or "").strip().lower()
-        if word and code:
-            return f"「{word}」在编码 {code} 上有一项需要确认的风险"
-        if word:
-            return f"「{word}」有一项需要确认的风险"
-        return "服务端返回了一项需要确认的风险"
-    if isinstance(warning, (list, tuple)):
-        messages = [_plain_authoritative_warning(item) for item in warning]
-        return "；".join(message for message in messages if message)
-    return str(warning or "服务端返回了一项需要确认的风险").strip()
+    return plain_warning_message(warning)
 
 
 def _pending_candidate_capability(
@@ -1775,14 +1756,14 @@ class AgentOrchestrator:
                             "success": False,
                             "policyBlocked": True,
                             "message": render_remediation_reply(
-                                "待确认操作过大，未保存确认票据；"
+                                "待确认操作过大，未保存确认请求；"
                                 "系统无法替你决定如何拆分本批"
                             ),
                         }
                         result_str = json.dumps(result_data, ensure_ascii=False)
                     if result_data.get("localConfirmationRequired") and pending_saved:
-                        confirmation_code = self._state_store.arm_reconfirmation(conv_key)
-                        if not confirmation_code:
+                        confirmation_saved = self._state_store.arm_reconfirmation(conv_key)
+                        if not confirmation_saved:
                             if termination_state is not None:
                                 termination_state["reason"] = "confirmation_save_failure"
                             return self._append_authoritative_result_links(
@@ -1792,13 +1773,9 @@ class AgentOrchestrator:
                                 ),
                                 authoritative_result_links,
                             )
-                        ticket_command = render_executable_suggestion(
-                            f"确认票据 {confirmation_code}"
-                        )
                         return self._append_authoritative_result_links((
                             f"{result_data.get('message', '操作尚未执行')}\n\n"
                             f"{pending_confirmation_copy()}"
-                            f"备用可执行命令：\n{ticket_command}"
                         ), authoritative_result_links)
                     if self._tool_receipt_recorder is not None:
                         recorded = self._tool_receipt_recorder(
@@ -2283,13 +2260,9 @@ class AgentOrchestrator:
         """Render completed writes only from authoritative same-turn receipts."""
         written: List[tuple[str, str]] = []
         shifted: List[tuple[str, str, str]] = []
-        batch_ids: List[str] = []
         batch_urls: List[str] = []
         for receipt in receipts:
-            batch_id = str(receipt.get("batchId") or "").strip()
             batch_url = str(receipt.get("batchUrl") or "").strip()
-            if batch_id and batch_id not in batch_ids:
-                batch_ids.append(batch_id)
             if batch_url and batch_url not in batch_urls:
                 batch_urls.append(batch_url)
             for item in receipt.get("items") or []:
@@ -2322,8 +2295,6 @@ class AgentOrchestrator:
                 f"- 已顺延：「{word}」 {from_code} → {to_code}"
                 for word, from_code, to_code in shifted
             )
-        if batch_ids:
-            lines.append("关联批次：" + "、".join(batch_ids))
         lines.extend(f"草稿/批次地址：{url}" for url in batch_urls)
         return "\n".join(lines)
 
@@ -2496,8 +2467,8 @@ class AgentOrchestrator:
                 code = str(authorized_item.get("code") or "").strip().lower()
                 lines = [
                     "✅ 本轮已完成两步：",
-                    f"- 已将「{word}」 → {code} 写入批次 {batch_id} 的草稿。",
-                    f"- 已提交批次 {batch_id} 审核。",
+                    f"- 已将「{word}」 → {code} 写入草稿。",
+                    "- 已提交审核。",
                 ]
                 batch_url = next((
                     str(receipt.get("batchUrl") or "").strip()
@@ -2515,16 +2486,14 @@ class AgentOrchestrator:
             (termination_state or {}).get("reason") or ""
         ).strip()
         if receipts and (failure_state or termination_reason or reply_denies_write):
-            submitted_batches: List[str] = []
-            for receipt in receipts:
-                batch_id = str(receipt.get("batchId") or "").strip()
-                if receipt.get("tool") == "keytao_submit_batch" and batch_id:
-                    submitted_batches.append(batch_id)
-            lines = cls._receipt_completion_reply(receipts).splitlines()
-            lines.extend(
-                f"- 已提交批次：{batch_id}"
-                for batch_id in submitted_batches
+            submitted = any(
+                receipt.get("tool") == "keytao_submit_batch"
+                and str(receipt.get("batchId") or "").strip()
+                for receipt in receipts
             )
+            lines = cls._receipt_completion_reply(receipts).splitlines()
+            if submitted:
+                lines.append("- 已提交审核。")
             if failure_state:
                 failed_tool = str(failure_state.get("_failedTool") or "")
                 failure_label = (
@@ -2564,7 +2533,7 @@ class AgentOrchestrator:
                     "invalid_tool_request": "后续工具请求未通过校验",
                     "duplicate_tool_runaway": "后续处理因重复工具调用而停止",
                     "tool_dispatch_exception": "后续工具分发发生异常",
-                    "confirmation_save_failure": "后续确认票据未能安全保存",
+                    "confirmation_save_failure": "后续确认请求未能安全保存",
                     "iteration_cap": "后续处理达到模型轮次上限",
                     "exception": "后续处理发生异常",
                 }
