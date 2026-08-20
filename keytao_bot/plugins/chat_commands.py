@@ -92,6 +92,7 @@ from .chat_render import (
     _format_referenced_word_presence_response,
     _format_replace_char_confirmation,
     _format_reviewed_add_prompt,
+    _format_submit_conflict_failure,
     _normalize_generated_review_copy,
     _plain_warning_line,
     _plain_warning_message,
@@ -3761,6 +3762,9 @@ async def _execute_confirmed_tool(
                 ),
                 data,
             )
+        conflict_failure = _format_submit_conflict_failure(data)
+        if conflict_failure:
+            return _append_batch_url_if_missing(conflict_failure, data)
         return _append_batch_url_if_missing(
             f"提交失败：{data.get('message', '未知错误')} qwq",
             data,
@@ -4140,6 +4144,12 @@ async def _perform_submit_current_draft(
         )
 
     if not submit_data.get("success"):
+        conflict_failure = _format_submit_conflict_failure(submit_data)
+        if conflict_failure:
+            return DraftActionResult(
+                _append_batch_url_if_missing(conflict_failure, submit_data),
+                data=submit_data,
+            )
         return DraftActionResult(
             _append_batch_url_if_missing(
                 f"提交失败：{submit_data.get('message', '未知错误')} qwq",

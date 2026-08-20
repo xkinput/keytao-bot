@@ -228,6 +228,305 @@ def _plain_warning_line(warning: Any) -> str:
     return _assert_plain_user_facing_reply(f"⚠️ {_plain_warning_message(warning)}")
 
 
+def _submit_conflict_snapshot_items(data: Dict) -> List[Dict]:
+    """Return the audited draft records carried beside a submit response."""
+    direct = data.get("snapshotItems")
+    if isinstance(direct, list):
+        return [item for item in direct if isinstance(item, dict)]
+    auto_review = data.get("autoReview")
+    nested = auto_review.get("snapshotItems") if isinstance(auto_review, dict) else None
+    return [item for item in nested if isinstance(item, dict)] if isinstance(nested, list) else []
+
+
+def _submit_conflict_draft_item(
+    conflict: Dict,
+    snapshot_items: List[Dict],
+    used_indexes: set[int],
+) -> Dict:
+    """Bind one conflict to the best matching audited draft item."""
+    code = str(conflict.get("code") or "").strip().lower()
+    current = conflict.get("currentPhrase")
+    current_word = (
+        str(current.get("word") or "").strip()
+        if isinstance(current, dict)
+        else ""
+    )
+    suggestions = [
+        suggestion
+        for suggestion in conflict.get("suggestions", [])
+        if isinstance(suggestion, dict)
+    ]
+    suggestion_words = tuple(dict.fromkeys(
+        str(suggestion.get("word") or "").strip()
+        for suggestion in suggestions
+        if str(suggestion.get("word") or "").strip()
+    ))
+    draft_hint_words = tuple(dict.fromkeys(
+        str(suggestion.get("word") or "").strip()
+        for suggestion in suggestions
+        if str(suggestion.get("action") or "").strip() in {"Adjust", "Cancel"}
+        and str(suggestion.get("word") or "").strip()
+    ))
+    ranked: List[Tuple[int, int, Dict]] = []
+    for index, item in enumerate(snapshot_items):
+        if index in used_indexes:
+            continue
+        item_code = str(item.get("code") or "").strip().lower()
+        if code and item_code != code:
+            continue
+        word = str(item.get("word") or "").strip()
+        score = 1
+        if word and word in draft_hint_words:
+            score += 4
+        elif word and word in suggestion_words:
+            score += 1
+        if word and word == current_word:
+            score += 2
+        ranked.append((score, -index, item))
+    if ranked:
+        _score, neg_index, item = max(ranked, key=lambda candidate: candidate[:2])
+        used_indexes.add(-neg_index)
+        return item
+
+    fallback_word = next(iter(draft_hint_words), "") or next(
+        iter(suggestion_words),
+        "",
+    ) or current_word
+    return {
+        "action": "",
+        "word": fallback_word,
+        "code": code or (
+            str(current.get("code") or "").strip().lower()
+            if isinstance(current, dict)
+            else ""
+        ),
+    }
+
+
+def _format_submit_conflict_failure(data: Dict) -> str:
+    """Explain structured submit conflicts and render record-bound recovery."""
+    conflicts = data.get("conflicts")
+    if not isinstance(conflicts, list) or not conflicts:
+        return ""
+    snapshot_items = _submit_conflict_snapshot_items(data)
+    used_indexes: set[int] = set()
+    message = str(data.get("message") or "批次中存在未解决的冲突，无法提交").strip()
+    lines = [f"提交失败：{message}", "冲突详情："]
+    for index, conflict in enumerate(conflicts, start=1):
+        if not isinstance(conflict, dict):
+            lines.append(f"{index}. 服务端返回了一条无法识别的冲突记录。")
+            continue
+        item = _submit_conflict_draft_item(conflict, snapshot_items, used_indexes)
+        action = str(item.get("action") or "").strip()
+        word = str(item.get("word") or "").strip()
+        code = str(item.get("code") or conflict.get("code") or "").strip().lower()
+        current = conflict.get("currentPhrase")
+        current_word = (
+            str(current.get("word") or "").strip()
+            if isinstance(current, dict)
+            else ""
+        )
+        current_code = (
+            str(current.get("code") or "").strip().lower()
+            if isinstance(current, dict)
+            else ""
+        )
+        old_word = str(item.get("oldWord") or "").strip()
+
+        def append_suggestion(
+            command: str,
+            *,
+            words: Tuple[str, ...],
+            guidance: str = "",
+        ) -> bool:
+            suggestion = render_executable_suggestion(command, words=words)
+            if not suggestion:
+                return False
+            if guidance:
+                lines.append(f"   处理建议：{guidance}")
+            lines.append(suggestion)
+            return True
+
+        same_word_code_items = [
+            snapshot_item
+            for snapshot_item in snapshot_items
+            if str(snapshot_item.get("word") or "").strip() == word
+            and str(snapshot_item.get("code") or "").strip().lower() == code
+        ]
+        exact_create = bool(
+            action == "Create"
+            and word
+            and code
+            and current_word == word
+            and current_code == code
+        )
+        if exact_create:
+            lines.append(
+                f"{index}. 草稿新增「{word}」→ {code}；"
+                f"词库中已存在完全相同的「{current_word}」→ {current_code}，不能重复新增。"
+            )
+            append_suggestion(
+                f"删除草稿里的「{word}」",
+                words=(word,),
+                guidance="删除这条重复草稿项。",
+            )
+            continue
+
+        if (
+            action == "Change"
+            and word
+            and code
+            and current_word == word
+            and current_code == code
+        ):
+            origin = f"把「{old_word}」改为" if old_word else "修改为"
+            lines.append(
+                f"{index}. 草稿{origin}「{word}」→ {code}；"
+                f"词库中的修改结果「{current_word}」→ {current_code} 已经存在，"
+                "这条草稿修改已无须重复提交。"
+            )
+            append_suggestion(
+                f"删除草稿里的「{word}」",
+                words=(word,),
+                guidance="删除这条已经落地的草稿修改。",
+            )
+            continue
+
+        if (
+            action == "Create"
+            and word
+            and code
+            and not current_word
+            and len(same_word_code_items) > 1
+        ):
+            lines.append(
+                f"{index}. 草稿新增「{word}」→ {code}；"
+                f"同一批次里已有相同的新增项「{word}」→ {code}，不能重复保留。"
+            )
+            append_suggestion(
+                f"删除草稿里的「{word}」",
+                words=(word,),
+                guidance="删除重复的草稿项。",
+            )
+            continue
+
+        occupied_by_other = bool(
+            action == "Create"
+            and word
+            and code
+            and current_word
+            and current_word != word
+            and current_code == code
+        )
+        if occupied_by_other:
+            lines.append(
+                f"{index}. 草稿新增「{word}」→ {code}；"
+                f"词库中的「{current_word}」→ {current_code} 现在占用这个编码位置。"
+            )
+            rendered_option = False
+            for server_suggestion in conflict.get("suggestions", []):
+                if not isinstance(server_suggestion, dict):
+                    continue
+                suggestion_action = str(server_suggestion.get("action") or "").strip()
+                suggestion_word = str(server_suggestion.get("word") or "").strip()
+                to_code = str(server_suggestion.get("toCode") or "").strip().lower()
+                if not suggestion_word or not to_code or to_code == code:
+                    continue
+                if suggestion_action == "Move" and suggestion_word == current_word:
+                    rendered_option = append_suggestion(
+                        f"把「{current_word}」调整到 {to_code}",
+                        words=(current_word,),
+                        guidance=(
+                            "顺延当前占位词，或改用服务端给出的其他编码。"
+                            if not rendered_option
+                            else ""
+                        ),
+                    ) or rendered_option
+                elif suggestion_action == "Adjust" and suggestion_word == word:
+                    rendered_option = append_suggestion(
+                        f"删除草稿里的「{word}」，再以编码 {to_code} 添加「{word}」",
+                        words=(word,),
+                        guidance=(
+                            "改用服务端给出的其他编码，或顺延当前占位词。"
+                            if not rendered_option
+                            else ""
+                        ),
+                    ) or rendered_option
+            if not rendered_option:
+                append_suggestion(
+                    f"加词 {word}",
+                    words=(word,),
+                    guidance="重新审词并选择新的空位编码；服务端没有返回可安全照抄的调码位置。",
+                )
+            continue
+
+        if action == "Change" and word and code:
+            if old_word:
+                current_fact = (
+                    f"；该编码位置现在是「{current_word}」→ {current_code}"
+                    if current_word and current_code
+                    else ""
+                )
+                lines.append(
+                    f"{index}. 草稿把「{old_word}」修改为「{word}」→ {code}；"
+                    f"词库中已找不到原目标「{old_word}」→ {code}"
+                    f"{current_fact}，目标已经变化。"
+                )
+            else:
+                lines.append(
+                    f"{index}. 草稿修改「{word}」→ {code}；"
+                    "这条草稿没有记录原词，无法确认要修改的目标。"
+                )
+            append_suggestion(
+                f"加词 {word}",
+                words=(word,),
+                guidance="按当前词库状态重新审词。",
+            )
+            continue
+
+        if (
+            action == "Delete"
+            and word
+            and code
+            and (not current_word or current_word != word or current_code != code)
+        ):
+            current_fact = (
+                f"；该编码位置现在是「{current_word}」→ {current_code}"
+                if current_word and current_code
+                else ""
+            )
+            lines.append(
+                f"{index}. 草稿删除「{word}」→ {code}；"
+                f"词库中已找不到要删除的「{word}」→ {code}"
+                f"{current_fact}，删除目标已经变化。"
+            )
+            append_suggestion(
+                f"加词 {word}",
+                words=(word,),
+                guidance="按当前词库状态重新审词。",
+            )
+            continue
+
+        action_label = {
+            "Create": "新增",
+            "Change": "修改",
+            "Delete": "删除",
+        }.get(action, "操作")
+        word_label = f"「{word}」" if word else "（词条未随冲突返回）"
+        code_label = code or "（编码未随冲突返回）"
+        lines.append(
+            f"{index}. 草稿{action_label}{word_label}→ {code_label}；"
+            "服务端返回了暂时无法进一步识别的冲突，未擅自推断原因。"
+        )
+        if word:
+            append_suggestion(
+                f"加词 {word}",
+                words=(word,),
+                guidance="只按这条草稿记录重新审词，不猜测冲突原因。",
+            )
+    return _assert_plain_user_facing_reply("\n".join(lines))
+
+
 def _format_pending_item_line(item: Any, *, include_id: bool = False) -> str:
     """Render one word/code fact from a trusted pending-record item."""
     if not isinstance(item, dict):

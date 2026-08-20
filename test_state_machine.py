@@ -16620,6 +16620,287 @@ def test_s28_rule_question_fallback_uses_encode_facts():
     asyncio.run(_run())
 
 
+def test_submit_conflict_failure_verbalizes_production_record_and_resolution():
+    """A structured submit conflict must not collapse to the server headline."""
+    print("\n🧪 submit conflict verbalizes production record and resolution")
+
+    async def _run():
+        server_payload = {
+            "success": False,
+            "message": "批次中存在未解决的冲突，无法提交",
+            "conflicts": [{
+                "hasConflict": True,
+                "code": "hhhooo",
+                "currentPhrase": {
+                    "id": 282760,
+                    "word": "呵呵呵",
+                    "code": "hhhooo",
+                    "weight": 100,
+                    "userId": 23,
+                    "type": "Phrase",
+                },
+                "impact": '词条 "呵呵呵" 与编码 "hhhooo" 的组合已存在，不能重复添加',
+                "suggestions": [{
+                    "action": "Cancel",
+                    "word": "呵呵呵",
+                    "reason": "该词条和编码的组合已在字典中存在",
+                }],
+            }],
+            "batchId": "bc32871a-1111-2222-3333-444444444444",
+            "batchUrl": "https://keytao.rea.ink/batch/bc32871a-1111-2222-3333-444444444444",
+            # The submit tool binds the raw response to the audited draft snapshot.
+            "snapshotItems": [
+                {
+                    "id": 9001,
+                    "action": "Create",
+                    "word": "呵呵呵",
+                    "code": "hhhooo",
+                    "type": "Phrase",
+                },
+                {
+                    "id": 9002,
+                    "action": "Create",
+                    "word": "幂等",
+                    "code": "mkdr",
+                    "type": "Phrase",
+                },
+            ],
+        }
+        tool_call = AsyncMock(return_value=json.dumps(server_payload, ensure_ascii=False))
+        with patch.object(chat_commands_module, "call_tool_function", tool_call):
+            result = await chat_commands_module._perform_submit_current_draft(
+                "qq",
+                "conflict-owner",
+            )
+
+        reply = result.text
+        check("submit conflict names the draft word", "呵呵呵" in reply)
+        check("submit conflict names the draft code", "hhhooo" in reply)
+        check(
+            "submit conflict explains the live dictionary fact",
+            "词库中已存在" in reply and "不能重复" in reply,
+        )
+        check(
+            "submit conflict renders the exact draft-remove command",
+            "删除草稿里的「呵呵呵」" in reply,
+        )
+        check(
+            "submit conflict keeps a record-bound rendered suggestion",
+            re.search(r"(?m)^- [「“『].*呵呵呵", reply) is not None,
+        )
+        check("submit conflict keeps the platform link", server_payload["batchUrl"] in reply)
+        check("submit conflict drops flippant copy", "qwq" not in reply)
+        check(
+            "submit conflict is not a raw message-only relay",
+            reply.strip() != "提交失败：批次中存在未解决的冲突，无法提交",
+        )
+
+    asyncio.run(_run())
+
+
+def test_submit_conflict_variants_render_specific_facts_and_actions():
+    """Every conflictDetector shape gets a fact-matched executable next step."""
+    print("\n🧪 submit conflict variants render specific facts and actions")
+
+    async def _run():
+        variants = {
+            "success": False,
+            "message": "批次中存在未解决的冲突，无法提交",
+            "conflicts": [
+                {
+                    "hasConflict": True,
+                    "code": "slot",
+                    "currentPhrase": {
+                        "id": 11,
+                        "word": "占位词",
+                        "code": "slot",
+                        "weight": 100,
+                        "userId": 1,
+                        "type": "Phrase",
+                    },
+                    "suggestions": [
+                        {
+                            "action": "Move",
+                            "word": "占位词",
+                            "fromCode": "slot",
+                            "toCode": "sloto",
+                            "reason": "移动现有词",
+                        },
+                        {
+                            "action": "Adjust",
+                            "word": "新词",
+                            "fromCode": "slot",
+                            "toCode": "sloti",
+                            "reason": "改用次选编码",
+                        },
+                    ],
+                },
+                {
+                    "hasConflict": True,
+                    "code": "change",
+                    "currentPhrase": {
+                        "id": 13,
+                        "word": "后来词",
+                        "code": "change",
+                        "weight": 100,
+                        "userId": 1,
+                        "type": "Phrase",
+                    },
+                    "suggestions": [{
+                        "action": "Cancel",
+                        "word": "新目标",
+                        "reason": "旧词不存在，请检查编码和旧词是否正确",
+                    }],
+                },
+                {
+                    "hasConflict": True,
+                    "code": "delete",
+                    "currentPhrase": {
+                        "id": 14,
+                        "word": "替代词",
+                        "code": "delete",
+                        "weight": 100,
+                        "userId": 1,
+                        "type": "Phrase",
+                    },
+                    "suggestions": [{
+                        "action": "Cancel",
+                        "word": "待删词",
+                        "reason": "该词条在字典中不存在",
+                    }],
+                },
+                {
+                    "hasConflict": True,
+                    "code": "landed",
+                    "currentPhrase": {
+                        "id": 12,
+                        "word": "已改词",
+                        "code": "landed",
+                        "weight": 100,
+                        "userId": 1,
+                        "type": "Phrase",
+                    },
+                    "suggestions": [{
+                        "action": "Cancel",
+                        "word": "已改词",
+                        "reason": "目标词已存在该编码下，会产生重复",
+                    }],
+                },
+                {
+                    "hasConflict": True,
+                    "code": "dupe",
+                    "suggestions": [{
+                        "action": "Cancel",
+                        "word": "重复词",
+                        "reason": "批次内已存在相同的词条",
+                    }],
+                },
+                {
+                    "hasConflict": True,
+                    "code": "mystery",
+                    "suggestions": [{
+                        "action": "Mystery",
+                        "word": "未知词",
+                        "reason": "未来服务端形态",
+                    }],
+                },
+            ],
+            "snapshotItems": [
+                {"action": "Create", "word": "新词", "code": "slot"},
+                {"action": "Change", "oldWord": "原词", "word": "新目标", "code": "change"},
+                {"action": "Delete", "word": "待删词", "code": "delete"},
+                {"action": "Change", "oldWord": "旧词", "word": "已改词", "code": "landed"},
+                {"action": "Create", "word": "重复词", "code": "dupe"},
+                {"action": "Create", "word": "重复词", "code": "dupe"},
+                {"action": "Create", "word": "未知词", "code": "mystery"},
+            ],
+            "batchUrl": "https://keytao.rea.ink/batch/conflict-variants",
+        }
+        state = PendingToolConfirm(
+            function_name="keytao_submit_batch",
+            args={"batch_id": "conflict-variants"},
+            confirmation_source="local_preview",
+        )
+        with patch.object(
+            chat_commands_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(variants, ensure_ascii=False)),
+        ):
+            reply = await chat_commands_module._execute_confirmed_tool(
+                state,
+                "qq",
+                "conflict-owner",
+            )
+
+        for word, code in (
+            ("新词", "slot"),
+            ("新目标", "change"),
+            ("待删词", "delete"),
+            ("已改词", "landed"),
+            ("重复词", "dupe"),
+            ("未知词", "mystery"),
+        ):
+            check(f"conflict reply includes {word}", word in reply)
+            check(f"conflict reply includes {code}", code in reply)
+
+        check(
+            "occupied slot names both draft and dictionary facts",
+            "草稿新增「新词」→ slot" in reply
+            and "词库中的「占位词」→ slot" in reply
+            and "占用" in reply,
+        )
+        check(
+            "occupied slot offers the structured recode option",
+            "删除草稿里的「新词」" in reply and "sloti" in reply,
+        )
+        check(
+            "occupied slot offers the structured shift option",
+            "把「占位词」调整到 sloto" in reply,
+        )
+        check(
+            "changed target explains the missing old dictionary fact",
+            "原目标「原词」→ change" in reply
+            and "现在是「后来词」→ change" in reply
+            and "目标已经变化" in reply,
+        )
+        check(
+            "changed target reruns review for the bound word",
+            "加词 新目标" in reply,
+        )
+        check(
+            "missing delete target is explained specifically",
+            "词库中已找不到要删除的「待删词」→ delete" in reply
+            and "现在是「替代词」→ delete" in reply,
+        )
+        check(
+            "missing delete target reruns review",
+            "加词 待删词" in reply,
+        )
+        check(
+            "already-landed change removes the stale draft item",
+            "修改结果「已改词」→ landed 已经存在" in reply
+            and "删除草稿里的「已改词」" in reply,
+        )
+        check(
+            "batch duplicate is distinguished from a dictionary duplicate",
+            "同一批次里已有相同的新增项「重复词」→ dupe" in reply,
+        )
+        check(
+            "unknown shape stays honest and record-bound",
+            "草稿新增「未知词」→ mystery" in reply
+            and "无法进一步识别" in reply
+            and "加词 未知词" in reply,
+        )
+        check(
+            "every conflict has a rendered executable suggestion",
+            len(re.findall(r"(?m)^- [「“『]", reply)) >= len(variants["conflicts"]),
+        )
+        check("structured conflict reply never falls back to view draft", "查看草稿" not in reply)
+        check("structured conflict reply preserves its link", variants["batchUrl"] in reply)
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("State Machine & Core Logic Tests")
@@ -16875,6 +17156,8 @@ if __name__ == "__main__":
     test_s28_full_add_replaces_live_candidate_and_fresh_state_keeps_readings()
     test_s28_invalid_code_copy_and_authoritative_url_guard_are_compact()
     test_s28_rule_question_fallback_uses_encode_facts()
+    test_submit_conflict_failure_verbalizes_production_record_and_resolution()
+    test_submit_conflict_variants_render_specific_facts_and_actions()
 
     print("\n" + "=" * 60)
     total = passed + failed
