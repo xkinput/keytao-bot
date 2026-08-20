@@ -6722,6 +6722,40 @@ def test_code_chain_reorder_command_is_structural_and_code_bound():
     )
 
 
+def test_explicit_word_list_reorder_command_is_structural_and_ordered():
+    """Whitespace/newline/dunhao/hyphen lists bind every literal word in order."""
+    print("\n🧪 explicit word-list reorder command is structural and ordered")
+    parser = getattr(chat_routing_module, "_parse_word_list_reorder_command", None)
+    check("word-list reorder parser exists", parser is not None)
+    if parser is None:
+        return
+
+    accepted = {
+        "重新排序下\n米等\n幂等\n迷瞪": ("米等", "幂等", "迷瞪"),
+        "排一下 米等、幂等-迷瞪": ("米等", "幂等", "迷瞪"),
+        "米等 幂等 迷瞪 按优先级排": ("米等", "幂等", "迷瞪"),
+        "米等、幂等 按优先级排一下": ("米等", "幂等"),
+    }
+    for message, words in accepted.items():
+        parsed = parser(message)
+        check(
+            f"accepted word-list reorder preserves order: {message!r}",
+            parsed is not None and parsed.words == words,
+        )
+
+    for message in (
+        "重新排序下米等",
+        "重新排序下 mkdr",
+        "不要重新排序 米等 幂等",
+        "他说重新排序下 米等 幂等",
+        "重新排序下 米等 幂等吗？",
+    ):
+        check(
+            f"unsafe or incomplete word-list reorder is rejected: {message!r}",
+            parser(message) is None,
+        )
+
+
 def test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation():
     """A code-bound reorder previews, stores, renders, then writes one exact plan."""
     print("\n🧪 code-chain reorder locks one exact weight plan")
@@ -6790,9 +6824,21 @@ def test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation():
                     "items": ranking["proposedOrder"],
                 }, ensure_ascii=False)
             if tool_name == "keytao_list_draft_items":
+                if not any(
+                    name == "keytao_batch_add_to_draft" and args.get("confirmed")
+                    for name, args in calls
+                ):
+                    return json.dumps({
+                        "success": True,
+                        "batchId": "chain-plan-batch",
+                        "contentVersion": 4,
+                        "count": 0,
+                        "items": [],
+                    }, ensure_ascii=False)
                 return json.dumps({
                     "success": True,
                     "batchId": "chain-plan-batch",
+                    "contentVersion": 5,
                     "count": 2,
                     "items": ranking["proposedOrder"],
                 }, ensure_ascii=False)
@@ -6845,9 +6891,9 @@ def test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation():
             )
             check(
                 "prompt phase is read-only",
-                len(calls) == 2
-                and calls[1][1].get("preview_only") is True
-                and calls[1][1].get("confirmed") is not True,
+                len(calls) == 3
+                and calls[2][1].get("preview_only") is True
+                and calls[2][1].get("confirmed") is not True,
             )
 
             completed = await chat_commands_module._execute_confirmed_tool(
@@ -6891,6 +6937,561 @@ def test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation():
     asyncio.run(_run())
 
 
+def test_incident_code_chain_reorder_merges_live_and_current_draft():
+    """The verbatim D1 command ranks the current draft projection with live rows."""
+    print("\n🧪 D1 code-chain reorder merges live and current draft")
+
+    async def _run():
+        store = MemoryConversationStateStore()
+        calls = []
+
+        async def rank_merged(entries, **_kwargs):
+            normalized = [
+                (entry.get("word"), entry.get("code"), entry.get("weight"))
+                for entry in entries
+            ]
+            check(
+                "ranking receives live 米等 plus draft 幂等",
+                normalized == [("米等", "mkdr", 100), ("幂等", "mkdr", 101)],
+            )
+            return {
+                "status": "reorder",
+                "reason": "comparison_edges",
+                "currentOrder": list(entries),
+                "proposedOrder": [entries[1], entries[0]],
+                "comparisons": [{"summary": "幂等的现代技术语料明显更多"}],
+                "evidenceLines": [
+                    "「米等」：整词语料频次低",
+                    "「幂等」：现代技术语料频次高",
+                ],
+            }
+
+        async def fake_call(tool_name, arguments, *_args, **_kwargs):
+            calls.append((tool_name, copy.deepcopy(arguments)))
+            if tool_name == "keytao_lookup_by_code":
+                return json.dumps({
+                    "success": True,
+                    "code": "mkdr",
+                    "phrases": [{
+                        "word": "米等", "code": "mkdr", "type": "Phrase", "weight": 100,
+                    }],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_list_draft_items":
+                return json.dumps({
+                    "success": True,
+                    "batchId": "bc32871a",
+                    "contentVersion": 5,
+                    "items": [{
+                        "id": 101,
+                        "action": "Create",
+                        "word": "幂等",
+                        "code": "mkdr",
+                        "type": "Phrase",
+                        "weight": 101,
+                    }],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_shift_phrase_code":
+                check(
+                    "merged commonness order is delegated to generalized shift machinery",
+                    arguments.get("ordered_words") == ["幂等", "米等"]
+                    and arguments.get("target_code") == "mkdr",
+                )
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "bc32871a",
+                    "contentVersion": 5,
+                    "planDigest": "b" * 64,
+                    "shiftPlan": {
+                        "scope": "same_code",
+                        "items": [{
+                            "action": "Change", "old_word": "米等", "word": "米等",
+                            "code": "mkdr", "type": "Phrase", "weight": 101,
+                        }],
+                        "draftUpdates": [{
+                            "id": 101, "word": "幂等", "code": "mkdr",
+                            "fromWeight": 101, "toWeight": 100,
+                        }],
+                        "currentState": [
+                            {"word": "米等", "code": "mkdr", "weight": 100, "source": "live"},
+                            {"word": "幂等", "code": "mkdr", "weight": 101, "source": "draft"},
+                        ],
+                        "proposedState": [
+                            {"word": "幂等", "code": "mkdr", "weight": 100},
+                            {"word": "米等", "code": "mkdr", "weight": 101},
+                        ],
+                        "listedWords": [],
+                        "evidenceLines": ["幂等的现代技术语料明显更多"],
+                    },
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        intent = MessageCommandIntent(
+            intent="code_chain_reorder",
+            confidence=1.0,
+            requested_code="mkdr",
+        )
+        with (
+            patch.object(chat_commands_module, "conversation_state_store", store),
+            patch.object(chat_commands_module, "call_tool_function", side_effect=fake_call),
+            patch.object(
+                chat_commands_module.keytao_review,
+                "rank_code_chain_by_commonness",
+                side_effect=rank_merged,
+            ),
+        ):
+            response = await chat_commands_module._try_handle_draft_management_command(
+                "重新排序下mkdr 编码链这几个词按优先级",
+                "qq",
+                "rea",
+                command_intent=intent,
+            )
+
+        check(
+            "D1 renders a merged current-to-proposed plan with one confirmation",
+            response is not None
+            and "当前状态" in response
+            and "米等：mkdr / 100（词库）" in response
+            and "幂等：mkdr / 101（草稿）" in response
+            and "建议状态" in response
+            and "幂等：mkdr / 100" in response
+            and "米等：mkdr / 101" in response
+            and response.count(pending_confirmation_copy()) == 1,
+        )
+        check(
+            "D1 reads both server views before planning",
+            [name for name, _arguments in calls[:2]]
+            == ["keytao_lookup_by_code", "keytao_list_draft_items"],
+        )
+
+    asyncio.run(_run())
+
+
+def test_incident_word_list_reorder_resolves_every_word_and_cross_chain_scope():
+    """The verbatim D2 command resolves live+draft rows and plans one prefix ring."""
+    print("\n🧪 D2 word-list reorder resolves every word across one prefix chain")
+
+    async def _run():
+        store = MemoryConversationStateStore()
+        calls = []
+
+        async def fake_rank(entries, **kwargs):
+            check(
+                "D2 passes the listed order as an evidence-tie signal",
+                kwargs.get("tie_break_words") == ("米等", "幂等", "迷瞪"),
+            )
+            by_word = {entry["word"]: entry for entry in entries}
+            return {
+                "status": "reorder",
+                "currentOrder": list(entries),
+                "proposedOrder": [by_word["幂等"], by_word["米等"], by_word["迷瞪"]],
+                "comparisons": [{"summary": "幂等 > 米等 > 迷瞪"}],
+                "evidenceLines": ["幂等的现代语料证据最强", "迷瞪的整词语料最少"],
+            }
+
+        async def fake_call(tool_name, arguments, *_args, **_kwargs):
+            calls.append((tool_name, copy.deepcopy(arguments)))
+            if tool_name == "keytao_lookup_by_words_batch":
+                return json.dumps({
+                    "success": True,
+                    "count": 3,
+                    "results": [
+                        {"word": "米等", "phrases": [{"word": "米等", "code": "mkdr", "type": "Phrase", "weight": 100}]},
+                        {"word": "幂等", "phrases": []},
+                        {"word": "迷瞪", "phrases": [{"word": "迷瞪", "code": "mkdro", "type": "Phrase", "weight": 100}]},
+                    ],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_list_draft_items":
+                return json.dumps({
+                    "success": True,
+                    "batchId": "bc32871a",
+                    "contentVersion": 5,
+                    "items": [{
+                        "id": 101, "action": "Create", "word": "幂等",
+                        "code": "mkdr", "type": "Phrase", "weight": 101,
+                    }],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_encode":
+                return json.dumps({
+                    "success": True,
+                    "word": arguments["word"],
+                    "code": "mkdr",
+                    "candidateCodes": ["mkdr", "mkdro", "mkdrol"],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_shift_phrase_code":
+                check(
+                    "D2 delegates the complete N-word order to shift machinery",
+                    arguments.get("ordered_words") == ["幂等", "米等", "迷瞪"]
+                    and arguments.get("listed_words") == ["米等", "幂等", "迷瞪"],
+                )
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "bc32871a",
+                    "contentVersion": 5,
+                    "planDigest": "c" * 64,
+                    "warningDigest": "d" * 64,
+                    "warnings": [{
+                        "warningType": "skipped_candidate_slot",
+                        "message": "编码链中更短候选 mkdr 仍是空位",
+                        "skippedCode": "mkdr",
+                        "skippedCodes": ["mkdr"],
+                        "item": {"word": "迷瞪", "code": "mkdrol"},
+                    }],
+                    "shiftPlan": {
+                        "scope": "prefix_chain",
+                        "items": [
+                            {"action": "Delete", "word": "米等", "code": "mkdr", "type": "Phrase"},
+                            {"action": "Delete", "word": "迷瞪", "code": "mkdro", "type": "Phrase"},
+                            {"action": "Create", "word": "米等", "code": "mkdro", "type": "Phrase", "weight": 100},
+                            {"action": "Create", "word": "迷瞪", "code": "mkdrol", "type": "Phrase", "weight": 100},
+                        ],
+                        "currentState": [
+                            {"word": "米等", "code": "mkdr", "weight": 100, "source": "live"},
+                            {"word": "幂等", "code": "mkdr", "weight": 101, "source": "draft"},
+                            {"word": "迷瞪", "code": "mkdro", "weight": 100, "source": "live"},
+                        ],
+                        "proposedState": [
+                            {"word": "幂等", "code": "mkdr", "weight": 100},
+                            {"word": "米等", "code": "mkdro", "weight": 100},
+                            {"word": "迷瞪", "code": "mkdrol", "weight": 100},
+                        ],
+                        "listedWords": ["米等", "幂等", "迷瞪"],
+                        "evidenceLines": ["幂等 > 米等 > 迷瞪"],
+                    },
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        intent = MessageCommandIntent(
+            intent="word_list_reorder",
+            confidence=1.0,
+            keep_words=("米等", "幂等", "迷瞪"),
+        )
+        with (
+            patch.object(chat_commands_module, "conversation_state_store", store),
+            patch.object(chat_commands_module, "call_tool_function", side_effect=fake_call),
+            patch.object(
+                chat_commands_module.keytao_review,
+                "rank_code_chain_by_commonness",
+                side_effect=fake_rank,
+            ),
+        ):
+            response = await chat_commands_module._try_handle_draft_management_command(
+                "重新排序下\n米等\n幂等\n迷瞪",
+                "qq",
+                "rea",
+                command_intent=intent,
+            )
+
+        check(
+            "D2 renders cross-chain code+weight moves, evidence, and list divergence",
+            response is not None
+            and "当前状态" in response
+            and "建议状态" in response
+            and "幂等：mkdr / 100" in response
+            and "米等：mkdro / 100" in response
+            and "迷瞪：mkdrol / 100" in response
+            and "你列的顺序与常用度证据不一致：" in response
+            and "完整计划会由「幂等」占用 mkdr，不会留下空位" in response
+            and "仍是空位" not in response
+            and response.count(pending_confirmation_copy()) == 1,
+        )
+        encode_words = [
+            arguments["word"]
+            for name, arguments in calls
+            if name == "keytao_encode"
+        ]
+        check("D2 resolves every listed word through encode", encode_words == ["米等", "幂等", "迷瞪"])
+
+    asyncio.run(_run())
+
+
+def test_word_list_prefix_scope_accepts_divergent_candidate_tails():
+    """A prefix family is shared even when each word has a different long tail."""
+    print("\n🧪 word-list prefix scope accepts divergent candidate tails")
+
+    entries = [
+        {"word": "米等", "code": "mkdrou", "type": "Phrase", "weight": 100},
+        {"word": "迷瞪", "code": "mkdroi", "type": "Phrase", "weight": 100},
+    ]
+    candidates = {
+        "米等": ("mkdr", "mkdro", "mkdrou"),
+        "迷瞪": ("mkdr", "mkdro", "mkdroi"),
+    }
+    check(
+        "divergent tails resolve to the shared shortest family root",
+        chat_commands_module._shared_candidate_chain_root(entries, candidates) == "mkdr",
+    )
+    unrelated = {
+        **candidates,
+        "迷瞪": ("zmdr", "zmdro", "zmdroi"),
+    }
+    check(
+        "unrelated candidate chains remain outside the prefix scope",
+        chat_commands_module._shared_candidate_chain_root(entries, unrelated) is None,
+    )
+
+
+def test_ranked_reorder_planner_accepts_divergent_current_tails():
+    """Server re-resolution applies the same own-chain prefix-family rule."""
+    print("\n🧪 ranked reorder planner accepts divergent current tails")
+
+    async def _run():
+        candidates = {
+            "米等": ["mkdr", "mkdro", "mkdrou"],
+            "迷瞪": ["mkdr", "mkdro", "mkdroi"],
+        }
+
+        async def fake_encode(word, _requested_code=None):
+            return {"success": True, "word": word, "candidateCodes": candidates[word]}
+
+        async def fake_words(_words):
+            return {
+                "success": True,
+                "results": [
+                    {"word": "米等", "phrases": [{
+                        "word": "米等", "code": "mkdrou", "type": "Phrase", "weight": 100,
+                    }]},
+                    {"word": "迷瞪", "phrases": [{
+                        "word": "迷瞪", "code": "mkdroi", "type": "Phrase", "weight": 100,
+                    }]},
+                ],
+            }
+
+        async def fake_codes(codes):
+            return {
+                "success": True,
+                "results": [{"code": code, "phrases": []} for code in codes],
+            }
+
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(
+                _draft_tools,
+                "keytao_list_draft_items",
+                AsyncMock(return_value={
+                    "success": True, "batchId": "", "contentVersion": 0, "items": [],
+                }),
+            ),
+        ):
+            plan = await _draft_tools._prepare_ranked_reorder_plan(
+                "qq", "rea", ["米等", "迷瞪"], "mkdr",
+            )
+
+        check(
+            "planner promotes divergent tails through each word's own chain",
+            plan.get("success") is True
+            and [
+                (entry["word"], entry["code"])
+                for entry in plan.get("proposedState", [])
+            ] == [("米等", "mkdr"), ("迷瞪", "mkdro")],
+        )
+
+    asyncio.run(_run())
+
+
+def test_ranked_reorder_planner_applies_draft_deletes_to_chain_occupancy():
+    """A live occupant already deleted in the draft must not be displaced again."""
+    print("\n🧪 ranked reorder planner merges draft deletes into code occupancy")
+
+    async def _run():
+        candidates = {
+            "甲词": ["abcd", "abcdo", "abcdou"],
+            "乙词": ["abcd", "abcdo", "abcdou"],
+        }
+
+        async def fake_encode(word, _requested_code=None):
+            return {"success": True, "word": word, "candidateCodes": candidates[word]}
+
+        async def fake_words(_words):
+            return {
+                "success": True,
+                "results": [
+                    {"word": "甲词", "phrases": [{
+                        "word": "甲词", "code": "abcd", "type": "Phrase", "weight": 100,
+                    }]},
+                    {"word": "乙词", "phrases": [{
+                        "word": "乙词", "code": "abcdou", "type": "Phrase", "weight": 100,
+                    }]},
+                ],
+            }
+
+        async def fake_codes(codes):
+            rows = {
+                "abcd": [{"word": "甲词", "code": "abcd", "type": "Phrase", "weight": 100}],
+                "abcdo": [{"word": "占位词", "code": "abcdo", "type": "Phrase", "weight": 100}],
+            }
+            return {
+                "success": True,
+                "results": [{"code": code, "phrases": rows.get(code, [])} for code in codes],
+            }
+
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(
+                _draft_tools,
+                "keytao_list_draft_items",
+                AsyncMock(return_value={
+                    "success": True,
+                    "batchId": "draft-merge",
+                    "contentVersion": 1,
+                    "items": [{
+                        "id": 303,
+                        "action": "Delete",
+                        "word": "占位词",
+                        "code": "abcdo",
+                        "type": "Phrase",
+                        "weight": None,
+                    }],
+                }),
+            ),
+        ):
+            plan = await _draft_tools._prepare_ranked_reorder_plan(
+                "qq", "rea", ["甲词", "乙词"], "abcd",
+            )
+
+        check(
+            "draft-deleted occupant is absent from the shift plan",
+            plan.get("success") is True
+            and not any(
+                item.get("word") == "占位词"
+                for item in plan.get("items", [])
+            ),
+        )
+
+    asyncio.run(_run())
+
+
+def test_word_list_commonness_uses_list_order_only_for_evidence_ties():
+    """Hard comparison edges win; the user's list breaks only a supported tie."""
+    print("\n🧪 word-list commonness uses listed order only for evidence ties")
+
+    async def _run():
+        entries = [
+            {"word": "米等", "code": "mkdr", "type": "Phrase", "weight": 100},
+            {"word": "迷瞪", "code": "mkdro", "type": "Phrase", "weight": 100},
+            {"word": "幂等", "code": "mkdr", "type": "Phrase", "weight": 101},
+        ]
+
+        async def compare(front, behind):
+            if (front, behind) in {("米等", "迷瞪"), ("米等", "幂等")}:
+                return {
+                    "success": True,
+                    "verdict": "behind_more_common",
+                    "summary": f"{behind} 的证据强于 {front}",
+                    "front": {"reference": {"attested": False}},
+                    "behind": {
+                        "reference": {
+                            "attested": True,
+                            "dictionaryPresenceCount": 2,
+                        }
+                    },
+                }
+            check("only the expected weak pair is tied", (front, behind) == ("迷瞪", "幂等"))
+            return {
+                "success": True,
+                "verdict": "not_enough_evidence",
+                "summary": "迷瞪与幂等的离线信号不足以拉开差距",
+                "front": {
+                    "reference": {
+                        "attested": True,
+                        "corpusFrequency": 5,
+                        "dictionaryPresenceCount": 3,
+                    }
+                },
+                "behind": {
+                    "reference": {
+                        "attested": True,
+                        "dictionaryPresenceCount": 2,
+                    }
+                },
+            }
+
+        with patch.object(
+            keytao_review_module,
+            "compare_word_commonness",
+            side_effect=compare,
+        ):
+            ranking = await keytao_review_module.rank_code_chain_by_commonness(
+                entries,
+                tie_break_words=("米等", "幂等", "迷瞪"),
+            )
+
+        check("hard evidence still moves 米等 behind both words", ranking.get("status") == "reorder")
+        check(
+            "the listed order breaks only the 幂等/迷瞪 evidence tie",
+            [entry["word"] for entry in ranking.get("proposedOrder", [])]
+            == ["幂等", "迷瞪", "米等"],
+        )
+        check(
+            "the tie basis remains visible",
+            any(
+                comparison.get("decisionReason") == "listed_order_tiebreak"
+                and "保留你列出的相对顺序" in comparison.get("summary", "")
+                for comparison in ranking.get("comparisons", [])
+            ),
+        )
+
+    asyncio.run(_run())
+
+
+def test_word_list_order_never_overrides_conflicting_semantic_evidence():
+    """The user's listed order is not authority when semantic signals conflict."""
+    print("\n🧪 word-list order does not override conflicting semantic evidence")
+
+    async def _run():
+        entries = [
+            {"word": "甲词", "code": "abcd", "type": "Phrase", "weight": 100},
+            {"word": "乙词", "code": "abcdo", "type": "Phrase", "weight": 100},
+        ]
+        comparison = {
+            "success": True,
+            "verdict": "close",
+            "front": {"reference": {"attested": True, "dictionaryPresenceCount": 1}},
+            "behind": {"reference": {"attested": True, "dictionaryPresenceCount": 1}},
+        }
+
+        def semantic_override(_review, pair, current):
+            return {
+                **current,
+                "success": True,
+                "verdict": "front_more_common",
+                "decisionReason": "modern_semantic_vs_dictionary_dominated",
+                "frontWord": pair["newWord"],
+                "behindWord": pair["occupantWord"],
+            }
+
+        with (
+            patch.object(
+                keytao_review_module,
+                "compare_word_commonness",
+                AsyncMock(return_value=comparison),
+            ),
+            patch.object(
+                keytao_review_module,
+                "_modern_semantic_commonness_override",
+                side_effect=semantic_override,
+            ),
+        ):
+            ranking = await keytao_review_module.rank_code_chain_by_commonness(
+                entries,
+                semantic_review_loader=AsyncMock(return_value={"success": True}),
+                tie_break_words=("甲词", "乙词"),
+            )
+
+        check(
+            "conflicting semantic evidence still asks with a listed order",
+            ranking.get("status") == "ask"
+            and ranking.get("reason") == "conflicting_evidence",
+        )
+
+    asyncio.run(_run())
+
+
 def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
     """Empty/unknown evidence asks; an evidence-supported current order is a no-op."""
     print("\n🧪 code-chain reorder ASK and no-op boundaries")
@@ -6918,6 +7519,14 @@ def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
                         "code": "mkdr",
                         "phrases": phrases,
                     }, ensure_ascii=False)
+                if tool_name == "keytao_list_draft_items":
+                    return json.dumps({
+                        "success": True,
+                        "batchId": "chain-boundary-batch",
+                        "contentVersion": 1,
+                        "count": 0,
+                        "items": [],
+                    }, ensure_ascii=False)
                 raise AssertionError((tool_name, arguments))
 
             with (
@@ -6940,9 +7549,9 @@ def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
         empty_response, empty_calls, empty_store = await run_case([], {})
         check(
             "unknown or empty code deterministically asks without a ticket",
-            "当前没有词条" in empty_response
+            "合并视图都没有词条" in empty_response
             and "未生成草稿修改" in empty_response
-            and len(empty_calls) == 1
+            and len(empty_calls) == 2
             and empty_store.get_record(("qq", "chain-boundary-owner")) is None,
         )
 
@@ -6955,7 +7564,7 @@ def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
             "evidence tie deterministically asks without previewing a write",
             "not_enough_evidence" in ask_response
             and "未生成草稿修改" in ask_response
-            and len(ask_calls) == 1
+            and len(ask_calls) == 2
             and ask_store.get_record(("qq", "chain-boundary-owner")) is None,
         )
 
@@ -6971,7 +7580,7 @@ def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
             "supported current order reports no-op without creating a ticket",
             "当前顺序已经符合" in already_response
             and "本次未生成草稿修改" in already_response
-            and len(already_calls) == 1
+            and len(already_calls) == 2
             and already_store.get_record(("qq", "chain-boundary-owner")) is None,
         )
 
@@ -16636,6 +17245,229 @@ def test_build_code_shift_plan_reuses_vacated_slot_for_circular_swap():
     )
 
 
+def test_build_code_shift_plan_generalizes_ring_to_ranked_n_entries():
+    """A three-word commonness order reuses the same shift planner."""
+    print("\n🧪 code shift plan generalizes the ring to N ranked entries")
+
+    result = _build_code_shift_plan(
+        word="幂等",
+        target_code="mkdr",
+        target_candidate_codes=["mkdr", "mkdro", "mkdrol"],
+        current_phrase={
+            "word": "幂等", "code": "mkdr", "type": "Phrase",
+            "weight": 101, "source": "draft", "draftId": 101,
+        },
+        code_phrase_map={
+            "mkdr": [{"word": "米等", "code": "mkdr", "type": "Phrase", "weight": 100}],
+            "mkdro": [{"word": "迷瞪", "code": "mkdro", "type": "Phrase", "weight": 100}],
+            "mkdrol": [],
+        },
+        word_candidate_code_map={
+            "幂等": ["mkdr", "mkdro", "mkdrol"],
+            "米等": ["mkdr", "mkdro", "mkdrol"],
+            "迷瞪": ["mkdr", "mkdro", "mkdrol"],
+        },
+        ordered_assignments=[
+            {
+                "word": "幂等", "targetCode": "mkdr", "type": "Phrase",
+                "current": {
+                    "word": "幂等", "code": "mkdr", "type": "Phrase",
+                    "weight": 101, "source": "draft", "draftId": 101,
+                },
+            },
+            {
+                "word": "米等", "targetCode": "mkdro", "type": "Phrase",
+                "current": {
+                    "word": "米等", "code": "mkdr", "type": "Phrase",
+                    "weight": 100, "source": "live",
+                },
+            },
+            {
+                "word": "迷瞪", "targetCode": "mkdrol", "type": "Phrase",
+                "current": {
+                    "word": "迷瞪", "code": "mkdro", "type": "Phrase",
+                    "weight": 100, "source": "live",
+                },
+            },
+        ],
+    )
+
+    check("ranked N-entry plan succeeds", result.get("success") is True)
+    expected = {
+        ("Delete", "米等", "mkdr"),
+        ("Delete", "迷瞪", "mkdro"),
+        ("Create", "米等", "mkdro"),
+        ("Create", "迷瞪", "mkdrol"),
+    }
+    actual = {
+        (item.get("action"), item.get("word"), item.get("code"))
+        for item in result.get("items", [])
+    }
+    check("ranked N-entry plan moves both live rows exactly once", actual == expected)
+    check(
+        "draft target stays in place and becomes one weight update",
+        result.get("draftUpdates") == [{
+            "id": 101,
+            "word": "幂等",
+            "code": "mkdr",
+            "type": "Phrase",
+            "fromWeight": 101,
+            "toWeight": 100,
+        }],
+    )
+    check(
+        "proposed state assigns shortest codes by commonness",
+        [(row["word"], row["code"], row["weight"]) for row in result.get("proposedState", [])]
+        == [("幂等", "mkdr", 100), ("米等", "mkdro", 100), ("迷瞪", "mkdrol", 100)],
+    )
+
+
+def test_ranked_n_entry_shift_preview_and_one_ticket_execution():
+    """The generalized shift tool seals warnings, writes live moves, then patches draft weight."""
+    print("\n🧪 ranked N-entry shift uses one sealed confirmation")
+
+    async def _run():
+        candidates_by_word = {
+            "幂等": ["mkdr", "mkdro", "mkdrou"],
+            "米等": ["mkdr", "mkdro", "mkdrou"],
+            "迷瞪": ["mkdr", "mkdro", "mkdroi"],
+        }
+        draft = {
+            "success": True,
+            "batchId": "bc32871a",
+            "contentVersion": 5,
+            "items": [{
+                "id": 101, "action": "Create", "word": "幂等",
+                "code": "mkdr", "type": "Phrase", "weight": 101,
+            }],
+        }
+        final_draft = {
+            **draft,
+            "contentVersion": 7,
+            "items": [
+                {**draft["items"][0], "weight": 100},
+                {"id": 102, "action": "Delete", "word": "米等", "code": "mkdr", "type": "Phrase"},
+                {"id": 103, "action": "Delete", "word": "迷瞪", "code": "mkdro", "type": "Phrase"},
+                {"id": 104, "action": "Create", "word": "米等", "code": "mkdro", "type": "Phrase", "weight": 100},
+                {"id": 105, "action": "Create", "word": "迷瞪", "code": "mkdroi", "type": "Phrase", "weight": 100},
+            ],
+        }
+
+        async def fake_encode(word, _requested_code=None):
+            return {
+                "success": True,
+                "word": word,
+                "candidateCodes": candidates_by_word[word],
+            }
+
+        async def fake_words(_words):
+            return {
+                "success": True,
+                "results": [
+                    {"word": "幂等", "phrases": []},
+                    {"word": "米等", "phrases": [{"word": "米等", "code": "mkdr", "type": "Phrase", "weight": 100}]},
+                    {"word": "迷瞪", "phrases": [{"word": "迷瞪", "code": "mkdro", "type": "Phrase", "weight": 100}]},
+                ],
+            }
+
+        rows = {
+            "mkdr": [{"word": "米等", "code": "mkdr", "type": "Phrase", "weight": 100}],
+            "mkdro": [{"word": "迷瞪", "code": "mkdro", "type": "Phrase", "weight": 100}],
+            "mkdrou": [],
+            "mkdroi": [],
+        }
+
+        async def fake_codes(codes):
+            return {
+                "success": True,
+                "results": [{"code": code, "phrases": rows[code]} for code in codes],
+            }
+
+        preview_strict = AsyncMock(return_value={
+            "success": False,
+            "requiresConfirmation": True,
+            "warningDigest": "d" * 64,
+            "warnings": [{"message": "完整链重排"}],
+        })
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(_draft_tools, "keytao_list_draft_items", AsyncMock(return_value=draft)),
+            patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", preview_strict),
+        ):
+            preview = await _draft_tools.keytao_shift_phrase_code(
+                "qq", "rea", "幂等", "mkdr",
+                ordered_words=["幂等", "米等", "迷瞪"],
+                listed_words=["米等", "幂等", "迷瞪"],
+                evidence_lines=["幂等 > 米等 > 迷瞪"],
+            )
+
+        check(
+            "initial call returns one complete server-bound ranked plan",
+            preview.get("requiresConfirmation") is True
+            and preview.get("warningDigest") == "d" * 64
+            and preview.get("shiftPlan", {}).get("scope") == "prefix_chain"
+            and len(preview.get("shiftPlan", {}).get("items", [])) == 4
+            and len(preview.get("shiftPlan", {}).get("draftUpdates", [])) == 1,
+        )
+        check(
+            "initial ranked plan preflights the strict live batch without writing",
+            preview_strict.await_count == 1
+            and preview_strict.await_args.kwargs.get("confirmed") is None,
+        )
+        check(
+            "ranked positions follow each word's own divergent candidate chain",
+            [
+                (entry["word"], entry["code"])
+                for entry in preview["shiftPlan"]["proposedState"]
+            ]
+            == [("幂等", "mkdr"), ("米等", "mkdro"), ("迷瞪", "mkdroi")],
+        )
+
+        confirmed_strict = AsyncMock(return_value={
+            "success": True,
+            "batchId": "bc32871a",
+            "contentVersion": 6,
+            "successCount": 4,
+        })
+        update = AsyncMock(return_value={"success": True, "batchId": "bc32871a"})
+        listing = AsyncMock(side_effect=[draft, final_draft])
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(_draft_tools, "keytao_list_draft_items", listing),
+            patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", confirmed_strict),
+            patch.object(_draft_tools, "keytao_update_draft_item_weight", update),
+        ):
+            result = await _draft_tools.keytao_shift_phrase_code(
+                "qq", "rea", "幂等", "mkdr",
+                confirmed_plan_digest=preview["planDigest"],
+                batch_id="bc32871a",
+                expected_content_version=5,
+                expected_warning_digest="d" * 64,
+                ordered_words=["幂等", "米等", "迷瞪"],
+                listed_words=["米等", "幂等", "迷瞪"],
+                evidence_lines=["幂等 > 米等 > 迷瞪"],
+            )
+
+        check("one ticket executes the complete ranked plan", result.get("success") is True)
+        check(
+            "confirmed strict batch replays the sealed warning digest once",
+            confirmed_strict.await_count == 1
+            and confirmed_strict.await_args.kwargs.get("confirmed") is True
+            and confirmed_strict.await_args.kwargs.get("expected_warning_digest") == "d" * 64,
+        )
+        update.assert_awaited_once_with("qq", "rea", "幂等", "mkdr", 100)
+        check(
+            "final response carries the post-write draft snapshot",
+            result.get("draft_snapshot", {}).get("contentVersion") == 7,
+        )
+
+    asyncio.run(_run())
+
+
 def test_build_code_shift_plan_rejects_invalid_occupant_code():
     """Verify the shift stops if an occupant's current code is not in its encode chain."""
     print("\n🧪 code shift plan rejects invalid occupant code")
@@ -18116,7 +18948,14 @@ if __name__ == "__main__":
     test_referenced_word_presence_query_extracts_quoted_words()
     test_referenced_word_presence_query_requires_a_pure_presence_question()
     test_code_chain_reorder_command_is_structural_and_code_bound()
+    test_explicit_word_list_reorder_command_is_structural_and_ordered()
     test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation()
+    test_incident_code_chain_reorder_merges_live_and_current_draft()
+    test_incident_word_list_reorder_resolves_every_word_and_cross_chain_scope()
+    test_word_list_prefix_scope_accepts_divergent_candidate_tails()
+    test_ranked_reorder_planner_accepts_divergent_current_tails()
+    test_ranked_reorder_planner_applies_draft_deletes_to_chain_occupancy()
+    test_word_list_order_never_overrides_conflicting_semantic_evidence()
     test_code_chain_reorder_asks_or_noops_without_a_unique_change()
     test_referenced_word_presence_query_uses_referenced_message_not_history()
     test_referenced_word_presence_query_explains_missing_quote_text()
@@ -18254,6 +19093,8 @@ if __name__ == "__main__":
     test_build_code_shift_plan_uses_occupant_encode_chain()
     test_build_code_shift_plan_cascades_until_empty()
     test_build_code_shift_plan_reuses_vacated_slot_for_circular_swap()
+    test_build_code_shift_plan_generalizes_ring_to_ranked_n_entries()
+    test_ranked_n_entry_shift_preview_and_one_ticket_execution()
     test_build_code_shift_plan_rejects_invalid_occupant_code()
     test_shift_phrase_code_works_with_no_draft_batch()
     test_shift_phrase_code_plans_real_occupant_move()

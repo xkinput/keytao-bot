@@ -4724,6 +4724,7 @@ async def rank_code_chain_by_commonness(
     entries: Sequence[Dict[str, Any]],
     *,
     semantic_review_loader: Optional[Any] = None,
+    tie_break_words: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     """Rank one server-resolved same-code/type chain conservatively.
 
@@ -4744,6 +4745,17 @@ async def rank_code_chain_by_commonness(
         or len(set(words)) != len(words)
     ):
         return {"status": "ask", "reason": "invalid_chain", "currentOrder": normalized}
+    tie_break_order = [str(word or "").strip() for word in tie_break_words or []]
+    if tie_break_order and (
+        len(tie_break_order) != len(words)
+        or len(set(tie_break_order)) != len(words)
+        or set(tie_break_order) != set(words)
+    ):
+        return {
+            "status": "ask",
+            "reason": "invalid_tie_break_order",
+            "currentOrder": normalized,
+        }
     if len(normalized) == 1:
         return {
             "status": "already_ordered",
@@ -4833,22 +4845,35 @@ async def rank_code_chain_by_commonness(
                     "comparisons": [*comparisons, *possible_overrides],
                     "evidenceLines": [evidence_by_word[word] for word in words],
                 }
-            if possible_overrides:
+            if len(possible_overrides) == 1:
                 comparison = possible_overrides[0]
 
-            comparisons.append(comparison)
             verdict = str(comparison.get("verdict") or "not_enough_evidence")
             if (
                 comparison.get("success") is not True
                 or verdict not in {"front_more_common", "behind_more_common", "close"}
             ):
-                return {
-                    "status": "ask",
-                    "reason": "not_enough_evidence",
-                    "currentOrder": normalized,
-                    "comparisons": comparisons,
-                    "evidenceLines": [evidence_by_word[word] for word in words],
-                }
+                if tie_break_order and _commonness_comparison_has_evidence(comparison):
+                    comparison = {
+                        **comparison,
+                        "success": True,
+                        "verdict": "close",
+                        "decisionReason": "listed_order_tiebreak",
+                        "summary": (
+                            str(comparison.get("summary") or "常用度信号未拉开差距")
+                            + "；证据未拉开差距，保留你列出的相对顺序"
+                        ),
+                    }
+                    verdict = "close"
+                else:
+                    return {
+                        "status": "ask",
+                        "reason": "not_enough_evidence",
+                        "currentOrder": normalized,
+                        "comparisons": [*comparisons, comparison],
+                        "evidenceLines": [evidence_by_word[word] for word in words],
+                    }
+            comparisons.append(comparison)
             if verdict == "close":
                 if not _commonness_comparison_has_evidence(comparison):
                     return {
@@ -4868,7 +4893,8 @@ async def rank_code_chain_by_commonness(
                 edges[winner].add(loser)
                 indegree[loser] += 1
 
-    original_index = {word: index for index, word in enumerate(words)}
+    stable_words = tie_break_order or words
+    original_index = {word: index for index, word in enumerate(stable_words)}
     available = sorted(
         (word for word in words if indegree[word] == 0),
         key=original_index.__getitem__,

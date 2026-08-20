@@ -133,6 +133,7 @@ from .chat_routing import (
     _message_authorizes_pending_state_control,
     _message_authorizes_replace_char,
     _parse_code_chain_reorder_command,
+    _parse_word_list_reorder_command,
     _parse_pending_choice_index,
     _pending_owner_label,
     _pending_assent_rejection_response,
@@ -3494,6 +3495,43 @@ def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
         )
 
 
+def _ranked_shift_warning_copy(
+    warning: Any,
+    proposed_state: List[Dict[str, Any]],
+) -> Tuple[str, bool]:
+    """Render strict item warnings against the complete sealed shift plan."""
+    plain = _plain_warning_message(warning)
+    if not isinstance(warning, dict) or warning.get("warningType") != "skipped_candidate_slot":
+        return plain, False
+    skipped_codes = [
+        str(code or "").strip().lower()
+        for code in warning.get("skippedCodes") or [warning.get("skippedCode")]
+        if str(code or "").strip()
+    ]
+    proposed_by_code = {
+        str(entry.get("code") or "").strip().lower(): str(entry.get("word") or "").strip()
+        for entry in proposed_state
+        if isinstance(entry, dict)
+        and str(entry.get("code") or "").strip()
+        and str(entry.get("word") or "").strip()
+    }
+    warning_item = warning.get("item") if isinstance(warning.get("item"), dict) else {}
+    warning_word = str(warning_item.get("word") or "").strip()
+    resolved = [
+        (code, proposed_by_code.get(code, ""))
+        for code in skipped_codes
+        if proposed_by_code.get(code) and proposed_by_code.get(code) != warning_word
+    ]
+    if not skipped_codes or len(resolved) != len(skipped_codes):
+        return plain, False
+    assignments = "、".join(f"「{word}」占用 {code}" for code, word in resolved)
+    return (
+        f"单项预览提示「{warning_word}」跳过更短候选；"
+        f"完整计划会由{assignments}，不会留下空位。",
+        True,
+    )
+
+
 def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     if function_name in {"keytao_remove_draft_item", "keytao_batch_remove_draft_items"}:
         targets = data.get("targets") if isinstance(data.get("targets"), list) else []
@@ -3532,7 +3570,66 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     if function_name == "keytao_shift_phrase_code":
         shift_plan = data.get("shiftPlan") if isinstance(data.get("shiftPlan"), dict) else {}
         items = shift_plan.get("items") if isinstance(shift_plan.get("items"), list) else []
-        lines = ["🔁 服务端已生成完整顺延计划："]
+        current_state = (
+            shift_plan.get("currentState")
+            if isinstance(shift_plan.get("currentState"), list)
+            else []
+        )
+        proposed_state = (
+            shift_plan.get("proposedState")
+            if isinstance(shift_plan.get("proposedState"), list)
+            else []
+        )
+        listed_words = [
+            str(word).strip()
+            for word in shift_plan.get("listedWords") or []
+            if str(word).strip()
+        ]
+        lines = [
+            (
+                "🔁 服务端已锁定常用度重排计划："
+                if current_state and proposed_state
+                else "🔁 服务端已生成完整顺延计划："
+            )
+        ]
+        if current_state and proposed_state:
+            lines.append("当前状态：")
+            for entry in current_state:
+                if not isinstance(entry, dict):
+                    continue
+                source = "草稿" if entry.get("source") == "draft" else "词库"
+                lines.append(
+                    f"• {entry.get('word') or ''}：{entry.get('code') or ''} / "
+                    f"{entry.get('weight')}（{source}）"
+                )
+            lines.append("建议状态：")
+            for entry in proposed_state:
+                if not isinstance(entry, dict):
+                    continue
+                lines.append(
+                    f"• {entry.get('word') or ''}：{entry.get('code') or ''} / "
+                    f"{entry.get('weight')}"
+                )
+            proposed_words = [
+                str(entry.get("word") or "").strip()
+                for entry in proposed_state
+                if isinstance(entry, dict) and str(entry.get("word") or "").strip()
+            ]
+            if listed_words:
+                relation = "一致" if proposed_words == listed_words else "不一致"
+                lines.append(
+                    f"你列的顺序与常用度证据{relation}："
+                    + " → ".join(proposed_words)
+                )
+            evidence_lines = [
+                str(line).strip()
+                for line in shift_plan.get("evidenceLines") or []
+                if str(line).strip()
+            ]
+            if evidence_lines:
+                lines.append("常用度证据：")
+                lines.extend(f"• {line}" for line in evidence_lines)
+            lines.append("草稿变更：")
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -3544,18 +3641,31 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 lines.append(f"• 修改：{old_word} → {word}（{code}）")
             else:
                 lines.append(f"• {action or '变更'}：{word}（{code}）")
+        for update in shift_plan.get("draftUpdates") or []:
+            if not isinstance(update, dict):
+                continue
+            lines.append(
+                f"• 调整草稿权重：{update.get('word') or ''}（{update.get('code') or ''}）"
+                f"{update.get('fromWeight')} → {update.get('toWeight')}"
+            )
         batch_url = _trusted_batch_url(data)
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
-        warning_digest = str(data.get("warningDigest") or "")
         warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
-        if warning_digest:
-            lines.append("服务端风险：")
-            for warning in warnings:
-                lines.append("• " + _plain_warning_message(warning))
+        if warnings:
+            rendered_warnings = [
+                _ranked_shift_warning_copy(warning, proposed_state)
+                for warning in warnings
+            ]
+            lines.append(
+                "服务端校验："
+                if all(resolved for _message, resolved in rendered_warnings)
+                else "服务端风险："
+            )
+            lines.extend(f"• {message}" for message, _resolved in rendered_warnings)
         lines.extend((
             "",
-            "以上每一项都将由服务端按同一批次版本校验。"
+            "以上计划已锁定；执行时服务端会逐步校验当前草稿批次及内容版本。"
             f"确认执行吗？{pending_confirmation_copy()}",
         ))
         return _assert_plain_user_facing_reply("\n".join(lines))
@@ -5651,6 +5761,222 @@ def _validated_code_chain_entries(data: Dict[str, Any], code: str) -> Optional[L
     return entries
 
 
+def _validated_draft_reorder_snapshot(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Validate the current draft CAS anchor and retain its full item projection."""
+    items = data.get("items")
+    batch_id = str(data.get("batchId") or "").strip()
+    content_version = data.get("contentVersion")
+    if (
+        data.get("success") is not True
+        or not isinstance(items, list)
+        or not isinstance(content_version, int)
+        or isinstance(content_version, bool)
+        or content_version < 0
+        or (items and not batch_id)
+    ):
+        return None
+    return {
+        "batchId": batch_id,
+        "contentVersion": content_version,
+        "items": items,
+    }
+
+
+def _draft_reorder_projection(
+    draft_snapshot: Dict[str, Any],
+) -> Optional[Tuple[List[Dict[str, Any]], set[Tuple[str, str, str]]]]:
+    """Project draft Create/Change/Delete rows onto the live dictionary view."""
+    projected: List[Dict[str, Any]] = []
+    removed: set[Tuple[str, str, str]] = set()
+    seen_projected: set[Tuple[str, str, str]] = set()
+    for raw_item in draft_snapshot.get("items", []):
+        if not isinstance(raw_item, dict):
+            return None
+        action = str(raw_item.get("action") or "").strip()
+        word = str(raw_item.get("word") or "").strip()
+        old_word = str(
+            raw_item.get("oldWord") or raw_item.get("old_word") or ""
+        ).strip()
+        code = str(raw_item.get("code") or "").strip().lower()
+        phrase_type = str(raw_item.get("type") or "").strip()
+        weight = raw_item.get("weight")
+        item_id = raw_item.get("id")
+        base_weight = _PHRASE_TYPE_BASE_WEIGHTS.get(phrase_type)
+        if (
+            action not in {"Create", "Change", "Delete"}
+            or not word
+            or not re.fullmatch(r"[a-z]{1,12}", code)
+            or base_weight is None
+            or not str(item_id).isdigit()
+        ):
+            return None
+        if action == "Change":
+            if not old_word:
+                return None
+            removed.add((phrase_type, code, old_word))
+        elif action == "Delete":
+            removed.add((phrase_type, code, word))
+            continue
+        if (
+            not isinstance(weight, int)
+            or isinstance(weight, bool)
+            or weight < base_weight
+        ):
+            return None
+        identity = (phrase_type, code, word)
+        if identity in seen_projected:
+            return None
+        seen_projected.add(identity)
+        projected.append({
+            "word": word,
+            "code": code,
+            "type": phrase_type,
+            "weight": weight,
+            "source": "draft",
+            "draftId": int(item_id),
+            "draftAction": action,
+        })
+    return projected, removed
+
+
+def _merge_live_and_draft_reorder_entries(
+    live_entries: List[Dict[str, Any]],
+    draft_snapshot: Dict[str, Any],
+) -> Optional[List[Dict[str, Any]]]:
+    """Return the effective dictionary view after applying the current draft."""
+    projection = _draft_reorder_projection(draft_snapshot)
+    if projection is None:
+        return None
+    projected, removed = projection
+    merged: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, str]] = set()
+    for raw_entry in live_entries:
+        entry = dict(raw_entry)
+        identity = (
+            str(entry.get("type") or ""),
+            str(entry.get("code") or "").lower(),
+            str(entry.get("word") or ""),
+        )
+        if identity in removed:
+            continue
+        entry["source"] = "live"
+        if identity in seen:
+            return None
+        seen.add(identity)
+        merged.append(entry)
+    for entry in projected:
+        identity = (entry["type"], entry["code"], entry["word"])
+        if identity in seen:
+            return None
+        seen.add(identity)
+        merged.append(entry)
+    merged.sort(key=lambda entry: (
+        str(entry["type"]),
+        str(entry["code"]),
+        int(entry["weight"]),
+        str(entry["word"]),
+    ))
+    return merged
+
+
+def _validated_word_lookup_entries(
+    data: Dict[str, Any],
+    words: Tuple[str, ...],
+) -> Optional[List[Dict[str, Any]]]:
+    """Validate an exact complete batch word lookup without accepting extras."""
+    results = data.get("results")
+    if (
+        data.get("success") is not True
+        or not isinstance(results, list)
+        or len(results) != len(words)
+    ):
+        return None
+    by_word: Dict[str, List[Dict[str, Any]]] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            return None
+        result_word = str(result.get("word") or "").strip()
+        phrases = result.get("phrases")
+        if result_word not in words or result_word in by_word or not isinstance(phrases, list):
+            return None
+        clean: List[Dict[str, Any]] = []
+        for phrase in phrases:
+            if not isinstance(phrase, dict):
+                return None
+            word = str(phrase.get("word") or "").strip()
+            code = str(phrase.get("code") or "").strip().lower()
+            phrase_type = str(phrase.get("type") or "").strip()
+            weight = phrase.get("weight")
+            base_weight = _PHRASE_TYPE_BASE_WEIGHTS.get(phrase_type)
+            if (
+                word != result_word
+                or not re.fullmatch(r"[a-z]{1,12}", code)
+                or base_weight is None
+                or not isinstance(weight, int)
+                or isinstance(weight, bool)
+                or weight < base_weight
+            ):
+                return None
+            clean.append({
+                "word": word,
+                "code": code,
+                "type": phrase_type,
+                "weight": weight,
+            })
+        by_word[result_word] = clean
+    if set(by_word) != set(words):
+        return None
+    return [entry for word in words for entry in by_word[word]]
+
+
+def _candidate_codes_from_encode(data: Dict[str, Any], word: str) -> Tuple[str, ...]:
+    """Read the ordered candidate chain returned for one exact word."""
+    returned_word = str(data.get("word") or data.get("input") or word).strip()
+    if data.get("success") is not True or returned_word != word:
+        return ()
+    raw_codes = [
+        data.get("code"),
+        *(data.get("codes") or []),
+        *(data.get("candidateCodes") or []),
+        *(data.get("altCodes") or []),
+        *(
+            status.get("code")
+            for status in data.get("candidateStatuses") or []
+            if isinstance(status, dict)
+        ),
+    ]
+    codes: List[str] = []
+    for raw_code in raw_codes:
+        code = str(raw_code or "").strip().lower()
+        if re.fullmatch(r"[a-z]{1,12}", code) and code not in codes:
+            codes.append(code)
+    return tuple(codes)
+
+
+def _shared_candidate_chain_root(
+    entries: List[Dict[str, Any]],
+    candidate_codes_by_word: Dict[str, Tuple[str, ...]],
+) -> Optional[str]:
+    """Find the shortest shared candidate prefix while validating each current code."""
+    common_codes: Optional[set[str]] = None
+    current_codes: List[str] = []
+    for entry in entries:
+        word = str(entry.get("word") or "").strip()
+        current_code = str(entry.get("code") or "").strip().lower()
+        candidates = candidate_codes_by_word.get(word, ())
+        if not word or not current_code or current_code not in candidates:
+            return None
+        current_codes.append(current_code)
+        candidate_set = set(candidates)
+        common_codes = candidate_set if common_codes is None else common_codes & candidate_set
+    roots = [
+        code
+        for code in common_codes or set()
+        if all(current_code.startswith(code) for current_code in current_codes)
+    ]
+    return min(roots, key=lambda code: (len(code), code)) if roots else None
+
+
 def _format_chain_order(entries: List[Dict[str, Any]]) -> str:
     return " → ".join(
         f"{entry['word']}({entry['weight']})"
@@ -5716,6 +6042,138 @@ def _format_code_chain_reorder_confirmation(
     return _assert_plain_user_facing_reply("\n".join(lines))
 
 
+def _reorder_evidence_lines(ranking: Dict[str, Any]) -> List[str]:
+    evidence = [
+        str(line).strip()
+        for line in ranking.get("evidenceLines") or []
+        if str(line).strip()
+    ]
+    summaries = [
+        str(comparison.get("summary") or "").strip()
+        for comparison in ranking.get("comparisons") or []
+        if isinstance(comparison, dict)
+        and str(comparison.get("summary") or "").strip()
+    ]
+    return list(OrderedDict.fromkeys([*evidence, *summaries]))
+
+
+async def _load_reorder_semantic_review(
+    word: str,
+    platform: str,
+    user_id: str,
+) -> Dict[str, Any]:
+    """Reuse the reviewed-add semantic evidence for every reorder shape."""
+    review_json = await call_tool_function(
+        "keytao_prepare_reviewed_add",
+        {"word": word},
+        platform,
+        user_id,
+    )
+    try:
+        review = json.loads(review_json)
+    except Exception:
+        return {}
+    return review if isinstance(review, dict) else {}
+
+
+def _ranked_words_from_complete_result(
+    ranking: Dict[str, Any],
+    entries: List[Dict[str, Any]],
+) -> Optional[List[str]]:
+    proposed = ranking.get("proposedOrder")
+    if not isinstance(proposed, list) or len(proposed) != len(entries):
+        return None
+    current_words = [str(entry.get("word") or "").strip() for entry in entries]
+    proposed_words = [
+        str(entry.get("word") or "").strip()
+        for entry in proposed
+        if isinstance(entry, dict)
+    ]
+    if (
+        len(proposed_words) != len(entries)
+        or len(set(proposed_words)) != len(entries)
+        or set(proposed_words) != set(current_words)
+    ):
+        return None
+    return proposed_words
+
+
+def _format_reorder_noop(
+    *,
+    code: str,
+    entries: List[Dict[str, Any]],
+    ranking: Dict[str, Any],
+    listed_words: Tuple[str, ...] = (),
+) -> str:
+    """Render a complete merged-view plan even when it needs no draft write."""
+    lines = [f"编码 {code} 的合并视图已经符合可核验的常用度证据，本次未生成草稿修改。"]
+    lines.append("当前状态：")
+    for entry in entries:
+        source = "草稿" if entry.get("source") == "draft" else "词库"
+        lines.append(
+            f"• {entry['word']}：{entry['code']} / {entry['weight']}（{source}）"
+        )
+    lines.append("建议状态：与当前状态一致。")
+    if listed_words:
+        proposed_words = _ranked_words_from_complete_result(ranking, entries) or []
+        relation = "一致" if tuple(proposed_words) == listed_words else "不一致"
+        lines.append(
+            f"你列的顺序与常用度证据{relation}："
+            + " → ".join(proposed_words or listed_words)
+        )
+    evidence = _reorder_evidence_lines(ranking)
+    if evidence:
+        lines.append("常用度证据：")
+        lines.extend(f"• {line}" for line in evidence)
+    return _assert_plain_user_facing_reply("\n".join(lines))
+
+
+async def _start_generalized_reorder_plan(
+    *,
+    entries: List[Dict[str, Any]],
+    ranking: Dict[str, Any],
+    target_code: str,
+    listed_words: Tuple[str, ...],
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> str:
+    proposed_words = _ranked_words_from_complete_result(ranking, entries)
+    if proposed_words is None:
+        return _chain_reorder_ask(target_code, "排序器没有返回完整词条集合")
+    if ranking.get("status") == "already_ordered":
+        return _format_reorder_noop(
+            code=target_code,
+            entries=entries,
+            ranking=ranking,
+            listed_words=listed_words,
+        )
+    if ranking.get("status") != "reorder":
+        return _chain_reorder_ask(
+            target_code,
+            str(ranking.get("reason") or "常用度证据不足"),
+        )
+    return await _execute_confirmed_tool(
+        PendingToolConfirm(
+            function_name="keytao_shift_phrase_code",
+            args={
+                "word": proposed_words[0],
+                "target_code": target_code,
+                "ordered_words": proposed_words,
+                "listed_words": list(listed_words),
+                "evidence_lines": _reorder_evidence_lines(ranking),
+            },
+            confirmation_source="local_preview",
+        ),
+        platform,
+        user_id,
+        (platform, user_id),
+        space_key,
+        owner_label,
+    )
+
+
 async def _try_handle_code_chain_reorder_command(
     message_text: str,
     command_intent: MessageCommandIntent,
@@ -5743,11 +6201,32 @@ async def _try_handle_code_chain_reorder_command(
         lookup_data = json.loads(lookup_json)
     except Exception:
         lookup_data = {}
-    entries = _validated_code_chain_entries(lookup_data, code)
-    if entries is None:
+    live_entries = _validated_code_chain_entries(lookup_data, code)
+    if live_entries is None:
         return _chain_reorder_ask(code, "服务端没有返回完整的词、类型和权重记录")
+
+    draft_json = await call_tool_function(
+        "keytao_list_draft_items",
+        {},
+        platform,
+        user_id,
+    )
+    try:
+        draft_data = json.loads(draft_json)
+    except Exception:
+        draft_data = {}
+    draft_snapshot = _validated_draft_reorder_snapshot(draft_data)
+    if draft_snapshot is None:
+        return _chain_reorder_ask(code, "当前草稿没有返回完整的批次和内容版本")
+    merged_entries = _merge_live_and_draft_reorder_entries(
+        live_entries,
+        draft_snapshot,
+    )
+    if merged_entries is None:
+        return _chain_reorder_ask(code, "当前草稿里存在无法唯一投影的词条记录")
+    entries = [entry for entry in merged_entries if entry.get("code") == code]
     if not entries:
-        return _chain_reorder_ask(code, "当前没有词条")
+        return _chain_reorder_ask(code, "词库和当前草稿的合并视图都没有词条")
     if command.focus_words:
         server_words = {str(entry.get("word") or "") for entry in entries}
         missing_words = [
@@ -5764,18 +6243,31 @@ async def _try_handle_code_chain_reorder_command(
             f"完整链共有 {len(entries)} 条，超过单条确认可完整展示的 {MAX_REPLACE_CHAR_ITEMS} 条上限",
         )
 
+    has_relevant_draft = any(entry.get("source") == "draft" for entry in entries)
+
     async def load_semantic_review(word: str) -> Dict[str, Any]:
-        review_json = await call_tool_function(
-            "keytao_prepare_reviewed_add",
-            {"word": word},
-            platform,
-            user_id,
+        return await _load_reorder_semantic_review(word, platform, user_id)
+
+    if has_relevant_draft:
+        ranking = await keytao_review.rank_code_chain_by_commonness(
+            entries,
+            semantic_review_loader=load_semantic_review,
         )
-        try:
-            review = json.loads(review_json)
-        except Exception:
-            return {}
-        return review if isinstance(review, dict) else {}
+        if not isinstance(ranking, dict) or ranking.get("status") == "ask":
+            return _chain_reorder_ask(
+                code,
+                str((ranking or {}).get("reason") or "常用度证据不足"),
+            )
+        return await _start_generalized_reorder_plan(
+            entries=entries,
+            ranking=ranking,
+            target_code=code,
+            listed_words=command.focus_words,
+            platform=platform,
+            user_id=user_id,
+            space_key=space_key,
+            owner_label=owner_label,
+        )
 
     groups_by_type: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
     for entry in entries:
@@ -5926,6 +6418,145 @@ async def _try_handle_code_chain_reorder_command(
     return confirmation
 
 
+def _format_word_resolution_rows(entries: List[Dict[str, Any]]) -> str:
+    rows = []
+    for entry in entries:
+        source = "草稿" if entry.get("source") == "draft" else "词库"
+        rows.append(
+            f"{entry.get('word')}→{entry.get('code')}"
+            f"（权重 {entry.get('weight')}，{source}）"
+        )
+    return "；".join(rows)
+
+
+async def _try_handle_word_list_reorder_command(
+    message_text: str,
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    """Resolve every literal word, then choose same-code or prefix-chain scope."""
+    command = _parse_word_list_reorder_command(message_text)
+    if (
+        command is None
+        or command_intent.intent != "word_list_reorder"
+        or command_intent.keep_words != command.words
+    ):
+        return None
+    set_turn_flow("draft-op")
+    words = command.words
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_words_batch",
+        {"words": list(words)},
+        platform,
+        user_id,
+    )
+    draft_json = await call_tool_function(
+        "keytao_list_draft_items",
+        {},
+        platform,
+        user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+    try:
+        draft_data = json.loads(draft_json)
+    except Exception:
+        draft_data = {}
+    live_entries = _validated_word_lookup_entries(lookup_data, words)
+    draft_snapshot = _validated_draft_reorder_snapshot(draft_data)
+    if live_entries is None or draft_snapshot is None:
+        return render_remediation_reply(
+            "无法取得每个词完整的词库记录和当前草稿版本；本次未生成排序计划"
+        )
+    merged = _merge_live_and_draft_reorder_entries(live_entries, draft_snapshot)
+    if merged is None:
+        return render_remediation_reply(
+            "当前草稿无法形成唯一的词条投影；本次未生成排序计划"
+        )
+    resolved: List[Dict[str, Any]] = []
+    unresolved: List[str] = []
+    for word in words:
+        matches = [entry for entry in merged if entry.get("word") == word]
+        if len(matches) != 1:
+            unresolved.append(word)
+        else:
+            resolved.append(matches[0])
+    if unresolved:
+        return render_remediation_reply(
+            "服务端无法为「" + "、".join(unresolved)
+            + "」各锁定唯一当前编码；已找到："
+            + (_format_word_resolution_rows(resolved) or "无")
+            + "；本次未生成排序计划"
+        )
+
+    phrase_types = {str(entry.get("type") or "") for entry in resolved}
+    current_codes = [str(entry.get("code") or "") for entry in resolved]
+    unique_codes = list(OrderedDict.fromkeys(current_codes))
+    target_code = min(unique_codes, key=lambda value: (len(value), value))
+    same_code_scope = len(unique_codes) == 1 and len(phrase_types) == 1
+    prefix_scope = False
+    if not same_code_scope:
+        candidate_codes_by_word: Dict[str, Tuple[str, ...]] = {}
+        for word in words:
+            encode_json = await call_tool_function(
+                "keytao_encode",
+                {"word": word},
+                platform,
+                user_id,
+            )
+            try:
+                encode_data = json.loads(encode_json)
+            except Exception:
+                encode_data = {}
+            candidate_codes_by_word[word] = _candidate_codes_from_encode(
+                encode_data,
+                word,
+            )
+        shared_root = _shared_candidate_chain_root(
+            resolved,
+            candidate_codes_by_word,
+        )
+        prefix_scope = len(phrase_types) == 1 and shared_root is not None
+        if shared_root is not None:
+            target_code = shared_root
+    if not same_code_scope and not prefix_scope:
+        return _assert_plain_user_facing_reply(
+            "这些词不在同一编码或同一候选前缀链："
+            + _format_word_resolution_rows(resolved)
+            + "。你想按同码权重排，还是调整各自编码？"
+        )
+    if len(resolved) > MAX_REPLACE_CHAR_ITEMS:
+        return render_remediation_reply(
+            f"完整词表共有 {len(resolved)} 条，超过单条确认可完整展示的 "
+            f"{MAX_REPLACE_CHAR_ITEMS} 条上限；本次未生成排序计划"
+        )
+
+    ranking = await keytao_review.rank_code_chain_by_commonness(
+        resolved,
+        tie_break_words=words,
+    )
+    if not isinstance(ranking, dict) or ranking.get("status") == "ask":
+        return _chain_reorder_ask(
+            target_code,
+            str((ranking or {}).get("reason") or "常用度证据不足"),
+        )
+    return await _start_generalized_reorder_plan(
+        entries=resolved,
+        ranking=ranking,
+        target_code=target_code,
+        listed_words=words,
+        platform=platform,
+        user_id=user_id,
+        space_key=space_key,
+        owner_label=owner_label,
+    )
+
+
 async def _try_handle_draft_management_command(
     message_text: str,
     platform: str,
@@ -5968,6 +6599,17 @@ async def _try_handle_draft_management_command(
 
     if command_intent is None:
         command_intent = await _classify_message_command_intent(message_text)
+
+    response = await _try_handle_word_list_reorder_command(
+        message_text,
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
 
     response = await _try_handle_entry_swap_command(
         message_text,

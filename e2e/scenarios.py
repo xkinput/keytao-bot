@@ -3908,6 +3908,228 @@ async def scenario_s31(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S32_CODE = "mkdr"
+S32_PREFIX_CODE = "mkdro"
+S32_DRAFT_WORD = "幂等"
+S32_CHAIN_COMMAND = "重新排序下mkdr 编码链这几个词按优先级"
+S32_WORD_LIST_COMMAND = "重新排序下\n米等\n幂等\n迷瞪"
+
+
+async def scenario_s32(ctx: ScenarioContext) -> dict[str, Any]:
+    """Replay both chain-scope incidents against one live+draft merged view."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    for code in (S32_CODE, S32_PREFIX_CODE):
+        exact_rows = [
+            row
+            for row in await ctx.next_client.phrases_by_code(code)
+            if str(row.get("code") or "") == code
+        ]
+        require(not exact_rows, f"S32 requires an empty {code} fixture slot: {exact_rows}")
+
+    await ctx.next_client.seed_phrase(
+        platform_id=ctx.platform_id,
+        word="米等",
+        code=S32_CODE,
+        weight=100,
+    )
+    await ctx.next_client.seed_phrase(
+        platform_id=ctx.platform_id,
+        word="迷瞪",
+        code=S32_PREFIX_CODE,
+        weight=100,
+    )
+    await ctx.next_client.add_draft_items(
+        platform_id=ctx.platform_id,
+        items=[{
+            "action": "Create",
+            "word": S32_DRAFT_WORD,
+            "code": S32_CODE,
+            "type": "Phrase",
+            "weight": 101,
+            "needsManualReview": False,
+            "remark": "S32 draft-aware chain fixture",
+        }],
+    )
+    original_draft = await ctx.draft()
+    require(
+        len(original_draft.get("items", [])) == 1
+        and item_key(original_draft["items"][0])
+        == ("Create", S32_DRAFT_WORD, S32_CODE)
+        and original_draft["items"][0].get("weight") == 101,
+        f"S32 could not establish its current draft fixture: {original_draft}",
+    )
+
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    chain_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S32_CHAIN_COMMAND)
+    chain_reply = await ctx.send(S32_CHAIN_COMMAND)
+    replies.append(chain_reply)
+    assert_reply_mentions(
+        chain_reply,
+        "当前状态",
+        "米等：mkdr / 100（词库）",
+        "幂等：mkdr / 101（草稿）",
+        "建议状态",
+        "幂等：mkdr / 100",
+        "米等：mkdr / 101",
+        "常用度证据",
+    )
+    require(
+        chain_reply.count(pending_confirmation_copy()) == 1,
+        f"S32 merged-view plan did not carry one confirmation: {chain_reply}",
+    )
+    require(
+        (await ctx.draft()).get("items") == original_draft.get("items"),
+        "S32 merged-view plan wrote before confirmation",
+    )
+    chain_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > chain_cutoff
+        and event.get("kind") == "tool"
+    ]
+    require(
+        any(event.get("name") == "keytao_lookup_by_code" for event in chain_events)
+        and any(event.get("name") == "keytao_list_draft_items" for event in chain_events)
+        and any(event.get("name") == "keytao_shift_phrase_code" for event in chain_events),
+        f"S32 merged-view turn did not traverse both views and the shared planner: {chain_events}",
+    )
+
+    messages.append("取消")
+    cancel_reply = await ctx.send("取消")
+    replies.append(cancel_reply)
+    require(
+        "取消" in cancel_reply or "放弃" in cancel_reply,
+        f"S32 could not cancel the first sealed plan: {cancel_reply}",
+    )
+    require(
+        (await ctx.draft()).get("items") == original_draft.get("items"),
+        "S32 cancellation changed the original draft fixture",
+    )
+
+    word_list_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S32_WORD_LIST_COMMAND)
+    word_list_reply = await ctx.send(S32_WORD_LIST_COMMAND)
+    replies.append(word_list_reply)
+    assert_reply_mentions(
+        word_list_reply,
+        "当前状态",
+        "米等：mkdr / 100（词库）",
+        "幂等：mkdr / 101（草稿）",
+        "迷瞪：mkdro / 100（词库）",
+        "建议状态",
+        "你列的顺序与常用度证据不一致",
+        "常用度证据",
+    )
+    require(
+        "没有可用的服务端候选记录" not in word_list_reply
+        and word_list_reply.count(pending_confirmation_copy()) == 1,
+        f"S32 word-list turn did not produce one executable plan: {word_list_reply}",
+    )
+    require(
+        (await ctx.draft()).get("items") == original_draft.get("items"),
+        "S32 word-list plan wrote before confirmation",
+    )
+    word_list_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > word_list_cutoff
+        and event.get("kind") == "tool"
+    ]
+    plan_event = next(
+        (
+            event
+            for event in word_list_events
+            if event.get("name") == "keytao_shift_phrase_code"
+            and isinstance(event.get("result"), dict)
+            and isinstance(event["result"].get("shiftPlan"), dict)
+            and event["result"]["shiftPlan"].get("scope") == "prefix_chain"
+        ),
+        None,
+    )
+    require(plan_event is not None, f"S32 did not use the generalized prefix planner: {word_list_events}")
+    shift_plan = plan_event["result"]["shiftPlan"]
+    current_state = shift_plan.get("currentState") or []
+    proposed_state = shift_plan.get("proposedState") or []
+    require(
+        {str(entry.get("word") or "") for entry in current_state}
+        == {"米等", "幂等", "迷瞪"}
+        and {str(entry.get("word") or "") for entry in proposed_state}
+        == {"米等", "幂等", "迷瞪"}
+        and next(
+            entry for entry in current_state if entry.get("word") == "迷瞪"
+        ).get("code") == S32_PREFIX_CODE,
+        f"S32 prefix plan omitted an incident word: {shift_plan}",
+    )
+    proposed_by_word = {
+        str(entry.get("word") or ""): str(entry.get("code") or "")
+        for entry in proposed_state
+        if isinstance(entry, dict)
+    }
+    require(
+        proposed_by_word.get(S32_DRAFT_WORD) == S32_CODE
+        and len(set(proposed_by_word.values())) == 3
+        and all(code.startswith(S32_CODE) for code in proposed_by_word.values()),
+        f"S32 proposed codes are not one ordered mkdr prefix chain: {proposed_by_word}",
+    )
+
+    messages.append("确认")
+    completion_reply = await ctx.send("确认")
+    replies.append(completion_reply)
+    assert_reply_mentions(completion_reply, "操作已完成", "幂等", "米等")
+    final_draft = await ctx.draft()
+    proposed_mi_code = proposed_by_word["米等"]
+    expected_items = {
+        ("Create", "幂等", S32_CODE),
+        ("Delete", "米等", S32_CODE),
+        ("Create", "米等", proposed_mi_code),
+    }
+    actual_items = {item_key(item) for item in final_draft.get("items", [])}
+    draft_idempotent = next(
+        (item for item in final_draft.get("items", []) if item.get("word") == "幂等"),
+        {},
+    )
+    require(
+        actual_items == expected_items and draft_idempotent.get("weight") == 100,
+        f"S32 confirmation did not materialize the sealed live+draft plan: {final_draft}",
+    )
+    confirmed_shift_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > word_list_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    require(
+        len(confirmed_shift_calls) == 1,
+        f"S32 expected one confirmed generalized-plan replay: {confirmed_shift_calls}",
+    )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": final_draft,
+        "facts": {
+            "mergedViewWords": ["米等", "幂等"],
+            "wordListWords": ["米等", "幂等", "迷瞪"],
+            "listedOrder": ["米等", "幂等", "迷瞪"],
+            "proposedOrder": [entry.get("word") for entry in proposed_state],
+            "proposedCodes": proposed_by_word,
+            "chainPlanCancelled": True,
+            "wordListConfirmationSteps": 1,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -3940,6 +4162,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S29", "quoted same-code commonness reorder", scenario_s29),
     Scenario("S30", "read cancel and natural assent closure", scenario_s30),
     Scenario("S31", "verbatim positional eviction closure", scenario_s31),
+    Scenario("S32", "draft-aware and explicit-list chain scope", scenario_s32),
 )
 
 

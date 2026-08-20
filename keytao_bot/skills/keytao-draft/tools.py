@@ -551,7 +551,244 @@ def _build_code_shift_plan(
     target_type: Optional[str] = None,
     target_remark: str = "",
     target_needs_manual_review: Optional[bool] = None,
+    ordered_assignments: Optional[List[Dict]] = None,
 ) -> Dict:
+    if ordered_assignments is not None:
+        assignments = [
+            dict(assignment)
+            for assignment in ordered_assignments
+            if isinstance(assignment, dict)
+        ]
+        assignment_words = [
+            str(assignment.get("word") or "").strip()
+            for assignment in assignments
+        ]
+        if (
+            len(assignments) != len(ordered_assignments)
+            or len(assignments) < 2
+            or any(not value for value in assignment_words)
+            or len(set(assignment_words)) != len(assignment_words)
+            or assignment_words[0] != word
+        ):
+            return {"success": False, "message": "常用度重排缺少完整的有序词条集合"}
+
+        desired_words = set(assignment_words)
+        raw_target_codes = [
+            str(assignment.get("targetCode") or "").strip().lower()
+            for assignment in assignments
+        ]
+        same_code_assignment = len(set(raw_target_codes)) == 1
+        desired_codes: set[str] = set()
+        current_state: List[Dict] = []
+        proposed_state: List[Dict] = []
+        deletes: List[Dict] = []
+        creates: List[Dict] = []
+        changes: List[Dict] = []
+        draft_updates: List[Dict] = []
+        draft_replacements: List[Dict] = []
+        shifted: List[Dict] = []
+
+        for assignment_index, assignment in enumerate(assignments):
+            assignment_word = str(assignment.get("word") or "").strip()
+            target = str(assignment.get("targetCode") or "").strip().lower()
+            phrase_type = str(assignment.get("type") or "").strip()
+            current = assignment.get("current")
+            base_weight = PHRASE_TYPE_BASE_WEIGHTS.get(phrase_type)
+            candidates = word_candidate_code_map.get(assignment_word, [])
+            if (
+                not re.fullmatch(r"[a-z]{1,12}", target)
+                or (target in desired_codes and not same_code_assignment)
+                or base_weight is None
+                or target not in candidates
+                or not isinstance(current, dict)
+            ):
+                return {
+                    "success": False,
+                    "message": f"无法为「{assignment_word}」锁定唯一候选编码位置",
+                }
+            current_code = str(current.get("code") or "").strip().lower()
+            current_type = str(current.get("type") or "").strip()
+            current_weight = current.get("weight")
+            source = str(current.get("source") or "live").strip()
+            if (
+                current_type != phrase_type
+                or not re.fullmatch(r"[a-z]{1,12}", current_code)
+                or not isinstance(current_weight, int)
+                or isinstance(current_weight, bool)
+                or source not in {"live", "draft"}
+            ):
+                return {
+                    "success": False,
+                    "message": f"「{assignment_word}」的当前记录不完整",
+                }
+            desired_codes.add(target)
+            target_weight = (
+                base_weight + assignment_index
+                if same_code_assignment
+                else base_weight
+            )
+            current_state.append({
+                "word": assignment_word,
+                "code": current_code,
+                "type": phrase_type,
+                "weight": current_weight,
+                "source": source,
+            })
+            proposed_state.append({
+                "word": assignment_word,
+                "code": target,
+                "type": phrase_type,
+                "weight": target_weight,
+            })
+            if source == "draft":
+                draft_id = current.get("draftId")
+                if not str(draft_id).isdigit():
+                    return {
+                        "success": False,
+                        "message": f"草稿中的「{assignment_word}」缺少可验证条目 ID",
+                    }
+                if current_code != target:
+                    draft_replacements.append({
+                        "id": int(draft_id),
+                        "word": assignment_word,
+                        "fromCode": current_code,
+                        "toCode": target,
+                        "type": phrase_type,
+                        "weight": target_weight,
+                    })
+                elif current_weight != target_weight:
+                    draft_updates.append({
+                        "id": int(draft_id),
+                        "word": assignment_word,
+                        "code": current_code,
+                        "type": phrase_type,
+                        "fromWeight": current_weight,
+                        "toWeight": target_weight,
+                    })
+                continue
+            if current_code != target:
+                deletes.append({
+                    "action": "Delete",
+                    "word": assignment_word,
+                    "code": current_code,
+                    "type": phrase_type,
+                })
+                creates.append({
+                    "action": "Create",
+                    "word": assignment_word,
+                    "code": target,
+                    "type": phrase_type,
+                    "weight": target_weight,
+                })
+                shifted.append({
+                    "word": assignment_word,
+                    "fromCode": current_code,
+                    "toCode": target,
+                    "candidateCodes": list(candidates),
+                })
+            elif current_weight != target_weight:
+                changes.append({
+                    "action": "Change",
+                    "old_word": assignment_word,
+                    "word": assignment_word,
+                    "code": target,
+                    "type": phrase_type,
+                    "weight": target_weight,
+                })
+
+        if same_code_assignment:
+            if any(
+                str(assignment.get("current", {}).get("code") or "").strip().lower()
+                != raw_target_codes[0]
+                for assignment in assignments
+            ):
+                return {
+                    "success": False,
+                    "message": "同码权重重排中出现了不同编码的当前词条",
+                }
+            return {
+                "success": True,
+                "items": changes,
+                "shifted": [],
+                "draftUpdates": draft_updates,
+                "draftReplacements": draft_replacements,
+                "currentState": current_state,
+                "proposedState": proposed_state,
+            }
+
+        occupants_by_code: Dict[str, List[Dict]] = {
+            code: _ordered_code_occupants(phrases, desired_words)
+            for code, phrases in code_phrase_map.items()
+        }
+        queue: List[Dict] = []
+        for assignment in assignments:
+            assigned_code = str(assignment.get("targetCode") or "").strip().lower()
+            queue.extend(occupants_by_code.get(assigned_code, []))
+            occupants_by_code[assigned_code] = []
+        reserved_codes = set(desired_codes)
+        displaced_words: set[str] = set()
+        while queue:
+            occupant = queue.pop(0)
+            occupant_word = str(occupant.get("word") or "").strip()
+            probe_code = str(occupant.get("code") or "").strip().lower()
+            if not occupant_word or occupant_word in displaced_words:
+                return {"success": False, "message": "顺延链出现重复或空词条"}
+            occupant_codes = word_candidate_code_map.get(occupant_word, [])
+            if probe_code not in occupant_codes:
+                return {
+                    "success": False,
+                    "message": f"无法顺延「{occupant_word}」：当前编码 {probe_code} 不在它自己的候选编码中",
+                }
+            next_code = next(
+                (
+                    candidate_code
+                    for candidate_code in occupant_codes[
+                        occupant_codes.index(probe_code) + 1:
+                    ]
+                    if candidate_code not in reserved_codes
+                ),
+                None,
+            )
+            if not next_code:
+                return {
+                    "success": False,
+                    "message": f"无法顺延「{occupant_word}」：{probe_code} 之后没有可用候选编码",
+                }
+            displaced_words.add(occupant_word)
+            occupant_type = str(occupant.get("type") or "Phrase")
+            base_weight = PHRASE_TYPE_BASE_WEIGHTS.get(occupant_type)
+            if base_weight is None:
+                return {"success": False, "message": f"无法验证「{occupant_word}」的词条类型"}
+            deletes.append({
+                "action": "Delete", "word": occupant_word,
+                "code": probe_code, "type": occupant_type,
+            })
+            creates.append({
+                "action": "Create", "word": occupant_word,
+                "code": next_code, "type": occupant_type, "weight": base_weight,
+            })
+            shifted.append({
+                "word": occupant_word,
+                "fromCode": probe_code,
+                "toCode": next_code,
+                "candidateCodes": list(occupant_codes),
+            })
+            reserved_codes.add(next_code)
+            evicted = list(occupants_by_code.get(next_code, []))
+            if evicted:
+                queue.extend(evicted)
+                occupants_by_code[next_code] = []
+
+        return {
+            "success": True,
+            "items": [*deletes, *changes, *creates],
+            "shifted": shifted,
+            "draftUpdates": draft_updates,
+            "draftReplacements": draft_replacements,
+            "currentState": current_state,
+            "proposedState": proposed_state,
+        }
+
     if target_code not in target_candidate_codes:
         return {
             "success": False,
@@ -4324,6 +4561,338 @@ async def _keytao_strict_batch_add_to_draft(
         return _inject_known_batch_url(result, batch_id)
 
 
+def _ranked_reorder_draft_projection(
+    items: List[Dict],
+) -> Optional[Tuple[List[Dict], set[Tuple[str, str, str]]]]:
+    projected: List[Dict] = []
+    removed: set[Tuple[str, str, str]] = set()
+    seen: set[Tuple[str, str, str]] = set()
+    for raw_item in items:
+        if not isinstance(raw_item, dict):
+            return None
+        action = str(raw_item.get("action") or "").strip()
+        word = str(raw_item.get("word") or "").strip()
+        old_word = str(raw_item.get("oldWord") or raw_item.get("old_word") or "").strip()
+        code = str(raw_item.get("code") or "").strip().lower()
+        phrase_type = str(raw_item.get("type") or "").strip()
+        weight = raw_item.get("weight")
+        item_id = raw_item.get("id")
+        base_weight = PHRASE_TYPE_BASE_WEIGHTS.get(phrase_type)
+        if (
+            action not in {"Create", "Change", "Delete"}
+            or not word
+            or not re.fullmatch(r"[a-z]{1,12}", code)
+            or base_weight is None
+            or not str(item_id).isdigit()
+        ):
+            return None
+        if action == "Change":
+            if not old_word:
+                return None
+            removed.add((phrase_type, code, old_word))
+        elif action == "Delete":
+            removed.add((phrase_type, code, word))
+            continue
+        if (
+            not isinstance(weight, int)
+            or isinstance(weight, bool)
+            or weight < base_weight
+        ):
+            return None
+        identity = (phrase_type, code, word)
+        if identity in seen:
+            return None
+        seen.add(identity)
+        projected.append({
+            "word": word,
+            "code": code,
+            "type": phrase_type,
+            "weight": weight,
+            "source": "draft",
+            "draftId": int(item_id),
+            "draftAction": action,
+        })
+    return projected, removed
+
+
+async def _prepare_ranked_reorder_plan(
+    platform: str,
+    platform_id: str,
+    ordered_words: List[str],
+    target_code: str,
+) -> Dict:
+    """Re-resolve an N-word order and feed it through the shared shift planner."""
+    if (
+        len(ordered_words) < 2
+        or len(set(ordered_words)) != len(ordered_words)
+        or any(not str(value or "").strip() for value in ordered_words)
+        or ordered_words[0] == ""
+    ):
+        return {"success": False, "message": "常用度重排需要至少两个唯一词条"}
+
+    candidate_map: Dict[str, List[str]] = {}
+    for ordered_word in ordered_words:
+        encoded = await _fetch_encode_candidates(ordered_word, target_code)
+        if not encoded.get("success"):
+            return encoded
+        candidate_codes = _clean_code_list(encoded.get("candidateCodes"))
+        if not candidate_codes:
+            return {"success": False, "message": f"无法取得「{ordered_word}」的候选编码链"}
+        candidate_map[ordered_word] = candidate_codes
+
+    word_lookup = await _lookup_words_raw(ordered_words)
+    if not word_lookup.get("success"):
+        return word_lookup
+    results = word_lookup.get("results")
+    if not isinstance(results, list):
+        return {"success": False, "message": "按词查询没有返回完整结果"}
+    live_by_word: Dict[str, List[Dict]] = {value: [] for value in ordered_words}
+    for result in results:
+        if not isinstance(result, dict):
+            return {"success": False, "message": "按词查询返回了无效记录"}
+        result_word = str(result.get("word") or "").strip()
+        phrases = result.get("phrases")
+        if result_word not in live_by_word or not isinstance(phrases, list):
+            return {"success": False, "message": "按词查询改变了请求词条集合"}
+        live_by_word[result_word] = [
+            dict(phrase)
+            for phrase in phrases
+            if isinstance(phrase, dict) and phrase.get("word") == result_word
+        ]
+
+    existing_draft = await keytao_list_draft_items(platform, platform_id)
+    if not existing_draft.get("success") or not isinstance(existing_draft.get("items"), list):
+        return {
+            "success": False,
+            "message": existing_draft.get("message", "无法读取当前草稿，重排未执行"),
+        }
+    projection = _ranked_reorder_draft_projection(existing_draft.get("items", []))
+    if projection is None:
+        return {"success": False, "message": "当前草稿无法形成可验证的重排投影"}
+    projected, removed = projection
+    projected_by_word: Dict[str, List[Dict]] = {value: [] for value in ordered_words}
+    for entry in projected:
+        if entry["word"] in projected_by_word:
+            projected_by_word[entry["word"]].append(entry)
+
+    current_by_word: Dict[str, Dict] = {}
+    for ordered_word in ordered_words:
+        effective_live = []
+        for raw_phrase in live_by_word.get(ordered_word, []):
+            phrase_type = str(raw_phrase.get("type") or "").strip()
+            code = str(raw_phrase.get("code") or "").strip().lower()
+            weight = raw_phrase.get("weight")
+            if (
+                (phrase_type, code, ordered_word) in removed
+                or PHRASE_TYPE_BASE_WEIGHTS.get(phrase_type) is None
+                or not re.fullmatch(r"[a-z]{1,12}", code)
+                or not isinstance(weight, int)
+                or isinstance(weight, bool)
+            ):
+                continue
+            effective_live.append({
+                "word": ordered_word,
+                "code": code,
+                "type": phrase_type,
+                "weight": weight,
+                "source": "live",
+            })
+        matches = [*effective_live, *projected_by_word.get(ordered_word, [])]
+        if len(matches) != 1:
+            return {
+                "success": False,
+                "message": f"服务端无法为「{ordered_word}」锁定唯一的词库或草稿记录",
+            }
+        current_by_word[ordered_word] = matches[0]
+
+    phrase_types = {entry["type"] for entry in current_by_word.values()}
+    current_codes = [entry["code"] for entry in current_by_word.values()]
+    if len(phrase_types) != 1:
+        return {"success": False, "message": "这些词的类型不同，不能共用一条重排计划"}
+    same_code_scope = len(set(current_codes)) == 1
+    if same_code_scope:
+        desired_codes = [current_codes[0]] * len(ordered_words)
+    else:
+        if (
+            any(target_code not in candidate_map[value] for value in ordered_words)
+            or any(not code.startswith(target_code) for code in current_codes)
+            or any(
+                current_by_word[value]["code"] not in candidate_map[value]
+                for value in ordered_words
+            )
+        ):
+            return {"success": False, "message": "这些词不属于同一条可验证候选前缀链"}
+        desired_codes = []
+        for position, ordered_word in enumerate(ordered_words):
+            own_chain = candidate_map[ordered_word]
+            target_index = own_chain.index(target_code) + position
+            if target_index >= len(own_chain):
+                return {
+                    "success": False,
+                    "message": f"「{ordered_word}」自己的候选前缀链没有第 {position + 1} 个位置",
+                }
+            desired_code = own_chain[target_index]
+            if (
+                not desired_code.startswith(target_code)
+                or desired_code in desired_codes
+            ):
+                return {
+                    "success": False,
+                    "message": f"「{ordered_word}」无法锁定唯一的第 {position + 1} 个前缀链位置",
+                }
+            desired_codes.append(desired_code)
+
+    desired_word_set = set(ordered_words)
+    desired_code_set = set(desired_codes)
+    unrelated_draft_chain_rows = [
+        entry
+        for entry in projected
+        if entry["word"] not in desired_word_set
+        and entry["code"] in desired_code_set
+    ]
+    if unrelated_draft_chain_rows:
+        return {
+            "success": False,
+            "requiresDraftCleanup": True,
+            "message": "同一候选链还有未列出的草稿词条，必须先明确是否一起重排",
+            "relatedDraftItems": unrelated_draft_chain_rows,
+        }
+
+    code_phrase_map: Dict[str, List[Dict]] = {}
+
+    async def ensure_code_lookup(code: str) -> Dict:
+        if code in code_phrase_map:
+            return {"success": True}
+        lookup = await _lookup_codes_raw([code])
+        if not lookup.get("success"):
+            return lookup
+        for result in lookup.get("results", []):
+            if not isinstance(result, dict):
+                return {"success": False, "message": "编码查询返回了无效记录"}
+            result_code = str(result.get("code") or "").strip().lower()
+            phrases = result.get("phrases")
+            if not re.fullmatch(r"[a-z]{1,12}", result_code) or not isinstance(phrases, list):
+                return {"success": False, "message": "编码查询缺少完整词条集合"}
+            code_phrase_map[result_code] = [
+                dict(phrase)
+                for phrase in phrases
+                if isinstance(phrase, dict)
+                and (
+                    str(phrase.get("type") or "").strip(),
+                    str(phrase.get("code") or result_code).strip().lower(),
+                    str(phrase.get("word") or "").strip(),
+                ) not in removed
+            ]
+        code_phrase_map.setdefault(code, [])
+        return {"success": True}
+
+    for code in desired_code_set:
+        lookup_result = await ensure_code_lookup(code)
+        if not lookup_result.get("success"):
+            return lookup_result
+
+    reserved_codes = set(desired_code_set)
+    queue = [
+        phrase
+        for code in desired_codes
+        for phrase in _ordered_code_occupants(
+            code_phrase_map.get(code, []),
+            desired_word_set,
+        )
+    ]
+    queued_words: set[str] = set()
+    while queue:
+        occupant = queue.pop(0)
+        occupant_word = str(occupant.get("word") or "").strip()
+        probe_code = str(occupant.get("code") or "").strip().lower()
+        if not occupant_word or occupant_word in queued_words:
+            return {"success": False, "message": "候选链中出现了重复占用词条"}
+        queued_words.add(occupant_word)
+        occupant_codes = candidate_map.get(occupant_word)
+        if occupant_codes is None:
+            encoded = await _fetch_encode_candidates(occupant_word)
+            if not encoded.get("success"):
+                return encoded
+            occupant_codes = _clean_code_list(encoded.get("candidateCodes"))
+            candidate_map[occupant_word] = occupant_codes
+        if probe_code not in occupant_codes:
+            return {
+                "success": False,
+                "message": f"无法顺延「{occupant_word}」：当前编码不在它自己的候选链",
+            }
+        next_code = next(
+            (
+                code
+                for code in occupant_codes[occupant_codes.index(probe_code) + 1:]
+                if code not in reserved_codes
+            ),
+            None,
+        )
+        if not next_code:
+            return {"success": False, "message": f"无法顺延「{occupant_word}」：没有后续候选编码"}
+        lookup_result = await ensure_code_lookup(next_code)
+        if not lookup_result.get("success"):
+            return lookup_result
+        reserved_codes.add(next_code)
+        queue.extend(_ordered_code_occupants(
+            code_phrase_map.get(next_code, []),
+            desired_word_set | queued_words,
+        ))
+
+    downstream_draft_chain_rows = [
+        entry
+        for entry in projected
+        if entry["word"] not in desired_word_set
+        and entry["code"] in reserved_codes
+    ]
+    if downstream_draft_chain_rows:
+        return {
+            "success": False,
+            "requiresDraftCleanup": True,
+            "message": "顺延会经过未列出的草稿词条，必须先明确是否一起重排",
+            "relatedDraftItems": downstream_draft_chain_rows,
+        }
+
+    assignments = [
+        {
+            "word": ordered_word,
+            "targetCode": desired_code,
+            "type": current_by_word[ordered_word]["type"],
+            "current": current_by_word[ordered_word],
+        }
+        for ordered_word, desired_code in zip(ordered_words, desired_codes)
+    ]
+    plan = _build_code_shift_plan(
+        word=ordered_words[0],
+        target_code=target_code,
+        target_candidate_codes=candidate_map[ordered_words[0]],
+        current_phrase=current_by_word[ordered_words[0]],
+        code_phrase_map=code_phrase_map,
+        word_candidate_code_map=candidate_map,
+        ordered_assignments=assignments,
+    )
+    if not plan.get("success"):
+        return plan
+    current_batch_id = str(existing_draft.get("batchId") or "")
+    current_version = existing_draft.get("contentVersion")
+    if not current_batch_id:
+        current_version = 0
+    if (
+        not isinstance(current_version, int)
+        or isinstance(current_version, bool)
+        or current_version < 0
+    ):
+        return {"success": False, "message": "当前草稿缺少可验证的内容版本"}
+    return {
+        "success": True,
+        "batchId": current_batch_id,
+        "contentVersion": current_version,
+        "candidateCodes": candidate_map[ordered_words[0]],
+        "scope": "same_code" if same_code_scope else "prefix_chain",
+        **plan,
+    }
+
+
 async def keytao_shift_phrase_code(
     platform: str,
     platform_id: str,
@@ -4336,12 +4905,186 @@ async def keytao_shift_phrase_code(
     target_type: Optional[str] = None,
     target_remark: str = "",
     target_needs_manual_review: Optional[bool] = None,
+    ordered_words: Optional[List[str]] = None,
+    listed_words: Optional[List[str]] = None,
+    evidence_lines: Optional[List[str]] = None,
 ) -> Dict:
-    """Preview, bind, then atomically write a complete code-shift plan."""
+    """Preview, bind, then CAS-write a complete code-shift plan."""
     word = word.strip()
     target_code = target_code.strip().lower()
     if not word or not target_code:
         return {"success": False, "message": "必须提供词条和目标编码"}
+
+    if ordered_words is not None:
+        normalized_order = [str(value or "").strip() for value in ordered_words]
+        normalized_listed = [str(value or "").strip() for value in listed_words or []]
+        normalized_evidence = [str(value or "").strip() for value in evidence_lines or []]
+        if (
+            len(normalized_order) < 2
+            or len(set(normalized_order)) != len(normalized_order)
+            or any(not value for value in normalized_order)
+            or normalized_order[0] != word
+            or any(not value for value in normalized_listed)
+            or (normalized_listed and set(normalized_listed) != set(normalized_order))
+            or any(not value for value in normalized_evidence)
+        ):
+            return {"success": False, "message": "常用度重排参数不完整"}
+        prepared = await _prepare_ranked_reorder_plan(
+            platform,
+            platform_id,
+            normalized_order,
+            target_code,
+        )
+        if not prepared.get("success"):
+            return prepared
+        if prepared.get("draftReplacements"):
+            return _inject_known_batch_url({
+                "success": False,
+                "requiresDraftCleanup": True,
+                "message": render_remediation_reply(
+                    "常用度顺序需要改变现有草稿词条的编码；当前服务端只能原子调整草稿权重，"
+                    "本次未写入；请先处理这些草稿条目"
+                ),
+                "relatedDraftItems": prepared.get("draftReplacements"),
+            }, str(prepared.get("batchId") or ""))
+        shift_plan = {
+            "word": word,
+            "targetCode": target_code,
+            "candidateCodes": prepared.get("candidateCodes", []),
+            "scope": prepared.get("scope"),
+            "items": prepared.get("items", []),
+            "shifted": prepared.get("shifted", []),
+            "draftUpdates": prepared.get("draftUpdates", []),
+            "draftReplacements": [],
+            "currentState": prepared.get("currentState", []),
+            "proposedState": prepared.get("proposedState", []),
+            "listedWords": normalized_listed,
+            "evidenceLines": normalized_evidence,
+        }
+        current_batch_id = str(prepared.get("batchId") or "")
+        current_content_version = int(prepared.get("contentVersion") or 0)
+        plan_items = prepared.get("items", [])
+        warning_digest = str(expected_warning_digest or "").strip().lower()
+        warnings: List[Any] = []
+        if plan_items and not confirmed_plan_digest:
+            strict_preview = await _keytao_strict_batch_add_to_draft(
+                platform,
+                platform_id,
+                plan_items,
+                batch_id=current_batch_id or None,
+                expected_content_version=current_content_version,
+            )
+            if strict_preview.get("requiresConfirmation") is not True:
+                return _inject_known_batch_url({
+                    **strict_preview,
+                    "success": False,
+                    "message": strict_preview.get("message") or "服务端未锁定完整重排修改快照",
+                    "shiftPlan": shift_plan,
+                }, current_batch_id)
+            warning_digest = str(strict_preview.get("warningDigest") or "").strip().lower()
+            warnings = list(strict_preview.get("warnings") or [])
+            if not re.fullmatch(r"[0-9a-f]{64}", warning_digest):
+                return _inject_known_batch_url({
+                    "success": False,
+                    "message": "服务端重排预览缺少风险摘要",
+                    "shiftPlan": shift_plan,
+                }, current_batch_id)
+        digest_payload = {
+            "batchId": current_batch_id,
+            "contentVersion": current_content_version,
+            "warningDigest": warning_digest,
+            "shiftPlan": shift_plan,
+        }
+        plan_digest = hashlib.sha256(json.dumps(
+            digest_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if not confirmed_plan_digest:
+            return _inject_known_batch_url({
+                "success": False,
+                "requiresConfirmation": True,
+                "confirmationKind": "rankedShiftPlan",
+                "message": "常用度重排会同时调整编码链和草稿权重，请核对完整计划",
+                "batchId": current_batch_id,
+                "contentVersion": current_content_version,
+                "planDigest": plan_digest,
+                "warningDigest": warning_digest,
+                "warnings": warnings,
+                "shiftPlan": shift_plan,
+            }, current_batch_id)
+        if (
+            confirmed_plan_digest.strip().lower() != plan_digest
+            or str(batch_id or "") != current_batch_id
+            or expected_content_version != current_content_version
+            or (plan_items and not re.fullmatch(r"[0-9a-f]{64}", warning_digest))
+        ):
+            return _inject_known_batch_url({
+                "success": False,
+                "staleConfirmation": True,
+                "message": render_remediation_reply(
+                    "常用度重排计划或草稿内容已变化，旧确认已失效",
+                    command="查看草稿",
+                ),
+                "batchId": current_batch_id,
+                "contentVersion": current_content_version,
+            }, current_batch_id)
+
+        write_result: Dict = {
+            "success": True,
+            "batchId": current_batch_id,
+            "successCount": 0,
+        }
+        if plan_items:
+            write_result = await _keytao_strict_batch_add_to_draft(
+                platform,
+                platform_id,
+                plan_items,
+                batch_id=current_batch_id or None,
+                expected_content_version=current_content_version,
+                confirmed=True,
+                expected_warning_digest=warning_digest,
+            )
+            if write_result.get("success") is not True:
+                write_result["shiftPlan"] = shift_plan
+                write_result["planDigest"] = plan_digest
+                return _inject_known_batch_url(write_result, current_batch_id)
+
+        for update in shift_plan["draftUpdates"]:
+            updated = await keytao_update_draft_item_weight(
+                platform,
+                platform_id,
+                str(update.get("word") or ""),
+                str(update.get("code") or ""),
+                int(update.get("toWeight")),
+            )
+            if updated.get("success") is not True:
+                return _inject_known_batch_url({
+                    **updated,
+                    "success": False,
+                    "partialWrite": bool(plan_items),
+                    "message": (
+                        "实时词库变更已写入草稿，但草稿权重调整未全部完成；"
+                        + str(updated.get("message") or "请查看草稿核对")
+                    ),
+                    "shiftPlan": shift_plan,
+                    "planDigest": plan_digest,
+                }, current_batch_id)
+
+        final_snapshot = await keytao_list_draft_items(
+            platform,
+            platform_id,
+            batch_id=str(write_result.get("batchId") or current_batch_id or "") or None,
+        )
+        if final_snapshot.get("success") is True:
+            write_result["draft_snapshot"] = final_snapshot
+            write_result["batchId"] = final_snapshot.get("batchId") or write_result.get("batchId")
+        write_result["success"] = True
+        write_result["successCount"] = len(plan_items) + len(shift_plan["draftUpdates"])
+        write_result["shiftPlan"] = shift_plan
+        write_result["planDigest"] = plan_digest
+        return _inject_known_batch_url(write_result, str(write_result.get("batchId") or current_batch_id))
 
     target_encode = await _fetch_encode_candidates(word, target_code)
     if not target_encode.get("success"):

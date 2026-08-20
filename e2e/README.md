@@ -72,6 +72,9 @@ S29 declares authoritative readings for `火锅` and `电脑`, clears only those
 rig-owned dictionary words, then seeds the exact `mkdr` Phrase chain at weights
 100 and 101. The complete vendored commonness database supplies the ordering
 evidence; the scenario never depends on an external search result.
+S32 declares authoritative readings for `米等`, `幂等`, and `迷瞪`, clears only
+those rig-owned dictionary words, then seeds `米等@mkdr(100)`,
+`迷瞪@mkdro(100)`, and a current-draft `幂等@mkdr(101)` projection.
 
 ## Prerequisites
 
@@ -308,6 +311,14 @@ S31 executes the verbatim incident command
 local `米等@mkdr` fixture, requires the bot to traverse lookup plus the
 server-generated circular shift plan, and verifies the exact three draft rows
 before API-only fixture cleanup.
+
+S32 replays both 2026-08-20 chain-scope incidents verbatim. The first command
+must merge the live `mkdr` row with the current draft row and render one locked
+weight plan; the scenario cancels that plan to retain the incident baseline.
+The newline-separated three-word command must then resolve every word, include
+`迷瞪@mkdro` in one `mkdr*` prefix-chain plan, show current and proposed
+code/weight facts plus the listed-order comparison, and apply the sealed plan
+after exactly one confirmation.
 
 Optional overrides:
 

@@ -240,6 +240,72 @@ class CodeChainReorderCommand:
     focus_words: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class WordListReorderCommand:
+    """One explicit ordered list whose scope must be resolved server-side."""
+
+    words: Tuple[str, ...]
+
+
+_WORD_LIST_REORDER_WORD_PATTERN = r"[\u3400-\u9fff]{1,30}"
+_WORD_LIST_REORDER_SEPARATOR_PATTERN = r"(?:\s+|[、\-‐‑‒–—]+)"
+_WORD_LIST_REORDER_LIST_PATTERN = (
+    rf"{_WORD_LIST_REORDER_WORD_PATTERN}"
+    rf"(?:{_WORD_LIST_REORDER_SEPARATOR_PATTERN}"
+    rf"{_WORD_LIST_REORDER_WORD_PATTERN}){{1,19}}"
+)
+_WORD_LIST_REORDER_VERB_PATTERN = (
+    r"(?:重新排序(?:下|一下)?|排一下|按优先级排(?:一下)?)"
+)
+_WORD_LIST_REORDER_PREFIX_RE = re.compile(
+    rf"^(?P<verb>{_WORD_LIST_REORDER_VERB_PATTERN})\s+"
+    rf"(?P<words>{_WORD_LIST_REORDER_LIST_PATTERN})(?:吧)?$"
+)
+_WORD_LIST_REORDER_SUFFIX_RE = re.compile(
+    rf"^(?P<words>{_WORD_LIST_REORDER_LIST_PATTERN})\s+"
+    rf"(?P<verb>{_WORD_LIST_REORDER_VERB_PATTERN})(?:吧)?$"
+)
+
+
+def _parse_word_list_reorder_command(
+    message_text: str,
+) -> Optional[WordListReorderCommand]:
+    """Parse a positive whole-message reorder over two or more literal words."""
+    source = unicodedata.normalize(
+        "NFKC",
+        _strip_command_message_prefixes(message_text),
+    ).strip()
+    if (
+        not source
+        or re.search(r"[?？\"'“”‘’『』]", source)
+        or re.search(r"^(?:不要|别|无需|不用|不必)", source)
+        or re.search(r"^(?:他说|她说|他们说|有人说|引用|转述)[：:]?", source)
+    ):
+        return None
+    source = re.sub(r"[。.!！~～]+$", "", source).strip()
+    match = (
+        _WORD_LIST_REORDER_PREFIX_RE.fullmatch(source)
+        or _WORD_LIST_REORDER_SUFFIX_RE.fullmatch(source)
+    )
+    if match is None:
+        return None
+    words = tuple(
+        token
+        for token in re.split(
+            _WORD_LIST_REORDER_SEPARATOR_PATTERN,
+            str(match.group("words") or "").strip(),
+        )
+        if token
+    )
+    if (
+        len(words) < 2
+        or len(set(words)) != len(words)
+        or any(_PURE_CHINESE_TOKEN_RE.fullmatch(word) is None for word in words)
+    ):
+        return None
+    return WordListReorderCommand(words=words)
+
+
 _CODE_CHAIN_REORDER_DIRECT_RE = re.compile(
     r"(?:重新排序|重新排|重排|排序|排)(?:下|一下)?"
     r"(?P<code>[a-z]{1,6})"
@@ -416,6 +482,7 @@ _DRAFT_FLOW_INTENTS = frozenset({
     "operation_recall",
     "batch_replace_char",
     "code_chain_reorder",
+    "word_list_reorder",
     "entry_swap",
 })
 
@@ -1736,6 +1803,12 @@ def _is_fresh_current_user_command_intent(
             command is not None
             and command.code == command_intent.requested_code
         )
+    if command_intent.intent == "word_list_reorder":
+        command = _parse_word_list_reorder_command(message_text)
+        return bool(
+            command is not None
+            and command.words == command_intent.keep_words
+        )
     if command_intent.intent == "entry_swap":
         command = parse_entry_swap(message_text)
         return bool(
@@ -1919,6 +1992,7 @@ def _parse_message_command_intent_payload(payload: Dict) -> MessageCommandIntent
         "operation_recall",
         "batch_replace_char",
         "code_chain_reorder",
+        "word_list_reorder",
         "pending_confirm",
         "pending_cancel",
         "pending_add_and_submit",
@@ -1991,6 +2065,13 @@ def _structural_draft_management_intent(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Keep the safest common recall/clear commands independent of the LLM."""
+    word_list_reorder = _parse_word_list_reorder_command(message_text)
+    if word_list_reorder is not None:
+        return MessageCommandIntent(
+            intent="word_list_reorder",
+            confidence=1.0,
+            keep_words=word_list_reorder.words,
+        )
     swap = parse_entry_swap(message_text)
     if swap is not None:
         return MessageCommandIntent(

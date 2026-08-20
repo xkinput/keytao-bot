@@ -42,6 +42,8 @@ from .scenarios import (
     S28_WORD,
     S29_CODE,
     S29_CURRENT,
+    S32_CHAIN_COMMAND,
+    S32_WORD_LIST_COMMAND,
     assert_batch_link_hosts,
     same_unique_item_set,
 )
@@ -398,15 +400,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S29 replays the 2026-08-20 quoted-summary incident", readme)
         self.assertIn("S30 pins three intent-coverage boundaries", readme)
         self.assertIn("S31 executes the verbatim incident command", readme)
+        self.assertIn("S32 replays both 2026-08-20 chain-scope incidents", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s31(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s32(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 32)],
+            [f"S{index}" for index in range(1, 33)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -779,6 +782,25 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             ZDIC_FIXTURES_BY_SCENARIO["S30"],
             ZDIC_FIXTURES_BY_SCENARIO["S2"],
         )
+
+    def test_s32_owns_both_verbatim_chain_scope_incidents(self) -> None:
+        self.assertEqual(
+            S32_CHAIN_COMMAND,
+            "重新排序下mkdr 编码链这几个词按优先级",
+        )
+        self.assertEqual(
+            S32_WORD_LIST_COMMAND,
+            "重新排序下\n米等\n幂等\n迷瞪",
+        )
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S32"]
+        self.assertEqual(fixture["probe_words"], ("米等", "幂等", "迷瞪"))
+        declared = {
+            (row["kind"], row["entry"]): (row["status"], tuple(row["pinyins"]))
+            for row in fixture["rows"]
+        }
+        self.assertEqual(declared[("entry", "米等")], ("found", ("mǐ", "děng")))
+        self.assertEqual(declared[("entry", "幂等")], ("found", ("mì", "děng")))
+        self.assertEqual(declared[("entry", "迷瞪")], ("found", ("mí", "dèng")))
 
     async def test_s29_seeds_the_exact_weighted_mkdr_chain(self) -> None:
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S29"]
