@@ -114,7 +114,7 @@ async def _try_llm_auto_review_for_preview(
         issues: List[str] = []
         for review_item in non_pass_items[:5]:
             reasons = review_item.get("reasons") if isinstance(review_item.get("reasons"), list) else []
-            title = review_item.get("title") or f"PR#{review_item.get('prId')} 需要复核"
+            title = review_item.get("title") or "该草稿条目需要复核"
             issues.append(str(reasons[0] if reasons else title))
         resolved_issues = issues or deterministic_audit.get("issues", [])
         return apply_manual_review_flag({

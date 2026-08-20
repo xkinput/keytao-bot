@@ -1689,7 +1689,7 @@ async def _audit_current_draft_for_auto_approval(
         ]
         if locked_items:
             labels = [
-                str(item.get("word") or f"PR#{item.get('id')}")
+                str(item.get("word") or "未命名草稿条目")
                 for item in locked_items[:10]
             ]
             return bind_snapshot({
@@ -1779,7 +1779,7 @@ async def _try_llm_auto_review_for_draft(list_result: Dict, deterministic_audit:
         issues = []
         for item in non_pass_items[:10]:
             reasons = item.get("reasons") if isinstance(item.get("reasons"), list) else []
-            title = item.get("title") or f"PR#{item.get('prId')} 需要复核"
+            title = item.get("title") or "该草稿条目需要复核"
             reason = reasons[0] if reasons else title
             issues.append(str(reason))
 

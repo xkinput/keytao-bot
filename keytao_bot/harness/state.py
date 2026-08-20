@@ -11,7 +11,7 @@ import uuid
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 from nonebot.log import logger
 
@@ -65,6 +65,205 @@ class PendingToolConfirm:
     function_name: str
     args: Dict
     confirmation_source: str = "local_preview"
+
+
+def _server_confirmation_display(data: Dict) -> Dict:
+    """Keep JSON-safe server facts for display, never for write authority."""
+    display: Dict[str, Any] = {}
+    batch_url = str(data.get("batchUrl") or "").strip()
+    if (
+        data.get("batchIdProvisional") is not True
+        and len(batch_url) <= 2048
+        and re.fullmatch(r"https?://[^\s]+", batch_url)
+    ):
+        display["batchUrl"] = batch_url
+
+    for key in ("warnings", "snapshotItems", "targets", "items"):
+        value = data.get(key)
+        if not isinstance(value, list):
+            continue
+        try:
+            display[key] = json.loads(json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+            ))
+        except (TypeError, ValueError):
+            continue
+
+    shift_plan = data.get("shiftPlan")
+    if isinstance(shift_plan, dict):
+        try:
+            display["shiftPlan"] = json.loads(json.dumps(
+                shift_plan,
+                ensure_ascii=False,
+                allow_nan=False,
+            ))
+        except (TypeError, ValueError):
+            pass
+    return display
+
+
+def server_warning_pending_state(
+    state: PendingToolConfirm,
+    data: Dict,
+) -> PendingToolConfirm:
+    """Seal one pending state to the server preview that produced it."""
+    args = dict(state.args)
+    args.pop("confirmed", None)
+    args.pop("preview_only", None)
+    response_content_version = data.get("contentVersion")
+    planned_content_version = args.get("expected_content_version")
+    planned_absence = state.function_name == "keytao_shift_phrase_code" and (
+        (
+            "batch_id" in args
+            and not str(args.get("batch_id") or "").strip()
+            and isinstance(planned_content_version, int)
+            and not isinstance(planned_content_version, bool)
+            and planned_content_version == 0
+        )
+        or (
+            "batchId" in data
+            and not str(data.get("batchId") or "").strip()
+            and isinstance(response_content_version, int)
+            and not isinstance(response_content_version, bool)
+            and response_content_version == 0
+        )
+    )
+    batch_id = (
+        ""
+        if planned_absence
+        else str(data.get("batchId") or args.get("batch_id") or "").strip()
+    )
+    bound_functions = {
+        "keytao_create_phrase",
+        "keytao_submit_batch",
+        "keytao_batch_add_to_draft",
+        "keytao_shift_phrase_code",
+        "keytao_recall_batch",
+        "keytao_remove_draft_item",
+        "keytao_batch_remove_draft_items",
+    }
+    if (batch_id or planned_absence) and state.function_name in bound_functions:
+        args["batch_id"] = batch_id
+    content_version = 0 if planned_absence else response_content_version
+    if (
+        state.function_name in bound_functions
+        and isinstance(content_version, int)
+        and not isinstance(content_version, bool)
+        and content_version >= 0
+    ):
+        args["expected_content_version"] = content_version
+    if state.function_name == "keytao_shift_phrase_code":
+        plan_digest = str(data.get("planDigest") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", plan_digest):
+            args["confirmed_plan_digest"] = plan_digest
+    if state.function_name in {
+        "keytao_create_phrase",
+        "keytao_batch_add_to_draft",
+        "keytao_shift_phrase_code",
+    }:
+        warning_digest = str(data.get("warningDigest") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", warning_digest):
+            args["expected_warning_digest"] = warning_digest
+    if state.function_name == "keytao_submit_batch":
+        digest_fields = {
+            "expected_server_snapshot_digest": "snapshotDigest",
+            "expected_warning_digest": "warningDigest",
+            "expected_audit_digest": "auditDigest",
+        }
+        for argument_name, response_name in digest_fields.items():
+            digest = str(data.get(response_name) or "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                args[argument_name] = digest
+    if state.function_name in {
+        "keytao_remove_draft_item",
+        "keytao_batch_remove_draft_items",
+    }:
+        target_digest = str(data.get("targetDigest") or "").strip().lower()
+        targets = data.get("targets")
+        if re.fullmatch(r"[0-9a-f]{64}", target_digest) and isinstance(targets, list):
+            args["expected_target_digest"] = target_digest
+            args["expected_targets"] = targets
+    pending_display = _server_confirmation_display(data)
+    if pending_display:
+        args["_pending_display"] = pending_display
+    else:
+        args.pop("_pending_display", None)
+    return PendingToolConfirm(
+        function_name=state.function_name,
+        args=args,
+        confirmation_source="server_warning",
+    )
+
+
+def server_warning_ticket_is_complete(state: PendingToolConfirm) -> bool:
+    """Return whether a server ticket has every field required for one replay."""
+    if state.confirmation_source != "server_warning":
+        return False
+    args = state.args if isinstance(state.args, dict) else {}
+    version = args.get("expected_content_version")
+    valid_version = bool(
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version >= 0
+    )
+    function_name = state.function_name
+    if function_name in {
+        "keytao_remove_draft_item",
+        "keytao_batch_remove_draft_items",
+    }:
+        return bool(
+            args.get("batch_id")
+            and valid_version
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(args.get("expected_target_digest") or ""),
+            )
+            and isinstance(args.get("expected_targets"), list)
+            and args.get("expected_targets")
+        )
+    if function_name == "keytao_recall_batch":
+        return bool(args.get("batch_id") and valid_version)
+    if function_name == "keytao_shift_phrase_code":
+        return bool(
+            valid_version
+            and (args.get("batch_id") or version == 0)
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(args.get("confirmed_plan_digest") or ""),
+            )
+        )
+    if function_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"}:
+        return bool(
+            args.get("batch_id")
+            and valid_version
+            and re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(args.get("expected_warning_digest") or ""),
+            )
+        )
+    if function_name == "keytao_submit_batch":
+        return bool(
+            args.get("batch_id")
+            and valid_version
+            and all(
+                re.fullmatch(r"[0-9a-f]{64}", str(args.get(key) or ""))
+                for key in (
+                    "expected_server_snapshot_digest",
+                    "expected_warning_digest",
+                    "expected_audit_digest",
+                )
+            )
+        )
+    return False
+
+
+def pending_execution_args(state: PendingToolConfirm) -> Dict:
+    """Return sealed execution arguments without display-only facts."""
+    args = dict(state.args)
+    args.pop("_pending_display", None)
+    return args
 
 
 def pending_batch_display_pairs(

@@ -197,6 +197,7 @@ def strip_bare_batch_ids(text: str) -> str:
 
 _INTERNAL_REPLY_FRAGMENT_RE = re.compile(
     r"(?:\bboundTarget\b|\bblockReason\b|\bbinding_incomplete\b|"
+    r"PR#\d+|"
     r"[（(]\s*缺少\s*[：:]\s*[^）)]*"
     r"(?:[a-z]+[A-Z_][A-Za-z0-9_]*|[a-z]+_[a-z0-9_]+)[^）)]*[）)])"
 )
@@ -527,7 +528,12 @@ def _format_submit_conflict_failure(data: Dict) -> str:
     return _assert_plain_user_facing_reply("\n".join(lines))
 
 
-def _format_pending_item_line(item: Any, *, include_id: bool = False) -> str:
+def _format_pending_item_line(
+    item: Any,
+    *,
+    separator: str = "→",
+    include_metadata: bool = False,
+) -> str:
     """Render one word/code fact from a trusted pending-record item."""
     if not isinstance(item, dict):
         return ""
@@ -535,9 +541,25 @@ def _format_pending_item_line(item: Any, *, include_id: bool = False) -> str:
     code = str(item.get("code") or "").strip().lower()
     if not word or not code:
         return ""
-    item_id = item.get("id")
-    prefix = f"PR#{item_id}：" if include_id and item_id is not None else ""
-    return f"- {prefix}「{word}」→ {code}"
+    line = f"- 「{word}」{separator} {code}"
+    if include_metadata:
+        action = {
+            "Create": "新增",
+            "Change": "修改",
+            "Delete": "删除",
+        }.get(str(item.get("action") or ""), str(item.get("action") or "操作"))
+        phrase_type = {
+            "Single": "单字",
+            "Phrase": "词组",
+            "Supplement": "补充",
+            "Symbol": "符号",
+            "Link": "链接",
+            "CSS": "声笔笔",
+            "CSSSingle": "声笔笔单字",
+            "English": "英文",
+        }.get(str(item.get("type") or ""), str(item.get("type") or "词条"))
+        line += f"（{action}/{phrase_type}）"
+    return line
 
 
 def _format_pending_state_details(state: PendingState) -> str:
@@ -565,7 +587,9 @@ def _format_pending_state_details(state: PendingState) -> str:
     function_name = state.function_name
     lines: List[str] = []
     items: List[Any] = []
-    include_ids = False
+    shifted_lines: List[str] = []
+    item_separator = "→"
+    include_metadata = False
 
     if function_name == "keytao_batch_add_to_draft":
         lines.append("批量加词，内容如下：")
@@ -605,6 +629,21 @@ def _format_pending_state_details(state: PendingState) -> str:
             if isinstance(shift_plan.get("items"), list)
             else []
         )
+        shifted = (
+            shift_plan.get("shifted")
+            if isinstance(shift_plan.get("shifted"), list)
+            else []
+        )
+        for shifted_item in shifted:
+            if not isinstance(shifted_item, dict):
+                continue
+            shifted_word = str(shifted_item.get("word") or "").strip()
+            from_code = str(shifted_item.get("fromCode") or "").strip().lower()
+            to_code = str(shifted_item.get("toCode") or "").strip().lower()
+            if shifted_word and from_code and to_code:
+                shifted_lines.append(
+                    f"- 「{shifted_word}」：{from_code} → {to_code}"
+                )
         if not items:
             word = str(args.get("word") or "").strip()
             code = str(args.get("target_code") or "").strip().lower()
@@ -613,7 +652,7 @@ def _format_pending_state_details(state: PendingState) -> str:
         "keytao_remove_draft_item",
         "keytao_batch_remove_draft_items",
     }:
-        lines.append("删除草稿条目，目标如下：")
+        lines.append("删除草稿条目，服务端已锁定目标如下：")
         items = (
             args.get("expected_targets")
             if isinstance(args.get("expected_targets"), list)
@@ -621,7 +660,8 @@ def _format_pending_state_details(state: PendingState) -> str:
             if isinstance(display.get("targets"), list)
             else []
         )
-        include_ids = True
+        item_separator = "@"
+        include_metadata = True
         if not items:
             draft_id = str(args.get("draft_id") or args.get("id") or "").strip()
             lines[0] = f"删除草稿条目 {draft_id}" if draft_id else "删除草稿条目"
@@ -638,12 +678,19 @@ def _format_pending_state_details(state: PendingState) -> str:
     rendered_items = [
         line
         for line in (
-            _format_pending_item_line(item, include_id=include_ids)
+            _format_pending_item_line(
+                item,
+                separator=item_separator,
+                include_metadata=include_metadata,
+            )
             for item in items
         )
         if line
     ]
     lines.extend(rendered_items)
+    if shifted_lines:
+        lines.append("顺延变化：")
+        lines.extend(shifted_lines)
 
     warnings = (
         display.get("warnings")
@@ -661,6 +708,42 @@ def _format_pending_state_details(state: PendingState) -> str:
     if batch_url:
         lines.append(f"草稿地址：{batch_url}")
     return "\n".join(lines)
+
+
+def _format_server_bound_confirmation_prompt(state: PendingToolConfirm) -> str:
+    """Render the first and only prompt from one sealed server ticket."""
+    if state.confirmation_source != "server_warning":
+        raise ValueError("Server-bound confirmation prompt requires a server ticket")
+    details = _format_pending_state_details(state)
+    return _assert_plain_user_facing_reply(
+        f"{details}\n\n{pending_confirmation_copy()}"
+    )
+
+
+def _format_changed_server_confirmation_prompt(
+    previous: PendingToolConfirm,
+    current: PendingToolConfirm,
+) -> str:
+    """Explain a changed server ticket before asking for fresh consent."""
+    if (
+        previous.confirmation_source != "server_warning"
+        or current.confirmation_source != "server_warning"
+        or previous.function_name != current.function_name
+    ):
+        raise ValueError("Changed confirmation prompt requires matching server tickets")
+    previous_details = _format_pending_state_details(previous)
+    current_details = _format_pending_state_details(current)
+    lines = [
+        "服务端复核发现确认内容已变化，原确认没有执行。",
+        "原确认内容：",
+        previous_details,
+        "",
+        "当前内容：",
+        current_details,
+        "",
+        pending_confirmation_copy(),
+    ]
+    return _assert_plain_user_facing_reply("\n".join(lines))
 
 
 def _format_full_add_and_submit_instruction(

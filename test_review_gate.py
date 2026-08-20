@@ -4684,8 +4684,123 @@ def test_audit_budget_nesting_and_timeout_retains_review():
     asyncio.run(_run())
 
 
-def test_multi_sense_recommendation_follows_meaning_or_asks():
-    print("\n🧪 multi-sense recommendation follows meaning evidence or asks")
+def test_multi_sense_agreeing_evidence_recommends_authoritative_reading():
+    print("\n🧪 multi-sense agreeing evidence recommends authoritative reading")
+
+    async def _run():
+        evidence = {
+            "success": True,
+            "groups": [{
+                "pinyin": "hái chē",
+                "normalized": ["hai", "che"],
+                "sources": [{
+                    "source": "汉典（离线数据集）",
+                    "url": "",
+                    "category": "dictionary",
+                    "trust": 5,
+                }],
+                "sourceIds": ["zdic_cibs"],
+                "score": 5,
+                "fallback": False,
+            }],
+            "sources": [],
+            "lookupComplete": True,
+            "sourceOutcomes": [{
+                "sourceId": "zdic_cibs",
+                "source": "汉典（离线数据集）",
+                "status": "completed",
+                "lookupResult": "found",
+            }],
+        }
+        encode_data = {
+            "success": True,
+            "word": "还车",
+            "codes": ["htje", "htjev", "htjevv"],
+            "altCodes": ["htwe", "htwev", "htwevv"],
+            "pronunciationSource": "zdic-phrase",
+            "standardPronunciationStatus": "found",
+            "phrasePinyins": ["huán", "chē"],
+            "contextPhrasePinyins": ["huán", "chē"],
+            "chars": [
+                {
+                    "char": "还",
+                    "pinyin": "huán",
+                    "pinyins": ["huán", "hái"],
+                    "pronunciationLookupStatus": "found",
+                    "phoneticCode": "h",
+                    "shapeCode": "t",
+                },
+                {
+                    "char": "车",
+                    "pinyin": "chē",
+                    "pinyins": ["chē"],
+                    "pronunciationLookupStatus": "found",
+                    "phoneticCode": "j",
+                    "shapeCode": "e",
+                },
+            ],
+        }
+        agreeing_proposal = {
+            "accepted": True,
+            "word": "还车",
+            "pinyins": ["huan", "che"],
+            "meaning": "把租用或借用的车辆归还给原主或服务方",
+            "confidence": 0.98,
+            "commonTransparent": True,
+            "commonnessReason": "归还车辆是明确且常见的现代汉语用法",
+            "usageType": "transparent_compound",
+        }
+
+        async def prepare(proposal):
+            with (
+                patch.object(
+                    review_module,
+                    "collect_pronunciation_evidence_limited",
+                    AsyncMock(return_value=evidence),
+                ),
+                patch.object(
+                    review_module,
+                    "fetch_keytao_encode",
+                    AsyncMock(return_value=encode_data),
+                ),
+                patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+                patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+                patch.object(
+                    review_module,
+                    "_infer_semantic_pronunciation_for_review",
+                    AsyncMock(return_value=proposal),
+                ),
+            ):
+                return await prepare_reviewed_word(CONFIG, "还车")
+
+        agreed = await prepare(agreeing_proposal)
+        agreed_groups = agreed.get("pronunciations", [])
+        check(
+            "whole-word authority and meaning agreement recommends huan che",
+            agreed.get("multiSenseChoice", {}).get("status") == "resolved"
+            and agreed_groups[0].get("normalized") == ["huan", "che"]
+            and agreed.get("recommendedCode") == "htje"
+            and agreed.get("autoReviewable") is True,
+        )
+        check(
+            "both agreeing-case reading groups remain visible",
+            {tuple(group.get("normalized", [])) for group in agreed_groups}
+            == {("huan", "che"), ("hai", "che")},
+        )
+
+        authority_only = await prepare({"accepted": False, "word": "还车"})
+        check(
+            "sole whole-word authority recommends when no decisive source contradicts it",
+            authority_only.get("multiSenseChoice", {}).get("status") == "resolved"
+            and authority_only.get("recommendedCode") == "htje"
+            and authority_only.get("pronunciationUnresolved") is not True,
+        )
+
+    asyncio.run(_run())
+
+
+def test_multi_sense_conflicting_evidence_asks_for_clarification():
+    print("\n🧪 multi-sense conflicting evidence asks for clarification")
 
     async def _run():
         evidence = {
@@ -4773,39 +4888,30 @@ def test_multi_sense_recommendation_follows_meaning_or_asks():
             ):
                 return await prepare_reviewed_word(CONFIG, "出圈")
 
-        resolved = await prepare(resolved_proposal)
-        resolved_groups = resolved.get("pronunciations", [])
-        check(
-            "meaning evidence selects modern chu quan reading",
-            resolved.get("multiSenseChoice", {}).get("status") == "resolved"
-            and resolved_groups[0].get("normalized") == ["chu", "quan"]
-            and resolved.get("recommendedCode")
-            in resolved_groups[0].get("codes", []),
-        )
-        check(
-            "both reading groups remain visible after resolution",
-            {tuple(group.get("normalized", [])) for group in resolved_groups}
-            == {("chu", "juan"), ("chu", "quan")},
-        )
-
-        ambiguous = await prepare({"accepted": False, "word": "出圈"})
-        ambiguity = ambiguous.get("multiSenseChoice", {})
+        conflicted = await prepare(resolved_proposal)
+        conflict = conflicted.get("multiSenseChoice", {})
+        conflicted_groups = conflicted.get("pronunciations", [])
         assessment = review_module._assess_semantic_context_auto_pass(
             "出圈",
             "jjjt",
-            ambiguous,
+            conflicted,
         )
         check(
-            "ambiguous meaning asks with both readings and no recommendation",
-            ambiguity.get("status") == "ambiguous"
-            and ambiguous.get("pronunciationUnresolved") is True
-            and ambiguous.get("recommendedCode") == ""
-            and "chu juan" in ambiguous.get("message", "")
-            and "chū quān" in ambiguous.get("message", ""),
+            "whole-word authority conflicting with meaning and modern usage asks",
+            conflict.get("status") == "ambiguous"
+            and conflicted.get("pronunciationUnresolved") is True
+            and conflicted.get("recommendedCode") == ""
+            and "chu juan" in conflicted.get("message", "")
+            and "chū quān" in conflicted.get("message", ""),
         )
         check(
-            "unresolved multi-sense choice cannot enter semantic auto-pass",
-            ambiguous.get("autoReviewable") is False
+            "both conflicting reading groups remain visible",
+            {tuple(group.get("normalized", [])) for group in conflicted_groups}
+            == {("chu", "juan"), ("chu", "quan")},
+        )
+        check(
+            "conflicting multi-sense choice cannot enter semantic auto-pass",
+            conflicted.get("autoReviewable") is False
             and assessment.get("accepted") is False
             and "multiSenseResolved" in assessment.get("failedChecks", []),
         )
@@ -4870,7 +4976,8 @@ def main():
     test_candidate_commonness_wiring_and_timeout()
     test_modern_semantic_vs_dictionary_dominated_commonness_matrix()
     test_audit_budget_nesting_and_timeout_retains_review()
-    test_multi_sense_recommendation_follows_meaning_or_asks()
+    test_multi_sense_agreeing_evidence_recommends_authoritative_reading()
+    test_multi_sense_conflicting_evidence_asks_for_clarification()
 
     print("\n" + "=" * 60)
     print(f"Results: {passed}/{passed + failed} passed" + (f", {failed} failed" if failed else ""))

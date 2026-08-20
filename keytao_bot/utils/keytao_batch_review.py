@@ -1039,7 +1039,7 @@ def _normalize_llm_review(
     suggested_note = _string(raw.get("suggestedReviewNote"))
     if not suggested_note:
         suggested_note = headline + "\n" + "\n".join(
-            f"- PR#{item['prId']} {item['title']}：{item['reasons'][0]}"
+            f"- {item['title']}：{item['reasons'][0]}"
             for item in normalized_items[:12]
         )
 

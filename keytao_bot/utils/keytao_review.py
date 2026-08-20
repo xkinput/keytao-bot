@@ -1971,7 +1971,7 @@ async def _resolve_multi_sense_pronunciation_choice(
     *,
     requester: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Use meaning evidence to rank distinct readings, otherwise keep ASK state."""
+    """Recommend only when the available decisive evidence agrees."""
     normalized_groups = [dict(group) for group in groups]
     sequences = {
         tuple(group.get("normalized") or ())
@@ -1988,50 +1988,103 @@ async def _resolve_multi_sense_pronunciation_choice(
         normalize_pinyin_syllable(str(value or ""))
         for value in proposal.get("pinyins") or []
     )
-    matching_indexes = [
-        index
-        for index, group in enumerate(normalized_groups)
-        if tuple(group.get("normalized") or ()) == proposed_sequence
-    ]
     meaning = str(proposal.get("meaning") or "").strip()
     try:
         confidence = float(proposal.get("confidence") or 0.0)
     except (TypeError, ValueError):
         confidence = 0.0
-    resolved = bool(
+    semantic_supported = bool(
         proposal.get("accepted") is True
         and proposal.get("commonTransparent") is True
         and len(proposed_sequence) == len(word)
-        and len(matching_indexes) == 1
+        and all(proposed_sequence)
         and _has_concrete_semantic_meaning(word, meaning)
         and math.isfinite(confidence)
         and confidence >= ENTITY_PRONUNCIATION_MIN_CONFIDENCE
     )
-    if not resolved:
+
+    authority_sequences = {
+        tuple(group.get("normalized") or ())
+        for group in normalized_groups
+        if str(group.get("readingEvidenceKind") or "")
+        == "encode_whole_word_zdic"
+    }
+    modern_usage_sequences = {
+        tuple(group.get("normalized") or ())
+        for group in normalized_groups
+        if any(
+            str(source_id or "").strip().lower().replace("_", "-")
+            in {"modern-usage", "commonness", "word-commonness"}
+            for source_id in group.get("sourceIds") or []
+        )
+        or any(
+            str(source.get("evidenceRole") or source.get("signalKind") or "")
+            .strip()
+            .lower()
+            .replace("_", "-")
+            in {"modern-usage", "commonness", "word-commonness"}
+            for source in group.get("sources") or []
+            if isinstance(source, dict)
+        )
+    }
+    decisive_sequences = set(authority_sequences) | set(modern_usage_sequences)
+    if semantic_supported:
+        decisive_sequences.add(proposed_sequence)
+
+    selected_sequence: Optional[Tuple[str, ...]] = None
+    if len(decisive_sequences) == 1:
+        selected_sequence = next(iter(decisive_sequences))
+    elif not decisive_sequences:
+        supported_sequences = {
+            tuple(group.get("normalized") or ())
+            for group in normalized_groups
+            if (
+                group.get("sources")
+                or group.get("sourceIds")
+                or group.get("score")
+            )
+            and not bool(group.get("fallback"))
+        }
+        if len(supported_sequences) == 1:
+            selected_sequence = next(iter(supported_sequences))
+
+    selected_indexes = [
+        index
+        for index, group in enumerate(normalized_groups)
+        if tuple(group.get("normalized") or ()) == selected_sequence
+    ]
+    if len(selected_indexes) != 1:
+        reason = (
+            "整词权威、含义或现代用法证据指向不同读音"
+            if len(decisive_sequences) > 1
+            else "现有含义与常用度证据没有唯一支持其中一个读音"
+        )
         return normalized_groups, {
             "status": "ambiguous",
             "candidateReadings": [
                 str(group.get("pinyin") or "").strip()
                 for group in normalized_groups
             ],
-            "reason": "现有含义与常用度证据没有唯一支持其中一个读音",
+            "reason": reason,
         }
 
-    selected_index = matching_indexes[0]
+    selected_index = selected_indexes[0]
     selected = normalized_groups[selected_index]
-    selected["semanticPronunciation"] = True
     selected["requiresManualReview"] = False
-    selected["readingEvidenceKind"] = "multi_sense_meaning_choice"
-    selected["contextPronunciation"] = {
-        "confidence": confidence,
-        "description": meaning,
-        "method": "meaning_backed_multi_sense_choice",
-        "commonTransparent": True,
-        "commonnessReason": str(
-            proposal.get("commonnessReason") or ""
-        ).strip(),
-        "usageType": str(proposal.get("usageType") or "").strip(),
-    }
+    if semantic_supported and proposed_sequence == selected_sequence:
+        selected["semanticPronunciation"] = True
+        if str(selected.get("readingEvidenceKind") or "") != "encode_whole_word_zdic":
+            selected["readingEvidenceKind"] = "multi_sense_meaning_choice"
+        selected["contextPronunciation"] = {
+            "confidence": confidence,
+            "description": meaning,
+            "method": "meaning_backed_multi_sense_choice",
+            "commonTransparent": True,
+            "commonnessReason": str(
+                proposal.get("commonnessReason") or ""
+            ).strip(),
+            "usageType": str(proposal.get("usageType") or "").strip(),
+        }
     reordered = [
         selected,
         *(
@@ -2042,13 +2095,15 @@ async def _resolve_multi_sense_pronunciation_choice(
     ]
     return reordered, {
         "status": "resolved",
-        "selectedPinyin": pinyin_sequence_label(proposed_sequence),
-        "meaning": meaning,
-        "confidence": confidence,
-        "commonTransparent": True,
-        "commonnessReason": str(
-            proposal.get("commonnessReason") or ""
-        ).strip(),
+        "selectedPinyin": pinyin_sequence_label(selected_sequence),
+        "meaning": meaning if semantic_supported else "",
+        "confidence": confidence if semantic_supported else 0.0,
+        "commonTransparent": bool(semantic_supported),
+        "commonnessReason": (
+            str(proposal.get("commonnessReason") or "").strip()
+            if semantic_supported
+            else ""
+        ),
     }
 
 

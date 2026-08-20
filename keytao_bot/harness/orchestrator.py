@@ -54,6 +54,8 @@ from .state import (
     PendingAddWord,
     PendingAdvertisedWordSets,
     PendingToolConfirm,
+    server_warning_pending_state,
+    server_warning_ticket_is_complete,
 )
 from .conversation import ConversationAddress
 from .authorization_grammar import parse_eviction_modified_add
@@ -69,7 +71,6 @@ from .tools import (
     explicit_combined_add_submit_item,
     front_insert_batch_warning_confirmation_binding,
     project_tool_result_for_model,
-    server_warning_confirmation_binding,
 )
 
 
@@ -84,6 +85,13 @@ AUTHORITATIVE_LINK_TOOLS = frozenset({
     "keytao_shift_phrase_code",
     "keytao_recall_batch",
     "keytao_get_batch_preview",
+})
+
+_LOCK_BEFORE_PROMPT_TOOL_NAMES = frozenset({
+    "keytao_remove_draft_item",
+    "keytao_batch_remove_draft_items",
+    "keytao_shift_phrase_code",
+    "keytao_recall_batch",
 })
 
 _BLOCK_REASON_USER_LABELS = {
@@ -1773,11 +1781,34 @@ class AgentOrchestrator:
                             "success": False,
                             "policyBlocked": True,
                             "message": render_remediation_reply(
-                                "待确认操作过大，未保存确认请求；"
-                                "系统无法替你决定如何拆分本批"
+                                "待确认操作未形成完整且可保存的服务端票据；"
+                                "本次未执行"
                             ),
                         }
                         result_str = json.dumps(result_data, ensure_ascii=False)
+                    if result_data.get("requiresConfirmation") and pending_saved:
+                        pending_record = self._state_store.get_record(conv_key)
+                        pending_state = (
+                            pending_record.state
+                            if pending_record is not None
+                            else None
+                        )
+                        if (
+                            isinstance(pending_state, PendingToolConfirm)
+                            and pending_state.function_name
+                            in _LOCK_BEFORE_PROMPT_TOOL_NAMES
+                            and server_warning_ticket_is_complete(pending_state)
+                        ):
+                            from keytao_bot.plugins.chat_render import (
+                                _format_server_bound_confirmation_prompt,
+                            )
+
+                            return self._append_authoritative_result_links(
+                                _format_server_bound_confirmation_prompt(
+                                    pending_state,
+                                ),
+                                authoritative_result_links,
+                            )
                     if result_data.get("localConfirmationRequired") and pending_saved:
                         confirmation_saved = self._state_store.arm_reconfirmation(conv_key)
                         if not confirmation_saved:
@@ -4129,36 +4160,34 @@ class AgentOrchestrator:
             key: value for key, value in fn_args.items()
             if key not in ("confirmed", "platform", "platform_id")
         }
-        if fn_name == "keytao_shift_phrase_code":
-            # Keep the server's plan identity inside the ticket.  Without it the
-            # ticket could never execute: confirming it only produced a second
-            # preview and a second challenge code for the same instruction.
-            binding = self._server_plan_binding(result_data, saved)
-            if binding:
-                saved.update(binding)
-            warning_digest = str(
-                result_data.get("warningDigest") or ""
-            ).strip().lower()
-            if re.fullmatch(r"[0-9a-f]{64}", warning_digest):
-                saved["expected_warning_digest"] = warning_digest
-        confirmation_source = "local_preview"
-        if fn_name == "keytao_batch_add_to_draft":
-            binding = server_warning_confirmation_binding(result_data)
-            if binding:
-                saved.update(binding)
-                confirmation_source = "server_warning"
-        saved_ok = self._state_store.set(
-            conv_key,
-            PendingToolConfirm(
+        pending_state = server_warning_pending_state(
+            PendingToolConfirm(function_name=fn_name, args=saved),
+            result_data,
+        )
+        if not server_warning_ticket_is_complete(pending_state):
+            if fn_name in _LOCK_BEFORE_PROMPT_TOOL_NAMES:
+                logger.warning(
+                    "Refusing unlocked confirmation prompt for strict-binding tool "
+                    f"{fn_name}"
+                )
+                return False
+            pending_state = PendingToolConfirm(
                 function_name=fn_name,
                 args=saved,
-                confirmation_source=confirmation_source,
-            ),
+                confirmation_source="local_preview",
+            )
+        saved_ok = self._state_store.set(
+            conv_key,
+            pending_state,
             space_key=space_key,
             owner_label=owner_label,
         )
         if saved_ok:
-            logger.info(f"💾 Saved PendingToolConfirm: {fn_name}({saved})")
+            logger.info(
+                "💾 Saved PendingToolConfirm: "
+                f"{fn_name}({pending_state.args}) "
+                f"source={pending_state.confirmation_source}"
+            )
         else:
             logger.warning(f"PendingToolConfirm rejected by local size limits: {fn_name}")
         return saved_ok

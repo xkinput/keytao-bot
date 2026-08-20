@@ -1980,6 +1980,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
 
     def test_pending_precedence_copy_is_record_first_for_every_ticket_kind(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
+        from keytao_bot.harness.state import server_warning_ticket_is_complete
         from keytao_bot.plugins.chat_render import render_platform_public_links
 
         batch_id = "pending-detail"
@@ -2071,7 +2072,25 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                         {"id": 42, "action": "Create", "word": "呵呵呵", "code": "hhhooo"},
                     ],
                 },
-                ("「呵呵呵」→ hhhooo",),
+                ("「呵呵呵」@ hhhooo",),
+            ),
+            (
+                "batch-delete",
+                PendingToolConfirm(
+                    "keytao_batch_remove_draft_items",
+                    {"ids": [42, 43]},
+                ),
+                {
+                    "batchId": batch_id,
+                    "batchUrl": batch_url,
+                    "contentVersion": 7,
+                    "targetDigest": "f" * 64,
+                    "targets": [
+                        {"id": 42, "action": "Create", "word": "呵呵呵", "code": "hhhooo"},
+                        {"id": 43, "action": "Change", "word": "哈哈哈", "code": "hhho"},
+                    ],
+                },
+                ("「呵呵呵」@ hhhooo", "「哈哈哈」@ hhho"),
             ),
             (
                 "recall",
@@ -2091,6 +2110,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     initial_state,
                     server_data,
                 )
+                self.assertTrue(server_warning_ticket_is_complete(state))
                 reply = chat_module._format_live_ticket_precedence_message(state)
                 action_at = reply.index("回复「确认」执行，或「取消」放弃。")
                 quote_at = reply.index("请引用本条消息回复", action_at)
@@ -2099,6 +2119,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(action_at, quote_at)
                 self.assertNotIn("或取消当前票据", reply)
                 self.assertNotIn("当前还有一项待确认操作：提交草稿。", reply)
+                self.assertNotIn("PR#", reply)
 
                 qq_reply = render_platform_public_links(reply, "qq")
                 if batch_url in expected_facts:
@@ -9735,6 +9756,319 @@ class _AdvertisedSetSkills:
         ]
 
 
+class _DeleteSkills:
+    @staticmethod
+    def get_skill_instructions():
+        return ""
+
+    @staticmethod
+    def has_tools():
+        return True
+
+    @staticmethod
+    def get_tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "keytao_list_draft_items",
+                    "description": "Read the current draft",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "keytao_remove_draft_item",
+                    "description": "Delete one exact draft item",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"pr_id": {"type": "integer"}},
+                        "required": ["pr_id"],
+                    },
+                },
+            },
+        ]
+
+
+class ServerBoundDeleteConfirmationTests(unittest.IsolatedAsyncioTestCase):
+    def test_incomplete_delete_preview_cannot_create_an_unlocked_prompt(self) -> None:
+        state_store = MemoryConversationStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: None,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_DeleteSkills(),
+            tool_executor=ToolExecutor(lambda _name: None, frozenset()),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        address = ConversationAddress.private("qq", "delete-owner")
+
+        saved = orchestrator._save_pending_tool_confirm(
+            address,
+            ("qq", "qq:private:delete-owner"),
+            "",
+            "keytao_remove_draft_item",
+            {"pr_id": 3062},
+            {
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "batch-delete",
+                "contentVersion": 7,
+                "targets": [{"id": 3062, "word": "呵呵呵", "code": "hhhooo"}],
+            },
+        )
+
+        self.assertFalse(saved)
+        self.assertIsNone(state_store.get_record(address))
+
+    async def test_single_delete_has_one_server_bound_prompt_before_execution(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import chat_commands as commands_module
+        from keytao_bot.plugins.chat_render import _assert_plain_user_facing_reply
+
+        target = {
+            "id": 3062,
+            "word": "呵呵呵",
+            "code": "hhhooo",
+            "action": "Create",
+            "type": "Phrase",
+        }
+        preview = {
+            "success": False,
+            "requiresConfirmation": True,
+            "confirmationKind": "deleteTargets",
+            "batchId": "batch-delete",
+            "batchUrl": "https://keytao.vercel.app/batch/batch-delete",
+            "contentVersion": 7,
+            "targetDigest": "d" * 64,
+            "targets": [target],
+            "message": "删除会永久移除以下草稿条目，请核对完整目标",
+        }
+        calls = []
+
+        async def dispatch(pr_id=None, expected_target_digest="", **kwargs):
+            if pr_id is None:
+                return {
+                    "success": True,
+                    "batchId": "batch-delete",
+                    "contentVersion": 7,
+                    "items": [target],
+                }
+            calls.append({
+                "pr_id": pr_id,
+                "expected_target_digest": expected_target_digest,
+                **kwargs,
+            })
+            if not expected_target_digest:
+                return dict(preview)
+            return {
+                "success": True,
+                "batchId": "batch-delete",
+                "batchUrl": "https://keytao.vercel.app/batch/batch-delete",
+                "draft_snapshot": {"count": 0, "items": [], "summary": {}},
+            }
+
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-list-delete",
+                    "keytao_list_draft_items",
+                    {},
+                )],
+            ),
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-delete-one",
+                    "keytao_remove_draft_item",
+                    {"pr_id": 3062},
+                )],
+            ),
+            _fake_response(
+                "stop",
+                "🗑️ 待删除草稿条目：呵呵呵 @ hhhooo\n"
+                + pending_confirmation_copy(),
+            ),
+        ])
+        state_store = MemoryConversationStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_DeleteSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: dispatch
+                if name in {"keytao_list_draft_items", "keytao_remove_draft_item"}
+                else None,
+                frozenset({"keytao_list_draft_items", "keytao_remove_draft_item"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="delete-owner",
+            mutations_allowed=True,
+        )
+
+        prompt = await orchestrator.run("删除草稿里的「呵呵呵」", context)
+        record = state_store.get_record(context.conversation_address)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.confirmation_source, "server_warning")
+        self.assertEqual(record.state.args["expected_target_digest"], "d" * 64)
+        self.assertEqual(record.state.args["expected_targets"], [target])
+        self.assertNotIn("PR#", prompt)
+        self.assertEqual(_assert_plain_user_facing_reply(prompt), prompt)
+
+        async def confirmed_call(tool_name, arguments, platform, user_id, **_kwargs):
+            self.assertEqual(tool_name, "keytao_remove_draft_item")
+            self.assertEqual((platform, user_id), ("qq", "delete-owner"))
+            return json.dumps(await dispatch(**arguments), ensure_ascii=False)
+
+        with (
+            patch.object(commands_module, "conversation_state_store", state_store),
+            patch.object(commands_module, "call_tool_function", confirmed_call),
+            patch.object(
+                commands_module,
+                "_format_draft_response",
+                AsyncMock(return_value="草稿里还没有内容。"),
+            ),
+        ):
+            executed = await commands_module.handle_pending_message_core(
+                "确认",
+                "qq",
+                "delete-owner",
+                context.conversation_address,
+                space_key=context.space_key,
+                allow_intent_model=False,
+            )
+
+        self.assertIn("操作已完成", executed)
+        self.assertEqual(
+            (prompt + "\n" + executed).count(pending_confirmation_copy()),
+            1,
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["batch_id"], "batch-delete")
+        self.assertEqual(calls[1]["expected_content_version"], 7)
+        self.assertEqual(calls[1]["expected_target_digest"], "d" * 64)
+        self.assertEqual(calls[1]["expected_targets"], [target])
+
+    async def test_same_server_delete_ticket_cannot_prompt_twice(self) -> None:
+        from keytao_bot.harness.state import server_warning_pending_state
+        from keytao_bot.plugins import chat_commands as commands_module
+
+        target = {
+            "id": 3062,
+            "word": "呵呵呵",
+            "code": "hhhooo",
+            "action": "Create",
+            "type": "Phrase",
+        }
+        preview = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "batch-delete",
+            "contentVersion": 7,
+            "targetDigest": "d" * 64,
+            "targets": [target],
+        }
+        state = server_warning_pending_state(
+            PendingToolConfirm("keytao_remove_draft_item", {"pr_id": 3062}),
+            preview,
+        )
+        store = MemoryConversationStateStore()
+
+        with (
+            patch.object(commands_module, "conversation_state_store", store),
+            patch.object(
+                commands_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps(preview, ensure_ascii=False)),
+            ),
+        ):
+            reply = await commands_module._execute_confirmed_tool(
+                state,
+                "qq",
+                "delete-owner",
+                ConversationAddress.private("qq", "delete-owner"),
+            )
+
+        self.assertNotIn(pending_confirmation_copy(), reply)
+        self.assertIn("没有返回不同的目标", reply)
+
+    async def test_changed_delete_target_may_reprompt_with_old_and_new_facts(
+        self,
+    ) -> None:
+        from keytao_bot.harness.state import server_warning_pending_state
+        from keytao_bot.plugins import chat_commands as commands_module
+
+        old_target = {
+            "id": 3062,
+            "word": "呵呵呵",
+            "code": "hhhooo",
+            "action": "Create",
+            "type": "Phrase",
+        }
+        new_target = {
+            "id": 3063,
+            "word": "哈哈哈",
+            "code": "hhhooo",
+            "action": "Create",
+            "type": "Phrase",
+        }
+        old_preview = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "batch-delete",
+            "contentVersion": 7,
+            "targetDigest": "d" * 64,
+            "targets": [old_target],
+        }
+        changed_preview = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "batch-delete",
+            "contentVersion": 8,
+            "targetDigest": "e" * 64,
+            "targets": [new_target],
+        }
+        state = server_warning_pending_state(
+            PendingToolConfirm("keytao_remove_draft_item", {"pr_id": 3062}),
+            old_preview,
+        )
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "delete-owner")
+
+        with (
+            patch.object(commands_module, "conversation_state_store", store),
+            patch.object(
+                commands_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps(changed_preview, ensure_ascii=False)),
+            ),
+        ):
+            reply = await commands_module._execute_confirmed_tool(
+                state,
+                "qq",
+                "delete-owner",
+                address,
+            )
+
+        self.assertEqual(reply.count(pending_confirmation_copy()), 1)
+        self.assertIn("原确认没有执行", reply)
+        self.assertIn("「呵呵呵」@ hhhooo", reply)
+        self.assertIn("「哈哈哈」@ hhhooo", reply)
+        self.assertNotIn("PR#", reply)
+        record = store.get_record(address)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.args["expected_targets"], [new_target])
+
+
 class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
     class _CountingStateStore(MemoryConversationStateStore):
         def __init__(self) -> None:
@@ -11881,8 +12215,9 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "keytao_shift_phrase_code",
             ],
         )
-        self.assertEqual(result.count("确认"), 1)
-        self.assertIn("完整级联计划", result)
+        self.assertEqual(result.count(pending_confirmation_copy()), 1)
+        self.assertIn("「米等」：mkdr → mkdro", result)
+        self.assertIn("「迷瞪」：mkdro → mkdrou", result)
         pending = store.get_record(
             ConversationAddress.private("qq", "s26-cascade")
         )
@@ -12086,7 +12421,9 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         record = store.get_record(address)
         self.assertIsNotNone(record)
         self.assertEqual(record.state.args["expected_warning_digest"], "b" * 64)
-        self.assertEqual(result, "请确认新增风险。")
+        self.assertEqual(result.count(pending_confirmation_copy()), 1)
+        self.assertIn("「吃席」→ wkxk", result)
+        self.assertIn("跳过更短的空位", result)
 
     async def test_front_same_code_marker_auto_confirms_only_named_occupant(self) -> None:
         calls = []
@@ -12323,13 +12660,9 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(record.state.args["confirmed_plan_digest"], "c" * 64)
         self.assertEqual(record.state.args["expected_content_version"], 9)
         self.assertIs(record.state.args["target_needs_manual_review"], True)
-        tool_payload = __import__("json").loads(next(
-            message["content"]
-            for message in client.completions.calls[-1]["messages"]
-            if message.get("role") == "tool"
-        ))
-        self.assertEqual(tool_payload["shiftPlan"], shift_plan)
-        self.assertEqual(result, "请确认完整顺延计划。")
+        self.assertEqual(result.count(pending_confirmation_copy()), 1)
+        self.assertIn("「赤溪」：wkxk → wkxko", result)
+        self.assertIn("「青溪」：wkxko → wkxkoo", result)
 
     async def test_front_wrong_shifted_word_requires_explicit_confirmation(self) -> None:
         calls = []
@@ -12392,7 +12725,8 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(record.state.args["batch_id"], "batch-wrong-word")
         self.assertEqual(record.state.args["expected_content_version"], 12)
         self.assertIs(record.state.args["target_needs_manual_review"], True)
-        self.assertEqual(result, "请确认完整顺延计划。")
+        self.assertEqual(result.count(pending_confirmation_copy()), 1)
+        self.assertIn("「别词」：wkxk → wkxko", result)
 
     async def test_live_pending_candidate_authorizes_plain_add_without_code_text(self) -> None:
         calls = []

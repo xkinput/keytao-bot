@@ -106,6 +106,12 @@ full transcripts are written under `e2e/artifacts/<timestamp>-<run-id>/`.
 Each failed scenario is cleaned and rerun once; two consecutive failures produce
 a FAILED verdict and a non-zero exit code.
 
+S4 first proves that an expired confirmation cannot write or invite a blind
+resend. It then seeds one exact draft record, requests its deletion through the
+real chat path, and requires the first user prompt to be composed from the
+server-locked target facts. Exactly one `确认` must remove the record; a second
+confirmation prompt or any `PR#...` identifier fails the scenario.
+
 S8 reuses the S1 real-LLM positional move, submits the resulting batch through
 the bot preview/confirm API, and approves it through the real admin endpoint. It
 asserts the persisted `needsManualReview=true` seal on the new `吃席@wkxk` row,

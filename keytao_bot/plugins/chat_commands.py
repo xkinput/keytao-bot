@@ -34,6 +34,9 @@ from ..harness.state import (
     PendingToolConfirm,
     SQLiteConversationStateStore,
     pending_batch_display_pairs,
+    pending_execution_args as _pending_execution_args,
+    server_warning_pending_state as _pending_state_from_server_warning,
+    server_warning_ticket_is_complete,
 )
 from ..harness.tools import (
     ToolContext,
@@ -85,6 +88,7 @@ from .chat_render import (
     _dedupe_authoritative_link_lines,
     _draft_item_display_line,
     _format_active_draft_operation_message,
+    _format_changed_server_confirmation_prompt,
     _format_full_add_and_submit_instruction,
     _format_operation_memory_for_reply,
     _format_pre_submit_audit_preview,
@@ -3168,146 +3172,6 @@ async def _resolve_requested_code_for_pending_add(
     )
 
 
-def _pending_display_from_server_warning(data: Dict) -> Dict:
-    """Keep only structured facts needed to re-render a live warning ticket."""
-    display: Dict[str, Any] = {}
-    batch_url = _trusted_batch_url(data)
-    if batch_url:
-        display["batchUrl"] = batch_url
-
-    for key in ("warnings", "snapshotItems", "targets", "items"):
-        value = data.get(key)
-        if not isinstance(value, list):
-            continue
-        try:
-            display[key] = json.loads(json.dumps(
-                value,
-                ensure_ascii=False,
-                allow_nan=False,
-            ))
-        except (TypeError, ValueError):
-            continue
-
-    shift_plan = data.get("shiftPlan")
-    if isinstance(shift_plan, dict):
-        try:
-            display["shiftPlan"] = json.loads(json.dumps(
-                shift_plan,
-                ensure_ascii=False,
-                allow_nan=False,
-            ))
-        except (TypeError, ValueError):
-            pass
-    return display
-
-
-def _pending_execution_args(state: PendingToolConfirm) -> Dict:
-    """Return tool arguments without record-only display metadata."""
-    args = dict(state.args)
-    args.pop("_pending_display", None)
-    return args
-
-
-def _pending_state_from_server_warning(
-    state: PendingToolConfirm,
-    data: Dict,
-) -> PendingToolConfirm:
-    """Bind a second-stage ticket to the server response that produced it."""
-    args = dict(state.args)
-    args.pop("confirmed", None)
-    args.pop("preview_only", None)
-    response_content_version = data.get("contentVersion")
-    planned_content_version = args.get("expected_content_version")
-    planned_absence = state.function_name == "keytao_shift_phrase_code" and (
-        (
-            "batch_id" in args
-            and not str(args.get("batch_id") or "").strip()
-            and isinstance(planned_content_version, int)
-            and not isinstance(planned_content_version, bool)
-            and planned_content_version == 0
-        )
-        or (
-            "batchId" in data
-            and not str(data.get("batchId") or "").strip()
-            and isinstance(response_content_version, int)
-            and not isinstance(response_content_version, bool)
-            and response_content_version == 0
-        )
-    )
-    batch_id = (
-        ""
-        if planned_absence
-        else str(data.get("batchId") or args.get("batch_id") or "").strip()
-    )
-    if (batch_id or planned_absence) and state.function_name in {
-        "keytao_create_phrase",
-        "keytao_submit_batch",
-        "keytao_batch_add_to_draft",
-        "keytao_shift_phrase_code",
-        "keytao_recall_batch",
-        "keytao_remove_draft_item",
-        "keytao_batch_remove_draft_items",
-    }:
-        args["batch_id"] = batch_id
-    content_version = 0 if planned_absence else response_content_version
-    if (
-        state.function_name in {
-            "keytao_submit_batch",
-            "keytao_shift_phrase_code",
-            "keytao_recall_batch",
-            "keytao_remove_draft_item",
-            "keytao_batch_remove_draft_items",
-            "keytao_create_phrase",
-            "keytao_batch_add_to_draft",
-        }
-        and isinstance(content_version, int)
-        and not isinstance(content_version, bool)
-        and content_version >= 0
-    ):
-        args["expected_content_version"] = content_version
-    if state.function_name == "keytao_shift_phrase_code":
-        plan_digest = str(data.get("planDigest") or "").strip().lower()
-        if re.fullmatch(r"[0-9a-f]{64}", plan_digest):
-            args["confirmed_plan_digest"] = plan_digest
-    if state.function_name in {
-        "keytao_create_phrase",
-        "keytao_batch_add_to_draft",
-        "keytao_shift_phrase_code",
-    }:
-        warning_digest = str(data.get("warningDigest") or "").strip().lower()
-        if re.fullmatch(r"[0-9a-f]{64}", warning_digest):
-            args["expected_warning_digest"] = warning_digest
-    if state.function_name == "keytao_submit_batch":
-        snapshot_digest = str(data.get("snapshotDigest") or "").strip().lower()
-        if re.fullmatch(r"[0-9a-f]{64}", snapshot_digest):
-            args["expected_server_snapshot_digest"] = snapshot_digest
-        warning_digest = str(data.get("warningDigest") or "").strip().lower()
-        if re.fullmatch(r"[0-9a-f]{64}", warning_digest):
-            args["expected_warning_digest"] = warning_digest
-        audit_digest = str(data.get("auditDigest") or "").strip().lower()
-        if re.fullmatch(r"[0-9a-f]{64}", audit_digest):
-            args["expected_audit_digest"] = audit_digest
-    if state.function_name in {
-        "keytao_remove_draft_item",
-        "keytao_batch_remove_draft_items",
-    }:
-        target_digest = str(data.get("targetDigest") or "").strip().lower()
-        targets = data.get("targets")
-        if re.fullmatch(r"[0-9a-f]{64}", target_digest) and isinstance(targets, list):
-            args["expected_target_digest"] = target_digest
-            args["expected_targets"] = targets
-    pending_display = _pending_display_from_server_warning(data)
-    if pending_display:
-        args["_pending_display"] = pending_display
-    else:
-        args.pop("_pending_display", None)
-    return PendingToolConfirm(
-        function_name=state.function_name,
-        args=args,
-        confirmation_source="server_warning",
-    )
-
-
 def _resolved_advertised_items_match(state: PendingToolConfirm) -> bool:
     """Fail closed if a snapshot-derived ticket no longer seals the exact set."""
     if "_resolved_advertised_words" not in state.args:
@@ -3376,10 +3240,8 @@ def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
         code = str(item.get("code") or "")
         action = str(item.get("action") or "")
         label = f"{old_word} → {word}" if action == "Change" and old_word else word
-        pr_id = item.get("id")
-        pr_label = f"PR#{pr_id}：" if pr_id is not None else ""
         lines.append(
-            f"• {pr_label}{action} {label} @ {code}（{item.get('type') or ''}）"
+            f"• {action} {label} @ {code}（{item.get('type') or ''}）"
         )
 
 
@@ -3391,7 +3253,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             if not isinstance(target, dict):
                 continue
             lines.append(
-                f"• PR#{target.get('id')}：{target.get('word', '')} "
+                f"• {target.get('word', '')} "
                 f"@ {target.get('code', '')}（{target.get('action', '')}/{target.get('type', '')}）"
             )
         batch_url = _trusted_batch_url(data)
@@ -3657,6 +3519,19 @@ async def _execute_confirmed_tool(
 
     if data.get("requiresConfirmation"):
         pending_state = _pending_state_from_server_warning(state, data)
+        if state.confirmation_source == "server_warning":
+            if not server_warning_ticket_is_complete(pending_state):
+                return render_remediation_reply(
+                    "服务端没有返回完整的新确认内容，原确认没有执行；"
+                    "当前票据已停止",
+                    command="查看草稿",
+                )
+            if _pending_execution_args(pending_state) == _pending_execution_args(state):
+                return render_remediation_reply(
+                    "服务端没有执行原确认，也没有返回不同的目标；"
+                    "当前票据已停止，避免重复确认",
+                    command="查看草稿",
+                )
         auto_confirm_binding = None
         if state.confirmation_source == "local_preview":
             if state.function_name == "keytao_create_phrase":
@@ -3686,9 +3561,13 @@ async def _execute_confirmed_tool(
                 on_transport_failure=on_transport_failure,
             )
         display_data = {**data, "submitAfter": submit_after}
-        warning_prompt = _format_server_warning_confirmation(
-            state.function_name,
-            display_data,
+        warning_prompt = (
+            _format_changed_server_confirmation_prompt(state, pending_state)
+            if state.confirmation_source == "server_warning"
+            else _format_server_warning_confirmation(
+                state.function_name,
+                display_data,
+            )
         )
         if len(warning_prompt) > MAX_REPLACE_CONFIRMATION_CHARS:
             return _append_batch_url_if_missing(

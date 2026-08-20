@@ -13,6 +13,7 @@ from keytao_bot.utils.pending_confirmation import (
     UNBOUND_BINDING_PRECHECK_NOTICE,
     advertised_batch_binding_pairs,
     advertised_reply_contract,
+    pending_confirmation_copy,
 )
 from keytao_bot.plugins.chat_render import (
     public_base_for_platform,
@@ -348,19 +349,75 @@ async def scenario_s3(ctx: ScenarioContext) -> dict[str, Any]:
 
 
 async def scenario_s4(ctx: ScenarioContext) -> dict[str, Any]:
-    reply = await ctx.send("确认")
+    stale_reply = await ctx.send("确认")
     draft = await ctx.draft()
     require(not draft["items"], f"stale confirmation changed the draft: {draft}")
-    require("已经过期" in reply or "已过期" in reply, f"S4 omitted expiry marker: {reply}")
     require(
-        not re.search(r"(?:重新|再次).{0,8}(?:发送|回复).{0,4}[「“]?确认", reply),
-        f"S4 advised resending confirmation: {reply}",
+        "已经过期" in stale_reply or "已过期" in stale_reply,
+        f"S4 omitted expiry marker: {stale_reply}",
     )
+    require(
+        not re.search(
+            r"(?:重新|再次).{0,8}(?:发送|回复).{0,4}[「“]?确认",
+            stale_reply,
+        ),
+        f"S4 advised resending confirmation: {stale_reply}",
+    )
+
+    fixture_word = "呵呵呵"
+    fixture_code = "hhhooo"
+    await ctx.next_client.add_draft_items(
+        platform_id=ctx.platform_id,
+        items=[{
+            "action": "Create",
+            "word": fixture_word,
+            "code": fixture_code,
+            "type": "Phrase",
+            "weight": 100,
+            "needsManualReview": True,
+            "remark": "S4 single-delete confirmation fixture",
+        }],
+    )
+    seeded_draft = await ctx.draft()
+    require(
+        len(seeded_draft["items"]) == 1
+        and item_key(seeded_draft["items"][0])
+        == ("Create", fixture_word, fixture_code),
+        f"S4 could not seed its delete fixture: {seeded_draft}",
+    )
+
+    delete_message = f"删除草稿里的「{fixture_word}」"
+    delete_prompt = await ctx.send(delete_message)
+    require(
+        delete_prompt.count(pending_confirmation_copy()) == 1,
+        f"S4 delete did not expose exactly one server-bound prompt: {delete_prompt}",
+    )
+    assert_reply_mentions(delete_prompt, fixture_word, fixture_code, "服务端已锁定")
+    require("PR#" not in delete_prompt, f"S4 delete leaked an internal id: {delete_prompt}")
+    require(
+        len((await ctx.draft())["items"]) == 1,
+        "S4 delete executed before its one required confirmation",
+    )
+
+    delete_completion = await ctx.send("确认")
+    final_draft = await ctx.draft()
+    require(not final_draft["items"], f"S4 confirmed delete did not execute: {final_draft}")
+    require(
+        pending_confirmation_copy() not in delete_completion,
+        f"S4 delete asked for a second confirmation: {delete_completion}",
+    )
+    require("PR#" not in delete_completion, f"S4 completion leaked an internal id: {delete_completion}")
     return {
-        "messages": ["确认"],
-        "replies": [reply],
-        "draft": draft,
-        "facts": {"draftChanges": 0, "expiryMarker": True},
+        "messages": ["确认", delete_message, "确认"],
+        "replies": [stale_reply, delete_prompt, delete_completion],
+        "draft": final_draft,
+        "facts": {
+            "staleDraftChanges": 0,
+            "expiryMarker": True,
+            "deleteConfirmationSteps": 1,
+            "deleteFixture": [fixture_word, fixture_code],
+            "internalIdLeak": False,
+        },
     }
 
 
@@ -3432,7 +3489,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
     Scenario("S3", "back placement", scenario_s3),
-    Scenario("S4", "stale confirmation", scenario_s4),
+    Scenario("S4", "stale and single-delete confirmation", scenario_s4),
     Scenario("S5", "self-service convergence", scenario_s5),
     Scenario("S6", "injection controls", scenario_s6),
     Scenario("S7", "timeout retry", scenario_s7),

@@ -342,6 +342,14 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("Link=10000", skill)
         self.assertNotIn("（权重 0）", skill)
 
+    def test_user_visible_reply_guard_rejects_internal_pr_identifiers(self) -> None:
+        from keytao_bot.plugins.chat_render import _assert_plain_user_facing_reply
+
+        with self.assertRaises(ValueError):
+            _assert_plain_user_facing_reply(
+                "服务端已锁定删除目标：PR#3062 呵呵呵 @ hhhooo"
+            )
+
     def test_e2e_docs_describe_repaired_and_new_scenarios(self) -> None:
         readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
         self.assertIn("S11 keeps the confirmation path", readme)
