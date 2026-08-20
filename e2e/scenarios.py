@@ -300,7 +300,7 @@ async def scenario_s2(ctx: ScenarioContext) -> dict[str, Any]:
     message = "添加「吃席」 wkxk，同码即可"
     reply = await ctx.send(message)
     draft = await ctx.draft()
-    require(len(draft["items"]) == 1, f"S2 created more than one draft item: {draft}")
+    require(len(draft["items"]) == 1, f"S2 did not create exactly one draft item: {draft}")
     item = draft["items"][0]
     require(item_key(item) == ("Create", "吃席", "wkxk"), f"unexpected S2 item: {item}")
     weight = item.get("weight")
@@ -355,6 +355,9 @@ async def scenario_s3(ctx: ScenarioContext) -> dict[str, Any]:
 
 
 async def scenario_s4(ctx: ScenarioContext) -> dict[str, Any]:
+    ctx.bot.seed_expired_confirmation_advertisement(
+        platform_id=ctx.platform_id,
+    )
     stale_reply = await ctx.send("确认")
     draft = await ctx.draft()
     require(not draft["items"], f"stale confirmation changed the draft: {draft}")
@@ -1110,7 +1113,9 @@ async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
 
     if second_batch_id:
         expected_code_match = re.search(
-            r"是否以编码\s+(?P<code>[a-z]{2,12})\s+将「亮面」加入草稿",
+            r"(?:推荐编码[：:]|是否以编码)\s*"
+            r"(?P<code>[a-z]{2,12})"
+            r"(?:（本次仅查询）|\s+将「亮面」加入草稿)",
             discovery_reply,
         )
         require(
@@ -2674,7 +2679,9 @@ async def scenario_s24(ctx: ScenarioContext) -> dict[str, Any]:
         "S24 discovery exposed no bot message id",
     )
     binding = re.search(
-        rf"是否以编码\s+(?P<code>[a-z]{{1,12}})\s+将「{re.escape(S24_WORD)}」加入草稿",
+        rf"(?:推荐编码[：:]|是否以编码)\s*"
+        rf"(?P<code>[a-z]{{1,12}})"
+        rf"(?:（本次仅查询）|\s+将「{re.escape(S24_WORD)}」加入草稿)",
         discovery,
     )
     require(binding is not None, f"S24 discovery omitted its exact candidate: {discovery}")
@@ -3183,8 +3190,10 @@ async def scenario_s27(ctx: ScenarioContext) -> dict[str, Any]:
     )
     first_reply = await send_as(unbound_platform_id, "S27-unbound", S27_WORD)
     require(S27_WORD in first_reply, f"S27 unbound review omitted the word: {first_reply}")
+    unbound_contract = advertised_reply_contract(first_reply)
     require(
-        advertised_reply_contract(first_reply).requires_live_state,
+        unbound_contract.read_only_single_word_lookup
+        or unbound_contract.requires_live_state,
         f"S27 unbound review did not render a candidate contract: {first_reply}",
     )
     require(
@@ -3231,8 +3240,10 @@ async def scenario_s27(ctx: ScenarioContext) -> dict[str, Any]:
 
     await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
     bound_reply = await send_as(ctx.platform_id, ctx.sender_name, S27_WORD)
+    bound_contract = advertised_reply_contract(bound_reply)
     require(
-        advertised_reply_contract(bound_reply).requires_live_state,
+        bound_contract.read_only_single_word_lookup
+        or bound_contract.requires_live_state,
         f"S27 bound control did not render candidates: {bound_reply}",
     )
     require(
@@ -3274,11 +3285,18 @@ def _rendered_candidate_rows(reply: str) -> list[tuple[int, str]]:
 
 
 def _rendered_recommended_code(reply: str) -> str:
-    match = re.search(
+    actionable = re.search(
         r"是否以编码\s+(?P<code>[a-z]{1,12})\s+将",
         reply,
         re.IGNORECASE,
     )
+    read_only = re.search(
+        r"(?m)^推荐编码[：:]\s*(?P<code>[a-z]{1,12})"
+        r"(?:（本次仅查询）|\(本次仅查询\))\s*$",
+        reply,
+        re.IGNORECASE,
+    )
+    match = actionable or read_only
     require(match is not None, f"candidate reply omitted its recommendation: {reply}")
     return match.group("code").lower()
 
@@ -3494,7 +3512,7 @@ async def scenario_s28(ctx: ScenarioContext) -> dict[str, Any]:
 S29_CODE = "mkdr"
 S29_CURRENT = (("火锅", 100), ("电脑", 101))
 S29_PROPOSED = (("电脑", 100), ("火锅", 101))
-S29_INCIDENT_COMMAND = "重新排序下mkdr 编码链这几个词按优先级"
+S29_INCIDENT_COMMAND = "mkdr 按优先级排一下"
 S29_PRESENCE_CONTROL = "这两个词现在词库都有吗"
 
 
@@ -3651,6 +3669,245 @@ async def scenario_s29(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S30_WORD = "吃席"
+S30_CANCEL = "先别加"
+S30_NATURAL_ASSENT = "那就加入并提交吧"
+
+
+async def scenario_s30(ctx: ScenarioContext) -> dict[str, Any]:
+    """Pin read-only lookup, cancel-negation, and tolerant natural assent."""
+    messages: list[str] = []
+    replies: list[str] = []
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    read_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S30_WORD)
+    read_reply = await ctx.send(S30_WORD)
+    replies.append(read_reply)
+    assert_reply_mentions(read_reply, S30_WORD)
+    require(
+        not (await ctx.draft()).get("items"),
+        f"S30 bare lookup wrote a draft item: {await ctx.draft()}",
+    )
+
+    messages.append("好")
+    stale_reply = await ctx.send("好")
+    replies.append(stale_reply)
+    read_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > read_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") in {
+            "keytao_create_phrase",
+            "keytao_batch_add_to_draft",
+            "keytao_submit_batch",
+            "keytao_shift_phrase_code",
+        }
+    ]
+    require(not read_events, f"S30 read lookup armed a later write: {read_events}")
+    require(
+        not (await ctx.draft()).get("items"),
+        f"S30 bare 好 after lookup wrote a draft item: {await ctx.draft()}",
+    )
+
+    messages.append(f"加词 {S30_WORD}")
+    cancel_candidate = await ctx.send(f"加词 {S30_WORD}")
+    replies.append(cancel_candidate)
+    assert_reply_mentions(cancel_candidate, S30_WORD, "候选编码")
+    cancel_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S30_CANCEL)
+    cancel_reply = await ctx.send(S30_CANCEL)
+    replies.append(cancel_reply)
+    require(
+        "取消" in cancel_reply or "放弃" in cancel_reply,
+        f"S30 negated add did not cancel: {cancel_reply}",
+    )
+    require(
+        "可执行命令" not in cancel_reply and "「加入" not in cancel_reply,
+        f"S30 negation advertised an add command: {cancel_reply}",
+    )
+    cancel_writes = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > cancel_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") in {
+            "keytao_create_phrase",
+            "keytao_batch_add_to_draft",
+            "keytao_submit_batch",
+            "keytao_shift_phrase_code",
+        }
+    ]
+    require(not cancel_writes, f"S30 cancellation wrote: {cancel_writes}")
+    require(
+        not (await ctx.draft()).get("items"),
+        f"S30 cancellation changed the draft: {await ctx.draft()}",
+    )
+
+    messages.append(f"加词 {S30_WORD}")
+    natural_candidate = await ctx.send(f"加词 {S30_WORD}")
+    replies.append(natural_candidate)
+    assert_reply_mentions(natural_candidate, S30_WORD, "候选编码")
+    recommended_match = re.search(
+        rf"是否以编码\s+(?P<code>[a-z]{{1,12}})\s+将「{S30_WORD}」加入草稿",
+        natural_candidate,
+        re.IGNORECASE,
+    )
+    require(
+        recommended_match is not None,
+        f"S30 natural candidate omitted its bound recommendation: {natural_candidate}",
+    )
+    recommended_code = recommended_match.group("code").lower()
+    submit_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S30_NATURAL_ASSENT)
+    assent_reply = await ctx.send(S30_NATURAL_ASSENT)
+    replies.append(assent_reply)
+    completed_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=submit_cutoff,
+    )
+    confirmation_steps = 0
+    while not completed_batch_id and confirmation_steps < 3:
+        require(
+            "确认" in assent_reply,
+            f"S30 natural assent neither progressed nor requested confirmation: {assent_reply}",
+        )
+        confirmation_steps += 1
+        messages.append("确认")
+        assent_reply = await ctx.send("确认")
+        replies.append(assent_reply)
+        completed_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=submit_cutoff,
+        )
+    require(completed_batch_id, f"S30 natural assent never submitted: {replies}")
+    completed_batch = await ctx.next_client.get_admin_batch(
+        batch_id=completed_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    actual_items = [
+        item_key(item)
+        for item in completed_batch.get("pullRequests", [])
+        if isinstance(item, dict)
+    ]
+    require(
+        same_unique_item_set(
+            actual_items,
+            [("Create", S30_WORD, recommended_code)],
+        ),
+        f"S30 natural assent submitted a different item set: {completed_batch}",
+    )
+    draft = await ctx.draft()
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "readQueryMutationCalls": len(read_events),
+            "cancelMutationCalls": len(cancel_writes),
+            "naturalAssent": S30_NATURAL_ASSENT,
+            "recommendedCode": recommended_code,
+            "submittedBatchId": completed_batch_id,
+            "confirmationSteps": confirmation_steps,
+        },
+    }
+
+
+S31_COMMAND = "把 幂等 放到 米等 前面，米等顺延到下一个空位"
+
+
+async def scenario_s31(ctx: ScenarioContext) -> dict[str, Any]:
+    """Execute the verbatim positional-plus-顺延 incident through the real path."""
+    target_code = "mkdr"
+    target_rows = await ctx.next_client.phrases_by_code(target_code)
+    require(not target_rows, f"S31 requires an empty {target_code} slot: {target_rows}")
+    await ctx.next_client.seed_phrase(
+        platform_id=ctx.platform_id,
+        word="米等",
+        code=target_code,
+        weight=100,
+    )
+    subject_encoding = await ctx.next_client.encode("幂等")
+    occupant_encoding = await ctx.next_client.encode("米等")
+    subject_codes = ordered_candidate_codes(subject_encoding)
+    occupant_codes = ordered_candidate_codes(occupant_encoding)
+    require(
+        target_code in subject_codes and target_code in occupant_codes,
+        f"S31 fixture encodings do not share {target_code}: "
+        f"subject={subject_encoding}, occupant={occupant_encoding}",
+    )
+    target_index = occupant_codes.index(target_code)
+    require(
+        target_index + 1 < len(occupant_codes),
+        f"S31 米等 has no served successor after {target_code}: {occupant_encoding}",
+    )
+    next_code = occupant_codes[target_index + 1]
+    require(
+        not await ctx.next_client.phrases_by_code(next_code),
+        f"S31 successor {next_code} is occupied",
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    reply = await ctx.send(S31_COMMAND)
+    draft = await ctx.draft()
+    expected = {
+        ("Delete", "米等", target_code),
+        ("Create", "幂等", target_code),
+        ("Create", "米等", next_code),
+    }
+    actual = {item_key(item) for item in draft.get("items", [])}
+    require(actual == expected, f"S31 verbatim command produced {draft}")
+    assert_reply_mentions(reply, "幂等", "米等", target_code, next_code)
+    assert_no_code_request(reply)
+    events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > cutoff
+        and event.get("kind") == "tool"
+    ]
+    shift_plan_events = [
+        event
+        for event in events
+        if isinstance(event.get("result"), dict)
+        and isinstance(event["result"].get("shiftPlan"), dict)
+        and {
+            item_key(item)
+            for item in event["result"]["shiftPlan"].get("items", [])
+            if isinstance(item, dict)
+        }
+        == expected
+    ]
+    require(
+        any(event.get("name") == "keytao_lookup_by_word" for event in events)
+        and bool(shift_plan_events),
+        f"S31 did not traverse lookup plus shift planning: {events}",
+    )
+    return {
+        "messages": [S31_COMMAND],
+        "replies": [reply],
+        "draft": draft,
+        "facts": {
+            "targetCode": target_code,
+            "successorCode": next_code,
+            "expectedItems": sorted(expected),
+            "actualItems": sorted(actual),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -3681,6 +3938,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S27", "binding precheck and question-turn reply", scenario_s27),
     Scenario("S28", "reviewed multi-reading cascade closure", scenario_s28),
     Scenario("S29", "quoted same-code commonness reorder", scenario_s29),
+    Scenario("S30", "read cancel and natural assent closure", scenario_s30),
+    Scenario("S31", "verbatim positional eviction closure", scenario_s31),
 )
 
 

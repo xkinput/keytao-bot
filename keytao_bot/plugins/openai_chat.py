@@ -91,6 +91,7 @@ from ..utils.pending_confirmation import (
     append_unbound_binding_notice as _append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_single_word_candidate_codes,
+    advertised_single_word_lookup_word,
     advertised_reply_contract,
     advertised_word_set_words,
     command_suggestions_are_closed_candidate_selections,
@@ -269,11 +270,13 @@ from .chat_commands import (
     _try_handle_draft_recall_command,
     _try_handle_draft_submit_command,
     _try_handle_draft_view_command,
+    _try_handle_complete_add_command,
     _try_handle_keep_only_draft_items_command,
     _try_handle_operation_recall,
     _try_handle_quoted_draft_selection,
     _try_handle_referenced_word_presence_query,
     _try_handle_replace_char,
+    _try_recover_reviewed_add_from_history,
     _try_handle_simple_single_word_query,
     _try_update_pending_pronunciation,
     background_draft_tasks,
@@ -1839,11 +1842,9 @@ async def trace_sensitive_message(bot: Bot, event: Event):
     if not message_text:
         return
 
-    compact_text = re.sub(r"[\s，,。.!！?？~～]+", "", message_text)
     is_sensitive_short_command = (
         _is_plain_draft_submit_request(message_text)
-        or compact_text in _PENDING_CONTROL_TEXTS
-        or compact_text in _DRAFT_SUBMIT_COMMANDS
+        or _is_contextual_short_reply(message_text)
     )
     contains_trigger = (
         GROUP_TRIGGER_KEYWORD_ANY in message_text
@@ -2919,6 +2920,8 @@ async def _stage_finish_scoped_pending_response(ctx: TurnContext) -> bool:
 
 async def _stage_guard_stale_confirmation(ctx: TurnContext) -> bool:
     """Production incident S13: stale-confirm guard must never outrank a live ticket."""
+    if ctx.history is None:
+        ctx.history = get_history(ctx.conv_key)
     active_pending_operation = draft_operation_coordinator.get(ctx.conv_key)
     other_owner_pending = (
         conversation_state_store.find_pending_for_other_owner(ctx.space_key, ctx.conv_key)
@@ -2938,6 +2941,7 @@ async def _stage_guard_stale_confirmation(ctx: TurnContext) -> bool:
             and active_pending_operation is None
             and other_owner_pending is None
             and not ctx.quoted_pending_add_control
+            and _latest_assistant_message_invites_contextual_reply(ctx.history)
         )
         else None
     )
@@ -2995,6 +2999,17 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
         and live_ticket_assent is None
     ):
         current_pending = conversation_state_store.get(ctx.conv_key)
+        if current_pending is None:
+            if ctx.history is None:
+                ctx.history = get_history(ctx.conv_key)
+            if advertised_single_word_lookup_word(
+                _get_latest_assistant_message(ctx.history)
+            ):
+                # A deterministic read snapshot carries no ticket, but the
+                # current whole-message add request can re-review it in the
+                # later single-word stage and complete against fresh facts.
+                ctx.generic_command_intent = MessageCommandIntent()
+                return False
         displayed_pairs = (
             advertised_batch_binding_pairs(ctx.reply_reference.text)
             if (
@@ -4111,6 +4126,27 @@ async def _stage_handle_replace_character(ctx: TurnContext) -> bool:
 
 async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
     """Production scenario: simple word lookup runs before general model fallback."""
+    if ctx.response is None and ctx.current_pending_record is None:
+        ctx.response = await _try_handle_complete_add_command(
+            ctx.normalized_message_text,
+            ctx.platform,
+            ctx.user_id,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
+        )
+    if ctx.response is None and ctx.current_pending_record is None:
+        if ctx.history is None:
+            ctx.history = get_history(ctx.conv_key)
+        ctx.response = await _try_recover_reviewed_add_from_history(
+            ctx.normalized_message_text,
+            ctx.history,
+            ctx.platform,
+            ctx.user_id,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
+        )
     if ctx.response is None:
         ctx.response = await _try_handle_simple_single_word_query(
             ctx.normalized_message_text,
@@ -4690,12 +4726,14 @@ _CHAT_COMPAT_NAMES = (
     "_try_handle_draft_recall_command",
     "_try_handle_draft_submit_command",
     "_try_handle_draft_view_command",
+    "_try_handle_complete_add_command",
     "_try_handle_keep_only_draft_items_command",
     "_try_handle_operation_recall",
     "_try_handle_quoted_draft_selection",
     "_try_handle_referenced_word_presence_query",
     "_try_handle_replace_char",
     "_try_handle_simple_single_word_query",
+    "_try_recover_reviewed_add_from_history",
     "_try_update_pending_pronunciation",
     "_verified_bot_reply_matches_record",
     "_vision_input_failed_reply",
@@ -4704,6 +4742,7 @@ _CHAT_COMPAT_NAMES = (
     "_vision_unavailable_reply",
     "background_draft_tasks",
     "background_draft_tasks_by_conversation",
+    "advertised_single_word_lookup_word",
     "build_reply_context",
     "call_tool_function",
     "config",

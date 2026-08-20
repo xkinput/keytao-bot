@@ -44,6 +44,7 @@ from keytao_bot.harness.state import (
     SQLiteConversationStateStore,
 )
 from keytao_bot.plugins.chat_routing import (
+    _canonical_draft_management_command,
     _resolve_advertised_word_set_selection,
 )
 from keytao_bot.harness.tools import (
@@ -54,6 +55,7 @@ from keytao_bot.harness.tools import (
     _RECORD_FRAME_RE,
     _mutation_authorization_view,
     _pending_positional_create_binding,
+    _positional_create_operands,
     _positional_same_code_requested,
     authorized_multi_add_items,
     create_warning_confirmation_binding,
@@ -62,8 +64,10 @@ from keytao_bot.harness.tools import (
     self_checked_suggested_command,
 )
 from keytao_bot.harness.authorization_grammar import (
+    parse_entry_swap,
     parse_eviction_modified_add,
     parse_existing_entry_move,
+    parse_indirect_entry_move,
 )
 from keytao_bot.utils.history_store import HistoryStore
 from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
@@ -2373,6 +2377,14 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     "麻烦加入草稿吧。": False,
                     "麻烦帮我把当前候选加入草稿。": False,
                     "确认写入草稿。": False,
+                    "两个都加入并提交": True,
+                    "一起加": False,
+                    "加吧": False,
+                    "可以加": False,
+                    "加进去并提交": True,
+                    "加入并提交 谢谢": True,
+                    "加入并提交，这个词挺常用的": True,
+                    "加入并提交 owo": True,
                     "加入草稿，然后就提交。": True,
                     "加完提交。": True,
                     "加入达致 dsfkv，然后提交。": True,
@@ -2402,7 +2414,6 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     "加入行。": "候选之外",
                     "加入达致 zzzzz，然后就提交。": "候选之外",
                     "加入草稿，然后删除大致。": "其他动作",
-                    "先别加入。": "否定",
                     "加入草稿然后提交吗？": "问句",
                     "他说「加入草稿，然后就提交」。": "转述",
                 }
@@ -6235,6 +6246,124 @@ def iter_record_frame_no_negator_control():
 
 
 class MutationAuthorizationTests(unittest.TestCase):
+    def test_swap_and_indirect_move_are_positive_whole_messages(self) -> None:
+        swap = parse_entry_swap("冒菜和茂才换个位置")
+        indirect = parse_indirect_entry_move(
+            "这三个词里词频最高的那个放在wtwwi上"
+        )
+        self.assertEqual(
+            (swap.first_word, swap.second_word) if swap else None,
+            ("冒菜", "茂才"),
+        )
+        self.assertEqual(
+            (
+                indirect.candidate_count,
+                indirect.target_code,
+            ) if indirect else None,
+            (3, "wtwwi"),
+        )
+        self.assertTrue(message_authorizes_mutation("冒菜与茂才对调"))
+        self.assertTrue(message_authorizes_mutation(
+            "这三个词里词频最高的那个放在wtwwi上"
+        ))
+        for message in (
+            "不要把冒菜和茂才换位置",
+            "他说冒菜和茂才换位置",
+            "冒菜和茂才换位置吗？",
+            "不要把这三个词里词频最高的那个放在wtwwi上",
+            "这三个词里词频最高的那个放在wtwwi上吗？",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(message_authorizes_mutation(message))
+
+    def test_postposed_change_delete_and_recall_are_positive_whole_messages(self) -> None:
+        for message in (
+            "呵呵呵改成 kxxooo",
+            "炒冷饭改成 wlfou",
+            "呵呵呵这条删了",
+            "删了 3051",
+            "可以提交了",
+            "那就提交",
+            "刚才那次提交撤回一下",
+            "回退一下",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(message_authorizes_mutation(message))
+        for message in (
+            "不要把呵呵呵改成 kxxooo",
+            "他说呵呵呵改成 kxxooo",
+            "呵呵呵这条删了吗？",
+            "他说删了 3051",
+            "不要那就提交",
+            "刚才那次提交不要撤回",
+            "回退一下会怎样？",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(message_authorizes_mutation(message))
+
+    def test_every_rendered_suggestion_unwraps_without_using_suffix_as_authority(self) -> None:
+        cases = (
+            ("撤回", (), True),
+            ("提交草稿", (), True),
+            ("清空草稿", (), True),
+            ("加词 甲 aa", ("甲",), True),
+            ("添加 甲 aa", ("火星词",), False),
+            ("将这 2 个词加入草稿", ("显眼包", "嘴替"), True),
+            ("查看草稿", ("显眼包", "嘴替"), False),
+        )
+        for command, words, expected in cases:
+            rendered = render_executable_suggestion(command, words=words)
+            with self.subTest(command=command, words=words):
+                self.assertEqual(
+                    message_authorizes_mutation(rendered),
+                    expected,
+                )
+
+        recall = _canonical_draft_management_command(
+            render_executable_suggestion("撤回")
+        )
+        self.assertIsNotNone(recall)
+        self.assertEqual(recall.intent, "draft_recall")
+        self.assertIsNone(
+            _canonical_draft_management_command('他说「撤回」')
+        )
+
+    def test_positional_reorder_accepts_spacing_verbs_and_bound_eviction_tail(self) -> None:
+        verbatim = "把 幂等 放到 米等 前面，米等顺延到下一个空位"
+        self.assertTrue(message_authorizes_mutation(verbatim))
+        self.assertEqual(
+            _positional_create_operands(verbatim),
+            ("幂等", "米等", "前面"),
+        )
+
+        for verb in ("排到", "调到", "移至", "挪去"):
+            message = f"把冒菜{verb}茂才前面"
+            with self.subTest(verb=verb):
+                self.assertTrue(message_authorizes_mutation(message))
+                self.assertEqual(
+                    _positional_create_operands(message),
+                    ("冒菜", "茂才", "前面"),
+                )
+                self.assertFalse(
+                    message_authorizes_mutation(f"不要把冒菜{verb}茂才前面")
+                )
+                self.assertFalse(
+                    message_authorizes_mutation(f"他说把冒菜{verb}茂才前面")
+                )
+
+        self.assertTrue(
+            message_authorizes_mutation("把吃席放在赤溪前面 谢谢")
+        )
+        for blocked in (
+            "把幂等放到米等前面，迷瞪顺延到下一个空位",
+            "不要把幂等放到米等前面，米等顺延到下一个空位",
+            "他说把幂等放到米等前面，米等顺延到下一个空位",
+            "把幂等放到米等前面，米等顺延到下一个空位？",
+        ):
+            with self.subTest(blocked=blocked):
+                self.assertFalse(message_authorizes_mutation(blocked))
+                self.assertIsNone(_positional_create_operands(blocked))
+
     def test_eviction_modified_add_is_one_closed_operation(self) -> None:
         expected = {
             "添加 幂等 mkdr，米等顺延": "顺延",
@@ -6335,6 +6464,7 @@ class MutationAuthorizationTests(unittest.TestCase):
             "添上炒冷饭的 wlf 编码",
             "也加炒冷饭的 wlf 编码",
             "再加炒冷饭的 wlf 编码",
+            "补上炒冷饭的 wlf 编码，再加回锅肉 hgr",
         )
         self.assertTrue(set(PENDING_BATCH_ADD_ADVERTISED_FORMS) <= set(
             ADD_OPERATION_VERB_FORMS
@@ -6345,7 +6475,7 @@ class MutationAuthorizationTests(unittest.TestCase):
             "不要补上炒冷饭的 wlf 编码",
             "怎么补上炒冷饭的 wlf 编码？",
             "他说「补上炒冷饭的 wlf 编码」",
-            "补上炒冷饭的 wlf 编码，再加回锅肉 hgr",
+            "补上炒冷饭的 wlf 编码，再删除回锅肉",
         )
         self.assertTrue(all(not message_authorizes_mutation(item) for item in blocked))
 
@@ -6656,9 +6786,13 @@ class MutationAuthorizationTests(unittest.TestCase):
                 ],
                 current_message=too_many_message,
             )
-            self.assertTrue(too_many.get("requiresTextFollowUp"), too_many)
-            self.assertEqual(too_many.get("reason"), "multi_add_limit_exceeded")
-            self.assertEqual(len(calls), 2)
+            self.assertTrue(too_many.get("success"), too_many)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(calls[-1]["items"]), 11)
+            self.assertEqual(
+                len(authorized_multi_add_items(too_many_message)),
+                11,
+            )
 
         asyncio.run(_run())
 
@@ -7215,6 +7349,124 @@ class MutationAuthorizationTests(unittest.TestCase):
         self.assertNotIn("preview_only", batch_message)
 
 
+class EntrySwapHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_literal_pair_resolves_both_words_before_ring_shift(self) -> None:
+        from keytao_bot.plugins import chat_commands
+        from keytao_bot.plugins.chat_routing import MessageCommandIntent
+
+        lookups = {
+            "冒菜": {"success": True, "phrases": [{
+                "word": "冒菜", "code": "mzchi", "type": "Phrase",
+            }]},
+            "茂才": {"success": True, "phrases": [{
+                "word": "茂才", "code": "mzch", "type": "Phrase",
+            }]},
+        }
+
+        async def fake_call(name, arguments, *_args, **_kwargs):
+            self.assertEqual(name, "keytao_lookup_by_word")
+            return json.dumps(lookups[arguments["word"]], ensure_ascii=False)
+
+        shift = AsyncMock(return_value="swap plan")
+        with (
+            patch.object(chat_commands, "call_tool_function", side_effect=fake_call),
+            patch.object(chat_commands, "_execute_shift_to_code", shift),
+        ):
+            result = await chat_commands._try_handle_entry_swap_command(
+                "冒菜和茂才换个位置",
+                MessageCommandIntent(
+                    intent="entry_swap",
+                    confidence=1.0,
+                    keep_words=("冒菜", "茂才"),
+                ),
+                "qq",
+                "swap-user",
+                None,
+                "",
+            )
+        self.assertEqual(result, "swap plan")
+        shift.assert_awaited_once_with(
+            "冒菜", "mzch", "qq", "swap-user", None, "",
+        )
+
+    async def test_ambiguous_word_never_reaches_ring_shift(self) -> None:
+        from keytao_bot.plugins import chat_commands
+        from keytao_bot.plugins.chat_routing import MessageCommandIntent
+
+        async def fake_call(_name, arguments, *_args, **_kwargs):
+            codes = ["mzchi", "mzchii"] if arguments["word"] == "冒菜" else ["mzch"]
+            return json.dumps({
+                "success": True,
+                "phrases": [
+                    {"word": arguments["word"], "code": code, "type": "Phrase"}
+                    for code in codes
+                ],
+            }, ensure_ascii=False)
+
+        shift = AsyncMock(return_value="unexpected")
+        with (
+            patch.object(chat_commands, "call_tool_function", side_effect=fake_call),
+            patch.object(chat_commands, "_execute_shift_to_code", shift),
+        ):
+            result = await chat_commands._try_handle_entry_swap_command(
+                "冒菜和茂才换个位置",
+                MessageCommandIntent(
+                    intent="entry_swap",
+                    confidence=1.0,
+                    keep_words=("冒菜", "茂才"),
+                ),
+                "qq",
+                "swap-user",
+                None,
+                "",
+            )
+        self.assertIn("无法", result)
+        shift.assert_not_awaited()
+
+
+class PendingCombinedIntentTests(unittest.TestCase):
+    @staticmethod
+    def _state() -> PendingAddWord:
+        return PendingAddWord(
+            word="呵呵呵",
+            recommended_code="hhhooo",
+            candidates=[("hhhooo", False), ("hxxooo", True)],
+            occupied_words={"hxxooo": ["粮棉"]},
+            server_candidates=[("hhhooo", False), ("hxxooo", True)],
+            server_occupied_words={"hxxooo": ["粮棉"]},
+            server_entries_by_code={"hxxooo": [("粮棉", 100)]},
+        )
+
+    def test_assent_plus_position_binds_only_the_server_occupant(self) -> None:
+        from keytao_bot.plugins.chat_routing import (
+            _pending_assent_rejection_response,
+            _pending_positional_add_intent,
+        )
+
+        state = self._state()
+        message = "加入并提交，排在粮棉前面"
+        intent = _pending_positional_add_intent(state, message)
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent.intent, "pending_add_and_submit")
+        self.assertEqual(intent.requested_codes, ("hxxooo",))
+        self.assertEqual(intent.target_word, "粮棉")
+        self.assertIsNone(_pending_assent_rejection_response(state, message))
+
+        self.assertIsNone(
+            _pending_positional_add_intent(
+                state,
+                "加入并提交，排在陌生词前面",
+            )
+        )
+        negated = _pending_assent_rejection_response(
+            state,
+            "不要加入并提交，排在粮棉前面",
+        )
+        self.assertIn("否定", negated)
+        self.assertNotIn("可执行命令", negated)
+        self.assertNotIn("「加入", negated)
+
+
 class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
     """The natural ways a user asks for a code shift must actually work."""
 
@@ -7239,6 +7491,92 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         return __import__("json").loads(raw)
+
+    async def test_bare_subject_code_change_reaches_only_the_literal_shift(self) -> None:
+        allowed = await self._shift(
+            "呵呵呵改成 kxxooo",
+            word="呵呵呵",
+            code="kxxooo",
+        )
+        self.assertTrue(allowed.get("success"), allowed)
+        self.assertEqual(
+            self.calls,
+            [{"word": "呵呵呵", "target_code": "kxxooo"}],
+        )
+        for blocked_message in (
+            "不要把呵呵呵改成 kxxooo",
+            "他说呵呵呵改成 kxxooo",
+            "呵呵呵改成 kxxooo 吗？",
+        ):
+            with self.subTest(message=blocked_message):
+                blocked = await self._shift(
+                    blocked_message,
+                    word="呵呵呵",
+                    code="kxxooo",
+                )
+                self.assertTrue(blocked.get("policyBlocked"), blocked)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_pair_swap_binds_both_server_resolved_codes(self) -> None:
+        lookup_codes = {
+            "冒菜": frozenset({"mzchi"}),
+            "茂才": frozenset({"mzch"}),
+        }
+        allowed = await self._shift(
+            "冒菜和茂才换个位置",
+            word="冒菜",
+            code="mzch",
+            trusted_word_lookup_codes_by_word=lookup_codes,
+        )
+        self.assertTrue(allowed.get("success"), allowed)
+        reversed_subject = await self._shift(
+            "冒菜和茂才换个位置",
+            word="茂才",
+            code="mzchi",
+            trusted_word_lookup_codes_by_word=lookup_codes,
+        )
+        untrusted_code = await self._shift(
+            "冒菜和茂才换个位置",
+            word="冒菜",
+            code="fake",
+            trusted_word_lookup_codes_by_word=lookup_codes,
+        )
+        self.assertTrue(reversed_subject.get("policyBlocked"), reversed_subject)
+        self.assertTrue(untrusted_code.get("policyBlocked"), untrusted_code)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_indirect_move_requires_exact_bounded_lookup_set(self) -> None:
+        message = "这三个词里词频最高的那个放在wtwwi上"
+        lookup_codes = {
+            "甲词": frozenset({"aa"}),
+            "乙词": frozenset({"bb"}),
+            "丙词": frozenset({"cc"}),
+        }
+        allowed = await self._shift(
+            message,
+            word="甲词",
+            code="wtwwi",
+            trusted_word_lookup_codes_by_word=lookup_codes,
+        )
+        self.assertTrue(allowed.get("success"), allowed)
+        wrong_code = await self._shift(
+            message,
+            word="甲词",
+            code="wrong",
+            trusted_word_lookup_codes_by_word=lookup_codes,
+        )
+        incomplete_set = await self._shift(
+            message,
+            word="甲词",
+            code="wtwwi",
+            trusted_word_lookup_codes_by_word={
+                "甲词": frozenset({"aa"}),
+                "乙词": frozenset({"bb"}),
+            },
+        )
+        self.assertTrue(wrong_code.get("policyBlocked"), wrong_code)
+        self.assertTrue(incomplete_set.get("policyBlocked"), incomplete_set)
+        self.assertEqual(len(self.calls), 1)
 
     async def _shift(self, message, word="吃席", code="wkxk", **context_kwargs):
         return await self._call(
@@ -7634,6 +7972,38 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(result.get("success"), (phrasing, result))
         self.assertEqual(len(self.calls), len(phrasings))
+
+    async def test_verbatim_spaced_positional_eviction_reaches_only_bound_shift(self) -> None:
+        message = "把 幂等 放到 米等 前面，米等顺延到下一个空位"
+        result = await self._shift(
+            message,
+            word="幂等",
+            code="mkdr",
+            trusted_codes_by_word={"幂等": frozenset({"mkdr"})},
+            trusted_phrase_types_by_key={
+                ("米等", "mkdr"): frozenset({"Phrase"}),
+            },
+        )
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(
+            self.calls[0],
+            {"word": "幂等", "target_code": "mkdr"},
+        )
+
+        before = len(self.calls)
+        mismatched = await self._shift(
+            "把幂等放到米等前面，迷瞪顺延到下一个空位",
+            word="幂等",
+            code="mkdr",
+            trusted_codes_by_word={"幂等": frozenset({"mkdr"})},
+            trusted_phrase_types_by_key={
+                ("米等", "mkdr"): frozenset({"Phrase"}),
+                ("迷瞪", "mkdr"): frozenset({"Phrase"}),
+            },
+        )
+        self.assertTrue(mismatched.get("policyBlocked"), mismatched)
+        self.assertEqual(len(self.calls), before)
 
     async def test_reported_speech_and_narrative_positional_text_never_reaches_sink(self) -> None:
         messages = (
@@ -8148,6 +8518,31 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(counts, {"ALLOW": 3, "BLOCK": 2, "ASK": 1})
         self.assertEqual(failures, [])
 
+    async def test_live_assent_can_bind_one_exact_positional_destination(self) -> None:
+        allowed = await self._call(
+            "加入并提交，排在赤溪前面",
+            capability=self._capability(),
+        )
+        self.assertTrue(allowed.get("success"), allowed)
+        self.assertEqual(
+            self.calls,
+            [("keytao_shift_phrase_code", {
+                "word": "吃席",
+                "target_code": "wkxk",
+                "target_needs_manual_review": True,
+                "platform": "qq",
+                "platform_id": "candidate-user",
+            })],
+        )
+
+        before = len(self.calls)
+        blocked = await self._call(
+            "加入并提交，排在陌生词前面",
+            capability=self._capability(),
+        )
+        self.assertTrue(blocked.get("policyBlocked"), blocked)
+        self.assertEqual(len(self.calls), before)
+
     async def test_destination_resolution_corpus_is_fail_closed_or_asks(self) -> None:
         cases = (
             (
@@ -8621,7 +9016,7 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
                 "back-same-collision",
                 "把吃席放在赤溪后面同编码",
                 back_collision,
-                "ASK",
+                "DUPLICATE",
             ),
         )
         counts = {
@@ -8661,8 +9056,15 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
                 "keytao_batch_add_to_draft"
             ]:
                 items = call_delta[0][1].get("items")
-                self.assertEqual(items[0].get("weight"), 100)
-                self.assertEqual(items[1].get("weight"), 101)
+                expected_weights = (
+                    (101, 102)
+                    if label == "back-same-collision"
+                    else (100, 101)
+                )
+                self.assertEqual(
+                    tuple(item.get("weight") for item in items),
+                    expected_weights,
+                )
                 actual = "DUPLICATE"
             else:
                 actual = "INVALID"
@@ -8674,10 +9076,10 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
         self.assertEqual(len(cases), 10)
         self.assertEqual(counts, {
             "SHIFT": 2,
-            "DUPLICATE": 2,
+            "DUPLICATE": 3,
             "NEXT_FREE": 2,
             "BLOCK": 2,
-            "ASK": 2,
+            "ASK": 1,
         })
         self.assertEqual(failures, [])
 
@@ -9027,6 +9429,31 @@ class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         return __import__("json").loads(raw)
+
+    async def test_postposed_delete_binds_literal_id_or_trusted_word(self) -> None:
+        by_id = await self._call(
+            "keytao_remove_draft_item",
+            {"pr_id": 3051},
+            "删了 3051",
+        )
+        by_word = await self._call(
+            "keytao_remove_draft_item",
+            {"pr_id": 3051},
+            "呵呵呵这条删了",
+            trusted_draft_words_by_id={"3051": "呵呵呵"},
+        )
+        self.assertTrue(by_id.get("success"), by_id)
+        self.assertTrue(by_word.get("success"), by_word)
+        self.assertEqual(len(self.calls), 2)
+
+        blocked = await self._call(
+            "keytao_remove_draft_item",
+            {"pr_id": 3051},
+            "他说呵呵呵这条删了",
+            trusted_draft_words_by_id={"3051": "呵呵呵"},
+        )
+        self.assertTrue(blocked.get("policyBlocked"), blocked)
+        self.assertEqual(len(self.calls), 2)
 
     async def test_word_substring_does_not_bind_a_different_word(self) -> None:
         result = await self._call(
@@ -13238,7 +13665,7 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertIsNone(store.get_record(address))
         self.assertEqual(result, "ordering unavailable")
 
-    async def test_marked_back_weight_collision_asks_without_sink(self) -> None:
+    async def test_marked_back_weight_collision_bumps_dense_tail_at_sink(self) -> None:
         calls = []
 
         async def dispatch(name, **kwargs):
@@ -13265,17 +13692,42 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             ),
         )
 
-        self.assertEqual(calls, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "keytao_batch_add_to_draft")
+        self.assertEqual(
+            calls[0][1]["items"],
+            [
+                {
+                    "action": "Create",
+                    "word": "吃席",
+                    "code": "wkxk",
+                    "type": "Phrase",
+                    "weight": 101,
+                    "needsManualReview": True,
+                },
+                {
+                    "action": "Change",
+                    "old_word": "下一个",
+                    "word": "下一个",
+                    "code": "wkxk",
+                    "type": "Phrase",
+                    "weight": 102,
+                },
+            ],
+        )
         payload = __import__("json").loads(next(
             message["content"]
             for message in client.completions.calls[-1]["messages"]
             if message.get("role") == "tool"
         ))
-        self.assertTrue(payload.get("requiresTextFollowUp"))
-        self.assertFalse(payload.get("policyBlocked", False))
-        self.assertEqual(payload.get("reason"), "ordering_not_expressible")
-        self.assertIsNotNone(store.get_record(address))
-        self.assertEqual(result, "ordering unavailable")
+        self.assertTrue(payload.get("success"))
+        self.assertNotEqual(payload.get("reason"), "ordering_not_expressible")
+        self.assertIsNone(store.get_record(address))
+        self.assertIn("ordering unavailable", result)
+        self.assertIn(
+            "同码顺序：wkxk：赤溪 → 吃席 → 下一个",
+            result,
+        )
 
     async def test_duplicate_warning_is_auto_confirmed_once_with_exact_ticket(self) -> None:
         calls = []

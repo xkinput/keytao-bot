@@ -1317,6 +1317,22 @@ class E2EBotHarness:
             group_context,
         )
 
+    def seed_expired_confirmation_advertisement(self, *, platform_id: str) -> None:
+        """Seed the history half of an expired ticket, with no live capability."""
+        from keytao_bot.harness.conversation import ConversationAddress
+
+        address = ConversationAddress.private("qq", platform_id)
+        stored = self.openai_chat.add_to_history(
+            address,
+            "删除草稿里的旧测试词",
+            "此前操作曾等待确认，现在是否继续？如需执行请回复「确认」。",
+        )
+        self.openai_chat.conversation_state_store.delete(address)
+        if not stored or self.openai_chat.conversation_state_store.get_record(address):
+            raise RigInfrastructureError(
+                "could not establish the expired-confirmation precondition"
+            )
+
     @staticmethod
     def _group_id(platform_id: str) -> int:
         return int(str(platform_id)[-15:]) + 1

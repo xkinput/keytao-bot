@@ -23,6 +23,7 @@ from ..harness.conversation import (
 from ..harness.authorization_grammar import (
     _PHRASE_TYPE_BASE_WEIGHTS,
     explicit_complete_add_item,
+    parse_entry_swap,
     parse_eviction_modified_add,
 )
 from ..harness.state import (
@@ -54,12 +55,16 @@ from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     append_unbound_binding_notice,
     advertised_batch_binding_pairs,
+    advertised_single_word_lookup_codes,
+    advertised_single_word_lookup_word,
     ensure_single_word_candidate_copy,
     ensure_multi_word_candidate_copy,
+    parse_pending_assent_phrase,
     parse_pending_candidate_selection,
     pending_confirmation_copy,
     render_executable_suggestion,
     render_remediation_reply,
+    render_server_backed_single_word_lookup,
     single_word_candidate_footer,
 )
 from ..utils.memory_store import (
@@ -110,6 +115,7 @@ from .chat_routing import (
     _canonical_draft_management_command,
     _canonical_keep_only_command,
     _classify_message_command_intent,
+    _closed_candidate_selection,
     _compact_command_text,
     _describe_pending_state,
     _describe_pending_ticket_choice,
@@ -721,6 +727,128 @@ def _get_latest_assistant_message(history: Optional[List[Dict]]) -> str:
     return ""
 
 
+async def _try_recover_reviewed_add_from_history(
+    message_text: str,
+    history: Optional[List[Dict]],
+    platform: str,
+    user_id: str,
+    conv_key: Optional[ConversationKey] = None,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    """Re-review an explicitly selected read snapshot, then finish the intent."""
+    assent = parse_pending_assent_phrase(message_text)
+    selection = _closed_candidate_selection(message_text)
+    if selection is None and not (assent.matched and assent.add_requested):
+        return None
+    latest_assistant = _get_latest_assistant_message(history)
+    displayed = _parse_pending_add_word(latest_assistant)
+    displayed_word = (
+        displayed.word
+        if isinstance(displayed, PendingAddWord)
+        else advertised_single_word_lookup_word(latest_assistant)
+    )
+    if not displayed_word:
+        return None
+    displayed_codes = (
+        tuple(code for code, _occupied in displayed.candidates)
+        if isinstance(displayed, PendingAddWord)
+        else advertised_single_word_lookup_codes(latest_assistant)
+    )
+    if not displayed_codes:
+        return None
+    refreshed = await _try_handle_simple_single_word_query(
+        f"加词 {displayed_word}",
+        platform,
+        user_id,
+        conv_key,
+        space_key,
+        owner_label,
+    )
+    if conv_key is None:
+        return refreshed
+    record = conversation_state_store.get_record(conv_key)
+    state = record.state if record is not None else None
+    if not isinstance(state, PendingAddWord) or not state.server_candidates:
+        return refreshed
+    current_codes = tuple(code for code, _occupied in state.server_candidates)
+    if current_codes != displayed_codes:
+        return refreshed
+
+    execution_message = message_text
+    if selection is not None:
+        indices, codes, _submit_after = selection
+        if (
+            any(index < 1 or index > len(displayed_codes) for index in indices)
+            or any(code not in displayed_codes for code in codes)
+        ):
+            return refreshed
+    else:
+        recommended = re.search(
+            r"(?m)^推荐编码[：:]\s*(?P<code>[a-z]{1,12})"
+            r"(?:（本次仅查询）|\(本次仅查询\))\s*$",
+            latest_assistant,
+            re.IGNORECASE,
+        )
+        displayed_recommended = (
+            displayed.recommended_code
+            if isinstance(displayed, PendingAddWord)
+            else recommended.group("code").lower() if recommended is not None else ""
+        )
+        if displayed_recommended != state.recommended_code:
+            return refreshed
+
+    executed = await handle_pending_message_core(
+        execution_message,
+        platform,
+        user_id,
+        conv_key,
+        history=history,
+        space_key=space_key,
+        owner_label=owner_label,
+        allow_intent_model=False,
+    )
+    return executed or refreshed
+
+
+async def _try_handle_complete_add_command(
+    message_text: str,
+    platform: str,
+    user_id: str,
+    conv_key: Optional[ConversationKey] = None,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    """Execute one whole-message word+code add through fresh server review."""
+    command = explicit_complete_add_item(message_text)
+    if command is None or conv_key is None:
+        return None
+    word = str(command.get("word") or "").strip()
+    if not word:
+        return None
+    refreshed = await _try_handle_simple_single_word_query(
+        f"加词 {word}",
+        platform,
+        user_id,
+        conv_key,
+        space_key,
+        owner_label,
+    )
+    record = conversation_state_store.get_record(conv_key)
+    if record is None or not isinstance(record.state, PendingAddWord):
+        return refreshed
+    completed = await _try_handle_explicit_pending_replacement(
+        record.state,
+        message_text,
+        platform,
+        user_id,
+        conv_key,
+        space_key,
+        owner_label,
+    )
+    return completed or refreshed
+
+
 def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
     """Detect a prior assistant message asking the user to reconfirm submission."""
     text = (response or "").strip()
@@ -749,9 +877,6 @@ def _parse_pending_state_from_response(response: str) -> PendingState:
     pending_add = _parse_pending_add_word(response)
     if pending_add is not None:
         return pending_add
-
-    if _looks_like_submit_reconfirm_prompt(response):
-        return PendingToolConfirm(function_name="keytao_submit_batch", args={})
 
     return None
 
@@ -813,6 +938,14 @@ _CONTEXTUAL_SHORT_REPLIES = {
 
 _CONTEXTUAL_REPLY_SUFFIXES = ("一下", "吧", "啦", "了", "哦", "喔", "呀", "呢", "哈", "嘛")
 
+_CONTEXTUAL_NEGATIVE_REPLY_WHOLE_RE = re.compile(
+    r"^(?:先|暂时)?(?:不|不用|不要|不需要|不了)(?:加|改)?(?:了)?(?:吧|啦)?$"
+)
+_CONTEXTUAL_POSITIVE_REPLY_WHOLE_RE = re.compile(
+    r"^(?:要(?:的|加)?|加|可(?:以(?:的)?)?|嗯+|是(?:的)?|对(?:的)?|"
+    r"这样(?:加)?|这么加|都加|选这个)(?:一下)?(?:吧|啦|了|哦|呀)?$"
+)
+
 
 _CONTEXTUAL_ASSISTANT_REPLY_HINTS = (
     "?",
@@ -846,23 +979,19 @@ def _is_contextual_short_reply(message_text: str) -> bool:
     text = _normalize_contextual_short_reply(message_text)
     if not text:
         return False
-    if text in _CONTEXTUAL_SHORT_REPLIES:
+    assent = parse_pending_assent_phrase(message_text)
+    if (
+        assent.recognized
+        or _CONTEXTUAL_NEGATIVE_REPLY_WHOLE_RE.fullmatch(text)
+        or _CONTEXTUAL_POSITIVE_REPLY_WHOLE_RE.fullmatch(text)
+    ):
         return True
     if re.fullmatch(r"\d{1,2}", text):
         return True
     if re.fullmatch(r"第?[一二三四五六七八九十两]+个?", text):
         return True
 
-    canonical = text
-    changed = True
-    while changed:
-        changed = False
-        for suffix in _CONTEXTUAL_REPLY_SUFFIXES:
-            if canonical.endswith(suffix) and len(canonical) > len(suffix):
-                canonical = canonical[:-len(suffix)]
-                changed = True
-                break
-    return canonical in _CONTEXTUAL_SHORT_REPLIES
+    return False
 
 
 def _latest_assistant_message_invites_contextual_reply(history: Optional[List[Dict]]) -> bool:
@@ -1296,14 +1425,15 @@ def _active_operation_message_for_request(
     return _format_active_draft_operation_message(operation)
 
 
-_UNCERTAIN_TICKET_READ_COMMANDS = frozenset(
-    {
-        "查看草稿",
-        "查看我的草稿",
-        "查看当前草稿",
-        "草稿详情",
-    }
+_UNCERTAIN_TICKET_READ_RE = re.compile(
+    r"^(?:查看(?:我的|当前)?草稿|草稿详情)$"
 )
+_UNCERTAIN_TICKET_READ_COMMANDS = frozenset({
+    "查看草稿",
+    "查看我的草稿",
+    "查看当前草稿",
+    "草稿详情",
+})
 
 
 def _resolve_uncertain_ticket_action(
@@ -1312,10 +1442,14 @@ def _resolve_uncertain_ticket_action(
 ) -> Tuple[str, str]:
     """Allow read-only reconciliation or cancellation of one uncertain operation."""
     compact_message = re.sub(r"\s+", "", str(message_text or "")).strip()
-    if compact_message in _UNCERTAIN_TICKET_READ_COMMANDS:
+    if _UNCERTAIN_TICKET_READ_RE.fullmatch(compact_message):
         return "read", ""
 
-    if compact_message in {"取消", "放弃", "不用了", "算了"}:
+    cancellation = parse_pending_assent_phrase(compact_message)
+    if (
+        cancellation.rejection == "negation"
+        and cancellation.cancel_requested
+    ):
         conversation_state_store.complete_execution(record)
         return "discard", "已放弃这项结果不确定的旧操作；不会重放。"
 
@@ -2074,17 +2208,27 @@ async def _try_handle_simple_single_word_query(
                 server_statuses,
                 review.get("candidateOrderingAssessments"),
             )
-            target_key = conv_key or (
-                current_memory_context.get().conversation_address
-                if current_memory_context.get() is not None
-                else ConversationAddress.private(platform, user_id)
-            )
-            conversation_state_store.set(
-                target_key,
-                pending,
-                space_key=space_key,
-                owner_label=owner_label,
-            )
+            if explicit_add_word:
+                target_key = conv_key or (
+                    current_memory_context.get().conversation_address
+                    if current_memory_context.get() is not None
+                    else ConversationAddress.private(platform, user_id)
+                )
+                conversation_state_store.set(
+                    target_key,
+                    pending,
+                    space_key=space_key,
+                    owner_label=owner_label,
+                )
+            else:
+                read_only_candidates = render_server_backed_single_word_lookup(
+                    pending.word,
+                    pending.recommended_code,
+                    pending.server_candidates,
+                    pending.server_occupied_words,
+                    reviewed_prompt=reviewed_prompt,
+                )
+                reviewed_prompt = read_only_candidates
         actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
         return append_unbound_binding_notice(reviewed_prompt, actor_is_bound)
 
@@ -2821,7 +2965,8 @@ async def _perform_add_to_draft_and_submit(
             if line.strip()
         ]
         final_status = (
-            f"✅ 搞定！「{word}」→ {code} 已加入草稿并自动审核入库。"
+            f"✅ 已将「{word}」 → {code} 写入草稿，"
+            "已提交审核并自动审核入库。"
             if isinstance(submit_result.data, dict)
             and submit_result.data.get("autoApproved") is True
             else f"✅ 搞定！「{word}」→ {code} 已加入草稿并提交审核。"
@@ -3473,6 +3618,20 @@ async def _execute_confirmed_tool(
     args.pop("preview_only", None)
     args.pop("_candidate_scopes", None)
     args.pop("_resolved_advertised_words", None)
+    replace_char_continuation = args.pop(
+        _REPLACE_CHAR_CONTINUATION_KEY,
+        None,
+    )
+    if (
+        replace_char_continuation is not None
+        and not _valid_replace_char_continuation(
+            state.args.get("items"),
+            replace_char_continuation,
+        )
+    ):
+        return render_remediation_reply(
+            "替换进度集合校验失败，当前确认已失效；本次未写入"
+        )
     ordering_summary = str(
         args.pop("_ordering_summary", "")
         or carried_ordering_summary
@@ -3725,6 +3884,62 @@ async def _execute_confirmed_tool(
             response + "\n\n" + submit_response
         )
 
+    def stage_next_replace_char_chunk(response: str) -> str:
+        if not isinstance(replace_char_continuation, dict):
+            return response
+        remaining = replace_char_continuation["remainingItems"]
+        old_char = replace_char_continuation["oldChar"]
+        new_char = replace_char_continuation["newChar"]
+        completed = (
+            int(replace_char_continuation["completed"])
+            + len(state.args.get("items", []))
+        )
+        total = int(replace_char_continuation["total"])
+        next_chunk, next_remaining, next_confirmation = _replace_char_chunk(
+            remaining,
+            old_char,
+            new_char,
+        )
+        if not next_chunk:
+            return response + "\n" + render_remediation_reply(
+                f"已完成 {completed}/{total} 条；下一条无法完整展示，已停止后续写入"
+            )
+        next_args: Dict[str, Any] = {"items": next_chunk}
+        if next_remaining:
+            next_args[_REPLACE_CHAR_CONTINUATION_KEY] = (
+                _sealed_replace_char_continuation(
+                    next_chunk,
+                    next_remaining,
+                    old_char,
+                    new_char,
+                    completed=completed,
+                    total=total,
+                )
+            )
+        target_key: ConversationKey = conv_key or (platform, user_id)
+        saved = conversation_state_store.set(
+            target_key,
+            PendingToolConfirm(
+                function_name="keytao_batch_add_to_draft",
+                args=next_args,
+                confirmation_source="local_preview",
+            ),
+            space_key=space_key,
+            owner_label=owner_label,
+        )
+        if not saved:
+            return response + "\n" + render_remediation_reply(
+                f"已完成 {completed}/{total} 条；剩余进度无法安全保存，已停止后续写入"
+            )
+        next_end = completed + len(next_chunk)
+        progress = (
+            f"替换进度：已完成 {completed}/{total} 条。"
+            f"接下来确认第 {completed + 1}-{next_end} 条"
+        )
+        if next_remaining:
+            progress += f"；之后还剩 {len(next_remaining)} 条"
+        return response + "\n\n" + progress + "。\n" + next_confirmation
+
     if state.function_name == "keytao_submit_batch":
         if data.get("success"):
             batch_url = data.get("batchUrl", "")
@@ -3772,6 +3987,7 @@ async def _execute_confirmed_tool(
                 if submit_after:
                     suffix += "，已停止后续提交"
                 return response + suffix + "。"
+            response = stage_next_replace_char_chunk(response)
             if submit_after:
                 return await continue_with_submit_preview(response)
             return response
@@ -5317,6 +5533,84 @@ def _chain_reorder_ask(code: str, reason: str) -> str:
     )
 
 
+def _server_codes_for_exact_word(data: Dict[str, Any], word: str) -> Tuple[str, ...]:
+    """Read only exact word/code rows from one successful lookup response."""
+    phrases = data.get("phrases")
+    if data.get("success") is not True or not isinstance(phrases, list):
+        return ()
+    codes: List[str] = []
+    for phrase in phrases:
+        if not isinstance(phrase, dict):
+            return ()
+        phrase_word = str(phrase.get("word") or "").strip()
+        code = str(phrase.get("code") or "").strip().lower()
+        if phrase_word != word or not re.fullmatch(r"[a-z]{1,12}", code):
+            continue
+        if code not in codes:
+            codes.append(code)
+    return tuple(codes)
+
+
+async def _try_handle_entry_swap_command(
+    message_text: str,
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    """Resolve both literal entries, then let the shift tool build the ring swap."""
+    command = parse_entry_swap(message_text)
+    expected_words = (
+        (command.first_word, command.second_word)
+        if command is not None
+        else ()
+    )
+    if (
+        command is None
+        or command_intent.intent != "entry_swap"
+        or command_intent.keep_words != expected_words
+    ):
+        return None
+    set_turn_flow("draft-op")
+    resolved_codes: Dict[str, Tuple[str, ...]] = {}
+    for word in expected_words:
+        payload_json = await call_tool_function(
+            "keytao_lookup_by_word",
+            {"word": word},
+            platform,
+            user_id,
+        )
+        try:
+            payload = json.loads(payload_json)
+        except Exception:
+            payload = {}
+        resolved_codes[word] = _server_codes_for_exact_word(payload, word)
+    ambiguous = [
+        word for word, codes in resolved_codes.items() if len(codes) != 1
+    ]
+    if ambiguous:
+        return render_remediation_reply(
+            "服务端无法为「" + "、".join(ambiguous)
+            + "」各锁定唯一当前编码；本次未生成换位计划"
+        )
+    first_code = resolved_codes[command.first_word][0]
+    second_code = resolved_codes[command.second_word][0]
+    if first_code == second_code:
+        return render_remediation_reply(
+            "两个词当前处在同一编码链，不能用编码环形换位；"
+            "请改用该编码链的常用度重排指令"
+        )
+    return await _execute_shift_to_code(
+        command.first_word,
+        second_code,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+
+
 def _validated_code_chain_entries(data: Dict[str, Any], code: str) -> Optional[List[Dict[str, Any]]]:
     phrases = data.get("phrases")
     if data.get("success") is not True or not isinstance(phrases, list):
@@ -5454,6 +5748,16 @@ async def _try_handle_code_chain_reorder_command(
         return _chain_reorder_ask(code, "服务端没有返回完整的词、类型和权重记录")
     if not entries:
         return _chain_reorder_ask(code, "当前没有词条")
+    if command.focus_words:
+        server_words = {str(entry.get("word") or "") for entry in entries}
+        missing_words = [
+            word for word in command.focus_words if word not in server_words
+        ]
+        if missing_words:
+            return _chain_reorder_ask(
+                code,
+                "服务端同码链中没有「" + "、".join(missing_words) + "」",
+            )
     if len(entries) > MAX_REPLACE_CHAR_ITEMS:
         return _chain_reorder_ask(
             code,
@@ -5664,6 +5968,17 @@ async def _try_handle_draft_management_command(
 
     if command_intent is None:
         command_intent = await _classify_message_command_intent(message_text)
+
+    response = await _try_handle_entry_swap_command(
+        message_text,
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
 
     response = await _try_handle_code_chain_reorder_command(
         message_text,
@@ -6091,7 +6406,10 @@ async def _handle_pending_add_word(
             return await _execute_confirmed_tool(
                 PendingToolConfirm(
                     function_name="keytao_create_phrase",
-                    args=_create_phrase_args(state, direct_code),
+                    args={
+                        **_create_phrase_args(state, direct_code),
+                        **({"_submit_after": True} if submit_after_add else {}),
+                    },
                 ),
                 platform,
                 user_id,
@@ -6761,6 +7079,106 @@ MAX_REPLACE_CHAR_ITEMS = 50
 MAX_REPLACE_CONFIRMATION_CHARS = 3500
 
 
+_REPLACE_CHAR_CONTINUATION_KEY = "_replace_char_continuation"
+
+
+def _replace_char_continuation_digest(
+    current_items: List[Dict],
+    continuation: Dict[str, Any],
+) -> str:
+    payload = {
+        "currentItems": current_items,
+        "oldChar": continuation.get("oldChar"),
+        "newChar": continuation.get("newChar"),
+        "completed": continuation.get("completed"),
+        "total": continuation.get("total"),
+        "remainingItems": continuation.get("remainingItems"),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _sealed_replace_char_continuation(
+    current_items: List[Dict],
+    remaining_items: List[Dict],
+    old_char: str,
+    new_char: str,
+    *,
+    completed: int,
+    total: int,
+) -> Dict[str, Any]:
+    continuation: Dict[str, Any] = {
+        "oldChar": old_char,
+        "newChar": new_char,
+        "completed": completed,
+        "total": total,
+        "remainingItems": remaining_items,
+    }
+    continuation["digest"] = _replace_char_continuation_digest(
+        current_items,
+        continuation,
+    )
+    return continuation
+
+
+def _valid_replace_char_continuation(
+    current_items: Any,
+    continuation: Any,
+) -> bool:
+    if not isinstance(current_items, list) or not isinstance(continuation, dict):
+        return False
+    remaining = continuation.get("remainingItems")
+    completed = continuation.get("completed")
+    total = continuation.get("total")
+    old_char = continuation.get("oldChar")
+    new_char = continuation.get("newChar")
+    return bool(
+        current_items
+        and isinstance(remaining, list)
+        and remaining
+        and isinstance(completed, int)
+        and not isinstance(completed, bool)
+        and completed >= 0
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and total == completed + len(current_items) + len(remaining)
+        and isinstance(old_char, str)
+        and old_char
+        and isinstance(new_char, str)
+        and new_char
+        and old_char != new_char
+        and re.fullmatch(r"[0-9a-f]{64}", str(continuation.get("digest") or ""))
+        and continuation["digest"]
+        == _replace_char_continuation_digest(current_items, continuation)
+    )
+
+
+def _replace_char_chunk(
+    items: List[Dict],
+    old_char: str,
+    new_char: str,
+) -> Tuple[List[Dict], List[Dict], str]:
+    """Choose the largest fully displayable first chunk, preserving order."""
+    chunk_size = min(len(items), MAX_REPLACE_CHAR_ITEMS)
+    while chunk_size > 0:
+        chunk = items[:chunk_size]
+        confirmation = _format_replace_char_confirmation(
+            chunk,
+            old_char,
+            new_char,
+        )
+        if len(confirmation) <= MAX_REPLACE_CONFIRMATION_CHARS:
+            return chunk, items[chunk_size:], confirmation
+        chunk_size -= 1
+    return [], list(items), ""
+
+
 _TYPE_HINTS = [
     ("声笔笔单字", "CSSSingle"),
     ("CSSSingle", "CSSSingle"),
@@ -6850,35 +7268,48 @@ async def _try_handle_replace_char(
     if not items:
         return None
 
-    if len(items) > MAX_REPLACE_CHAR_ITEMS:
-        logger.info(
-            f"[replace_char] Refused '{old_char}'→'{new_char}': "
-            f"{len(items)} items exceed the {MAX_REPLACE_CHAR_ITEMS}-item limit"
-        )
+    chunk, remaining, confirmation = _replace_char_chunk(
+        items,
+        old_char,
+        new_char,
+    )
+    if not chunk:
         return render_remediation_reply(
-            f"这次要替换 {len(items)} 条，一次最多只能处理 {MAX_REPLACE_CHAR_ITEMS} 条哦 qwq\n"
-            f"请把词条分批发给我，每批不超过 {MAX_REPLACE_CHAR_ITEMS} 条，我再逐批处理。"
+            "第一条替换也无法在一条确认消息中完整展示；未保存票据、未写入"
         )
 
-    confirmation = _format_replace_char_confirmation(items, old_char, new_char)
-    if len(confirmation) > MAX_REPLACE_CONFIRMATION_CHARS:
-        return render_remediation_reply(
-            "这批替换无法在一条确认消息中完整展示，因此未保存票据、未写入。"
-            "请拆成更小批次后重试。"
+    args: Dict[str, Any] = {"items": chunk}
+    if remaining:
+        args[_REPLACE_CHAR_CONTINUATION_KEY] = _sealed_replace_char_continuation(
+            chunk,
+            remaining,
+            old_char,
+            new_char,
+            completed=0,
+            total=len(items),
+        )
+        confirmation = (
+            f"本轮共 {len(items)} 条；先处理第 1-{len(chunk)} 条，"
+            f"其余 {len(remaining)} 条已按原顺序保留。\n"
+            + confirmation
         )
 
-    conversation_state_store.set(
+    saved = conversation_state_store.set(
         conv_key,
         PendingToolConfirm(
             function_name="keytao_batch_add_to_draft",
-            args={"items": items},
+            args=args,
         ),
         space_key=space_key,
         owner_label=owner_label,
     )
+    if not saved:
+        return render_remediation_reply(
+            "替换进度无法安全保存；未执行任何写入"
+        )
     logger.info(
         f"[replace_char] Staged pattern '{old_char}'→'{new_char}', "
-        f"{len(items)} items awaiting confirmation"
+        f"chunk={len(chunk)} remaining={len(remaining)} awaiting confirmation"
     )
     return confirmation
 

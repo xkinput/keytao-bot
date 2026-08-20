@@ -957,7 +957,6 @@ from .authorization_grammar import (
     _COMMAND_PREFIX_RE,
     _MULTI_ADD_VERB_RE,
     _MULTI_ADD_ADDRESS_CLAUSES,
-    _MAX_AUTHORIZED_MULTI_ADD_ITEMS,
     _AuthorizedAddClause,
     _MultiAddAuthorization,
     _parse_complete_add_clause,
@@ -1182,7 +1181,10 @@ class ToolExecutor:
             return unchanged
         if _positional_same_code_requested(context.current_message or ""):
             if (
-                binding.relation in _POSITIONAL_CREATE_FRONT_RELATIONS
+                binding.relation in (
+                    _POSITIONAL_CREATE_FRONT_RELATIONS
+                    | _POSITIONAL_CREATE_BACK_RELATIONS
+                )
                 and binding.weight is not None
                 and binding.bumped_entries
             ):
@@ -1686,29 +1688,6 @@ class ToolExecutor:
             if message and tool_name in MUTATING_TOOL_NAMES
             else None
         )
-        if (
-            multi_add is not None
-            and multi_add.valid
-            and len(multi_add.clauses) > _MAX_AUTHORIZED_MULTI_ADD_ITEMS
-        ):
-            refused = [
-                f"{clause.word} {clause.code}".strip()
-                for clause in multi_add.clauses
-            ]
-            logger.warning(
-                "Refused multi-add above per-message limit: "
-                f"count={len(refused)} items={refused}",
-            )
-            return text_follow_up(
-                "multi_add_limit_exceeded",
-                render_remediation_reply(
-                    f"本次点名了 {len(refused)} 条加词，超过单次上限 "
-                    f"{_MAX_AUTHORIZED_MULTI_ADD_ITEMS} 条；本次未截断、未写入；"
-                    "系统不能替你决定批次拆分边界"
-                ),
-                refusedItems=refused,
-                limit=_MAX_AUTHORIZED_MULTI_ADD_ITEMS,
-            )
         requested_batch = str(arguments.get("batch_id") or "").strip()
         if (
             requested_batch

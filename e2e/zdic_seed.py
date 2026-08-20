@@ -276,6 +276,24 @@ ZDIC_FIXTURES_BY_SCENARIO["S29"] = {
         {"kind": "entry", "entry": "电脑", "status": "found", "pinyins": ["diàn", "nǎo"]},
     ),
 }
+ZDIC_FIXTURES_BY_SCENARIO["S30"] = {
+    "probe_words": ("吃席",),
+    "rows": (
+        {"kind": "char", "entry": "吃", "status": "found", "pinyins": ["chī"]},
+        {"kind": "char", "entry": "席", "status": "found", "pinyins": ["xí"]},
+        {"kind": "entry", "entry": "吃席", "status": "absent", "pinyins": []},
+    ),
+}
+ZDIC_FIXTURES_BY_SCENARIO["S31"] = {
+    "probe_words": ("幂等", "米等"),
+    "rows": (
+        {"kind": "char", "entry": "幂", "status": "found", "pinyins": ["mì"]},
+        {"kind": "char", "entry": "米", "status": "found", "pinyins": ["mǐ"]},
+        {"kind": "char", "entry": "等", "status": "found", "pinyins": ["děng"]},
+        {"kind": "entry", "entry": "幂等", "status": "found", "pinyins": ["mì", "děng"]},
+        {"kind": "entry", "entry": "米等", "status": "found", "pinyins": ["mǐ", "děng"]},
+    ),
+}
 
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 

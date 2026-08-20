@@ -290,12 +290,24 @@ and expose neither a raw candidate dump nor a root-only draft URL.
 
 S29 replays the 2026-08-20 quoted-summary incident. It quotes a bot-authored
 operation summary containing the `mkdr` diff and submit instruction, sends the
-actionable chain-reorder request, and requires a complete current-to-proposed
+code-first actionable chain-reorder request, and requires a complete current-to-proposed
 plan with evidence and exactly one confirmation. Before confirmation the draft
 must remain empty; after confirmation it must contain only the two sealed
 same-word Change operations at weights 100 and 101. A real quoted presence
 question against the same summary remains on the presence-lookup route and
 cannot change that draft.
+
+S30 pins three intent-coverage boundaries in one actor flow. A bare `吃席`
+lookup followed by `好` must make zero mutation calls; a fresh reviewed-add
+ticket followed by `先别加` must cancel without advertising an add command;
+and a second fresh ticket must accept `那就加入并提交吧`, preserving its exact
+displayed word/code pair through submission.
+
+S31 executes the verbatim incident command
+`把 幂等 放到 米等 前面，米等顺延到下一个空位`. The rig seeds only the declared
+local `米等@mkdr` fixture, requires the bot to traverse lookup plus the
+server-generated circular shift plan, and verifies the exact three draft rows
+before API-only fixture cleanup.
 
 Optional overrides:
 

@@ -21,7 +21,9 @@ from ..harness.state import (
 )
 from ..harness.authorization_grammar import (
     explicit_complete_add_item,
+    parse_entry_swap,
     parse_eviction_modified_add,
+    parse_pending_positional_add,
 )
 from ..harness.tools import (
     _COMMAND_PREFIX_PATTERN,
@@ -215,18 +217,18 @@ _WORD_LIBRARY_QUERY_HINTS = (
 )
 
 
-_REFERENCED_WORD_PRESENCE_QUESTION_RE = re.compile(
-    r"(?:有没有|是否(?:在词库|收录|有编码)|是不是(?:在词库|收录)|在不在词库)|"
-    r"(?:在(?:词库)?里|词库(?:都|也)?有|已经?收录|收录了|有编码)"
-    r"(?:吗|么|嘛|没|没有|[?？])"
-)
-
-
-_REFERENCED_WORD_ACTIONABLE_RE = re.compile(
-    r"重新排序|重排|排序|加词|添加|加入|写入|删除|删掉|移除|"
-    r"改到|改成|修改|更名|替换|调整到|移到|挪到|换到|换成|"
-    r"顺延|重新编码|调整权重|按(?:优先级|常用度).{0,8}排|排一下|"
-    r"提交|提审|送审|撤回|清空|清理"
+_REFERENCED_WORD_PRESENCE_WHOLE_RE = re.compile(
+    r"^(?:这两个词|这俩词|这几个词|这些词|上面两个词|上面几个词|"
+    r"引用里(?:的)?这些?词|引用的(?:这两个|这俩|这几个|这些)?词)"
+    r"(?:[，,])?(?:现在|目前)?"
+    r"(?:"
+    r"(?:是否|是不是)?(?:都|也)?在词库(?:里|中)?(?:都|也)?(?:有|收录(?:了)?)?|"
+    r"(?:是否|是不是)?词库(?:里|中)?(?:都|也)?(?:有|收录)(?:了)?|"
+    r"(?:是否|是不是)?(?:都|也)?(?:已经?)?(?:被)?(?:词库)?收录(?:了)?|"
+    r"(?:是否|是不是)?(?:都|也)?有编码|"
+    r"有没有(?:被词库)?收录|在不在词库"
+    r")"
+    r"(?:吗|么|嘛|没|没有)?[?？]?$"
 )
 
 
@@ -235,17 +237,11 @@ class CodeChainReorderCommand:
     """One direct request to reorder the server-resolved same-code chain."""
 
     code: str
-
-
-_CODE_CHAIN_REORDER_UNSAFE_RE = re.compile(
-    r"不要|别|不用|无需|不必|取消|停止|他说|她说|他们说|有人说|"
-    r"引用|转发|转述|复述|解释|举例|例子|假设|如果|"
-    r"提交|提审|送审|删除|删掉|移除|加词|添加|加入|写入|顺延|改到|调整到"
-)
+    focus_words: Tuple[str, ...] = ()
 
 
 _CODE_CHAIN_REORDER_DIRECT_RE = re.compile(
-    r"(?:重新排序|重排)(?:下|一下)?"
+    r"(?:重新排序|重新排|重排|排序|排)(?:下|一下)?"
     r"(?P<code>[a-z]{1,6})"
     r"(?:(?:这条)?(?:编码)?链)?"
     r"(?:(?:这几个|这些|这)词)?"
@@ -256,9 +252,31 @@ _CODE_CHAIN_REORDER_DIRECT_RE = re.compile(
 
 
 _CODE_CHAIN_REORDER_BA_RE = re.compile(
-    r"(?:把|将)(?P<code>[a-z]{1,6})(?:这条)?(?:编码)?链"
+    r"(?:把|将)?(?P<code>[a-z]{1,6})"
+    r"(?:(?:这条)?(?:编码)?链)?"
+    r"(?:(?:这几个|这些|这)词)?"
     r"(?:按(?:优先级|常用度))?"
-    r"(?:重新排序|重排|排(?:序)?)(?:一下|吧)?",
+    r"(?:重新排序|重新排|重排|排(?:序)?)(?:下|一下|吧)?",
+    re.IGNORECASE,
+)
+
+
+_CODE_CHAIN_REORDER_CRITERION_FIRST_RE = re.compile(
+    r"按(?:优先级|常用度)"
+    r"(?:重新排序|重新排|重排|排(?:序)?)(?:下|一下)?"
+    r"(?P<code>[a-z]{1,6})"
+    r"(?:(?:这条)?(?:编码)?链)?"
+    r"(?:(?:这几个|这些|这)词)?(?:一下|吧)?",
+    re.IGNORECASE,
+)
+
+
+_CODE_CHAIN_REORDER_PAIR_RE = re.compile(
+    r"调整(?P<code>[a-z]{1,6})"
+    r"(?P<left>[\u3400-\u9fff]{1,30}?)(?:和|与|及|、)"
+    r"(?P<right>[\u3400-\u9fff]{1,30}?)"
+    r"(?:明显(?P<preferred>[\u3400-\u9fff]{1,30})更常用)?"
+    r"(?:一下|吧)?",
     re.IGNORECASE,
 )
 
@@ -271,29 +289,51 @@ def _parse_code_chain_reorder_command(
         "NFKC",
         _strip_command_message_prefixes(message_text),
     ).strip()
-    if (
-        not raw
-        or re.search(r"[?？\"'“”‘’「」《》【】\[\]（）()<>]", raw)
-        or _CODE_CHAIN_REORDER_UNSAFE_RE.search(raw)
-    ):
+    if not raw:
         return None
-    compact = re.sub(r"[\s，,。.!！~～]+", "", raw)
+    compact = re.sub(r"\s+", "", raw)
+    compact = re.sub(r"[。.!！~～]+$", "", compact)
     polite = r"(?:(?:请|请你|帮我|麻烦|麻烦你|劳驾|拜托|给我))?"
-    match = re.fullmatch(
-        polite + r"(?:" + _CODE_CHAIN_REORDER_DIRECT_RE.pattern + r")",
-        compact,
-        re.IGNORECASE,
-    )
-    if match is None:
+    match = None
+    for pattern in (
+        _CODE_CHAIN_REORDER_DIRECT_RE,
+        _CODE_CHAIN_REORDER_BA_RE,
+        _CODE_CHAIN_REORDER_CRITERION_FIRST_RE,
+    ):
         match = re.fullmatch(
-            polite + r"(?:" + _CODE_CHAIN_REORDER_BA_RE.pattern + r")",
+            polite + r"(?:" + pattern.pattern + r")",
             compact,
             re.IGNORECASE,
         )
+        if match is not None:
+            break
+    focus_words: Tuple[str, ...] = ()
+    if match is None:
+        pair_source = compact.replace("，", "").replace(",", "")
+        match = re.fullmatch(
+            polite + r"(?:" + _CODE_CHAIN_REORDER_PAIR_RE.pattern + r")",
+            pair_source,
+            re.IGNORECASE,
+        )
+        if match is not None:
+            focus_words = (
+                str(match.group("left") or "").strip(),
+                str(match.group("right") or "").strip(),
+            )
+            preferred = str(match.group("preferred") or "").strip()
+            if (
+                len(set(focus_words)) != 2
+                or (preferred and preferred not in focus_words)
+            ):
+                return None
     if match is None:
         return None
     code = str(match.group("code") or "").strip().lower()
-    return CodeChainReorderCommand(code=code) if _CODE_TOKEN_RE.fullmatch(code) else None
+    return (
+        CodeChainReorderCommand(code=code, focus_words=focus_words)
+        if _CODE_TOKEN_RE.fullmatch(code)
+        else None
+    )
 
 
 _DRAFT_SUBMIT_COMMANDS = {
@@ -376,6 +416,7 @@ _DRAFT_FLOW_INTENTS = frozenset({
     "operation_recall",
     "batch_replace_char",
     "code_chain_reorder",
+    "entry_swap",
 })
 
 
@@ -444,6 +485,21 @@ def _is_explicit_draft_submit_request(message_text: str) -> bool:
     return _is_plain_draft_submit_request(message_text)
 
 
+def _is_pending_assent_then_submit_request(message_text: str) -> bool:
+    """Recognize confirmation of one live write followed by draft submit."""
+    compact = re.sub(
+        r"[\s，,。.!！~～]+",
+        "",
+        str(message_text or ""),
+    )
+    return bool(re.fullmatch(
+        r"(?:请|麻烦|帮我|给我|现在|立即|直接)*"
+        r"确认(?:并|并且|然后|后|再)(?:提交|提审|送审)"
+        r"(?:审核|草稿|批次)?(?:一下)?(?:吧|啦|了)?",
+        compact,
+    ))
+
+
 @dataclass(frozen=True)
 class KeepOnlyDraftCommand:
     keep_words: Tuple[str, ...]
@@ -475,18 +531,37 @@ def _pending_tool_assent_intent(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Resolve shared natural assent against one server-backed live state."""
-    compact = _compact_command_text(message_text)
-    if isinstance(state, PendingToolConfirm):
-        allowed_forms = set(PENDING_CONFIRM_ASSENT_TEXTS)
-        if (
-            state.function_name == "keytao_batch_add_to_draft"
-            and state.confirmation_source != "server_warning"
-        ):
-            allowed_forms.update(PENDING_BATCH_ADD_ASSENT_TEXTS)
-            allowed_forms.update(PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS)
-        if compact not in allowed_forms:
-            return None
+    if (
+        isinstance(state, PendingToolConfirm)
+        and state.function_name == "keytao_submit_batch"
+        and _is_explicit_draft_submit_request(message_text)
+    ):
+        return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+    if (
+        _is_explicit_draft_submit_request(message_text)
+        and not _is_pending_assent_then_submit_request(message_text)
+    ):
+        # "提交" and "确认提交" target the current draft. They must not be
+        # reinterpreted as assent to an unrelated add candidate merely because
+        # the latter happens to be live in the same conversation.
+        return None
     assent = _pending_assent_phrase_for_state(state, message_text)
+    add_ticket = bool(
+        isinstance(state, PendingAddWord)
+        or (
+            isinstance(state, PendingToolConfirm)
+            and state.function_name in {
+                "keytao_create_phrase",
+                "keytao_batch_add_to_draft",
+            }
+        )
+    )
+    if (
+        add_ticket
+        and assent.rejection == "negation"
+        and assent.cancel_requested
+    ):
+        return MessageCommandIntent(intent="pending_cancel", confidence=1.0)
     if not assent.matched:
         return None
     if isinstance(state, PendingAddWord):
@@ -519,9 +594,47 @@ def _pending_tool_assent_intent(
         )
     if add_confirmation_tool:
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
-    if compact in _PENDING_CONFIRM_ASSENT_TEXTS:
+    if not assent.add_requested:
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     return None
+
+
+def _pending_positional_add_intent(
+    state: Optional[PendingState],
+    message_text: str,
+) -> Optional[MessageCommandIntent]:
+    """Bind an omitted add subject to one live server-backed candidate only."""
+    if (
+        not isinstance(state, PendingAddWord)
+        or not state.server_candidates
+        or state.server_candidates != state.candidates
+    ):
+        return None
+    command = parse_pending_positional_add(message_text)
+    if command is None:
+        return None
+    destination_codes = [
+        code
+        for code, words in state.server_occupied_words.items()
+        if command.destination_word in words
+    ]
+    occupied = dict(state.server_candidates)
+    if (
+        len(destination_codes) != 1
+        or occupied.get(destination_codes[0]) is not True
+    ):
+        return None
+    return MessageCommandIntent(
+        intent=(
+            "pending_add_and_submit"
+            if command.submit_after
+            else "pending_confirm"
+        ),
+        confidence=1.0,
+        submit_after=command.submit_after,
+        requested_codes=(destination_codes[0],),
+        target_word=command.destination_word,
+    )
 
 
 def _pending_assent_state_operands(state: PendingState) -> Tuple[str, ...]:
@@ -572,6 +685,7 @@ def _pending_assent_rejection_response(
     if (
         parse_eviction_modified_add(message_text) is not None
         or explicit_complete_add_item(message_text) is not None
+        or _pending_positional_add_intent(state, message_text) is not None
     ):
         return None
     add_candidate = bool(
@@ -602,6 +716,8 @@ def _pending_assent_rejection_response(
     ):
         return None
     assent = _pending_assent_phrase_for_state(state, message_text)
+    if assent.cancel_requested:
+        return None
     if not assent.recognized or assent.matched:
         return None
     reasons = {
@@ -623,8 +739,10 @@ def _pending_assent_rejection_response(
         word = str(state.args.get("word") or "").strip()
         live_words = (word,) if word else ()
     command = (
-        "加入并提交" if assent.submit_after else "加入"
-    ) if live_words else ""
+        ("加入并提交" if assent.submit_after else "加入")
+        if live_words and assent.rejection != "negation"
+        else ""
+    )
     return render_remediation_reply(
         reasons.get(
             assent.rejection,
@@ -656,12 +774,19 @@ def _compact_command_text(message_text: str) -> str:
 def _is_short_add_and_submit_request(message_text: str) -> bool:
     """Recognize target-free add-and-submit controls."""
     stripped = _strip_command_message_prefixes(message_text)
+    unwrapped = _whole_message_unquoted_source(stripped)
+    source = unwrapped if unwrapped is not None else stripped
     if (
-        re.search(r"[?？]", stripped)
-        or not message_authorizes_mutation(stripped)
+        re.search(r"[?？]", source)
+        or not message_authorizes_mutation(source)
     ):
         return False
-    return _compact_command_text(message_text) in _PENDING_ADD_AND_SUBMIT_COMMANDS
+    assent = parse_pending_assent_phrase(source)
+    return bool(
+        assent.matched
+        and assent.add_requested
+        and assent.submit_after
+    )
 
 
 def _is_target_bound_add_and_submit_request(
@@ -690,6 +815,8 @@ def _is_target_bound_add_and_submit_request(
     )
 
 
+# Rendering/compatibility vocabulary only. Acceptance is owned exclusively by
+# ``parse_pending_assent_phrase`` and the structural live-state parsers above.
 _QUOTED_PENDING_ADD_CONFIRM_TEXTS = {
     *_PENDING_CONFIRM_ASSENT_TEXTS,
     *PENDING_BATCH_ADD_ASSENT_TEXTS,
@@ -715,15 +842,7 @@ def _quoted_pending_add_control_intent(
     structural = _structural_pending_add_word_intent(message_text, state)
     if structural is not None:
         return structural
-    compact = _compact_command_text(message_text)
-    if compact not in _QUOTED_PENDING_ADD_CONFIRM_TEXTS:
-        return None
-    intent = MessageCommandIntent(intent="pending_confirm", confidence=1.0)
-    return (
-        intent
-        if _message_authorizes_pending_state_control(state, message_text, intent)
-        else None
-    )
+    return None
 
 
 def _message_authorizes_clear_history(
@@ -775,8 +894,18 @@ def _canonical_draft_management_command(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Parse the complete positive syntax that may authorize draft mutations."""
-    raw = _strip_command_message_prefixes(message_text).strip()
-    if not raw or re.search(r"[\"'“”‘’「」《》【】\[\]（）()<>]", raw):
+    unwrapped = _whole_message_unquoted_source(message_text)
+    if (
+        unwrapped is None
+        and re.search(r"[「」“”『』《》【】\[\]]", str(message_text or ""))
+    ):
+        return None
+    raw = _strip_command_message_prefixes(
+        trusted_mutation_source(
+            unwrapped if unwrapped is not None else message_text
+        )
+    ).strip()
+    if not raw:
         return None
 
     compact = _normalized_execution_command_text(raw)
@@ -795,15 +924,17 @@ def _canonical_draft_management_command(
         else:
             return None
     prefix = (
-        r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|我要|我想|替我|为我|"
+        r"(?:请|麻烦|帮我|给我|现在|立即|直接|确认|那就|可以|就|我要|我想|替我|为我|"
         r"能不能|可不可以|能否|可否|可以帮我|可以请你)*"
     )
     scope = r"(?:(?:最近|上次|刚才)(?:一次|的)?)?"
     recall_core = (
-        rf"(?:(?:撤回|撤销|召回)(?:"
+        rf"(?:(?:撤回|撤销|召回|回退)(?:"
         rf"{scope}(?:提交|提审|送审|审核|批次)?|"
         rf"{scope}(?:提交|提审|送审)(?:的)?批次)"
-        rf"|取消{scope}(?:提审|送审))"
+        rf"|取消{scope}(?:提审|送审)"
+        rf"|(?:最近|上次|刚才)(?:那次|一次|的)?"
+        rf"(?:提交|提审|送审)(?:撤回|撤销|召回|回退))"
     )
     draft_target = r"(?:恢复(?:后(?:的)?|的))?(?:当前|我的)?(?:草稿|批次)"
     all_suffix = r"(?:(?:的)?(?:全部|所有)(?:条目|内容)?)?"
@@ -965,12 +1096,21 @@ def _message_authorizes_pending_control(
     compact = _compact_command_text(message_text).lower()
     if not compact or len(compact) > 48:
         return False
+    assent = parse_pending_assent_phrase(message_text)
     if command_intent.intent == "pending_confirm":
-        return compact in _PENDING_CONTROL_TEXTS - {"取消", "不用", "不要", "不了", "算了"}
+        return bool(assent.matched and not assent.add_requested)
     if command_intent.intent == "pending_cancel":
-        return compact in {"取消", "不用", "不要", "不了", "算了", "不加", "不改"}
+        assent = parse_pending_assent_phrase(message_text)
+        return bool(
+            assent.rejection == "negation"
+            and assent.cancel_requested
+        )
     if command_intent.intent == "pending_add_and_submit":
-        return compact in _PENDING_ADD_AND_SUBMIT_COMMANDS
+        return bool(
+            assent.matched
+            and assent.add_requested
+            and assent.submit_after
+        )
     if command_intent.intent == "pending_choice":
         parsed_choice = _parse_pending_choice_index(compact)
         return bool(
@@ -1013,27 +1153,22 @@ def _message_authorizes_pending_control(
     return False
 
 
-_STALE_CONFIRMATION_ONLY_TEXTS = _PENDING_CONFIRM_ASSENT_TEXTS
-
-
 _ORIGINAL_COMMAND_LINE_RE = re.compile(
     r"^(?:原始操作指令|原始指令|原指令)\s*[：:]\s*[「“\"]?(.+?)[」”\"]?$"
 )
 
+# Compatibility/rendering vocabulary; stale acceptance is parser-owned below.
+_STALE_CONFIRMATION_ONLY_TEXTS = _PENDING_CONFIRM_ASSENT_TEXTS
+
 
 def _is_unambiguous_stale_confirmation(message_text: str) -> bool:
-    """Reuse exact pending-control shapes without interpreting mixed commands."""
-    if re.search(r"[?？]", message_text):
-        return False
-    compact = _compact_command_text(message_text)
-    if _message_authorizes_pending_control(
-        message_text,
-        MessageCommandIntent(intent="pending_confirm", confidence=1.0),
-    ) and compact in _PENDING_CONFIRM_ASSENT_TEXTS:
-        return True
-    if compact in _STALE_CONFIRMATION_ONLY_TEXTS:
-        return True
-    return False
+    """Accept only a positive whole-message generic assent as stale control."""
+    assent = parse_pending_assent_phrase(message_text)
+    return bool(
+        assent.matched
+        and not assent.add_requested
+        and not assent.submit_after
+    )
 
 
 def _recover_original_command_from_confirmation_quote(
@@ -1282,16 +1417,19 @@ def _closed_candidate_selection(
         return parsed.indices, parsed.codes, parsed.submit_after
     compact = _compact_command_text(text).lower()
     match = re.fullmatch(
-        r"(?:添加|加入|加词|加)?(?P<index>[1-9]\d{0,2})"
-        r"(?P<submit>并提交)?",
+        r"(?:(?:添加|加入|加词|加)?(?P<prefix_index>[1-9]\d{0,2})"
+        r"(?P<prefix_submit>并提交)?|"
+        r"(?P<suffix_index>[1-9]\d{0,2})(?:添加|加入|加词|加)"
+        r"(?P<suffix_submit>并提交)?)",
         compact,
     )
     if match is None:
         return None
+    index = match.group("prefix_index") or match.group("suffix_index")
     return (
-        (int(match.group("index")),),
+        (int(index),),
         (),
-        match.group("submit") is not None,
+        bool(match.group("prefix_submit") or match.group("suffix_submit")),
     )
 
 
@@ -1598,6 +1736,13 @@ def _is_fresh_current_user_command_intent(
             command is not None
             and command.code == command_intent.requested_code
         )
+    if command_intent.intent == "entry_swap":
+        command = parse_entry_swap(message_text)
+        return bool(
+            command is not None
+            and command_intent.keep_words
+            == (command.first_word, command.second_word)
+        )
     return command_intent.intent in {
         "draft_view",
         "operation_recall",
@@ -1612,10 +1757,11 @@ def _is_prefixed_fresh_word_query(message_text: str, normalized_message_text: st
     words = _extract_pure_chinese_words(normalized)
     if not words:
         return False
-    compact = "".join(words)
-    if normalized in _PENDING_CONTROL_TEXTS or compact in _PENDING_CONTROL_TEXTS:
-        return False
-    if normalized in _DRAFT_SUBMIT_COMMANDS or compact in _DRAFT_SUBMIT_COMMANDS:
+    if (
+        parse_pending_assent_phrase(normalized).recognized
+        or _is_explicit_draft_submit_request(normalized)
+        or _canonical_draft_management_command(normalized) is not None
+    ):
         return False
     return True
 
@@ -1845,6 +1991,13 @@ def _structural_draft_management_intent(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Keep the safest common recall/clear commands independent of the LLM."""
+    swap = parse_entry_swap(message_text)
+    if swap is not None:
+        return MessageCommandIntent(
+            intent="entry_swap",
+            confidence=1.0,
+            keep_words=(swap.first_word, swap.second_word),
+        )
     chain_reorder = _parse_code_chain_reorder_command(message_text)
     if chain_reorder is not None:
         return MessageCommandIntent(
@@ -1862,45 +2015,59 @@ async def _classify_message_command_intent(
     """Use the configured flash/intent model for command and pending-control semantics."""
     if not message_text.strip():
         return MessageCommandIntent()
+    pending_positional_add = _pending_positional_add_intent(
+        pending_state,
+        message_text,
+    )
+    if pending_positional_add is not None:
+        return pending_positional_add
     pending_tool_assent = _pending_tool_assent_intent(
         pending_state,
         message_text,
     )
     if pending_tool_assent is not None:
         return pending_tool_assent
-    compact_message = re.sub(
-        r"[\s，,。.!！?？~～]+",
-        "",
-        _strip_command_message_prefixes(message_text),
-    )
-    pending_accepts_add_submit = (
-        isinstance(pending_state, PendingAddWord)
-        or (
-            isinstance(pending_state, PendingToolConfirm)
-            and pending_state.function_name == "keytao_batch_add_to_draft"
-        )
-    )
     if (
-        isinstance(pending_state, PendingAddWord)
-        and _is_target_bound_add_and_submit_request(message_text, pending_state)
+        _is_explicit_draft_submit_request(message_text)
+        and not _is_pending_assent_then_submit_request(message_text)
     ):
-        return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
-    if pending_accepts_add_submit and compact_message in _PENDING_ADD_AND_SUBMIT_COMMANDS:
-        return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
-    if isinstance(pending_state, PendingAddWord):
-        structural_pending_intent = _structural_pending_add_word_intent(
-            message_text,
-            pending_state,
-        )
-        if structural_pending_intent is not None:
-            return structural_pending_intent
-    if _is_explicit_draft_submit_request(message_text):
         if (
             isinstance(pending_state, PendingToolConfirm)
             and pending_state.function_name == "keytao_submit_batch"
         ):
             return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
         return MessageCommandIntent(intent="draft_submit", confidence=1.0)
+    compact_message = re.sub(
+        r"[\s，,。.!！?？~～]+",
+        "",
+        _strip_command_message_prefixes(message_text),
+    )
+    if (
+        isinstance(pending_state, PendingAddWord)
+        and _is_target_bound_add_and_submit_request(message_text, pending_state)
+    ):
+        return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
+    if isinstance(pending_state, PendingAddWord):
+        # Keep intent recognition separate from authorization. A historical
+        # candidate quote can carry a clear control shape, but only a current
+        # server-backed state may pass the pending-state authorization gate.
+        assent = _pending_assent_phrase_for_state(pending_state, message_text)
+        if assent.matched:
+            return MessageCommandIntent(
+                intent=(
+                    "pending_add_and_submit"
+                    if assent.submit_after
+                    else "pending_confirm"
+                ),
+                confidence=1.0,
+                submit_after=assent.submit_after,
+            )
+        structural_pending_intent = _structural_pending_add_word_intent(
+            message_text,
+            pending_state,
+        )
+        if structural_pending_intent is not None:
+            return structural_pending_intent
     if (
         isinstance(pending_state, PendingToolConfirm)
         and _pending_tool_confirmation_matches(pending_state, message_text)
@@ -1909,14 +2076,6 @@ async def _classify_message_command_intent(
     if pending_state is not None and compact_message.startswith("确认票据"):
         # The retired code form is handled deterministically as non-executable.
         return MessageCommandIntent()
-    if pending_state is not None and compact_message in {
-        "取消", "不用", "不要", "不了", "算了", "不加", "不改",
-    }:
-        return MessageCommandIntent(intent="pending_cancel", confidence=1.0)
-    if pending_state is not None and compact_message in (
-        _PENDING_CONTROL_TEXTS - {"取消", "不用", "不要", "不了", "算了"}
-    ):
-        return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     structural_draft_intent = _structural_draft_management_intent(message_text)
     if structural_draft_intent is not None:
         return structural_draft_intent
@@ -2137,10 +2296,7 @@ def _extract_explicit_reviewed_add_word(message_text: str) -> Optional[str]:
     match = _EXPLICIT_REVIEWED_ADD_WORD_RE.fullmatch(text)
     if not match:
         return None
-    word = match.group("word").strip()
-    if word in _PENDING_CONTROL_TEXTS or word in _DRAFT_SUBMIT_COMMANDS:
-        return None
-    return word
+    return match.group("word").strip()
 
 
 def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
@@ -2228,6 +2384,9 @@ def _message_authorizes_pending_state_control(
     """Allow a generic short control or an exact target-bound local preview."""
     if re.search(r"[?？]", message_text):
         return False
+    positional_intent = _pending_positional_add_intent(state, message_text)
+    if positional_intent == command_intent:
+        return True
     structural_tool_intent = _pending_tool_assent_intent(state, message_text)
     if (
         structural_tool_intent is not None
@@ -2350,8 +2509,6 @@ def _active_operation_confirmation_matches(
         return False
     if not isinstance(operation.pending_state, PendingToolConfirm):
         return False
-    if _compact_command_text(message_text) not in PENDING_CONFIRM_ASSENT_TEXTS:
-        return False
     intent = _pending_tool_assent_intent(operation.pending_state, message_text)
     return bool(intent is not None and intent.intent == "pending_confirm")
 
@@ -2360,15 +2517,7 @@ def _is_referenced_word_presence_query(message_text: str) -> bool:
     """Detect deictic quoted-message questions like "这两个词词库都有吗"."""
     text = _strip_command_message_prefixes(message_text)
     text = re.sub(r"\s+", "", text)
-    if not text:
-        return False
-    if _REFERENCED_WORD_ACTIONABLE_RE.search(text):
-        return False
-    if _REFERENCED_WORD_PRESENCE_QUESTION_RE.search(text) is None:
-        return False
-    has_reference_hint = any(hint in text for hint in _REFERENCED_WORD_QUERY_HINTS)
-    has_library_hint = any(hint in text for hint in _WORD_LIBRARY_QUERY_HINTS)
-    return has_reference_hint and has_library_hint
+    return _REFERENCED_WORD_PRESENCE_WHOLE_RE.fullmatch(text) is not None
 
 
 def _dedupe_words(words: List[str], limit: int) -> List[str]:

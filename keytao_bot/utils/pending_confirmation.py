@@ -252,6 +252,8 @@ class PendingAssentPhrase:
     matched: bool = False
     submit_after: bool = False
     rejection: str = ""
+    add_requested: bool = False
+    cancel_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -326,6 +328,10 @@ def advertised_batch_assent_verb(text: str) -> str:
 _NATURAL_ASSENT_FORMS = tuple(sorted(
     {
         *PENDING_ASSENT_TEXTS,
+        "都加入",
+        "加进去",
+        "加好",
+        "加完",
         "写入草稿",
         "写入",
     },
@@ -337,6 +343,10 @@ _NATURAL_ASSENT_FORM_RE = re.compile(
 _NATURAL_ACTION_ASSENT_FORMS = tuple(sorted(
     {
         *PENDING_BATCH_ASSENT_TEXTS,
+        "都加入",
+        "加进去",
+        "加好",
+        "加完",
         "确认",
         "执行",
         "确定",
@@ -348,6 +358,14 @@ _NATURAL_ACTION_ASSENT_FORMS = tuple(sorted(
 ))
 _NATURAL_ACTION_ASSENT_RE = re.compile(
     "|".join(re.escape(value) for value in _NATURAL_ACTION_ASSENT_FORMS)
+)
+_NATURAL_ADD_ACTION_RE = re.compile(
+    "|".join(
+        re.escape(value)
+        for value in _NATURAL_ACTION_ASSENT_FORMS
+        if value not in PENDING_CONFIRM_ASSENT_TEXTS
+        and value not in {"确认", "执行", "确定", "同意"}
+    )
 )
 _NATURAL_SUBMIT_RE = re.compile(
     r"(?:(?:并且?|然后(?:就)?|再|接着|随后|完成后|加入后|添加后|"
@@ -371,13 +389,13 @@ _NATURAL_OTHER_ACTION_RE = re.compile(
     r"顺延|重排|排序|调码|重新编码|放在|放到|排在|提前|靠前|靠后|撤回)"
 )
 _NATURAL_ASSENT_PREFIX_RE = (
-    r"(?:(?:好的|好|可以|行|嗯|麻烦|劳驾|请|我确认|我想|我要|"
+    r"(?:(?:那就|就|好的|好|可以|行|嗯|麻烦|劳驾|请|我确认|我想|我要|"
     r"直接|现在|马上|立刻)){0,4}"
 )
 _NATURAL_ASSENT_ACTOR_RE = r"(?:(?:帮我|帮忙))?"
 _NATURAL_ASSENT_OBJECT_RE = (
     r"(?:当前候选|这些候选|全部候选|这个候选|这些|这个|它们|候选|"
-    r"全部|所有)"
+    r"这两个|两个|全部|所有|一起|都)"
 )
 _NATURAL_ASSENT_TARGET_RE = (
     rf"(?:(?:把|将){_NATURAL_ASSENT_OBJECT_RE}|"
@@ -390,6 +408,11 @@ _NATURAL_ASSENT_BRIDGE_RE = (
     r"(?:(?:确认|执行)(?=(?:加入|添加|加|都加|写入)))?"
 )
 _NATURAL_ASSENT_SUFFIX_RE = r"(?:(?:一下|吧|啦|了|呀|哦)){0,3}"
+_NATURAL_ASSENT_CLOSING_FILLER_RE = re.compile(
+    r"(?:(?:谢谢(?:你)?|多谢|辛苦了|拜托了|麻烦了|感谢(?:你)?|"
+    r"劳驾|拜托|有劳|谢啦|owo|这个词挺常用的)|[啦呀哦哈嘛])+$",
+    re.IGNORECASE,
+)
 _NATURAL_ASSENT_WHOLE_RE = re.compile(
     rf"{_NATURAL_ASSENT_PREFIX_RE}"
     rf"{_NATURAL_ASSENT_ACTOR_RE}"
@@ -406,6 +429,17 @@ _NATURAL_ASSENT_ACTION_START_RE = re.compile(
     rf"{_NATURAL_ASSENT_TARGET_RE}"
     rf"{_NATURAL_ASSENT_BRIDGE_RE}"
     rf"(?:{_NATURAL_ACTION_ASSENT_RE.pattern})"
+)
+_NATURAL_ADD_CANCEL_WHOLE_RE = re.compile(
+    r"(?:(?:那就|就|先)?(?:"
+    r"放弃(?:(?:这|本)次)?(?:添加|加词|加入|操作)?|"
+    r"取消(?:(?:这|本)次)?(?:添加|加词|加入|操作)?|"
+    r"撤销(?:(?:这|本)次)?(?:添加|加词|加入|操作)|"
+    r"(?:这个|这次|当前|刚才(?:这个|这次)?)(?:不要|不用)(?:了)?|"
+    r"(?:不|别|不用|不要)(?:再)?(?:加|添加|加入)(?:了)?|"
+    r"(?:不用|不要|不了)(?:了)?|"
+    r"算了(?:不加(?:了)?)?"
+    r"))"
 )
 
 
@@ -426,7 +460,6 @@ def parse_pending_assent_phrase(
         )
     )
     question = _NATURAL_QUESTION_RE.search(source) is not None
-    negation = _NATURAL_NEGATION_RE.search(source) is not None
     framed = bool(
         re.search(r"[\"'`“”‘’「」『』]", source)
         or _NATURAL_UNSAFE_FRAME_RE.search(source)
@@ -442,29 +475,66 @@ def parse_pending_assent_phrase(
         key=lambda value: (-len(value), value),
     ):
         residual = residual.replace(operand, "")
+    residual = _NATURAL_ASSENT_CLOSING_FILLER_RE.sub("", residual)
     whole_match = _NATURAL_ASSENT_WHOLE_RE.fullmatch(residual) is not None
     action_start = _NATURAL_ASSENT_ACTION_START_RE.search(residual) is not None
     action_anywhere = _NATURAL_ACTION_ASSENT_RE.search(residual) is not None
+    add_requested = _NATURAL_ADD_ACTION_RE.search(residual) is not None
     other_action = _NATURAL_OTHER_ACTION_RE.search(residual) is not None
+    cancel_requested = bool(
+        not question
+        and not framed
+        and _NATURAL_ADD_CANCEL_WHOLE_RE.fullmatch(residual)
+    )
+    negation = bool(
+        _NATURAL_NEGATION_RE.search(source) is not None
+        or cancel_requested
+    )
     recognized = bool(
         whole_match
         or action_start
         or negation
+        or cancel_requested
         or ((framed or other_action) and action_anywhere)
     )
     if not recognized:
-        return PendingAssentPhrase(submit_after=submit_after)
+        return PendingAssentPhrase(
+            submit_after=submit_after,
+            add_requested=add_requested,
+            cancel_requested=cancel_requested,
+        )
     if question:
-        return PendingAssentPhrase(True, False, submit_after, "question")
+        return PendingAssentPhrase(
+            True, False, submit_after, "question", add_requested,
+            cancel_requested,
+        )
     if negation:
-        return PendingAssentPhrase(True, False, submit_after, "negation")
+        return PendingAssentPhrase(
+            True, False, submit_after, "negation", add_requested,
+            cancel_requested,
+        )
     if framed:
-        return PendingAssentPhrase(True, False, submit_after, "framed")
+        return PendingAssentPhrase(
+            True, False, submit_after, "framed", add_requested,
+            cancel_requested,
+        )
     if other_action:
-        return PendingAssentPhrase(True, False, submit_after, "other_action")
+        return PendingAssentPhrase(
+            True, False, submit_after, "other_action", add_requested,
+            cancel_requested,
+        )
     if not whole_match:
-        return PendingAssentPhrase(True, False, submit_after, "extra_content")
-    return PendingAssentPhrase(True, True, submit_after)
+        return PendingAssentPhrase(
+            True, False, submit_after, "extra_content", add_requested,
+            cancel_requested,
+        )
+    return PendingAssentPhrase(
+        True,
+        True,
+        submit_after,
+        add_requested=add_requested,
+        cancel_requested=cancel_requested,
+    )
 
 
 _PLACEHOLDER_OPERAND_RE = re.compile(
@@ -1052,6 +1122,95 @@ def render_server_backed_single_word_candidates(
     return "\n".join(lines)
 
 
+def render_server_backed_single_word_lookup(
+    word: object,
+    recommended_code: object,
+    candidates: object,
+    occupied_words: object,
+    *,
+    reviewed_prompt: object = "",
+) -> str:
+    """Render a rich trusted read snapshot without minting write capability."""
+    actionable = render_server_backed_single_word_candidates(
+        word,
+        recommended_code,
+        candidates,
+        occupied_words,
+    )
+    if not actionable:
+        return ""
+    normalized_word = str(word or "").strip()
+    recommended = str(recommended_code or "").strip().lower()
+    expected_codes = advertised_single_word_candidate_codes(actionable)
+    source = str(reviewed_prompt or "").strip()
+    body = ""
+    if source and advertised_single_word_candidate_codes(source) == expected_codes:
+        confirmation = re.search(
+            rf"(?m)^(?:如不调整现有排序，)?是否(?:仍)?以编码\s+"
+            rf"{re.escape(recommended)}\s+将「{re.escape(normalized_word)}」"
+            r"加入草稿[?？]\s*$",
+            source,
+            re.IGNORECASE,
+        )
+        if confirmation is not None:
+            body = source[:confirmation.start()].rstrip()
+            body = re.sub(
+                r"（回复[「“『][^」”』]+[」”』]执行）",
+                "",
+                body,
+            )
+    if not body:
+        body = actionable.partition("\n\n是否以编码")[0].rstrip()
+    if not body or advertised_single_word_candidate_codes(body) != expected_codes:
+        return ""
+    return "\n".join((
+        body,
+        "",
+        f"推荐编码：{recommended}（本次仅查询）",
+        f"「{normalized_word}」的以上候选为只读展示；"
+        "本次不建立加词确认，也不会写入草稿。",
+        single_word_candidate_footer(len(expected_codes)),
+        "以上回复只表达本轮意图；执行前系统会重新审词，"
+        "并绑定当前服务端候选。",
+    ))
+
+
+def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
+    """Return ordered codes only from the deterministic read-only contract."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    match = re.search(
+        r"(?m)^「(?P<word>[^「」\r\n]{1,128})」的以上候选为只读展示;"
+        r"本次不建立加词确认,也不会写入草稿。\s*$",
+        normalized,
+    )
+    if match is None:
+        return ()
+    codes = advertised_single_word_candidate_codes(normalized[:match.start()])
+    if not codes:
+        return ()
+    recommended = re.search(
+        r"(?m)^推荐编码:(?P<code>[a-z]{1,12})\(本次仅查询\)\s*$",
+        normalized[:match.start()],
+        re.IGNORECASE,
+    )
+    if recommended is None or recommended.group("code").lower() not in codes:
+        return ()
+    return codes
+
+
+def advertised_single_word_lookup_word(text: str) -> str:
+    """Extract only the referent from the deterministic read-only renderer."""
+    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    match = re.search(
+        r"(?m)^「(?P<word>[^「」\r\n]{1,128})」的以上候选为只读展示;"
+        r"本次不建立加词确认,也不会写入草稿。\s*$",
+        normalized,
+    )
+    if match is None or not advertised_single_word_lookup_codes(normalized):
+        return ""
+    return match.group("word").strip()
+
+
 def ensure_single_word_candidate_copy(text: str, candidate_count: int) -> str:
     """Normalize legacy one-word footers to the shared truthful contract."""
     response = str(text or "")
@@ -1112,10 +1271,23 @@ class AdvertisedReplyContract:
     deictic_batch_command: bool = False
     binding_advertisement: bool = False
     word_set_advertisement: bool = False
+    read_only_single_word_lookup: bool = False
     command_suggestions: tuple[str, ...] = ()
 
     @property
     def requires_live_state(self) -> bool:
+        if self.read_only_single_word_lookup:
+            return bool(
+                self.generic_assent_forms
+                or self.deictic_batch_command
+                or self.word_set_advertisement
+                or (
+                    self.command_suggestions
+                    and not command_suggestions_are_closed_candidate_selections(
+                        self.command_suggestions
+                    )
+                )
+            )
         return bool(
             self.generic_assent_forms
             or self.batch_assent_forms
@@ -1289,6 +1461,9 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         )
         or (deictic_batch_command and has_binding_pairs)
     )
+    read_only_single_word_lookup = bool(
+        advertised_single_word_lookup_word(normalized)
+    )
     return AdvertisedReplyContract(
         generic_assent_forms=generic_assent_forms,
         batch_assent_forms=batch_assent_forms,
@@ -1297,6 +1472,7 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         deictic_batch_command=deictic_batch_command,
         binding_advertisement=binding_advertisement,
         word_set_advertisement=word_set_advertisement,
+        read_only_single_word_lookup=read_only_single_word_lookup,
         command_suggestions=advertised_command_suggestions(normalized),
     )
 

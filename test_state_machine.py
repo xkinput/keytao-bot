@@ -648,8 +648,7 @@ def test_parse_pending_state_from_referenced_message():
 
     submit_response = "⚠️ 检测到批次中存在重码，是否继续提交？回复「确认」继续提交，回复「取消」放弃。"
     submit_state = _parse_pending_state_from_response(submit_response)
-    check("quoted submit pending parsed", isinstance(submit_state, PendingToolConfirm))
-    check("quoted submit tool parsed", submit_state.function_name == "keytao_submit_batch")
+    check("submit prose cannot mint a ticket", submit_state is None)
 
 
 def test_referenced_other_owner_pending_does_not_copy():
@@ -2055,7 +2054,10 @@ def test_extract_explicit_reviewed_add_word():
     check("prefixed bot name extracted", _extract_explicit_reviewed_add_word("喵喵 加词 平替") == "平替")
     check("colon form extracted", _extract_explicit_reviewed_add_word("请帮我加词：平替") == "平替")
     check("explicit code falls through", _extract_explicit_reviewed_add_word("加词 平替 pgtk") is None)
-    check("draft command not treated as word", _extract_explicit_reviewed_add_word("加词 提交") is None)
+    check(
+        "explicit add grammar preserves a command-shaped literal word",
+        _extract_explicit_reviewed_add_word("加词 提交") == "提交",
+    )
 
 
 def test_classify_simple_word_query_intent_calls_model():
@@ -2372,31 +2374,294 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
         finally:
             openai_chat_module.conversation_state_store = old_store
 
-        pending = _parse_pending_add_word(result or "")
-
         check("lookup called first", tool_calls[0] == ("keytao_lookup_by_word", {"word": "洛阳纸贵"}))
         check("review called second", tool_calls[1] == ("keytao_prepare_reviewed_add", {"word": "洛阳纸贵"}))
         check("encode not needed on reviewed success", all(name != "keytao_encode" for name, _ in tool_calls))
         check("source shown", result is not None and "汉典" in result)
         check("valid code shown", result is not None and "lyfg" in result)
         check("invalid hallucinated code absent", result is not None and "loyfg" not in result)
-        check("pending parsed from tool response", isinstance(pending, PendingAddWord))
-        check("pending recommended uses tool code", pending.recommended_code == "lyfg")
-        check("pending keeps review remark", "lyfg" in pending.code_remarks)
-        check("display parsing does not mint server capability", pending.server_candidates == [])
-        check("deterministic review stores a structured pending", stored_pending is not None and isinstance(stored_pending.state, PendingAddWord))
-        check("deterministic pending keeps full group address", stored_pending is not None and stored_pending.owner_key == conv_key)
+        check("read response does not parse as a write ticket", _parse_pending_add_word(result or "") is None)
+        check("read response labels its no-ticket boundary", result is not None and "本次仅查询" in result)
+        check("deterministic read stores no pending capability", stored_pending is None)
         check(
-            "stored pending freezes server candidate occupancy",
-            stored_pending is not None
-            and stored_pending.state.server_candidates == [
-                ("lyfg", False),
-                ("lyfga", False),
-                ("lyfgb", True),
-            ]
-            and stored_pending.state.server_occupied_words == {
-                "lyfgb": ["洛阳"],
+            "read response still shows trusted candidate occupancy",
+            result is not None
+            and "lyfgb — 已有「洛阳」" in result,
+        )
+
+    asyncio.run(_run())
+
+
+def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
+    """A read lookup may show candidates, but a later bare assent must not write."""
+    print("\n🧪 read word query never arms an add ticket")
+
+    async def _run():
+        review = {
+            "success": True,
+            "word": "洛阳纸贵",
+            "recommendedCode": "lyfg",
+            "preSubmitAudit": {
+                "success": True,
+                "verdict": "pass",
+                "autoApprove": True,
+                "summary": "读音和编码候选链一致",
+                "issues": [],
             },
+            "pronunciations": [{
+                "pinyin": "luo yang zhi gui",
+                "recommendedCode": "lyfg",
+                "sources": [{"source": "汉典"}],
+                "candidateStatuses": [
+                    {"code": "lyfg", "occupied": False, "label": "空位"},
+                    {"code": "lyfga", "occupied": False, "label": "空位"},
+                ],
+            }],
+        }
+        tool_calls = []
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({
+                    "success": True,
+                    "word": "洛阳纸贵",
+                    "phrases": [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_prepare_reviewed_add":
+                return json.dumps(review, ensure_ascii=False)
+            raise AssertionError(f"unexpected tool call: {tool_name}")
+
+        from keytao_bot.plugins import chat_commands as chat_commands_module
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group(
+            "qq", "read-query-group", "read-query-user"
+        )
+        space_key = ("qq", "qq:group:read-query-group")
+        execute_add = AsyncMock(return_value="已加入草稿")
+        old_store = openai_chat_module.conversation_state_store
+        old_command_store = chat_commands_module.conversation_state_store
+        openai_chat_module.conversation_state_store = store
+        chat_commands_module.conversation_state_store = store
+        try:
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    new=AsyncMock(return_value=SimpleWordQueryIntent(
+                        True,
+                        ("洛阳纸贵",),
+                        "word_lookup",
+                        0.99,
+                    )),
+                ),
+                patch.object(
+                    chat_commands_module,
+                    "call_tool_function",
+                    side_effect=fake_call,
+                ),
+                patch.object(
+                    chat_commands_module.user_resolver,
+                    "resolve_actor_binding",
+                    new=AsyncMock(return_value=True),
+                ),
+            ):
+                lookup_response = await _try_handle_simple_single_word_query(
+                    "洛阳纸贵",
+                    "qq",
+                    "read-query-user",
+                    conv_key,
+                    space_key,
+                    "Rea",
+                )
+            query_record = store.get_record(conv_key)
+            delivered_lookup_response = (
+                openai_chat_module._enforce_advertised_reply_contract(
+                    lookup_response or "",
+                    conv_key,
+                )
+            )
+            short_submit_ctx = openai_chat_module.TurnContext(
+                bot=object(),
+                event=object(),
+                platform="qq",
+                user_id="read-query-user",
+                normalized_message_text="添加并提交",
+                history=[{"role": "assistant", "content": lookup_response}],
+                conv_key=conv_key,
+                space_key=space_key,
+                owner_label="Rea",
+            )
+            short_submit_finished = await (
+                openai_chat_module._stage_apply_scoped_pending_intent(
+                    short_submit_ctx
+                )
+            )
+
+            with (
+                patch.object(openai_chat_module, "OPENAI_API_KEY", ""),
+                patch.object(openai_chat_module, "AsyncOpenAI", None),
+                patch.object(
+                    chat_commands_module,
+                    "_execute_add_to_draft",
+                    execute_add,
+                ),
+            ):
+                assent_response = await openai_chat_module.handle_pending_message_core(
+                    "好",
+                    "qq",
+                    "read-query-user",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Rea",
+                )
+            bare_assent_write_count = execute_add.await_count
+
+            recovery_ctx = openai_chat_module.TurnContext(
+                bot=object(),
+                event=object(),
+                platform="qq",
+                user_id="read-query-user",
+                normalized_message_text="加入",
+                response=None,
+                history=[{"role": "assistant", "content": lookup_response}],
+                conv_key=conv_key,
+                space_key=space_key,
+                owner_label="Rea",
+                current_pending_record=None,
+            )
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    new=AsyncMock(return_value=SimpleWordQueryIntent(False)),
+                ),
+                patch.object(
+                    chat_commands_module,
+                    "call_tool_function",
+                    side_effect=fake_call,
+                ),
+                patch.object(
+                    chat_commands_module.user_resolver,
+                    "resolve_actor_binding",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch.object(
+                    chat_commands_module,
+                    "_execute_add_to_draft",
+                    execute_add,
+                ),
+            ):
+                await openai_chat_module._stage_handle_simple_word_query(
+                    recovery_ctx
+                )
+            recovered_record = store.get_record(conv_key)
+
+            store.delete(conv_key)
+            framed_ctx = openai_chat_module.TurnContext(
+                bot=object(),
+                event=object(),
+                platform="qq",
+                user_id="read-query-user",
+                normalized_message_text="他说加入",
+                response=None,
+                history=[{"role": "assistant", "content": lookup_response}],
+                conv_key=conv_key,
+                space_key=space_key,
+                owner_label="Rea",
+                current_pending_record=None,
+            )
+            with patch.object(
+                openai_chat_module,
+                "_classify_simple_word_query_intent",
+                new=AsyncMock(return_value=SimpleWordQueryIntent(False)),
+            ):
+                await openai_chat_module._stage_handle_simple_word_query(framed_ctx)
+            framed_record = store.get_record(conv_key)
+
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    new=AsyncMock(
+                        side_effect=AssertionError(
+                            "explicit add must not use the word-query classifier"
+                        )
+                    ),
+                ),
+                patch.object(
+                    chat_commands_module,
+                    "call_tool_function",
+                    side_effect=fake_call,
+                ),
+                patch.object(
+                    chat_commands_module.user_resolver,
+                    "resolve_actor_binding",
+                    new=AsyncMock(return_value=True),
+                ),
+            ):
+                explicit_response = await _try_handle_simple_single_word_query(
+                    "加词 洛阳纸贵",
+                    "qq",
+                    "read-query-user",
+                    conv_key,
+                    space_key,
+                    "Rea",
+                )
+            explicit_record = store.get_record(conv_key)
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+            chat_commands_module.conversation_state_store = old_command_store
+
+        check(
+            "read query still renders reviewed candidates",
+            lookup_response is not None
+            and "洛阳纸贵" in lookup_response
+            and "lyfg" in lookup_response,
+        )
+        check(
+            "read candidates survive the production delivery guard without a ticket",
+            "洛阳纸贵" in delivered_lookup_response
+            and "lyfg" in delivered_lookup_response
+            and "本次仅查询" in delivered_lookup_response,
+        )
+        check(
+            "read-backed add-submit bypasses only the missing-ticket prefilter",
+            short_submit_finished is False
+            and short_submit_ctx.response is None,
+        )
+        check(
+            "read query leaves no PendingAddWord capability",
+            query_record is None,
+        )
+        check("bare assent after read performs zero writes", bare_assent_write_count == 0)
+        check("bare assent after read has no pending action", assent_response is None)
+        check(
+            "explicit add assent re-runs review and completes the current intent",
+            recovery_ctx.response == "已加入草稿"
+            and recovered_record is None
+            and execute_add.await_count == 1
+            and sum(
+                1
+                for name, arguments in tool_calls
+                if name == "keytao_prepare_reviewed_add"
+                and arguments == {"word": "洛阳纸贵"}
+            )
+            >= 3,
+        )
+        check(
+            "reported-speech add never recovers a capability",
+            framed_ctx.response is None and framed_record is None,
+        )
+        check(
+            "explicit add still establishes a server-backed ticket",
+            explicit_response is not None
+            and explicit_record is not None
+            and isinstance(explicit_record.state, PendingAddWord)
+            and explicit_record.state.server_candidates
+            == [("lyfg", False), ("lyfga", False)],
         )
 
     asyncio.run(_run())
@@ -2537,17 +2802,10 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
         check("presentation calls only lookup and review tools", [name for name, _ in tool_calls] == ["keytao_lookup_by_word", "keytao_prepare_reviewed_add"])
         check("presentation returns the ordering assessment", response is not None and "常用度评估" in response)
         check(
-            "trusted pending state carries server-backed ordering facts",
-            record is not None
-            and isinstance(record.state, PendingAddWord)
-            and record.state.server_ordering_assessments == [{
-                "verdict": "front_more_common",
-                "newWord": "射覆",
-                "occupantWord": "慑服",
-                "occupantCode": "eefj",
-                "freeCode": "eefju",
-                "newCode": "eefj",
-            }],
+            "read-only ordering advice carries no pending write capability",
+            record is None
+            and response is not None
+            and "回复「1 重新编码」执行" not in response,
         )
 
     asyncio.run(_run())
@@ -2556,6 +2814,35 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
 def test_explicit_add_word_query_uses_review_tool_before_ai():
     """Verify `加词 X` uses the reviewed add tool instead of the old encode prompt."""
     print("\n🧪 explicit add-word query uses review tool")
+    from keytao_bot.harness.authorization_grammar import explicit_complete_add_item
+
+    natural_code_first = explicit_complete_add_item("补上炒冷饭的 wlf 编码")
+    check(
+        "natural code-first add binds both literal operands",
+        natural_code_first == {
+            "action": "Create",
+            "word": "炒冷饭",
+            "code": "wlf",
+            "submitAfter": False,
+        },
+    )
+    check(
+        "natural code-first add rejects a question tail",
+        explicit_complete_add_item("补上炒冷饭的 wlf 编码怎么样") is None,
+    )
+    check(
+        "explicit same-code add keeps its literal operands",
+        explicit_complete_add_item("添加「吃席」 wkxk，同码即可") == {
+            "action": "Create",
+            "word": "吃席",
+            "code": "wkxk",
+            "submitAfter": False,
+        },
+    )
+    check(
+        "same-code add question still cannot authorize a write",
+        explicit_complete_add_item("添加「吃席」 wkxk，同码可以吗？") is None,
+    )
 
     async def _run():
         tool_calls = []
@@ -5665,6 +5952,10 @@ def test_draft_recall_authorization_forms():
         ("帮我取消最近一次提审", recall_intent),
         ("撤回提交并清空草稿", recall_and_clear_intent),
         ("取消提审并清空恢复后的草稿", recall_and_clear_intent),
+        ("刚才那次提交撤回一下", recall_intent),
+        ("回退一下", recall_intent),
+        ("「取消提审」", recall_intent),
+        ("“取消提审”", recall_intent),
     ]
     denied = [
         ("取消提交", recall_intent),
@@ -5674,7 +5965,6 @@ def test_draft_recall_authorization_forms():
         ("撤回提交可不可以", recall_intent),
         ("不要取消提审", recall_intent),
         ("请不撤回提交", recall_intent),
-        ("“取消提审”", recall_intent),
         ("《取消提审》", recall_intent),
         ("【取消提审并清空草稿】", recall_and_clear_intent),
         ("解释取消提审", recall_intent),
@@ -6309,6 +6599,27 @@ def test_referenced_word_presence_query_requires_a_pure_presence_question():
             "这两个词现在词库都有吗"
         ),
     )
+    measured_probe_cases = (
+        ("这几个词的编码能不能按常用度排一下？", False),
+        ("这几个词的编码顺序对吗？", False),
+        ("引用的这些词，哪个编码更靠前？", False),
+        ("这几个词编码谁排前面？", False),
+        ("这两个词的编码要不要换一下位置？", False),
+        ("这几个词的编码优先级怎么定的？", False),
+        ("这些词的编码是不是要重新排一下？", False),
+        ("这几个词在词库里都有吗", True),
+        ("这两个词词库都收录了吗", True),
+        ("这几个词的编码帮我调一调优先级好吗？", False),
+        ("引用里这些词的编码能对调吗？", False),
+        ("这几个词，编码按使用频率重排好不好？", False),
+        ("这些词的编码谁该排第一？", False),
+    )
+    for message, expected in measured_probe_cases:
+        check(
+            f"measured presence whitelist: {message}",
+            chat_routing_module._is_referenced_word_presence_query(message)
+            is expected,
+        )
     for actionable in (
         "重新排序下mkdr 编码链这几个词按优先级",
         "这几个词收录了吗，按常用度排一下",
@@ -6343,6 +6654,14 @@ def test_code_chain_reorder_command_is_structural_and_code_bound():
         "重新排序 mkdr 编码链按常用度": "mkdr",
         "把 mkdr 这条链按常用度排一下": "mkdr",
         "重排 mkdr": "mkdr",
+        "mkdr 编码链重新排序": "mkdr",
+        "mkdr 按优先级排一下": "mkdr",
+        "把 mkdr 这几个词按常用度重新排序": "mkdr",
+        "重新排一下 mkdr 编码链": "mkdr",
+        "按优先级排一下 mkdr 编码链": "mkdr",
+        "按常用度排序 mkdr": "mkdr",
+        "调整 mkdr 茂才 和 冒菜": "mkdr",
+        "调整 mkdr 茂才 和 冒菜，明显冒菜更常用": "mkdr",
     }
     for message, code in allowed.items():
         parsed = parser(message)
@@ -6350,6 +6669,11 @@ def test_code_chain_reorder_command_is_structural_and_code_bound():
             f"accepted reorder form binds {code}: {message}",
             parsed is not None and parsed.code == code,
         )
+    pairwise = parser("调整 mkdr 茂才 和 冒菜，明显冒菜更常用")
+    check(
+        "pairwise reorder binds both server-checkable words",
+        pairwise is not None and pairwise.focus_words == ("茂才", "冒菜"),
+    )
 
     for message in (
         "不要重排 mkdr",
@@ -6920,6 +7244,119 @@ def test_exact_numeric_pending_reply_executes_without_intent_model():
     asyncio.run(_run())
 
 
+def test_natural_add_negation_cancels_the_one_live_ticket():
+    """Direct add negation cancels; questions and reported speech preserve state."""
+    print("\n🧪 natural add negation cancels one live ticket")
+
+    async def _run():
+        conv_key = ConversationAddress.group(
+            "qq", "cancel-group", "cancel-user"
+        )
+        space_key = ("qq", "qq:group:cancel-group")
+        state = PendingAddWord(
+            word="呵呵呵",
+            recommended_code="hhhooo",
+            candidates=[("hhhooo", False), ("hxxooo", True)],
+            occupied_words={"hxxooo": ["哈哈哈"]},
+            server_candidates=[("hhhooo", False), ("hxxooo", True)],
+            server_occupied_words={"hxxooo": ["哈哈哈"]},
+        )
+        store = MemoryConversationStateStore()
+        execute_add = AsyncMock(return_value="unexpected write")
+        execute_submit = AsyncMock(return_value="unexpected submit")
+        old_store = openai_chat_module.conversation_state_store
+        openai_chat_module.conversation_state_store = store
+        try:
+            with (
+                patch.object(openai_chat_module, "OPENAI_API_KEY", ""),
+                patch.object(openai_chat_module, "AsyncOpenAI", None),
+                patch.object(
+                    openai_chat_module,
+                    "_execute_add_to_draft",
+                    execute_add,
+                ),
+                patch.object(
+                    openai_chat_module,
+                    "_execute_add_to_draft_and_submit",
+                    execute_submit,
+                ),
+            ):
+                for message in (
+                    "取消添加",
+                    "不加了",
+                    "别加了",
+                    "不用加了",
+                    "先别加",
+                    "这个不要了",
+                    "算了不加了",
+                    "撤销这次添加",
+                    "取消这次操作",
+                ):
+                    store.set(
+                        conv_key,
+                        state,
+                        space_key=space_key,
+                        owner_label="Rea",
+                    )
+                    response = await openai_chat_module.handle_pending_message_core(
+                        message,
+                        "qq",
+                        "cancel-user",
+                        conv_key,
+                        history=[],
+                        space_key=space_key,
+                        owner_label="Rea",
+                    )
+                    check(
+                        f"direct cancel consumes the ticket: {message}",
+                        response == "好的，已取消 owo"
+                        and store.get_record(conv_key) is None,
+                    )
+                    rejection = (
+                        openai_chat_module._pending_assent_rejection_response(
+                            state,
+                            message,
+                        )
+                    )
+                    check(
+                        f"cancel never advertises the rejected add: {message}",
+                        rejection is None or "加入" not in rejection,
+                    )
+
+                for message in (
+                    "他说不加了",
+                    "不加了吗？",
+                    "不要取消添加",
+                ):
+                    store.set(
+                        conv_key,
+                        state,
+                        space_key=space_key,
+                        owner_label="Rea",
+                    )
+                    response = await openai_chat_module.handle_pending_message_core(
+                        message,
+                        "qq",
+                        "cancel-user",
+                        conv_key,
+                        history=[],
+                        space_key=space_key,
+                        owner_label="Rea",
+                    )
+                    check(
+                        f"non-direct cancel keeps the live ticket: {message}",
+                        response != "好的，已取消 owo"
+                        and store.get_record(conv_key) is not None,
+                    )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        check("cancel path performs zero add writes", execute_add.await_count == 0)
+        check("cancel path performs zero submit writes", execute_submit.await_count == 0)
+
+    asyncio.run(_run())
+
+
 def test_exact_pending_selection_syntax_is_structural_and_fail_closed():
     """Exact candidate selectors are local protocol syntax, not LLM semantics."""
     print("\n🧪 exact pending selection syntax is structural and fail closed")
@@ -7009,6 +7446,12 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
                 ("mjbfau", False),
             ],
             occupied_words={"mjbf": ["木板"]},
+            server_candidates=[
+                ("mjbf", True),
+                ("mjbfa", False),
+                ("mjbfau", False),
+            ],
+            server_occupied_words={"mjbf": ["木板"]},
             pronunciation_recommended_codes=["mjbfa", "mjbfau"],
         )
         old_store = openai_chat_module.conversation_state_store
@@ -8660,7 +9103,7 @@ def test_active_confirmation_uses_bare_assent_without_exposing_nonce():
     )
     first_code = first.confirmation_code
     check("bare confirmation is accepted", _active_operation_confirmation_matches(first, "确认"))
-    check("targetless submit rejects semantic shortcut", not _active_operation_confirmation_matches(first, "确认提交"))
+    check("targetless submit accepts natural confirmation", _active_operation_confirmation_matches(first, "确认提交"))
     check("targetless submit advertises bare confirmation", first.confirmation_command == "确认")
     check("targetless submit hides its internal nonce", first_code not in first.prompt_text)
     check(
@@ -8702,7 +9145,7 @@ def test_active_confirmation_uses_bare_assent_without_exposing_nonce():
         ),
         "是否继续加入？",
     )
-    check("generic add confirmation is rejected", not _active_operation_confirmation_matches(add_operation, "确认加入"))
+    check("generic add confirmation is accepted", _active_operation_confirmation_matches(add_operation, "确认加入"))
     check("target-only add confirmation is rejected", not _active_operation_confirmation_matches(add_operation, "确认加入 阻抑 zjyka"))
     check("server warning accepts bare confirmation", _active_operation_confirmation_matches(add_operation, "确认"))
     check("server warning hides current nonce", add_operation.confirmation_code not in add_operation.prompt_text)
@@ -10042,6 +10485,11 @@ def test_pending_add_word_adds_multiple_reviewed_codes():
             word="测试词",
             recommended_code="ceek",
             candidates=[("ceek", False), ("ceekv", False), ("ceeo", False)],
+            server_candidates=[
+                ("ceek", False),
+                ("ceekv", False),
+                ("ceeo", False),
+            ],
             code_remarks={
                 "ceek": "喵喵审词：读音 ce shi；来源 汉典",
                 "ceeo": "喵喵审词：读音 ce ci；来源 百度百科",
@@ -10359,14 +10807,19 @@ def test_local_draft_submit_intent_detection():
                 word="自改",
                 recommended_code="zkgh",
                 candidates=[("zkgh", False)],
+                server_candidates=[("zkgh", False)],
             ),
         )
+        can_submit = await _classify_message_command_intent("可以提交了")
+        then_submit = await _classify_message_command_intent("那就提交")
 
         check("plain submit routes to draft_submit", intent.intent == "draft_submit")
         check("plain submit confidence is deterministic", intent.confidence == 1.0)
         check("pending candidate does not steal draft submit", pending_intent.intent == "draft_submit")
         check("explicit add-submit stays with pending add", add_submit_intent.intent == "pending_add_and_submit")
         check("explicit add-submit shortcut is deterministic", add_submit_intent.confidence == 1.0)
+        check("can-submit variant routes locally", can_submit.intent == "draft_submit")
+        check("then-submit variant routes locally", then_submit.intent == "draft_submit")
 
     asyncio.run(_run())
 
@@ -14051,7 +14504,14 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
     class HandlerBot:
         pass
 
-    async def run_case(message, reply_reference, *, live_state=None, tool_result=None):
+    async def run_case(
+        message,
+        reply_reference,
+        *,
+        history=None,
+        live_state=None,
+        tool_result=None,
+    ):
         user_id = f"stale-confirm-{abs(hash((message, reply_reference.text))) % 100000}"
         context = ChatMemoryContext(
             platform="qq",
@@ -14089,7 +14549,7 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
                 AsyncMock(return_value=context),
             ),
             patch.object(openai_chat_module, "_classify_message_command_intent", classifier),
-            patch.object(openai_chat_module, "get_history", return_value=[]),
+            patch.object(openai_chat_module, "get_history", return_value=history or []),
             patch.object(openai_chat_module, "build_reply_context", AsyncMock(return_value="")),
             patch.object(
                 openai_chat_module,
@@ -14136,21 +14596,36 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
 
     async def _run():
         bare = await run_case("确认", ReplyReferenceInfo())
-        check("bare stale confirm bypasses intent model", bare["classifier_calls"] == 0)
-        check("bare stale confirm bypasses main model", bare["main_calls"] == 0)
-        check("bare stale confirm reaches no tool sink", bare["tool_calls"] == 0)
+        check("bare confirm without an invitation reaches intent model", bare["classifier_calls"] == 1)
+        check("bare confirm without an invitation reaches main model", bare["main_calls"] == 1)
+        check("bare confirm without an invitation reaches no tool sink", bare["tool_calls"] == 0)
+        check("bare confirm without an invitation stays ordinary chat", bare["response"] == "normal pipeline response")
+
+        invited = await run_case(
+            "确认",
+            ReplyReferenceInfo(),
+            history=[
+                {
+                    "role": "assistant",
+                    "content": "是否继续处理？需要的话请回复确认。",
+                }
+            ],
+        )
+        check("invited stale confirm bypasses intent model", invited["classifier_calls"] == 0)
+        check("invited stale confirm bypasses main model", invited["main_calls"] == 0)
+        check("invited stale confirm reaches no tool sink", invited["tool_calls"] == 0)
         check(
             "stale reply explains expiry or absence",
-            "过期或不存在" in bare["response"],
+            "过期或不存在" in invited["response"],
         )
         check(
             "stale reply offers plain recovery guidance",
-            "查看草稿" in bare["response"],
+            "查看草稿" in invited["response"],
         )
         check(
             "stale reply never recommends confirming again",
-            "再发一次确认" not in bare["response"]
-            and "再发一次「确认」" not in bare["response"],
+            "再发一次确认" not in invited["response"]
+            and "再发一次「确认」" not in invited["response"],
         )
 
         ticket = await run_case("确认票据 E8CA23", ReplyReferenceInfo())
@@ -14158,6 +14633,11 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
         check("retired ticket syntax reaches normal text flow", ticket["response"] == "normal pipeline response")
         check("stale ticket shape reaches no sink", ticket["tool_calls"] == 0)
 
+        quoted_display = (
+            "原始操作指令：「把吃席放在赤溪前面」\n"
+            "🔁 服务端已生成完整顺延计划：\n"
+            "以上每一项都将由服务端按同一批次版本校验。确认执行吗？"
+        )
         quoted = await run_case(
             "执行吧",
             ReplyReferenceInfo(
@@ -14165,12 +14645,9 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
                 is_to_bot=True,
                 sender_id="bot-id",
                 sender_name="喵喵",
-                text=(
-                    "原始操作指令：「把吃席放在赤溪前面」\n"
-                    "🔁 服务端已生成完整顺延计划：\n"
-                    "以上每一项都将由服务端按同一批次版本校验。确认执行吗？"
-                ),
+                text=quoted_display,
             ),
+            history=[{"role": "assistant", "content": quoted_display}],
         )
         check("quoted assent bypasses both models", quoted["classifier_calls"] == 0 and quoted["main_calls"] == 0)
         check("quoted assent reaches no sink", quoted["tool_calls"] == 0)
@@ -14926,6 +15403,143 @@ def test_orchestrator_tool_batch_validation():
     """Invalid or incomplete tool-call batches must execute no tools."""
     print("\n🧪 AgentOrchestrator tool-call batch validation")
     asyncio.run(_run_orchestrator_tool_batch_validation_checks())
+
+
+def test_exact_multi_add_above_ten_chunks_reviews_then_writes_full_set():
+    print("\n🧪 exact multi-add above ten chunks review work")
+
+    async def _run():
+        pairs = [
+            (f"{marker}词", f"c{chr(97 + index)}x")
+            for index, marker in enumerate("甲乙丙丁戊己庚辛壬癸子")
+        ]
+        message = "\n".join(
+            f"加词 {word} {code}" for word, code in pairs
+        )
+        client = _FakeClient([
+            _FakeAIResponse("stop", "开始审词"),
+            _FakeAIResponse("stop", "准备写入"),
+            _FakeAIResponse("stop", "全部完成"),
+        ])
+        review_calls = []
+        batch_calls = []
+        progress_lines = []
+
+        async def review(word, platform, platform_id):
+            review_calls.append((word, platform, platform_id))
+            code = dict(pairs)[word]
+            return {
+                "success": True,
+                "word": word,
+                "type": "Phrase",
+                "recommendedCode": code,
+                "candidateStatuses": [{
+                    "code": code,
+                    "occupied": False,
+                    "words": [],
+                    "phrases": [],
+                }],
+                "preSubmitAudit": {
+                    "autoApprove": False,
+                    "summary": "人工复核",
+                    "issues": ["人工复核"],
+                },
+            }
+
+        async def batch(items):
+            batch_calls.append(items)
+            return {
+                "success": True,
+                "successCount": len(items),
+                "failedCount": 0,
+                "batchId": "multi-eleven",
+            }
+
+        class MultiAddSkillsManager:
+            def get_skill_instructions(self):
+                return ""
+
+            def has_tools(self):
+                return True
+
+            def get_tools(self):
+                return [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": name,
+                            "parameters": {
+                                "type": "object",
+                                "properties": properties,
+                                "required": list(properties),
+                            },
+                        },
+                    }
+                    for name, properties in (
+                        (
+                            "keytao_prepare_reviewed_add",
+                            {"word": {"type": "string"}},
+                        ),
+                        (
+                            "keytao_batch_add_to_draft",
+                            {"items": {"type": "array"}},
+                        ),
+                    )
+                ]
+
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="deepseek-v4-flash",
+                max_tokens=1000,
+                temperature=0.7,
+                timeout=180.0,
+            ),
+            skills_manager=MultiAddSkillsManager(),
+            tool_executor=ToolExecutor(
+                lambda name: {
+                    "keytao_prepare_reviewed_add": review,
+                    "keytao_batch_add_to_draft": batch,
+                }.get(name),
+                frozenset({"keytao_prepare_reviewed_add"}),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        result = await orchestrator.run(
+            message,
+            AgentRequestContext(
+                platform="qq",
+                user_id="multi-eleven-owner",
+                mutations_allowed=True,
+                progress_reporter=progress_lines.append,
+            ),
+        )
+
+        check(
+            "all eleven literal pairs are reviewed in original order",
+            [word for word, _platform, _owner in review_calls]
+            == [word for word, _code in pairs],
+        )
+        check(
+            "review work reports first chunk progress",
+            progress_lines
+            and "已完成 8/11" in progress_lines[0]
+            and "还剩 1 轮" in progress_lines[0],
+        )
+        check(
+            "one exact-set batch writes all eleven reviewed pairs",
+            len(batch_calls) == 1
+            and [
+                (item.get("word"), item.get("code"))
+                for item in batch_calls[0]
+            ] == pairs,
+        )
+        check("multi-add reaches the final response", result == "全部完成")
+
+    asyncio.run(_run())
 
 
 def test_agent_chunk_progress_uses_existing_event_delivery():
@@ -16459,6 +17073,129 @@ def test_replace_char_preserves_explicit_css_type():
     asyncio.run(_run())
 
 
+def test_replace_char_chunks_and_preserves_sealed_progress():
+    print("\n🧪 replace-char chunks and preserves sealed progress")
+
+    async def _run():
+        lines = [
+            f"粘词{index:02d} c{chr(97 + index // 26)}{chr(97 + index % 26)}"
+            for index in range(51)
+        ]
+        message = "将这些词条中的粘改为黏：\n" + "\n".join(lines)
+        conv_key = ConversationAddress.private("qq", "replace-chunk-owner")
+        old_store = openai_chat_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        openai_chat_module.conversation_state_store = store
+        batch_call = AsyncMock(
+            side_effect=(
+                json.dumps({
+                    "success": True,
+                    "successCount": 50,
+                    "failedCount": 0,
+                    "batchId": "replace-batch",
+                }, ensure_ascii=False),
+                json.dumps({
+                    "success": True,
+                    "successCount": 1,
+                    "failedCount": 0,
+                    "batchId": "replace-batch",
+                }, ensure_ascii=False),
+            )
+        )
+        try:
+            prompt = await _try_handle_replace_char(
+                message,
+                "qq",
+                "replace-chunk-owner",
+                MessageCommandIntent(
+                    intent="batch_replace_char",
+                    old_char="粘",
+                    new_char="黏",
+                    confidence=1.0,
+                ),
+                conv_key,
+                owner_label="Chunk Owner",
+            )
+            first_record = store.get_record(conv_key)
+            first_state = first_record.state if first_record is not None else None
+            check(
+                "first replace chunk stages exactly 50 items",
+                isinstance(first_state, PendingToolConfirm)
+                and len(first_state.args.get("items", [])) == 50,
+            )
+            check(
+                "first prompt reports total and preserved remainder",
+                prompt is not None
+                and "本轮共 51 条" in prompt
+                and "其余 1 条已按原顺序保留" in prompt,
+            )
+
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "call_tool_function",
+                    batch_call,
+                ),
+                patch.object(
+                    openai_chat_module,
+                    "_format_draft_response",
+                    AsyncMock(return_value="草稿快照"),
+                ),
+            ):
+                first_response = await openai_chat_module.handle_pending_message_core(
+                    "确认",
+                    "qq",
+                    "replace-chunk-owner",
+                    conv_key,
+                    history=[],
+                    owner_label="Chunk Owner",
+                )
+                second_record = store.get_record(conv_key)
+                second_state = second_record.state if second_record is not None else None
+                check(
+                    "first confirmation writes only the first sealed chunk",
+                    batch_call.await_count == 1
+                    and len(batch_call.await_args_list[0].args[1]["items"]) == 50,
+                )
+                check(
+                    "next one-item confirmation replaces the consumed ticket",
+                    isinstance(second_state, PendingToolConfirm)
+                    and len(second_state.args.get("items", [])) == 1,
+                )
+                check(
+                    "progress response advertises the exact next range",
+                    first_response is not None
+                    and "已完成 50/51 条" in first_response
+                    and "第 51-51 条" in first_response,
+                )
+
+                second_response = await openai_chat_module.handle_pending_message_core(
+                    "确认",
+                    "qq",
+                    "replace-chunk-owner",
+                    conv_key,
+                    history=[],
+                    owner_label="Chunk Owner",
+                )
+                check(
+                    "second confirmation writes the final one-item chunk",
+                    batch_call.await_count == 2
+                    and len(batch_call.await_args_list[1].args[1]["items"]) == 1,
+                )
+                check(
+                    "all replace chunks consume one ticket at a time",
+                    store.get_record(conv_key) is None,
+                )
+                check(
+                    "final chunk reports successful draft addition",
+                    second_response is not None and "已加入草稿" in second_response,
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+    asyncio.run(_run())
+
+
 async def _capture_mocked_turn_metrics(*, policy_blocked: bool) -> Tuple[str, bool]:
     class MetricsBot:
         def __init__(self):
@@ -17320,6 +18057,7 @@ if __name__ == "__main__":
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
     test_simple_single_word_query_uses_review_tool_before_ai()
+    test_read_word_query_never_arms_add_ticket_through_pending_execution_path()
     test_candidate_commonness_copy_snapshot_and_zero_writes()
     test_explicit_add_word_query_uses_review_tool_before_ai()
     test_word_discovery_prechecks_binding_without_blocking_review()
@@ -17387,6 +18125,7 @@ if __name__ == "__main__":
     test_pending_add_word_numeric_choice()
     test_numeric_reply_means_exact_candidate_selection()
     test_exact_numeric_pending_reply_executes_without_intent_model()
+    test_natural_add_negation_cancels_the_one_live_ticket()
     test_exact_pending_selection_syntax_is_structural_and_fail_closed()
     test_exact_pending_selectors_execute_only_the_bound_action()
     test_occupied_numeric_choice_means_duplicate_confirm()
@@ -17500,6 +18239,7 @@ if __name__ == "__main__":
     test_orchestrator_suppresses_retried_reviewed_add()
     test_orchestrator_persists_semantic_basis_in_review_capability()
     test_orchestrator_tool_batch_validation()
+    test_exact_multi_add_above_ten_chunks_reviews_then_writes_full_set()
     test_agent_chunk_progress_uses_existing_event_delivery()
     test_advertised_set_selection_enters_the_production_stage_pipeline()
     test_eviction_modified_add_bypasses_pending_assent_classifier()
@@ -17520,6 +18260,7 @@ if __name__ == "__main__":
     test_strict_shift_batch_payload_preserves_item_level_seal()
     test_absence_batch_preview_never_formats_provisional_url()
     test_replace_char_preserves_explicit_css_type()
+    test_replace_char_chunks_and_preserves_sealed_progress()
     test_turn_metrics_normal_mocked_turn()
     test_turn_metrics_policy_blocked_mocked_turn()
     test_state_metrics_startup_log()

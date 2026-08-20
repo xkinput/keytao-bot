@@ -396,15 +396,17 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S27 replays the binding-precheck incident", readme)
         self.assertIn("S28 replays the multi-reading candidate cascade", readme)
         self.assertIn("S29 replays the 2026-08-20 quoted-summary incident", readme)
+        self.assertIn("S30 pins three intent-coverage boundaries", readme)
+        self.assertIn("S31 executes the verbatim incident command", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s29(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s31(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 30)],
+            [f"S{index}" for index in range(1, 32)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -771,6 +773,12 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(S28_WORD, "还车")
         self.assertEqual(S28_INVALID_CODE, "zzzzzz")
         self.assertIn("S28", {scenario.scenario_id for scenario in SCENARIOS})
+
+    def test_s30_reuses_the_absent_whole_word_shape_for_e2e_deduplication(self) -> None:
+        self.assertEqual(
+            ZDIC_FIXTURES_BY_SCENARIO["S30"],
+            ZDIC_FIXTURES_BY_SCENARIO["S2"],
+        )
 
     async def test_s29_seeds_the_exact_weighted_mkdr_chain(self) -> None:
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S29"]
