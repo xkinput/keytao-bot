@@ -849,6 +849,7 @@ class LocalNextClient:
         word: str,
         code: str,
         phrase_type: str = "Phrase",
+        weight: int | None = None,
     ) -> dict[str, Any]:
         current = await self.get_draft(platform_id)
         item = {
@@ -859,6 +860,8 @@ class LocalNextClient:
             "needsManualReview": False,
             "remark": "E2E local fixture",
         }
+        if weight is not None:
+            item["weight"] = weight
         _status, preview = await self._json(
             "POST",
             "/api/bot/pull-requests/batch-draft",
@@ -1154,6 +1157,34 @@ class E2EBotHarness:
         self._assert_isolated_state(state_dir)
         self._install_boundary_finish()
         self._install_tool_tracing()
+
+    def inject_bot_message(self, *, platform_id: str, text: str) -> int:
+        """Register one bot-authored message for native-quote scenarios."""
+        from nonebot.adapters.onebot.v11 import Message
+
+        message_id = self._next_bot_message_id
+        self._next_bot_message_id += 1
+        message = Message(text)
+        self._sent_messages[message_id] = {
+            "message_id": message_id,
+            "user_id": int(self.bot.self_id),
+            "sender": {
+                "user_id": int(self.bot.self_id),
+                "nickname": "喵喵",
+                "card": "",
+            },
+            "message": message,
+            "raw_message": text,
+        }
+        self.last_reply_message_id = message_id
+        self.recorder.record_message(
+            direction="reply",
+            text=text,
+            platform_id=platform_id,
+            message_id=message_id,
+        )
+        self.replies.append(text)
+        return message_id
 
     def _assert_isolated_state(self, state_dir: Path) -> None:
         from keytao_bot.utils import draft_mutation_store

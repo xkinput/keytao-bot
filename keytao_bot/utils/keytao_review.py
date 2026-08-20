@@ -4649,6 +4649,260 @@ async def assess_candidate_chain_commonness(
     return assessments
 
 
+def _reverse_commonness_comparison(comparison: Dict[str, Any]) -> Dict[str, Any]:
+    """View one pair comparison from the opposite word order."""
+    verdict = str(comparison.get("verdict") or "not_enough_evidence")
+    reversed_verdict = {
+        "front_more_common": "behind_more_common",
+        "behind_more_common": "front_more_common",
+    }.get(verdict, verdict)
+    return {
+        **comparison,
+        "verdict": reversed_verdict,
+        "frontWord": comparison.get("behindWord"),
+        "behindWord": comparison.get("frontWord"),
+        "front": comparison.get("behind"),
+        "behind": comparison.get("front"),
+        "scoreDelta": -float(comparison.get("scoreDelta") or 0.0),
+    }
+
+
+def _comparison_side_is_dictionary_dominated(value: Any) -> bool:
+    reference = (
+        value.get("reference")
+        if isinstance(value, dict) and isinstance(value.get("reference"), dict)
+        else {}
+    )
+    frequency = reference.get("corpusFrequency")
+    return bool(
+        int(reference.get("dictionaryPresenceCount") or 0) > 0
+        and (
+            frequency is None
+            or (
+                isinstance(frequency, int)
+                and not isinstance(frequency, bool)
+                and frequency < COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT
+            )
+        )
+    )
+
+
+def _comparison_evidence_line(word: str, value: Any) -> str:
+    reference = (
+        value.get("reference")
+        if isinstance(value, dict) and isinstance(value.get("reference"), dict)
+        else {}
+    )
+    frequency = reference.get("corpusFrequency")
+    presence = int(reference.get("dictionaryPresenceCount") or 0)
+    if reference:
+        return (
+            f"「{word}」：语料频次 "
+            f"{frequency if frequency is not None else '无'}，词典收录 {presence}"
+        )
+    return f"「{word}」：当前没有可核验的语料/词典信号"
+
+
+def _commonness_comparison_has_evidence(comparison: Dict[str, Any]) -> bool:
+    for side_name in ("front", "behind"):
+        side = comparison.get(side_name)
+        reference = (
+            side.get("reference")
+            if isinstance(side, dict) and isinstance(side.get("reference"), dict)
+            else {}
+        )
+        if (
+            reference.get("attested") is True
+            or reference.get("corpusFrequency") is not None
+            or int(reference.get("dictionaryPresenceCount") or 0) > 0
+        ):
+            return True
+    return False
+
+
+async def rank_code_chain_by_commonness(
+    entries: Sequence[Dict[str, Any]],
+    *,
+    semantic_review_loader: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Rank one server-resolved same-code/type chain conservatively.
+
+    Pairwise comparator results establish only strict precedence edges. Close
+    comparisons retain the current relative order; missing evidence and cycles
+    fail closed so a caller can render one deterministic ASK.
+    """
+    normalized = [dict(entry) for entry in entries if isinstance(entry, dict)]
+    normalized.sort(key=lambda entry: (
+        int(entry.get("weight") or 0),
+        str(entry.get("word") or ""),
+    ))
+    words = [str(entry.get("word") or "").strip() for entry in normalized]
+    if (
+        len(normalized) != len(entries)
+        or not normalized
+        or any(not word for word in words)
+        or len(set(words)) != len(words)
+    ):
+        return {"status": "ask", "reason": "invalid_chain", "currentOrder": normalized}
+    if len(normalized) == 1:
+        return {
+            "status": "already_ordered",
+            "reason": "single_entry",
+            "currentOrder": normalized,
+            "proposedOrder": normalized,
+            "comparisons": [],
+            "evidenceLines": [],
+        }
+
+    review_cache: Dict[str, Dict[str, Any]] = {}
+
+    async def load_review(word: str) -> Dict[str, Any]:
+        if word in review_cache:
+            return review_cache[word]
+        if semantic_review_loader is None:
+            review_cache[word] = {}
+            return {}
+        try:
+            loaded = await semantic_review_loader(word)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Code-chain semantic review failed for %s: %s",
+                word,
+                error,
+            )
+            loaded = {}
+        review_cache[word] = loaded if isinstance(loaded, dict) else {}
+        return review_cache[word]
+
+    comparisons: List[Dict[str, Any]] = []
+    evidence_by_word: Dict[str, str] = {}
+    edges: Dict[str, set[str]] = {word: set() for word in words}
+    indegree: Dict[str, int] = {word: 0 for word in words}
+
+    for left_index, left_word in enumerate(words):
+        for right_word in words[left_index + 1:]:
+            comparison = await compare_word_commonness(left_word, right_word)
+            if not isinstance(comparison, dict):
+                comparison = {
+                    "success": False,
+                    "verdict": "not_enough_evidence",
+                    "summary": "常用度比较没有返回结构化结果",
+                }
+            comparison = {
+                **comparison,
+                "frontWord": left_word,
+                "behindWord": right_word,
+            }
+            evidence_by_word.setdefault(
+                left_word,
+                _comparison_evidence_line(left_word, comparison.get("front")),
+            )
+            evidence_by_word.setdefault(
+                right_word,
+                _comparison_evidence_line(right_word, comparison.get("behind")),
+            )
+
+            possible_overrides: List[Dict[str, Any]] = []
+            if _comparison_side_is_dictionary_dominated(comparison.get("behind")):
+                left_review = await load_review(left_word)
+                overridden = _modern_semantic_commonness_override(
+                    left_review,
+                    {"newWord": left_word, "occupantWord": right_word},
+                    comparison,
+                )
+                if overridden.get("decisionReason") == "modern_semantic_vs_dictionary_dominated":
+                    possible_overrides.append(overridden)
+            if _comparison_side_is_dictionary_dominated(comparison.get("front")):
+                right_review = await load_review(right_word)
+                reversed_override = _modern_semantic_commonness_override(
+                    right_review,
+                    {"newWord": right_word, "occupantWord": left_word},
+                    _reverse_commonness_comparison(comparison),
+                )
+                if reversed_override.get("decisionReason") == "modern_semantic_vs_dictionary_dominated":
+                    possible_overrides.append(
+                        _reverse_commonness_comparison(reversed_override)
+                    )
+            if len(possible_overrides) > 1:
+                return {
+                    "status": "ask",
+                    "reason": "conflicting_evidence",
+                    "currentOrder": normalized,
+                    "comparisons": [*comparisons, *possible_overrides],
+                    "evidenceLines": [evidence_by_word[word] for word in words],
+                }
+            if possible_overrides:
+                comparison = possible_overrides[0]
+
+            comparisons.append(comparison)
+            verdict = str(comparison.get("verdict") or "not_enough_evidence")
+            if (
+                comparison.get("success") is not True
+                or verdict not in {"front_more_common", "behind_more_common", "close"}
+            ):
+                return {
+                    "status": "ask",
+                    "reason": "not_enough_evidence",
+                    "currentOrder": normalized,
+                    "comparisons": comparisons,
+                    "evidenceLines": [evidence_by_word[word] for word in words],
+                }
+            if verdict == "close":
+                if not _commonness_comparison_has_evidence(comparison):
+                    return {
+                        "status": "ask",
+                        "reason": "not_enough_evidence",
+                        "currentOrder": normalized,
+                        "comparisons": comparisons,
+                        "evidenceLines": [evidence_by_word[word] for word in words],
+                    }
+                continue
+            winner, loser = (
+                (left_word, right_word)
+                if verdict == "front_more_common"
+                else (right_word, left_word)
+            )
+            if loser not in edges[winner]:
+                edges[winner].add(loser)
+                indegree[loser] += 1
+
+    original_index = {word: index for index, word in enumerate(words)}
+    available = sorted(
+        (word for word in words if indegree[word] == 0),
+        key=original_index.__getitem__,
+    )
+    proposed_words: List[str] = []
+    while available:
+        word = available.pop(0)
+        proposed_words.append(word)
+        for follower in sorted(edges[word], key=original_index.__getitem__):
+            indegree[follower] -= 1
+            if indegree[follower] == 0:
+                available.append(follower)
+                available.sort(key=original_index.__getitem__)
+    if len(proposed_words) != len(words):
+        return {
+            "status": "ask",
+            "reason": "conflicting_evidence",
+            "currentOrder": normalized,
+            "comparisons": comparisons,
+            "evidenceLines": [evidence_by_word[word] for word in words],
+        }
+
+    entry_by_word = {str(entry.get("word") or "").strip(): entry for entry in normalized}
+    proposed = [entry_by_word[word] for word in proposed_words]
+    return {
+        "status": "already_ordered" if proposed_words == words else "reorder",
+        "reason": "current_order_supported" if proposed_words == words else "comparison_edges",
+        "currentOrder": normalized,
+        "proposedOrder": proposed,
+        "comparisons": comparisons,
+        "evidenceLines": [evidence_by_word[word] for word in words],
+    }
+
+
 def _active_commonness_signals(commonness: Dict) -> int:
     signals = commonness.get("signals") or {}
     return sum(1 for value in signals.values() if float(value or 0) > 0.15)

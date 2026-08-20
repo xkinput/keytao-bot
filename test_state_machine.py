@@ -6299,6 +6299,361 @@ def test_referenced_word_presence_query_extracts_quoted_words():
     check("extracts second quoted heading word", words == ["直连", "直链"])
 
 
+def test_referenced_word_presence_query_requires_a_pure_presence_question():
+    """A quoted-message lookup must never absorb an actionable instruction."""
+    print("\n🧪 referenced word presence route requires a pure question")
+
+    check(
+        "real presence question remains eligible",
+        chat_routing_module._is_referenced_word_presence_query(
+            "这两个词现在词库都有吗"
+        ),
+    )
+    for actionable in (
+        "重新排序下mkdr 编码链这几个词按优先级",
+        "这几个词收录了吗，按常用度排一下",
+        "把这些词加到草稿",
+        "删除这些词",
+        "把这些词改到 mkdr",
+        "这些词顺延一下",
+        "提交这些词",
+    ):
+        check(
+            f"actionable quoted-context turn is not a presence query: {actionable}",
+            not chat_routing_module._is_referenced_word_presence_query(actionable),
+        )
+    check(
+        "a non-presence code question is not eligible",
+        not chat_routing_module._is_referenced_word_presence_query(
+            "这几个词的编码是什么？"
+        ),
+    )
+
+
+def test_code_chain_reorder_command_is_structural_and_code_bound():
+    """Natural reorder forms bind one literal code and reject unsafe framing."""
+    print("\n🧪 code-chain reorder command is structural and code-bound")
+    parser = getattr(chat_routing_module, "_parse_code_chain_reorder_command", None)
+    check("code-chain reorder parser exists", parser is not None)
+    if parser is None:
+        return
+
+    allowed = {
+        "重新排序下mkdr 编码链这几个词按优先级": "mkdr",
+        "重新排序 mkdr 编码链按常用度": "mkdr",
+        "把 mkdr 这条链按常用度排一下": "mkdr",
+        "重排 mkdr": "mkdr",
+    }
+    for message, code in allowed.items():
+        parsed = parser(message)
+        check(
+            f"accepted reorder form binds {code}: {message}",
+            parsed is not None and parsed.code == code,
+        )
+
+    for message in (
+        "不要重排 mkdr",
+        "重排 mkdr 吗",
+        "他说重排 mkdr",
+        "引用：重排 mkdr",
+        "重排 mkdr 然后提交",
+        "重排 mkdrx7",
+    ):
+        check(f"unsafe reorder form is rejected: {message}", parser(message) is None)
+
+    chain_ticket = PendingToolConfirm(
+        function_name="keytao_batch_add_to_draft",
+        args={
+            "items": [
+                {
+                    "action": "Change",
+                    "old_word": "火锅",
+                    "word": "火锅",
+                    "code": "mkdr",
+                    "type": "Phrase",
+                    "weight": 101,
+                },
+                {
+                    "action": "Change",
+                    "old_word": "电脑",
+                    "word": "电脑",
+                    "code": "mkdr",
+                    "type": "Phrase",
+                    "weight": 100,
+                },
+            ],
+            "_pending_display": {"chainReorderPlan": {"code": "mkdr"}},
+        },
+        confirmation_source="server_warning",
+    )
+    derived, derived_intent, rejection = (
+        chat_routing_module._resolve_multi_word_pending_candidate_selection(
+            chain_ticket,
+            "确认",
+        )
+    )
+    check(
+        "bare confirmation does not reinterpret Change operations as add candidates",
+        derived is None and derived_intent is None and rejection is None,
+    )
+
+
+def test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation():
+    """A code-bound reorder previews, stores, renders, then writes one exact plan."""
+    print("\n🧪 code-chain reorder locks one exact weight plan")
+
+    async def _run():
+        store = MemoryConversationStateStore()
+        calls = []
+        ranking = {
+            "status": "reorder",
+            "reason": "comparison_edges",
+            "currentOrder": [
+                {"word": "茂才", "code": "mkdr", "type": "Phrase", "weight": 100},
+                {"word": "冒菜", "code": "mkdr", "type": "Phrase", "weight": 101},
+            ],
+            "proposedOrder": [
+                {"word": "冒菜", "code": "mkdr", "type": "Phrase", "weight": 101},
+                {"word": "茂才", "code": "mkdr", "type": "Phrase", "weight": 100},
+            ],
+            "comparisons": [{
+                "success": True,
+                "verdict": "behind_more_common",
+                "decisionReason": "modern_semantic_vs_dictionary_dominated",
+                "summary": "冒菜：现代常用饮食词（语义判断）；茂才：古语，词典收录但语料频次低",
+            }],
+            "evidenceLines": [
+                "「茂才」：词典收录 2，整词语料频次无",
+                "「冒菜」：现代常用饮食词（语义判断）",
+            ],
+        }
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None, **_kwargs):
+            calls.append((tool_name, copy.deepcopy(arguments)))
+            if tool_name == "keytao_lookup_by_code":
+                return json.dumps({
+                    "success": True,
+                    "code": "mkdr",
+                    "phrases": ranking["currentOrder"],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_batch_add_to_draft" and arguments.get("preview_only"):
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "chain-plan-batch",
+                    "contentVersion": 4,
+                    "warningDigest": "a" * 64,
+                    "failedCount": 0,
+                    "skippedCount": 0,
+                    "warnings": [],
+                    "message": "请确认将 2 个修改写入草稿",
+                }, ensure_ascii=False)
+            if tool_name == "keytao_batch_add_to_draft" and arguments.get("confirmed"):
+                return json.dumps({
+                    "success": True,
+                    "batchId": "chain-plan-batch",
+                    "contentVersion": 5,
+                    "successCount": 2,
+                    "failedCount": 0,
+                    "draftItems": arguments["items"],
+                    "draftTotal": 2,
+                }, ensure_ascii=False)
+            if tool_name == "keytao_get_batch_preview":
+                return json.dumps({
+                    "success": True,
+                    "batchId": "chain-plan-batch",
+                    "count": 2,
+                    "items": ranking["proposedOrder"],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_list_draft_items":
+                return json.dumps({
+                    "success": True,
+                    "batchId": "chain-plan-batch",
+                    "count": 2,
+                    "items": ranking["proposedOrder"],
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        intent = MessageCommandIntent(
+            intent="code_chain_reorder",
+            confidence=1.0,
+            requested_code="mkdr",
+        )
+        with (
+            patch.object(chat_commands_module, "conversation_state_store", store),
+            patch.object(chat_commands_module, "call_tool_function", side_effect=fake_call),
+            patch.object(
+                chat_commands_module.keytao_review,
+                "rank_code_chain_by_commonness",
+                AsyncMock(return_value=ranking),
+            ),
+        ):
+            prompt = await chat_commands_module._try_handle_draft_management_command(
+                "重新排序下mkdr 编码链这几个词按优先级",
+                "qq",
+                "chain-owner",
+                command_intent=intent,
+            )
+
+            record = store.get_record(("qq", "chain-owner"))
+            check("server-locked ticket is saved before prompting", record is not None)
+            state = record.state if record is not None else None
+            check(
+                "ticket carries the exact two Change operations",
+                isinstance(state, PendingToolConfirm)
+                and state.confirmation_source == "server_warning"
+                and state.function_name == "keytao_batch_add_to_draft"
+                and len(state.args.get("items", [])) == 2
+                and all(item.get("action") == "Change" for item in state.args["items"]),
+            )
+            check(
+                "plan renders current and proposed order with per-word moves and evidence",
+                prompt is not None
+                and "当前：茂才(100) → 冒菜(101)" in prompt
+                and "建议：冒菜(100) → 茂才(101)" in prompt
+                and "「冒菜」：101 → 100" in prompt
+                and "「茂才」：100 → 101" in prompt
+                and "现代常用饮食词" in prompt,
+            )
+            check(
+                "plan asks for exactly one shared confirmation",
+                prompt is not None and prompt.count(pending_confirmation_copy()) == 1,
+            )
+            check(
+                "prompt phase is read-only",
+                len(calls) == 2
+                and calls[1][1].get("preview_only") is True
+                and calls[1][1].get("confirmed") is not True,
+            )
+
+            completed = await chat_commands_module._execute_confirmed_tool(
+                state,
+                "qq",
+                "chain-owner",
+                ("qq", "chain-owner"),
+            )
+            confirmed_calls = [
+                arguments
+                for name, arguments in calls
+                if name == "keytao_batch_add_to_draft" and arguments.get("confirmed")
+            ]
+            check(
+                "one confirmation writes the exact sealed set with CAS fields",
+                len(confirmed_calls) == 1
+                and confirmed_calls[0]["items"] == state.args["items"]
+                and confirmed_calls[0]["batch_id"] == "chain-plan-batch"
+                and confirmed_calls[0]["expected_content_version"] == 4
+                and confirmed_calls[0]["expected_warning_digest"] == "a" * 64,
+            )
+            check("confirmation reports completion", "已加入草稿" in completed)
+
+            tampered = PendingToolConfirm(
+                function_name=state.function_name,
+                args={**state.args, "items": state.args["items"][:1]},
+                confirmation_source=state.confirmation_source,
+            )
+            before_tamper_calls = len(calls)
+            rejected = await chat_commands_module._execute_confirmed_tool(
+                tampered,
+                "qq",
+                "chain-owner",
+            )
+            check(
+                "tampered exact set is rejected before the sink",
+                len(calls) == before_tamper_calls
+                and "集合校验失败" in rejected,
+            )
+
+    asyncio.run(_run())
+
+
+def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
+    """Empty/unknown evidence asks; an evidence-supported current order is a no-op."""
+    print("\n🧪 code-chain reorder ASK and no-op boundaries")
+
+    async def _run():
+        intent = MessageCommandIntent(
+            intent="code_chain_reorder",
+            confidence=1.0,
+            requested_code="mkdr",
+        )
+        entries = [
+            {"word": "冒菜", "code": "mkdr", "type": "Phrase", "weight": 100},
+            {"word": "茂才", "code": "mkdr", "type": "Phrase", "weight": 101},
+        ]
+
+        async def run_case(phrases, ranking):
+            store = MemoryConversationStateStore()
+            calls = []
+
+            async def fake_call(tool_name, arguments, *_args, **_kwargs):
+                calls.append((tool_name, copy.deepcopy(arguments)))
+                if tool_name == "keytao_lookup_by_code":
+                    return json.dumps({
+                        "success": True,
+                        "code": "mkdr",
+                        "phrases": phrases,
+                    }, ensure_ascii=False)
+                raise AssertionError((tool_name, arguments))
+
+            with (
+                patch.object(chat_commands_module, "conversation_state_store", store),
+                patch.object(chat_commands_module, "call_tool_function", side_effect=fake_call),
+                patch.object(
+                    chat_commands_module.keytao_review,
+                    "rank_code_chain_by_commonness",
+                    AsyncMock(return_value=ranking),
+                ),
+            ):
+                response = await chat_commands_module._try_handle_draft_management_command(
+                    "重排 mkdr",
+                    "qq",
+                    "chain-boundary-owner",
+                    command_intent=intent,
+                )
+            return response, calls, store
+
+        empty_response, empty_calls, empty_store = await run_case([], {})
+        check(
+            "unknown or empty code deterministically asks without a ticket",
+            "当前没有词条" in empty_response
+            and "未生成草稿修改" in empty_response
+            and len(empty_calls) == 1
+            and empty_store.get_record(("qq", "chain-boundary-owner")) is None,
+        )
+
+        ask_response, ask_calls, ask_store = await run_case(entries, {
+            "status": "ask",
+            "reason": "not_enough_evidence",
+            "currentOrder": entries,
+        })
+        check(
+            "evidence tie deterministically asks without previewing a write",
+            "not_enough_evidence" in ask_response
+            and "未生成草稿修改" in ask_response
+            and len(ask_calls) == 1
+            and ask_store.get_record(("qq", "chain-boundary-owner")) is None,
+        )
+
+        already_response, already_calls, already_store = await run_case(entries, {
+            "status": "already_ordered",
+            "reason": "current_order_supported",
+            "currentOrder": entries,
+            "proposedOrder": entries,
+            "comparisons": [{"summary": "冒菜的现代使用证据更强"}],
+            "evidenceLines": ["「冒菜」：语料频次 5000", "「茂才」：词典收录 2"],
+        })
+        check(
+            "supported current order reports no-op without creating a ticket",
+            "当前顺序已经符合" in already_response
+            and "本次未生成草稿修改" in already_response
+            and len(already_calls) == 1
+            and already_store.get_record(("qq", "chain-boundary-owner")) is None,
+        )
+
+    asyncio.run(_run())
+
+
 def test_referenced_word_presence_query_uses_referenced_message_not_history():
     """Verify "这两个词词库都有吗" queries the quoted message, not stale user history."""
     print("\n🧪 referenced word presence query uses referenced message")
@@ -10837,13 +11192,25 @@ async def _run_draft_code_validation_checks():
             {"action": "Create", "word": "喜上眉梢", "code": "xiehmp", "type": "Phrase"},
             {"action": "Create", "word": "喜上眉梢", "code": "XEMEV", "type": "Phrase"},
             {"action": "Delete", "word": "旧词", "code": "abc", "type": "Phrase"},
+            {
+                "action": "Change",
+                "oldWord": "既有词",
+                "word": "既有词",
+                "code": "servercode",
+                "type": "Phrase",
+                "weight": 101,
+            },
         ])
 
     check("invalid code is rejected", invalid.get("success") is False)
     check("invalid reason names code", "xiehmp" in invalid.get("reason", ""))
     check("valid code is accepted", valid.get("success") is True)
-    check("batch validation keeps valid and non-create items", len(valid_items) == 2)
+    check("batch validation keeps valid and non-code-writing items", len(valid_items) == 3)
     check("batch validation normalizes valid code", valid_items[0]["code"] == "xemev")
+    check(
+        "same-word Change stays a server-validated weight operation",
+        valid_items[2].get("oldWord") == valid_items[2].get("word") == "既有词",
+    )
     check("batch validation reports one failed item", len(failed_items) == 1)
     check("failed item keeps original index", failed_items[0]["index"] == 0)
 
@@ -17009,6 +17376,10 @@ if __name__ == "__main__":
     test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority()
     test_augment_simple_word_query_response_handles_multiple_words()
     test_referenced_word_presence_query_extracts_quoted_words()
+    test_referenced_word_presence_query_requires_a_pure_presence_question()
+    test_code_chain_reorder_command_is_structural_and_code_bound()
+    test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation()
+    test_code_chain_reorder_asks_or_noops_without_a_unique_change()
     test_referenced_word_presence_query_uses_referenced_message_not_history()
     test_referenced_word_presence_query_explains_missing_quote_text()
     test_augment_simple_word_query_response_skips_confirm_and_draft_reply()

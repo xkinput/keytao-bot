@@ -40,6 +40,8 @@ from .scenarios import (
     S27_WORD,
     S28_INVALID_CODE,
     S28_WORD,
+    S29_CODE,
+    S29_CURRENT,
     assert_batch_link_hosts,
     same_unique_item_set,
 )
@@ -52,6 +54,7 @@ from .run import (
     ensure_s16_fixture,
     ensure_s18_fixture,
     ensure_s25_fixture,
+    ensure_s29_fixture,
     ensure_scenario_zdic_fixture,
     repair_scenario_dictionary_fixture,
 )
@@ -342,6 +345,25 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("Link=10000", skill)
         self.assertNotIn("（权重 0）", skill)
 
+    def test_advertised_chain_reorder_phrasing_replays_through_closed_parser(self) -> None:
+        from keytao_bot.plugins.chat_routing import _parse_code_chain_reorder_command
+
+        lookup_skill = (
+            Path(__file__).parents[1]
+            / "keytao_bot/skills/keytao-lookup/SKILL.md"
+        ).read_text(encoding="utf-8")
+        advertised = (
+            "重新排序 mkdr 编码链按常用度",
+            "把 mkdr 这条链按常用度排一下",
+            "重排 mkdr",
+        )
+        for phrase in advertised:
+            with self.subTest(phrase=phrase):
+                self.assertIn(f"`{phrase}`", lookup_skill)
+                parsed = _parse_code_chain_reorder_command(phrase)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(parsed.code, "mkdr")
+
     def test_user_visible_reply_guard_rejects_internal_pr_identifiers(self) -> None:
         from keytao_bot.plugins.chat_render import _assert_plain_user_facing_reply
 
@@ -373,15 +395,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S26 replays the add-plus-eviction incident", readme)
         self.assertIn("S27 replays the binding-precheck incident", readme)
         self.assertIn("S28 replays the multi-reading candidate cascade", readme)
+        self.assertIn("S29 replays the 2026-08-20 quoted-summary incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s28(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s29(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 29)],
+            [f"S{index}" for index in range(1, 30)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -748,6 +771,34 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(S28_WORD, "还车")
         self.assertEqual(S28_INVALID_CODE, "zzzzzz")
         self.assertIn("S28", {scenario.scenario_id for scenario in SCENARIOS})
+
+    async def test_s29_seeds_the_exact_weighted_mkdr_chain(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S29"]
+        self.assertEqual(fixture["probe_words"], ("火锅", "电脑"))
+        self.assertEqual(S29_CODE, "mkdr")
+        client = MagicMock()
+        client.phrases_by_code = AsyncMock(side_effect=[
+            [],
+            [
+                {"word": word, "code": S29_CODE, "type": "Phrase", "weight": weight}
+                for word, weight in S29_CURRENT
+            ],
+        ])
+        client.seed_phrase = AsyncMock(side_effect=[
+            {"batchId": "seed-fire"},
+            {"batchId": "seed-computer"},
+        ])
+
+        result = await ensure_s29_fixture(
+            client=client,
+            seed_identity={"platform_id": "9" * 32},
+        )
+
+        self.assertEqual(result["currentOrder"], ["火锅", "电脑"])
+        self.assertEqual(
+            [item.kwargs["weight"] for item in client.seed_phrase.await_args_list],
+            [100, 101],
+        )
 
     def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
         class FakeBuildResult:

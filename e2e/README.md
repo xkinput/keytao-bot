@@ -68,6 +68,10 @@ whole-word reading and its three unique character rows, while user-dictionary
 repair keeps `来都来了` absent. The separately built vendored bot reference DB
 has no exact whole-word reading; the scenario follows the seeded local encode
 reality.
+S29 declares authoritative readings for `火锅` and `电脑`, clears only those
+rig-owned dictionary words, then seeds the exact `mkdr` Phrase chain at weights
+100 and 101. The complete vendored commonness database supplies the ordering
+evidence; the scenario never depends on an external search result.
 
 ## Prerequisites
 
@@ -283,6 +287,15 @@ different valid reading chain. A third clean state sends `添加4并提交` and 
 retain the fourth candidate's code-to-reading binding through submission. The
 invalid-code control must name compact per-reading chains, call no write tool,
 and expose neither a raw candidate dump nor a root-only draft URL.
+
+S29 replays the 2026-08-20 quoted-summary incident. It quotes a bot-authored
+operation summary containing the `mkdr` diff and submit instruction, sends the
+actionable chain-reorder request, and requires a complete current-to-proposed
+plan with evidence and exactly one confirmation. Before confirmation the draft
+must remain empty; after confirmation it must contain only the two sealed
+same-word Change operations at weights 100 and 101. A real quoted presence
+question against the same summary remains on the presence-lookup route and
+cannot change that draft.
 
 Optional overrides:
 

@@ -215,6 +215,87 @@ _WORD_LIBRARY_QUERY_HINTS = (
 )
 
 
+_REFERENCED_WORD_PRESENCE_QUESTION_RE = re.compile(
+    r"(?:有没有|是否(?:在词库|收录|有编码)|是不是(?:在词库|收录)|在不在词库)|"
+    r"(?:在(?:词库)?里|词库(?:都|也)?有|已经?收录|收录了|有编码)"
+    r"(?:吗|么|嘛|没|没有|[?？])"
+)
+
+
+_REFERENCED_WORD_ACTIONABLE_RE = re.compile(
+    r"重新排序|重排|排序|加词|添加|加入|写入|删除|删掉|移除|"
+    r"改到|改成|修改|更名|替换|调整到|移到|挪到|换到|换成|"
+    r"顺延|重新编码|调整权重|按(?:优先级|常用度).{0,8}排|排一下|"
+    r"提交|提审|送审|撤回|清空|清理"
+)
+
+
+@dataclass(frozen=True)
+class CodeChainReorderCommand:
+    """One direct request to reorder the server-resolved same-code chain."""
+
+    code: str
+
+
+_CODE_CHAIN_REORDER_UNSAFE_RE = re.compile(
+    r"不要|别|不用|无需|不必|取消|停止|他说|她说|他们说|有人说|"
+    r"引用|转发|转述|复述|解释|举例|例子|假设|如果|"
+    r"提交|提审|送审|删除|删掉|移除|加词|添加|加入|写入|顺延|改到|调整到"
+)
+
+
+_CODE_CHAIN_REORDER_DIRECT_RE = re.compile(
+    r"(?:重新排序|重排)(?:下|一下)?"
+    r"(?P<code>[a-z]{1,6})"
+    r"(?:(?:这条)?(?:编码)?链)?"
+    r"(?:(?:这几个|这些|这)词)?"
+    r"(?:按(?:优先级|常用度)(?:排(?:序)?(?:一下)?|重新排序)?)?"
+    r"(?:一下|吧)?",
+    re.IGNORECASE,
+)
+
+
+_CODE_CHAIN_REORDER_BA_RE = re.compile(
+    r"(?:把|将)(?P<code>[a-z]{1,6})(?:这条)?(?:编码)?链"
+    r"(?:按(?:优先级|常用度))?"
+    r"(?:重新排序|重排|排(?:序)?)(?:一下|吧)?",
+    re.IGNORECASE,
+)
+
+
+def _parse_code_chain_reorder_command(
+    message_text: str,
+) -> Optional[CodeChainReorderCommand]:
+    """Parse a closed, positive whole-message code-chain reorder command."""
+    raw = unicodedata.normalize(
+        "NFKC",
+        _strip_command_message_prefixes(message_text),
+    ).strip()
+    if (
+        not raw
+        or re.search(r"[?？\"'“”‘’「」《》【】\[\]（）()<>]", raw)
+        or _CODE_CHAIN_REORDER_UNSAFE_RE.search(raw)
+    ):
+        return None
+    compact = re.sub(r"[\s，,。.!！~～]+", "", raw)
+    polite = r"(?:(?:请|请你|帮我|麻烦|麻烦你|劳驾|拜托|给我))?"
+    match = re.fullmatch(
+        polite + r"(?:" + _CODE_CHAIN_REORDER_DIRECT_RE.pattern + r")",
+        compact,
+        re.IGNORECASE,
+    )
+    if match is None:
+        match = re.fullmatch(
+            polite + r"(?:" + _CODE_CHAIN_REORDER_BA_RE.pattern + r")",
+            compact,
+            re.IGNORECASE,
+        )
+    if match is None:
+        return None
+    code = str(match.group("code") or "").strip().lower()
+    return CodeChainReorderCommand(code=code) if _CODE_TOKEN_RE.fullmatch(code) else None
+
+
 _DRAFT_SUBMIT_COMMANDS = {
     "提交",
     "提审",
@@ -294,6 +375,7 @@ _DRAFT_FLOW_INTENTS = frozenset({
     "draft_keep_only",
     "operation_recall",
     "batch_replace_char",
+    "code_chain_reorder",
 })
 
 
@@ -1234,6 +1316,16 @@ def _multi_word_candidate_scope_rows(
         or len(set(words)) != len(words)
     ):
         return [], {}
+    if any(
+        str(item.get("action") or "Create") != "Create"
+        or item.get("old_word")
+        or item.get("oldWord")
+        for item in clean_items
+    ):
+        # This parser is only for choosing among advertised add candidates.
+        # A batch of Change operations (for example a sealed chain reorder)
+        # must reach its own exact-set validator unchanged.
+        return [], {}
 
     raw_scopes = state.args.get("_candidate_scopes")
     if not isinstance(raw_scopes, list):
@@ -1500,6 +1592,12 @@ def _is_fresh_current_user_command_intent(
         return _message_authorizes_draft_clear(message_text, command_intent)
     if command_intent.intent == "batch_replace_char":
         return _message_authorizes_replace_char(message_text, command_intent)
+    if command_intent.intent == "code_chain_reorder":
+        command = _parse_code_chain_reorder_command(message_text)
+        return bool(
+            command is not None
+            and command.code == command_intent.requested_code
+        )
     return command_intent.intent in {
         "draft_view",
         "operation_recall",
@@ -1674,6 +1772,7 @@ def _parse_message_command_intent_payload(payload: Dict) -> MessageCommandIntent
         "draft_keep_only",
         "operation_recall",
         "batch_replace_char",
+        "code_chain_reorder",
         "pending_confirm",
         "pending_cancel",
         "pending_add_and_submit",
@@ -1746,6 +1845,13 @@ def _structural_draft_management_intent(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Keep the safest common recall/clear commands independent of the LLM."""
+    chain_reorder = _parse_code_chain_reorder_command(message_text)
+    if chain_reorder is not None:
+        return MessageCommandIntent(
+            intent="code_chain_reorder",
+            confidence=1.0,
+            requested_code=chain_reorder.code,
+        )
     return _canonical_draft_management_command(message_text)
 
 
@@ -2255,6 +2361,10 @@ def _is_referenced_word_presence_query(message_text: str) -> bool:
     text = _strip_command_message_prefixes(message_text)
     text = re.sub(r"\s+", "", text)
     if not text:
+        return False
+    if _REFERENCED_WORD_ACTIONABLE_RE.search(text):
+        return False
+    if _REFERENCED_WORD_PRESENCE_QUESTION_RE.search(text) is None:
         return False
     has_reference_hint = any(hint in text for hint in _REFERENCED_WORD_QUERY_HINTS)
     has_library_hint = any(hint in text for hint in _WORD_LIBRARY_QUERY_HINTS)

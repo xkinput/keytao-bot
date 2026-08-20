@@ -21,6 +21,7 @@ from ..harness.conversation import (
     normalize_conversation_key,
 )
 from ..harness.authorization_grammar import (
+    _PHRASE_TYPE_BASE_WEIGHTS,
     explicit_complete_add_item,
     parse_eviction_modified_add,
 )
@@ -125,6 +126,7 @@ from .chat_routing import (
     _message_authorizes_draft_recall,
     _message_authorizes_pending_state_control,
     _message_authorizes_replace_char,
+    _parse_code_chain_reorder_command,
     _parse_pending_choice_index,
     _pending_owner_label,
     _pending_assent_rejection_response,
@@ -3203,6 +3205,108 @@ def _resolved_advertised_items_match(state: PendingToolConfirm) -> bool:
     return actual == expected
 
 
+def _chain_reorder_plan_digest(plan: Dict[str, Any]) -> str:
+    sealed = {key: value for key, value in plan.items() if key != "digest"}
+    payload = json.dumps(
+        sealed,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _chain_reorder_expected_items(plan: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    code = str(plan.get("code") or "").strip().lower()
+    groups = plan.get("groups")
+    if not re.fullmatch(r"[a-z]{2,12}", code) or not isinstance(groups, list) or not groups:
+        return None
+    expected: List[Dict[str, Any]] = []
+    seen = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            return None
+        phrase_type = str(group.get("type") or "").strip()
+        base_weight = _PHRASE_TYPE_BASE_WEIGHTS.get(phrase_type)
+        current = group.get("current")
+        proposed = group.get("proposed")
+        if (
+            base_weight is None
+            or not isinstance(current, list)
+            or not isinstance(proposed, list)
+            or not current
+            or len(current) != len(proposed)
+        ):
+            return None
+        current_by_word: Dict[str, Dict[str, Any]] = {}
+        for entry in current:
+            if not isinstance(entry, dict):
+                return None
+            word = str(entry.get("word") or "").strip()
+            weight = entry.get("weight")
+            identity = (phrase_type, word)
+            if (
+                not word
+                or entry.get("code") != code
+                or entry.get("type") != phrase_type
+                or not isinstance(weight, int)
+                or isinstance(weight, bool)
+                or weight < base_weight
+                or identity in seen
+            ):
+                return None
+            seen.add(identity)
+            current_by_word[word] = entry
+        proposed_words = []
+        for index, entry in enumerate(proposed):
+            if not isinstance(entry, dict):
+                return None
+            word = str(entry.get("word") or "").strip()
+            target_weight = entry.get("weight")
+            current_entry = current_by_word.get(word)
+            if (
+                current_entry is None
+                or entry.get("code") != code
+                or entry.get("type") != phrase_type
+                or target_weight != base_weight + index
+            ):
+                return None
+            proposed_words.append(word)
+            if current_entry["weight"] != target_weight:
+                expected.append({
+                    "action": "Change",
+                    "old_word": word,
+                    "word": word,
+                    "code": code,
+                    "type": phrase_type,
+                    "weight": target_weight,
+                })
+        if len(set(proposed_words)) != len(current_by_word):
+            return None
+    return expected or None
+
+
+def _resolved_chain_reorder_items_match(state: PendingToolConfirm) -> bool:
+    """Fail closed if a chain-order ticket no longer carries its sealed set."""
+    pending_display = state.args.get("_pending_display")
+    if not isinstance(pending_display, dict) or "chainReorderPlan" not in pending_display:
+        return True
+    plan = pending_display.get("chainReorderPlan")
+    expected_items = _chain_reorder_expected_items(plan) if isinstance(plan, dict) else None
+    if (
+        state.function_name != "keytao_batch_add_to_draft"
+        or not isinstance(plan, dict)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(plan.get("digest") or ""))
+        or _chain_reorder_plan_digest(plan) != plan.get("digest")
+        or not isinstance(plan.get("items"), list)
+        or not isinstance(state.args.get("items"), list)
+        or expected_items is None
+    ):
+        return False
+    return state.args["items"] == plan["items"] == expected_items
+
+
 def _prepend_resolved_advertised_words(
     state: PendingToolConfirm,
     response: str,
@@ -3359,6 +3463,10 @@ async def _execute_confirmed_tool(
             "候选集合校验失败，当前确认已失效；本次未写入",
             command=("加词 " + " ".join(invalid_words)) if invalid_words else "",
             words=invalid_words,
+        )
+    if not _resolved_chain_reorder_items_match(state):
+        return render_remediation_reply(
+            "编码链重排集合校验失败，当前确认已失效；本次未写入",
         )
 
     args = _pending_execution_args(state)
@@ -5202,6 +5310,318 @@ async def _try_handle_keep_only_draft_items_command(
     return "\n".join(prefix_parts) + "\n" + await _format_draft_response(remove_data, platform, user_id)
 
 
+def _chain_reorder_ask(code: str, reason: str) -> str:
+    return render_remediation_reply(
+        f"编码 {code} 的同码链暂时无法形成唯一、可核验的常用度顺序：{reason}；"
+        "本次未生成草稿修改"
+    )
+
+
+def _validated_code_chain_entries(data: Dict[str, Any], code: str) -> Optional[List[Dict[str, Any]]]:
+    phrases = data.get("phrases")
+    if data.get("success") is not True or not isinstance(phrases, list):
+        return None
+    entries: List[Dict[str, Any]] = []
+    seen = set()
+    for phrase in phrases:
+        if not isinstance(phrase, dict):
+            return None
+        word = str(phrase.get("word") or "").strip()
+        phrase_code = str(phrase.get("code") or "").strip().lower()
+        phrase_type = str(phrase.get("type") or "").strip()
+        weight = phrase.get("weight")
+        identity = (phrase_type, word)
+        base_weight = _PHRASE_TYPE_BASE_WEIGHTS.get(phrase_type)
+        if (
+            not word
+            or phrase_code != code
+            or base_weight is None
+            or not isinstance(weight, int)
+            or isinstance(weight, bool)
+            or weight < base_weight
+            or identity in seen
+        ):
+            return None
+        seen.add(identity)
+        entries.append({
+            "word": word,
+            "code": phrase_code,
+            "type": phrase_type,
+            "weight": weight,
+        })
+    entries.sort(key=lambda entry: (
+        str(entry["type"]),
+        int(entry["weight"]),
+        str(entry["word"]),
+    ))
+    return entries
+
+
+def _format_chain_order(entries: List[Dict[str, Any]]) -> str:
+    return " → ".join(
+        f"{entry['word']}({entry['weight']})"
+        for entry in entries
+    )
+
+
+def _format_code_chain_reorder_confirmation(
+    plan: Dict[str, Any],
+    preview_data: Dict[str, Any],
+) -> str:
+    lines = [f"🔁 编码 {plan['code']} 同码链常用度重排计划："]
+    groups = plan.get("groups") if isinstance(plan.get("groups"), list) else []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        if len(groups) > 1:
+            lines.append(f"{group.get('type') or '未知类型'}：")
+        current = group.get("current") if isinstance(group.get("current"), list) else []
+        proposed = group.get("proposed") if isinstance(group.get("proposed"), list) else []
+        lines.append("当前：" + _format_chain_order(current))
+        lines.append("建议：" + _format_chain_order(proposed))
+
+    lines.append("移动：")
+    for item in plan.get("moves") or []:
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            f"• 「{item.get('word') or ''}」："
+            f"{item.get('fromWeight')} → {item.get('toWeight')}"
+            f"（第{int(item.get('fromPosition') or 0) + 1}位 → "
+            f"第{int(item.get('toPosition') or 0) + 1}位）"
+        )
+
+    evidence = [
+        str(line).strip()
+        for group in groups
+        if isinstance(group, dict)
+        for line in group.get("evidenceLines") or []
+        if str(line).strip()
+    ]
+    summaries = [
+        str(comparison.get("summary") or "").strip()
+        for group in groups
+        if isinstance(group, dict)
+        for comparison in group.get("comparisons") or []
+        if isinstance(comparison, dict) and str(comparison.get("summary") or "").strip()
+    ]
+    visible_evidence = list(OrderedDict.fromkeys([*evidence, *summaries]))
+    if visible_evidence:
+        lines.append("常用度证据：")
+        lines.extend(f"• {line}" for line in visible_evidence)
+
+    warnings = preview_data.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        lines.append("服务端风险：")
+        lines.extend(f"• {_plain_warning_message(warning)}" for warning in warnings)
+    lines.extend((
+        "",
+        "服务端已锁定以上完整修改集合。",
+        pending_confirmation_copy(),
+    ))
+    return _assert_plain_user_facing_reply("\n".join(lines))
+
+
+async def _try_handle_code_chain_reorder_command(
+    message_text: str,
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    command = _parse_code_chain_reorder_command(message_text)
+    if (
+        command is None
+        or command_intent.intent != "code_chain_reorder"
+        or command_intent.requested_code != command.code
+    ):
+        return None
+    set_turn_flow("draft-op")
+    code = command.code
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_code",
+        {"code": code},
+        platform,
+        user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+    entries = _validated_code_chain_entries(lookup_data, code)
+    if entries is None:
+        return _chain_reorder_ask(code, "服务端没有返回完整的词、类型和权重记录")
+    if not entries:
+        return _chain_reorder_ask(code, "当前没有词条")
+    if len(entries) > MAX_REPLACE_CHAR_ITEMS:
+        return _chain_reorder_ask(
+            code,
+            f"完整链共有 {len(entries)} 条，超过单条确认可完整展示的 {MAX_REPLACE_CHAR_ITEMS} 条上限",
+        )
+
+    async def load_semantic_review(word: str) -> Dict[str, Any]:
+        review_json = await call_tool_function(
+            "keytao_prepare_reviewed_add",
+            {"word": word},
+            platform,
+            user_id,
+        )
+        try:
+            review = json.loads(review_json)
+        except Exception:
+            return {}
+        return review if isinstance(review, dict) else {}
+
+    groups_by_type: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+    for entry in entries:
+        groups_by_type.setdefault(entry["type"], []).append(entry)
+
+    groups: List[Dict[str, Any]] = []
+    items: List[Dict[str, Any]] = []
+    moves: List[Dict[str, Any]] = []
+    any_reorder = False
+    for phrase_type, current_entries in groups_by_type.items():
+        ranking = await keytao_review.rank_code_chain_by_commonness(
+            current_entries,
+            semantic_review_loader=load_semantic_review,
+        )
+        if not isinstance(ranking, dict) or ranking.get("status") == "ask":
+            reason = str((ranking or {}).get("reason") or "常用度证据不足")
+            return _chain_reorder_ask(code, reason)
+        proposed_source = ranking.get("proposedOrder")
+        if not isinstance(proposed_source, list) or len(proposed_source) != len(current_entries):
+            return _chain_reorder_ask(code, "排序器没有返回完整的同码集合")
+        current_by_identity = {
+            (entry["type"], entry["word"]): entry
+            for entry in current_entries
+        }
+        current_position_by_identity = {
+            (entry["type"], entry["word"]): index
+            for index, entry in enumerate(current_entries)
+        }
+        proposed_entries: List[Dict[str, Any]] = []
+        proposed_identities = []
+        base_weight = _PHRASE_TYPE_BASE_WEIGHTS[phrase_type]
+        for index, raw_entry in enumerate(proposed_source):
+            if not isinstance(raw_entry, dict):
+                return _chain_reorder_ask(code, "排序器返回了无效词条")
+            identity = (
+                str(raw_entry.get("type") or "").strip(),
+                str(raw_entry.get("word") or "").strip(),
+            )
+            current = current_by_identity.get(identity)
+            if current is None:
+                return _chain_reorder_ask(code, "排序器改变了服务端词条集合")
+            proposed_identities.append(identity)
+            target_weight = base_weight + index
+            proposed = {**current, "weight": target_weight}
+            proposed_entries.append(proposed)
+            if current["weight"] != target_weight:
+                item = {
+                    "action": "Change",
+                    "old_word": current["word"],
+                    "word": current["word"],
+                    "code": code,
+                    "type": phrase_type,
+                    "weight": target_weight,
+                }
+                items.append(item)
+            moves.append({
+                "word": current["word"],
+                "type": phrase_type,
+                "fromWeight": current["weight"],
+                "toWeight": target_weight,
+                "fromPosition": current_position_by_identity[identity],
+                "toPosition": index,
+            })
+        if len(set(proposed_identities)) != len(current_entries):
+            return _chain_reorder_ask(code, "排序器改变了服务端词条集合")
+        any_reorder = any_reorder or ranking.get("status") == "reorder"
+        groups.append({
+            "type": phrase_type,
+            "current": current_entries,
+            "proposed": proposed_entries,
+            "comparisons": [
+                {
+                    key: comparison.get(key)
+                    for key in (
+                        "frontWord",
+                        "behindWord",
+                        "verdict",
+                        "decisionReason",
+                        "summary",
+                    )
+                    if comparison.get(key) is not None
+                }
+                for comparison in ranking.get("comparisons") or []
+                if isinstance(comparison, dict)
+            ],
+            "evidenceLines": ranking.get("evidenceLines") or [],
+        })
+
+    if not any_reorder:
+        lines = [f"编码 {code} 当前顺序已经符合可核验的常用度证据，本次未生成草稿修改。"]
+        for group in groups:
+            lines.append("当前：" + _format_chain_order(group["current"]))
+            for evidence in group["evidenceLines"]:
+                if str(evidence).strip():
+                    lines.append("• " + str(evidence).strip())
+        return _assert_plain_user_facing_reply("\n".join(lines))
+    if not items:
+        return _chain_reorder_ask(code, "建议顺序没有形成可执行的权重变化")
+
+    plan: Dict[str, Any] = {
+        "code": code,
+        "groups": groups,
+        "moves": moves,
+        "items": items,
+    }
+    plan["digest"] = _chain_reorder_plan_digest(plan)
+    preview_json = await call_tool_function(
+        "keytao_batch_add_to_draft",
+        {"items": items, "preview_only": True},
+        platform,
+        user_id,
+    )
+    try:
+        preview_data = json.loads(preview_json)
+    except Exception:
+        preview_data = {}
+    if (
+        preview_data.get("requiresConfirmation") is not True
+        or int(preview_data.get("failedCount") or 0) != 0
+        or int(preview_data.get("skippedCount") or 0) != 0
+        or bool(preview_data.get("failed"))
+        or bool(preview_data.get("skipped"))
+        or not isinstance(preview_data.get("warnings", []), list)
+    ):
+        return _chain_reorder_ask(code, "服务端未锁定完整修改快照")
+    preview_data["chainReorderPlan"] = plan
+    pending = _pending_state_from_server_warning(
+        PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={"items": items},
+        ),
+        preview_data,
+    )
+    if not server_warning_ticket_is_complete(pending) or not _resolved_chain_reorder_items_match(pending):
+        return _chain_reorder_ask(code, "服务端确认票据不完整")
+
+    confirmation = _format_code_chain_reorder_confirmation(plan, preview_data)
+    if len(confirmation) > MAX_REPLACE_CONFIRMATION_CHARS:
+        return _chain_reorder_ask(code, "完整计划超出单条消息展示上限")
+    saved = conversation_state_store.set(
+        (platform, user_id),
+        pending,
+        space_key=space_key,
+        owner_label=owner_label,
+    )
+    if not saved:
+        return _chain_reorder_ask(code, "完整确认票据无法安全保存")
+    return confirmation
+
+
 async def _try_handle_draft_management_command(
     message_text: str,
     platform: str,
@@ -5244,6 +5664,17 @@ async def _try_handle_draft_management_command(
 
     if command_intent is None:
         command_intent = await _classify_message_command_intent(message_text)
+
+    response = await _try_handle_code_chain_reorder_command(
+        message_text,
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
 
     response = await _try_handle_draft_recall_command(
         message_text,

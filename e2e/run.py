@@ -1165,6 +1165,57 @@ async def ensure_s25_fixture(
     )
 
 
+async def ensure_s29_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed the exact mkdr chain used by the quoted-reorder incident."""
+    expected = (
+        ("火锅", 100),
+        ("电脑", 101),
+    )
+    existing = [
+        row
+        for row in await client.phrases_by_code("mkdr")
+        if row.get("code") == "mkdr"
+    ]
+    if existing:
+        raise RigInfrastructureError(
+            f"S29 requires an empty exact mkdr fixture slot before seeding: {existing}"
+        )
+    seeded = []
+    for word, weight in expected:
+        seeded.append(await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word=word,
+            code="mkdr",
+            weight=weight,
+        ))
+    exact_rows = [
+        row
+        for row in await client.phrases_by_code("mkdr")
+        if row.get("code") == "mkdr"
+    ]
+    actual = tuple(
+        (str(row.get("word") or ""), row.get("weight"))
+        for row in sorted(
+            exact_rows,
+            key=lambda row: (int(row.get("weight") or 0), str(row.get("word") or "")),
+        )
+    )
+    if actual != expected or any(row.get("type") != "Phrase" for row in exact_rows):
+        raise RigInfrastructureError(
+            f"S29 exact mkdr chain did not match the seeded weights: {exact_rows}"
+        )
+    return {
+        "code": "mkdr",
+        "currentOrder": [word for word, _weight in expected],
+        "currentWeights": [weight for _word, weight in expected],
+        "seedBatches": [value.get("batchId") for value in seeded],
+    }
+
+
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
     apply_bot_environment(config)
     import nonebot
@@ -1484,6 +1535,12 @@ async def async_main(args: argparse.Namespace) -> int:
                             client=client,
                             scenario_id=scenario.scenario_id,
                             recorder=recorder,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S29":
+                        fixture_facts["s29"] = await ensure_s29_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     await client.clean_draft(identities[scenario.scenario_id]["platform_id"])

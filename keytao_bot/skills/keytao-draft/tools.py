@@ -386,8 +386,16 @@ def _should_validate_item_code(item: Dict) -> bool:
     action = str(item.get("action") or "Create")
     if action not in CODE_WRITING_ACTIONS:
         return False
+    word = str(item.get("word") or "").strip()
+    old_word = str(item.get("oldWord") or item.get("old_word") or "").strip()
+    # A same-word Change addresses an existing server record at this code and
+    # changes only metadata such as weight. The server preview/confirmation
+    # contract validates that record identity; re-running pronunciation-based
+    # Create validation here would incorrectly reject legacy or custom codes.
+    if action == "Change" and old_word and old_word == word:
+        return False
     return bool(
-        str(item.get("word") or "").strip()
+        word
         and str(item.get("code") or "").strip()
     )
 

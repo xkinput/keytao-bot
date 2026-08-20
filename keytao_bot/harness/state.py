@@ -91,11 +91,13 @@ def _server_confirmation_display(data: Dict) -> Dict:
         except (TypeError, ValueError):
             continue
 
-    shift_plan = data.get("shiftPlan")
-    if isinstance(shift_plan, dict):
+    for key in ("shiftPlan", "chainReorderPlan"):
+        plan = data.get(key)
+        if not isinstance(plan, dict):
+            continue
         try:
-            display["shiftPlan"] = json.loads(json.dumps(
-                shift_plan,
+            display[key] = json.loads(json.dumps(
+                plan,
                 ensure_ascii=False,
                 allow_nan=False,
             ))

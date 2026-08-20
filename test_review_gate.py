@@ -4503,6 +4503,137 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
     asyncio.run(_run())
 
 
+def test_existing_code_chain_commonness_ranking_uses_modern_override_and_asks_on_unknown():
+    """Existing-chain ranking shares the comparator and fails closed on no evidence."""
+    print("\n🧪 existing code-chain commonness ranking")
+
+    entries = [
+        {"word": "茂才", "code": "mkdr", "type": "Phrase", "weight": 100},
+        {"word": "冒菜", "code": "mkdr", "type": "Phrase", "weight": 101},
+    ]
+    baseline = {
+        "success": True,
+        "verdict": "front_more_common",
+        "summary": "「茂才」较「冒菜」更常用：词典信号",
+        "decisionReason": "dictionary_presence_margin",
+        "front": {"reference": {
+            "available": True,
+            "attested": True,
+            "corpusFrequency": None,
+            "dictionaryPresenceCount": 2,
+        }},
+        "behind": {"reference": {
+            "available": True,
+            "attested": False,
+            "corpusFrequency": None,
+            "dictionaryPresenceCount": 0,
+        }},
+    }
+    modern_review = {
+        "preSubmitAudit": {
+            "semanticContextAutoPassItems": [{
+                "word": "冒菜",
+                "assessment": {
+                    "accepted": True,
+                    "confidence": 0.96,
+                    "meaning": "现代常用饮食词",
+                    "nonObscurity": {
+                        "route": "common_characters_and_llm",
+                        "characterReferences": [
+                            {"corpusFrequency": 5231},
+                            {"corpusFrequency": 8544},
+                        ],
+                    },
+                },
+            }],
+        },
+    }
+
+    async def _run():
+        semantic_loader = AsyncMock(return_value=modern_review)
+        with patch.object(
+            review_module,
+            "compare_word_commonness",
+            AsyncMock(return_value=baseline),
+        ):
+            ranked = await review_module.rank_code_chain_by_commonness(
+                entries,
+                semantic_review_loader=semantic_loader,
+            )
+        check(
+            "modern word moves ahead of dictionary-dominated archaic word",
+            ranked.get("status") == "reorder"
+            and [item["word"] for item in ranked.get("proposedOrder", [])]
+            == ["冒菜", "茂才"],
+        )
+        check(
+            "modern override evidence is retained",
+            ranked.get("comparisons", [{}])[0].get("decisionReason")
+            == "modern_semantic_vs_dictionary_dominated",
+        )
+        check(
+            "semantic evidence is loaded only for the possible modern side",
+            semantic_loader.await_count == 1
+            and semantic_loader.await_args.args == ("冒菜",),
+        )
+
+        with patch.object(
+            review_module,
+            "compare_word_commonness",
+            AsyncMock(return_value={
+                "success": True,
+                "verdict": "not_enough_evidence",
+                "summary": "常用度信号不足",
+                "front": {},
+                "behind": {},
+            }),
+        ):
+            unknown = await review_module.rank_code_chain_by_commonness(entries)
+        check(
+            "no-evidence tie produces deterministic ASK",
+            unknown.get("status") == "ask"
+            and unknown.get("reason") == "not_enough_evidence",
+        )
+
+        with patch.object(
+            review_module,
+            "compare_word_commonness",
+            AsyncMock(return_value={
+                "success": True,
+                "verdict": "close",
+                "summary": "两词接近",
+                "front": {},
+                "behind": {},
+            }),
+        ):
+            unevidenced_close = await review_module.rank_code_chain_by_commonness(entries)
+        check(
+            "close result without any evidence also produces deterministic ASK",
+            unevidenced_close.get("status") == "ask"
+            and unevidenced_close.get("reason") == "not_enough_evidence",
+        )
+
+        with patch.object(
+            review_module,
+            "compare_word_commonness",
+            AsyncMock(return_value={
+                "success": True,
+                "verdict": "unexpected",
+                "summary": "未知比较结论",
+                "front": baseline["front"],
+                "behind": baseline["behind"],
+            }),
+        ):
+            unexpected = await review_module.rank_code_chain_by_commonness(entries)
+        check(
+            "unknown comparator verdict fails closed",
+            unexpected.get("status") == "ask"
+            and unexpected.get("reason") == "not_enough_evidence",
+        )
+
+    asyncio.run(_run())
+
+
 def test_audit_budget_nesting_and_timeout_retains_review():
     print("\n🧪 audit budget nesting and partial-result retention")
 
@@ -4975,6 +5106,7 @@ def main():
     test_batch_add_uses_structured_verdict_not_prose()
     test_candidate_commonness_wiring_and_timeout()
     test_modern_semantic_vs_dictionary_dominated_commonness_matrix()
+    test_existing_code_chain_commonness_ranking_uses_modern_override_and_asks_on_unknown()
     test_audit_budget_nesting_and_timeout_retains_review()
     test_multi_sense_agreeing_evidence_recommends_authoritative_reading()
     test_multi_sense_conflicting_evidence_asks_for_clarification()

@@ -218,6 +218,12 @@ class ScenarioContext:
     def last_reply_message_id(self) -> int | None:
         return self.bot.last_reply_message_id
 
+    def inject_bot_message(self, text: str) -> int:
+        return self.bot.inject_bot_message(
+            platform_id=self.platform_id,
+            text=text,
+        )
+
     async def send(self, text: str) -> str:
         reply = await self.bot.send(
             platform_id=self.platform_id,
@@ -3485,6 +3491,166 @@ async def scenario_s28(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S29_CODE = "mkdr"
+S29_CURRENT = (("火锅", 100), ("电脑", 101))
+S29_PROPOSED = (("电脑", 100), ("火锅", 101))
+S29_INCIDENT_COMMAND = "重新排序下mkdr 编码链这几个词按优先级"
+S29_PRESENCE_CONTROL = "这两个词现在词库都有吗"
+
+
+async def scenario_s29(ctx: ScenarioContext) -> dict[str, Any]:
+    messages: list[str] = []
+    replies: list[str] = []
+
+    # Register the bot-authored operation-summary context directly at the
+    # OneBot boundary. The scenario under test starts with the user's native
+    # quote and therefore must not depend on an unrelated model-generated turn.
+    summary_reply = (
+        "✅ 操作已完成\n"
+        "草稿变更：\n"
+        "• Change：「火锅」mkdr，权重 101 → 102\n"
+        "请检查以上变更，确认后提交。"
+    )
+    replies.append(summary_reply)
+    assert_reply_mentions(summary_reply, "操作已完成", "mkdr", "提交")
+    summary_message_id = ctx.inject_bot_message(summary_reply)
+    require(
+        isinstance(summary_message_id, int) and summary_message_id > 0,
+        "S29 harness did not retain the operation-summary message id",
+    )
+
+    reorder_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S29_INCIDENT_COMMAND)
+    plan_reply = await ctx.send_group_reply(
+        S29_INCIDENT_COMMAND,
+        reply_message_id=summary_message_id,
+        to_me=True,
+    )
+    replies.append(plan_reply)
+    assert_reply_mentions(
+        plan_reply,
+        "编码 mkdr 同码链常用度重排计划",
+        "当前：火锅(100) → 电脑(101)",
+        "建议：电脑(100) → 火锅(101)",
+        "「电脑」：101 → 100",
+        "「火锅」：100 → 101",
+        "常用度证据",
+    )
+    require(
+        plan_reply.count(pending_confirmation_copy()) == 1,
+        f"S29 plan did not carry exactly one shared confirmation: {plan_reply}",
+    )
+    draft_before_confirm = await ctx.draft()
+    require(
+        not draft_before_confirm.get("items"),
+        f"S29 wrote before confirmation: {draft_before_confirm}",
+    )
+    reorder_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > reorder_cutoff
+        and event.get("kind") == "tool"
+    ]
+    require(
+        any(event.get("name") == "keytao_lookup_by_code" for event in reorder_events)
+        and not any(event.get("name") == "keytao_lookup_by_words_batch" for event in reorder_events),
+        f"S29 incident turn did not stay on the code-chain route: {reorder_events}",
+    )
+
+    messages.append("确认")
+    confirm_reply = await ctx.send_group("确认", to_me=True)
+    replies.append(confirm_reply)
+    assert_reply_mentions(confirm_reply, "已加入草稿", "火锅", "电脑", "mkdr")
+    draft = await ctx.draft()
+    actual = tuple(sorted(
+        (
+            str(item.get("word") or ""),
+            item.get("weight"),
+        )
+        for item in draft.get("items", [])
+        if isinstance(item, dict)
+        and item.get("action") == "Change"
+        and item.get("code") == S29_CODE
+        and item.get("type") == "Phrase"
+        and item.get("oldWord") == item.get("word")
+    ))
+    require(
+        len(draft.get("items", [])) == 2
+        and actual == tuple(sorted(S29_PROPOSED)),
+        f"S29 confirmation did not write the exact proposed weights: {draft}",
+    )
+    batch_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > reorder_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    confirmed_calls = [
+        event
+        for event in batch_calls
+        if event.get("arguments", {}).get("confirmed") is True
+    ]
+    require(
+        len(confirmed_calls) == 1,
+        f"S29 expected one confirmed batch replay: {batch_calls}",
+    )
+
+    presence_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S29_PRESENCE_CONTROL)
+    presence_reply = await ctx.send_group_reply(
+        S29_PRESENCE_CONTROL,
+        reply_message_id=summary_message_id,
+        to_me=True,
+    )
+    replies.append(presence_reply)
+    assert_reply_mentions(presence_reply, "查的是你引用那条消息里的")
+    presence_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > presence_cutoff
+        and event.get("kind") == "tool"
+    ]
+    require(
+        any(event.get("name") == "keytao_lookup_by_words_batch" for event in presence_events)
+        and not any(
+            event.get("name") == "keytao_batch_add_to_draft"
+            for event in presence_events
+        ),
+        f"S29 presence control did not stay on the quoted lookup route: {presence_events}",
+    )
+    draft_after_control = await ctx.draft()
+    require(
+        tuple(sorted(
+            (str(item.get("word") or ""), item.get("weight"))
+            for item in draft_after_control.get("items", [])
+            if isinstance(item, dict)
+        )) == tuple(sorted(S29_PROPOSED)),
+        f"S29 presence control changed the sealed draft: {draft_after_control}",
+    )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft_after_control,
+        "facts": {
+            "code": S29_CODE,
+            "quotedSummaryMessageId": summary_message_id,
+            "currentOrder": [word for word, _weight in S29_CURRENT],
+            "proposedOrder": [word for word, _weight in S29_PROPOSED],
+            "confirmationSteps": 1,
+            "confirmedBatchCalls": len(confirmed_calls),
+            "presenceControlTool": "keytao_lookup_by_words_batch",
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -3514,6 +3680,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S26", "server-resolved add with occupant eviction", scenario_s26),
     Scenario("S27", "binding precheck and question-turn reply", scenario_s27),
     Scenario("S28", "reviewed multi-reading cascade closure", scenario_s28),
+    Scenario("S29", "quoted same-code commonness reorder", scenario_s29),
 )
 
 
