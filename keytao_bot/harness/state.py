@@ -265,6 +265,7 @@ def pending_execution_args(state: PendingToolConfirm) -> Dict:
     """Return sealed execution arguments without display-only facts."""
     args = dict(state.args)
     args.pop("_pending_display", None)
+    args.pop("_continuation_command", None)
     return args
 
 

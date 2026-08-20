@@ -3119,6 +3119,9 @@ async def keytao_update_draft_item_weight(
     word: str,
     code: str,
     weight: int,
+    *,
+    batch_id: Optional[str] = None,
+    snapshot: Optional[Dict] = None,
 ) -> Dict:
     """Update one exact server-known draft item through a CAS-bound route."""
     word = str(word or "").strip()
@@ -3134,9 +3137,27 @@ async def keytao_update_draft_item_weight(
             "message": "权重调整需要完整的词条、编码和整数权重，本次未写入。",
         }
 
-    snapshot = await keytao_list_draft_items(platform, platform_id)
+    requested_batch_id = str(batch_id or "").strip()
+    if snapshot is None:
+        snapshot = await keytao_list_draft_items(
+            platform,
+            platform_id,
+            batch_id=requested_batch_id or None,
+        )
+    elif not isinstance(snapshot, dict):
+        return {
+            "success": False,
+            "message": "草稿快照格式无效，本次未写入。",
+        }
     if not snapshot.get("success"):
         return snapshot
+    snapshot_batch_id = str(snapshot.get("batchId") or "").strip()
+    if requested_batch_id and snapshot_batch_id != requested_batch_id:
+        return {
+            "success": False,
+            "staleConfirmation": True,
+            "message": "草稿批次已变化，本次未写入。",
+        }
     matches = [
         item
         for item in snapshot.get("items", [])
@@ -3176,7 +3197,7 @@ async def keytao_update_draft_item_weight(
             ),
         }
 
-    batch_id = str(snapshot.get("batchId") or "").strip()
+    batch_id = snapshot_batch_id
     content_version = snapshot.get("contentVersion")
     item_id = item.get("id")
     if (
@@ -5031,6 +5052,7 @@ async def keytao_shift_phrase_code(
                 "contentVersion": current_content_version,
             }, current_batch_id)
 
+        receipts: List[Dict[str, Any]] = []
         write_result: Dict = {
             "success": True,
             "batchId": current_batch_id,
@@ -5050,27 +5072,140 @@ async def keytao_shift_phrase_code(
                 write_result["shiftPlan"] = shift_plan
                 write_result["planDigest"] = plan_digest
                 return _inject_known_batch_url(write_result, current_batch_id)
+            receipts.append({
+                "step": "dictionary",
+                "status": "applied",
+                "changes": [
+                    {
+                        "word": str(change.get("word") or ""),
+                        "fromCode": str(change.get("fromCode") or ""),
+                        "toCode": str(change.get("toCode") or ""),
+                    }
+                    for change in shift_plan.get("shifted") or []
+                    if isinstance(change, dict)
+                    and str(change.get("word") or "").strip()
+                    and str(change.get("fromCode") or "").strip()
+                    and str(change.get("toCode") or "").strip()
+                ],
+                "itemCount": len(plan_items),
+            })
 
-        for update in shift_plan["draftUpdates"]:
+        exact_batch_id = str(write_result.get("batchId") or current_batch_id or "")
+        draft_updates = shift_plan["draftUpdates"]
+        for update_index, update in enumerate(draft_updates):
+            refreshed = await keytao_list_draft_items(
+                platform,
+                platform_id,
+                batch_id=exact_batch_id or None,
+            )
+            matches = [
+                item
+                for item in refreshed.get("items", [])
+                if isinstance(item, dict)
+                and str(item.get("word") or "").strip()
+                == str(update.get("word") or "").strip()
+                and str(item.get("code") or "").strip().lower()
+                == str(update.get("code") or "").strip().lower()
+            ] if refreshed.get("success") is True else []
+            current_weight = matches[0].get("weight") if len(matches) == 1 else None
+            if len(matches) == 1 and current_weight == update.get("toWeight"):
+                receipts.append({
+                    "step": "draftWeight",
+                    "status": "alreadyApplied",
+                    "word": str(update.get("word") or ""),
+                    "code": str(update.get("code") or ""),
+                    "fromWeight": update.get("fromWeight"),
+                    "toWeight": update.get("toWeight"),
+                })
+                continue
+            if (
+                refreshed.get("success") is not True
+                or str(refreshed.get("batchId") or "") != exact_batch_id
+                or len(matches) != 1
+                or current_weight != update.get("fromWeight")
+            ):
+                reason = str(
+                    refreshed.get("message")
+                    or "草稿版本或目标条目已变化"
+                ).strip()
+                receipts.append({
+                    "step": "draftWeight",
+                    "status": "failed",
+                    "word": str(update.get("word") or ""),
+                    "code": str(update.get("code") or ""),
+                    "fromWeight": update.get("fromWeight"),
+                    "toWeight": update.get("toWeight"),
+                    "reason": reason,
+                })
+                receipts.extend({
+                    "step": "draftWeight",
+                    "status": "pending",
+                    "word": str(remaining.get("word") or ""),
+                    "code": str(remaining.get("code") or ""),
+                    "fromWeight": remaining.get("fromWeight"),
+                    "toWeight": remaining.get("toWeight"),
+                } for remaining in draft_updates[update_index + 1:])
+                return _inject_known_batch_url({
+                    "success": False,
+                    "partialWrite": any(
+                        receipt.get("status") in {"applied", "alreadyApplied"}
+                        for receipt in receipts
+                    ),
+                    "message": "计划只完成了一部分，剩余步骤需要按最新草稿重新锁定。",
+                    "receipts": receipts,
+                    "shiftPlan": shift_plan,
+                    "planDigest": plan_digest,
+                }, exact_batch_id)
             updated = await keytao_update_draft_item_weight(
                 platform,
                 platform_id,
                 str(update.get("word") or ""),
                 str(update.get("code") or ""),
                 int(update.get("toWeight")),
+                batch_id=exact_batch_id,
+                snapshot=refreshed,
             )
             if updated.get("success") is not True:
+                reason = str(
+                    updated.get("message") or "草稿权重调整失败"
+                ).strip()
+                receipts.append({
+                    "step": "draftWeight",
+                    "status": "failed",
+                    "word": str(update.get("word") or ""),
+                    "code": str(update.get("code") or ""),
+                    "fromWeight": update.get("fromWeight"),
+                    "toWeight": update.get("toWeight"),
+                    "reason": reason,
+                })
+                receipts.extend({
+                    "step": "draftWeight",
+                    "status": "pending",
+                    "word": str(remaining.get("word") or ""),
+                    "code": str(remaining.get("code") or ""),
+                    "fromWeight": remaining.get("fromWeight"),
+                    "toWeight": remaining.get("toWeight"),
+                } for remaining in draft_updates[update_index + 1:])
                 return _inject_known_batch_url({
                     **updated,
                     "success": False,
-                    "partialWrite": bool(plan_items),
-                    "message": (
-                        "实时词库变更已写入草稿，但草稿权重调整未全部完成；"
-                        + str(updated.get("message") or "请查看草稿核对")
+                    "partialWrite": any(
+                        receipt.get("status") in {"applied", "alreadyApplied"}
+                        for receipt in receipts
                     ),
+                    "message": "计划只完成了一部分，剩余步骤需要按最新草稿重新锁定。",
+                    "receipts": receipts,
                     "shiftPlan": shift_plan,
                     "planDigest": plan_digest,
-                }, current_batch_id)
+                }, exact_batch_id)
+            receipts.append({
+                "step": "draftWeight",
+                "status": "applied",
+                "word": str(update.get("word") or ""),
+                "code": str(update.get("code") or ""),
+                "fromWeight": update.get("fromWeight"),
+                "toWeight": update.get("toWeight"),
+            })
 
         final_snapshot = await keytao_list_draft_items(
             platform,
@@ -5082,6 +5217,7 @@ async def keytao_shift_phrase_code(
             write_result["batchId"] = final_snapshot.get("batchId") or write_result.get("batchId")
         write_result["success"] = True
         write_result["successCount"] = len(plan_items) + len(shift_plan["draftUpdates"])
+        write_result["receipts"] = receipts
         write_result["shiftPlan"] = shift_plan
         write_result["planDigest"] = plan_digest
         return _inject_known_batch_url(write_result, str(write_result.get("batchId") or current_batch_id))

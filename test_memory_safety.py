@@ -1955,7 +1955,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         guidance = chat_module._format_live_ticket_precedence_message(state)
-        self.assertIn("回复「确认」执行，或「取消」放弃。", guidance)
+        self.assertIn(pending_confirmation_copy(), guidance)
         for index, word in enumerate(words):
             self.assertIn(f"「{word}」→ a{index}", guidance)
 
@@ -2116,11 +2116,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(server_warning_ticket_is_complete(state))
                 reply = chat_module._format_live_ticket_precedence_message(state)
-                action_at = reply.index("回复「确认」执行，或「取消」放弃。")
-                quote_at = reply.index("请引用本条消息回复", action_at)
+                action_at = reply.index(pending_confirmation_copy())
                 for fact in expected_facts:
                     self.assertIn(fact, reply[:action_at])
-                self.assertLess(action_at, quote_at)
+                self.assertNotIn("请引用本条消息回复", reply)
                 self.assertNotIn("或取消当前票据", reply)
                 self.assertNotIn("当前还有一项待确认操作：提交草稿。", reply)
                 self.assertNotIn("PR#", reply)
@@ -2139,7 +2138,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
         candidate_reply = chat_module._format_live_ticket_precedence_message(candidate)
         self.assertIn("「候选词」→ hxc", candidate_reply)
-        self.assertIn("回复「确认」执行，或「取消」放弃。", candidate_reply)
+        self.assertIn(pending_confirmation_copy(), candidate_reply)
 
     async def test_rendered_batch_command_envelope_is_allowlisted_at_sink(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
@@ -2251,8 +2250,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "可回复编号、编码，或「都加」；可多选，如「添加2、4」。"
         )
         rendered_single = chat_module._ensure_pending_add_word_guidance(single_word)
-        self.assertIn("回复「加入」只加入草稿", rendered_single)
-        self.assertIn("回复「加入并提交」则加入后提交", rendered_single)
+        self.assertIn("回复「加入」写入草稿", rendered_single)
+        self.assertIn("回复「加入并提交」写入并提交", rendered_single)
         self.assertNotIn("「都加」", rendered_single)
         self.assertIn("可多选，如「添加2、4」", rendered_single)
 
@@ -2263,8 +2262,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "可回复编号、编码，或「都加」；可多选，如「添加2、4」。"
         )
         rendered_one_slot = chat_module._ensure_pending_add_word_guidance(one_slot)
-        self.assertIn("回复「加入」只加入草稿", rendered_one_slot)
-        self.assertIn("回复「加入并提交」则加入后提交", rendered_one_slot)
+        self.assertIn("回复「加入」写入草稿", rendered_one_slot)
+        self.assertIn("回复「加入并提交」写入并提交", rendered_one_slot)
         self.assertNotIn("「都加」", rendered_one_slot)
         self.assertNotIn("添加2、4", rendered_one_slot)
 
@@ -3529,7 +3528,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(saved, PendingToolConfirm)
             self.assertEqual(saved.args["expected_warning_digest"], "e" * 64)
             record = state_store.get_record(conv_key)
-            self.assertIn("请引用本条消息回复「确认」或「取消」", reply)
+            self.assertIn(pending_confirmation_copy(), reply)
             self.assertNotIn(record.reconfirmation_code, reply)
             self.assertNotIn("「确认加入」", reply)
             self.assertNotIn("「确认提交」", reply)
@@ -3687,7 +3686,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     owner_label="Garth",
                 )
             self.assertEqual(calls, [])
-            self.assertIn("待确认", blocked)
+            self.assertIn(pending_confirmation_copy(), blocked)
+            self.assertIn("「王中王」→ wfw", blocked)
             self.assertIsNotNone(state_store.get_record(conv_key))
 
             calls.clear()
@@ -3757,14 +3757,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         advertised_forms = tuple(re.findall(r"「([^」]+)」", advertised_copy))
         self.assertEqual(
             advertised_forms,
-            (
-                "加入",
-                "都加",
-                "添加",
-                "加入并提交",
-                "都加并提交",
-                "添加并提交",
-            ),
+            ("加入", "加入并提交"),
         )
 
         generic_copy = chat_module.pending_confirmation_copy()
@@ -4103,7 +4096,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             )
 
             self.assertIn("提交前请核对快照", first_reply)
-            self.assertIn("请引用本条消息回复「确认」或「取消」", first_reply)
+            self.assertIn(pending_confirmation_copy(), first_reply)
             self.assertNotIn("参数摘要", first_reply)
             self.assertNotIn("风险摘要", first_reply)
             self.assertNotIn("复审摘要", first_reply)
@@ -4157,7 +4150,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(calls[2]["preview_only"])
             self.assertNotEqual(current_code, second_code)
             self.assertNotIn(current_code, bare_reply)
-            self.assertIn("请引用本条消息回复「确认」或「取消」", bare_reply)
+            self.assertIn(pending_confirmation_copy(), bare_reply)
 
             stale_reply = await chat_module.handle_pending_message_core(
                 f"确认票据 {first_code}",
@@ -10487,7 +10480,7 @@ class ServerBoundDeleteConfirmationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(reply.count(pending_confirmation_copy()), 1)
-        self.assertIn("原确认没有执行", reply)
+        self.assertIn("原确认未执行", reply)
         self.assertIn("「呵呵呵」@ hhhooo", reply)
         self.assertIn("「哈哈哈」@ hhhooo", reply)
         self.assertNotIn("PR#", reply)

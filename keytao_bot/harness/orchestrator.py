@@ -2198,7 +2198,7 @@ class AgentOrchestrator:
             f"已重新复核以下 {len(lines)} 个词，读音、编码、占用状态和审核结论"
             "均以当前服务端结果为准：\n"
             + "\n".join(lines)
-            + "\n确认后才会写入草稿。\n\n"
+            + "\n"
             + pending_batch_confirmation_copy()
         )
 

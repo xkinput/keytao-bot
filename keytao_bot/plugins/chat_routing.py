@@ -598,6 +598,17 @@ def _pending_tool_assent_intent(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Resolve shared natural assent against one server-backed live state."""
+    if isinstance(state, PendingToolConfirm):
+        continuation_command = str(
+            state.args.get("_continuation_command") or ""
+        ).strip()
+        if (
+            continuation_command
+            and _compact_command_text(message_text)
+            == _compact_command_text(continuation_command)
+            and not re.search(r"[?？]", message_text)
+        ):
+            return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     if (
         isinstance(state, PendingToolConfirm)
         and state.function_name == "keytao_submit_batch"
@@ -822,12 +833,7 @@ def _pending_assent_rejection_response(
 
 def _format_live_ticket_precedence_message(state: PendingState) -> str:
     details = _describe_pending_state(state)
-    return (
-        "当前还有一项待确认操作，内容如下：\n"
-        f"{details}\n"
-        "为避免跳过这张票据，本次没有执行其他写入或提交。\n\n"
-        f"{pending_confirmation_copy()}"
-    )
+    return f"{details}\n{pending_confirmation_copy()}"
 
 
 def _compact_command_text(message_text: str) -> str:

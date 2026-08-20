@@ -1098,7 +1098,7 @@ async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
         after_sequence=second_cutoff,
     )
     additional_confirmation_steps = 0
-    if not second_batch_id and "请引用本条消息回复「确认」或「取消」" in guidance:
+    if not second_batch_id and pending_confirmation_copy() in guidance:
         messages.append("确认")
         replies.append(await ctx.send(messages[-1]))
         additional_confirmation_steps = 1
@@ -1292,7 +1292,7 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
     )
     if not batch_id:
         require(
-            "请引用本条消息回复「确认」或「取消」" in replies[-1],
+            pending_confirmation_copy() in replies[-1],
             f"S16 bare assent neither submitted nor reached one bound confirmation: {replies[-1]}",
         )
         messages.append("确认")
@@ -1342,6 +1342,11 @@ def _recommended_empty_code(reply: str, *, word: str) -> str:
         rf"(?:是否以|仍以)编码\s+(?P<code>[a-z]{{2,12}})\s+将「{re.escape(word)}」加入草稿",
         reply,
     )
+    if match is None:
+        match = re.search(
+            rf"(?m)^[•*-]\s*「{re.escape(word)}」\s*→\s*(?P<code>[a-z]{{2,12}})\s*（推荐）\s*$",
+            reply,
+        )
     require(match is not None, f"{word} discovery omitted a recommended empty code: {reply}")
     code = match.group("code")
     require(
@@ -1378,7 +1383,7 @@ async def scenario_s17(ctx: ScenarioContext) -> dict[str, Any]:
         ctx.attempt_events(),
         after_sequence=semantic_cutoff,
     )
-    if not semantic_batch_id and "请引用本条消息回复「确认」或「取消」" in replies[-1]:
+    if not semantic_batch_id and pending_confirmation_copy() in replies[-1]:
         messages.append("确认")
         replies.append(await ctx.send(messages[-1]))
         semantic_batch_id = _successful_submit_batch_id(
@@ -1420,7 +1425,7 @@ async def scenario_s17(ctx: ScenarioContext) -> dict[str, Any]:
         ctx.attempt_events(),
         after_sequence=obscure_cutoff,
     )
-    if not obscure_batch_id and "请引用本条消息回复「确认」或「取消」" in replies[-1]:
+    if not obscure_batch_id and pending_confirmation_copy() in replies[-1]:
         messages.append("确认")
         replies.append(await ctx.send(messages[-1]))
         obscure_batch_id = _successful_submit_batch_id(
@@ -1887,7 +1892,7 @@ async def scenario_s20(ctx: ScenarioContext) -> dict[str, Any]:
     draft = await ctx.draft()
     if not draft.get("items"):
         require(
-            "请引用本条消息回复「确认」或「取消」" in replies[-1]
+            pending_confirmation_copy() in replies[-1]
             or "确认" in replies[-1],
             f"S20 quoted assent neither wrote nor reached one bound confirmation: {replies[-1]}",
         )
@@ -2086,8 +2091,8 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     guidance = await ctx.send_group("提交草稿", to_me=True)
     replies.append(guidance)
     require(
-        "回复「确认」执行，或「取消」放弃。" in guidance
-        and "请引用本条消息回复「确认」或「取消」" in guidance,
+        guidance.count(pending_confirmation_copy()) == 1
+        and "请引用本条消息回复" not in guidance,
         f"S21 precedence refusal did not render one coherent option block: {guidance}",
     )
     require(
@@ -3550,16 +3555,15 @@ async def scenario_s29(ctx: ScenarioContext) -> dict[str, Any]:
     replies.append(plan_reply)
     assert_reply_mentions(
         plan_reply,
-        "编码 mkdr 同码链常用度重排计划",
-        "当前：火锅(100) → 电脑(101)",
-        "建议：电脑(100) → 火锅(101)",
-        "「电脑」：101 → 100",
-        "「火锅」：100 → 101",
-        "常用度证据",
+        "编码 mkdr 调整计划",
+        "「电脑」：权重 101 → 100",
+        "「火锅」：权重 100 → 101",
+        "依据：",
     )
     require(
-        plan_reply.count(pending_confirmation_copy()) == 1,
-        f"S29 plan did not carry exactly one shared confirmation: {plan_reply}",
+        plan_reply.count(pending_confirmation_copy()) == 1
+        and len(plan_reply.splitlines()) <= 8,
+        f"S29 plan was not compact with one shared confirmation: {plan_reply}",
     )
     draft_before_confirm = await ctx.draft()
     require(
@@ -3755,16 +3759,7 @@ async def scenario_s30(ctx: ScenarioContext) -> dict[str, Any]:
     natural_candidate = await ctx.send(f"加词 {S30_WORD}")
     replies.append(natural_candidate)
     assert_reply_mentions(natural_candidate, S30_WORD, "候选编码")
-    recommended_match = re.search(
-        rf"是否以编码\s+(?P<code>[a-z]{{1,12}})\s+将「{S30_WORD}」加入草稿",
-        natural_candidate,
-        re.IGNORECASE,
-    )
-    require(
-        recommended_match is not None,
-        f"S30 natural candidate omitted its bound recommendation: {natural_candidate}",
-    )
-    recommended_code = recommended_match.group("code").lower()
+    recommended_code = _recommended_empty_code(natural_candidate, word=S30_WORD).lower()
     submit_cutoff = max(
         (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
         default=0,
@@ -3971,17 +3966,15 @@ async def scenario_s32(ctx: ScenarioContext) -> dict[str, Any]:
     replies.append(chain_reply)
     assert_reply_mentions(
         chain_reply,
-        "当前状态",
-        "米等：mkdr / 100（词库）",
-        "幂等：mkdr / 101（草稿）",
-        "建议状态",
-        "幂等：mkdr / 100",
-        "米等：mkdr / 101",
-        "常用度证据",
+        "幂等：mkdr / 101（草稿）→ mkdr / 100",
+        "米等：mkdr / 100（词库）→ mkdr / 101",
+        "依据：",
     )
     require(
-        chain_reply.count(pending_confirmation_copy()) == 1,
-        f"S32 merged-view plan did not carry one confirmation: {chain_reply}",
+        chain_reply.count(pending_confirmation_copy()) == 1
+        and len(chain_reply.splitlines()) <= 8
+        and sum(line.startswith("依据：") for line in chain_reply.splitlines()) == 1,
+        f"S32 merged-view plan was not compact with one confirmation: {chain_reply}",
     )
     require(
         (await ctx.draft()).get("items") == original_draft.get("items"),
@@ -4021,18 +4014,30 @@ async def scenario_s32(ctx: ScenarioContext) -> dict[str, Any]:
     replies.append(word_list_reply)
     assert_reply_mentions(
         word_list_reply,
-        "当前状态",
-        "米等：mkdr / 100（词库）",
-        "幂等：mkdr / 101（草稿）",
-        "迷瞪：mkdro / 100（词库）",
-        "建议状态",
-        "你列的顺序与常用度证据不一致",
-        "常用度证据",
+        "幂等：mkdr / 101（草稿）→ mkdr / 100",
+        "米等：mkdr / 100（词库）→",
+        "与你列的不一致",
+        "依据：",
     )
+    word_list_lines = word_list_reply.splitlines()
+    evidence_lines = [
+        line for line in word_list_lines
+        if line.startswith("依据：")
+    ]
     require(
         "没有可用的服务端候选记录" not in word_list_reply
-        and word_list_reply.count(pending_confirmation_copy()) == 1,
-        f"S32 word-list turn did not produce one executable plan: {word_list_reply}",
+        and word_list_reply.count(pending_confirmation_copy()) == 1
+        and len(word_list_lines) <= 8
+        and len(evidence_lines) == 1
+        and "迷瞪" in evidence_lines[0]
+        and not any(
+            line.startswith("• 迷瞪：") and "→" in line
+            for line in word_list_lines
+        )
+        and "当前状态" not in word_list_reply
+        and "建议状态" not in word_list_reply
+        and "服务端校验：" not in word_list_reply,
+        f"S32 word-list turn did not produce one compact executable plan: {word_list_reply}",
     )
     require(
         (await ctx.draft()).get("items") == original_draft.get("items"),
@@ -4080,11 +4085,39 @@ async def scenario_s32(ctx: ScenarioContext) -> dict[str, Any]:
         and all(code.startswith(S32_CODE) for code in proposed_by_word.values()),
         f"S32 proposed codes are not one ordered mkdr prefix chain: {proposed_by_word}",
     )
+    require(
+        shift_plan.get("items") == [
+            {"action": "Delete", "word": "米等", "code": S32_CODE, "type": "Phrase"},
+            {
+                "action": "Create",
+                "word": "米等",
+                "code": proposed_by_word["米等"],
+                "type": "Phrase",
+                "weight": 100,
+            },
+        ]
+        and len(shift_plan.get("draftUpdates") or []) == 1
+        and (shift_plan.get("draftUpdates") or [])[0].get("word") == S32_DRAFT_WORD
+        and (shift_plan.get("draftUpdates") or [])[0].get("fromWeight") == 101
+        and (shift_plan.get("draftUpdates") or [])[0].get("toWeight") == 100,
+        f"S32 did not seal the exact incident dictionary plus weight shape: {shift_plan}",
+    )
 
     messages.append("确认")
     completion_reply = await ctx.send("确认")
     replies.append(completion_reply)
-    assert_reply_mentions(completion_reply, "操作已完成", "幂等", "米等")
+    assert_reply_mentions(
+        completion_reply,
+        "操作已完成",
+        "米等",
+        "幂等",
+        "草稿地址：",
+    )
+    require(
+        len(completion_reply.splitlines()) <= 3
+        and "服务端校验：" not in completion_reply,
+        f"S32 completion was not compact: {completion_reply}",
+    )
     final_draft = await ctx.draft()
     proposed_mi_code = proposed_by_word["米等"]
     expected_items = {
@@ -4113,6 +4146,16 @@ async def scenario_s32(ctx: ScenarioContext) -> dict[str, Any]:
         len(confirmed_shift_calls) == 1,
         f"S32 expected one confirmed generalized-plan replay: {confirmed_shift_calls}",
     )
+    confirmed_result = confirmed_shift_calls[0].get("result") or {}
+    receipts = confirmed_result.get("receipts") or []
+    require(
+        confirmed_result.get("success") is True
+        and confirmed_result.get("successCount") == 3
+        and [receipt.get("step") for receipt in receipts]
+        == ["dictionary", "draftWeight"]
+        and all(receipt.get("status") in {"applied", "alreadyApplied"} for receipt in receipts),
+        f"S32 one confirmation did not return complete step receipts: {confirmed_result}",
+    )
 
     return {
         "messages": messages,
@@ -4126,6 +4169,9 @@ async def scenario_s32(ctx: ScenarioContext) -> dict[str, Any]:
             "proposedCodes": proposed_by_word,
             "chainPlanCancelled": True,
             "wordListConfirmationSteps": 1,
+            "wordListPlanLines": len(word_list_reply.splitlines()),
+            "completionLines": len(completion_reply.splitlines()),
+            "receiptSteps": [receipt.get("step") for receipt in receipts],
         },
     }
 

@@ -2727,7 +2727,8 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
     check(
         "front branch keeps the free slot as an alternative",
         "eefju — 空位（不调序备选）" in front_prompt
-        and "如不调整现有排序，是否仍以编码 eefju 将「射覆」加入草稿？" in front_prompt,
+        and "提示：当前建议不调整现有排序。" in front_prompt
+        and "• 「射覆」→ eefju（推荐）" in front_prompt,
     )
     hinted_selection = openai_chat_module.parse_pending_candidate_selection(
         "添加1、2"
@@ -4667,7 +4668,7 @@ def test_add_submit_extra_snapshot_shows_one_exact_confirmation():
         check("risk prompt hides the internal nonce", operation.confirmation_code not in operation.prompt_text)
         check(
             "risk prompt advertises bare shared confirmation",
-            "请引用本条消息回复「确认」或「取消」" in operation.prompt_text,
+            pending_confirmation_copy() in operation.prompt_text,
         )
 
     asyncio.run(_run())
@@ -6877,12 +6878,10 @@ def test_code_chain_reorder_locks_exact_weight_plan_before_one_confirmation():
                 and all(item.get("action") == "Change" for item in state.args["items"]),
             )
             check(
-                "plan renders current and proposed order with per-word moves and evidence",
+                "plan renders only per-word moves and one evidence summary",
                 prompt is not None
-                and "当前：茂才(100) → 冒菜(101)" in prompt
-                and "建议：冒菜(100) → 茂才(101)" in prompt
-                and "「冒菜」：101 → 100" in prompt
-                and "「茂才」：100 → 101" in prompt
+                and "「冒菜」：权重 101 → 100" in prompt
+                and "「茂才」：权重 100 → 101" in prompt
                 and "现代常用饮食词" in prompt,
             )
             check(
@@ -7050,12 +7049,9 @@ def test_incident_code_chain_reorder_merges_live_and_current_draft():
         check(
             "D1 renders a merged current-to-proposed plan with one confirmation",
             response is not None
-            and "当前状态" in response
-            and "米等：mkdr / 100（词库）" in response
-            and "幂等：mkdr / 101（草稿）" in response
-            and "建议状态" in response
-            and "幂等：mkdr / 100" in response
-            and "米等：mkdr / 101" in response
+            and "幂等：mkdr / 101（草稿）→ mkdr / 100" in response
+            and "米等：mkdr / 100（词库）→ mkdr / 101" in response
+            and "依据：" in response
             and response.count(pending_confirmation_copy()) == 1,
         )
         check(
@@ -7157,7 +7153,15 @@ def test_incident_word_list_reorder_resolves_every_word_and_cross_chain_scope():
                             {"word": "迷瞪", "code": "mkdrol", "weight": 100},
                         ],
                         "listedWords": ["米等", "幂等", "迷瞪"],
-                        "evidenceLines": ["幂等 > 米等 > 迷瞪"],
+                        "evidenceLines": [
+                            "「米等」：语料频次 无，词典收录 0",
+                            "「迷瞪」：语料频次 5，词典收录 3",
+                            "「幂等」：语料频次 无，词典收录 2",
+                            "「迷瞪」较「米等」更常用：语料频次 无 vs 5，词典收录 0 vs 3",
+                            "「幂等」较「米等」更常用：语料频次 无 vs 无，词典收录 0 vs 2",
+                            "常用度信号不足：语料频次 5 vs 无，词典收录 3 vs 2；"
+                            "证据未拉开差距，保留你列出的相对顺序",
+                        ],
                     },
                 }, ensure_ascii=False)
             raise AssertionError((tool_name, arguments))
@@ -7183,16 +7187,23 @@ def test_incident_word_list_reorder_resolves_every_word_and_cross_chain_scope():
                 command_intent=intent,
             )
 
+        rendered_evidence_lines = [
+            line for line in (response or "").splitlines()
+            if line.startswith("依据：")
+        ]
         check(
             "D2 renders cross-chain code+weight moves, evidence, and list divergence",
             response is not None
-            and "当前状态" in response
-            and "建议状态" in response
-            and "幂等：mkdr / 100" in response
-            and "米等：mkdro / 100" in response
-            and "迷瞪：mkdrol / 100" in response
-            and "你列的顺序与常用度证据不一致：" in response
+            and "幂等：mkdr / 101（草稿）→ mkdr / 100" in response
+            and "米等：mkdr / 100（词库）→ mkdro / 100" in response
+            and "迷瞪：mkdro / 100（词库）→ mkdrol / 100" in response
+            and "依据：建议 幂等→米等→迷瞪（与你列的不一致）；"
+            "关键证据：迷瞪 语料5/词典3，幂等 词典2，米等 无记录" in response
+            and len(rendered_evidence_lines) == 1
+            and rendered_evidence_lines[0].count("；") == 1
+            and " vs " not in rendered_evidence_lines[0]
             and "完整计划会由「幂等」占用 mkdr，不会留下空位" in response
+            and len(response.splitlines()) <= 8
             and "仍是空位" not in response
             and response.count(pending_confirmation_copy()) == 1,
         )
@@ -9890,7 +9901,7 @@ def test_verified_bot_reply_is_a_single_prompt_capability():
             check("verified reply confirms without nonce", resolved.intent == "pending_confirm" and response is None)
             check(
                 "prompt explains bare single-ticket confirmation",
-                "请引用本条消息回复「确认」或「取消」" in prompt,
+                pending_confirmation_copy() in prompt,
             )
         finally:
             openai_chat_module.conversation_state_store = old_store
@@ -11073,7 +11084,11 @@ def test_mixed_batch_add_and_submit_stays_in_admin_review():
         check("each review remark reaches draft write", all(item.get("remark") for item in submitted_items))
         check("submit preview is non-mutating", calls[2][1] == {"batch_id": "draft-mixed", "preview_only": True})
         check("submit write binds exact snapshot", calls[3][1].get("confirmed") is True and calls[3][1].get("expected_server_snapshot_digest") == snapshot_digest)
-        check("mixed result says admin review", "该批次需管理员审核" in result.text)
+        check(
+            "mixed result uses the compact submitted-for-review outcome",
+            "批次已提交审核" in result.text
+            and "该批次需管理员审核" not in result.text,
+        )
         check("mixed result does not claim dictionary admission", "已加入词库" not in result.text)
         check("mixed result includes batch link", "https://keytao.test/batch/mixed" in result.text)
         check("mixed preview keeps both requested words", "追速" in submit_preview.text and "摆件" in submit_preview.text)
@@ -17431,8 +17446,23 @@ def test_ranked_n_entry_shift_preview_and_one_ticket_execution():
             "contentVersion": 6,
             "successCount": 4,
         })
-        update = AsyncMock(return_value={"success": True, "batchId": "bc32871a"})
-        listing = AsyncMock(side_effect=[draft, final_draft])
+        refreshed_draft = {
+            **draft,
+            "contentVersion": 6,
+            "items": [
+                *draft["items"],
+                {"id": 102, "action": "Delete", "word": "米等", "code": "mkdr", "type": "Phrase"},
+                {"id": 103, "action": "Delete", "word": "迷瞪", "code": "mkdro", "type": "Phrase"},
+                {"id": 104, "action": "Create", "word": "米等", "code": "mkdro", "type": "Phrase", "weight": 100},
+                {"id": 105, "action": "Create", "word": "迷瞪", "code": "mkdroi", "type": "Phrase", "weight": 100},
+            ],
+        }
+        update = AsyncMock(return_value={
+            "success": True,
+            "batchId": "bc32871a",
+            "contentVersion": 7,
+        })
+        listing = AsyncMock(side_effect=[draft, refreshed_draft, final_draft])
         with (
             patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
             patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
@@ -17459,10 +17489,411 @@ def test_ranked_n_entry_shift_preview_and_one_ticket_execution():
             and confirmed_strict.await_args.kwargs.get("confirmed") is True
             and confirmed_strict.await_args.kwargs.get("expected_warning_digest") == "d" * 64,
         )
-        update.assert_awaited_once_with("qq", "rea", "幂等", "mkdr", 100)
+        update.assert_awaited_once_with(
+            "qq",
+            "rea",
+            "幂等",
+            "mkdr",
+            100,
+            batch_id="bc32871a",
+            snapshot=refreshed_draft,
+        )
+        check(
+            "ranked execution refreshes the exact batch after the strict write",
+            listing.await_args_list[1].kwargs == {"batch_id": "bc32871a"},
+        )
         check(
             "final response carries the post-write draft snapshot",
             result.get("draft_snapshot", {}).get("contentVersion") == 7,
+        )
+
+        failed_update = AsyncMock(return_value={
+            "success": False,
+            "staleConfirmation": True,
+            "batchId": "bc32871a",
+            "message": "待删除条目已发生变化，请刷新草稿后重试",
+        })
+        failed_listing = AsyncMock(side_effect=[draft, refreshed_draft])
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(_draft_tools, "keytao_list_draft_items", failed_listing),
+            patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", confirmed_strict),
+            patch.object(_draft_tools, "keytao_update_draft_item_weight", failed_update),
+        ):
+            partial = await _draft_tools.keytao_shift_phrase_code(
+                "qq", "rea", "幂等", "mkdr",
+                confirmed_plan_digest=preview["planDigest"],
+                batch_id="bc32871a",
+                expected_content_version=5,
+                expected_warning_digest="d" * 64,
+                ordered_words=["幂等", "米等", "迷瞪"],
+                listed_words=["米等", "幂等", "迷瞪"],
+                evidence_lines=["幂等 > 米等 > 迷瞪"],
+            )
+
+        check(
+            "forced weight CAS failure returns authoritative applied and failed receipts",
+            partial.get("success") is False
+            and partial.get("partialWrite") is True
+            and partial.get("message")
+            == "计划只完成了一部分，剩余步骤需要按最新草稿重新锁定。"
+            and partial.get("receipts", [])[0].get("status") == "applied"
+            and partial.get("receipts", [])[1] == {
+                "step": "draftWeight",
+                "status": "failed",
+                "word": "幂等",
+                "code": "mkdr",
+                "fromWeight": 101,
+                "toWeight": 100,
+                "reason": "待删除条目已发生变化，请刷新草稿后重试",
+            },
+        )
+
+    asyncio.run(_run())
+
+
+def test_ranked_shift_partial_receipts_stage_executable_continuation():
+    """A forced mid-plan CAS failure reports receipts and stages only the remainder."""
+    print("\n🧪 ranked shift partial failure stages one executable continuation")
+
+    async def _run():
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("qq", "rea")
+        initial_state = PendingToolConfirm(
+            function_name="keytao_shift_phrase_code",
+            args={
+                "word": "幂等",
+                "target_code": "mkdr",
+                "ordered_words": ["幂等", "迷瞪", "米等"],
+                "listed_words": ["米等", "幂等", "迷瞪"],
+                "evidence_lines": ["幂等 > 迷瞪 > 米等"],
+                "batch_id": "bc32871a",
+                "expected_content_version": 5,
+                "confirmed_plan_digest": "a" * 64,
+                "expected_warning_digest": "d" * 64,
+                "_pending_display": {
+                    "batchUrl": "https://keytao.vercel.app/batch/bc32871a",
+                    "shiftPlan": {
+                        "items": [
+                            {"action": "Delete", "word": "米等", "code": "mkdr", "type": "Phrase"},
+                            {"action": "Create", "word": "米等", "code": "mkdrou", "type": "Phrase", "weight": 100},
+                        ],
+                        "draftUpdates": [{
+                            "id": 101,
+                            "word": "幂等",
+                            "code": "mkdr",
+                            "type": "Phrase",
+                            "fromWeight": 101,
+                            "toWeight": 100,
+                        }],
+                    },
+                },
+            },
+            confirmation_source="server_warning",
+        )
+        check("incident ticket is stored", store.set(conv_key, initial_state))
+
+        calls = []
+
+        async def fake_call(tool_name, arguments, *_args, **_kwargs):
+            calls.append((tool_name, copy.deepcopy(arguments)))
+            if len(calls) == 1:
+                return json.dumps({
+                    "success": False,
+                    "partialWrite": True,
+                    "batchId": "bc32871a",
+                    "batchUrl": "https://keytao.vercel.app/batch/bc32871a",
+                    "receipts": [
+                        {
+                            "step": "dictionary",
+                            "status": "applied",
+                            "changes": [{
+                                "word": "米等",
+                                "fromCode": "mkdr",
+                                "toCode": "mkdrou",
+                            }],
+                        },
+                        {
+                            "step": "draftWeight",
+                            "status": "failed",
+                            "word": "幂等",
+                            "code": "mkdr",
+                            "fromWeight": 101,
+                            "toWeight": 100,
+                            "reason": "草稿版本冲突",
+                        },
+                    ],
+                }, ensure_ascii=False)
+            if len(calls) == 2:
+                check(
+                    "continuation recomputes from semantics without stale CAS fields",
+                    tool_name == "keytao_shift_phrase_code"
+                    and arguments == {
+                        "word": "幂等",
+                        "target_code": "mkdr",
+                        "ordered_words": ["幂等", "迷瞪", "米等"],
+                        "listed_words": ["米等", "幂等", "迷瞪"],
+                        "evidence_lines": ["幂等 > 迷瞪 > 米等"],
+                    },
+                )
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "rankedShiftPlan",
+                    "batchId": "bc32871a",
+                    "batchUrl": "https://keytao.vercel.app/batch/bc32871a",
+                    "contentVersion": 6,
+                    "planDigest": "b" * 64,
+                    "warningDigest": "",
+                    "warnings": [],
+                    "shiftPlan": {
+                        "items": [],
+                        "draftUpdates": [{
+                            "id": 101,
+                            "word": "幂等",
+                            "code": "mkdr",
+                            "type": "Phrase",
+                            "fromWeight": 101,
+                            "toWeight": 100,
+                        }],
+                        "currentState": [{
+                            "word": "幂等", "code": "mkdr", "weight": 101, "source": "draft",
+                        }],
+                        "proposedState": [{
+                            "word": "幂等", "code": "mkdr", "weight": 100,
+                        }],
+                    },
+                }, ensure_ascii=False)
+            if len(calls) == 3:
+                return json.dumps({
+                    "success": True,
+                    "batchId": "bc32871a",
+                    "batchUrl": "https://keytao.vercel.app/batch/bc32871a",
+                    "successCount": 1,
+                    "draft_snapshot": {"count": 3, "items": []},
+                    "receipts": [{
+                        "step": "draftWeight",
+                        "status": "applied",
+                        "word": "幂等",
+                        "code": "mkdr",
+                        "fromWeight": 101,
+                        "toWeight": 100,
+                    }],
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        old_store = chat_commands_module.conversation_state_store
+        chat_commands_module.conversation_state_store = store
+        try:
+            with (
+                patch.object(chat_commands_module, "call_tool_function", side_effect=fake_call),
+                patch.object(
+                    chat_commands_module,
+                    "_format_draft_response",
+                    AsyncMock(return_value="已调整：幂等 mkdr 权重 101→100\n草稿地址：https://keytao.vercel.app/batch/bc32871a"),
+                ),
+            ):
+                partial_reply = await chat_commands_module.handle_pending_message_core(
+                    "确认",
+                    "qq",
+                    "rea",
+                    conv_key,
+                    history=[],
+                )
+                continuation = store.get(conv_key)
+                check(
+                    "partial reply is receipt-bound and never asks for a manual refresh",
+                    "已完成：米等 mkdr→mkdrou" in partial_reply
+                    and "未完成：幂等 mkdr 权重 101→100（草稿版本冲突）" in partial_reply
+                    and "回复「继续调整」" in partial_reply
+                    and "请刷新草稿后重试" not in partial_reply,
+                )
+                check(
+                    "remaining delta is sealed as a fresh continuation ticket",
+                    isinstance(continuation, PendingToolConfirm)
+                    and continuation.args.get("expected_content_version") == 6
+                    and continuation.args.get("confirmed_plan_digest") == "b" * 64
+                    and continuation.args.get("_continuation_command") == "继续调整",
+                )
+
+                completed_reply = await chat_commands_module.handle_pending_message_core(
+                    "继续调整",
+                    "qq",
+                    "rea",
+                    conv_key,
+                    history=[],
+                )
+                check(
+                    "advertised continuation executes the remaining sealed delta",
+                    "已变更：幂等 mkdr 权重 101→100" in completed_reply
+                    and store.get(conv_key) is None
+                    and len(calls) == 3,
+                )
+        finally:
+            chat_commands_module.conversation_state_store = old_store
+
+    asyncio.run(_run())
+
+
+def test_incident_ranked_shift_exact_shape_completes_and_retries_remaining_delta():
+    """The 米等 move plus 幂等 draft weight shape completes, and half-state retry is idempotent."""
+    print("\n🧪 incident ranked shift exact shape completes and resumes by delta")
+
+    async def _run():
+        candidates = {
+            "幂等": ["mkdr", "mkdro", "mkdrou"],
+            "迷瞪": ["mkdr", "mkdro", "mkdroi"],
+            "米等": ["mkdr", "mkdro", "mkdrou"],
+        }
+        initial = {
+            "success": True,
+            "batchId": "bc32871a",
+            "contentVersion": 5,
+            "items": [{
+                "id": 101, "action": "Create", "word": "幂等",
+                "code": "mkdr", "type": "Phrase", "weight": 101,
+            }],
+        }
+        half_applied = {
+            **initial,
+            "contentVersion": 6,
+            "items": [
+                *initial["items"],
+                {"id": 102, "action": "Delete", "word": "米等", "code": "mkdr", "type": "Phrase"},
+                {"id": 103, "action": "Create", "word": "米等", "code": "mkdrou", "type": "Phrase", "weight": 100},
+            ],
+        }
+        final = {
+            **half_applied,
+            "contentVersion": 7,
+            "items": [{**half_applied["items"][0], "weight": 100}, *half_applied["items"][1:]],
+        }
+
+        async def fake_encode(word, _requested_code=None):
+            return {"success": True, "word": word, "candidateCodes": candidates[word]}
+
+        async def fake_words(_words):
+            return {
+                "success": True,
+                "results": [
+                    {"word": "幂等", "phrases": []},
+                    {"word": "迷瞪", "phrases": [{"word": "迷瞪", "code": "mkdro", "type": "Phrase", "weight": 100}]},
+                    {"word": "米等", "phrases": [{"word": "米等", "code": "mkdr", "type": "Phrase", "weight": 100}]},
+                ],
+            }
+
+        rows = {
+            "mkdr": [{"word": "米等", "code": "mkdr", "type": "Phrase", "weight": 100}],
+            "mkdro": [{"word": "迷瞪", "code": "mkdro", "type": "Phrase", "weight": 100}],
+            "mkdrou": [],
+        }
+
+        async def fake_codes(codes):
+            return {
+                "success": True,
+                "results": [{"code": code, "phrases": rows[code]} for code in codes],
+            }
+
+        strict_preview = AsyncMock(return_value={
+            "success": False,
+            "requiresConfirmation": True,
+            "warningDigest": "d" * 64,
+            "warnings": [],
+        })
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(_draft_tools, "keytao_list_draft_items", AsyncMock(return_value=initial)),
+            patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", strict_preview),
+        ):
+            preview = await _draft_tools.keytao_shift_phrase_code(
+                "qq", "rea", "幂等", "mkdr",
+                ordered_words=["幂等", "迷瞪", "米等"],
+                listed_words=["米等", "幂等", "迷瞪"],
+                evidence_lines=["幂等 > 迷瞪 > 米等"],
+            )
+
+        check(
+            "incident preview seals Delete 米等@mkdr plus Create 米等@mkdrou and one weight update",
+            preview.get("requiresConfirmation") is True
+            and preview.get("shiftPlan", {}).get("items") == [
+                {"action": "Delete", "word": "米等", "code": "mkdr", "type": "Phrase"},
+                {"action": "Create", "word": "米等", "code": "mkdrou", "type": "Phrase", "weight": 100},
+            ]
+            and preview.get("shiftPlan", {}).get("draftUpdates") == [{
+                "id": 101,
+                "word": "幂等",
+                "code": "mkdr",
+                "type": "Phrase",
+                "fromWeight": 101,
+                "toWeight": 100,
+            }],
+        )
+
+        strict_write = AsyncMock(return_value={
+            "success": True,
+            "batchId": "bc32871a",
+            "contentVersion": 6,
+            "successCount": 2,
+        })
+        update = AsyncMock(return_value={
+            "success": True,
+            "batchId": "bc32871a",
+            "contentVersion": 7,
+        })
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(
+                _draft_tools,
+                "keytao_list_draft_items",
+                AsyncMock(side_effect=[initial, half_applied, final]),
+            ),
+            patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", strict_write),
+            patch.object(_draft_tools, "keytao_update_draft_item_weight", update),
+        ):
+            completed = await _draft_tools.keytao_shift_phrase_code(
+                "qq", "rea", "幂等", "mkdr",
+                confirmed_plan_digest=preview["planDigest"],
+                batch_id="bc32871a",
+                expected_content_version=5,
+                expected_warning_digest="d" * 64,
+                ordered_words=["幂等", "迷瞪", "米等"],
+                listed_words=["米等", "幂等", "迷瞪"],
+                evidence_lines=["幂等 > 迷瞪 > 米等"],
+            )
+        check(
+            "one confirmed incident plan completes both mutation classes",
+            completed.get("success") is True
+            and completed.get("successCount") == 3
+            and [receipt.get("status") for receipt in completed.get("receipts", [])]
+            == ["applied", "applied"],
+        )
+
+        retry_strict = AsyncMock()
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(_draft_tools, "keytao_list_draft_items", AsyncMock(return_value=half_applied)),
+            patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", retry_strict),
+        ):
+            remaining = await _draft_tools.keytao_shift_phrase_code(
+                "qq", "rea", "幂等", "mkdr",
+                ordered_words=["幂等", "迷瞪", "米等"],
+                listed_words=["米等", "幂等", "迷瞪"],
+                evidence_lines=["幂等 > 迷瞪 > 米等"],
+            )
+        check(
+            "retrying the half-applied draft seals only the remaining weight delta",
+            remaining.get("requiresConfirmation") is True
+            and remaining.get("shiftPlan", {}).get("items") == []
+            and len(remaining.get("shiftPlan", {}).get("draftUpdates", [])) == 1
+            and retry_strict.await_count == 0,
         )
 
     asyncio.run(_run())
@@ -17900,7 +18331,10 @@ def test_replace_char_preserves_explicit_css_type():
         check("replace-char generated two staged items", len(items) == 2)
         check("replace-char marks staged items as CSS", len(items) == 2 and all(item.get("type") == "CSS" for item in items))
         check("replace-char keeps the full conversation address", record is not None and record.owner_key == conv_key)
-        check("replace-char asks for explicit confirmation", response is not None and "确认后" in response)
+        check(
+            "replace-char asks for explicit confirmation",
+            response is not None and pending_confirmation_copy() in response,
+        )
 
     asyncio.run(_run())
 
@@ -19095,6 +19529,8 @@ if __name__ == "__main__":
     test_build_code_shift_plan_reuses_vacated_slot_for_circular_swap()
     test_build_code_shift_plan_generalizes_ring_to_ranked_n_entries()
     test_ranked_n_entry_shift_preview_and_one_ticket_execution()
+    test_ranked_shift_partial_receipts_stage_executable_continuation()
+    test_incident_ranked_shift_exact_shape_completes_and_retries_remaining_delta()
     test_build_code_shift_plan_rejects_invalid_occupant_code()
     test_shift_phrase_code_works_with_no_draft_batch()
     test_shift_phrase_code_plans_real_occupant_move()

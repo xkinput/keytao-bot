@@ -1015,7 +1015,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     )
                 if text == "添加并提交":
                     if self.require_confirmation:
-                        return "提交前请核对服务端快照。\n\n请引用本条消息回复「确认」或「取消」；当前只有这一项待确认时，也可直接回复确认。"
+                        return "提交前请核对服务端快照。\n回复「确认」执行，或「取消」。"
                     return self.complete_submit()
                 if text == "确认" and self.require_confirmation:
                     return self.complete_submit()
@@ -1130,8 +1130,8 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 if text == "加入并提交":
                     if self.require_confirmation:
                         return (
-                            "提交前请核对服务端快照。\n\n"
-                            "请引用本条消息回复「确认」或「取消」；当前只有这一项待确认时，也可直接回复确认。"
+                            "提交前请核对服务端快照。\n"
+                            "回复「确认」执行，或「取消」。"
                         )
                     self.events.append({
                         "sequence": 10,
@@ -1357,7 +1357,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                             }],
                         },
                     })
-                    return "发现重码，请引用本条消息回复「确认」或「取消」；当前只有这一项待确认时，也可直接回复确认。"
+                    return "发现重码\n回复「确认」执行，或「取消」。"
                 if text == "确认":
                     self.items = [
                         {
@@ -1437,7 +1437,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     return (
                         "已解析为以下 9 个词："
                         + "、".join(S19_ADVERTISED_WORDS[:-2])
-                        + "\n确认后才会写入草稿。请引用本条消息回复「确认」或「取消」；当前只有这一项待确认时，也可直接回复确认。"
+                        + "\n回复「确认」执行，或「取消」。"
                     )
                 if text == "确认":
                     self.items = [

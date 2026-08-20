@@ -277,10 +277,19 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     and the numbered candidate list.
     """
     confirm_match = re.search(r'以编码\s*([a-z]+)\s*将「(.+?)」加入草稿', response)
-    if not confirm_match:
+    compact_match = re.search(
+        r'(?m)^\s*[•-]\s*「(?P<word>[^」\n]+)」\s*→\s*'
+        r'(?P<code>[a-z]+)\s*[（(]推荐[）)]\s*$',
+        response,
+    )
+    if confirm_match is not None:
+        recommended_code = confirm_match.group(1)
+        word = confirm_match.group(2)
+    elif compact_match is not None:
+        recommended_code = compact_match.group("code")
+        word = compact_match.group("word")
+    else:
         return None
-    recommended_code = confirm_match.group(1)
-    word = confirm_match.group(2)
 
     candidates: List[Tuple[str, bool]] = []
     occupied_words: Dict[str, List[str]] = {}
@@ -1371,7 +1380,6 @@ async def _resolve_pending_ticket_control(
         )
         return MessageCommandIntent(), (
             f"当前待确认内容已更新为：{description}。\n"
-            "为避免把延迟的旧回复误当成新操作的确认，"
             f"{pending_confirmation_copy()}"
         )
 
@@ -2682,8 +2690,7 @@ async def _execute_add_to_draft(
             for w in warnings
         ) if warnings else data.get("message", "存在重码警告")
         return _append_batch_url_if_missing((
-            f"{warn_text}\n\n确认添加吗？"
-            f"{pending_confirmation_copy()}"
+            f"{warn_text}\n{pending_confirmation_copy()}"
         ), data)
 
     if not data.get("success"):
@@ -2693,7 +2700,9 @@ async def _execute_add_to_draft(
         )
 
     header = f"✅ 已将「{word}」以编码 {code} 加入草稿\n"
-    return header + await _format_draft_response(data, platform, user_id)
+    return header + await _format_draft_response(
+        data, platform, user_id, compact=True,
+    )
 
 
 async def _execute_add_to_draft_and_submit(
@@ -2915,8 +2924,7 @@ async def _perform_add_to_draft_and_submit(
             for w in warnings
         ) if warnings else create_data.get("message", "存在重码警告")
         return DraftActionResult(_append_batch_url_if_missing(
-            f"{warn_text}\n\n确认添加吗？"
-            f"{pending_confirmation_copy()}",
+            f"{warn_text}\n{pending_confirmation_copy()}",
             create_data,
         ), pending_state=pending_state, data=create_data)
 
@@ -3081,8 +3089,7 @@ async def _perform_batch_add_to_draft_and_submit(
             for warning in warnings
         ) if warnings else add_data.get("message", "批量添加前需要确认")
         return DraftActionResult(_append_batch_url_if_missing(
-            f"{warning_text}\n\n确认继续添加吗？"
-            f"{pending_confirmation_copy()}",
+            f"{warning_text}\n{pending_confirmation_copy()}",
             add_data,
         ), pending_state=pending_state, data=add_data)
 
@@ -3098,7 +3105,9 @@ async def _perform_batch_add_to_draft_and_submit(
         )
 
     if failed_count > 0 or success_count < len(requested_items):
-        draft_text = await _format_draft_response(add_data, platform, user_id)
+        draft_text = await _format_draft_response(
+            add_data, platform, user_id, compact=True,
+        )
         return DraftActionResult(
             f"仅成功加入 {success_count}/{len(requested_items)} 条，已停止提交，避免生成不完整批次。\n\n{draft_text}"
         )
@@ -3532,6 +3541,55 @@ def _ranked_shift_warning_copy(
     )
 
 
+_RANKED_SHIFT_SIGNAL_RE = re.compile(
+    r"^「(?P<word>[^」]+)」：(?:整词)?语料频次\s*"
+    r"(?P<frequency>无|[\d,.]+)，词典收录\s*"
+    r"(?P<dictionary>无|[\d,.]+)$"
+)
+
+
+def _compact_ranked_shift_evidence(evidence_lines: List[str]) -> str:
+    """Keep one decisive visible clause while raw evidence remains in tool logs."""
+    unique_lines = list(OrderedDict.fromkeys(evidence_lines))
+    signals: List[Tuple[float, float, str]] = []
+    for line in unique_lines:
+        match = _RANKED_SHIFT_SIGNAL_RE.fullmatch(line)
+        if match is None:
+            continue
+        frequency_text = match.group("frequency")
+        dictionary_text = match.group("dictionary")
+        frequency = (
+            0.0
+            if frequency_text == "无"
+            else float(frequency_text.replace(",", ""))
+        )
+        dictionary = (
+            0.0
+            if dictionary_text == "无"
+            else float(dictionary_text.replace(",", ""))
+        )
+        if frequency > 0 and dictionary > 0:
+            summary = (
+                f"{match.group('word')} 语料{frequency_text}/词典{dictionary_text}"
+            )
+        elif frequency > 0:
+            summary = f"{match.group('word')} 语料{frequency_text}"
+        elif dictionary > 0:
+            summary = f"{match.group('word')} 词典{dictionary_text}"
+        else:
+            summary = f"{match.group('word')} 无记录"
+        signals.append((frequency, dictionary, summary))
+    if signals:
+        signals.sort(key=lambda item: (item[0] > 0, item[0], item[1]), reverse=True)
+        return "关键证据：" + "，".join(summary for _freq, _dict, summary in signals[:3])
+    if not unique_lines:
+        return ""
+    decisive = re.split(r"[；。]", unique_lines[0], maxsplit=1)[0].strip()
+    if len(decisive) > 48:
+        decisive = decisive[:47].rstrip() + "…"
+    return "关键证据：" + decisive
+
+
 def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     if function_name in {"keytao_remove_draft_item", "keytao_batch_remove_draft_items"}:
         targets = data.get("targets") if isinstance(data.get("targets"), list) else []
@@ -3546,14 +3604,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         batch_url = _trusted_batch_url(data)
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
-        lines.extend((
-            "",
-            (
-                "确认删除这些精确条目并随后核对提交快照吗？"
-                if data.get("submitAfter")
-                else "确认删除这些精确条目吗？"
-            ) + pending_confirmation_copy(),
-        ))
+        lines.append(pending_confirmation_copy())
         return _assert_plain_user_facing_reply("\n".join(lines))
 
     if function_name == "keytao_recall_batch":
@@ -3561,10 +3612,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         lines = ["↩️ 服务端已锁定待撤回批次。"]
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
-        lines.extend((
-            "",
-            "确认把这个批次恢复为草稿吗？" + pending_confirmation_copy(),
-        ))
+        lines.append(pending_confirmation_copy())
         return _assert_plain_user_facing_reply("\n".join(lines))
 
     if function_name == "keytao_shift_phrase_code":
@@ -3585,89 +3633,72 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             for word in shift_plan.get("listedWords") or []
             if str(word).strip()
         ]
-        lines = [
-            (
-                "🔁 服务端已锁定常用度重排计划："
-                if current_state and proposed_state
-                else "🔁 服务端已生成完整顺延计划："
-            )
-        ]
+        lines = ["🔁 调整计划："]
         if current_state and proposed_state:
-            lines.append("当前状态：")
-            for entry in current_state:
-                if not isinstance(entry, dict):
-                    continue
-                source = "草稿" if entry.get("source") == "draft" else "词库"
-                lines.append(
-                    f"• {entry.get('word') or ''}：{entry.get('code') or ''} / "
-                    f"{entry.get('weight')}（{source}）"
-                )
-            lines.append("建议状态：")
+            current_by_word = {
+                str(entry.get("word") or "").strip(): entry
+                for entry in current_state
+                if isinstance(entry, dict)
+                and str(entry.get("word") or "").strip()
+            }
             for entry in proposed_state:
                 if not isinstance(entry, dict):
                     continue
+                word = str(entry.get("word") or "").strip()
+                previous = current_by_word.get(word)
+                if not word or not isinstance(previous, dict):
+                    continue
+                old_code = str(previous.get("code") or "").strip()
+                new_code = str(entry.get("code") or "").strip()
+                old_weight = previous.get("weight")
+                new_weight = entry.get("weight")
+                if old_code == new_code and old_weight == new_weight:
+                    continue
+                source = "草稿" if previous.get("source") == "draft" else "词库"
                 lines.append(
-                    f"• {entry.get('word') or ''}：{entry.get('code') or ''} / "
-                    f"{entry.get('weight')}"
+                    f"• {word}：{old_code} / {old_weight}（{source}）"
+                    f"→ {new_code} / {new_weight}"
                 )
             proposed_words = [
                 str(entry.get("word") or "").strip()
                 for entry in proposed_state
                 if isinstance(entry, dict) and str(entry.get("word") or "").strip()
             ]
+            evidence_summary: List[str] = []
             if listed_words:
                 relation = "一致" if proposed_words == listed_words else "不一致"
-                lines.append(
-                    f"你列的顺序与常用度证据{relation}："
-                    + " → ".join(proposed_words)
+                evidence_summary.append(
+                    f"建议 {'→'.join(proposed_words)}（与你列的{relation}）"
                 )
             evidence_lines = [
                 str(line).strip()
                 for line in shift_plan.get("evidenceLines") or []
                 if str(line).strip()
             ]
-            if evidence_lines:
-                lines.append("常用度证据：")
-                lines.extend(f"• {line}" for line in evidence_lines)
-            lines.append("草稿变更：")
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            action = str(item.get("action") or "")
-            word = str(item.get("word") or "")
-            old_word = str(item.get("old_word") or item.get("oldWord") or "")
-            code = str(item.get("code") or "")
-            if action == "Change" and old_word:
-                lines.append(f"• 修改：{old_word} → {word}（{code}）")
-            else:
-                lines.append(f"• {action or '变更'}：{word}（{code}）")
-        for update in shift_plan.get("draftUpdates") or []:
-            if not isinstance(update, dict):
-                continue
-            lines.append(
-                f"• 调整草稿权重：{update.get('word') or ''}（{update.get('code') or ''}）"
-                f"{update.get('fromWeight')} → {update.get('toWeight')}"
-            )
-        batch_url = _trusted_batch_url(data)
-        if batch_url:
-            lines.append(f"草稿地址：{batch_url}")
+            decisive_evidence = _compact_ranked_shift_evidence(evidence_lines)
+            if decisive_evidence:
+                evidence_summary.append(decisive_evidence)
+            if evidence_summary:
+                lines.append("依据：" + "；".join(evidence_summary))
+        else:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                action = str(item.get("action") or "变更")
+                word = str(item.get("word") or "")
+                code = str(item.get("code") or "")
+                lines.append(f"• {word}：{action} {code}")
         warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
         if warnings:
             rendered_warnings = [
                 _ranked_shift_warning_copy(warning, proposed_state)
                 for warning in warnings
             ]
-            lines.append(
-                "服务端校验："
-                if all(resolved for _message, resolved in rendered_warnings)
-                else "服务端风险："
-            )
-            lines.extend(f"• {message}" for message, _resolved in rendered_warnings)
-        lines.extend((
-            "",
-            "以上计划已锁定；执行时服务端会逐步校验当前草稿批次及内容版本。"
-            f"确认执行吗？{pending_confirmation_copy()}",
-        ))
+            lines.extend(f"提示：{message}" for message, _resolved in rendered_warnings)
+        lines.append(pending_confirmation_copy())
+        batch_url = _trusted_batch_url(data)
+        if batch_url:
+            lines.append(f"草稿地址：{batch_url}")
         return _assert_plain_user_facing_reply("\n".join(lines))
 
     warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
@@ -3679,20 +3710,208 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     if function_name == "keytao_submit_batch":
         _append_submit_review_lines(review_parts, data)
         _append_submit_snapshot_lines(review_parts, data)
-    review_text = ("\n\n" + "\n".join(review_parts)) if review_parts else ""
-    action_text = {
-        "keytao_submit_batch": "继续提交",
-        "keytao_batch_add_to_draft": "继续批量加入草稿",
-        "keytao_create_phrase": "继续加入草稿",
-    }.get(function_name, "继续执行")
-    if data.get("submitAfter"):
-        action_text += "，并随后核对提交快照"
+    review_text = ("\n" + "\n".join(review_parts)) if review_parts else ""
     batch_url = _trusted_batch_url(data)
     link_text = f"\n草稿地址：{batch_url}" if batch_url else ""
     return _assert_plain_user_facing_reply(
-        f"{warning_text}{review_text}{link_text}\n\n"
-        f"这是服务端在实际校验后返回的风险。确认{action_text}吗？"
-        f"{pending_confirmation_copy()}"
+        f"{warning_text}{review_text}\n{pending_confirmation_copy()}{link_text}"
+    )
+
+
+_RANKED_SHIFT_CONTINUATION_COMMAND = "继续调整"
+_RANKED_SHIFT_SEMANTIC_ARGS = (
+    "word",
+    "target_code",
+    "target_type",
+    "target_remark",
+    "target_needs_manual_review",
+    "ordered_words",
+    "listed_words",
+    "evidence_lines",
+)
+
+
+def _ranked_shift_continuation_args(state: PendingToolConfirm) -> Dict[str, Any]:
+    """Keep only user-bound semantics when recomputing a remaining delta."""
+    return {
+        key: state.args[key]
+        for key in _RANKED_SHIFT_SEMANTIC_ARGS
+        if key in state.args
+    }
+
+
+def _compact_ranked_shift_receipt_reason(value: Any) -> str:
+    reason = re.sub(r"\s+", " ", str(value or "").strip())
+    if any(marker in reason for marker in ("版本", "变化", "冲突", "待删除条目")):
+        return "草稿版本冲突"
+    if any(marker in reason for marker in ("目标", "条目", "找不到", "不存在")):
+        return "草稿目标已变化"
+    if any(marker in reason.lower() for marker in ("timeout", "network", "连接", "超时")):
+        return "服务暂时不可用"
+    return "草稿权重调整未完成"
+
+
+def _format_ranked_shift_partial_failure(
+    data: Dict[str, Any],
+    *,
+    continuation_staged: bool,
+) -> str:
+    """Render only authoritative step receipts plus one safe next action."""
+    applied: List[str] = []
+    remaining: List[str] = []
+    receipts = data.get("receipts") if isinstance(data.get("receipts"), list) else []
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            continue
+        step = str(receipt.get("step") or "")
+        status = str(receipt.get("status") or "")
+        if step == "dictionary" and status in {"applied", "alreadyApplied"}:
+            changes = [
+                f"{str(change.get('word') or '').strip()} "
+                f"{str(change.get('fromCode') or '').strip()}→"
+                f"{str(change.get('toCode') or '').strip()}"
+                for change in receipt.get("changes") or []
+                if isinstance(change, dict)
+                and str(change.get("word") or "").strip()
+                and str(change.get("fromCode") or "").strip()
+                and str(change.get("toCode") or "").strip()
+            ]
+            applied.extend(changes)
+            if not changes and int(receipt.get("itemCount") or 0) > 0:
+                applied.append(f"实时词库变更 {int(receipt['itemCount'])} 项")
+        elif step == "draftWeight":
+            word = str(receipt.get("word") or "").strip()
+            code = str(receipt.get("code") or "").strip()
+            change = (
+                f"{word} {code} 权重 "
+                f"{receipt.get('fromWeight')}→{receipt.get('toWeight')}"
+            ).strip()
+            if status in {"applied", "alreadyApplied"}:
+                applied.append(change)
+            elif status in {"failed", "pending"}:
+                if status == "failed":
+                    change += "（" + _compact_ranked_shift_receipt_reason(
+                        receipt.get("reason")
+                    ) + "）"
+                remaining.append(change)
+
+    lines = ["⚠️ 计划部分完成"]
+    if applied:
+        lines.append("已完成：" + "、".join(applied))
+    if remaining:
+        lines.append("未完成：" + "、".join(remaining))
+    batch_url = _trusted_batch_url(data)
+    if batch_url:
+        lines.append(f"草稿地址：{batch_url}")
+    if continuation_staged:
+        lines.append(
+            f"回复「{_RANKED_SHIFT_CONTINUATION_COMMAND}」完成剩余步骤，"
+            "或「取消」放弃。"
+        )
+    else:
+        lines.append("剩余步骤暂未形成可安全执行的新票据。")
+    return _assert_plain_user_facing_reply("\n".join(lines))
+
+
+def _format_ranked_shift_success(data: Dict[str, Any]) -> str:
+    """Render applied shift receipts without repeating the full draft."""
+    changes: List[str] = []
+    receipts = data.get("receipts") if isinstance(data.get("receipts"), list) else []
+    for receipt in receipts:
+        if not isinstance(receipt, dict) or receipt.get("status") not in {
+            "applied", "alreadyApplied",
+        }:
+            continue
+        if receipt.get("step") == "dictionary":
+            changes.extend(
+                f"{str(change.get('word') or '').strip()} "
+                f"{str(change.get('fromCode') or '').strip()}→"
+                f"{str(change.get('toCode') or '').strip()}"
+                for change in receipt.get("changes") or []
+                if isinstance(change, dict)
+                and str(change.get("word") or "").strip()
+                and str(change.get("fromCode") or "").strip()
+                and str(change.get("toCode") or "").strip()
+            )
+        elif receipt.get("step") == "draftWeight":
+            changes.append(
+                f"{str(receipt.get('word') or '').strip()} "
+                f"{str(receipt.get('code') or '').strip()} 权重 "
+                f"{receipt.get('fromWeight')}→{receipt.get('toWeight')}"
+            )
+    if not changes:
+        shift_plan = data.get("shiftPlan") if isinstance(data.get("shiftPlan"), dict) else {}
+        changes.extend(
+            f"{str(change.get('word') or '').strip()} "
+            f"{str(change.get('fromCode') or '').strip()}→"
+            f"{str(change.get('toCode') or '').strip()}"
+            for change in shift_plan.get("shifted") or []
+            if isinstance(change, dict)
+            and str(change.get("word") or "").strip()
+            and str(change.get("fromCode") or "").strip()
+            and str(change.get("toCode") or "").strip()
+        )
+        changes.extend(
+            f"{str(update.get('word') or '').strip()} "
+            f"{str(update.get('code') or '').strip()} 权重 "
+            f"{update.get('fromWeight')}→{update.get('toWeight')}"
+            for update in shift_plan.get("draftUpdates") or []
+            if isinstance(update, dict) and str(update.get("word") or "").strip()
+        )
+    lines = ["✅ 操作已完成"]
+    if changes:
+        lines.append("已变更：" + "、".join(OrderedDict.fromkeys(changes)))
+    batch_url = _trusted_batch_url(data)
+    if batch_url:
+        lines.append(f"草稿地址：{batch_url}")
+    return _assert_plain_user_facing_reply("\n".join(lines))
+
+
+async def _stage_ranked_shift_continuation(
+    state: PendingToolConfirm,
+    data: Dict[str, Any],
+    platform: str,
+    user_id: str,
+    conv_key: Optional[ConversationKey],
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> bool:
+    """Recompute and seal only the remaining ranked-shift delta."""
+    continuation_args = _ranked_shift_continuation_args(state)
+    if (
+        state.function_name != "keytao_shift_phrase_code"
+        or not continuation_args.get("word")
+        or not continuation_args.get("target_code")
+    ):
+        return False
+    preview_json = await call_tool_function(
+        state.function_name,
+        continuation_args,
+        platform,
+        user_id,
+    )
+    try:
+        preview_data = json.loads(preview_json)
+    except Exception:
+        return False
+    if preview_data.get("requiresConfirmation") is not True:
+        return False
+    pending = _pending_state_from_server_warning(
+        PendingToolConfirm(
+            function_name=state.function_name,
+            args=continuation_args,
+        ),
+        preview_data,
+    )
+    pending.args["_continuation_command"] = _RANKED_SHIFT_CONTINUATION_COMMAND
+    if not server_warning_ticket_is_complete(pending):
+        return False
+    target_key: ConversationKey = conv_key or (platform, user_id)
+    return conversation_state_store.set(
+        target_key,
+        pending,
+        space_key=space_key,
+        owner_label=owner_label,
     )
 
 
@@ -3884,6 +4103,25 @@ async def _execute_confirmed_tool(
             command="确认",
         )
 
+    if (
+        state.function_name == "keytao_shift_phrase_code"
+        and data.get("partialWrite") is True
+        and isinstance(data.get("receipts"), list)
+    ):
+        continuation_staged = await _stage_ranked_shift_continuation(
+            state,
+            data,
+            platform,
+            user_id,
+            conv_key,
+            space_key,
+            owner_label,
+        )
+        return _format_ranked_shift_partial_failure(
+            data,
+            continuation_staged=continuation_staged,
+        )
+
     if data.get("success") is True and carried_warnings:
         data["warnings"] = list(carried_warnings)
         data["warnedCount"] = len(carried_warnings)
@@ -4061,7 +4299,6 @@ async def _execute_confirmed_tool(
                 parts.append(f"\n草稿地址：{batch_url}")
             if pr_url:
                 parts.append(f"PR：{pr_url}")
-            _append_submit_review_lines(parts, data)
             return "\n".join(parts)
         if data.get("uncertain"):
             return _append_batch_url_if_missing(
@@ -4091,7 +4328,9 @@ async def _execute_confirmed_tool(
             failed_count = int(data.get("failedCount") or 0)
             partial = failed_count > 0 or success_count != expected_count
             header = "⚠️ 仅部分加入草稿\n" if partial else "✅ 已加入草稿\n"
-            response = header + await _format_draft_response(data, platform, user_id)
+            response = header + await _format_draft_response(
+                data, platform, user_id, compact=True,
+            )
             if partial:
                 suffix = f"\n仅成功加入 {success_count}/{expected_count} 条"
                 if submit_after:
@@ -4131,10 +4370,13 @@ async def _execute_confirmed_tool(
                         ),
                         data,
                     )
+            if state.function_name == "keytao_shift_phrase_code":
+                return _format_ranked_shift_success(data)
             response = "✅ 操作已完成\n" + await _format_draft_response(
                 data,
                 platform,
                 user_id,
+                compact=True,
             )
             if expected_keep_words:
                 list_data = await _fetch_current_draft_items(
@@ -4175,7 +4417,9 @@ async def _execute_confirmed_tool(
 
     if data.get("success"):
         header = "✅ 已确认添加到草稿\n"
-        response = header + await _format_draft_response(data, platform, user_id)
+        response = header + await _format_draft_response(
+            data, platform, user_id, compact=True,
+        )
         if submit_after:
             return await continue_with_submit_preview(response)
         return response
@@ -4190,8 +4434,10 @@ async def _format_draft_response(
     platform: str,
     user_id: str,
     batch_id: Optional[str] = None,
+    *,
+    compact: bool = False,
 ) -> str:
-    """Format draft state (summary + diff + items + URL) after an operation."""
+    """Format a compact mutation result or the full current-draft view."""
     # "Current draft" is an implicit pointer to the newest draft batch, and a
     # read can move it.  Whenever this turn knows which batch it just operated
     # on, the data is read from that batch, and a drifted pointer is reported
@@ -4263,12 +4509,26 @@ async def _format_draft_response(
 
     # Diff block
     diff_text = preview.get("diff_text", "") if preview.get("success") else ""
-    if diff_text:
+    if diff_text and not compact:
         parts.append(f"\n{diff_text}")
 
     # Draft items
     draft_count: Optional[int] = None
-    if snapshot:
+    if snapshot and compact:
+        items = snapshot.get("items", [])
+        if isinstance(items, list) and items:
+            visible_items = [
+                f"{str(item.get('word') or '').strip()} {str(item.get('code') or '').strip()}"
+                for item in items[:5]
+                if isinstance(item, dict)
+                and str(item.get("word") or "").strip()
+                and str(item.get("code") or "").strip()
+            ]
+            if visible_items:
+                remainder = len(items) - len(visible_items)
+                suffix = f" 等 {len(items)} 条" if remainder > 0 else ""
+                parts.append("草稿内容：" + "、".join(visible_items) + suffix)
+    elif snapshot:
         items = snapshot.get("items", [])
         count = snapshot.get("count", len(items))
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
@@ -4280,9 +4540,10 @@ async def _format_draft_response(
     # Batch URL
     batch_url = data.get("batchUrl") or preview.get("batchUrl", "") or list_batch_url
     if batch_url:
-        parts.append(f"\n草稿地址：{batch_url}")
+        prefix = "" if compact else "\n"
+        parts.append(f"{prefix}草稿地址：{batch_url}")
 
-    if draft_count != 0:
+    if not compact and draft_count != 0:
         parts.append("\n发送「提交」以提交该草稿，也可继续加改动")
     return "\n".join(parts)
 
@@ -4480,7 +4741,6 @@ async def _perform_submit_current_draft(
         parts.append(f"批次地址：{batch_url}")
     if pr_url:
         parts.append(f"PR：{pr_url}")
-    _append_submit_review_lines(parts, submit_data)
     return DraftActionResult("\n".join(parts), success=True, data=submit_data)
 
 
@@ -5458,6 +5718,7 @@ async def _perform_recall_latest_batch(
         platform,
         user_id,
         batch_id=exact_batch_id,
+        compact=True,
     )
     return DraftActionResult(
         "✅ 已撤回最近提审，批次已恢复为草稿。\n" + formatted,
@@ -5633,7 +5894,9 @@ async def _try_handle_keep_only_draft_items_command(
         submit_response = await _submit_current_draft(platform, user_id, space_key, owner_label)
         return "\n".join([*prefix_parts, submit_response])
 
-    return "\n".join(prefix_parts) + "\n" + await _format_draft_response(remove_data, platform, user_id)
+    return "\n".join(prefix_parts) + "\n" + await _format_draft_response(
+        remove_data, platform, user_id, compact=True,
+    )
 
 
 def _chain_reorder_ask(code: str, reason: str) -> str:
@@ -5988,27 +6251,14 @@ def _format_code_chain_reorder_confirmation(
     plan: Dict[str, Any],
     preview_data: Dict[str, Any],
 ) -> str:
-    lines = [f"🔁 编码 {plan['code']} 同码链常用度重排计划："]
+    lines = [f"🔁 编码 {plan['code']} 调整计划："]
     groups = plan.get("groups") if isinstance(plan.get("groups"), list) else []
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        if len(groups) > 1:
-            lines.append(f"{group.get('type') or '未知类型'}：")
-        current = group.get("current") if isinstance(group.get("current"), list) else []
-        proposed = group.get("proposed") if isinstance(group.get("proposed"), list) else []
-        lines.append("当前：" + _format_chain_order(current))
-        lines.append("建议：" + _format_chain_order(proposed))
-
-    lines.append("移动：")
     for item in plan.get("moves") or []:
         if not isinstance(item, dict):
             continue
         lines.append(
             f"• 「{item.get('word') or ''}」："
-            f"{item.get('fromWeight')} → {item.get('toWeight')}"
-            f"（第{int(item.get('fromPosition') or 0) + 1}位 → "
-            f"第{int(item.get('toPosition') or 0) + 1}位）"
+            f"权重 {item.get('fromWeight')} → {item.get('toWeight')}"
         )
 
     evidence = [
@@ -6027,18 +6277,15 @@ def _format_code_chain_reorder_confirmation(
     ]
     visible_evidence = list(OrderedDict.fromkeys([*evidence, *summaries]))
     if visible_evidence:
-        lines.append("常用度证据：")
-        lines.extend(f"• {line}" for line in visible_evidence)
+        lines.append("依据：" + "；".join(visible_evidence))
 
     warnings = preview_data.get("warnings")
     if isinstance(warnings, list) and warnings:
-        lines.append("服务端风险：")
-        lines.extend(f"• {_plain_warning_message(warning)}" for warning in warnings)
-    lines.extend((
-        "",
-        "服务端已锁定以上完整修改集合。",
-        pending_confirmation_copy(),
-    ))
+        lines.extend(f"提示：{_plain_warning_message(warning)}" for warning in warnings)
+    lines.append(pending_confirmation_copy())
+    batch_url = _trusted_batch_url(preview_data)
+    if batch_url:
+        lines.append(f"草稿地址：{batch_url}")
     return _assert_plain_user_facing_reply("\n".join(lines))
 
 

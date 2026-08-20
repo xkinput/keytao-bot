@@ -850,20 +850,12 @@ def _quoted_choices(forms: tuple[str, ...]) -> str:
 
 def pending_confirmation_copy() -> str:
     """Render the generic forms accepted by a single actor-owned ticket."""
-    return (
-        "回复「确认」执行，或「取消」放弃。\n"
-        "请引用本条消息回复「确认」或「取消」；"
-        "当前只有这一项待确认时，也可直接回复确认。"
-    )
+    return "回复「确认」执行，或「取消」。"
 
 
 def pending_batch_confirmation_copy() -> str:
-    """Render every advertised add-only and add-then-submit form."""
-    return (
-        f"回复{_quoted_choices(PENDING_BATCH_ADD_ADVERTISED_FORMS)}只加入草稿；"
-        f"回复{_quoted_choices(PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS)}"
-        "则加入后提交。"
-    )
+    """Render one canonical add-only and add-then-submit form."""
+    return "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
 
 
 _SERVER_BACKED_WORD_SET_HEADER = "本轮服务端查询确认未收录的词："
@@ -1017,34 +1009,25 @@ def render_server_backed_batch_candidates(
         review_copy = "需管理员审核" if needs_review else "可自动通过"
         lines.append(f"   审核结论：{review_copy}")
 
-    lines.extend((
-        "",
-        "确认后才会写入草稿。",
-        pending_batch_confirmation_copy(),
-    ))
+    lines.append(pending_batch_confirmation_copy())
     return "\n".join(lines)
 
 
 def pending_single_candidate_confirmation_copy() -> str:
     """Render the only whole-state assent forms for one-word candidates."""
-    return (
-        f"回复{_quoted_choices(PENDING_SINGLE_ADD_ADVERTISED_FORMS)}只加入草稿；"
-        f"回复{_quoted_choices(PENDING_SINGLE_ADD_AND_SUBMIT_ADVERTISED_FORMS)}"
-        "则加入后提交。"
-    )
+    return "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
 
 
 def single_word_candidate_footer(candidate_count: int) -> str:
     """Render truthful selection and whole-state actions for one word."""
-    lines = []
     if candidate_count > 1:
         example = "2、4" if candidate_count >= 4 else "1、2"
-        lines.append(
-            "可回复编号或编码选择其他编码；"
-            f"可多选，如「添加{example}」。"
+        return (
+            "回复编号或编码选择"
+            f"（可多选，如「添加{example}」）；"
+            "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
         )
-    lines.append(pending_single_candidate_confirmation_copy())
-    return "\n".join(lines)
+    return pending_single_candidate_confirmation_copy()
 
 
 def advertised_single_word_candidate_codes(text: str) -> tuple[str, ...]:
@@ -1152,6 +1135,13 @@ def render_server_backed_single_word_lookup(
             source,
             re.IGNORECASE,
         )
+        if confirmation is None:
+            confirmation = re.search(
+                rf"(?m)^\s*[•-]\s*「{re.escape(normalized_word)}」\s*→\s*"
+                rf"{re.escape(recommended)}\s*[（(]推荐[）)]\s*$",
+                source,
+                re.IGNORECASE,
+            )
         if confirmation is not None:
             body = source[:confirmation.start()].rstrip()
             body = re.sub(
@@ -1214,31 +1204,26 @@ def advertised_single_word_lookup_word(text: str) -> str:
 def ensure_single_word_candidate_copy(text: str, candidate_count: int) -> str:
     """Normalize legacy one-word footers to the shared truthful contract."""
     response = str(text or "")
-    selection_copy = ""
-    if candidate_count > 1:
-        example = "2、4" if candidate_count >= 4 else "1、2"
-        selection_copy = (
-            "可回复编号或编码选择其他编码；"
-            f"可多选，如「添加{example}」。"
-        )
     for old in (
         "可回复编号、编码，或「都加」；可多选，如「添加2、4」。",
         "可回复编号、编码，或「都加」；",
         "可回复编号、编码，或「都加」。",
         "也可回复编号选其他编码。",
+        "可回复编号或编码选择其他编码；可多选，如「添加2、4」。",
+        "可回复编号或编码选择其他编码；可多选，如「添加1、2」。",
     ):
-        response = response.replace(old, selection_copy)
+        response = response.replace(old, "")
     if candidate_count <= 1:
         response = re.sub(
             r"可多选，如[「“『]添加\d+(?:、\d+)+[」”』][。.]?",
             "",
             response,
         )
-    elif "可回复编号或编码选择其他编码" not in response:
-        response = response.rstrip() + "\n" + selection_copy
     confirmation_copy = pending_single_candidate_confirmation_copy()
-    if confirmation_copy not in response:
-        response = response.rstrip() + "\n" + confirmation_copy
+    response = response.replace(confirmation_copy, "")
+    footer = single_word_candidate_footer(candidate_count)
+    if footer not in response:
+        response = response.rstrip() + "\n" + footer
     response = re.sub(r"[ \t]+(?=\n|$)", "", response)
     response = re.sub(r"\n{3,}", "\n\n", response)
     return response.strip()

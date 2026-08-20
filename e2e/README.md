@@ -316,9 +316,12 @@ S32 replays both 2026-08-20 chain-scope incidents verbatim. The first command
 must merge the live `mkdr` row with the current draft row and render one locked
 weight plan; the scenario cancels that plan to retain the incident baseline.
 The newline-separated three-word command must then resolve every word, include
-`迷瞪@mkdro` in one `mkdr*` prefix-chain plan, show current and proposed
-code/weight facts plus the listed-order comparison, and apply the sealed plan
-after exactly one confirmation.
+`迷瞪@mkdro` in one `mkdr*` prefix-chain plan, and render only old-to-new moves,
+one evidence summary, one confirmation line, and the draft link in at most eight
+lines. The sealed incident shape is exactly `Delete 米等@mkdr`,
+`Create 米等@mkdrou`, and `幂等@mkdr 101→100`; one confirmation must return
+successful dictionary and draft-weight receipts and materialize all three
+changes before the compact completion reply.
 
 Optional overrides:
 

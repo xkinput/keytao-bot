@@ -312,7 +312,7 @@ def _format_submit_conflict_failure(data: Dict) -> str:
     snapshot_items = _submit_conflict_snapshot_items(data)
     used_indexes: set[int] = set()
     message = str(data.get("message") or "批次中存在未解决的冲突，无法提交").strip()
-    lines = [f"提交失败：{message}", "冲突详情："]
+    lines = [f"提交失败：{message}"]
     for index, conflict in enumerate(conflicts, start=1):
         if not isinstance(conflict, dict):
             lines.append(f"{index}. 服务端返回了一条无法识别的冲突记录。")
@@ -343,8 +343,6 @@ def _format_submit_conflict_failure(data: Dict) -> str:
             suggestion = render_executable_suggestion(command, words=words)
             if not suggestion:
                 return False
-            if guidance:
-                lines.append(f"   处理建议：{guidance}")
             lines.append(suggestion)
             return True
 
@@ -716,7 +714,7 @@ def _format_server_bound_confirmation_prompt(state: PendingToolConfirm) -> str:
         raise ValueError("Server-bound confirmation prompt requires a server ticket")
     details = _format_pending_state_details(state)
     return _assert_plain_user_facing_reply(
-        f"{details}\n\n{pending_confirmation_copy()}"
+        f"{details}\n{pending_confirmation_copy()}"
     )
 
 
@@ -731,16 +729,16 @@ def _format_changed_server_confirmation_prompt(
         or previous.function_name != current.function_name
     ):
         raise ValueError("Changed confirmation prompt requires matching server tickets")
-    previous_details = _format_pending_state_details(previous)
-    current_details = _format_pending_state_details(current)
+    previous_details = re.sub(
+        r"\s*\n\s*", "；", _format_pending_state_details(previous)
+    )
+    current_details = re.sub(
+        r"\s*\n\s*", "；", _format_pending_state_details(current)
+    )
     lines = [
-        "服务端复核发现确认内容已变化，原确认没有执行。",
-        "原确认内容：",
-        previous_details,
-        "",
-        "当前内容：",
-        current_details,
-        "",
+        "服务端复核发现内容已变化，原确认未执行。",
+        f"原：{previous_details}",
+        f"现：{current_details}",
         pending_confirmation_copy(),
     ]
     return _assert_plain_user_facing_reply("\n".join(lines))
@@ -1303,15 +1301,9 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             _format_candidate_ordering_assessment(assessment, candidate_indexes)
             for assessment in ordering_assessments
         )
-    lines.append("")
     if ordering_recommended_code:
-        lines.append(
-            f"如不调整现有排序，是否仍以编码 {recommended_code} 将「{word}」加入草稿？"
-        )
-    else:
-        lines.append(
-            f"是否以编码 {recommended_code} 将「{word}」加入草稿？"
-        )
+        lines.append("提示：当前建议不调整现有排序。")
+    lines.append(f"• 「{word}」→ {recommended_code}（推荐）")
     lines.append(single_word_candidate_footer(candidate_index - 1))
     occupied_choice = next(
         (
@@ -1649,11 +1641,7 @@ def _format_replace_char_confirmation(
     parts = [f"🔁 准备把 {len(items)} 条词条里的「{old_char}」替换为「{new_char}」："]
     for item in items:
         parts.append(f"• {item['old_word']} → {item['word']}（{item['code']}）")
-    parts.extend((
-        "",
-        "确认后我才会把这批修改加入草稿。"
-        f"{pending_confirmation_copy()}",
-    ))
+    parts.append(pending_confirmation_copy())
     return _assert_plain_user_facing_reply("\n".join(parts))
 
 
