@@ -406,7 +406,7 @@ class AgentOrchestrator:
         if context.resolved_advertised_words and not resolved_advertised_words:
             requested_words = tuple(context.resolved_advertised_words)
             return render_remediation_reply(
-                "刚才的候选快照已变化或失效；本次未写入",
+                "刚才的候选已变化或失效，本次未写入",
                 command="加词 " + " ".join(requested_words),
                 words=requested_words,
             )
@@ -1027,7 +1027,7 @@ class AgentOrchestrator:
                         if not saved:
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
-                                    "刚才的候选快照已变化或失效；本次未写入",
+                                    "刚才的候选已变化或失效，本次未写入",
                                     command="加词 " + " ".join(resolved_advertised_words),
                                     words=resolved_advertised_words,
                                 ),
@@ -1085,7 +1085,7 @@ class AgentOrchestrator:
                         if not saved:
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
-                                    "当前单词候选无法安全保存；本次不会写入"
+                                    "当前单词候选无法保存，本次不会写入"
                                 ),
                                 authoritative_result_links,
                             )
@@ -1142,8 +1142,7 @@ class AgentOrchestrator:
                         if not token:
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
-                                    "本轮未收录词记录无法安全保存为候选快照；"
-                                    "本次不会写入"
+                                    "本轮未收录词记录无法保存，本次不会写入"
                                 ),
                                 authoritative_result_links,
                             )
@@ -1243,7 +1242,7 @@ class AgentOrchestrator:
                             )
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
-                                    "当前候选无法安全保存；没有执行添加",
+                                    "当前候选无法保存，本次未添加",
                                     command="加词 " + " ".join(
                                         str(item.get("word") or "").strip()
                                         for item in pending_items
@@ -1528,7 +1527,7 @@ class AgentOrchestrator:
                     if termination_state is not None:
                         termination_state["reason"] = "duplicate_tool_runaway"
                     return self._append_authoritative_result_links(
-                        "呜呜，AI 陷入了循环 qwq 请换个方式描述任务再试试～",
+                        "请求陷入循环，请换种说法后重试。",
                         authoritative_result_links,
                     )
                 except Exception as error:
@@ -1781,8 +1780,7 @@ class AgentOrchestrator:
                             "success": False,
                             "policyBlocked": True,
                             "message": render_remediation_reply(
-                                "待确认操作未形成完整且可保存的服务端票据；"
-                                "本次未执行"
+                                "待确认内容不完整，本次未执行"
                             ),
                         }
                         result_str = json.dumps(result_data, ensure_ascii=False)
@@ -1816,8 +1814,7 @@ class AgentOrchestrator:
                                 termination_state["reason"] = "confirmation_save_failure"
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
-                                    "待确认操作未能安全保存；"
-                                    "当前没有仍受服务端票据绑定的完整指令"
+                                    "待确认内容无法保存，本次未执行"
                                 ),
                                 authoritative_result_links,
                             )
@@ -1950,7 +1947,7 @@ class AgentOrchestrator:
         return self._append_authoritative_result_links(
             f"本轮已完成 {total_tool_calls} 项：{completed_text}。"
             f"但模型处理已达到 {max_iterations} 轮上限，最终汇总尚未完成；"
-            "可执行命令：\n"
+            "\n"
             + render_executable_suggestion("继续处理剩余项"),
             authoritative_result_links,
         )
@@ -3282,12 +3279,21 @@ class AgentOrchestrator:
                             or audit.get("summary")
                             or "预审证据不足"
                         ).replace("\n", " ").strip()[:240]
+                        reason = reason.replace(
+                            "读音由有明确含义支撑的整词语境判定",
+                            "读音有明确含义支撑",
+                        ).replace("权威整词读音来源", "读音来源")
+                        reason = re.sub(
+                            r"[，,；;]?\s*(?:需要|需)管理员审核[。.]?$",
+                            "",
+                            reason,
+                        ).strip("；;。 ，,")
                         if needs_manual_review:
-                            verdict = f"自动审核：该词需管理员审核（{reason}）"
+                            verdict = f"自动审核：{reason}，需要管理员审核"
                         elif semantic_basis:
                             verdict = f"自动审核：{reason}"
                         else:
-                            verdict = f"自动审核：该词可自动通过（{reason}）"
+                            verdict = f"自动审核：{reason}，可自动通过"
                         base_reviewed = {
                             "type": phrase_type,
                             "remark": f"喵喵审词：{verdict}",
@@ -3553,7 +3559,7 @@ class AgentOrchestrator:
             f"本轮工具调用已达到 {_MAX_TOOL_CALLS_PER_RUN} 次上限；"
             f"当前这批已完成 {completed}/{total}：{completed_text}。"
             f"尚有 {len(remaining_labels)} 项未执行：{remaining_text}。"
-            "已完成结果会保留。\n可执行命令：\n"
+            "已完成结果会保留。\n"
             + render_executable_suggestion("继续处理剩余项")
         )
 

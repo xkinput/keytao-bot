@@ -4048,7 +4048,7 @@ def _validate_current_message_binding(
             return text_follow_up(
                 BLOCK_REASON_BINDING_INCOMPLETE,
                 render_remediation_reply(
-                    "服务端没有提供唯一、完整的同码链权重快照，本次未写入"
+                    "同码链权重不完整，本次未写入"
                 ),
                 word=word,
                 destinationWord=positional_create.destination_word,
@@ -4232,7 +4232,7 @@ def _validate_current_message_binding(
             )
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                f"{POLICY_BLOCK_TEMPLATE_PREFIX}本次批量写入无法与候选快照中选中的"
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}本次批量写入无法与候选中选中的"
                 f"{expected_labels}精确对应；整批均未写入。",
                 missing=["exactAuthorizedItemSet"],
                 suggestion=(SUGGESTION_MENTION_PREFIX + retry) if retry else "",

@@ -1861,7 +1861,7 @@ async def submit_discovered_words(
     ):
         logger.error("[word_discovery] batch-draft preview returned no verifiable snapshot")
         return failure(
-            "草稿写入预检未返回可校验的服务端快照",
+            "草稿写入检查不完整",
             batch_id=batch_id,
         )
 
@@ -1980,7 +1980,7 @@ async def submit_discovered_words(
             or not re.fullmatch(r"[0-9a-f]{64}", submit_warning_digest)
             or not re.fullmatch(r"[0-9a-f]{64}", submit_snapshot_digest)
         ):
-            submit_error = "提交预检未返回可校验的服务端快照"
+            submit_error = "提交检查不完整"
 
     if not submit_error:
         try:

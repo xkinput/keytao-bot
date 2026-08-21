@@ -1143,8 +1143,7 @@ async def _canonicalize_pending_ticket_intent(
                 )
             ):
                 return None, render_remediation_reply(
-                    f"只接受 1-{len(state.candidates)} 之间的编号；"
-                    "系统不能替你选择其中一个",
+                    f"只接受 1-{len(state.candidates)} 之间的编号",
                     command="加入",
                     words=(state.word,),
                 )
@@ -1159,7 +1158,7 @@ async def _canonicalize_pending_ticket_intent(
                 or any(code not in candidate_codes for code in multi_selection.codes)
             ):
                 return None, render_remediation_reply(
-                    "所选编码不全在当前候选中；系统不能替你选择另一个编码",
+                    "所选编码不全在当前候选中",
                     command="加入",
                     words=(state.word,),
                 )
@@ -1193,8 +1192,7 @@ async def _canonicalize_pending_ticket_intent(
     ):
         if not 1 <= command_intent.choice_index <= len(state.candidates):
             return None, render_remediation_reply(
-                f"只接受 1-{len(state.candidates)} 之间的编号；"
-                "系统不能替你选择其中一个",
+                f"只接受 1-{len(state.candidates)} 之间的编号",
                 command="加入",
                 words=(state.word,),
             )
@@ -1204,8 +1202,7 @@ async def _canonicalize_pending_ticket_intent(
         choice_index = _parse_pending_choice_index(_compact_command_text(message_text))
         if choice_index is None or not 1 <= choice_index <= len(state.candidates):
             return None, render_remediation_reply(
-                f"只接受 1-{len(state.candidates)} 之间的编号；"
-                "系统不能替你选择其中一个",
+                f"只接受 1-{len(state.candidates)} 之间的编号",
                 command="加入",
                 words=(state.word,),
             )
@@ -1222,7 +1219,7 @@ async def _canonicalize_pending_ticket_intent(
         target_code = _resolve_shift_target_code(state, canonical_intent)
         if target_code is None:
             return None, render_remediation_reply(
-                "无法唯一确定要顺延的占用编码；系统不能替你选择候选编号",
+                "无法唯一确定要顺延的占用编码",
                 command=f"加词 {state.word}",
                 words=(state.word,),
             )
@@ -1258,7 +1255,7 @@ async def _canonicalize_pending_ticket_intent(
         )
         if requested_target is None:
             return None, render_remediation_reply(
-                "无法把该编码绑定到当前候选；系统不能替你选择另一个编码",
+                "该编码不在当前候选中",
                 command=f"加词 {state.word}",
                 words=(state.word,),
             )
@@ -1297,8 +1294,9 @@ async def _resolve_pending_ticket_control(
     compact_control = _compact_command_text(message_text)
     if compact_control.startswith("确认票据"):
         return MessageCommandIntent(), (
-            "这种确认码已经停用；请引用当前确认消息回复「确认」或「取消」。\n"
-            f"当前待确认内容是：{_describe_pending_state(state_record.state)}。"
+            "确认码已停用。\n"
+            f"待确认：{_describe_pending_state(state_record.state)}。\n"
+            f"{pending_confirmation_copy()}"
         )
 
     if (
@@ -1364,7 +1362,7 @@ async def _resolve_pending_ticket_control(
             )
             if confirmation_code is None:
                 return MessageCommandIntent(), render_remediation_reply(
-                    "当前确认请求暂时无法安全保存"
+                    "当前确认无法保存"
                 )
         else:
             # Compatibility for isolated helpers that intentionally pass a
@@ -1379,7 +1377,7 @@ async def _resolve_pending_ticket_control(
             canonical_intent,
         )
         return MessageCommandIntent(), (
-            f"当前待确认内容已更新为：{description}。\n"
+            f"待确认：{description}。\n"
             f"{pending_confirmation_copy()}"
         )
 
@@ -1460,15 +1458,13 @@ def _resolve_uncertain_ticket_action(
         and cancellation.cancel_requested
     ):
         conversation_state_store.complete_execution(record)
-        return "discard", "已放弃这项结果不确定的旧操作；不会重放。"
+        return "discard", "已放弃上一次结果不确定的操作。"
 
     view_command = render_executable_suggestion("查看草稿")
     return (
         "block",
-        "上一次确认操作正在执行或结果不确定。为避免重复写入，这项操作不会再次执行；"
-        "可执行核对命令：\n"
-        + view_command
-        + "\n如需放弃，请引用当前消息回复「取消」。"
+        "上一次操作正在执行或结果不确定，不会重复写入。\n"
+        f"{view_command}\n或引用本消息回复「取消」。"
     )
 
 
@@ -1483,8 +1479,7 @@ def _format_other_owner_pending_message(
         else tuple(word for word, _code in pending_batch_display_pairs(state))
     )
     return render_remediation_reply(
-        f"这条是 {owner_label} 的待确认操作：{description}。\n"
-        f"你不能替 {owner_label} 确认；如需处理这些词，应为你自己重新审词",
+        f"这是 {owner_label} 的待确认操作：{description}；你不能代为确认",
         command=("加词 " + " ".join(words)) if words else "",
         words=words,
     )
@@ -1526,13 +1521,13 @@ def _format_batch_display_mismatch(
         if referenced_only:
             differences.append("引用显示 " + render(referenced_only))
         if live_only:
-            differences.append("当前票据显示 " + render(live_only))
+            differences.append("当前显示 " + render(live_only))
         detail = "；".join(differences)
     else:
         detail = (
             "展示顺序不同：引用为 "
             + render(referenced_pairs)
-            + "；当前票据为 "
+            + "；当前为 "
             + render(live_pairs)
         )
     live_words = tuple(word for word, _code in live_pairs)
@@ -1541,8 +1536,7 @@ def _format_batch_display_mismatch(
         words=live_words,
     )
     return (
-        f"你引用的批量加词与当前待确认批次不一致：{detail}。\n"
-        "为避免写错，本次未执行。\n可执行的当前票据命令：\n"
+        f"引用的批量加词与当前内容不一致：{detail}；本次未执行。\n"
         + suggestion
     )
 
@@ -1592,8 +1586,7 @@ def _handle_referenced_pending_from_other_user(
         )
     )
     return render_remediation_reply(
-        f"你引用的是一条待确认操作：{_describe_pending_state(referenced_state)}。\n"
-        "引用文字不能创建或恢复确认权限",
+        f"引用的待确认操作不可恢复：{_describe_pending_state(referenced_state)}",
         command=("加词 " + " ".join(referenced_words)) if referenced_words else "",
         words=referenced_words,
     )
@@ -1661,7 +1654,7 @@ async def _revalidate_referenced_add_pending(
     code_remarks: Dict[str, str] = {}
     audit_preview = _format_pre_submit_audit_preview(review, recommended_code)
     if not audit_preview:
-        audit_preview = "自动审核：该词需管理员审核（当前审词证据不足）"
+        audit_preview = "自动审核：当前审词证据不足，需要管理员审核"
     for pronunciation in review.get("pronunciations") or []:
         if not isinstance(pronunciation, dict):
             continue
@@ -2133,17 +2126,14 @@ async def _try_handle_referenced_word_presence_query(
     set_turn_flow("word-discovery")
     if not reply_reference.text:
         return render_remediation_reply(
-            "本喵看见你是在回复一条消息，但平台没有把被引用的原文给到本喵。"
-            "可能是消息过期、权限不足，或适配器没返回引用内容；"
-            "因此无法确定查询目标"
+            "平台未提供引用原文，无法确定查询目标"
         )
 
     expected_count = 2 if re.search(r"(两个|俩)", message_text) else 6
     words = _extract_referenced_word_targets(reply_reference.text, expected_count=expected_count)
     if not words:
         return render_remediation_reply(
-            "本喵拿到了被引用消息，但没能稳定识别出里面要查的词。"
-            "为避免把旧聊天记录里的词拿来误答，本次没有查询"
+            "无法从引用消息中确定要查询的词，本次未查询"
         )
 
     lookup_json = await call_tool_function(
@@ -2160,8 +2150,7 @@ async def _try_handle_referenced_word_presence_query(
     if not lookup_data.get("success"):
         message = lookup_data.get("message") or lookup_data.get("error") or "词库查询暂时失败"
         return (
-            f"本喵从引用消息里识别到：{'、'.join(f'「{word}」' for word in words)}，"
-            f"但查询词库时失败了：{message}。这次不会改用旧上下文，免得答错。"
+            f"查询 {'、'.join(f'「{word}」' for word in words)} 失败：{message}。"
         )
 
     return _format_referenced_word_presence_response(words, lookup_data)
@@ -2246,7 +2235,7 @@ async def _try_handle_simple_single_word_query(
         or review.get("error")
         or "审词工具暂时没有返回可靠读音"
     ).strip()
-    return f"{review_message}；本次不生成候选，也不会建立待确认加词操作。"
+    return review_message
 
 
 _INJECT_PLATFORM_TOOLS = frozenset({
@@ -2695,7 +2684,7 @@ async def _execute_add_to_draft(
 
     if not data.get("success"):
         return _append_batch_url_if_missing(
-            f"添加失败：{data.get('message', '未知错误')} qwq",
+            f"添加失败：{data.get('message', '未知错误')}",
             data,
         )
 
@@ -2931,7 +2920,7 @@ async def _perform_add_to_draft_and_submit(
     if not create_data.get("success"):
         return DraftActionResult(
             _append_batch_url_if_missing(
-                f"添加失败：{create_data.get('message', '未知错误')} qwq",
+                f"添加失败：{create_data.get('message', '未知错误')}",
                 create_data,
             ),
             data=create_data,
@@ -2961,8 +2950,8 @@ async def _perform_add_to_draft_and_submit(
     if submit_result.pending_state is not None:
         return DraftActionResult(
             _append_batch_url_if_missing((
-                f"✅ 已将「{word}」以编码 {code} 加入草稿。\n\n"
-                + ("\n".join(create_notice_lines) + "\n\n" if create_notice_lines else "")
+                f"✅ 「{word}」→ {code} 已加入草稿。\n"
+                + ("\n".join(create_notice_lines) + "\n" if create_notice_lines else "")
                 + submit_result.text
             ), create_data, submit_result.data or {}),
             pending_state=submit_result.pending_state,
@@ -2974,11 +2963,10 @@ async def _perform_add_to_draft_and_submit(
             if line.strip()
         ]
         final_status = (
-            f"✅ 已将「{word}」 → {code} 写入草稿，"
-            "已提交审核并自动审核入库。"
+            f"✅ 已将「{word}」→ {code} 写入草稿，已提交审核并加入词库。"
             if isinstance(submit_result.data, dict)
             and submit_result.data.get("autoApproved") is True
-            else f"✅ 搞定！「{word}」→ {code} 已加入草稿并提交审核。"
+            else f"✅ 已将「{word}」→ {code} 写入草稿，已提交审核。"
         )
         return DraftActionResult(
             _append_batch_url_if_missing(
@@ -3098,7 +3086,7 @@ async def _perform_batch_add_to_draft_and_submit(
     if success_count <= 0:
         return DraftActionResult(
             _append_batch_url_if_missing(
-                f"添加失败：{add_data.get('message', '未知错误')} qwq",
+                f"添加失败：{add_data.get('message', '未知错误')}",
                 add_data,
             ),
             data=add_data,
@@ -3474,9 +3462,7 @@ def _prepend_resolved_advertised_words(
     if len(words) != len(expected):
         return response
     return (
-        f"已按当前确认请求解析为以下 {len(words)} 个词："
-        + "、".join(words)
-        + "。\n"
+        f"词：{'、'.join(words)}\n"
         + str(response or "")
     )
 
@@ -3490,7 +3476,7 @@ def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
     )
     if not snapshot_items:
         return
-    lines.append("本次提交快照：")
+    lines.append("提交内容：")
     for item in snapshot_items:
         if not isinstance(item, dict):
             continue
@@ -3593,7 +3579,7 @@ def _compact_ranked_shift_evidence(evidence_lines: List[str]) -> str:
 def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     if function_name in {"keytao_remove_draft_item", "keytao_batch_remove_draft_items"}:
         targets = data.get("targets") if isinstance(data.get("targets"), list) else []
-        lines = [f"🗑️ 服务端已锁定 {len(targets)} 个删除目标："]
+        lines = [f"🗑️ 删除 {len(targets)} 个草稿项："]
         for target in targets:
             if not isinstance(target, dict):
                 continue
@@ -3609,7 +3595,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
 
     if function_name == "keytao_recall_batch":
         batch_url = _trusted_batch_url(data)
-        lines = ["↩️ 服务端已锁定待撤回批次。"]
+        lines = ["↩️ 撤回批次："]
         if batch_url:
             lines.append(f"草稿地址：{batch_url}")
         lines.append(pending_confirmation_copy())
@@ -3809,7 +3795,7 @@ def _format_ranked_shift_partial_failure(
             "或「取消」放弃。"
         )
     else:
-        lines.append("剩余步骤暂未形成可安全执行的新票据。")
+        lines.append("剩余步骤暂不可执行。")
     return _assert_plain_user_facing_reply("\n".join(lines))
 
 
@@ -3928,7 +3914,7 @@ async def _execute_confirmed_tool(
 ) -> str:
     """Execute one staged step without bypassing unseen server warnings."""
     if state.confirmation_source not in {"local_preview", "server_warning"}:
-        return render_remediation_reply("确认请求来源无效，已拒绝执行")
+        return render_remediation_reply("确认来源无效，已拒绝执行")
     if not _resolved_advertised_items_match(state):
         invalid_words = tuple(
             word for word, _code in pending_batch_display_pairs(state)
@@ -4011,7 +3997,7 @@ async def _execute_confirmed_tool(
             )
         ):
             return render_remediation_reply(
-                "提交确认请求缺少完整批次快照，已安全拒绝",
+                "提交确认内容不完整，已拒绝执行",
                 command="提交",
             )
         if state.function_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"} and (
@@ -4025,7 +4011,7 @@ async def _execute_confirmed_tool(
                 word for word, _code in pending_batch_display_pairs(state)
             )
             return render_remediation_reply(
-                "添加确认请求缺少服务端风险快照，已安全拒绝",
+                "添加确认内容不完整，已拒绝执行",
                 command=("加词 " + " ".join(invalid_words)) if invalid_words else "",
                 words=invalid_words,
             )
@@ -4040,7 +4026,7 @@ async def _execute_confirmed_tool(
             or (not args.get("batch_id") and args["expected_content_version"] != 0)
         ):
             return render_remediation_reply(
-                "顺延确认请求缺少完整计划版本，已安全拒绝",
+                "顺延确认内容不完整，已拒绝执行",
                 command="查看草稿",
             )
     if state.confirmation_source == "server_warning" and state.function_name == "keytao_recall_batch":
@@ -4051,7 +4037,7 @@ async def _execute_confirmed_tool(
             or args["expected_content_version"] < 0
         ):
             return render_remediation_reply(
-                "撤回确认请求缺少精确批次版本，已安全拒绝",
+                "撤回确认内容不完整，已拒绝执行",
                 command="查看草稿",
             )
     if state.confirmation_source == "server_warning" and state.function_name in {
@@ -4067,7 +4053,7 @@ async def _execute_confirmed_tool(
             or args["expected_content_version"] < 0
         ):
             return render_remediation_reply(
-                "删除确认请求缺少精确实体快照，已安全拒绝",
+                "删除确认内容不完整，已拒绝执行",
                 command="查看草稿",
             )
     reviewed_capability = (
@@ -4098,8 +4084,7 @@ async def _execute_confirmed_tool(
         if on_transport_failure is not None:
             on_transport_failure()
         return render_remediation_reply(
-            "连接服务时发生超时或网络错误，本次没有取得确定结果；"
-            "当前确认请求仍有效",
+            "连接服务失败，结果不确定；仍可再次确认",
             command="确认",
         )
 
@@ -4137,14 +4122,12 @@ async def _execute_confirmed_tool(
         if state.confirmation_source == "server_warning":
             if not server_warning_ticket_is_complete(pending_state):
                 return render_remediation_reply(
-                    "服务端没有返回完整的新确认内容，原确认没有执行；"
-                    "当前票据已停止",
+                    "新的确认内容不完整，原确认未执行",
                     command="查看草稿",
                 )
             if _pending_execution_args(pending_state) == _pending_execution_args(state):
                 return render_remediation_reply(
-                    "服务端没有执行原确认，也没有返回不同的目标；"
-                    "当前票据已停止，避免重复确认",
+                    "确认内容未变化，原确认未执行",
                     command="查看草稿",
                 )
         auto_confirm_binding = None
@@ -4187,8 +4170,7 @@ async def _execute_confirmed_tool(
         if len(warning_prompt) > MAX_REPLACE_CONFIRMATION_CHARS:
             return _append_batch_url_if_missing(
                 render_remediation_reply(
-                    "服务端风险计划过大，无法在一条消息中完整展示；"
-                    "本次未保存票据、未执行；系统不能替你决定如何缩小范围"
+                    "确认内容过长，本次未执行；请缩小范围"
                 ),
                 display_data,
             )
@@ -4202,8 +4184,7 @@ async def _execute_confirmed_tool(
         if not saved:
             return _append_batch_url_if_missing(
                 render_remediation_reply(
-                    "服务端风险详情过大，无法安全保存确认请求；"
-                    "本次未执行；系统不能替你决定如何缩小范围"
+                    "确认内容过长，本次未执行；请缩小范围"
                 ),
                 display_data,
             )
@@ -4277,7 +4258,7 @@ async def _execute_confirmed_tool(
         )
         if not saved:
             return response + "\n" + render_remediation_reply(
-                f"已完成 {completed}/{total} 条；剩余进度无法安全保存，已停止后续写入"
+                f"已完成 {completed}/{total} 条；剩余进度无法保存，已停止后续写入"
             )
         next_end = completed + len(next_chunk)
         progress = (
@@ -4292,9 +4273,9 @@ async def _execute_confirmed_tool(
         if data.get("success"):
             batch_url = data.get("batchUrl", "")
             pr_url = data.get("prUrl", "")
-            parts = ["✅ 草稿已成功提交审核！"]
+            parts = ["✅ 草稿已提交审核。"]
             if data.get("autoApproved"):
-                parts = ["✅ 草稿已加入词库！"]
+                parts = ["✅ 草稿已加入词库。"]
             if batch_url:
                 parts.append(f"\n草稿地址：{batch_url}")
             if pr_url:
@@ -4315,7 +4296,7 @@ async def _execute_confirmed_tool(
         if conflict_failure:
             return _append_batch_url_if_missing(conflict_failure, data)
         return _append_batch_url_if_missing(
-            f"提交失败：{data.get('message', '未知错误')} qwq",
+            f"提交失败：{data.get('message', '未知错误')}",
             data,
         )
 
@@ -4341,7 +4322,7 @@ async def _execute_confirmed_tool(
                 return await continue_with_submit_preview(response)
             return response
         return _append_batch_url_if_missing(
-            f"添加失败：{data.get('message', '未知错误')} qwq",
+            f"添加失败：{data.get('message', '未知错误')}",
             data,
         )
 
@@ -4410,7 +4391,7 @@ async def _execute_confirmed_tool(
                     command="查看草稿",
                 )
                 if data.get("uncertain")
-                else f"操作失败：{data.get('message', '未知错误')} qwq"
+                else f"操作失败：{data.get('message', '未知错误')}"
             ),
             data,
         )
@@ -4424,7 +4405,7 @@ async def _execute_confirmed_tool(
             return await continue_with_submit_preview(response)
         return response
     return _append_batch_url_if_missing(
-        f"操作失败：{data.get('message', '未知错误')} qwq",
+        f"操作失败：{data.get('message', '未知错误')}",
         data,
     )
 
@@ -4479,10 +4460,7 @@ async def _format_draft_response(
 
     parts: List[str] = []
     if pointer_batch_id:
-        parts.append(
-            "⚠️ 当前草稿已切换到另一批；"
-            "下面显示的是本次操作对应的内容。"
-        )
+        parts.append("⚠️ 当前草稿已切换；以下为操作批次。")
 
     parts.extend(_create_notice_lines(data))
 
@@ -4533,18 +4511,17 @@ async def _format_draft_response(
         count = snapshot.get("count", len(items))
         if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
             draft_count = count
-        parts.append(f"\n当前草稿（共 {count} 条）：")
+        parts.append(f"当前草稿（{count} 条）：")
         for index, item in enumerate(items, start=1):
             parts.append(_draft_item_display_line(item, index))
 
     # Batch URL
     batch_url = data.get("batchUrl") or preview.get("batchUrl", "") or list_batch_url
     if batch_url:
-        prefix = "" if compact else "\n"
-        parts.append(f"{prefix}草稿地址：{batch_url}")
+        parts.append(f"草稿地址：{batch_url}")
 
     if not compact and draft_count != 0:
-        parts.append("\n发送「提交」以提交该草稿，也可继续加改动")
+        parts.append("发送「提交」，或继续修改。")
     return "\n".join(parts)
 
 
@@ -4688,8 +4665,7 @@ async def _perform_submit_current_draft(
             return DraftActionResult(
                 _append_batch_url_if_missing(
                     render_remediation_reply(
-                        "提交快照过大，无法在一条消息中完整展示；"
-                        "本次未保存确认",
+                        "提交内容过长，本次未确认；请缩小范围",
                         command="查看草稿",
                     ),
                     submit_data,
@@ -4726,7 +4702,7 @@ async def _perform_submit_current_draft(
             )
         return DraftActionResult(
             _append_batch_url_if_missing(
-                f"提交失败：{submit_data.get('message', '未知错误')} qwq",
+                f"提交失败：{submit_data.get('message', '未知错误')}",
                 submit_data,
             ),
             data=submit_data,
@@ -4734,9 +4710,9 @@ async def _perform_submit_current_draft(
 
     batch_url = submit_data.get("batchUrl", "")
     pr_url = submit_data.get("prUrl", "")
-    parts = ["✅ 批次已提交审核！"]
+    parts = ["✅ 批次已提交审核。"]
     if submit_data.get("autoApproved"):
-        parts = ["✅ 批次已加入词库！"]
+        parts = ["✅ 批次已加入词库。"]
     if batch_url:
         parts.append(f"批次地址：{batch_url}")
     if pr_url:
@@ -4881,7 +4857,7 @@ async def _try_handle_draft_view_command(
         return _BIND_HELP_TEXT
     if not list_data.get("success"):
         return _append_batch_url_if_missing(
-            f"查看草稿失败：{list_data.get('message', '未知错误')} qwq",
+            f"查看草稿失败：{list_data.get('message', '未知错误')}",
             list_data,
         )
 
@@ -4955,7 +4931,7 @@ async def _perform_exact_batch_remove(
         or not isinstance(source_targets, list)
         or len(source_targets) != len(unique_ids)
     ):
-        return DraftActionResult("草稿快照缺少完整版本或目标，未执行删除。")
+        return DraftActionResult("草稿内容不完整，未执行删除。")
 
     preview_args: Dict[str, Any] = {"ids": unique_ids}
     if batch_id:
@@ -4985,7 +4961,7 @@ async def _perform_exact_batch_remove(
             )
         return DraftActionResult(
             _append_batch_url_if_missing(
-                f"清理草稿失败：{preview_data.get('message', '未取得精确删除快照')} qwq",
+                f"清理草稿失败：{preview_data.get('message', '删除内容不完整')}",
                 preview_data,
             ),
             data=preview_data,
@@ -5088,7 +5064,7 @@ async def _perform_exact_batch_remove(
                 (
                     f"清理草稿结果不确定：{failure_text}"
                     if confirmed_data.get("uncertain")
-                    else f"清理草稿失败：{failure_text} qwq"
+                    else f"清理草稿失败：{failure_text}"
                 ),
                 confirmed_data,
                 preview_data,
@@ -5148,7 +5124,7 @@ async def _perform_clear_current_draft(
     if not list_data.get("success"):
         return DraftActionResult(
             _append_batch_url_if_missing(
-                f"获取草稿失败：{list_data.get('message', '未知错误')} qwq",
+                f"获取草稿失败：{list_data.get('message', '未知错误')}",
                 list_data,
             ),
             data=list_data,
@@ -5168,7 +5144,7 @@ async def _perform_clear_current_draft(
     if not isinstance(items, list):
         return DraftActionResult(
             _append_batch_url_if_missing(
-                "草稿快照缺少条目列表，未执行清空。",
+                "草稿内容不完整，未执行清空。",
                 list_data,
             ),
             data=list_data,
@@ -5182,7 +5158,7 @@ async def _perform_clear_current_draft(
     if not resolved_batch_id:
         return DraftActionResult(
             _append_batch_url_if_missing(
-                "草稿快照缺少批次 ID，未执行清空。",
+                "草稿批次不完整，未执行清空。",
                 list_data,
             ),
             data=list_data,
@@ -5359,13 +5335,13 @@ async def _try_handle_quoted_draft_selection(
         return _BIND_HELP_TEXT
     if not list_data.get("success"):
         return _append_batch_url_if_missing(
-            f"查看草稿失败：{list_data.get('message', '未知错误')} qwq",
+            f"查看草稿失败：{list_data.get('message', '未知错误')}",
             list_data,
         )
     items = list_data.get("items")
     if not isinstance(items, list):
         return render_remediation_reply(
-            "当前草稿快照缺少条目列表，没有执行操作",
+            "当前草稿内容不完整，本次未执行",
             command="查看草稿",
         )
 
@@ -5379,7 +5355,7 @@ async def _try_handle_quoted_draft_selection(
     ]
     if quoted_lines != expected_lines:
         return render_remediation_reply(
-            "引用的草稿列表已不是当前快照；没有执行操作",
+            "引用的草稿列表已变化，本次未执行",
             command="查看草稿",
         )
 
@@ -5396,8 +5372,7 @@ async def _try_handle_quoted_draft_selection(
             index = int(value or 0)
             if index < 1 or index > len(items):
                 return render_remediation_reply(
-                    f"只接受 1-{len(items)} 之间的草稿编号；"
-                    "系统不能替你选择其中一个",
+                    f"只接受 1-{len(items)} 之间的草稿编号",
                     command="查看草稿",
                 )
             selected_items = [items[index - 1]]
@@ -5592,7 +5567,7 @@ async def _perform_recall_latest_batch(
     if not preview_data.get("requiresConfirmation") and not already_applied:
         return DraftActionResult(
             _append_batch_url_if_missing(
-                f"撤回失败：{preview_data.get('message', '没有找到可撤回的提交批次')} qwq",
+                f"撤回失败：{preview_data.get('message', '没有找到可撤回的提交批次')}",
                 preview_data,
             ),
             data=preview_data,
@@ -5655,7 +5630,7 @@ async def _perform_recall_latest_batch(
                 (
                     f"撤回结果不确定：{failure_text}"
                     if confirmed_data.get("uncertain")
-                    else f"撤回失败：{failure_text} qwq"
+                    else f"撤回失败：{failure_text}"
                 ),
                 confirmed_data,
                 preview_data,
@@ -5818,7 +5793,7 @@ async def _try_handle_keep_only_draft_items_command(
         if recall_note:
             return _append_batch_url_if_missing(recall_note, list_data)
         return _append_batch_url_if_missing(
-            f"获取草稿失败：{list_data.get('message', '未知错误')} qwq",
+            f"获取草稿失败：{list_data.get('message', '未知错误')}",
             list_data,
         )
 
@@ -5900,9 +5875,8 @@ async def _try_handle_keep_only_draft_items_command(
 
 
 def _chain_reorder_ask(code: str, reason: str) -> str:
-    return render_remediation_reply(
-        f"编码 {code} 的同码链暂时无法形成唯一、可核验的常用度顺序：{reason}；"
-        "本次未生成草稿修改"
+    return _assert_plain_user_facing_reply(
+        f"编码 {code} 无法确定常用度顺序：{reason}。"
     )
 
 
@@ -6256,6 +6230,8 @@ def _format_code_chain_reorder_confirmation(
     for item in plan.get("moves") or []:
         if not isinstance(item, dict):
             continue
+        if item.get("fromWeight") == item.get("toWeight"):
+            continue
         lines.append(
             f"• 「{item.get('word') or ''}」："
             f"权重 {item.get('fromWeight')} → {item.get('toWeight')}"
@@ -6276,8 +6252,14 @@ def _format_code_chain_reorder_confirmation(
         if isinstance(comparison, dict) and str(comparison.get("summary") or "").strip()
     ]
     visible_evidence = list(OrderedDict.fromkeys([*evidence, *summaries]))
-    if visible_evidence:
-        lines.append("依据：" + "；".join(visible_evidence))
+    evidence_parts = list(OrderedDict.fromkeys(summaries[:1]))
+    compact_evidence = _compact_ranked_shift_evidence(evidence)
+    if compact_evidence:
+        evidence_parts.append(compact_evidence)
+    elif not evidence_parts and visible_evidence:
+        evidence_parts.append(_compact_ranked_shift_evidence(visible_evidence))
+    if evidence_parts:
+        lines.append("依据：" + "；".join(evidence_parts))
 
     warnings = preview_data.get("warnings")
     if isinstance(warnings, list) and warnings:
@@ -6352,26 +6334,21 @@ def _format_reorder_noop(
     ranking: Dict[str, Any],
     listed_words: Tuple[str, ...] = (),
 ) -> str:
-    """Render a complete merged-view plan even when it needs no draft write."""
-    lines = [f"编码 {code} 的合并视图已经符合可核验的常用度证据，本次未生成草稿修改。"]
-    lines.append("当前状态：")
-    for entry in entries:
-        source = "草稿" if entry.get("source") == "draft" else "词库"
-        lines.append(
-            f"• {entry['word']}：{entry['code']} / {entry['weight']}（{source}）"
-        )
-    lines.append("建议状态：与当前状态一致。")
+    """Render the unchanged order and one decisive evidence line."""
+    lines = [f"编码 {code} 顺序不变：{_format_chain_order(entries)}"]
+    evidence_summary: List[str] = []
     if listed_words:
         proposed_words = _ranked_words_from_complete_result(ranking, entries) or []
         relation = "一致" if tuple(proposed_words) == listed_words else "不一致"
-        lines.append(
-            f"你列的顺序与常用度证据{relation}："
-            + " → ".join(proposed_words or listed_words)
+        evidence_summary.append(
+            f"建议 {'→'.join(proposed_words or listed_words)}（与你列的{relation}）"
         )
     evidence = _reorder_evidence_lines(ranking)
-    if evidence:
-        lines.append("常用度证据：")
-        lines.extend(f"• {line}" for line in evidence)
+    compact_evidence = _compact_ranked_shift_evidence(evidence)
+    if compact_evidence:
+        evidence_summary.append(compact_evidence)
+    if evidence_summary:
+        lines.append("依据：" + "；".join(evidence_summary))
     return _assert_plain_user_facing_reply("\n".join(lines))
 
 
@@ -6604,12 +6581,18 @@ async def _try_handle_code_chain_reorder_command(
         })
 
     if not any_reorder:
-        lines = [f"编码 {code} 当前顺序已经符合可核验的常用度证据，本次未生成草稿修改。"]
+        lines = [f"编码 {code} 顺序不变。"]
+        evidence: List[str] = []
         for group in groups:
-            lines.append("当前：" + _format_chain_order(group["current"]))
-            for evidence in group["evidenceLines"]:
-                if str(evidence).strip():
-                    lines.append("• " + str(evidence).strip())
+            lines.append("• " + _format_chain_order(group["current"]))
+            evidence.extend(
+                str(item).strip()
+                for item in group["evidenceLines"]
+                if str(item).strip()
+            )
+        compact_evidence = _compact_ranked_shift_evidence(evidence)
+        if compact_evidence:
+            lines.append("依据：" + compact_evidence)
         return _assert_plain_user_facing_reply("\n".join(lines))
     if not items:
         return _chain_reorder_ask(code, "建议顺序没有形成可执行的权重变化")
@@ -6639,7 +6622,7 @@ async def _try_handle_code_chain_reorder_command(
         or bool(preview_data.get("skipped"))
         or not isinstance(preview_data.get("warnings", []), list)
     ):
-        return _chain_reorder_ask(code, "服务端未锁定完整修改快照")
+        return _chain_reorder_ask(code, "修改内容不完整")
     preview_data["chainReorderPlan"] = plan
     pending = _pending_state_from_server_warning(
         PendingToolConfirm(
@@ -6649,7 +6632,7 @@ async def _try_handle_code_chain_reorder_command(
         preview_data,
     )
     if not server_warning_ticket_is_complete(pending) or not _resolved_chain_reorder_items_match(pending):
-        return _chain_reorder_ask(code, "服务端确认票据不完整")
+        return _chain_reorder_ask(code, "确认内容不完整")
 
     confirmation = _format_code_chain_reorder_confirmation(plan, preview_data)
     if len(confirmation) > MAX_REPLACE_CONFIRMATION_CHARS:
@@ -6661,7 +6644,7 @@ async def _try_handle_code_chain_reorder_command(
         owner_label=owner_label,
     )
     if not saved:
-        return _chain_reorder_ask(code, "完整确认票据无法安全保存")
+        return _chain_reorder_ask(code, "确认内容无法保存")
     return confirmation
 
 
@@ -6718,12 +6701,12 @@ async def _try_handle_word_list_reorder_command(
     draft_snapshot = _validated_draft_reorder_snapshot(draft_data)
     if live_entries is None or draft_snapshot is None:
         return render_remediation_reply(
-            "无法取得每个词完整的词库记录和当前草稿版本；本次未生成排序计划"
+            "无法取得完整词库记录或草稿版本，未生成排序计划"
         )
     merged = _merge_live_and_draft_reorder_entries(live_entries, draft_snapshot)
     if merged is None:
         return render_remediation_reply(
-            "当前草稿无法形成唯一的词条投影；本次未生成排序计划"
+            "当前草稿无法确定唯一词条，未生成排序计划"
         )
     resolved: List[Dict[str, Any]] = []
     unresolved: List[str] = []
@@ -6735,10 +6718,10 @@ async def _try_handle_word_list_reorder_command(
             resolved.append(matches[0])
     if unresolved:
         return render_remediation_reply(
-            "服务端无法为「" + "、".join(unresolved)
-            + "」各锁定唯一当前编码；已找到："
+            "无法确定「" + "、".join(unresolved)
+            + "」的唯一当前编码；已找到："
             + (_format_word_resolution_rows(resolved) or "无")
-            + "；本次未生成排序计划"
+            + "；未生成排序计划"
         )
 
     phrase_types = {str(entry.get("type") or "") for entry in resolved}
@@ -6780,7 +6763,7 @@ async def _try_handle_word_list_reorder_command(
     if len(resolved) > MAX_REPLACE_CHAR_ITEMS:
         return render_remediation_reply(
             f"完整词表共有 {len(resolved)} 条，超过单条确认可完整展示的 "
-            f"{MAX_REPLACE_CHAR_ITEMS} 条上限；本次未生成排序计划"
+            f"{MAX_REPLACE_CHAR_ITEMS} 条上限，未生成排序计划"
         )
 
     ranking = await keytao_review.rank_code_chain_by_commonness(
@@ -7143,11 +7126,10 @@ async def _try_update_pending_pronunciation(
         reviewed_pinyin = " ".join(pronunciation_parts)
     review_line = (
         f"读音 {reviewed_pinyin}；来源 用户当前纠正 + 编码服务多音候选；"
-        "自动审核：该词需管理员审核（读音纠正需人工复核）"
+        "自动审核：读音纠正需人工复核，需要管理员审核"
     )
     lines = [
-        f"已按你的读音纠正重新生成「{state.word}」候选：",
-        "",
+        f"「{state.word}」读音已纠正：",
         f"审词：{review_line}",
         "候选编码:",
     ]
@@ -7159,8 +7141,7 @@ async def _try_update_pending_pronunciation(
         marker = " ✅ 推荐" if code == recommended_code else ""
         lines.append(f"{index}. {code} — {label}{marker}")
     lines.extend((
-        "",
-        f"是否以编码 {recommended_code} 将「{state.word}」加入草稿？",
+        f"• 「{state.word}」→ {recommended_code}（推荐）",
         single_word_candidate_footer(len(variant_codes)),
     ))
     response = "\n".join(lines)
@@ -7183,8 +7164,7 @@ async def _try_update_pending_pronunciation(
     )
     if not stored:
         return render_remediation_reply(
-            "新读音候选过大，未保存也未执行；"
-            "系统不能替你决定如何缩小候选范围",
+            "新读音候选过长，本次未执行；请缩小范围",
             command=f"加词 {state.word}",
             words=(state.word,),
         )
@@ -7369,8 +7349,7 @@ async def _handle_pending_add_word(
                     owner_label=owner_label,
                 )
             return render_remediation_reply(
-                f"候选编号超出范围；有效范围为 1-{len(state.candidates)}，"
-                "系统不能替你选择其中一个",
+                f"候选编号超出范围；有效范围为 1-{len(state.candidates)}",
                 command="加入",
                 words=(state.word,),
             )
@@ -7848,7 +7827,7 @@ async def handle_pending_message_core(
 
     if pending_command_intent.intent == "pending_cancel":
         conversation_state_store.complete_execution(state_record)
-        return "好的，已取消 owo"
+        return "已取消。"
 
     if isinstance(state, PendingAddWord):
         if _pending_pronunciation_correction(message, state) is not None:
@@ -7863,7 +7842,7 @@ async def handle_pending_message_core(
             return _append_pending_ticket_challenge(response, conv_key)
         if not conversation_state_store.begin_execution(state_record):
             return render_remediation_reply(
-                "当前确认请求已被其他处理占用",
+                "当前确认正在处理中",
                 command="查看草稿",
             )
         try:
@@ -7907,7 +7886,7 @@ async def handle_pending_message_core(
             )
         if not conversation_state_store.begin_execution(state_record):
             return render_remediation_reply(
-                "当前确认请求已被其他处理占用",
+                "当前确认正在处理中",
                 command="查看草稿",
             )
         if (
@@ -8164,7 +8143,7 @@ async def _try_handle_replace_char(
     )
     if not chunk:
         return render_remediation_reply(
-            "第一条替换也无法在一条确认消息中完整展示；未保存票据、未写入"
+            "第一条替换也无法完整展示，本次未写入；请缩小范围"
         )
 
     args: Dict[str, Any] = {"items": chunk}
@@ -8194,7 +8173,7 @@ async def _try_handle_replace_char(
     )
     if not saved:
         return render_remediation_reply(
-            "替换进度无法安全保存；未执行任何写入"
+            "替换进度无法保存，本次未写入"
         )
     logger.info(
         f"[replace_char] Staged pattern '{old_char}'→'{new_char}', "
@@ -8224,12 +8203,8 @@ def _try_handle_operation_recall(
             "当前会话里没有可由工具回执验证的词库操作记录"
         )
 
-    lines = [
-        "最近通过喵喵经手的词库操作："
-        if not current_user_only else
-        "你最近通过喵喵经手的词库操作："
-    ]
+    lines = ["最近的词库操作：" if not current_user_only else "你最近的词库操作："]
     for item in operations:
         lines.append(f"• {_format_operation_memory_for_reply(item)}")
-    lines.append("\n这里只统计通过喵喵处理过的记录；网页端或其他方式直接操作的草稿，我不会假装知道。")
+    lines.append("仅含机器人处理记录。")
     return "\n".join(lines)

@@ -126,9 +126,7 @@ def _resolve_advertised_word_set_selection(
         return AdvertisedWordSetSelection(
             matched=True,
             ask=(
-                f"当前有两组仍有效的候选（{groups}）；"
-                "系统不能替你选择其中一组，本次未写入。\n"
-                "请复制其中一组对应的命令：\n"
+                f"当前有两组候选（{groups}），请选择一组：\n"
                 + "\n".join(suggestion for suggestion in suggestions if suggestion)
             ),
         )
@@ -1593,7 +1591,7 @@ def _resolve_multi_word_pending_candidate_selection(
         words,
     ):
         return None, None, render_remediation_reply(
-            "命令引号外含有非允许内容；当前确认请求仍保留，本次未写入",
+            "命令引号外含有其他内容，本次未写入；当前确认仍有效",
             command=f"将这 {len(words)} 个词加入草稿",
             words=words,
         )
@@ -1631,7 +1629,7 @@ def _resolve_multi_word_pending_candidate_selection(
             return None, None, render_remediation_reply(
                 "按这些排除项计算后没有剩余词；当前有效候选为「"
                 + "、".join(words)
-                + "」；本次未写入；系统不能替你决定至少保留哪个词",
+                + "」；本次未写入",
                 command=f"将这 {len(words)} 个词加入草稿",
                 words=words,
             )
@@ -1711,7 +1709,7 @@ def _resolve_multi_word_pending_candidate_selection(
         return None, None, None
     if not scopes:
         return None, None, render_remediation_reply(
-            "当前多词候选缺少可信编号快照，本次未写入",
+            "当前多词候选缺少编号，本次未写入",
             command="加词 " + " ".join(words),
             words=words,
         )
@@ -1724,8 +1722,7 @@ def _resolve_multi_word_pending_candidate_selection(
             or any(not 1 <= index <= len(candidates) for index in indices)
         ):
             return None, None, render_remediation_reply(
-                f"「{target_word}」只接受 1-{len(candidates)} 之间的编号；"
-                "系统不能替你选择其中一个",
+                f"「{target_word}」只接受 1-{len(candidates)} 之间的编号",
                 command=f"{target_word} 添加1",
                 words=(target_word,),
             )
@@ -1738,8 +1735,7 @@ def _resolve_multi_word_pending_candidate_selection(
             or any(code not in candidate_codes for code in requested_codes)
         ):
             return None, None, render_remediation_reply(
-                f"所选编码不全在「{target_word}」当前候选中；"
-                "系统不能替你选择另一个编码",
+                f"所选编码不全在「{target_word}」当前候选中",
                 command=f"{target_word} 添加1",
                 words=(target_word,),
             )

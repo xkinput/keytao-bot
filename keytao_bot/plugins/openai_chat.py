@@ -1690,7 +1690,7 @@ async def get_ai_response_core(
 
     except Exception as e:
         logger.error(f"API error: {e}")
-        return "呜呜，AI 服务暂时不可用 qwq 等等再来找我吧～"
+        return "AI 服务暂时不可用，请稍后再试。"
 
 
 async def get_openai_response(
@@ -2691,7 +2691,7 @@ async def _stage_describe_visual_candidate(ctx: TurnContext) -> bool:
 async def _stage_reject_empty_input(ctx: TurnContext) -> bool:
     """Production scenario: empty turns exit before state or model access."""
     if not ctx.message_text and not ctx.image_attachments:
-        await _finish_ai_chat_matcher("你好呀～ owo 我是喵喵，键道输入法的助手！有什么可以帮你的吗？")
+        await _finish_ai_chat_matcher("我是键道输入法助手，请告诉我需要什么。")
         return True
     return False
 
@@ -2747,7 +2747,7 @@ async def _stage_handle_image_turn(ctx: TurnContext) -> bool:
                 visual_image_count=ctx.vision_result.image_count,
             )
             if not ctx.response:
-                ctx.response = "呜呜，处理请求时出错了 qwq 要不再试一次？"
+                ctx.response = "处理请求失败，请重试。"
             ctx.response = _normalize_generated_review_copy(ctx.response)
             if ctx.vision_result.warnings:
                 ctx.response += "\n\n图片处理提示：" + "；".join(
@@ -3174,7 +3174,7 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
                 await _finish_ai_chat_matcher(ctx.response)
                 return True
             ctx.response = render_remediation_reply(
-                "引用中的词可以识别，但本轮无法安全建立复核快照；本次未写入",
+                "引用中的词可以识别，但无法完成复核；本次未写入",
                 command="加词 " + " ".join(displayed_words),
                 words=displayed_words,
             )
@@ -3377,9 +3377,9 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
                     pending_function = getattr(active_operation.pending_state, "function_name", "")
                     draft_operation_coordinator.finish(ctx.conv_key, active_operation.operation_id)
                     ctx.response = (
-                        "好的，已取消继续提交，草稿仍为你保留 owo"
+                        "已取消提交，草稿已保留。"
                         if pending_function == "keytao_submit_batch"
-                        else "好的，已取消这次添加 owo"
+                        else "已取消添加。"
                     )
                     remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
                     await _finish_ai_chat_matcher(ctx.response)
@@ -3468,7 +3468,7 @@ async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
         )
         if not stored:
             ctx.response = render_remediation_reply(
-                "当前候选无法安全保存；没有执行添加",
+                "当前候选无法保存，本次未添加",
                 command=f"加词 {restored_state.word}",
                 words=(restored_state.word,),
             )
@@ -3586,7 +3586,7 @@ async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
                 current_record = conversation_state_store.get_record(ctx.conv_key)
             else:
                 ctx.response = render_remediation_reply(
-                    "当前候选无法安全保存；没有执行添加",
+                    "当前候选无法保存，本次未添加",
                     command=f"加词 {restored_state.word}",
                     words=(restored_state.word,),
                 )
@@ -3793,7 +3793,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                     ctx.response = ticket_response
             if ctx.response is None and pending_command_intent.intent == "pending_cancel":
                 complete_pending_execution()
-                ctx.response = "好的，已取消 owo"
+                ctx.response = "已取消。"
 
             elif ctx.response is None and isinstance(state, PendingAddWord):
                 if ctx.history is None:
@@ -3838,8 +3838,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                     ):
                         restore_pending_state()
                         ctx.response = render_remediation_reply(
-                            f"只接受 1-{len(state.candidates)} 之间的编号；"
-                            "系统不能替你选择其中一个",
+                            f"只接受 1-{len(state.candidates)} 之间的编号",
                             command="加入",
                             words=(state.word,),
                         )
@@ -3867,7 +3866,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                                 operation.operation_id,
                             )
                             ctx.response = render_remediation_reply(
-                                "当前确认请求已被其他处理占用",
+                                "当前确认正在处理中",
                                 command="查看草稿",
                             )
                         else:
@@ -3901,7 +3900,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                 else:
                     if not begin_pending_execution():
                         ctx.response = render_remediation_reply(
-                            "当前确认请求已被其他处理占用",
+                            "当前确认正在处理中",
                             command="查看草稿",
                         )
                     else:
@@ -3975,7 +3974,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                                 operation.operation_id,
                             )
                             ctx.response = render_remediation_reply(
-                                "当前确认请求已被其他处理占用",
+                                "当前确认正在处理中",
                                 command="查看草稿",
                             )
                         else:
@@ -4019,7 +4018,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                     else:
                         if not begin_pending_execution():
                             ctx.response = render_remediation_reply(
-                                "当前确认请求已被其他处理占用",
+                                "当前确认正在处理中",
                                 command="查看草稿",
                             )
                         else:
@@ -4195,7 +4194,7 @@ async def _stage_reject_empty_response(ctx: TurnContext) -> bool:
     """Production scenario: an empty model result emits the existing deterministic error."""
     if not ctx.response:
         mark_turn_outcome("error")
-        await _finish_ai_chat_matcher("呜呜，处理请求时出错了 qwq 要不再试一次？")
+        await _finish_ai_chat_matcher("处理请求失败，请重试。")
         return True
     return False
 

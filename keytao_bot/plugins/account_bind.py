@@ -227,9 +227,7 @@ async def _handle_bind(bot: Bot, event: Event, matcher):
                 user_name = data.get("userName", "")
                 nickname = data.get("userNickname") or user_name
                 await matcher.finish(
-                    f"✅ 绑定成功！\n\n"
-                    f"账号：{nickname}\n"
-                    f"现在你可以使用机器人创建词条了～ >w<"
+                    f"✅ 绑定成功\n账号：{nickname}"
                 )
             else:
                 await matcher.finish(
@@ -253,12 +251,11 @@ async def _handle_bind(bot: Bot, event: Event, matcher):
         logger.error(f"Bind request failed: {error}")
         await matcher.finish(
             render_remediation_reply(
-                "❌ 绑定请求没有得到确认，可能已经生效；"
-                "请先在网站核对绑定状态，必要时重新生成绑定码"
+                "❌ 绑定结果不确定；请在网站核对，必要时重新生成绑定码"
             )
         )
     except Exception as e:
         logger.error(f"Bind error: {e}")
         await matcher.finish(render_remediation_reply(
-            "❌ 绑定失败；当前错误没有提供可安全重试的绑定码"
+            "❌ 绑定失败；没有可重试的绑定码"
         ))

@@ -568,8 +568,8 @@ def test_parse_pending_batch_add_preserves_each_review_result():
     check("mixed batch pending parsed", isinstance(result, PendingToolConfirm))
     check("arrow summary yields two items", len(items) == 2)
     check("mixed batch keeps requested order", [item.get("word") for item in items] == ["追速", "摆件"])
-    check("manual item keeps its own review", "该词需管理员审核" in items[0].get("remark", ""))
-    check("passing item keeps its own review", "该词可自动通过" in items[1].get("remark", ""))
+    check("manual item keeps its own review", "管理员审核" in items[0].get("remark", ""))
+    check("passing item keeps its own review", "可自动通过" in items[1].get("remark", ""))
     check("generated old prediction wording normalized", "预计需管理员审核" not in normalized)
 
 
@@ -690,7 +690,7 @@ def test_referenced_other_owner_pending_does_not_copy():
         current_record = store.get_record(current_key)
         check("other owner matched", other_record is not None)
         check("response names owner", response is not None and "EVO" in response)
-        check("response blocks acting for owner", response is not None and "不能替 EVO 确认" in response)
+        check("response blocks acting for owner", response is not None and "不能代为确认" in response)
         check("current pending is not replaced by referenced prose", current_record.state.word == "增香")
         check("current pending keeps current owner label", current_record.owner_label == "音樂盒")
     finally:
@@ -763,7 +763,7 @@ def test_referenced_other_owner_cancel_does_not_copy():
             MessageCommandIntent(intent="pending_cancel", confidence=0.96),
         )
 
-        check("cancel response blocks other owner operation", response is not None and "不能替 Garth 确认" in response)
+        check("cancel response blocks other owner operation", response is not None and "不能代为确认" in response)
         check("cancel does not copy pending", store.get_record(current_key) is None)
     finally:
         openai_chat_module.conversation_state_store = old_store
@@ -1081,11 +1081,11 @@ def test_quoted_batch_pending_requires_exact_live_display_match():
     check("tampered display reaches no write sink", tool_call.await_count == 0)
     check(
         "missing live ticket keeps the existing refusal",
-        missing_response is not None and "引用文字不能创建或恢复确认权限" in missing_response,
+        missing_response is not None and "待确认操作不可恢复" in missing_response,
     )
     check(
         "other actor batch ticket remains refused",
-        other_response is not None and "不能替 EVO 确认" in other_response,
+        other_response is not None and "不能代为确认" in other_response,
     )
 
 
@@ -1135,7 +1135,7 @@ def test_referenced_pending_does_not_scan_current_user_history():
         check("referenced pending parsed", referenced_pending is not None)
         check("current pending is not restored from older history", current_record is None)
         check("history recovery leaves the store empty", store.get_record(current_key) is None)
-        check("quoted prose requires a fresh full instruction", response is not None and "不能创建或恢复确认权限" in response)
+        check("quoted prose requires a fresh full instruction", response is not None and "待确认操作不可恢复" in response)
     finally:
         openai_chat_module.conversation_state_store = old_store
 
@@ -1184,7 +1184,7 @@ def test_referenced_pending_does_not_restore_from_bot_mention():
         check("referenced owner key identifies current actor", referenced_owner_key == ("qq", "2002"))
         check("mention alone restores no pending", current_record is None)
         check("mention recovery leaves the store empty", store.get_record(current_key) is None)
-        check("mentioned prose requires a fresh full instruction", response is not None and "不能创建或恢复确认权限" in response)
+        check("mentioned prose requires a fresh full instruction", response is not None and "待确认操作不可恢复" in response)
     finally:
         openai_chat_module.conversation_state_store = old_store
 
@@ -1233,7 +1233,7 @@ def test_referenced_pending_mention_blocks_other_user_direct_action():
 
         check("referenced owner key is other user", referenced_owner_key == ("qq", "1001"))
         check("other owner record built from mention", other_record is not None)
-        check("other mentioned prompt is blocked", response is not None and "不能替" in response)
+        check("other mentioned prompt is blocked", response is not None and "不能代为确认" in response)
         check("other user's ticket is never copied", store.get_record(current_key) is None)
         check(
             "response offers an actor-owned review command",
@@ -3042,9 +3042,9 @@ def test_reviewed_add_prompt_explains_fallback_review_policy():
 
     check("fallback prompt generated", bool(prompt))
     check("fallback prompt does not say cannot auto approve", "不能自动通过" not in (prompt or ""))
-    check("fallback prompt mentions no authoritative page", "来源 暂无权威页" in (prompt or ""))
+    check("fallback prompt mentions no authoritative page", "来源 暂无；" in (prompt or ""))
     check("fallback prompt keeps one concise review line", "审词：读音 bai sui shan" in (prompt or ""))
-    check("fallback prompt states preaudit is incomplete", "该词暂未完成预审" in (prompt or ""))
+    check("fallback prompt states preaudit is incomplete", "自动审核：预审未完成" in (prompt or ""))
     check("fallback prompt hides internal submit review", "提交后复审" not in (prompt or ""))
     check("fallback candidate line avoids repeated source", "1. bse — 已有「不算数」；来源" not in (prompt or ""))
 
@@ -3080,7 +3080,7 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
     })
 
     check("pre-submit preview is concise", "预审结论（同提交审核逻辑）" not in (prompt or ""))
-    check("pre-submit preview confirms word auto approval", "自动审核：该词可自动通过" in (prompt or ""))
+    check("pre-submit preview confirms word auto approval", "，可自动通过" in (prompt or ""))
     check("pre-submit preview hides internal batch re-review", "提交整批时会重审" not in (prompt or ""))
     check("pre-submit preview keeps common-known reason", "实体常识" in (prompt or ""))
     check("pre-submit preview appears once", (prompt or "").count("自动审核：") == 1)
@@ -3120,7 +3120,7 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
     )
     check(
         "encode authority prompt reaches the user-facing auto-approval copy",
-        "自动审核：该词可自动通过" in (encode_authority_prompt or ""),
+        "，可自动通过" in (encode_authority_prompt or ""),
     )
 
 
@@ -3173,10 +3173,10 @@ def test_reviewed_add_prompt_explains_entity_common_knowledge():
     })
 
     text = prompt or ""
-    check("entity prompt still states no authority page", "来源 暂无权威页" in text)
-    check("entity prompt names inferred type", "本喵识别为历史人物" in text)
+    check("entity prompt still states no authority page", "来源 暂无；" in text)
+    check("entity prompt names inferred type", "识别为历史人物" in text)
     check("entity prompt names canonical identity", "尉迟恭" in text)
-    check("entity prompt says word auto approval once", text.count("自动审核：该词可自动通过") == 1)
+    check("entity prompt says word auto approval once", text.count("，可自动通过") == 1)
     check("entity candidate lines stay compact", "1. jgde — 已有「惊得」；来源" not in text)
 
 
@@ -3213,7 +3213,7 @@ def test_reviewed_add_prompt_confirms_idiom_auto_approval():
     })
 
     text = prompt or ""
-    check("idiom prompt confirms auto approval", "自动审核：该词可自动通过" in text)
+    check("idiom prompt confirms auto approval", "，可自动通过" in text)
     check("idiom prompt names idiom evidence", "属于成语/熟语" in text)
     check("idiom prompt avoids prediction wording", "预计" not in text)
     check("idiom prompt hides internal re-review", "重审" not in text and "复审" not in text)
@@ -3253,8 +3253,8 @@ def test_reviewed_add_prompt_keeps_waiting_review_concise():
     text = prompt or ""
     check("uncertain prompt generated", bool(prompt))
     check("uncertain prompt uses one review line", text.count("自动审核：") == 1)
-    check("uncertain prompt confirms word needs admin review", "自动审核：该词需管理员审核" in text)
-    check("uncertain prompt keeps concrete reason", "没有权威读音来源，且常用词信号不足" in text)
+    check("uncertain prompt confirms word needs admin review", "需要管理员审核" in text)
+    check("uncertain prompt keeps concrete reason", "没有读音来源，且常用词信号不足" in text)
     check("uncertain prompt omits old long preview", "预审结论（同提交审核逻辑）" not in text)
     check("uncertain candidate lines omit repeated pronunciation", "1. hebs — 已有「喝吧」；读音" not in text)
 
@@ -3371,7 +3371,7 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
         check("wrong cang chain is not retained", "ylcb" not in pronunciation.get("codes", []))
         check("semantic pronunciation alone is not authority", review.get("autoReviewable") is False)
         check("correction records default pronunciation", pronunciation.get("contextPronunciation", {}).get("defaultPinyin") == "ya lu cang bu")
-        check("prompt explains entity-context source", "来源 本喵实体语境判断（地名，暂无权威页）" in prompt)
+        check("prompt explains missing source compactly", "来源 暂无；" in prompt)
         check("low-confidence context cannot override default", keytao_review_module._entity_pronunciation_group(
             "雅鲁藏布",
             {**entity, "confidence": 0.70},
@@ -4183,12 +4183,12 @@ def test_auto_approved_review_lines_explain_pass_reason():
     ) or ""
     check("common-known auto approval mentions common signals", "常见词/实体常识" in common_text)
     check("common-known auto approval avoids generic evidence-only wording", "证据一致" not in common_text)
-    check("auto-approved lines use human review label", common_text.startswith("本喵审核：") and llm_text.startswith("本喵审核："))
+    check("auto-approved lines use compact review label", common_text.startswith("自动审核：") and llm_text.startswith("自动审核："))
     check("llm fallback avoids internal re-review wording", "自动复审" not in llm_text and "复审" not in llm_text)
     check("llm fallback auto approval keeps summary", "语言常识" in llm_text)
     check(
         "mixed-batch fallback reply uses fallback copy instead of semantic copy",
-        "语言常识、读音、编码和同码链检查通过" in mixed_text
+        "语言常识、读音、编码和同码链一致" in mixed_text
         and "语境读音、具体含义、非生僻证据" not in mixed_text
         and semantic_basis not in mixed_text,
     )
@@ -4212,7 +4212,7 @@ def test_auto_approve_failure_copy_reports_pass_and_real_reason():
         "批次已提交，自动批准失败，转交管理员审核",
         "批次已提交，自动批准超时，转交管理员审核",
     ]
-    expected_prefix = "本喵审核：常见词/实体常识、编码候选链和同码链检查通过，但自动批准未执行："
+    expected_prefix = "自动审核：常见词/实体常识、编码候选链和同码链一致，可自动通过，但自动批准未执行："
 
     for reason in failure_reasons:
         parts: List[str] = []
@@ -4252,8 +4252,7 @@ def test_auto_approve_failure_copy_reports_pass_and_real_reason():
         "encodeOnly": False,
     }
     expected_manual_line = (
-        "本喵审核：该批次需管理员审核"
-        "（纯删除项或缺少词条/编码，无法完成逐项自动核验）"
+        "自动审核：纯删除项或缺少词条/编码，无法完成逐项自动核验，需管理员审核"
     )
     pure_delete_parts: List[str] = []
     _append_submit_review_lines(pure_delete_parts, {
@@ -4370,7 +4369,7 @@ def test_submit_review_copy_is_decisive_and_non_redundant():
     manual_text = "\n".join(manual_parts)
     check("approved reply contains one review line", len(approved_parts) == 1)
     check("approved reply omits backend approval echo", "已由本喵自动审核通过" not in approved_text)
-    check("manual reply states batch status", "本喵审核：该批次需管理员审核" in manual_text)
+    check("manual reply states batch status", "自动审核：" in manual_text and "需管理员审核" in manual_text)
     check("manual reply removes temporal process wording", "提交后" not in manual_text and "等待管理员审核原因" not in manual_text)
     check("manual issue uses positive status wording", "不能自动通过" not in manual_text and "需管理员审核" in manual_text)
 
@@ -5485,7 +5484,7 @@ def test_keep_only_draft_command_removes_others_and_submits():
 
         remove_calls = [arguments for name, arguments in tool_calls if name == "keytao_batch_remove_draft_items"]
 
-        check("keep-only first shows exact deletion ticket", "2 个删除目标" in delete_preview)
+        check("keep-only first shows exact deletion ticket", "删除 2 个草稿项" in delete_preview)
         check("remove excludes kept item", remove_calls[0].get("ids") == [1, 3])
         check("delete confirmation binds target digest", remove_calls[1].get("expected_target_digest") == target_digest)
         check("delete confirmation binds exact targets", remove_calls[1].get("expected_targets") == targets)
@@ -5494,7 +5493,7 @@ def test_keep_only_draft_command_removes_others_and_submits():
         check("keep-only next shows submit snapshot", "确认提交保留后的草稿" in submit_preview)
         check("submit preview stays non-mutating", any(name == "keytao_submit_batch" and args == {"batch_id": "draft-1", "preview_only": True} for name, args in tool_calls))
         check("submit confirmation binds exact snapshot", any(name == "keytao_submit_batch" and args.get("confirmed") is True and args.get("expected_server_snapshot_digest") == snapshot_digest for name, args in tool_calls))
-        check("submit response shown", "草稿已成功提交审核" in submitted)
+        check("submit response shown", "草稿已提交审核" in submitted)
 
     asyncio.run(_run())
 
@@ -6258,7 +6257,7 @@ def test_recall_shows_items_from_the_recalled_batch():
         check("empty draft is not reported", "共 0 条" not in result.text)
         check(
             "pointer drift is disclosed",
-            "当前草稿已切换到另一批" in result.text
+            "当前草稿已切换" in result.text
             and "drifted-99" not in result.text,
         )
         check(
@@ -7561,7 +7560,6 @@ def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
         check(
             "unknown or empty code deterministically asks without a ticket",
             "合并视图都没有词条" in empty_response
-            and "未生成草稿修改" in empty_response
             and len(empty_calls) == 2
             and empty_store.get_record(("qq", "chain-boundary-owner")) is None,
         )
@@ -7574,7 +7572,6 @@ def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
         check(
             "evidence tie deterministically asks without previewing a write",
             "not_enough_evidence" in ask_response
-            and "未生成草稿修改" in ask_response
             and len(ask_calls) == 2
             and ask_store.get_record(("qq", "chain-boundary-owner")) is None,
         )
@@ -7589,8 +7586,7 @@ def test_code_chain_reorder_asks_or_noops_without_a_unique_change():
         })
         check(
             "supported current order reports no-op without creating a ticket",
-            "当前顺序已经符合" in already_response
-            and "本次未生成草稿修改" in already_response
+            "顺序不变" in already_response
             and len(already_calls) == 2
             and already_store.get_record(("qq", "chain-boundary-owner")) is None,
         )
@@ -7683,7 +7679,7 @@ def test_referenced_word_presence_query_explains_missing_quote_text():
             "123",
         )
 
-        check("missing quote text explained", result is not None and "没有把被引用的原文" in result)
+        check("missing quote text explained", result is not None and "平台未提供引用原文" in result)
         check(
             "missing operands advertise no invented query command",
             result is not None
@@ -7929,7 +7925,7 @@ def test_natural_add_negation_cancels_the_one_live_ticket():
                     )
                     check(
                         f"direct cancel consumes the ticket: {message}",
-                        response == "好的，已取消 owo"
+                        response == "已取消。"
                         and store.get_record(conv_key) is None,
                     )
                     rejection = (
@@ -8357,7 +8353,7 @@ def test_pending_add_word_add_and_submit_uses_recommended():
             "confirmed": True,
         })
         check("submit uses current user", all(call[2:] == ("qq", "2002") for call in calls))
-        check("response says submitted", "已加入草稿并提交审核" in submitted)
+        check("response says submitted", "写入草稿，已提交审核" in submitted)
         check("combined success includes batch link", "https://keytao.test/batch/current" in submitted)
         check("combined command leaves no ticket", store.get_record(conv_key) is None)
         check("combined command shows no ticket code", "确认票据" not in submitted and "确认操作" not in submitted)
@@ -8414,7 +8410,7 @@ def test_quoted_self_add_and_submit_requires_live_ticket():
         check("quoted prose executes no draft tools", tool_call.await_count == 0)
         check(
             "quoted prose asks for a fresh full instruction",
-            result is not None and "不能创建或恢复确认权限" in result,
+            result is not None and "待确认操作不可恢复" in result,
         )
 
     asyncio.run(_run())
@@ -8699,7 +8695,7 @@ def test_unquoted_short_add_submit_without_server_snapshot_restarts_discovery():
         check(
             "unquoted short command offers executable re-review without a code",
             result is not None
-            and "当前候选缺少可核验的服务端候选快照" in result
+            and "当前候选缺少可核验的候选记录" in result
             and "加词 窨茶" in result
             and "xwwso" not in result,
         )
@@ -9993,7 +9989,7 @@ def test_quoted_draft_list_binds_ordinal_and_rejects_stale_snapshot():
         if remove.await_count:
             check("quoted ordinal binds item two ID", remove.await_args.args[0] == [12])
             check("quoted ordinal binds current version", remove.await_args.kwargs["source_content_version"] == 7)
-        check("stale quoted list is rejected", "已不是当前快照" in (stale_response or ""))
+        check("stale quoted list is rejected", "引用的草稿列表已变化" in (stale_response or ""))
 
     asyncio.run(_run())
 
@@ -10016,8 +10012,8 @@ def test_active_operation_message_preserves_second_word():
     message = _format_active_draft_operation_message(operation, second_pending)
     check("message names active word", "技术栈" in message)
     check("message names second word", "小酥肉" in message)
-    check("message says second candidate is preserved", "候选仍为你保留" in message)
-    check("message explains draft collision guard", "同一份草稿" in message)
+    check("message says second candidate is preserved", "小酥肉」暂未处理" in message)
+    check("message explains draft collision guard", "上一批" in message)
     check(
         "message gives an executable full follow-up command",
         "添加 小酥肉 xsri 并提交" in message,
@@ -14730,7 +14726,7 @@ def test_short_add_submit_copy_distinguishes_quote_without_live_state():
         )
         check(
             "unquoted/no-state copy states the missing live candidate",
-            "当前没有可执行候选状态" in unquoted,
+            "没有可执行候选或具体词条" in unquoted,
         )
         check(
             "unquoted/no-state copy does not pretend a quote was detected",
@@ -15387,11 +15383,11 @@ def test_pending_replay_transport_failure_retains_exact_ticket():
         finally:
             openai_chat_module.conversation_state_store = old_store
 
-        check("transport failure returns retryable guidance", failed is not None and "仍有效" in failed)
+        check("transport failure returns retryable guidance", failed is not None and "仍可再次确认" in failed)
         check("transport failure retains the same ticket object", retained is record)
         check("transport failure releases the execution claim", retained_execution_released)
         check("immediate retry reuses the exact sink", tool_call.await_count == 2)
-        check("immediate retry succeeds", retried is not None and "成功提交" in retried)
+        check("immediate retry succeeds", retried is not None and "已提交审核" in retried)
         check("success consumes the retained ticket", store.get_record(conv_key) is None)
 
         conflict_store = MemoryConversationStateStore()
@@ -17000,7 +16996,7 @@ def test_pending_pronunciation_correction_updates_live_ticket():
             check(
                 "restart revalidation conservatively requires manual review",
                 isinstance(restored_after_restart, PendingAddWord)
-                and "自动审核：该词需管理员审核"
+                and "需要管理员审核"
                 in restored_after_restart.code_remarks.get("xwwso", ""),
             )
             store.set(
@@ -17042,7 +17038,7 @@ def test_pending_pronunciation_correction_updates_live_ticket():
             )
             check(
                 "revalidated execution keeps the manual-review marker",
-                "自动审核：该词需管理员审核"
+                "需要管理员审核"
                 in restored_remark,
             )
 

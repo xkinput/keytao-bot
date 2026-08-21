@@ -80,11 +80,9 @@ async def resolve_actor_binding(platform: str, platform_id: str) -> Optional[boo
 def get_not_bound_message() -> str:
     """Get not bound prompt message"""
     return (
-        "❌ 未找到你在键道平台的账号 qwq\n\n"
-        "使用机器人创建词条需要先绑定键道平台账号：\n"
-        "1. 访问 https://keytao.vercel.app 注册或登录账号\n"
-        "2. 登录后进入【我的资料】页面\n"
-        "3. 在【机器人账号绑定】部分生成绑定码\n"
-        "4. 在这里发送：/bind [绑定码]\n\n"
-        "绑定后就可以使用啦～ owo"
+        "未找到已绑定的键道账号。\n"
+        "1. 登录：https://keytao.vercel.app\n"
+        "2. 打开【我的资料】：https://keytao.vercel.app/profile\n"
+        "3. 在【机器人账号绑定】生成并复制绑定码\n"
+        "4. 发送：/bind [绑定码]"
     )

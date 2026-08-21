@@ -1712,7 +1712,7 @@ class ToolExecutor:
             if context.attachment_context:
                 return policy_block(
                     BLOCK_REASON_SOURCE_UNTRUSTED,
-                    "安全拦截：本轮带有附件或图片，附件内容不能授权修改草稿或提交。",
+                    "附件或图片不能授权修改草稿或提交。",
                     missing=["trustedTextCommand"],
                     suggestion=self_checked_suggested_command(
                         tool_name, arguments, context
@@ -1722,15 +1722,12 @@ class ToolExecutor:
             if advertised_verb:
                 return policy_block(
                     BLOCK_REASON_VERB_NOT_MATCHED,
-                    f"安全拦截：识别到了已公示执行动词「{advertised_verb}」，"
-                    "但附带的排除条件未通过确定性解析，或没有绑定到当前"
-                    "发送者仍有效的批量确认请求；本次未写入。",
+                    f"「{advertised_verb}」附带的排除条件无法确认，本次未写入。",
                     missing=["liveBatchTicketModifierBinding"],
                 )
             return policy_block(
                 BLOCK_REASON_VERB_NOT_MATCHED,
-                "安全拦截：这条消息里没有识别到明确的执行指令"
-                "（与历史、记忆或引用无关，只是当前这句话没被认成命令）。",
+                "这条消息没有明确的执行指令，本次未写入。",
                 missing=["executionVerb"],
                 suggestion=self_checked_suggested_command(
                     tool_name, arguments, context
@@ -1749,15 +1746,12 @@ class ToolExecutor:
             if advertised_verb:
                 return policy_block(
                     BLOCK_REASON_VERB_NOT_MATCHED,
-                    f"安全拦截：识别到了已公示执行动词「{advertised_verb}」，"
-                    "但附带的排除条件未通过确定性解析，或没有绑定到当前"
-                    "发送者仍有效的批量确认请求；本次未写入。",
+                    f"「{advertised_verb}」附带的排除条件无法确认，本次未写入。",
                     missing=["liveBatchTicketModifierBinding"],
                 )
             return policy_block(
                 BLOCK_REASON_VERB_NOT_MATCHED,
-                "安全拦截：当前文字不是明确的执行指令。"
-                "问句、解释、引用、备注或已经取消的说法不能授权写操作。",
+                "当前文字不是明确的执行指令；问句、解释、引用、备注或取消说法不能授权写操作。",
                 missing=["executionVerb"],
                 suggestion=self_checked_suggested_command(
                     tool_name, arguments, context
@@ -1771,8 +1765,7 @@ class ToolExecutor:
         ):
             return policy_block(
                 BLOCK_REASON_TICKET_REQUIRED,
-                "安全拦截：模型不能自行声明 confirmed=true。"
-                "只有服务端保存的待确认请求才能进入确认执行流程。",
+                "当前操作缺少有效确认，已拒绝执行。",
                 missing=["serverTicket"],
             )
         if message and tool_name in MUTATING_TOOL_NAMES:
@@ -1826,8 +1819,7 @@ class ToolExecutor:
                     "policyBlocked": True,
                     "blockReason": BLOCK_REASON_BULK_DELETE_NOT_REQUESTED,
                     "message": render_remediation_reply(
-                        "安全拦截：当前消息不是批量删除请求，禁止一次删除多个草稿条目；"
-                        "系统不能替你选择要删除的目标"
+                        "当前消息不是批量删除请求，已拒绝删除多个草稿项"
                     ),
                     "blockedIds": ids,
                 }
@@ -1887,8 +1879,7 @@ class ToolExecutor:
                 "policyBlocked": True,
                 "message": (
                     render_remediation_reply(
-                        "安全拦截：拟执行内容过大，无法在一条确认消息中完整展示；"
-                        "本次未保存票据，也未写入；系统不能替你决定批次拆分边界"
+                        "确认内容过长，本次未写入；请拆分操作"
                     )
                 ),
                 "previewCharacters": len(preview),

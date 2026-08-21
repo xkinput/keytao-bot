@@ -571,10 +571,10 @@ def _format_pending_state_details(state: PendingState) -> str:
             for snapshot in state.snapshots
             if snapshot.words
         ]
-        return "待筛选候选词：" + "；".join(groups) if groups else "待筛选候选词"
+        return "候选词：" + "；".join(groups) if groups else "候选词"
 
     if not isinstance(state, PendingToolConfirm):
-        return "待确认操作"
+        return "待确认"
 
     args = state.args if isinstance(state.args, dict) else {}
     display = (
@@ -590,7 +590,7 @@ def _format_pending_state_details(state: PendingState) -> str:
     include_metadata = False
 
     if function_name == "keytao_batch_add_to_draft":
-        lines.append("批量加词，内容如下：")
+        lines.append("批量加词：")
         pairs = pending_batch_display_pairs(state)
         items = [{"word": word, "code": code} for word, code in pairs]
     elif function_name == "keytao_create_phrase":
@@ -607,7 +607,7 @@ def _format_pending_state_details(state: PendingState) -> str:
             else action_label
         )
     elif function_name == "keytao_submit_batch":
-        lines.append("提交草稿，内容如下：")
+        lines.append("提交草稿：")
         items = (
             display.get("snapshotItems")
             if isinstance(display.get("snapshotItems"), list)
@@ -616,7 +616,7 @@ def _format_pending_state_details(state: PendingState) -> str:
         if not items:
             lines[0] = "提交草稿"
     elif function_name == "keytao_shift_phrase_code":
-        lines.append("顺延调码，完整计划如下：")
+        lines.append("顺延调码：")
         shift_plan = (
             display.get("shiftPlan")
             if isinstance(display.get("shiftPlan"), dict)
@@ -650,7 +650,7 @@ def _format_pending_state_details(state: PendingState) -> str:
         "keytao_remove_draft_item",
         "keytao_batch_remove_draft_items",
     }:
-        lines.append("删除草稿条目，服务端已锁定目标如下：")
+        lines.append("删除草稿条目：")
         items = (
             args.get("expected_targets")
             if isinstance(args.get("expected_targets"), list)
@@ -671,7 +671,7 @@ def _format_pending_state_details(state: PendingState) -> str:
             else []
         )
     else:
-        lines.append("待确认操作")
+        lines.append("待确认")
 
     rendered_items = [
         line
@@ -696,7 +696,7 @@ def _format_pending_state_details(state: PendingState) -> str:
         else []
     )
     if warnings:
-        lines.append("待确认风险：")
+        lines.append("风险：")
         lines.extend(
             f"- {_plain_warning_message(warning)}"
             for warning in warnings
@@ -736,7 +736,7 @@ def _format_changed_server_confirmation_prompt(
         r"\s*\n\s*", "；", _format_pending_state_details(current)
     )
     lines = [
-        "服务端复核发现内容已变化，原确认未执行。",
+        "确认内容已变化：",
         f"原：{previous_details}",
         f"现：{current_details}",
         pending_confirmation_copy(),
@@ -759,26 +759,18 @@ def _format_full_add_and_submit_instruction(
         ))
         if quoted:
             return render_remediation_reply(
-                "已检测到你引用了机器人消息，但这条消息对应的可执行候选状态"
-                "不存在（可能已过期，或发送时未建立）；本次不会写入",
+                "引用的候选已过期或不可执行，本次未写入",
                 command=("加词 " + " ".join(words)) if words else "",
                 words=words,
             )
         return render_remediation_reply(
-            "当前没有可执行候选状态，本次不会写入；"
-            "这条消息也没有提供可绑定的具体词条"
+            "没有可执行候选或具体词条，本次未写入"
         )
 
     if quoted:
-        reason = (
-            "引用已经选中了当前候选，但它缺少可核验的服务端候选快照；"
-            "系统不能把引用文字当作词条或编码，本次未写入"
-        )
+        reason = "引用候选缺少可核验的候选记录，本次未写入"
     else:
-        reason = (
-            "当前候选缺少可核验的服务端候选快照；"
-            "系统不能用这条回复补造词条或编码，本次未写入"
-        )
+        reason = "当前候选缺少可核验的候选记录，本次未写入"
     return render_remediation_reply(
         reason,
         command=f"加词 {state.word}",
@@ -790,12 +782,14 @@ def _normalize_generated_review_copy(response: str) -> str:
     """Normalize model-generated review status text to the deterministic UI wording."""
     text = str(response or "")
     replacements = (
-        ("自动审核：预计需管理员审核", "自动审核：该词需管理员审核"),
-        ("自动审核:预计需管理员审核", "自动审核：该词需管理员审核"),
-        ("自动审核：预计需要管理员审核", "自动审核：该词需管理员审核"),
-        ("自动审核:预计需要管理员审核", "自动审核：该词需管理员审核"),
-        ("自动审核：预计可通过", "自动审核：该词可自动通过"),
-        ("自动审核:预计可通过", "自动审核：该词可自动通过"),
+        ("自动审核：预计需管理员审核", "自动审核：需管理员审核"),
+        ("自动审核:预计需管理员审核", "自动审核：需管理员审核"),
+        ("自动审核：预计需要管理员审核", "自动审核：需管理员审核"),
+        ("自动审核:预计需要管理员审核", "自动审核：需管理员审核"),
+        ("自动审核：该词需管理员审核", "自动审核：需管理员审核"),
+        ("自动审核：预计可通过", "自动审核：可自动通过"),
+        ("自动审核:预计可通过", "自动审核：可自动通过"),
+        ("自动审核：该词可自动通过", "自动审核：可自动通过"),
     )
     for old, new in replacements:
         text = text.replace(old, new)
@@ -821,14 +815,12 @@ def _format_active_draft_operation_message(
             words=(pending_state.word,),
         )
         return (
-            f"上一批 {operation.description} {phase}，为避免两个批次写进同一份草稿，"
-            f"本喵暂时不会操作「{pending_state.word}」。\n"
-            f"「{pending_state.word}」的候选仍为你保留；上一批结束后请复制发送：\n"
-            f"{suggestion}\n或引用候选消息回复「添加并提交」。"
+            f"上一批 {operation.description} {phase}；「{pending_state.word}」暂未处理。\n"
+            f"{suggestion}\n"
+            "或引用候选消息回复「添加并提交」。"
         )
     message = (
-        f"{operation.description} {phase}，不用重复发送。"
-        "本喵完成后会直接回复最终结果。"
+        f"{operation.description} {phase}，请勿重复发送。"
     )
     if operation.status == "awaiting_confirmation":
         message += f"\n{pending_confirmation_copy()}"
@@ -857,8 +849,7 @@ def _format_referenced_word_presence_response(words: List[str], lookup_data: Dic
         for item in lookup_data.get("results", [])
         if isinstance(item, dict) and str(item.get("word") or "").strip()
     }
-    lines = [f"查的是你引用那条消息里的：{'、'.join(f'「{word}」' for word in words)}。", ""]
-    all_found = True
+    lines: List[str] = []
 
     for word in words:
         phrases = results.get(word, {}).get("phrases", [])
@@ -870,15 +861,7 @@ def _format_referenced_word_presence_response(words: List[str], lookup_data: Dic
             )
             lines.append(f"• 「{word}」：已收录 {briefs}")
         else:
-            all_found = False
-            lines.append(f"• 「{word}」：当前词库未收录")
-
-    if all_found:
-        lines.append("")
-        lines.append("结论：这些词当前都在词库里。")
-    else:
-        lines.append("")
-        lines.append("结论：不是全部都在词库里，未收录的可以再让本喵按读音和编码候选走加词流程。")
+            lines.append(f"• 「{word}」：未收录")
     return "\n".join(lines)
 
 
@@ -960,15 +943,13 @@ def _format_tool_encoded_add_prompt(word: str, encoding: Dict) -> Optional[str]:
     word_type = str(encoding.get("type") or "").strip()
     type_label = word_type or f"{len(word)}字词"
     lines = [
-        f"词库暂无收录「{word}」，按工具规则计算如下：",
-        "",
-        f"「{word}」的键道编码（{type_label}）",
-        "",
+        f"词库暂无收录「{word}」：",
+        f"键道编码（{type_label}）",
     ]
 
     split_lines = _format_encode_char_split(encoding.get("chars"))
     if split_lines:
-        lines.extend(["逐字拆分:", *split_lines, ""])
+        lines.extend(["逐字拆分:", *split_lines])
 
     lines.append("候选编码:")
     lines.extend(
@@ -976,8 +957,7 @@ def _format_tool_encoded_add_prompt(word: str, encoding: Dict) -> Optional[str]:
         for index, status in enumerate(statuses, start=1)
     )
     lines.extend((
-        "",
-        f"是否以编码 {recommended_code} 将「{word}」加入草稿？",
+        f"• 「{word}」→ {recommended_code}（推荐）",
         single_word_candidate_footer(len(statuses)),
     ))
     return "\n".join(lines)
@@ -1070,13 +1050,46 @@ def _clean_review_audit_reason(reason: str) -> str:
     return text
 
 
+def _compact_review_reason(reason: str) -> str:
+    """Remove verdict repetition and internal review jargon from visible reasons."""
+    text = _clean_review_audit_reason(reason)
+    wrapped_verdict = re.fullmatch(
+        r"(?:自动审核[：:]\s*)?(?:该词)?(?:预计)?"
+        r"(?:可自动通过|(?:需|需要)管理员(?:审核|确认))"
+        r"[（(](?P<reason>.+)[）)]",
+        text,
+    )
+    if wrapped_verdict is not None:
+        text = wrapped_verdict.group("reason").strip()
+    replacements = (
+        ("读音由有明确含义支撑的整词语境判定", "读音有明确含义支撑"),
+        ("缺少权威整词读音来源", "缺少读音来源"),
+        ("没有权威整词读音来源", "没有读音来源"),
+        ("没有权威读音来源", "没有读音来源"),
+        ("缺少权威读音来源", "缺少读音来源"),
+    )
+    for old, new in replacements:
+        text = text.replace(old, new)
+    text = re.sub(
+        r"(?:[，,；;]\s*)?(?:该词)?(?:需要|需)管理员(?:审核|确认)[。.]?$",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"(?:[，,；;]\s*)?(?:该词)?可自动通过[。.]?$",
+        "",
+        text,
+    )
+    return text.strip("；;。 ，,")
+
+
 def _format_source_summary(sources: List[Dict]) -> str:
     labels = []
     for source in sources[:3]:
         label = _review_source_label(source)
         if label:
             labels.append(label)
-    return "；".join(labels) if labels else "暂无权威页"
+    return "；".join(labels) if labels else "暂无"
 
 
 def _format_pronunciation_source(pronunciation: Dict) -> str:
@@ -1086,7 +1099,10 @@ def _format_pronunciation_source(pronunciation: Dict) -> str:
     ]
     if sources:
         return _format_source_summary(sources)
-    return str(pronunciation.get("sourceSummary") or "").strip() or "暂无权威页"
+    summary = str(pronunciation.get("sourceSummary") or "").strip()
+    if not summary or "暂无权威页" in summary:
+        return "暂无"
+    return summary
 
 
 def _format_common_known_brief_reason(item: Optional[Dict], fallback: str) -> str:
@@ -1097,11 +1113,11 @@ def _format_common_known_brief_reason(item: Optional[Dict], fallback: str) -> st
     label = _common_known_item_label(item)
     identity = _entity_identity_label(entity)
     if identity:
-        return f"本喵识别为{label}（{identity}），编码在候选链中"
+        return f"识别为{label}（{identity}），编码有效"
     summary = _clean_review_audit_reason(str(item.get("summary") or "").strip())
     if summary:
         return summary
-    return _clean_review_audit_reason(fallback) or f"本喵识别为{label}"
+    return _clean_review_audit_reason(fallback) or f"识别为{label}"
 
 
 def _format_review_candidate_line(
@@ -1175,9 +1191,7 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
         ]
         if semantic_items and not audit.get("llmFallback"):
             basis_line = str(semantic_items[0].get("basisLine") or "").strip()
-            if basis_line:
-                return f"自动审核：{basis_line}"
-            reason = "语境读音、具体含义和非生僻证据一致"
+            reason = basis_line or "语境读音、具体含义和非生僻证据一致"
         elif audit.get("llmFallback"):
             reason = "语言常识、读音、编码和同码链检查一致"
         elif audit.get("commonKnownItems"):
@@ -1188,7 +1202,8 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
             )
         else:
             reason = _clean_review_audit_reason(summary or "权威来源、编码和常用度证据一致")
-        return f"自动审核：该词可自动通过（{reason}）"
+        reason = _compact_review_reason(reason) or "证据一致"
+        return f"自动审核：{reason}，可自动通过"
 
     issues = [
         _plain_warning_message(issue).strip()
@@ -1196,8 +1211,8 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
         if _plain_warning_message(issue).strip()
     ]
     reason = issues[0] if issues else summary or "证据不足"
-    reason = _clean_review_audit_reason(reason)
-    return f"自动审核：该词需管理员审核（{reason or '证据不足'}）"
+    reason = _compact_review_reason(reason) or "证据不足"
+    return f"自动审核：{reason}，需要管理员审核"
 
 
 def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
@@ -1206,10 +1221,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
     word = str(review.get("word") or "").strip()
     if word and review.get("pronunciationUnresolved"):
         message = str(review.get("message") or "").strip()
-        return message or (
-            f"「{word}」存在多音字语境冲突，但暂时无法确定有明确含义支撑的整词读音。"
-            "本次不推荐编码，也不会创建待确认加词操作。"
-        )
+        return message or f"「{word}」读音存在冲突，暂不推荐编码。"
     recommended_code = str(review.get("recommendedCode") or "").strip()
     pronunciations = [
         item for item in review.get("pronunciations", [])
@@ -1232,10 +1244,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         "",
     )
 
-    lines = [
-        f"词库暂无收录「{word}」，先审读音和编码候选：",
-        "",
-    ]
+    lines = [f"词库暂无收录「{word}」："]
     candidate_index = 1
     candidate_indexes: Dict[str, int] = {}
     pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)
@@ -1246,11 +1255,8 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             f"读音 {pinyin}" if pinyin else "读音待确认",
             f"来源 {_format_pronunciation_source(pronunciation)}",
         ]
-        if pre_submit_preview:
-            review_parts.append(pre_submit_preview)
-        else:
-            review_parts.append("自动审核：该词暂未完成预审（当前仅确认读音与候选编码）")
-        lines.append("审词：" + "；".join(review_parts))
+        lines.append("审词：" + "；".join(review_parts) + "；")
+        lines.append(pre_submit_preview or "自动审核：预审未完成")
         lines.append("候选编码:")
         for status in pronunciation.get("candidateStatuses", []):
             code = str(status.get("code") or "").strip().lower()
@@ -1264,7 +1270,6 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
                 )
             )
             candidate_index += 1
-        lines.append("")
     else:
         lines.append("读音与来源:")
         for index, pronunciation in enumerate(pronunciations, start=1):
@@ -1273,8 +1278,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         if pre_submit_preview:
             lines.append(pre_submit_preview)
         else:
-            lines.append("自动审核：该词暂未完成预审（当前仅确认读音与候选编码）")
-        lines.append("")
+            lines.append("自动审核：预审未完成")
 
         for index, pronunciation in enumerate(pronunciations, start=1):
             pinyin = str(pronunciation.get("pinyin") or "").strip()
@@ -1291,12 +1295,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
                     )
                 )
                 candidate_index += 1
-            lines.append("")
-
-    while lines and not lines[-1]:
-        lines.pop()
     if ordering_assessments:
-        lines.append("")
         lines.extend(
             _format_candidate_ordering_assessment(assessment, candidate_indexes)
             for assessment in ordering_assessments
@@ -1527,30 +1526,32 @@ def _append_submit_review_lines(parts: List[str], submit_data: object) -> None:
     if isinstance(auto_review, dict):
         will_auto_approve = review_flags.audit_allows_batch_auto_approve(auto_review)
         if will_auto_approve and submit_data.get("requiresConfirmation"):
-            parts.append(
-                _format_auto_approved_review_line(auto_review)
-                + "确认提交后将尝试自动批准入库。"
-            )
+            parts.append(_format_auto_approved_review_line(auto_review))
             return
         if will_auto_approve and approve_result and not approve_result.get("success"):
             passed_line = _format_auto_approved_review_line(auto_review).rstrip("。")
             reason = str(approve_result.get("message") or "未知原因")
             parts.append(f"{passed_line}，但自动批准未执行：{reason}")
             return
-        block_reason = _clean_review_audit_reason(
+        block_reason = _compact_review_reason(
             review_flags.batch_auto_approve_block_reason(auto_review)
         )
-        if block_reason and "管理员审核" not in block_reason and "管理员确认" not in block_reason:
-            parts.append(f"本喵审核：该批次需管理员审核（{block_reason}）")
-        else:
-            parts.append("本喵审核：该批次需管理员审核。")
+        parts.append(
+            f"自动审核：{block_reason}，需管理员审核"
+            if block_reason
+            else "自动审核：需管理员审核"
+        )
         issues = auto_review.get("issues") or []
         if issues:
-            issue_lines = "\n".join(
-                f"• {_plain_warning_message(issue).replace('不能自动通过', '需管理员审核').replace('提交后等待管理员审核', '需管理员审核')}"
+            issue_lines = [
+                _compact_review_reason(_plain_warning_message(issue))
                 for issue in issues[:5]
+            ]
+            parts.extend(
+                f"• {line}"
+                for line in issue_lines
+                if line and line != block_reason
             )
-            parts.append("需管理员审核：\n" + issue_lines)
     if approve_result and not approve_result.get("success"):
         parts.append(f"自动批准未执行：{approve_result.get('message', '未知原因')}")
 
@@ -1563,14 +1564,14 @@ def _format_auto_approved_review_line(auto_review: Optional[Dict]) -> str:
             auto_review.get("semanticContextAutoPassItems")
             and not auto_review.get("llmFallback")
         ):
-            return "本喵审核：语境读音、具体含义、非生僻证据和编码候选链检查通过。"
+            return "自动审核：语境读音、具体含义、非生僻证据和编码候选链一致，可自动通过"
         if auto_review.get("llmFallback"):
-            return "本喵审核：语言常识、读音、编码和同码链检查通过。"
+            return "自动审核：语言常识、读音、编码和同码链一致，可自动通过"
         if auto_review.get("commonKnownItems"):
-            return "本喵审核：常见词/实体常识、编码候选链和同码链检查通过。"
+            return "自动审核：常见词/实体常识、编码候选链和同码链一致，可自动通过"
         if summary and summary != "证据一致":
-            return f"本喵审核：{summary}。"
-    return "本喵审核：权威来源、编码和常用度证据一致。"
+            return f"自动审核：{_compact_review_reason(summary)}，可自动通过"
+    return "自动审核：权威来源、编码和常用度证据一致，可自动通过"
 
 
 def _trusted_batch_url(*sources: Dict) -> str:
@@ -1660,10 +1661,9 @@ def _format_operation_memory_for_reply(item: Dict) -> str:
 
 
 def _format_clear_response(had_inflight_draft: bool) -> str:
-    response = "好哒～ 对话历史已清空！我们重新开始吧 owo"
+    response = "对话历史已清空。"
     if had_inflight_draft:
         response += (
-            "\n\n注意：刚才的草稿操作已经发往服务端，清空对话不能撤销它。"
-            "结果可能已经生效；请等当前操作结束后先发「查看草稿」，避免重复操作。"
+            "\n草稿操作可能已生效；操作结束后请发送「查看草稿」，避免重复。"
         )
     return response

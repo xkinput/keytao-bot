@@ -98,21 +98,18 @@ PENDING_BATCH_CONFIRMATION_COPY_TOKEN = "{{PENDING_BATCH_CONFIRMATION_COPY}}"
 
 
 _BIND_HELP_TEXT = (
-    "你还没有绑定键道账号哦～\n\n"
-    "📝 绑定步骤：\n\n"
-    "1. 登录键道网站：https://keytao.vercel.app\n"
-    "2. 点击右上角用户名，进入【我的资料】\n"
-    "   （或直接访问：https://keytao.vercel.app/profile ）\n"
-    "3. 在【机器人账号绑定】区域点击【生成绑定码】\n"
-    "4. 复制绑定码\n"
-    "5. 在这里发送：/bind [你的绑定码]\n\n"
+    "你还未绑定键道账号。\n"
+    "1. 登录：https://keytao.vercel.app\n"
+    "2. 打开【我的资料】：https://keytao.vercel.app/profile\n"
+    "3. 在【机器人账号绑定】生成并复制绑定码\n"
+    "4. 发送：/bind [绑定码]\n"
     "示例：/bind AB12CD\n\n"
-    "💡 群聊中需要 @我 或回复我的消息才能触发绑定"
+    "群聊中请 @我 或回复我的消息。"
 )
 
 
 REMEDIATION_FALLBACK_GUIDANCE = (
-    "这一步我做不了，请换一种说法，或发「查看草稿」看看现状"
+    "可发送「查看草稿」"
 )
 FAILED_WRITE_TEMPLATE_PREFIX = "这条指令按当前表述无法执行"
 FAILED_WRITE_TEMPLATE_MARKER = "本次未写入"
@@ -587,10 +584,10 @@ def render_remediation_reply(
     clean_reason = str(reason or "").strip().rstrip("；;。")
     suggestion = render_executable_suggestion(command, words=words)
     if suggestion:
-        return f"{clean_reason}。\n可执行命令：\n{suggestion}"
+        return f"{clean_reason}。\n{suggestion}"
     if advertised_reply_contract(clean_reason).requires_live_state:
         return clean_reason + "。"
-    return f"{clean_reason}。{REMEDIATION_FALLBACK_GUIDANCE}。"
+    return f"{clean_reason}。\n{REMEDIATION_FALLBACK_GUIDANCE}。"
 
 
 def _humanize_warning_text(text: str) -> str:
@@ -858,7 +855,7 @@ def pending_batch_confirmation_copy() -> str:
     return "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
 
 
-_SERVER_BACKED_WORD_SET_HEADER = "本轮服务端查询确认未收录的词："
+_SERVER_BACKED_WORD_SET_HEADER = "未收录："
 _SERVER_BACKED_WORD_SET_FOOTER = "可以把列表中的词加入草稿。"
 
 
@@ -989,14 +986,12 @@ def render_server_backed_batch_candidates(
     if seen_words != set(scopes_by_word):
         return ""
 
-    lines = [
-        f"已根据当前服务端审词记录重列以下 {len(normalized_items)} 个词的候选："
-    ]
+    lines = [f"{len(normalized_items)} 个词的候选："]
     for word_index, (word, recommended_code, needs_review) in enumerate(
         normalized_items,
         start=1,
     ):
-        lines.extend(("", f"{word_index}. 「{word}」", "   候选："))
+        lines.extend((f"{word_index}. 「{word}」", "   候选："))
         for candidate_index, (code, occupied) in enumerate(
             scopes_by_word[word],
             start=1,
@@ -1007,7 +1002,7 @@ def render_server_backed_batch_candidates(
                 f"   {candidate_index}. {code} — {occupancy_copy}{recommended_copy}"
             )
         review_copy = "需管理员审核" if needs_review else "可自动通过"
-        lines.append(f"   审核结论：{review_copy}")
+        lines.append(f"   自动审核：{review_copy}")
 
     lines.append(pending_batch_confirmation_copy())
     return "\n".join(lines)
@@ -1025,6 +1020,7 @@ def single_word_candidate_footer(candidate_count: int) -> str:
         return (
             "回复编号或编码选择"
             f"（可多选，如「添加{example}」）；"
+            "\n"
             "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
         )
     return pending_single_candidate_confirmation_copy()
@@ -1081,7 +1077,7 @@ def render_server_backed_single_word_candidates(
         seen.add(code)
     if len(normalized_candidates) < 2 or recommended not in seen:
         return ""
-    lines = [f"「{normalized_word}」的服务端候选编码："]
+    lines = [f"「{normalized_word}」候选编码："]
     for index, (code, occupied) in enumerate(normalized_candidates, start=1):
         if occupied:
             words = [
@@ -1098,8 +1094,7 @@ def render_server_backed_single_word_candidates(
             label += "（推荐）"
         lines.append(f"{index}. {code} — {label}")
     lines.extend((
-        "",
-        f"是否以编码 {recommended} 将「{normalized_word}」加入草稿？",
+        f"• 「{normalized_word}」→ {recommended}（推荐）",
         single_word_candidate_footer(len(normalized_candidates)),
     ))
     return "\n".join(lines)
@@ -1155,35 +1150,25 @@ def render_server_backed_single_word_lookup(
         return ""
     return "\n".join((
         body,
-        "",
         f"推荐编码：{recommended}（本次仅查询）",
-        f"「{normalized_word}」的以上候选为只读展示；"
-        "本次不建立加词确认，也不会写入草稿。",
         single_word_candidate_footer(len(expected_codes)),
-        "以上回复只表达本轮意图；执行前系统会重新审词，"
-        "并绑定当前服务端候选。",
     ))
 
 
 def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
     """Return ordered codes only from the deterministic read-only contract."""
     normalized = unicodedata.normalize("NFKC", str(text or ""))
-    match = re.search(
-        r"(?m)^「(?P<word>[^「」\r\n]{1,128})」的以上候选为只读展示;"
-        r"本次不建立加词确认,也不会写入草稿。\s*$",
-        normalized,
-    )
-    if match is None:
-        return ()
-    codes = advertised_single_word_candidate_codes(normalized[:match.start()])
-    if not codes:
-        return ()
     recommended = re.search(
         r"(?m)^推荐编码:(?P<code>[a-z]{1,12})\(本次仅查询\)\s*$",
-        normalized[:match.start()],
+        normalized,
         re.IGNORECASE,
     )
-    if recommended is None or recommended.group("code").lower() not in codes:
+    if recommended is None:
+        return ()
+    codes = advertised_single_word_candidate_codes(normalized[:recommended.start()])
+    if not codes:
+        return ()
+    if recommended.group("code").lower() not in codes:
         return ()
     return codes
 
@@ -1192,8 +1177,8 @@ def advertised_single_word_lookup_word(text: str) -> str:
     """Extract only the referent from the deterministic read-only renderer."""
     normalized = unicodedata.normalize("NFKC", str(text or ""))
     match = re.search(
-        r"(?m)^「(?P<word>[^「」\r\n]{1,128})」的以上候选为只读展示;"
-        r"本次不建立加词确认,也不会写入草稿。\s*$",
+        r"(?m)^(?:词库暂无收录)?「(?P<word>[^「」\r\n]{1,128})」"
+        r"(?:候选编码)?[:：]\s*$",
         normalized,
     )
     if match is None or not advertised_single_word_lookup_codes(normalized):
@@ -1219,11 +1204,11 @@ def ensure_single_word_candidate_copy(text: str, candidate_count: int) -> str:
             "",
             response,
         )
+    footer = single_word_candidate_footer(candidate_count)
+    response = response.replace(footer, "")
     confirmation_copy = pending_single_candidate_confirmation_copy()
     response = response.replace(confirmation_copy, "")
-    footer = single_word_candidate_footer(candidate_count)
-    if footer not in response:
-        response = response.rstrip() + "\n" + footer
+    response = response.rstrip() + "\n" + footer
     response = re.sub(r"[ \t]+(?=\n|$)", "", response)
     response = re.sub(r"\n{3,}", "\n\n", response)
     return response.strip()
@@ -1240,8 +1225,8 @@ def scoped_multi_word_candidate_copy(words: tuple[str, ...]) -> str:
         return ""
     example = clean_words[-1]
     return (
-        "多个词的候选编号分别从 1 开始；选择时请带上词条，"
-        f"例如「{example} 添加1」；多选请回复「{example} 添加2、4」。"
+        "每个词的编号都从 1 开始；"
+        f"回复「{example} 添加1」，多选回复「{example} 添加2、4」。"
     )
 
 

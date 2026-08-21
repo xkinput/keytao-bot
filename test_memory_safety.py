@@ -1015,7 +1015,7 @@ class PendingPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "keytao_submit_batch")
         self.assertEqual(calls[0][1], {**submit_args, "confirmed": True})
-        self.assertIn("成功提交审核", result)
+        self.assertIn("草稿已提交审核", result)
         self.assertIsNone(
             SQLiteConversationStateStore(
                 self.db_path,
@@ -1435,7 +1435,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             chat_module.conversation_state_store = old_state_store
 
         self.assertEqual(resolved.intent, "none")
-        self.assertIn("请引用当前确认消息", response)
+        self.assertIn("确认码已停用", response)
         self.assertNotIn(record.reconfirmation_code, response)
         self.assertIs(state_store.get_record(conv_key), record)
 
@@ -1571,7 +1571,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNone(canonical)
         self.assertIn("只接受 1-4", error)
-        self.assertIn("可执行命令", error)
+        self.assertIn("「加入」（还车）", error)
         self.assertIn("加入", error)
         self.assertIn("（还车）", error)
         self.assertNotIn("当前没有可安全执行" + "的后续命令", error)
@@ -1880,7 +1880,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertTrue(result.success)
-        self.assertIn("以下 2 个词：显眼包、嘴替", result.text)
+        self.assertIn("词：显眼包、嘴替", result.text)
         self.assertIn("已加入草稿并提交审核", result.text)
 
     async def test_live_batch_ticket_modifier_controls_ask_without_write(self) -> None:
@@ -2771,7 +2771,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     owner_label="Ealin",
                 )
                 self.assertIn("只接受 1-4", control)
-                self.assertIn("可执行命令", control)
+                self.assertIn("「加入」（还车）", control)
                 self.assertIn("加入", control)
                 self.assertIn("（还车）", control)
                 self.assertNotIn("当前没有可安全执行" + "的后续命令", control)
@@ -3085,7 +3085,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(numbered_calls[0][1]["code"], "hbbki")
-        self.assertIn("已加入草稿并提交审核", numbered_reply)
+        self.assertIn("写入草稿，已提交审核", numbered_reply)
         self.assertNotIn("没有匹配到", numbered_reply)
 
         rejected_calls, rejected_reply, _rendered = await exercise(
@@ -3093,7 +3093,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(rejected_calls, [])
         self.assertIn("只接受 1-3", rejected_reply)
-        self.assertIn("可执行命令", rejected_reply)
+        self.assertIn("「加入」（会比）", rejected_reply)
         self.assertIn("加入", rejected_reply)
         self.assertIn("（会比）", rejected_reply)
         self.assertNotIn("当前没有可安全执行" + "的后续命令", rejected_reply)
@@ -3235,7 +3235,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 calls[3][1]["expected_server_snapshot_digest"],
                 snapshot_digest,
             )
-            self.assertIn("已加入草稿并提交审核", reply)
+            self.assertIn("写入草稿，已提交审核", reply)
             self.assertIn("zjyka 与「已有词」同码", reply)
             self.assertIn("同码顺序：zjyka：已有词 → 阻抑", reply)
             self.assertNotIn("确认票据", reply)
@@ -4120,7 +4120,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 conv_key,
             )
 
-            self.assertIn("成功提交", server_reply)
+            self.assertIn("草稿已提交审核", server_reply)
             self.assertEqual(len(calls), 2)
             self.assertTrue(calls[1]["confirmed"])
             self.assertEqual(calls[1]["batch_id"], "batch-1")
@@ -4159,7 +4159,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 conv_key,
             )
             self.assertEqual(len(calls), 3)
-            self.assertIn("确认码已经停用", stale_reply)
+            self.assertIn("确认码已停用", stale_reply)
             self.assertNotIn(current_code, stale_reply)
 
             await chat_module.handle_pending_message_core(
@@ -4224,8 +4224,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 conv_key,
             )
             self.assertEqual(len(calls), 1)
-            self.assertIn("不会再次执行", blocked_reply)
-            self.assertIn("引用当前消息回复「取消」", blocked_reply)
+            self.assertIn("不会重复写入", blocked_reply)
+            self.assertIn("引用本消息回复「取消」", blocked_reply)
             self.assertNotIn(ticket_code, blocked_reply)
             self.assertIsNone(
                 await chat_module.handle_pending_message_core(
@@ -4241,7 +4241,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 "42",
                 conv_key,
             )
-            self.assertIn("不会重放", discard_reply)
+            self.assertIn("已放弃上一次结果不确定的操作", discard_reply)
             self.assertIsNone(state_store.get_record(conv_key))
         finally:
             chat_module.tool_executor = old_tool_executor
@@ -7317,7 +7317,8 @@ class MutationAuthorizationTests(unittest.TestCase):
 
         self.assertTrue(rejected["policyBlocked"])
         self.assertFalse(rejected.get("requiresConfirmation", False))
-        self.assertIn("未保存票据", rejected["message"])
+        self.assertIn("确认内容过长", rejected["message"])
+        self.assertIn("本次未写入", rejected["message"])
 
         from keytao_bot.harness.tools import _describe_staged_mutation
 
@@ -8088,7 +8089,7 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(verb_miss.get("policyBlocked"))
         self.assertEqual(verb_miss.get("blockReason"), "verb_not_matched")
         self.assertNotIn("不能授权修改草稿", verb_miss["message"])
-        self.assertIn("与历史、记忆或引用无关", verb_miss["message"])
+        self.assertIn("没有明确的执行指令", verb_miss["message"])
         self.assertEqual(self.calls, [])
 
         # A user-written ASCII destination still lacks server provenance.  The
@@ -10419,7 +10420,7 @@ class ServerBoundDeleteConfirmationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertNotIn(pending_confirmation_copy(), reply)
-        self.assertIn("没有返回不同的目标", reply)
+        self.assertIn("确认内容未变化", reply)
 
     async def test_changed_delete_target_may_reprompt_with_old_and_new_facts(
         self,
@@ -10480,7 +10481,7 @@ class ServerBoundDeleteConfirmationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(reply.count(pending_confirmation_copy()), 1)
-        self.assertIn("原确认未执行", reply)
+        self.assertIn("确认内容已变化", reply)
         self.assertIn("「呵呵呵」@ hhhooo", reply)
         self.assertIn("「哈哈哈」@ hhhooo", reply)
         self.assertNotIn("PR#", reply)
@@ -10645,8 +10646,8 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             model_reply
             + "\n\n"
             + pending_batch_confirmation_copy()
-            + "\n多个词的候选编号分别从 1 开始；选择时请带上词条，"
-            "例如「载流子 添加1」；多选请回复「载流子 添加2、4」。"
+            + "\n每个词的编号都从 1 开始；回复「载流子 添加1」，"
+            "多选回复「载流子 添加2、4」。"
         )
         client = _FakeClient([
             _fake_response(
@@ -10759,7 +10760,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                     "word": "载流",
                     "code": "zhlq",
                     "type": "Phrase",
-                    "remark": "喵喵审词：自动审核：该词需管理员审核（missing authoritative pronunciation source）",
+                    "remark": "喵喵审词：自动审核：missing authoritative pronunciation source，需要管理员审核",
                     "needsManualReview": True,
                     "manualReviewReason": "missing authoritative pronunciation source",
                 },
@@ -10768,7 +10769,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                     "word": "载流子",
                     "code": "zlzu",
                     "type": "Phrase",
-                    "remark": "喵喵审词：自动审核：该词可自动通过（authoritative pronunciation and code agree）",
+                    "remark": "喵喵审词：自动审核：authoritative pronunciation and code agree，可自动通过",
                     "needsManualReview": False,
                     "manualReviewReason": "authoritative pronunciation and code agree",
                 },
@@ -10869,7 +10870,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ("wlfoou", False),
         ])
         self.assertEqual(record.state.server_occupied_words["wlf"], ["窝里反"])
-        self.assertIn("是否以编码 wlfoo 将「炒冷饭」加入草稿", rendered)
+        self.assertIn("• 「炒冷饭」→ wlfoo（推荐）", rendered)
         self.assertNotEqual(rendered, model_reply)
         with patch.object(
             chat_module,
@@ -11172,7 +11173,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(result == model_reply, not expects_replacement)
                 if expects_replacement:
-                    self.assertIn("当前服务端审词记录", result)
+                    self.assertIn("2 个词的候选：", result)
                 self.assertEqual(record.owner_key, context.conversation_address)
                 self.assertIsInstance(record.state, PendingToolConfirm)
                 self.assertEqual(
@@ -14143,7 +14144,7 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(raw)
 
         self.assertEqual(payload.get("blockReason"), "verb_not_matched")
-        self.assertIn("识别到了已公示执行动词「都加」", payload["message"])
+        self.assertIn("「都加」附带的排除条件", payload["message"])
         self.assertIn("排除条件", payload["message"])
         self.assertNotIn("没有识别到明确的执行指令", payload["message"])
         self.assertNotIn("缺少可执行的动词", payload["message"])
@@ -15226,7 +15227,7 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("没有成功写入任何数据", reply)
-        self.assertIn("可执行命令", reply)
+        self.assertIn(f"- “{command}”", reply)
         self.assertIn(command, reply)
         self.assertNotIn("已执行结果请以链接为准", reply)
         self.assertNotIn("链接为准", reply)
@@ -16210,7 +16211,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
                 "suggestedCommand": "@我 将草稿中「亮面」lxmmov 的权重调整为 101",
             },
         )
-        self.assertIn("可执行命令：\n- “@我 将草稿中", finalized)
+        self.assertIn("- “@我 将草稿中", finalized)
         self.assertNotIn("重新发送", finalized)
 
     def test_confirmation_can_still_request_original_operation(self) -> None:

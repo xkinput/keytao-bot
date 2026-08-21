@@ -401,7 +401,7 @@ async def scenario_s4(ctx: ScenarioContext) -> dict[str, Any]:
         delete_prompt.count(pending_confirmation_copy()) == 1,
         f"S4 delete did not expose exactly one server-bound prompt: {delete_prompt}",
     )
-    assert_reply_mentions(delete_prompt, fixture_word, fixture_code, "服务端已锁定")
+    assert_reply_mentions(delete_prompt, fixture_word, fixture_code, "删除草稿条目：")
     require("PR#" not in delete_prompt, f"S4 delete leaked an internal id: {delete_prompt}")
     require(
         len((await ctx.draft())["items"]) == 1,
@@ -1366,7 +1366,7 @@ async def scenario_s17(ctx: ScenarioContext) -> dict[str, Any]:
     semantic_reply = replies[-1]
     assert_reply_mentions(
         semantic_reply,
-        "该词可自动通过",
+        "可自动通过",
         "语境读音与含义明确",
         "语料/词典证据",
         "逐字 jieba 词频 产 6838、季 1619",
@@ -1413,7 +1413,7 @@ async def scenario_s17(ctx: ScenarioContext) -> dict[str, Any]:
     messages.append("喵喵 加词 龘季")
     replies.append(await ctx.send(messages[-1]))
     obscure_reply = replies[-1]
-    assert_reply_mentions(obscure_reply, "龘季", "该词需管理员审核")
+    assert_reply_mentions(obscure_reply, "龘季", "需要管理员审核")
     obscure_code = _recommended_empty_code(obscure_reply, word="龘季")
     obscure_cutoff = max(
         (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
@@ -1537,11 +1537,11 @@ async def scenario_s18(ctx: ScenarioContext) -> dict[str, Any]:
         "可多选，如「添加2、4」" in discovery,
         f"S18 discovery omitted the advertised multi-select form: {discovery}",
     )
-    if "该词可自动通过" in discovery:
+    if "可自动通过" in discovery:
         empty_needs_manual_review = False
     else:
         require(
-            "该词需管理员审核" in discovery,
+            "需要管理员审核" in discovery,
             f"S18 discovery omitted its review verdict: {discovery}",
         )
         empty_needs_manual_review = True
@@ -3207,7 +3207,7 @@ async def scenario_s27(ctx: ScenarioContext) -> dict[str, Any]:
     )
 
     bind_reply = await send_as(unbound_platform_id, "S27-unbound", S27_ASSENT)
-    assert_reply_mentions(bind_reply, "你还没有绑定键道账号", "/bind", "/profile")
+    assert_reply_mentions(bind_reply, "你还未绑定键道账号", "/bind", "/profile")
 
     cutoff = max(
         (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
@@ -3632,7 +3632,11 @@ async def scenario_s29(ctx: ScenarioContext) -> dict[str, Any]:
         to_me=True,
     )
     replies.append(presence_reply)
-    assert_reply_mentions(presence_reply, "查的是你引用那条消息里的")
+    assert_reply_mentions(
+        presence_reply,
+        "「操作已完成」：未收录",
+        "「火锅」：已收录",
+    )
     presence_events = [
         event
         for event in ctx.attempt_events()

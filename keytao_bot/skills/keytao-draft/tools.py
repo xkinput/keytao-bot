@@ -1574,7 +1574,7 @@ async def keytao_create_phrase(
         or expected_content_version < 0
         or not re.fullmatch(r"[0-9a-f]{64}", expected_warning_digest)
     ):
-        return {"success": False, "message": "添加确认缺少有效的服务端风险快照"}
+        return {"success": False, "message": "添加确认内容不完整"}
     if (
         weight is not None
         and (
@@ -1669,7 +1669,7 @@ async def keytao_create_phrase(
                     return _inject_known_batch_url({
                         "success": False,
                         "uncertain": True,
-                        "message": "服务端未返回可确认的添加快照，已停止后续操作",
+                        "message": "添加确认内容不完整，已停止后续操作",
                         "batchId": batch_id,
                     }, batch_id)
                 logger.info(f"[keytao_create_phrase] API response (200): {json.dumps(data, ensure_ascii=False)}")
@@ -1893,7 +1893,7 @@ async def _audit_current_draft_for_auto_approval(
                 "success": False,
                 "verdict": "needs_admin",
                 "autoApprove": False,
-                "summary": "草稿快照缺少可验证版本，已停止提交",
+                "summary": "草稿版本不完整，已停止提交",
                 "issues": ["草稿批次或内容版本不匹配"],
             }
 
@@ -2303,7 +2303,7 @@ async def keytao_submit_batch(
         return _inject_known_batch_url({
             "success": False,
             "error": "invalid_audit_content_version",
-            "message": auto_review.get("summary") or "草稿快照缺少可验证版本，已停止提交",
+            "message": auto_review.get("summary") or "草稿版本不完整，已停止提交",
             "autoReview": auto_review,
         }, batch_id)
     if confirmed and expected_content_version != audited_content_version:
@@ -2327,7 +2327,7 @@ async def keytao_submit_batch(
             "staleConfirmation": True,
             "error": "submit_audit_digest_changed",
             "message": render_remediation_reply(
-                "提交检查与当前快照不匹配，本次确认已失效",
+                "提交检查与当前内容不匹配，本次确认已失效",
                 command="提交",
             ),
             "batchId": batch_id,
@@ -2348,7 +2348,7 @@ async def keytao_submit_batch(
                 "uncertain": True,
                 "error": "invalid_submit_preview",
                 "message": render_remediation_reply(
-                    "服务端未返回完整的只读提交快照",
+                    "提交检查不完整",
                     command="查看草稿",
                 ),
                 "batchId": batch_id,
@@ -2373,7 +2373,7 @@ async def keytao_submit_batch(
                 "success": False,
                 "error": "audit_snapshot_not_stored",
                 "message": render_remediation_reply(
-                    "提交检查无法安全保存（结果过大或容量不足）",
+                    "提交检查无法保存，请缩小范围",
                     command="查看草稿",
                 ),
                 "batchId": batch_id,
@@ -2732,7 +2732,7 @@ async def keytao_recall_batch(
                 "batchId": claimed_batch_id,
                 "contentVersion": recalled_snapshot.get("contentVersion"),
                 "items": recalled_snapshot.get("items") or [],
-                "message": "上一次撤回已通过只读草稿快照确认生效",
+                "message": "上一次撤回已确认生效",
             }
             if recalled_snapshot.get("batchUrl"):
                 applied["batchUrl"] = recalled_snapshot.get("batchUrl")
@@ -2746,7 +2746,7 @@ async def keytao_recall_batch(
             ):
                 return _locked_mutation_result(
                     claimed_batch_id,
-                    "原撤回结果已核验，但最终回执无法安全保存；本次不会继续操作。",
+                    "原撤回已核验，但结果无法保存；本次不会继续操作。",
                 )
             return applied
         if batch_id:
@@ -2916,7 +2916,7 @@ async def keytao_recall_batch(
                     **data,
                     "success": False,
                     "staleConfirmation": True,
-                    "message": data.get("message") or "待撤回批次已变化，旧票据已作废",
+                    "message": data.get("message") or "待撤回批次已变化，原确认已失效",
                 }
                 _inject_batch_url(stale)
                 if not _resolve_draft_mutation_claim(
@@ -2928,7 +2928,7 @@ async def keytao_recall_batch(
                 ):
                     return _locked_mutation_result(
                         str(batch_id),
-                        "撤回失败结果无法安全保存；已锁定原批次。",
+                        "撤回失败结果无法保存；不会操作其他批次。",
                     )
                 return stale
             if response.status_code >= 500:
@@ -2950,7 +2950,7 @@ async def keytao_recall_batch(
                     return _locked_mutation_result(
                         str(batch_id),
                         render_remediation_reply(
-                            "撤回结果无法安全保存；已锁定原批次",
+                            "撤回结果无法保存；不会操作其他批次",
                             command="查看草稿",
                         ),
                     )
@@ -3147,7 +3147,7 @@ async def keytao_update_draft_item_weight(
     elif not isinstance(snapshot, dict):
         return {
             "success": False,
-            "message": "草稿快照格式无效，本次未写入。",
+            "message": "草稿内容格式无效，本次未写入。",
         }
     if not snapshot.get("success"):
         return snapshot
@@ -3209,7 +3209,7 @@ async def keytao_update_draft_item_weight(
     ):
         return {
             "success": False,
-            "message": "草稿快照缺少可验证的批次、版本或条目 ID，本次未写入。",
+            "message": "草稿批次、版本或条目不完整，本次未写入。",
         }
     canonical_target = {
         "id": int(item_id),
@@ -3319,7 +3319,7 @@ async def _prepare_delete_targets(
         or content_version < 0
     ):
         return _inject_known_batch_url(
-            {"success": False, "message": "草稿快照缺少可验证版本"},
+            {"success": False, "message": "草稿版本不完整"},
             current_batch_id,
         )
     if batch_id and current_batch_id != str(batch_id):
@@ -3535,7 +3535,7 @@ async def _resolve_existing_delete_claim(
             "batchId": claimed_batch_id,
             "successCount": len(normalized_claimed_ids),
             "draftItems": snapshot.get("items") or [],
-            "message": "上一次删除已通过只读草稿快照确认生效",
+            "message": "上一次删除已确认生效",
         }
         batch_url = snapshot.get("batchUrl")
         if batch_url:
@@ -3550,7 +3550,7 @@ async def _resolve_existing_delete_claim(
         ):
             return _locked_mutation_result(
                 claimed_batch_id,
-                "原删除结果已核验，但最终回执无法安全保存；本次不会继续删除。",
+                "原删除已核验，但结果无法保存；本次不会继续删除。",
             ), None
         return result, None
 
@@ -3776,7 +3776,7 @@ async def keytao_remove_draft_item(
                     **data,
                     "success": False,
                     "staleConfirmation": True,
-                    "message": data.get("message") or "删除目标已变化，旧票据已作废",
+                    "message": data.get("message") or "删除目标已变化，原确认已失效",
                 }
                 _inject_batch_url(stale)
                 if not _resolve_draft_mutation_claim(
@@ -3788,7 +3788,7 @@ async def keytao_remove_draft_item(
                 ):
                     return _locked_mutation_result(
                         str(batch_id or ""),
-                        "删除失败结果无法安全保存；已锁定原批次。",
+                        "删除失败结果无法保存；不会操作其他批次。",
                     )
                 return stale
             if response.status_code >= 500:
@@ -3816,7 +3816,7 @@ async def keytao_remove_draft_item(
                     return _locked_mutation_result(
                         str(batch_id or ""),
                         render_remediation_reply(
-                            "删除结果无法安全保存；已锁定原批次",
+                            "删除结果无法保存；不会操作其他批次",
                             command="查看草稿",
                         ),
                     )
@@ -4049,7 +4049,7 @@ async def keytao_batch_add_to_draft(
     ):
         return _inject_known_batch_url({
             "success": False,
-            "message": "批量添加确认缺少有效的服务端风险快照",
+            "message": "批量添加确认内容不完整",
         }, batch_id)
 
     valid_items, validation_failed = await _split_items_by_code_validation(items)
@@ -4150,7 +4150,7 @@ async def keytao_batch_add_to_draft(
                 return _inject_known_batch_url({
                     "success": False,
                     "uncertain": True,
-                    "message": "服务端未返回可确认的批量添加快照，已停止后续操作",
+                    "message": "批量添加确认内容不完整，已停止后续操作",
                     "batchId": batch_id,
                 }, batch_id)
             if validation_failed:
@@ -4346,7 +4346,7 @@ async def keytao_batch_remove_draft_items(
                     **data,
                     "success": False,
                     "staleConfirmation": True,
-                    "message": data.get("message") or "批量删除目标已变化，旧票据已作废",
+                    "message": data.get("message") or "批量删除目标已变化，原确认已失效",
                 }
                 _inject_batch_url(stale)
                 if not _resolve_draft_mutation_claim(
@@ -4358,7 +4358,7 @@ async def keytao_batch_remove_draft_items(
                 ):
                     return _locked_mutation_result(
                         str(batch_id or ""),
-                        "批量删除失败结果无法安全保存；已锁定原批次。",
+                        "批量删除失败结果无法保存；不会操作其他批次。",
                     )
                 return stale
             if response.status_code >= 500:
@@ -4382,7 +4382,7 @@ async def keytao_batch_remove_draft_items(
                     return _locked_mutation_result(
                         str(batch_id or ""),
                         render_remediation_reply(
-                            "批量删除结果无法安全保存；已锁定原批次",
+                            "批量删除结果无法保存；不会操作其他批次",
                             command="查看草稿",
                         ),
                     )
@@ -4999,7 +4999,7 @@ async def keytao_shift_phrase_code(
                 return _inject_known_batch_url({
                     **strict_preview,
                     "success": False,
-                    "message": strict_preview.get("message") or "服务端未锁定完整重排修改快照",
+                    "message": strict_preview.get("message") or "重排修改内容不完整",
                     "shiftPlan": shift_plan,
                 }, current_batch_id)
             warning_digest = str(strict_preview.get("warningDigest") or "").strip().lower()

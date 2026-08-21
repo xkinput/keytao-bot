@@ -815,7 +815,9 @@ def test_semantic_context_pass_clears_prepare_seal_and_enters_autoapprove_chain(
         check(
             "review copy is one honest auto-pass basis line",
             f"审词：读音 chan ji；来源" in prompt
-            and f"自动审核：{basis_line}" in prompt
+            and "自动审核：语境读音与含义明确" in prompt
+            and "语料/词典证据" in prompt
+            and prompt.count("可自动通过") == 1
             and "需管理员审核" not in prompt,
         )
         check(
