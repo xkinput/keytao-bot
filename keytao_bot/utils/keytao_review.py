@@ -10,6 +10,7 @@ import sqlite3
 import time
 import unicodedata
 from collections import OrderedDict
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
@@ -103,6 +104,62 @@ CODE_CHAIN_PRIORITY_MAX_OCCUPANTS = 8
 CODE_CHAIN_REORDER_SCORE_MARGIN = 0.20
 CANDIDATE_COMMONNESS_MAX_OCCUPANTS = 2
 CANDIDATE_COMMONNESS_TIMEOUT_SECONDS = 5.0
+
+_current_commonness_evidence: ContextVar[Tuple[str, ...]] = ContextVar(
+    "current_commonness_evidence",
+    default=(),
+)
+
+
+def begin_commonness_evidence_turn() -> Token[Tuple[str, ...]]:
+    """Start one isolated delivery-provenance scope for commonness copy."""
+    return _current_commonness_evidence.set(())
+
+
+def end_commonness_evidence_turn(token: Token[Tuple[str, ...]]) -> None:
+    """Restore the caller's previous commonness-provenance scope."""
+    _current_commonness_evidence.reset(token)
+
+
+def current_commonness_evidence() -> Tuple[str, ...]:
+    """Return exact comparator-authored lines recorded in this turn."""
+    return _current_commonness_evidence.get()
+
+
+def record_commonness_evidence(value: Any) -> None:
+    """Record only exact structured comparator copy for the delivery guard."""
+    lines: List[str] = []
+
+    def collect(current: Any) -> None:
+        if isinstance(current, dict):
+            summary = str(current.get("summary") or "").strip()
+            if summary:
+                lines.append(summary)
+            evidence_lines = current.get("evidenceLines")
+            if isinstance(evidence_lines, list):
+                lines.extend(
+                    str(line).strip()
+                    for line in evidence_lines
+                    if str(line).strip()
+                )
+            comparisons = current.get("comparisons")
+            if isinstance(comparisons, list):
+                for comparison in comparisons:
+                    collect(comparison)
+        elif isinstance(current, (list, tuple)):
+            for item in current:
+                collect(item)
+
+    collect(value)
+    if not lines:
+        return
+    existing = list(_current_commonness_evidence.get())
+    for line in lines:
+        if line not in existing:
+            existing.append(line)
+    _current_commonness_evidence.set(tuple(existing))
+
+
 PERSON_ALIAS_SEARCH_QUERIES = [
     '"{word}" "字"',
     '"{word}" "号"',
@@ -4369,24 +4426,28 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
     if reference_available and (
         front_reference.get("attested") or behind_reference.get("attested")
     ):
-        return _compare_reference_commonness(
+        comparison = _compare_reference_commonness(
             front_word,
             behind_word,
             front_reference,
             behind_reference,
         )
+        record_commonness_evidence(comparison)
+        return comparison
 
     front, behind = await asyncio.gather(
         _estimate_word_commonness_web_fallback(front_word),
         _estimate_word_commonness_web_fallback(behind_word),
     )
-    return _compare_web_commonness_results(
+    comparison = _compare_web_commonness_results(
         front_word,
         behind_word,
         front,
         behind,
         reference_available=reference_available,
     )
+    record_commonness_evidence(comparison)
+    return comparison
 
 
 def _candidate_commonness_pairs(review: Dict) -> List[Dict[str, str]]:
@@ -4646,6 +4707,7 @@ async def assess_candidate_chain_commonness(
                     comparison,
                 ),
             ))
+    record_commonness_evidence(assessments)
     return assessments
 
 

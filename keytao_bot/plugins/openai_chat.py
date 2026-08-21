@@ -102,6 +102,7 @@ from ..utils.pending_confirmation import (
     pending_confirmation_copy,
     pending_confirmation_prompt_instruction,
     render_remediation_reply,
+    render_query_retry_reply,
     render_server_backed_batch_candidates,
     render_server_backed_single_word_candidates,
     render_server_backed_word_set,
@@ -1561,6 +1562,10 @@ async def _try_handle_encoding_rule_question(
     return "\n".join(lines)
 
 
+class ServerBackedQueryReply(str):
+    """Internal provenance for an exact server-rendered read-only reply."""
+
+
 async def get_ai_response_core(
     message: str,
     platform: str,
@@ -1681,12 +1686,25 @@ async def get_ai_response_core(
             ),
             max_iterations=max_iterations,
         )
-        if result and advertised_reply_contract(result).requires_live_state:
+        server_backed_query = orchestrator.is_server_backed_query_reply(result)
+        if server_backed_query:
+            logger.info(
+                "[advertised_reply_contract] "
+                "branch=orchestrator_query_claim trusted=True"
+            )
+            result = ServerBackedQueryReply(str(result or ""))
+        if (
+            result
+            and advertised_reply_contract(result).requires_live_state
+            and not isinstance(result, ServerBackedQueryReply)
+        ):
             actor_is_bound = await _user_resolver.resolve_actor_binding(
                 platform,
                 user_id,
             )
             result = _append_unbound_binding_notice(result, actor_is_bound)
+        if isinstance(result, ServerBackedQueryReply):
+            return result
         return _normalize_generated_review_copy(result) if result else result
 
     except Exception as e:
@@ -2057,15 +2075,91 @@ def _render_live_single_candidate_record(
     )
 
 
+_COMMONNESS_COMPARISON_COPY_RE = re.compile(
+    r"(?:常用度(?:对比|比较)|较[^\n，。；]{0,16}常用|"
+    r"更[^\n，。；]{0,16}常用|频率[^\n，。；]{0,16}(?:高|低)|"
+    r"日常语感|直觉比较)"
+)
+_COMMONNESS_SPECULATION_RE = re.compile(r"(?:日常语感|直觉|凭感觉|我觉得|可能略?[高低])")
+
+
+def _normalized_commonness_copy(value: object) -> str:
+    return re.sub(
+        r"\s+",
+        "",
+        unicodedata.normalize("NFKC", str(value or "")).strip(),
+    )
+
+
+def _commonness_line_is_backed(
+    line: str,
+    evidence_lines: Tuple[str, ...],
+) -> bool:
+    """Accept only an exact comparator fragment without speculative suffixes."""
+    normalized_line = _normalized_commonness_copy(line)
+    normalized_evidence = tuple(
+        _normalized_commonness_copy(evidence)
+        for evidence in evidence_lines
+        if _normalized_commonness_copy(evidence)
+    )
+    if not normalized_evidence:
+        return False
+    payload = re.sub(r"^[•*-]+", "", normalized_line)
+    payload = re.sub(r"^(?:常用度(?:对比|比较)|依据)[:：]", "", payload)
+    if payload in normalized_evidence:
+        return True
+    matched = [evidence for evidence in normalized_evidence if evidence in payload]
+    if not matched or _COMMONNESS_SPECULATION_RE.search(payload):
+        return False
+    remainder = payload
+    for evidence in sorted(matched, key=len, reverse=True):
+        remainder = remainder.replace(evidence, "")
+    remainder = re.sub(r"[；;，,。:：()（）]+", "", remainder)
+    return not _COMMONNESS_COMPARISON_COPY_RE.search(remainder)
+
+
+def _strip_unbacked_commonness_copy(
+    text: str,
+    evidence_lines: Tuple[str, ...],
+) -> str:
+    """Remove comparison lines that lack exact same-turn comparator evidence."""
+    kept: List[str] = []
+    for line in str(text or "").splitlines():
+        if (
+            _COMMONNESS_COMPARISON_COPY_RE.search(line)
+            and not _commonness_line_is_backed(line, evidence_lines)
+        ):
+            logger.warning(
+                "[commonness_evidence_guard] branch=strip_unbacked_comparison"
+            )
+            continue
+        kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept)
+
+
 def _enforce_advertised_reply_contract(
     response: str,
     conv_key: Optional[ConversationKey],
+    *,
+    query_words: Tuple[str, ...] = (),
 ) -> str:
     """Single delivery guard for the advertisement-implies-live-state invariant."""
-    text = str(response or "")
+    server_backed_query = isinstance(response, ServerBackedQueryReply)
+    text = _strip_unbacked_commonness_copy(
+        str(response or ""),
+        keytao_review.current_commonness_evidence(),
+    )
     contract = advertised_reply_contract(text)
     if not contract.requires_live_state:
         return text
+    if server_backed_query:
+        logger.info(
+            "[advertised_reply_contract] "
+            "branch=send_server_backed_query"
+        )
+        return ServerBackedQueryReply(text)
     record = (
         conversation_state_store.get_record(conv_key)
         if conv_key is not None
@@ -2102,6 +2196,8 @@ def _enforce_advertised_reply_contract(
         f"bindings={len(displayed_pairs)}"
     )
     displayed_words = tuple(word for word, _code in displayed_pairs)
+    if query_words:
+        return render_query_retry_reply(query_words)
     return render_remediation_reply(
         "这条消息没有可用的服务端候选记录，本次不会写入",
         command=("加词 " + " ".join(displayed_words)) if displayed_words else "",
@@ -2622,6 +2718,7 @@ class TurnContext:
     scoped_pending_response: Optional[str] = None
     resolved_advertised_words: Tuple[str, ...] = ()
     advertised_snapshot_token: str = ""
+    simple_word_query_words: Tuple[str, ...] = ()
     generic_command_intent: MessageCommandIntent = field(
         default_factory=MessageCommandIntent
     )
@@ -4219,6 +4316,8 @@ async def _stage_reject_empty_response(ctx: TurnContext) -> bool:
 
 async def _stage_normalize_response(ctx: TurnContext) -> bool:
     """Production scenario: review copy and pending guidance normalization remain ordered."""
+    if isinstance(ctx.response, ServerBackedQueryReply):
+        return False
     ctx.response = _normalize_generated_review_copy(ctx.response)
     ctx.response = _ensure_pending_add_word_guidance(ctx.response)
     return False
@@ -4226,18 +4325,32 @@ async def _stage_normalize_response(ctx: TurnContext) -> bool:
 
 async def _stage_augment_word_query(ctx: TurnContext) -> bool:
     """Production scenario: only ordinary Q&A receives simple-word augmentation."""
-    if ctx.generic_command_intent.intent == "none":
+    if isinstance(ctx.response, ServerBackedQueryReply):
+        return False
+    if (
+        ctx.generic_command_intent.intent == "none"
+        and _should_augment_simple_word_query(
+            ctx.normalized_message_text,
+            ctx.response,
+        )
+    ):
+        ctx.simple_word_query_words = await _get_simple_word_query_words(
+            ctx.normalized_message_text,
+        )
         ctx.response = await _augment_simple_word_query_response(
             ctx.normalized_message_text,
             ctx.response,
             ctx.platform,
             ctx.user_id,
+            query_words=ctx.simple_word_query_words,
         )
     return False
 
 
 async def _stage_append_ticket_challenge(ctx: TurnContext) -> bool:
     """Production scenario: recall and clear replies never receive a pending challenge."""
+    if isinstance(ctx.response, ServerBackedQueryReply):
+        return False
     if ctx.generic_command_intent.intent not in {"draft_recall", "draft_clear"}:
         ctx.response = _append_pending_ticket_challenge(ctx.response, ctx.conv_key)
     return False
@@ -4248,6 +4361,7 @@ async def _stage_enforce_advertised_reply_contract(ctx: TurnContext) -> bool:
     ctx.response = _enforce_advertised_reply_contract(
         ctx.response,
         ctx.conv_key,
+        query_words=ctx.simple_word_query_words,
     )
     return False
 
@@ -4345,6 +4459,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
     platform, user_id = extract_platform_info(bot, event)
     conv_key = get_conversation_key(bot, event)
     metrics_token = begin_turn_metrics(platform, conv_key.space_type)
+    commonness_token = keytao_review.begin_commonness_evidence_turn()
     try:
         async with (
             conversation_space_message_locks.lock(
@@ -4380,6 +4495,7 @@ async def handle_ai_chat(bot: Bot, event: Event):
             emit_turn_metrics(logger)
         raise
     finally:
+        keytao_review.end_commonness_evidence_turn(commonness_token)
         end_turn_metrics(metrics_token)
 
 

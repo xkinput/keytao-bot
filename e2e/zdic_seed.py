@@ -308,7 +308,7 @@ ZDIC_FIXTURES_BY_SCENARIO["S32"] = {
     ),
 }
 ZDIC_FIXTURES_BY_SCENARIO["S33"] = {
-    "probe_words": ("洒漏", "撒漏", "洒溇"),
+    "probe_words": ("洒漏", "撒漏", "洒溇", "缩手", "所售", "所受"),
     "rows": (
         {"kind": "char", "entry": "洒", "status": "found", "pinyins": ["sǎ"]},
         {"kind": "char", "entry": "撒", "status": "found", "pinyins": ["sǎ", "sā"]},
@@ -317,6 +317,14 @@ ZDIC_FIXTURES_BY_SCENARIO["S33"] = {
         {"kind": "entry", "entry": "洒漏", "status": "found", "pinyins": ["sǎ", "lòu"]},
         {"kind": "entry", "entry": "撒漏", "status": "found", "pinyins": ["sǎ", "lòu"]},
         {"kind": "entry", "entry": "洒溇", "status": "found", "pinyins": ["sǎ", "lóu"]},
+        {"kind": "char", "entry": "缩", "status": "found", "pinyins": ["suō"]},
+        {"kind": "char", "entry": "手", "status": "found", "pinyins": ["shǒu"]},
+        {"kind": "char", "entry": "所", "status": "found", "pinyins": ["suǒ"]},
+        {"kind": "char", "entry": "售", "status": "found", "pinyins": ["shòu"]},
+        {"kind": "char", "entry": "受", "status": "found", "pinyins": ["shòu"]},
+        {"kind": "entry", "entry": "缩手", "status": "found", "pinyins": ["suō", "shǒu"]},
+        {"kind": "entry", "entry": "所售", "status": "found", "pinyins": ["suǒ", "shòu"]},
+        {"kind": "entry", "entry": "所受", "status": "found", "pinyins": ["suǒ", "shòu"]},
     ),
 }
 

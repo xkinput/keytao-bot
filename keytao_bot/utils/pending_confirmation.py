@@ -1034,6 +1034,7 @@ def render_server_backed_batch_candidates(
         return ""
 
     scopes_by_word: dict[str, tuple[tuple[str, bool], ...]] = {}
+    occupied_words_by_scope: dict[str, dict[str, tuple[str, ...]]] = {}
     for raw_scope in candidate_scopes:
         if not isinstance(raw_scope, dict):
             return ""
@@ -1068,6 +1069,34 @@ def render_server_backed_batch_candidates(
             candidates.append((code, occupied))
             seen_codes.add(code)
         scopes_by_word[word] = tuple(candidates)
+        raw_occupied_words = raw_scope.get("occupiedWords", {})
+        if not isinstance(raw_occupied_words, dict):
+            return ""
+        occupied_words: dict[str, tuple[str, ...]] = {}
+        for raw_code, raw_words in raw_occupied_words.items():
+            code = unicodedata.normalize("NFKC", str(raw_code or "")).strip().lower()
+            if (
+                code not in seen_codes
+                or not isinstance(raw_words, list)
+                or not raw_words
+            ):
+                return ""
+            normalized_words: list[str] = []
+            for raw_occupied_word in raw_words:
+                occupied_word = unicodedata.normalize(
+                    "NFKC",
+                    str(raw_occupied_word or ""),
+                ).strip()
+                if (
+                    not occupied_word
+                    or len(occupied_word) > 128
+                    or any(marker in occupied_word for marker in ("\r", "\n", "「", "」"))
+                    or occupied_word in normalized_words
+                ):
+                    return ""
+                normalized_words.append(occupied_word)
+            occupied_words[code] = tuple(normalized_words)
+        occupied_words_by_scope[word] = occupied_words
 
     normalized_items: list[tuple[str, str, bool]] = []
     seen_words: set[str] = set()
@@ -1109,7 +1138,14 @@ def render_server_backed_batch_candidates(
             scopes_by_word[word],
             start=1,
         ):
-            occupancy_copy = "已占用" if occupied else "空位"
+            occupied_words = occupied_words_by_scope[word].get(code, ())
+            occupancy_copy = (
+                "已有「" + "、".join(occupied_words) + "」"
+                if occupied and occupied_words
+                else "已占用"
+                if occupied
+                else "空位"
+            )
             recommended_copy = "（推荐）" if code == recommended_code else ""
             lines.append(
                 f"   {candidate_index}. {code} — {occupancy_copy}{recommended_copy}"
@@ -1119,6 +1155,45 @@ def render_server_backed_batch_candidates(
 
     lines.append(pending_batch_confirmation_copy())
     return "\n".join(lines)
+
+
+def render_server_backed_batch_lookup(
+    items: object,
+    candidate_scopes: object,
+) -> str:
+    """Render a multi-word candidate snapshot without minting write controls."""
+    rendered = render_server_backed_batch_candidates(items, candidate_scopes)
+    footer = pending_batch_confirmation_copy()
+    if not rendered.endswith(footer):
+        return ""
+    return (
+        rendered[: -len(footer)].rstrip()
+        + "\n以上推荐仅用于本次查询；如需复核，可逐词发送对应词语重新查询。"
+    )
+
+
+def render_query_retry_reply(words: object) -> str:
+    """Offer a read-only retry when a query display cannot be proven."""
+    if not isinstance(words, (list, tuple)):
+        return "这条候选查询无法绑定到本轮服务端编码记录；请逐词重新查询。"
+    normalized: list[str] = []
+    for raw_word in words:
+        word = unicodedata.normalize("NFKC", str(raw_word or "")).strip()
+        if (
+            not word
+            or len(word) > 128
+            or any(marker in word for marker in ("\r", "\n", "「", "」"))
+            or word in normalized
+        ):
+            continue
+        normalized.append(word)
+    if not normalized:
+        return "这条候选查询无法绑定到本轮服务端编码记录；请逐词重新查询。"
+    targets = "、".join(f"「{word}」" for word in normalized)
+    return (
+        "这条候选查询无法唯一绑定到本轮服务端编码记录。"
+        f"可逐词发送 {targets} 重新查询。"
+    )
 
 
 def pending_single_candidate_confirmation_copy() -> str:

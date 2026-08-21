@@ -4183,6 +4183,50 @@ async def scenario_s32(ctx: ScenarioContext) -> dict[str, Any]:
 S33_WORDS = ("洒漏", "撒漏")
 S33_SIX_WORDS = ("洒漏", "洒溇")
 S33_DISCOVERY = "喵喵 加词 洒漏 撒漏"
+S33_EXTERNAL_WORDS = ("缩手", "所售")
+S33_EXTERNAL_OCCUPANT = ("所受", "sled")
+S33_EXTERNAL_QUERY = "缩手 所售"
+S33_EXTERNAL_EXPECTED = (("缩手", "sleda"), ("所售", "sledu"))
+
+
+def _s33_external_query_pairs(reply: str) -> tuple[tuple[str, str], ...]:
+    """Read either the sealed batch layout or the rich read-only dual list."""
+    batch_pairs = advertised_batch_binding_pairs(reply)
+    if batch_pairs:
+        return batch_pairs
+    headings: list[tuple[str, int]] = []
+    for word in S33_EXTERNAL_WORDS:
+        heading = re.search(
+            rf"(?m)^(?:\d+\.\s*)?(?:"
+            rf"[「【]{re.escape(word)}[」】][^\r\n]{{0,80}}"
+            rf"|{re.escape(word)}(?:（[^\r\n]{{0,80}}|\s*|的键道编码[^\r\n]{{0,80}})"
+            r")$",
+            reply,
+        )
+        if heading is None:
+            return ()
+        headings.append((word, heading.start()))
+    if tuple(word for word, _start in sorted(headings, key=lambda item: item[1])) != (
+        S33_EXTERNAL_WORDS
+    ):
+        return ()
+    pairs: list[tuple[str, str]] = []
+    for index, (word, start) in enumerate(headings):
+        end = headings[index + 1][1] if index + 1 < len(headings) else len(reply)
+        block = reply[start:end]
+        expected_code = dict(S33_EXTERNAL_EXPECTED)[word]
+        recommendation = re.search(
+            rf"(?m)^推荐编码[：:]\s*{re.escape(expected_code)}\s*$",
+            block,
+        ) or re.search(
+            rf"(?m)^\s*\d+\.\s*{re.escape(expected_code)}\s+—\s+"
+            r".*空位.*(?:✅|推荐).*$",
+            block,
+        )
+        if recommendation is None:
+            return ()
+        pairs.append((word, expected_code))
+    return tuple(pairs)
 
 
 async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
@@ -4190,6 +4234,7 @@ async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
     messages: list[str] = []
     replies: list[str] = []
     dictionary_cleanups: list[dict[str, Any]] = []
+    external_replies: list[str] = []
 
     async def reset_words() -> None:
         dictionary_cleanup = await ctx.next_client.remove_rig_owned_dictionary_words(
@@ -4251,6 +4296,67 @@ async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
                 f"S33 {label} batch lacks {word}@{code}: {batch}",
             )
         return batch, displayed
+
+    external_fixture_words = (*S33_EXTERNAL_WORDS, S33_EXTERNAL_OCCUPANT[0])
+    external_cleanup = await ctx.next_client.remove_rig_owned_dictionary_words(
+        platform_id=ctx.platform_id,
+        admin_token=ctx.admin_token,
+        scenario_id="S33",
+        fixture_words=external_fixture_words,
+    )
+    require(
+        external_cleanup.get("verified") is True,
+        f"S33 external-occupant cleanup was not verified: {external_cleanup}",
+    )
+    dictionary_cleanups.append(external_cleanup)
+    external_seed = await ctx.next_client.seed_phrase(
+        platform_id=ctx.platform_id,
+        word=S33_EXTERNAL_OCCUPANT[0],
+        code=S33_EXTERNAL_OCCUPANT[1],
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    external_reply = await ctx.send(S33_EXTERNAL_QUERY)
+    external_replies.append(external_reply)
+    external_pairs = _s33_external_query_pairs(external_reply)
+    require(
+        external_pairs == S33_EXTERNAL_EXPECTED,
+        f"S33 external occupant was not allocated by priority: {external_reply}",
+    )
+    require(
+        S33_EXTERNAL_OCCUPANT[0] in external_reply
+        and S33_EXTERNAL_OCCUPANT[1] in external_reply,
+        f"S33 external occupant was not shown: {external_reply}",
+    )
+    require(
+        "本次查询" in external_reply
+        and "无法唯一绑定" not in external_reply
+        and "本次不会写入" not in external_reply
+        and "查看草稿" not in external_reply,
+        f"S33 pure query used write-flow failure copy: {external_reply}",
+    )
+    require(
+        all(
+            marker not in external_reply
+            for marker in ("日常语感", "直觉比较", "频率可能", "可能略高")
+        ),
+        f"S33 pure query leaked speculative commonness copy: {external_reply}",
+    )
+    external_draft = await ctx.draft()
+    require(
+        not external_draft.get("items"),
+        f"S33 pure query unexpectedly wrote a draft: {external_draft}",
+    )
+    external_post_cleanup = await ctx.next_client.remove_rig_owned_dictionary_words(
+        platform_id=ctx.platform_id,
+        admin_token=ctx.admin_token,
+        scenario_id="S33",
+        fixture_words=external_fixture_words,
+    )
+    require(
+        external_post_cleanup.get("verified") is True,
+        f"S33 external fixture post-cleanup was not verified: {external_post_cleanup}",
+    )
+    dictionary_cleanups.append(external_post_cleanup)
 
     await reset_words()
     messages.append(S33_DISCOVERY)
@@ -4420,11 +4526,18 @@ async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
     replies.append(await ctx.send("取消"))
 
     return {
-        "messages": messages,
-        "replies": replies,
+        "messages": [S33_EXTERNAL_QUERY, *messages],
+        "replies": [*external_replies, *replies],
         "draft": await ctx.draft(),
         "facts": {
             "words": list(S33_WORDS),
+            "externalOccupant": {
+                "words": list(S33_EXTERNAL_WORDS),
+                "occupant": list(S33_EXTERNAL_OCCUPANT),
+                "allocated": [list(pair) for pair in S33_EXTERNAL_EXPECTED],
+                "seedBatchId": external_seed.get("batchId"),
+                "readOnly": True,
+            },
             "candidateChains": {
                 word: list(chain) for word, chain in review_chains.items()
             },

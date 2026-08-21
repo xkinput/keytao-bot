@@ -1974,69 +1974,52 @@ async def _generate_usage_comparison_note(
     current_code: str,
     prior_occupied: List[Dict],
 ) -> Optional[str]:
-    """Ask the model for a concise common-usage comparison note."""
-    if not prior_occupied or not OPENAI_API_KEY or not AsyncOpenAI:
+    """Return only evidence-backed copy from the commonness comparator."""
+    del current_code
+    if not prior_occupied:
         return None
 
-    occupied_text = "；".join(
-        f"{item.get('code', '')} {item.get('label', '')}"
-        for item in prior_occupied
-        if item.get("code")
-    )
-    occupied_words = []
+    occupied_words: List[str] = []
     for item in prior_occupied:
         occupied_words.extend(_extract_words_from_candidate_label(str(item.get("label", ""))))
-    if not occupied_text:
+    occupied_words = list(dict.fromkeys(
+        occupied_word
+        for occupied_word in occupied_words
+        if occupied_word and occupied_word != word
+    ))[:2]
+    if not occupied_words:
         return None
 
-    try:
-        client = AsyncOpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url=OPENAI_BASE_URL,
-            timeout=min(OPENAI_TIMEOUT, 30.0),
-            max_retries=1,
-        )
-        response = await observe_model_call(client.chat.completions.create(**with_deepseek_chat_policy(
-            {
-                "model": OPENAI_MODEL,
-                "temperature": 0.3,
-                "max_tokens": 180,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "你是中文输入法助手。请用1到2句简短中文，比较当前词和前面占位词在日常使用中的常见场景/常用度差异。"
-                            "语气克制，不要绝对化，不要使用项目符号。"
-                            "优先直接点名占位词，并明确这只是日常语感层面的比较，不等于实际码序规则。"
-                            "最后顺带点明：当前码位顺序仍以现有词库占位为准。"
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"当前词：{word}\n"
-                            f"当前编码：{current_code}\n"
-                            f"更前面被占用的候选码位：{occupied_text}\n"
-                            f"前面占位词：{'、'.join(occupied_words) if occupied_words else '未知'}"
-                        ),
-                    },
-                ],
-            },
-            thinking=False,
-        )))
-        log_chat_usage(
-            logger,
-            response,
-            operation="usage_comparison",
-            model=OPENAI_MODEL,
-        )
-        if not response.choices:
-            return None
-        content = (response.choices[0].message.content or "").strip()
-        return content or None
-    except Exception as error:
-        logger.warning(f"Failed to generate usage comparison note for {word}: {error}")
+    summaries: List[str] = []
+    for occupied_word in occupied_words:
+        try:
+            comparison = await keytao_review.compare_word_commonness(
+                word,
+                occupied_word,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "Commonness comparator failed for %s/%s: %s",
+                word,
+                occupied_word,
+                error,
+            )
+            continue
+        if (
+            not isinstance(comparison, dict)
+            or not keytao_review._commonness_comparison_has_evidence(comparison)
+        ):
+            continue
+        summary = str(comparison.get("summary") or "").strip()
+        if summary:
+            summaries.append(summary)
+    if not summaries:
         return None
+    combined = "；".join(summaries)
+    keytao_review.record_commonness_evidence({"summary": combined})
+    return combined
 
 
 async def _augment_simple_word_query_response(
@@ -2046,6 +2029,7 @@ async def _augment_simple_word_query_response(
     user_id: str,
     *,
     handled_as_command: bool = False,
+    query_words: Optional[Tuple[str, ...]] = None,
 ) -> str:
     """Append deterministic code-priority notes for simple word-only queries."""
     if handled_as_command:
@@ -2053,7 +2037,11 @@ async def _augment_simple_word_query_response(
     if not _should_augment_simple_word_query(message_text, response):
         return response
 
-    words = await _get_simple_word_query_words(message_text)
+    words = (
+        await _get_simple_word_query_words(message_text)
+        if query_words is None
+        else tuple(query_words)
+    )
     if not words:
         return response
 

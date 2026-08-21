@@ -42,8 +42,10 @@ from keytao_bot.utils.pending_confirmation import (
     pending_word_reminder_lines,
     plain_warning_message,
     render_server_backed_batch_candidates,
+    render_server_backed_batch_lookup,
     render_server_backed_word_set,
     render_executable_suggestion,
+    render_query_retry_reply,
     render_remediation_reply,
     same_unique_binding_set,
     render_server_backed_single_word_candidates,
@@ -109,6 +111,21 @@ _BLOCK_REASON_USER_LABELS = {
     "batch_too_large": "待处理批次过大",
     "untrusted_batch_reference": "批次引用未经可信记录核验",
 }
+
+_FUTURE_BATCH_ASSENT_OFFER_RE = re.compile(
+    r"(?:末尾|最后|结尾)[^\r\n]{0,48}(?:说明|注明|写明)[^\r\n]{0,32}"
+    r"(?:可|可以)(?:直接)?回复[「『“\"']?加入(?:并提交)?[」』”\"']?"
+)
+
+
+def requests_future_batch_assent_offer(message: object) -> bool:
+    """Match only an explicit request to advertise a future batch assent."""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).strip()
+    return bool(
+        normalized
+        and len(normalized) <= 1000
+        and _FUTURE_BATCH_ASSENT_OFFER_RE.search(normalized)
+    )
 
 
 def build_system_prompt(
@@ -294,6 +311,14 @@ class AgentOrchestrator:
         self._system_prompt_core = system_prompt_core
         self._tool_receipt_recorder = tool_receipt_recorder
         self._deterministic_fallback_handler = deterministic_fallback_handler
+        self._server_backed_query_reply: Optional[str] = None
+
+    def is_server_backed_query_reply(self, reply: object) -> bool:
+        """Identify the exact read-only renderer output from the last run."""
+        return bool(
+            self._server_backed_query_reply
+            and str(reply or "") == self._server_backed_query_reply
+        )
 
     async def run(
         self,
@@ -302,6 +327,7 @@ class AgentOrchestrator:
         max_iterations: int = 20,
     ) -> Optional[str]:
         """Emit every final reply through one same-turn loop breaker."""
+        self._server_backed_query_reply = None
         failure_state: Dict[str, Any] = {}
         termination_state: Dict[str, Any] = {}
         successful_write_receipts: List[Dict[str, Any]] = []
@@ -325,7 +351,7 @@ class AgentOrchestrator:
                 "本轮没有成功写入任何数据",
                 command=message,
             )
-        return self._finalize_reply(
+        finalized = self._finalize_reply(
             message,
             reply,
             failure_state,
@@ -333,6 +359,11 @@ class AgentOrchestrator:
             termination_state,
             history=context.history,
         )
+        if self._server_backed_query_reply == reply:
+            self._server_backed_query_reply = finalized
+        else:
+            self._server_backed_query_reply = None
+        return finalized
 
     async def _run_loop(
         self,
@@ -1007,16 +1038,14 @@ class AgentOrchestrator:
                     )
                     if pending_items is not None:
                         candidate_scopes = [
-                            {
-                                "word": item["word"],
-                                "candidates": [
-                                    [code, occupied]
-                                    for code, occupied
-                                    in trusted_candidate_slots_by_word[
-                                        item["word"]
-                                    ]
-                                ],
-                            }
+                            self._reviewed_candidate_scope(
+                                item["word"],
+                                trusted_candidate_slots_by_word[item["word"]],
+                                trusted_candidate_statuses_by_word.get(
+                                    item["word"],
+                                    (),
+                                ),
+                            )
                             for item in pending_items
                         ]
                         pending = PendingToolConfirm(
@@ -1064,9 +1093,67 @@ class AgentOrchestrator:
                         )
                 if content.strip():
                     reply_contract = advertised_reply_contract(content)
+                    future_batch_assent_requested = (
+                        requests_future_batch_assent_offer(message)
+                    )
+                    if (
+                        not context.mutations_allowed
+                        and not future_batch_assent_requested
+                    ):
+                        read_only_items = (
+                            await self._trusted_read_only_candidate_items(
+                                trusted_absent_word_sets,
+                                trusted_candidate_slots_by_word,
+                                trusted_recommended_codes_by_word,
+                                ToolContext(
+                                    platform=context.platform,
+                                    user_id=context.user_id,
+                                    current_message=message,
+                                    writes_allowed=False,
+                                ),
+                            )
+                        )
+                        if read_only_items is not None:
+                            candidate_scopes = [
+                                self._reviewed_candidate_scope(
+                                    item["word"],
+                                    trusted_candidate_slots_by_word[item["word"]],
+                                    trusted_candidate_statuses_by_word.get(
+                                        item["word"],
+                                        (),
+                                    ),
+                                )
+                                for item in read_only_items
+                            ]
+                            read_only_content = render_server_backed_batch_lookup(
+                                read_only_items,
+                                candidate_scopes,
+                            )
+                            if not read_only_content:
+                                return self._append_authoritative_result_links(
+                                    render_query_retry_reply(tuple(
+                                        item["word"] for item in read_only_items
+                                    )),
+                                    authoritative_result_links,
+                                )
+                            logger.info(
+                                "[advertised_reply_contract] "
+                                "branch=replace_absent_query_from_server_records "
+                                f"owner={conv_key} items={len(read_only_items)}"
+                            )
+                            read_only_reply = self._append_authoritative_result_links(
+                                read_only_content,
+                                authoritative_result_links,
+                            )
+                            self._server_backed_query_reply = read_only_reply
+                            return read_only_reply
                     if (
                         reply_contract.code_choice_advertisement
                         and not context.visual_context
+                        and not (
+                            not context.mutations_allowed
+                            and len(trusted_candidate_slots_by_word) >= 2
+                        )
                     ):
                         pending_add = self._trusted_single_pending_add(
                             trusted_candidate_slots_by_word,
@@ -1086,6 +1173,13 @@ class AgentOrchestrator:
                             else ""
                         )
                         if not rendered_single or pending_add is None:
+                            if not context.mutations_allowed:
+                                return self._append_authoritative_result_links(
+                                    render_query_retry_reply(tuple(
+                                        trusted_candidate_slots_by_word
+                                    )),
+                                    authoritative_result_links,
+                                )
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
                                     "这条单词候选列表无法唯一绑定到本轮服务端"
@@ -1100,6 +1194,11 @@ class AgentOrchestrator:
                             owner_label=context.speaker_name,
                         )
                         if not saved:
+                            if not context.mutations_allowed:
+                                return self._append_authoritative_result_links(
+                                    render_query_retry_reply((pending_add.word,)),
+                                    authoritative_result_links,
+                                )
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
                                     "当前单词候选无法保存，本次不会写入"
@@ -1198,15 +1297,14 @@ class AgentOrchestrator:
                     pending_items = record_backed_items
                     if pending_items is not None:
                         candidate_scopes = [
-                            {
-                                "word": item["word"],
-                                "candidates": [
-                                    [code, occupied]
-                                    for code, occupied in trusted_candidate_slots_by_word[
-                                        item["word"]
-                                    ]
-                                ],
-                            }
+                            self._reviewed_candidate_scope(
+                                item["word"],
+                                trusted_candidate_slots_by_word[item["word"]],
+                                trusted_candidate_statuses_by_word.get(
+                                    item["word"],
+                                    (),
+                                ),
+                            )
                             for item in pending_items
                         ]
                         display_pairs = advertised_batch_binding_pairs(content)
@@ -1245,6 +1343,49 @@ class AgentOrchestrator:
                             display_action = "append_backed_contract"
                         else:
                             display_action = "send_backed"
+
+                    if (
+                        pending_items is not None
+                        and not context.mutations_allowed
+                        and not future_batch_assent_requested
+                    ):
+                        read_only_content = render_server_backed_batch_lookup(
+                            pending_items,
+                            candidate_scopes,
+                        )
+                        if not read_only_content:
+                            return self._append_authoritative_result_links(
+                                render_query_retry_reply(tuple(
+                                    str(item.get("word") or "").strip()
+                                    for item in pending_items
+                                )),
+                                authoritative_result_links,
+                            )
+                        logger.info(
+                            "[advertised_reply_contract] "
+                            "branch=replace_query_from_server_records "
+                            f"owner={conv_key} items={len(pending_items)}"
+                        )
+                        read_only_reply = self._append_authoritative_result_links(
+                            read_only_content,
+                            authoritative_result_links,
+                        )
+                        self._server_backed_query_reply = read_only_reply
+                        return read_only_reply
+
+                    if (
+                        pending_items is None
+                        and not context.mutations_allowed
+                        and not future_batch_assent_requested
+                        and reply_contract.requires_live_state
+                        and len(trusted_candidate_slots_by_word) >= 2
+                    ):
+                        return self._append_authoritative_result_links(
+                            render_query_retry_reply(tuple(
+                                trusted_candidate_slots_by_word
+                            )),
+                            authoritative_result_links,
+                        )
 
                     if pending_items is not None:
                         saved = self._state_store.set(
@@ -2039,6 +2180,78 @@ class AgentOrchestrator:
             occupancy_tool_context,
             allow_same_code=allow_same_code,
         )
+
+    async def _trusted_read_only_candidate_items(
+        self,
+        absent_word_sets: List[tuple[str, ...]],
+        candidate_slots_by_word: Dict[
+            str,
+            tuple[tuple[str, bool], ...],
+        ],
+        recommended_codes_by_word: Dict[str, str],
+        occupancy_tool_context: ToolContext,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Allocate one exact absent lookup set without creating write state."""
+        matching_sets = [
+            words
+            for words in absent_word_sets
+            if (
+                len(words) >= 2
+                and set(words) == set(candidate_slots_by_word)
+                and all(word in recommended_codes_by_word for word in words)
+            )
+        ]
+        if len(matching_sets) != 1:
+            return None
+        words = matching_sets[0]
+        synthetic_reviews: Dict[tuple[str, str], Dict[str, Any]] = {}
+        for word in words:
+            recommended = recommended_codes_by_word[word]
+            if recommended not in {
+                code for code, _occupied in candidate_slots_by_word[word]
+            }:
+                return None
+            synthetic_reviews[(word, recommended)] = {
+                "recommended": True,
+                "type": "Phrase",
+                "needs_manual_review": True,
+            }
+        return await self._resolved_advertised_pending_items(
+            words,
+            synthetic_reviews,
+            candidate_slots_by_word,
+            occupancy_tool_context,
+        )
+
+    @staticmethod
+    def _reviewed_candidate_scope(
+        word: str,
+        slots: tuple[tuple[str, bool], ...],
+        statuses: tuple[Dict[str, Any], ...],
+    ) -> Dict[str, Any]:
+        """Project candidate occupancy and exact occupant names for display."""
+        occupied_words: Dict[str, List[str]] = {}
+        for status in statuses:
+            code = str(status.get("code") or "").strip().lower()
+            if status.get("occupied") is not True or not code:
+                continue
+            words = [
+                str(value or "").strip()
+                for value in status.get("words") or ()
+                if str(value or "").strip()
+            ]
+            if words:
+                occupied_words[code] = list(dict.fromkeys(words))
+        scope: Dict[str, Any] = {
+            "word": word,
+            "candidates": [
+                [code, occupied]
+                for code, occupied in slots
+            ],
+        }
+        if occupied_words:
+            scope["occupiedWords"] = occupied_words
+        return scope
 
     @staticmethod
     def _trusted_single_pending_add(

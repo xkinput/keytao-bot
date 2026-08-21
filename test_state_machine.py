@@ -2122,15 +2122,35 @@ def test_remaining_llm_call_policies():
                 with patch.object(openai_chat_module, "WORD_QUERY_INTENT_MODEL", "deepseek-v4-flash"):
                     await openai_chat_module._classify_message_command_intent("看看我现在的草稿")
 
-        usage_client = _FakeClient([_FakeAIResponse("stop", "日常语感接近，仍以词库码序为准。")])
-        with patch.object(openai_chat_module, "AsyncOpenAI", return_value=usage_client):
-            with patch.object(openai_chat_module, "OPENAI_API_KEY", "fake-key"):
-                with patch.object(openai_chat_module, "OPENAI_MODEL", "deepseek-v4-flash"):
-                    await openai_chat_module._generate_usage_comparison_note(
-                        "研判",
-                        "ypj",
-                        [{"code": "yp", "label": "严判"}],
-                    )
+        comparator_result = {
+            "success": True,
+            "verdict": "front_more_common",
+            "summary": "「研判」较「严判」更常用：语料频次 20 vs 2，词典收录 2 vs 1",
+            "front": {
+                "reference": {
+                    "attested": True,
+                    "corpusFrequency": 20,
+                    "dictionaryPresenceCount": 2,
+                },
+            },
+            "behind": {
+                "reference": {
+                    "attested": True,
+                    "corpusFrequency": 2,
+                    "dictionaryPresenceCount": 1,
+                },
+            },
+        }
+        with patch.object(
+            keytao_review_module,
+            "compare_word_commonness",
+            AsyncMock(return_value=comparator_result),
+        ) as usage_comparator:
+            usage_note = await openai_chat_module._generate_usage_comparison_note(
+                "研判",
+                "ypj",
+                [{"code": "yp", "label": "已有「严判」"}],
+            )
 
         memory_client = _FakeClient([_FakeAIResponse("stop", "- 用户偏好简洁答复")])
         with patch.object(openai_chat_module, "AsyncOpenAI", return_value=memory_client):
@@ -2173,7 +2193,6 @@ def test_remaining_llm_call_policies():
                 await keytao_review_module._infer_entity_knowledge("杰伦")
 
         command_call = command_client.completions.calls[0]
-        usage_call = usage_client.completions.calls[0]
         memory_call = memory_client.completions.calls[0]
         entity_call = entity_client.completions.calls[0]
 
@@ -2186,10 +2205,10 @@ def test_remaining_llm_call_policies():
             command_call.get("response_format") == {"type": "json_object"},
         )
         check(
-            "usage comparison disables thinking",
-            usage_call.get("extra_body") == {"thinking": {"type": "disabled"}},
+            "usage comparison uses the evidence comparator instead of an LLM",
+            usage_comparator.await_count == 1
+            and usage_note == comparator_result["summary"],
         )
-        check("usage comparison stays text output", "response_format" not in usage_call)
         check(
             "memory summary disables thinking",
             memory_call.get("extra_body") == {"thinking": {"type": "disabled"}},
@@ -14634,7 +14653,9 @@ def test_generic_ai_prose_does_not_persist_pending():
                 patch.object(
                     openai_chat_module,
                     "_augment_simple_word_query_response",
-                    AsyncMock(side_effect=lambda message, response, platform, user_id: response),
+                    AsyncMock(
+                        side_effect=lambda message, response, platform, user_id, **kwargs: response
+                    ),
                 ),
                 patch.object(openai_chat_module, "remember_conversation", MagicMock(return_value=True)),
                 patch.object(openai_chat_module, "schedule_memory_compaction", MagicMock()),
@@ -15554,7 +15575,9 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
             patch.object(
                 openai_chat_module,
                 "_augment_simple_word_query_response",
-                AsyncMock(side_effect=lambda message, response, platform, user_id: response),
+                AsyncMock(
+                    side_effect=lambda message, response, platform, user_id, **kwargs: response
+                ),
             ),
             patch.object(openai_chat_module, "remember_conversation", MagicMock(return_value=True)),
             patch.object(openai_chat_module, "schedule_memory_compaction", MagicMock()),

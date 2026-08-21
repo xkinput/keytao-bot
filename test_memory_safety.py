@@ -10198,6 +10198,51 @@ class _AdvertisedSetSkills:
         ]
 
 
+class _ReadOnlyEncodeSkills:
+    @staticmethod
+    def get_skill_instructions():
+        return ""
+
+    @staticmethod
+    def has_tools():
+        return True
+
+    @staticmethod
+    def get_tools():
+        return [
+            _AdvertisedSetSkills.get_tools()[0],
+            {
+                "type": "function",
+                "function": {
+                    "name": "keytao_encode",
+                    "description": "Encode one word",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"word": {"type": "string"}},
+                        "required": ["word"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "keytao_lookup_by_codes_batch",
+                    "description": "Look up phrases by code",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "codes": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["codes"],
+                    },
+                },
+            },
+        ]
+
+
 class _DeleteSkills:
     @staticmethod
     def get_skill_instructions():
@@ -10800,63 +10845,87 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_chain_batch_candidates_allocate_distinct_slots_by_priority(
         self,
     ) -> None:
-        """One server occupancy snapshot is allocated across the ranked word set."""
+        """The verbatim pure lookup skips one external first-slot occupant."""
         from keytao_bot.harness import orchestrator as orchestrator_module
+        from keytao_bot.plugins import openai_chat as chat_module
 
-        listed_words = ("洒漏", "撒漏")
+        listed_words = ("缩手", "所售")
         candidate_codes_by_word = {
-            "洒漏": ("ssld", "sslda", "ssldaa"),
-            "撒漏": ("ssld", "ssldi", "ssldia"),
+            "缩手": ("sled", "sleda", "sledai"),
+            "所售": ("sled", "sledu", "sledui"),
         }
         occupancy_snapshots = []
 
-        async def dispatch(word=None, items=None, codes=None, **_kwargs):
+        async def dispatch(word=None, words=None, codes=None, **_kwargs):
+            if words is not None:
+                return {
+                    "success": True,
+                    "count": len(words),
+                    "results": [
+                        {"success": True, "word": item, "phrases": []}
+                        for item in words
+                    ],
+                }
             if codes is not None:
                 occupancy_snapshots.append(tuple(codes))
                 return {
                     "success": True,
                     "count": len(codes),
                     "results": [
-                        {"code": code, "phrases": []}
+                        {
+                            "code": code,
+                            "phrases": (
+                                [{"word": "所受", "code": "sled", "type": "Phrase"}]
+                                if code == "sled"
+                                else []
+                            ),
+                        }
                         for code in codes
                     ],
                 }
-            if items is not None:
-                self.fail("candidate review must not write before assent")
             candidate_codes = candidate_codes_by_word[word]
-            reviewed = self._reviewed_candidate(
-                word,
-                candidate_codes[0],
-                needs_review=False,
-            )
-            reviewed["candidateCodes"] = list(candidate_codes)
-            reviewed["candidateStatuses"] = [
-                {"code": code, "occupied": False}
-                for code in candidate_codes
-            ]
-            reviewed["pronunciations"] = [{
-                "pinyin": "sa lou",
+            return {
+                "success": True,
+                "word": word,
+                "type": "Phrase",
                 "recommendedCode": candidate_codes[0],
+                "candidateCodes": list(candidate_codes),
+                "codes": list(candidate_codes),
                 "candidateStatuses": [
-                    {"code": code, "occupied": False}
-                    for code in candidate_codes
+                {
+                    "code": code,
+                    "occupied": code == "sled",
+                    "phrases": (
+                        [{"word": "所受", "code": "sled", "type": "Phrase"}]
+                        if code == "sled"
+                        else []
+                    ),
+                }
+                for code in candidate_codes
                 ],
-            }]
-            return reviewed
+            }
 
         model_reply = (
             "是否将这两个词一起加入草稿？\n"
-            "- 「洒漏」 → ssld\n"
-            "- 「撒漏」 → ssld\n"
+            "- 「缩手」 → sled\n"
+            "- 「所售」 → sled\n"
             + pending_batch_confirmation_copy()
         )
         client = _FakeClient([
             _fake_response(
                 "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-homophone-lookup",
+                    "keytao_lookup_by_words_batch",
+                    {"words": list(listed_words)},
+                )],
+            ),
+            _fake_response(
+                "tool_calls",
                 tool_calls=[
                     _named_tool_call(
                         f"call-homophone-{index}",
-                        "keytao_prepare_reviewed_add",
+                        "keytao_encode",
                         {"word": word},
                     )
                     for index, word in enumerate(listed_words)
@@ -10868,12 +10937,13 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         orchestrator = AgentOrchestrator(
             client_factory=lambda: client,
             runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
-            skills_manager=_ReviewedBatchAddSkills(),
+            skills_manager=_ReadOnlyEncodeSkills(),
             tool_executor=ToolExecutor(
                 lambda _name: dispatch,
                 frozenset({
-                    "keytao_prepare_reviewed_add",
-                    "keytao_batch_add_to_draft",
+                    "keytao_lookup_by_words_batch",
+                    "keytao_encode",
+                    "keytao_lookup_by_codes_batch",
                 }),
             ),
             state_store=state_store,
@@ -10883,13 +10953,13 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         context = AgentRequestContext(
             platform="qq",
             user_id="homophone-owner",
-            mutations_allowed=True,
+            mutations_allowed=False,
         )
         ranking = {
             "status": "reorder",
             "proposedOrder": [
-                {"word": "撒漏", "weight": 1},
-                {"word": "洒漏", "weight": 0},
+                {"word": "缩手", "weight": 0},
+                {"word": "所售", "weight": 1},
             ],
         }
 
@@ -10898,37 +10968,27 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             "rank_code_chain_by_commonness",
             new=AsyncMock(return_value=ranking),
         ) as rank_mock:
-            result = await orchestrator.run("加词 洒漏 撒漏", context)
+            result = await asyncio.create_task(
+                orchestrator.run("缩手 所售", context)
+            )
+        self.assertTrue(orchestrator.is_server_backed_query_reply(result))
+        delivered = chat_module._enforce_advertised_reply_contract(
+            chat_module.ServerBackedQueryReply(result),
+            context.conversation_address,
+            query_words=listed_words,
+        )
 
         record = state_store.get_record(context.conversation_address)
-        self.assertIsNotNone(record)
-        self.assertEqual(
-            [(item["word"], item["code"]) for item in record.state.args["items"]],
-            [("撒漏", "ssld"), ("洒漏", "sslda")],
-        )
+        self.assertIsNone(record)
+        self.assertEqual(delivered, result)
         self.assertEqual(
             advertised_batch_binding_pairs(result),
-            (("撒漏", "ssld"), ("洒漏", "sslda")),
+            (("缩手", "sleda"), ("所售", "sledu")),
         )
-        self.assertEqual(
-            record.state.args["_candidate_scopes"],
-            [
-                {
-                    "word": "撒漏",
-                    "candidates": [
-                        [code, False]
-                        for code in candidate_codes_by_word["撒漏"]
-                    ],
-                },
-                {
-                    "word": "洒漏",
-                    "candidates": [
-                        [code, False]
-                        for code in candidate_codes_by_word["洒漏"]
-                    ],
-                },
-            ],
-        )
+        self.assertIn("所受", result)
+        self.assertIn("本次查询", result)
+        self.assertNotIn("无法唯一绑定", result)
+        self.assertNotIn("写入", result)
         rank_mock.assert_awaited_once()
         self.assertEqual(
             rank_mock.await_args.kwargs["tie_break_words"],
@@ -10936,8 +10996,180 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             occupancy_snapshots,
-            [("ssld", "sslda", "ssldaa", "ssldi", "ssldia")],
+            [("sled", "sleda", "sledai", "sledu", "sledui")],
         )
+
+    async def test_query_delivery_failure_uses_query_shaped_recovery_copy(self) -> None:
+        """A pure lookup failure never claims that a write was requested."""
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        response = (
+            "2 个词的候选：\n"
+            "- 「缩手」 → sleda（推荐）\n"
+            "- 「所售」 → sledi（推荐）\n"
+            + pending_batch_confirmation_copy()
+        )
+        delivered = chat_module._enforce_advertised_reply_contract(
+            response,
+            ConversationAddress.private("qq", "query-copy-owner"),
+            query_words=("缩手", "所售"),
+        )
+
+        self.assertIn("候选查询", delivered)
+        self.assertIn("逐词", delivered)
+        self.assertIn("缩手", delivered)
+        self.assertIn("所售", delivered)
+        self.assertNotIn("写入", delivered)
+        self.assertNotIn("查看草稿", delivered)
+        self.assertNotIn("加词", delivered)
+
+    def test_future_batch_assent_offer_uses_a_closed_query_boundary(self) -> None:
+        """Only an explicit future-offer request escapes query-only rendering."""
+        from keytao_bot.harness import orchestrator as orchestrator_module
+
+        self.assertTrue(orchestrator_module.requests_future_batch_assent_offer(
+            "请只重新复核这两个词；末尾说明可直接回复「加入并提交」"
+        ))
+        for message in (
+            "缩手 所售",
+            "请只重新复核这两个词",
+            "为什么回复里出现了加入并提交？",
+            "他说可以直接回复「加入并提交」",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(
+                    orchestrator_module.requests_future_batch_assent_offer(message)
+                )
+
+    async def test_query_orchestrator_binding_failure_uses_query_shaped_copy(
+        self,
+    ) -> None:
+        """The server-record binding failure site stays lookup-shaped."""
+        async def review(**_kwargs):
+            return {
+                "success": True,
+                "word": "缩手",
+                "type": "Phrase",
+                "recommendedCode": "sled",
+                "codes": ["sled", "sleda"],
+                "candidateCodes": ["sled", "sleda"],
+                "candidateStatuses": [
+                    {"code": "sled", "occupied": True},
+                    {"code": "sleda", "occupied": False},
+                ],
+                "preSubmitAudit": {
+                    "success": True,
+                    "autoApprove": False,
+                    "summary": "manual review",
+                    "issues": ["manual review"],
+                },
+            }
+
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-query-binding-failure",
+                    "keytao_prepare_reviewed_add",
+                    {"word": "缩手"},
+                )],
+            ),
+            _fake_response(
+                "stop",
+                "1. sled — 已占用\n2. sleda — 空位（推荐）\n用 sleda",
+            ),
+        ])
+        state_store = MemoryConversationStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_ReviewedCreateSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: review if name == "keytao_prepare_reviewed_add" else None,
+                frozenset({"keytao_prepare_reviewed_add"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="query-binding-failure-owner",
+            mutations_allowed=False,
+        )
+
+        result = await orchestrator.run("缩手怎么编码", context)
+
+        self.assertIsNone(state_store.get_record(context.conversation_address))
+        self.assertIn("候选查询", result)
+        self.assertIn("逐词", result)
+        self.assertIn("缩手", result)
+        self.assertNotIn("写入", result)
+        self.assertNotIn("查看草稿", result)
+        self.assertNotIn("加词", result)
+
+    async def test_delivery_commonness_copy_requires_same_turn_comparator_evidence(
+        self,
+    ) -> None:
+        """Comparator copy survives; evidence-free intuition is removed."""
+        from keytao_bot.plugins import openai_chat as chat_module
+        from keytao_bot.utils import keytao_review
+
+        token = keytao_review.begin_commonness_evidence_turn()
+        try:
+            comparison = keytao_review._compare_reference_commonness(
+                "诉讼法",
+                "诉讼费",
+                {
+                    "available": True,
+                    "attested": True,
+                    "word": "诉讼法",
+                    "corpusFrequency": 66,
+                    "partOfSpeech": "n",
+                    "dictionaryPresenceCount": 3,
+                },
+                {
+                    "available": True,
+                    "attested": True,
+                    "word": "诉讼费",
+                    "corpusFrequency": 15,
+                    "partOfSpeech": "n",
+                    "dictionaryPresenceCount": 2,
+                },
+            )
+            keytao_review.record_commonness_evidence(comparison)
+            evidence_backed = chat_module._enforce_advertised_reply_contract(
+                "• 常用度对比：" + comparison["summary"],
+                None,
+            )
+        finally:
+            keytao_review.end_commonness_evidence_turn(token)
+        self.assertEqual(evidence_backed, "• 常用度对比：" + comparison["summary"])
+
+        structured_review = chat_module._enforce_advertised_reply_contract(
+            "自动审核：权威来源、编码和常用度证据一致，可自动通过",
+            None,
+        )
+        self.assertEqual(
+            structured_review,
+            "自动审核：权威来源、编码和常用度证据一致，可自动通过",
+        )
+
+        token = keytao_review.begin_commonness_evidence_turn()
+        try:
+            speculative = chat_module._enforce_advertised_reply_contract(
+                "补充说明：\n"
+                "• 缩手 当前用 sleda，因为 sled 已有「所受」。\n"
+                "• 常用度对比：「所受」多用于书面或正式表达，"
+                "日常语感上「所受」出现频率可能略高，但这只是直觉比较。",
+                None,
+            )
+        finally:
+            keytao_review.end_commonness_evidence_turn(token)
+        self.assertIn("sled 已有「所受」", speculative)
+        self.assertNotIn("常用度对比", speculative)
+        self.assertNotIn("日常语感", speculative)
+        self.assertNotIn("直觉比较", speculative)
 
     async def test_sink_replans_short_collision_but_preserves_explicit_and_six_code(
         self,
@@ -11381,17 +11613,15 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 context.conversation_address,
             )
 
-        self.assertIsNotNone(record)
-        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertIsNone(record)
+        self.assertEqual(delivered, result)
         self.assertEqual(
-            {
-                (item["word"], item["code"])
-                for item in record.state.args["items"]
-            },
+            set(advertised_batch_binding_pairs(result)),
             set(codes.items()),
         )
-        self.assertEqual(delivered, result)
         self.assertNotIn(model_only_word, delivered)
+        self.assertIn("本次查询", delivered)
+        self.assertNotIn("加入草稿", delivered)
 
     async def test_read_only_rereview_advertisement_reestablishes_live_ticket(
         self,
@@ -11447,7 +11677,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        for case_index, (label, model_reply, expects_replacement) in enumerate(layouts):
+        for case_index, (label, model_reply, _expects_replacement) in enumerate(layouts):
             with self.subTest(layout=label):
                 review_calls = []
 
@@ -11519,65 +11749,35 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                     )
 
                 record = state_store.get_record(context.conversation_address)
-                self.assertIsNotNone(record)
-                nonce = record.nonce
-                with (
-                    patch.object(
-                        chat_module,
-                        "conversation_state_store",
-                        state_store,
-                    ),
-                    patch.object(chat_module.logger, "info") as delivery_log,
+                self.assertIsNone(record)
+                with patch.object(
+                    chat_module,
+                    "conversation_state_store",
+                    state_store,
                 ):
                     delivered = chat_module._enforce_advertised_reply_contract(
                         result,
                         context.conversation_address,
                     )
                 self.assertEqual(delivered, result)
-                self.assertEqual(state_store.set_count, 1)
-                self.assertEqual(
-                    state_store.get_record(context.conversation_address).nonce,
-                    nonce,
-                )
+                self.assertEqual(state_store.set_count, 0)
                 establishment_logs = [
                     str(call.args[0])
                     for call in info_log.call_args_list
                     if call.args
-                    and "branch=establish_from_server_records" in str(call.args[0])
+                    and "branch=replace_query_from_server_records" in str(call.args[0])
                 ]
                 self.assertEqual(len(establishment_logs), 1)
-                self.assertIn(
-                    "display=replace_from_server_records"
-                    if expects_replacement
-                    else "display=send_backed",
-                    establishment_logs[0],
-                )
-                self.assertTrue(any(
-                    call.args
-                    and "branch=send_backed" in str(call.args[0])
-                    for call in delivery_log.call_args_list
-                ))
                 self.assertEqual(review_calls, ["显眼包", "嘴替"])
                 self.assertEqual(
                     set(advertised_batch_binding_pairs(result)),
                     set(expected_pairs),
                 )
-                self.assertEqual(result == model_reply, not expects_replacement)
-                if expects_replacement:
-                    self.assertIn("2 个词的候选：", result)
-                self.assertEqual(record.owner_key, context.conversation_address)
-                self.assertIsInstance(record.state, PendingToolConfirm)
-                self.assertEqual(
-                    record.state.function_name,
-                    "keytao_batch_add_to_draft",
-                )
-                self.assertEqual(
-                    {
-                        (item["word"], item["code"])
-                        for item in record.state.args["items"]
-                    },
-                    set(expected_pairs),
-                )
+                self.assertNotEqual(result, model_reply)
+                self.assertIn("2 个词的候选：", result)
+                self.assertIn("本次查询", result)
+                self.assertNotIn("加入并提交", result)
+                self.assertNotIn("加入草稿", result)
 
     async def test_scan_advertisement_uses_only_same_turn_absent_lookup_records(
         self,
@@ -11747,18 +11947,16 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 context.conversation_address,
             )
 
-        self.assertIsNotNone(record)
-        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertIsNone(record)
+        self.assertEqual(delivered, result)
         self.assertEqual(
-            {
-                (item["word"], item["code"])
-                for item in record.state.args["items"]
-            },
+            set(advertised_batch_binding_pairs(result)),
             set(candidate_codes.items()),
         )
-        self.assertEqual(delivered, result)
         self.assertNotIn(model_only_word, delivered)
         self.assertTrue(all(word not in delivered for word in absent_words))
+        self.assertIn("本次查询", delivered)
+        self.assertNotIn("加入草稿", delivered)
 
     async def test_advertisement_without_either_record_kind_has_no_command(
         self,

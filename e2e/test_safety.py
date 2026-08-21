@@ -45,8 +45,13 @@ from .scenarios import (
     S32_CHAIN_COMMAND,
     S32_WORD_LIST_COMMAND,
     S33_DISCOVERY,
+    S33_EXTERNAL_EXPECTED,
+    S33_EXTERNAL_OCCUPANT,
+    S33_EXTERNAL_QUERY,
+    S33_EXTERNAL_WORDS,
     S33_SIX_WORDS,
     S33_WORDS,
+    _s33_external_query_pairs,
     S34_PENDING_CODE,
     S34_WORD,
     assert_batch_link_hosts,
@@ -406,7 +411,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S30 pins three intent-coverage boundaries", readme)
         self.assertIn("S31 executes the verbatim incident command", readme)
         self.assertIn("S32 replays both 2026-08-20 chain-scope incidents", readme)
-        self.assertIn("S33 replays the 2026-08-21 homophone batch incident", readme)
+        self.assertIn("S33 replays both 2026-08-21 homophone batch shapes", readme)
         self.assertIn("S34 replays the 2026-08-21 pending-batch incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
@@ -813,8 +818,37 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(S33_WORDS, ("洒漏", "撒漏"))
         self.assertEqual(S33_SIX_WORDS, ("洒漏", "洒溇"))
         self.assertEqual(S33_DISCOVERY, "喵喵 加词 洒漏 撒漏")
+        self.assertEqual(S33_EXTERNAL_WORDS, ("缩手", "所售"))
+        self.assertEqual(S33_EXTERNAL_OCCUPANT, ("所受", "sled"))
+        self.assertEqual(S33_EXTERNAL_QUERY, "缩手 所售")
+        self.assertEqual(
+            S33_EXTERNAL_EXPECTED,
+            (("缩手", "sleda"), ("所售", "sledu")),
+        )
+        self.assertEqual(
+            _s33_external_query_pairs(
+                "缩手（suō shǒu）\n"
+                "推荐编码：sleda\n"
+                "1. sled — 已有「所受」\n"
+                "2. sleda — 空位 ✅（推荐）\n"
+                "所售（suǒ shòu）\n"
+                "1. sled — 已有「所受」\n"
+                "2. sledu — 空位 ✅\n"
+            ),
+            S33_EXTERNAL_EXPECTED,
+        )
+        self.assertEqual(
+            _s33_external_query_pairs(
+                "缩手（suō shǒu）\n1. sleda — 空位\n"
+                "所售（suǒ shòu）\n1. sledu — 空位\n"
+            ),
+            (),
+        )
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S33"]
-        self.assertEqual(fixture["probe_words"], (*S33_WORDS, "洒溇"))
+        self.assertEqual(
+            fixture["probe_words"],
+            (*S33_WORDS, "洒溇", *S33_EXTERNAL_WORDS, S33_EXTERNAL_OCCUPANT[0]),
+        )
         entries = {
             row["entry"]: tuple(row["pinyins"])
             for row in fixture["rows"]
@@ -824,6 +858,9 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             "洒漏": ("sǎ", "lòu"),
             "撒漏": ("sǎ", "lòu"),
             "洒溇": ("sǎ", "lóu"),
+            "缩手": ("suō", "shǒu"),
+            "所售": ("suǒ", "shòu"),
+            "所受": ("suǒ", "shòu"),
         })
 
     def test_s34_owns_the_exact_pending_batch_incident_fixture(self) -> None:
