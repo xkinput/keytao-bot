@@ -36,6 +36,7 @@ from keytao_bot.utils.keytao_review import (
     fetch_keytao_encode,
     manual_preaudit_issue_for_item,
     prepare_reviewed_word,
+    rank_code_chain_by_commonness,
 )
 from keytao_bot.utils.pending_confirmation import _BIND_HELP_TEXT, render_remediation_reply
 
@@ -3996,6 +3997,203 @@ TOOLS = [
 ]
 
 
+async def _replan_intra_batch_create_collisions(
+    platform: str,
+    platform_id: str,
+    items: List[Dict],
+    *,
+    batch_id: Optional[str],
+    allow_same_code: bool,
+) -> Dict:
+    """Move later-priority Creates off duplicate short codes before any write."""
+    normalized = [_normalize_draft_item_for_request(item) for item in items]
+    creates_by_code: "OrderedDict[str, List[tuple[int, Dict]]]" = OrderedDict()
+    for index, item in enumerate(normalized):
+        if str(item.get("action") or "Create") != "Create":
+            continue
+        word = str(item.get("word") or "").strip()
+        code = str(item.get("code") or "").strip().lower()
+        if word and code:
+            creates_by_code.setdefault(code, []).append((index, item))
+    collisions = {
+        code: grouped
+        for code, grouped in creates_by_code.items()
+        if len(grouped) > 1 and len(code) < 6
+    }
+    if not collisions or allow_same_code is True:
+        return {"success": True, "items": normalized, "replanned": False}
+
+    collision_words = tuple(dict.fromkeys(
+        str(item.get("word") or "").strip()
+        for grouped in collisions.values()
+        for _index, item in grouped
+    ))
+    encoded_results = await asyncio.gather(*(
+        _fetch_encode_candidates(word)
+        for word in collision_words
+    ))
+    candidate_codes_by_word: Dict[str, List[str]] = {}
+    for word, encoding in zip(collision_words, encoded_results):
+        candidate_codes = _clean_code_list(encoding.get("candidateCodes"))
+        if not encoding.get("success") or not candidate_codes:
+            return {
+                "success": False,
+                "message": f"无法核验「{word}」的后续候选编码，本批未写入",
+            }
+        candidate_codes_by_word[word] = candidate_codes
+
+    snapshot_codes = list(dict.fromkeys(
+        code
+        for candidate_codes in candidate_codes_by_word.values()
+        for code in candidate_codes
+    ))
+    occupancy_result, draft_snapshot = await asyncio.gather(
+        _lookup_codes_raw(snapshot_codes),
+        (
+            _fetch_draft_snapshot(platform, platform_id, batch_id)
+            if batch_id
+            else asyncio.sleep(0, result={"count": 0, "items": [], "summary": {}})
+        ),
+    )
+    raw_results = occupancy_result.get("results")
+    if not occupancy_result.get("success") or not isinstance(raw_results, list):
+        return {
+            "success": False,
+            "message": "无法取得同批候选的服务端占用快照，本批未写入",
+        }
+    phrases_by_code: Dict[str, List[Dict]] = {}
+    for result in raw_results:
+        if not isinstance(result, dict):
+            return {
+                "success": False,
+                "message": "同批候选占用快照不完整，本批未写入",
+            }
+        code = str(result.get("code") or "").strip().lower()
+        phrases = result.get("phrases")
+        if code and isinstance(phrases, list) and code not in phrases_by_code:
+            phrases_by_code[code] = phrases
+    if any(code not in phrases_by_code for code in snapshot_codes):
+        return {
+            "success": False,
+            "message": "同批候选占用快照不完整，本批未写入",
+        }
+    if not isinstance(draft_snapshot, dict) or not isinstance(
+        draft_snapshot.get("items"), list
+    ):
+        return {
+            "success": False,
+            "message": "无法取得当前草稿占用快照，本批未写入",
+        }
+
+    occupied_codes = {
+        code for code, phrases in phrases_by_code.items() if phrases
+    }
+    for draft_item in draft_snapshot["items"]:
+        if not isinstance(draft_item, dict):
+            return {
+                "success": False,
+                "message": "当前草稿占用快照不完整，本批未写入",
+            }
+        if str(draft_item.get("action") or "") in {"Create", "Change"}:
+            draft_code = str(draft_item.get("code") or "").strip().lower()
+            if draft_code:
+                occupied_codes.add(draft_code)
+
+    effective = [dict(item) for item in normalized]
+    reserved_counts: Dict[str, int] = {}
+    for item in effective:
+        if str(item.get("action") or "Create") == "Create":
+            code = str(item.get("code") or "").strip().lower()
+            if code:
+                reserved_counts[code] = reserved_counts.get(code, 0) + 1
+
+    changes: List[tuple[str, str, str]] = []
+    for collision_code, grouped in collisions.items():
+        grouped_words = [
+            str(item.get("word") or "").strip()
+            for _index, item in grouped
+        ]
+        ranking_entries = [
+            {
+                "word": word,
+                "code": collision_code,
+                "type": str(item.get("type") or "Phrase"),
+                "weight": priority,
+            }
+            for priority, ((_index, item), word) in enumerate(
+                zip(grouped, grouped_words)
+            )
+        ]
+        ranking = await rank_code_chain_by_commonness(
+            ranking_entries,
+            tie_break_words=grouped_words,
+        )
+        proposed = ranking.get("proposedOrder") if isinstance(ranking, dict) else None
+        priority_words = [
+            str(entry.get("word") or "").strip()
+            for entry in proposed
+            if isinstance(entry, dict)
+        ] if isinstance(proposed, list) else []
+        if (
+            len(priority_words) != len(grouped_words)
+            or set(priority_words) != set(grouped_words)
+        ):
+            priority_words = grouped_words
+        index_by_word = {
+            str(item.get("word") or "").strip(): index
+            for index, item in grouped
+        }
+        for word in priority_words[1:]:
+            item_index = index_by_word[word]
+            candidate_codes = candidate_codes_by_word[word]
+            if collision_code not in candidate_codes:
+                return {
+                    "success": False,
+                    "message": f"{collision_code} 不在「{word}」的当前候选链中，本批未写入",
+                }
+            reserved_counts[collision_code] -= 1
+            collision_position = candidate_codes.index(collision_code)
+            next_code = next(
+                (
+                    code
+                    for code in candidate_codes[collision_position + 1:]
+                    if (
+                        len(code) == 6
+                        or (
+                            code not in occupied_codes
+                            and reserved_counts.get(code, 0) == 0
+                        )
+                    )
+                ),
+                "",
+            )
+            if not next_code:
+                reserved_counts[collision_code] += 1
+                return {
+                    "success": False,
+                    "message": (
+                        f"「{word}」在 {collision_code} 后没有已核验空位；"
+                        "请明确是否同码，本批未写入"
+                    ),
+                }
+            effective[item_index]["code"] = next_code
+            reserved_counts[next_code] = reserved_counts.get(next_code, 0) + 1
+            changes.append((word, collision_code, next_code))
+
+    if not changes:
+        return {"success": True, "items": normalized, "replanned": False}
+    change_copy = "；".join(
+        f"「{word}」{old_code}→{new_code}"
+        for word, old_code, new_code in changes
+    )
+    return {
+        "success": True,
+        "items": effective,
+        "replanned": True,
+        "line": f"已调整：{change_copy}（同批短码不重码）",
+    }
+
+
 async def keytao_batch_add_to_draft(
     platform: str,
     platform_id: str,
@@ -4005,6 +4203,7 @@ async def keytao_batch_add_to_draft(
     expected_content_version: Optional[int] = None,
     expected_warning_digest: str = "",
     preview_only: bool = False,
+    _allow_same_code: bool = False,
 ) -> Dict:
     """
     Batch add word entries to draft (tolerant mode).
@@ -4051,6 +4250,30 @@ async def keytao_batch_add_to_draft(
             "success": False,
             "message": "批量添加确认内容不完整",
         }, batch_id)
+
+    collision_plan = await _replan_intra_batch_create_collisions(
+        platform,
+        platform_id,
+        items,
+        batch_id=batch_id,
+        allow_same_code=_allow_same_code is True,
+    )
+    if not collision_plan.get("success"):
+        return _inject_known_batch_url({
+            "success": False,
+            "collisionBlocked": True,
+            "message": collision_plan.get("message") or "同批短码冲突无法安全调整，本批未写入",
+        }, batch_id)
+    items = collision_plan.get("items") or []
+    collision_replanned = collision_plan.get("replanned") is True
+    collision_replan_line = str(collision_plan.get("line") or "").strip()
+    if collision_replanned:
+        # Even a caller presenting an old confirmed ticket must see and confirm
+        # the changed exact set. This invocation can only mint a new preview.
+        confirmed = False
+        preview_only = True
+        expected_content_version = None
+        expected_warning_digest = ""
 
     valid_items, validation_failed = await _split_items_by_code_validation(items)
     if validation_failed and not valid_items:
@@ -4146,6 +4369,10 @@ async def keytao_batch_add_to_draft(
             if isinstance(data.get("draftItems"), list):
                 data["draftItems"] = [enrich_pr_item_labels(item) for item in data["draftItems"]]
             data.setdefault("batchId", batch_id)
+            if collision_replanned:
+                data["collisionReplanned"] = True
+                data["effectiveItems"] = [dict(item) for item in valid_items]
+                data["collisionReplanLine"] = collision_replan_line
             if preview_only and not data.get("requiresConfirmation"):
                 return _inject_known_batch_url({
                     "success": False,

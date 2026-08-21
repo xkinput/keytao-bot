@@ -18,7 +18,7 @@ from keytao_bot.utils.llm_policy import (
     with_deepseek_chat_policy,
 )
 from keytao_bot.utils.history_store import _parse_stored_timestamp
-from keytao_bot.utils import review_flags
+from keytao_bot.utils import keytao_review, review_flags
 from keytao_bot.utils.observability import (
     mark_turn_outcome,
     observe_model_call,
@@ -58,7 +58,10 @@ from .state import (
     server_warning_ticket_is_complete,
 )
 from .conversation import ConversationAddress
-from .authorization_grammar import parse_eviction_modified_add
+from .authorization_grammar import (
+    explicit_same_code_requested,
+    parse_eviction_modified_add,
+)
 from .tools import (
     MUTATING_TOOL_NAMES,
     PendingCandidateCapability,
@@ -988,10 +991,18 @@ class AgentOrchestrator:
                             + "。其余词也未写入。",
                             authoritative_result_links,
                         )
-                    pending_items = self._resolved_advertised_pending_items(
+                    allow_same_code = explicit_same_code_requested(message)
+                    pending_items = await self._resolved_advertised_pending_items(
                         resolved_advertised_words,
                         trusted_reviewed_items_by_key,
                         trusted_candidate_slots_by_word,
+                        ToolContext(
+                            platform=context.platform,
+                            user_id=context.user_id,
+                            current_message=message,
+                            writes_allowed=False,
+                        ),
+                        allow_same_code=allow_same_code,
                     )
                     if pending_items is not None:
                         candidate_scopes = [
@@ -1012,6 +1023,11 @@ class AgentOrchestrator:
                             args={
                                 "items": pending_items,
                                 "_candidate_scopes": candidate_scopes,
+                                **(
+                                    {"_allow_same_code": True}
+                                    if allow_same_code
+                                    else {}
+                                ),
                                 "_resolved_advertised_words": list(
                                     resolved_advertised_words
                                 ),
@@ -1155,10 +1171,18 @@ class AgentOrchestrator:
                             candidate_reply(rendered_word_set),
                             authoritative_result_links,
                         )
+                    allow_same_code = explicit_same_code_requested(message)
                     record_backed_items = (
-                        self._trusted_review_pending_items(
+                        await self._trusted_review_pending_items(
                             trusted_reviewed_items_by_key,
                             trusted_candidate_slots_by_word,
+                            ToolContext(
+                                platform=context.platform,
+                                user_id=context.user_id,
+                                current_message=message,
+                                writes_allowed=False,
+                            ),
+                            allow_same_code=allow_same_code,
                         )
                         if (
                             not context.visual_context
@@ -1229,6 +1253,11 @@ class AgentOrchestrator:
                                 args={
                                     "items": pending_items,
                                     "_candidate_scopes": candidate_scopes,
+                                    **(
+                                        {"_allow_same_code": True}
+                                        if allow_same_code
+                                        else {}
+                                    ),
                                 },
                             ),
                             space_key=context.space_key,
@@ -1596,6 +1625,29 @@ class AgentOrchestrator:
                         canonical_fn_args,
                         tool_context,
                     )
+                    if result_data.get("collisionReplanned") is True:
+                        replanned_args = self._validated_collision_replan_arguments(
+                            fn_name,
+                            canonical_fn_args,
+                            result_data,
+                        )
+                        if replanned_args is None:
+                            result_data = {
+                                "success": False,
+                                "policyBlocked": True,
+                                "message": render_remediation_reply(
+                                    "同批改码结果不完整，本批未写入"
+                                ),
+                            }
+                            result_str = json.dumps(result_data, ensure_ascii=False)
+                        else:
+                            canonical_fn_args = replanned_args
+                            result_str = json.dumps(result_data, ensure_ascii=False)
+                            execution_route = self._tool_executor.resolve_execution_route(
+                                fn_name,
+                                canonical_fn_args,
+                                tool_context,
+                            )
                     auto_confirmed = await self._auto_confirm_shift_plan(
                         fn_name,
                         canonical_fn_args,
@@ -1793,8 +1845,11 @@ class AgentOrchestrator:
                         )
                         if (
                             isinstance(pending_state, PendingToolConfirm)
-                            and pending_state.function_name
-                            in _LOCK_BEFORE_PROMPT_TOOL_NAMES
+                            and (
+                                result_data.get("collisionReplanned") is True
+                                or pending_state.function_name
+                                in _LOCK_BEFORE_PROMPT_TOOL_NAMES
+                            )
                             and server_warning_ticket_is_complete(pending_state)
                         ):
                             from keytao_bot.plugins.chat_render import (
@@ -1952,13 +2007,16 @@ class AgentOrchestrator:
             authoritative_result_links,
         )
 
-    @staticmethod
-    def _trusted_review_pending_items(
+    async def _trusted_review_pending_items(
+        self,
         reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
         candidate_slots_by_word: Dict[
             str,
             tuple[tuple[str, bool], ...],
         ],
+        occupancy_tool_context: ToolContext,
+        *,
+        allow_same_code: bool = False,
     ) -> Optional[List[Dict[str, Any]]]:
         """Seal the complete same-turn review set without consulting reply prose."""
         words = tuple(dict.fromkeys(
@@ -1968,10 +2026,12 @@ class AgentOrchestrator:
         ))
         if len(words) < 2:
             return None
-        return AgentOrchestrator._resolved_advertised_pending_items(
+        return await self._resolved_advertised_pending_items(
             words,
             reviewed_items_by_key,
             candidate_slots_by_word,
+            occupancy_tool_context,
+            allow_same_code=allow_same_code,
         )
 
     @staticmethod
@@ -2097,20 +2157,32 @@ class AgentOrchestrator:
             return ()
         return resolved
 
-    @staticmethod
-    def _resolved_advertised_pending_items(
+    async def _resolved_advertised_pending_items(
+        self,
         words: tuple[str, ...],
         reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
         candidate_slots_by_word: Dict[
             str,
             tuple[tuple[str, bool], ...],
         ],
+        occupancy_tool_context: ToolContext,
+        *,
+        allow_same_code: bool = False,
     ) -> Optional[List[Dict[str, Any]]]:
-        """Seal one reviewed item per word from the exact resolved universe."""
+        """Allocate one shared candidate snapshot across each reviewed code family."""
         if not words:
             return None
-        items: List[Dict[str, Any]] = []
-        for word in words:
+        listed_words = tuple(dict.fromkeys(
+            str(word or "").strip() for word in words if str(word or "").strip()
+        ))
+        if len(listed_words) != len(words):
+            return None
+
+        base_reviews: Dict[str, Dict[str, Any]] = {}
+        word_slots: Dict[str, tuple[tuple[str, bool], ...]] = {}
+        original_codes: Dict[str, str] = {}
+        family_words: Dict[str, List[str]] = {}
+        for word in listed_words:
             slots = candidate_slots_by_word.get(word, ())
             allowed_codes = {code for code, _occupied in slots}
             reviewed_matches = [
@@ -2127,12 +2199,151 @@ class AgentOrchestrator:
                     (code, reviewed)
                     for (reviewed_word, code), reviewed in reviewed_items_by_key.items()
                     if reviewed_word == word and code in allowed_codes
-                ]
+            ]
             if len(reviewed_matches) != 1:
                 return None
-            code, reviewed = reviewed_matches[0]
+            _code, reviewed = reviewed_matches[0]
             phrase_type = str(reviewed.get("type") or "").strip()
-            if not phrase_type:
+            family = slots[0][0] if slots else ""
+            if (
+                not phrase_type
+                or not family
+                or len(allowed_codes) != len(slots)
+                or any(not isinstance(occupied, bool) for _code, occupied in slots)
+            ):
+                return None
+            recommended = next(
+                (
+                    code
+                    for (reviewed_word, code), candidate_review
+                    in reviewed_items_by_key.items()
+                    if reviewed_word == word
+                    and code in allowed_codes
+                    and candidate_review.get("recommended") is True
+                ),
+                "",
+            )
+            if not recommended:
+                return None
+            base_reviews[word] = reviewed
+            word_slots[word] = slots
+            original_codes[word] = recommended
+            family_words.setdefault(family, []).append(word)
+
+        allocated: Dict[str, str] = {}
+        priority_by_family: Dict[str, List[str]] = {}
+        for family, grouped_words in family_words.items():
+            grouped_original_codes = [original_codes[word] for word in grouped_words]
+
+            if len(grouped_words) == 1 or allow_same_code or (
+                len(set(grouped_original_codes)) == 1
+                and len(grouped_original_codes[0]) == 6
+            ):
+                priority_by_family[family] = list(grouped_words)
+                allocated.update(zip(grouped_words, grouped_original_codes))
+                continue
+
+            snapshot_codes = list(dict.fromkeys(
+                code
+                for word in grouped_words
+                for code, _occupied in word_slots[word]
+            ))
+            try:
+                snapshot_result = json.loads(await self._tool_executor.call(
+                    "keytao_lookup_by_codes_batch",
+                    {"codes": snapshot_codes},
+                    occupancy_tool_context,
+                ))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            raw_snapshot = snapshot_result.get("results")
+            if (
+                snapshot_result.get("success") is not True
+                or not isinstance(raw_snapshot, list)
+            ):
+                return None
+            snapshot: Dict[str, bool] = {}
+            for result in raw_snapshot:
+                if not isinstance(result, dict):
+                    return None
+                code = str(result.get("code") or "").strip().lower()
+                phrases = result.get("phrases")
+                if (
+                    code not in snapshot_codes
+                    or code in snapshot
+                    or not isinstance(phrases, list)
+                ):
+                    return None
+                snapshot[code] = bool(phrases)
+            if set(snapshot) != set(snapshot_codes):
+                return None
+            for word in grouped_words:
+                refreshed_slots = tuple(
+                    (code, snapshot[code])
+                    for code, _occupied in word_slots[word]
+                )
+                word_slots[word] = refreshed_slots
+                candidate_slots_by_word[word] = refreshed_slots
+
+            ranking_entries = [
+                {
+                    "word": word,
+                    "code": family,
+                    "type": str(base_reviews[word].get("type") or "Phrase"),
+                    "weight": index,
+                }
+                for index, word in enumerate(grouped_words)
+            ]
+            ranking = await keytao_review.rank_code_chain_by_commonness(
+                ranking_entries,
+                tie_break_words=list(grouped_words),
+            )
+            proposed = ranking.get("proposedOrder") if isinstance(ranking, dict) else None
+            priority_words = [
+                str(entry.get("word") or "").strip()
+                for entry in proposed
+                if isinstance(entry, dict)
+            ] if isinstance(proposed, list) else []
+            if (
+                len(priority_words) != len(grouped_words)
+                or set(priority_words) != set(grouped_words)
+            ):
+                # Missing/close evidence is a tie, resolved by the user's list.
+                priority_words = list(grouped_words)
+            priority_by_family[family] = priority_words
+
+            reserved: set[str] = set()
+            for word in priority_words:
+                selected = next(
+                    (
+                        code
+                        for code, _occupied in word_slots[word]
+                        if (
+                            len(code) == 6
+                            or (
+                                snapshot.get(code) is False
+                                and code not in reserved
+                            )
+                        )
+                    ),
+                    "",
+                )
+                if not selected:
+                    return None
+                allocated[word] = selected
+                if len(selected) < 6:
+                    reserved.add(selected)
+
+        ordered_words: List[str] = []
+        for family in family_words:
+            ordered_words.extend(priority_by_family[family])
+
+        items: List[Dict[str, Any]] = []
+        for word in ordered_words:
+            code = allocated.get(word, "")
+            reviewed = reviewed_items_by_key.get((word, code)) or base_reviews[word]
+            phrase_type = str(reviewed.get("type") or "").strip()
+            if not code or not phrase_type:
                 return None
             item: Dict[str, Any] = {
                 "action": "Create",
@@ -4023,6 +4234,7 @@ class AgentOrchestrator:
                 "keytao_batch_add_to_draft",
             }
             or not tool_context.writes_allowed
+            or result_data.get("collisionReplanned") is True
         ):
             return None
         if (
@@ -4105,6 +4317,60 @@ class AgentOrchestrator:
                 )
             confirmed_str = json.dumps(confirmed_data, ensure_ascii=False)
         return confirmed_data, confirmed_str, downstream_args
+
+    @staticmethod
+    def _validated_collision_replan_arguments(
+        fn_name: str,
+        fn_args: Dict,
+        result_data: Dict,
+    ) -> Optional[Dict]:
+        """Seal a sink-replanned exact set before exposing one new prompt."""
+        requested_items = fn_args.get("items")
+        effective_items = result_data.get("effectiveItems")
+        if (
+            fn_name != "keytao_batch_add_to_draft"
+            or not isinstance(requested_items, list)
+            or not isinstance(effective_items, list)
+            or len(effective_items) != len(requested_items)
+        ):
+            return None
+
+        validated: List[Dict] = []
+        changes: List[tuple[str, str, str]] = []
+        for requested, effective in zip(requested_items, effective_items):
+            if not isinstance(requested, dict) or not isinstance(effective, dict):
+                return None
+            requested_action = str(requested.get("action") or "Create").strip()
+            effective_action = str(effective.get("action") or "Create").strip()
+            requested_word = str(requested.get("word") or "").strip()
+            effective_word = str(effective.get("word") or "").strip()
+            old_code = str(requested.get("code") or "").strip().lower()
+            new_code = str(effective.get("code") or "").strip().lower()
+            if (
+                requested_action != effective_action
+                or not requested_word
+                or requested_word != effective_word
+                or not re.fullmatch(r"[a-z]{1,6}", old_code)
+                or not re.fullmatch(r"[a-z]{1,6}", new_code)
+            ):
+                return None
+            validated.append(dict(effective))
+            if old_code != new_code:
+                changes.append((effective_word, old_code, new_code))
+
+        short_create_codes = [
+            str(item.get("code") or "").strip().lower()
+            for item in validated
+            if str(item.get("action") or "Create").strip() == "Create"
+            and len(str(item.get("code") or "").strip()) < 6
+        ]
+        if not changes or len(short_create_codes) != len(set(short_create_codes)):
+            return None
+        result_data["collisionReplanLine"] = "已调整：" + "；".join(
+            f"「{word}」{old_code}→{new_code}"
+            for word, old_code, new_code in changes
+        ) + "（同批短码不重码）"
+        return {**fn_args, "items": validated}
 
     @staticmethod
     def _deduplicate_block_reason(

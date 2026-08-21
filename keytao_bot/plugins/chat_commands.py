@@ -22,6 +22,7 @@ from ..harness.conversation import (
 )
 from ..harness.authorization_grammar import (
     _PHRASE_TYPE_BASE_WEIGHTS,
+    explicit_same_code_requested,
     explicit_complete_add_item,
     parse_entry_swap,
     parse_eviction_modified_add,
@@ -3007,6 +3008,7 @@ async def _perform_batch_add_to_draft_and_submit(
     expected_content_version: Optional[int] = None,
     expected_warning_digest: str = "",
     auto_confirm: bool = False,
+    allow_same_code: bool = False,
 ) -> DraftActionResult:
     """Add every confirmed reviewed item, then submit exactly that batch."""
     requested_items = [dict(item) for item in items if isinstance(item, dict)]
@@ -3016,6 +3018,8 @@ async def _perform_batch_add_to_draft_and_submit(
         ))
 
     add_arguments: Dict[str, Any] = {"items": requested_items}
+    if allow_same_code:
+        add_arguments["_allow_same_code"] = True
     if batch_id:
         add_arguments["batch_id"] = batch_id
     if confirmed_add:
@@ -3036,17 +3040,77 @@ async def _perform_batch_add_to_draft_and_submit(
     if add_data.get("not_bound"):
         return DraftActionResult(_BIND_HELP_TEXT)
 
+    effective_items = requested_items
+    collision_replan_line = ""
+    if add_data.get("collisionReplanned") is True:
+        raw_effective = add_data.get("effectiveItems")
+        if (
+            not isinstance(raw_effective, list)
+            or len(raw_effective) != len(requested_items)
+        ):
+            return DraftActionResult(render_remediation_reply(
+                "同批改码结果不完整，本批未写入"
+            ), data=add_data)
+        validated_effective: List[Dict] = []
+        changes: List[Tuple[str, str, str]] = []
+        for requested, effective in zip(requested_items, raw_effective):
+            if not isinstance(effective, dict):
+                return DraftActionResult(render_remediation_reply(
+                    "同批改码结果不完整，本批未写入"
+                ), data=add_data)
+            requested_action = str(requested.get("action") or "Create").strip()
+            effective_action = str(effective.get("action") or "Create").strip()
+            requested_word = str(requested.get("word") or "").strip()
+            effective_word = str(effective.get("word") or "").strip()
+            old_code = str(requested.get("code") or "").strip().lower()
+            new_code = str(effective.get("code") or "").strip().lower()
+            if (
+                requested_action != effective_action
+                or requested_word != effective_word
+                or not re.fullmatch(r"[a-z]{1,6}", new_code)
+            ):
+                return DraftActionResult(render_remediation_reply(
+                    "同批改码集合与原确认不一致，本批未写入"
+                ), data=add_data)
+            validated_effective.append(dict(effective))
+            if old_code != new_code:
+                changes.append((effective_word, old_code, new_code))
+        short_create_codes = [
+            str(item.get("code") or "").strip().lower()
+            for item in validated_effective
+            if str(item.get("action") or "Create") == "Create"
+            and len(str(item.get("code") or "").strip()) < 6
+        ]
+        if not changes or len(short_create_codes) != len(set(short_create_codes)):
+            return DraftActionResult(render_remediation_reply(
+                "同批短码冲突仍未消除，本批未写入"
+            ), data=add_data)
+        effective_items = validated_effective
+        collision_replan_line = "已调整：" + "；".join(
+            f"「{word}」{old_code}→{new_code}"
+            for word, old_code, new_code in changes
+        ) + "（同批短码不重码）"
+
     if add_data.get("requiresConfirmation"):
         pending_state = _pending_state_from_server_warning(
             PendingToolConfirm(
                 function_name="keytao_batch_add_to_draft",
-                args={"items": requested_items, "_submit_after": True},
+                args={
+                    "items": effective_items,
+                    "_submit_after": True,
+                    **(
+                        {"_allow_same_code": True}
+                        if allow_same_code
+                        else {}
+                    ),
+                },
             ),
             add_data,
         )
         if (
             auto_confirm
             and not confirmed_add
+            and not collision_replan_line
             and batch_warning_confirmation_binding(
                 add_data,
                 {"items": requested_items},
@@ -3066,6 +3130,7 @@ async def _perform_batch_add_to_draft_and_submit(
                     exact_args.get("expected_warning_digest") or ""
                 ),
                 auto_confirm=True,
+                allow_same_code=allow_same_code,
             )
             return _preserve_action_result_link(
                 confirmed_result,
@@ -3076,6 +3141,10 @@ async def _perform_batch_add_to_draft_and_submit(
             _plain_warning_line(warning)
             for warning in warnings
         ) if warnings else add_data.get("message", "批量添加前需要确认")
+        if collision_replan_line:
+            warning_text = "\n".join(
+                line for line in (collision_replan_line, warning_text) if line
+            )
         return DraftActionResult(_append_batch_url_if_missing(
             f"{warning_text}\n{pending_confirmation_copy()}",
             add_data,
@@ -3092,12 +3161,12 @@ async def _perform_batch_add_to_draft_and_submit(
             data=add_data,
         )
 
-    if failed_count > 0 or success_count < len(requested_items):
+    if failed_count > 0 or success_count < len(effective_items):
         draft_text = await _format_draft_response(
             add_data, platform, user_id, compact=True,
         )
         return DraftActionResult(
-            f"仅成功加入 {success_count}/{len(requested_items)} 条，已停止提交，避免生成不完整批次。\n\n{draft_text}"
+            f"仅成功加入 {success_count}/{len(effective_items)} 条，已停止提交，避免生成不完整批次。\n\n{draft_text}"
         )
 
     submit_result = await _perform_submit_current_draft(
@@ -3106,11 +3175,11 @@ async def _perform_batch_add_to_draft_and_submit(
         batch_id=str(add_data.get("batchId") or ""),
         preview_only=True,
         auto_confirm=auto_confirm,
-        authorized_items=requested_items,
+        authorized_items=effective_items,
     )
     item_lines = "\n".join(
         f"- 「{str(item.get('word') or '').strip()}」→ {str(item.get('code') or '').strip()}"
-        for item in requested_items
+        for item in effective_items
         if item.get("word") and item.get("code")
     )
     text = submit_result.text
@@ -4780,6 +4849,7 @@ async def _perform_active_operation_confirmation(
             expected_content_version=args.get("expected_content_version"),
             expected_warning_digest=str(args.get("expected_warning_digest") or ""),
             auto_confirm=True,
+            allow_same_code=args.get("_allow_same_code") is True,
         )
 
     return DraftActionResult(render_remediation_reply(
@@ -7906,6 +7976,10 @@ async def handle_pending_message_core(
                     state.args.get("expected_warning_digest") or ""
                 ),
                 auto_confirm=True,
+                allow_same_code=(
+                    state.args.get("_allow_same_code") is True
+                    or explicit_same_code_requested(message)
+                ),
             )
             if result.pending_state is not None:
                 conversation_state_store.set(

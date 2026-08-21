@@ -501,7 +501,9 @@ def _multi_add_authorization_contract(
         if (
             index == 0
             and compact in _MULTI_ADD_ADDRESS_CLAUSES
-        ) or _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(compact):
+        ) or _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(
+            compact
+        ) or _SAME_CODE_ADD_TAIL_RE.fullmatch(compact):
             continue
         refused.append(clause[:120])
     return _MultiAddAuthorization(
@@ -1715,6 +1717,20 @@ def _positional_same_code_requested(message: str) -> bool:
         marker_found
         and _has_complete_positional_reorder_command(normalized)
     )
+
+
+def explicit_same_code_requested(message: str) -> bool:
+    """Recognize a trusted, unquoted same-code opt-in for any add flow."""
+    if not message_authorizes_mutation(message):
+        return False
+    trusted = trusted_mutation_source(str(message or ""))
+    masked = _mask_quoted_record_frames(trusted)
+    for match in _POSITIONAL_SAME_CODE_MARKER_RE.finditer(masked):
+        prefix = re.sub(r"\s+", "", masked[max(0, match.start() - 8):match.start()])
+        if re.search(r"(?:不要|别|不许|禁止|避免)$", prefix):
+            continue
+        return True
+    return False
 
 
 def _record_frame_is_mutation_operand(

@@ -590,6 +590,11 @@ def _format_pending_state_details(state: PendingState) -> str:
     include_metadata = False
 
     if function_name == "keytao_batch_add_to_draft":
+        collision_replan_line = str(
+            display.get("collisionReplanLine") or ""
+        ).strip()
+        if collision_replan_line:
+            lines.append(collision_replan_line)
         lines.append("批量加词：")
         pairs = pending_batch_display_pairs(state)
         items = [{"word": word, "code": code} for word, code in pairs]

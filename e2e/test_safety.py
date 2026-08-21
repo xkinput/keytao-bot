@@ -44,6 +44,9 @@ from .scenarios import (
     S29_CURRENT,
     S32_CHAIN_COMMAND,
     S32_WORD_LIST_COMMAND,
+    S33_DISCOVERY,
+    S33_SIX_WORDS,
+    S33_WORDS,
     assert_batch_link_hosts,
     same_unique_item_set,
 )
@@ -401,15 +404,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S30 pins three intent-coverage boundaries", readme)
         self.assertIn("S31 executes the verbatim incident command", readme)
         self.assertIn("S32 replays both 2026-08-20 chain-scope incidents", readme)
+        self.assertIn("S33 replays the 2026-08-21 homophone batch incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s32(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s33(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 33)],
+            [f"S{index}" for index in range(1, 34)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -801,6 +805,23 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(declared[("entry", "米等")], ("found", ("mǐ", "děng")))
         self.assertEqual(declared[("entry", "幂等")], ("found", ("mì", "děng")))
         self.assertEqual(declared[("entry", "迷瞪")], ("found", ("mí", "dèng")))
+
+    def test_s33_owns_the_exact_homophone_incident_fixture(self) -> None:
+        self.assertEqual(S33_WORDS, ("洒漏", "撒漏"))
+        self.assertEqual(S33_SIX_WORDS, ("洒漏", "洒溇"))
+        self.assertEqual(S33_DISCOVERY, "喵喵 加词 洒漏 撒漏")
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S33"]
+        self.assertEqual(fixture["probe_words"], (*S33_WORDS, "洒溇"))
+        entries = {
+            row["entry"]: tuple(row["pinyins"])
+            for row in fixture["rows"]
+            if row["kind"] == "entry"
+        }
+        self.assertEqual(entries, {
+            "洒漏": ("sǎ", "lòu"),
+            "撒漏": ("sǎ", "lòu"),
+            "洒溇": ("sǎ", "lóu"),
+        })
 
     async def test_s29_seeds_the_exact_weighted_mkdr_chain(self) -> None:
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S29"]

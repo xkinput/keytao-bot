@@ -103,6 +103,14 @@ def _server_confirmation_display(data: Dict) -> Dict:
             ))
         except (TypeError, ValueError):
             pass
+    collision_replan_line = str(data.get("collisionReplanLine") or "").strip()
+    if (
+        data.get("collisionReplanned") is True
+        and collision_replan_line.startswith("已调整：")
+        and "\n" not in collision_replan_line
+        and len(collision_replan_line) <= 500
+    ):
+        display["collisionReplanLine"] = collision_replan_line
     return display
 
 

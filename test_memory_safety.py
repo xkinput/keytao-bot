@@ -57,6 +57,7 @@ from keytao_bot.harness.tools import (
     _pending_positional_create_binding,
     _positional_create_operands,
     _positional_same_code_requested,
+    explicit_same_code_requested,
     authorized_multi_add_items,
     create_warning_confirmation_binding,
     message_authorizes_mutation,
@@ -6239,6 +6240,17 @@ def iter_record_frame_no_negator_control():
 
 
 class MutationAuthorizationTests(unittest.TestCase):
+    def test_same_code_opt_in_requires_a_positive_unquoted_write_command(self) -> None:
+        self.assertTrue(explicit_same_code_requested("喵喵 加词 洒漏 撒漏，同码"))
+        for message in (
+            "我没要求同码",
+            "加词 洒漏 撒漏，但不要同码",
+            "把这句话记录下来：『加词 洒漏 撒漏，同码』",
+            "如果加词时要求同码，会怎样？",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(explicit_same_code_requested(message))
+
     def test_swap_and_indirect_move_are_positive_whole_messages(self) -> None:
         swap = parse_entry_swap("冒菜和茂才换个位置")
         indirect = parse_indirect_entry_move(
@@ -6676,6 +6688,7 @@ class MutationAuthorizationTests(unittest.TestCase):
             "喵喵\n加词 王中王 wfw\n加词 微服务 wfwu",
             "喵喵；录入 王中王 wfw；收录 微服务 wfwu；谢谢",
             "添加词组「王中王」 wfw；添加词组「微服务」 wfwu",
+            "添加词组「洒漏」 ssld；添加词组「撒漏」 ssld；同码",
         )
         for message in allowed:
             with self.subTest(allowed=message):
@@ -6688,6 +6701,14 @@ class MutationAuthorizationTests(unittest.TestCase):
                 {"action": "Create", "word": "微服务", "code": "wfwu"},
             ),
         )
+        self.assertEqual(
+            authorized_multi_add_items(allowed[3]),
+            (
+                {"action": "Create", "word": "洒漏", "code": "ssld"},
+                {"action": "Create", "word": "撒漏", "code": "ssld"},
+            ),
+        )
+        self.assertTrue(explicit_same_code_requested(allowed[3]))
         self.assertEqual(
             authorized_multi_add_items(
                 "确认加入 王中王 wfw 微服务 wfwu"
@@ -10776,6 +10797,367 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_same_chain_batch_candidates_allocate_distinct_slots_by_priority(
+        self,
+    ) -> None:
+        """One server occupancy snapshot is allocated across the ranked word set."""
+        from keytao_bot.harness import orchestrator as orchestrator_module
+
+        listed_words = ("洒漏", "撒漏")
+        candidate_codes_by_word = {
+            "洒漏": ("ssld", "sslda", "ssldaa"),
+            "撒漏": ("ssld", "ssldi", "ssldia"),
+        }
+        occupancy_snapshots = []
+
+        async def dispatch(word=None, items=None, codes=None, **_kwargs):
+            if codes is not None:
+                occupancy_snapshots.append(tuple(codes))
+                return {
+                    "success": True,
+                    "count": len(codes),
+                    "results": [
+                        {"code": code, "phrases": []}
+                        for code in codes
+                    ],
+                }
+            if items is not None:
+                self.fail("candidate review must not write before assent")
+            candidate_codes = candidate_codes_by_word[word]
+            reviewed = self._reviewed_candidate(
+                word,
+                candidate_codes[0],
+                needs_review=False,
+            )
+            reviewed["candidateCodes"] = list(candidate_codes)
+            reviewed["candidateStatuses"] = [
+                {"code": code, "occupied": False}
+                for code in candidate_codes
+            ]
+            reviewed["pronunciations"] = [{
+                "pinyin": "sa lou",
+                "recommendedCode": candidate_codes[0],
+                "candidateStatuses": [
+                    {"code": code, "occupied": False}
+                    for code in candidate_codes
+                ],
+            }]
+            return reviewed
+
+        model_reply = (
+            "是否将这两个词一起加入草稿？\n"
+            "- 「洒漏」 → ssld\n"
+            "- 「撒漏」 → ssld\n"
+            + pending_batch_confirmation_copy()
+        )
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[
+                    _named_tool_call(
+                        f"call-homophone-{index}",
+                        "keytao_prepare_reviewed_add",
+                        {"word": word},
+                    )
+                    for index, word in enumerate(listed_words)
+                ],
+            ),
+            _fake_response("stop", model_reply),
+        ])
+        state_store = MemoryConversationStateStore()
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_ReviewedBatchAddSkills(),
+            tool_executor=ToolExecutor(
+                lambda _name: dispatch,
+                frozenset({
+                    "keytao_prepare_reviewed_add",
+                    "keytao_batch_add_to_draft",
+                }),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="homophone-owner",
+            mutations_allowed=True,
+        )
+        ranking = {
+            "status": "reorder",
+            "proposedOrder": [
+                {"word": "撒漏", "weight": 1},
+                {"word": "洒漏", "weight": 0},
+            ],
+        }
+
+        with patch.object(
+            orchestrator_module.keytao_review,
+            "rank_code_chain_by_commonness",
+            new=AsyncMock(return_value=ranking),
+        ) as rank_mock:
+            result = await orchestrator.run("加词 洒漏 撒漏", context)
+
+        record = state_store.get_record(context.conversation_address)
+        self.assertIsNotNone(record)
+        self.assertEqual(
+            [(item["word"], item["code"]) for item in record.state.args["items"]],
+            [("撒漏", "ssld"), ("洒漏", "sslda")],
+        )
+        self.assertEqual(
+            advertised_batch_binding_pairs(result),
+            (("撒漏", "ssld"), ("洒漏", "sslda")),
+        )
+        self.assertEqual(
+            record.state.args["_candidate_scopes"],
+            [
+                {
+                    "word": "撒漏",
+                    "candidates": [
+                        [code, False]
+                        for code in candidate_codes_by_word["撒漏"]
+                    ],
+                },
+                {
+                    "word": "洒漏",
+                    "candidates": [
+                        [code, False]
+                        for code in candidate_codes_by_word["洒漏"]
+                    ],
+                },
+            ],
+        )
+        rank_mock.assert_awaited_once()
+        self.assertEqual(
+            rank_mock.await_args.kwargs["tie_break_words"],
+            list(listed_words),
+        )
+        self.assertEqual(
+            occupancy_snapshots,
+            [("ssld", "sslda", "ssldaa", "ssldi", "ssldia")],
+        )
+
+    async def test_sink_replans_short_collision_but_preserves_explicit_and_six_code(
+        self,
+    ) -> None:
+        """The public batch sink never sends an unapproved short-code collision."""
+        import importlib
+
+        draft_tools = importlib.import_module(
+            "keytao_bot.skills.keytao-draft.tools"
+        )
+
+        sent_items = []
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "batchId": "batch-homophone",
+                    "contentVersion": 8,
+                    "warningDigest": "a" * 64,
+                    "warnings": [],
+                    "warnedCount": 0,
+                }
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, _url, **_kwargs):
+                raise AssertionError("the bounded request helper owns dispatch")
+
+        async def request_with_retries(_requester, **_kwargs):
+            return FakeResponse()
+
+        def request_body(payload):
+            sent_items.append(payload["items"])
+            return json.dumps(payload, ensure_ascii=False).encode()
+
+        async def validate(items):
+            return [dict(item) for item in items], []
+
+        async def encode(word, requested_code=None):
+            return {
+                "success": True,
+                "word": word,
+                "candidateCodes": ["ssld", "ssldo", "ssldou"],
+            }
+
+        occupancy = {
+            "success": True,
+            "results": [
+                {"code": "ssld", "phrases": []},
+                {"code": "ssldo", "phrases": []},
+                {"code": "ssldou", "phrases": []},
+            ],
+        }
+        ranking = {
+            "status": "already_ordered",
+            "proposedOrder": [
+                {"word": "洒漏", "weight": 0},
+                {"word": "撒漏", "weight": 1},
+            ],
+        }
+        short_collision = [
+            {"action": "Create", "word": "洒漏", "code": "ssld"},
+            {"action": "Create", "word": "撒漏", "code": "ssld"},
+        ]
+
+        with (
+            patch.object(draft_tools, "get_bot_token", return_value="token"),
+            patch.object(
+                draft_tools,
+                "get_latest_draft_batch",
+                new=AsyncMock(return_value="batch-homophone"),
+            ),
+            patch.object(
+                draft_tools,
+                "_fetch_encode_candidates",
+                new=AsyncMock(side_effect=encode),
+            ) as encode_mock,
+            patch.object(
+                draft_tools,
+                "_lookup_codes_raw",
+                new=AsyncMock(return_value=occupancy),
+            ) as occupancy_mock,
+            patch.object(
+                draft_tools,
+                "_fetch_draft_snapshot",
+                new=AsyncMock(return_value={"count": 0, "items": [], "summary": {}}),
+            ),
+            patch.object(
+                draft_tools,
+                "rank_code_chain_by_commonness",
+                new=AsyncMock(return_value=ranking),
+            ),
+            patch.object(
+                draft_tools,
+                "_split_items_by_code_validation",
+                new=AsyncMock(side_effect=validate),
+            ),
+            patch.object(
+                draft_tools.http_client,
+                "request_with_retries",
+                side_effect=request_with_retries,
+            ),
+            patch.object(
+                draft_tools,
+                "_json_request_body",
+                side_effect=request_body,
+            ),
+            patch.object(
+                draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+            ),
+        ):
+            replanned = await draft_tools.keytao_batch_add_to_draft(
+                "qq",
+                "123",
+                short_collision,
+                preview_only=True,
+            )
+            explicit = await draft_tools.keytao_batch_add_to_draft(
+                "qq",
+                "123",
+                short_collision,
+                preview_only=True,
+                _allow_same_code=True,
+            )
+            six_code = await draft_tools.keytao_batch_add_to_draft(
+                "qq",
+                "123",
+                [
+                    {"action": "Create", "word": "六码甲", "code": "abcdef"},
+                    {"action": "Create", "word": "六码乙", "code": "abcdef"},
+                ],
+                preview_only=True,
+            )
+
+        self.assertEqual(
+            [(item["word"], item["code"]) for item in sent_items[0]],
+            [("洒漏", "ssld"), ("撒漏", "ssldo")],
+        )
+        self.assertEqual(
+            [(item["word"], item["code"]) for item in sent_items[1]],
+            [("洒漏", "ssld"), ("撒漏", "ssld")],
+        )
+        self.assertEqual(
+            [item["code"] for item in sent_items[2]],
+            ["abcdef", "abcdef"],
+        )
+        self.assertIs(replanned["collisionReplanned"], True)
+        self.assertEqual(
+            [(item["word"], item["code"]) for item in replanned["effectiveItems"]],
+            [("洒漏", "ssld"), ("撒漏", "ssldo")],
+        )
+        self.assertEqual(
+            replanned["collisionReplanLine"],
+            "已调整：「撒漏」ssld→ssldo（同批短码不重码）",
+        )
+        self.assertNotIn("collisionReplanned", explicit)
+        self.assertNotIn("collisionReplanned", six_code)
+        self.assertEqual(encode_mock.await_count, 2)
+        occupancy_mock.assert_awaited_once()
+
+    async def test_replanned_sink_set_waits_for_one_new_confirmation(self) -> None:
+        """A changed exact set is displayed and sealed before any replay."""
+        from keytao_bot.plugins import chat_commands as commands_module
+
+        requested = [
+            {"action": "Create", "word": "洒漏", "code": "ssld"},
+            {"action": "Create", "word": "撒漏", "code": "ssld"},
+        ]
+        effective = [
+            requested[0],
+            {"action": "Create", "word": "撒漏", "code": "ssldo"},
+        ]
+        calls = []
+
+        async def fake_call(tool_name, arguments, *_args, **_kwargs):
+            calls.append((tool_name, dict(arguments)))
+            return json.dumps({
+                "success": False,
+                "requiresConfirmation": True,
+                "batchId": "batch-replanned",
+                "contentVersion": 9,
+                "warningDigest": "b" * 64,
+                "warnings": [],
+                "warnedCount": 0,
+                "collisionReplanned": True,
+                "effectiveItems": effective,
+                "collisionReplanLine": "已调整：「撒漏」ssld→ssldo（同批短码不重码）",
+            }, ensure_ascii=False)
+
+        with patch.object(
+            commands_module,
+            "call_tool_function",
+            side_effect=fake_call,
+        ):
+            result = await commands_module._perform_batch_add_to_draft_and_submit(
+                requested,
+                "qq",
+                "123",
+                auto_confirm=True,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("已调整：「撒漏」ssld→ssldo", result.text)
+        self.assertEqual(result.text.count(pending_confirmation_copy()), 1)
+        self.assertIsNotNone(result.pending_state)
+        self.assertEqual(result.pending_state.args["items"], effective)
+        self.assertEqual(result.pending_state.confirmation_source, "server_warning")
+
     async def test_single_word_code_choice_is_redrawn_and_executes_from_record(self) -> None:
         from keytao_bot.plugins import chat_routing as routing_module
         from keytao_bot.plugins import chat_commands as commands_module
@@ -11831,6 +12213,82 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 "materialized-batch" in result,
             ),
             (2, True, 0, "d" * 64, False, True),
+        )
+
+    async def test_model_composed_collision_seals_replan_before_replay(self) -> None:
+        """A model-composed duplicate cannot auto-confirm the pre-replan set."""
+        requested = [
+            {"action": "Create", "word": "洒漏", "code": "ssld"},
+            {"action": "Create", "word": "撒漏", "code": "ssld"},
+        ]
+        effective = [
+            requested[0],
+            {"action": "Create", "word": "撒漏", "code": "ssldi"},
+        ]
+        calls = []
+
+        async def dispatch(**kwargs):
+            calls.append(dict(kwargs))
+            self.assertFalse(kwargs.get("confirmed"))
+            return {
+                "success": False,
+                "requiresConfirmation": True,
+                "warnings": [],
+                "warnedCount": 0,
+                "batchId": "collision-preview",
+                "batchIdProvisional": True,
+                "contentVersion": 0,
+                "warningDigest": "f" * 64,
+                "collisionReplanned": True,
+                "effectiveItems": effective,
+                "collisionReplanLine": "untrusted display text",
+            }
+
+        store = MemoryConversationStateStore()
+        client = _FakeClient([_fake_response(
+            "tool_calls",
+            tool_calls=[_named_tool_call(
+                "call-collision",
+                "keytao_batch_add_to_draft",
+                {"items": requested},
+            )],
+        )])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_BatchAddSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: dispatch if name == "keytao_batch_add_to_draft" else None,
+                frozenset({"keytao_batch_add_to_draft"}),
+            ),
+            state_store=store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="collision-owner",
+            mutations_allowed=True,
+        )
+
+        result = await orchestrator.run(
+            "喵喵\n加词 洒漏 ssld\n加词 撒漏 ssld",
+            context,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("已调整：「撒漏」ssld→ssldi（同批短码不重码）", result)
+        self.assertEqual(result.count(pending_confirmation_copy()), 1)
+        record = store.get_record(context.conversation_address)
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.args["items"], effective)
+        self.assertEqual(record.state.confirmation_source, "server_warning")
+        from keytao_bot.plugins import openai_chat as openai_chat_module
+        self.assertTrue(
+            openai_chat_module._advertised_reply_matches_live_record(
+                result,
+                record,
+            )
         )
 
     async def test_sealed_multi_add_cannot_end_as_candidate_only_reply(self) -> None:

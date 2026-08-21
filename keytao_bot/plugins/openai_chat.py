@@ -33,6 +33,7 @@ from ..harness.conversation import (
     normalize_conversation_key,
 )
 from ..harness import authorization_grammar as _authorization_grammar
+from ..harness import state as _state
 from ..harness.state import (
     ActiveDraftOperation,
     ConversationLockStore,
@@ -1951,6 +1952,16 @@ def _advertised_reply_matches_live_record(
     advertises_batch_action = bool(
         contract.batch_assent_forms or contract.deictic_batch_command
     )
+    collision_replan_ticket = bool(
+        isinstance(state, PendingToolConfirm)
+        and state.function_name == "keytao_batch_add_to_draft"
+        and state.confirmation_source == "server_warning"
+        and _state.server_warning_ticket_is_complete(state)
+        and isinstance(state.args.get("_pending_display"), dict)
+        and str(
+            state.args["_pending_display"].get("collisionReplanLine") or ""
+        ).startswith("已调整：")
+    )
     if advertises_batch_action and not (
         (
             isinstance(state, PendingToolConfirm)
@@ -1963,6 +1974,7 @@ def _advertised_reply_matches_live_record(
         return False
     if contract.candidate_selection and not (
         isinstance(state, PendingAddWord)
+        or collision_replan_ticket
         or (
             isinstance(state, PendingToolConfirm)
             and isinstance(state.args.get("_candidate_scopes"), list)
@@ -3997,6 +4009,12 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                                             state.args.get("expected_warning_digest") or ""
                                         ),
                                         auto_confirm=True,
+                                        allow_same_code=(
+                                            state.args.get("_allow_same_code") is True
+                                            or _authorization_grammar.explicit_same_code_requested(
+                                                ctx.normalized_message_text
+                                            )
+                                        ),
                                     ),
                                 ),
                                 ctx.bot,

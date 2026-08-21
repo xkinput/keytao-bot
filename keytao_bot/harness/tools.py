@@ -1019,6 +1019,7 @@ from .authorization_grammar import (
     _mask_quoted_record_frames,
     _normalize_positional_same_code_markers,
     _positional_same_code_requested,
+    explicit_same_code_requested,
     _record_frame_is_mutation_operand,
     _has_complete_mutation_instruction,
     _record_frame_wraps_complete_mutation,
@@ -1542,6 +1543,7 @@ class ToolExecutor:
         # their value.
         call_args.pop("_reviewed_pinyin", None)
         call_args.pop("_reviewed_candidate_codes", None)
+        internal_same_code = call_args.pop("_allow_same_code", None) is True
 
         def inject_reviewed_validation(
             target: Dict,
@@ -1562,6 +1564,8 @@ class ToolExecutor:
                 target["_reviewed_candidate_codes"] = candidate_codes
 
         if not context.current_message:
+            if tool_name == "keytao_batch_add_to_draft" and internal_same_code:
+                call_args["_allow_same_code"] = True
             if tool_name == "keytao_create_phrase":
                 word = str(call_args.get("word") or "").strip()
                 code = str(call_args.get("code") or "").strip().lower()
@@ -1571,6 +1575,11 @@ class ToolExecutor:
                 inject_reviewed_validation(call_args, capability, code)
             return call_args
         message = _mutation_authorization_view(context.current_message or "")
+        if (
+            tool_name == "keytao_batch_add_to_draft"
+            and explicit_same_code_requested(context.current_message or "")
+        ):
+            call_args["_allow_same_code"] = True
 
         if (
             tool_name == "keytao_submit_batch"

@@ -4180,6 +4180,266 @@ async def scenario_s32(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S33_WORDS = ("洒漏", "撒漏")
+S33_SIX_WORDS = ("洒漏", "洒溇")
+S33_DISCOVERY = "喵喵 加词 洒漏 撒漏"
+
+
+async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
+    """Pin batch-aware homophone allocation and the sink collision controls."""
+    messages: list[str] = []
+    replies: list[str] = []
+    dictionary_cleanups: list[dict[str, Any]] = []
+
+    async def reset_words() -> None:
+        dictionary_cleanup = await ctx.next_client.remove_rig_owned_dictionary_words(
+            platform_id=ctx.platform_id,
+            admin_token=ctx.admin_token,
+            scenario_id="S33",
+            fixture_words=(*S33_WORDS, "洒溇"),
+        )
+        require(
+            dictionary_cleanup.get("verified") is True,
+            f"S33 dictionary cleanup was not verified: {dictionary_cleanup}",
+        )
+        dictionary_cleanups.append(dictionary_cleanup)
+        cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(cleanup.get("success") is True, f"S33 draft cleanup failed: {cleanup}")
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    async def submit_advertised(label: str, discovery: str) -> tuple[dict[str, Any], dict[str, str]]:
+        displayed = dict(advertised_batch_binding_pairs(discovery))
+        require(
+            set(displayed) == set(S33_WORDS),
+            f"S33 {label} discovery did not bind both homophones: {discovery}",
+        )
+        cutoff = max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+        messages.append("加入并提交")
+        reply = await ctx.send("加入并提交")
+        replies.append(reply)
+        batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=cutoff,
+        )
+        if not batch_id:
+            require(
+                pending_confirmation_copy() in reply,
+                f"S33 {label} assent neither submitted nor exposed one ticket: {reply}",
+            )
+            messages.append("确认")
+            confirm_reply = await ctx.send("确认")
+            replies.append(confirm_reply)
+            batch_id = _successful_submit_batch_id(
+                ctx.attempt_events(),
+                after_sequence=cutoff,
+            )
+        require(batch_id, f"S33 {label} did not submit its advertised set")
+        batch = await ctx.next_client.get_admin_batch(
+            batch_id=batch_id,
+            admin_token=ctx.admin_token,
+        )
+        require(
+            batch.get("status") in {"Submitted", "Approved"},
+            f"S33 {label} batch was not submitted: {batch}",
+        )
+        for word, code in displayed.items():
+            require(
+                _submitted_item(batch, word=word, code=code) is not None,
+                f"S33 {label} batch lacks {word}@{code}: {batch}",
+            )
+        return batch, displayed
+
+    await reset_words()
+    messages.append(S33_DISCOVERY)
+    discovery = await ctx.send(S33_DISCOVERY)
+    replies.append(discovery)
+    main_pairs = dict(advertised_batch_binding_pairs(discovery))
+    require(
+        set(main_pairs) == set(S33_WORDS)
+        and len(set(main_pairs.values())) == 2,
+        f"S33 candidate display repeated a short recommendation: {discovery}",
+    )
+    review_events = [
+        event
+        for event in ctx.attempt_events()
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_prepare_reviewed_add"
+        and str((event.get("result") or {}).get("word") or "") in S33_WORDS
+    ]
+
+    def reviewed_candidate_chain(event: dict[str, Any]) -> tuple[str, ...]:
+        result = event.get("result") or {}
+        direct = ordered_candidate_codes(result)
+        if direct:
+            return tuple(direct)
+        pronunciations = result.get("pronunciations") or []
+        recommended = str(result.get("recommendedCode") or "").lower()
+        pronunciation = next(
+            (
+                item for item in pronunciations
+                if isinstance(item, dict)
+                and str(item.get("recommendedCode") or "").lower() == recommended
+            ),
+            pronunciations[0] if pronunciations else {},
+        )
+        return tuple(ordered_candidate_codes(pronunciation))
+
+    review_chains = {
+        str((event.get("result") or {}).get("word") or ""):
+            reviewed_candidate_chain(event)
+        for event in review_events
+    }
+    require(
+        len(review_chains) == 2
+        and all(review_chains.values())
+        and len({chain[0] for chain in review_chains.values()}) == 1,
+        f"S33 reviews did not expose one common candidate family: {review_events}",
+    )
+    candidate_family = next(iter(review_chains.values()))[0]
+    main_batch, main_displayed = await submit_advertised("distinct", discovery)
+    require(
+        len(messages) == 2,
+        f"S33 distinct reviewed set required an extra confirmation: {replies}",
+    )
+
+    await reset_words()
+    explicit_request = (
+        f"喵喵\n加词 {S33_WORDS[0]} {candidate_family}\n"
+        f"加词 {S33_WORDS[1]} {candidate_family}\n同码"
+    )
+    explicit_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(explicit_request)
+    explicit_reply = await ctx.send(explicit_request)
+    replies.append(explicit_reply)
+    explicit_draft = await ctx.draft()
+    if len(explicit_draft.get("items") or []) != 2:
+        require(
+            pending_confirmation_copy() in explicit_reply,
+            f"S33 explicit same-code request neither wrote nor exposed one ticket: {explicit_reply}",
+        )
+        messages.append("确认")
+        replies.append(await ctx.send("确认"))
+        explicit_draft = await ctx.draft()
+    explicit_items = [
+        item_key(item) for item in explicit_draft.get("items") or []
+    ]
+    require(
+        len(explicit_items) == 2
+        and {
+            (action, word, code) for action, word, code in explicit_items
+        } == {
+            ("Create", word, candidate_family) for word in S33_WORDS
+        },
+        f"S33 explicit same-code request did not preserve the duplicate: {explicit_draft}",
+    )
+    explicit_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > explicit_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(
+        explicit_events
+        and all(
+            (event.get("result") or {}).get("collisionBlocked") is not True
+            and (event.get("result") or {}).get("collisionReplanned") is not True
+            for event in explicit_events
+        ),
+        f"S33 explicit same-code opt-in did not pass the sink: {explicit_events}",
+    )
+
+    await reset_words()
+    six_code = "ssldaa"
+    six_command = (
+        f"喵喵\n加词 {S33_SIX_WORDS[0]} {six_code}\n"
+        f"加词 {S33_SIX_WORDS[1]} {six_code}"
+    )
+    six_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(six_command)
+    six_reply = await ctx.send(six_command)
+    replies.append(six_reply)
+    six_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > six_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(
+        six_events
+        and all(
+            (event.get("result") or {}).get("collisionBlocked") is not True
+            and (event.get("result") or {}).get("collisionReplanned") is not True
+            for event in six_events
+        ),
+        f"S33 six-code duplicate did not pass the sink gate: {six_events}",
+    )
+
+    await reset_words()
+    short_code = candidate_family
+    collision_command = (
+        f"喵喵\n加词 {S33_WORDS[0]} {short_code}\n"
+        f"加词 {S33_WORDS[1]} {short_code}"
+    )
+    collision_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(collision_command)
+    collision_reply = await ctx.send(collision_command)
+    replies.append(collision_reply)
+    assert_reply_mentions(collision_reply, "已调整：", f"{short_code}→")
+    require(
+        collision_reply.count(pending_confirmation_copy()) == 1
+        and not (await ctx.draft()).get("items"),
+        f"S33 sink replan did not pause on one changed-set confirmation: {collision_reply}",
+    )
+    collision_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > collision_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(
+        len(collision_events) == 1
+        and (collision_events[0].get("result") or {}).get("collisionReplanned") is True,
+        f"S33 model-composed collision did not replan exactly once at the sink: {collision_events}",
+    )
+    messages.append("取消")
+    replies.append(await ctx.send("取消"))
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "words": list(S33_WORDS),
+            "candidateChains": {
+                word: list(chain) for word, chain in review_chains.items()
+            },
+            "candidateFamily": candidate_family,
+            "priorityOrder": list(main_displayed),
+            "distinctCodes": list(main_displayed.values()),
+            "mainBatchId": main_batch.get("id"),
+            "explicitSameCode": candidate_family,
+            "sixCodeControl": six_code,
+            "sinkReplanned": True,
+            "dictionaryCleanups": dictionary_cleanups,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -4213,6 +4473,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S30", "read cancel and natural assent closure", scenario_s30),
     Scenario("S31", "verbatim positional eviction closure", scenario_s31),
     Scenario("S32", "draft-aware and explicit-list chain scope", scenario_s32),
+    Scenario("S33", "batch-aware homophone slot allocation", scenario_s33),
 )
 
 

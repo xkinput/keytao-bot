@@ -323,6 +323,14 @@ lines. The sealed incident shape is exactly `Delete 米等@mkdr`,
 successful dictionary and draft-weight receipts and materialize all three
 changes before the compact completion reply.
 
+S33 replays the 2026-08-21 homophone batch incident with `洒漏` and `撒漏`.
+One reviewed turn must advertise two different recommendations from their one
+shared `ssld*` occupancy snapshot, ordered by the commonness comparator, and a
+bare `加入并提交` must submit those exact distinct pairs without another prompt.
+Controls preserve an explicit `同码` duplicate and a full six-code duplicate,
+while a model-composed short-code collision must be replanned at the batch sink,
+shown as one compact changed-code line, and stopped on one new confirmation.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`
