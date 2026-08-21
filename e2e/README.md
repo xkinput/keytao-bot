@@ -331,6 +331,15 @@ Controls preserve an explicit `同码` duplicate and a full six-code duplicate,
 while a model-composed short-code collision must be replanned at the batch sink,
 shown as one compact changed-code line, and stopped on one new confirmation.
 
+S34 replays the 2026-08-21 pending-batch incident with `开团→khtt`. It creates
+and submits one actor-owned manual-review batch through the local server, then
+queries `开团` again. The reply must lead with the exact Submitted batch link,
+must not restart reviewed-add discovery, and may advertise only actions that
+remain available. A fresh explicit add followed by `加入` must stop at one
+local confirmation before an exact duplicate reaches the server write route.
+After cancellation, selecting a different reviewed code must proceed through
+the same sink while preserving the Submitted reminder as the first line.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`

@@ -39,6 +39,7 @@ from keytao_bot.utils.pending_confirmation import (
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
+    pending_word_reminder_lines,
     plain_warning_message,
     render_server_backed_batch_candidates,
     render_server_backed_word_set,
@@ -1768,6 +1769,11 @@ class AgentOrchestrator:
                         result_data,
                         authoritative_result_links,
                     )
+                    self._capture_authoritative_pending_reminders(
+                        fn_name,
+                        result_data,
+                        authoritative_result_links,
+                    )
                     self._capture_authoritative_shift_notice(
                         execution_route.tool_name,
                         result_data,
@@ -3099,6 +3105,26 @@ class AgentOrchestrator:
             links["_createNotices"] = "\n".join(notices[:8])
 
     @staticmethod
+    def _capture_authoritative_pending_reminders(
+        tool_name: str,
+        result: Dict[str, Any],
+        links: Dict[str, str],
+    ) -> None:
+        """Preserve only validated actor-bound pending facts at reply lead."""
+        if tool_name not in {"keytao_create_phrase", "keytao_batch_add_to_draft"}:
+            return
+        reminders = [
+            line
+            for line in str(links.get("_pendingReminders") or "").splitlines()
+            if line
+        ]
+        for line in pending_word_reminder_lines(result.get("pendingItems")):
+            if line not in reminders:
+                reminders.append(line)
+        if reminders:
+            links["_pendingReminders"] = "\n".join(reminders[:16])
+
+    @staticmethod
     def _capture_authoritative_shift_notice(
         tool_name: str,
         result: Dict[str, Any],
@@ -3190,6 +3216,21 @@ class AgentOrchestrator:
         while cleaned_lines and not cleaned_lines[-1]:
             cleaned_lines.pop()
         content = "\n".join(cleaned_lines)
+
+        pending_reminders = [
+            line
+            for line in str(links.get("_pendingReminders") or "").splitlines()
+            if line
+        ]
+        if pending_reminders:
+            content_lines = [
+                line for line in content.splitlines()
+                if line.strip() not in pending_reminders
+            ]
+            body = "\n".join(content_lines).strip()
+            content = "\n".join(pending_reminders) + (
+                ("\n\n" + body) if body else ""
+            )
 
         lines: List[str] = [
             line
@@ -4432,6 +4473,25 @@ class AgentOrchestrator:
             key: value for key, value in fn_args.items()
             if key not in ("confirmed", "platform", "platform_id")
         }
+        if result_data.get("pendingDuplicateConfirmation") is True:
+            saved["_pending_submitted_confirmed"] = True
+            pending_state = PendingToolConfirm(
+                function_name=fn_name,
+                args=saved,
+                confirmation_source="local_preview",
+            )
+            saved_ok = self._state_store.set(
+                conv_key,
+                pending_state,
+                space_key=space_key,
+                owner_label=owner_label,
+            )
+            if saved_ok:
+                logger.info(
+                    "Saved local pending-submitted duplicate confirmation: "
+                    f"{fn_name}"
+                )
+            return saved_ok
         pending_state = server_warning_pending_state(
             PendingToolConfirm(function_name=fn_name, args=saved),
             result_data,

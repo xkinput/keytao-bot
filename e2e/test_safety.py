@@ -47,6 +47,8 @@ from .scenarios import (
     S33_DISCOVERY,
     S33_SIX_WORDS,
     S33_WORDS,
+    S34_PENDING_CODE,
+    S34_WORD,
     assert_batch_link_hosts,
     same_unique_item_set,
 )
@@ -405,15 +407,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S31 executes the verbatim incident command", readme)
         self.assertIn("S32 replays both 2026-08-20 chain-scope incidents", readme)
         self.assertIn("S33 replays the 2026-08-21 homophone batch incident", readme)
+        self.assertIn("S34 replays the 2026-08-21 pending-batch incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s33(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s34(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 34)],
+            [f"S{index}" for index in range(1, 35)],
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -822,6 +825,17 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             "撒漏": ("sǎ", "lòu"),
             "洒溇": ("sǎ", "lóu"),
         })
+
+    def test_s34_owns_the_exact_pending_batch_incident_fixture(self) -> None:
+        self.assertEqual(S34_WORD, "开团")
+        self.assertEqual(S34_PENDING_CODE, "khtt")
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S34"]
+        self.assertEqual(fixture["probe_words"], (S34_WORD,))
+        entry = next(
+            row for row in fixture["rows"]
+            if row["kind"] == "entry" and row["entry"] == S34_WORD
+        )
+        self.assertEqual(tuple(entry["pinyins"]), ("kāi", "tuán"))
 
     async def test_s29_seeds_the_exact_weighted_mkdr_chain(self) -> None:
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S29"]

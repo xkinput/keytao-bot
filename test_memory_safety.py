@@ -11017,6 +11017,15 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             patch.object(draft_tools, "get_bot_token", return_value="token"),
             patch.object(
                 draft_tools,
+                "keytao_pending_items_by_words",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "complete": True,
+                    "items": [],
+                }),
+            ),
+            patch.object(
+                draft_tools,
                 "get_latest_draft_batch",
                 new=AsyncMock(return_value="batch-homophone"),
             ),

@@ -38,7 +38,11 @@ from keytao_bot.utils.keytao_review import (
     prepare_reviewed_word,
     rank_code_chain_by_commonness,
 )
-from keytao_bot.utils.pending_confirmation import _BIND_HELP_TEXT, render_remediation_reply
+from keytao_bot.utils.pending_confirmation import (
+    _BIND_HELP_TEXT,
+    render_remediation_reply,
+    trusted_pending_word_items,
+)
 
 
 ACTION_LABELS = {
@@ -1509,6 +1513,57 @@ async def _lookup_codes_raw(codes: List[str]) -> Dict:
 
 
 async def keytao_create_phrase(
+    platform: str,
+    platform_id: str,
+    word: str,
+    code: str,
+    action: str = "Create",
+    old_word: Optional[str] = None,
+    type: str = "Phrase",
+    remark: Optional[str] = None,
+    confirmed: bool = False,
+    needs_manual_review: Optional[bool] = None,
+    batch_id: Optional[str] = None,
+    expected_content_version: Optional[int] = None,
+    expected_warning_digest: str = "",
+    preview_only: bool = False,
+    weight: Optional[int] = None,
+    _reviewed_pinyin: str = "",
+    _reviewed_candidate_codes: Optional[List[str]] = None,
+    _pending_submitted_confirmed: bool = False,
+) -> Dict:
+    """Guard Create writes with current actor-bound draft/submitted facts."""
+    guard, pending_items = await _pending_create_guard(
+        platform,
+        platform_id,
+        [{"action": action, "word": word, "code": code, "type": type}],
+        duplicate_confirmed=_pending_submitted_confirmed is True,
+    )
+    if guard is not None:
+        return guard
+    result = await _keytao_create_phrase_after_pending_check(
+        platform,
+        platform_id,
+        word,
+        code,
+        action=action,
+        old_word=old_word,
+        type=type,
+        remark=remark,
+        confirmed=confirmed,
+        needs_manual_review=needs_manual_review,
+        batch_id=batch_id,
+        expected_content_version=expected_content_version,
+        expected_warning_digest=expected_warning_digest,
+        preview_only=preview_only,
+        weight=weight,
+        _reviewed_pinyin=_reviewed_pinyin,
+        _reviewed_candidate_codes=_reviewed_candidate_codes,
+    )
+    return _attach_pending_items(result, pending_items)
+
+
+async def _keytao_create_phrase_after_pending_check(
     platform: str,
     platform_id: str,
     word: str,
@@ -3114,6 +3169,332 @@ async def keytao_list_draft_items(
         }
 
 
+def _normalized_pending_words(words: object) -> Optional[List[str]]:
+    if not isinstance(words, list):
+        return None
+    normalized: List[str] = []
+    for value in words:
+        if not isinstance(value, str):
+            return None
+        word = unicodedata.normalize("NFKC", value).strip()
+        if not word or len(word) > 50 or any(ch in word for ch in "\r\n\x00"):
+            return None
+        if word not in normalized:
+            normalized.append(word)
+    return normalized if 1 <= len(normalized) <= 50 else None
+
+
+async def keytao_pending_items_by_words(
+    platform: str,
+    platform_id: str,
+    words: List[str],
+) -> Dict:
+    """Read the actor's current draft and all discoverable Submitted items."""
+    requested_words = _normalized_pending_words(words)
+    if requested_words is None:
+        return {
+            "success": False,
+            "complete": False,
+            "message": "待审核词条查询需要 1–50 个完整词语",
+        }
+    api_base = get_keytao_url()
+    if not get_bot_token():
+        return {
+            "success": False,
+            "complete": False,
+            "message": "喵喵配置错误：缺少API token",
+        }
+
+    find_body = _json_request_body({
+        "platform": platform,
+        "platformId": platform_id,
+    })
+
+    async def find_actor() -> Optional[int]:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await http_client.request_with_retries(
+                lambda: client.post(
+                    f"{api_base}/api/bot/user/find",
+                    headers=get_bot_headers(
+                        platform,
+                        platform_id,
+                        content_type=True,
+                        method="POST",
+                        path="/api/bot/user/find",
+                        raw_body=find_body,
+                    ),
+                    content=find_body,
+                ),
+                method="POST",
+                url="/api/bot/user/find",
+                idempotent=True,
+            )
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200:
+                raise KeytaoApiError(
+                    f"user find returned HTTP {response.status_code}"
+                )
+            payload = response.json()
+            user = payload.get("user") if isinstance(payload, dict) else None
+            actor_id = _safe_numeric_id(
+                user.get("id") if isinstance(user, dict) else None
+            )
+            if payload.get("found") is not True or actor_id is None:
+                raise KeytaoApiError("user find returned an incomplete actor")
+            return actor_id
+
+    try:
+        draft_result, actor_id = await asyncio.gather(
+            keytao_list_draft_items(platform, platform_id),
+            find_actor(),
+        )
+        if actor_id is None:
+            return {
+                "success": True,
+                "complete": True,
+                "bound": False,
+                "notBound": True,
+                "words": requested_words,
+                "items": [],
+            }
+        if not draft_result.get("success") or not isinstance(
+            draft_result.get("items"), list
+        ):
+            raise KeytaoApiError("current draft snapshot was incomplete")
+
+        pending_items: List[Dict] = []
+        requested_set = set(requested_words)
+        draft_batch_id = str(draft_result.get("batchId") or "").strip()
+        if draft_batch_id:
+            draft_url = make_batch_url(draft_batch_id)
+            for item in draft_result.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                item_word = str(item.get("word") or "").strip()
+                old_word = str(item.get("oldWord") or item.get("old_word") or "").strip()
+                if item_word not in requested_set and old_word not in requested_set:
+                    continue
+                pending_items.append({
+                    "source": "draft",
+                    "batchId": draft_batch_id,
+                    "batchUrl": draft_url,
+                    "batchStatus": "Draft",
+                    "itemStatus": str(item.get("status") or "Draft"),
+                    "action": str(item.get("action") or "Create"),
+                    "word": item_word,
+                    "oldWord": old_word,
+                    "code": str(item.get("code") or "").strip().lower(),
+                    "type": str(item.get("type") or "Phrase"),
+                })
+
+        candidate_batches: Dict[str, Dict] = {}
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            for word in requested_words:
+                page = 1
+                while True:
+                    response = await http_client.request_with_retries(
+                        lambda page=page, word=word: client.get(
+                            f"{api_base}/api/batches",
+                            params={
+                                "status": "Submitted",
+                                "search": word,
+                                "page": page,
+                                "pageSize": 100,
+                            },
+                        ),
+                        method="GET",
+                        url="/api/batches",
+                        idempotent=True,
+                    )
+                    if response.status_code != 200:
+                        raise KeytaoApiError(
+                            f"batch search returned HTTP {response.status_code}"
+                        )
+                    payload = response.json()
+                    batches = payload.get("batches") if isinstance(payload, dict) else None
+                    pagination = payload.get("pagination") if isinstance(payload, dict) else None
+                    if not isinstance(batches, list) or not isinstance(pagination, dict):
+                        raise KeytaoApiError("batch search returned an incomplete page")
+                    total_pages = pagination.get("totalPages")
+                    current_page = pagination.get("page")
+                    if (
+                        not isinstance(total_pages, int)
+                        or isinstance(total_pages, bool)
+                        or total_pages < 0
+                        or total_pages > 100
+                        or current_page != page
+                    ):
+                        raise KeytaoApiError("batch search pagination was incomplete")
+                    for batch in batches:
+                        creator = batch.get("creator") if isinstance(batch, dict) else None
+                        candidate_id = _safe_path_segment(
+                            batch.get("id") if isinstance(batch, dict) else None
+                        )
+                        creator_id = _safe_numeric_id(
+                            creator.get("id") if isinstance(creator, dict) else None
+                        )
+                        if (
+                            candidate_id
+                            and creator_id == actor_id
+                            and batch.get("status") == "Submitted"
+                        ):
+                            candidate_batches[candidate_id] = batch
+                    if page >= total_pages:
+                        break
+                    page += 1
+
+            for batch_id in candidate_batches:
+                response = await http_client.request_with_retries(
+                    lambda batch_id=batch_id: client.get(
+                        f"{api_base}/api/batches/{batch_id}"
+                    ),
+                    method="GET",
+                    url="/api/batches/{id}",
+                    idempotent=True,
+                )
+                if response.status_code != 200:
+                    raise KeytaoApiError(
+                        f"batch detail returned HTTP {response.status_code}"
+                    )
+                payload = response.json()
+                batch = payload.get("batch") if isinstance(payload, dict) else None
+                if (
+                    not isinstance(batch, dict)
+                    or str(batch.get("id") or "") != batch_id
+                    or _safe_numeric_id(batch.get("creatorId")) != actor_id
+                    or batch.get("status") != "Submitted"
+                    or not isinstance(batch.get("pullRequests"), list)
+                ):
+                    raise KeytaoApiError("batch detail did not match the actor/status claim")
+                batch_url = make_batch_url(batch_id)
+                for item in batch["pullRequests"]:
+                    if not isinstance(item, dict):
+                        continue
+                    item_word = str(item.get("word") or "").strip()
+                    old_word = str(item.get("oldWord") or "").strip()
+                    if (
+                        item.get("status") != "Pending"
+                        or item_word not in requested_set
+                        and old_word not in requested_set
+                    ):
+                        continue
+                    pending_items.append({
+                        "source": "submitted",
+                        "batchId": batch_id,
+                        "batchUrl": batch_url,
+                        "batchStatus": "Submitted",
+                        "itemStatus": "Pending",
+                        "action": str(item.get("action") or "Create"),
+                        "word": item_word,
+                        "oldWord": old_word,
+                        "code": str(item.get("code") or "").strip().lower(),
+                        "type": str(item.get("type") or "Phrase"),
+                    })
+
+        trusted = trusted_pending_word_items(pending_items)
+        trusted.sort(key=lambda item: (
+            0 if item["source"] == "submitted" else 1,
+            item["word"],
+            item["code"],
+            item["batchId"],
+        ))
+        return {
+            "success": True,
+            "complete": True,
+            "bound": True,
+            "words": requested_words,
+            "items": trusted,
+        }
+    except (httpx.TimeoutException, httpx.TransportError, KeytaoApiError) as error:
+        return {
+            "success": False,
+            "complete": False,
+            "message": _draft_tool_failure(
+                "暂时无法核验当前草稿和待审核批次",
+                command="查看草稿",
+                error=error,
+                log_context="pending_items_by_words",
+            ),
+        }
+    except Exception as error:
+        return {
+            "success": False,
+            "complete": False,
+            "message": _draft_tool_failure(
+                "暂时无法核验当前草稿和待审核批次",
+                command="查看草稿",
+                error=error,
+                log_context="pending_items_by_words",
+            ),
+        }
+
+
+async def _pending_create_guard(
+    platform: str,
+    platform_id: str,
+    items: List[Dict],
+    *,
+    duplicate_confirmed: bool,
+) -> Tuple[Optional[Dict], List[Dict]]:
+    creates = [
+        item for item in items
+        if isinstance(item, dict)
+        and str(item.get("action") or "Create") == "Create"
+        and str(item.get("word") or "").strip()
+    ]
+    if not creates:
+        return None, []
+    words = list(OrderedDict.fromkeys(
+        str(item.get("word") or "").strip() for item in creates
+    ))
+    pending = await keytao_pending_items_by_words(platform, platform_id, words)
+    if pending.get("success") is not True or pending.get("complete") is not True:
+        return {
+            "success": False,
+            "pendingFactsIncomplete": True,
+            "message": pending.get("message")
+            or "暂时无法核验待审核词条，本次未写入",
+        }, []
+    pending_items = trusted_pending_word_items(pending.get("items"))
+    requested_pairs = {
+        (
+            str(item.get("word") or "").strip(),
+            str(item.get("code") or "").strip().lower(),
+        )
+        for item in creates
+    }
+    duplicates = [
+        item for item in pending_items
+        if item["source"] == "submitted"
+        and item["action"] == "Create"
+        and (item["word"], item["code"]) in requested_pairs
+    ]
+    if duplicates and not duplicate_confirmed:
+        return {
+            "success": False,
+            "requiresConfirmation": True,
+            "localConfirmationRequired": True,
+            "pendingDuplicateConfirmation": True,
+            "message": "该词已在审核中，确认再提交一条相同词条吗？",
+            "warnings": [{
+                "warningType": "pending_submitted_duplicate",
+                "word": item["word"],
+                "code": item["code"],
+                "batchUrl": item["batchUrl"],
+            } for item in duplicates],
+            "warnedCount": len(duplicates),
+            "pendingItems": pending_items,
+        }, pending_items
+    return None, pending_items
+
+
+def _attach_pending_items(result: Dict, pending_items: List[Dict]) -> Dict:
+    if pending_items:
+        result["pendingItems"] = [dict(item) for item in pending_items]
+    return result
+
+
 async def keytao_update_draft_item_weight(
     platform: str,
     platform_id: str,
@@ -4195,6 +4576,41 @@ async def _replan_intra_batch_create_collisions(
 
 
 async def keytao_batch_add_to_draft(
+    platform: str,
+    platform_id: str,
+    items: List[Dict],
+    batch_id: Optional[str] = None,
+    confirmed: bool = False,
+    expected_content_version: Optional[int] = None,
+    expected_warning_digest: str = "",
+    preview_only: bool = False,
+    _allow_same_code: bool = False,
+    _pending_submitted_confirmed: bool = False,
+) -> Dict:
+    """Guard every model/deterministic batch Create at the shared sink."""
+    guard, pending_items = await _pending_create_guard(
+        platform,
+        platform_id,
+        items,
+        duplicate_confirmed=_pending_submitted_confirmed is True,
+    )
+    if guard is not None:
+        return guard
+    result = await _keytao_batch_add_to_draft_after_pending_check(
+        platform,
+        platform_id,
+        items,
+        batch_id=batch_id,
+        confirmed=confirmed,
+        expected_content_version=expected_content_version,
+        expected_warning_digest=expected_warning_digest,
+        preview_only=preview_only,
+        _allow_same_code=_allow_same_code,
+    )
+    return _attach_pending_items(result, pending_items)
+
+
+async def _keytao_batch_add_to_draft_after_pending_check(
     platform: str,
     platform_id: str,
     items: List[Dict],
@@ -5829,6 +6245,7 @@ TOOLS += [
 
 # Tool registry for dynamic calling
 TOOL_FUNCTIONS = {
+    "keytao_pending_items_by_words": keytao_pending_items_by_words,
     "keytao_create_phrase": keytao_create_phrase,
     "keytao_submit_batch": keytao_submit_batch,
     "keytao_list_draft_items": keytao_list_draft_items,

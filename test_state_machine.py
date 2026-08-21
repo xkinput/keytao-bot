@@ -2307,6 +2307,8 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
             tool_calls.append((tool_name, arguments))
             if tool_name == "keytao_lookup_by_word":
                 return json.dumps({"success": True, "word": "洛阳纸贵", "phrases": []}, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []})
             if tool_name == "keytao_prepare_reviewed_add":
                 return json.dumps({
                     "success": True,
@@ -2375,7 +2377,8 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
             openai_chat_module.conversation_state_store = old_store
 
         check("lookup called first", tool_calls[0] == ("keytao_lookup_by_word", {"word": "洛阳纸贵"}))
-        check("review called second", tool_calls[1] == ("keytao_prepare_reviewed_add", {"word": "洛阳纸贵"}))
+        check("pending facts called second", tool_calls[1] == ("keytao_pending_items_by_words", {"words": ["洛阳纸贵"]}))
+        check("review called third", tool_calls[2] == ("keytao_prepare_reviewed_add", {"word": "洛阳纸贵"}))
         check("encode not needed on reviewed success", all(name != "keytao_encode" for name, _ in tool_calls))
         check("source shown", result is not None and "汉典" in result)
         check("valid code shown", result is not None and "lyfg" in result)
@@ -2390,6 +2393,354 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
         )
 
     asyncio.run(_run())
+
+
+def test_pending_submitted_word_query_leads_with_reminder_without_new_ticket():
+    """A repeated lookup must expose the actor's submitted item, not restart add."""
+    print("\n🧪 submitted word lookup is pending-aware")
+
+    async def _run():
+        calls = []
+        batch_url = "https://keytao.test/batch/ef5c5243"
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, arguments))
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({
+                    "success": True,
+                    "word": "开团",
+                    "phrases": [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({
+                    "success": True,
+                    "complete": True,
+                    "items": [{
+                        "source": "submitted",
+                        "batchId": "ef5c5243",
+                        "batchUrl": batch_url,
+                        "batchStatus": "Submitted",
+                        "itemStatus": "Pending",
+                        "action": "Create",
+                        "word": "开团",
+                        "code": "khtt",
+                        "type": "Phrase",
+                    }],
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        store = MemoryConversationStateStore()
+        old_store = openai_chat_module.conversation_state_store
+        openai_chat_module.conversation_state_store = store
+        conv_key = ConversationAddress.private("qq", "pending-user")
+        try:
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    AsyncMock(return_value=SimpleWordQueryIntent(
+                        True, ("开团",), "word_lookup", 0.99,
+                    )),
+                ),
+                patch.object(
+                    openai_chat_module,
+                    "call_tool_function",
+                    side_effect=fake_call,
+                ),
+            ):
+                reply = await _try_handle_simple_single_word_query(
+                    "开团", "qq", "pending-user", conv_key,
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+
+        expected = f"「开团」已在待审核批次中（→ khtt，审核中）：{batch_url}"
+        check("pending reminder leads", reply is not None and reply.startswith(expected))
+        check("repeat lookup does not review anew", all(
+            name != "keytao_prepare_reviewed_add" for name, _args in calls
+        ))
+        check("repeat lookup does not arm add", store.get_record(conv_key) is None)
+        check("repeat lookup offers only pending actions", reply is not None
+              and "其他编码" in reply and "撤回" in reply
+              and "候选" not in reply and "加入" not in reply)
+
+    asyncio.run(_run())
+
+
+def test_pending_submitted_duplicate_is_blocked_at_single_and_batch_sinks():
+    """Both mutation sinks require one local confirmation before an exact duplicate."""
+    print("\n🧪 submitted duplicate is blocked at both add sinks")
+
+    async def _run():
+        pending = {
+            "success": True,
+            "complete": True,
+            "items": [{
+                "source": "submitted",
+                "batchId": "ef5c5243",
+                "batchUrl": "https://keytao.test/batch/ef5c5243",
+                "batchStatus": "Submitted",
+                "itemStatus": "Pending",
+                "action": "Create",
+                "word": "开团",
+                "code": "khtt",
+                "type": "Phrase",
+            }],
+        }
+        with (
+            patch.object(
+                _draft_tools,
+                "keytao_pending_items_by_words",
+                new=AsyncMock(return_value=pending),
+                create=True,
+            ) as pending_query,
+            patch.object(
+                _draft_tools,
+                "get_latest_draft_batch",
+                new=AsyncMock(return_value="draft-batch"),
+            ),
+            patch.object(
+                _draft_tools,
+                "_validate_draft_item_code",
+                new=AsyncMock(return_value={"success": True}),
+            ),
+        ):
+            single = await _draft_tools.keytao_create_phrase(
+                "qq", "pending-user", "开团", "khtt", preview_only=True,
+            )
+            batch = await _draft_tools.keytao_batch_add_to_draft(
+                "qq",
+                "pending-user",
+                [{"action": "Create", "word": "开团", "code": "khtt", "type": "Phrase"}],
+                preview_only=True,
+            )
+
+        for label, result in (("single", single), ("batch", batch)):
+            check(f"{label} exact pending duplicate needs confirmation",
+                  result.get("requiresConfirmation") is True)
+            check(f"{label} exact pending duplicate is local ticket",
+                  result.get("pendingDuplicateConfirmation") is True)
+            check(f"{label} exact pending duplicate uses fixed warning",
+                  result.get("message") == "该词已在审核中，确认再提交一条相同词条吗？")
+        check("both sinks used the same pending facts", pending_query.await_count == 2)
+
+    asyncio.run(_run())
+
+
+def test_pending_items_query_filters_submitted_batches_to_bound_actor():
+    """Public search candidates become facts only after actor/detail revalidation."""
+    print("\n🧪 pending item query revalidates actor-owned submitted details")
+
+    class FakeResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            raise AssertionError("request helper owns dispatch")
+
+        async def get(self, *_args, **_kwargs):
+            raise AssertionError("request helper owns dispatch")
+
+    own_batch = "ef5c5243-0000-4000-8000-000000000001"
+    other_batch = "ef5c5243-0000-4000-8000-000000000002"
+
+    async def _run():
+        responses = [
+            FakeResponse(200, {
+                "found": True,
+                "user": {"id": 42, "name": "Rea"},
+            }),
+            FakeResponse(200, {
+                "batches": [
+                    {"id": own_batch, "status": "Submitted", "creator": {"id": 42}},
+                    {"id": other_batch, "status": "Submitted", "creator": {"id": 7}},
+                ],
+                "pagination": {"page": 1, "pageSize": 100, "total": 2, "totalPages": 1},
+            }),
+            FakeResponse(200, {
+                "batch": {
+                    "id": own_batch,
+                    "creatorId": 42,
+                    "status": "Submitted",
+                    "pullRequests": [{
+                        "status": "Pending",
+                        "action": "Create",
+                        "word": "开团",
+                        "code": "khtt",
+                        "type": "Phrase",
+                    }],
+                },
+            }),
+        ]
+        with (
+            patch.object(_draft_tools, "get_bot_token", return_value="token"),
+            patch.object(_draft_tools, "get_keytao_url", return_value="https://keytao.test"),
+            patch.object(_draft_tools, "get_bot_headers", return_value={}),
+            patch.object(
+                _draft_tools,
+                "keytao_list_draft_items",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "batchId": "draft-1",
+                    "items": [{
+                        "status": "Draft",
+                        "action": "Create",
+                        "word": "开团",
+                        "code": "khttv",
+                        "type": "Phrase",
+                    }],
+                }),
+            ),
+            patch.object(
+                _draft_tools.http_client,
+                "request_with_retries",
+                new=AsyncMock(side_effect=responses),
+            ) as request,
+            patch.object(
+                _draft_tools.httpx,
+                "AsyncClient",
+                side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
+            ),
+        ):
+            result = await _draft_tools.keytao_pending_items_by_words(
+                "qq", "pending-user", ["开团"],
+            )
+
+        check("pending query is complete", result.get("success") is True
+              and result.get("complete") is True)
+        check("submitted reminder sorts before current draft", [
+            item.get("source") for item in result.get("items", [])
+        ] == ["submitted", "draft"])
+        check("submitted item is exact", result["items"][0]["word"] == "开团"
+              and result["items"][0]["code"] == "khtt"
+              and result["items"][0]["batchId"] == own_batch)
+        check("other actor batch is never detailed", request.await_count == 3)
+
+    asyncio.run(_run())
+
+
+def test_different_code_proceeds_through_both_sinks_with_pending_fact():
+    """The owner rule warns on same word while preserving a new-code add."""
+    print("\n🧪 different code proceeds with the submitted reminder fact")
+
+    async def _run():
+        pending = {
+            "success": True,
+            "complete": True,
+            "items": [{
+                "source": "submitted",
+                "batchId": "ef5c5243",
+                "batchUrl": "https://keytao.test/batch/ef5c5243",
+                "batchStatus": "Submitted",
+                "itemStatus": "Pending",
+                "action": "Create",
+                "word": "开团",
+                "code": "khtt",
+                "type": "Phrase",
+            }],
+        }
+        with (
+            patch.object(
+                _draft_tools,
+                "keytao_pending_items_by_words",
+                new=AsyncMock(return_value=pending),
+            ),
+            patch.object(
+                _draft_tools,
+                "_keytao_create_phrase_after_pending_check",
+                new=AsyncMock(return_value={"success": True, "batchId": "draft-2"}),
+            ) as single_write,
+            patch.object(
+                _draft_tools,
+                "_keytao_batch_add_to_draft_after_pending_check",
+                new=AsyncMock(return_value={"success": True, "successCount": 1}),
+            ) as batch_write,
+        ):
+            single = await _draft_tools.keytao_create_phrase(
+                "qq", "pending-user", "开团", "khttv", preview_only=True,
+            )
+            batch = await _draft_tools.keytao_batch_add_to_draft(
+                "qq",
+                "pending-user",
+                [{"action": "Create", "word": "开团", "code": "khttv", "type": "Phrase"}],
+                preview_only=True,
+            )
+
+        check("single different-code add reaches server preview",
+              single_write.await_count == 1 and single.get("success") is True)
+        check("batch different-code add reaches server preview",
+              batch_write.await_count == 1 and batch.get("success") is True)
+        check("single different-code result keeps pending fact",
+              single.get("pendingItems") == pending["items"])
+        check("batch different-code result keeps pending fact",
+              batch.get("pendingItems") == pending["items"])
+
+    asyncio.run(_run())
+
+
+def test_model_batch_pending_fact_leads_and_arms_one_local_confirmation():
+    """Model-composed batches cannot drop the reminder or bypass exact duplicate assent."""
+    print("\n🧪 model batch sink keeps authoritative pending reminder and local ticket")
+    batch_url = "https://keytao.test/batch/ef5c5243"
+    result = {
+        "success": False,
+        "requiresConfirmation": True,
+        "localConfirmationRequired": True,
+        "pendingDuplicateConfirmation": True,
+        "message": "该词已在审核中，确认再提交一条相同词条吗？",
+        "pendingItems": [{
+            "source": "submitted",
+            "batchId": "ef5c5243",
+            "batchUrl": batch_url,
+            "batchStatus": "Submitted",
+            "itemStatus": "Pending",
+            "action": "Create",
+            "word": "开团",
+            "code": "khtt",
+            "type": "Phrase",
+        }],
+    }
+    links = {}
+    AgentOrchestrator._capture_authoritative_pending_reminders(
+        "keytao_batch_add_to_draft", result, links,
+    )
+    reply = AgentOrchestrator._append_authoritative_result_links(
+        "该词已在审核中，确认再提交一条相同词条吗？\n回复「确认」执行，或「取消」。",
+        links,
+    )
+    expected = f"「开团」已在待审核批次中（→ khtt，审核中）：{batch_url}"
+    check("model batch reminder leads", reply.startswith(expected))
+
+    store = MemoryConversationStateStore()
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator._state_store = store
+    conv_key = ConversationAddress.private("qq", "model-pending-user")
+    saved = orchestrator._save_pending_tool_confirm(
+        conv_key,
+        conv_key.space_key,
+        "Rea",
+        "keytao_batch_add_to_draft",
+        {"items": [{"action": "Create", "word": "开团", "code": "khtt"}]},
+        result,
+    )
+    record = store.get_record(conv_key)
+    check("model batch local ticket saved", saved is True and record is not None)
+    check("model batch ticket requires pending-aware replay",
+          isinstance(record.state, PendingToolConfirm)
+          and record.state.confirmation_source == "local_preview"
+          and record.state.args.get("_pending_submitted_confirmed") is True)
 
 
 def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
@@ -2428,6 +2779,8 @@ def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
                     "word": "洛阳纸贵",
                     "phrases": [],
                 }, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []})
             if tool_name == "keytao_prepare_reviewed_add":
                 return json.dumps(review, ensure_ascii=False)
             raise AssertionError(f"unexpected tool call: {tool_name}")
@@ -2762,6 +3115,8 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
             tool_calls.append((tool_name, arguments))
             if tool_name == "keytao_lookup_by_word":
                 return json.dumps({"success": True, "phrases": []}, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []})
             if tool_name == "keytao_prepare_reviewed_add":
                 return json.dumps(front_review, ensure_ascii=False)
             raise AssertionError(f"presentation reached mutation sink: {tool_name}")
@@ -2800,7 +3155,7 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
         finally:
             openai_chat_module.conversation_state_store = old_store
 
-        check("presentation calls only lookup and review tools", [name for name, _ in tool_calls] == ["keytao_lookup_by_word", "keytao_prepare_reviewed_add"])
+        check("presentation calls lookup, pending facts and review tools", [name for name, _ in tool_calls] == ["keytao_lookup_by_word", "keytao_pending_items_by_words", "keytao_prepare_reviewed_add"])
         check("presentation returns the ordering assessment", response is not None and "常用度评估" in response)
         check(
             "read-only ordering advice carries no pending write capability",
@@ -2852,6 +3207,8 @@ def test_explicit_add_word_query_uses_review_tool_before_ai():
             tool_calls.append((tool_name, arguments))
             if tool_name == "keytao_lookup_by_word":
                 return json.dumps({"success": True, "word": "平替", "phrases": []}, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []})
             if tool_name == "keytao_prepare_reviewed_add":
                 return json.dumps({
                     "success": True,
@@ -2903,7 +3260,8 @@ def test_explicit_add_word_query_uses_review_tool_before_ai():
         pending = _parse_pending_add_word(result or "")
 
         check("lookup called for explicit add", tool_calls[0] == ("keytao_lookup_by_word", {"word": "平替"}))
-        check("review called for explicit add", tool_calls[1] == ("keytao_prepare_reviewed_add", {"word": "平替"}))
+        check("pending facts called for explicit add", tool_calls[1] == ("keytao_pending_items_by_words", {"words": ["平替"]}))
+        check("review called for explicit add", tool_calls[2] == ("keytao_prepare_reviewed_add", {"word": "平替"}))
         check("encode not called for explicit reviewed add", all(name != "keytao_encode" for name, _ in tool_calls))
         check("authority source shown", result is not None and "百度百科" in result)
         check("concise reviewed template used", result is not None and "审词：读音 ping ti" in result)
@@ -2928,6 +3286,8 @@ def test_word_discovery_prechecks_binding_without_blocking_review():
                     "word": "来都来了",
                     "phrases": [],
                 }, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []})
             if tool_name == "keytao_prepare_reviewed_add":
                 return json.dumps({
                     "success": True,
@@ -4386,6 +4746,8 @@ def test_simple_single_word_query_existing_word_falls_through():
                     "word": "寿司郎",
                     "phrases": [{"word": "寿司郎", "code": "eslv"}],
                 }, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []})
             raise AssertionError("existing word should not encode in this bypass")
 
         with patch.object(openai_chat_module, "_classify_simple_word_query_intent", AsyncMock(return_value=SimpleWordQueryIntent(True, ("寿司郎",), "word_lookup", 0.98))):
@@ -18245,6 +18607,15 @@ def test_absence_batch_preview_never_formats_provisional_url():
             patch.object(_draft_tools, "get_bot_token", return_value="token"),
             patch.object(
                 _draft_tools,
+                "keytao_pending_items_by_words",
+                new=AsyncMock(return_value={
+                    "success": True,
+                    "complete": True,
+                    "items": [],
+                }),
+            ),
+            patch.object(
+                _draft_tools,
                 "get_latest_draft_batch",
                 new=AsyncMock(return_value=None),
             ),
@@ -19319,6 +19690,11 @@ if __name__ == "__main__":
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
     test_simple_single_word_query_uses_review_tool_before_ai()
+    test_pending_submitted_word_query_leads_with_reminder_without_new_ticket()
+    test_pending_submitted_duplicate_is_blocked_at_single_and_batch_sinks()
+    test_pending_items_query_filters_submitted_batches_to_bound_actor()
+    test_different_code_proceeds_through_both_sinks_with_pending_fact()
+    test_model_batch_pending_fact_leads_and_arms_one_local_confirmation()
     test_read_word_query_never_arms_add_ticket_through_pending_execution_path()
     test_candidate_commonness_copy_snapshot_and_zero_writes()
     test_explicit_add_word_query_uses_review_tool_before_ai()

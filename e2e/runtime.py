@@ -318,6 +318,55 @@ class LocalNextClient:
             raise RigInfrastructureError("Draft cleanup returned success but items remain")
         return {"success": True, "deleted": len(targets), "batchId": batch_id}
 
+    async def clean_submitted_batches(self, platform_id: str) -> dict[str, Any]:
+        """Recall and empty this reserved actor's Submitted bot batches."""
+        recalled: list[str] = []
+        for _attempt in range(20):
+            await self.clean_draft(platform_id)
+            status, preview = await self._json(
+                "GET",
+                "/api/bot/batches/recall",
+                params={"platform": "qq", "platformId": platform_id},
+                allowed_status=(200, 404),
+            )
+            if status == 404:
+                return {"success": True, "recalled": recalled}
+            batch_id = str(preview.get("batchId") or "").strip()
+            content_version = preview.get("contentVersion")
+            if (
+                preview.get("success") is not True
+                or not batch_id
+                or not isinstance(content_version, int)
+                or isinstance(content_version, bool)
+                or content_version < 0
+            ):
+                raise RigInfrastructureError(
+                    f"Submitted cleanup preview was incomplete: {preview}"
+                )
+            _status, result = await self._json(
+                "POST",
+                "/api/bot/batches/recall",
+                body={
+                    "platform": "qq",
+                    "platformId": platform_id,
+                    "batchId": batch_id,
+                    "expectedContentVersion": content_version,
+                },
+                allowed_status=(200, 400, 409),
+            )
+            if (
+                result.get("success") is not True
+                or result.get("batchId") != batch_id
+                or result.get("status") != "Draft"
+            ):
+                raise RigInfrastructureError(
+                    f"Submitted cleanup recall failed closed: {result}"
+                )
+            recalled.append(batch_id)
+        raise RigInfrastructureError(
+            "Submitted cleanup exceeded 20 actor-owned batches"
+        )
+
     async def phrases_by_word(self, word: str) -> list[dict[str, Any]]:
         _status, payload = await self._json(
             "GET",

@@ -4440,6 +4440,223 @@ async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S34_WORD = "开团"
+S34_PENDING_CODE = "khtt"
+
+
+async def scenario_s34(ctx: ScenarioContext) -> dict[str, Any]:
+    """Re-query one actor-owned Submitted item and gate exact duplicate assent."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    submitted_cleanup = await ctx.next_client.clean_submitted_batches(
+        ctx.platform_id
+    )
+    dictionary_cleanup = await ctx.next_client.remove_rig_owned_dictionary_words(
+        platform_id=ctx.platform_id,
+        admin_token=ctx.admin_token,
+        scenario_id="S34",
+        fixture_words=(S34_WORD,),
+    )
+    require(
+        dictionary_cleanup.get("verified") is True,
+        f"S34 dictionary cleanup was not verified: {dictionary_cleanup}",
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    added = await ctx.next_client.add_draft_items(
+        platform_id=ctx.platform_id,
+        items=[{
+            "action": "Create",
+            "word": S34_WORD,
+            "code": S34_PENDING_CODE,
+            "type": "Phrase",
+            "needsManualReview": True,
+            "remark": "S34 pending-batch awareness fixture",
+        }],
+    )
+    draft_before_submit = await ctx.draft()
+    batch_id = str(draft_before_submit.get("batchId") or "").strip()
+    content_version = draft_before_submit.get("contentVersion")
+    require(
+        added.get("success") is True
+        and batch_id
+        and isinstance(content_version, int),
+        f"S34 could not create its pending fixture: {added}; {draft_before_submit}",
+    )
+    submitted = await ctx.next_client.submit_batch(
+        platform_id=ctx.platform_id,
+        batch_id=batch_id,
+        content_version=content_version,
+    )
+    require(
+        ((submitted.get("submitted") or {}).get("batch") or {}).get("status")
+        == "Submitted",
+        f"S34 fixture did not stay Submitted: {submitted}",
+    )
+
+    public_batch_url = (
+        f"{public_base_for_platform('qq').rstrip('/')}/batch/{batch_id}"
+    )
+    reminder = (
+        f"「{S34_WORD}」已在待审核批次中"
+        f"（→ {S34_PENDING_CODE}，审核中）：{public_batch_url}"
+    )
+
+    query_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(f"喵喵 {S34_WORD}")
+    query_reply = await ctx.send(messages[-1])
+    replies.append(query_reply)
+    require(
+        query_reply.startswith(reminder),
+        f"S34 repeated query did not lead with the pending fact: {query_reply}",
+    )
+    require(
+        "其他编码" in query_reply
+        and "撤回" in query_reply
+        and pending_confirmation_copy() not in query_reply,
+        f"S34 repeated query restarted or omitted pending actions: {query_reply}",
+    )
+    require(
+        not any(
+            int(event.get("sequence") or 0) > query_cutoff
+            and event.get("kind") == "tool"
+            and event.get("name") == "keytao_prepare_reviewed_add"
+            for event in ctx.attempt_events()
+        ),
+        "S34 repeated query restarted the reviewed-add ritual",
+    )
+
+    messages.append(f"喵喵 加词 {S34_WORD}")
+    discovery = await ctx.send(messages[-1])
+    replies.append(discovery)
+    require(
+        discovery.startswith(reminder) and S34_PENDING_CODE in discovery,
+        f"S34 explicit add omitted the pending lead or reviewed code: {discovery}",
+    )
+
+    duplicate_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入")
+    duplicate_reply = await ctx.send(messages[-1])
+    replies.append(duplicate_reply)
+    require(
+        duplicate_reply.startswith(reminder)
+        and "该词已在审核中，确认再提交一条相同词条吗？" in duplicate_reply
+        and duplicate_reply.count(pending_confirmation_copy()) == 1,
+        f"S34 exact duplicate assent did not warn once: {duplicate_reply}",
+    )
+    duplicate_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > duplicate_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_create_phrase"
+    ]
+    require(
+        len(duplicate_events) == 1
+        and (duplicate_events[0].get("result") or {}).get(
+            "pendingDuplicateConfirmation"
+        ) is True
+        and (duplicate_events[0].get("result") or {}).get("success") is not True,
+        f"S34 exact duplicate reached a write or missed the sink gate: {duplicate_events}",
+    )
+    messages.append("取消")
+    replies.append(await ctx.send(messages[-1]))
+
+    messages.append(f"喵喵 加词 {S34_WORD}")
+    different_discovery = await ctx.send(messages[-1])
+    replies.append(different_discovery)
+    candidate_rows = [
+        (int(index), code.lower())
+        for index, code in re.findall(
+            r"(?m)^\s*(\d+)[.、]\s*([a-z]{1,6})\b",
+            different_discovery,
+        )
+    ]
+    different_row = next(
+        ((index, code) for index, code in candidate_rows
+         if code != S34_PENDING_CODE),
+        None,
+    )
+    require(
+        different_discovery.startswith(reminder) and different_row is not None,
+        f"S34 did not expose a different reviewed code with the reminder: {different_discovery}",
+    )
+    different_index, different_code = different_row
+    different_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(str(different_index))
+    different_reply = await ctx.send(messages[-1])
+    replies.append(different_reply)
+    require(
+        different_reply.startswith(reminder),
+        f"S34 different-code add did not keep the pending lead: {different_reply}",
+    )
+    current_draft = await ctx.draft()
+    if not any(
+        item_key(item) == ("Create", S34_WORD, different_code)
+        for item in current_draft.get("items", [])
+        if isinstance(item, dict)
+    ):
+        require(
+            pending_confirmation_copy() in different_reply,
+            f"S34 different-code add neither wrote nor returned its normal confirmation: {different_reply}",
+        )
+        messages.append("确认")
+        confirmation_reply = await ctx.send(messages[-1])
+        replies.append(confirmation_reply)
+        require(
+            confirmation_reply.startswith(reminder),
+            f"S34 different-code confirmation dropped the pending lead: {confirmation_reply}",
+        )
+        current_draft = await ctx.draft()
+    require(
+        any(
+            item_key(item) == ("Create", S34_WORD, different_code)
+            for item in current_draft.get("items", [])
+            if isinstance(item, dict)
+        ),
+        f"S34 different-code add did not proceed: {current_draft}",
+    )
+    require(
+        any(
+            int(event.get("sequence") or 0) > different_cutoff
+            and event.get("kind") == "tool"
+            and event.get("name") == "keytao_create_phrase"
+            and (event.get("result") or {}).get("success") is True
+            for event in ctx.attempt_events()
+        ),
+        "S34 different-code path has no successful sink receipt",
+    )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": current_draft,
+        "facts": {
+            "word": S34_WORD,
+            "pendingCode": S34_PENDING_CODE,
+            "differentCode": different_code,
+            "pendingBatchId": batch_id,
+            "reminder": reminder,
+            "submittedCleanup": submitted_cleanup,
+            "dictionaryCleanup": dictionary_cleanup,
+            "queryRestartedReview": False,
+            "exactDuplicateBlocked": True,
+            "differentCodeProceeded": True,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -4474,6 +4691,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S31", "verbatim positional eviction closure", scenario_s31),
     Scenario("S32", "draft-aware and explicit-list chain scope", scenario_s32),
     Scenario("S33", "batch-aware homophone slot allocation", scenario_s33),
+    Scenario("S34", "pending submitted word awareness", scenario_s34),
 )
 
 

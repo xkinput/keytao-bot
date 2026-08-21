@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
 import re
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 import unicodedata
+from urllib.parse import urlsplit
 
 
 PENDING_CONFIRM_ADVERTISED_FORMS = ("确认",)
@@ -70,6 +71,118 @@ PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS = (
     "都加并提交",
     "添加并提交",
 )
+
+
+def trusted_pending_word_items(items: object) -> list[dict[str, str]]:
+    """Keep only exact display-safe draft/submitted word records."""
+    if not isinstance(items, list):
+        return []
+    trusted: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        source = str(raw.get("source") or "").strip()
+        batch_id = str(raw.get("batchId") or "").strip()
+        batch_url = str(raw.get("batchUrl") or "").strip()
+        status = str(raw.get("batchStatus") or "").strip()
+        item_status = str(raw.get("itemStatus") or "").strip()
+        action = str(raw.get("action") or "").strip()
+        word = str(raw.get("word") or "").strip()
+        code = str(raw.get("code") or "").strip().lower()
+        phrase_type = str(raw.get("type") or "Phrase").strip()
+        parsed_url = urlsplit(batch_url)
+        safe_url = bool(
+            parsed_url.scheme in {"http", "https"}
+            and parsed_url.netloc
+            and parsed_url.path.rstrip("/").endswith(f"/batch/{batch_id}")
+            and not parsed_url.query
+            and not parsed_url.fragment
+        )
+        valid_status = (
+            source == "draft"
+            and status == "Draft"
+            or source == "submitted"
+            and status == "Submitted"
+            and item_status == "Pending"
+        )
+        if (
+            not valid_status
+            or not safe_url
+            or not batch_id
+            or action not in {"Create", "Change", "Delete"}
+            or not word
+            or len(word) > 80
+            or not re.fullmatch(r"[a-z]{1,6}", code)
+            or phrase_type not in {
+                "Single", "Phrase", "Supplement", "Symbol",
+                "Link", "CSS", "CSSSingle", "English",
+            }
+        ):
+            continue
+        key = (source, batch_id, word, code)
+        if key in seen:
+            continue
+        seen.add(key)
+        trusted.append({
+            "source": source,
+            "batchId": batch_id,
+            "batchUrl": batch_url,
+            "batchStatus": status,
+            "itemStatus": item_status,
+            "action": action,
+            "word": word,
+            "code": code,
+            "type": phrase_type,
+        })
+    return trusted
+
+
+def pending_word_reminder_lines(
+    items: object,
+    *,
+    words: Iterable[str] = (),
+) -> list[str]:
+    """Render compact actor-bound reminders from trusted server records."""
+    word_filter = {
+        str(word or "").strip() for word in words if str(word or "").strip()
+    }
+    lines: list[str] = []
+    for item in trusted_pending_word_items(items):
+        word = item["word"]
+        if word_filter and word not in word_filter:
+            continue
+        if item["source"] == "submitted":
+            line = (
+                f"「{word}」已在待审核批次中"
+                f"（→ {item['code']}，审核中）：{item['batchUrl']}"
+            )
+        else:
+            line = (
+                f"「{word}」已在当前草稿中"
+                f"（→ {item['code']}）：{item['batchUrl']}"
+            )
+        if line not in lines:
+            lines.append(line)
+    return lines
+
+
+def prepend_pending_word_reminders(
+    text: str,
+    items: object,
+    *,
+    words: Iterable[str] = (),
+) -> str:
+    """Put pending facts first and avoid repeating an identical reminder."""
+    reminders = pending_word_reminder_lines(items, words=words)
+    if not reminders:
+        return str(text or "").strip()
+    body_lines = [
+        line for line in str(text or "").strip().splitlines()
+        if line.strip() not in reminders
+    ]
+    body = "\n".join(body_lines).strip()
+    return "\n".join(reminders) + (("\n\n" + body) if body else "")
 PENDING_SINGLE_ADD_ADVERTISED_FORMS = ("加入",)
 PENDING_SINGLE_ADD_AND_SUBMIT_ADVERTISED_FORMS = ("加入并提交",)
 PENDING_BATCH_ADD_ASSENT_TEXTS = frozenset({

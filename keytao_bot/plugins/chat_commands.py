@@ -63,6 +63,8 @@ from ..utils.pending_confirmation import (
     parse_pending_assent_phrase,
     parse_pending_candidate_selection,
     pending_confirmation_copy,
+    pending_word_reminder_lines,
+    prepend_pending_word_reminders,
     render_executable_suggestion,
     render_remediation_reply,
     render_server_backed_single_word_lookup,
@@ -2181,6 +2183,47 @@ async def _try_handle_simple_single_word_query(
     except Exception:
         lookup_data = {}
 
+    pending_json = await call_tool_function(
+        "keytao_pending_items_by_words",
+        {"words": [word]},
+        platform,
+        user_id,
+    )
+    try:
+        pending_data = json.loads(pending_json)
+    except Exception:
+        pending_data = {}
+    if (
+        pending_data.get("success") is not True
+        or pending_data.get("complete") is not True
+    ):
+        return str(
+            pending_data.get("message")
+            or "暂时无法核验当前草稿和待审核批次，本次未继续"
+        ).strip()
+    pending_items = pending_data.get("items") or []
+    reminder_lines = pending_word_reminder_lines(
+        pending_items,
+        words=(word,),
+    )
+    if reminder_lines and not explicit_add_word:
+        has_submitted = any(
+            isinstance(item, dict) and item.get("source") == "submitted"
+            for item in pending_items
+        )
+        action_copy = (
+            f"若要再加其他编码，可发送「添加 {word} <编码>」；"
+            "若需撤回，可发送「撤回提交」。"
+            if has_submitted
+            else f"若要再加其他编码，可发送「添加 {word} <编码>」；"
+            "也可发送「查看草稿」或「提交」。"
+        )
+        return prepend_pending_word_reminders(
+            action_copy,
+            pending_items,
+            words=(word,),
+        )
+
     if lookup_data.get("success") and lookup_data.get("phrases"):
         return None
 
@@ -2194,6 +2237,11 @@ async def _try_handle_simple_single_word_query(
 
     reviewed_prompt = _format_reviewed_add_prompt(review)
     if reviewed_prompt:
+        reviewed_prompt = prepend_pending_word_reminders(
+            reviewed_prompt,
+            pending_items,
+            words=(word,),
+        )
         pending = _parse_pending_add_word(reviewed_prompt)
         if pending is not None:
             server_statuses = [
@@ -2241,6 +2289,7 @@ async def _try_handle_simple_single_word_query(
 
 _INJECT_PLATFORM_TOOLS = frozenset({
     'keytao_prepare_reviewed_add',
+    'keytao_pending_items_by_words',
     'keytao_create_phrase', 'keytao_submit_batch',
     'keytao_list_draft_items', 'keytao_remove_draft_item',
     'keytao_update_draft_item_weight',
@@ -2647,13 +2696,21 @@ async def _execute_add_to_draft(
             pending_args["_reviewed_candidate_codes"] = list(
                 reviewed_candidate_codes
             )
-        pending_state = _pending_state_from_server_warning(
-            PendingToolConfirm(
+        if data.get("pendingDuplicateConfirmation") is True:
+            pending_args["_pending_submitted_confirmed"] = True
+            pending_state = PendingToolConfirm(
                 function_name="keytao_create_phrase",
                 args=pending_args,
-            ),
-            data,
-        )
+                confirmation_source="local_preview",
+            )
+        else:
+            pending_state = _pending_state_from_server_warning(
+                PendingToolConfirm(
+                    function_name="keytao_create_phrase",
+                    args=pending_args,
+                ),
+                data,
+            )
         if auto_confirm and _create_preview_can_auto_confirm(data, args):
             return await _execute_confirmed_tool(
                 pending_state,
@@ -2675,23 +2732,41 @@ async def _execute_add_to_draft(
             owner_label=owner_label,
         )
         warnings = data.get("warnings", [])
-        warn_text = "\n".join(
-            _plain_warning_line(w)
-            for w in warnings
-        ) if warnings else data.get("message", "存在重码警告")
-        return _append_batch_url_if_missing((
+        warn_text = (
+            str(data.get("message") or "").strip()
+            if data.get("pendingDuplicateConfirmation") is True
+            else "\n".join(_plain_warning_line(w) for w in warnings)
+            if warnings
+            else data.get("message", "存在重码警告")
+        )
+        response = _append_batch_url_if_missing((
             f"{warn_text}\n{pending_confirmation_copy()}"
         ), data)
+        return prepend_pending_word_reminders(
+            response,
+            data.get("pendingItems"),
+            words=(word,),
+        )
 
     if not data.get("success"):
-        return _append_batch_url_if_missing(
+        failure = _append_batch_url_if_missing(
             f"添加失败：{data.get('message', '未知错误')}",
             data,
         )
+        return prepend_pending_word_reminders(
+            failure,
+            data.get("pendingItems"),
+            words=(word,),
+        )
 
     header = f"✅ 已将「{word}」以编码 {code} 加入草稿\n"
-    return header + await _format_draft_response(
+    response = header + await _format_draft_response(
         data, platform, user_id, compact=True,
+    )
+    return prepend_pending_word_reminders(
+        response,
+        data.get("pendingItems"),
+        words=(word,),
     )
 
 
@@ -2849,6 +2924,14 @@ async def _perform_add_to_draft_and_submit(
             "keytao_create_phrase", create_args, platform, user_id,
         )
     create_data = json.loads(create_json)
+    pending_items = create_data.get("pendingItems") or []
+
+    def with_pending_reminder(text: str) -> str:
+        return prepend_pending_word_reminders(
+            text,
+            pending_items,
+            words=(word,),
+        )
     if create_data.get("success") is True and informational_warnings:
         create_data["warnings"] = list(informational_warnings)
         create_data["warnedCount"] = len(informational_warnings)
@@ -2870,13 +2953,21 @@ async def _perform_add_to_draft_and_submit(
             pending_args["_reviewed_candidate_codes"] = list(
                 reviewed_candidate_codes
             )
-        pending_state = _pending_state_from_server_warning(
-            PendingToolConfirm(
+        if create_data.get("pendingDuplicateConfirmation") is True:
+            pending_args["_pending_submitted_confirmed"] = True
+            pending_state = PendingToolConfirm(
                 function_name="keytao_create_phrase",
                 args=pending_args,
-            ),
-            create_data,
-        )
+                confirmation_source="local_preview",
+            )
+        else:
+            pending_state = _pending_state_from_server_warning(
+                PendingToolConfirm(
+                    function_name="keytao_create_phrase",
+                    args=pending_args,
+                ),
+                create_data,
+            )
         if (
             auto_confirm
             and not confirmed_create
@@ -2909,21 +3000,34 @@ async def _perform_add_to_draft_and_submit(
                 create_data,
             )
         warnings = create_data.get("warnings", [])
-        warn_text = "\n".join(
-            _plain_warning_line(w)
-            for w in warnings
-        ) if warnings else create_data.get("message", "存在重码警告")
-        return DraftActionResult(_append_batch_url_if_missing(
+        warn_text = (
+            str(create_data.get("message") or "").strip()
+            if create_data.get("pendingDuplicateConfirmation") is True
+            else "\n".join(_plain_warning_line(w) for w in warnings)
+            if warnings
+            else create_data.get("message", "存在重码警告")
+        )
+        warning_response = _append_batch_url_if_missing(
             f"{warn_text}\n{pending_confirmation_copy()}",
             create_data,
-        ), pending_state=pending_state, data=create_data)
+        )
+        warning_response = prepend_pending_word_reminders(
+            warning_response,
+            create_data.get("pendingItems"),
+            words=(word,),
+        )
+        return DraftActionResult(
+            warning_response,
+            pending_state=pending_state,
+            data=create_data,
+        )
 
     if not create_data.get("success"):
         return DraftActionResult(
-            _append_batch_url_if_missing(
+            with_pending_reminder(_append_batch_url_if_missing(
                 f"添加失败：{create_data.get('message', '未知错误')}",
                 create_data,
-            ),
+            )),
             data=create_data,
         )
 
@@ -2948,13 +3052,15 @@ async def _perform_add_to_draft_and_submit(
             },
         ],
     )
+    if pending_items and isinstance(submit_result.data, dict):
+        submit_result.data.setdefault("pendingItems", pending_items)
     if submit_result.pending_state is not None:
         return DraftActionResult(
-            _append_batch_url_if_missing((
+            with_pending_reminder(_append_batch_url_if_missing((
                 f"✅ 「{word}」→ {code} 已加入草稿。\n"
                 + ("\n".join(create_notice_lines) + "\n" if create_notice_lines else "")
                 + submit_result.text
-            ), create_data, submit_result.data or {}),
+            ), create_data, submit_result.data or {})),
             pending_state=submit_result.pending_state,
             data=submit_result.data or create_data,
         )
@@ -2970,7 +3076,7 @@ async def _perform_add_to_draft_and_submit(
             else f"✅ 已将「{word}」→ {code} 写入草稿，已提交审核。"
         )
         return DraftActionResult(
-            _append_batch_url_if_missing(
+            with_pending_reminder(_append_batch_url_if_missing(
                 "\n".join([
                     final_status,
                     *create_notice_lines,
@@ -2979,12 +3085,12 @@ async def _perform_add_to_draft_and_submit(
                 submit_result.data or {},
                 create_data,
                 label="批次地址",
-            ),
+            )),
             success=True,
             data=submit_result.data or create_data,
         )
     return DraftActionResult(
-        _append_batch_url_if_missing(
+        with_pending_reminder(_append_batch_url_if_missing(
             "\n".join([
                 f"✅ 已将「{word}」以编码 {code} 加入草稿。",
                 *create_notice_lines,
@@ -2993,7 +3099,7 @@ async def _perform_add_to_draft_and_submit(
             ]),
             create_data,
             submit_result.data or {},
-        ),
+        )),
         data=submit_result.data or create_data,
     )
 
@@ -3037,6 +3143,18 @@ async def _perform_batch_add_to_draft_and_submit(
         user_id,
     )
     add_data = json.loads(add_json)
+    pending_items = add_data.get("pendingItems") or []
+
+    def with_pending_reminder(text: str) -> str:
+        return prepend_pending_word_reminders(
+            text,
+            pending_items,
+            words=tuple(
+                str(item.get("word") or "").strip()
+                for item in requested_items
+                if isinstance(item, dict)
+            ),
+        )
     if add_data.get("not_bound"):
         return DraftActionResult(_BIND_HELP_TEXT)
 
@@ -3092,21 +3210,30 @@ async def _perform_batch_add_to_draft_and_submit(
         ) + "（同批短码不重码）"
 
     if add_data.get("requiresConfirmation"):
-        pending_state = _pending_state_from_server_warning(
-            PendingToolConfirm(
-                function_name="keytao_batch_add_to_draft",
-                args={
-                    "items": effective_items,
-                    "_submit_after": True,
-                    **(
-                        {"_allow_same_code": True}
-                        if allow_same_code
-                        else {}
-                    ),
-                },
+        pending_args = {
+            "items": effective_items,
+            "_submit_after": True,
+            **(
+                {"_allow_same_code": True}
+                if allow_same_code
+                else {}
             ),
-            add_data,
-        )
+        }
+        if add_data.get("pendingDuplicateConfirmation") is True:
+            pending_args["_pending_submitted_confirmed"] = True
+            pending_state = PendingToolConfirm(
+                function_name="keytao_batch_add_to_draft",
+                args=pending_args,
+                confirmation_source="local_preview",
+            )
+        else:
+            pending_state = _pending_state_from_server_warning(
+                PendingToolConfirm(
+                    function_name="keytao_batch_add_to_draft",
+                    args=pending_args,
+                ),
+                add_data,
+            )
         if (
             auto_confirm
             and not confirmed_add
@@ -3137,27 +3264,44 @@ async def _perform_batch_add_to_draft_and_submit(
                 add_data,
             )
         warnings = add_data.get("warnings", [])
-        warning_text = "\n".join(
-            _plain_warning_line(warning)
-            for warning in warnings
-        ) if warnings else add_data.get("message", "批量添加前需要确认")
+        warning_text = (
+            str(add_data.get("message") or "").strip()
+            if add_data.get("pendingDuplicateConfirmation") is True
+            else "\n".join(_plain_warning_line(warning) for warning in warnings)
+            if warnings
+            else add_data.get("message", "批量添加前需要确认")
+        )
         if collision_replan_line:
             warning_text = "\n".join(
                 line for line in (collision_replan_line, warning_text) if line
             )
-        return DraftActionResult(_append_batch_url_if_missing(
+        warning_response = _append_batch_url_if_missing(
             f"{warning_text}\n{pending_confirmation_copy()}",
             add_data,
-        ), pending_state=pending_state, data=add_data)
+        )
+        warning_response = prepend_pending_word_reminders(
+            warning_response,
+            add_data.get("pendingItems"),
+            words=tuple(
+                str(item.get("word") or "").strip()
+                for item in effective_items
+                if isinstance(item, dict)
+            ),
+        )
+        return DraftActionResult(
+            warning_response,
+            pending_state=pending_state,
+            data=add_data,
+        )
 
     success_count = int(add_data.get("successCount") or 0)
     failed_count = int(add_data.get("failedCount") or 0)
     if success_count <= 0:
         return DraftActionResult(
-            _append_batch_url_if_missing(
+            with_pending_reminder(_append_batch_url_if_missing(
                 f"添加失败：{add_data.get('message', '未知错误')}",
                 add_data,
-            ),
+            )),
             data=add_data,
         )
 
@@ -3166,7 +3310,10 @@ async def _perform_batch_add_to_draft_and_submit(
             add_data, platform, user_id, compact=True,
         )
         return DraftActionResult(
-            f"仅成功加入 {success_count}/{len(effective_items)} 条，已停止提交，避免生成不完整批次。\n\n{draft_text}"
+            with_pending_reminder(
+                f"仅成功加入 {success_count}/{len(effective_items)} 条，"
+                f"已停止提交，避免生成不完整批次。\n\n{draft_text}"
+            )
         )
 
     submit_result = await _perform_submit_current_draft(
@@ -3186,12 +3333,12 @@ async def _perform_batch_add_to_draft_and_submit(
     if item_lines:
         text = f"{text}\n\n{item_lines}"
     return DraftActionResult(
-        _append_batch_url_if_missing(
+        with_pending_reminder(_append_batch_url_if_missing(
             text,
             submit_result.data or {},
             add_data,
             label="批次地址" if submit_result.success else "草稿地址",
-        ),
+        )),
         pending_state=submit_result.pending_state,
         success=submit_result.success,
         data=submit_result.data or add_data,
@@ -4278,8 +4425,12 @@ async def _execute_confirmed_tool(
             space_key,
             owner_label,
         )
-        return _dedupe_authoritative_link_lines(
+        combined = _dedupe_authoritative_link_lines(
             response + "\n\n" + submit_response
+        )
+        return prepend_pending_word_reminders(
+            combined,
+            data.get("pendingItems"),
         )
 
     def stage_next_replace_char_chunk(response: str) -> str:
@@ -4385,14 +4536,24 @@ async def _execute_confirmed_tool(
                 suffix = f"\n仅成功加入 {success_count}/{expected_count} 条"
                 if submit_after:
                     suffix += "，已停止后续提交"
-                return response + suffix + "。"
+                return prepend_pending_word_reminders(
+                    response + suffix + "。",
+                    data.get("pendingItems"),
+                )
             response = stage_next_replace_char_chunk(response)
             if submit_after:
                 return await continue_with_submit_preview(response)
-            return response
-        return _append_batch_url_if_missing(
+            return prepend_pending_word_reminders(
+                response,
+                data.get("pendingItems"),
+            )
+        failure = _append_batch_url_if_missing(
             f"添加失败：{data.get('message', '未知错误')}",
             data,
+        )
+        return prepend_pending_word_reminders(
+            failure,
+            data.get("pendingItems"),
         )
 
     if state.function_name in {
@@ -4472,10 +4633,17 @@ async def _execute_confirmed_tool(
         )
         if submit_after:
             return await continue_with_submit_preview(response)
-        return response
-    return _append_batch_url_if_missing(
+        return prepend_pending_word_reminders(
+            response,
+            data.get("pendingItems"),
+        )
+    failure = _append_batch_url_if_missing(
         f"操作失败：{data.get('message', '未知错误')}",
         data,
+    )
+    return prepend_pending_word_reminders(
+        failure,
+        data.get("pendingItems"),
     )
 
 
