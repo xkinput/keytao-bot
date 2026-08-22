@@ -1624,7 +1624,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "action": "Create",
                         "word": "载流子",
-                        "code": "zlzu",
+                        "code": "zlz",
                         "type": "Phrase",
                         "needsManualReview": False,
                     },
@@ -1646,6 +1646,15 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                             ["zlzua", False],
                             ["zlzuaa", False],
                         ],
+                        "occupiedWords": {"zlz": ["座落在"]},
+                        "orderingAssessments": [{
+                            "newWord": "载流子",
+                            "occupantWord": "座落在",
+                            "occupantCode": "zlz",
+                            "freeCode": "zlzu",
+                            "verdict": "front_more_common",
+                            "newCode": "zlz",
+                        }],
                     },
                 ],
             },
@@ -1716,6 +1725,36 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("_candidate_scopes", selected_state.args)
                 self.assertIsNone(state_store.get_record(conv_key))
                 self.assertEqual(classifier.await_count, 0)
+
+                seed_state()
+                response = await chat_module.handle_pending_message_core(
+                    "加入并提交",
+                    "qq",
+                    "704974384",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="Ealin",
+                )
+                self.assertTrue(response.endswith("batch-added"))
+                self.assertIn("载流、载流子", response)
+                self.assertEqual(execute.await_count, 2)
+                shift_state = execute.await_args.args[0]
+                self.assertEqual(
+                    shift_state.function_name,
+                    "keytao_shift_phrase_code",
+                )
+                self.assertEqual(shift_state.args["word"], "载流子")
+                self.assertEqual(shift_state.args["target_code"], "zlz")
+                self.assertTrue(shift_state.args["_submit_after"])
+                self.assertEqual(
+                    [
+                        (item["word"], item["code"])
+                        for item in shift_state.args["additional_items"]
+                    ],
+                    [("载流", "zhlq")],
+                )
+                self.assertIsNone(state_store.get_record(conv_key))
         finally:
             chat_module.conversation_state_store = old_state_store
 

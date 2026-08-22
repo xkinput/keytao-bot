@@ -22,9 +22,11 @@ from ..utils.pending_confirmation import (
     _humanize_warning_text,
     pending_confirmation_copy,
     plain_warning_message,
+    front_insert_recommendation_copy,
     render_executable_suggestion,
     render_remediation_reply,
     single_word_candidate_footer,
+    validated_front_insert_recommendation,
 )
 
 
@@ -1158,18 +1160,16 @@ def _format_candidate_ordering_assessment(
     occupant_code = str(assessment.get("occupantCode") or "").strip().lower()
     free_code = str(assessment.get("freeCode") or "").strip().lower()
     if verdict == "front_more_common":
-        selector = candidate_indexes.get(occupant_code)
-        command = f"{selector} 重新编码" if selector is not None else f"{occupant_code} 重新编码"
-        summary = str(assessment.get("summary") or "").strip()
-        comparison_copy = (
-            summary
-            if summary
-            else f"「{word}」较「{occupant}」更常用"
-        )
-        return (
-            f"常用度评估：{comparison_copy} → "
-            f"建议「{word}」占 {occupant_code}、「{occupant}」顺延"
-            f"（回复「{command}」执行）"
+        fallback_selector = candidate_indexes.get(free_code)
+        return front_insert_recommendation_copy(
+            {
+                **assessment,
+                "newWord": word,
+                "occupantWord": occupant,
+                "occupantCode": occupant_code,
+                "freeCode": free_code,
+            },
+            fallback_selector,
         )
     if verdict in {"behind_more_common", "close"}:
         return (
@@ -1240,13 +1240,41 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         for assessment in review.get("candidateOrderingAssessments") or []
         if isinstance(assessment, dict)
     ][:2]
-    ordering_recommended_code = next(
-        (
-            str(assessment.get("occupantCode") or "").strip().lower()
-            for assessment in ordering_assessments
-            if assessment.get("verdict") == "front_more_common"
-        ),
-        "",
+    snapshot_candidates: List[Tuple[str, bool]] = []
+    snapshot_occupied_words: Dict[str, List[str]] = {}
+    for pronunciation in pronunciations:
+        for status in pronunciation.get("candidateStatuses", []):
+            if not isinstance(status, dict):
+                continue
+            code = str(status.get("code") or "").strip().lower()
+            occupied = status.get("occupied")
+            if not code or not isinstance(occupied, bool):
+                continue
+            snapshot_candidates.append((code, occupied))
+            words = [
+                str(value or "").strip()
+                for value in status.get("words") or []
+                if str(value or "").strip()
+            ]
+            if not words:
+                words = [
+                    str(phrase.get("word") or "").strip()
+                    for phrase in status.get("phrases") or []
+                    if isinstance(phrase, dict)
+                    and str(phrase.get("word") or "").strip()
+                ]
+            if occupied and words:
+                snapshot_occupied_words.setdefault(code, []).extend(words)
+    reorder_recommendation = validated_front_insert_recommendation(
+        word,
+        snapshot_candidates,
+        snapshot_occupied_words,
+        ordering_assessments,
+    )
+    ordering_recommended_code = (
+        reorder_recommendation["occupantCode"]
+        if reorder_recommendation is not None
+        else ""
     )
 
     lines = [f"词库暂无收录「{word}」："]
@@ -1300,14 +1328,20 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
                     )
                 )
                 candidate_index += 1
-    if ordering_assessments:
+    if reorder_recommendation is not None:
+        lines.append(
+            _format_candidate_ordering_assessment(
+                reorder_recommendation,
+                candidate_indexes,
+            )
+        )
+    elif ordering_assessments:
         lines.extend(
             _format_candidate_ordering_assessment(assessment, candidate_indexes)
             for assessment in ordering_assessments
         )
-    if ordering_recommended_code:
-        lines.append("提示：当前建议不调整现有排序。")
-    lines.append(f"• 「{word}」→ {recommended_code}（推荐）")
+    if reorder_recommendation is None:
+        lines.append(f"• 「{word}」→ {recommended_code}（推荐）")
     lines.append(single_word_candidate_footer(candidate_index - 1))
     occupied_choice = next(
         (
@@ -1329,7 +1363,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         ),
         None,
     )
-    if occupied_choice and occupied_choice[0]:
+    if reorder_recommendation is None and occupied_choice and occupied_choice[0]:
         occupied_index, occupied_word = occupied_choice
         target_copy = f"已有词「{occupied_word}」" if occupied_word else "该已有词"
         lines.append(

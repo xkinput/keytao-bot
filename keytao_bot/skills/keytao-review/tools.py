@@ -9,6 +9,7 @@ from nonebot.log import logger
 from keytao_bot.utils import http_client
 from keytao_bot.utils.keytao_review import (
     ReviewHttpConfig,
+    apply_candidate_ordering_recommendation,
     assess_candidate_chain_commonness,
     audit_draft_items,
     can_llm_override_audit_issues,
@@ -233,8 +234,9 @@ async def keytao_prepare_reviewed_add(
         apply_manual_review_flag(review, bool(flag), reason)
         if flag and read_review_disposition(review) is None:
             apply_review_disposition(review, "pre_submit_judgement")
-    review["candidateOrderingAssessments"] = await assess_candidate_chain_commonness(
-        review
+    apply_candidate_ordering_recommendation(
+        review,
+        await assess_candidate_chain_commonness(review),
     )
     return review
 

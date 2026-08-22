@@ -4554,6 +4554,51 @@ def _candidate_commonness_assessment(
     }
 
 
+def apply_candidate_ordering_recommendation(
+    review: Dict[str, Any],
+    assessments: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Make a validated comparator front verdict the review's one default."""
+    review["candidateOrderingAssessments"] = assessments
+    pairs = _candidate_commonness_pairs(review)
+    for assessment in assessments[:2]:
+        if (
+            not isinstance(assessment, dict)
+            or assessment.get("verdict") != "front_more_common"
+        ):
+            continue
+        matching_pair = next(
+            (
+                pair
+                for pair in pairs
+                if all(assessment.get(key) == value for key, value in pair.items())
+            ),
+            None,
+        )
+        occupant_code = str(assessment.get("occupantCode") or "").strip().lower()
+        new_code = str(
+            assessment.get("newCode")
+            or assessment.get("recommendedCode")
+            or ""
+        ).strip().lower()
+        if matching_pair is not None and new_code == occupant_code:
+            review["recommendedCode"] = occupant_code
+            free_code = str(assessment.get("freeCode") or "").strip().lower()
+            for pronunciation in review.get("pronunciations") or []:
+                if not isinstance(pronunciation, dict):
+                    continue
+                status_codes = {
+                    str(status.get("code") or "").strip().lower()
+                    for status in pronunciation.get("candidateStatuses") or []
+                    if isinstance(status, dict)
+                }
+                if {occupant_code, free_code}.issubset(status_codes):
+                    pronunciation["recommendedCode"] = occupant_code
+                    break
+            break
+    return review
+
+
 def _confident_modern_semantic_label(review: Dict, word: str) -> str:
     """Return a narrow modern-use label from the already-computed audit."""
     audit = review.get("preSubmitAudit") if isinstance(review, dict) else None

@@ -994,10 +994,39 @@ async def ensure_s16_fixture(
         raise RigInfrastructureError(
             f"S16 fixture did not resolve to sole 座落在@zlz weight 100: {exact_rows}"
         )
+    occupant_encoded = await _retry_fixture_client_call(
+        probe="S16 座落在 successor encode",
+        request=lambda: client.encode("座落在"),
+        attempt_facts=transport_attempts,
+    )
+    occupant_codes = ordered_candidate_codes(occupant_encoded)
+    if not occupant_codes or occupant_codes[0] != "zlz":
+        raise RigInfrastructureError(
+            f"S16 座落在 candidate chain did not start at zlz: {occupant_codes}"
+        )
+    shifted_code = ""
+    for code in occupant_codes[1:]:
+        successor_rows = [
+            row
+            for row in await _retry_fixture_client_call(
+                probe=f"S16 座落在 successor {code} lookup",
+                request=lambda code=code: client.phrases_by_code(code),
+                attempt_facts=transport_attempts,
+            )
+            if row.get("code") == code
+        ]
+        if not successor_rows:
+            shifted_code = code
+            break
+    if not shifted_code:
+        raise RigInfrastructureError(
+            f"S16 座落在 candidate chain has no free successor: {occupant_codes}"
+        )
     return _with_transport_attempts(
         {
             "occupantWord": "座落在",
             "occupiedCode": "zlz",
+            "shiftedCode": shifted_code,
             "occupant": exact_rows[0],
         },
         transport_attempts,
@@ -1213,6 +1242,130 @@ async def ensure_s29_fixture(
         "currentOrder": [word for word, _weight in expected],
         "currentWeights": [weight for _word, weight in expected],
         "seedBatches": [value.get("batchId") for value in seeded],
+    }
+
+
+async def ensure_s35_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed two isolated occupied chains and prove the free-slot control."""
+    front_cases = (
+        ("发布会", "重病号", "fbh"),
+        ("计算机", "建三江", "jsj"),
+    )
+    case_facts: list[dict[str, Any]] = []
+    for newcomer, occupant, occupied_code in front_cases:
+        encoded = await client.encode(newcomer)
+        candidate_codes = ordered_candidate_codes(encoded)
+        if not candidate_codes or candidate_codes[0] != occupied_code:
+            raise RigInfrastructureError(
+                f"S35 {newcomer} candidate chain did not start at {occupied_code}: "
+                f"{candidate_codes}"
+            )
+        existing = [
+            row
+            for row in await client.phrases_by_code(occupied_code)
+            if row.get("code") == occupied_code
+        ]
+        if existing:
+            raise RigInfrastructureError(
+                f"S35 requires empty exact slot {occupied_code} before seeding: {existing}"
+            )
+        await client.clean_draft(seed_identity["platform_id"])
+        seeded = await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word=occupant,
+            code=occupied_code,
+        )
+        exact_occupants = [
+            row
+            for row in await client.phrases_by_code(occupied_code)
+            if row.get("code") == occupied_code
+        ]
+        if not (
+            len(exact_occupants) == 1
+            and exact_occupants[0].get("word") == occupant
+            and exact_occupants[0].get("type") == "Phrase"
+        ):
+            raise RigInfrastructureError(
+                f"S35 did not seed sole {occupant}@{occupied_code}: {exact_occupants}"
+            )
+        occupant_encoded = await client.encode(occupant)
+        occupant_candidate_codes = ordered_candidate_codes(occupant_encoded)
+        if (
+            not occupant_candidate_codes
+            or occupant_candidate_codes[0] != occupied_code
+        ):
+            raise RigInfrastructureError(
+                f"S35 {occupant} candidate chain did not start at "
+                f"{occupied_code}: {occupant_candidate_codes}"
+            )
+        shifted_code = ""
+        for code in occupant_candidate_codes[1:]:
+            exact_shift_occupants = [
+                row
+                for row in await client.phrases_by_code(code)
+                if row.get("code") == code
+            ]
+            if not exact_shift_occupants:
+                shifted_code = code
+                break
+        if not shifted_code:
+            raise RigInfrastructureError(
+                f"S35 {occupant} candidate chain has no free shift slot: "
+                f"{occupant_candidate_codes}"
+            )
+        free_code = ""
+        for code in candidate_codes[1:]:
+            exact_successors = [
+                row
+                for row in await client.phrases_by_code(code)
+                if row.get("code") == code
+            ]
+            if not exact_successors:
+                free_code = code
+                break
+        if not free_code:
+            raise RigInfrastructureError(
+                f"S35 {newcomer} candidate chain has no free successor: {candidate_codes}"
+            )
+        case_facts.append({
+            "newcomerWord": newcomer,
+            "occupantWord": occupant,
+            "occupiedCode": occupied_code,
+            "freeCode": free_code,
+            "candidateCodes": candidate_codes,
+            "shiftedCode": shifted_code,
+            "occupantCandidateCodes": occupant_candidate_codes,
+            "occupant": exact_occupants[0],
+            "seedBatchId": seeded.get("batchId"),
+        })
+
+    free_word = "无事忙"
+    free_encoded = await client.encode(free_word)
+    free_candidates = ordered_candidate_codes(free_encoded)
+    if not free_candidates or free_candidates[0] != "wem":
+        raise RigInfrastructureError(
+            f"S35 {free_word} candidate chain did not start at wem: {free_candidates}"
+        )
+    exact_free_base = [
+        row
+        for row in await client.phrases_by_code("wem")
+        if row.get("code") == "wem"
+    ]
+    if exact_free_base:
+        raise RigInfrastructureError(
+            f"S35 no-recommendation control requires wem to be free: {exact_free_base}"
+        )
+    return {
+        "frontCases": case_facts,
+        "freeControl": {
+            "word": free_word,
+            "recommendedCode": "wem",
+            "candidateCodes": free_candidates,
+        },
     }
 
 
@@ -1539,6 +1692,17 @@ async def async_main(args: argparse.Namespace) -> int:
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S29":
                         fixture_facts["s29"] = await ensure_s29_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S35":
+                        fixture_facts["s35SubmittedCleanup"] = (
+                            await client.clean_submitted_batches(
+                                identities[scenario.scenario_id]["platform_id"]
+                            )
+                        )
+                        fixture_facts["s35"] = await ensure_s35_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

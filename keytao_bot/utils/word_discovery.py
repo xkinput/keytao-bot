@@ -46,6 +46,7 @@ from .keytao_review import (
     DUPLICATE_REASON,
     LOOKUP_FAILURE_REASON,
     ReviewHttpConfig,
+    apply_candidate_ordering_recommendation,
     assess_candidate_chain_commonness,
     get_llm_client,
     llm_config,
@@ -1197,8 +1198,9 @@ async def review_candidates(candidates: Sequence[WordCandidate]) -> List[Dict[st
         async with semaphore:
             try:
                 review = await prepare_reviewed_word(config, candidate.word)
-                review["candidateOrderingAssessments"] = (
-                    await assess_candidate_chain_commonness(review)
+                apply_candidate_ordering_recommendation(
+                    review,
+                    await assess_candidate_chain_commonness(review),
                 )
             except asyncio.CancelledError:
                 raise

@@ -268,6 +268,12 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
     positioned_pairs: list[tuple[int, str, str]] = []
     patterns = (
         re.compile(
+            r"(?m)^\s*推荐[：:]\s*「(?P<word>[^」\n]{1,128})」\s*"
+            r"占\s*(?P<code>[a-z]{1,12})\s*、\s*"
+            r"「[^」\n]{1,128}」顺延(?:[；;][^\n]*)?\s*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
             r"(?m)^\s*[-•]\s*「(?P<word>[^」\n]{1,128})」\s*"
             r"(?:→|->)\s*(?P<code>[a-z]{1,12})"
             r"(?:\s*[（(][^）)\n]{0,128}[）)])?\s*$",
@@ -1035,6 +1041,7 @@ def render_server_backed_batch_candidates(
 
     scopes_by_word: dict[str, tuple[tuple[str, bool], ...]] = {}
     occupied_words_by_scope: dict[str, dict[str, tuple[str, ...]]] = {}
+    ordering_assessments_by_scope: dict[str, list[dict[str, object]]] = {}
     for raw_scope in candidate_scopes:
         if not isinstance(raw_scope, dict):
             return ""
@@ -1097,6 +1104,14 @@ def render_server_backed_batch_candidates(
                 normalized_words.append(occupied_word)
             occupied_words[code] = tuple(normalized_words)
         occupied_words_by_scope[word] = occupied_words
+        raw_ordering = raw_scope.get("orderingAssessments", [])
+        if not isinstance(raw_ordering, list) or any(
+            not isinstance(value, dict) for value in raw_ordering
+        ):
+            return ""
+        ordering_assessments_by_scope[word] = [
+            dict(value) for value in raw_ordering[:2]
+        ]
 
     normalized_items: list[tuple[str, str, bool]] = []
     seen_words: set[str] = set()
@@ -1133,6 +1148,17 @@ def render_server_backed_batch_candidates(
         normalized_items,
         start=1,
     ):
+        reorder_recommendation = validated_front_insert_recommendation(
+            word,
+            scopes_by_word[word],
+            occupied_words_by_scope[word],
+            ordering_assessments_by_scope[word],
+        )
+        if (
+            reorder_recommendation is not None
+            and recommended_code != reorder_recommendation["occupantCode"]
+        ):
+            return ""
         lines.extend((f"{word_index}. 「{word}」", "   候选："))
         for candidate_index, (code, occupied) in enumerate(
             scopes_by_word[word],
@@ -1146,9 +1172,32 @@ def render_server_backed_batch_candidates(
                 if occupied
                 else "空位"
             )
-            recommended_copy = "（推荐）" if code == recommended_code else ""
+            if reorder_recommendation is not None:
+                if code == reorder_recommendation["occupantCode"]:
+                    recommended_copy = "（推荐：需重排）"
+                elif code == reorder_recommendation["freeCode"]:
+                    recommended_copy = "（不调序备选）"
+                else:
+                    recommended_copy = ""
+            else:
+                recommended_copy = "（推荐）" if code == recommended_code else ""
             lines.append(
                 f"   {candidate_index}. {code} — {occupancy_copy}{recommended_copy}"
+            )
+        if reorder_recommendation is not None:
+            fallback_index = next(
+                index
+                for index, (code, _occupied) in enumerate(
+                    scopes_by_word[word],
+                    start=1,
+                )
+                if code == reorder_recommendation["freeCode"]
+            )
+            lines.extend(
+                front_insert_recommendation_copy(
+                    reorder_recommendation,
+                    fallback_index,
+                ).splitlines()
             )
         review_copy = "需管理员审核" if needs_review else "可自动通过"
         lines.append(f"   自动审核：{review_copy}")
@@ -1201,6 +1250,105 @@ def pending_single_candidate_confirmation_copy() -> str:
     return "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
 
 
+def validated_front_insert_recommendation(
+    word: object,
+    candidates: object,
+    occupied_words: object,
+    assessments: object,
+) -> Optional[dict[str, str]]:
+    """Return the first comparator-backed front insert bound to one snapshot."""
+    normalized_word = str(word or "").strip()
+    if (
+        not normalized_word
+        or not isinstance(candidates, (list, tuple))
+        or not isinstance(occupied_words, dict)
+        or not isinstance(assessments, list)
+    ):
+        return None
+
+    occupancy: dict[str, bool] = {}
+    for raw in candidates:
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            return None
+        code = str(raw[0] or "").strip().lower()
+        occupied = raw[1]
+        if (
+            re.fullmatch(r"[a-z]{1,12}", code) is None
+            or not isinstance(occupied, bool)
+            or (code in occupancy and occupancy[code] is not occupied)
+        ):
+            return None
+        occupancy[code] = occupied
+
+    for assessment in assessments[:2]:
+        if not isinstance(assessment, dict):
+            return None
+        if str(assessment.get("verdict") or "") != "front_more_common":
+            continue
+        new_word = str(assessment.get("newWord") or "").strip()
+        occupant_word = str(assessment.get("occupantWord") or "").strip()
+        occupant_code = str(assessment.get("occupantCode") or "").strip().lower()
+        free_code = str(assessment.get("freeCode") or "").strip().lower()
+        new_code = str(
+            assessment.get("newCode")
+            or assessment.get("recommendedCode")
+            or ""
+        ).strip().lower()
+        raw_bound_occupants = occupied_words.get(occupant_code, ())
+        if not isinstance(raw_bound_occupants, (list, tuple)):
+            return None
+        bound_occupants = tuple(
+            str(value or "").strip()
+            for value in raw_bound_occupants
+            if str(value or "").strip()
+        )
+        ordered_codes = tuple(occupancy)
+        if (
+            new_word != normalized_word
+            or not occupant_word
+            or occupancy.get(occupant_code) is not True
+            or occupancy.get(free_code) is not False
+            or ordered_codes.index(occupant_code) >= ordered_codes.index(free_code)
+            or occupant_word not in bound_occupants
+            or new_code != occupant_code
+        ):
+            return None
+        return {
+            "verdict": "front_more_common",
+            "newWord": new_word,
+            "occupantWord": occupant_word,
+            "occupantCode": occupant_code,
+            "freeCode": free_code,
+            "newCode": new_code,
+            "summary": str(assessment.get("summary") or "").strip(),
+        }
+    return None
+
+
+def front_insert_recommendation_copy(
+    recommendation: dict[str, str],
+    fallback_selector: object = None,
+) -> str:
+    """Render the one two-line recommendation/opt-out contract."""
+    word = str(recommendation.get("newWord") or "").strip()
+    occupant = str(recommendation.get("occupantWord") or "").strip()
+    occupant_code = str(recommendation.get("occupantCode") or "").strip().lower()
+    free_code = str(recommendation.get("freeCode") or "").strip().lower()
+    summary = str(recommendation.get("summary") or "").strip()
+    recommendation_line = (
+        f"推荐：「{word}」占 {occupant_code}、「{occupant}」顺延"
+    )
+    if summary:
+        recommendation_line += f"；依据：{summary}"
+    selector = str(fallback_selector or "").strip()
+    opt_out = (
+        f"不重排选 {selector}（{free_code}）。"
+        if selector
+        else f"不重排选 {free_code}。"
+    )
+    return recommendation_line + "\n" + opt_out
+
+
 def single_word_candidate_footer(candidate_count: int) -> str:
     """Render truthful selection and whole-state actions for one word."""
     if candidate_count > 1:
@@ -1236,6 +1384,7 @@ def render_server_backed_single_word_candidates(
     recommended_code: object,
     candidates: object,
     occupied_words: object,
+    ordering_assessments: object = None,
 ) -> str:
     """Render one candidate interface solely from trusted same-turn records."""
     normalized_word = str(word or "").strip()
@@ -1265,6 +1414,14 @@ def render_server_backed_single_word_candidates(
         seen.add(code)
     if len(normalized_candidates) < 2 or recommended not in seen:
         return ""
+    reorder_recommendation = validated_front_insert_recommendation(
+        normalized_word,
+        normalized_candidates,
+        occupied_words,
+        ordering_assessments,
+    )
+    if reorder_recommendation is not None:
+        recommended = reorder_recommendation["occupantCode"]
     lines = [f"「{normalized_word}」候选编码："]
     for index, (code, occupied) in enumerate(normalized_candidates, start=1):
         if occupied:
@@ -1278,13 +1435,32 @@ def render_server_backed_single_word_candidates(
             label = "已有「" + "、".join(words) + "」"
         else:
             label = "空位"
-        if code == recommended:
+        if reorder_recommendation is not None:
+            if code == reorder_recommendation["occupantCode"]:
+                label += "（推荐：需重排）"
+            elif code == reorder_recommendation["freeCode"]:
+                label += "（不调序备选）"
+        elif code == recommended:
             label += "（推荐）"
         lines.append(f"{index}. {code} — {label}")
-    lines.extend((
-        f"• 「{normalized_word}」→ {recommended}（推荐）",
-        single_word_candidate_footer(len(normalized_candidates)),
-    ))
+    if reorder_recommendation is not None:
+        fallback_index = next(
+            index
+            for index, (code, _occupied) in enumerate(
+                normalized_candidates,
+                start=1,
+            )
+            if code == reorder_recommendation["freeCode"]
+        )
+        lines.append(
+            front_insert_recommendation_copy(
+                reorder_recommendation,
+                fallback_index,
+            )
+        )
+    else:
+        lines.append(f"• 「{normalized_word}」→ {recommended}（推荐）")
+    lines.append(single_word_candidate_footer(len(normalized_candidates)))
     return "\n".join(lines)
 
 
@@ -1310,23 +1486,36 @@ def render_server_backed_single_word_lookup(
     expected_codes = advertised_single_word_candidate_codes(actionable)
     source = str(reviewed_prompt or "").strip()
     body = ""
+    has_reorder_copy = False
     if source and advertised_single_word_candidate_codes(source) == expected_codes:
-        confirmation = re.search(
-            rf"(?m)^(?:如不调整现有排序，)?是否(?:仍)?以编码\s+"
-            rf"{re.escape(recommended)}\s+将「{re.escape(normalized_word)}」"
-            r"加入草稿[?？]\s*$",
+        reorder_copy = re.search(
+            rf"(?m)^\s*推荐[：:]\s*「{re.escape(normalized_word)}」\s*占\s*"
+            rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延(?:[；;][^\n]*)?\n"
+            r"\s*不重排选\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
             source,
             re.IGNORECASE,
         )
-        if confirmation is None:
+        if reorder_copy is not None:
+            body = source[:reorder_copy.end()].rstrip()
+            has_reorder_copy = True
+        else:
             confirmation = re.search(
-                rf"(?m)^\s*[•-]\s*「{re.escape(normalized_word)}」\s*→\s*"
-                rf"{re.escape(recommended)}\s*[（(]推荐[）)]\s*$",
+                rf"(?m)^(?:如不调整现有排序，)?是否(?:仍)?以编码\s+"
+                rf"{re.escape(recommended)}\s+将「{re.escape(normalized_word)}」"
+                r"加入草稿[?？]\s*$",
                 source,
                 re.IGNORECASE,
             )
-        if confirmation is not None:
-            body = source[:confirmation.start()].rstrip()
+            if confirmation is None:
+                confirmation = re.search(
+                    rf"(?m)^\s*[•-]\s*「{re.escape(normalized_word)}」\s*→\s*"
+                    rf"{re.escape(recommended)}\s*[（(]推荐[）)]\s*$",
+                    source,
+                    re.IGNORECASE,
+                )
+            if confirmation is not None:
+                body = source[:confirmation.start()].rstrip()
+        if body:
             body = re.sub(
                 r"（回复[「“『][^」”』]+[」”』]执行）",
                 "",
@@ -1336,6 +1525,11 @@ def render_server_backed_single_word_lookup(
         body = actionable.partition("\n\n是否以编码")[0].rstrip()
     if not body or advertised_single_word_candidate_codes(body) != expected_codes:
         return ""
+    if has_reorder_copy:
+        return "\n".join((
+            body,
+            single_word_candidate_footer(len(expected_codes)),
+        ))
     return "\n".join((
         body,
         f"推荐编码：{recommended}（本次仅查询）",
@@ -1352,8 +1546,20 @@ def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
         re.IGNORECASE,
     )
     if recommended is None:
-        return ()
-    codes = advertised_single_word_candidate_codes(normalized[:recommended.start()])
+        recommended = re.search(
+            r"(?m)^推荐:\s*「[^「」\r\n]{1,128}」占\s*"
+            r"(?P<code>[a-z]{1,12})、\s*「[^「」\r\n]{1,128}」顺延"
+            r"(?:;[^\r\n]*)?\n不重排选\s+[1-9]\d{0,2}"
+            r"(?:\([a-z]{1,12}\))?[。.]*\s*$",
+            normalized,
+            re.IGNORECASE,
+        )
+        if recommended is None:
+            return ()
+        candidate_source = normalized[:recommended.start()]
+    else:
+        candidate_source = normalized[:recommended.start()]
+    codes = advertised_single_word_candidate_codes(candidate_source)
     if not codes:
         return ()
     if recommended.group("code").lower() not in codes:

@@ -69,6 +69,7 @@ from ..utils.pending_confirmation import (
     render_remediation_reply,
     render_server_backed_single_word_lookup,
     single_word_candidate_footer,
+    validated_front_insert_recommendation,
 )
 from ..utils.memory_store import (
     ChatMemoryContext,
@@ -285,9 +286,17 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
         r'(?P<code>[a-z]+)\s*[（(]推荐[）)]\s*$',
         response,
     )
+    reorder_match = re.search(
+        r'(?m)^\s*推荐[：:]\s*「(?P<word>[^」\n]+)」\s*占\s*'
+        r'(?P<code>[a-z]+)\s*、\s*「[^」\n]+」顺延(?:[；;].*)?$',
+        response,
+    )
     if confirm_match is not None:
         recommended_code = confirm_match.group(1)
         word = confirm_match.group(2)
+    elif reorder_match is not None:
+        recommended_code = reorder_match.group("code")
+        word = reorder_match.group("word")
     elif compact_match is not None:
         recommended_code = compact_match.group("code")
         word = compact_match.group("word")
@@ -573,6 +582,70 @@ def _pending_add_ordering_summary(state: PendingAddWord, code: str) -> str:
             "（新词按默认权重排在后）"
         )
     return ""
+
+
+def _pending_add_reorder_recommendation(
+    state: PendingAddWord,
+) -> Optional[Dict[str, str]]:
+    """Resolve the live default only from its bound comparator snapshot."""
+    return validated_front_insert_recommendation(
+        state.word,
+        state.server_candidates,
+        state.server_occupied_words,
+        state.server_ordering_assessments,
+    )
+
+
+def _pending_batch_front_insert_plan(
+    state: PendingToolConfirm,
+) -> Optional[Dict[str, Any]]:
+    """Bind one comparator front insert to its sealed companion additions."""
+    if state.function_name != "keytao_batch_add_to_draft":
+        return None
+    items = state.args.get("items")
+    scopes = state.args.get("_candidate_scopes")
+    if not isinstance(items, list) or not isinstance(scopes, list):
+        return None
+    items_by_word = {
+        str(item.get("word") or "").strip(): item
+        for item in items
+        if isinstance(item, dict) and str(item.get("word") or "").strip()
+    }
+    recommendations: List[Tuple[Dict[str, str], Dict[str, Any]]] = []
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            return {"invalid": True}
+        word = str(scope.get("word") or "").strip()
+        recommendation = validated_front_insert_recommendation(
+            word,
+            scope.get("candidates"),
+            scope.get("occupiedWords"),
+            scope.get("orderingAssessments"),
+        )
+        if recommendation is None:
+            continue
+        item = items_by_word.get(word)
+        if (
+            not isinstance(item, dict)
+            or str(item.get("code") or "").strip().lower()
+            != recommendation["occupantCode"]
+        ):
+            return {"invalid": True}
+        recommendations.append((recommendation, item))
+    if not recommendations:
+        return None
+    if len(recommendations) != 1:
+        return {"unsupportedCount": len(recommendations)}
+    recommendation, target_item = recommendations[0]
+    return {
+        "recommendation": recommendation,
+        "targetItem": dict(target_item),
+        "additionalItems": [
+            dict(item)
+            for item in items
+            if isinstance(item, dict) and item is not target_item
+        ],
+    }
 
 
 def _create_phrase_args(state: PendingAddWord, code: str) -> Dict:
@@ -1700,16 +1773,59 @@ async def _revalidate_referenced_add_pending(
         return reject(
             f"编码 {recommended_code} 已不在「{referenced_state.word}」的当前候选中"
         )
+    occupied_words: Dict[str, List[str]] = {}
+    status_map = {
+        str(status.get("code") or "").strip().lower(): status
+        for status in current_statuses
+    }
+    for code, occupied in current_candidates:
+        if not occupied:
+            continue
+        status = status_map[code]
+        words = [
+            str(word or "").strip()
+            for word in status.get("words") or []
+            if str(word or "").strip()
+        ]
+        if not words:
+            words = [
+                str(phrase.get("word") or "").strip()
+                for phrase in status.get("phrases") or []
+                if isinstance(phrase, dict) and str(phrase.get("word") or "").strip()
+            ]
+        occupied_words[code] = words
     current_recommended = str(
         matching_pronunciation.get("recommendedCode") or ""
     ).strip().lower()
     global_recommended = str(review.get("recommendedCode") or "").strip().lower()
-    if global_recommended != recommended_code:
+    current_ordering = _server_ordering_snapshot(
+        PendingAddWord(
+            word=referenced_state.word,
+            recommended_code=global_recommended,
+            candidates=current_candidates,
+            occupied_words=occupied_words,
+        ),
+        current_candidates,
+        occupied_words,
+        review.get("candidateOrderingAssessments"),
+    )
+    current_reorder = validated_front_insert_recommendation(
+        referenced_state.word,
+        current_candidates,
+        occupied_words,
+        current_ordering,
+    )
+    effective_recommended = (
+        current_reorder["occupantCode"]
+        if current_reorder is not None
+        else global_recommended
+    )
+    if effective_recommended != recommended_code:
         return reject(
             f"「{referenced_state.word}」的推荐编码已从 {recommended_code} "
-            f"变为 {global_recommended or '不可解析'}"
+            f"变为 {effective_recommended or '不可解析'}"
         )
-    if current_recommended != recommended_code:
+    if current_reorder is None and current_recommended != recommended_code:
         return reject(
             f"编码 {recommended_code} 已不再是其当前读音组的推荐编码"
         )
@@ -1773,28 +1889,6 @@ async def _revalidate_referenced_add_pending(
         after = "需管理员审核" if current_needs_manual_review else "可自动通过"
         return reject(f"审核结论已从{before}变为{after}")
 
-    occupied_words: Dict[str, List[str]] = {}
-    status_map = {
-        str(status.get("code") or "").strip().lower(): status
-        for status in current_statuses
-    }
-    for code, occupied in current_candidates:
-        if not occupied:
-            continue
-        status = status_map[code]
-        words = [
-            str(word or "").strip()
-            for word in status.get("words") or []
-            if str(word or "").strip()
-        ]
-        if not words:
-            words = [
-                str(phrase.get("word") or "").strip()
-                for phrase in status.get("phrases") or []
-                if isinstance(phrase, dict) and str(phrase.get("word") or "").strip()
-            ]
-        occupied_words[code] = words
-
     return _attach_server_candidate_snapshot(PendingAddWord(
         word=referenced_state.word,
         recommended_code=recommended_code,
@@ -1840,6 +1934,11 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
             response,
             len(pending.candidates),
         )
+        if (
+            re.search(r"(?m)^\s*推荐[：:].+顺延(?:[；;].*)?$", response)
+            and re.search(r"(?m)^\s*不重排选\s+\d+", response)
+        ):
+            return response
 
     if pending is None:
         fallback_occupied = re.search(
@@ -3340,12 +3439,36 @@ async def _execute_shift_to_code(
     user_id: str,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    *,
+    submit_after: bool = False,
+    target_item: Optional[Dict[str, Any]] = None,
+    additional_items: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
     return await _execute_confirmed_tool(
         PendingToolConfirm(
             function_name="keytao_shift_phrase_code",
-            args={"word": word, "target_code": target_code},
+            args={
+                "word": word,
+                "target_code": target_code,
+                **(
+                    {
+                        "target_type": str(target_item.get("type") or "Phrase"),
+                        "target_remark": str(target_item.get("remark") or ""),
+                        "target_needs_manual_review": bool(
+                            target_item.get("needsManualReview", True)
+                        ),
+                    }
+                    if isinstance(target_item, dict)
+                    else {}
+                ),
+                **(
+                    {"additional_items": [dict(item) for item in additional_items]}
+                    if additional_items
+                    else {}
+                ),
+                **({"_submit_after": True} if submit_after else {}),
+            },
             confirmation_source="local_preview",
         ),
         platform,
@@ -4394,25 +4517,48 @@ async def _execute_confirmed_tool(
             )
         return _append_batch_url_if_missing(warning_prompt, display_data)
 
-    async def continue_with_submit_preview(response: str) -> str:
+    async def continue_with_submit_preview(
+        response: str,
+        *,
+        authorized_items: Optional[List[Dict]] = None,
+    ) -> str:
         batch_id = str(data.get("batchId") or args.get("batch_id") or "").strip()
         if not batch_id:
             return response + "\n" + render_remediation_reply(
                 "操作完成，但响应缺少精确批次，已停止后续提交",
                 command="查看草稿",
             )
-        submit_response = await _execute_confirmed_tool(
-            PendingToolConfirm(
-                function_name="keytao_submit_batch",
-                args={"batch_id": batch_id},
-                confirmation_source="local_preview",
-            ),
-            platform,
-            user_id,
-            conv_key,
-            space_key,
-            owner_label,
-        )
+        if authorized_items:
+            submit_result = await _perform_submit_current_draft(
+                platform,
+                user_id,
+                batch_id=batch_id,
+                preview_only=True,
+                auto_confirm=True,
+                authorized_items=authorized_items,
+            )
+            if submit_result.pending_state is not None:
+                target_key: ConversationKey = conv_key or (platform, user_id)
+                conversation_state_store.set(
+                    target_key,
+                    submit_result.pending_state,
+                    space_key=space_key,
+                    owner_label=owner_label,
+                )
+            submit_response = submit_result.text
+        else:
+            submit_response = await _execute_confirmed_tool(
+                PendingToolConfirm(
+                    function_name="keytao_submit_batch",
+                    args={"batch_id": batch_id},
+                    confirmation_source="local_preview",
+                ),
+                platform,
+                user_id,
+                conv_key,
+                space_key,
+                owner_label,
+            )
         combined = _dedupe_authoritative_link_lines(
             response + "\n\n" + submit_response
         )
@@ -4570,7 +4716,24 @@ async def _execute_confirmed_tool(
                         data,
                     )
             if state.function_name == "keytao_shift_phrase_code":
-                return _format_ranked_shift_success(data)
+                response = _format_ranked_shift_success(data)
+                if submit_after:
+                    shift_plan = (
+                        data.get("shiftPlan")
+                        if isinstance(data.get("shiftPlan"), dict)
+                        else {}
+                    )
+                    authorized_items = (
+                        shift_plan.get("items")
+                        if isinstance(shift_plan.get("items"), list)
+                        and shift_plan.get("items")
+                        else None
+                    )
+                    return await continue_with_submit_preview(
+                        response,
+                        authorized_items=authorized_items,
+                    )
+                return response
             response = "✅ 操作已完成\n" + await _format_draft_response(
                 data,
                 platform,
@@ -4776,7 +4939,7 @@ def _submit_preview_matches_authorized_items(
     submit_data: Dict,
     authorized_items: Optional[List[Dict]],
 ) -> bool:
-    """Only auto-confirm a submit preview with the exact authorized create set."""
+    """Only auto-confirm a submit preview with the exact authorized item set."""
     if not authorized_items:
         return False
     snapshot_items = submit_data.get("snapshotItems")
@@ -4791,7 +4954,7 @@ def _submit_preview_matches_authorized_items(
             action = str(item.get("action") or "Create").strip()
             word = str(item.get("word") or "").strip()
             code = str(item.get("code") or "").strip().lower()
-            if action != "Create" or not word or not code:
+            if action not in {"Create", "Change", "Delete"} or not word or not code:
                 return None
             normalized.append((action, word, code))
         return sorted(normalized)
@@ -7469,6 +7632,24 @@ async def _handle_pending_add_word(
             owner_label,
         )
 
+    reorder_recommendation = _pending_add_reorder_recommendation(state)
+    if (
+        reorder_recommendation is not None
+        and state.recommended_code == reorder_recommendation["occupantCode"]
+        and not requested_codes
+        and command_intent.choice_index is None
+        and command_intent.intent in {"pending_confirm", "pending_add_and_submit"}
+    ):
+        return await _execute_shift_to_code(
+            state.word,
+            reorder_recommendation["occupantCode"],
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+            submit_after=submit_after_add,
+        )
+
     if len(requested_codes) == 1:
         direct_code = requested_codes[0]
         for code, occupied in state.candidates:
@@ -8115,7 +8296,31 @@ async def handle_pending_message_core(
                 "当前确认正在处理中",
                 command="查看草稿",
             )
-        if (
+        batch_front_insert = _pending_batch_front_insert_plan(state)
+        if batch_front_insert is not None and (
+            batch_front_insert.get("invalid") is True
+            or batch_front_insert.get("unsupportedCount")
+        ):
+            response = render_remediation_reply(
+                "这批候选包含无法唯一锁定的重排计划，本次未写入",
+                command="逐词重新查询",
+            )
+        elif batch_front_insert is not None:
+            recommendation = batch_front_insert["recommendation"]
+            response = await _execute_shift_to_code(
+                recommendation["newWord"],
+                recommendation["occupantCode"],
+                platform,
+                user_id,
+                space_key,
+                owner_label,
+                submit_after=(
+                    pending_command_intent.intent == "pending_add_and_submit"
+                ),
+                target_item=batch_front_insert["targetItem"],
+                additional_items=batch_front_insert["additionalItems"],
+            )
+        elif (
             state.function_name == "keytao_batch_add_to_draft"
             and pending_command_intent.intent == "pending_add_and_submit"
         ):

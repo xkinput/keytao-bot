@@ -933,6 +933,8 @@ class MemoryConversationStateStore:
                     left.server_candidates == right.server_candidates
                     and left.server_occupied_words == right.server_occupied_words
                     and left.server_entries_by_code == right.server_entries_by_code
+                    and left.server_ordering_assessments
+                    == right.server_ordering_assessments
                 )
             # Parsed display text may select an already-live record, but it can
             # never create the server capability that is absent from the text.

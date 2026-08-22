@@ -5569,6 +5569,7 @@ async def keytao_shift_phrase_code(
     target_type: Optional[str] = None,
     target_remark: str = "",
     target_needs_manual_review: Optional[bool] = None,
+    additional_items: Optional[List[Dict]] = None,
     ordered_words: Optional[List[str]] = None,
     listed_words: Optional[List[str]] = None,
     evidence_lines: Optional[List[str]] = None,
@@ -5579,7 +5580,50 @@ async def keytao_shift_phrase_code(
     if not word or not target_code:
         return {"success": False, "message": "必须提供词条和目标编码"}
 
+    companion_items: List[Dict] = []
+    if additional_items is not None:
+        if not isinstance(additional_items, list) or len(additional_items) > 20:
+            return {"success": False, "message": "同批附加词条集合无效"}
+        seen_companion_words: set[str] = set()
+        for raw_item in additional_items:
+            if not isinstance(raw_item, dict):
+                return {"success": False, "message": "同批附加词条集合无效"}
+            companion_word = str(raw_item.get("word") or "").strip()
+            companion_code = str(raw_item.get("code") or "").strip().lower()
+            companion_type = str(raw_item.get("type") or "Phrase").strip()
+            needs_manual_review = raw_item.get("needsManualReview", True)
+            if (
+                str(raw_item.get("action") or "Create") != "Create"
+                or not companion_word
+                or companion_word == word
+                or companion_word in seen_companion_words
+                or re.fullmatch(r"[a-z]{1,12}", companion_code) is None
+                or companion_type not in PHRASE_TYPE_BASE_WEIGHTS
+                or not isinstance(needs_manual_review, bool)
+            ):
+                return {"success": False, "message": "同批附加词条集合无效"}
+            companion_item = {
+                "action": "Create",
+                "word": companion_word,
+                "code": companion_code,
+                "type": companion_type,
+                "needsManualReview": needs_manual_review,
+            }
+            remark = str(raw_item.get("remark") or "").strip()
+            manual_reason = str(raw_item.get("manualReviewReason") or "").strip()
+            if remark:
+                companion_item["remark"] = remark
+            if manual_reason:
+                companion_item["manualReviewReason"] = manual_reason
+            companion_items.append(companion_item)
+            seen_companion_words.add(companion_word)
+
     if ordered_words is not None:
+        if companion_items:
+            return {
+                "success": False,
+                "message": "常用度重排不接受额外的同批加词",
+            }
         normalized_order = [str(value or "").strip() for value in ordered_words]
         normalized_listed = [str(value or "").strip() for value in listed_words or []]
         normalized_evidence = [str(value or "").strip() for value in evidence_lines or []]
@@ -5976,7 +6020,30 @@ async def keytao_shift_phrase_code(
     if not plan.get("success"):
         return plan
 
-    planned_words = {item.get("word") for item in plan.get("items", []) if item.get("word")}
+    plan_items = [
+        dict(item)
+        for item in plan.get("items", [])
+        if isinstance(item, dict)
+    ]
+    shift_words = {
+        str(item.get("word") or "").strip()
+        for item in plan_items
+        if str(item.get("word") or "").strip()
+    }
+    shift_codes = {
+        str(item.get("code") or "").strip().lower()
+        for item in plan_items
+        if str(item.get("code") or "").strip()
+    }
+    if any(
+        item["word"] in shift_words or item["code"] in shift_codes
+        for item in companion_items
+    ):
+        return {"success": False, "message": "同批附加词条与顺延计划冲突"}
+    plan_items.extend(companion_items)
+    planned_words = {
+        item.get("word") for item in plan_items if item.get("word")
+    }
     existing_draft = await keytao_list_draft_items(
         platform,
         platform_id,
@@ -6034,13 +6101,41 @@ async def keytao_shift_phrase_code(
         "word": word,
         "targetCode": target_code,
         "candidateCodes": target_candidate_codes,
-        "items": plan.get("items", []),
+        "items": plan_items,
         "shifted": plan.get("shifted", []),
         "removedDraftIds": [],
     }
+    warning_digest = str(expected_warning_digest or "").strip().lower()
+    warnings: List[Any] = []
+    if plan_items and not confirmed_plan_digest:
+        strict_preview = await _keytao_strict_batch_add_to_draft(
+            platform,
+            platform_id,
+            plan_items,
+            batch_id=current_batch_id or None,
+            expected_content_version=current_content_version,
+        )
+        if strict_preview.get("requiresConfirmation") is not True:
+            return _inject_known_batch_url({
+                **strict_preview,
+                "success": False,
+                "message": strict_preview.get("message") or "顺延修改内容不完整",
+                "shiftPlan": shift_plan,
+            }, current_batch_id)
+        warning_digest = str(
+            strict_preview.get("warningDigest") or ""
+        ).strip().lower()
+        warnings = list(strict_preview.get("warnings") or [])
+        if not re.fullmatch(r"[0-9a-f]{64}", warning_digest):
+            return _inject_known_batch_url({
+                "success": False,
+                "message": "服务端顺延预览缺少风险摘要",
+                "shiftPlan": shift_plan,
+            }, current_batch_id)
     digest_payload = {
         "batchId": current_batch_id,
         "contentVersion": current_content_version,
+        "warningDigest": warning_digest,
         "shiftPlan": shift_plan,
     }
     plan_digest = hashlib.sha256(json.dumps(
@@ -6059,6 +6154,8 @@ async def keytao_shift_phrase_code(
             "batchId": current_batch_id,
             "contentVersion": current_content_version,
             "planDigest": plan_digest,
+            "warningDigest": warning_digest,
+            "warnings": warnings,
             "shiftPlan": shift_plan,
         }
         _inject_batch_url(preview)
@@ -6067,6 +6164,7 @@ async def keytao_shift_phrase_code(
         confirmed_plan_digest.strip().lower() != plan_digest
         or str(batch_id or "") != current_batch_id
         or expected_content_version != current_content_version
+        or (plan_items and not re.fullmatch(r"[0-9a-f]{64}", warning_digest))
     ):
         return _inject_known_batch_url({
             "success": False,
@@ -6083,13 +6181,13 @@ async def keytao_shift_phrase_code(
     write_result = await _keytao_strict_batch_add_to_draft(
         platform,
         platform_id,
-        plan.get("items", []),
+        plan_items,
         # No draft yet: send no batch id and let the server materialise one
         # under the same absence baseline the plan was built on.
         batch_id=current_batch_id or None,
         expected_content_version=current_content_version,
-        confirmed=bool(expected_warning_digest),
-        expected_warning_digest=expected_warning_digest,
+        confirmed=True,
+        expected_warning_digest=warning_digest,
     )
     write_result["shiftPlan"] = shift_plan
     write_result["planDigest"] = plan_digest

@@ -50,6 +50,7 @@ from keytao_bot.utils.pending_confirmation import (
     same_unique_binding_set,
     render_server_backed_single_word_candidates,
     system_reply_template_marker,
+    validated_front_insert_recommendation,
 )
 
 from .state import (
@@ -537,6 +538,7 @@ class AgentOrchestrator:
             tuple[Dict[str, Any], ...],
         ] = {}
         trusted_recommended_codes_by_word: Dict[str, str] = {}
+        trusted_candidate_ordering_by_word: Dict[str, List[Dict[str, Any]]] = {}
         trusted_candidate_readings_by_word: Dict[str, Dict[str, str]] = {}
         trusted_word_lookup_codes_by_word: Dict[str, frozenset[str]] = {}
         trusted_entries_by_code: Dict[str, tuple[tuple[str, int], ...]] = {}
@@ -918,7 +920,37 @@ class AgentOrchestrator:
                     reasoning_only_empty_responses
                     >= _MAX_CONSECUTIVE_REASONING_ONLY_EMPTY_RESPONSES
                 ):
-                    if self._deterministic_fallback_handler is not None:
+                    record_backed_words = (
+                        tuple(resolved_advertised_words)
+                        or tuple(trusted_candidate_slots_by_word)
+                        if context.mutations_allowed
+                        else tuple(resolved_advertised_words)
+                    )
+                    record_backed_batch_ready = bool(
+                        len(record_backed_words) >= 2
+                        and not blocked_review_words
+                        and all(
+                            word in trusted_candidate_slots_by_word
+                            and word in trusted_candidate_statuses_by_word
+                            and any(
+                                reviewed_word == word
+                                for reviewed_word, _code
+                                in trusted_reviewed_items_by_key
+                            )
+                            for word in record_backed_words
+                        )
+                    )
+                    if record_backed_batch_ready:
+                        logger.warning(
+                            "Replacing consecutive reasoning-only output with "
+                            "the complete server-backed batch candidate"
+                        )
+                        finish_reason = "stop"
+                        response_reasoning_content = ""
+                        reasoning_only_empty_responses = 0
+                        if not content.strip():
+                            content = pending_batch_confirmation_copy()
+                    elif self._deterministic_fallback_handler is not None:
                         deterministic_reply = await self._deterministic_fallback_handler(
                             message,
                             context,
@@ -934,20 +966,21 @@ class AgentOrchestrator:
                                 deterministic_reply,
                                 authoritative_result_links,
                             )
-                    logger.error(
-                        "Stopping after consecutive reasoning-only empty responses: "
-                        f"count={reasoning_only_empty_responses} "
-                        f"max_tokens={current_max_tokens}"
-                    )
-                    if termination_state is not None:
-                        termination_state["reason"] = "reasoning_runaway"
-                    return self._append_authoritative_result_links(
-                        render_remediation_reply(
-                            "连续两次没有生成可见回复或工具调用，已停止扩大处理预算；"
-                            "本次未执行任何新写入"
-                        ),
-                        authoritative_result_links,
-                    )
+                    if not record_backed_batch_ready:
+                        logger.error(
+                            "Stopping after consecutive reasoning-only empty responses: "
+                            f"count={reasoning_only_empty_responses} "
+                            f"max_tokens={current_max_tokens}"
+                        )
+                        if termination_state is not None:
+                            termination_state["reason"] = "reasoning_runaway"
+                        return self._append_authoritative_result_links(
+                            render_remediation_reply(
+                                "连续两次没有生成可见回复或工具调用，已停止扩大处理预算；"
+                                "本次未执行任何新写入"
+                            ),
+                            authoritative_result_links,
+                        )
             else:
                 reasoning_only_empty_responses = 0
 
@@ -1045,6 +1078,10 @@ class AgentOrchestrator:
                                     item["word"],
                                     (),
                                 ),
+                                trusted_candidate_ordering_by_word.get(
+                                    item["word"],
+                                    [],
+                                ),
                             )
                             for item in pending_items
                         ]
@@ -1122,6 +1159,10 @@ class AgentOrchestrator:
                                         item["word"],
                                         (),
                                     ),
+                                    trusted_candidate_ordering_by_word.get(
+                                        item["word"],
+                                        [],
+                                    ),
                                 )
                                 for item in read_only_items
                             ]
@@ -1161,6 +1202,7 @@ class AgentOrchestrator:
                             trusted_recommended_codes_by_word,
                             trusted_reviewed_items_by_key,
                             trusted_candidate_readings_by_word,
+                            trusted_candidate_ordering_by_word,
                         )
                         rendered_single = (
                             render_server_backed_single_word_candidates(
@@ -1168,6 +1210,7 @@ class AgentOrchestrator:
                                 pending_add.recommended_code,
                                 pending_add.server_candidates,
                                 pending_add.server_occupied_words,
+                                pending_add.server_ordering_assessments,
                             )
                             if pending_add is not None
                             else ""
@@ -1303,6 +1346,10 @@ class AgentOrchestrator:
                                 trusted_candidate_statuses_by_word.get(
                                     item["word"],
                                     (),
+                                ),
+                                trusted_candidate_ordering_by_word.get(
+                                    item["word"],
+                                    [],
                                 ),
                             )
                             for item in pending_items
@@ -1939,6 +1986,7 @@ class AgentOrchestrator:
                         trusted_candidate_statuses_by_word,
                         trusted_recommended_codes_by_word,
                         trusted_candidate_readings_by_word,
+                        trusted_candidate_ordering_by_word,
                     )
                     pending_tool_name = (
                         execution_route.tool_name
@@ -2228,6 +2276,7 @@ class AgentOrchestrator:
         word: str,
         slots: tuple[tuple[str, bool], ...],
         statuses: tuple[Dict[str, Any], ...],
+        ordering_assessments: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Project candidate occupancy and exact occupant names for display."""
         occupied_words: Dict[str, List[str]] = {}
@@ -2251,6 +2300,12 @@ class AgentOrchestrator:
         }
         if occupied_words:
             scope["occupiedWords"] = occupied_words
+        if ordering_assessments:
+            scope["orderingAssessments"] = [
+                dict(value)
+                for value in ordering_assessments[:2]
+                if isinstance(value, dict)
+            ]
         return scope
 
     @staticmethod
@@ -2266,6 +2321,9 @@ class AgentOrchestrator:
         recommended_codes_by_word: Dict[str, str],
         reviewed_items_by_key: Dict[tuple[str, str], Dict[str, Any]],
         candidate_readings_by_word: Optional[Dict[str, Dict[str, str]]] = None,
+        candidate_ordering_by_word: Optional[
+            Dict[str, List[Dict[str, Any]]]
+        ] = None,
     ) -> Optional[PendingAddWord]:
         """Build one single-word ticket solely from same-turn tool records."""
         words = tuple(
@@ -2314,7 +2372,7 @@ class AgentOrchestrator:
             reviewed.get("manual_review_reason")
             or "当前候选尚未形成自动通过结论"
         ).strip()
-        return PendingAddWord(
+        state = PendingAddWord(
             word=word,
             recommended_code=recommended,
             candidates=list(candidates),
@@ -2322,6 +2380,9 @@ class AgentOrchestrator:
             server_candidates=list(candidates),
             server_occupied_words=dict(occupied_words),
             server_entries_by_code=entries_by_code,
+            server_ordering_assessments=list(
+                (candidate_ordering_by_word or {}).get(word, [])
+            ),
             code_remarks={recommended: remark} if remark else {},
             pronunciation_codes={
                 code: pinyin
@@ -2336,6 +2397,15 @@ class AgentOrchestrator:
             needs_manual_review=needs_manual_review,
             manual_review_reason=manual_reason,
         )
+        reorder_recommendation = validated_front_insert_recommendation(
+            state.word,
+            state.server_candidates,
+            state.server_occupied_words,
+            state.server_ordering_assessments,
+        )
+        if reorder_recommendation is not None:
+            state.recommended_code = reorder_recommendation["occupantCode"]
+        return state
 
     def _validated_resolved_advertised_words(
         self,
@@ -3485,6 +3555,9 @@ class AgentOrchestrator:
         ] = None,
         recommended_codes_by_word: Optional[Dict[str, str]] = None,
         candidate_readings_by_word: Optional[Dict[str, Dict[str, str]]] = None,
+        candidate_ordering_by_word: Optional[
+            Dict[str, List[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         """Capture narrowly scoped capabilities from successful read-tool results."""
         if (
@@ -3713,6 +3786,15 @@ class AgentOrchestrator:
                         }
 
                 if tool_name == "keytao_prepare_reviewed_add":
+                    raw_ordering = result.get("candidateOrderingAssessments")
+                    if candidate_ordering_by_word is not None:
+                        candidate_ordering_by_word.pop(word, None)
+                        if isinstance(raw_ordering, list):
+                            candidate_ordering_by_word[word] = [
+                                dict(value)
+                                for value in raw_ordering[:2]
+                                if isinstance(value, dict)
+                            ]
                     recommended_code = str(result.get("recommendedCode") or "").strip()
                     audit = result.get("preSubmitAudit")
                     if recommended_code and isinstance(audit, dict):

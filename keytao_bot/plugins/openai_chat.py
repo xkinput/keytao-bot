@@ -108,6 +108,7 @@ from ..utils.pending_confirmation import (
     render_server_backed_word_set,
     same_unique_binding_set,
     strip_warning_count_copy,
+    validated_front_insert_recommendation as _validated_front_insert_recommendation_from_record,
 )
 from ..utils.memory_store import (
     ChatMemoryContext,
@@ -233,6 +234,7 @@ from .chat_commands import (
     _parse_pending_batch_add,
     _parse_pending_state_from_response,
     _pending_add_ordering_summary,
+    _pending_batch_front_insert_plan,
     _pending_pronunciation_correction,
     _pending_state_from_server_warning,
     _perform_active_operation_confirmation,
@@ -2072,6 +2074,7 @@ def _render_live_single_candidate_record(
         record.state.recommended_code,
         record.state.server_candidates,
         record.state.server_occupied_words,
+        record.state.server_ordering_assessments,
     )
 
 
@@ -3939,6 +3942,17 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                 elif (
                     pending_command_intent.intent == "pending_add_and_submit"
                     and len(pending_command_intent.requested_codes) <= 1
+                    and not (
+                        pending_command_intent.choice_index is None
+                        and not pending_command_intent.requested_codes
+                        and _validated_front_insert_recommendation_from_record(
+                            state.word,
+                            state.server_candidates,
+                            state.server_occupied_words,
+                            state.server_ordering_assessments,
+                        )
+                        is not None
+                    )
                 ):
                     choice_index = pending_command_intent.choice_index
                     if (
@@ -4051,6 +4065,51 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                             current_operation,
                             state,
                         )
+                    elif (
+                        batch_front_insert := _pending_batch_front_insert_plan(
+                            state
+                        )
+                    ) is not None:
+                        if (
+                            batch_front_insert.get("invalid") is True
+                            or batch_front_insert.get("unsupportedCount")
+                        ):
+                            complete_pending_execution()
+                            ctx.response = render_remediation_reply(
+                                "这批候选包含无法唯一锁定的重排计划，本次未写入",
+                                command="逐词重新查询",
+                            )
+                        elif not begin_pending_execution():
+                            ctx.response = render_remediation_reply(
+                                "当前确认正在处理中",
+                                command="查看草稿",
+                            )
+                        else:
+                            recommendation = batch_front_insert[
+                                "recommendation"
+                            ]
+                            ctx.response = await _execute_shift_to_code(
+                                recommendation["newWord"],
+                                recommendation["occupantCode"],
+                                ctx.platform,
+                                ctx.user_id,
+                                ctx.space_key,
+                                ctx.owner_label,
+                                submit_after=(
+                                    pending_command_intent.intent
+                                    == "pending_add_and_submit"
+                                ),
+                                target_item=batch_front_insert["targetItem"],
+                                additional_items=batch_front_insert[
+                                    "additionalItems"
+                                ],
+                            )
+                            ctx.response = _prepend_resolved_advertised_words(
+                                state,
+                                ctx.response,
+                            )
+                            if not preserve_pending_after_response:
+                                complete_pending_execution()
                     elif (
                         state.function_name == "keytao_batch_add_to_draft"
                         and pending_command_intent.intent == "pending_add_and_submit"
@@ -4778,6 +4837,7 @@ _CHAT_COMPAT_NAMES = (
     "_parse_pending_state_from_response",
     "_parse_simple_word_query_intent_payload",
     "_pending_add_ordering_summary",
+    "_pending_batch_front_insert_plan",
     "_pending_assent_rejection_response",
     "_pending_context_for_command_intent",
     "_pending_owner_label",

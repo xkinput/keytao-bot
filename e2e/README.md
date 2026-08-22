@@ -75,6 +75,10 @@ evidence; the scenario never depends on an external search result.
 S32 declares authoritative readings for `米等`, `幂等`, and `迷瞪`, clears only
 those rig-owned dictionary words, then seeds `米等@mkdr(100)`,
 `迷瞪@mkdro(100)`, and a current-draft `幂等@mkdr(101)` projection.
+S35 declares authoritative readings for the isolated `发布会`/`重病号`,
+`计算机`/`建三江`, and `无事忙` controls. It clears only those declared
+rig-owned words, seeds the exact `重病号@fbh` and `建三江@jsj` occupants, and
+uses the vendored commonness reference for both front-insert verdicts.
 
 ## Prerequisites
 
@@ -181,8 +185,9 @@ and verifies that command reaches a submitted batch without another correction.
 
 S16 replays the two-word 载流 production transcript with `座落在@zlz` seeded as
 a Phrase, weight 100 dictionary occupant: it discovers `载流@zhlq` and
-`载流子@zlzu` in one turn, sends bare `加入并提交` without a native quote, and
-requires both exact items to reach the same submitted batch.
+the comparator-backed `载流子@zlz` front insert in one turn, sends bare
+`加入并提交` without a native quote, and requires the free add, newcomer create,
+and sealed `座落在` shift to reach the same submitted batch.
 At most one server-bound `确认` step may intervene. The flow rejects
 target-completion guidance and any submit-only remediation.
 
@@ -343,6 +348,14 @@ remain available. A fresh explicit add followed by `加入` must stop at one
 local confirmation before an exact duplicate reaches the server write route.
 After cancellation, selecting a different reviewed code must proceed through
 the same sink while preserving the Submitted reminder as the first line.
+
+S35 replays the 2026-08-22 default-reorder incident without touching its
+production-shaped words or batch. A comparator-backed front-insert review must
+render one recommendation plus one numbered no-reorder opt-out. Bare
+`加入并提交` must consume one sealed plan confirmation, shift the named occupant,
+create the newcomer at the occupied slot, and submit that exact batch. A second
+front-insert pair pins numbered fallback selection, while a free-chain control
+pins the unchanged no-recommendation default.
 
 Optional overrides:
 

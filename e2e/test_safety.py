@@ -54,6 +54,8 @@ from .scenarios import (
     _s33_external_query_pairs,
     S34_PENDING_CODE,
     S34_WORD,
+    S35_FRONT_CASES,
+    S35_FREE_CONTROL,
     assert_batch_link_hosts,
     same_unique_item_set,
 )
@@ -413,15 +415,31 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S32 replays both 2026-08-20 chain-scope incidents", readme)
         self.assertIn("S33 replays both 2026-08-21 homophone batch shapes", readme)
         self.assertIn("S34 replays the 2026-08-21 pending-batch incident", readme)
+        self.assertIn("S35 replays the 2026-08-22 default-reorder incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s34(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s35(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 35)],
+            [f"S{index}" for index in range(1, 36)],
+        )
+
+    def test_s35_declares_isolated_reorder_and_free_slot_controls(self) -> None:
+        self.assertEqual(
+            S35_FRONT_CASES,
+            (
+                ("发布会", "重病号", "fbh"),
+                ("计算机", "建三江", "jsj"),
+            ),
+        )
+        self.assertEqual(S35_FREE_CONTROL, ("无事忙", "wem"))
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S35"]
+        self.assertEqual(
+            fixture["probe_words"],
+            ("发布会", "重病号", "计算机", "建三江", "无事忙"),
         )
 
     def test_artifacts_redact_admin_credentials(self) -> None:
@@ -1132,15 +1150,31 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                             "code": "zhlq",
                         },
                         {
+                            "action": "Delete",
+                            "word": "座落在",
+                            "code": "zlz",
+                        },
+                        {
+                            "action": "Create",
+                            "word": "座落在",
+                            "code": "zlza",
+                        },
+                        {
                             "action": "Create",
                             "word": "载流子",
-                            "code": "zlzu",
+                            "code": "zlz",
                         },
                     ],
                 }
 
         class FakeContext:
-            fixture_facts = {}
+            fixture_facts = {
+                "s16": {
+                    "occupantWord": "座落在",
+                    "occupiedCode": "zlz",
+                    "shiftedCode": "zlza",
+                },
+            }
             admin_token = "offline-admin-token"
 
             def __init__(self, *, require_confirmation: bool, per_word_rendering: bool):
@@ -1170,7 +1204,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                             "result": {
                                 "success": True,
                                 "word": "载流子",
-                                "recommendedCode": "zlzu",
+                                "recommendedCode": "zlz",
                                 "needsManualReview": False,
                             },
                         },
@@ -1186,7 +1220,9 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     if self.per_word_rendering:
                         return (
                             "是否以编码 zhlq 将「载流」加入草稿？\n"
-                            "是否以编码 zlzu 将「载流子」加入草稿？\n\n"
+                            "是否以编码 zlz 将「载流子」加入草稿？\n"
+                            "推荐：「载流子」占 zlz、「座落在」顺延\n"
+                            "不重排选 2（zlzu）。\n\n"
                             "回复「加入」、「都加」、「添加」只加入草稿；"
                             "回复「加入并提交」、「都加并提交」、「添加并提交」则加入后提交。\n"
                             "多个词的候选编号分别从 1 开始；选择时请带上词条，"
@@ -1195,7 +1231,9 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     return (
                         "这些词是否一起加入草稿并提交？\n"
                         "- 「载流」→ zhlq\n"
-                        "- 「载流子」→ zlzu\n\n"
+                        "- 「载流子」→ zlz\n"
+                        "推荐：「载流子」占 zlz、「座落在」顺延\n"
+                        "不重排选 2（zlzu）。\n\n"
                         "回复「加入」、「都加」、「添加」只加入草稿；"
                         "回复「加入并提交」、「都加并提交」、「添加并提交」则加入后提交。"
                     )
@@ -1244,7 +1282,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     )
                     self.assertEqual(
                         result["facts"]["submittedCodes"],
-                        ["zhlq", "zlzu"],
+                        ["zhlq", "zlz"],
                     )
                     self.assertFalse(result["facts"]["quoteRequired"])
                     self.assertEqual(
@@ -3151,7 +3189,8 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             "weight": 100,
             "user": {"name": "keytao-e2e-llm-rig-run-seed"},
         }
-        client.phrases_by_code = AsyncMock(side_effect=[[], [occupant]])
+        client.phrases_by_code = AsyncMock(side_effect=[[], [occupant], []])
+        client.encode = AsyncMock(return_value={"codes": ["zlz", "zlza"]})
         client.clean_draft = AsyncMock(return_value={"success": True})
         client.seed_phrase = AsyncMock(return_value={"batchId": "fixture-batch"})
 
@@ -3168,6 +3207,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         )
         self.assertEqual(result["occupantWord"], "座落在")
         self.assertEqual(result["occupiedCode"], "zlz")
+        self.assertEqual(result["shiftedCode"], "zlza")
         self.assertEqual(result["occupant"]["weight"], 100)
 
     async def test_s18_dictionary_fixture_seeds_the_exact_duplicate_occupant(

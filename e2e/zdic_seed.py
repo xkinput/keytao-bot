@@ -337,6 +337,32 @@ ZDIC_FIXTURES_BY_SCENARIO["S34"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S35"] = {
+    "probe_words": ("发布会", "重病号", "计算机", "建三江", "无事忙"),
+    "rows": (
+        {"kind": "char", "entry": "发", "status": "found", "pinyins": ["fā"]},
+        {"kind": "char", "entry": "布", "status": "found", "pinyins": ["bù"]},
+        {"kind": "char", "entry": "会", "status": "found", "pinyins": ["huì"]},
+        {"kind": "char", "entry": "重", "status": "found", "pinyins": ["zhòng", "chóng"]},
+        {"kind": "char", "entry": "病", "status": "found", "pinyins": ["bìng"]},
+        {"kind": "char", "entry": "号", "status": "found", "pinyins": ["hào", "háo"]},
+        {"kind": "char", "entry": "计", "status": "found", "pinyins": ["jì"]},
+        {"kind": "char", "entry": "算", "status": "found", "pinyins": ["suàn"]},
+        {"kind": "char", "entry": "机", "status": "found", "pinyins": ["jī"]},
+        {"kind": "char", "entry": "建", "status": "found", "pinyins": ["jiàn"]},
+        {"kind": "char", "entry": "三", "status": "found", "pinyins": ["sān"]},
+        {"kind": "char", "entry": "江", "status": "found", "pinyins": ["jiāng"]},
+        {"kind": "char", "entry": "无", "status": "found", "pinyins": ["wú"]},
+        {"kind": "char", "entry": "事", "status": "found", "pinyins": ["shì"]},
+        {"kind": "char", "entry": "忙", "status": "found", "pinyins": ["máng"]},
+        {"kind": "entry", "entry": "发布会", "status": "found", "pinyins": ["fā", "bù", "huì"]},
+        {"kind": "entry", "entry": "重病号", "status": "found", "pinyins": ["zhòng", "bìng", "hào"]},
+        {"kind": "entry", "entry": "计算机", "status": "found", "pinyins": ["jì", "suàn", "jī"]},
+        {"kind": "entry", "entry": "建三江", "status": "found", "pinyins": ["jiàn", "sān", "jiāng"]},
+        {"kind": "entry", "entry": "无事忙", "status": "found", "pinyins": ["wú", "shì", "máng"]},
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

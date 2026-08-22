@@ -1229,10 +1229,14 @@ async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
 
 
 async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
+    fixture = ctx.fixture_facts["s16"]
+    occupant_word = str(fixture["occupantWord"])
+    occupied_code = str(fixture["occupiedCode"])
+    shifted_code = str(fixture["shiftedCode"])
     messages = ["喵喵 加词 载流 载流子"]
     replies = [await ctx.send(messages[-1])]
     discovery_reply = replies[-1]
-    expected_bindings = {("载流", "zhlq"), ("载流子", "zlzu")}
+    expected_bindings = {("载流", "zhlq"), ("载流子", occupied_code)}
     review_events = [
         event
         for event in ctx.attempt_events()
@@ -1255,6 +1259,11 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
     require(
         displayed_bindings == expected_bindings,
         f"S16 discovery rendering did not advertise both exact bindings: {discovery_reply}",
+    )
+    require(
+        f"推荐：「载流子」占 {occupied_code}、「{occupant_word}」顺延" in discovery_reply
+        and "不重排选 2（zlzu）。" in discovery_reply,
+        f"S16 discovery did not render the comparator default coherently: {discovery_reply}",
     )
     saved_ticket_events = [
         event
@@ -1316,19 +1325,30 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
         batch.get("status") in {"Submitted", "Approved"},
         f"S16 batch did not pass through submission: {batch}",
     )
-    expected_items = (("载流", "zhlq"), ("载流子", "zlzu"))
-    for word, code in expected_items:
-        require(
-            _submitted_item(batch, word=word, code=code) is not None,
-            f"S16 submitted batch lacks {word}@{code}: {batch}",
-        )
+    expected_items = {
+        ("Create", "载流", "zhlq"),
+        ("Delete", occupant_word, occupied_code),
+        ("Create", occupant_word, shifted_code),
+        ("Create", "载流子", occupied_code),
+    }
+    actual_items = {
+        item_key(item)
+        for item in batch.get("pullRequests", [])
+        if isinstance(item, dict)
+    }
+    require(
+        actual_items == expected_items,
+        f"S16 submitted batch did not atomically combine the free add and front insert: {batch}",
+    )
     return {
         "messages": messages,
         "replies": replies,
         "draft": await ctx.draft(),
         "facts": {
-            "submittedWords": [word for word, _code in expected_items],
-            "submittedCodes": [code for _word, code in expected_items],
+            "submittedWords": ["载流", "载流子"],
+            "submittedCodes": ["zhlq", occupied_code],
+            "shiftedOccupant": occupant_word,
+            "shiftedToCode": shifted_code,
             "batchId": batch_id,
             "batchStatus": batch.get("status"),
             "quoteRequired": False,
@@ -4770,6 +4790,259 @@ async def scenario_s34(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S35_FRONT_CASES = (
+    ("发布会", "重病号", "fbh"),
+    ("计算机", "建三江", "jsj"),
+)
+S35_FREE_CONTROL = ("无事忙", "wem")
+
+
+async def scenario_s35(ctx: ScenarioContext) -> dict[str, Any]:
+    """Pin comparator-driven copy, default front insert, and both controls."""
+    fixture = ctx.fixture_facts["s35"]
+    messages: list[str] = []
+    replies: list[str] = []
+
+    default_case = fixture["frontCases"][0]
+    default_word = str(default_case["newcomerWord"])
+    default_occupant = str(default_case["occupantWord"])
+    default_code = str(default_case["occupiedCode"])
+    default_free = str(default_case["freeCode"])
+    default_shifted = str(default_case["shiftedCode"])
+    messages.append(f"喵喵 {default_word}")
+    recommendation = await ctx.send(messages[-1])
+    replies.append(recommendation)
+    recommendation_lines = [
+        line
+        for line in recommendation.splitlines()
+        if line.startswith("推荐：") or line.startswith("不重排选 ")
+    ]
+    require(
+        len(recommendation_lines) == 2
+        and recommendation_lines[0].startswith(
+            f"推荐：「{default_word}」占 {default_code}、"
+            f"「{default_occupant}」顺延；依据："
+        )
+        and recommendation_lines[1] == f"不重排选 2（{default_free}）。"
+        and "推荐编码：" not in recommendation
+        and "当前建议不调整现有排序" not in recommendation
+        and f"{default_word} → {default_free}（推荐）" not in recommendation,
+        f"S35 default recommendation was contradictory or longer than two lines: "
+        f"{recommendation}",
+    )
+    require(
+        not (await ctx.draft()).get("items"),
+        f"S35 recommendation wrote before assent: {await ctx.draft()}",
+    )
+
+    submit_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入并提交")
+    assent_reply = await ctx.send(messages[-1])
+    replies.append(assent_reply)
+    confirmation_steps = 0
+    default_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=submit_cutoff,
+    )
+    if not default_batch_id:
+        require(
+            pending_confirmation_copy() in assent_reply,
+            f"S35 default assent neither submitted nor exposed the sealed plan: {assent_reply}",
+        )
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        confirmation_steps = 1
+        default_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=submit_cutoff,
+        )
+    require(default_batch_id, "S35 one front-insert confirmation did not submit")
+    default_batch = await ctx.next_client.get_admin_batch(
+        batch_id=default_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    default_items = [
+        item_key(item)
+        for item in default_batch.get("pullRequests", [])
+        if isinstance(item, dict)
+    ]
+    expected_default_items = (
+        ("Delete", default_occupant, default_code),
+        ("Create", default_occupant, default_shifted),
+        ("Create", default_word, default_code),
+    )
+    newcomer_item = next(
+        (
+            item
+            for item in default_batch.get("pullRequests", [])
+            if isinstance(item, dict)
+            and item_key(item) == ("Create", default_word, default_code)
+        ),
+        None,
+    )
+    require(
+        default_batch.get("status") in {"Submitted", "Approved"}
+        and same_unique_item_set(default_items, expected_default_items)
+        and isinstance(newcomer_item, dict)
+        and newcomer_item.get("needsManualReview") is True,
+        f"S35 default assent did not submit the sealed front insert: {default_batch}",
+    )
+    confirmed_shift_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > submit_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    require(
+        confirmation_steps <= 1 and len(confirmed_shift_calls) == 1,
+        f"S35 default reorder did not preserve one-confirmation semantics: "
+        f"steps={confirmation_steps}, calls={confirmed_shift_calls}",
+    )
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    opt_out_case = fixture["frontCases"][1]
+    opt_out_word = str(opt_out_case["newcomerWord"])
+    opt_out_occupant = str(opt_out_case["occupantWord"])
+    opt_out_code = str(opt_out_case["occupiedCode"])
+    opt_out_free = str(opt_out_case["freeCode"])
+    messages.append(f"喵喵 {opt_out_word}")
+    opt_out_discovery = await ctx.send(messages[-1])
+    replies.append(opt_out_discovery)
+    require(
+        f"推荐：「{opt_out_word}」占 {opt_out_code}、「{opt_out_occupant}」顺延"
+        in opt_out_discovery
+        and f"不重排选 2（{opt_out_free}）。" in opt_out_discovery,
+        f"S35 opt-out discovery lacked the bound fallback: {opt_out_discovery}",
+    )
+    opt_out_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("2 添加并提交")
+    opt_out_reply = await ctx.send(messages[-1])
+    replies.append(opt_out_reply)
+    opt_out_confirmations = 0
+    opt_out_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=opt_out_cutoff,
+    )
+    if not opt_out_batch_id and pending_confirmation_copy() in opt_out_reply:
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        opt_out_confirmations = 1
+        opt_out_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=opt_out_cutoff,
+        )
+    require(opt_out_batch_id, "S35 numbered opt-out never submitted")
+    opt_out_batch = await ctx.next_client.get_admin_batch(
+        batch_id=opt_out_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        opt_out_batch.get("status") in {"Submitted", "Approved"}
+        and [
+            item_key(item)
+            for item in opt_out_batch.get("pullRequests", [])
+            if isinstance(item, dict)
+        ]
+        == [("Create", opt_out_word, opt_out_free)],
+        f"S35 numbered opt-out did not land on the free slot: {opt_out_batch}",
+    )
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    free_control = fixture["freeControl"]
+    free_word = str(free_control["word"])
+    free_code = str(free_control["recommendedCode"])
+    messages.append(f"喵喵 {free_word}")
+    free_discovery = await ctx.send(messages[-1])
+    replies.append(free_discovery)
+    require(
+        free_word in free_discovery
+        and free_code in free_discovery
+        and "不重排选" not in free_discovery,
+        f"S35 no-recommendation control did not advertise the free default: "
+        f"{free_discovery}",
+    )
+    free_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入并提交")
+    free_reply = await ctx.send(messages[-1])
+    replies.append(free_reply)
+    free_confirmations = 0
+    free_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=free_cutoff,
+    )
+    if not free_batch_id and pending_confirmation_copy() in free_reply:
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        free_confirmations = 1
+        free_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=free_cutoff,
+        )
+    require(free_batch_id, "S35 no-recommendation assent never submitted")
+    free_batch = await ctx.next_client.get_admin_batch(
+        batch_id=free_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        free_batch.get("status") in {"Submitted", "Approved"}
+        and [
+            item_key(item)
+            for item in free_batch.get("pullRequests", [])
+            if isinstance(item, dict)
+        ]
+        == [("Create", free_word, free_code)],
+        f"S35 no-recommendation assent changed the current free-slot default: {free_batch}",
+    )
+
+    final_draft = await ctx.draft()
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": final_draft,
+        "facts": {
+            "defaultRecommendation": {
+                "newcomer": default_word,
+                "occupiedCode": default_code,
+                "shiftedOccupant": default_occupant,
+                "shiftedToCode": default_shifted,
+                "batchId": default_batch_id,
+                "batchStatus": default_batch.get("status"),
+                "confirmationSteps": confirmation_steps,
+                "sealedCreate": True,
+            },
+            "numberedOptOut": {
+                "newcomer": opt_out_word,
+                "selectedNumber": 2,
+                "code": opt_out_free,
+                "batchId": opt_out_batch_id,
+                "batchStatus": opt_out_batch.get("status"),
+                "confirmationSteps": opt_out_confirmations,
+            },
+            "noRecommendationControl": {
+                "word": free_word,
+                "code": free_code,
+                "batchId": free_batch_id,
+                "batchStatus": free_batch.get("status"),
+                "confirmationSteps": free_confirmations,
+            },
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -4805,6 +5078,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S32", "draft-aware and explicit-list chain scope", scenario_s32),
     Scenario("S33", "batch-aware homophone slot allocation", scenario_s33),
     Scenario("S34", "pending submitted word awareness", scenario_s34),
+    Scenario("S35", "comparator recommendation is the default add plan", scenario_s35),
 )
 
 

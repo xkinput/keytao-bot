@@ -4344,6 +4344,11 @@ def test_candidate_commonness_wiring_and_timeout():
             "review tool returns the structured ordering snapshot",
             tool_result.get("candidateOrderingAssessments") == ordering,
         )
+        check(
+            "review tool promotes the comparator verdict to the one recommendation",
+            tool_result.get("recommendedCode") == "eefj"
+            and tool_result["pronunciations"][0].get("recommendedCode") == "eefj",
+        )
 
     asyncio.run(_run())
 
@@ -4498,8 +4503,8 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
             "ordering copy cites both semantic and dictionary/corpus evidence",
             "冒菜：现代常用饮食词（语义判断）" in rendered
             and "茂才：古语，词典收录但语料频次低" in rendered
-            and "建议「冒菜」占 mzch、「茂才」顺延" in rendered
-            and "回复「1 重新编码」执行" in rendered,
+            and "推荐：「冒菜」占 mzch、「茂才」顺延" in rendered
+            and "不重排选 2（mzchi）" in rendered,
         )
 
     asyncio.run(_run())

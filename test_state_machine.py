@@ -228,6 +228,7 @@ from keytao_bot.utils.pending_confirmation import (
     SYSTEM_REPLY_TEMPLATE_MARKERS,
     advertised_command_has_placeholder,
     advertised_batch_binding_pairs,
+    advertised_single_word_lookup_codes,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     render_remediation_reply,
@@ -3092,15 +3093,16 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
     behind_prompt = _format_reviewed_add_prompt(review_for("behind_more_common")) or ""
     insufficient_prompt = _format_reviewed_add_prompt(review_for("not_enough_evidence")) or ""
     check(
-        "front branch recommends reordering with the exact selector",
-        "建议「射覆」占 eefj、「慑服」顺延" in front_prompt
-        and "回复「1 重新编码」执行" in front_prompt,
+        "front branch has one coherent two-line recommendation",
+        "推荐：「射覆」占 eefj、「慑服」顺延" in front_prompt
+        and "不重排选 2（eefju）" in front_prompt
+        and "回复「1 重新编码」执行" not in front_prompt,
     )
     check(
-        "front branch keeps the free slot as an alternative",
+        "front branch keeps the free slot only as the opt-out",
         "eefju — 空位（不调序备选）" in front_prompt
-        and "提示：当前建议不调整现有排序。" in front_prompt
-        and "• 「射覆」→ eefju（推荐）" in front_prompt,
+        and "提示：当前建议不调整现有排序。" not in front_prompt
+        and "• 「射覆」→ eefju（推荐）" not in front_prompt,
     )
     hinted_selection = openai_chat_module.parse_pending_candidate_selection(
         "添加1、2"
@@ -3121,9 +3123,190 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
     )
     parsed = _parse_pending_add_word(front_prompt)
     check(
-        "presentation marker does not misparse the occupied slot as free",
+        "comparator recommendation becomes the parsed assent default",
         isinstance(parsed, PendingAddWord)
+        and parsed.recommended_code == "eefj"
         and parsed.candidates == [("eefj", True), ("eefju", False)],
+    )
+
+    async def _assert_assent_defaults():
+        assert isinstance(parsed, PendingAddWord)
+        chat_commands_module._attach_server_candidate_snapshot(
+            parsed,
+            review_for("front_more_common")["pronunciations"][0][
+                "candidateStatuses"
+            ],
+            review_for("front_more_common")["candidateOrderingAssessments"],
+        )
+        with (
+            patch.object(
+                chat_commands_module,
+                "_execute_shift_to_code",
+                new=AsyncMock(return_value="sealed reorder"),
+            ) as shift,
+            patch.object(
+                chat_commands_module,
+                "_execute_add_to_draft_and_submit",
+                new=AsyncMock(side_effect=AssertionError("used fallback create")),
+            ),
+        ):
+            result = await _handle_pending_add_word(
+                parsed,
+                "加入并提交",
+                "qq",
+                "commonness-user",
+                [],
+                command_intent=MessageCommandIntent(
+                    intent="pending_add_and_submit",
+                    confidence=1.0,
+                    submit_after=True,
+                ),
+            )
+        check("bare add-submit stages the recommended reorder", result == "sealed reorder")
+        check(
+            "bare add-submit carries submit through the sealed reorder",
+            shift.await_args.args[:4] == (
+                "射覆",
+                "eefj",
+                "qq",
+                "commonness-user",
+            )
+            and shift.await_args.kwargs.get("submit_after") is True,
+        )
+
+        bare_add_shift = AsyncMock(return_value="sealed reorder only")
+        with patch.object(
+            chat_commands_module,
+            "_execute_shift_to_code",
+            new=bare_add_shift,
+        ):
+            bare_add_result = await _handle_pending_add_word(
+                parsed,
+                "加入",
+                "qq",
+                "commonness-user",
+                [],
+                command_intent=MessageCommandIntent(
+                    intent="pending_confirm",
+                    confidence=1.0,
+                ),
+            )
+        check("bare add also stages the recommended reorder", bare_add_result == "sealed reorder only")
+        check(
+            "bare add does not implicitly submit",
+            bare_add_shift.await_args.kwargs.get("submit_after") is False,
+        )
+
+        fallback_add = AsyncMock(return_value="fallback added")
+        with (
+            patch.object(
+                chat_commands_module,
+                "_execute_shift_to_code",
+                new=AsyncMock(side_effect=AssertionError("shifted explicit opt-out")),
+            ),
+            patch.object(
+                chat_commands_module,
+                "_execute_add_to_draft_and_submit",
+                new=fallback_add,
+            ),
+        ):
+            fallback_result = await _handle_pending_add_word(
+                parsed,
+                "2 添加并提交",
+                "qq",
+                "commonness-user",
+                [],
+                command_intent=MessageCommandIntent(
+                    intent="pending_add_and_submit",
+                    confidence=1.0,
+                    submit_after=True,
+                    choice_index=2,
+                ),
+            )
+        check("numbered fallback remains an opt-out", fallback_result == "fallback added")
+        check(
+            "numbered fallback lands on the free code",
+            fallback_add.await_args.args[:2] == ("射覆", "eefju"),
+        )
+
+        no_reorder_prompt = _format_reviewed_add_prompt(
+            review_for("behind_more_common")
+        ) or ""
+        no_reorder = _parse_pending_add_word(no_reorder_prompt)
+        assert isinstance(no_reorder, PendingAddWord)
+        chat_commands_module._attach_server_candidate_snapshot(
+            no_reorder,
+            review_for("behind_more_common")["pronunciations"][0][
+                "candidateStatuses"
+            ],
+            review_for("behind_more_common")["candidateOrderingAssessments"],
+        )
+        ordinary_add = AsyncMock(return_value="ordinary added")
+        with (
+            patch.object(
+                chat_commands_module,
+                "_execute_shift_to_code",
+                new=AsyncMock(side_effect=AssertionError("shifted no-recommendation state")),
+            ),
+            patch.object(
+                chat_commands_module,
+                "_execute_add_to_draft_and_submit",
+                new=ordinary_add,
+            ),
+        ):
+            ordinary_result = await _handle_pending_add_word(
+                no_reorder,
+                "加入并提交",
+                "qq",
+                "commonness-user",
+                [],
+                command_intent=MessageCommandIntent(
+                    intent="pending_add_and_submit",
+                    confidence=1.0,
+                    submit_after=True,
+                ),
+            )
+        check("no-recommendation assent keeps today's free-slot behavior", ordinary_result == "ordinary added")
+        check(
+            "no-recommendation assent uses the recommended free code",
+            ordinary_add.await_args.args[:2] == ("射覆", "eefju"),
+        )
+
+    asyncio.run(_assert_assent_defaults())
+
+    ordering_by_word = {}
+    candidate_slots = {}
+    candidate_statuses = {}
+    recommended_codes = {}
+    reviewed_items = {}
+    AgentOrchestrator._update_trusted_capabilities(
+        tool_name="keytao_prepare_reviewed_add",
+        arguments={"word": "射覆"},
+        result=review_for("front_more_common"),
+        codes_by_word={},
+        word_lookup_codes_by_word={},
+        entries_by_code={},
+        draft_words_by_id={},
+        draft_items_by_id={},
+        phrase_types_by_key={},
+        reviewed_items_by_key=reviewed_items,
+        candidate_slots_by_word=candidate_slots,
+        candidate_statuses_by_word=candidate_statuses,
+        recommended_codes_by_word=recommended_codes,
+        candidate_ordering_by_word=ordering_by_word,
+    )
+    record_first = AgentOrchestrator._trusted_single_pending_add(
+        candidate_slots,
+        candidate_statuses,
+        recommended_codes,
+        reviewed_items,
+        candidate_ordering_by_word=ordering_by_word,
+    )
+    check(
+        "record-first model route preserves the comparator default",
+        record_first is not None
+        and record_first.recommended_code == "eefj"
+        and record_first.server_ordering_assessments,
     )
 
     async def _run():
@@ -3175,13 +3358,175 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
             openai_chat_module.conversation_state_store = old_store
 
         check("presentation calls lookup, pending facts and review tools", [name for name, _ in tool_calls] == ["keytao_lookup_by_word", "keytao_pending_items_by_words", "keytao_prepare_reviewed_add"])
-        check("presentation returns the ordering assessment", response is not None and "常用度评估" in response)
+        check(
+            "presentation returns the coherent ordering recommendation",
+            response is not None
+            and "推荐：「射覆」占 eefj、「慑服」顺延" in response
+            and "不重排选 2（eefju）" in response
+            and "推荐编码：" not in response
+            and advertised_single_word_lookup_codes(response)
+            == ("eefj", "eefju"),
+        )
         check(
             "read-only ordering advice carries no pending write capability",
             record is None
             and response is not None
             and "回复「1 重新编码」执行" not in response,
         )
+
+    asyncio.run(_run())
+
+
+def test_recommended_reorder_submit_chains_after_one_plan_confirmation():
+    """One sealed front-insert confirmation completes its bound submit request."""
+    print("\n🧪 recommended reorder submit chains after one plan confirmation")
+
+    async def _run():
+        calls = []
+        plan_digest = "1" * 64
+        shift_warning_digest = "2" * 64
+        snapshot_digest = "3" * 64
+        submit_warning_digest = "4" * 64
+        audit_digest = "5" * 64
+        shift_items = [
+            {
+                "action": "Delete",
+                "word": "慑服",
+                "code": "eefj",
+                "type": "Phrase",
+            },
+            {
+                "action": "Create",
+                "word": "慑服",
+                "code": "eefju",
+                "type": "Phrase",
+            },
+            {
+                "action": "Create",
+                "word": "射覆",
+                "code": "eefj",
+                "type": "Phrase",
+            },
+        ]
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            calls.append((tool_name, dict(arguments)))
+            if tool_name == "keytao_shift_phrase_code":
+                if not arguments.get("confirmed_plan_digest"):
+                    return json.dumps({
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "batchId": "default-reorder",
+                        "contentVersion": 7,
+                        "planDigest": plan_digest,
+                        "warningDigest": shift_warning_digest,
+                        "warnings": [],
+                        "shiftPlan": {
+                            "items": shift_items,
+                            "shifted": [{
+                                "word": "慑服",
+                                "fromCode": "eefj",
+                                "toCode": "eefju",
+                            }],
+                        },
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": True,
+                    "batchId": "default-reorder",
+                    "contentVersion": 8,
+                    "shiftPlan": {
+                        "items": shift_items,
+                        "shifted": [{
+                            "word": "慑服",
+                            "fromCode": "eefj",
+                            "toCode": "eefju",
+                        }],
+                    },
+                    "receipts": [{
+                        "step": "dictionary",
+                        "status": "applied",
+                        "changes": [{
+                            "word": "慑服",
+                            "fromCode": "eefj",
+                            "toCode": "eefju",
+                        }],
+                    }],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_submit_batch":
+                if arguments.get("preview_only"):
+                    return json.dumps({
+                        "success": False,
+                        "requiresConfirmation": True,
+                        "batchId": "default-reorder",
+                        "contentVersion": 8,
+                        "snapshotDigest": snapshot_digest,
+                        "warningDigest": submit_warning_digest,
+                        "auditDigest": audit_digest,
+                        "snapshotItems": shift_items,
+                        "warnings": [],
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": True,
+                    "batchId": "default-reorder",
+                    "autoApproved": True,
+                    "batchUrl": "https://keytao.test/batch/default-reorder",
+                }, ensure_ascii=False)
+            raise AssertionError(tool_name)
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("qq", "default-reorder-user")
+        with (
+            patch.object(chat_commands_module, "conversation_state_store", store),
+            patch.object(
+                chat_commands_module,
+                "call_tool_function",
+                side_effect=fake_call,
+            ),
+        ):
+            preview = await chat_commands_module._execute_shift_to_code(
+                "射覆",
+                "eefj",
+                "qq",
+                "default-reorder-user",
+                submit_after=True,
+            )
+            record = store.get_record(conv_key)
+            check(
+                "bare add-submit produces one sealed reorder confirmation",
+                record is not None
+                and isinstance(record.state, PendingToolConfirm)
+                and record.state.function_name == "keytao_shift_phrase_code"
+                and record.state.args.get("_submit_after") is True
+                and pending_confirmation_copy() in preview,
+            )
+            completed = await chat_commands_module._execute_confirmed_tool(
+                record.state,
+                "qq",
+                "default-reorder-user",
+                conv_key,
+            )
+
+        check(
+            "one plan confirmation executes shift then preview and confirmed submit",
+            [name for name, _arguments in calls] == [
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+                "keytao_submit_batch",
+                "keytao_submit_batch",
+            ],
+        )
+        check(
+            "confirmed shift replays the exact sealed plan",
+            calls[1][1] == {
+                "word": "射覆",
+                "target_code": "eefj",
+                "batch_id": "default-reorder",
+                "expected_content_version": 7,
+                "confirmed_plan_digest": plan_digest,
+                "expected_warning_digest": shift_warning_digest,
+            },
+        )
+        check("chained response reports the submitted batch", "批次已加入词库" in completed)
 
     asyncio.run(_run())
 
@@ -18342,6 +18687,13 @@ def test_shift_phrase_code_works_with_no_draft_batch():
 
         async def fake_strict_add(platform, platform_id, items, **kwargs):
             strict_calls.append({"items": items, **kwargs})
+            if kwargs.get("confirmed") is not True:
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warningDigest": "a" * 64,
+                    "warnings": [],
+                }
             return {"success": True, "batchId": "materialised-1", "items": items}
 
         with patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_fetch), \
@@ -18349,8 +18701,24 @@ def test_shift_phrase_code_works_with_no_draft_batch():
                 patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_lookup_codes), \
                 patch.object(_draft_tools, "keytao_list_draft_items", side_effect=empty_draft), \
                 patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", side_effect=fake_strict_add):
-            preview = await _draft_tools.keytao_shift_phrase_code("qq", "123", "增香", "zrxx")
-            writes_during_preview = len(strict_calls)
+            companion_items = [{
+                "action": "Create",
+                "word": "载流",
+                "code": "zhlq",
+                "type": "Phrase",
+                "needsManualReview": True,
+            }]
+            preview = await _draft_tools.keytao_shift_phrase_code(
+                "qq",
+                "123",
+                "增香",
+                "zrxx",
+                target_needs_manual_review=False,
+                additional_items=companion_items,
+            )
+            writes_during_preview = len([
+                call for call in strict_calls if call.get("confirmed") is True
+            ])
             confirmed = await _draft_tools.keytao_shift_phrase_code(
                 "qq",
                 "123",
@@ -18359,6 +18727,9 @@ def test_shift_phrase_code_works_with_no_draft_batch():
                 confirmed_plan_digest=preview["planDigest"],
                 batch_id=preview["batchId"],
                 expected_content_version=preview["contentVersion"],
+                expected_warning_digest=preview["warningDigest"],
+                target_needs_manual_review=False,
+                additional_items=companion_items,
             )
             stale = await _draft_tools.keytao_shift_phrase_code(
                 "qq",
@@ -18368,19 +18739,30 @@ def test_shift_phrase_code_works_with_no_draft_batch():
                 confirmed_plan_digest="0" * 64,
                 batch_id=preview["batchId"],
                 expected_content_version=preview["contentVersion"],
+                target_needs_manual_review=False,
+                additional_items=companion_items,
             )
 
         check("no draft still yields a confirmable plan", preview.get("requiresConfirmation") is True)
         check("the absence baseline is stated, not guessed", preview.get("batchId") == "" and preview.get("contentVersion") == 0)
         check("the preview writes nothing", writes_during_preview == 0)
-        check("the confirmed shift writes once", len(strict_calls) == 1)
-        check("the write carries no batch id", strict_calls[0].get("batch_id") is None)
-        check("the write asserts the absence baseline", strict_calls[0].get("expected_content_version") == 0)
+        confirmed_calls = [
+            call for call in strict_calls if call.get("confirmed") is True
+        ]
+        check("the confirmed shift writes once", len(confirmed_calls) == 1)
+        check("the write carries no batch id", confirmed_calls[0].get("batch_id") is None)
+        check("the write asserts the absence baseline", confirmed_calls[0].get("expected_content_version") == 0)
         target_item = next(
-            item for item in strict_calls[0]["items"]
+            item for item in confirmed_calls[0]["items"]
             if item.get("action") == "Create" and item.get("word") == "增香"
         )
-        check("an untrusted new target is sealed", target_item.get("needsManualReview") is True)
+        check("the reviewed target verdict is preserved", target_item.get("needsManualReview") is False)
+        companion_item = next(
+            item for item in confirmed_calls[0]["items"]
+            if item.get("word") == "载流"
+        )
+        check("the companion add is in the same sealed write", companion_item.get("code") == "zhlq")
+        check("the companion review seal is preserved", companion_item.get("needsManualReview") is True)
         check("the shift succeeds", confirmed.get("success") is True)
         check("the occupant is still moved", confirmed.get("shiftPlan", {}).get("shifted"))
         check("a wrong digest is still refused", stale.get("staleConfirmation") is True)
@@ -18425,6 +18807,13 @@ def test_shift_phrase_code_plans_real_occupant_move():
 
         async def fake_strict_add(platform, platform_id, items, **kwargs):
             strict_calls.append((platform, platform_id, items, kwargs))
+            if kwargs.get("confirmed") is not True:
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warningDigest": "b" * 64,
+                    "warnings": [],
+                }
             return {"success": True, "items": items}
 
         with patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_fetch):
@@ -18433,7 +18822,10 @@ def test_shift_phrase_code_plans_real_occupant_move():
                     with patch.object(_draft_tools, "keytao_list_draft_items", side_effect=fake_list):
                         with patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", side_effect=fake_strict_add):
                             preview = await _draft_tools.keytao_shift_phrase_code("qq", "123", "增香", "zrxx")
-                            preview_write_count = len(strict_calls)
+                            preview_write_count = len([
+                                call for call in strict_calls
+                                if call[3].get("confirmed") is True
+                            ])
                             result = await _draft_tools.keytao_shift_phrase_code(
                                 "qq",
                                 "123",
@@ -18442,14 +18834,18 @@ def test_shift_phrase_code_plans_real_occupant_move():
                                 confirmed_plan_digest=preview["planDigest"],
                                 batch_id=preview["batchId"],
                                 expected_content_version=preview["contentVersion"],
+                                expected_warning_digest=preview["warningDigest"],
                             )
 
         check("shift preview performs no write", preview["requiresConfirmation"] is True)
-        check("shift preview never calls strict write", preview_write_count == 0)
+        check("shift preview performs only a read-only strict preview", preview_write_count == 0)
         check("shift preview binds exact batch version", preview["batchId"] == "draft-shift" and preview["contentVersion"] == 30)
         check("shift preview binds plan digest", len(preview["planDigest"]) == 64)
         check("shift tool succeeds after exact confirmation", result["success"] is True)
-        check("shift exact confirmation writes once", len(strict_calls) == 1)
+        confirmed_calls = [
+            call for call in strict_calls if call[3].get("confirmed") is True
+        ]
+        check("shift exact confirmation writes once", len(confirmed_calls) == 1)
         items = result["shiftPlan"]["items"]
         check("plan deletes occupant old code", {"action": "Delete", "word": "增翔", "code": "zrxx", "type": "Phrase"} in items)
         check("plan recreates occupant at next code", {"action": "Create", "word": "增翔", "code": "zrxxv", "type": "Phrase"} in items)
@@ -18464,7 +18860,7 @@ def test_shift_phrase_code_plans_real_occupant_move():
         check("plan creates target word at requested code", target_item.get("code") == "zrxx")
         check("plan seals the untrusted target create", target_item.get("needsManualReview") is True)
         check("relocation create keeps change-class review treatment", "needsManualReview" not in occupant_create)
-        strict_items = strict_calls[0][2]
+        strict_items = confirmed_calls[0][2]
         strict_target = next(
             item for item in strict_items
             if item.get("action") == "Create" and item.get("word") == "增香"
@@ -19720,6 +20116,7 @@ if __name__ == "__main__":
     test_model_batch_pending_fact_leads_and_arms_one_local_confirmation()
     test_read_word_query_never_arms_add_ticket_through_pending_execution_path()
     test_candidate_commonness_copy_snapshot_and_zero_writes()
+    test_recommended_reorder_submit_chains_after_one_plan_confirmation()
     test_explicit_add_word_query_uses_review_tool_before_ai()
     test_word_discovery_prechecks_binding_without_blocking_review()
     test_reviewed_add_prompt_explains_fallback_review_policy()
