@@ -357,6 +357,14 @@ create the newcomer at the occupied slot, and submit that exact batch. A second
 front-insert pair pins numbered fallback selection, while a free-chain control
 pins the unchanged no-recommendation default.
 
+S36 replays the 2026-08-23 delete-and-swap incident round: deleting an existing
+dictionary word through one locked Delete confirmation and submit, a
+code-qualified delete, a two-move code swap as one sealed plan, a bare
+previous-turn record-backed action-name follow-up with its no-record word-query control, and an
+exact same-chain priority swap over the draft-aware merged view. Every reply is
+also checked for normalized internal tool identifiers and model-facing
+`禁止重复调用` / `请直接根据…回复用户` directives.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`

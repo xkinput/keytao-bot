@@ -1663,7 +1663,6 @@ class AdvertisedReplyContract:
             or self.command_suggestions
         )
 
-
 _ADVERTISED_QUOTE_PAIRS = (
     ("「", "」"),
     ("“", "”"),

@@ -40,11 +40,16 @@ from keytao_bot.harness.state import (
     MemoryConversationStateStore,
     PendingAddWord,
     PendingAdvertisedWordSets,
+    PendingTrustedWordRecord,
     PendingToolConfirm,
     SQLiteConversationStateStore,
+    create_pending_trusted_word_record,
+    trusted_word_record_is_complete,
 )
 from keytao_bot.plugins.chat_routing import (
     _canonical_draft_management_command,
+    _pending_trusted_word_action_matches,
+    _pending_tool_assent_intent,
     _resolve_advertised_word_set_selection,
 )
 from keytao_bot.harness.tools import (
@@ -65,7 +70,9 @@ from keytao_bot.harness.tools import (
     self_checked_suggested_command,
 )
 from keytao_bot.harness.authorization_grammar import (
+    parse_dictionary_delete_command,
     parse_entry_swap,
+    parse_entry_move_plan,
     parse_eviction_modified_add,
     parse_existing_entry_move,
     parse_indirect_entry_move,
@@ -75,6 +82,7 @@ from keytao_bot.utils.memory_store import ChatMemoryContext, ScopedMemoryStore
 from keytao_bot.utils.llm_request_gate import RequestWindowGate
 from keytao_bot.utils.pending_confirmation import (
     advertised_batch_binding_pairs,
+    advertised_reply_contract,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     render_executable_suggestion,
@@ -632,6 +640,47 @@ class PendingIsolationTests(unittest.TestCase):
         self.assertRegex(record.reconfirmation_code, r"^[A-F0-9]{6}$")
         self.assertEqual(record.reconfirmation_intent["intent"], "pending_confirm")
 
+    def test_trusted_word_record_is_digest_bound_and_cas_replaced_only_after_claim(self) -> None:
+        trusted_record = create_pending_trusted_word_record(
+            "箭头",
+            "jmtdu",
+            "Phrase",
+        )
+        self.assertTrue(self.store.set(self.group_a, trusted_record))
+        record = self.store.get_record(self.group_a)
+        self.assertFalse(record.requires_reconfirmation)
+        self.assertFalse(record.confirmation_armed)
+
+        tampered = PendingTrustedWordRecord(
+            word=trusted_record.word,
+            code="jmtd",
+            phrase_type=trusted_record.phrase_type,
+            record_digest=trusted_record.record_digest,
+        )
+        self.assertFalse(trusted_word_record_is_complete(tampered))
+        self.assertFalse(self.store.set(self.group_b, tampered))
+
+        ticket = PendingToolConfirm(
+            "keytao_batch_add_to_draft",
+            {"items": [{
+                "action": "Delete",
+                "word": trusted_record.word,
+                "code": trusted_record.code,
+                "type": trusted_record.phrase_type,
+            }]},
+        )
+        self.assertFalse(
+            self.store.replace_claimed_trusted_word_record(record, ticket)
+        )
+        self.assertTrue(self.store.begin_execution(record))
+        self.assertTrue(
+            self.store.replace_claimed_trusted_word_record(record, ticket)
+        )
+        self.assertFalse(
+            self.store.replace_claimed_trusted_word_record(record, ticket)
+        )
+        self.assertIsInstance(self.store.get(self.group_a), PendingToolConfirm)
+
     def test_invalidate_actor_related_crosses_sessions_but_keeps_unrelated_tickets(self) -> None:
         store = MemoryConversationStateStore(max_pending=8)
         related_private = ConversationAddress.private("qq", "user-1")
@@ -1023,6 +1072,29 @@ class PendingPersistenceTests(unittest.IsolatedAsyncioTestCase):
                 clock=self.clock,
             ).get_record(self.owner)
         )
+
+    def test_trusted_word_record_survives_restart_without_becoming_a_write_ticket(self) -> None:
+        store = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        trusted_record = create_pending_trusted_word_record(
+            "箭头",
+            "jmtdu",
+            "Phrase",
+        )
+        self.assertTrue(store.set(self.owner, trusted_record, owner_label="Owner"))
+        original = store.get_record(self.owner)
+        self.assertFalse(original.requires_reconfirmation)
+        self.assertFalse(original.confirmation_armed)
+
+        restored = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        record = restored.get_record(self.owner)
+
+        self.assertIsInstance(record.state, PendingTrustedWordRecord)
+        self.assertTrue(trusted_word_record_is_complete(record.state))
+        self.assertEqual(record.state, trusted_record)
+        self.assertEqual(record.nonce, original.nonce)
+        self.assertEqual(record.owner_key, self.owner)
+        self.assertFalse(record.requires_reconfirmation)
+        self.assertFalse(record.confirmation_armed)
 
     def test_expired_pending_confirmation_is_deleted_during_restart(self) -> None:
         store = SQLiteConversationStateStore(
@@ -6307,6 +6379,18 @@ class MutationAuthorizationTests(unittest.TestCase):
             (3, "wtwwi"),
         )
         self.assertTrue(message_authorizes_mutation("冒菜与茂才对调"))
+        for message in (
+            "把冒菜和茂才调换优先级",
+            "冒菜和茂才换位置",
+            "调换 冒菜 茂才 的优先级",
+        ):
+            with self.subTest(message=message):
+                parsed = parse_entry_swap(message)
+                self.assertEqual(
+                    (parsed.first_word, parsed.second_word) if parsed else None,
+                    ("冒菜", "茂才"),
+                )
+                self.assertTrue(message_authorizes_mutation(message))
         self.assertTrue(message_authorizes_mutation(
             "这三个词里词频最高的那个放在wtwwi上"
         ))
@@ -6318,6 +6402,45 @@ class MutationAuthorizationTests(unittest.TestCase):
             "这三个词里词频最高的那个放在wtwwi上吗？",
         ):
             with self.subTest(message=message):
+                self.assertFalse(message_authorizes_mutation(message))
+
+    def test_dictionary_delete_and_two_move_plan_are_exact_whole_messages(self) -> None:
+        delete_forms = {
+            "删词 五百万": ("五百万", ""),
+            "删词 五百万 wbw": ("五百万", "wbw"),
+            "删除词库里的「五百万」": ("五百万", ""),
+            "把 jmtdu 的箭头删掉": ("箭头", "jmtdu"),
+            "删除 箭头 @ jmtdu": ("箭头", "jmtdu"),
+        }
+        for message, expected in delete_forms.items():
+            with self.subTest(message=message):
+                command = parse_dictionary_delete_command(message)
+                self.assertEqual(
+                    (command.word, command.code) if command else None,
+                    expected,
+                )
+                self.assertTrue(message_authorizes_mutation(message))
+
+        move_plan = parse_entry_move_plan(
+            "把「箭头」换到jmtd，把「剪贴」换到jmtdoa"
+        )
+        self.assertEqual(
+            tuple((move.word, move.target_code) for move in move_plan.moves)
+            if move_plan else None,
+            (("箭头", "jmtd"), ("剪贴", "jmtdoa")),
+        )
+        self.assertTrue(message_authorizes_mutation(
+            "把「箭头」换到jmtd，把「剪贴」换到jmtdoa"
+        ))
+        for message in (
+            "不要删词 五百万",
+            "他说把 jmtdu 的箭头删掉",
+            "删除 箭头 @ jmtdu？",
+            "如果把「箭头」换到jmtd，把「剪贴」换到jmtdoa会怎样？",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(parse_dictionary_delete_command(message))
+                self.assertIsNone(parse_entry_move_plan(message))
                 self.assertFalse(message_authorizes_mutation(message))
 
     def test_postposed_change_delete_and_recall_are_positive_whole_messages(self) -> None:
@@ -7408,18 +7531,29 @@ class EntrySwapHandlerTests(unittest.IsolatedAsyncioTestCase):
         from keytao_bot.plugins import chat_commands
         from keytao_bot.plugins.chat_routing import MessageCommandIntent
 
-        lookups = {
-            "冒菜": {"success": True, "phrases": [{
-                "word": "冒菜", "code": "mzchi", "type": "Phrase",
-            }]},
-            "茂才": {"success": True, "phrases": [{
-                "word": "茂才", "code": "mzch", "type": "Phrase",
-            }]},
-        }
-
         async def fake_call(name, arguments, *_args, **_kwargs):
-            self.assertEqual(name, "keytao_lookup_by_word")
-            return json.dumps(lookups[arguments["word"]], ensure_ascii=False)
+            if name == "keytao_lookup_by_words_batch":
+                self.assertEqual(arguments, {"words": ["冒菜", "茂才"]})
+                return json.dumps({
+                    "success": True,
+                    "results": [
+                        {"word": "冒菜", "phrases": [{
+                            "word": "冒菜", "code": "mzchi",
+                            "type": "Phrase", "weight": 100,
+                        }]},
+                        {"word": "茂才", "phrases": [{
+                            "word": "茂才", "code": "mzch",
+                            "type": "Phrase", "weight": 100,
+                        }]},
+                    ],
+                }, ensure_ascii=False)
+            self.assertEqual(name, "keytao_list_draft_items")
+            return json.dumps({
+                "success": True,
+                "batchId": "",
+                "contentVersion": 0,
+                "items": [],
+            }, ensure_ascii=False)
 
         shift = AsyncMock(return_value="swap plan")
         with (
@@ -7440,7 +7574,17 @@ class EntrySwapHandlerTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(result, "swap plan")
         shift.assert_awaited_once_with(
-            "冒菜", "mzch", "qq", "swap-user", None, "",
+            "冒菜",
+            "mzch",
+            "qq",
+            "swap-user",
+            None,
+            "",
+            ordered_words=["冒菜", "茂才"],
+            listed_words=["冒菜", "茂才"],
+            expected_codes=["mzch", "mzchi"],
+            expected_weights=[100, 100],
+            evidence_lines=["按本轮指令互换这两个词的现有编码和权重"],
         )
 
     async def test_ambiguous_word_never_reaches_ring_shift(self) -> None:
@@ -7448,12 +7592,26 @@ class EntrySwapHandlerTests(unittest.IsolatedAsyncioTestCase):
         from keytao_bot.plugins.chat_routing import MessageCommandIntent
 
         async def fake_call(_name, arguments, *_args, **_kwargs):
-            codes = ["mzchi", "mzchii"] if arguments["word"] == "冒菜" else ["mzch"]
+            if _name == "keytao_list_draft_items":
+                return json.dumps({
+                    "success": True,
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "items": [],
+                }, ensure_ascii=False)
+            self.assertEqual(arguments, {"words": ["冒菜", "茂才"]})
             return json.dumps({
                 "success": True,
-                "phrases": [
-                    {"word": arguments["word"], "code": code, "type": "Phrase"}
-                    for code in codes
+                "results": [
+                    {"word": "冒菜", "phrases": [
+                        {"word": "冒菜", "code": code,
+                         "type": "Phrase", "weight": 100 + index}
+                        for index, code in enumerate(("mzchi", "mzchii"))
+                    ]},
+                    {"word": "茂才", "phrases": [{
+                        "word": "茂才", "code": "mzch",
+                        "type": "Phrase", "weight": 100,
+                    }]},
                 ],
             }, ensure_ascii=False)
 
@@ -7477,6 +7635,180 @@ class EntrySwapHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("无法", result)
         shift.assert_not_awaited()
 
+    async def test_same_code_priority_swap_uses_merged_rows_and_exact_weights(self) -> None:
+        from keytao_bot.plugins import chat_commands
+        from keytao_bot.plugins.chat_routing import MessageCommandIntent
+
+        merged = {
+            "火锅": {
+                "word": "火锅", "code": "mkdr", "type": "Phrase",
+                "weight": 101, "source": "live",
+            },
+            "电脑": {
+                "word": "电脑", "code": "mkdr", "type": "Phrase",
+                "weight": 103, "source": "draft", "draftId": 44,
+            },
+        }
+        shift = AsyncMock(return_value="priority swap plan")
+        with (
+            patch.object(
+                chat_commands,
+                "_load_merged_word_entries",
+                AsyncMock(return_value=merged),
+            ) as load,
+            patch.object(chat_commands, "_execute_shift_to_code", shift),
+        ):
+            result = await chat_commands._try_handle_entry_swap_command(
+                "把火锅和电脑调换优先级",
+                MessageCommandIntent(
+                    intent="entry_swap",
+                    confidence=1.0,
+                    keep_words=("火锅", "电脑"),
+                ),
+                "qq",
+                "priority-owner",
+                None,
+                "",
+            )
+
+        self.assertEqual(result, "priority swap plan")
+        load.assert_awaited_once_with(("火锅", "电脑"), "qq", "priority-owner")
+        shift.assert_awaited_once_with(
+            "火锅",
+            "mkdr",
+            "qq",
+            "priority-owner",
+            None,
+            "",
+            ordered_words=["火锅", "电脑"],
+            listed_words=["火锅", "电脑"],
+            expected_codes=["mkdr", "mkdr"],
+            expected_weights=[103, 101],
+            evidence_lines=["按本轮指令互换这两个词的现有优先级"],
+        )
+
+
+class DictionaryDeleteAndMovePlanHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_dictionary_delete_stages_one_exact_delete_ticket(self) -> None:
+        from keytao_bot.plugins import chat_commands
+        from keytao_bot.plugins.chat_routing import MessageCommandIntent
+
+        execute = AsyncMock(return_value="locked delete confirmation")
+        with (
+            patch.object(
+                chat_commands,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps({
+                    "success": True,
+                    "phrases": [{
+                        "word": "五百万",
+                        "code": "wbw",
+                        "type": "Phrase",
+                    }],
+                }, ensure_ascii=False)),
+            ) as lookup,
+            patch.object(chat_commands, "_execute_confirmed_tool", execute),
+        ):
+            result = await chat_commands._try_handle_dictionary_delete_command(
+                "删词 五百万",
+                MessageCommandIntent(
+                    intent="dictionary_delete",
+                    confidence=1.0,
+                    keep_words=("五百万",),
+                    requested_code="",
+                ),
+                "qq",
+                "delete-owner",
+                None,
+                "Garth",
+            )
+
+        self.assertEqual(result, "locked delete confirmation")
+        lookup.assert_awaited_once_with(
+            "keytao_lookup_by_word",
+            {"word": "五百万"},
+            "qq",
+            "delete-owner",
+        )
+        state = execute.await_args.args[0]
+        self.assertIsInstance(state, PendingToolConfirm)
+        self.assertEqual(state.function_name, "keytao_batch_add_to_draft")
+        self.assertEqual(state.confirmation_source, "local_preview")
+        self.assertEqual(state.args["items"], [{
+            "action": "Delete",
+            "word": "五百万",
+            "code": "wbw",
+            "type": "Phrase",
+        }])
+        self.assertEqual(execute.await_count, 1)
+
+    async def test_two_literal_moves_stage_one_exact_ring_plan(self) -> None:
+        from keytao_bot.plugins import chat_commands
+        from keytao_bot.plugins.chat_routing import MessageCommandIntent
+
+        merged = {
+            "箭头": {
+                "word": "箭头", "code": "jmtdu", "type": "Phrase",
+                "weight": 100, "source": "live",
+            },
+            "剪贴": {
+                "word": "剪贴", "code": "jmtd", "type": "Phrase",
+                "weight": 100, "source": "live",
+            },
+        }
+
+        async def encode(_name, arguments, *_args, **_kwargs):
+            self.assertEqual(_name, "keytao_encode")
+            candidates = (
+                ["jmtd", "jmtdu"]
+                if arguments["word"] == "箭头"
+                else ["jmtd", "jmtdoa"]
+            )
+            return json.dumps({
+                "success": True,
+                "word": arguments["word"],
+                "candidateCodes": candidates,
+            }, ensure_ascii=False)
+
+        shift = AsyncMock(return_value="one move plan")
+        with (
+            patch.object(
+                chat_commands,
+                "_load_merged_word_entries",
+                AsyncMock(return_value=merged),
+            ),
+            patch.object(chat_commands, "call_tool_function", side_effect=encode),
+            patch.object(chat_commands, "_execute_shift_to_code", shift),
+        ):
+            result = await chat_commands._try_handle_entry_move_plan_command(
+                "把「箭头」换到jmtd，把「剪贴」换到jmtdoa",
+                MessageCommandIntent(
+                    intent="entry_move_plan",
+                    confidence=1.0,
+                    keep_words=("箭头", "剪贴"),
+                    requested_codes=("jmtd", "jmtdoa"),
+                ),
+                "qq",
+                "move-owner",
+                None,
+                "",
+            )
+
+        self.assertEqual(result, "one move plan")
+        self.assertEqual(shift.await_count, 1)
+        shift.assert_awaited_once_with(
+            "箭头",
+            "jmtd",
+            "qq",
+            "move-owner",
+            None,
+            "",
+            ordered_words=["箭头", "剪贴"],
+            listed_words=["箭头", "剪贴"],
+            expected_codes=["jmtd", "jmtdoa"],
+            evidence_lines=["目标编码均来自本轮指令，并由服务端候选链重新核验"],
+        )
+
 
 class PendingCombinedIntentTests(unittest.TestCase):
     @staticmethod
@@ -7490,6 +7822,31 @@ class PendingCombinedIntentTests(unittest.TestCase):
             server_occupied_words={"hxxooo": ["粮棉"]},
             server_entries_by_code={"hxxooo": [("粮棉", 100)]},
         )
+
+    def test_bare_named_action_resolves_only_live_previous_turn_records(self) -> None:
+        trusted_record = create_pending_trusted_word_record(
+            "箭头",
+            "jmtdu",
+            "Phrase",
+        )
+        self.assertIsInstance(trusted_record, PendingTrustedWordRecord)
+        self.assertTrue(trusted_word_record_is_complete(trusted_record))
+        for action_name in ("换码", "删除", "删掉"):
+            self.assertTrue(
+                _pending_trusted_word_action_matches(trusted_record, action_name)
+            )
+        self.assertFalse(
+            _pending_trusted_word_action_matches(trusted_record, "换码？")
+        )
+        self.assertIsNone(_pending_tool_assent_intent(trusted_record, "换码"))
+        self.assertIsNone(_pending_tool_assent_intent(trusted_record, "确认"))
+
+        ordinary_state = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={"items": []},
+        )
+        self.assertIsNone(_pending_tool_assent_intent(ordinary_state, "换码"))
+        self.assertIsNone(_canonical_draft_management_command("换码"))
 
     def test_assent_plus_position_binds_only_the_server_occupant(self) -> None:
         from keytao_bot.plugins.chat_routing import (
@@ -9558,6 +9915,59 @@ class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.get("policyBlocked"))
         self.assertEqual(self.calls, [])
 
+    async def test_dictionary_delete_binds_server_type_and_literal_code_pair(self) -> None:
+        item = {
+            "action": "Delete",
+            "word": "箭头",
+            "code": "jmtdu",
+            "type": "Phrase",
+        }
+        trusted = {
+            "trusted_word_lookup_codes_by_word": {
+                "箭头": frozenset({"jmtdu"}),
+            },
+            "trusted_phrase_types_by_key": {
+                ("箭头", "jmtdu"): frozenset({"Phrase"}),
+            },
+        }
+        for message in (
+            "把 jmtdu 的箭头删掉",
+            "删除 箭头 @ jmtdu",
+            "删词 箭头",
+        ):
+            with self.subTest(message=message):
+                result = await self._call(
+                    "keytao_batch_add_to_draft",
+                    {"items": [item]},
+                    message,
+                    **trusted,
+                )
+                self.assertTrue(result.get("success"), result)
+        self.assertEqual(len(self.calls), 3)
+
+        wrong_type = await self._call(
+            "keytao_batch_add_to_draft",
+            {"items": [{**item, "type": "Char"}]},
+            "把 jmtdu 的箭头删掉",
+            **trusted,
+        )
+        self.assertTrue(wrong_type.get("success"), wrong_type)
+        self.assertEqual(self.calls[-1]["items"][0]["type"], "Phrase")
+
+        missing_server_type = await self._call(
+            "keytao_batch_add_to_draft",
+            {"items": [item]},
+            "把 jmtdu 的箭头删掉",
+            trusted_word_lookup_codes_by_word={
+                "箭头": frozenset({"jmtdu"}),
+            },
+        )
+        self.assertTrue(
+            missing_server_type.get("policyBlocked"),
+            missing_server_type,
+        )
+        self.assertEqual(len(self.calls), 4)
+
     async def test_model_cannot_self_assert_confirmation(self) -> None:
         result = await self._call(
             "keytao_create_phrase",
@@ -10317,6 +10727,23 @@ class _DeleteSkills:
         ]
 
 
+class _PreviousTurnLookupSkills:
+    @staticmethod
+    def get_skill_instructions():
+        return ""
+
+    @staticmethod
+    def has_tools():
+        return True
+
+    @staticmethod
+    def get_tools():
+        return [
+            _DestinationDerivedCreateSkills.get_tools()[1],
+            _BatchAddSkills.get_tools()[0],
+        ]
+
+
 class ServerBoundDeleteConfirmationTests(unittest.IsolatedAsyncioTestCase):
     def test_incomplete_delete_preview_cannot_create_an_unlocked_prompt(self) -> None:
         state_store = MemoryConversationStateStore()
@@ -10348,6 +10775,197 @@ class ServerBoundDeleteConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(saved)
         self.assertIsNone(state_store.get_record(address))
+
+    async def test_previous_turn_lookup_routes_bare_action_to_one_server_bound_confirmation(self) -> None:
+        from keytao_bot.plugins import chat_commands as commands_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        lookup_reply = "词库中有「箭头」：jmtdu，排序 100。"
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "lookup-arrow",
+                    "keytao_lookup_by_word",
+                    {"word": "箭头"},
+                )],
+            ),
+            _fake_response("stop", lookup_reply),
+        ])
+        state_store = MemoryConversationStateStore()
+
+        async def lookup(**kwargs):
+            self.assertEqual(kwargs["word"], "箭头")
+            return {
+                "success": True,
+                "word": "箭头",
+                "phrases": [{
+                    "word": "箭头",
+                    "code": "jmtdu",
+                    "type": "Phrase",
+                    "weight": 100,
+                }],
+            }
+
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_PreviousTurnLookupSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: lookup if name == "keytao_lookup_by_word" else None,
+                frozenset({"keytao_lookup_by_word"}),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+        context = AgentRequestContext(
+            platform="qq",
+            user_id="named-delete-owner",
+            mutations_allowed=False,
+        )
+
+        rendered = await orchestrator.run("查询词库里的箭头", context)
+        self.assertEqual(rendered, lookup_reply)
+        record = state_store.get_record(context.conversation_address)
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingTrustedWordRecord)
+        self.assertEqual(
+            (record.state.word, record.state.code, record.state.phrase_type),
+            ("箭头", "jmtdu", "Phrase"),
+        )
+        self.assertTrue(trusted_word_record_is_complete(record.state))
+        self.assertFalse(record.requires_reconfirmation)
+        self.assertFalse(record.confirmation_armed)
+
+        old_delivery_store = chat_module.conversation_state_store
+        chat_module.conversation_state_store = state_store
+        try:
+            self.assertEqual(
+                chat_module._enforce_advertised_reply_contract(
+                    lookup_reply,
+                    context.conversation_address,
+                ),
+                lookup_reply,
+            )
+        finally:
+            chat_module.conversation_state_store = old_delivery_store
+
+        preview = {
+            "success": False,
+            "requiresConfirmation": True,
+            "batchId": "named-delete-batch",
+            "contentVersion": 4,
+            "warningDigest": "a" * 64,
+            "warnings": [{
+                "warningType": "dictionary_delete",
+                "message": "将删除词库中的现有词条",
+            }],
+        }
+
+        seen_calls = []
+
+        async def preview_call(tool_name, arguments, *_args, **_kwargs):
+            if tool_name == "keytao_get_batch_preview":
+                return json.dumps({
+                    "success": True,
+                    "batchId": "named-delete-batch",
+                }, ensure_ascii=False)
+            seen_calls.append((tool_name, dict(arguments)))
+            self.assertEqual(tool_name, "keytao_batch_add_to_draft")
+            self.assertEqual(arguments["items"][0]["word"], "箭头")
+            if arguments.get("preview_only"):
+                self.assertNotIn("confirmed", arguments)
+                return json.dumps(preview, ensure_ascii=False)
+            self.assertTrue(arguments.get("confirmed"))
+            self.assertEqual(arguments.get("batch_id"), "named-delete-batch")
+            self.assertEqual(arguments.get("expected_content_version"), 4)
+            self.assertEqual(arguments.get("expected_warning_digest"), "a" * 64)
+            return json.dumps({
+                "success": True,
+                "successCount": 1,
+                "failedCount": 0,
+                "batchId": "named-delete-batch",
+                "draft_snapshot": {"count": 1, "items": [], "summary": {}},
+            }, ensure_ascii=False)
+
+        old_state_store = commands_module.conversation_state_store
+        commands_module.conversation_state_store = state_store
+        try:
+            with patch.object(
+                commands_module,
+                "call_tool_function",
+                side_effect=preview_call,
+            ) as call:
+                ignored = await commands_module.handle_pending_message_core(
+                    "确认",
+                    "qq",
+                    "named-delete-owner",
+                    context.conversation_address,
+                    history=[],
+                    owner_label="Owner",
+                    allow_intent_model=False,
+                )
+                self.assertIsNone(ignored)
+                self.assertEqual(call.await_count, 0)
+                self.assertIsNone(state_store.get_record(context.conversation_address))
+
+                self.assertTrue(state_store.set(context.conversation_address, record.state))
+
+                prompt = await commands_module.handle_pending_message_core(
+                    "换码",
+                    "qq",
+                    "named-delete-owner",
+                    context.conversation_address,
+                    history=[],
+                    owner_label="Owner",
+                    allow_intent_model=False,
+                )
+            self.assertEqual(call.await_count, 1)
+            self.assertIn(pending_confirmation_copy(), prompt)
+            self.assertIn("箭头", prompt)
+            self.assertIn("jmtdu", prompt)
+            sealed = state_store.get_record(context.conversation_address)
+            self.assertIsInstance(sealed.state, PendingToolConfirm)
+            self.assertEqual(
+                sealed.state.confirmation_source,
+                "server_warning",
+            )
+            self.assertTrue(sealed.requires_reconfirmation)
+
+            with patch.object(
+                commands_module,
+                "call_tool_function",
+                side_effect=preview_call,
+            ) as call:
+                completed = await commands_module.handle_pending_message_core(
+                    "确认",
+                    "qq",
+                    "named-delete-owner",
+                    context.conversation_address,
+                    history=[],
+                    owner_label="Owner",
+                    allow_intent_model=False,
+                )
+            self.assertEqual(call.await_count, 2)
+            self.assertIn("已加入草稿", completed)
+            self.assertIsNone(
+                state_store.get_record(context.conversation_address)
+            )
+            self.assertEqual(len(seen_calls), 2)
+
+            recordless = await commands_module.handle_pending_message_core(
+                "换码",
+                "qq",
+                "named-delete-owner",
+                context.conversation_address,
+                history=[],
+                owner_label="Owner",
+                allow_intent_model=False,
+            )
+            self.assertIsNone(recordless)
+        finally:
+            commands_module.conversation_state_store = old_state_store
 
     async def test_single_delete_has_one_server_bound_prompt_before_execution(
         self,
@@ -16491,6 +17109,65 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         retired = "当前没有可安全执行" + "的后续命令"
         with self.assertRaisesRegex(ValueError, "retired user-facing copy"):
             _assert_plain_user_facing_reply(retired)
+
+    def test_user_facing_guard_rejects_tool_ids_and_model_directives_in_any_spelling(self) -> None:
+        from keytao_bot.plugins.chat_render import _assert_plain_user_facing_reply
+
+        for fragment in (
+            "工具 keytao_shift_phrase_code 首次调用失败",
+            "工具 keytaoshiftphrase_code 首次调用失败",
+            "工具 keytao-shift-phrase-code 首次调用失败",
+            "禁止重复调用。",
+            "请直接根据上方结果回复用户。",
+            "禁止再次调用此工具。请直接使用上方已有数据继续下一步操作。",
+        ):
+            with self.subTest(fragment=fragment):
+                with self.assertRaises(ValueError):
+                    _assert_plain_user_facing_reply(fragment)
+
+    def test_internal_duplicate_hint_is_replaced_but_partial_receipt_is_reported(self) -> None:
+        receipt = AgentOrchestrator._successful_write_receipt(
+            "keytao_shift_phrase_code",
+            {"word": "剪贴", "target_code": "jmtdoa"},
+            {
+                "success": True,
+                "batchId": "partial-shift",
+                "shiftPlan": {
+                    "shifted": [],
+                    "currentState": [{
+                        "word": "剪贴", "code": "jmtd",
+                    }],
+                    "proposedState": [{
+                        "word": "剪贴", "code": "jmtdoa",
+                    }],
+                },
+            },
+        )
+        finalized = AgentOrchestrator._finalize_reply(
+            "把「箭头」换到jmtd，把「剪贴」换到jmtdoa",
+            (
+                "后续操作未完成；原因：工具 keytaoshiftphrase_code 首次调用"
+                "（已被安全层拦截或执行未成功）。禁止重复调用。"
+                "请直接根据上方结果回复用户。"
+            ),
+            {
+                "success": False,
+                "message": (
+                    "工具 keytaoshiftphrase_code 首次调用未成功。"
+                    "禁止重复调用。请直接根据上方结果回复用户。"
+                ),
+                "_failedTool": "keytao_shift_phrase_code",
+            },
+            [receipt],
+        )
+
+        self.assertIn("剪贴", finalized)
+        self.assertIn("jmtd → jmtdoa", finalized)
+        self.assertIn("后续操作未完成", finalized)
+        self.assertNotRegex(
+            finalized,
+            r"keytao|禁止(?:再次|重复)?调用|请直接根据.*回复用户",
+        )
 
     def test_model_authored_system_refusal_is_replaced_for_binding_meta_question(self) -> None:
         reply = (

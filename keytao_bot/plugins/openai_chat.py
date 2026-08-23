@@ -43,6 +43,7 @@ from ..harness.state import (
     PendingAdvertisedWordSets,
     PendingState,
     PendingStateRecord,
+    PendingTrustedWordRecord,
     PendingToolConfirm,
     SQLiteConversationStateStore,
 )
@@ -256,6 +257,7 @@ from .chat_commands import (
     _recover_pending_state_from_history,
     _requested_codes_from_pending_message,
     _resolve_pending_ticket_control,
+    _resolve_pending_trusted_word_action,
     _resolved_advertised_items_match,
     _resolve_requested_code_for_pending_add,
     _resolve_uncertain_ticket_action,
@@ -440,6 +442,7 @@ from .chat_routing import (
     _pending_context_for_command_intent,
     _pending_owner_label,
     _pending_assent_rejection_response,
+    _pending_trusted_word_action_matches,
     _pending_tool_assent_intent,
     _pending_tool_confirmation_matches,
     _pending_tool_state_with_trailing_submit,
@@ -2979,6 +2982,18 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
             elif selection.resolved_words:
                 ctx.resolved_advertised_words = selection.resolved_words
                 ctx.advertised_snapshot_token = selection.snapshot_token
+        elif isinstance(
+            ctx.current_pending_record.state,
+            PendingTrustedWordRecord,
+        ):
+            # The lookup snapshot applies only to the immediately following
+            # turn. Any non-action consumes it before ordinary routing.
+            if not _pending_trusted_word_action_matches(
+                ctx.current_pending_record.state,
+                ctx.normalized_message_text,
+            ):
+                conversation_state_store.delete(ctx.conv_key)
+                ctx.current_pending_record = None
         else:
             if (
                 isinstance(ctx.current_pending_record.state, PendingAddWord)
@@ -3358,6 +3373,14 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
     if (
         ctx.current_pending_record is not None
         and isinstance(ctx.current_pending_record.state, PendingToolConfirm)
+    ):
+        ctx.generic_intent_is_fresh_command = False
+    if (
+        ctx.current_pending_record is not None
+        and _pending_trusted_word_action_matches(
+            ctx.current_pending_record.state,
+            ctx.normalized_message_text,
+        )
     ):
         ctx.generic_intent_is_fresh_command = False
 
@@ -3870,6 +3893,20 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
             if uncertain_action != "read":
                 ctx.response = uncertain_response
             state = None
+
+        if isinstance(state, PendingTrustedWordRecord):
+            ctx.response = await _resolve_pending_trusted_word_action(
+                state_record,
+                ctx.normalized_message_text,
+                ctx.platform,
+                ctx.user_id,
+                ctx.conv_key,
+                state_space_key,
+                ctx.owner_label,
+            )
+            if ctx.response is None:
+                restore_pending_state()
+            return False
 
         if state is not None:
             try:
@@ -4596,6 +4633,7 @@ _CHAT_COMPAT_NAMES = (
     "PendingAdvertisedWordSets",
     "PendingState",
     "PendingStateRecord",
+    "PendingTrustedWordRecord",
     "PendingToolConfirm",
     "SQLiteConversationStateStore",
     "ToolContext",
@@ -4837,6 +4875,7 @@ _CHAT_COMPAT_NAMES = (
     "_parse_pending_state_from_response",
     "_parse_simple_word_query_intent_payload",
     "_pending_add_ordering_summary",
+    "_pending_trusted_word_action_matches",
     "_pending_batch_front_insert_plan",
     "_pending_assent_rejection_response",
     "_pending_context_for_command_intent",
@@ -4872,6 +4911,7 @@ _CHAT_COMPAT_NAMES = (
     "_referenced_owner_key_from_reply_reference",
     "_requested_codes_from_pending_message",
     "_resolve_multi_word_pending_candidate_selection",
+    "_resolve_pending_trusted_word_action",
     "_resolve_pending_ticket_control",
     "_resolve_advertised_word_set_selection",
     "_resolved_advertised_items_match",

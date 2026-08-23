@@ -2,6 +2,7 @@
 
 import json
 import re
+import unicodedata
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
@@ -12,6 +13,7 @@ from ..harness.state import (
     PendingAddWord,
     PendingAdvertisedWordSets,
     PendingState,
+    PendingTrustedWordRecord,
     PendingToolConfirm,
     pending_batch_display_pairs,
 )
@@ -200,9 +202,50 @@ def strip_bare_batch_ids(text: str) -> str:
 _INTERNAL_REPLY_FRAGMENT_RE = re.compile(
     r"(?:\bboundTarget\b|\bblockReason\b|\bbinding_incomplete\b|"
     r"PR#\d+|"
+    r"禁止(?:再次|重复)?调用|"
+    r"请直接(?:根据|使用)[^\r\n。！？]{0,80}(?:回复用户|继续下一步操作)|"
     r"[（(]\s*缺少\s*[：:]\s*[^）)]*"
     r"(?:[a-z]+[A-Z_][A-Za-z0-9_]*|[a-z]+_[a-z0-9_]+)[^）)]*[）)])"
 )
+
+_INTERNAL_TOOL_IDENTIFIERS = (
+    "keytao_batch_add_to_draft",
+    "keytao_batch_remove_draft_items",
+    "keytao_audit_draft_items",
+    "keytao_compare_commonness",
+    "keytao_create_phrase",
+    "keytao_encode",
+    "keytao_fetch_docs",
+    "keytao_get_batch_preview",
+    "keytao_infer_word",
+    "keytao_list_draft_items",
+    "keytao_lookup_by_code",
+    "keytao_lookup_by_codes_batch",
+    "keytao_lookup_by_word",
+    "keytao_lookup_by_words_batch",
+    "keytao_prepare_reviewed_add",
+    "keytao_recall_batch",
+    "keytao_remove_draft_item",
+    "keytao_shift_phrase_code",
+    "keytao_submit_batch",
+    "keytao_update_draft_item_weight",
+)
+_NORMALIZED_INTERNAL_TOOL_IDENTIFIERS = tuple(
+    re.sub(r"[\W_]+", "", identifier).lower()
+    for identifier in _INTERNAL_TOOL_IDENTIFIERS
+)
+
+
+def _reply_has_internal_fragment(text: str) -> bool:
+    """Catch policy directives and internal tool IDs despite separator changes."""
+    reply = str(text or "")
+    if _INTERNAL_REPLY_FRAGMENT_RE.search(reply):
+        return True
+    normalized = re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", reply)).lower()
+    return any(
+        identifier in normalized
+        for identifier in _NORMALIZED_INTERNAL_TOOL_IDENTIFIERS
+    )
 
 
 def _assert_plain_user_facing_reply(text: str) -> str:
@@ -217,7 +260,7 @@ def _assert_plain_user_facing_reply(text: str) -> str:
     if marker:
         logger.error("Refusing user-facing reply with raw Python repr marker %r", marker)
         raise ValueError("User-facing reply contains a raw Python representation")
-    if _INTERNAL_REPLY_FRAGMENT_RE.search(reply):
+    if _reply_has_internal_fragment(reply):
         logger.error("Refusing user-facing reply with an internal policy identifier")
         raise ValueError("User-facing reply contains a raw Python representation")
     return reply
@@ -574,6 +617,9 @@ def _format_pending_state_details(state: PendingState) -> str:
             if snapshot.words
         ]
         return "候选词：" + "；".join(groups) if groups else "候选词"
+
+    if isinstance(state, PendingTrustedWordRecord):
+        return f"上一轮词条「{state.word}」@{state.code}"
 
     if not isinstance(state, PendingToolConfirm):
         return "待确认"

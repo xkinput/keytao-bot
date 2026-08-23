@@ -1,5 +1,6 @@
 """Conversation and operation state primitives for the agent harness."""
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -65,6 +66,91 @@ class PendingToolConfirm:
     function_name: str
     args: Dict
     confirmation_source: str = "local_preview"
+
+
+@dataclass(frozen=True)
+class PendingTrustedWordRecord:
+    """The previous turn's unique server-backed dictionary row.
+
+    This record contains no action name or tool route and therefore grants no
+    write authority.  A later bare action may use it only to request a fresh
+    server preview, which still requires its own confirmation.
+    """
+
+    word: str
+    code: str
+    phrase_type: str
+    record_digest: str
+
+
+def _canonical_trusted_word_record(
+    word: str,
+    code: str,
+    phrase_type: str,
+) -> Optional[Tuple[str, str, str, str]]:
+    """Normalize and seal one exact row captured from a successful lookup."""
+    normalized_word = unicodedata.normalize("NFKC", str(word or "")).strip()
+    normalized_code = str(code or "").strip().lower()
+    normalized_type = str(phrase_type or "").strip()
+    if (
+        not normalized_word
+        or len(normalized_word.encode("utf-8")) > 512
+        or not re.fullmatch(r"[a-z]{1,12}", normalized_code)
+        or normalized_type not in {
+            "Single", "Phrase", "Supplement", "Symbol", "Link", "CSS",
+            "CSSSingle", "English",
+        }
+    ):
+        return None
+    payload = json.dumps(
+        {
+            "word": normalized_word,
+            "code": normalized_code,
+            "type": normalized_type,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return normalized_word, normalized_code, normalized_type, digest
+
+
+def create_pending_trusted_word_record(
+    word: str,
+    code: str,
+    phrase_type: str,
+) -> Optional[PendingTrustedWordRecord]:
+    """Build a non-authorizing previous-turn snapshot from trusted operands."""
+    canonical = _canonical_trusted_word_record(word, code, phrase_type)
+    if canonical is None:
+        return None
+    normalized_word, normalized_code, normalized_type, digest = canonical
+    return PendingTrustedWordRecord(
+        word=normalized_word,
+        code=normalized_code,
+        phrase_type=normalized_type,
+        record_digest=digest,
+    )
+
+
+def trusted_word_record_is_complete(state: PendingTrustedWordRecord) -> bool:
+    """Return whether a previous-turn snapshot still matches its row digest."""
+    canonical = _canonical_trusted_word_record(
+        state.word,
+        state.code,
+        state.phrase_type,
+    )
+    if canonical is None:
+        return False
+    normalized_word, normalized_code, normalized_type, digest = canonical
+    return bool(
+        state.word == normalized_word
+        and state.code == normalized_code
+        and state.phrase_type == normalized_type
+        and re.fullmatch(r"[0-9a-f]{64}", str(state.record_digest or ""))
+        and state.record_digest == digest
+    )
 
 
 def _server_confirmation_display(data: Dict) -> Dict:
@@ -327,6 +413,7 @@ class PendingAdvertisedWordSets:
 PendingState = Union[
     PendingAddWord,
     PendingAdvertisedWordSets,
+    PendingTrustedWordRecord,
     PendingToolConfirm,
     None,
 ]
@@ -676,7 +763,7 @@ class MemoryConversationStateStore:
         self._records[address] = record
         self._evict_over_capacity()
         saved = self._records.get(address) is not None
-        if saved:
+        if saved and not isinstance(state, PendingTrustedWordRecord):
             mark_turn_outcome("asked-confirmation")
         return saved
 
@@ -775,6 +862,31 @@ class MemoryConversationStateStore:
             record.owner_key,
             pending,
             space_key=space_key or record.space_key,
+            owner_label=owner_label or record.owner_label,
+        )
+
+    def replace_claimed_trusted_word_record(
+        self,
+        record: PendingStateRecord,
+        pending: PendingToolConfirm,
+        *,
+        owner_label: str = "",
+    ) -> bool:
+        """CAS-replace one claimed lookup row with its first real ticket."""
+        self._purge_expired()
+        address = normalize_conversation_key(record.owner_key, record.space_key)
+        current = self._records.get(address)
+        if (
+            current is not record
+            or not current.execution_id
+            or not isinstance(current.state, PendingTrustedWordRecord)
+            or not trusted_word_record_is_complete(current.state)
+        ):
+            return False
+        return self.set(
+            address,
+            pending,
+            space_key=address.space_key,
             owner_label=owner_label or record.owner_label,
         )
 
@@ -957,6 +1069,15 @@ class MemoryConversationStateStore:
                 and left.args == right.args
                 and left.confirmation_source == right.confirmation_source
             )
+        if isinstance(left, PendingTrustedWordRecord) and isinstance(
+            right,
+            PendingTrustedWordRecord,
+        ):
+            return bool(
+                trusted_word_record_is_complete(left)
+                and trusted_word_record_is_complete(right)
+                and left == right
+            )
         if isinstance(left, PendingAdvertisedWordSets) and isinstance(
             right,
             PendingAdvertisedWordSets,
@@ -989,6 +1110,8 @@ class MemoryConversationStateStore:
         self._purge_expired()
         owner_address = normalize_conversation_key(owner_key, space_key)
         for record in self._records.values():
+            if isinstance(record.state, PendingTrustedWordRecord):
+                continue
             if record.space_key == space_key and record.owner_key != owner_address:
                 return record
         return None
@@ -1006,6 +1129,8 @@ class MemoryConversationStateStore:
         owner_address = normalize_conversation_key(owner_key, space_key)
         for record in self._records.values():
             if record.owner_key == owner_address:
+                continue
+            if isinstance(record.state, PendingTrustedWordRecord):
                 continue
             if record.space_key == space_key and self.states_equivalent(record.state, state):
                 return record
@@ -1121,6 +1246,10 @@ class MemoryConversationStateStore:
             self._states.pop(address, None)
 
     def _state_within_limits(self, state: PendingState) -> bool:
+        if isinstance(state, PendingTrustedWordRecord):
+            if not trusted_word_record_is_complete(state):
+                return False
+            return len(repr(state).encode("utf-8")) <= self._max_pending_payload_bytes
         if isinstance(state, PendingToolConfirm):
             items = state.args.get("items")
             if isinstance(items, list) and len(items) > self._max_pending_items:
@@ -1240,6 +1369,7 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                     space_type TEXT NOT NULL,
                     space_id TEXT NOT NULL,
                     actor_id TEXT NOT NULL,
+                    state_type TEXT NOT NULL DEFAULT 'tool_confirm',
                     function_name TEXT NOT NULL,
                     arguments_json TEXT NOT NULL,
                     confirmation_source TEXT NOT NULL,
@@ -1258,6 +1388,17 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                     PRIMARY KEY (platform, space_type, space_id, actor_id)
                 )
             """)
+            columns = {
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(pending_confirmations)"
+                ).fetchall()
+            }
+            if "state_type" not in columns:
+                conn.execute(
+                    "ALTER TABLE pending_confirmations "
+                    "ADD COLUMN state_type TEXT NOT NULL DEFAULT 'tool_confirm'"
+                )
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_pending_confirmations_expiry
                 ON pending_confirmations(expires_at)
@@ -1276,14 +1417,37 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
 
     def _persist_record(self, record: PendingStateRecord) -> bool:
         address = normalize_conversation_key(record.owner_key, record.space_key)
-        if not isinstance(record.state, PendingToolConfirm):
+        if not isinstance(
+            record.state,
+            (PendingTrustedWordRecord, PendingToolConfirm),
+        ):
             # Candidate selection and other conversational state remain
             # intentionally process-local in this round. Replacing a durable
             # tool ticket must still remove the old authorization from disk.
             return self._delete_persisted(address)
+        state_type = (
+            "trusted_word_record"
+            if isinstance(record.state, PendingTrustedWordRecord)
+            else "tool_confirm"
+        )
+        persisted_arguments: object = (
+            record.state.args
+            if isinstance(record.state, PendingToolConfirm)
+            else {
+                "word": record.state.word,
+                "code": record.state.code,
+                "phraseType": record.state.phrase_type,
+                "recordDigest": record.state.record_digest,
+            }
+        )
+        confirmation_source = (
+            "trusted_word_record"
+            if isinstance(record.state, PendingTrustedWordRecord)
+            else str(record.state.confirmation_source)
+        )
         try:
             arguments_json, canonical_arguments = self._canonical_json(
-                record.state.args
+                persisted_arguments
             )
             intent_json, canonical_intent = self._canonical_json(
                 record.reconfirmation_intent
@@ -1297,11 +1461,19 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
             canonical_intent, dict
         ):
             return False
-        canonical_state = PendingToolConfirm(
-            function_name=str(record.state.function_name),
-            args=canonical_arguments,
-            confirmation_source=str(record.state.confirmation_source),
-        )
+        if isinstance(record.state, PendingTrustedWordRecord):
+            canonical_state: PendingState = PendingTrustedWordRecord(
+                word=str(canonical_arguments.get("word") or ""),
+                code=str(canonical_arguments.get("code") or ""),
+                phrase_type=str(canonical_arguments.get("phraseType") or ""),
+                record_digest=str(canonical_arguments.get("recordDigest") or ""),
+            )
+        else:
+            canonical_state = PendingToolConfirm(
+                function_name=str(record.state.function_name),
+                args=canonical_arguments,
+                confirmation_source=confirmation_source,
+            )
         if not self._state_within_limits(canonical_state):
             return False
         try:
@@ -1309,15 +1481,16 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                 conn.execute("""
                     INSERT INTO pending_confirmations (
                         platform, space_type, space_id, actor_id,
-                        function_name, arguments_json, confirmation_source,
+                        state_type, function_name, arguments_json, confirmation_source,
                         owner_label, created_at, expires_at, nonce,
                         origin_message_id, origin_prompt_digest,
                         requires_reconfirmation, confirmation_armed,
                         reconfirmation_code, reconfirmation_message,
                         reconfirmation_intent_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(platform, space_type, space_id, actor_id)
                     DO UPDATE SET
+                        state_type = excluded.state_type,
                         function_name = excluded.function_name,
                         arguments_json = excluded.arguments_json,
                         confirmation_source = excluded.confirmation_source,
@@ -1338,9 +1511,14 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                     address.space_type,
                     address.space_id,
                     address.actor_id,
-                    canonical_state.function_name,
+                    state_type,
+                    (
+                        canonical_state.function_name
+                        if isinstance(canonical_state, PendingToolConfirm)
+                        else ""
+                    ),
                     arguments_json,
-                    canonical_state.confirmation_source,
+                    confirmation_source,
                     str(record.owner_label or ""),
                     float(record.created_at),
                     float(record.expires_at),
@@ -1411,11 +1589,24 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                     reconfirmation_intent = json.loads(
                         str(row["reconfirmation_intent_json"])
                     )
-                    state = PendingToolConfirm(
-                        function_name=str(row["function_name"]),
-                        args=arguments,
-                        confirmation_source=str(row["confirmation_source"]),
-                    )
+                    state_type = str(row["state_type"] or "tool_confirm")
+                    if state_type == "trusted_word_record":
+                        if not isinstance(arguments, dict):
+                            raise ValueError("invalid trusted word record payload")
+                        state: PendingState = PendingTrustedWordRecord(
+                            word=str(arguments.get("word") or ""),
+                            code=str(arguments.get("code") or ""),
+                            phrase_type=str(arguments.get("phraseType") or ""),
+                            record_digest=str(arguments.get("recordDigest") or ""),
+                        )
+                    elif state_type == "tool_confirm":
+                        state = PendingToolConfirm(
+                            function_name=str(row["function_name"]),
+                            args=arguments,
+                            confirmation_source=str(row["confirmation_source"]),
+                        )
+                    else:
+                        raise ValueError("invalid pending state type")
                     created_at = float(row["created_at"])
                     stored_expiry = float(row["expires_at"])
                     expires_at = min(
@@ -1428,9 +1619,20 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                     if (
                         not isinstance(arguments, dict)
                         or not isinstance(reconfirmation_intent, dict)
-                        or not state.function_name
-                        or state.confirmation_source
-                        not in {"local_preview", "server_warning"}
+                        or (
+                            isinstance(state, PendingToolConfirm)
+                            and not state.function_name
+                        )
+                        or (
+                            isinstance(state, PendingToolConfirm)
+                            and state.confirmation_source
+                            not in {"local_preview", "server_warning"}
+                        )
+                        or (
+                            isinstance(state, PendingTrustedWordRecord)
+                            and str(row["confirmation_source"])
+                            != "trusted_word_record"
+                        )
                         or not self._state_within_limits(state)
                         or not math.isfinite(created_at)
                         or not math.isfinite(expires_at)

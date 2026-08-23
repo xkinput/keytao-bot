@@ -1369,6 +1369,127 @@ async def ensure_s35_fixture(
     }
 
 
+async def ensure_s36_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed the delete, two-move, and same-code swap incident records."""
+
+    async def ensure_exact(word: str, code: str, weight: int) -> dict[str, Any]:
+        encoded = ordered_candidate_codes(await client.encode(word))
+        if code not in encoded:
+            raise RigInfrastructureError(
+                f"S36 {word} does not encode to required {code}: {encoded}"
+            )
+        rows = [
+            row for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        matching = [
+            row for row in rows
+            if row.get("word") == word
+            and row.get("type") == "Phrase"
+            and row.get("weight") == weight
+        ]
+        if not rows:
+            await client.clean_draft(seed_identity["platform_id"])
+            await client.seed_phrase(
+                platform_id=seed_identity["platform_id"],
+                word=word,
+                code=code,
+                weight=weight,
+            )
+            rows = [
+                row for row in await client.phrases_by_code(code)
+                if row.get("code") == code
+            ]
+            matching = [
+                row for row in rows
+                if row.get("word") == word
+                and row.get("type") == "Phrase"
+                and row.get("weight") == weight
+            ]
+        if len(matching) != 1 or len(rows) != 1:
+            raise RigInfrastructureError(
+                f"S36 requires sole {word}@{code} weight {weight}: {rows}"
+            )
+        return matching[0]
+
+    delete_word = "五百万"
+    delete_rows = await client.phrases_by_word(delete_word)
+    if delete_rows:
+        if len(delete_rows) != 1 or delete_rows[0].get("type") != "Phrase":
+            raise RigInfrastructureError(
+                f"S36 requires one typed 五百万 row: {delete_rows}"
+            )
+        delete_row = delete_rows[0]
+        delete_code = str(delete_row.get("code") or "")
+    else:
+        candidates = ordered_candidate_codes(await client.encode(delete_word))
+        delete_code = ""
+        for candidate in candidates:
+            occupied = [
+                row for row in await client.phrases_by_code(candidate)
+                if row.get("code") == candidate
+            ]
+            if not occupied:
+                delete_code = candidate
+                break
+        if not delete_code:
+            raise RigInfrastructureError(
+                f"S36 五百万 has no free candidate slot: {candidates}"
+            )
+        delete_row = await ensure_exact(delete_word, delete_code, 100)
+
+    arrow = await ensure_exact("箭头", "jmtdu", 100)
+    clip = await ensure_exact("剪贴", "jmtd", 100)
+
+    priority_rows = [
+        row for row in await client.phrases_by_code("mkdr")
+        if row.get("code") == "mkdr"
+    ]
+    if not priority_rows:
+        await client.clean_draft(seed_identity["platform_id"])
+        await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word="火锅",
+            code="mkdr",
+            weight=100,
+        )
+        await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word="电脑",
+            code="mkdr",
+            weight=101,
+        )
+        priority_rows = [
+            row for row in await client.phrases_by_code("mkdr")
+            if row.get("code") == "mkdr"
+        ]
+    priority = {
+        str(row.get("word") or ""): row.get("weight")
+        for row in priority_rows
+        if row.get("type") == "Phrase"
+    }
+    if priority != {"火锅": 100, "电脑": 101}:
+        raise RigInfrastructureError(
+            f"S36 priority fixture drifted: {priority_rows}"
+        )
+    return {
+        "delete": {
+            "word": delete_word,
+            "code": delete_code,
+            "row": delete_row,
+        },
+        "moves": {
+            "箭头": arrow,
+            "剪贴": clip,
+        },
+        "priority": priority,
+    }
+
+
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
     apply_bot_environment(config)
     import nonebot
@@ -1703,6 +1824,17 @@ async def async_main(args: argparse.Namespace) -> int:
                             )
                         )
                         fixture_facts["s35"] = await ensure_s35_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S36":
+                        fixture_facts["s36SubmittedCleanup"] = (
+                            await client.clean_submitted_batches(
+                                identities[scenario.scenario_id]["platform_id"]
+                            )
+                        )
+                        fixture_facts["s36"] = await ensure_s36_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

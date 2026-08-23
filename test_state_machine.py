@@ -8028,6 +8028,87 @@ def test_ranked_reorder_planner_accepts_divergent_current_tails():
     asyncio.run(_run())
 
 
+def test_ranked_reorder_planner_preserves_legacy_code_for_priority_swap():
+    """Exact weight swaps may keep a trusted code omitted by today's encoder."""
+    print("\n🧪 priority swap keeps a server-backed legacy code")
+
+    async def _run():
+        async def fake_encode(word, _requested_code=None):
+            return {
+                "success": True,
+                "word": word,
+                "candidateCodes": ["other"],
+            }
+
+        async def fake_words(_words):
+            return {
+                "success": True,
+                "results": [
+                    {"word": "火锅", "phrases": [{
+                        "word": "火锅", "code": "mkdr",
+                        "type": "Phrase", "weight": 100,
+                    }]},
+                    {"word": "电脑", "phrases": [{
+                        "word": "电脑", "code": "mkdr",
+                        "type": "Phrase", "weight": 101,
+                    }]},
+                ],
+            }
+
+        async def fake_codes(codes):
+            return {
+                "success": True,
+                "results": [{
+                    "code": code,
+                    "phrases": [
+                        {"word": "火锅", "code": code,
+                         "type": "Phrase", "weight": 100},
+                        {"word": "电脑", "code": code,
+                         "type": "Phrase", "weight": 101},
+                    ],
+                } for code in codes],
+            }
+
+        with (
+            patch.object(
+                _draft_tools,
+                "_fetch_encode_candidates",
+                side_effect=fake_encode,
+            ),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(
+                _draft_tools,
+                "keytao_list_draft_items",
+                AsyncMock(return_value={
+                    "success": True,
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "items": [],
+                }),
+            ),
+        ):
+            plan = await _draft_tools._prepare_ranked_reorder_plan(
+                "qq",
+                "rea",
+                ["火锅", "电脑"],
+                "mkdr",
+                expected_codes=["mkdr", "mkdr"],
+                expected_weights=[101, 100],
+            )
+
+        check(
+            "legacy-code priority swap succeeds from exact live records",
+            plan.get("success") is True
+            and {
+                (item.get("word"), item.get("weight"))
+                for item in plan.get("items", [])
+            } == {("火锅", 101), ("电脑", 100)},
+        )
+
+    asyncio.run(_run())
+
+
 def test_ranked_reorder_planner_applies_draft_deletes_to_chain_occupancy():
     """A live occupant already deleted in the draft must not be displaced again."""
     print("\n🧪 ranked reorder planner merges draft deletes into code occupancy")
@@ -18063,6 +18144,77 @@ def test_build_code_shift_plan_generalizes_ring_to_ranked_n_entries():
     )
 
 
+def test_build_code_shift_plan_swaps_same_code_weights_exactly():
+    """Priority swap preserves the two server weights and exchanges owners."""
+    print("\n🧪 same-code priority swap exchanges exact weights")
+
+    result = _build_code_shift_plan(
+        word="火锅",
+        target_code="mkdr",
+        target_candidate_codes=["mkdr"],
+        current_phrase={
+            "word": "火锅", "code": "mkdr", "type": "Phrase",
+            "weight": 101, "source": "live",
+        },
+        code_phrase_map={"mkdr": []},
+        word_candidate_code_map={
+            "火锅": ["mkdr"],
+            "电脑": ["mkdr"],
+        },
+        ordered_assignments=[
+            {
+                "word": "火锅",
+                "targetCode": "mkdr",
+                "targetWeight": 103,
+                "type": "Phrase",
+                "current": {
+                    "word": "火锅", "code": "mkdr", "type": "Phrase",
+                    "weight": 101, "source": "live",
+                },
+            },
+            {
+                "word": "电脑",
+                "targetCode": "mkdr",
+                "targetWeight": 101,
+                "type": "Phrase",
+                "current": {
+                    "word": "电脑", "code": "mkdr", "type": "Phrase",
+                    "weight": 103, "source": "draft", "draftId": 44,
+                },
+            },
+        ],
+    )
+
+    check("same-code exact swap plan succeeds", result.get("success") is True)
+    check(
+        "live row takes the other exact weight",
+        result.get("items") == [{
+            "action": "Change",
+            "old_word": "火锅",
+            "word": "火锅",
+            "code": "mkdr",
+            "type": "Phrase",
+            "weight": 103,
+        }],
+    )
+    check(
+        "draft row takes the first exact weight",
+        result.get("draftUpdates") == [{
+            "id": 44,
+            "word": "电脑",
+            "code": "mkdr",
+            "type": "Phrase",
+            "fromWeight": 103,
+            "toWeight": 101,
+        }],
+    )
+    check(
+        "proposed state is the exact ring swap",
+        [(row["word"], row["weight"]) for row in result.get("proposedState", [])]
+        == [("火锅", 103), ("电脑", 101)],
+    )
+
+
 def test_ranked_n_entry_shift_preview_and_one_ticket_execution():
     """The generalized shift tool seals warnings, writes live moves, then patches draft weight."""
     print("\n🧪 ranked N-entry shift uses one sealed confirmation")
@@ -20180,6 +20332,7 @@ if __name__ == "__main__":
     test_incident_word_list_reorder_resolves_every_word_and_cross_chain_scope()
     test_word_list_prefix_scope_accepts_divergent_candidate_tails()
     test_ranked_reorder_planner_accepts_divergent_current_tails()
+    test_ranked_reorder_planner_preserves_legacy_code_for_priority_swap()
     test_ranked_reorder_planner_applies_draft_deletes_to_chain_occupancy()
     test_word_list_order_never_overrides_conflicting_semantic_evidence()
     test_code_chain_reorder_asks_or_noops_without_a_unique_change()
@@ -20320,6 +20473,7 @@ if __name__ == "__main__":
     test_build_code_shift_plan_cascades_until_empty()
     test_build_code_shift_plan_reuses_vacated_slot_for_circular_swap()
     test_build_code_shift_plan_generalizes_ring_to_ranked_n_entries()
+    test_build_code_shift_plan_swaps_same_code_weights_exactly()
     test_ranked_n_entry_shift_preview_and_one_ticket_execution()
     test_ranked_shift_partial_receipts_stage_executable_continuation()
     test_incident_ranked_shift_exact_shape_completes_and_retries_remaining_delta()

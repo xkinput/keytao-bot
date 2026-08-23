@@ -57,7 +57,9 @@ from .state import (
     MemoryConversationStateStore,
     PendingAddWord,
     PendingAdvertisedWordSets,
+    PendingTrustedWordRecord,
     PendingToolConfirm,
+    create_pending_trusted_word_record,
     server_warning_pending_state,
     server_warning_ticket_is_complete,
 )
@@ -1129,6 +1131,38 @@ class AgentOrchestrator:
                             authoritative_result_links,
                         )
                 if content.strip():
+                    trusted_row: Optional[PendingTrustedWordRecord] = None
+                    if len(trusted_word_lookup_codes_by_word) == 1:
+                        word, lookup_codes = next(iter(
+                            trusted_word_lookup_codes_by_word.items()
+                        ))
+                        if len(lookup_codes) == 1:
+                            code = next(iter(lookup_codes))
+                            action_types = trusted_phrase_types_by_key.get(
+                                (word, code),
+                                frozenset(),
+                            )
+                            if len(action_types) == 1:
+                                trusted_row = create_pending_trusted_word_record(
+                                    word,
+                                    code,
+                                    next(iter(action_types)),
+                                )
+                    if (
+                        trusted_row is not None
+                        and self._state_store.get_record(conv_key) is None
+                        and self._state_store.set(
+                            conv_key,
+                            trusted_row,
+                            space_key=context.space_key,
+                            owner_label=context.speaker_name,
+                        )
+                    ):
+                        logger.info(
+                            "[trusted_turn_records] "
+                            "branch=save_unique_word_lookup "
+                            f"word={trusted_row.word} code={trusted_row.code}"
+                        )
                     reply_contract = advertised_reply_contract(content)
                     future_batch_assent_requested = (
                         requests_future_batch_assent_offer(message)
@@ -2785,11 +2819,42 @@ class AgentOrchestrator:
             from_code = str(move.get("fromCode") or "").strip().lower()
             to_code = str(move.get("toCode") or "").strip().lower()
             if word and from_code and to_code:
-                shifted.append({
+                projected_move = {
                     "word": word,
                     "fromCode": from_code,
                     "toCode": to_code,
-                })
+                }
+                if projected_move not in shifted:
+                    shifted.append(projected_move)
+        if isinstance(shift_plan, dict):
+            current_by_word = {
+                str(entry.get("word") or "").strip(): entry
+                for entry in shift_plan.get("currentState") or []
+                if isinstance(entry, dict)
+                and str(entry.get("word") or "").strip()
+            }
+            for proposed in shift_plan.get("proposedState") or []:
+                if not isinstance(proposed, dict):
+                    continue
+                word = str(proposed.get("word") or "").strip()
+                current = current_by_word.get(word)
+                from_code = str(
+                    current.get("code") if isinstance(current, dict) else ""
+                ).strip().lower()
+                to_code = str(proposed.get("code") or "").strip().lower()
+                projected_move = {
+                    "word": word,
+                    "fromCode": from_code,
+                    "toCode": to_code,
+                }
+                if (
+                    word
+                    and from_code
+                    and to_code
+                    and from_code != to_code
+                    and projected_move not in shifted
+                ):
+                    shifted.append(projected_move)
         return {
             "tool": tool_name,
             "batchId": str(
@@ -2842,6 +2907,14 @@ class AgentOrchestrator:
             )
         lines.extend(f"草稿/批次地址：{url}" for url in batch_urls)
         return "\n".join(lines)
+
+    @staticmethod
+    def _public_failure_reason(value: Any, fallback: str) -> str:
+        """Keep model/tool control language out of receipt corrections."""
+        from keytao_bot.plugins.chat_render import _reply_has_internal_fragment
+
+        reason = str(value or "").strip()
+        return fallback if _reply_has_internal_fragment(reason) else reason
 
     @staticmethod
     def _submit_snapshot_binding(
@@ -2970,6 +3043,14 @@ class AgentOrchestrator:
         receipts = list(successful_write_receipts or [])
         if reply is None:
             return cls._receipt_completion_reply(receipts) if receipts else None
+        from keytao_bot.plugins.chat_render import _reply_has_internal_fragment
+        if _reply_has_internal_fragment(reply) and not failure_state:
+            logger.error("Replacing final reply containing an internal policy fragment")
+            reply = (
+                "后续操作未完成；本轮状态以服务端写入回执为准。"
+                if receipts
+                else "后续处理未能生成安全回复；本次未执行新的写入。"
+            )
         if failure_state and parse_eviction_modified_add(current_message) is not None:
             # A failed echoed front-insert must never degrade to the pending
             # candidate's recommended (and possibly occupied) bare add. Keep
@@ -3083,11 +3164,11 @@ class AgentOrchestrator:
                     if failed_tool == "keytao_submit_batch"
                     else "后续操作未完成"
                 )
-                raw_reason = str(
+                raw_reason = cls._public_failure_reason(
                     failure_state.get("message")
-                    or failure_state.get("error")
-                    or "后续工具没有成功"
-                ).strip()
+                    or failure_state.get("error"),
+                    "后续工具没有成功",
+                )
                 reason = re.split(
                     r"请把下面这条指令|请在下一条消息中|"
                     r"请重新发送|请再次发送|请原样发送",
@@ -3152,10 +3233,10 @@ class AgentOrchestrator:
             failure_state.get("blockReason") == "binding_incomplete"
             and failure_state.get("liveCandidateSelected") is True
         ):
-            raw_reason = str(
-                failure_state.get("message")
-                or "当前候选状态仍有效，但本次确认没有通过受信路由；本次未写入"
-            ).strip()
+            raw_reason = cls._public_failure_reason(
+                failure_state.get("message"),
+                "当前候选状态仍有效，但本次确认没有通过受信路由；本次未写入",
+            )
             suggestion = str(
                 failure_state.get("suggestedCommand") or ""
             ).strip()
@@ -3167,10 +3248,10 @@ class AgentOrchestrator:
             failure_state.get("blockReason") == "binding_incomplete"
             and (binding_reply_is_internal or binding_reply_retries_same_turn)
         ):
-            raw_reason = str(
-                failure_state.get("message")
-                or "无法把本次操作与消息中的完整目标逐项对应；整批均未写入"
-            ).strip()
+            raw_reason = cls._public_failure_reason(
+                failure_state.get("message"),
+                "无法把本次操作与消息中的完整目标逐项对应；整批均未写入",
+            )
             reason = re.split(
                 r"请把下面这条指令|请在下一条消息中|"
                 r"请重新发送|请再次发送|请原样发送",
@@ -3210,11 +3291,10 @@ class AgentOrchestrator:
         if not same_reference and not repeats_literal:
             return reply
 
-        raw_reason = str(
-            failure_state.get("message")
-            or failure_state.get("error")
-            or "本轮没有可执行的已绑定写操作"
-        ).strip()
+        raw_reason = cls._public_failure_reason(
+            failure_state.get("message") or failure_state.get("error"),
+            "本轮没有可执行的已绑定写操作",
+        )
         reason = re.split(
             r"请把下面这条指令|请在下一条消息中|"
             r"请重新发送|请再次发送|请原样发送",

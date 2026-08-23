@@ -16,6 +16,7 @@ from keytao_bot.utils.pending_confirmation import (
     pending_confirmation_copy,
 )
 from keytao_bot.plugins.chat_render import (
+    _reply_has_internal_fragment,
     public_base_for_platform,
     render_platform_public_links,
 )
@@ -5043,6 +5044,235 @@ async def scenario_s35(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+def _s36_assert_no_internal_reply_fragments(replies: list[str]) -> None:
+    leaked = [reply for reply in replies if _reply_has_internal_fragment(reply)]
+    require(not leaked, f"S36 exposed internal model/tool fragments: {leaked}")
+
+
+async def scenario_s36(ctx: ScenarioContext) -> dict[str, Any]:
+    """Delete, exact move/swap, named follow-up, and leak-guard incident round."""
+    fixture = ctx.fixture_facts["s36"]
+    messages: list[str] = []
+    replies: list[str] = []
+
+    delete_word = str(fixture["delete"]["word"])
+    delete_code = str(fixture["delete"]["code"])
+    delete_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(f"删词 {delete_word}")
+    delete_prompt = await ctx.send(messages[-1])
+    replies.append(delete_prompt)
+    require(
+        pending_confirmation_copy() in delete_prompt
+        and delete_word in delete_prompt
+        and delete_code in delete_prompt
+        and not (await ctx.draft()).get("items"),
+        f"S36 dictionary delete was not one locked preview: {delete_prompt}",
+    )
+    messages.append("确认")
+    replies.append(await ctx.send(messages[-1]))
+    delete_draft = await ctx.draft()
+    require(
+        [item_key(item) for item in delete_draft.get("items", [])]
+        == [("Delete", delete_word, delete_code)],
+        f"S36 delete confirmation did not stage the exact Delete: {delete_draft}",
+    )
+    messages.append("提交")
+    submit_reply = await ctx.send(messages[-1])
+    replies.append(submit_reply)
+    delete_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(), after_sequence=delete_cutoff,
+    )
+    if not delete_batch_id:
+        require(
+            pending_confirmation_copy() in submit_reply,
+            f"S36 delete submit neither completed nor requested confirmation: {submit_reply}",
+        )
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        delete_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(), after_sequence=delete_cutoff,
+        )
+    require(delete_batch_id, "S36 delete flow never submitted")
+    delete_batch = await ctx.next_client.get_admin_batch(
+        batch_id=delete_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        delete_batch.get("status") in {"Submitted", "Approved"}
+        and [
+            item_key(item)
+            for item in delete_batch.get("pullRequests", [])
+            if isinstance(item, dict)
+        ] == [("Delete", delete_word, delete_code)],
+        f"S36 submitted delete batch drifted: {delete_batch}",
+    )
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    messages.append("把 jmtdu 的箭头删掉")
+    qualified_prompt = await ctx.send(messages[-1])
+    replies.append(qualified_prompt)
+    require(
+        pending_confirmation_copy() in qualified_prompt
+        and "箭头" in qualified_prompt
+        and "jmtdu" in qualified_prompt
+        and not (await ctx.draft()).get("items"),
+        f"S36 code-qualified delete was not bound: {qualified_prompt}",
+    )
+    messages.append("取消")
+    replies.append(await ctx.send(messages[-1]))
+
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    move_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("把「箭头」换到jmtd，把「剪贴」换到jmtdoa")
+    move_prompt = await ctx.send(messages[-1])
+    replies.append(move_prompt)
+    require(
+        pending_confirmation_copy() in move_prompt
+        and all(marker in move_prompt for marker in ("箭头", "剪贴", "jmtd", "jmtdoa"))
+        and not (await ctx.draft()).get("items"),
+        f"S36 two-move request was not one complete plan: {move_prompt}",
+    )
+    messages.append("确认")
+    replies.append(await ctx.send(messages[-1]))
+    move_draft = await ctx.draft()
+    expected_move_items = {
+        ("Delete", "箭头", "jmtdu"),
+        ("Create", "箭头", "jmtd"),
+        ("Delete", "剪贴", "jmtd"),
+        ("Create", "剪贴", "jmtdoa"),
+    }
+    require(
+        {item_key(item) for item in move_draft.get("items", [])}
+        == expected_move_items,
+        f"S36 two-move plan did not land atomically in one draft: {move_draft}",
+    )
+    confirmed_move_calls = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > move_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    require(
+        len(confirmed_move_calls) == 1,
+        f"S36 two moves did not execute as one confirmed plan: {confirmed_move_calls}",
+    )
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    priority_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("把火锅和电脑调换优先级")
+    priority_prompt = await ctx.send(messages[-1])
+    replies.append(priority_prompt)
+    require(
+        pending_confirmation_copy() in priority_prompt
+        and all(marker in priority_prompt for marker in ("火锅", "电脑", "100", "101")),
+        f"S36 priority swap did not render the exact ring plan: {priority_prompt}",
+    )
+    messages.append("确认")
+    replies.append(await ctx.send(messages[-1]))
+    priority_draft = await ctx.draft()
+    priority_items = {
+        (str(item.get("word") or ""), item.get("weight"))
+        for item in priority_draft.get("items", [])
+        if item_key(item)[0] == "Change"
+        and item_key(item)[2] == "mkdr"
+    }
+    require(
+        priority_items == {("火锅", 101), ("电脑", 100)},
+        f"S36 priority swap did not exchange exact weights: {priority_draft}",
+    )
+    confirmed_priority_calls = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > priority_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    require(
+        len(confirmed_priority_calls) == 1,
+        f"S36 priority swap used more than one confirmed plan: {confirmed_priority_calls}",
+    )
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    messages.append("查询词库里的箭头，不要执行写入")
+    lookup_reply = await ctx.send(messages[-1])
+    replies.append(lookup_reply)
+    require(
+        "箭头" in lookup_reply
+        and "jmtdu" in lookup_reply
+        and not (await ctx.draft()).get("items"),
+        f"S36 lookup turn did not expose the trusted dictionary row: {lookup_reply}",
+    )
+    messages.append("换码")
+    named_action_prompt = await ctx.send(messages[-1])
+    replies.append(named_action_prompt)
+    require(
+        pending_confirmation_copy() in named_action_prompt
+        and "箭头" in named_action_prompt
+        and "jmtdu" in named_action_prompt
+        and not (await ctx.draft()).get("items"),
+        f"S36 bare advertised action fell through to word query: {named_action_prompt}",
+    )
+    messages.append("取消")
+    replies.append(await ctx.send(messages[-1]))
+
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    no_records_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("换码")
+    plain_query = await ctx.send(messages[-1])
+    replies.append(plain_query)
+    no_records_writes = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > no_records_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") in {
+            "keytao_batch_add_to_draft",
+            "keytao_create_phrase",
+            "keytao_shift_phrase_code",
+        }
+    ]
+    require(
+        "换码" in plain_query
+        and pending_confirmation_copy() not in plain_query
+        and not no_records_writes
+        and not (await ctx.draft()).get("items"),
+        f"S36 recordless 换码 did not stay a word query: {plain_query}; {no_records_writes}",
+    )
+    _s36_assert_no_internal_reply_fragments(replies)
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": priority_draft,
+        "facts": {
+            "deleteBatchId": delete_batch_id,
+            "deleteItem": ["Delete", delete_word, delete_code],
+            "qualifiedDeleteBound": True,
+            "twoMoveItems": sorted(expected_move_items),
+            "twoMoveConfirmedPlans": len(confirmed_move_calls),
+            "namedActionFollowUp": True,
+            "bareQueryControl": True,
+            "priorityWeights": sorted(priority_items),
+            "priorityConfirmedPlans": len(confirmed_priority_calls),
+            "leakGuard": True,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -5079,6 +5309,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S33", "batch-aware homophone slot allocation", scenario_s33),
     Scenario("S34", "pending submitted word awareness", scenario_s34),
     Scenario("S35", "comparator recommendation is the default add plan", scenario_s35),
+    Scenario("S36", "dictionary delete and exact swap incident round", scenario_s36),
 )
 
 

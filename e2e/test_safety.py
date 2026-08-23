@@ -416,15 +416,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S33 replays both 2026-08-21 homophone batch shapes", readme)
         self.assertIn("S34 replays the 2026-08-21 pending-batch incident", readme)
         self.assertIn("S35 replays the 2026-08-22 default-reorder incident", readme)
+        self.assertIn("S36 replays the 2026-08-23 delete-and-swap incident round", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s35(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s36(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 36)],
+            [f"S{index}" for index in range(1, 37)],
         )
 
     def test_s35_declares_isolated_reorder_and_free_slot_controls(self) -> None:

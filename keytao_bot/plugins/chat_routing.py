@@ -16,11 +16,15 @@ from ..harness.state import (
     PendingAdvertisedWordSets,
     PendingState,
     PendingStateRecord,
+    PendingTrustedWordRecord,
     PendingToolConfirm,
     pending_batch_display_pairs,
+    trusted_word_record_is_complete,
 )
 from ..harness.authorization_grammar import (
     explicit_complete_add_item,
+    parse_dictionary_delete_command,
+    parse_entry_move_plan,
     parse_entry_swap,
     parse_eviction_modified_add,
     parse_pending_positional_add,
@@ -482,6 +486,8 @@ _DRAFT_FLOW_INTENTS = frozenset({
     "code_chain_reorder",
     "word_list_reorder",
     "entry_swap",
+    "entry_move_plan",
+    "dictionary_delete",
 })
 
 
@@ -673,6 +679,23 @@ def _pending_tool_assent_intent(
     if not assent.add_requested:
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     return None
+
+
+_TRUSTED_WORD_ACTION_NAMES = frozenset({"换码", "删除", "删掉", "删了", "移除"})
+
+
+def _pending_trusted_word_action_matches(
+    state: PendingState,
+    message_text: str,
+) -> bool:
+    """Match a bare action name against the previous turn's trusted row."""
+    normalized = _compact_command_text(message_text)
+    return bool(
+        isinstance(state, PendingTrustedWordRecord)
+        and trusted_word_record_is_complete(state)
+        and not re.search(r"[?？]", message_text)
+        and normalized in _TRUSTED_WORD_ACTION_NAMES
+    )
 
 
 def _pending_positional_add_intent(
@@ -1811,6 +1834,22 @@ def _is_fresh_current_user_command_intent(
             command is not None
             and command.words == command_intent.keep_words
         )
+    if command_intent.intent == "entry_move_plan":
+        command = parse_entry_move_plan(message_text)
+        return bool(
+            command is not None
+            and tuple(move.word for move in command.moves)
+            == command_intent.keep_words
+            and tuple(move.target_code for move in command.moves)
+            == command_intent.requested_codes
+        )
+    if command_intent.intent == "dictionary_delete":
+        command = parse_dictionary_delete_command(message_text)
+        return bool(
+            command is not None
+            and (command.word,) == command_intent.keep_words
+            and command.code == command_intent.requested_code
+        )
     if command_intent.intent == "entry_swap":
         command = parse_entry_swap(message_text)
         return bool(
@@ -2073,6 +2112,24 @@ def _structural_draft_management_intent(
             intent="word_list_reorder",
             confidence=1.0,
             keep_words=word_list_reorder.words,
+        )
+    entry_move_plan = parse_entry_move_plan(message_text)
+    if entry_move_plan is not None:
+        return MessageCommandIntent(
+            intent="entry_move_plan",
+            confidence=1.0,
+            keep_words=tuple(move.word for move in entry_move_plan.moves),
+            requested_codes=tuple(
+                move.target_code for move in entry_move_plan.moves
+            ),
+        )
+    dictionary_delete = parse_dictionary_delete_command(message_text)
+    if dictionary_delete is not None:
+        return MessageCommandIntent(
+            intent="dictionary_delete",
+            confidence=1.0,
+            keep_words=(dictionary_delete.word,),
+            requested_code=dictionary_delete.code,
         )
     swap = parse_entry_swap(message_text)
     if swap is not None:

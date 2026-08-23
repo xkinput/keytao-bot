@@ -642,6 +642,21 @@ class EntrySwapCommand:
 
 
 @dataclass(frozen=True)
+class DictionaryDeleteCommand:
+    """One dictionary entry selected by a literal word and optional code."""
+
+    word: str
+    code: str = ""
+
+
+@dataclass(frozen=True)
+class EntryMovePlanCommand:
+    """Two literal existing-entry moves that must share one sealed plan."""
+
+    moves: Tuple[ExistingEntryMove, ExistingEntryMove]
+
+
+@dataclass(frozen=True)
 class IndirectEntryMove:
     """A bounded deictic selection whose literal referent needs model recovery."""
 
@@ -735,6 +750,60 @@ _ENTRY_SWAP_WHOLE_RE = re.compile(
     r"(?:互换(?:一下)?位置|换(?:个|一下)?位置|位置(?:互换|对调)|对调(?:一下)?)"
     r"(?:吧|啦|了)?$"
 )
+_ENTRY_PRIORITY_SWAP_WHOLE_RE = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:把|将)?\s*"
+    r"[「“]?(?P<first>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
+    r"(?:和|与|跟|、)\s*"
+    r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
+    r"(?:调换|互换|对调)(?:一下)?(?:优先级|优先顺序)"
+    r"(?:吧|啦|了)?$"
+)
+_ENTRY_PRIORITY_SWAP_PREFIX_RE = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:调换|互换|对调)(?:一下)?\s*"
+    r"[「“]?(?P<first>[\u3400-\u9fff]{1,16}?)[」”]?\s+"
+    r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
+    r"的?(?:优先级|优先顺序)(?:吧|啦|了)?$"
+)
+
+_DICTIONARY_DELETE_WORD_PATTERN = r"[\u3400-\u9fff]{1,30}"
+_DICTIONARY_DELETE_PATTERNS = (
+    re.compile(
+        rf"^{_COMMAND_PREFIX_PATTERN}(?:删词|删除词条)\s*"
+        rf"[「“]?(?P<word>{_DICTIONARY_DELETE_WORD_PATTERN})[」”]?"
+        rf"(?:\s+(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN}))?"
+        r"(?:吧|啦|了)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^{_COMMAND_PREFIX_PATTERN}(?:删除|删掉|移除)\s*"
+        r"词库(?:里|中)?(?:的)?\s*"
+        rf"[「“]?(?P<word>{_DICTIONARY_DELETE_WORD_PATTERN})[」”]?"
+        rf"(?:\s+(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN}))?"
+        r"(?:吧|啦|了)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^{_COMMAND_PREFIX_PATTERN}(?:把|将)\s*"
+        rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*的\s*"
+        rf"[「“]?(?P<word>{_DICTIONARY_DELETE_WORD_PATTERN})[」”]?\s*"
+        r"(?:删除|删掉|删了|移除)(?:吧|啦|了)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^{_COMMAND_PREFIX_PATTERN}(?:删除|删掉|移除)\s*"
+        rf"[「“]?(?P<word>{_DICTIONARY_DELETE_WORD_PATTERN})[」”]?\s*"
+        rf"@\s*(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})"
+        r"(?:吧|啦|了)?$",
+        re.IGNORECASE,
+    ),
+)
+
+_ENTRY_MOVE_PLAN_CLAUSE_RE = re.compile(
+    r"^(?:把|将)\s*[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
+    r"(?:调整到|改到|移到|挪到|换到)\s*"
+    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})$",
+    re.IGNORECASE,
+)
 _INDIRECT_ENTRY_MOVE_WHOLE_RE = re.compile(
     rf"^{_COMMAND_PREFIX_PATTERN}"
     r"(?:把|将)?(?:这|上述|上面|前面)(?P<count>[二两三四五六七八九十]|[2-9]|1[0-9])"
@@ -779,8 +848,11 @@ def _safe_whole_entry_command_source(message: str) -> str:
 
 def parse_entry_swap(message: str) -> Optional[EntrySwapCommand]:
     """Parse one positive whole-message pair swap."""
-    match = _ENTRY_SWAP_WHOLE_RE.fullmatch(
-        _safe_whole_entry_command_source(message)
+    source = _safe_whole_entry_command_source(message)
+    match = (
+        _ENTRY_SWAP_WHOLE_RE.fullmatch(source)
+        or _ENTRY_PRIORITY_SWAP_WHOLE_RE.fullmatch(source)
+        or _ENTRY_PRIORITY_SWAP_PREFIX_RE.fullmatch(source)
     )
     if match is None:
         return None
@@ -791,6 +863,62 @@ def parse_entry_swap(message: str) -> Optional[EntrySwapCommand]:
         if first and second and first != second
         else None
     )
+
+
+def parse_dictionary_delete_command(
+    message: str,
+) -> Optional[DictionaryDeleteCommand]:
+    """Parse a positive whole-message delete of one live dictionary row."""
+    source = _safe_whole_entry_command_source(message)
+    if not source:
+        return None
+    source = source.rstrip("。.!！").strip()
+    match = next(
+        (
+            candidate.fullmatch(source)
+            for candidate in _DICTIONARY_DELETE_PATTERNS
+            if candidate.fullmatch(source) is not None
+        ),
+        None,
+    )
+    if match is None:
+        return None
+    word = str(match.group("word") or "").strip()
+    code = str(match.groupdict().get("code") or "").strip().lower()
+    if not word or (code and re.fullmatch(_POSITIONAL_REORDER_CODE_PATTERN, code) is None):
+        return None
+    return DictionaryDeleteCommand(word=word, code=code)
+
+
+def parse_entry_move_plan(message: str) -> Optional[EntryMovePlanCommand]:
+    """Parse exactly two literal existing-entry moves as one instruction."""
+    source = _safe_whole_entry_command_source(message)
+    if not source:
+        return None
+    source = source.rstrip("。.!！").strip()
+    clauses = [
+        clause.strip()
+        for clause in re.split(r"[，,；;]", source)
+        if clause.strip()
+    ]
+    if len(clauses) != 2:
+        return None
+    moves: List[ExistingEntryMove] = []
+    for clause in clauses:
+        match = _ENTRY_MOVE_PLAN_CLAUSE_RE.fullmatch(clause)
+        if match is None:
+            return None
+        moves.append(ExistingEntryMove(
+            word=match.group("word").strip(),
+            target_code=match.group("code").strip().lower(),
+            verb="换到",
+        ))
+    if (
+        moves[0].word == moves[1].word
+        or moves[0].target_code == moves[1].target_code
+    ):
+        return None
+    return EntryMovePlanCommand(moves=(moves[0], moves[1]))
 
 
 def parse_indirect_entry_move(message: str) -> Optional[IndirectEntryMove]:
@@ -2045,6 +2173,10 @@ def message_authorizes_mutation(message: str) -> bool:
         return True
     if parse_entry_swap(message) is not None:
         return True
+    if parse_dictionary_delete_command(message) is not None:
+        return True
+    if parse_entry_move_plan(message) is not None:
+        return True
     if parse_indirect_entry_move(message) is not None:
         return True
     if _positive_bare_entry_mutation(message):
@@ -2077,7 +2209,9 @@ _WEIGHT_ADJUST_VERB_RE = re.compile(
     r"调整权重|修改权重|权重(?:调整|修改|改)(?:为|到)?"
 )
 _CREATE_VERB_RE = re.compile(ADD_OPERATION_VERB_PATTERN)
-_DELETE_VERB_RE = re.compile(r"删除|删掉|删了|删干净|去掉|移除|清空|清理")
+_DELETE_VERB_RE = re.compile(
+    r"删词|删除词条|删除|删掉|删了|删干净|去掉|移除|清空|清理"
+)
 _SUBMIT_VERB_RE = re.compile(r"提交|提审|送审|发起审核")
 _RECALL_VERB_RE = re.compile(r"撤回|撤销|召回|回退|取消")
 _TOOL_INTENT_PATTERNS = {
@@ -4225,6 +4359,50 @@ def _validate_current_message_binding(
                 f"{POLICY_BLOCK_TEMPLATE_PREFIX}批量操作缺少可绑定的词条。",
                 missing=["items"],
             )
+        dictionary_delete = parse_dictionary_delete_command(
+            context.current_message or ""
+        )
+        dictionary_delete_is_bound = False
+        if dictionary_delete is not None and len(items) == 1:
+            delete_item = items[0] if isinstance(items[0], dict) else {}
+            delete_word = str(delete_item.get("word") or "").strip()
+            delete_code = str(delete_item.get("code") or "").strip().lower()
+            delete_type = str(delete_item.get("type") or "").strip()
+            lookup_codes = trusted_word_lookup_codes.get(
+                dictionary_delete.word,
+                frozenset(),
+            )
+            trusted_type = ToolExecutor._trusted_phrase_type(
+                context,
+                dictionary_delete.word,
+                delete_code,
+            )
+            dictionary_delete_is_bound = bool(
+                str(delete_item.get("action") or "Create").strip() == "Delete"
+                and delete_word == dictionary_delete.word
+                and delete_code in lookup_codes
+                and (
+                    delete_code == dictionary_delete.code
+                    if dictionary_delete.code
+                    else len(lookup_codes) == 1
+                )
+                and trusted_type is not None
+                and delete_type == trusted_type
+            )
+            if not dictionary_delete_is_bound:
+                return policy_block(
+                    BLOCK_REASON_BINDING_INCOMPLETE,
+                    f"{POLICY_BLOCK_TEMPLATE_PREFIX}词库删除目标与本轮服务端记录不一致；"
+                    "整批均未写入。",
+                    missing=["serverDictionaryTarget"],
+                )
+        elif dictionary_delete is not None:
+            return policy_block(
+                BLOCK_REASON_BINDING_INCOMPLETE,
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}本轮只授权删除一条词库记录；"
+                "整批均未写入。",
+                missing=["exactDictionaryDeleteSet"],
+            )
         pending_selected_items = _pending_batch_selected_items(
             message,
             context,
@@ -4273,7 +4451,11 @@ def _validate_current_message_binding(
                 authorizedItems=authorized_items,
             )
         blocked_items: List[str] = []
-        for item in ([] if pending_batch_is_bound else items):
+        for item in (
+            []
+            if pending_batch_is_bound or dictionary_delete_is_bound
+            else items
+        ):
             if not isinstance(item, dict):
                 blocked_items.append("无效条目")
                 continue

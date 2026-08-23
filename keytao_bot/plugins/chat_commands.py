@@ -24,6 +24,8 @@ from ..harness.authorization_grammar import (
     _PHRASE_TYPE_BASE_WEIGHTS,
     explicit_same_code_requested,
     explicit_complete_add_item,
+    parse_dictionary_delete_command,
+    parse_entry_move_plan,
     parse_entry_swap,
     parse_eviction_modified_add,
 )
@@ -34,12 +36,14 @@ from ..harness.state import (
     PendingAddWord,
     PendingState,
     PendingStateRecord,
+    PendingTrustedWordRecord,
     PendingToolConfirm,
     SQLiteConversationStateStore,
     pending_batch_display_pairs,
     pending_execution_args as _pending_execution_args,
     server_warning_pending_state as _pending_state_from_server_warning,
     server_warning_ticket_is_complete,
+    trusted_word_record_is_complete,
 )
 from ..harness.tools import (
     ToolContext,
@@ -141,6 +145,7 @@ from .chat_routing import (
     _parse_pending_choice_index,
     _pending_owner_label,
     _pending_assent_rejection_response,
+    _pending_trusted_word_action_matches,
     _pending_tool_assent_intent,
     _pending_tool_confirmation_matches,
     _pending_tool_state_with_trailing_submit,
@@ -3443,6 +3448,11 @@ async def _execute_shift_to_code(
     submit_after: bool = False,
     target_item: Optional[Dict[str, Any]] = None,
     additional_items: Optional[List[Dict[str, Any]]] = None,
+    ordered_words: Optional[List[str]] = None,
+    listed_words: Optional[List[str]] = None,
+    expected_codes: Optional[List[str]] = None,
+    expected_weights: Optional[List[int]] = None,
+    evidence_lines: Optional[List[str]] = None,
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
     return await _execute_confirmed_tool(
@@ -3465,6 +3475,31 @@ async def _execute_shift_to_code(
                 **(
                     {"additional_items": [dict(item) for item in additional_items]}
                     if additional_items
+                    else {}
+                ),
+                **(
+                    {"ordered_words": list(ordered_words)}
+                    if ordered_words
+                    else {}
+                ),
+                **(
+                    {"listed_words": list(listed_words)}
+                    if listed_words
+                    else {}
+                ),
+                **(
+                    {"expected_codes": list(expected_codes)}
+                    if expected_codes
+                    else {}
+                ),
+                **(
+                    {"expected_weights": list(expected_weights)}
+                    if expected_weights
+                    else {}
+                ),
+                **(
+                    {"evidence_lines": list(evidence_lines)}
+                    if evidence_lines
                     else {}
                 ),
                 **({"_submit_after": True} if submit_after else {}),
@@ -3920,6 +3955,41 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
         lines.append(pending_confirmation_copy())
         return _assert_plain_user_facing_reply("\n".join(lines))
 
+    if function_name == "keytao_batch_add_to_draft":
+        pending_items = (
+            data.get("effectiveItems")
+            if isinstance(data.get("effectiveItems"), list)
+            else data.get("pendingItems")
+        )
+        delete_items = [
+            item
+            for item in pending_items or []
+            if isinstance(item, dict)
+            and str(item.get("action") or "").strip() == "Delete"
+        ]
+        if delete_items and len(delete_items) == len(pending_items or []):
+            lines = [f"🗑️ 删除 {len(delete_items)} 个词库项："]
+            lines.extend(
+                f"• {str(item.get('word') or '').strip()} "
+                f"@ {str(item.get('code') or '').strip().lower()}"
+                f"（{str(item.get('type') or '').strip()}）"
+                for item in delete_items
+            )
+            warnings = (
+                data.get("warnings")
+                if isinstance(data.get("warnings"), list)
+                else []
+            )
+            lines.extend(
+                f"提示：{_plain_warning_message(warning)}"
+                for warning in warnings
+            )
+            lines.append(pending_confirmation_copy())
+            batch_url = _trusted_batch_url(data)
+            if batch_url:
+                lines.append(f"草稿地址：{batch_url}")
+            return _assert_plain_user_facing_reply("\n".join(lines))
+
     if function_name == "keytao_recall_batch":
         batch_url = _trusted_batch_url(data)
         lines = ["↩️ 撤回批次："]
@@ -4040,6 +4110,8 @@ _RANKED_SHIFT_SEMANTIC_ARGS = (
     "target_needs_manual_review",
     "ordered_words",
     "listed_words",
+    "expected_codes",
+    "expected_weights",
     "evidence_lines",
 )
 
@@ -4485,7 +4557,15 @@ async def _execute_confirmed_tool(
                 carried_ordering_summary=warning_ordering_summary,
                 on_transport_failure=on_transport_failure,
             )
-        display_data = {**data, "submitAfter": submit_after}
+        display_data = {
+            **data,
+            "submitAfter": submit_after,
+            **(
+                {"pendingItems": list(args.get("items") or [])}
+                if state.function_name == "keytao_batch_add_to_draft"
+                else {}
+            ),
+        }
         warning_prompt = (
             _format_changed_server_confirmation_prompt(state, pending_state)
             if state.confirmation_source == "server_warning"
@@ -6295,7 +6375,7 @@ async def _try_handle_entry_swap_command(
     space_key: Optional[Tuple[str, str]],
     owner_label: str,
 ) -> Optional[str]:
-    """Resolve both literal entries, then let the shift tool build the ring swap."""
+    """Resolve both entries from the merged view and seal one exact swap."""
     command = parse_entry_swap(message_text)
     expected_words = (
         (command.first_word, command.second_word)
@@ -6309,41 +6389,312 @@ async def _try_handle_entry_swap_command(
     ):
         return None
     set_turn_flow("draft-op")
-    resolved_codes: Dict[str, Tuple[str, ...]] = {}
-    for word in expected_words:
-        payload_json = await call_tool_function(
-            "keytao_lookup_by_word",
-            {"word": word},
+    resolved = await _load_merged_word_entries(
+        expected_words,
+        platform,
+        user_id,
+    )
+    if resolved is None:
+        return render_remediation_reply(
+            "服务端无法为这两个词各锁定唯一的词库或草稿记录；"
+            "本次未生成换位计划"
+        )
+    first = resolved[command.first_word]
+    second = resolved[command.second_word]
+    first_code = str(first.get("code") or "").strip().lower()
+    second_code = str(second.get("code") or "").strip().lower()
+    if str(first.get("type") or "") != str(second.get("type") or ""):
+        return render_remediation_reply(
+            "两个词的词库类型不同，不能共用一张换位计划"
+        )
+    if first_code == second_code:
+        first_weight = first.get("weight")
+        second_weight = second.get("weight")
+        if (
+            not isinstance(first_weight, int)
+            or isinstance(first_weight, bool)
+            or not isinstance(second_weight, int)
+            or isinstance(second_weight, bool)
+            or first_weight == second_weight
+        ):
+            return render_remediation_reply(
+                "两个词当前权重无法形成唯一互换计划"
+            )
+        return await _execute_shift_to_code(
+            command.first_word,
+            first_code,
             platform,
             user_id,
+            space_key,
+            owner_label,
+            ordered_words=list(expected_words),
+            listed_words=list(expected_words),
+            expected_codes=[first_code, first_code],
+            expected_weights=[second_weight, first_weight],
+            evidence_lines=["按本轮指令互换这两个词的现有优先级"],
         )
-        try:
-            payload = json.loads(payload_json)
-        except Exception:
-            payload = {}
-        resolved_codes[word] = _server_codes_for_exact_word(payload, word)
-    ambiguous = [
-        word for word, codes in resolved_codes.items() if len(codes) != 1
-    ]
-    if ambiguous:
+    first_weight = first.get("weight")
+    second_weight = second.get("weight")
+    target_root = min((first_code, second_code), key=lambda value: (len(value), value))
+    if (
+        not second_code.startswith(target_root)
+        or not isinstance(first_weight, int)
+        or isinstance(first_weight, bool)
+        or not isinstance(second_weight, int)
+        or isinstance(second_weight, bool)
+    ):
         return render_remediation_reply(
-            "服务端无法为「" + "、".join(ambiguous)
-            + "」各锁定唯一当前编码；本次未生成换位计划"
-        )
-    first_code = resolved_codes[command.first_word][0]
-    second_code = resolved_codes[command.second_word][0]
-    if first_code == second_code:
-        return render_remediation_reply(
-            "两个词当前处在同一编码链，不能用编码环形换位；"
-            "请改用该编码链的常用度重排指令"
+            "两个词不在同一条可验证候选链，不能共用一张换位计划"
         )
     return await _execute_shift_to_code(
         command.first_word,
-        second_code,
+        target_root,
         platform,
         user_id,
         space_key,
         owner_label,
+        ordered_words=list(expected_words),
+        listed_words=list(expected_words),
+        expected_codes=[second_code, first_code],
+        expected_weights=[second_weight, first_weight],
+        evidence_lines=["按本轮指令互换这两个词的现有编码和权重"],
+    )
+
+
+def _validated_dictionary_delete_entries(
+    data: Dict[str, Any],
+    word: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """Return exact typed live rows from one complete word lookup."""
+    phrases = data.get("phrases")
+    if data.get("success") is not True or not isinstance(phrases, list):
+        return None
+    entries: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, str]] = set()
+    for phrase in phrases:
+        if not isinstance(phrase, dict):
+            return None
+        phrase_word = str(phrase.get("word") or word).strip()
+        code = str(phrase.get("code") or "").strip().lower()
+        phrase_type = str(phrase.get("type") or "").strip()
+        identity = (phrase_word, code, phrase_type)
+        if (
+            phrase_word != word
+            or re.fullmatch(r"[a-z]{1,12}", code) is None
+            or phrase_type not in _PHRASE_TYPE_BASE_WEIGHTS
+            or identity in seen
+        ):
+            return None
+        seen.add(identity)
+        entries.append({
+            "word": phrase_word,
+            "code": code,
+            "type": phrase_type,
+        })
+    return entries
+
+
+async def _try_handle_dictionary_delete_command(
+    message_text: str,
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    """Resolve a live dictionary row, then stage one typed Delete item."""
+    command = parse_dictionary_delete_command(message_text)
+    if (
+        command is None
+        or command_intent.intent != "dictionary_delete"
+        or command_intent.keep_words != (command.word,)
+        or command_intent.requested_code != command.code
+    ):
+        return None
+    set_turn_flow("draft-op")
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_word",
+        {"word": command.word},
+        platform,
+        user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+    entries = _validated_dictionary_delete_entries(lookup_data, command.word)
+    if entries is None:
+        return render_remediation_reply(
+            f"无法取得「{command.word}」的完整词库记录；本次未生成删除草稿"
+        )
+    matches = [
+        entry
+        for entry in entries
+        if not command.code or entry["code"] == command.code
+    ]
+    if not matches:
+        qualifier = f" @ {command.code}" if command.code else ""
+        return _assert_plain_user_facing_reply(
+            f"词库没有可删除的「{command.word}」{qualifier}。"
+        )
+    if len(matches) != 1:
+        choices = "、".join(
+            f"{entry['code']}（{entry['type']}）" for entry in matches
+        )
+        return _assert_plain_user_facing_reply(
+            f"「{command.word}」对应多条词库记录：{choices}。"
+            f"请用“删词 {command.word} 编码”指定一条；本次未写入。"
+        )
+    target = matches[0]
+    return await _execute_confirmed_tool(
+        PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [{
+                    "action": "Delete",
+                    "word": target["word"],
+                    "code": target["code"],
+                    "type": target["type"],
+                }],
+            },
+            confirmation_source="local_preview",
+        ),
+        platform,
+        user_id,
+        (platform, user_id),
+        space_key,
+        owner_label,
+    )
+
+
+async def _load_merged_word_entries(
+    words: Tuple[str, ...],
+    platform: str,
+    user_id: str,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Resolve one unique effective row per word from live plus current draft."""
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_words_batch",
+        {"words": list(words)},
+        platform,
+        user_id,
+    )
+    draft_json = await call_tool_function(
+        "keytao_list_draft_items",
+        {},
+        platform,
+        user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+    try:
+        draft_data = json.loads(draft_json)
+    except Exception:
+        draft_data = {}
+    live_entries = _validated_word_lookup_entries(lookup_data, words)
+    draft_snapshot = _validated_draft_reorder_snapshot(draft_data)
+    if live_entries is None or draft_snapshot is None:
+        return None
+    merged = _merge_live_and_draft_reorder_entries(
+        live_entries,
+        draft_snapshot,
+    )
+    if merged is None:
+        return None
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for word in words:
+        matches = [entry for entry in merged if entry.get("word") == word]
+        if len(matches) != 1:
+            return None
+        resolved[word] = matches[0]
+    return resolved
+
+
+async def _try_handle_entry_move_plan_command(
+    message_text: str,
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    """Turn two literal target codes into one server-rechecked ring plan."""
+    command = parse_entry_move_plan(message_text)
+    if command is None:
+        return None
+    words = tuple(move.word for move in command.moves)
+    target_by_word = {
+        move.word: move.target_code for move in command.moves
+    }
+    if (
+        command_intent.intent != "entry_move_plan"
+        or command_intent.keep_words != words
+        or command_intent.requested_codes
+        != tuple(move.target_code for move in command.moves)
+    ):
+        return None
+    set_turn_flow("draft-op")
+    resolved = await _load_merged_word_entries(words, platform, user_id)
+    if resolved is None:
+        return render_remediation_reply(
+            "无法从词库和当前草稿中锁定两条唯一记录；本次未生成调整计划"
+        )
+    if len({str(entry.get("type") or "") for entry in resolved.values()}) != 1:
+        return render_remediation_reply(
+            "两个词的词库类型不同，不能共用一张调整计划"
+        )
+    candidate_codes_by_word: Dict[str, Tuple[str, ...]] = {}
+    for word in words:
+        encode_json = await call_tool_function(
+            "keytao_encode",
+            {"word": word, "requested_code": target_by_word[word]},
+            platform,
+            user_id,
+        )
+        try:
+            encode_data = json.loads(encode_json)
+        except Exception:
+            encode_data = {}
+        candidate_codes_by_word[word] = _candidate_codes_from_encode(
+            encode_data,
+            word,
+        )
+    target_root = min(
+        target_by_word.values(),
+        key=lambda value: (len(value), value),
+    )
+    current_codes = [
+        str(resolved[word].get("code") or "").strip().lower()
+        for word in words
+    ]
+    if (
+        any(
+            target_by_word[word]
+            not in candidate_codes_by_word.get(word, ())
+            for word in words
+        )
+        or len(set(target_by_word.values())) != len(words)
+        or any(not code.startswith(target_root) for code in target_by_word.values())
+        or any(not code.startswith(target_root) for code in current_codes)
+    ):
+        return render_remediation_reply(
+            "两组目标编码不能形成唯一、可验证的同一候选链计划；本次未写入"
+        )
+    ordered_words = words
+    expected_codes = [target_by_word[word] for word in ordered_words]
+    return await _execute_shift_to_code(
+        ordered_words[0],
+        target_root,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+        ordered_words=list(ordered_words),
+        listed_words=list(words),
+        expected_codes=expected_codes,
+        evidence_lines=["目标编码均来自本轮指令，并由服务端候选链重新核验"],
     )
 
 
@@ -7218,6 +7569,28 @@ async def _try_handle_draft_management_command(
 
     if command_intent is None:
         command_intent = await _classify_message_command_intent(message_text)
+
+    response = await _try_handle_dictionary_delete_command(
+        message_text,
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
+
+    response = await _try_handle_entry_move_plan_command(
+        message_text,
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
 
     response = await _try_handle_word_list_reorder_command(
         message_text,
@@ -8112,6 +8485,137 @@ async def _try_handle_explicit_pending_replacement(
     )
 
 
+def _trusted_word_action_preview_args(
+    state: PendingTrustedWordRecord,
+) -> Optional[Dict[str, Any]]:
+    """Project a trusted row into a delete preview without adding authority."""
+    if not trusted_word_record_is_complete(state):
+        return None
+    return {
+        "items": [{
+            "action": "Delete",
+            "word": state.word,
+            "code": state.code,
+            "type": state.phrase_type,
+        }],
+        "preview_only": True,
+    }
+
+
+async def _resolve_pending_trusted_word_action(
+    state_record: PendingStateRecord,
+    message: str,
+    platform: str,
+    user_id: str,
+    conv_key: ConversationKey,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    """Resolve a previous-turn row into a server-sealed plan, never a write."""
+    state = state_record.state
+    if (
+        not isinstance(state, PendingTrustedWordRecord)
+        or state_record.owner_key.actor_id != str(user_id)
+    ):
+        return None
+    if not _pending_trusted_word_action_matches(state, message):
+        conversation_state_store.delete(conv_key)
+        return None
+    action_name = _compact_command_text(message)
+    preview_args = _trusted_word_action_preview_args(state)
+    if preview_args is None:
+        conversation_state_store.complete_execution(state_record)
+        return render_remediation_reply(
+            "上一轮词条记录不完整或已变化，本次未写入"
+        )
+    if not conversation_state_store.begin_execution(state_record):
+        return render_remediation_reply(
+            "当前操作正在处理中",
+            command=action_name,
+        )
+
+    try:
+        preview_json = await call_tool_function(
+            "keytao_batch_add_to_draft",
+            preview_args,
+            platform,
+            user_id,
+        )
+    except BaseException:
+        # preview_only cannot have written; the same exact row may be retried.
+        conversation_state_store.abort_execution(state_record)
+        raise
+    try:
+        preview = json.loads(preview_json)
+    except Exception:
+        preview = None
+    if not isinstance(preview, dict):
+        conversation_state_store.complete_execution(state_record)
+        return render_remediation_reply(
+            "后续操作没有返回可验证的服务端计划，本次未写入"
+        )
+    if preview.get("transportError") is True:
+        conversation_state_store.abort_execution(state_record)
+        return render_remediation_reply(
+            "连接服务失败；尚未生成确认计划，本次未写入",
+            command=action_name,
+        )
+    if preview.get("requiresConfirmation") is not True:
+        conversation_state_store.complete_execution(state_record)
+        return render_remediation_reply(
+            "后续操作没有返回完整的待确认计划，本次未写入"
+        )
+
+    pending = _pending_state_from_server_warning(
+        PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={"items": preview_args["items"]},
+            confirmation_source="local_preview",
+        ),
+        preview,
+    )
+    if not server_warning_ticket_is_complete(pending):
+        conversation_state_store.complete_execution(state_record)
+        return render_remediation_reply(
+            "后续操作的确认内容不完整，本次未写入"
+        )
+    display_data = {
+        **preview,
+        "pendingItems": list(preview_args["items"]),
+    }
+    prompt = _format_server_warning_confirmation(
+        "keytao_batch_add_to_draft",
+        display_data,
+    )
+    if len(prompt) > MAX_REPLACE_CONFIRMATION_CHARS:
+        conversation_state_store.complete_execution(state_record)
+        return _append_batch_url_if_missing(
+            render_remediation_reply(
+                "后续操作的确认内容过长，本次未写入"
+            ),
+            display_data,
+        )
+    saved = conversation_state_store.replace_claimed_trusted_word_record(
+        state_record,
+        pending,
+        owner_label=owner_label,
+    )
+    if not saved:
+        conversation_state_store.abort_execution(state_record)
+        return render_remediation_reply(
+            "后续操作已变化或失效，本次未写入"
+        )
+    logger.info(
+        "Resolved previous-turn word record into server-warning confirmation: "
+        f"owner={state_record.owner_key} action={action_name} "
+        f"word={state.word} code={state.code}"
+    )
+    return _append_pending_ticket_challenge(
+        _append_batch_url_if_missing(prompt, display_data),
+        conv_key,
+    )
+
+
 async def handle_pending_message_core(
     message: str,
     platform: str,
@@ -8130,6 +8634,16 @@ async def handle_pending_message_core(
     if state_record is None or state_record.state is None:
         return None
     state = state_record.state
+    if isinstance(state, PendingTrustedWordRecord):
+        return await _resolve_pending_trusted_word_action(
+            state_record,
+            message,
+            platform,
+            user_id,
+            conv_key,
+            space_key,
+            owner_label,
+        )
     if state_record.execution_id:
         uncertain_action, uncertain_response = _resolve_uncertain_ticket_action(
             state_record,

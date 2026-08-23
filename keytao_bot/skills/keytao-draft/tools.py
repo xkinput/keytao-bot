@@ -627,10 +627,24 @@ def _build_code_shift_plan(
                     "message": f"「{assignment_word}」的当前记录不完整",
                 }
             desired_codes.add(target)
+            exact_target_weight = assignment.get("targetWeight")
+            if exact_target_weight is not None and (
+                not isinstance(exact_target_weight, int)
+                or isinstance(exact_target_weight, bool)
+                or exact_target_weight < base_weight
+            ):
+                return {
+                    "success": False,
+                    "message": f"「{assignment_word}」的目标权重无效",
+                }
             target_weight = (
-                base_weight + assignment_index
-                if same_code_assignment
-                else base_weight
+                exact_target_weight
+                if exact_target_weight is not None
+                else (
+                    base_weight + assignment_index
+                    if same_code_assignment
+                    else base_weight
+                )
             )
             current_state.append({
                 "word": assignment_word,
@@ -5284,6 +5298,8 @@ async def _prepare_ranked_reorder_plan(
     platform_id: str,
     ordered_words: List[str],
     target_code: str,
+    expected_codes: Optional[List[str]] = None,
+    expected_weights: Optional[List[int]] = None,
 ) -> Dict:
     """Re-resolve an N-word order and feed it through the shared shift planner."""
     if (
@@ -5369,12 +5385,56 @@ async def _prepare_ranked_reorder_plan(
             }
         current_by_word[ordered_word] = matches[0]
 
+    # An existing server-backed code remains valid for an in-place weight
+    # change even when today's encoder no longer emits that legacy slot.
+    for ordered_word, current in current_by_word.items():
+        current_code = current["code"]
+        if current_code not in candidate_map[ordered_word]:
+            candidate_map[ordered_word] = [
+                current_code,
+                *candidate_map[ordered_word],
+            ]
+
     phrase_types = {entry["type"] for entry in current_by_word.values()}
     current_codes = [entry["code"] for entry in current_by_word.values()]
     if len(phrase_types) != 1:
         return {"success": False, "message": "这些词的类型不同，不能共用一条重排计划"}
     same_code_scope = len(set(current_codes)) == 1
-    if same_code_scope:
+    if expected_codes is not None:
+        if (
+            len(expected_codes) != len(ordered_words)
+            or any(
+                expected_code not in candidate_map[ordered_word]
+                for ordered_word, expected_code in zip(
+                    ordered_words,
+                    expected_codes,
+                )
+            )
+            or (
+                same_code_scope
+                and len(set(expected_codes)) != 1
+            )
+            or (
+                not same_code_scope
+                and (
+                    len(set(expected_codes)) != len(expected_codes)
+                    or any(
+                        not code.startswith(target_code)
+                        for code in current_codes
+                    )
+                    or any(
+                        not code.startswith(target_code)
+                        for code in expected_codes
+                    )
+                )
+            )
+        ):
+            return {
+                "success": False,
+                "message": "服务端无法把本轮目标编码锁定到同一候选链",
+            }
+        desired_codes = list(expected_codes)
+    elif same_code_scope:
         desired_codes = [current_codes[0]] * len(ordered_words)
     else:
         if (
@@ -5405,6 +5465,26 @@ async def _prepare_ranked_reorder_plan(
                     "message": f"「{ordered_word}」无法锁定唯一的第 {position + 1} 个前缀链位置",
                 }
             desired_codes.append(desired_code)
+
+    if expected_weights is not None:
+        current_weights = [
+            current_by_word[value].get("weight") for value in ordered_words
+        ]
+        if (
+            len(expected_weights) != len(ordered_words)
+            or any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in current_weights
+            )
+            or any(
+                value not in set(expected_weights)
+                for value in current_weights
+            )
+        ):
+            return {
+                "success": False,
+                "message": "服务端重新读取的优先级无法形成本轮要求的精确互换",
+            }
 
     desired_word_set = set(ordered_words)
     desired_code_set = set(desired_codes)
@@ -5523,8 +5603,15 @@ async def _prepare_ranked_reorder_plan(
             "targetCode": desired_code,
             "type": current_by_word[ordered_word]["type"],
             "current": current_by_word[ordered_word],
+            **(
+                {"targetWeight": expected_weights[index]}
+                if expected_weights is not None
+                else {}
+            ),
         }
-        for ordered_word, desired_code in zip(ordered_words, desired_codes)
+        for index, (ordered_word, desired_code) in enumerate(
+            zip(ordered_words, desired_codes)
+        )
     ]
     plan = _build_code_shift_plan(
         word=ordered_words[0],
@@ -5572,6 +5659,8 @@ async def keytao_shift_phrase_code(
     additional_items: Optional[List[Dict]] = None,
     ordered_words: Optional[List[str]] = None,
     listed_words: Optional[List[str]] = None,
+    expected_codes: Optional[List[str]] = None,
+    expected_weights: Optional[List[int]] = None,
     evidence_lines: Optional[List[str]] = None,
 ) -> Dict:
     """Preview, bind, then CAS-write a complete code-shift plan."""
@@ -5626,6 +5715,16 @@ async def keytao_shift_phrase_code(
             }
         normalized_order = [str(value or "").strip() for value in ordered_words]
         normalized_listed = [str(value or "").strip() for value in listed_words or []]
+        normalized_expected_codes = (
+            [str(value or "").strip().lower() for value in expected_codes]
+            if expected_codes is not None
+            else None
+        )
+        normalized_expected_weights = (
+            list(expected_weights)
+            if expected_weights is not None
+            else None
+        )
         normalized_evidence = [str(value or "").strip() for value in evidence_lines or []]
         if (
             len(normalized_order) < 2
@@ -5634,6 +5733,26 @@ async def keytao_shift_phrase_code(
             or normalized_order[0] != word
             or any(not value for value in normalized_listed)
             or (normalized_listed and set(normalized_listed) != set(normalized_order))
+            or (
+                normalized_expected_codes is not None
+                and (
+                    len(normalized_expected_codes) != len(normalized_order)
+                    or any(
+                        re.fullmatch(r"[a-z]{1,12}", value) is None
+                        for value in normalized_expected_codes
+                    )
+                )
+            )
+            or (
+                normalized_expected_weights is not None
+                and (
+                    len(normalized_expected_weights) != len(normalized_order)
+                    or any(
+                        not isinstance(value, int) or isinstance(value, bool)
+                        for value in normalized_expected_weights
+                    )
+                )
+            )
             or any(not value for value in normalized_evidence)
         ):
             return {"success": False, "message": "常用度重排参数不完整"}
@@ -5642,6 +5761,8 @@ async def keytao_shift_phrase_code(
             platform_id,
             normalized_order,
             target_code,
+            expected_codes=normalized_expected_codes,
+            expected_weights=normalized_expected_weights,
         )
         if not prepared.get("success"):
             return prepared
