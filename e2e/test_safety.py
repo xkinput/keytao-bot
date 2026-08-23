@@ -35,6 +35,11 @@ from .scenarios import (
     S26_COMMAND,
     S26_OCCUPANT,
     S26_WORD,
+    S37_COMMAND,
+    S37_OCCUPANT,
+    S37_SELECTION,
+    S37_TARGET_CODE,
+    S37_WORD,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -407,6 +412,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S24 replays the single-word natural-assent incident", readme)
         self.assertIn("S25 replays the 炒冷饭 production incident", readme)
         self.assertIn("S26 replays the add-plus-eviction incident", readme)
+        self.assertIn("S37 sends the verbatim occupant-derived eviction", readme)
         self.assertIn("S27 replays the binding-precheck incident", readme)
         self.assertIn("S28 replays the multi-reading candidate cascade", readme)
         self.assertIn("S29 replays the 2026-08-20 quoted-summary incident", readme)
@@ -422,11 +428,22 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s36(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s37(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 37)],
+            [f"S{index}" for index in range(1, 38)],
         )
+
+    def test_s37_declares_owned_eviction_fixture_readings(self) -> None:
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S37"]
+        self.assertEqual(fixture["probe_words"], (S37_WORD, S37_OCCUPANT))
+        entries = {
+            row["entry"]: row["pinyins"]
+            for row in fixture["rows"]
+            if row["kind"] == "entry"
+        }
+        self.assertEqual(entries[S37_WORD], ["pá", "pá", "gān"])
+        self.assertEqual(entries[S37_OCCUPANT], ["pí", "pá", "gǔ"])
 
     def test_s35_declares_isolated_reorder_and_free_slot_controls(self) -> None:
         self.assertEqual(
@@ -2523,6 +2540,115 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["confirmationSteps"], 0)
         self.assertEqual(result["facts"]["batchId"], "batch-s26")
         self.assertEqual(result["facts"]["nextCode"], "wkxko")
+
+    async def test_s37_offline_recovers_changed_selected_slot_without_looping(self) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S37")
+
+        class FakeContext:
+            def __init__(self):
+                self.platform_id = "s37-user"
+                self.next_client = self
+                self.bot = self
+                self.fixture_facts = {"s37": {"shiftedCode": "ppgv"}}
+                self.items = []
+                self.events = []
+                self.clean_calls = 0
+                self.reset_calls = 0
+                self.injected = ""
+
+            async def clean_draft(self, platform_id: str):
+                self.assert_equal(platform_id, self.platform_id)
+                self.items = []
+                self.clean_calls += 1
+                return {"success": True}
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.assert_equal(platform_id, self.platform_id)
+                self.reset_calls += 1
+
+            async def phrases_by_word(self, word: str):
+                self.assert_equal(word, S37_OCCUPANT)
+                return [{
+                    "word": S37_OCCUPANT,
+                    "code": S37_TARGET_CODE,
+                    "type": "Phrase",
+                    "weight": 100,
+                }]
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assert_true(to_me)
+                if text == S37_COMMAND:
+                    self.items = [
+                        {"action": "Delete", "word": S37_OCCUPANT, "code": S37_TARGET_CODE},
+                        {"action": "Create", "word": S37_WORD, "code": S37_TARGET_CODE},
+                        {"action": "Create", "word": S37_OCCUPANT, "code": "ppgv"},
+                    ]
+                    return (
+                        "本轮已完成的写操作：\n"
+                        f"- 已写入草稿：「{S37_WORD}」 → {S37_TARGET_CODE}\n"
+                        f"- 已顺延：「{S37_OCCUPANT}」 {S37_TARGET_CODE} → ppgv\n"
+                        "草稿/批次地址：http://localhost:3100/batch/batch-s37"
+                    )
+                if text == f"喵喵 {S37_WORD}":
+                    return (
+                        f"「{S37_WORD}」候选编码：\n"
+                        f"1. {S37_TARGET_CODE} — 已有「{S37_OCCUPANT}」\n"
+                        "2. ppgv — 空位（推荐）"
+                    )
+                if text == S37_SELECTION:
+                    return "已建立当前顺延计划；回复「确认」执行，或「取消」放弃。"
+                raise AssertionError(text)
+
+            def inject_bot_message(self, text: str) -> int:
+                self.injected = text
+                return 937
+
+            async def send_group_reply(
+                self,
+                text: str,
+                *,
+                reply_message_id: int,
+                to_me: bool,
+            ) -> str:
+                self.assert_equal((text, reply_message_id, to_me), (S37_SELECTION, 937, True))
+                return (
+                    "所选编码 zzzz 已不在当前候选中；"
+                    "已刷新为当前候选，请按下面的列表重新选择。本次未写入。\n"
+                    f"「{S37_WORD}」候选编码：\n"
+                    f"1. {S37_TARGET_CODE} — 已有「{S37_OCCUPANT}」\n"
+                    "2. ppgv — 空位（推荐）"
+                )
+
+            async def draft(self):
+                return {
+                    "batchId": "batch-s37" if self.items else None,
+                    "items": list(self.items),
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+            @staticmethod
+            def assert_equal(actual, expected):
+                if actual != expected:
+                    raise AssertionError((actual, expected))
+
+            @staticmethod
+            def assert_true(value):
+                if not value:
+                    raise AssertionError(value)
+
+        context = FakeContext()
+        result = await scenario.execute(context)
+
+        self.assertEqual(result["facts"]["verbatimEviction"], S37_COMMAND)
+        self.assertEqual(result["facts"]["confirmationSteps"], 0)
+        self.assertEqual(result["facts"]["shiftedCode"], "ppgv")
+        self.assertTrue(result["facts"]["freshListRecovery"])
+        self.assertFalse(result["facts"]["identicalRefusalRepeated"])
+        self.assertEqual(context.clean_calls, 3)
+        self.assertEqual(context.reset_calls, 4)
+        self.assertIn("zzzz", context.injected)
 
     async def test_s27_offline_replays_binding_precheck_and_meta_answer(self) -> None:
         from keytao_bot.utils.pending_confirmation import (

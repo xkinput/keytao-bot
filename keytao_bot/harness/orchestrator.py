@@ -19,6 +19,7 @@ from keytao_bot.utils.llm_policy import (
 )
 from keytao_bot.utils.history_store import _parse_stored_timestamp
 from keytao_bot.utils import keytao_review, review_flags
+from keytao_bot.utils.candidate_inventory import select_candidate_inventory
 from keytao_bot.utils.observability import (
     mark_turn_outcome,
     observe_model_call,
@@ -557,6 +558,7 @@ class AgentOrchestrator:
         multi_add_write_attempted = False
         eviction_lookup_attempted = False
         eviction_write_attempted = False
+        eviction_target_code = eviction_add.code if eviction_add is not None else ""
         eviction_terminal_reply: Optional[str] = None
         authoritative_result_links: Dict[str, str] = {}
         receipt_run_id = uuid.uuid4().hex
@@ -591,11 +593,36 @@ class AgentOrchestrator:
                 and context.mutations_allowed
                 and not context.visual_context
             ):
+                if not eviction_target_code:
+                    occupant_codes = trusted_word_lookup_codes_by_word.get(
+                        eviction_add.named_occupant,
+                        frozenset(),
+                    )
+                    matching_codes = [
+                        code
+                        for code, occupied in trusted_candidate_slots_by_word.get(
+                            eviction_add.word,
+                            (),
+                        )
+                        if (
+                            occupied is True
+                            and code in occupant_codes
+                            and sum(
+                                entry_word == eviction_add.named_occupant
+                                for entry_word, _weight in trusted_entries_by_code.get(
+                                    code,
+                                    (),
+                                )
+                            ) == 1
+                        )
+                    ]
+                    if len(matching_codes) == 1:
+                        eviction_target_code = matching_codes[0]
                 recommended_code = trusted_recommended_codes_by_word.get(
                     eviction_add.word,
                     "",
                 )
-                requested_key = (eviction_add.word, eviction_add.code)
+                requested_key = (eviction_add.word, eviction_target_code)
                 recommended_review = trusted_reviewed_items_by_key.get(
                     (eviction_add.word, recommended_code)
                 )
@@ -609,7 +636,7 @@ class AgentOrchestrator:
                 }
                 if (
                     requested_key not in trusted_reviewed_items_by_key
-                    and eviction_add.code in served_codes
+                    and eviction_target_code in served_codes
                     and recommended_review is not None
                 ):
                     # The audit is word-level; the requested code remains
@@ -619,7 +646,7 @@ class AgentOrchestrator:
                     )
                 reviewed = (
                     eviction_add.word,
-                    eviction_add.code,
+                    eviction_target_code,
                 ) in trusted_reviewed_items_by_key
                 internal_calls: List[_InternalToolCall] = []
                 if (
@@ -639,14 +666,33 @@ class AgentOrchestrator:
                     ))
                 if (
                     not eviction_lookup_attempted
-                    and "keytao_lookup_by_code" in tool_schemas
+                    and (
+                        (
+                            eviction_target_code
+                            and "keytao_lookup_by_code" in tool_schemas
+                        )
+                        or (
+                            not eviction_target_code
+                            and "keytao_lookup_by_word" in tool_schemas
+                        )
+                    )
                 ):
+                    lookup_name = (
+                        "keytao_lookup_by_code"
+                        if eviction_target_code
+                        else "keytao_lookup_by_word"
+                    )
+                    lookup_arguments = (
+                        {"code": eviction_target_code}
+                        if eviction_target_code
+                        else {"word": eviction_add.named_occupant}
+                    )
                     internal_calls.append(_InternalToolCall(
                         id=f"internal-eviction-lookup-{uuid.uuid4().hex}",
                         function=_InternalFunctionCall(
-                            name="keytao_lookup_by_code",
+                            name=lookup_name,
                             arguments=json.dumps(
-                                {"code": eviction_add.code},
+                                lookup_arguments,
                                 ensure_ascii=False,
                             ),
                         ),
@@ -669,7 +715,7 @@ class AgentOrchestrator:
                         (),
                     )
                     entries = trusted_entries_by_code.get(
-                        eviction_add.code,
+                        eviction_target_code,
                         (),
                     )
                     occupant_matches = bool(
@@ -682,13 +728,13 @@ class AgentOrchestrator:
                         [
                             occupied
                             for code, occupied in slots
-                            if code == eviction_add.code
+                            if code == eviction_target_code
                         ]
                         == [True]
                     )
                     reviewed = (
                         eviction_add.word,
-                        eviction_add.code,
+                        eviction_target_code,
                     ) in trusted_reviewed_items_by_key
                     if (
                         reviewed
@@ -703,7 +749,7 @@ class AgentOrchestrator:
                                 name="keytao_create_phrase",
                                 arguments=json.dumps({
                                     "word": eviction_add.word,
-                                    "code": eviction_add.code,
+                                    "code": eviction_target_code,
                                 }, ensure_ascii=False),
                             ),
                         )]
@@ -714,14 +760,19 @@ class AgentOrchestrator:
                         logger.info(
                             "Routing exact eviction add through sealed shift: "
                             f"word={eviction_add.word} "
-                            f"code={eviction_add.code} "
+                            f"code={eviction_target_code} "
                             f"occupant={eviction_add.named_occupant}"
                         )
                     else:
+                        target_label = (
+                            f"当前服务端编码 {eviction_target_code} 的占位词"
+                            if eviction_target_code
+                            else f"当前服务端词条“{eviction_add.named_occupant}”的编码"
+                        )
                         return render_remediation_reply(
                             (
-                                f"当前服务端编码 {eviction_add.code} 的占位词"
-                                f"与指令中的“{eviction_add.named_occupant}”不一致，"
+                                target_label
+                                + f"与指令中的“{eviction_add.named_occupant}”不一致，"
                                 "或该编码不在新词的已核验候选链中；"
                                 "为避免创建重码，本次未写入"
                                 if eviction_lookup_attempted
@@ -3081,7 +3132,11 @@ class AgentOrchestrator:
                 == cls._normalize_loop_text(current_message)
                 and cls._normalize_loop_text(previous_assistant)
                 == cls._normalize_loop_text(reply)
-                and re.search(r"(?:无法执行|未写入|安全拦截|没有识别到)", reply)
+                and re.search(
+                    r"(?:无法执行|未写入|安全拦截|没有识别到|"
+                    r"没有执行|本次未执行|本次未添加)",
+                    reply,
+                )
             ):
                 return (
                     "同一指令再次进入相同拒绝路径，已停止重复建议；"
@@ -3745,125 +3800,24 @@ class AgentOrchestrator:
                         set(codes_by_word.get(word, frozenset())) | codes
                     )
 
-                status_groups: List[tuple[str, str, List[Dict[str, Any]]]] = []
-                top_level_statuses = result.get("candidateStatuses")
-                if isinstance(top_level_statuses, list):
-                    status_groups.append(("", "", top_level_statuses))
-                for pronunciation in result.get("pronunciations") or []:
-                    if not isinstance(pronunciation, dict):
-                        continue
-                    pronunciation_statuses = pronunciation.get(
-                        "candidateStatuses"
-                    )
-                    if isinstance(pronunciation_statuses, list):
-                        status_groups.append((
-                            str(pronunciation.get("pinyin") or "").strip(),
-                            str(pronunciation.get("recommendedCode") or "").strip().lower(),
-                            pronunciation_statuses,
-                        ))
                 recommended = str(result.get("recommendedCode") or "").strip()
-                valid_slot_groups: List[
-                    tuple[
-                        tuple[tuple[str, bool], ...],
-                        tuple[Dict[str, Any], ...],
-                        str,
-                        str,
-                    ]
-                ] = []
-                reading_sets_by_code: Dict[str, set[str]] = {}
-                for group_pinyin, group_recommended, statuses in status_groups:
-                    slots: List[tuple[str, bool]] = []
-                    normalized_statuses: List[Dict[str, Any]] = []
-                    seen_codes: set[str] = set()
-                    valid = bool(statuses)
-                    for status in statuses:
-                        if not isinstance(status, dict):
-                            valid = False
-                            break
-                        code = str(status.get("code") or "").strip().lower()
-                        occupied = status.get("occupied")
-                        if (
-                            not code
-                            or code in seen_codes
-                            or not isinstance(occupied, bool)
-                        ):
-                            valid = False
-                            break
-                        slots.append((code, occupied))
-                        words = [
-                            str(value or "").strip()
-                            for value in status.get("words") or []
-                            if str(value or "").strip()
-                        ]
-                        entries: List[tuple[str, int]] = []
-                        for phrase in status.get("phrases") or []:
-                            if not isinstance(phrase, dict):
-                                continue
-                            phrase_word = str(
-                                phrase.get("word") or ""
-                            ).strip()
-                            weight = phrase.get("weight")
-                            if phrase_word and phrase_word not in words:
-                                words.append(phrase_word)
-                            if (
-                                phrase_word
-                                and isinstance(weight, int)
-                                and not isinstance(weight, bool)
-                                and weight >= 0
-                            ):
-                                entries.append((phrase_word, weight))
-                        normalized_statuses.append({
-                            "code": code,
-                            "occupied": occupied,
-                            "words": tuple(words),
-                            "entries": tuple(entries),
-                        })
-                        seen_codes.add(code)
-                        if group_pinyin:
-                            reading_sets_by_code.setdefault(code, set()).add(
-                                group_pinyin
-                            )
-                    if valid and (
-                        not recommended
-                        or recommended in seen_codes
-                    ):
-                        valid_slot_groups.append((
-                            tuple(slots),
-                            tuple(normalized_statuses),
-                            group_pinyin,
-                            group_recommended,
-                        ))
-                unique_slot_groups: Dict[
-                    tuple[tuple[str, bool], ...],
-                    tuple[Dict[str, Any], ...],
-                ] = {}
-                preferred_slot_groups = [
-                    group
-                    for group in valid_slot_groups
-                    if group[2] and group[3] == recommended
-                ]
-                selected_slot_groups = preferred_slot_groups or valid_slot_groups
-                for slots, normalized_statuses, _pinyin, _group_recommended in selected_slot_groups:
-                    unique_slot_groups.setdefault(slots, normalized_statuses)
-                if len(unique_slot_groups) == 1:
-                    slots, normalized_statuses = next(
-                        iter(unique_slot_groups.items())
-                    )
-                    candidate_slots_by_word[word] = slots
+                inventory = select_candidate_inventory(result)
+                if inventory is not None:
+                    candidate_slots_by_word[word] = inventory.candidates
                     if candidate_statuses_by_word is not None:
-                        candidate_statuses_by_word[word] = normalized_statuses
+                        candidate_statuses_by_word[word] = inventory.statuses
                     if (
                         recommended_codes_by_word is not None
                         and recommended
-                        and recommended in {code for code, _occupied in slots}
+                        and recommended in {
+                            code for code, _occupied in inventory.candidates
+                        }
                     ):
                         recommended_codes_by_word[word] = recommended
                     if candidate_readings_by_word is not None:
-                        candidate_readings_by_word[word] = {
-                            code: next(iter(readings))
-                            for code, readings in reading_sets_by_code.items()
-                            if len(readings) == 1
-                        }
+                        candidate_readings_by_word[word] = dict(
+                            inventory.readings
+                        )
 
                 if tool_name == "keytao_prepare_reviewed_add":
                     raw_ordering = result.get("candidateOrderingAssessments")

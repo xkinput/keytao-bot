@@ -683,19 +683,29 @@ _ECHOED_EVICTION_ADD_RE = re.compile(
     re.IGNORECASE,
 )
 _EVICTION_ADD_OCCUPANT_PATTERN = r"(?![把将])[\u3400-\u9fff]{1,16}"
+_EVICTION_MODIFIER_PATTERN = r"顺延|挪开|往后排|重新编码|顶掉|顶下去|挤掉|换下来"
 _EVICTION_ADD_TAIL_RES = (
     re.compile(
         rf"^(?:让\s*)?(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})\s*"
-        r"(?P<modifier>顺延|挪开|往后排|重新编码)$"
+        rf"(?P<modifier>{_EVICTION_MODIFIER_PATTERN})$"
     ),
     re.compile(
         rf"^(?:把|将)\s*(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})\s*"
-        r"(?P<modifier>顺延|挪开|往后排|重新编码)$"
+        rf"(?P<modifier>{_EVICTION_MODIFIER_PATTERN})$"
     ),
     re.compile(
         rf"^(?P<modifier>挪开)\s*"
         rf"(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})$"
     ),
+)
+_EVICTION_ADD_BY_OCCUPANT_RE = re.compile(
+    rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
+    rf"{ADD_OPERATION_VERB_PATTERN}\s*(?:词组\s*)?"
+    r"[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
+    r"[，,；;]?\s*(?:把|将)\s*"
+    rf"(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})\s*"
+    rf"(?P<modifier>{_EVICTION_MODIFIER_PATTERN})$",
+    re.IGNORECASE,
 )
 _EVICTION_ADD_TRAILING_FILLER_RE = re.compile(
     r"(?:一下|吧|了|谢谢|谢谢你|辛苦了|麻烦了|拜托了)[。.!！]?$"
@@ -959,6 +969,16 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
             code=echoed_match.group("code").strip().lower(),
             named_occupant=echoed_match.group("occupant").strip(),
             modifier="排在前面",
+        )
+        return parsed if parsed.word != parsed.named_occupant else None
+
+    occupant_match = _EVICTION_ADD_BY_OCCUPANT_RE.fullmatch(source)
+    if occupant_match is not None:
+        parsed = EvictionModifiedAdd(
+            word=occupant_match.group("word").strip(),
+            code="",
+            named_occupant=occupant_match.group("occupant").strip(),
+            modifier=occupant_match.group("modifier").strip(),
         )
         return parsed if parsed.word != parsed.named_occupant else None
 
@@ -3608,20 +3628,39 @@ def _eviction_modified_create_binding(
     word = str(arguments.get("word") or "").strip()
     code = str(arguments.get("code") or "").strip().lower()
     action = str(arguments.get("action") or "Create").strip()
+    resolved_codes = [
+        slot_code
+        for slot_code, occupied in (
+            (context.trusted_candidate_slots_by_word or {}).get(word, ())
+        )
+        if (
+            occupied is True
+            and sum(
+                entry_word == parsed.named_occupant
+                for entry_word, _entry_weight in (
+                    (context.trusted_entries_by_code or {}).get(slot_code, ())
+                )
+            ) == 1
+        )
+    ]
+    target_code = parsed.code or (
+        resolved_codes[0] if len(resolved_codes) == 1 else ""
+    )
     if (
         action != "Create"
         or arguments.get("old_word")
         or word != parsed.word
-        or code != parsed.code
+        or not target_code
+        or code != target_code
         or (word, code) not in (context.trusted_reviewed_items_by_key or {})
     ):
         return None
 
     slots = (context.trusted_candidate_slots_by_word or {}).get(word, ())
     matching_slots = [
-        occupied for slot_code, occupied in slots if slot_code == code
+        occupied for slot_code, occupied in slots if slot_code == target_code
     ]
-    entries = (context.trusted_entries_by_code or {}).get(code, ())
+    entries = (context.trusted_entries_by_code or {}).get(target_code, ())
     if (
         matching_slots != [True]
         or sum(

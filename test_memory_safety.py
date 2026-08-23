@@ -6540,6 +6540,10 @@ class MutationAuthorizationTests(unittest.TestCase):
             "添加 幂等 mkdr，米等往后排": "往后排",
             "添加 幂等 mkdr，米等重新编码": "重新编码",
             "添加 幂等 mkdr，让米等顺延": "顺延",
+            "添加 幂等 mkdr，把米等顶掉": "顶掉",
+            "添加 幂等 mkdr，把米等顶下去": "顶下去",
+            "添加 幂等 mkdr，把米等挤掉": "挤掉",
+            "添加 幂等 mkdr，把米等换下来": "换下来",
         }
         for message, modifier in expected.items():
             with self.subTest(message=message):
@@ -6550,6 +6554,20 @@ class MutationAuthorizationTests(unittest.TestCase):
                 self.assertEqual(parsed.named_occupant, "米等")
                 self.assertEqual(parsed.modifier, modifier)
                 self.assertTrue(message_authorizes_mutation(message))
+
+        incident = "加词 耙耙柑 把琵琶骨顶掉"
+        parsed = parse_eviction_modified_add(incident)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(
+            (
+                parsed.word,
+                parsed.code,
+                parsed.named_occupant,
+                parsed.modifier,
+            ),
+            ("耙耙柑", "", "琵琶骨", "顶掉"),
+        )
+        self.assertTrue(message_authorizes_mutation(incident))
 
         blocked = (
             "不要添加 幂等 mkdr，米等顺延",
@@ -10461,6 +10479,7 @@ class _EvictionAddSkills:
     def get_tools():
         return [
             _ReviewedCreateSkills.get_tools()[0],
+            _DestinationDerivedCreateSkills.get_tools()[1],
             {
                 "type": "function",
                 "function": {
@@ -13610,6 +13629,84 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertIn("「米等」 mkdr → mkdro", result)
         self.assertIn("s26-materialized", result)
         self.assertNotIn("重码", result)
+
+    async def test_verbatim_occupant_eviction_derives_code_from_server_records(self) -> None:
+        calls = []
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if name == "keytao_prepare_reviewed_add":
+                return {
+                    "success": True,
+                    "word": "耙耙柑",
+                    "recommendedCode": "ppgv",
+                    "candidateStatuses": [
+                        {
+                            "code": "ppg",
+                            "occupied": True,
+                            "words": ["琵琶骨"],
+                            "phrases": [{"word": "琵琶骨", "weight": 100}],
+                        },
+                        {"code": "ppgv", "occupied": False, "words": []},
+                    ],
+                    "type": "Phrase",
+                    "preSubmitAudit": {
+                        "autoApprove": False,
+                        "issues": ["manual review"],
+                    },
+                }
+            if name == "keytao_lookup_by_word":
+                return {
+                    "success": True,
+                    "word": "琵琶骨",
+                    "phrases": [{
+                        "word": "琵琶骨",
+                        "code": "ppg",
+                        "type": "Phrase",
+                        "weight": 100,
+                    }],
+                }
+            return {
+                "success": True,
+                "batchId": "s37-derived",
+                "shiftPlan": {
+                    "word": "耙耙柑",
+                    "targetCode": "ppg",
+                    "items": [
+                        {"action": "Create", "word": "耙耙柑", "code": "ppg"},
+                        {"action": "Create", "word": "琵琶骨", "code": "ppgv"},
+                    ],
+                    "shifted": [{
+                        "word": "琵琶骨",
+                        "fromCode": "ppg",
+                        "toCode": "ppgv",
+                    }],
+                },
+            }
+
+        client = _FakeClient([])
+        result = await self._eviction_orchestrator(client, dispatch).run(
+            "加词 耙耙柑 把琵琶骨顶掉",
+            AgentRequestContext(
+                platform="qq",
+                user_id="garth",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            [
+                "keytao_prepare_reviewed_add",
+                "keytao_lookup_by_word",
+                "keytao_shift_phrase_code",
+            ],
+        )
+        self.assertEqual(calls[-1][1]["word"], "耙耙柑")
+        self.assertEqual(calls[-1][1]["target_code"], "ppg")
+        self.assertIn("「耙耙柑」 → ppg", result)
+        self.assertIn("「琵琶骨」 ppg → ppgv", result)
 
     async def test_echoed_incident_front_insert_uses_exact_code_and_live_occupant(self) -> None:
         calls = []
@@ -16818,6 +16915,41 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
+    def test_delivery_choke_point_breaks_identical_deterministic_refusal(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        message = "1 重新编码"
+        refusal = "候选编码集合已变化；没有执行添加。"
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id="garth",
+            space_type="group",
+            space_id="incident-group",
+            speaker_name="Garth",
+        )
+        token = chat_module._current_turn_message.set(message)
+        try:
+            with patch.object(
+                chat_module,
+                "get_history",
+                return_value=[
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": refusal},
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": refusal},
+                ],
+            ):
+                delivered = chat_module._prepare_user_facing_reply(
+                    refusal,
+                    memory_context,
+                )
+        finally:
+            chat_module._current_turn_message.reset(token)
+
+        self.assertNotEqual(delivered, refusal)
+        self.assertIn("同一指令再次进入相同拒绝路径", delivered)
+        self.assertIn("查看草稿", delivered)
+
     @staticmethod
     def _create_orchestrator(client, create):
         return AgentOrchestrator(

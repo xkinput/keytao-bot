@@ -10396,8 +10396,18 @@ def test_revalidated_quote_requires_current_semantic_snapshot():
         check(
             "multi-reading display binds each candidate code to its reading",
             isinstance(multireading_state, PendingAddWord)
-            and multireading_state.pronunciation_codes.get("htje") == "huan che"
-            and multireading_state.pronunciation_codes.get("hhje") == "hái chē",
+            and multireading_state.pronunciation_codes
+            == {
+                "htje": "huan che",
+                "htjev": "huan che",
+                "htjevv": "huan che",
+                "htwe": "huan che",
+                "htwev": "huan che",
+                "htwevv": "huan che",
+                "hhje": "hái chē",
+                "hhjev": "hái chē",
+                "hhjevv": "hái chē",
+            },
         )
         with patch.object(
             openai_chat_module,
@@ -10417,6 +10427,141 @@ def test_revalidated_quote_requires_current_semantic_snapshot():
             and restored_multireading.candidates == multireading_state.candidates
             and restored_multireading.pronunciation_codes
             == multireading_state.pronunciation_codes,
+        )
+
+    asyncio.run(_run())
+
+
+def test_revalidated_quote_checks_selected_target_not_unrelated_candidate_families():
+    """A stable selected slot survives removal of unrelated reading families."""
+    print("\n🧪 selected candidate revalidation ignores unrelated families")
+    referenced = PendingAddWord(
+        word="耙耙柑",
+        recommended_code="ppgv",
+        candidates=[
+            ("ppg", True),
+            ("ppgv", False),
+            ("ppgvv", False),
+            ("ppgvvv", False),
+            ("bpg", False),
+            ("bpgv", False),
+            ("pbg", True),
+            ("pbgv", False),
+            ("ppq", True),
+            ("ppqv", False),
+        ],
+        occupied_words={
+            "ppg": ["琵琶骨"],
+            "pbg": ["皮包骨"],
+            "ppq": ["乒乓球"],
+        },
+        pronunciation_codes={code: "pa pa gan" for code in (
+            "ppg", "ppgv", "ppgvv", "ppgvvv",
+            "bpg", "bpgv", "pbg", "pbgv", "ppq", "ppqv",
+        )},
+        needs_manual_review=True,
+    )
+    current_review = {
+        "success": True,
+        "word": "耙耙柑",
+        "recommendedCode": "ppgv",
+        "needsManualReview": True,
+        "pronunciations": [{
+            "pinyin": "pa pa gan",
+            "recommendedCode": "ppgv",
+            "candidateStatuses": [
+                {"code": "ppg", "occupied": True, "words": ["琵琶骨"]},
+                {"code": "ppgv", "occupied": False},
+                {"code": "ppgvv", "occupied": False},
+                {"code": "ppgvvv", "occupied": False},
+            ],
+        }],
+        "preSubmitAudit": {
+            "success": True,
+            "autoApprove": False,
+            "issues": ["manual review"],
+        },
+    }
+
+    async def _run():
+        divergent_review = json.loads(json.dumps(current_review, ensure_ascii=False))
+        divergent_review["candidateStatuses"] = [
+            {
+                "code": code,
+                "occupied": occupied,
+                "words": referenced.occupied_words.get(code, []),
+            }
+            for code, occupied in referenced.candidates
+        ]
+        with patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(divergent_review, ensure_ascii=False)),
+        ):
+            deterministic = await openai_chat_module._revalidate_referenced_add_pending(
+                referenced,
+                "qq",
+                "garth",
+                selected_code="ppg",
+            )
+        check(
+            "top-level and nested review shapes enumerate one deterministic complete list",
+            isinstance(deterministic, PendingAddWord)
+            and deterministic.candidates == referenced.candidates,
+        )
+
+        with patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(current_review, ensure_ascii=False)),
+        ):
+            restored = await openai_chat_module._revalidate_referenced_add_pending(
+                referenced,
+                "qq",
+                "garth",
+                selected_code="ppg",
+            )
+        check(
+            "stable ppg target survives unrelated family removal",
+            isinstance(restored, PendingAddWord)
+            and restored.candidates
+            == [("ppg", True), ("ppgv", False), ("ppgvv", False), ("ppgvvv", False)],
+        )
+
+        stale = PendingAddWord(
+            word="耙耙柑",
+            recommended_code="zzzz",
+            candidates=[("zzzz", True), ("ppg", True)],
+            occupied_words={"zzzz": ["旧占位"], "ppg": ["琵琶骨"]},
+            pronunciation_codes={"zzzz": "pa pa gan", "ppg": "pa pa gan"},
+            needs_manual_review=True,
+        )
+        refresh_states = []
+        failures = []
+        with patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            AsyncMock(return_value=json.dumps(current_review, ensure_ascii=False)),
+        ):
+            changed_target = await openai_chat_module._revalidate_referenced_add_pending(
+                stale,
+                "qq",
+                "garth",
+                selected_code="zzzz",
+                refresh_states=refresh_states,
+                failure_reasons=failures,
+            )
+        refreshed_copy = openai_chat_module._render_refreshed_single_candidate(
+            refresh_states[0],
+            failures[0],
+        )
+        check(
+            "changed selected target yields a fresh executable list",
+            changed_target is None
+            and len(refresh_states) == 1
+            and "已刷新为当前候选" in refreshed_copy
+            and "候选编码集合已变化" not in refreshed_copy
+            and "移除 " not in refreshed_copy,
         )
 
     asyncio.run(_run())
@@ -19723,6 +19868,10 @@ def test_s28_full_add_replaces_live_candidate_and_fresh_state_keeps_readings():
             "hhho": "he he he",
             "hhhoo": "he he he",
             "hhhooo": "he he he",
+            "kkk": "ke ke ke",
+            "kkko": "ke ke ke",
+            "kkkoo": "ke ke ke",
+            "kkkooo": "ke ke ke",
         },
     )
 
@@ -20362,6 +20511,7 @@ if __name__ == "__main__":
     test_draft_suggestion_routes_share_authorization_lead_ins()
     test_cross_user_bot_quote_creates_only_current_actor_operation()
     test_revalidated_quote_requires_current_semantic_snapshot()
+    test_revalidated_quote_checks_selected_target_not_unrelated_candidate_families()
     test_conversation_lock_serializes_same_actor_messages()
     test_draft_operation_coordinator_guards_lifecycle()
     test_draft_operation_confirmation_lease_expires()

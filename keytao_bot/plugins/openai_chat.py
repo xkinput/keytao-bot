@@ -2219,6 +2219,36 @@ def _prepare_user_facing_reply(
     conv_key = memory_context.conversation_address if memory_context else None
     platform = memory_context.platform if memory_context else "web"
     prepared = _enforce_advertised_reply_contract(response, conv_key)
+    current_message = _current_turn_message.get("")
+    if (
+        conv_key is not None
+        and current_message
+        and re.search(
+            r"(?:无法执行|未写入|没有执行|本次未执行|本次未添加|安全拦截)",
+            prepared,
+        )
+    ):
+        history = get_history(conv_key)
+        if (
+            len(history) >= 2
+            and history[-2].get("role") == "user"
+            and history[-1].get("role") == "assistant"
+            and AgentOrchestrator._normalize_loop_text(
+                history[-2].get("content")
+            ) == AgentOrchestrator._normalize_loop_text(current_message)
+            and AgentOrchestrator._normalize_loop_text(
+                history[-1].get("content")
+            ) == AgentOrchestrator._normalize_loop_text(prepared)
+        ):
+            # Deterministic stages remember the current round before delivery;
+            # the shared finalizer expects only earlier rounds as history.
+            history = history[:-2]
+        prepared = AgentOrchestrator._finalize_reply(
+            current_message,
+            prepared,
+            {},
+            history=history,
+        ) or prepared
     prepared = strip_warning_count_copy(prepared)
     prepared = render_platform_public_links(prepared, platform)
     prepared = strip_bare_batch_ids(prepared)
@@ -2588,6 +2618,10 @@ if hasattr(driver, "on_startup"):
 
 
 ai_chat = on_message(rule=should_handle, priority=99, block=True)
+_current_turn_message: ContextVar[str] = ContextVar(
+    "current_turn_message",
+    default="",
+)
 
 
 async def _finish_ai_chat_matcher(response: str) -> None:
@@ -2819,6 +2853,7 @@ async def _stage_normalize_message_text(ctx: TurnContext) -> bool:
         )
     else:
         ctx.normalized_message_text = "请描述并分析我发送的图片。"
+    _current_turn_message.set(ctx.normalized_message_text)
     return False
 
 
@@ -3554,6 +3589,79 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
     return False
 
 
+def _selected_code_for_quoted_candidate(
+    state: PendingAddWord,
+    intent: MessageCommandIntent,
+) -> str:
+    """Resolve one displayed selector before the candidate list is refreshed."""
+    if intent.requested_code:
+        return intent.requested_code.strip().lower()
+    if len(intent.requested_codes) == 1:
+        return intent.requested_codes[0].strip().lower()
+    selected_index = intent.choice_index
+    if selected_index is None and len(intent.choice_indices) == 1:
+        selected_index = intent.choice_indices[0]
+    if selected_index is not None and 1 <= selected_index <= len(state.candidates):
+        return state.candidates[selected_index - 1][0]
+    if intent.target_word:
+        matches = [
+            code
+            for code, occupied in state.candidates
+            if occupied and intent.target_word in state.occupied_words.get(code, [])
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    return state.recommended_code
+
+
+def _remap_quoted_candidate_intent(
+    intent: MessageCommandIntent,
+    selected_code: str,
+    state: PendingAddWord,
+) -> MessageCommandIntent:
+    """Keep the literal selected code stable when a current list is reordered."""
+    selected_index = next((
+        index
+        for index, (code, _occupied) in enumerate(state.candidates, start=1)
+        if code == selected_code
+    ), None)
+    if selected_index is None:
+        return intent
+    if intent.intent in {"pending_choice", "pending_recode"}:
+        return replace(
+            intent,
+            choice_index=selected_index,
+            choice_indices=(),
+            requested_code="",
+            requested_codes=(),
+            target_word="",
+        )
+    if intent.intent == "pending_code_request":
+        return replace(intent, requested_code=selected_code)
+    return intent
+
+
+def _render_refreshed_single_candidate(state: PendingAddWord, reason: str) -> str:
+    rendered = render_server_backed_single_word_candidates(
+        state.word,
+        state.recommended_code,
+        state.server_candidates,
+        state.server_occupied_words,
+        state.server_ordering_assessments,
+    )
+    if not rendered:
+        return render_remediation_reply(
+            reason + "；当前列表无法建立可执行状态，本次未写入",
+            command=f"加词 {state.word}",
+            words=(state.word,),
+        )
+    return (
+        reason.rstrip("；;。")
+        + "；已刷新为当前候选，请按下面的列表重新选择。本次未写入。\n"
+        + rendered
+    )
+
+
 async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
     """Production scenario: quoted pending control revalidates the referenced candidate."""
     ctx.quoted_pending_add_control_authorized = False
@@ -3573,13 +3681,42 @@ async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
             await _finish_ai_chat_matcher(ctx.response)
             return True
         revalidation_failures: List[str] = []
+        refresh_states: List[PendingAddWord] = []
+        selected_code = _selected_code_for_quoted_candidate(
+            ctx.referenced_pending,
+            ctx.quoted_pending_add_intent,
+        )
         restored_state = await _revalidate_referenced_add_pending(
             ctx.referenced_pending,
             ctx.platform,
             ctx.user_id,
+            selected_code=selected_code,
+            refresh_states=refresh_states,
             failure_reasons=revalidation_failures,
         )
         if restored_state is None:
+            if refresh_states:
+                refreshed_state = refresh_states[-1]
+                stored = conversation_state_store.set(
+                    ctx.conv_key,
+                    refreshed_state,
+                    space_key=ctx.space_key,
+                    owner_label=ctx.owner_label,
+                )
+                if stored:
+                    ctx.response = _render_refreshed_single_candidate(
+                        refreshed_state,
+                        revalidation_failures[0] if revalidation_failures else
+                        "所选候选已变化",
+                    )
+                    remember_conversation(
+                        ctx.conv_key,
+                        ctx.memory_context,
+                        ctx.normalized_message_text,
+                        ctx.response,
+                    )
+                    await _finish_ai_chat_matcher(ctx.response)
+                    return True
             ctx.response = render_remediation_reply(
                 (revalidation_failures[0] if revalidation_failures else
                  "当前候选无法完成安全复核")
@@ -3621,7 +3758,11 @@ async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
                 current_record.state.__class__.__name__,
                 _describe_pending_state(current_record.state),
             )
-            ctx.command_intent_cache[cache_key] = ctx.quoted_pending_add_intent
+            ctx.command_intent_cache[cache_key] = _remap_quoted_candidate_intent(
+                ctx.quoted_pending_add_intent,
+                selected_code,
+                restored_state,
+            )
             ctx.quoted_pending_add_control_authorized = True
     return False
 
@@ -3689,13 +3830,42 @@ async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
             and referenced_command_intent.intent == "pending_add_and_submit"
         ):
             revalidation_failures: List[str] = []
+            refresh_states: List[PendingAddWord] = []
+            selected_code = _selected_code_for_quoted_candidate(
+                ctx.referenced_pending,
+                referenced_command_intent,
+            )
             restored_state = await _revalidate_referenced_add_pending(
                 ctx.referenced_pending,
                 ctx.platform,
                 ctx.user_id,
+                selected_code=selected_code,
+                refresh_states=refresh_states,
                 failure_reasons=revalidation_failures,
             )
             if restored_state is None:
+                if refresh_states:
+                    refreshed_state = refresh_states[-1]
+                    stored = conversation_state_store.set(
+                        ctx.conv_key,
+                        refreshed_state,
+                        space_key=ctx.space_key,
+                        owner_label=ctx.owner_label,
+                    )
+                    if stored:
+                        ctx.response = _render_refreshed_single_candidate(
+                            refreshed_state,
+                            revalidation_failures[0] if revalidation_failures else
+                            "所选候选已变化",
+                        )
+                        remember_conversation(
+                            ctx.conv_key,
+                            ctx.memory_context,
+                            ctx.normalized_message_text,
+                            ctx.response,
+                        )
+                        await _finish_ai_chat_matcher(ctx.response)
+                        return True
                 ctx.response = render_remediation_reply(
                     (revalidation_failures[0] if revalidation_failures else
                      "当前候选无法完成安全复核")

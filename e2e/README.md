@@ -279,6 +279,18 @@ candidate, with at most one confirmation. The completion must name both
 outcomes, may not deny a completed write, and may never auto-confirm a
 `duplicate_code` creation in place of the requested eviction.
 
+S37 sends the verbatim occupant-derived eviction
+`加词 耙耙柑 把琵琶骨顶掉`, requiring direct same-turn materialization because
+the only shifted word is the named live occupant. The receipt must place
+`耙耙柑@ppg`, move `琵琶骨` to its fixture-proven next free slot, name both
+results, include the materialized batch link, and ask for no user confirmation.
+The runner removes any prior rig-owned S37 rows before seeding and cleans them
+through approved APIs after each attempt. A separate native-quote leg injects
+an obsolete selected slot, requires a fresh current candidate list, and proves
+the same normalized selection cannot repeat the old candidate-set refusal. The
+offline cascade control still requires one explicit confirmation whenever the
+shift would also displace an unnamed third word.
+
 S27 replays the binding-precheck incident with an intentionally unprovisioned
 synthetic actor and the scenario's provisioned bound control. The unbound actor
 asks for `来都来了`: the first deterministic candidate reply must include one

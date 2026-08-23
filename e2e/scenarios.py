@@ -3182,6 +3182,139 @@ async def scenario_s26(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S37_WORD = "耙耙柑"
+S37_OCCUPANT = "琵琶骨"
+S37_TARGET_CODE = "ppg"
+S37_COMMAND = "加词 耙耙柑 把琵琶骨顶掉"
+S37_SELECTION = "1 重新编码"
+
+
+async def scenario_s37(ctx: ScenarioContext) -> dict[str, Any]:
+    """Close occupant-derived eviction and stale selected-slot recovery."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S37 cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    occupant_rows = [
+        row
+        for row in await ctx.next_client.phrases_by_word(S37_OCCUPANT)
+        if row.get("word") == S37_OCCUPANT
+        and row.get("code") == S37_TARGET_CODE
+    ]
+    require(
+        len(occupant_rows) == 1,
+        f"S37 requires {S37_OCCUPANT}@{S37_TARGET_CODE}: {occupant_rows}",
+    )
+    shifted_code = str(
+        (ctx.fixture_facts.get("s37") or {}).get("shiftedCode") or ""
+    ).strip()
+    require(
+        shifted_code and shifted_code != S37_TARGET_CODE,
+        f"S37 fixture omitted the occupant's next free slot: {ctx.fixture_facts}",
+    )
+
+    messages.append(S37_COMMAND)
+    eviction_reply = await ctx.send_group(S37_COMMAND, to_me=True)
+    replies.append(eviction_reply)
+    draft = await ctx.draft()
+    require(
+        bool(draft.get("items")),
+        f"S37 named-occupant eviction did not execute directly: {eviction_reply}",
+    )
+    require(
+        pending_confirmation_copy() not in eviction_reply,
+        f"S37 named-occupant eviction requested redundant confirmation: {eviction_reply}",
+    )
+    expected = {
+        ("Delete", S37_OCCUPANT, S37_TARGET_CODE),
+        ("Create", S37_WORD, S37_TARGET_CODE),
+        ("Create", S37_OCCUPANT, shifted_code),
+    }
+    actual = {item_key(item) for item in draft.get("items", [])}
+    require(
+        actual == expected and len(draft.get("items", [])) == 3,
+        f"S37 did not materialize one front-insert plan: {draft}",
+    )
+    batch_id = str(draft.get("batchId") or "").strip()
+    require(
+        bool(batch_id) and batch_link_ids(eviction_reply) == {batch_id},
+        f"S37 receipt omitted its materialized batch link: {eviction_reply}",
+    )
+    assert_only_materialized_batch_links([eviction_reply], draft)
+    assert_reply_mentions(
+        eviction_reply,
+        f"「{S37_WORD}」 → {S37_TARGET_CODE}",
+        f"「{S37_OCCUPANT}」 {S37_TARGET_CODE} → {shifted_code}",
+    )
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S37 recovery cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    messages.append(f"喵喵 {S37_WORD}")
+    discovery = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(discovery)
+    require(
+        S37_WORD in discovery and S37_TARGET_CODE in discovery,
+        f"S37 current discovery omitted its target: {discovery}",
+    )
+
+    stale_display = (
+        f"「{S37_WORD}」候选编码：\n"
+        "1. zzzz — 已有「旧占位」\n"
+        f"2. {S37_TARGET_CODE} — 已有「{S37_OCCUPANT}」\n"
+        f"• 「{S37_WORD}」→ zzzz（推荐）\n"
+        "若要挪开已有词，回复“1 重新编码”。"
+    )
+    stale_message_id = ctx.inject_bot_message(stale_display)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    messages.append(S37_SELECTION)
+    refreshed = await ctx.send_group_reply(
+        S37_SELECTION,
+        reply_message_id=stale_message_id,
+        to_me=True,
+    )
+    replies.append(refreshed)
+    require(
+        "已刷新为当前候选" in refreshed
+        and S37_TARGET_CODE in refreshed
+        and "候选编码集合已变化" not in refreshed
+        and "移除 " not in refreshed,
+        f"S37 stale selection did not recover with a fresh list: {refreshed}",
+    )
+
+    messages.append(S37_SELECTION)
+    second = await ctx.send_group(S37_SELECTION, to_me=True)
+    replies.append(second)
+    require(
+        second != refreshed
+        and "候选编码集合已变化" not in second
+        and "没有执行添加" not in second,
+        f"S37 repeated selection returned the same dead-end: {second}",
+    )
+    final_cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(
+        final_cleanup.get("success") is True,
+        f"S37 final cleanup failed: {final_cleanup}",
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "verbatimEviction": S37_COMMAND,
+            "targetCode": S37_TARGET_CODE,
+            "shiftedCode": shifted_code,
+            "batchId": batch_id,
+            "confirmationSteps": 0,
+            "freshListRecovery": True,
+            "identicalRefusalRepeated": False,
+        },
+    }
+
+
 S27_WORD = "来都来了"
 S27_ASSENT = "加入并提交"
 S27_META_QUESTION = "你是否会先确认对方有没有绑定账号？"
@@ -5310,6 +5443,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S34", "pending submitted word awareness", scenario_s34),
     Scenario("S35", "comparator recommendation is the default add plan", scenario_s35),
     Scenario("S36", "dictionary delete and exact swap incident round", scenario_s36),
+    Scenario("S37", "occupant eviction and selected-slot revalidation", scenario_s37),
 )
 
 

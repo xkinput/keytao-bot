@@ -45,6 +45,9 @@ from .safety import (
 )
 from .scenarios import (
     SCENARIOS,
+    S37_OCCUPANT,
+    S37_TARGET_CODE,
+    S37_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -1490,6 +1493,83 @@ async def ensure_s36_fixture(
     }
 
 
+async def ensure_s37_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed the sole live occupant required by the eviction incident."""
+    newcomer_codes = ordered_candidate_codes(await client.encode(S37_WORD))
+    occupant_codes = ordered_candidate_codes(await client.encode(S37_OCCUPANT))
+    if S37_TARGET_CODE not in newcomer_codes:
+        raise RigInfrastructureError(
+            f"S37 {S37_WORD} does not encode to {S37_TARGET_CODE}: "
+            f"{newcomer_codes}"
+        )
+    if not occupant_codes or occupant_codes[0] != S37_TARGET_CODE:
+        raise RigInfrastructureError(
+            f"S37 {S37_OCCUPANT} candidate chain does not start at "
+            f"{S37_TARGET_CODE}: {occupant_codes}"
+        )
+    exact_rows = [
+        row
+        for row in await client.phrases_by_code(S37_TARGET_CODE)
+        if row.get("code") == S37_TARGET_CODE
+    ]
+    if exact_rows:
+        raise RigInfrastructureError(
+            f"S37 requires an empty exact {S37_TARGET_CODE} slot before seeding: "
+            f"{exact_rows}"
+        )
+    await client.clean_draft(seed_identity["platform_id"])
+    seeded = await client.seed_phrase(
+        platform_id=seed_identity["platform_id"],
+        word=S37_OCCUPANT,
+        code=S37_TARGET_CODE,
+    )
+    exact_rows = [
+        row
+        for row in await client.phrases_by_code(S37_TARGET_CODE)
+        if row.get("code") == S37_TARGET_CODE
+    ]
+    if not (
+        len(exact_rows) == 1
+        and exact_rows[0].get("word") == S37_OCCUPANT
+        and exact_rows[0].get("type") == "Phrase"
+        and str((exact_rows[0].get("user") or {}).get("name") or "").startswith(
+            RESERVED_BINDING_PREFIX
+        )
+    ):
+        raise RigInfrastructureError(
+            f"S37 did not seed sole rig-owned {S37_OCCUPANT}@"
+            f"{S37_TARGET_CODE}: {exact_rows}"
+        )
+    shifted_code = ""
+    for code in occupant_codes[1:]:
+        occupied = [
+            row
+            for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if not occupied:
+            shifted_code = code
+            break
+    if not shifted_code:
+        raise RigInfrastructureError(
+            f"S37 {S37_OCCUPANT} candidate chain has no free shift slot: "
+            f"{occupant_codes}"
+        )
+    return {
+        "word": S37_WORD,
+        "occupantWord": S37_OCCUPANT,
+        "targetCode": S37_TARGET_CODE,
+        "newcomerCandidateCodes": newcomer_codes,
+        "occupantCandidateCodes": occupant_codes,
+        "shiftedCode": shifted_code,
+        "seedBatchId": seeded.get("batchId"),
+    }
+
+
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
     apply_bot_environment(config)
     import nonebot
@@ -1835,6 +1915,12 @@ async def async_main(args: argparse.Namespace) -> int:
                             )
                         )
                         fixture_facts["s36"] = await ensure_s36_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S37":
+                        fixture_facts["s37"] = await ensure_s37_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

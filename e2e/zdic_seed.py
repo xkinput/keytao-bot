@@ -363,6 +363,19 @@ ZDIC_FIXTURES_BY_SCENARIO["S35"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S37"] = {
+    "probe_words": ("耙耙柑", "琵琶骨"),
+    "rows": (
+        {"kind": "char", "entry": "耙", "status": "found", "pinyins": ["pá", "bà"]},
+        {"kind": "char", "entry": "柑", "status": "found", "pinyins": ["gān"]},
+        {"kind": "char", "entry": "琵", "status": "found", "pinyins": ["pí"]},
+        {"kind": "char", "entry": "琶", "status": "found", "pinyins": ["pá"]},
+        {"kind": "char", "entry": "骨", "status": "found", "pinyins": ["gǔ", "gū"]},
+        {"kind": "entry", "entry": "耙耙柑", "status": "found", "pinyins": ["pá", "pá", "gān"]},
+        {"kind": "entry", "entry": "琵琶骨", "status": "found", "pinyins": ["pí", "pá", "gǔ"]},
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 
