@@ -721,6 +721,18 @@ _EVICTION_ADD_BY_OCCUPANT_RE = re.compile(
 _EVICTION_ADD_TRAILING_FILLER_RE = re.compile(
     r"(?:一下|吧|了|谢谢|谢谢你|辛苦了|麻烦了|拜托了)[。.!！]?$"
 )
+_UNNAMED_EVICTION_MODIFIED_ADD_RE = re.compile(
+    rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
+    rf"{ADD_OPERATION_VERB_PATTERN}\s*(?:词组\s*)?"
+    r"[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
+    r"(?:的\s*)?(?:编码|代码)?\s*"
+    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*"
+    r"(?:[，,；;]\s*)?"
+    r"(?:重新编码|腾位|顺延(?:其他|其余|相关)?(?:的)?(?:词|词条)?|"
+    r"顶掉(?:其他|其余|相关)?(?:的)?(?:词|词条)?|"
+    r"挪开(?:其他|其余|相关)?(?:的)?(?:词|词条)?)$",
+    re.IGNORECASE,
+)
 
 
 _PENDING_POSITIONAL_ADD_WHOLE_RE = re.compile(
@@ -2681,6 +2693,8 @@ def self_checked_suggested_command(
     if not candidate:
         return ""
     display = SUGGESTION_MENTION_PREFIX + candidate
+    if not suggestion_preserves_expressed_operation(raw_message, display):
+        return ""
     if not message_authorizes_mutation(display):
         return ""
     strict = ToolContext(
@@ -3095,6 +3109,56 @@ def explicit_shift_modified_add_item(message: str) -> Optional[Dict[str, object]
         "code": clause.code,
         "submitAfter": False,
     }
+
+
+def _has_unnamed_eviction_modified_add(message: str) -> bool:
+    """Recognize an add whose requested eviction omits the live occupant."""
+    if not message_authorizes_mutation(message):
+        return False
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    ).strip()
+    source = _EVICTION_ADD_TRAILING_FILLER_RE.sub("", source).strip()
+    source = source.rstrip("。.!！").strip()
+    return _UNNAMED_EVICTION_MODIFIED_ADD_RE.fullmatch(source) is not None
+
+
+def parsed_operation_kinds(message: str) -> frozenset[str]:
+    """Return only operation kinds closed by the current user message.
+
+    This deliberately models compound-operation closure, not tool authority.
+    It lets remediation compare the operation it proposes with the operation
+    the user actually asked for, so an add-and-evict request cannot degrade to
+    a bare add (and an add-and-submit request cannot degrade to add-only).
+    """
+    if parse_eviction_modified_add(message) is not None:
+        return frozenset({"add", "evict"})
+    if (
+        explicit_shift_modified_add_item(message) is not None
+        or _has_unnamed_eviction_modified_add(message)
+    ):
+        return frozenset({"add", "evict"})
+    if explicit_combined_add_submit_item(message) is not None:
+        return frozenset({"add", "submit"})
+    if explicit_complete_add_item(message) is not None:
+        return frozenset({"add"})
+    return frozenset()
+
+
+def suggestion_preserves_expressed_operation(
+    user_message: str,
+    suggested_command: str,
+) -> bool:
+    """Reject a parsed remediation that silently drops an operation kind."""
+    required = parsed_operation_kinds(user_message)
+    # This closure guard protects the inseparable add-and-evict operation.
+    # Other compound flows can have a truthful partial success (for example,
+    # add succeeded and submit failed), where suggesting only the unfinished
+    # operation is correct and must remain available.
+    if "evict" not in required:
+        return True
+    proposed = parsed_operation_kinds(suggested_command)
+    return required.issubset(proposed)
 
 
 def _explicit_recall_command_matches(compact: str) -> bool:

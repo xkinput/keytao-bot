@@ -937,6 +937,25 @@ def _extract_explicit_reading_request(
     source = unicodedata.normalize("NFKC", str(message_text or "")).strip()
     if not source or re.search(r"[?？]", source):
         return None
+    character_reading = re.fullmatch(
+        rf"^(?:(?:请|麻烦)?\s*(?:帮我|帮忙|给我)?\s*"
+        rf"(?:加词|添加词|新增词)\s*)?"
+        rf"(?P<word>[\u3400-\u9fff]{{1,20}})\s*[，,；;]?\s+"
+        rf"(?P<char>[\u3400-\u9fff])(?:字)?(?:的)?(?:读音)?"
+        rf"(?:是|为|读作|读成|读)\s*[:：]?\s*"
+        rf"(?P<pinyin>[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ]+)"
+        rf"(?:\s*[。.!！])?$",
+        source,
+        re.IGNORECASE,
+    )
+    if character_reading is not None:
+        word = character_reading.group("word").strip()
+        character = character_reading.group("char")
+        pinyin = keytao_review.normalize_pinyin_syllable(
+            character_reading.group("pinyin")
+        )
+        if character in word and pinyin:
+            return word, f"{character}={pinyin}"
     patterns = (
         re.compile(
             rf"^(?:(?:请|麻烦)?\s*(?:帮我|帮忙|给我)?\s*"
@@ -979,6 +998,36 @@ def _extract_explicit_reading_request(
     return None
 
 
+def _extract_explicit_reading_meaning_request(
+    message_text: str,
+    history: Optional[List[Dict]] = None,
+) -> Optional[Tuple[str, str]]:
+    """Bind a concrete sense description to one named or unresolved word."""
+    source = unicodedata.normalize("NFKC", str(message_text or "")).strip()
+    if (
+        not source
+        or len(source) > 180
+        or re.search(r"[?？]", source)
+        or not re.search(r"(?:意思|含义|指的是|语境|用法|那个)", source)
+    ):
+        return None
+    explicit = re.fullmatch(
+        r"(?:(?:请|麻烦)?\s*(?:帮我|帮忙|给我)?\s*"
+        r"(?:加词|添加词|新增词)\s*)"
+        r"(?P<word>[\u3400-\u9fff]{1,20})\s*[，,；;]?\s*"
+        r"(?P<meaning>.+)",
+        source,
+    )
+    if explicit is not None:
+        word = explicit.group("word").strip()
+        meaning = explicit.group("meaning").strip()
+        return (word, meaning) if meaning else None
+    word = _latest_unresolved_review_word(history)
+    if not word or re.search(r"(?:不要|别|取消|删除|移除|提交)", source):
+        return None
+    return word, source
+
+
 async def _try_handle_explicit_reading_disambiguation(
     message_text: str,
     history: Optional[List[Dict]],
@@ -990,9 +1039,18 @@ async def _try_handle_explicit_reading_disambiguation(
 ) -> Optional[str]:
     """Re-review a named reading before the free-form model can consume a turn."""
     explicit = _extract_explicit_reading_request(message_text, history)
-    if explicit is None:
-        return None
-    word, requested_reading = explicit
+    requested_reading = ""
+    requested_meaning = ""
+    if explicit is not None:
+        word, requested_reading = explicit
+    else:
+        meaning_request = _extract_explicit_reading_meaning_request(
+            message_text,
+            history,
+        )
+        if meaning_request is None:
+            return None
+        word, requested_meaning = meaning_request
     return await _try_handle_simple_single_word_query(
         f"加词 {word}",
         platform,
@@ -1001,6 +1059,7 @@ async def _try_handle_explicit_reading_disambiguation(
         space_key,
         owner_label,
         requested_reading=requested_reading,
+        requested_meaning=requested_meaning,
     )
 
 
@@ -2438,6 +2497,7 @@ async def _try_handle_simple_single_word_query(
     owner_label: str = "",
     *,
     requested_reading: str = "",
+    requested_meaning: str = "",
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     explicit_add_word = _extract_explicit_reviewed_add_word(message_text)
@@ -2502,6 +2562,8 @@ async def _try_handle_simple_single_word_query(
     review_args = {"word": word}
     if requested_reading:
         review_args["requested_reading"] = requested_reading
+    if requested_meaning:
+        review_args["requested_meaning"] = requested_meaning
     review_json = await call_tool_function(
         "keytao_prepare_reviewed_add", review_args, platform, user_id,
     )
@@ -3655,6 +3717,7 @@ async def _execute_shift_to_code(
     evidence_lines: Optional[List[str]] = None,
     reviewed_pinyin: str = "",
     reviewed_candidate_codes: Tuple[str, ...] = (),
+    auto_confirm_shift_plan: bool = False,
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
     return await _execute_confirmed_tool(
@@ -3723,6 +3786,7 @@ async def _execute_shift_to_code(
         (platform, user_id),
         space_key,
         owner_label,
+        auto_confirm_shift_plan=auto_confirm_shift_plan,
     )
 
 
@@ -4522,6 +4586,7 @@ async def _execute_confirmed_tool(
     carried_warnings: Optional[List[Any]] = None,
     carried_ordering_summary: str = "",
     on_transport_failure: Optional[Callable[[], None]] = None,
+    auto_confirm_shift_plan: bool = False,
 ) -> str:
     """Execute one staged step without bypassing unseen server warnings."""
     if state.confirmation_source not in {"local_preview", "server_warning"}:
@@ -4748,6 +4813,34 @@ async def _execute_confirmed_tool(
                     "确认内容未变化，原确认未执行",
                     command="查看草稿",
                 )
+        should_auto_confirm_shift = bool(
+            auto_confirm_shift_plan
+            and state.function_name == "keytao_shift_phrase_code"
+            and server_warning_ticket_is_complete(pending_state)
+            and (
+                (
+                    state.confirmation_source == "local_preview"
+                    and data.get("confirmationKind") == "shiftPlan"
+                )
+                or (
+                    state.confirmation_source == "server_warning"
+                    and data.get("warnings") == []
+                )
+            )
+        )
+        if should_auto_confirm_shift:
+            return await _execute_confirmed_tool(
+                pending_state,
+                platform,
+                user_id,
+                conv_key,
+                space_key,
+                owner_label,
+                carried_warnings=list(data.get("warnings") or []),
+                carried_ordering_summary=ordering_summary,
+                on_transport_failure=on_transport_failure,
+                auto_confirm_shift_plan=True,
+            )
         auto_confirm_binding = None
         if state.confirmation_source == "local_preview":
             if state.function_name == "keytao_create_phrase":
@@ -8215,6 +8308,11 @@ async def _handle_pending_add_word(
 
     shift_target_code = _resolve_shift_target_code(state, command_intent)
     if shift_target_code is not None:
+        create_args = _create_phrase_args(state, shift_target_code)
+        reviewed_pinyin, reviewed_candidate_codes = _pending_reviewed_reading(
+            state,
+            shift_target_code,
+        )
         return await _execute_shift_to_code(
             state.word,
             shift_target_code,
@@ -8222,6 +8320,16 @@ async def _handle_pending_add_word(
             user_id,
             space_key,
             owner_label,
+            target_item={
+                "type": "Phrase",
+                "remark": str(create_args.get("remark") or ""),
+                "needsManualReview": bool(
+                    create_args.get("needs_manual_review", True)
+                ),
+            },
+            reviewed_pinyin=reviewed_pinyin,
+            reviewed_candidate_codes=reviewed_candidate_codes,
+            auto_confirm_shift_plan=True,
         )
 
     reorder_recommendation = _pending_add_reorder_recommendation(state)

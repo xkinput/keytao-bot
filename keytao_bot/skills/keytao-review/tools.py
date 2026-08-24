@@ -157,6 +157,7 @@ async def keytao_prepare_reviewed_add(
     platform: Optional[str] = None,
     platform_id: Optional[str] = None,
     requested_reading: str = "",
+    requested_meaning: str = "",
 ) -> Dict:
     config = _review_config()
     semantic_requester = _semantic_requester_for_actor(platform, platform_id)
@@ -165,6 +166,8 @@ async def keytao_prepare_reviewed_add(
         review_kwargs["semantic_requester"] = semantic_requester
     if requested_reading:
         review_kwargs["requested_reading"] = requested_reading
+    if requested_meaning:
+        review_kwargs["requested_meaning"] = requested_meaning
     review = await prepare_reviewed_word(config, word, **review_kwargs)
     recommended_code = str(review.get("recommendedCode") or "").strip()
     reviewed_word = str(review.get("word") or word or "").strip()
@@ -207,10 +210,19 @@ async def keytao_prepare_reviewed_add(
         reason = str(
             (pre_submit.get("issues") or [""])[0] if flag else pre_submit.get("summary") or ""
         )
+        base_site = str(review.get("reviewVerdictSite") or "")
+        may_clear_base_seal = (
+            base_disposition in {None, ReviewDisposition.PASS}
+            or (
+                base_disposition is ReviewDisposition.SEAL
+                and base_site == "entity_context_reading"
+                and pre_submit_site == "semantic_context_common_word"
+            )
+        )
         if (
             pre_submit_disposition is ReviewDisposition.PASS
             and registered_pre_submit_disposition is ReviewDisposition.PASS
-            and base_disposition is not ReviewDisposition.BLOCK
+            and may_clear_base_seal
         ):
             flag = False
             semantic_items = [
@@ -260,9 +272,12 @@ TOOLS = [
                     "requested_reading": {
                         "type": "string",
                         "description": (
-                            "用户本轮明确指定的整词拼音；必须原样传入读音是X、按X读、X那个等说法中的拼音，"
-                            "服务端会按该读音复算候选链"
+                            "用户本轮明确指定的整词拼音或单字读音提示；只从一次编码结果已有的读音组中选择"
                         ),
+                    },
+                    "requested_meaning": {
+                        "type": "string",
+                        "description": "用户本轮明确描述的词义或用法；只用于映射并选择编码结果已有的读音组",
                     },
                 },
                 "required": ["word"],

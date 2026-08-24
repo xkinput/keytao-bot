@@ -2220,8 +2220,22 @@ def _prepare_user_facing_reply(
     """Apply the final copy and platform policy at every delivery boundary."""
     conv_key = memory_context.conversation_address if memory_context else None
     platform = memory_context.platform if memory_context else "web"
-    prepared = _enforce_advertised_reply_contract(response, conv_key)
     current_message = _current_turn_message.get("")
+    if (
+        current_message
+        and "evict" in _authorization_grammar.parsed_operation_kinds(
+            current_message
+        )
+        and re.search(
+            r"(?:无法执行|未写入|没有执行|本次未执行|本次未添加|安全拦截|已停止)",
+            str(response or ""),
+        )
+    ):
+        response = (
+            "当前无法完整执行你要求的添加并腾位操作；"
+            "本次未写入。"
+        )
+    prepared = _enforce_advertised_reply_contract(response, conv_key)
     if (
         conv_key is not None
         and current_message

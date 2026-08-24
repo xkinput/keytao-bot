@@ -1922,10 +1922,10 @@ def test_system_prompt_includes_word_lookup_rule_for_single_and_multi_word_input
 
     check("prompt mentions one or many Chinese words", "如果用户只发了一个或多个中文词/短词" in SYSTEM_PROMPT_CORE)
     check("prompt mentions meaning explanation", "每个词都先用 1-2 句解释它的大致含义" in SYSTEM_PROMPT_CORE)
-    check("prompt gates contextual pronunciation on meaning", "只有当你能给出这个词明确、合理的含义或常见用法时" in SYSTEM_PROMPT_CORE)
-    check("prompt requires semantic pronunciation re-encode", "semantic_pinyin=完整逐字拼音" in SYSTEM_PROMPT_CORE)
+    check("prompt gates contextual pronunciation on meaning", "用户给出具体含义时传 requested_meaning" in SYSTEM_PROMPT_CORE)
+    check("prompt forbids semantic pronunciation re-encode", "不得按读音再次调用编码服务" in SYSTEM_PROMPT_CORE)
     check("prompt preserves authority outage status", "如果 standardPronunciationStatus=unavailable" in SYSTEM_PROMPT_CORE)
-    check("prompt requires admin review after outage fallback", "才可作为需管理员复核的语义候选" in SYSTEM_PROMPT_CORE)
+    check("prompt requires admin review after outage fallback", "选中后作为需管理员复核的语义候选" in SYSTEM_PROMPT_CORE)
     check("prompt mentions batch lookup preference", "多个词时优先使用批量查询工具" in SYSTEM_PROMPT_CORE)
     check("prompt excludes ordinary Q&A from add-word flow", "普通问答，不要为了加词而生成确认句" in SYSTEM_PROMPT_CORE)
     check("prompt mentions duplicate order", "主动说明该词在同码词里的排序位置" in SYSTEM_PROMPT_CORE)
@@ -2075,6 +2075,7 @@ def test_s38_explicit_reading_turns_reenter_review_before_the_model():
     history = [{"role": "assistant", "content": unresolved}]
     cases = (
         ("加词 出圈，读音是 chū quān", "出圈", "chu quan"),
+        ("加词 出圈 圈字读quan", "出圈", "圈=quan"),
         ("按 chu quan 读", "出圈", "chu quan"),
         ("chū quān 那个", "出圈", "chu quan"),
         (
@@ -2092,6 +2093,17 @@ def test_s38_explicit_reading_turns_reenter_review_before_the_model():
             f"explicit reading parsed: {message}",
             parsed == (expected_word, expected_reading),
         )
+    meaning_request = (
+        chat_commands_module._extract_explicit_reading_meaning_request(
+            "我是说作品走红、突破原有圈层的那个意思",
+            history,
+        )
+    )
+    check(
+        "a concrete sense description binds the unresolved word",
+        meaning_request
+        == ("出圈", "我是说作品走红、突破原有圈层的那个意思"),
+    )
 
     async def _run():
         reviewed = AsyncMock(return_value="SERVER-REVIEWED-CANDIDATES")
@@ -2114,6 +2126,28 @@ def test_s38_explicit_reading_turns_reenter_review_before_the_model():
             "explicit reading is supplied to the review call",
             reviewed.await_args.args[0] == "加词 出圈"
             and reviewed.await_args.kwargs["requested_reading"] == "chu quan",
+        )
+
+        reviewed.reset_mock()
+        with patch.object(
+            chat_commands_module,
+            "_try_handle_simple_single_word_query",
+            reviewed,
+        ):
+            meaning_result = await chat_commands_module._try_handle_explicit_reading_disambiguation(
+                "我是说作品走红、突破原有圈层的那个意思",
+                history,
+                "qq",
+                "actor",
+                ("qq", "actor"),
+                ("qq", "private:actor"),
+                "Garth",
+            )
+        check(
+            "sense description is supplied to the same reviewed-add path",
+            meaning_result == "SERVER-REVIEWED-CANDIDATES"
+            and reviewed.await_args.kwargs["requested_meaning"]
+            == "我是说作品走红、突破原有圈层的那个意思",
         )
 
     asyncio.run(_run())
@@ -4263,6 +4297,13 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
         encode_data = {
             "success": True,
             "codes": ["ylcb", "ylcbv", "ylcbvu"],
+            "candidateCodes": [
+                "ylcb", "ylcbv", "ylcbvu", "ylzb", "ylzbv", "ylzbvu",
+            ],
+            "alternatePhrasePronunciationCodes": [{
+                "pinyins": ["ya", "lu", "zang", "bu"],
+                "codes": ["ylzb", "ylzbv", "ylzbvu"],
+            }],
             "chars": [
                 {"char": "雅", "pinyin": "ya", "pinyins": ["ya"], "pronunciationLookupStatus": "found", "shapeCode": "v"},
                 {"char": "鲁", "pinyin": "lu", "pinyins": ["lu"], "pronunciationLookupStatus": "found", "shapeCode": "u"},
@@ -4283,17 +4324,7 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
             "reviewHint": "地名中的藏读 zang",
         }
 
-        async def fake_fetch_keytao_encode(config, word, semantic_meaning="", semantic_pinyin=""):
-            if semantic_pinyin == "ya lu zang bu":
-                return {
-                    **encode_data,
-                    "codes": ["ylzb", "ylzbv", "ylzbvu"],
-                    "chars": [
-                        *encode_data["chars"][:2],
-                        {**encode_data["chars"][2], "pinyin": "zang"},
-                        encode_data["chars"][3],
-                    ],
-                }
+        async def fake_fetch_keytao_encode(config, word):
             return encode_data
 
         with patch.object(keytao_review_module, "collect_pronunciation_evidence_limited", AsyncMock(return_value={
@@ -4326,8 +4357,8 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
             },
         }) or ""
 
-        check("entity pronunciation replaces context-free default", pronunciation.get("pinyin") == "ya lu zang bu")
-        check("corrected code chain uses zang initial", pronunciation.get("codes") == ["ylzb", "ylzbv", "ylzbvu"])
+        check("entity pronunciation selects the returned zang group", pronunciation.get("pinyin") == "ya lu zang bu")
+        check("selected group keeps its returned zang chain", pronunciation.get("codes") == ["ylzb", "ylzbv", "ylzbvu"])
         check("wrong cang chain is not retained", "ylcb" not in pronunciation.get("codes", []))
         check("semantic pronunciation alone is not authority", review.get("autoReviewable") is False)
         check("correction records default pronunciation", pronunciation.get("contextPronunciation", {}).get("defaultPinyin") == "ya lu cang bu")
@@ -4750,6 +4781,13 @@ def test_reviewed_word_automatically_disambiguates_polyphone_before_recommending
             "semanticPronunciationAccepted": False,
             "phrasePinyins": ["yìn", "chá"],
             "contextPhrasePinyins": ["xūn", "chá"],
+            "candidateCodes": [
+                "ybws", "ybwso", "ybwsoi", "xwws", "xwwso", "xwwsoi",
+            ],
+            "alternatePhrasePronunciationCodes": [{
+                "pinyins": ["xūn", "chá"],
+                "codes": ["xwws", "xwwso", "xwwsoi"],
+            }],
             "chars": [
                 {
                     "char": "窨",
@@ -4769,18 +4807,6 @@ def test_reviewed_word_automatically_disambiguates_polyphone_before_recommending
                 },
             ],
         }
-        semantic_encode = {
-            **baseline_encode,
-            "codes": ["xwws", "xwwso", "xwwsoi"],
-            "pronunciationSource": "llm-semantic",
-            "semanticPronunciationNeeded": False,
-            "semanticPronunciationAccepted": True,
-            "phrasePinyins": ["xūn", "chá"],
-            "chars": [
-                {**baseline_encode["chars"][0], "pinyin": "xūn", "phoneticCode": "xw"},
-                baseline_encode["chars"][1],
-            ],
-        }
         semantic_proposal = {
             "accepted": True,
             "word": "窨茶",
@@ -4790,7 +4816,7 @@ def test_reviewed_word_automatically_disambiguates_polyphone_before_recommending
             "usageType": "technical_term",
         }
 
-        encode_mock = AsyncMock(side_effect=[baseline_encode, semantic_encode])
+        encode_mock = AsyncMock(return_value=baseline_encode)
         with patch.object(keytao_review_module, "collect_pronunciation_evidence_limited", AsyncMock(return_value={
             "success": True,
             "groups": [],
@@ -4817,17 +4843,11 @@ def test_reviewed_word_automatically_disambiguates_polyphone_before_recommending
 
         pronunciation = review.get("pronunciations", [{}])[0]
         check("fresh review asks semantic disambiguator", semantic_mock.await_count == 1)
-        check("semantic proposal is revalidated by encode service", encode_mock.await_count == 2)
-        semantic_encode_kwargs = (
-            encode_mock.await_args_list[1].kwargs
-            if encode_mock.await_count >= 2
-            else {}
-        )
-        check("semantic revalidation sends pinyin and meaning", semantic_encode_kwargs == {
-            "semantic_pinyin": "xun cha",
-            "semantic_meaning": semantic_proposal["meaning"],
-        })
-        check("fresh review uses xun cha", pronunciation.get("pinyin") == "xun cha")
+        check("semantic proposal selects from one encode result", encode_mock.await_count == 1)
+        check("ordinary encode call carries no semantic recompute operands", encode_mock.await_args.kwargs == {})
+        check("fresh review uses xun cha", keytao_review_module.normalize_pinyin_sequence(
+            pronunciation.get("pinyin", "")
+        ) == ("xun", "cha"))
         check("fresh review recommends xun candidate chain", pronunciation.get("codes") == ["xwws", "xwwso", "xwwsoi"])
         check("semantic-only correction remains administrator reviewed", review.get("requiresManualPronunciationReview") is True)
         check("authority outage remains visible", review.get("standardPronunciationStatus") == "unavailable")
@@ -5035,6 +5055,13 @@ def test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable():
         short_encode = {
             "success": True,
             "codes": ["ylcb", "ylcbv", "ylcbvu"],
+            "candidateCodes": [
+                "ylcb", "ylcbv", "ylcbvu", "ylzb", "ylzbv", "ylzbvu",
+            ],
+            "alternatePhrasePronunciationCodes": [{
+                "pinyins": ["ya", "lu", "zang", "bu"],
+                "codes": ["ylzb", "ylzbv", "ylzbvu"],
+            }],
             "chars": [
                 {"char": "雅", "pinyin": "ya", "pinyins": ["ya"], "pronunciationLookupStatus": "found", "shapeCode": "v"},
                 {"char": "鲁", "pinyin": "lu", "pinyins": ["lu"], "pronunciationLookupStatus": "found", "shapeCode": "u"},
@@ -5057,21 +5084,7 @@ def test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable():
         async def fake_encode(_config, value, **kwargs):
             if value == "雅鲁藏布江":
                 return full_encode
-            if kwargs.get("semantic_pinyin") == "ya lu zang bu":
-                return {
-                    **short_encode,
-                    "codes": ["ylzb", "ylzbv", "ylzbvu"],
-                    "chars": [
-                        short_encode["chars"][0],
-                        short_encode["chars"][1],
-                        {
-                            **short_encode["chars"][2],
-                            "pinyin": "zang",
-                            "phoneticCode": "z",
-                        },
-                        short_encode["chars"][3],
-                    ],
-                }
+            check("context lookup never sends reading recompute operands", kwargs == {})
             return short_encode
 
         with patch.object(keytao_review_module, "collect_pronunciation_evidence_limited", AsyncMock(return_value={
@@ -5102,7 +5115,7 @@ def test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable():
         context = pronunciation.get("contextPronunciation", {})
         check("encyclopedia title expands entity name", context.get("canonicalName") == "雅鲁藏布江")
         check("full-name encoder corrects polyphone", pronunciation.get("pinyin") == "ya lu zang bu")
-        check("full-name correction rebuilds code chain", pronunciation.get("codes") == ["ylzb", "ylzbv", "ylzbvu"])
+        check("full-name context selects the returned code chain", pronunciation.get("codes") == ["ylzb", "ylzbv", "ylzbvu"])
         check("correction source remains transparent", "百科实体全称语境" in pronunciation.get("sourceSummary", ""))
         check("context inference is not mislabeled authority", review.get("autoReviewable") is False)
 
@@ -9061,6 +9074,13 @@ def test_exact_pending_selection_syntax_is_structural_and_fail_closed():
                 "选 mjbfa": ("pending_code_request", None, "mjbfa", ""),
                 "1 重新编码": ("pending_recode", 1, "", ""),
                 "木板 重新编码": ("pending_recode", None, "", "木板"),
+                '重新编码 "木板" mjbf': (
+                    "pending_recode", None, "mjbf", "木板"
+                ),
+                "把 木板 从 mjbf 挪走": (
+                    "pending_recode", None, "mjbf", "木板"
+                ),
+                "顺延 木板": ("pending_recode", None, "", "木板"),
             }
             for message, expected in cases.items():
                 intent = await openai_chat_module._classify_message_command_intent(
@@ -9083,6 +9103,8 @@ def test_exact_pending_selection_syntax_is_structural_and_fail_closed():
                 "mjbfa 吗",
                 "abcd",
                 "桌子 重新编码",
+                '重新编码 "桌子" mjbf',
+                "把 木板 从 mjbfa 挪走",
             ):
                 intent = await openai_chat_module._classify_message_command_intent(
                     message,
@@ -9167,6 +9189,11 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
                 duplicate_response = await run_message("1")
                 numbered_shift_response = await run_message("1 重新编码")
                 named_shift_response = await run_message("木板 重新编码")
+                occupant_first_response = await run_message(
+                    '重新编码 "木板" mjbf'
+                )
+                move_away_response = await run_message("把 木板 从 mjbf 挪走")
+                shift_occupant_response = await run_message("顺延 木板")
                 multi_response = await run_message("都加")
                 invalid_response = await run_message("4")
                 question_response = await run_message("2？")
@@ -9179,9 +9206,12 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
         check("occupied number binds one create target", duplicate_mock.await_count == 1)
         check("numbered recode executes shift", numbered_shift_response == "shifted")
         check("named recode executes shift", named_shift_response == "shifted")
+        check("occupant-first recode executes shift", occupant_first_response == "shifted")
+        check("move-away form executes shift", move_away_response == "shifted")
+        check("shift-occupant form executes shift", shift_occupant_response == "shifted")
         check(
-            "both recode forms bind occupied code",
-            shift_mock.await_count == 2
+            "all recode forms bind the occupied code for the live newcomer",
+            shift_mock.await_count == 5
             and all(call.args[1] == "mjbf" for call in shift_mock.await_args_list),
         )
         check("all-add executes reviewed multi-code path", multi_response == "multi-added")
@@ -9195,7 +9225,107 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
             and "没有可安全执行的后续命令" not in invalid_response,
         )
         check("question does not execute a pending mutation", question_response is None)
-        check("unsafe selectors add no extra writes", add_mock.await_count == 1 and duplicate_mock.await_count == 1 and shift_mock.await_count == 2 and multi_mock.await_count == 1)
+        check("unsafe selectors add no extra writes", add_mock.await_count == 1 and duplicate_mock.await_count == 1 and shift_mock.await_count == 5 and multi_mock.await_count == 1)
+
+    asyncio.run(_run())
+
+
+def test_pending_recode_selection_completes_its_server_plan_in_one_message():
+    """The advertised recode reply is the one confirmation for its sealed plan."""
+    print("\n🧪 pending recode selection completes one sealed server plan")
+
+    async def _run():
+        calls = []
+        plan_digest = "a" * 64
+        warning_digest = "b" * 64
+        shift_plan = {
+            "items": [
+                {"action": "Delete", "word": "除权", "code": "jjqt", "type": "Phrase"},
+                {"action": "Create", "word": "出圈", "code": "jjqt", "type": "Phrase",
+                 "needsManualReview": True},
+                {"action": "Create", "word": "除权", "code": "jjqta", "type": "Phrase"},
+            ],
+            "shifted": [{"word": "除权", "fromCode": "jjqt", "toCode": "jjqta"}],
+        }
+
+        async def fake_call(tool_name, arguments, *_args, **_kwargs):
+            calls.append((tool_name, dict(arguments)))
+            if not arguments.get("confirmed_plan_digest"):
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "planDigest": plan_digest,
+                    "warningDigest": warning_digest,
+                    "warnings": [],
+                    "shiftPlan": shift_plan,
+                }, ensure_ascii=False)
+            return json.dumps({
+                "success": True,
+                "batchId": "batch-s39",
+                "batchUrl": "https://keytao.test/batch/batch-s39",
+                "contentVersion": 1,
+                "shiftPlan": shift_plan,
+                "receipts": [{
+                    "step": "dictionary",
+                    "status": "applied",
+                    "changes": [{"word": "除权", "fromCode": "jjqt", "toCode": "jjqta"}],
+                }],
+            }, ensure_ascii=False)
+
+        state = PendingAddWord(
+            word="出圈",
+            recommended_code="jjqta",
+            candidates=[("jjqt", True), ("jjqta", False), ("jjqtai", False)],
+            occupied_words={"jjqt": ["除权"]},
+            server_candidates=[("jjqt", True), ("jjqta", False), ("jjqtai", False)],
+            server_occupied_words={"jjqt": ["除权"]},
+            pronunciation_codes={
+                "jjqt": "chū quān",
+                "jjqta": "chū quān",
+                "jjqtai": "chū quān",
+            },
+            needs_manual_review=True,
+            manual_review_reason="requested reading differs from authority",
+        )
+        with patch.object(
+            chat_commands_module,
+            "call_tool_function",
+            side_effect=fake_call,
+        ):
+            response = await _handle_pending_add_word(
+                state,
+                "1 重新编码",
+                "qq",
+                "s39-user",
+                [],
+                command_intent=MessageCommandIntent(
+                    intent="pending_recode",
+                    choice_index=1,
+                    confidence=1.0,
+                ),
+            )
+
+        check(
+            "selection previews and confirms the same server plan",
+            len(calls) == 2
+            and calls[0][0] == calls[1][0] == "keytao_shift_phrase_code"
+            and calls[1][1].get("confirmed_plan_digest") == plan_digest,
+        )
+        check(
+            "manual-review reading seal reaches the shift target",
+            calls[0][1].get("target_needs_manual_review") is True
+            and calls[0][1].get("_reviewed_pinyin") == "chū quān"
+            and calls[0][1].get("_reviewed_candidate_codes")
+            == ["jjqt", "jjqta", "jjqtai"],
+        )
+        check(
+            "no third user confirmation is requested",
+            pending_confirmation_copy() not in response
+            and "batch-s39" in response,
+        )
 
     asyncio.run(_run())
 
@@ -16318,12 +16448,12 @@ def test_s38_shift_suggestion_closes_over_the_reviewed_encode_record():
         },
     )
     check(
-        "reviewed shift suggestion replays verbatim through the same record",
+        "reviewed shift suggestion cannot drop the expressed add operation",
         self_checked_suggested_command(
             "keytao_shift_phrase_code",
             arguments,
             reviewed_context,
-        ) == "@我 顺延「耙耙柑」到 ppg",
+        ) == "",
     )
 
 
@@ -17750,9 +17880,9 @@ def test_normalize_encode_response_codes_first():
     check("chars are display-only without fullCode", "fullCode" not in result["chars"][0])
 
 
-def test_keytao_encode_forwards_meaning_gated_pronunciation():
-    """The LLM proposal must reach the encoder only as a pinyin/meaning pair."""
-    print("\n🧪 keytao_encode meaning-gated pronunciation forwarding")
+def test_keytao_encode_exposes_only_one_pass_reading_groups():
+    """The public encode tool cannot request a semantic recomputation."""
+    print("\n🧪 keytao_encode one-pass reading groups")
 
     captured = []
     captured_headers = []
@@ -17783,7 +17913,7 @@ def test_keytao_encode_forwards_meaning_gated_pronunciation():
             return None
 
         async def get(self, url, *, params, headers):
-            check("semantic encode uses bot-only route", url.endswith("/api/bot/phrases/encode"))
+            check("one-pass encode uses bot-only route", url.endswith("/api/bot/phrases/encode"))
             captured.append(dict(params))
             captured_headers.append(dict(headers))
             return FakeResponse()
@@ -17794,8 +17924,8 @@ def test_keytao_encode_forwards_meaning_gated_pronunciation():
             if item["function"]["name"] == "keytao_encode"
         )
         properties = schema["parameters"]["properties"]
-        check("tool schema exposes semantic pinyin", "semantic_pinyin" in properties)
-        check("tool schema exposes semantic meaning", "semantic_meaning" in properties)
+        check("tool schema removes semantic pinyin recompute", "semantic_pinyin" not in properties)
+        check("tool schema removes semantic meaning recompute", "semantic_meaning" not in properties)
 
         lookup_result = {
             "success": True,
@@ -17807,20 +17937,12 @@ def test_keytao_encode_forwards_meaning_gated_pronunciation():
                 "keytao_lookup_by_codes_batch",
                 AsyncMock(return_value=lookup_result),
             ):
-                result = await _lookup_tools.keytao_encode(
-                    "攀着",
-                    semantic_pinyin="pan zhe",
-                    semantic_meaning="表示正攀附着或抓住某物向上移动",
-                )
+                result = await _lookup_tools.keytao_encode("攀着")
 
-        check("semantic pair forwarded together", captured == [{
-            "word": "攀着",
-            "semantic_pinyin": "pan zhe",
-            "semantic_meaning": "表示正攀附着或抓住某物向上移动",
-        }])
-        check("semantic encode authenticates to next", captured_headers == [{"X-Bot-Token": "fake"}])
-        check("accepted semantic source reaches model", result.get("pronunciationSource") == "llm-semantic")
-        check("accepted semantic flag reaches model", result.get("semanticPronunciationAccepted") is True)
+        check("ordinary encode sends no reading override", captured == [{"word": "攀着"}])
+        check("one-pass encode authenticates to next", captured_headers == [{"X-Bot-Token": "fake"}])
+        check("server reading status remains visible", result.get("pronunciationSource") == "llm-semantic")
+        check("server semantic flag remains visible", result.get("semanticPronunciationAccepted") is True)
 
     asyncio.run(_run())
 
@@ -20936,7 +21058,7 @@ if __name__ == "__main__":
     test_advertised_set_selection_enters_the_production_stage_pipeline()
     test_eviction_modified_add_bypasses_pending_assent_classifier()
     test_normalize_encode_response_codes_first()
-    test_keytao_encode_forwards_meaning_gated_pronunciation()
+    test_keytao_encode_exposes_only_one_pass_reading_groups()
     test_normalize_encode_response_infer_fallback()
     test_apply_candidate_occupancy_updates_recommendation()
     test_normalize_encode_response_includes_alternate_pronunciation_candidates()

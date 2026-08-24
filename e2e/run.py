@@ -51,6 +51,9 @@ from .scenarios import (
     S37_OCCUPANT,
     S37_TARGET_CODE,
     S37_WORD,
+    S39_OCCUPANT,
+    S39_TARGET_CODE,
+    S39_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -1651,6 +1654,96 @@ async def ensure_s37_fixture(
     }
 
 
+async def ensure_s39_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+    encode_word: Any,
+) -> dict[str, Any]:
+    """Seed the exact occupied quān slot for the reading-selection flow."""
+    newcomer_encoding = await encode_word(
+        S39_WORD,
+        requested_code=S39_TARGET_CODE,
+    )
+    returned_candidates = [
+        str(code or "").strip().lower()
+        for code in newcomer_encoding.get("candidateCodes") or []
+        if str(code or "").strip()
+    ]
+    expected_candidates = [
+        "jjqt", "jjqta", "jjqtai", "jjjt", "jjjta", "jjjtai",
+    ]
+    if returned_candidates != expected_candidates:
+        raise RigInfrastructureError(
+            f"S39 {S39_WORD} did not return both reading chains in one encode: "
+            f"{returned_candidates}"
+        )
+
+    occupant_codes = ordered_candidate_codes(await client.encode(S39_OCCUPANT))
+    if not occupant_codes or occupant_codes[0] != S39_TARGET_CODE:
+        raise RigInfrastructureError(
+            f"S39 {S39_OCCUPANT} candidate chain does not start at "
+            f"{S39_TARGET_CODE}: {occupant_codes}"
+        )
+    exact_rows = [
+        row
+        for row in await client.phrases_by_code(S39_TARGET_CODE)
+        if row.get("code") == S39_TARGET_CODE
+    ]
+    if exact_rows:
+        raise RigInfrastructureError(
+            f"S39 requires an empty exact {S39_TARGET_CODE} slot before seeding: "
+            f"{exact_rows}"
+        )
+    await client.clean_draft(seed_identity["platform_id"])
+    seeded = await client.seed_phrase(
+        platform_id=seed_identity["platform_id"],
+        word=S39_OCCUPANT,
+        code=S39_TARGET_CODE,
+    )
+    exact_rows = [
+        row
+        for row in await client.phrases_by_code(S39_TARGET_CODE)
+        if row.get("code") == S39_TARGET_CODE
+    ]
+    if not (
+        len(exact_rows) == 1
+        and exact_rows[0].get("word") == S39_OCCUPANT
+        and exact_rows[0].get("type") == "Phrase"
+        and str((exact_rows[0].get("user") or {}).get("name") or "").startswith(
+            RESERVED_BINDING_PREFIX
+        )
+    ):
+        raise RigInfrastructureError(
+            f"S39 did not seed sole rig-owned {S39_OCCUPANT}@"
+            f"{S39_TARGET_CODE}: {exact_rows}"
+        )
+    shifted_code = ""
+    for code in occupant_codes[1:]:
+        occupied = [
+            row
+            for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if not occupied:
+            shifted_code = code
+            break
+    if not shifted_code:
+        raise RigInfrastructureError(
+            f"S39 {S39_OCCUPANT} candidate chain has no free shift slot: "
+            f"{occupant_codes}"
+        )
+    return {
+        "word": S39_WORD,
+        "occupantWord": S39_OCCUPANT,
+        "targetCode": S39_TARGET_CODE,
+        "newcomerCandidateCodes": returned_candidates,
+        "occupantCandidateCodes": occupant_codes,
+        "shiftedCode": shifted_code,
+        "seedBatchId": seeded.get("batchId"),
+    }
+
+
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
     apply_bot_environment(config)
     import nonebot
@@ -2020,6 +2113,20 @@ async def async_main(args: argparse.Namespace) -> int:
                         fixture_facts["s37"] = await ensure_s37_fixture(
                             client=client,
                             seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S39":
+                        encode_word = openai_chat.skills_manager.get_tool_function(
+                            "keytao_encode"
+                        )
+                        if not callable(encode_word):
+                            raise RigInfrastructureError(
+                                "S39 could not resolve the public keytao_encode tool"
+                            )
+                        fixture_facts["s39"] = await ensure_s39_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                            encode_word=encode_word,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     await client.clean_draft(identities[scenario.scenario_id]["platform_id"])

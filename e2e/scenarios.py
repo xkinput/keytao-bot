@@ -5586,6 +5586,202 @@ async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S39_WORD = "出圈"
+S39_OCCUPANT = "除权"
+S39_TARGET_CODE = "jjqt"
+S39_COMMAND = "加词 出圈 圈字读quan"
+S39_SELECTION = "1 重新编码"
+S39_OCCUPANT_COMMAND = '重新编码 "除权" jjqt'
+
+
+async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
+    """Collapse reading selection and occupant eviction into two user turns."""
+    messages: list[str] = []
+    replies: list[str] = []
+    fixture = ctx.fixture_facts["s39"]
+    shifted_code = str(fixture.get("shiftedCode") or "").strip()
+    require(
+        shifted_code and shifted_code != S39_TARGET_CODE,
+        f"S39 fixture omitted the occupant's next free slot: {fixture}",
+    )
+
+    async def clean_and_reset(label: str) -> None:
+        cleaned = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(cleaned.get("success") is True, f"S39 {label} cleanup failed: {cleaned}")
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    async def require_live_occupant(label: str) -> None:
+        rows = [
+            row
+            for row in await ctx.next_client.phrases_by_word(S39_OCCUPANT)
+            if row.get("word") == S39_OCCUPANT
+            and row.get("code") == S39_TARGET_CODE
+        ]
+        require(
+            len(rows) == 1,
+            f"S39 {label} requires {S39_OCCUPANT}@{S39_TARGET_CODE}: {rows}",
+        )
+
+    await clean_and_reset("happy path")
+    await require_live_occupant("happy path")
+    happy_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S39_COMMAND)
+    reading_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(reading_reply)
+    require(
+        S39_WORD in reading_reply
+        and "chū quān" in reading_reply
+        and "chū juàn" not in reading_reply
+        and re.search(
+            rf"(?m)^1\.\s*{S39_TARGET_CODE}\s*—\s*已有「{S39_OCCUPANT}」",
+            reading_reply,
+        )
+        and re.search(r"(?m)^2\.\s*jjqta\s*—\s*.*空位", reading_reply)
+        and re.search(r"(?m)^3\.\s*jjqtai\s*—\s*.*空位", reading_reply)
+        and "管理员审核" in reading_reply
+        and "回复编号或编码选择" in reading_reply
+        and S39_SELECTION in reading_reply
+        and "复算" not in reading_reply
+        and "网页端人工处理" not in reading_reply,
+        f"S39 first turn did not render the selected reading group: {reading_reply}",
+    )
+    review_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > happy_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_prepare_reviewed_add"
+        and event.get("arguments", {}).get("word") == S39_WORD
+        and event.get("arguments", {}).get("requested_reading") == "圈=quan"
+    ]
+    require(
+        len(review_calls) == 1,
+        f"S39 reading selection did not use one reviewed-add request: {review_calls}",
+    )
+
+    messages.append(S39_SELECTION)
+    selection_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(selection_reply)
+    happy_draft = await ctx.draft()
+    expected_items = {
+        ("Delete", S39_OCCUPANT, S39_TARGET_CODE),
+        ("Create", S39_WORD, S39_TARGET_CODE),
+        ("Create", S39_OCCUPANT, shifted_code),
+    }
+    actual_items = {item_key(item) for item in happy_draft.get("items", [])}
+    newcomer_item = next(
+        (
+            item
+            for item in happy_draft.get("items", [])
+            if item_key(item) == ("Create", S39_WORD, S39_TARGET_CODE)
+        ),
+        None,
+    )
+    confirmed_shift_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > happy_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and event.get("arguments", {}).get("word") == S39_WORD
+        and event.get("arguments", {}).get("target_code") == S39_TARGET_CODE
+        and event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    require(
+        actual_items == expected_items
+        and len(happy_draft.get("items", [])) == 3
+        and isinstance(newcomer_item, dict)
+        and newcomer_item.get("needsManualReview") is True
+        and len(confirmed_shift_calls) == 1
+        and pending_confirmation_copy() not in selection_reply,
+        f"S39 second turn did not finish the sealed eviction: "
+        f"reply={selection_reply}; draft={happy_draft}; calls={confirmed_shift_calls}",
+    )
+
+    await clean_and_reset("unmatched reading")
+    messages.append("加词 出圈 圈字读xing")
+    unmatched_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(unmatched_reply)
+    require(
+        "可用读音" in unmatched_reply
+        and "chū juàn" in unmatched_reply
+        and "chū quān" in unmatched_reply
+        and "管理员" not in unmatched_reply
+        and "网页端" not in unmatched_reply
+        and not (await ctx.draft()).get("items"),
+        f"S39 unmatched reading did not list only available readings: {unmatched_reply}",
+    )
+
+    await clean_and_reset("compound suggestion closure")
+    messages.append("加词 出圈 jjqt 重新编码")
+    compound_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(compound_reply)
+    narrowed_suggestion = bool(re.search(
+        r"(?:可执行命令|可以改为)[\s\S]{0,80}添加「出圈」\s*jjqt"
+        r"(?![\s\S]{0,24}(?:重新编码|顺延|腾位))",
+        compound_reply,
+    ))
+    compound_closed = bool(
+        "加词 出圈 jjqt 重新编码" in compound_reply
+        or "不能保留你要求的添加并腾位操作" in compound_reply
+        or (
+            "添加" in compound_reply
+            and any(marker in compound_reply for marker in ("重新编码", "顺延", "腾位"))
+        )
+    )
+    require(
+        compound_closed
+        and not narrowed_suggestion
+        and not (await ctx.draft()).get("items"),
+        f"S39 compound remediation silently narrowed the request: {compound_reply}",
+    )
+
+    await clean_and_reset("occupant perspective")
+    await require_live_occupant("occupant perspective")
+    messages.append(S39_COMMAND)
+    occupant_discovery = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(occupant_discovery)
+    require(
+        S39_TARGET_CODE in occupant_discovery
+        and S39_OCCUPANT in occupant_discovery,
+        f"S39 occupant control lacked a live newcomer state: {occupant_discovery}",
+    )
+    messages.append(S39_OCCUPANT_COMMAND)
+    occupant_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(occupant_reply)
+    occupant_draft = await ctx.draft()
+    require(
+        {item_key(item) for item in occupant_draft.get("items", [])}
+        == expected_items
+        and pending_confirmation_copy() not in occupant_reply,
+        f"S39 occupant-perspective command did not resolve {S39_WORD}: "
+        f"{occupant_reply}; {occupant_draft}",
+    )
+
+    await clean_and_reset("final")
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": happy_draft,
+        "facts": {
+            "command": S39_COMMAND,
+            "selection": S39_SELECTION,
+            "selectedReading": "chū quān",
+            "selectedCandidateCodes": ["jjqt", "jjqta", "jjqtai"],
+            "happyPathTurnCount": 2,
+            "selectionConfirmations": 1,
+            "shiftedCode": shifted_code,
+            "manualReviewSealed": True,
+            "unmatchedReadingListedAvailable": True,
+            "compoundSuggestionClosed": compound_closed,
+            "occupantPerspectiveResolved": True,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -5625,6 +5821,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S36", "dictionary delete and exact swap incident round", scenario_s36),
     Scenario("S37", "occupant eviction and selected-slot revalidation", scenario_s37),
     Scenario("S38", "reading, query recovery, and modifier incident closure", scenario_s38),
+    Scenario("S39", "one-turn reading selection and occupant eviction closure", scenario_s39),
 )
 
 

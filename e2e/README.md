@@ -307,6 +307,16 @@ shifting its occupant. The positive trailing-modifier control may advertise a
 shift only when replay reaches the same reviewed encode record that authorized
 the suggestion.
 
+S39 collapses the explicit-reading eviction flow. `加词 出圈 圈字读quan`
+must select the `chū quān` group from the six candidates returned by one
+encode result and render `jjqt` occupied by `除权` plus the two free
+successors, the manual-review seal, and the standard selectors in the first
+turn. `1 重新编码` is the single confirmation in the second turn: it must
+materialize `出圈@jjqt` and shift `除权` to its next free code without a
+third user message. Controls require an unmatched reading to list both returned
+readings, forbid an add-and-evict remediation from narrowing to add-only, and
+prove `重新编码 "除权" jjqt` resolves the newcomer from the live candidate state.
+
 S27 replays the binding-precheck incident with an intentionally unprovisioned
 synthetic actor and the scenario's provisioned bound control. The unbound actor
 asks for `来都来了`: the first deterministic candidate reply must include one

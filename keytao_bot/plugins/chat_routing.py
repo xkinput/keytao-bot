@@ -1344,6 +1344,74 @@ _PENDING_NUMBERED_ADD_REPLY_RE = re.compile(
     r"(?:一下)?(?:吧|啦|了)?$",
 )
 
+_PENDING_OCCUPANT_WORD_PATTERN = r"[\u3400-\u9fff]{1,16}"
+_PENDING_OCCUPANT_CODE_PATTERN = r"[a-z]{1,12}"
+_PENDING_OCCUPANT_QUOTE_OPEN_PATTERN = r"[「“‘\"']?"
+_PENDING_OCCUPANT_QUOTE_CLOSE_PATTERN = r"[」”’\"']?"
+_PENDING_OCCUPANT_RECODE_RES = (
+    re.compile(
+        rf"^重新编码\s*{_PENDING_OCCUPANT_QUOTE_OPEN_PATTERN}\s*"
+        rf"(?P<occupant>{_PENDING_OCCUPANT_WORD_PATTERN})\s*"
+        rf"{_PENDING_OCCUPANT_QUOTE_CLOSE_PATTERN}"
+        rf"(?:\s*(?P<code>{_PENDING_OCCUPANT_CODE_PATTERN}))?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^(?:把|将)\s*{_PENDING_OCCUPANT_QUOTE_OPEN_PATTERN}\s*"
+        rf"(?P<occupant>{_PENDING_OCCUPANT_WORD_PATTERN})\s*"
+        rf"{_PENDING_OCCUPANT_QUOTE_CLOSE_PATTERN}\s*从\s*"
+        rf"(?P<code>{_PENDING_OCCUPANT_CODE_PATTERN})\s*挪走$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^顺延\s*{_PENDING_OCCUPANT_QUOTE_OPEN_PATTERN}\s*"
+        rf"(?P<occupant>{_PENDING_OCCUPANT_WORD_PATTERN})\s*"
+        rf"{_PENDING_OCCUPANT_QUOTE_CLOSE_PATTERN}$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _occupant_perspective_pending_recode_intent(
+    message_text: str,
+    state: PendingAddWord,
+) -> Optional[MessageCommandIntent]:
+    """Bind an occupant-perspective command to the one live newcomer."""
+    source = _strip_command_message_prefixes(
+        trusted_mutation_source(message_text)
+    ).strip()
+    if not source or re.search(r"[?？]", source):
+        return None
+    match = next(
+        (
+            candidate.fullmatch(source)
+            for candidate in _PENDING_OCCUPANT_RECODE_RES
+            if candidate.fullmatch(source) is not None
+        ),
+        None,
+    )
+    if match is None:
+        return None
+    occupant = str(match.group("occupant") or "").strip()
+    requested_code = str(match.groupdict().get("code") or "").strip().lower()
+    matching_codes = {
+        code
+        for code, occupied in state.candidates
+        if occupied
+        and occupant in state.occupied_words.get(code, [])
+        and (not requested_code or requested_code == code)
+    }
+    if not matching_codes:
+        return None
+    if requested_code and matching_codes != {requested_code}:
+        return None
+    return MessageCommandIntent(
+        intent="pending_recode",
+        confidence=1.0,
+        requested_code=requested_code,
+        target_word=occupant,
+    )
+
 
 def _structural_pending_add_word_intent(
     message_text: str,
@@ -1353,6 +1421,12 @@ def _structural_pending_add_word_intent(
     stripped = _strip_command_message_prefixes(
         trusted_mutation_source(message_text)
     ).strip()
+    occupant_recode = _occupant_perspective_pending_recode_intent(
+        message_text,
+        state,
+    )
+    if occupant_recode is not None:
+        return occupant_recode
     if (
         not stripped
         or re.search(r"[?？\"'“”‘’「」『』]", stripped)
@@ -1508,6 +1582,8 @@ def message_authorizes_live_pending_mutation(
         return False
     if intent.intent == "pending_choice" and intent.choice_index is not None:
         return 1 <= intent.choice_index <= len(state.server_candidates)
+    if intent.intent == "pending_recode":
+        return _resolve_shift_target_code(state, intent) is not None
     return _message_authorizes_pending_control(message_text, intent)
 
 
@@ -2746,6 +2822,26 @@ def _resolve_shift_target_code(
     if command_intent.intent != "pending_recode":
         return None
 
+    requested_code = str(command_intent.requested_code or "").strip().lower()
+    if requested_code:
+        requested_slot = next(
+            (
+                (code, occupied)
+                for code, occupied in state.candidates
+                if code == requested_code
+            ),
+            None,
+        )
+        if requested_slot is None or not requested_slot[1]:
+            return None
+        occupants = state.occupied_words.get(requested_code, [])
+        if (
+            command_intent.target_word
+            and command_intent.target_word not in occupants
+        ):
+            return None
+        return requested_code
+
     if command_intent.choice_index is not None:
         idx = command_intent.choice_index - 1
         if 0 <= idx < len(state.candidates):
@@ -2753,12 +2849,17 @@ def _resolve_shift_target_code(
             if occupied:
                 return code
 
-    for code, occupied in state.candidates:
-        if not occupied:
-            continue
-        for occupant_word in state.occupied_words.get(code, []):
-            if occupant_word and occupant_word == command_intent.target_word:
-                return code
+    word_matching_codes = {
+        code
+        for code, occupied in state.candidates
+        if occupied
+        and command_intent.target_word
+        and command_intent.target_word in state.occupied_words.get(code, [])
+    }
+    if len(word_matching_codes) == 1:
+        return next(iter(word_matching_codes))
+    if len(word_matching_codes) > 1:
+        return None
 
     occupied_codes = [code for code, occupied in state.candidates if occupied]
     if len(occupied_codes) == 1:

@@ -68,6 +68,7 @@ from .conversation import ConversationAddress
 from .authorization_grammar import (
     explicit_same_code_requested,
     parse_eviction_modified_add,
+    suggestion_preserves_expressed_operation,
 )
 from .tools import (
     MUTATING_TOOL_NAMES,
@@ -3116,6 +3117,24 @@ class AgentOrchestrator:
             failure_state["suggestedCommand"] = (
                 f"@我 {clean_command}" if clean_command else ""
             )
+        narrowed_suggestion = str(
+            failure_state.get("suggestedCommand") or ""
+        ).strip()
+        if (
+            failure_state
+            and narrowed_suggestion
+            and not suggestion_preserves_expressed_operation(
+                current_message,
+                narrowed_suggestion,
+            )
+        ):
+            failure_state = dict(failure_state)
+            failure_state.pop("suggestedCommand", None)
+            closure_notice = (
+                "现有建议不能保留你要求的添加并腾位操作，"
+                "因此不提供缩窄后的命令；本次未写入。"
+            )
+            reply = f"{str(reply).rstrip()}{closure_notice}"
         if not receipts and history:
             previous_user = next((
                 str(item.get("content") or "")

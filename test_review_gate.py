@@ -877,6 +877,33 @@ def test_semantic_context_pass_clears_prepare_seal_and_enters_autoapprove_chain(
             and read_review_disposition(rejected) is ReviewDisposition.SEAL,
         )
 
+        explicit_reading_base = _semantic_context_review(word, code)
+        explicit_reading_base["recommendedCode"] = code
+        explicit_reading_base["reviewVerdictSite"] = "missing_authoritative_page"
+        with (
+            patch.object(
+                _review_tools,
+                "prepare_reviewed_word",
+                AsyncMock(return_value=explicit_reading_base),
+            ),
+            patch.object(
+                _review_tools,
+                "_build_pre_submit_audit",
+                AsyncMock(return_value=pass_audit),
+            ),
+            patch.object(
+                _review_tools,
+                "assess_candidate_chain_commonness",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            explicit_reading = await _review_tools.keytao_prepare_reviewed_add(word)
+        check(
+            "generic pre-submit PASS cannot clear an explicit-reading seal",
+            read_manual_review_flag(explicit_reading) is True
+            and read_review_disposition(explicit_reading) is ReviewDisposition.SEAL,
+        )
+
         blocked_base = _semantic_context_review(word, code)
         blocked_base["recommendedCode"] = code
         blocked_base["reviewDisposition"] = "BLOCK"
@@ -919,6 +946,13 @@ def test_chanji_semantic_prepare_revalidation_reaches_common_char_pass():
             "success": True,
             "word": word,
             "codes": ["isjk"],
+            "candidateCodes": ["isjk", code],
+            "alternatePhrasePronunciationCodes": [{
+                "char": "产",
+                "charIndex": 0,
+                "pinyin": "chǎn",
+                "codes": [code],
+            }],
             "pronunciationSource": "zdic-character-default",
             "standardPronunciationStatus": "absent",
             "semanticPronunciationNeeded": True,
@@ -938,18 +972,6 @@ def test_chanji_semantic_prepare_revalidation_reaches_common_char_pass():
                     "pinyins": ["jì"],
                     "pronunciationLookupStatus": "found",
                 },
-            ],
-        }
-        semantic_encode = {
-            **baseline_encode,
-            "codes": [code],
-            "pronunciationSource": "llm-semantic",
-            "semanticPronunciationNeeded": False,
-            "semanticPronunciationAccepted": True,
-            "phrasePinyins": ["chǎn", "jì"],
-            "chars": [
-                {**baseline_encode["chars"][0], "pinyin": "chǎn"},
-                baseline_encode["chars"][1],
             ],
         }
         proposal = {
@@ -974,7 +996,7 @@ def test_chanji_semantic_prepare_revalidation_reaches_common_char_pass():
                 "lookupResult": "absent",
             }],
         }
-        encode_mock = AsyncMock(side_effect=[baseline_encode, semantic_encode])
+        encode_mock = AsyncMock(return_value=baseline_encode)
         with (
             patch.object(
                 review_module,
@@ -1006,12 +1028,9 @@ def test_chanji_semantic_prepare_revalidation_reaches_common_char_pass():
 
         pronunciation = prepared.get("pronunciations", [{}])[0]
         check(
-            "semantic reading is revalidated with concrete meaning",
-            encode_mock.await_count == 2
-            and encode_mock.await_args_list[1].kwargs == {
-                "semantic_pinyin": "chan ji",
-                "semantic_meaning": proposal["meaning"],
-            },
+            "semantic reading selects the matching chain from one encode result",
+            encode_mock.await_count == 1
+            and encode_mock.await_args.kwargs == {},
         )
         check(
             "prepared review exposes exact known readings for every character",
@@ -4855,6 +4874,15 @@ def test_multi_sense_agreeing_evidence_recommends_authoritative_reading():
             "word": "还车",
             "codes": ["htje", "htjev", "htjevv"],
             "altCodes": ["htwe", "htwev", "htwevv"],
+            "candidateCodes": [
+                "htje", "htjev", "htjevv", "htwe", "htwev", "htwevv",
+            ],
+            "alternatePhrasePronunciationCodes": [{
+                "char": "还",
+                "charIndex": 0,
+                "pinyin": "hái",
+                "codes": ["htwe", "htwev", "htwevv"],
+            }],
             "pronunciationSource": "zdic-phrase",
             "standardPronunciationStatus": "found",
             "phrasePinyins": ["huán", "chē"],
@@ -4889,16 +4917,10 @@ def test_multi_sense_agreeing_evidence_recommends_authoritative_reading():
             "usageType": "transparent_compound",
         }
 
-        async def encode_for_reading(_config, _word, **kwargs):
-            if kwargs.get("semantic_pinyin") == "hai che":
-                # Production's semantic endpoint keeps the whole-word
-                # authoritative huan reading here. The baseline response still
-                # supplies exactly one service alt chain for the sole remaining
-                # evidence-backed hai group.
-                return encode_data
-            return encode_data
+        async def prepare(proposal, prepared_encode=encode_data):
+            async def encode_for_reading(_config, _word):
+                return prepared_encode
 
-        async def prepare(proposal):
             with (
                 patch.object(
                     review_module,
@@ -4939,9 +4961,22 @@ def test_multi_sense_agreeing_evidence_recommends_authoritative_reading():
             for group in agreed_groups
         }
         check(
-            "service chains stay separated by recomputed reading",
+            "service-returned reading groups keep their own chains",
             codes_by_reading.get(("huan", "che")) == ["htje", "htjev", "htjevv"]
             and codes_by_reading.get(("hai", "che")) == ["htwe", "htwev", "htwevv"],
+        )
+
+        unscoped_encode = dict(encode_data)
+        unscoped_encode.pop("alternatePhrasePronunciationCodes")
+        unscoped_encode["candidateCodes"] = None
+        unscoped = await prepare(agreeing_proposal, unscoped_encode)
+        unscoped_codes = {
+            tuple(group.get("normalized", [])): group.get("codes", [])
+            for group in unscoped.get("pronunciations", [])
+        }
+        check(
+            "sole reviewed alternate binds the ordinary response altCodes chain",
+            unscoped_codes.get(("hai", "che")) == ["htwe", "htwev", "htwevv"],
         )
 
         authority_only = await prepare({"accepted": False, "word": "还车"})
@@ -5022,22 +5057,7 @@ def test_multi_sense_conflicting_evidence_asks_for_clarification():
             "usageType": "modern_word",
         }
 
-        async def encode_for_reading(_config, _word, **kwargs):
-            if kwargs.get("semantic_pinyin") == "chu quan":
-                return {
-                    **encode_data,
-                    "codes": ["jq", "jqt", "jqto"],
-                    "phrasePinyins": ["chū", "quān"],
-                    "contextPhrasePinyins": ["chū", "quān"],
-                    "chars": [
-                        encode_data["chars"][0],
-                        {
-                            **encode_data["chars"][1],
-                            "pinyin": "quān",
-                            "phoneticCode": "q",
-                        },
-                    ],
-                }
+        async def encode_for_reading(_config, _word):
             return encode_data
 
         async def prepare(proposal):
@@ -5093,8 +5113,8 @@ def test_multi_sense_conflicting_evidence_asks_for_clarification():
     asyncio.run(_run())
 
 
-def test_explicit_reading_is_a_decisive_server_recomputed_choice():
-    print("\n🧪 explicit reading decisively selects one server-recomputed group")
+def test_explicit_reading_selects_one_group_from_the_single_encode_result():
+    print("\n🧪 explicit reading selects one group from the single encode result")
 
     async def _run():
         evidence = {
@@ -5126,6 +5146,15 @@ def test_explicit_reading_is_a_decisive_server_recomputed_choice():
             "word": "出圈",
             "codes": ["jjjt", "jjjto", "jjjtou"],
             "altCodes": [],
+            "candidateCodes": [
+                "jjjt", "jjjto", "jjjtou", "jjqt", "jjqta", "jjqtai",
+            ],
+            "alternatePhrasePronunciationCodes": [{
+                "char": "圈",
+                "charIndex": 1,
+                "pinyin": "quān",
+                "codes": ["jjqt", "jjqta", "jjqtai"],
+            }],
             "pronunciationSource": "zdic-phrase",
             "standardPronunciationStatus": "found",
             "phrasePinyins": ["chū", "juàn"],
@@ -5149,23 +5178,7 @@ def test_explicit_reading_is_a_decisive_server_recomputed_choice():
                 },
             ],
         }
-        selected = {
-            **baseline,
-            "codes": ["jq", "jqt", "jqto"],
-            "pronunciationSource": "llm-semantic",
-            "phrasePinyins": ["chū", "quān"],
-            "contextPhrasePinyins": ["chū", "quān"],
-            "semanticPronunciationAccepted": True,
-            "chars": [
-                baseline["chars"][0],
-                {
-                    **baseline["chars"][1],
-                    "pinyin": "quān",
-                    "phoneticCode": "q",
-                },
-            ],
-        }
-        encode_mock = AsyncMock(side_effect=[baseline, selected])
+        encode_mock = AsyncMock(return_value=baseline)
         with (
             patch.object(
                 review_module,
@@ -5188,9 +5201,9 @@ def test_explicit_reading_is_a_decisive_server_recomputed_choice():
             )
 
         check(
-            "requested reading is sent into the authenticated encode call",
-            encode_mock.await_count == 2
-            and encode_mock.await_args_list[1].kwargs["semantic_pinyin"] == "chu quan",
+            "requested reading reuses the one ordinary encode call",
+            encode_mock.await_count == 1
+            and encode_mock.await_args.kwargs == {},
         )
         check(
             "only the explicitly selected reading group is rendered",
@@ -5198,7 +5211,155 @@ def test_explicit_reading_is_a_decisive_server_recomputed_choice():
             and reviewed.get("multiSenseChoice", {}).get("status") == "resolved"
             and [group.get("normalized") for group in reviewed.get("pronunciations", [])]
             == [["chu", "quan"]]
-            and reviewed.get("recommendedCode") == "jq",
+            and reviewed.get("recommendedCode") == "jjqt",
+        )
+        check(
+            "a choice differing from the authoritative whole-word reading stays sealed",
+            reviewed.get("needsManualReview") is True
+            and reviewed.get("requiresManualPronunciationReview") is True,
+        )
+        import keytao_bot.plugins.openai_chat as chat
+
+        sealed_preview = {
+            **reviewed,
+            "preSubmitAudit": {
+                "success": True,
+                "verdict": "pass",
+                "autoApprove": True,
+                "summary": "权威来源、编码和常用度证据一致",
+                "issues": [],
+                "approvedItems": ["出圈@jjqt"],
+            },
+        }
+        sealed_prompt = chat._format_reviewed_add_prompt(sealed_preview) or ""
+        check(
+            "rendering cannot advertise auto-pass for an explicit-reading seal",
+            "需要管理员审核" in sealed_prompt
+            and "可自动通过" not in sealed_prompt,
+        )
+
+        absent_baseline = {
+            **baseline,
+            "pronunciationSource": "zdic-character-default",
+            "standardPronunciationStatus": "absent",
+        }
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=evidence),
+            ),
+            patch.object(
+                review_module,
+                "fetch_keytao_encode",
+                AsyncMock(return_value=absent_baseline),
+            ),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+            patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+        ):
+            selected_without_whole_word_page = await prepare_reviewed_word(
+                CONFIG,
+                "出圈",
+                requested_reading="圈=quan",
+            )
+        check(
+            "a non-default explicit reading stays sealed without a whole-word page",
+            selected_without_whole_word_page.get("needsManualReview") is True
+            and selected_without_whole_word_page.get(
+                "requiresManualPronunciationReview"
+            ) is True,
+        )
+
+        for requested in ("圈=quan", "chū quān"):
+            one_call_encode = AsyncMock(return_value=baseline)
+            with (
+                patch.object(
+                    review_module,
+                    "collect_pronunciation_evidence_limited",
+                    AsyncMock(return_value=evidence),
+                ),
+                patch.object(
+                    review_module,
+                    "fetch_keytao_encode",
+                    one_call_encode,
+                ),
+                patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+                patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+            ):
+                selected_by_form = await prepare_reviewed_word(
+                    CONFIG,
+                    "出圈",
+                    requested_reading=requested,
+                )
+            check(
+                f"reading selector form chooses the returned quan group: {requested}",
+                one_call_encode.await_count == 1
+                and selected_by_form.get("recommendedCode") == "jjqt",
+            )
+
+        unmatched_encode = AsyncMock(return_value=baseline)
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=evidence),
+            ),
+            patch.object(
+                review_module,
+                "fetch_keytao_encode",
+                unmatched_encode,
+            ),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+        ):
+            unmatched = await prepare_reviewed_word(
+                CONFIG,
+                "出圈",
+                requested_reading="chū qióng",
+            )
+        unmatched_message = unmatched.get("message", "")
+        check(
+            "a missing reading lists only the readings returned by encode",
+            unmatched.get("pronunciationUnresolved") is True
+            and "都不匹配" in unmatched_message
+            and "chū juàn" in unmatched_message
+            and "chū quān" in unmatched_message
+            and "管理员" not in unmatched_message
+            and "复算" not in unmatched_message,
+        )
+
+        meaning_encode = AsyncMock(return_value=baseline)
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=evidence),
+            ),
+            patch.object(review_module, "fetch_keytao_encode", meaning_encode),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+            patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+            patch.object(
+                review_module,
+                "_infer_requested_meaning_pronunciation_for_review",
+                AsyncMock(return_value={
+                    "accepted": True,
+                    "pinyins": ["chu", "quan"],
+                    "meaning": "指作品走红并突破原有圈层",
+                    "confidence": 0.98,
+                }),
+            ) as meaning_mapper,
+        ):
+            meaning_selected = await prepare_reviewed_word(
+                CONFIG,
+                "出圈",
+                requested_meaning="作品走红、突破原有圈层的用法",
+            )
+        check(
+            "a concrete sense maps to one returned reading group",
+            meaning_mapper.await_count == 1
+            and meaning_encode.await_count == 1
+            and meaning_selected.get("recommendedCode") == "jjqt"
+            and meaning_selected.get("multiSenseChoice", {}).get("method")
+            == "user_meaning_selected_encode_group",
         )
 
     asyncio.run(_run())
@@ -5264,7 +5425,7 @@ def main():
     test_audit_budget_nesting_and_timeout_retains_review()
     test_multi_sense_agreeing_evidence_recommends_authoritative_reading()
     test_multi_sense_conflicting_evidence_asks_for_clarification()
-    test_explicit_reading_is_a_decisive_server_recomputed_choice()
+    test_explicit_reading_selects_one_group_from_the_single_encode_result()
 
     print("\n" + "=" * 60)
     print(f"Results: {passed}/{passed + failed} passed" + (f", {failed} failed" if failed else ""))

@@ -44,6 +44,11 @@ from .scenarios import (
     S38_EXPLANATION_MESSAGE,
     S38_NEGATIVE_MODIFIER_MESSAGE,
     S38_QUERY_CONTROLS,
+    S39_COMMAND,
+    S39_OCCUPANT,
+    S39_SELECTION,
+    S39_TARGET_CODE,
+    S39_WORD,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -499,15 +504,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S34 replays the 2026-08-21 pending-batch incident", readme)
         self.assertIn("S35 replays the 2026-08-22 default-reorder incident", readme)
         self.assertIn("S36 replays the 2026-08-23 delete-and-swap incident round", readme)
+        self.assertIn("S39 collapses the explicit-reading eviction flow", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s38(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s39(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 39)],
+            [f"S{index}" for index in range(1, 40)],
         )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:
@@ -551,6 +557,22 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         )
         self.assertTrue(out_circle["expected_semantic_pronunciation_needed"])
         self.assertEqual(out_circle["expected_context_pinyins"], ["chū", "quān"])
+
+    def test_s39_pins_reading_selection_and_occupant_fixture(self) -> None:
+        self.assertEqual(S39_COMMAND, "加词 出圈 圈字读quan")
+        self.assertEqual(S39_SELECTION, "1 重新编码")
+        self.assertEqual((S39_WORD, S39_OCCUPANT, S39_TARGET_CODE), (
+            "出圈", "除权", "jjqt",
+        ))
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S39"]
+        self.assertEqual(fixture["probe_words"], (S39_WORD, S39_OCCUPANT))
+        entries = {
+            row["entry"]: (row["status"], row["pinyins"])
+            for row in fixture["rows"]
+            if row["kind"] == "entry"
+        }
+        self.assertEqual(entries[S39_WORD], ("absent", []))
+        self.assertEqual(entries[S39_OCCUPANT], ("found", ["chú", "quán"]))
 
     def test_s35_declares_isolated_reorder_and_free_slot_controls(self) -> None:
         self.assertEqual(
@@ -2756,6 +2778,117 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(context.clean_calls, 3)
         self.assertEqual(context.reset_calls, 4)
         self.assertIn("zzzz", context.injected)
+
+    async def test_s39_offline_collapses_reading_selection_to_two_turns(self) -> None:
+        scenario = next(item for item in SCENARIOS if item.scenario_id == "S39")
+
+        class FakeContext:
+            def __init__(self):
+                self.platform_id = "s39-user"
+                self.next_client = self
+                self.bot = self
+                self.fixture_facts = {"s39": {"shiftedCode": "jjqta"}}
+                self.items = []
+                self.events = []
+                self.sequence = 0
+
+            async def clean_draft(self, platform_id: str):
+                self.assert_equal(platform_id, self.platform_id)
+                self.items = []
+                return {"success": True}
+
+            async def reset_conversation(self, *, platform_id: str):
+                self.assert_equal(platform_id, self.platform_id)
+
+            async def phrases_by_word(self, word: str):
+                self.assert_equal(word, S39_OCCUPANT)
+                return [{
+                    "word": S39_OCCUPANT,
+                    "code": S39_TARGET_CODE,
+                    "type": "Phrase",
+                    "weight": 100,
+                }]
+
+            def _record(self, name: str, arguments: dict[str, Any]) -> None:
+                self.sequence += 1
+                self.events.append({
+                    "sequence": self.sequence,
+                    "kind": "tool",
+                    "name": name,
+                    "arguments": arguments,
+                })
+
+            async def send_group(self, text: str, *, to_me: bool) -> str:
+                self.assert_true(to_me)
+                if text == S39_COMMAND:
+                    self._record("keytao_prepare_reviewed_add", {
+                        "word": S39_WORD,
+                        "requested_reading": "圈=quan",
+                    })
+                    return (
+                        f"词库暂无收录「{S39_WORD}」：\n"
+                        "审词：读音 chū quān；来源 用户当前指定 + 编码服务；\n"
+                        "自动审核：指定读音与整词权威读音不同，需要管理员审核\n"
+                        "候选编码:\n"
+                        f"1. {S39_TARGET_CODE} — 已有「{S39_OCCUPANT}」\n"
+                        "2. jjqta — 空位\n"
+                        "3. jjqtai — 空位\n"
+                        "回复编号或编码选择；回复“1 重新编码”挪开已有词。"
+                    )
+                if text in {S39_SELECTION, '重新编码 "除权" jjqt'}:
+                    self._record("keytao_shift_phrase_code", {
+                        "word": S39_WORD,
+                        "target_code": S39_TARGET_CODE,
+                        "confirmed_plan_digest": "a" * 64,
+                    })
+                    self.items = [
+                        {"action": "Delete", "word": S39_OCCUPANT, "code": S39_TARGET_CODE},
+                        {"action": "Create", "word": S39_WORD, "code": S39_TARGET_CODE,
+                         "needsManualReview": True},
+                        {"action": "Create", "word": S39_OCCUPANT, "code": "jjqta"},
+                    ]
+                    return (
+                        f"已写入草稿：「{S39_WORD}」 → {S39_TARGET_CODE}；"
+                        f"已顺延「{S39_OCCUPANT}」 {S39_TARGET_CODE} → jjqta。"
+                    )
+                if text == "加词 出圈 圈字读xing":
+                    return (
+                        "「出圈」的指定读音 xing 与编码服务返回的候选读音都不匹配。"
+                        "可用读音：chū juàn、chū quān。"
+                    )
+                if text == "加词 出圈 jjqt 重新编码":
+                    return (
+                        "现有建议不能保留你要求的添加并腾位操作，"
+                        "因此不提供缩窄后的命令；本次未写入。"
+                    )
+                raise AssertionError(text)
+
+            async def draft(self):
+                return {
+                    "batchId": "batch-s39" if self.items else None,
+                    "items": list(self.items),
+                }
+
+            def attempt_events(self):
+                return list(self.events)
+
+            @staticmethod
+            def assert_equal(actual, expected):
+                if actual != expected:
+                    raise AssertionError((actual, expected))
+
+            @staticmethod
+            def assert_true(value):
+                if not value:
+                    raise AssertionError(value)
+
+        result = await scenario.execute(FakeContext())
+
+        self.assertEqual(result["facts"]["happyPathTurnCount"], 2)
+        self.assertEqual(result["facts"]["selectionConfirmations"], 1)
+        self.assertTrue(result["facts"]["unmatchedReadingListedAvailable"])
+        self.assertTrue(result["facts"]["compoundSuggestionClosed"])
+        self.assertTrue(result["facts"]["occupantPerspectiveResolved"])
 
     async def test_s27_offline_replays_binding_precheck_and_meta_answer(self) -> None:
         from keytao_bot.utils.pending_confirmation import (

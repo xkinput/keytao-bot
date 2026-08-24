@@ -16913,6 +16913,34 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
+    def test_compound_eviction_failure_cannot_advertise_a_narrowed_add(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        message = "加词 出圈 jjqt 重新编码"
+        response = (
+            "无法执行腾位；没有执行添加。\n"
+            "可以改为：添加「出圈」 jjqt"
+        )
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id="garth",
+            space_type="group",
+            space_id="incident-group",
+            speaker_name="Garth",
+        )
+        token = chat_module._current_turn_message.set(message)
+        try:
+            delivered = chat_module._prepare_user_facing_reply(
+                response,
+                memory_context,
+            )
+        finally:
+            chat_module._current_turn_message.reset(token)
+
+        self.assertIn("添加并腾位操作", delivered)
+        self.assertIn("本次未写入", delivered)
+        self.assertNotIn("添加「出圈」 jjqt", delivered)
+
     def test_delivery_choke_point_breaks_identical_deterministic_refusal(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
@@ -17692,6 +17720,27 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertIn("亮面", finalized)
         self.assertIn("粮棉", finalized)
         self.assertNotIn('- 「加入」', finalized)
+
+        incident = "加词 出圈 jjqt 重新编码"
+        narrowed = self_checked_suggested_command(
+            "keytao_create_phrase",
+            {"word": "出圈", "code": "jjqt"},
+            ToolContext(current_message=incident, writes_allowed=False),
+        )
+        self.assertEqual(narrowed, "")
+
+        blocked = AgentOrchestrator._finalize_reply(
+            incident,
+            "这次添加和腾位没有完成；本次未写入。",
+            {
+                "success": False,
+                "blockReason": "binding_incomplete",
+                "message": "当前无法完成添加并腾位。",
+                "suggestedCommand": "@我 添加「出圈」 jjqt",
+            },
+        )
+        self.assertNotIn("添加「出圈」 jjqt", blocked)
+        self.assertIn("不能保留你要求的添加并腾位操作", blocked)
 
     def test_second_identical_rejection_does_not_repeat_the_same_advice(self) -> None:
         message = "把冒菜改到 mzch，茂才顺延"

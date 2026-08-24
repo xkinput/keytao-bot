@@ -1234,6 +1234,14 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
         return None
 
     summary = str(audit.get("summary") or "").strip()
+    if review_flags.read_manual_review_flag(review) is True:
+        reason = (
+            review_flags.manual_review_reason(review)
+            or summary
+            or "本词条已封印为人工复核"
+        )
+        reason = _compact_review_reason(reason) or "本词条已封印为人工复核"
+        return f"自动审核：{reason}，需要管理员审核"
     if audit.get("autoApprove"):
         semantic_items = [
             item
