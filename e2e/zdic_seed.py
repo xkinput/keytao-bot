@@ -376,6 +376,24 @@ ZDIC_FIXTURES_BY_SCENARIO["S37"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S38"] = {
+    "probe_words": ("出圈", "耙耙柑", "琵琶骨"),
+    "rows": (
+        *ZDIC_FIXTURES_BY_SCENARIO["S37"]["rows"],
+        {"kind": "char", "entry": "出", "status": "found", "pinyins": ["chū"]},
+        {"kind": "char", "entry": "圈", "status": "found", "pinyins": ["juàn", "quān"]},
+        {
+            "kind": "entry",
+            "entry": "出圈",
+            "status": "absent",
+            "pinyins": [],
+            "expected_pronunciation_source": "zdic-character-default",
+            "expected_semantic_pronunciation_needed": True,
+            "expected_context_pinyins": ["chū", "quān"],
+        },
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

@@ -53,6 +53,17 @@ _SAME_CODE_ADD_TAIL_RE = re.compile(
     rf"^(?:{_POSITIONAL_SAME_CODE_MARKER_PATTERN})"
     r"(?:即可|就行|可以|就好|也行)?$"
 )
+_NO_SHIFT_DUPLICATE_TAIL_RE = re.compile(
+    r"^(?:(?:并且|而且|同时))?(?:"
+    r"(?:不要|不|别)(?:再)?顺延(?:其他|其余)?(?:相关)?(?:的)?(?:词|词条)?|"
+    r"(?:不要|不|别)(?:再)?动(?:其他|其余)(?:相关)?(?:的)?(?:词|词条)?|"
+    r"保持(?:其他|其余)(?:相关)?(?:的)?(?:词|词条)?不变"
+    r")$"
+)
+_POSITIVE_SHIFT_TAIL_RE = re.compile(
+    r"^(?:(?:并且|而且|同时))?"
+    r"(?:顺延|顶掉|挤掉|挪开)(?:其他|其余|相关)(?:的)?(?:词|词条)?$"
+)
 _POSITIONAL_DESTINATION_VERB_PATTERN = (
     r"(?:提前到|放在|放到|排在|排到|挪到|挪去|移到|移至|"
     r"提到|调到)"
@@ -959,6 +970,12 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
         count=1,
     ).strip()
     if not source or re.search(r"[?？]", source):
+        return None
+    if any(
+        _NO_SHIFT_DUPLICATE_TAIL_RE.fullmatch(re.sub(r"\s+", "", clause))
+        for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if clause.strip()
+    ):
         return None
     source = _EVICTION_ADD_TRAILING_FILLER_RE.sub("", source).strip()
     source = source.rstrip("。.!！").strip()
@@ -1873,6 +1890,12 @@ def explicit_same_code_requested(message: str) -> bool:
         return False
     trusted = trusted_mutation_source(str(message or ""))
     masked = _mask_quoted_record_frames(trusted)
+    if any(
+        _NO_SHIFT_DUPLICATE_TAIL_RE.fullmatch(re.sub(r"\s+", "", clause))
+        for clause in _COMMAND_CLAUSE_SPLIT_RE.split(masked)
+        if clause.strip()
+    ):
+        return True
     for match in _POSITIONAL_SAME_CODE_MARKER_RE.finditer(masked):
         prefix = re.sub(r"\s+", "", masked[max(0, match.start() - 8):match.start()])
         if re.search(r"(?:不要|别|不许|禁止|避免)$", prefix):
@@ -2157,9 +2180,49 @@ def _positive_complete_add_multiclause(message: str) -> Optional[bool]:
                 re.sub(r"\s+", "", clause)
             )
             is not None
+            or _NO_SHIFT_DUPLICATE_TAIL_RE.fullmatch(
+                re.sub(r"\s+", "", clause)
+            )
+            is not None
+            or _POSITIVE_SHIFT_TAIL_RE.fullmatch(
+                re.sub(r"\s+", "", clause)
+            )
+            is not None
         )
         for clause in clauses[1:]
     )
+
+
+def _explicit_add_or_change_with_closed_shift_modifiers(
+    message: str,
+) -> Optional[bool]:
+    """Preserve a literal add/change verb across known trailing shift policy."""
+    source = trusted_mutation_source(message)
+    clauses = tuple(
+        clause.strip()
+        for clause in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if clause.strip()
+    )
+    if len(clauses) < 2:
+        return None
+    modifiers = tuple(re.sub(r"\s+", "", clause) for clause in clauses[1:])
+    if not all(
+        _NO_SHIFT_DUPLICATE_TAIL_RE.fullmatch(modifier)
+        or _POSITIVE_SHIFT_TAIL_RE.fullmatch(modifier)
+        for modifier in modifiers
+    ):
+        return None
+    first = clauses[0]
+    parsed_add = _parse_complete_add_clause(first)
+    if parsed_add is not None and parsed_add.code:
+        return True
+    compact_first = re.sub(r"\s+", "", first)
+    if (
+        re.search(r"(?:改成|改为|改到|换成|换到)", compact_first)
+        and _message_authorizes_mutation_core(first)
+    ):
+        return True
+    return False
 
 
 def message_authorizes_mutation(message: str) -> bool:
@@ -2183,6 +2246,11 @@ def message_authorizes_mutation(message: str) -> bool:
         return False
     if _record_frame_wraps_complete_mutation(message):
         return False
+    modifier_authorization = _explicit_add_or_change_with_closed_shift_modifiers(
+        message
+    )
+    if modifier_authorization is not None:
+        return modifier_authorization
     # The bot advertises this exact first-person shape. Its inner corner
     # quotes delimit live word operands; they are not a quotation frame around
     # the command. The closed parser has already rejected report prefixes,
@@ -2584,6 +2652,31 @@ def self_checked_suggested_command(
             )
         ):
             return ""
+    if tool_name == "keytao_shift_phrase_code":
+        word = str(arguments.get("word") or "").strip()
+        target_code = str(arguments.get("target_code") or "").strip().lower()
+        capability = (context.trusted_reviewed_items_by_key or {}).get(
+            (word, target_code)
+        )
+        candidate_codes = tuple(
+            str(value or "").strip().lower()
+            for value in (capability or {}).get("candidate_codes") or ()
+        )
+        matching_slots = [
+            occupied
+            for code, occupied in (
+                (context.trusted_candidate_slots_by_word or {}).get(word, ())
+            )
+            if code == target_code
+        ]
+        if (
+            not str((capability or {}).get("pinyin") or "").strip()
+            or target_code not in candidate_codes
+            or len(candidate_codes) != len(set(candidate_codes))
+            or len(matching_slots) != 1
+            or not isinstance(matching_slots[0], bool)
+        ):
+            return ""
     candidate = _suggested_command_text(tool_name, arguments)
     if not candidate:
         return ""
@@ -2952,7 +3045,12 @@ def explicit_complete_add_item(message: str) -> Optional[Dict[str, object]]:
     if (
         len(clauses) >= 2
         and all(
-            _SAME_CODE_ADD_TAIL_RE.fullmatch(re.sub(r"\s+", "", part))
+            (
+                _SAME_CODE_ADD_TAIL_RE.fullmatch(re.sub(r"\s+", "", part))
+                or _NO_SHIFT_DUPLICATE_TAIL_RE.fullmatch(
+                    re.sub(r"\s+", "", part)
+                )
+            )
             is not None
             for part in clauses[1:]
         )
@@ -2960,6 +3058,35 @@ def explicit_complete_add_item(message: str) -> Optional[Dict[str, object]]:
         clause = _parse_complete_add_clause(clauses[0])
     else:
         clause = _parse_complete_add_clause(source)
+    if clause is None or not clause.code:
+        return None
+    return {
+        "action": "Create",
+        "word": clause.word,
+        "code": clause.code,
+        "submitAfter": False,
+    }
+
+
+def explicit_shift_modified_add_item(message: str) -> Optional[Dict[str, object]]:
+    """Return one closed word+code add whose trailing policy requests shifting."""
+    if not message_authorizes_mutation(message):
+        return None
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    ).strip()
+    clauses = tuple(
+        part.strip()
+        for part in _COMMAND_CLAUSE_SPLIT_RE.split(source)
+        if part.strip()
+    )
+    if len(clauses) < 2 or not all(
+        _POSITIVE_SHIFT_TAIL_RE.fullmatch(re.sub(r"\s+", "", part))
+        is not None
+        for part in clauses[1:]
+    ):
+        return None
+    clause = _parse_complete_add_clause(clauses[0])
     if clause is None or not clause.code:
         return None
     return {

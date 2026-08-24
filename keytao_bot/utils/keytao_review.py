@@ -25,7 +25,6 @@ except Exception:  # pragma: no cover - optional dependency guard
 from . import http_client
 from .http_client import KeytaoApiError
 from .keytao_encoding import (
-    build_phrase_code_chain,
     normalize_contextual_phrase_encoding,
     pinyin_to_phonetic_code,
 )
@@ -2385,6 +2384,7 @@ async def _contextual_pronunciation_group(
 
 
 def _codes_for_pinyin_sequence(encode_data: Dict, sequence: Sequence[str]) -> List[str]:
+    """Read one candidate chain only from an encoder response for that reading."""
     chars = encode_data.get("chars")
     if not isinstance(chars, list) or len(chars) != len(sequence):
         return []
@@ -2407,26 +2407,66 @@ def _codes_for_pinyin_sequence(encode_data: Dict, sequence: Sequence[str]) -> Li
 
     normalized_sequence = tuple(normalize_pinyin_syllable(str(item)) for item in sequence)
     default_sequence = _encode_default_pinyin_sequence(encode_data)
-    if normalized_sequence == default_sequence:
-        service_codes: List[str] = []
-        for code in [*(encode_data.get("codes") or []), *(encode_data.get("altCodes") or [])]:
-            normalized_code = str(code or "").strip().lower()
-            if normalized_code and normalized_code not in service_codes:
-                service_codes.append(normalized_code)
-        if service_codes:
-            return service_codes
-
-    phonetic_codes: List[str] = []
-    for index, syllable in enumerate(normalized_sequence):
-        char_info = chars[index] if isinstance(chars[index], dict) else {}
-        service_phonetic = str(char_info.get("phoneticCode") or "").strip().lower()
-        if index < len(default_sequence) and syllable == default_sequence[index] and service_phonetic:
-            phonetic_codes.append(service_phonetic)
-        else:
-            phonetic_codes.append(pinyin_to_phonetic_code(syllable) or "")
-    if any(not code for code in phonetic_codes):
+    if normalized_sequence != default_sequence:
         return []
-    return build_phrase_code_chain(chars, phonetic_codes)
+    service_codes: List[str] = []
+    # ``altCodes`` is not reading-scoped in the encode contract: it may contain
+    # a chain for another pronunciation.  Folding it into the current group
+    # makes two readings appear as one (for example 还车 huan/hai).  A reviewed
+    # group therefore consumes only the service's primary ``codes`` for the
+    # exact reading returned by this call; other readings receive their own
+    # semantic encode call in ``_service_codes_for_pronunciation_group``.
+    for code in encode_data.get("codes") or []:
+        normalized_code = str(code or "").strip().lower()
+        if normalized_code and normalized_code not in service_codes:
+            service_codes.append(normalized_code)
+    return service_codes
+
+
+async def _service_codes_for_pronunciation_group(
+    config: ReviewHttpConfig,
+    word: str,
+    baseline_encode: Dict,
+    group: Dict[str, Any],
+    *,
+    baseline_alt_fallback: Sequence[str] = (),
+) -> Tuple[List[str], Dict]:
+    """Return the exact service chain for one reviewed pronunciation group."""
+    sequence = tuple(group.get("normalized") or ())
+    if sequence == _encode_default_pinyin_sequence(baseline_encode):
+        return _codes_for_pinyin_sequence(baseline_encode, sequence), baseline_encode
+    label = pinyin_sequence_label(sequence)
+    source_summary = str(group.get("sourceSummary") or "").strip()
+    source_names = "、".join(
+        str(source.get("source") or source.get("title") or "").strip()
+        for source in group.get("sources") or []
+        if isinstance(source, dict)
+        and str(source.get("source") or source.get("title") or "").strip()
+    )
+    basis = source_summary or source_names or "审词读音证据"
+    group_encode = await fetch_keytao_encode(
+        config,
+        word,
+        semantic_pinyin=label,
+        semantic_meaning=f"{basis}确认「{word}」整词读音为 {label}",
+    )
+    codes = (
+        _codes_for_pinyin_sequence(group_encode, sequence)
+        if _encode_default_pinyin_sequence(group_encode) == sequence
+        else []
+    )
+    if codes:
+        return codes, group_encode
+    # The baseline encode contract exposes one unscoped ``altCodes`` chain.
+    # It can be assigned without guessing only when review evidence leaves one
+    # and only one non-default reading group.  The codes still come verbatim
+    # from the encode service; this is a binding fallback, not local encoding.
+    fallback = list(dict.fromkeys(
+        str(code or "").strip().lower()
+        for code in baseline_alt_fallback
+        if str(code or "").strip()
+    ))
+    return (fallback, baseline_encode) if fallback else ([], group_encode)
 
 
 def _status_label(phrases: List[Dict]) -> str:
@@ -2477,6 +2517,7 @@ async def prepare_reviewed_word(
     word: str,
     *,
     semantic_requester: Optional[str] = None,
+    requested_reading: str = "",
 ) -> Dict:
     word = word.strip()
     if not word:
@@ -2484,6 +2525,16 @@ async def prepare_reviewed_word(
             {"success": False, "message": "词不能为空"},
             "empty_word",
         )
+    requested_sequence = normalize_pinyin_sequence(requested_reading)
+    if requested_reading and (
+        len(requested_sequence) != len(word)
+        or not all(requested_sequence)
+    ):
+        return apply_review_disposition({
+            "success": False,
+            "word": word,
+            "message": f"「{word}」的指定读音音节数与字数不一致",
+        }, "pronunciation_unresolved")
 
     evidence, encode_data, existing_words_result = await asyncio.gather(
         collect_pronunciation_evidence_limited(word),
@@ -2594,6 +2645,67 @@ async def prepare_reviewed_word(
         *cross_validation_rejections,
         *encode_validation_rejections,
     ]
+    explicit_reading_choice: Optional[Dict[str, Any]] = None
+    if requested_sequence:
+        requested_label = pinyin_sequence_label(requested_sequence)
+        requested_encode = await fetch_keytao_encode(
+            config,
+            word,
+            semantic_pinyin=requested_label,
+            semantic_meaning=f"用户明确指定「{word}」的读音为 {requested_label}",
+        )
+        encoded_sequence = _encode_default_pinyin_sequence(requested_encode)
+        if (
+            not requested_encode.get("success", True)
+            or encoded_sequence != requested_sequence
+            or not _codes_for_pinyin_sequence(requested_encode, requested_sequence)
+        ):
+            return apply_review_disposition(apply_manual_review_flag({
+                "success": False,
+                "word": word,
+                "pronunciations": [],
+                "recommendedCode": "",
+                "pronunciationUnresolved": True,
+                "requiresManualPronunciationReview": True,
+                "message": str(
+                    requested_encode.get("message")
+                    or f"编码服务未能按指定读音 {requested_label} 复算「{word}」"
+                ).strip(),
+            }, True, "指定读音未通过编码服务复算"), "pronunciation_unresolved")
+
+        matching_groups = [
+            dict(group)
+            for group in groups
+            if tuple(group.get("normalized") or ()) == requested_sequence
+        ]
+        selected_group = matching_groups[0] if matching_groups else {
+            "pinyin": requested_label,
+            "normalized": list(requested_sequence),
+            "sources": [],
+            "sourceIds": [],
+            "score": 0,
+            "fallback": False,
+            "requiresManualReview": True,
+            "readingEvidenceKind": "user_explicit_reading",
+            "sourceSummary": "用户明确指定读音，编码服务已按该读音复算",
+        }
+        selected_group["pinyin"] = str(
+            selected_group.get("pinyin") or requested_label
+        ).strip()
+        selected_group["normalized"] = list(requested_sequence)
+        selected_group["semanticPronunciation"] = True
+        selected_group["contextPronunciation"] = {
+            "description": f"用户明确指定读音为 {requested_label}",
+            "method": "user_explicit_reading",
+        }
+        groups = [selected_group]
+        encode_data = requested_encode
+        standard_status = _standard_pronunciation_status(requested_encode)
+        explicit_reading_choice = {
+            "status": "resolved",
+            "selectedPinyin": requested_label,
+            "method": "user_explicit_reading",
+        }
     # Rejected web evidence belongs to another word (or fails this word's
     # character readings). Keep it rejected and auditable, but do not let its
     # mere presence suppress a separately verified own-character fallback.
@@ -2743,17 +2855,41 @@ async def prepare_reviewed_word(
             "entityKnowledge": entity_knowledge if entity_knowledge.get("recognized") else None,
         }, True, "候选读音未通过逐字权威读音交叉校验"), "pronunciation_unresolved")
 
-    groups, multi_sense_choice = await _resolve_multi_sense_pronunciation_choice(
-        word,
-        groups,
-        requester=semantic_requester,
-    )
+    if explicit_reading_choice is not None:
+        multi_sense_choice = explicit_reading_choice
+    else:
+        groups, multi_sense_choice = await _resolve_multi_sense_pronunciation_choice(
+            word,
+            groups,
+            requester=semantic_requester,
+        )
 
     all_codes: List[str] = []
     pronunciations: List[Dict] = []
+    baseline_sequence = _encode_default_pinyin_sequence(encode_data)
+    non_default_sequences = {
+        tuple(group.get("normalized") or ())
+        for group in groups
+        if tuple(group.get("normalized") or ()) != baseline_sequence
+    }
+    sole_alternate_codes = (
+        encode_data.get("altCodes") or []
+        if len(non_default_sequences) == 1
+        else []
+    )
     for group in groups:
         sequence = tuple(group.get("normalized", []))
-        codes = _codes_for_pinyin_sequence(encode_data, sequence)
+        codes, group_encode = await _service_codes_for_pronunciation_group(
+            config,
+            word,
+            encode_data,
+            group,
+            baseline_alt_fallback=(
+                sole_alternate_codes
+                if sequence in non_default_sequences
+                else ()
+            ),
+        )
         if not codes:
             continue
         for code in codes:
@@ -2774,7 +2910,7 @@ async def prepare_reviewed_word(
             "characterReadings": _character_reading_evidence(
                 word,
                 sequence,
-                encode_data,
+                group_encode,
             ),
         })
 

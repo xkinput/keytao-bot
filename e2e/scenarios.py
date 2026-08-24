@@ -2844,7 +2844,8 @@ async def scenario_s24(ctx: ScenarioContext) -> dict[str, Any]:
 
 S25_WORD = "炒冷饭"
 S25_PREFIX_CODE = "wlf"
-S25_SELECTED_CODE = "wlfoo"
+S25_REVIEWED_PREFIX_CODE = "jlf"
+S25_SELECTED_CODE = S25_REVIEWED_PREFIX_CODE
 S25_NATURAL_ADD = f"补上{S25_WORD}的 {S25_PREFIX_CODE} 编码"
 S25_COMBINED_COMMAND = f"添加 {S25_WORD} {S25_SELECTED_CODE} 并提交"
 
@@ -2893,16 +2894,15 @@ async def scenario_s25(ctx: ScenarioContext) -> dict[str, Any]:
     selected_index = _rendered_candidate_index(discovery, S25_SELECTED_CODE)
     require(
         re.search(
-            rf"(?m)^\d+\.\s*{re.escape(S25_PREFIX_CODE)}\b.*已有.*$",
+            rf"(?m)^\d+\.\s*{re.escape(S25_REVIEWED_PREFIX_CODE)}\b.*空位.*$",
             discovery,
         )
         is not None,
-        f"S25 did not render the occupied series prefix: {discovery}",
+        f"S25 did not render the encode-service series prefix: {discovery}",
     )
     require(
-        re.search(r"(?m)^\d+\.\s*wlfo\b.*已有.*晚礼服.*$", discovery)
-        is not None,
-        f"S25 did not carry wlfo occupancy from the server record: {discovery}",
+        re.search(r"(?m)^\d+\.\s*wlf(?:o+)?\b", discovery) is None,
+        f"S25 leaked the explicit-code fixture into the reviewed chain: {discovery}",
     )
     require(
         re.search(
@@ -3562,10 +3562,7 @@ async def scenario_s28(ctx: ScenarioContext) -> dict[str, Any]:
     # R2: a complete same-word command replaces, rather than mutates, live state.
     await reset_case("explicit-replacement")
     _replacement_discovery, replacement_rows, replacement_recommended = await discover("explicit-replacement")
-    replacement_code = next(
-        code for _index, code in reversed(replacement_rows)
-        if code != replacement_recommended
-    )
+    replacement_code = next(code for index, code in replacement_rows if index == 4)
     replacement_command = f"添加 {S28_WORD} {replacement_code} 并提交"
     replacement_cutoff = max(
         (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
@@ -5406,6 +5403,189 @@ async def scenario_s36(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S38_EXPLICIT_READING_MESSAGE = "加词 出圈，读音是 chū quān"
+S38_EXPLANATION_MESSAGE = "耙耙柑为pá pá gān，因此这三个字的声母分别为p, p, g"
+S38_NEGATIVE_MODIFIER_MESSAGE = "加词 耙耙柑 ppg，不要顺延其他相关的词条"
+S38_POSITIVE_MODIFIER_MESSAGE = "加词 耙耙柑 ppg，顺延其他词条"
+S38_QUERY_CONTROLS = ("1", "回复1", "加入")
+
+
+async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
+    """Close explicit-reading, query recovery, modifier, and suggestion incidents."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    async def clean_and_reset(label: str) -> None:
+        cleaned = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(cleaned.get("success") is True, f"S38 {label} cleanup failed: {cleaned}")
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    async def finish_one_control(reply: str, *, label: str) -> tuple[str, dict[str, Any]]:
+        current = reply
+        draft = await ctx.draft()
+        if not draft.get("items") and pending_confirmation_copy() in current:
+            messages.append("确认")
+            current = await ctx.send_group(messages[-1], to_me=True)
+            replies.append(current)
+            draft = await ctx.draft()
+        require(bool(draft.get("items")), f"S38 {label} did not reach a draft: {current}")
+        return current, draft
+
+    await clean_and_reset("explicit reading")
+    reading_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S38_EXPLICIT_READING_MESSAGE)
+    reading_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(reading_reply)
+    require(
+        "出圈" in reading_reply
+        and "候选" in reading_reply
+        and "请明确要采用的读音或具体含义" not in reading_reply
+        and "这条单词候选列表无法唯一绑定到本轮服务端编码记录" not in reading_reply,
+        f"S38 explicit reading did not produce one candidate group: {reading_reply}",
+    )
+    reading_review_calls = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > reading_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_prepare_reviewed_add"
+        and event.get("arguments", {}).get("word") == "出圈"
+        and event.get("arguments", {}).get("requested_reading") == "chu quan"
+    ]
+    require(
+        bool(reading_review_calls),
+        f"S38 explicit reading was not supplied to server review: {ctx.attempt_events()}",
+    )
+    messages.append("加入")
+    add_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(add_reply)
+    _completion, reading_draft = await finish_one_control(
+        add_reply,
+        label="explicit-reading add",
+    )
+    require(
+        any(item_key(item)[0:2] == ("Create", "出圈") for item in reading_draft.get("items", [])),
+        f"S38 explicit-reading add did not land 出圈: {reading_draft}",
+    )
+
+    await clean_and_reset("explanation")
+    messages.append(S38_EXPLANATION_MESSAGE)
+    explanation_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(explanation_reply)
+    require(
+        S37_WORD in explanation_reply
+        and S37_TARGET_CODE in explanation_reply
+        and "连续两次没有生成可见回复或工具调用" not in explanation_reply,
+        f"S38 explanatory reading burned the reasoning budget: {explanation_reply}",
+    )
+    messages.append("取消")
+    replies.append(await ctx.send_group(messages[-1], to_me=True))
+
+    recovered_controls: list[str] = []
+    for control in S38_QUERY_CONTROLS:
+        await clean_and_reset(f"query recovery {control}")
+        messages.append(f"喵喵 {S37_WORD}")
+        query_reply = await ctx.send_group(messages[-1], to_me=True)
+        replies.append(query_reply)
+        require(
+            S37_WORD in query_reply
+            and S37_TARGET_CODE in query_reply
+            and "本次仅查询" in query_reply,
+            f"S38 query did not render a read-only candidate record: {query_reply}",
+        )
+        messages.append(control)
+        control_reply = await ctx.send_group(messages[-1], to_me=True)
+        replies.append(control_reply)
+        control_reply, control_draft = await finish_one_control(
+            control_reply,
+            label=f"query recovery {control}",
+        )
+        require(
+            any(item_key(item)[1] == S37_WORD for item in control_draft.get("items", []))
+            and "这条消息没有可用的服务端候选记录" not in control_reply
+            and "引用候选没有保留编码" not in control_reply
+            and "没有执行添加" not in control_reply,
+            f"S38 query control {control} dead-ended: {control_reply}; {control_draft}",
+        )
+        recovered_controls.append(control)
+
+    await clean_and_reset("negative modifier")
+    messages.append(S38_NEGATIVE_MODIFIER_MESSAGE)
+    negative_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(negative_reply)
+    negative_reply, negative_draft = await finish_one_control(
+        negative_reply,
+        label="negative modifier",
+    )
+    negative_items = [item_key(item) for item in negative_draft.get("items", [])]
+    require(
+        negative_items == [("Create", S37_WORD, S37_TARGET_CODE)]
+        and "执行动词" not in negative_reply,
+        f"S38 negative modifier shifted or lost the add verb: {negative_reply}; {negative_draft}",
+    )
+
+    await clean_and_reset("positive modifier")
+    positive_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S38_POSITIVE_MODIFIER_MESSAGE)
+    positive_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(positive_reply)
+    require(
+        "执行动词" not in positive_reply
+        and "缺少明确" not in positive_reply
+        and "连续两次没有生成可见回复或工具调用" not in positive_reply
+        and "调整计划" in positive_reply
+        and f"{S37_WORD}：Create {S37_TARGET_CODE}" in positive_reply
+        and f"{S37_OCCUPANT}：Delete {S37_TARGET_CODE}" in positive_reply,
+        f"S38 positive modifier lost its explicit add verb: {positive_reply}",
+    )
+    advertised = re.search(
+        rf"顺延「{re.escape(S37_WORD)}」到\s*{re.escape(S37_TARGET_CODE)}",
+        positive_reply,
+    )
+    if advertised is not None:
+        messages.append(advertised.group(0))
+        replay = await ctx.send_group(messages[-1], to_me=True)
+        replies.append(replay)
+        require(
+            "不是「耙耙柑」的有效候选编码" not in replay
+            and "不在它的候选链里" not in replay,
+            f"S38 advertised shift failed its own validator: {replay}",
+        )
+    shift_calls = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > positive_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and event.get("arguments", {}).get("word") == S37_WORD
+        and event.get("arguments", {}).get("target_code") == S37_TARGET_CODE
+    ]
+    require(
+        bool(shift_calls),
+        f"S38 positive modifier did not reach its same-record shift validator: {positive_reply}",
+    )
+    await clean_and_reset("final")
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": negative_draft,
+        "facts": {
+            "explicitReadingMessage": S38_EXPLICIT_READING_MESSAGE,
+            "explanationMessage": S38_EXPLANATION_MESSAGE,
+            "readingReviewBound": True,
+            "completedExplicitReadingAdd": True,
+            "recoveredQueryControls": recovered_controls,
+            "negativeModifierDuplicate": negative_items,
+            "advertisedShiftCount": 1 if advertised is not None else 0,
+            "advertisedShiftValidated": advertised is None or bool(shift_calls),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -5444,6 +5624,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S35", "comparator recommendation is the default add plan", scenario_s35),
     Scenario("S36", "dictionary delete and exact swap incident round", scenario_s36),
     Scenario("S37", "occupant eviction and selected-slot revalidation", scenario_s37),
+    Scenario("S38", "reading, query recovery, and modifier incident closure", scenario_s38),
 )
 
 

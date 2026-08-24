@@ -1566,9 +1566,14 @@ class ToolExecutor:
         if not context.current_message:
             if tool_name == "keytao_batch_add_to_draft" and internal_same_code:
                 call_args["_allow_same_code"] = True
-            if tool_name == "keytao_create_phrase":
+            if tool_name in {"keytao_create_phrase", "keytao_shift_phrase_code"}:
                 word = str(call_args.get("word") or "").strip()
-                code = str(call_args.get("code") or "").strip().lower()
+                code = str(
+                    call_args.get(
+                        "target_code" if tool_name == "keytao_shift_phrase_code" else "code"
+                    )
+                    or ""
+                ).strip().lower()
                 capability = (context.trusted_reviewed_items_by_key or {}).get(
                     (word, code)
                 )
@@ -1580,6 +1585,15 @@ class ToolExecutor:
             and explicit_same_code_requested(context.current_message or "")
         ):
             call_args["_allow_same_code"] = True
+
+        if tool_name == "keytao_shift_phrase_code":
+            word = str(call_args.get("word") or "").strip()
+            code = str(call_args.get("target_code") or "").strip().lower()
+            capability = (context.trusted_reviewed_items_by_key or {}).get(
+                (word, code)
+            )
+            inject_reviewed_validation(call_args, capability, code)
+            return call_args
 
         if (
             tool_name == "keytao_submit_batch"

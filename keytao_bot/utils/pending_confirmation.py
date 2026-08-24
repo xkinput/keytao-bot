@@ -1528,6 +1528,7 @@ def render_server_backed_single_word_lookup(
     if has_reorder_copy:
         return "\n".join((
             body,
+            "本次仅查询，不建立写入确认。",
             single_word_candidate_footer(len(expected_codes)),
         ))
     return "\n".join((

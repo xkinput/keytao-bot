@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import secrets
+import shutil
 import subprocess
 import sys
 import time
@@ -23,6 +25,7 @@ from keytao_bot.utils.pinyin_reference_build import build_reference_database
 from .recording import ArtifactRecorder
 from .runtime import (
     E2EBotHarness,
+    E2E_RUNTIME_ROOT,
     LocalNextClient,
     NextServer,
     RigInfrastructureError,
@@ -61,6 +64,9 @@ from .zdic_seed import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_NEXT_DIR = REPO_ROOT.parent / "keytao-next"
+ARTIFACTS_DIR = REPO_ROOT / "e2e" / "artifacts"
+DEFAULT_ARTIFACT_RETENTION = 5
+_ARTIFACT_RUN_NAME_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
 S9_ZDIC_WARMUP_BACKOFF_SECONDS = (4.0, 5.0, 6.0)
 _TRANSIENT_LOCAL_NEXT_ERRORS = (
     httpx.ConnectTimeout,
@@ -146,11 +152,11 @@ def abort_record_for_error(error: BaseException) -> dict[str, Any]:
     return record
 
 
-def build_bot_reference_fixture(artifact_dir: Path) -> dict[str, Any]:
-    """Build the complete vendored reference DB before importing the bot plugin."""
+def build_bot_reference_fixture(runtime_dir: Path = E2E_RUNTIME_ROOT) -> dict[str, Any]:
+    """Reuse the checksum-idempotent vendored reference DB across rig runs."""
 
     source_dir = REPO_ROOT / "vendor" / "pinyin_reference"
-    database_path = artifact_dir / "state" / "pinyin-reference.db"
+    database_path = runtime_dir / "pinyin-reference.db"
     result = build_reference_database(source_dir, database_path)
     os.environ[PINYIN_REFERENCE_DB_ENV] = str(database_path)
     return {
@@ -159,6 +165,69 @@ def build_bot_reference_fixture(artifact_dir: Path) -> dict[str, Any]:
         "environmentVariable": PINYIN_REFERENCE_DB_ENV,
         "build": result.as_json_dict(),
     }
+
+
+def artifact_retention_limit() -> int:
+    raw_limit = os.getenv(
+        "E2E_ARTIFACT_RETENTION",
+        str(DEFAULT_ARTIFACT_RETENTION),
+    ).strip()
+    try:
+        retention = int(raw_limit)
+    except ValueError as error:
+        raise RigInfrastructureError(
+            "E2E_ARTIFACT_RETENTION must be an integer of at least 1"
+        ) from error
+    if retention < 1:
+        raise RigInfrastructureError(
+            "E2E_ARTIFACT_RETENTION must be at least 1"
+        )
+    return retention
+
+
+def prune_artifact_runs(
+    artifacts_dir: Path,
+    *,
+    current_run: Path,
+    retention: int,
+) -> list[str]:
+    """Keep the current run plus the newest completed rig artifacts."""
+
+    if retention < 1:
+        raise RigInfrastructureError(
+            "E2E_ARTIFACT_RETENTION must be at least 1"
+        )
+    artifacts_root = artifacts_dir.resolve()
+    current = current_run.resolve()
+    if current.parent != artifacts_root or not current.is_dir():
+        raise RigInfrastructureError(
+            f"Current E2E artifact directory is outside the artifact root: {current_run}"
+        )
+
+    completed_runs = sorted(
+        (
+            path
+            for path in artifacts_dir.iterdir()
+            if path != current_run
+            and not path.is_symlink()
+            and path.is_dir()
+            and _ARTIFACT_RUN_NAME_RE.fullmatch(path.name)
+        ),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    pruned = completed_runs[max(0, retention - 1):]
+    for path in pruned:
+        shutil.rmtree(path)
+    pruned_names = sorted(path.name for path in pruned)
+    if pruned_names:
+        print(
+            f"Artifact retention pruned {len(pruned_names)} run(s): "
+            + ", ".join(pruned_names)
+        )
+    else:
+        print("Artifact retention pruned 0 runs")
+    return pruned_names
 
 
 async def _retry_fixture_client_call(
@@ -531,7 +600,15 @@ def _encoded_matches_zdic_fixture(
             for char in word
             if ("char", char) in rows_by_key
         ]
-        expected_source = "pinyin-pro-context"
+        expected_source = entry_row.get(
+            "expected_pronunciation_source",
+            "pinyin-pro-context",
+        )
+    expected_semantic_needed = entry_row.get(
+        "expected_semantic_pronunciation_needed",
+        False,
+    )
+    expected_context_pinyins = entry_row.get("expected_context_pinyins")
     characters_match = len(encoded_chars) == len(word) and all(
         isinstance(actual, dict)
         and actual.get("char") == char
@@ -551,7 +628,11 @@ def _encoded_matches_zdic_fixture(
     return not (
         encoded.get("pronunciationSource") != expected_source
         or encoded.get("standardPronunciationStatus") != entry_row["status"]
-        or encoded.get("semanticPronunciationNeeded") is not False
+        or encoded.get("semanticPronunciationNeeded") is not expected_semantic_needed
+        or (
+            expected_context_pinyins is not None
+            and encoded.get("contextPhrasePinyins") != expected_context_pinyins
+        )
         or not characters_match
     )
 
@@ -1675,8 +1756,14 @@ async def async_main(args: argparse.Namespace) -> int:
     config = load_configuration(args)
     run_id = uuid.uuid4().hex
     timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    artifact_dir = REPO_ROOT / "e2e" / "artifacts" / f"{timestamp}-{run_id[:8]}"
+    artifact_dir = ARTIFACTS_DIR / f"{timestamp}-{run_id[:8]}"
+    retention = artifact_retention_limit()
     recorder = ArtifactRecorder(artifact_dir)
+    pruned_artifacts = prune_artifact_runs(
+        ARTIFACTS_DIR,
+        current_run=artifact_dir,
+        retention=retention,
+    )
     encode_delay = EncodeDelayController(
         delay_seconds=float(os.getenv("E2E_ENCODE_DELAY_ONCE_SECONDS", "0.20")),
         attempt_timeout_seconds=float(os.getenv("E2E_ENCODE_ATTEMPT_TIMEOUT_SECONDS", "0.05")),
@@ -1722,6 +1809,10 @@ async def async_main(args: argparse.Namespace) -> int:
             "apiKeyPresent": True,
         },
         "selectedScenarios": [item.scenario_id for item in scenarios],
+        "artifactRetention": {
+            "limit": retention,
+            "prunedRuns": pruned_artifacts,
+        },
         "safetyProof": safety_proof,
         "identities": identities,
         "adminIdentity": admin_identity,
@@ -1735,7 +1826,7 @@ async def async_main(args: argparse.Namespace) -> int:
         manifest["repoHead"] = head.strip()
         manifest["botReferenceData"] = await asyncio.to_thread(
             build_bot_reference_fixture,
-            artifact_dir,
+            E2E_RUNTIME_ROOT,
         )
         zdic_scenario_ids = [
             scenario.scenario_id
@@ -1754,6 +1845,12 @@ async def async_main(args: argparse.Namespace) -> int:
         manifest["nextServer"] = {
             "reusedExisting": server.reused_existing,
             "startedByRig": not server.reused_existing,
+            "runtimeDirectory": (
+                str(server.runtime_dir) if server.runtime_dir is not None else None
+            ),
+            "runtimeRefreshed": server.runtime_refreshed,
+            "runtimeSourceFingerprint": server.runtime_source_fingerprint or None,
+            "writableRuntimePaths": [".next/"],
         }
         client = LocalNextClient(
             base_url=config["keytao_base"],
@@ -1919,7 +2016,7 @@ async def async_main(args: argparse.Namespace) -> int:
                             seed_identity=seed_identity,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
-                    if scenario.scenario_id == "S37":
+                    if scenario.scenario_id in {"S37", "S38"}:
                         fixture_facts["s37"] = await ensure_s37_fixture(
                             client=client,
                             seed_identity=seed_identity,

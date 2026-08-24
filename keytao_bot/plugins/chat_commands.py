@@ -24,6 +24,7 @@ from ..harness.authorization_grammar import (
     _PHRASE_TYPE_BASE_WEIGHTS,
     explicit_same_code_requested,
     explicit_complete_add_item,
+    explicit_shift_modified_add_item,
     parse_dictionary_delete_command,
     parse_entry_move_plan,
     parse_entry_swap,
@@ -286,6 +287,8 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     Looks for: 是否以编码 XXX 将「YYY」加入草稿
     and the numbered candidate list.
     """
+    if "本次仅查询" in response:
+        return None
     confirm_match = re.search(r'以编码\s*([a-z]+)\s*将「(.+?)」加入草稿', response)
     compact_match = re.search(
         r'(?m)^\s*[•-]\s*「(?P<word>[^」\n]+)」\s*→\s*'
@@ -882,6 +885,13 @@ async def _try_recover_reviewed_add_from_history(
             latest_assistant,
             re.IGNORECASE,
         )
+        if recommended is None:
+            recommended = re.search(
+                r"(?m)^推荐[：:]\s*「[^」\r\n]+」\s*占\s*"
+                r"(?P<code>[a-z]{1,12})\s*、\s*「[^」\r\n]+」顺延",
+                latest_assistant,
+                re.IGNORECASE,
+            )
         displayed_recommended = (
             displayed.recommended_code
             if isinstance(displayed, PendingAddWord)
@@ -901,6 +911,97 @@ async def _try_recover_reviewed_add_from_history(
         allow_intent_model=False,
     )
     return executed or refreshed
+
+
+_EXPLICIT_READING_TOKEN_PATTERN = (
+    r"[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ]+"
+    r"(?:\s+[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ]+){0,19}"
+)
+
+
+def _latest_unresolved_review_word(history: Optional[List[Dict]]) -> str:
+    latest = _get_latest_assistant_message(history)
+    match = re.search(
+        r"「(?P<word>[^「」\r\n]{1,20})」(?:存在[^\r\n]{0,40}多个读音|"
+        r"的[^\r\n]{0,20}读音[^\r\n]{0,20}(?:冲突|未确定))",
+        latest,
+    )
+    return match.group("word").strip() if match is not None else ""
+
+
+def _extract_explicit_reading_request(
+    message_text: str,
+    history: Optional[List[Dict]] = None,
+) -> Optional[Tuple[str, str]]:
+    """Bind a literal pinyin reading to the named or currently unresolved word."""
+    source = unicodedata.normalize("NFKC", str(message_text or "")).strip()
+    if not source or re.search(r"[?？]", source):
+        return None
+    patterns = (
+        re.compile(
+            rf"^(?:(?:请|麻烦)?\s*(?:帮我|帮忙|给我)?\s*"
+            rf"(?:加词|添加词|新增词)\s*)?"
+            rf"(?P<word>[\u3400-\u9fff]{{1,20}})\s*[，,；;]?\s*"
+            rf"(?:的)?(?:读音(?:是|为)?|读作)\s*[:：]?\s*"
+            rf"(?P<reading>{_EXPLICIT_READING_TOKEN_PATTERN})(?:\s*[。.!！])?$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"^(?P<word>[\u3400-\u9fff]{{1,20}})\s*为\s*"
+            rf"(?P<reading>{_EXPLICIT_READING_TOKEN_PATTERN})"
+            rf"(?:\s*[，,；;].*)?$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"^(?:(?P<word>[\u3400-\u9fff]{{1,20}})\s*)?按\s*"
+            rf"(?P<reading>{_EXPLICIT_READING_TOKEN_PATTERN})\s*读"
+            rf"(?:\s*[。.!！])?$",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"^(?P<reading>{_EXPLICIT_READING_TOKEN_PATTERN})\s*那个"
+            rf"(?:\s*[。.!！])?$",
+            re.IGNORECASE,
+        ),
+    )
+    for pattern in patterns:
+        match = pattern.fullmatch(source)
+        if match is None:
+            continue
+        word = str(match.groupdict().get("word") or "").strip()
+        if not word:
+            word = _latest_unresolved_review_word(history)
+        reading = keytao_review.normalize_pinyin_sequence(
+            str(match.group("reading") or "")
+        )
+        if word and len(reading) == len(word) and all(reading):
+            return word, " ".join(reading)
+    return None
+
+
+async def _try_handle_explicit_reading_disambiguation(
+    message_text: str,
+    history: Optional[List[Dict]],
+    platform: str,
+    user_id: str,
+    conv_key: Optional[ConversationKey] = None,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    """Re-review a named reading before the free-form model can consume a turn."""
+    explicit = _extract_explicit_reading_request(message_text, history)
+    if explicit is None:
+        return None
+    word, requested_reading = explicit
+    return await _try_handle_simple_single_word_query(
+        f"加词 {word}",
+        platform,
+        user_id,
+        conv_key,
+        space_key,
+        owner_label,
+        requested_reading=requested_reading,
+    )
 
 
 async def _try_handle_complete_add_command(
@@ -939,6 +1040,80 @@ async def _try_handle_complete_add_command(
         owner_label,
     )
     return completed or refreshed
+
+
+async def _try_handle_shift_modified_add_command(
+    message_text: str,
+    platform: str,
+    user_id: str,
+    conv_key: Optional[ConversationKey] = None,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    """Re-review a closed add-plus-shift command and start its bound shift plan."""
+    command = explicit_shift_modified_add_item(message_text)
+    if command is None or conv_key is None:
+        return None
+    word = str(command.get("word") or "").strip()
+    code = str(command.get("code") or "").strip().lower()
+    refreshed = await _try_handle_simple_single_word_query(
+        f"加词 {word}",
+        platform,
+        user_id,
+        conv_key,
+        space_key,
+        owner_label,
+    )
+    record = conversation_state_store.get_record(conv_key)
+    state = record.state if record is not None else None
+    if not isinstance(state, PendingAddWord) or not state.server_candidates:
+        return refreshed
+    candidates = dict(state.server_candidates)
+    if code not in candidates:
+        return (
+            f"{code} 不是「{word}」本轮服务端审词记录中的候选编码；"
+            "本次未执行添加或顺延"
+        )
+    reviewed_pinyin, reviewed_candidate_codes = _pending_reviewed_reading(
+        state,
+        code,
+    )
+    if not reviewed_pinyin or code not in reviewed_candidate_codes:
+        return (
+            f"「{word}」的候选编码 {code} 没有保留对应读音；"
+            "本次未执行添加或顺延"
+        )
+    create_args = _create_phrase_args(state, code)
+    if candidates[code] is not True:
+        return await _execute_add_to_draft(
+            word,
+            code,
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+            remark=str(create_args.get("remark") or ""),
+            needs_manual_review=create_args.get("needs_manual_review"),
+            reviewed_pinyin=reviewed_pinyin,
+            reviewed_candidate_codes=reviewed_candidate_codes,
+        )
+    return await _execute_shift_to_code(
+        word,
+        code,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+        target_item={
+            "type": "Phrase",
+            "remark": str(create_args.get("remark") or ""),
+            "needsManualReview": bool(
+                create_args.get("needs_manual_review", True)
+            ),
+        },
+        reviewed_pinyin=reviewed_pinyin,
+        reviewed_candidate_codes=reviewed_candidate_codes,
+    )
 
 
 def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
@@ -1281,7 +1456,19 @@ async def _canonicalize_pending_ticket_intent(
         return command_intent, None
 
     if command_intent.intent == "pending_choice":
-        choice_index = _parse_pending_choice_index(_compact_command_text(message_text))
+        closed_selection = _closed_candidate_selection(message_text)
+        closed_indices = (
+            closed_selection[0]
+            if closed_selection is not None
+            and not closed_selection[1]
+            and closed_selection[2] is False
+            else ()
+        )
+        choice_index = (
+            closed_indices[0]
+            if len(closed_indices) == 1
+            else _parse_pending_choice_index(_compact_command_text(message_text))
+        )
         if choice_index is None or not 1 <= choice_index <= len(state.candidates):
             return None, render_remediation_reply(
                 f"只接受 1-{len(state.candidates)} 之间的编号",
@@ -2249,6 +2436,8 @@ async def _try_handle_simple_single_word_query(
     conv_key: Optional[ConversationKey] = None,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    *,
+    requested_reading: str = "",
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     explicit_add_word = _extract_explicit_reviewed_add_word(message_text)
@@ -2310,8 +2499,11 @@ async def _try_handle_simple_single_word_query(
     if lookup_data.get("success") and lookup_data.get("phrases"):
         return None
 
+    review_args = {"word": word}
+    if requested_reading:
+        review_args["requested_reading"] = requested_reading
     review_json = await call_tool_function(
-        "keytao_prepare_reviewed_add", {"word": word}, platform, user_id,
+        "keytao_prepare_reviewed_add", review_args, platform, user_id,
     )
     try:
         review = json.loads(review_json)
@@ -2327,6 +2519,7 @@ async def _try_handle_simple_single_word_query(
         )
         pending = _parse_pending_add_word(reviewed_prompt)
         if pending is not None:
+            inventory = select_candidate_inventory(review)
             server_statuses = [
                 status
                 for pronunciation in review.get("pronunciations") or []
@@ -2337,6 +2530,22 @@ async def _try_handle_simple_single_word_query(
                 pending,
                 server_statuses,
                 review.get("candidateOrderingAssessments"),
+            )
+            if inventory is None or any(
+                not str(inventory.readings.get(code) or "").strip()
+                for code, _occupied in pending.server_candidates
+            ):
+                return render_remediation_reply(
+                    "审词记录没有为每个候选保留读音，本次不展示可执行候选",
+                    command=f"加词 {word}",
+                    words=(word,),
+                )
+            pending.pronunciation_codes = dict(inventory.readings)
+            group_recommended = str(
+                inventory.group_recommended_code or pending.recommended_code
+            ).strip().lower()
+            pending.pronunciation_recommended_codes = (
+                [group_recommended] if group_recommended else []
             )
             if explicit_add_word:
                 target_key = conv_key or (
@@ -3444,6 +3653,8 @@ async def _execute_shift_to_code(
     expected_codes: Optional[List[str]] = None,
     expected_weights: Optional[List[int]] = None,
     evidence_lines: Optional[List[str]] = None,
+    reviewed_pinyin: str = "",
+    reviewed_candidate_codes: Tuple[str, ...] = (),
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
     return await _execute_confirmed_tool(
@@ -3491,6 +3702,16 @@ async def _execute_shift_to_code(
                 **(
                     {"evidence_lines": list(evidence_lines)}
                     if evidence_lines
+                    else {}
+                ),
+                **(
+                    {
+                        "_reviewed_pinyin": reviewed_pinyin,
+                        "_reviewed_candidate_codes": list(
+                            reviewed_candidate_codes
+                        ),
+                    }
+                    if reviewed_pinyin and reviewed_candidate_codes
                     else {}
                 ),
                 **({"_submit_after": True} if submit_after else {}),
@@ -4456,6 +4677,13 @@ async def _execute_confirmed_tool(
         if state.function_name == "keytao_create_phrase"
         else None
     )
+    if (
+        state.function_name == "keytao_shift_phrase_code"
+        and reviewed_pinyin
+        and reviewed_candidate_codes
+    ):
+        args["_reviewed_pinyin"] = reviewed_pinyin
+        args["_reviewed_candidate_codes"] = list(reviewed_candidate_codes)
     if reviewed_capability is not None:
         result_json = await call_tool_function(
             state.function_name,

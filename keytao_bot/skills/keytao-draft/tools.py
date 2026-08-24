@@ -5662,6 +5662,8 @@ async def keytao_shift_phrase_code(
     expected_codes: Optional[List[str]] = None,
     expected_weights: Optional[List[int]] = None,
     evidence_lines: Optional[List[str]] = None,
+    _reviewed_pinyin: str = "",
+    _reviewed_candidate_codes: Optional[List[str]] = None,
 ) -> Dict:
     """Preview, bind, then CAS-write a complete code-shift plan."""
     word = word.strip()
@@ -6030,7 +6032,16 @@ async def keytao_shift_phrase_code(
         write_result["planDigest"] = plan_digest
         return _inject_known_batch_url(write_result, str(write_result.get("batchId") or current_batch_id))
 
-    target_encode = await _fetch_encode_candidates(word, target_code)
+    trusted_reviewed_codes = _clean_code_list(_reviewed_candidate_codes)
+    if _reviewed_pinyin.strip() and target_code in trusted_reviewed_codes:
+        target_encode = {
+            "success": True,
+            "word": word,
+            "candidateCodes": trusted_reviewed_codes,
+            "reviewedPinyin": _reviewed_pinyin.strip(),
+        }
+    else:
+        target_encode = await _fetch_encode_candidates(word, target_code)
     if not target_encode.get("success"):
         return target_encode
     target_candidate_codes = target_encode.get("candidateCodes", [])

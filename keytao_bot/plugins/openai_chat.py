@@ -277,6 +277,8 @@ from .chat_commands import (
     _try_handle_draft_submit_command,
     _try_handle_draft_view_command,
     _try_handle_complete_add_command,
+    _try_handle_shift_modified_add_command,
+    _try_handle_explicit_reading_disambiguation,
     _try_handle_keep_only_draft_items_command,
     _try_handle_operation_recall,
     _try_handle_quoted_draft_selection,
@@ -4506,6 +4508,27 @@ async def _stage_handle_replace_character(ctx: TurnContext) -> bool:
 
 async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
     """Production scenario: simple word lookup runs before general model fallback."""
+    if ctx.response is None:
+        if ctx.history is None:
+            ctx.history = get_history(ctx.conv_key)
+        ctx.response = await _try_handle_explicit_reading_disambiguation(
+            ctx.normalized_message_text,
+            ctx.history,
+            ctx.platform,
+            ctx.user_id,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
+        )
+    if ctx.response is None and ctx.current_pending_record is None:
+        ctx.response = await _try_handle_shift_modified_add_command(
+            ctx.normalized_message_text,
+            ctx.platform,
+            ctx.user_id,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
+        )
     if ctx.response is None and ctx.current_pending_record is None:
         ctx.response = await _try_handle_complete_add_command(
             ctx.normalized_message_text,
@@ -5130,6 +5153,8 @@ _CHAT_COMPAT_NAMES = (
     "_try_handle_draft_submit_command",
     "_try_handle_draft_view_command",
     "_try_handle_complete_add_command",
+    "_try_handle_shift_modified_add_command",
+    "_try_handle_explicit_reading_disambiguation",
     "_try_handle_keep_only_draft_items_command",
     "_try_handle_operation_recall",
     "_try_handle_quoted_draft_selection",

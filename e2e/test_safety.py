@@ -40,6 +40,10 @@ from .scenarios import (
     S37_SELECTION,
     S37_TARGET_CODE,
     S37_WORD,
+    S38_EXPLICIT_READING_MESSAGE,
+    S38_EXPLANATION_MESSAGE,
+    S38_NEGATIVE_MODIFIER_MESSAGE,
+    S38_QUERY_CONTROLS,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -98,6 +102,7 @@ class NextServerRuntimeTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source"
             artifact = root / "artifact"
+            runtime_root = root / "runtime"
             (source / ".next" / "dev").mkdir(parents=True)
             (source / "app").mkdir()
             (source / "node_modules").mkdir()
@@ -111,10 +116,14 @@ class NextServerRuntimeTests(unittest.TestCase):
                 artifact_dir=artifact,
                 start_timeout=1,
                 child_env={},
+                runtime_root=runtime_root,
             )
             runtime = server._prepare_runtime_dir()
 
+            self.assertEqual(runtime, runtime_root.resolve() / "keytao-next")
+            self.assertFalse(str(runtime).startswith(str(artifact)))
             self.assertFalse((runtime / "app").is_symlink())
+            self.assertTrue((runtime / "app" / "page.tsx").is_symlink())
             self.assertEqual(
                 (runtime / "app" / "page.tsx").read_text(),
                 "export default null",
@@ -128,6 +137,73 @@ class NextServerRuntimeTests(unittest.TestCase):
                 (source / ".next" / "dev" / "lock").read_text(),
                 "stale",
             )
+
+            self.assertEqual(server._prepare_runtime_dir(), runtime)
+            self.assertTrue((runtime / ".next" / "dev" / "lock").is_file())
+
+            (source / "app" / "page.tsx").write_text("export default 42")
+            refreshed = server._prepare_runtime_dir()
+            self.assertEqual(refreshed, runtime)
+            self.assertEqual(
+                (refreshed / "app" / "page.tsx").read_text(),
+                "export default 42",
+            )
+            self.assertFalse((refreshed / ".next").exists())
+
+
+class ArtifactRetentionTests(unittest.TestCase):
+    def test_retention_keeps_current_and_newest_completed_runs(self) -> None:
+        from .run import prune_artifact_runs
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory) / "artifacts"
+            run_names = [
+                f"20260824T0{index}0000Z-{index:08x}"
+                for index in range(1, 7)
+            ]
+            for name in run_names:
+                (artifacts / name).mkdir(parents=True)
+            current = artifacts / "20260824T070000Z-00000007"
+            current.mkdir()
+            unrelated = artifacts / "keep-me"
+            unrelated.mkdir()
+            linked_run = artifacts / "20260824T000000Z-deadbeef"
+            linked_run.symlink_to(unrelated, target_is_directory=True)
+
+            pruned = prune_artifact_runs(
+                artifacts,
+                current_run=current,
+                retention=3,
+            )
+
+            self.assertEqual(pruned, run_names[:4])
+            self.assertEqual(
+                sorted(path.name for path in artifacts.iterdir() if path.is_dir()),
+                sorted(
+                    [*run_names[4:], current.name, unrelated.name, linked_run.name]
+                ),
+            )
+            self.assertTrue(current.is_dir())
+            self.assertTrue(unrelated.is_dir())
+            self.assertTrue(linked_run.is_symlink())
+
+    def test_retention_rejects_non_positive_limit(self) -> None:
+        from .run import prune_artifact_runs
+
+        with tempfile.TemporaryDirectory() as directory:
+            artifacts = Path(directory) / "artifacts"
+            current = artifacts / "20260824T070000Z-00000007"
+            current.mkdir(parents=True)
+
+            with self.assertRaisesRegex(
+                RigInfrastructureError,
+                "E2E_ARTIFACT_RETENTION must be at least 1",
+            ):
+                prune_artifact_runs(
+                    artifacts,
+                    current_run=current,
+                    retention=0,
+                )
 
 
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
@@ -428,10 +504,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s37(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s38(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 38)],
+            [f"S{index}" for index in range(1, 39)],
         )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:
@@ -444,6 +520,37 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         }
         self.assertEqual(entries[S37_WORD], ["pá", "pá", "gān"])
         self.assertEqual(entries[S37_OCCUPANT], ["pí", "pá", "gǔ"])
+
+    def test_s38_pins_the_incident_messages_and_fixture(self) -> None:
+        self.assertEqual(S38_EXPLICIT_READING_MESSAGE, "加词 出圈，读音是 chū quān")
+        self.assertEqual(
+            S38_EXPLANATION_MESSAGE,
+            "耙耙柑为pá pá gān，因此这三个字的声母分别为p, p, g",
+        )
+        self.assertEqual(
+            S38_NEGATIVE_MODIFIER_MESSAGE,
+            "加词 耙耙柑 ppg，不要顺延其他相关的词条",
+        )
+        self.assertEqual(S38_QUERY_CONTROLS, ("1", "回复1", "加入"))
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S38"]
+        self.assertEqual(fixture["probe_words"], ("出圈", S37_WORD, S37_OCCUPANT))
+        entries = {
+            row["entry"]: (row["status"], row["pinyins"])
+            for row in fixture["rows"]
+            if row["kind"] == "entry"
+        }
+        self.assertEqual(entries["出圈"], ("absent", []))
+        out_circle = next(
+            row
+            for row in fixture["rows"]
+            if row["kind"] == "entry" and row["entry"] == "出圈"
+        )
+        self.assertEqual(
+            out_circle["expected_pronunciation_source"],
+            "zdic-character-default",
+        )
+        self.assertTrue(out_circle["expected_semantic_pronunciation_needed"])
+        self.assertEqual(out_circle["expected_context_pinyins"], ["chū", "quān"])
 
     def test_s35_declares_isolated_reorder_and_free_slot_controls(self) -> None:
         self.assertEqual(
@@ -938,7 +1045,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             [100, 101],
         )
 
-    def test_bot_reference_fixture_uses_full_vendored_database(self) -> None:
+    def test_bot_reference_fixture_uses_stable_full_vendored_database(self) -> None:
         class FakeBuildResult:
             def as_json_dict(self):
                 return {
@@ -947,7 +1054,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 }
 
         with tempfile.TemporaryDirectory() as temporary:
-            artifact_dir = Path(temporary) / "artifacts"
+            runtime_dir = Path(temporary) / "runtime"
             with (
                 patch(
                     "e2e.run.build_reference_database",
@@ -955,7 +1062,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 ) as build_mock,
                 patch.dict("os.environ", {}, clear=False),
             ):
-                result = build_bot_reference_fixture(artifact_dir)
+                result = build_bot_reference_fixture(runtime_dir)
                 configured_path = result["databasePath"]
 
         self.assertEqual(
@@ -963,7 +1070,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             Path(__file__).parents[1] / "vendor" / "pinyin_reference",
         )
         self.assertEqual(build_mock.call_args.args[1], Path(configured_path))
-        self.assertTrue(configured_path.endswith("state/pinyin-reference.db"))
+        self.assertEqual(Path(configured_path), runtime_dir / "pinyin-reference.db")
         self.assertEqual(result["build"]["corpus_word_count"], 349045)
 
     async def test_s15_offline_scenario_contract(self) -> None:
@@ -2337,13 +2444,13 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 if text == f"喵喵 {S25_WORD}":
                     return (
                         f"「{S25_WORD}」候选编码：\n"
-                        f"1. {S25_PREFIX_CODE} — 已有「窝里反」\n"
-                        "2. wlfo — 已有「晚礼服」\n"
-                        f"3. {S25_SELECTED_CODE} — 空位 ✅\n"
-                        "4. wlfoou — 空位\n"
+                        f"1. {S25_SELECTED_CODE} — 空位 ✅\n"
+                        "2. jlfo — 空位\n"
+                        "3. jlfoo — 空位\n"
+                        "4. jlfoou — 空位\n"
                         f"回复编号，或回复「用 {S25_SELECTED_CODE}」。"
                     )
-                if text == "3":
+                if text == "1":
                     self.batch_id = "batch-s25-number"
                     self.items = [{
                         "action": "Create",
@@ -2436,11 +2543,11 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(context.reset_calls, 3)
         self.assertEqual(
             result["messages"],
-            [S25_NATURAL_ADD, f"喵喵 {S25_WORD}", "3", S25_COMBINED_COMMAND],
+            [S25_NATURAL_ADD, f"喵喵 {S25_WORD}", "1", S25_COMBINED_COMMAND],
         )
         self.assertTrue(result["facts"]["naturalVerbReachedWriteGate"])
         self.assertTrue(result["facts"]["bareNumberWroteFromRecord"])
-        self.assertEqual(result["facts"]["selectedIndex"], 3)
+        self.assertEqual(result["facts"]["selectedIndex"], 1)
         self.assertEqual(result["facts"]["confirmationSteps"], 0)
         self.assertEqual(result["facts"]["batchId"], "batch-s25-combined")
         self.assertEqual(result["facts"]["batchStatus"], "Approved")

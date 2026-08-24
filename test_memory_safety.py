@@ -8527,14 +8527,12 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("没有明确的执行指令", verb_miss["message"])
         self.assertEqual(self.calls, [])
 
-        # A user-written ASCII destination still lacks server provenance.  The
-        # safe legacy suggestion remains executable exactly as written.
+        # A user-written ASCII destination still lacks server provenance, so
+        # the renderer must not advertise a shift command it cannot close over
+        # the reviewed encode record.
         with_code = await self._shift("把吃席的编码放到 wkxk")
         self.assertTrue(with_code.get("policyBlocked"), with_code)
-        suggestion = with_code.get("suggestedCommand", "")
-        self.assertEqual(suggestion, "@我 顺延「吃席」到 wkxk")
-        replayed = await self._shift(suggestion)
-        self.assertTrue(replayed.get("success"), replayed)
+        self.assertNotIn("suggestedCommand", with_code)
 
     async def test_every_suggested_command_passes_its_own_validator(self) -> None:
         # Each message is one a real user could send: it asks for this change,
@@ -12711,7 +12709,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         advertised = (
             "本次缺少这些常用词：\n"
             + "\n".join(f"- {word}" for word in words)
-            + "\n直接发「把显眼包、嘴替、松弛感加入草稿」这类指令。"
+            + "\n这些词都能加入草稿。回复「加入」或回复「加入并提交」。"
         )
         scan_client = _FakeClient([
             _fake_response(
@@ -15737,7 +15735,7 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
         )
         payload = __import__("json").loads(tool_reply["content"])
         self.assertEqual(payload["blockReason"], "verb_not_matched")
-        self.assertTrue(payload["suggestedCommand"].startswith("@我 "))
+        self.assertNotIn("suggestedCommand", payload)
         self.assertEqual(calls, [])
         self.assertEqual(result, "本轮只读，已说明需要的指令。")
 

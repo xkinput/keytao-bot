@@ -1356,8 +1356,8 @@ class AgentOrchestrator:
                     )
                     if (
                         advertises_word_set_from_records
-                        and not reply_contract.binding_advertisement
                         and trusted_absent_word_sets
+                        and not trusted_candidate_slots_by_word
                     ):
                         trusted_word_set = (
                             trusted_absent_word_sets[0]

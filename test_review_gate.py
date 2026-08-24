@@ -4889,6 +4889,15 @@ def test_multi_sense_agreeing_evidence_recommends_authoritative_reading():
             "usageType": "transparent_compound",
         }
 
+        async def encode_for_reading(_config, _word, **kwargs):
+            if kwargs.get("semantic_pinyin") == "hai che":
+                # Production's semantic endpoint keeps the whole-word
+                # authoritative huan reading here. The baseline response still
+                # supplies exactly one service alt chain for the sole remaining
+                # evidence-backed hai group.
+                return encode_data
+            return encode_data
+
         async def prepare(proposal):
             with (
                 patch.object(
@@ -4899,7 +4908,7 @@ def test_multi_sense_agreeing_evidence_recommends_authoritative_reading():
                 patch.object(
                     review_module,
                     "fetch_keytao_encode",
-                    AsyncMock(return_value=encode_data),
+                    AsyncMock(side_effect=encode_for_reading),
                 ),
                 patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
                 patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
@@ -4924,6 +4933,15 @@ def test_multi_sense_agreeing_evidence_recommends_authoritative_reading():
             "both agreeing-case reading groups remain visible",
             {tuple(group.get("normalized", [])) for group in agreed_groups}
             == {("huan", "che"), ("hai", "che")},
+        )
+        codes_by_reading = {
+            tuple(group.get("normalized", [])): group.get("codes", [])
+            for group in agreed_groups
+        }
+        check(
+            "service chains stay separated by recomputed reading",
+            codes_by_reading.get(("huan", "che")) == ["htje", "htjev", "htjevv"]
+            and codes_by_reading.get(("hai", "che")) == ["htwe", "htwev", "htwevv"],
         )
 
         authority_only = await prepare({"accepted": False, "word": "还车"})
@@ -5004,6 +5022,24 @@ def test_multi_sense_conflicting_evidence_asks_for_clarification():
             "usageType": "modern_word",
         }
 
+        async def encode_for_reading(_config, _word, **kwargs):
+            if kwargs.get("semantic_pinyin") == "chu quan":
+                return {
+                    **encode_data,
+                    "codes": ["jq", "jqt", "jqto"],
+                    "phrasePinyins": ["chū", "quān"],
+                    "contextPhrasePinyins": ["chū", "quān"],
+                    "chars": [
+                        encode_data["chars"][0],
+                        {
+                            **encode_data["chars"][1],
+                            "pinyin": "quān",
+                            "phoneticCode": "q",
+                        },
+                    ],
+                }
+            return encode_data
+
         async def prepare(proposal):
             with (
                 patch.object(
@@ -5014,7 +5050,7 @@ def test_multi_sense_conflicting_evidence_asks_for_clarification():
                 patch.object(
                     review_module,
                     "fetch_keytao_encode",
-                    AsyncMock(return_value=encode_data),
+                    AsyncMock(side_effect=encode_for_reading),
                 ),
                 patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
                 patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
@@ -5052,6 +5088,117 @@ def test_multi_sense_conflicting_evidence_asks_for_clarification():
             conflicted.get("autoReviewable") is False
             and assessment.get("accepted") is False
             and "multiSenseResolved" in assessment.get("failedChecks", []),
+        )
+
+    asyncio.run(_run())
+
+
+def test_explicit_reading_is_a_decisive_server_recomputed_choice():
+    print("\n🧪 explicit reading decisively selects one server-recomputed group")
+
+    async def _run():
+        evidence = {
+            "success": True,
+            "groups": [{
+                "pinyin": "chū quān",
+                "normalized": ["chu", "quan"],
+                "sources": [{
+                    "source": "现代用法证据",
+                    "url": "https://example.test/chuquan",
+                    "category": "dictionary",
+                    "trust": 4,
+                }],
+                "sourceIds": ["modern-usage"],
+                "score": 4,
+                "fallback": False,
+            }],
+            "sources": [],
+            "lookupComplete": True,
+            "sourceOutcomes": [{
+                "sourceId": "handian",
+                "source": "汉典",
+                "status": "completed",
+                "lookupResult": "found",
+            }],
+        }
+        baseline = {
+            "success": True,
+            "word": "出圈",
+            "codes": ["jjjt", "jjjto", "jjjtou"],
+            "altCodes": [],
+            "pronunciationSource": "zdic-phrase",
+            "standardPronunciationStatus": "found",
+            "phrasePinyins": ["chū", "juàn"],
+            "contextPhrasePinyins": ["chū", "juàn"],
+            "chars": [
+                {
+                    "char": "出",
+                    "pinyin": "chū",
+                    "pinyins": ["chū"],
+                    "pronunciationLookupStatus": "found",
+                    "phoneticCode": "j",
+                    "shapeCode": "t",
+                },
+                {
+                    "char": "圈",
+                    "pinyin": "juàn",
+                    "pinyins": ["juàn", "quān"],
+                    "pronunciationLookupStatus": "found",
+                    "phoneticCode": "j",
+                    "shapeCode": "t",
+                },
+            ],
+        }
+        selected = {
+            **baseline,
+            "codes": ["jq", "jqt", "jqto"],
+            "pronunciationSource": "llm-semantic",
+            "phrasePinyins": ["chū", "quān"],
+            "contextPhrasePinyins": ["chū", "quān"],
+            "semanticPronunciationAccepted": True,
+            "chars": [
+                baseline["chars"][0],
+                {
+                    **baseline["chars"][1],
+                    "pinyin": "quān",
+                    "phoneticCode": "q",
+                },
+            ],
+        }
+        encode_mock = AsyncMock(side_effect=[baseline, selected])
+        with (
+            patch.object(
+                review_module,
+                "collect_pronunciation_evidence_limited",
+                AsyncMock(return_value=evidence),
+            ),
+            patch.object(review_module, "fetch_keytao_encode", encode_mock),
+            patch.object(review_module, "lookup_words", AsyncMock(return_value={})),
+            patch.object(review_module, "lookup_codes", AsyncMock(return_value={})),
+            patch.object(
+                review_module,
+                "_infer_semantic_pronunciation_for_review",
+                AsyncMock(side_effect=AssertionError("explicit reading must bypass semantic guess")),
+            ),
+        ):
+            reviewed = await prepare_reviewed_word(
+                CONFIG,
+                "出圈",
+                requested_reading="chū quān",
+            )
+
+        check(
+            "requested reading is sent into the authenticated encode call",
+            encode_mock.await_count == 2
+            and encode_mock.await_args_list[1].kwargs["semantic_pinyin"] == "chu quan",
+        )
+        check(
+            "only the explicitly selected reading group is rendered",
+            reviewed.get("pronunciationUnresolved") is not True
+            and reviewed.get("multiSenseChoice", {}).get("status") == "resolved"
+            and [group.get("normalized") for group in reviewed.get("pronunciations", [])]
+            == [["chu", "quan"]]
+            and reviewed.get("recommendedCode") == "jq",
         )
 
     asyncio.run(_run())
@@ -5117,6 +5264,7 @@ def main():
     test_audit_budget_nesting_and_timeout_retains_review()
     test_multi_sense_agreeing_evidence_recommends_authoritative_reading()
     test_multi_sense_conflicting_evidence_asks_for_clarification()
+    test_explicit_reading_is_a_decisive_server_recomputed_choice()
 
     print("\n" + "=" * 60)
     print(f"Results: {passed}/{passed + failed} passed" + (f", {failed} failed" if failed else ""))

@@ -114,6 +114,10 @@ available to the runner.
 The runner reuses a compatible local next server on the selected port or starts
 the installed local Next.js binary. A process started by the rig is stopped on exit. Results and
 full transcripts are written under `e2e/artifacts/<timestamp>-<run-id>/`.
+The writable Next build cache and checksum-idempotent pinyin reference database
+are reused under ignored `e2e/.runtime/`; per-run `state/` contains only the
+conversation databases. At startup, artifacts are pruned to the newest five
+runs including the run in progress.
 Each failed scenario is cleaned and rerun once; two consecutive failures produce
 a FAILED verdict and a non-zero exit code.
 
@@ -260,17 +264,18 @@ sends `加入草稿，然后就提交。`. The exact state-derived item must rea
 submitted batch with at most one server-bound confirmation. No reply may ask
 for a full word-plus-code line or claim that the selecting quote did not match.
 
-S25 replays the 炒冷饭 production incident over one flykey series. It first
-sends `补上炒冷饭的 wlf 编码` and requires the natural add verb to reach the
-occupied-code write gate. In a clean actor state it renders the numbered
-`wlf`/`wlfo`/`wlfoo` series, sends the bare index for `wlfoo`, and requires the
-exact trusted record item to reach the draft. After another explicit cleanup it
-sends `添加 炒冷饭 wlfoo 并提交`; that same-turn item must reach one submitted
+S25 replays the 炒冷饭 production incident while separating explicit-code and
+reviewed-code contracts. It first sends `补上炒冷饭的 wlf 编码` and requires the
+natural add verb to reach the occupied-code write gate. In a clean actor state
+it renders the encode-service `jlf` series, rejects leakage from the unrelated
+explicit `wlf` fixture, sends the bare index for `jlf`, and requires the exact
+trusted record item to reach the draft. After another explicit cleanup it sends
+`添加 炒冷饭 jlf 并提交`; that same-turn item must reach one submitted
 batch with at most one server-bound confirmation. No executable sub-path may
 emit read-only, no-write, impossible-to-execute, or no-safe-next-command copy.
-The rig seeds and verifies `窝里反@wlf` and `晚礼服@wlfo` as its exact occupied
-fixtures and refuses to start S25 unless `wlfoo` is empty, so every displayed
-occupancy label comes from the local server rather than scenario prose.
+The rig seeds and verifies `窝里反@wlf` and `晚礼服@wlfo` as the exact occupied
+fixtures for the explicit duplicate-code subcase; reviewed candidates remain
+strictly bound to the encode service's `jlf` chain.
 
 S26 replays the add-plus-eviction incident with
 `添加 吃席 wkxk，赤溪顺延`. It requires one atomic draft batch containing the
@@ -290,6 +295,17 @@ an obsolete selected slot, requires a fresh current candidate list, and proves
 the same normalized selection cannot repeat the old candidate-set refusal. The
 offline cascade control still requires one explicit confirmation whenever the
 shift would also displace an unnamed third word.
+
+S38 pins the reading-chain incident round. It sends the verbatim
+`加词 出圈，读音是 chū quān` and requires `requested_reading` to reach the
+server review before candidates are rendered, then completes the add. It also
+pins the explanatory `耙耙柑为pá pá gān，因此这三个字的声母分别为p, p, g`
+turn and rejects reasoning-only exhaustion. Three clean query-only candidate
+snapshots must recover through `1`, `回复1`, and `加入`; the negative modifier
+`加词 耙耙柑 ppg，不要顺延其他相关的词条` must create the duplicate code without
+shifting its occupant. The positive trailing-modifier control may advertise a
+shift only when replay reaches the same reviewed encode record that authorized
+the suggestion.
 
 S27 replays the binding-precheck incident with an intentionally unprovisioned
 synthetic actor and the scenario's provisioned bound control. The unbound actor
@@ -382,6 +398,7 @@ Optional overrides:
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`
 - `E2E_OPENAI_TIMEOUT`, `E2E_OPENAI_MAX_TOKENS`, `E2E_OPENAI_TEMPERATURE`
 - `E2E_KEYTAO_PORT`, `E2E_NEXT_START_TIMEOUT`, `E2E_MESSAGE_TIMEOUT`
+- `E2E_ARTIFACT_RETENTION` (default: `5`, minimum: `1`)
 - `E2E_ENCODE_DELAY_ONCE_SECONDS`, `E2E_ENCODE_ATTEMPT_TIMEOUT_SECONDS`
 
 The encode delay is armed only by S7. Its first matching GET is delayed and

@@ -13,6 +13,7 @@ import re
 import sqlite3
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, List, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2061,6 +2062,63 @@ def test_extract_explicit_reviewed_add_word():
     )
 
 
+def test_s38_explicit_reading_turns_reenter_review_before_the_model():
+    print("\n🧪 S38 explicit-reading turns re-enter reviewed add deterministically")
+
+    unresolved = (
+        "「出圈」存在含义不同的多个读音，当前含义与常用度证据未能唯一支持其中一个；"
+        "本次不推荐编码，也不会创建待确认加词操作。\n"
+        "- chu juan：jjjt、jjjto\n"
+        "- chū quān：jqt、jqto\n"
+        "请明确要采用的读音或具体含义。"
+    )
+    history = [{"role": "assistant", "content": unresolved}]
+    cases = (
+        ("加词 出圈，读音是 chū quān", "出圈", "chu quan"),
+        ("按 chu quan 读", "出圈", "chu quan"),
+        ("chū quān 那个", "出圈", "chu quan"),
+        (
+            "耙耙柑为pá pá gān，因此这三个字的声母分别为p, p, g",
+            "耙耙柑",
+            "pa pa gan",
+        ),
+    )
+    for message, expected_word, expected_reading in cases:
+        parsed = chat_commands_module._extract_explicit_reading_request(
+            message,
+            history,
+        )
+        check(
+            f"explicit reading parsed: {message}",
+            parsed == (expected_word, expected_reading),
+        )
+
+    async def _run():
+        reviewed = AsyncMock(return_value="SERVER-REVIEWED-CANDIDATES")
+        with patch.object(
+            chat_commands_module,
+            "_try_handle_simple_single_word_query",
+            reviewed,
+        ):
+            result = await chat_commands_module._try_handle_explicit_reading_disambiguation(
+                "加词 出圈，读音是 chū quān",
+                history,
+                "qq",
+                "actor",
+                ("qq", "actor"),
+                ("qq", "private:actor"),
+                "Garth",
+            )
+        check("explicit reading bypasses the model", result == "SERVER-REVIEWED-CANDIDATES")
+        check(
+            "explicit reading is supplied to the review call",
+            reviewed.await_args.args[0] == "加词 出圈"
+            and reviewed.await_args.kwargs["requested_reading"] == "chu quan",
+        )
+
+    asyncio.run(_run())
+
+
 def test_classify_simple_word_query_intent_calls_model():
     """Verify the intent classifier calls the configured model and parses JSON output."""
     print("\n🧪 classify simple word query intent calls model")
@@ -3036,6 +3094,127 @@ def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
             and explicit_record.state.server_candidates
             == [("lyfg", False), ("lyfga", False)],
         )
+        check(
+            "fresh recovery state keeps a reading for every rendered code",
+            isinstance(explicit_record.state, PendingAddWord)
+            and explicit_record.state.pronunciation_codes
+            == {"lyfg": "luo yang zhi gui", "lyfga": "luo yang zhi gui"},
+        )
+
+    asyncio.run(_run())
+
+
+def test_s38_query_candidate_controls_all_use_record_first_recovery():
+    print("\n🧪 S38 query candidate controls use record-first recovery")
+
+    query_snapshot = (
+        "词库暂无收录「耙耙柑」：\n"
+        "审词：读音 pa pa gan；来源 汉典；\n"
+        "候选编码:\n"
+        "1. ppg — 已有「琵琶骨」\n"
+        "2. ppgv — 空位\n"
+        "推荐：「耙耙柑」占 ppg、「琵琶骨」顺延；比较结论已锁定\n"
+        "不重排选 2（ppgv）。\n"
+        "本次仅查询，不建立写入确认。\n"
+        + chat_commands_module.single_word_candidate_footer(2)
+    )
+    check(
+        "query-only reorder snapshot cannot parse as a live write ticket",
+        _parse_pending_add_word(query_snapshot) is None,
+    )
+    check(
+        "回复1 is the same closed selector as 1",
+        openai_chat_module._closed_candidate_selection("回复1")
+        == openai_chat_module._closed_candidate_selection("1")
+        == ((1,), (), False),
+    )
+    reply_intent = chat_routing_module._structural_pending_add_word_intent(
+        "回复1",
+        PendingAddWord(
+            word="耙耙柑",
+            recommended_code="ppg",
+            candidates=[("ppg", True), ("ppgv", False)],
+            server_candidates=[("ppg", True), ("ppgv", False)],
+        ),
+    )
+    check(
+        "回复1 is accepted by the live pending selector parser",
+        reply_intent is not None
+        and reply_intent.intent == "pending_choice"
+        and reply_intent.choice_index == 1,
+    )
+
+    async def _run():
+        old_store = chat_commands_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        chat_commands_module.conversation_state_store = store
+        conv_key = ConversationAddress.private("qq", "s38-recovery")
+        history = [{"role": "assistant", "content": query_snapshot}]
+        try:
+            canonical_intent, canonical_error = await (
+                chat_commands_module._canonicalize_pending_ticket_intent(
+                    PendingAddWord(
+                        word="耙耙柑",
+                        recommended_code="ppg",
+                        candidates=[("ppg", True), ("ppgv", False)],
+                        server_candidates=[("ppg", True), ("ppgv", False)],
+                    ),
+                    "回复1",
+                    reply_intent,
+                    "qq",
+                    "s38-recovery",
+                )
+            )
+            check(
+                "回复1 survives pending-ticket canonicalization",
+                canonical_error is None
+                and canonical_intent is not None
+                and canonical_intent.choice_index == 1,
+            )
+            for control in ("1", "回复1", "加入"):
+                store.delete(conv_key)
+
+                async def refresh(*_args, **_kwargs):
+                    state = PendingAddWord(
+                        word="耙耙柑",
+                        recommended_code="ppg",
+                        candidates=[("ppg", True), ("ppgv", False)],
+                        server_candidates=[("ppg", True), ("ppgv", False)],
+                        pronunciation_codes={
+                            "ppg": "pa pa gan",
+                            "ppgv": "pa pa gan",
+                        },
+                    )
+                    store.set(conv_key, state)
+                    return "REFRESHED"
+
+                execute = AsyncMock(return_value=f"EXECUTED:{control}")
+                with (
+                    patch.object(
+                        chat_commands_module,
+                        "_try_handle_simple_single_word_query",
+                        new=refresh,
+                    ),
+                    patch.object(
+                        chat_commands_module,
+                        "handle_pending_message_core",
+                        new=execute,
+                    ),
+                ):
+                    result = await chat_commands_module._try_recover_reviewed_add_from_history(
+                        control,
+                        history,
+                        "qq",
+                        "s38-recovery",
+                        conv_key,
+                    )
+                check(
+                    f"query control recovers and proceeds: {control}",
+                    result == f"EXECUTED:{control}"
+                    and execute.await_count == 1,
+                )
+        finally:
+            chat_commands_module.conversation_state_store = old_store
 
     asyncio.run(_run())
 
@@ -3563,6 +3742,50 @@ def test_explicit_add_word_query_uses_review_tool_before_ai():
         "same-code add question still cannot authorize a write",
         explicit_complete_add_item("添加「吃席」 wkxk，同码可以吗？") is None,
     )
+    from keytao_bot.harness.authorization_grammar import (
+        explicit_shift_modified_add_item,
+        explicit_same_code_requested,
+        message_authorizes_mutation,
+        parse_eviction_modified_add,
+    )
+
+    negative_adds = (
+        "加词 耙耙柑 ppg，不要顺延其他相关的词条",
+        "加词 耙耙柑 ppg，不顺延",
+        "加词 耙耙柑 ppg，别动其他词",
+        "加词 耙耙柑 ppg，保持其他不变",
+    )
+    for command in negative_adds:
+        check(
+            f"negative shift modifier authorizes duplicate create: {command}",
+            message_authorizes_mutation(command)
+            and explicit_same_code_requested(command)
+            and explicit_complete_add_item(command) == {
+                "action": "Create",
+                "word": "耙耙柑",
+                "code": "ppg",
+                "submitAfter": False,
+            }
+            and parse_eviction_modified_add(command) is None,
+        )
+    negative_change = "把 礼拜五 的编码改为 lbw，并且不要顺延其他相关的词条"
+    check(
+        "negative modifier cannot erase an explicit change verb",
+        message_authorizes_mutation(negative_change)
+        and explicit_same_code_requested(negative_change),
+    )
+    check(
+        "positive trailing shift cannot erase an explicit add verb",
+        message_authorizes_mutation("加词 耙耙柑 ppg，顺延其他词条")
+        and explicit_shift_modified_add_item(
+            "加词 耙耙柑 ppg，顺延其他词条"
+        ) == {
+            "action": "Create",
+            "word": "耙耙柑",
+            "code": "ppg",
+            "submitAfter": False,
+        },
+    )
 
     async def _run():
         tool_calls = []
@@ -4060,12 +4283,25 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
             "reviewHint": "地名中的藏读 zang",
         }
 
+        async def fake_fetch_keytao_encode(config, word, semantic_meaning="", semantic_pinyin=""):
+            if semantic_pinyin == "ya lu zang bu":
+                return {
+                    **encode_data,
+                    "codes": ["ylzb", "ylzbv", "ylzbvu"],
+                    "chars": [
+                        *encode_data["chars"][:2],
+                        {**encode_data["chars"][2], "pinyin": "zang"},
+                        encode_data["chars"][3],
+                    ],
+                }
+            return encode_data
+
         with patch.object(keytao_review_module, "collect_pronunciation_evidence_limited", AsyncMock(return_value={
             "success": True,
             "groups": [],
             "sources": [],
         })):
-            with patch.object(keytao_review_module, "fetch_keytao_encode", AsyncMock(return_value=encode_data)):
+            with patch.object(keytao_review_module, "fetch_keytao_encode", side_effect=fake_fetch_keytao_encode):
                 with patch.object(keytao_review_module, "lookup_words", AsyncMock(return_value={})):
                     with patch.object(keytao_review_module, "lookup_codes", AsyncMock(return_value={})):
                         with patch.object(keytao_review_module, "_infer_entity_knowledge", AsyncMock(return_value=entity)):
@@ -4785,7 +5021,7 @@ def test_reviewed_word_preserves_encode_service_candidate_chains():
 
         codes = review.get("pronunciations", [{}])[0].get("codes", [])
         check("service standard chain is preserved", codes[:3] == ["yzgm", "yzgmi", "yzgmii"])
-        check("service fly-key chain remains valid", codes[3:] == ["yzgx", "yzgxi", "yzgxii"])
+        check("unscoped service alt chain is not merged into the reading", codes == ["yzgm", "yzgmi", "yzgmii"])
         check("official short code is accepted", "yzgm" in codes)
 
     asyncio.run(_run())
@@ -4818,8 +5054,25 @@ def test_reviewed_word_uses_encyclopedia_full_name_when_llm_is_unavailable():
             ],
         }
 
-        async def fake_encode(_config, value):
-            return full_encode if value == "雅鲁藏布江" else short_encode
+        async def fake_encode(_config, value, **kwargs):
+            if value == "雅鲁藏布江":
+                return full_encode
+            if kwargs.get("semantic_pinyin") == "ya lu zang bu":
+                return {
+                    **short_encode,
+                    "codes": ["ylzb", "ylzbv", "ylzbvu"],
+                    "chars": [
+                        short_encode["chars"][0],
+                        short_encode["chars"][1],
+                        {
+                            **short_encode["chars"][2],
+                            "pinyin": "zang",
+                            "phoneticCode": "z",
+                        },
+                        short_encode["chars"][3],
+                    ],
+                }
+            return short_encode
 
         with patch.object(keytao_review_module, "collect_pronunciation_evidence_limited", AsyncMock(return_value={
             "success": True,
@@ -13048,6 +13301,33 @@ async def _run_tool_executor_checks():
         len(calls) == 1 and calls[0]["items"][0]["type"] == "CSS",
     )
 
+    reviewed_shift = draft_executor.canonicalize_arguments(
+        "keytao_shift_phrase_code",
+        {
+            "word": "耙耙柑",
+            "target_code": "ppg",
+            "_reviewed_pinyin": "forged",
+            "_reviewed_candidate_codes": ["forged"],
+        },
+        ToolContext(
+            platform="qq",
+            user_id="123",
+            current_message="顺延「耙耙柑」到 ppg",
+            trusted_reviewed_items_by_key={
+                ("耙耙柑", "ppg"): {
+                    "pinyin": "pa pa gan",
+                    "candidate_codes": ["ppg", "ppgv", "ppgvv"],
+                },
+            },
+        ),
+    )
+    check(
+        "shift validator receives only the reviewed encode chain",
+        reviewed_shift.get("_reviewed_pinyin") == "pa pa gan"
+        and reviewed_shift.get("_reviewed_candidate_codes")
+        == ["ppg", "ppgv", "ppgvv"],
+    )
+
 
 def test_tool_executor_context_injection():
     """Verify contextual tools still receive platform identifiers."""
@@ -16003,6 +16283,47 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
     check(
         "operandless refusal offers plain recovery guidance",
         "查看草稿" in no_command_reply,
+    )
+
+
+def test_s38_shift_suggestion_closes_over_the_reviewed_encode_record():
+    print("\n🧪 S38 suggested shift closes over reviewed encode records")
+    from keytao_bot.harness.authorization_grammar import self_checked_suggested_command
+
+    arguments = {"word": "耙耙柑", "target_code": "ppg"}
+    base_context = ToolContext(
+        platform="qq",
+        user_id="garth",
+        current_message="加词 耙耙柑 ppg，顺延其他词条",
+        writes_allowed=False,
+    )
+    check(
+        "unreviewed shift is never advertised",
+        self_checked_suggested_command(
+            "keytao_shift_phrase_code",
+            arguments,
+            base_context,
+        ) == "",
+    )
+    reviewed_context = replace(
+        base_context,
+        trusted_candidate_slots_by_word={
+            "耙耙柑": (("ppg", True), ("ppgv", False)),
+        },
+        trusted_reviewed_items_by_key={
+            ("耙耙柑", "ppg"): {
+                "pinyin": "pa pa gan",
+                "candidate_codes": ["ppg", "ppgv"],
+            },
+        },
+    )
+    check(
+        "reviewed shift suggestion replays verbatim through the same record",
+        self_checked_suggested_command(
+            "keytao_shift_phrase_code",
+            arguments,
+            reviewed_context,
+        ) == "@我 顺延「耙耙柑」到 ppg",
     )
 
 
@@ -20404,6 +20725,7 @@ if __name__ == "__main__":
     test_parse_simple_word_query_intent_payload()
     test_get_simple_word_query_words_uses_semantic_classifier()
     test_extract_explicit_reviewed_add_word()
+    test_s38_explicit_reading_turns_reenter_review_before_the_model()
     test_classify_simple_word_query_intent_calls_model()
     test_remaining_llm_call_policies()
     test_draft_management_command_detection()
@@ -20416,6 +20738,7 @@ if __name__ == "__main__":
     test_different_code_proceeds_through_both_sinks_with_pending_fact()
     test_model_batch_pending_fact_leads_and_arms_one_local_confirmation()
     test_read_word_query_never_arms_add_ticket_through_pending_execution_path()
+    test_s38_query_candidate_controls_all_use_record_first_recovery()
     test_candidate_commonness_copy_snapshot_and_zero_writes()
     test_recommended_reorder_submit_chains_after_one_plan_confirmation()
     test_explicit_add_word_query_uses_review_tool_before_ai()
@@ -20599,6 +20922,7 @@ if __name__ == "__main__":
     test_outgoing_advertisement_requires_matching_live_state()
     test_short_add_submit_copy_distinguishes_quote_without_live_state()
     test_refusal_remediation_copy_uses_bound_executable_suggestions()
+    test_s38_shift_suggestion_closes_over_the_reviewed_encode_record()
     test_partial_batch_add_never_uses_success_header()
     test_stale_confirmation_short_circuits_only_without_live_state()
     test_pending_replay_transport_failure_retains_exact_ticket()

@@ -1358,6 +1358,15 @@ def _structural_pending_add_word_intent(
         or re.search(r"[?？\"'“”‘’「」『』]", stripped)
     ):
         return None
+    reply_number = re.fullmatch(
+        r"回复\s*(?P<selector>[1-9]\d{0,2})(?P<submit>并提交)?",
+        stripped,
+    )
+    if reply_number is not None:
+        stripped = (
+            reply_number.group("selector")
+            + ("并提交" if reply_number.group("submit") else "")
+        )
     compact = _compact_command_text(stripped).lower()
     if not compact:
         return None
@@ -1510,6 +1519,8 @@ def _closed_candidate_selection(
     if parsed is not None:
         return parsed.indices, parsed.codes, parsed.submit_after
     compact = _compact_command_text(text).lower()
+    if compact.startswith("回复"):
+        compact = compact[2:]
     match = re.fullmatch(
         r"(?:(?:添加|加入|加词|加)?(?P<prefix_index>[1-9]\d{0,2})"
         r"(?P<prefix_submit>并提交)?|"

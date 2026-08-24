@@ -57,3 +57,4 @@ napcat/config/webui.json
 .coverage
 htmlcov/
 e2e/artifacts/
+e2e/.runtime/

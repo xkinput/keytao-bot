@@ -34,6 +34,18 @@ class RigInfrastructureError(RuntimeError):
 LOCAL_NEXT_RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
 LOCAL_NEXT_CONNECT_TIMEOUT_SECONDS = 5.0
 LOCAL_NEXT_REQUEST_TIMEOUT_SECONDS = 90.0
+E2E_RUNTIME_ROOT = Path(__file__).resolve().parent / ".runtime"
+_NEXT_RUNTIME_EXCLUDED_NAMES = {
+    ".DS_Store",
+    ".cache",
+    ".claude",
+    ".direnv",
+    ".next",
+    ".vercel",
+    "test-results",
+}
+_NEXT_RUNTIME_LINKED_DIRECTORIES = {".git", "node_modules"}
+_NEXT_RUNTIME_FINGERPRINT_FILE = ".source-fingerprint"
 
 
 class NextServer:
@@ -45,42 +57,142 @@ class NextServer:
         artifact_dir: Path,
         start_timeout: float,
         child_env: dict[str, str],
+        runtime_root: Path = E2E_RUNTIME_ROOT,
     ) -> None:
-        self.next_dir = next_dir
+        self.next_dir = next_dir.resolve()
         self.base_url = validate_keytao_base(base_url)
         self.artifact_dir = artifact_dir
         self.start_timeout = start_timeout
         self.child_env = child_env
+        self.runtime_root = runtime_root.resolve()
         self.process: Optional[subprocess.Popen[str]] = None
         self.log_handle: Any = None
         self.reused_existing = False
+        self.runtime_dir: Optional[Path] = None
+        self.runtime_refreshed = False
+        self.runtime_source_fingerprint = ""
+
+    def _source_fingerprint(self) -> str:
+        """Hash the source inputs whose changes must invalidate Next's cache."""
+
+        def source_entries(directory: Path, relative_parent: Path):
+            for source in sorted(directory.iterdir(), key=lambda path: path.name):
+                relative = relative_parent / source.name
+                if (
+                    len(relative.parts) == 1
+                    and source.name in _NEXT_RUNTIME_EXCLUDED_NAMES
+                ):
+                    continue
+                yield source, relative
+                if (
+                    len(relative.parts) == 1
+                    and source.name in _NEXT_RUNTIME_LINKED_DIRECTORIES
+                ):
+                    continue
+                if source.is_dir() and not source.is_symlink():
+                    yield from source_entries(source, relative)
+
+        digest = hashlib.sha256()
+        for source, relative in source_entries(self.next_dir, Path()):
+            digest.update(relative.as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            if (
+                len(relative.parts) == 1
+                and relative.name in _NEXT_RUNTIME_LINKED_DIRECTORIES
+            ):
+                digest.update(b"linked-directory\0")
+                continue
+            if source.is_symlink():
+                digest.update(b"symlink\0")
+                digest.update(str(source.readlink()).encode("utf-8"))
+                digest.update(b"\0")
+            elif source.is_dir():
+                digest.update(b"directory\0")
+            elif source.is_file():
+                digest.update(b"file\0")
+                with source.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _populate_runtime_shadow(self, runtime_dir: Path) -> None:
+        """Build real directory scaffolding with read-only source file links."""
+
+        def link_entry(source: Path, destination: Path, *, top_level: bool) -> None:
+            if top_level and source.name in _NEXT_RUNTIME_LINKED_DIRECTORIES:
+                destination.symlink_to(source, target_is_directory=source.is_dir())
+                return
+            if source.is_symlink():
+                destination.symlink_to(source, target_is_directory=source.is_dir())
+                return
+            if source.is_dir():
+                destination.mkdir()
+                for child in sorted(source.iterdir(), key=lambda path: path.name):
+                    link_entry(child, destination / child.name, top_level=False)
+                return
+            destination.symlink_to(source)
+
+        runtime_dir.mkdir(parents=True)
+        for source in sorted(self.next_dir.iterdir(), key=lambda path: path.name):
+            if source.name in _NEXT_RUNTIME_EXCLUDED_NAMES:
+                continue
+            link_entry(source, runtime_dir / source.name, top_level=True)
+
+    @staticmethod
+    def _remove_runtime_tree(path: Path) -> None:
+        if path.is_symlink():
+            raise RigInfrastructureError(
+                f"Refusing to replace symlinked E2E runtime directory: {path}"
+            )
+        if path.exists():
+            shutil.rmtree(path)
 
     def _prepare_runtime_dir(self) -> Path:
-        """Create a writable Next workspace around the read-only source tree."""
-        runtime_dir = self.artifact_dir / "keytao-next-runtime"
-        runtime_dir.mkdir(parents=True, exist_ok=True)
-        for source in self.next_dir.iterdir():
-            if source.name in {
-                ".DS_Store",
-                ".cache",
-                ".claude",
-                ".direnv",
-                ".next",
-                ".vercel",
-                "test-results",
-            }:
-                continue
-            destination = runtime_dir / source.name
-            if destination.exists() or destination.is_symlink():
-                continue
-            if source.name in {".git", "node_modules"} or source.name.startswith(
-                ".env"
-            ):
-                destination.symlink_to(source, target_is_directory=source.is_dir())
-            elif source.is_dir():
-                shutil.copytree(source, destination, symlinks=True)
-            else:
-                shutil.copy2(source, destination)
+        """Refresh one shared Next workspace only when its source changes."""
+
+        runtime_dir = self.runtime_root / "keytao-next"
+        fingerprint_path = runtime_dir / _NEXT_RUNTIME_FINGERPRINT_FILE
+        source_fingerprint = self._source_fingerprint()
+        self.runtime_source_fingerprint = source_fingerprint
+        self.runtime_dir = runtime_dir
+        if (
+            runtime_dir.is_dir()
+            and not runtime_dir.is_symlink()
+            and fingerprint_path.is_file()
+            and fingerprint_path.read_text(encoding="utf-8").strip()
+            == source_fingerprint
+        ):
+            self.runtime_refreshed = False
+            return runtime_dir
+
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        temporary = self.runtime_root / f".keytao-next-{secrets.token_hex(8)}.tmp"
+        backup = self.runtime_root / f".keytao-next-{secrets.token_hex(8)}.old"
+        try:
+            self._populate_runtime_shadow(temporary)
+            (temporary / _NEXT_RUNTIME_FINGERPRINT_FILE).write_text(
+                f"{source_fingerprint}\n",
+                encoding="utf-8",
+            )
+            if runtime_dir.exists() or runtime_dir.is_symlink():
+                if runtime_dir.is_symlink():
+                    raise RigInfrastructureError(
+                        f"Refusing to replace symlinked E2E runtime directory: {runtime_dir}"
+                    )
+                runtime_dir.replace(backup)
+            temporary.replace(runtime_dir)
+            self._remove_runtime_tree(backup)
+        except BaseException:
+            self._remove_runtime_tree(temporary)
+            if backup.exists() and not runtime_dir.exists():
+                backup.replace(runtime_dir)
+            raise
+        self.runtime_refreshed = True
+        print(
+            "Refreshed shared keytao-next runtime from source: "
+            f"{runtime_dir}"
+        )
         return runtime_dir
 
     async def _probe(self) -> bool:

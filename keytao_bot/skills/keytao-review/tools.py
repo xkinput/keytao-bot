@@ -156,17 +156,16 @@ async def keytao_prepare_reviewed_add(
     word: str,
     platform: Optional[str] = None,
     platform_id: Optional[str] = None,
+    requested_reading: str = "",
 ) -> Dict:
     config = _review_config()
     semantic_requester = _semantic_requester_for_actor(platform, platform_id)
+    review_kwargs: Dict[str, str] = {}
     if semantic_requester:
-        review = await prepare_reviewed_word(
-            config,
-            word,
-            semantic_requester=semantic_requester,
-        )
-    else:
-        review = await prepare_reviewed_word(config, word)
+        review_kwargs["semantic_requester"] = semantic_requester
+    if requested_reading:
+        review_kwargs["requested_reading"] = requested_reading
+    review = await prepare_reviewed_word(config, word, **review_kwargs)
     recommended_code = str(review.get("recommendedCode") or "").strip()
     reviewed_word = str(review.get("word") or word or "").strip()
     if review.get("success") and reviewed_word and recommended_code:
@@ -257,6 +256,13 @@ TOOLS = [
                     "word": {
                         "type": "string",
                         "description": "要审查并准备加词的中文词语",
+                    },
+                    "requested_reading": {
+                        "type": "string",
+                        "description": (
+                            "用户本轮明确指定的整词拼音；必须原样传入读音是X、按X读、X那个等说法中的拼音，"
+                            "服务端会按该读音复算候选链"
+                        ),
                     },
                 },
                 "required": ["word"],
