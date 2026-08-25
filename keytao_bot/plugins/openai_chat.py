@@ -417,6 +417,7 @@ from .chat_routing import (
     _get_simple_word_query_words,
     _is_explicit_draft_submit_request,
     _is_fresh_current_user_command_intent,
+    _is_pending_assent_then_submit_request,
     _is_pending_tool_confirm_message,
     _is_plain_draft_submit_request,
     _is_prefixed_fresh_word_query,
@@ -3015,6 +3016,49 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     ctx.scoped_pending_response: Optional[str] = None
     ctx.resolved_advertised_words = ()
     ctx.advertised_snapshot_token = ""
+    recent_write_state = (
+        ctx.current_pending_record.state
+        if (
+            ctx.current_pending_record is not None
+            and isinstance(ctx.current_pending_record.state, PendingToolConfirm)
+            and ctx.current_pending_record.state.function_name == "keytao_submit_batch"
+            and ctx.current_pending_record.state.args.get("_recent_own_write") is True
+        )
+        else None
+    )
+    if recent_write_state is not None:
+        submit_requested = bool(
+            _is_explicit_draft_submit_request(ctx.normalized_message_text)
+            or _is_pending_assent_then_submit_request(
+                ctx.normalized_message_text
+            )
+        )
+        if not submit_requested:
+            # The receipt capability is deliberately next-turn-only.
+            conversation_state_store.delete(ctx.conv_key)
+            ctx.current_pending_record = None
+            return False
+        batch_ids = tuple(dict.fromkeys(
+            str(value or "").strip()
+            for value in recent_write_state.args.get("_recent_batch_ids", [])
+            if str(value or "").strip()
+        ))
+        if len(batch_ids) != 1:
+            conversation_state_store.delete(ctx.conv_key)
+            ctx.current_pending_record = None
+            ctx.scoped_pending_response = (
+                "上一轮写入涉及多个草稿批次，无法唯一确定要提交哪个；"
+                "本次未提交。请先查看草稿并明确批次。"
+                if batch_ids
+                else "上一轮没有可验证的草稿批次；本次未提交。"
+            )
+            return False
+        ctx.scoped_pending_state = recent_write_state
+        ctx.scoped_pending_intent = MessageCommandIntent(
+            intent="pending_confirm",
+            confidence=1.0,
+        )
+        return False
     if (
         ctx.eviction_modified_add is None
         and ctx.current_pending_record is not None
@@ -3323,14 +3367,31 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
                                 f"{'需管理员审核' if old_review else '可自动通过'} → "
                                 f"{'需管理员审核' if new_review else '可自动通过'}"
                             )
-                    ctx.response = str(recovered)
-                    if changed:
-                        ctx.response = (
-                            "⚠️ 重新复核后编码已变化："
-                            + "；".join(changed)
-                            + "。以下当前候选为准。\n"
-                            + ctx.response
+                    applied = await handle_pending_message_core(
+                        ctx.normalized_message_text,
+                        ctx.platform,
+                        ctx.user_id,
+                        ctx.conv_key,
+                        history=ctx.history,
+                        space_key=ctx.space_key,
+                        owner_label=ctx.owner_label,
+                        allow_intent_model=False,
+                    )
+                    if applied is None:
+                        ctx.response = render_remediation_reply(
+                            "候选已重新复核，但原指令未能绑定到新候选；本次未写入",
+                            command="加入并提交",
+                            words=displayed_words,
                         )
+                    else:
+                        ctx.response = str(applied)
+                        if changed:
+                            ctx.response = (
+                                "⚠️ 重新复核后事实已变化："
+                                + "；".join(changed)
+                                + "。\n"
+                                + ctx.response
+                            )
                 else:
                     reason = re.split(
                         r"(?:请|可复制|回复)",
@@ -3365,16 +3426,35 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
             await _finish_ai_chat_matcher(ctx.response)
             return True
         set_turn_flow("pending-confirmation")
-        ctx.response = _format_full_add_and_submit_instruction(
-            current_pending if isinstance(current_pending, PendingAddWord) else None,
-            quoted=ctx.reply_reference.is_reply,
-            referenced_words=tuple(
-                word
-                for word, _code in advertised_batch_binding_pairs(
-                    ctx.reply_reference.text
-                )
-            ),
-        )
+        if _is_pending_assent_then_submit_request(
+            ctx.normalized_message_text
+        ):
+            other_record = conversation_state_store.find_pending_for_other_owner(
+                ctx.space_key,
+                ctx.conv_key,
+            )
+            other_recent_write = bool(
+                other_record is not None
+                and isinstance(other_record.state, PendingToolConfirm)
+                and other_record.state.function_name == "keytao_submit_batch"
+                and other_record.state.args.get("_recent_own_write") is True
+            )
+            ctx.response = (
+                "上一轮写入的是另一位用户的草稿批次，不能替其提交；本次未提交。"
+                if other_recent_write
+                else "上一轮没有你刚写入的唯一草稿批次；本次未提交。"
+            )
+        else:
+            ctx.response = _format_full_add_and_submit_instruction(
+                current_pending if isinstance(current_pending, PendingAddWord) else None,
+                quoted=ctx.reply_reference.is_reply,
+                referenced_words=tuple(
+                    word
+                    for word, _code in advertised_batch_binding_pairs(
+                        ctx.reply_reference.text
+                    )
+                ),
+            )
         remember_conversation(
             ctx.conv_key,
             ctx.memory_context,
@@ -4266,7 +4346,45 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                 # response is None → unrecognized input, fall through to Phase 2
 
             elif ctx.response is None and isinstance(state, PendingToolConfirm):
-                if _is_pending_tool_confirm_message(state, pending_command_intent):
+                recent_batch_ids = tuple(dict.fromkeys(
+                    str(value or "").strip()
+                    for value in state.args.get("_recent_batch_ids", [])
+                    if str(value or "").strip()
+                )) if state.args.get("_recent_own_write") is True else ()
+                if recent_batch_ids:
+                    if (
+                        len(recent_batch_ids) != 1
+                        or pending_command_intent.intent != "pending_confirm"
+                    ):
+                        complete_pending_execution()
+                        ctx.response = (
+                            "上一轮写入的草稿批次无法唯一确定；本次未提交。"
+                        )
+                    elif not begin_pending_execution():
+                        ctx.response = render_remediation_reply(
+                            "当前提交正在处理中",
+                            command="查看草稿",
+                        )
+                    else:
+                        submit_result = await _perform_submit_current_draft(
+                            ctx.platform,
+                            ctx.user_id,
+                            batch_id=recent_batch_ids[0],
+                            auto_confirm=True,
+                            authorize_current_draft=True,
+                        )
+                        if submit_result.pending_state is not None:
+                            conversation_state_store.set(
+                                ctx.conv_key,
+                                submit_result.pending_state,
+                                space_key=state_space_key,
+                                owner_label=ctx.owner_label,
+                            )
+                            pending_claimed = False
+                        else:
+                            complete_pending_execution()
+                        ctx.response = submit_result.text
+                elif _is_pending_tool_confirm_message(state, pending_command_intent):
                     if not _resolved_advertised_items_match(state):
                         complete_pending_execution()
                         stale_words = tuple(
@@ -5047,6 +5165,7 @@ _CHAT_COMPAT_NAMES = (
     "_is_contextual_short_reply",
     "_is_explicit_draft_submit_request",
     "_is_fresh_current_user_command_intent",
+    "_is_pending_assent_then_submit_request",
     "_is_pending_tool_confirm_message",
     "_is_plain_draft_submit_request",
     "_is_prefixed_fresh_word_query",

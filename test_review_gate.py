@@ -4522,7 +4522,8 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
             "ordering copy cites both semantic and dictionary/corpus evidence",
             "冒菜：现代常用饮食词（语义判断）" in rendered
             and "茂才：古语，词典收录但语料频次低" in rendered
-            and "推荐：「冒菜」占 mzch、「茂才」顺延" in rendered
+            and "推荐：\n- " in rendered
+            and "「冒菜」占 mzch、「茂才」顺延" in rendered
             and "不重排选 2（mzchi）" in rendered,
         )
 

@@ -419,6 +419,20 @@ ZDIC_FIXTURES_BY_SCENARIO["S39"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S40"] = {
+    "probe_words": tuple(dict.fromkeys((
+        *ZDIC_FIXTURES_BY_SCENARIO["S35"]["probe_words"],
+        *ZDIC_FIXTURES_BY_SCENARIO["S22"]["probe_words"],
+    ))),
+    "rows": tuple({
+        (str(row["kind"]), str(row["entry"])): row
+        for row in (
+            *ZDIC_FIXTURES_BY_SCENARIO["S35"]["rows"],
+            *ZDIC_FIXTURES_BY_SCENARIO["S22"]["rows"],
+        )
+    }.values()),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

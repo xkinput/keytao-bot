@@ -188,6 +188,7 @@ from keytao_bot.harness.state import (
     MemoryConversationStateStore,
     PendingAdvertisedWordSets,
     PendingStateRecord,
+    PendingTrustedWordRecord,
 )
 from keytao_bot.harness.conversation import ConversationAddress
 from keytao_bot.harness.tools import (
@@ -3147,7 +3148,9 @@ def test_s38_query_candidate_controls_all_use_record_first_recovery():
         "候选编码:\n"
         "1. ppg — 已有「琵琶骨」\n"
         "2. ppgv — 空位\n"
-        "推荐：「耙耙柑」占 ppg、「琵琶骨」顺延；比较结论已锁定\n"
+        "推荐：\n"
+        "- “「耙耙柑」占 ppg、「琵琶骨」顺延”（耙耙柑、琵琶骨）\n"
+        "依据：比较结论已锁定\n"
         "不重排选 2（ppgv）。\n"
         "本次仅查询，不建立写入确认。\n"
         + chat_commands_module.single_word_candidate_footer(2)
@@ -3306,8 +3309,8 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
     behind_prompt = _format_reviewed_add_prompt(review_for("behind_more_common")) or ""
     insufficient_prompt = _format_reviewed_add_prompt(review_for("not_enough_evidence")) or ""
     check(
-        "front branch has one coherent two-line recommendation",
-        "推荐：「射覆」占 eefj、「慑服」顺延" in front_prompt
+        "front branch has one coherent executable recommendation",
+        "- “「射覆」占 eefj、「慑服」顺延”（射覆、慑服）" in front_prompt
         and "不重排选 2（eefju）" in front_prompt
         and "回复「1 重新编码」执行" not in front_prompt,
     )
@@ -3574,7 +3577,7 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
         check(
             "presentation returns the coherent ordering recommendation",
             response is not None
-            and "推荐：「射覆」占 eefj、「慑服」顺延" in response
+            and "- “「射覆」占 eefj、「慑服」顺延”（射覆、慑服）" in response
             and "不重排选 2（eefju）" in response
             and "推荐编码：" not in response
             and advertised_single_word_lookup_codes(response)
@@ -3891,6 +3894,49 @@ def test_explicit_add_word_query_uses_review_tool_before_ai():
         check("pending recommended code", pending.recommended_code == "pgtk")
         check("explicit add stores a structured pending", stored_pending is not None and isinstance(stored_pending.state, PendingAddWord))
         check("explicit add pending stays in private address", stored_pending is not None and stored_pending.owner_key == conv_key)
+
+    asyncio.run(_run())
+
+
+def test_incomplete_shift_modified_add_preserves_compound_refusal():
+    """An omitted live occupant cannot silently degrade to a plain add."""
+    print("\n🧪 incomplete shift-modified add preserves compound refusal")
+    from keytao_bot.harness.authorization_grammar import (
+        unnamed_eviction_modified_add_item,
+    )
+
+    command = "加词 出圈 jjqt 重新编码"
+    check(
+        "incomplete shift command retains its trusted add operands",
+        unnamed_eviction_modified_add_item(command) == {
+            "action": "Create",
+            "word": "出圈",
+            "code": "jjqt",
+            "submitAfter": False,
+        },
+    )
+
+    async def _run():
+        with patch.object(
+            chat_commands_module,
+            "_try_handle_simple_single_word_query",
+            new=AsyncMock(side_effect=AssertionError(
+                "an incomplete shift command must stop before review or write"
+            )),
+        ):
+            result = await chat_commands_module._try_handle_shift_modified_add_command(
+                command,
+                "qq",
+                "compound-owner",
+                ConversationAddress.private("qq", "compound-owner"),
+            )
+        check(
+            "incomplete shift command explains the preserved compound failure",
+            "不能保留你要求的添加并腾位操作" in (result or "")
+            and "出圈" in (result or "")
+            and "jjqt" in (result or "")
+            and "本次未写入" in (result or ""),
+        )
 
     asyncio.run(_run())
 
@@ -5364,27 +5410,75 @@ def test_submit_review_copy_is_decisive_and_non_redundant():
     check("manual issue uses positive status wording", "不能自动通过" not in manual_text and "需管理员审核" in manual_text)
 
 
-def test_simple_single_word_query_existing_word_falls_through():
-    """Verify existing words still use the richer normal lookup response path."""
-    print("\n🧪 simple single word query existing word falls through")
+def test_simple_single_word_query_existing_word_leads_with_exact_fact():
+    """Verify an existing word returns a deterministic fact before options."""
+    print("\n🧪 simple single word query existing word leads with exact fact")
 
     async def _run():
+        state_store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("qq", "existing-word-owner")
+
         async def fake_call(tool_name, arguments, platform=None, user_id=None):
             if tool_name == "keytao_lookup_by_word":
                 return json.dumps({
                     "success": True,
                     "word": "寿司郎",
-                    "phrases": [{"word": "寿司郎", "code": "eslv"}],
+                    "phrases": [{
+                        "word": "寿司郎",
+                        "code": "eslv",
+                        "type": "Phrase",
+                    }],
                 }, ensure_ascii=False)
             if tool_name == "keytao_pending_items_by_words":
                 return json.dumps({"success": True, "complete": True, "items": []})
-            raise AssertionError("existing word should not encode in this bypass")
+            raise AssertionError("existing word should not encode in this path")
 
-        with patch.object(openai_chat_module, "_classify_simple_word_query_intent", AsyncMock(return_value=SimpleWordQueryIntent(True, ("寿司郎",), "word_lookup", 0.98))):
-            with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
-                result = await _try_handle_simple_single_word_query("寿司郎", "qq", "123")
+        old_store = chat_commands_module.conversation_state_store
+        chat_commands_module.conversation_state_store = state_store
+        try:
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    AsyncMock(return_value=SimpleWordQueryIntent(
+                        True,
+                        ("寿司郎",),
+                        "word_lookup",
+                        0.98,
+                    )),
+                ),
+                patch.object(
+                    chat_commands_module,
+                    "call_tool_function",
+                    side_effect=fake_call,
+                ),
+            ):
+                result = await _try_handle_simple_single_word_query(
+                    "寿司郎",
+                    "qq",
+                    "existing-word-owner",
+                    conv_key,
+                    conv_key.space_key,
+                    "Existing Owner",
+                )
+        finally:
+            chat_commands_module.conversation_state_store = old_store
 
-        check("existing word falls through", result is None)
+        check(
+            "existing word leads with its exact dictionary fact",
+            result is not None
+            and result.startswith("「寿司郎」已在词库（eslv）。")
+            and "换码" in result
+            and "无需操作" in result,
+        )
+        record = state_store.get_record(conv_key)
+        check(
+            "existing word lookup stages its unique trusted row for next-turn action",
+            record is not None
+            and isinstance(record.state, PendingTrustedWordRecord)
+            and (record.state.word, record.state.code, record.state.phrase_type)
+            == ("寿司郎", "eslv", "Phrase"),
+        )
 
     asyncio.run(_run())
 
@@ -15950,6 +16044,25 @@ def test_short_add_submit_copy_distinguishes_quote_without_live_state():
             )
 
         recovery_core = AsyncMock(side_effect=recover_review)
+
+        async def apply_recovered_assent(
+            message,
+            _platform,
+            _user_id,
+            conv_key,
+            **_kwargs,
+        ):
+            record = store.get_record(conv_key)
+            check(
+                "recovered assent executes only against the fresh live ticket",
+                message == "加入并提交"
+                and record is not None
+                and isinstance(record.state, PendingToolConfirm),
+            )
+            store.delete(conv_key)
+            return "已写入草稿：显眼包 → xybo；嘴替 → zbtk；已提交。"
+
+        apply_assent = AsyncMock(side_effect=apply_recovered_assent)
         with (
             patch.object(
                 openai_chat_module,
@@ -15972,6 +16085,11 @@ def test_short_add_submit_copy_distinguishes_quote_without_live_state():
                 classifier,
             ),
             patch.object(openai_chat_module, "get_ai_response_core", recovery_core),
+            patch.object(
+                openai_chat_module,
+                "handle_pending_message_core",
+                apply_assent,
+            ),
             patch.object(openai_chat_module, "remember_conversation", MagicMock()),
             patch.object(openai_chat_module, "_finish_ai_chat_matcher", finish),
         ):
@@ -15981,10 +16099,24 @@ def test_short_add_submit_copy_distinguishes_quote_without_live_state():
                 "qq",
                 "739497722",
             )
-        return str(finish.await_args.args[0]), classifier, recovery_core, recovery_calls, store
+        return (
+            str(finish.await_args.args[0]),
+            classifier,
+            recovery_core,
+            recovery_calls,
+            store,
+            apply_assent,
+        )
 
     async def _run():
-        quoted, quoted_classifier, quoted_recovery, recovery_calls, quoted_store = await run_case(
+        (
+            quoted,
+            quoted_classifier,
+            quoted_recovery,
+            recovery_calls,
+            quoted_store,
+            quoted_apply,
+        ) = await run_case(
             ReplyReferenceInfo(
                 is_reply=True,
                 is_to_bot=True,
@@ -15994,13 +16126,12 @@ def test_short_add_submit_copy_distinguishes_quote_without_live_state():
             )
         )
         check(
-            "quoted/no-state assent returns a fresh reviewed list in the same turn",
-            "已重新复核" in quoted,
+            "quoted/no-state assent re-reviews and executes in the same turn",
+            "已写入草稿" in quoted and "已提交" in quoted,
         )
         check(
             "quoted/no-state recovery preserves the exact displayed bindings",
-            advertised_batch_binding_pairs(quoted)
-            == (("显眼包", "xybo"), ("嘴替", "zbtk")),
+            quoted_apply.await_count == 1,
         )
         check(
             "quoted/no-state recovery warns when occupancy changed",
@@ -16014,78 +16145,24 @@ def test_short_add_submit_copy_distinguishes_quote_without_live_state():
             and bool(recovery_calls[0][1]),
         )
         check(
-            "quoted/no-state recovery leaves a backed batch ticket",
-            isinstance(quoted_store.get(ConversationAddress.group(
+            "quoted/no-state recovery consumes the backed batch ticket",
+            quoted_store.get(ConversationAddress.group(
                 "qq", "865189947", "739497722"
-            )), PendingToolConfirm),
+            )) is None,
         )
         check(
             "quoted/no-state recovery bypasses the intent model",
             quoted_classifier.await_count == 0,
         )
 
-        recovered_context = ChatMemoryContext(
-            platform="qq",
-            user_id="739497722",
-            space_type="group",
-            space_id="865189947",
-            speaker_name="Rea",
-        )
-        recovered_key = recovered_context.conversation_address
-        coordinator = DraftOperationCoordinator()
-        schedule = MagicMock(return_value=True)
-        second_classifier = AsyncMock(return_value=MessageCommandIntent())
-        second_model = AsyncMock(return_value="unexpected model response")
-        with (
-            patch.object(openai_chat_module, "conversation_state_store", quoted_store),
-            patch.object(openai_chat_module, "draft_operation_coordinator", coordinator),
-            patch.object(
-                openai_chat_module,
-                "extract_reply_reference_info",
-                AsyncMock(return_value=ReplyReferenceInfo()),
-            ),
-            patch.object(
-                openai_chat_module,
-                "extract_memory_context",
-                AsyncMock(return_value=recovered_context),
-            ),
-            patch.object(
-                openai_chat_module,
-                "_classify_message_command_intent",
-                second_classifier,
-            ),
-            patch.object(
-                openai_chat_module,
-                "_schedule_background_draft_operation",
-                schedule,
-            ),
-            patch.object(openai_chat_module, "get_history", return_value=[]),
-            patch.object(openai_chat_module, "get_ai_response_core", second_model),
-            patch.object(openai_chat_module, "remember_conversation", MagicMock()),
-        ):
-            await openai_chat_module._handle_ai_chat_serialized(
-                HandlerBot(),
-                HandlerEvent(),
-                "qq",
-                "739497722",
-            )
-        operation = coordinator.get(recovered_key)
-        check(
-            "following bare assent schedules the exact recovered set once",
-            schedule.call_count == 1
-            and operation is not None
-            and operation.kind == "batch_add_and_submit"
-            and operation.word == "显眼包、嘴替"
-            and operation.code == "xybo、zbtk",
-        )
-        check(
-            "following bare assent bypasses both models and consumes the ticket",
-            second_classifier.await_count == 0
-            and second_model.await_count == 0
-            and quoted_store.get_record(recovered_key) is None,
-        )
-
-        unquoted, unquoted_classifier, unquoted_recovery, unquoted_calls, _unquoted_store = await run_case(
+        (
+            unquoted,
+            unquoted_classifier,
+            unquoted_recovery,
+            unquoted_calls,
+            _unquoted_store,
+            unquoted_apply,
+        ) = await run_case(
             ReplyReferenceInfo()
         )
         check(
@@ -16104,7 +16181,8 @@ def test_short_add_submit_copy_distinguishes_quote_without_live_state():
             "unquoted/no-state case cannot invent recovery operands",
             unquoted_classifier.await_count == 0
             and unquoted_recovery.await_count == 0
-            and unquoted_calls == [],
+            and unquoted_calls == []
+            and unquoted_apply.await_count == 0,
         )
 
         unknown_context = ChatMemoryContext(
@@ -20864,6 +20942,7 @@ if __name__ == "__main__":
     test_candidate_commonness_copy_snapshot_and_zero_writes()
     test_recommended_reorder_submit_chains_after_one_plan_confirmation()
     test_explicit_add_word_query_uses_review_tool_before_ai()
+    test_incomplete_shift_modified_add_preserves_compound_refusal()
     test_word_discovery_prechecks_binding_without_blocking_review()
     test_reviewed_add_prompt_explains_fallback_review_policy()
     test_reviewed_add_prompt_shows_pre_submit_audit_result()
@@ -20887,7 +20966,7 @@ if __name__ == "__main__":
     test_auto_approve_failure_copy_reports_pass_and_real_reason()
     test_auto_approve_generic_exception_is_redacted()
     test_submit_review_copy_is_decisive_and_non_redundant()
-    test_simple_single_word_query_existing_word_falls_through()
+    test_simple_single_word_query_existing_word_leads_with_exact_fact()
     test_simple_single_word_query_skips_draft_commands()
     test_simple_single_word_query_skips_chat_comparison_questions()
     test_draft_view_command_uses_draft_tools()

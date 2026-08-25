@@ -718,6 +718,12 @@ _EVICTION_ADD_BY_OCCUPANT_RE = re.compile(
     rf"(?P<modifier>{_EVICTION_MODIFIER_PATTERN})$",
     re.IGNORECASE,
 )
+_OCCUPY_SLOT_ADD_RE = re.compile(
+    rf"^[「“](?P<word>[\u3400-\u9fff]{{1,16}})[」”]\s*占\s*"
+    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})"
+    r"(?:\s*、\s*[「“](?P<occupant>[\u3400-\u9fff]{1,16})[」”]\s*顺延)?$",
+    re.IGNORECASE,
+)
 _EVICTION_ADD_TRAILING_FILLER_RE = re.compile(
     r"(?:一下|吧|了|谢谢|谢谢你|辛苦了|麻烦了|拜托了)[。.!！]?$"
 )
@@ -991,6 +997,19 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
         return None
     source = _EVICTION_ADD_TRAILING_FILLER_RE.sub("", source).strip()
     source = source.rstrip("。.!！").strip()
+    occupy_match = _OCCUPY_SLOT_ADD_RE.fullmatch(source)
+    if occupy_match is not None:
+        parsed = EvictionModifiedAdd(
+            word=occupy_match.group("word").strip(),
+            code=occupy_match.group("code").strip().lower(),
+            named_occupant=str(occupy_match.group("occupant") or "").strip(),
+            modifier="顺延" if occupy_match.group("occupant") else "占",
+        )
+        return (
+            parsed
+            if not parsed.named_occupant or parsed.word != parsed.named_occupant
+            else None
+        )
     echoed_match = _ECHOED_EVICTION_ADD_RE.fullmatch(source)
     if echoed_match is not None:
         parsed = EvictionModifiedAdd(
@@ -3084,6 +3103,14 @@ def explicit_complete_add_item(message: str) -> Optional[Dict[str, object]]:
 
 def explicit_shift_modified_add_item(message: str) -> Optional[Dict[str, object]]:
     """Return one closed word+code add whose trailing policy requests shifting."""
+    parsed = parse_eviction_modified_add(message)
+    if parsed is not None and parsed.code:
+        return {
+            "action": "Create",
+            "word": parsed.word,
+            "code": parsed.code,
+            "submitAfter": False,
+        }
     if not message_authorizes_mutation(message):
         return None
     source = _LEADING_MENTION_RE.sub(
@@ -3111,16 +3138,31 @@ def explicit_shift_modified_add_item(message: str) -> Optional[Dict[str, object]
     }
 
 
-def _has_unnamed_eviction_modified_add(message: str) -> bool:
-    """Recognize an add whose requested eviction omits the live occupant."""
+def unnamed_eviction_modified_add_item(
+    message: str,
+) -> Optional[dict[str, object]]:
+    """Return trusted add operands when the requested eviction omits its occupant."""
     if not message_authorizes_mutation(message):
-        return False
+        return None
     source = _LEADING_MENTION_RE.sub(
         "", trusted_mutation_source(message), count=1
     ).strip()
     source = _EVICTION_ADD_TRAILING_FILLER_RE.sub("", source).strip()
     source = source.rstrip("。.!！").strip()
-    return _UNNAMED_EVICTION_MODIFIED_ADD_RE.fullmatch(source) is not None
+    match = _UNNAMED_EVICTION_MODIFIED_ADD_RE.fullmatch(source)
+    if match is None:
+        return None
+    return {
+        "action": "Create",
+        "word": match.group("word").strip(),
+        "code": match.group("code").strip().lower(),
+        "submitAfter": False,
+    }
+
+
+def _has_unnamed_eviction_modified_add(message: str) -> bool:
+    """Recognize an add whose requested eviction omits the live occupant."""
+    return unnamed_eviction_modified_add_item(message) is not None
 
 
 def parsed_operation_kinds(message: str) -> frozenset[str]:

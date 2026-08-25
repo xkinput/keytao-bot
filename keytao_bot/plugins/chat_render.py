@@ -22,6 +22,7 @@ from ..utils import http_client
 from ..utils.pending_confirmation import (
     _BIND_HELP_TEXT,
     _humanize_warning_text,
+    already_existing_word_copy,
     pending_confirmation_copy,
     plain_warning_message,
     front_insert_recommendation_copy,
@@ -1331,7 +1332,32 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         else ""
     )
 
-    lines = [f"词库暂无收录「{word}」："]
+    exact_existing_codes = tuple(dict.fromkeys(
+        str(entry.get("code") or "").strip().lower()
+        for entry in review.get("existing") or []
+        if isinstance(entry, dict)
+        and str(entry.get("word") or "").strip() == word
+        and str(entry.get("code") or "").strip()
+    ))
+    if not exact_existing_codes:
+        exact_existing_codes = tuple(dict.fromkeys(
+            code
+            for code, _occupied in snapshot_candidates
+            if word in snapshot_occupied_words.get(code, [])
+        ))
+    existing_copy = already_existing_word_copy(
+        word,
+        exact_existing_codes,
+        can_choose_other_code=any(
+            code not in exact_existing_codes for code, _occupied in snapshot_candidates
+        ),
+        can_reorder=reorder_recommendation is not None,
+    )
+    lines = (
+        [*existing_copy.splitlines(), f"「{word}」候选编码："]
+        if existing_copy
+        else [f"词库暂无收录「{word}」："]
+    )
     candidate_index = 1
     candidate_indexes: Dict[str, int] = {}
     pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)

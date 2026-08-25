@@ -29,6 +29,7 @@ from ..harness.authorization_grammar import (
     parse_entry_move_plan,
     parse_entry_swap,
     parse_eviction_modified_add,
+    unnamed_eviction_modified_add_item,
 )
 from ..harness.state import (
     ActiveDraftOperation,
@@ -40,6 +41,7 @@ from ..harness.state import (
     PendingTrustedWordRecord,
     PendingToolConfirm,
     SQLiteConversationStateStore,
+    create_pending_trusted_word_record,
     pending_batch_display_pairs,
     pending_execution_args as _pending_execution_args,
     server_warning_pending_state as _pending_state_from_server_warning,
@@ -60,6 +62,7 @@ from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
+    already_existing_word_copy,
     append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_single_word_lookup_codes,
@@ -296,10 +299,17 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
         response,
     )
     reorder_match = re.search(
-        r'(?m)^\s*推荐[：:]\s*「(?P<word>[^」\n]+)」\s*占\s*'
-        r'(?P<code>[a-z]+)\s*、\s*「[^」\n]+」顺延(?:[；;].*)?$',
+        r'(?m)^\s*[-•]\s*[“『]「(?P<word>[^」\n]+)」\s*占\s*'
+        r'(?P<code>[a-z]+)\s*、\s*「[^」\n]+」顺延[”』]'
+        r'(?:\s*[（(][^）)\n]*[）)])?\s*$',
         response,
     )
+    if reorder_match is None:
+        reorder_match = re.search(
+            r'(?m)^\s*推荐[：:]\s*「(?P<word>[^」\n]+)」\s*占\s*'
+            r'(?P<code>[a-z]+)\s*、\s*「[^」\n]+」顺延(?:[；;].*)?$',
+            response,
+        )
     if confirm_match is not None:
         recommended_code = confirm_match.group(1)
         word = confirm_match.group(2)
@@ -892,6 +902,14 @@ async def _try_recover_reviewed_add_from_history(
                 latest_assistant,
                 re.IGNORECASE,
             )
+        if recommended is None:
+            recommended = re.search(
+                r"(?m)^-\s*[“\"]?「[^」\r\n]+」\s*占\s*"
+                r"(?P<code>[a-z]{1,12})\s*、\s*"
+                r"「[^」\r\n]+」\s*顺延[”\"]?",
+                latest_assistant,
+                re.IGNORECASE,
+            )
         displayed_recommended = (
             displayed.recommended_code
             if isinstance(displayed, PendingAddWord)
@@ -1111,7 +1129,18 @@ async def _try_handle_shift_modified_add_command(
 ) -> Optional[str]:
     """Re-review a closed add-plus-shift command and start its bound shift plan."""
     command = explicit_shift_modified_add_item(message_text)
-    if command is None or conv_key is None:
+    if command is None:
+        incomplete = unnamed_eviction_modified_add_item(message_text)
+        if incomplete is None:
+            return None
+        word = str(incomplete.get("word") or "").strip()
+        code = str(incomplete.get("code") or "").strip().lower()
+        return (
+            "这条指令缺少要重新编码或顺延的现有词条，"
+            "不能保留你要求的添加并腾位操作；本次未写入。"
+            f"请明确要为「{word}」腾出 {code} 的现有词条。"
+        )
+    if conv_key is None:
         return None
     word = str(command.get("word") or "").strip()
     code = str(command.get("code") or "").strip().lower()
@@ -2557,7 +2586,51 @@ async def _try_handle_simple_single_word_query(
         )
 
     if lookup_data.get("success") and lookup_data.get("phrases"):
-        return None
+        matching_rows = tuple(
+            phrase
+            for phrase in lookup_data.get("phrases") or []
+            if isinstance(phrase, dict)
+            and str(phrase.get("word") or word).strip() == word
+            and str(phrase.get("code") or "").strip()
+        )
+        existing_codes = tuple(dict.fromkeys(
+            str(phrase.get("code") or "").strip().lower()
+            for phrase in matching_rows
+        ))
+        if existing_codes:
+            if len(existing_codes) == 1 and conv_key is not None:
+                phrase_types = tuple(dict.fromkeys(
+                    str(phrase.get("type") or "").strip()
+                    for phrase in matching_rows
+                    if str(phrase.get("code") or "").strip().lower()
+                    == existing_codes[0]
+                    and str(phrase.get("type") or "").strip()
+                ))
+                trusted_row = (
+                    create_pending_trusted_word_record(
+                        word,
+                        existing_codes[0],
+                        phrase_types[0],
+                    )
+                    if len(phrase_types) == 1
+                    else None
+                )
+                if (
+                    trusted_row is not None
+                    and conversation_state_store.get_record(conv_key) is None
+                ):
+                    conversation_state_store.set(
+                        conv_key,
+                        trusted_row,
+                        space_key=space_key,
+                        owner_label=owner_label,
+                    )
+            return already_existing_word_copy(
+                word,
+                existing_codes,
+                can_choose_other_code=True,
+            )
+        return "词库查询返回了不完整的已有词条记录；本次未继续。"
 
     review_args = {"word": word}
     if requested_reading:
@@ -2803,6 +2876,43 @@ _DRAFT_RESOLUTION_TOOL_KINDS = {
     "keytao_batch_remove_draft_items": "delete",
 }
 
+_DRAFT_WRITE_RECEIPT_TOOLS = frozenset({
+    "keytao_create_phrase",
+    "keytao_batch_add_to_draft",
+    "keytao_shift_phrase_code",
+    "keytao_remove_draft_item",
+    "keytao_batch_remove_draft_items",
+})
+
+
+def _capture_successful_draft_write_delivery(
+    tool_name: str,
+    result: Dict[str, Any],
+    platform: Optional[str],
+    user_id: Optional[str],
+) -> None:
+    """Keep an exact batch receipt until the corresponding reply is delivered."""
+    deliveries = current_draft_delivery_claims.get()
+    if deliveries is None or not platform or not user_id:
+        return
+    is_write = tool_name in _DRAFT_WRITE_RECEIPT_TOOLS
+    is_submit = tool_name == "keytao_submit_batch"
+    if not (is_write or is_submit) or result.get("success") is not True:
+        return
+    if result.get("requiresConfirmation") is True:
+        return
+    batch_id = str(result.get("batchId") or "").strip()
+    if not batch_id:
+        return
+    receipt = {
+        "platform": str(platform),
+        "platformId": str(user_id),
+        "operationKind": "draft_submit" if is_submit else "draft_write",
+        "batchId": batch_id,
+    }
+    if receipt not in deliveries:
+        deliveries.append(receipt)
+
 
 def _capture_resolved_mutation_delivery(
     tool_name: str,
@@ -2856,7 +2966,11 @@ def _acknowledge_delivered_draft_mutations() -> None:
     deliveries = current_draft_delivery_claims.get()
     if not deliveries:
         return
-    for receipt in list(deliveries):
+    mutation_claims = [
+        receipt for receipt in deliveries
+        if receipt.get("operationKind") not in {"draft_write", "draft_submit"}
+    ]
+    for receipt in mutation_claims:
         try:
             acknowledged = get_default_draft_mutation_claim_store().acknowledge(
                 receipt["platform"],
@@ -2877,6 +2991,40 @@ def _acknowledge_delivered_draft_mutations() -> None:
                 receipt["platform"],
                 receipt["platformId"],
                 receipt["operationKind"],
+            )
+    memory_context = current_memory_context.get()
+    if memory_context is not None:
+        submitted_ids = {
+            str(receipt.get("batchId") or "").strip()
+            for receipt in deliveries
+            if receipt.get("operationKind") == "draft_submit"
+        }
+        recent_batch_ids = tuple(dict.fromkeys(
+            str(receipt.get("batchId") or "").strip()
+            for receipt in deliveries
+            if receipt.get("operationKind") == "draft_write"
+            and str(receipt.get("batchId") or "").strip()
+            and str(receipt.get("batchId") or "").strip() not in submitted_ids
+        ))
+        address = memory_context.conversation_address
+        if recent_batch_ids and conversation_state_store.get_record(address) is None:
+            conversation_state_store.set(
+                address,
+                PendingToolConfirm(
+                    function_name="keytao_submit_batch",
+                    args={
+                        "batch_id": (
+                            recent_batch_ids[0]
+                            if len(recent_batch_ids) == 1
+                            else ""
+                        ),
+                        "_recent_own_write": True,
+                        "_recent_batch_ids": list(recent_batch_ids),
+                    },
+                    confirmation_source="local_preview",
+                ),
+                space_key=address.space_key,
+                owner_label=memory_context.speaker_name,
             )
     deliveries.clear()
 
@@ -2930,6 +3078,12 @@ async def call_tool_function(
             if operation_links is not None and tool_name in AUTHORITATIVE_LINK_TOOLS:
                 _capture_trusted_result_links(parsed_result, operation_links)
             _capture_resolved_mutation_delivery(tool_name, platform, user_id)
+            _capture_successful_draft_write_delivery(
+                tool_name,
+                parsed_result,
+                platform,
+                user_id,
+            )
     except (TypeError, ValueError):
         pass
     memory_context = current_memory_context.get()
@@ -2951,6 +3105,12 @@ def _record_agent_tool_receipt(
     result: Dict,
     receipt_id: str,
 ) -> None:
+    _capture_successful_draft_write_delivery(
+        tool_name,
+        result,
+        request_context.platform,
+        request_context.user_id,
+    )
     memory_store.record_tool_receipt(
         ChatMemoryContext(
             platform=request_context.platform,

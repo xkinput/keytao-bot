@@ -33,6 +33,7 @@ from keytao_bot.utils.pending_confirmation import (
     FAILED_WRITE_TEMPLATE_PREFIX,
     SYSTEM_REPLY_TEMPLATE_MARKERS,
     append_unbound_binding_notice,
+    already_existing_word_copy,
     advertised_batch_binding_pairs,
     advertised_reply_contract,
     command_suggestions_are_closed_candidate_selections,
@@ -1097,6 +1098,43 @@ class AgentOrchestrator:
                 )
 
             if not response_tool_calls:
+                existing_fact_blocks = [
+                    (
+                        already_existing_word_copy(
+                            word,
+                            tuple(sorted(codes)),
+                            can_choose_other_code=True,
+                        ).splitlines()[0]
+                        if same_turn_write_batch_ids
+                        else already_existing_word_copy(
+                            word,
+                            tuple(sorted(codes)),
+                            can_choose_other_code=True,
+                        )
+                    )
+                    for word, codes in trusted_word_lookup_codes_by_word.items()
+                    if word in message and codes
+                ]
+                existing_fact_prefix = "\n\n".join(
+                    block for block in existing_fact_blocks if block
+                )
+
+                def lead_with_existing_facts(reply: str) -> str:
+                    rendered = str(reply or "").strip()
+                    if not existing_fact_prefix:
+                        return rendered
+                    if all(
+                        block.splitlines()[0] in rendered
+                        for block in existing_fact_blocks
+                        if block
+                    ):
+                        return rendered
+                    return (
+                        existing_fact_prefix
+                        if not rendered
+                        else existing_fact_prefix + "\n\n" + rendered
+                    )
+
                 if resolved_advertised_words:
                     blocked = [
                         word
@@ -1269,7 +1307,7 @@ class AgentOrchestrator:
                                 f"owner={conv_key} items={len(read_only_items)}"
                             )
                             read_only_reply = self._append_authoritative_result_links(
-                                read_only_content,
+                                lead_with_existing_facts(read_only_content),
                                 authoritative_result_links,
                             )
                             self._server_backed_query_reply = read_only_reply
@@ -1500,7 +1538,7 @@ class AgentOrchestrator:
                             f"owner={conv_key} items={len(pending_items)}"
                         )
                         read_only_reply = self._append_authoritative_result_links(
-                            read_only_content,
+                            lead_with_existing_facts(read_only_content),
                             authoritative_result_links,
                         )
                         self._server_backed_query_reply = read_only_reply
@@ -1590,7 +1628,7 @@ class AgentOrchestrator:
                     if termination_state is not None:
                         termination_state["model_authored_reply"] = True
                     return self._append_authoritative_result_links(
-                        candidate_reply(content),
+                        candidate_reply(lead_with_existing_facts(content)),
                         authoritative_result_links,
                     )
                 if empty_response_retries < 1:

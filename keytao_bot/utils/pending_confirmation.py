@@ -268,6 +268,13 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
     positioned_pairs: list[tuple[int, str, str]] = []
     patterns = (
         re.compile(
+            r"(?m)^\s*[-•]\s*[“『]「(?P<word>[^」\n]{1,128})」\s*"
+            r"占\s*(?P<code>[a-z]{1,12})\s*、\s*"
+            r"「[^」\n]{1,128}」顺延[”』]"
+            r"(?:\s*[（(][^）)\n]{0,128}[）)])?\s*$",
+            re.IGNORECASE,
+        ),
+        re.compile(
             r"(?m)^\s*推荐[：:]\s*「(?P<word>[^」\n]{1,128})」\s*"
             r"占\s*(?P<code>[a-z]{1,12})\s*、\s*"
             r"「[^」\n]{1,128}」顺延(?:[；;][^\n]*)?\s*$",
@@ -758,6 +765,11 @@ def plain_warning_message(warning: Any) -> str:
         ))
         if existing_words:
             target_copy = f"「{word}」" if word else "该词"
+            if word and word in existing_words:
+                return (
+                    f"「{word}」已在词库（{code}）；"
+                    "若无意保留重复词条，无需再次写入"
+                )
             return (
                 f"{code} 与「{'、'.join(existing_words)}」同码，"
                 f"确认后{target_copy}将作为重码写入{weight_copy}"
@@ -779,6 +791,32 @@ def plain_warning_message(warning: Any) -> str:
     if word:
         return f"「{word}」写入前需要确认{weight_copy}"
     return "服务端返回了一项需要确认的风险"
+
+
+def already_existing_word_copy(
+    word: str,
+    codes: tuple[str, ...],
+    *,
+    can_choose_other_code: bool,
+    can_reorder: bool = False,
+) -> str:
+    """Lead with an exact existing fact, then state only live options."""
+    clean_codes = tuple(dict.fromkeys(
+        str(code or "").strip().lower() for code in codes if str(code or "").strip()
+    ))
+    if not word or not clean_codes:
+        return ""
+    actions: list[str] = []
+    if can_choose_other_code:
+        actions.append("选择其他编码（回复「换码」）")
+    if can_reorder:
+        actions.append("调整现有排序（回复「重排」）")
+    action_copy = (
+        "仍可" + "或".join(actions) + "；若保留现状，无需操作。"
+        if actions
+        else "当前没有必须执行的变更；若保留现状，无需操作。"
+    )
+    return f"「{word}」已在词库（{'、'.join(clean_codes)}）。\n{action_copy}"
 
 
 _WARNING_COUNT_COPY_RE = re.compile(
@@ -1159,7 +1197,23 @@ def render_server_backed_batch_candidates(
             and recommended_code != reorder_recommendation["occupantCode"]
         ):
             return ""
-        lines.extend((f"{word_index}. 「{word}」", "   候选："))
+        existing_codes = tuple(
+            code
+            for code, _occupied in scopes_by_word[word]
+            if word in occupied_words_by_scope[word].get(code, ())
+        )
+        lines.append(f"{word_index}. 「{word}」")
+        existing_copy = already_existing_word_copy(
+            word,
+            existing_codes,
+            can_choose_other_code=any(
+                code not in existing_codes for code, _occupied in scopes_by_word[word]
+            ),
+            can_reorder=reorder_recommendation is not None,
+        )
+        if existing_copy:
+            lines.extend(f"   {line}" for line in existing_copy.splitlines())
+        lines.append("   候选：")
         for candidate_index, (code, occupied) in enumerate(
             scopes_by_word[word],
             start=1,
@@ -1215,10 +1269,7 @@ def render_server_backed_batch_lookup(
     footer = pending_batch_confirmation_copy()
     if not rendered.endswith(footer):
         return ""
-    return (
-        rendered[: -len(footer)].rstrip()
-        + "\n以上推荐仅用于本次查询；如需复核，可逐词发送对应词语重新查询。"
-    )
+    return rendered[: -len(footer)].rstrip()
 
 
 def render_query_retry_reply(words: object) -> str:
@@ -1329,24 +1380,32 @@ def front_insert_recommendation_copy(
     recommendation: dict[str, str],
     fallback_selector: object = None,
 ) -> str:
-    """Render the one two-line recommendation/opt-out contract."""
+    """Render one parser-checked recommendation plus its opt-out."""
     word = str(recommendation.get("newWord") or "").strip()
     occupant = str(recommendation.get("occupantWord") or "").strip()
     occupant_code = str(recommendation.get("occupantCode") or "").strip().lower()
     free_code = str(recommendation.get("freeCode") or "").strip().lower()
     summary = str(recommendation.get("summary") or "").strip()
-    recommendation_line = (
-        f"推荐：「{word}」占 {occupant_code}、「{occupant}」顺延"
+    command = (
+        f"「{word}」占 {occupant_code}、「{occupant}」顺延"
     )
-    if summary:
-        recommendation_line += f"；依据：{summary}"
+    recommendation_line = render_executable_suggestion(
+        command,
+        words=(word, occupant),
+    )
+    if not recommendation_line:
+        return ""
     selector = str(fallback_selector or "").strip()
     opt_out = (
         f"不重排选 {selector}（{free_code}）。"
         if selector
         else f"不重排选 {free_code}。"
     )
-    return recommendation_line + "\n" + opt_out
+    lines = ["推荐：", recommendation_line]
+    if summary:
+        lines.append(f"依据：{summary}")
+    lines.append(opt_out)
+    return "\n".join(lines)
 
 
 def single_word_candidate_footer(candidate_count: int) -> str:
@@ -1422,7 +1481,26 @@ def render_server_backed_single_word_candidates(
     )
     if reorder_recommendation is not None:
         recommended = reorder_recommendation["occupantCode"]
-    lines = [f"「{normalized_word}」候选编码："]
+    existing_codes = tuple(
+        code
+        for code, _occupied in normalized_candidates
+        if normalized_word in {
+            str(value or "").strip()
+            for value in occupied_words.get(code, [])
+        }
+    )
+    lines: list[str] = []
+    existing_copy = already_existing_word_copy(
+        normalized_word,
+        existing_codes,
+        can_choose_other_code=any(
+            code not in existing_codes for code, _occupied in normalized_candidates
+        ),
+        can_reorder=reorder_recommendation is not None,
+    )
+    if existing_copy:
+        lines.extend(existing_copy.splitlines())
+    lines.append(f"「{normalized_word}」候选编码：")
     for index, (code, occupied) in enumerate(normalized_candidates, start=1):
         if occupied:
             words = [
@@ -1489,12 +1567,23 @@ def render_server_backed_single_word_lookup(
     has_reorder_copy = False
     if source and advertised_single_word_candidate_codes(source) == expected_codes:
         reorder_copy = re.search(
-            rf"(?m)^\s*推荐[：:]\s*「{re.escape(normalized_word)}」\s*占\s*"
-            rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延(?:[；;][^\n]*)?\n"
+            rf"(?m)^\s*推荐[：:]\s*\n"
+            rf"\s*[-•]\s*[“『]「{re.escape(normalized_word)}」\s*占\s*"
+            rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延[”』]"
+            rf"(?:\s*[（(][^）)\n]*[）)])?\s*\n"
+            rf"(?:\s*依据[：:][^\n]*\n)?"
             r"\s*不重排选\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
             source,
             re.IGNORECASE,
         )
+        if reorder_copy is None:
+            reorder_copy = re.search(
+                rf"(?m)^\s*推荐[：:]\s*「{re.escape(normalized_word)}」\s*占\s*"
+                rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延(?:[；;][^\n]*)?\n"
+                r"\s*不重排选\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
+                source,
+                re.IGNORECASE,
+            )
         if reorder_copy is not None:
             body = source[:reorder_copy.end()].rstrip()
             has_reorder_copy = True
@@ -1548,13 +1637,23 @@ def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
     )
     if recommended is None:
         recommended = re.search(
-            r"(?m)^推荐:\s*「[^「」\r\n]{1,128}」占\s*"
-            r"(?P<code>[a-z]{1,12})、\s*「[^「」\r\n]{1,128}」顺延"
-            r"(?:;[^\r\n]*)?\n不重排选\s+[1-9]\d{0,2}"
+            r"(?m)^推荐:\s*\n[-•]\s*[“『]「[^「」\r\n]{1,128}」占\s*"
+            r"(?P<code>[a-z]{1,12})、\s*「[^「」\r\n]{1,128}」顺延[”』]"
+            r"(?:\s*\([^\r\n)]*\))?\s*\n(?:依据:[^\r\n]*\n)?"
+            r"不重排选\s+[1-9]\d{0,2}"
             r"(?:\([a-z]{1,12}\))?[。.]*\s*$",
             normalized,
             re.IGNORECASE,
         )
+        if recommended is None:
+            recommended = re.search(
+                r"(?m)^推荐:\s*「[^「」\r\n]{1,128}」占\s*"
+                r"(?P<code>[a-z]{1,12})、\s*「[^「」\r\n]{1,128}」顺延"
+                r"(?:;[^\r\n]*)?\n不重排选\s+[1-9]\d{0,2}"
+                r"(?:\([a-z]{1,12}\))?[。.]*\s*$",
+                normalized,
+                re.IGNORECASE,
+            )
         if recommended is None:
             return ()
         candidate_source = normalized[:recommended.start()]

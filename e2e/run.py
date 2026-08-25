@@ -2098,6 +2098,17 @@ async def async_main(args: argparse.Namespace) -> int:
                             seed_identity=seed_identity,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S40":
+                        fixture_facts["s40SubmittedCleanup"] = (
+                            await client.clean_submitted_batches(
+                                identities[scenario.scenario_id]["platform_id"]
+                            )
+                        )
+                        fixture_facts["s40"] = await ensure_s35_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S36":
                         fixture_facts["s36SubmittedCleanup"] = (
                             await client.clean_submitted_batches(

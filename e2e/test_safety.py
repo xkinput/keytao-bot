@@ -49,6 +49,10 @@ from .scenarios import (
     S39_SELECTION,
     S39_TARGET_CODE,
     S39_WORD,
+    S40_BATCH_WORDS,
+    S40_COPY_WORD,
+    S40_OCCUPANT,
+    S40_TARGET_CODE,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -505,15 +509,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S35 replays the 2026-08-22 default-reorder incident", readme)
         self.assertIn("S36 replays the 2026-08-23 delete-and-swap incident round", readme)
         self.assertIn("S39 collapses the explicit-reading eviction flow", readme)
+        self.assertIn("S40 closes the 2026-08-25 assent-execution incident round", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s39(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s40(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 40)],
+            [f"S{index}" for index in range(1, 41)],
         )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:
@@ -573,6 +578,18 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         }
         self.assertEqual(entries[S39_WORD], ("absent", []))
         self.assertEqual(entries[S39_OCCUPANT], ("found", ["chú", "quán"]))
+
+    def test_s40_declares_combined_incident_fixture(self) -> None:
+        self.assertEqual(
+            (S40_COPY_WORD, S40_OCCUPANT, S40_TARGET_CODE),
+            ("发布会", "重病号", "fbh"),
+        )
+        self.assertEqual(S40_BATCH_WORDS, S23_BATCH_WORDS[:2])
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S40"]
+        self.assertEqual(
+            fixture["probe_words"],
+            (*ZDIC_FIXTURES_BY_SCENARIO["S35"]["probe_words"], *S40_BATCH_WORDS),
+        )
 
     def test_s35_declares_isolated_reorder_and_free_slot_controls(self) -> None:
         self.assertEqual(
@@ -1368,7 +1385,8 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                         return (
                             "是否以编码 zhlq 将「载流」加入草稿？\n"
                             "是否以编码 zlz 将「载流子」加入草稿？\n"
-                            "推荐：「载流子」占 zlz、「座落在」顺延\n"
+                            "推荐：\n"
+                            "- “「载流子」占 zlz、「座落在」顺延”（载流子、座落在）\n"
                             "不重排选 2（zlzu）。\n\n"
                             "回复「加入」、「都加」、「添加」只加入草稿；"
                             "回复「加入并提交」、「都加并提交」、「添加并提交」则加入后提交。\n"
@@ -1379,7 +1397,8 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                         "这些词是否一起加入草稿并提交？\n"
                         "- 「载流」→ zhlq\n"
                         "- 「载流子」→ zlz\n"
-                        "推荐：「载流子」占 zlz、「座落在」顺延\n"
+                        "推荐：\n"
+                        "- “「载流子」占 zlz、「座落在」顺延”（载流子、座落在）\n"
                         "不重排选 2（zlzu）。\n\n"
                         "回复「加入」、「都加」、「添加」只加入草稿；"
                         "回复「加入并提交」、「都加并提交」、「添加并提交」则加入后提交。"
@@ -2138,7 +2157,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         )
         self.assertEqual(result["facts"]["batchId"], "batch-s22")
 
-    async def test_s23_offline_recovers_stale_quote_then_bare_assent_writes_exact_set(
+    async def test_s23_offline_recovers_stale_quote_and_applies_same_assent(
         self,
     ) -> None:
         scenario = next(item for item in SCENARIOS if item.scenario_id == "S23")
@@ -2199,26 +2218,6 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                         )
                         + "\n回复「加入并提交」则加入后提交。"
                     )
-                if text == "加入并提交":
-                    items = [
-                        {"action": "Create", "word": word, "code": code}
-                        for word, code in persisted_pairs
-                    ]
-                    self.completed_batch_id = "batch-s23"
-                    self.record(
-                        name="keytao_batch_add_to_draft",
-                        arguments={"items": items},
-                        result={"success": True, "batchId": self.completed_batch_id},
-                    )
-                    self.record(
-                        name="keytao_submit_batch",
-                        result={
-                            "success": True,
-                            "batchId": self.completed_batch_id,
-                            "autoApproved": True,
-                        },
-                    )
-                    return "✅ 已按新确认请求加入并提交"
                 if text == "确认":
                     raise AssertionError("offline S23 should not need extra confirmation")
                 raise AssertionError(text)
@@ -2234,14 +2233,25 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 self.reply_requests.append((text, reply_message_id))
                 self.assertEqual((text, reply_message_id), ("加入并提交", 601))
                 self.last_reply_message_id = 602
-                return (
-                    "已重新复核以下 9 个词，当前候选如下：\n"
-                    + "\n".join(
-                        f'- 「{word}」 → {code}'
-                        for word, code in expected_pairs
-                    )
-                    + "\n回复「加入并提交」则加入后提交。"
+                items = [
+                    {"action": "Create", "word": word, "code": code}
+                    for word, code in persisted_pairs
+                ]
+                self.completed_batch_id = "batch-s23"
+                self.record(
+                    name="keytao_batch_add_to_draft",
+                    arguments={"items": items},
+                    result={"success": True, "batchId": self.completed_batch_id},
                 )
+                self.record(
+                    name="keytao_submit_batch",
+                    result={
+                        "success": True,
+                        "batchId": self.completed_batch_id,
+                        "autoApproved": True,
+                    },
+                )
+                return "✅ 已重新复核并按本轮指令加入并提交"
 
             async def draft(self):
                 return {"batchId": None, "contentVersion": 0, "items": []}
@@ -2273,12 +2283,12 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
 
         self.assertEqual(context.reset_calls, 2)
         self.assertEqual(context.reply_requests, [("加入并提交", 601)])
-        self.assertEqual(result["facts"]["recoveryWrites"], 0)
+        self.assertEqual(result["facts"]["recoveryWrites"], 1)
         self.assertEqual(result["facts"]["confirmationSteps"], 0)
         self.assertEqual(result["facts"]["batchId"], "batch-s23")
         self.assertEqual(result["facts"]["batchStatus"], "Approved")
         self.assertEqual(
-            result["facts"]["freshAdvertisedPairs"],
+            result["facts"]["recoveredAppliedPairs"],
             [list(pair) for pair in expected_pairs],
         )
 

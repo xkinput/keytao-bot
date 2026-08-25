@@ -403,6 +403,13 @@ exact same-chain priority swap over the draft-aware merged view. Every reply is
 also checked for normalized internal tool identifiers and model-facing
 `禁止重复调用` / `请直接根据…回复用户` directives.
 
+S40 closes the 2026-08-25 assent-execution incident round. It proves that an
+executable front-insert recommendation can be copied back verbatim, that the
+actor's next-turn `确认并提交` submits the one batch just written, that a
+stale quoted multi-word `加入并提交` re-establishes and applies the same assent
+without a politeness loop, and that an existing dictionary word leads with its
+exact current code before any remaining options.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`

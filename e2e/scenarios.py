@@ -1262,7 +1262,8 @@ async def scenario_s16(ctx: ScenarioContext) -> dict[str, Any]:
         f"S16 discovery rendering did not advertise both exact bindings: {discovery_reply}",
     )
     require(
-        f"推荐：「载流子」占 {occupied_code}、「{occupant_word}」顺延" in discovery_reply
+        f"「载流子」占 {occupied_code}、「{occupant_word}」顺延" in discovery_reply
+        and "推荐：\n- " in discovery_reply
         and "不重排选 2（zlzu）。" in discovery_reply,
         f"S16 discovery did not render the comparator default coherently: {discovery_reply}",
     )
@@ -2492,7 +2493,7 @@ S23_BATCH_WORDS = S19_ADVERTISED_WORDS[:9]
 
 
 async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
-    """A stale advertised assent re-reviews in place, then its fresh ticket writes."""
+    """A stale advertised assent re-reviews and consumes that assent immediately."""
     messages: list[str] = []
     replies: list[str] = []
 
@@ -2535,20 +2536,15 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
         to_me=True,
     )
     replies.append(recovered)
-    fresh_message_id = ctx.last_reply_message_id
-    fresh_pairs = advertised_batch_binding_pairs(recovered)
+    recovery_message_id = ctx.last_reply_message_id
     require(
-        fresh_message_id is not None and fresh_message_id != stale_message_id,
-        "S23 same-turn recovery exposed no distinct fresh bot message",
+        recovery_message_id is not None and recovery_message_id != stale_message_id,
+        "S23 same-turn recovery exposed no distinct result message",
     )
     require(
-        len(fresh_pairs) == len(S23_BATCH_WORDS)
-        and tuple(word for word, _code in fresh_pairs) == S23_BATCH_WORDS,
-        f"S23 recovery did not re-review the exact display-bound words: {recovered}",
-    )
-    require(
-        "已重新复核" in recovered,
-        f"S23 stale assent did not continue through re-review: {recovered}",
+        "加入并提交」则加入后提交" not in recovered
+        and "回复「加入并提交」" not in recovered,
+        f"S23 recovery re-prompted for the assent it had already received: {recovered}",
     )
     require(
         not any(
@@ -2561,10 +2557,6 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
         ),
         f"S23 stale assent still dead-ended: {recovered}",
     )
-    require(
-        not (await ctx.draft()).get("items"),
-        "S23 recovery wrote before the fresh ticket was accepted",
-    )
     recovery_writes = [
         event
         for event in ctx.attempt_events()
@@ -2572,16 +2564,6 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
         and event.get("kind") == "tool"
         and event.get("name") == "keytao_batch_add_to_draft"
     ]
-    require(
-        not recovery_writes,
-        f"S23 same-turn recovery mutated the draft: {recovery_writes}",
-    )
-
-    # This assent deliberately carries no native quote. The fresh actor-owned
-    # ticket created above must be enough to execute exactly the new display.
-    messages.append("加入并提交")
-    assent_reply = await ctx.send_group("加入并提交", to_me=True)
-    replies.append(assent_reply)
     draft = await ctx.draft()
     completed_batch_id = _successful_submit_batch_id(
         ctx.attempt_events(),
@@ -2590,8 +2572,8 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
     confirmation_steps = 0
     if not draft.get("items") and not completed_batch_id:
         require(
-            "确认" in assent_reply,
-            f"S23 fresh bare assent neither wrote nor reached confirmation: {assent_reply}",
+            pending_confirmation_copy() in recovered or "确认" in recovered,
+            f"S23 recovered assent neither executed nor reached policy confirmation: {recovered}",
         )
         confirmation_steps = 1
         messages.append("确认")
@@ -2603,10 +2585,7 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
         )
 
     batch_status = "Draft"
-    expected_keys = tuple(
-        ("Create", word, code)
-        for word, code in fresh_pairs
-    )
+    expected_keys = tuple(("Create", word, code) for word, code in stale_pairs)
     if completed_batch_id:
         batch_id = completed_batch_id
         completed_batch = await ctx.next_client.get_admin_batch(
@@ -2634,7 +2613,7 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
 
     require(
         same_unique_item_set(actual_keys, expected_keys),
-        "S23 fresh bare assent did not write exactly its displayed set: "
+        "S23 recovered assent did not write exactly its displayed set: "
         f"expected={expected_keys}, actual={actual_keys}",
     )
     write_events = [
@@ -2644,7 +2623,7 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
         and event.get("kind") == "tool"
         and event.get("name") == "keytao_batch_add_to_draft"
     ]
-    require(write_events, "S23 fresh bare assent never reached the batch tool")
+    require(write_events, "S23 recovered assent never reached the batch tool")
     for event in write_events:
         event_pairs = tuple(
             (
@@ -2655,7 +2634,7 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
             if isinstance(item, dict)
         )
         require(
-            same_unique_item_set(event_pairs, fresh_pairs),
+            same_unique_item_set(event_pairs, stale_pairs),
             f"S23 write escaped the recovered ticket: {event}",
         )
 
@@ -2665,9 +2644,9 @@ async def scenario_s23(ctx: ScenarioContext) -> dict[str, Any]:
         "draft": draft,
         "facts": {
             "staleAdvertisedPairs": [list(pair) for pair in stale_pairs],
-            "freshAdvertisedPairs": [list(pair) for pair in fresh_pairs],
+            "recoveredAppliedPairs": [list(pair) for pair in stale_pairs],
             "staleMessageId": stale_message_id,
-            "freshMessageId": fresh_message_id,
+            "recoveryMessageId": recovery_message_id,
             "forcedStateLoss": True,
             "recoveryWrites": len(recovery_writes),
             "confirmationSteps": confirmation_steps,
@@ -4479,8 +4458,7 @@ async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
         f"S33 external occupant was not shown: {external_reply}",
     )
     require(
-        "本次查询" in external_reply
-        and "无法唯一绑定" not in external_reply
+        "无法唯一绑定" not in external_reply
         and "本次不会写入" not in external_reply
         and "查看草稿" not in external_reply,
         f"S33 pure query used write-flow failure copy: {external_reply}",
@@ -4950,11 +4928,13 @@ async def scenario_s35(ctx: ScenarioContext) -> dict[str, Any]:
     ]
     require(
         len(recommendation_lines) == 2
-        and recommendation_lines[0].startswith(
-            f"推荐：「{default_word}」占 {default_code}、"
-            f"「{default_occupant}」顺延；依据："
-        )
+        and recommendation_lines[0] == "推荐："
         and recommendation_lines[1] == f"不重排选 2（{default_free}）。"
+        and (
+            f'- “「{default_word}」占 {default_code}、'
+            f'「{default_occupant}」顺延”'
+        ) in recommendation
+        and "依据：" in recommendation
         and "推荐编码：" not in recommendation
         and "当前建议不调整现有排序" not in recommendation
         and f"{default_word} → {default_free}（推荐）" not in recommendation,
@@ -5046,8 +5026,9 @@ async def scenario_s35(ctx: ScenarioContext) -> dict[str, Any]:
     opt_out_discovery = await ctx.send(messages[-1])
     replies.append(opt_out_discovery)
     require(
-        f"推荐：「{opt_out_word}」占 {opt_out_code}、「{opt_out_occupant}」顺延"
+        f"「{opt_out_word}」占 {opt_out_code}、「{opt_out_occupant}」顺延"
         in opt_out_discovery
+        and "推荐：\n- " in opt_out_discovery
         and f"不重排选 2（{opt_out_free}）。" in opt_out_discovery,
         f"S35 opt-out discovery lacked the bound fallback: {opt_out_discovery}",
     )
@@ -5782,6 +5763,208 @@ async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S40_COPY_WORD = "发布会"
+S40_OCCUPANT = "重病号"
+S40_TARGET_CODE = "fbh"
+S40_BATCH_WORDS = S23_BATCH_WORDS[:2]
+
+
+async def scenario_s40(ctx: ScenarioContext) -> dict[str, Any]:
+    """Close executable copy, next-turn submit, recovery, and existing facts."""
+    fixture = ctx.fixture_facts["s40"]
+    front = fixture["frontCases"][0]
+    shifted_code = str(front["shiftedCode"])
+    messages: list[str] = []
+    replies: list[str] = []
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    messages.append(f"喵喵 {S40_OCCUPANT}")
+    existing_reply = await ctx.send(messages[-1])
+    replies.append(existing_reply)
+    first_existing_line = next(
+        (line.strip() for line in existing_reply.splitlines() if line.strip()),
+        "",
+    )
+    require(
+        first_existing_line == f"「{S40_OCCUPANT}」已在词库（{S40_TARGET_CODE}）。"
+        and "无需操作" in existing_reply,
+        f"S40 existing-word lookup did not lead with the exact fact: {existing_reply}",
+    )
+
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    messages.append(f"喵喵 {S40_COPY_WORD}")
+    recommendation = await ctx.send(messages[-1])
+    replies.append(recommendation)
+    executable_lines = [
+        line.strip()
+        for line in recommendation.splitlines()
+        if line.strip().startswith("- ")
+        and f"「{S40_COPY_WORD}」占 {S40_TARGET_CODE}" in line
+        and f"「{S40_OCCUPANT}」顺延" in line
+    ]
+    require(
+        len(executable_lines) == 1,
+        f"S40 discovery exposed no unique executable recommendation: {recommendation}",
+    )
+    copied_line = executable_lines[0]
+    require(
+        advertised_batch_binding_pairs(copied_line)
+        == ((S40_COPY_WORD, S40_TARGET_CODE),),
+        f"S40 copied recommendation did not preserve its displayed operands: {copied_line}",
+    )
+
+    copy_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(copied_line)
+    copy_reply = await ctx.send(messages[-1])
+    replies.append(copy_reply)
+    copy_confirmations = 0
+    draft = await ctx.draft()
+    if not draft.get("items"):
+        require(
+            pending_confirmation_copy() in copy_reply or "确认" in copy_reply,
+            f"S40 copied recommendation neither wrote nor exposed its sealed plan: {copy_reply}",
+        )
+        messages.append("确认")
+        replies.append(await ctx.send(messages[-1]))
+        copy_confirmations = 1
+        draft = await ctx.draft()
+    batch_id = str(draft.get("batchId") or "")
+    expected_reorder_items = (
+        ("Delete", S40_OCCUPANT, S40_TARGET_CODE),
+        ("Create", S40_OCCUPANT, shifted_code),
+        ("Create", S40_COPY_WORD, S40_TARGET_CODE),
+    )
+    actual_reorder_items = tuple(
+        item_key(item)
+        for item in draft.get("items", [])
+        if isinstance(item, dict)
+    )
+    require(
+        batch_id and same_unique_item_set(actual_reorder_items, expected_reorder_items),
+        f"S40 copied recommendation did not materialize its exact plan: {draft}",
+    )
+    copy_calls = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > copy_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+    ]
+    require(copy_calls, "S40 copy-back never reached the shift tool")
+
+    submit_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("确认并提交")
+    submit_reply = await ctx.send(messages[-1])
+    replies.append(submit_reply)
+    submitted_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=submit_cutoff,
+    )
+    require(
+        submitted_batch_id == batch_id,
+        "S40 next-turn 确认并提交 did not submit the actor's just-written batch: "
+        f"expected={batch_id}, actual={submitted_batch_id}, reply={submit_reply}",
+    )
+    submitted_batch = await ctx.next_client.get_admin_batch(
+        batch_id=batch_id,
+        admin_token=ctx.admin_token,
+    )
+    require(
+        submitted_batch.get("status") in {"Submitted", "Approved"},
+        f"S40 copy-back batch never reached submission: {submitted_batch}",
+    )
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    discovery_message = "喵喵 加词 " + " ".join(S40_BATCH_WORDS)
+    messages.append(discovery_message)
+    batch_discovery = await ctx.send_group(discovery_message, to_me=True)
+    replies.append(batch_discovery)
+    stale_message_id = ctx.last_reply_message_id
+    displayed_pairs = advertised_batch_binding_pairs(batch_discovery)
+    require(
+        stale_message_id is not None
+        and tuple(word for word, _code in displayed_pairs) == S40_BATCH_WORDS
+        and "以上推荐仅用于本次查询" not in batch_discovery,
+        f"S40 multi-word query did not expose the exact clean assent set: {batch_discovery}",
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    recovery_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入并提交")
+    recovered_reply = await ctx.send_group_reply(
+        "加入并提交",
+        reply_message_id=stale_message_id,
+        to_me=True,
+    )
+    replies.append(recovered_reply)
+    require(
+        "回复「加入」写入草稿" not in recovered_reply
+        and "回复「加入并提交」" not in recovered_reply,
+        f"S40 recovery consumed assent only to ask for it again: {recovered_reply}",
+    )
+    recovered_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=recovery_cutoff,
+    )
+    recovery_confirmations = 0
+    if not recovered_batch_id:
+        recovered_draft = await ctx.draft()
+        require(
+            not recovered_draft.get("items")
+            and (pending_confirmation_copy() in recovered_reply or "确认" in recovered_reply),
+            f"S40 recovered assent neither submitted nor reached policy confirmation: {recovered_reply}",
+        )
+        messages.append("确认")
+        replies.append(await ctx.send_group("确认", to_me=True))
+        recovery_confirmations = 1
+        recovered_batch_id = _successful_submit_batch_id(
+            ctx.attempt_events(),
+            after_sequence=recovery_cutoff,
+        )
+    require(recovered_batch_id, "S40 recovered add-and-submit never submitted")
+    recovered_batch = await ctx.next_client.get_admin_batch(
+        batch_id=recovered_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    recovered_pairs = tuple(
+        (str(item.get("word") or ""), str(item.get("code") or "").lower())
+        for item in recovered_batch.get("pullRequests", [])
+        if isinstance(item, dict) and item.get("action") == "Create"
+    )
+    require(
+        recovered_batch.get("status") in {"Submitted", "Approved"}
+        and same_unique_item_set(recovered_pairs, displayed_pairs),
+        f"S40 recovery escaped its displayed batch: {recovered_batch}",
+    )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "existingLead": first_existing_line,
+            "copiedRecommendation": copied_line,
+            "copyConfirmationSteps": copy_confirmations,
+            "copyBatchId": batch_id,
+            "nextTurnSubmitBatchId": submitted_batch_id,
+            "recoveredPairs": [list(pair) for pair in recovered_pairs],
+            "recoveryConfirmationSteps": recovery_confirmations,
+            "recoveredBatchId": recovered_batch_id,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -5822,6 +6005,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S37", "occupant eviction and selected-slot revalidation", scenario_s37),
     Scenario("S38", "reading, query recovery, and modifier incident closure", scenario_s38),
     Scenario("S39", "one-turn reading selection and occupant eviction closure", scenario_s39),
+    Scenario("S40", "assent execution and existing-word incident closure", scenario_s40),
 )
 
 
