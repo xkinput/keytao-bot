@@ -54,6 +54,8 @@ from .scenarios import (
     S39_OCCUPANT,
     S39_TARGET_CODE,
     S39_WORD,
+    S41_EXISTING_CODES,
+    S41_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -1744,6 +1746,80 @@ async def ensure_s39_fixture(
     }
 
 
+async def ensure_s41_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed the incident word at both exact codes and reject any conflict."""
+    transport_attempts: list[dict[str, Any]] = []
+    existing_rows: dict[str, dict[str, Any]] = {}
+    for code in S41_EXISTING_CODES:
+        exact_rows = [
+            row
+            for row in await _retry_fixture_client_call(
+                probe=f"S41 {code} existing-word lookup",
+                request=lambda code=code: client.phrases_by_code(code),
+                attempt_facts=transport_attempts,
+            )
+            if row.get("code") == code
+        ]
+        if exact_rows:
+            valid_existing = (
+                len(exact_rows) == 1
+                and exact_rows[0].get("word") == S41_WORD
+                and exact_rows[0].get("type") == "Phrase"
+                and exact_rows[0].get("weight") == 100
+            )
+            if not valid_existing:
+                raise RigInfrastructureError(
+                    f"S41 cannot safely use occupied fixture code {code}: {exact_rows}"
+                )
+        else:
+            await _retry_fixture_client_call(
+                probe=f"S41 {code} seed draft cleanup",
+                request=lambda: client.clean_draft(seed_identity["platform_id"]),
+                attempt_facts=transport_attempts,
+            )
+            await _retry_fixture_client_call(
+                probe=f"S41 {S41_WORD}@{code} seed",
+                request=lambda code=code: client.seed_phrase(
+                    platform_id=seed_identity["platform_id"],
+                    word=S41_WORD,
+                    code=code,
+                ),
+                attempt_facts=transport_attempts,
+            )
+            exact_rows = [
+                row
+                for row in await _retry_fixture_client_call(
+                    probe=f"S41 {code} fixture verification lookup",
+                    request=lambda code=code: client.phrases_by_code(code),
+                    attempt_facts=transport_attempts,
+                )
+                if row.get("code") == code
+            ]
+        if not (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == S41_WORD
+            and exact_rows[0].get("type") == "Phrase"
+            and exact_rows[0].get("weight") == 100
+        ):
+            raise RigInfrastructureError(
+                f"S41 fixture did not resolve to sole {S41_WORD}@{code} "
+                f"weight 100: {exact_rows}"
+            )
+        existing_rows[code] = exact_rows[0]
+    return _with_transport_attempts(
+        {
+            "word": S41_WORD,
+            "existingCodes": list(S41_EXISTING_CODES),
+            "rows": existing_rows,
+        },
+        transport_attempts,
+    )
+
+
 def initialize_openai_chat(config: dict[str, Any], *, state_dir: Path) -> Any:
     apply_bot_environment(config)
     import nonebot
@@ -2105,6 +2181,12 @@ async def async_main(args: argparse.Namespace) -> int:
                             )
                         )
                         fixture_facts["s40"] = await ensure_s35_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S41":
+                        fixture_facts["s41"] = await ensure_s41_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

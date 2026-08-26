@@ -53,6 +53,11 @@ from .scenarios import (
     S40_COPY_WORD,
     S40_OCCUPANT,
     S40_TARGET_CODE,
+    S41_CODE_MESSAGE,
+    S41_EXISTING_CODES,
+    S41_READING_MESSAGE,
+    S41_WORD,
+    S42_WORDS,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -74,6 +79,7 @@ from .scenarios import (
     S34_WORD,
     S35_FRONT_CASES,
     S35_FREE_CONTROL,
+    _recommended_empty_code,
     assert_batch_link_hosts,
     same_unique_item_set,
 )
@@ -87,6 +93,7 @@ from .run import (
     ensure_s18_fixture,
     ensure_s25_fixture,
     ensure_s29_fixture,
+    ensure_s41_fixture,
     ensure_scenario_zdic_fixture,
     repair_scenario_dictionary_fixture,
 )
@@ -510,15 +517,17 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S36 replays the 2026-08-23 delete-and-swap incident round", readme)
         self.assertIn("S39 collapses the explicit-reading eviction flow", readme)
         self.assertIn("S40 closes the 2026-08-25 assent-execution incident round", readme)
+        self.assertIn("S41 closes the 2026-08-26 reading-reply duplication incident", readme)
+        self.assertIn("S42 closes the 2026-08-26 missing-affordance incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s40(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s42(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 41)],
+            [f"S{index}" for index in range(1, 43)],
         )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:
@@ -589,6 +598,40 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(
             fixture["probe_words"],
             (*ZDIC_FIXTURES_BY_SCENARIO["S35"]["probe_words"], *S40_BATCH_WORDS),
+        )
+
+    def test_s41_pins_reading_and_code_questions(self) -> None:
+        self.assertEqual(S41_WORD, "畜产品")
+        self.assertEqual(S41_READING_MESSAGE, "畜产品的畜字怎么读")
+        self.assertEqual(S41_CODE_MESSAGE, "畜产品怎么编码")
+        self.assertEqual(S41_EXISTING_CODES, ("xjpoo", "jjpoo"))
+
+    def test_s42_pins_the_three_word_affordance_incident(self) -> None:
+        self.assertEqual(S42_WORDS, ("老登", "中登", "小登"))
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S42"]
+        self.assertEqual(fixture["probe_words"], S42_WORDS)
+        entries = {
+            row["entry"]: (row["status"], row["pinyins"])
+            for row in fixture["rows"]
+            if row["kind"] == "entry"
+        }
+        self.assertEqual(
+            entries,
+            {word: ("absent", []) for word in S42_WORDS},
+        )
+
+    def test_recommended_empty_code_accepts_executable_opt_out(self) -> None:
+        reply = (
+            "候选编码:\n"
+            "1. wkxk — 已有「赤溪」 ← 常用度推荐（需重排）\n"
+            "2. wkxko — 空位\n"
+            "推荐：\n"
+            "- “「吃席」占 wkxk、「赤溪」顺延”（吃席、赤溪）\n"
+            "不重排选 2（wkxko）。"
+        )
+        self.assertEqual(
+            _recommended_empty_code(reply, word="吃席"),
+            "wkxko",
         )
 
     def test_s35_declares_isolated_reorder_and_free_slot_controls(self) -> None:
@@ -3664,6 +3707,35 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["occupants"]["wlf"]["word"], "窝里反")
         self.assertEqual(result["occupants"]["wlfo"]["word"], "晚礼服")
         self.assertEqual(result["emptyCode"], "wlfoo")
+
+    async def test_s41_dictionary_fixture_seeds_both_existing_codes(self) -> None:
+        client = LocalNextClient(base_url="http://localhost:3100", bot_token="test")
+        xjpoo = {
+            "word": "畜产品",
+            "code": "xjpoo",
+            "type": "Phrase",
+            "weight": 100,
+            "user": {"name": "keytao-e2e-llm-rig-run-seed"},
+        }
+        jjpoo = {**xjpoo, "code": "jjpoo"}
+        client.phrases_by_code = AsyncMock(side_effect=[[], [xjpoo], [], [jjpoo]])
+        client.clean_draft = AsyncMock(return_value={"success": True})
+        client.seed_phrase = AsyncMock(return_value={"batchId": "fixture-batch"})
+
+        result = await ensure_s41_fixture(
+            client=client,
+            seed_identity={"platform_id": "6" * 32},
+        )
+
+        self.assertEqual(
+            client.seed_phrase.await_args_list,
+            [
+                call(platform_id="6" * 32, word="畜产品", code="xjpoo"),
+                call(platform_id="6" * 32, word="畜产品", code="jjpoo"),
+            ],
+        )
+        self.assertEqual(result["word"], "畜产品")
+        self.assertEqual(result["existingCodes"], ["xjpoo", "jjpoo"])
 
     def test_llm_endpoint_can_never_be_keytao_production(self) -> None:
         self.assertEqual(

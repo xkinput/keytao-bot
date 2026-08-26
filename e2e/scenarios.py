@@ -110,6 +110,20 @@ def assert_reply_mentions(reply: str, *markers: str) -> None:
     require(not missing, f"reply omitted stable markers {missing}: {reply}")
 
 
+def duplicate_visible_lines(reply: str) -> tuple[str, ...]:
+    """Return normalized non-empty lines that were displayed more than once."""
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for raw_line in reply.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        if line in seen and line not in duplicates:
+            duplicates.append(line)
+        seen.add(line)
+    return tuple(duplicates)
+
+
 def batch_link_ids(reply: str) -> set[str]:
     return set(re.findall(r"/batch/([A-Za-z0-9_-]+)", reply))
 
@@ -1367,6 +1381,12 @@ def _recommended_empty_code(reply: str, *, word: str) -> str:
     if match is None:
         match = re.search(
             rf"(?m)^[•*-]\s*「{re.escape(word)}」\s*→\s*(?P<code>[a-z]{{2,12}})\s*（推荐）\s*$",
+            reply,
+        )
+    if match is None:
+        match = re.search(
+            r"(?m)^不重排选\s+\d+\s*[（(]"
+            r"(?P<code>[a-z]{2,12})[）)]。?\s*$",
             reply,
         )
     require(match is not None, f"{word} discovery omitted a recommended empty code: {reply}")
@@ -5965,6 +5985,207 @@ async def scenario_s40(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S41_WORD = "畜产品"
+S41_READING_MESSAGE = f"{S41_WORD}的畜字怎么读"
+S41_CODE_MESSAGE = f"{S41_WORD}怎么编码"
+S41_EXISTING_CODES = ("xjpoo", "jjpoo")
+
+
+async def scenario_s41(ctx: ScenarioContext) -> dict[str, Any]:
+    """Keep reading Q&A focused while code Q&A gets bounded unique facts."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    messages.append(f"喵喵 {S41_READING_MESSAGE}")
+    reading_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(reading_reply)
+    require(
+        S41_WORD in reading_reply
+        and re.search(
+            r"(?:畜产品[^\n]{0,30}(?:畜[^\n]{0,12})?|畜[^\n]{0,20})"
+            r"(?:规范)?读\s*chù",
+            reading_reply,
+        )
+        is not None
+        and any(marker in reading_reply for marker in ("这里", "产品", "牲畜", "表示", "用于")),
+        f"S41 reading question did not answer the contextual pronunciation: {reading_reply}",
+    )
+    require(
+        re.search(r"畜产品[^\n]{0,40}读\s*xù", reading_reply) is None
+        and re.search(r"畜产品[^\n]{0,40}畜[^\n]{0,20}(?:是|为)\s*xù", reading_reply) is None,
+        f"S41 reading question assigned the wrong contextual pronunciation: {reading_reply}",
+    )
+    require(
+        not any(
+            marker in reading_reply
+            for marker in (
+                "补充说明：",
+                "编码位置说明",
+                "常用度对比",
+                "当前用",
+                *S41_EXISTING_CODES,
+            )
+        ),
+        f"S41 reading question leaked code-position diagnostics: {reading_reply}",
+    )
+    require(
+        "？不，" not in reading_reply
+        and "?不," not in reading_reply
+        and not duplicate_visible_lines(reading_reply),
+        f"S41 reading reply retained scratch correction or duplicate lines: {reading_reply}",
+    )
+
+    messages.append(f"喵喵 {S41_CODE_MESSAGE}")
+    code_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(code_reply)
+    existing_fact_lines = [
+        line.strip()
+        for line in code_reply.splitlines()
+        if "「畜产品」已在词库：" in line
+        and all(code in line for code in S41_EXISTING_CODES)
+    ]
+    require(
+        "补充说明：" in code_reply
+        and "畜产品 的编码位置说明：" in code_reply
+        and len(existing_fact_lines) == 1,
+        f"S41 code question did not render one existing-entry fact block: {code_reply}",
+    )
+    require(
+        "当前用" not in code_reply
+        and code_reply.count("常用度对比：") <= 1
+        and not duplicate_visible_lines(code_reply),
+        f"S41 code explanation repeated or narrated existing entries as placements: {code_reply}",
+    )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "readingFocused": True,
+            "existingFact": existing_fact_lines[0],
+            "commonnessLineCount": code_reply.count("常用度对比："),
+            "readingDuplicateLines": list(duplicate_visible_lines(reading_reply)),
+            "codeDuplicateLines": list(duplicate_visible_lines(code_reply)),
+        },
+    }
+
+
+S42_WORDS = ("老登", "中登", "小登")
+
+
+async def scenario_s42(ctx: ScenarioContext) -> dict[str, Any]:
+    """Keep every live candidate reply executable without restoring meta prose."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    discovery_message = "喵喵 加词 " + " ".join(S42_WORDS)
+    messages.append(discovery_message)
+    candidate_reply = await ctx.send_group(discovery_message, to_me=True)
+    replies.append(candidate_reply)
+    displayed_pairs = advertised_batch_binding_pairs(candidate_reply)
+    contract = advertised_reply_contract(candidate_reply)
+    require(
+        tuple(word for word, _code in displayed_pairs) == S42_WORDS,
+        f"S42 candidate listing did not bind the exact three words: {candidate_reply}",
+    )
+    require(
+        {"加入", "加入并提交"}.issubset(contract.batch_assent_forms),
+        f"S42 live candidate listing omitted assent forms: {candidate_reply}",
+    )
+    scoped_selection = re.search(
+        r"回复「(?P<word>[^」\n]+) 添加(?P<indexes>[1-9]\d*(?:、[1-9]\d*)*)」",
+        candidate_reply,
+    )
+    require(
+        scoped_selection is not None
+        and scoped_selection.group("word") in S42_WORDS,
+        f"S42 restarted numbering omitted a word-scoped selection: {candidate_reply}",
+    )
+    require(
+        not any(
+            marker in candidate_reply
+            for marker in ("本次仅查询", "只读展示", "执行前系统会重新审词")
+        ),
+        f"S42 live candidate listing restored meta narration: {candidate_reply}",
+    )
+
+    submit_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入并提交")
+    submit_reply = await ctx.send_group("加入并提交", to_me=True)
+    replies.append(submit_reply)
+    submitted_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=submit_cutoff,
+    )
+    require(
+        submitted_batch_id
+        and "回复「加入」" not in submit_reply
+        and "回复「加入并提交」" not in submit_reply,
+        f"S42 bare add-and-submit did not execute in that turn: {submit_reply}",
+    )
+    submitted_batch = await ctx.next_client.get_admin_batch(
+        batch_id=submitted_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    submitted_pairs = tuple(
+        (str(item.get("word") or ""), str(item.get("code") or "").lower())
+        for item in submitted_batch.get("pullRequests", [])
+        if isinstance(item, dict) and item.get("action") == "Create"
+    )
+    require(
+        submitted_batch.get("status") in {"Submitted", "Approved"}
+        and same_unique_item_set(submitted_pairs, displayed_pairs),
+        f"S42 bare assent escaped its displayed batch: {submitted_batch}",
+    )
+
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    query_message = f"喵喵 {S41_READING_MESSAGE}"
+    messages.append(query_message)
+    query_reply = await ctx.send_group(query_message, to_me=True)
+    replies.append(query_reply)
+    query_contract = advertised_reply_contract(query_reply)
+    require(
+        S41_WORD in query_reply
+        and not query_contract.requires_live_state
+        and not any(
+            marker in query_reply
+            for marker in (
+                "回复「加入」",
+                "加入并提交",
+                " 添加1",
+                " 添加2",
+                "本次仅查询",
+                "只读展示",
+                "执行前系统会重新审词",
+            )
+        ),
+        f"S42 query-only reply advertised a nonexistent action: {query_reply}",
+    )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "advertisedPairs": [list(pair) for pair in displayed_pairs],
+            "advertisedForms": list(contract.batch_assent_forms),
+            "scopedSelection": scoped_selection.group(0),
+            "submittedBatchId": submitted_batch_id,
+            "queryAdvertisesAction": query_contract.requires_live_state,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -6006,6 +6227,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S38", "reading, query recovery, and modifier incident closure", scenario_s38),
     Scenario("S39", "one-turn reading selection and occupant eviction closure", scenario_s39),
     Scenario("S40", "assent execution and existing-word incident closure", scenario_s40),
+    Scenario("S41", "reading focus and code explanation deduplication", scenario_s41),
+    Scenario("S42", "live candidate affordances and bare assent execution", scenario_s42),
 )
 
 

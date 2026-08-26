@@ -1039,6 +1039,7 @@ def render_server_backed_word_set(words: object) -> str:
         _SERVER_BACKED_WORD_SET_HEADER,
         *(f"- 「{word}」" for word in normalized),
         _SERVER_BACKED_WORD_SET_FOOTER,
+        pending_batch_confirmation_copy(),
     ))
 
 
@@ -1046,14 +1047,15 @@ def advertised_word_set_words(text: str) -> tuple[str, ...]:
     """Parse only the deterministic server-backed no-code inventory shape."""
     lines = str(text or "").strip().splitlines()
     if (
-        len(lines) < 4
+        len(lines) < 5
         or lines[0] != _SERVER_BACKED_WORD_SET_HEADER
-        or lines[-1] != _SERVER_BACKED_WORD_SET_FOOTER
+        or lines[-2] != _SERVER_BACKED_WORD_SET_FOOTER
+        or lines[-1] != pending_batch_confirmation_copy()
     ):
         return ()
     words: list[str] = []
     seen: set[str] = set()
-    for line in lines[1:-1]:
+    for line in lines[1:-2]:
         match = re.fullmatch(r"- 「([^」\n]{1,128})」", line)
         if match is None:
             return ()
@@ -1257,6 +1259,11 @@ def render_server_backed_batch_candidates(
         lines.append(f"   自动审核：{review_copy}")
 
     lines.append(pending_batch_confirmation_copy())
+    scoped_copy = scoped_multi_word_candidate_copy(tuple(
+        word for word, _code, _needs_review in normalized_items
+    ))
+    if scoped_copy:
+        lines.append(scoped_copy)
     return "\n".join(lines)
 
 
@@ -1266,7 +1273,15 @@ def render_server_backed_batch_lookup(
 ) -> str:
     """Render a multi-word candidate snapshot without minting write controls."""
     rendered = render_server_backed_batch_candidates(items, candidate_scopes)
-    footer = pending_batch_confirmation_copy()
+    words = tuple(
+        str(item.get("word") or "").strip()
+        for item in items or []
+        if isinstance(item, dict) and str(item.get("word") or "").strip()
+    )
+    footer = "\n".join(filter(None, (
+        pending_batch_confirmation_copy(),
+        scoped_multi_word_candidate_copy(words),
+    )))
     if not rendered.endswith(footer):
         return ""
     return rendered[: -len(footer)].rstrip()
@@ -1857,6 +1872,7 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
             direct_advertisement = any(
                 f"回复{left}{form}{right}" in normalized
                 or f"发送{left}{form}{right}" in normalized
+                or f"或{left}{form}{right}" in normalized
                 for left, right in _ADVERTISED_QUOTE_PAIRS
             )
             action_list_advertisement = False

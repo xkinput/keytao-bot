@@ -847,6 +847,12 @@ def _normalize_generated_review_copy(response: str) -> str:
     )
     for old, new in replacements:
         text = text.replace(old, new)
+    text = re.sub(
+        r"(?P<term>[\u3400-\u9fff]{1,12})[？?]\s*(?:不|不是)[，,]\s*"
+        r"(?=(?P=term))",
+        "",
+        text,
+    )
     return re.sub(
         r"[；;]\s*提交整批时会(?:重新审核|重审|复审)",
         "",

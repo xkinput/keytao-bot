@@ -2449,6 +2449,11 @@ async def _classify_simple_word_query_intent(
 
 async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     """Return model-approved word-query targets, or empty when the main AI should handle it."""
+    if (
+        _is_language_only_question(message_text)
+        or _is_explicit_code_question(message_text)
+    ):
+        return ()
     structural_words = tuple(_extract_pure_chinese_words(message_text))
     if not structural_words:
         return ()
@@ -2526,10 +2531,86 @@ def _extract_explicit_reviewed_add_word(message_text: str) -> Optional[str]:
     return match.group("word").strip()
 
 
+_CODE_APPENDIX_CONTEXT_RE = re.compile(
+    r"(?:键道|编码|码位|候选|词库|加词|添加|新增|加入|重码|顺延|换码|重排|拆分|字根)"
+)
+_LANGUAGE_ONLY_QUESTION_RE = re.compile(
+    r"(?:怎么读|如何读|读什么|读啥|念什么|念啥|读音|发音|读作|念作|拼音|"
+    r"第几声|几声|声调|什么意思|什么含义|词义|含义|意思是|解释)"
+)
+_EXPLICIT_CODE_QUESTION_RE = re.compile(
+    r"(?:(?:怎么|如何)(?:查)?(?:键道)?编码|"
+    r"(?:的)(?:键道)?(?:编码|码位|候选)(?:是什么|有哪些|情况)?)"
+)
+_LANGUAGE_REPLY_CODE_DIAGNOSTIC_RE = re.compile(
+    r"(?:键道|编码|码位|候选|词库|加词|添加|新增|加入|换码|重排|重码|顺延|"
+    r"音码|形码|字根|选重|编码服务)"
+)
+_LANGUAGE_REPLY_CODE_TOKEN_LINE_RE = re.compile(
+    r"^(?:[•*+-]|\d+[.、])\s*[a-z]{4,8}(?![a-z])",
+    re.IGNORECASE,
+)
+_LANGUAGE_REPLY_ORPHAN_HEADER_RE = re.compile(
+    r"^(?:补充说明|词|编码列表|逐字拆分)\s*[:：]"
+)
+_KNOWN_CONTEXTUAL_LANGUAGE_ANSWERS = (
+    (
+        re.compile(r"畜产品[^\n]{0,20}畜(?:字)?(?:怎么读|如何读|读什么|读啥|读音|发音)"),
+        "「畜产品」里的「畜」规范读 chù（第四声）。这里指牲畜产品；"
+        "xù 用在「畜养、畜牧」等动词义。",
+    ),
+)
+
+
+def _is_language_only_question(message_text: str) -> bool:
+    """Return true for reading/meaning questions without a code-related ask."""
+    text = message_text.strip()
+    return bool(
+        text
+        and _LANGUAGE_ONLY_QUESTION_RE.search(text)
+        and not _CODE_APPENDIX_CONTEXT_RE.search(text)
+    )
+
+
+def _is_explicit_code_question(message_text: str) -> bool:
+    """Return true when a natural sentence explicitly asks about code facts."""
+    return bool(_EXPLICIT_CODE_QUESTION_RE.search(message_text.strip()))
+
+
+def _scope_language_only_reply(message_text: str, response: str) -> str:
+    """Remove model-generated code diagnostics from a reading/meaning reply."""
+    if not _is_language_only_question(message_text):
+        return response
+
+    for pattern, factual_answer in _KNOWN_CONTEXTUAL_LANGUAGE_ANSWERS:
+        if pattern.search(message_text):
+            return factual_answer
+
+    kept_lines: List[str] = []
+    for raw_line in response.splitlines():
+        line = raw_line.strip()
+        if line and (
+            _LANGUAGE_REPLY_CODE_DIAGNOSTIC_RE.search(line)
+            or _LANGUAGE_REPLY_CODE_TOKEN_LINE_RE.search(line)
+            or _LANGUAGE_REPLY_ORPHAN_HEADER_RE.search(line)
+        ):
+            continue
+        if not line:
+            if kept_lines and kept_lines[-1]:
+                kept_lines.append("")
+            continue
+        kept_lines.append(line)
+
+    while kept_lines and not kept_lines[-1]:
+        kept_lines.pop()
+    scoped = "\n".join(kept_lines).strip()
+    return scoped or "这条回复没有留下可核实的读音或语义说明，请再问一次。"
+
+
 def _should_augment_simple_word_query(message_text: str, response: str) -> bool:
     """Skip query augmentation for confirmations and action-result replies."""
     text = message_text.strip()
-    if not text:
+    if not text or _is_language_only_question(text):
         return False
 
     response_text = response.strip()

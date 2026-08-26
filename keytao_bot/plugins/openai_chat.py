@@ -464,6 +464,7 @@ from .chat_routing import (
     _sanitize_optional_positive_int,
     _sanitize_optional_single_char,
     _sanitize_simple_word_intent_words,
+    _scope_language_only_reply,
     _should_augment_simple_word_query,
     _should_block_for_other_owner_pending,
     _split_reference_word_group,
@@ -2084,6 +2085,100 @@ def _render_live_single_candidate_record(
     )
 
 
+def _reply_carries_live_candidate_state(
+    response: str,
+    record: Optional[PendingStateRecord],
+) -> bool:
+    """Recognize a candidate display whose live affordance trailer was removed."""
+    if record is None or record.execution_id or "候选" not in response:
+        return False
+    state = record.state
+    if isinstance(state, PendingAdvertisedWordSets):
+        return bool(
+            len(state.snapshots) == 1
+            and re.search(r"(?m)^\s*\d+\.\s+", response) is not None
+            and all(word in response for word in state.snapshots[0].words)
+        )
+    if isinstance(state, PendingAddWord):
+        word = str(state.word or "").strip()
+        candidate_codes = tuple(
+            code for code, _occupied in state.server_candidates
+        )
+        return bool(
+            word
+            and candidate_codes
+            and word in response
+            and all(
+                re.search(
+                    rf"(?<![a-z]){re.escape(code)}(?![a-z])",
+                    response,
+                    re.IGNORECASE,
+                )
+                is not None
+                for code in candidate_codes
+            )
+        )
+    if not (
+        isinstance(state, PendingToolConfirm)
+        and state.function_name == "keytao_batch_add_to_draft"
+        and isinstance(state.args.get("_candidate_scopes"), list)
+    ):
+        return False
+    pairs = _pending_state_binding_pairs(state)
+    scopes = state.args["_candidate_scopes"]
+    if len(pairs) < 2 or len(scopes) != len(pairs):
+        return False
+    for word, _recommended_code in pairs:
+        scope = next(
+            (
+                value for value in scopes
+                if isinstance(value, dict)
+                and str(value.get("word") or "").strip() == word
+            ),
+            None,
+        )
+        candidates = scope.get("candidates") if isinstance(scope, dict) else None
+        codes = tuple(
+            str(value[0] or "").strip().lower()
+            for value in candidates or []
+            if isinstance(value, (list, tuple)) and len(value) == 2
+        )
+        if (
+            word not in response
+            or not codes
+            or not any(
+                re.search(
+                    rf"(?<![a-z]){re.escape(code)}(?![a-z])",
+                    response,
+                    re.IGNORECASE,
+                )
+                is not None
+                for code in codes
+            )
+        ):
+            return False
+    return True
+
+
+def _live_candidate_affordances_are_complete(
+    response: str,
+    record: PendingStateRecord,
+) -> bool:
+    """Require whole-state assent plus selection whenever candidates are numbered."""
+    contract = advertised_reply_contract(response)
+    if not {"加入", "加入并提交"}.issubset(contract.batch_assent_forms):
+        return False
+    if isinstance(record.state, PendingAdvertisedWordSets):
+        return re.search(r"(?m)^\s*\d+\.\s+", response) is None
+    if isinstance(record.state, PendingAddWord):
+        return (
+            contract.candidate_selection
+            if len(record.state.server_candidates) > 1
+            else True
+        )
+    return contract.candidate_selection
+
+
 _COMMONNESS_COMPARISON_COPY_RE = re.compile(
     r"(?:常用度(?:对比|比较)|较[^\n，。；]{0,16}常用|"
     r"更[^\n，。；]{0,16}常用|频率[^\n，。；]{0,16}(?:高|低)|"
@@ -2161,6 +2256,35 @@ def _enforce_advertised_reply_contract(
         keytao_review.current_commonness_evidence(),
     )
     contract = advertised_reply_contract(text)
+    record = (
+        conversation_state_store.get_record(conv_key)
+        if conv_key is not None
+        else None
+    )
+    carries_live_candidates = (
+        not server_backed_query
+        and _reply_carries_live_candidate_state(text, record)
+    )
+    if (
+        carries_live_candidates
+        and not _live_candidate_affordances_are_complete(text, record)
+    ):
+        if isinstance(record.state, PendingAddWord):
+            replacement = _render_live_single_candidate_record(record)
+        elif isinstance(record.state, PendingAdvertisedWordSets):
+            replacement = _render_live_word_set_record(record)
+        else:
+            replacement = _render_live_batch_record(record)
+        if replacement and _advertised_reply_matches_live_record(
+            replacement,
+            record,
+        ):
+            logger.warning(
+                "[advertised_reply_contract] "
+                "branch=restore_missing_affordances "
+                f"state={record.state.__class__.__name__}"
+            )
+            return replacement
     if not contract.requires_live_state:
         return text
     if server_backed_query:
@@ -2169,11 +2293,6 @@ def _enforce_advertised_reply_contract(
             "branch=send_server_backed_query"
         )
         return ServerBackedQueryReply(text)
-    record = (
-        conversation_state_store.get_record(conv_key)
-        if conv_key is not None
-        else None
-    )
     displayed_pairs = advertised_batch_binding_pairs(text)
     if _advertised_reply_matches_live_record(text, record):
         logger.info(
@@ -4768,6 +4887,21 @@ async def _stage_augment_word_query(ctx: TurnContext) -> bool:
     return False
 
 
+async def _stage_scope_language_only_response(ctx: TurnContext) -> bool:
+    """Production scenario: reading/meaning turns cannot expose code diagnostics."""
+    scoped = _scope_language_only_reply(
+        ctx.normalized_message_text,
+        str(ctx.response),
+    )
+    if scoped != ctx.response:
+        ctx.response = (
+            ServerBackedQueryReply(scoped)
+            if isinstance(ctx.response, ServerBackedQueryReply)
+            else scoped
+        )
+    return False
+
+
 async def _stage_append_ticket_challenge(ctx: TurnContext) -> bool:
     """Production scenario: recall and clear replies never receive a pending challenge."""
     if isinstance(ctx.response, ServerBackedQueryReply):
@@ -4848,6 +4982,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_reject_empty_response,
     _stage_normalize_response,
     _stage_augment_word_query,
+    _stage_scope_language_only_response,
     _stage_append_ticket_challenge,
     _stage_enforce_advertised_reply_contract,
     _stage_persist_conversation,
@@ -4990,6 +5125,7 @@ _CHAT_COMPAT_NAMES = (
     "advertised_batch_binding_pairs",
     "ensure_multi_word_candidate_copy",
     "parse_pending_candidate_selection",
+    "pending_batch_confirmation_copy",
     "pending_confirmation_copy",
     "pending_confirmation_prompt_instruction",
     "render_remediation_reply",
@@ -5265,6 +5401,7 @@ _CHAT_COMPAT_NAMES = (
     "_split_reference_word_group",
     "_split_telegram_text",
     "_strip_command_message_prefixes",
+    "_scope_language_only_reply",
     "_strip_markdown",
     "_structural_draft_management_intent",
     "_structural_pending_add_word_intent",

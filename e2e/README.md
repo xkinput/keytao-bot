@@ -410,6 +410,18 @@ stale quoted multi-word `加入并提交` re-establishes and applies the same as
 without a politeness loop, and that an existing dictionary word leads with its
 exact current code before any remaining options.
 
+S41 closes the 2026-08-26 reading-reply duplication incident. A pure contextual
+reading question about `畜产品` must answer the pronunciation without code-position
+or commonness diagnostics. A follow-up code question must render one bounded
+supplementary block, state `xjpoo` and `jjpoo` as existing dictionary facts,
+never describe them as new placements, and contain no duplicated visible line.
+
+S42 closes the 2026-08-26 missing-affordance incident. A three-word candidate
+listing for `老登` / `中登` / `小登` must advertise both whole-state assent forms
+and a word-scoped numbered selection without meta narration. A following bare
+`加入并提交` must write and submit the exact displayed pairs in that turn, while a
+query-only reading reply with no live action must advertise no reply form.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`

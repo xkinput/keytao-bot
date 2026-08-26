@@ -71,6 +71,7 @@ from ..utils.pending_confirmation import (
     ensure_multi_word_candidate_copy,
     parse_pending_assent_phrase,
     parse_pending_candidate_selection,
+    pending_batch_confirmation_copy,
     pending_confirmation_copy,
     pending_word_reminder_lines,
     prepend_pending_word_reminders,
@@ -1763,9 +1764,19 @@ def _append_pending_ticket_challenge(
 
     if isinstance(record.state, PendingAddWord):
         return bind_prompt(response)
-    if pending_confirmation_copy() in response:
+    challenge = pending_confirmation_copy()
+    if pending_batch_confirmation_copy() in response:
+        compact = re.sub(
+            r"\n+\s*" + re.escape(challenge) + r"\s*$",
+            " " + challenge,
+            response.rstrip(),
+        )
+        if challenge not in compact:
+            compact += " " + challenge
+        return bind_prompt(compact)
+    if challenge in response:
         return bind_prompt(response)
-    return bind_prompt(response.rstrip() + "\n\n" + pending_confirmation_copy())
+    return bind_prompt(response.rstrip() + "\n\n" + challenge)
 
 
 def _active_operation_message_for_request(
@@ -2256,62 +2267,149 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
 
 
 def _build_existing_word_priority_note(word: str, lookup_entry: Dict, encode_data: Dict) -> Optional[str]:
-    """Explain why an existing word uses its current code and where it ranks there."""
-    phrases = lookup_entry.get("phrases", [])
-    if not phrases:
+    """Render bounded facts about an existing word without narrating a placement."""
+    existing_codes = _existing_word_codes(lookup_entry)
+    if not existing_codes:
         return None
 
-    candidate_statuses = encode_data.get("candidateStatuses", [])
-    candidate_index = {
-        item.get("code", ""): idx
-        for idx, item in enumerate(candidate_statuses)
-        if isinstance(item, dict) and item.get("code")
-    }
+    ordered_codes = _ordered_existing_word_codes(existing_codes, encode_data)
+    primary_code = ordered_codes[0]
+    facts = [f"• 「{word}」已在词库：{'、'.join(ordered_codes)}。"]
 
-    notes: List[str] = []
-    for phrase in phrases:
-        code = phrase.get("code", "")
-        if not code:
-            continue
+    primary_prior = _extract_prior_occupied_candidates(
+        primary_code,
+        encode_data,
+        candidate_codes=_candidate_reading_group_codes(primary_code, encode_data),
+    )
+    if primary_prior:
+        prior_text = "；".join(
+            f"{item.get('code', '')} {item.get('label', '')}"
+            for item in primary_prior[:3]
+        )
+        facts.append(f"• {primary_code} 前的候选码位已被占用：{prior_text}。")
 
-        idx = candidate_index.get(code)
-        if idx is not None and idx > 0:
-            prior_statuses = [
-                item for item in candidate_statuses[:idx]
-                if isinstance(item, dict) and item.get("occupied")
-            ]
-            if prior_statuses:
-                prior_text = "；".join(
-                    f"{item.get('code', '')} {item.get('label', '')}"
-                    for item in prior_statuses[:3]
-                )
-                notes.append(f"{word} 当前用 {code}，因为更前面的候选码位已被占用：{prior_text}。")
-
-        dup = phrase.get("duplicate_info")
-        if isinstance(dup, dict) and len(dup.get("all_words", [])) > 1:
-            position_label = dup.get("position_label") or "首位"
-            all_words = dup.get("all_words", [])
-            dup_text = "、".join(
-                (
-                    f"{item.get('word', '')}（{item.get('label')}）"
-                    if item.get("label")
-                    else str(item.get("word", ""))
-                )
-                for item in all_words[:5]
-                if item.get("word")
+    primary_phrase = next(
+        (
+            phrase
+            for phrase in lookup_entry.get("phrases", [])
+            if isinstance(phrase, dict)
+            and str(phrase.get("code") or "").strip().lower() == primary_code
+        ),
+        None,
+    )
+    duplicate_info = (
+        primary_phrase.get("duplicate_info")
+        if isinstance(primary_phrase, dict)
+        and isinstance(primary_phrase.get("duplicate_info"), dict)
+        else None
+    )
+    if duplicate_info and len(duplicate_info.get("all_words", [])) > 1:
+        position_label = duplicate_info.get("position_label") or "首位"
+        duplicate_text = "、".join(
+            (
+                f"{item.get('word', '')}（{item.get('label')}）"
+                if item.get("label")
+                else str(item.get("word", ""))
             )
-            notes.append(f"{code} 这个码位里，{word} 排在{position_label}；同码词有：{dup_text}。")
+            for item in duplicate_info.get("all_words", [])[:5]
+            if isinstance(item, dict) and item.get("word")
+        )
+        facts.append(
+            f"• {primary_code} 这个码位里，{word} 排在{position_label}；"
+            f"同码词有：{duplicate_text}。"
+        )
 
-    if not notes:
-        return None
-    return "\n".join(f"• {note}" for note in notes)
+    secondary_fact_count = sum(
+        bool(_extract_prior_occupied_candidates(
+            code,
+            encode_data,
+            candidate_codes=_candidate_reading_group_codes(code, encode_data),
+        ))
+        for code in ordered_codes[1:]
+    )
+    if secondary_fact_count:
+        facts.append(
+            f"• 其他已有编码还有 {secondary_fact_count} 组不同的前置占位情况，已省略明细。"
+        )
+    return "\n".join(dict.fromkeys(facts))
 
 
-def _extract_prior_occupied_candidates(current_code: str, encode_data: Dict) -> List[Dict]:
+def _existing_word_codes(lookup_entry: Dict) -> Tuple[str, ...]:
+    """Return each exact existing code once in lookup order."""
+    return tuple(dict.fromkeys(
+        str(phrase.get("code") or "").strip().lower()
+        for phrase in lookup_entry.get("phrases", [])
+        if isinstance(phrase, dict) and str(phrase.get("code") or "").strip()
+    ))
+
+
+def _ordered_existing_word_codes(
+    existing_codes: Tuple[str, ...],
+    encode_data: Dict,
+) -> Tuple[str, ...]:
+    """Lead with the recommended/current candidate when it is already present."""
+    recommended = str(encode_data.get("recommendedCode") or "").strip().lower()
+    status_order = tuple(
+        str(item.get("code") or "").strip().lower()
+        for item in encode_data.get("candidateStatuses", [])
+        if isinstance(item, dict) and str(item.get("code") or "").strip()
+    )
+    preferred = [recommended] if recommended in existing_codes else []
+    preferred.extend(code for code in status_order if code in existing_codes)
+    preferred.extend(existing_codes)
+    return tuple(dict.fromkeys(preferred))
+
+
+def _candidate_reading_group_codes(
+    current_code: str,
+    encode_data: Dict,
+) -> Tuple[str, ...]:
+    """Find the one server-returned reading group that owns a candidate code."""
+    grouped_codes: List[Tuple[str, ...]] = []
+    for field in (
+        "alternatePhrasePronunciationCodes",
+        "alternatePronunciationCodes",
+    ):
+        for group in encode_data.get(field, []) or []:
+            if not isinstance(group, dict):
+                continue
+            codes = tuple(
+                str(code or "").strip().lower()
+                for code in group.get("codes", []) or []
+                if str(code or "").strip()
+            )
+            if codes:
+                grouped_codes.append(codes)
+    for group in encode_data.get("candidateDisplayGroups", []) or []:
+        if not isinstance(group, dict):
+            continue
+        codes = tuple(
+            str(item.get("code") or "").strip().lower()
+            for item in group.get("items", []) or []
+            if isinstance(item, dict) and str(item.get("code") or "").strip()
+        )
+        if codes:
+            grouped_codes.append(codes)
+    return next((codes for codes in grouped_codes if current_code in codes), ())
+
+
+def _extract_prior_occupied_candidates(
+    current_code: str,
+    encode_data: Dict,
+    *,
+    candidate_codes: Tuple[str, ...] = (),
+) -> List[Dict]:
     """Return occupied candidate slots before the current code."""
     candidate_statuses = encode_data.get("candidateStatuses", [])
     if not isinstance(candidate_statuses, list):
         return []
+    if candidate_codes:
+        allowed_codes = set(candidate_codes)
+        candidate_statuses = [
+            item for item in candidate_statuses
+            if isinstance(item, dict)
+            and str(item.get("code") or "").strip().lower() in allowed_codes
+        ]
     current_index = next(
         (idx for idx, item in enumerate(candidate_statuses) if isinstance(item, dict) and item.get("code") == current_code),
         None,
@@ -2392,6 +2490,30 @@ async def _generate_usage_comparison_note(
     return combined
 
 
+_CODE_APPENDIX_WORD_PATTERNS = (
+    re.compile(
+        r"^(?P<word>[\u3400-\u9fff]{1,20}?)(?:怎么|如何)(?:查)?(?:键道)?编码$"
+    ),
+    re.compile(
+        r"^(?P<word>[\u3400-\u9fff]{1,20}?)(?:的)?(?:键道)?"
+        r"(?:编码|码位|候选)(?:是什么|有哪些|情况)?$"
+    ),
+)
+
+
+def _extract_code_appendix_query_words(message_text: str) -> Tuple[str, ...]:
+    """Extract one explicit code-query target without relying on model routing."""
+    text = re.sub(r"[？?！!。]+$", "", message_text.strip())
+    text = re.sub(r"^(?:请问|麻烦|帮我|帮忙|给我|查一下|看一下|看看)\s*", "", text)
+    for pattern in _CODE_APPENDIX_WORD_PATTERNS:
+        match = pattern.fullmatch(text)
+        if match is not None:
+            word = match.group("word").strip()
+            if word:
+                return (word,)
+    return ()
+
+
 async def _augment_simple_word_query_response(
     message_text: str,
     response: str,
@@ -2413,7 +2535,10 @@ async def _augment_simple_word_query_response(
         else tuple(query_words)
     )
     if not words:
+        words = _extract_code_appendix_query_words(message_text)
+    if not words:
         return response
+    words = tuple(dict.fromkeys(words))
 
     lookup_json = await call_tool_function(
         "keytao_lookup_by_words_batch", {"words": list(words)}, platform, user_id,
@@ -2432,6 +2557,11 @@ async def _augment_simple_word_query_response(
     }
 
     note_blocks: List[str] = []
+    seen_lines = {
+        line.strip()
+        for line in response.splitlines()
+        if line.strip()
+    }
     for word in words:
         lookup_entry = lookup_map.get(word, {})
         if not lookup_entry.get("phrases"):
@@ -2451,26 +2581,50 @@ async def _augment_simple_word_query_response(
                 if line.strip() and line.strip() not in response
             ]
         comparison_notes: List[str] = []
-        for phrase in lookup_entry.get("phrases", []):
-            code = phrase.get("code", "")
-            if not code:
-                continue
-            prior_occupied = _extract_prior_occupied_candidates(code, encode_data)
-            comparison = await _generate_usage_comparison_note(word, code, prior_occupied)
+        existing_codes = _existing_word_codes(lookup_entry)
+        ordered_codes = _ordered_existing_word_codes(existing_codes, encode_data)
+        if ordered_codes:
+            primary_code = ordered_codes[0]
+            prior_occupied = _extract_prior_occupied_candidates(
+                primary_code,
+                encode_data,
+                candidate_codes=_candidate_reading_group_codes(
+                    primary_code,
+                    encode_data,
+                ),
+            )
+            comparison = await _generate_usage_comparison_note(
+                word,
+                primary_code,
+                prior_occupied,
+            )
             comparison_line = f"• 常用度对比：{comparison}" if comparison else ""
             if comparison_line and comparison_line not in response:
-                comparison_notes.append(f"• 常用度对比：{comparison}")
+                comparison_notes.append(comparison_line)
         if note_lines or comparison_notes:
             block_parts = [f"{word} 的编码位置说明："]
             if note_lines:
                 block_parts.extend(note_lines)
             if comparison_notes:
                 block_parts.extend(comparison_notes)
-            note_blocks.append("\n".join(block_parts))
+            unique_block_parts = []
+            for line in block_parts:
+                formatted = line.strip()
+                if not formatted or formatted in seen_lines:
+                    continue
+                unique_block_parts.append(formatted)
+                seen_lines.add(formatted)
+            if len(unique_block_parts) > 1:
+                note_blocks.append("\n".join(unique_block_parts))
 
     if not note_blocks:
         return response
-    return response.rstrip() + "\n\n补充说明：\n" + "\n\n".join(note_blocks)
+    has_supplement_header = any(
+        line.strip() == "补充说明："
+        for line in response.splitlines()
+    )
+    separator = "\n" if has_supplement_header else "\n\n补充说明：\n"
+    return response.rstrip() + separator + "\n\n".join(note_blocks)
 
 
 async def _try_handle_referenced_word_presence_query(

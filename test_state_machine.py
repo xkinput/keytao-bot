@@ -228,11 +228,13 @@ from keytao_bot.utils.observability import (
 )
 from keytao_bot.utils.pending_confirmation import (
     SYSTEM_REPLY_TEMPLATE_MARKERS,
+    advertised_reply_contract,
     advertised_command_has_placeholder,
     advertised_batch_binding_pairs,
     advertised_single_word_lookup_codes,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
+    render_server_backed_batch_lookup,
     render_remediation_reply,
     scoped_multi_word_candidate_copy,
 )
@@ -574,6 +576,17 @@ def test_parse_pending_batch_add_preserves_each_review_result():
     check("manual item keeps its own review", "管理员审核" in items[0].get("remark", ""))
     check("passing item keeps its own review", "可自动通过" in items[1].get("remark", ""))
     check("generated old prediction wording normalized", "预计需管理员审核" not in normalized)
+
+
+def test_normalize_generated_reply_drops_repeated_self_correction():
+    """Visible same-phrase scratch corrections collapse to the corrected prose."""
+    print("\n🧪 generated reply drops repeated self-correction")
+
+    response = "「畜」在这里读 chù。畜产？不，畜产也是 chù——xù 用于畜牧、畜养。"
+    normalized = _normalize_generated_review_copy(response)
+
+    check("scratch correction marker is removed", "畜产？不，" not in normalized)
+    check("corrected explanation remains", "畜产也是 chù" in normalized)
 
 
 def test_parse_pending_batch_add_inline_priority_recommendation():
@@ -2024,7 +2037,10 @@ def test_get_simple_word_query_words_uses_semantic_classifier():
     print("\n🧪 simple word query words use semantic classifier")
 
     async def _run():
+        classified_messages = []
+
         async def fake_classifier(message_text, structural_words):
+            classified_messages.append(message_text)
             if message_text == "洛阳纸贵":
                 return SimpleWordQueryIntent(
                     should_handle=True,
@@ -2042,9 +2058,18 @@ def test_get_simple_word_query_words_uses_semantic_classifier():
         with patch.object(openai_chat_module, "_classify_simple_word_query_intent", side_effect=fake_classifier):
             bare_words = await _get_simple_word_query_words("洛阳纸贵")
             comparison_words = await _get_simple_word_query_words("严判用得多还是研判用得多")
+            reading_words = await _get_simple_word_query_words("畜产品的畜字怎么读")
+            code_question_words = await _get_simple_word_query_words("畜产品怎么编码")
 
         check("bare word accepted by classifier", bare_words == ("洛阳纸贵",))
         check("comparison rejected by classifier", comparison_words == ())
+        check("reading question bypasses the bare-word classifier", reading_words == ())
+        check("code question bypasses the bare-word classifier", code_question_words == ())
+        check(
+            "explicit language/code questions never reach the bare-word model",
+            "畜产品的畜字怎么读" not in classified_messages
+            and "畜产品怎么编码" not in classified_messages,
+        )
 
     asyncio.run(_run())
 
@@ -7506,6 +7531,172 @@ def test_augment_simple_word_query_response_appends_priority_note():
     asyncio.run(_run())
 
 
+def test_pure_reading_question_never_gets_code_priority_appendix():
+    """A reading answer stays focused even if a later classifier returns words."""
+    print("\n🧪 pure reading question skips code-priority appendix")
+
+    async def _run():
+        calls = []
+
+        async def fake_call(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("reading replies must not run code appendix tools")
+
+        response = (
+            "「畜产品」里的「畜」读 chù。这里指作为产品来源的牲畜，"
+            "所以用 chù；xù 常见于「畜牧」「蓄养」这一义项。"
+        )
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            result = await _augment_simple_word_query_response(
+                "畜产品的畜字怎么读",
+                response,
+                "qq",
+                "reading-user",
+                query_words=("畜产品", "畜"),
+            )
+
+        check("reading reply is unchanged", result == response)
+        check("reading reply makes no appendix tool calls", not calls)
+        check(
+            "reading reply has no encoding diagnostics",
+            "编码位置说明" not in result and "常用度对比" not in result,
+        )
+
+    asyncio.run(_run())
+
+
+def test_language_only_reply_composer_strips_main_model_code_diagnostics():
+    """A tool-happy model cannot leak code facts into a reading-only reply."""
+    print("\n🧪 language-only reply composer strips main-model code diagnostics")
+
+    response = (
+        "「畜产品」已在词库（jjpoo、xjpoo）。\n"
+        "仍可选择其他编码（回复「换码」）；若保留现状，无需操作。\n"
+        "「畜产品」的「畜」规范读音是 chù（第四声），指牲畜的产品。\n"
+        "注意和「畜牧 xùmù」「畜养 xùyǎng」里的 xù 区分开。\n"
+        "键道这边也查了下：词库里已经收录两个编码：\n"
+        "• jjpoo —— 按 chù 音\n"
+        "• xjpoo —— 按 xù 音\n"
+        "补充说明：编码服务的权威读音库暂时不可用。"
+    )
+
+    scoped = chat_routing_module._scope_language_only_reply(
+        "畜产品的畜字怎么读",
+        response,
+    )
+
+    check("reading answer remains", "chù" in scoped and "牲畜" in scoped)
+    check("reading distinction remains", "畜牧" in scoped and "xù" in scoped)
+    check(
+        "main-model code diagnostics are removed",
+        not any(
+            marker in scoped
+            for marker in ("已在词库", "编码", "换码", "jjpoo", "xjpoo", "补充说明")
+        ),
+    )
+
+
+def test_language_only_reply_composer_enforces_known_contextual_reading():
+    """A fluent but wrong multi-reading answer cannot pass the reply boundary."""
+    print("\n🧪 language-only reply composer enforces known contextual reading")
+
+    response = (
+        "「畜产品」里的“畜”读 xù（四声），和“畜牧”的“畜”同音。\n"
+        "• 畜 xù：动词，畜养、畜牧，如“畜牧、畜产品”\n"
+        "• 畜 chù：名词，牲畜，如“牲畜、家畜”"
+    )
+
+    scoped = chat_routing_module._scope_language_only_reply(
+        "畜产品的畜字怎么读",
+        response,
+    )
+
+    check("contextual answer leads with chù", "规范读 chù" in scoped)
+    check("contextual reason is factual", "牲畜产品" in scoped)
+    check(
+        "wrong contextual xù claim is removed",
+        "畜产品" in scoped and "畜产品”里的“畜”读 xù" not in scoped,
+    )
+    check("alternate reading remains bounded", "xù" in scoped and "畜养" in scoped)
+
+
+def test_code_priority_appendix_dedupes_existing_word_facts_and_caps_details():
+    """The final code-oriented reply emits each formatted fact only once."""
+    print("\n🧪 code-priority appendix dedupes existing-word facts")
+
+    async def _run():
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            if tool_name == "keytao_lookup_by_words_batch":
+                return json.dumps({
+                    "success": True,
+                    "results": [{
+                        "word": "畜产品",
+                        "phrases": [
+                            {"word": "畜产品", "code": "xjpoo"},
+                            {"word": "畜产品", "code": "jjpoo"},
+                        ],
+                    }],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_encode":
+                return json.dumps({
+                    "success": True,
+                    "recommendedCode": "xjpoo",
+                    "candidateCodes": ["xjp", "xjpo", "xjpoo", "jjp", "jjpo", "jjpoo"],
+                    "candidateStatuses": [
+                        {"code": "xjp", "occupied": True, "label": "已有「习近平」"},
+                        {"code": "xjpo", "occupied": True, "label": "已有「新产品」"},
+                        {"code": "xjpoo", "occupied": True, "label": "已有「畜产品」"},
+                        {"code": "jjp", "occupied": True, "label": "已有「机键盘」"},
+                        {"code": "jjpo", "occupied": True, "label": "已有「经济品」"},
+                        {"code": "jjpoo", "occupied": True, "label": "已有「畜产品」"},
+                    ],
+                    "alternatePhrasePronunciationCodes": [
+                        {"pinyin": "xù", "codes": ["xjp", "xjpo", "xjpoo"]},
+                        {"pinyin": "chù", "codes": ["jjp", "jjpo", "jjpoo"]},
+                    ],
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        comparison = AsyncMock(
+            return_value="「畜产品」较「习近平」更常用：语料频次 157 vs 4。"
+        )
+        with patch.object(openai_chat_module, "call_tool_function", side_effect=fake_call):
+            with patch.object(
+                openai_chat_module,
+                "_generate_usage_comparison_note",
+                comparison,
+            ):
+                result = await _augment_simple_word_query_response(
+                    "畜产品怎么编码",
+                    "「畜产品」可以从读音和词库现状两方面看。",
+                    "qq",
+                    "code-user",
+                    query_words=(),
+                )
+
+        visible_lines = [line.strip() for line in result.splitlines() if line.strip()]
+        fact_line = next(
+            (line for line in visible_lines if "「畜产品」已在词库：" in line),
+            "",
+        )
+        check("code question keeps the appendix", "编码位置说明" in result)
+        check("existing fact lists xjpoo", "xjpoo" in fact_line)
+        check("existing fact lists jjpoo", "jjpoo" in fact_line)
+        check("existing entries are not narrated as placements", "当前用" not in result)
+        check(
+            "each formatted visible line appears once",
+            len(visible_lines) == len(dict.fromkeys(visible_lines)),
+        )
+        check("commonness comparison is emitted once", result.count("常用度对比：") == 1)
+        check("commonness comparator runs only for the primary explanation", comparison.await_count == 1)
+        check(
+            "secondary reading-group details are capped to one summary line",
+            result.count("其他已有编码") <= 1,
+        )
+
+    asyncio.run(_run())
+
+
 def test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority():
     """Verify usage comparison is still appended even if base reply already mentions prior code occupancy."""
     print("\n🧪 augment simple word query response preserves usage comparison")
@@ -7561,6 +7752,12 @@ def test_augment_simple_word_query_response_keeps_usage_comparison_when_response
         check("keeps existing response text", "更前面的候选码位已被占用" in result)
         check("still appends usage comparison", "常用度对比：" in result)
         check("comparison mentions occupant word", "神速力" in result)
+        visible_lines = [line.strip() for line in result.splitlines() if line.strip()]
+        check("existing appendix header is not duplicated", result.count("补充说明：") == 1)
+        check(
+            "re-augmentation never duplicates a visible line",
+            len(visible_lines) == len(dict.fromkeys(visible_lines)),
+        )
 
     asyncio.run(_run())
 
@@ -15668,7 +15865,7 @@ def test_generic_ai_prose_does_not_persist_pending():
 
         @staticmethod
         def get_plaintext():
-            return "请解释一下这个词"
+            return "帮我看看这个词能不能加"
 
     class HandlerBot:
         pass
@@ -15867,7 +16064,6 @@ def test_outgoing_advertisement_requires_matching_live_state():
         store.set(conv_key, batch_state, owner_label="Rea")
         for label, rendered in (
             ("incident-model-summary", incident_summary),
-            ("action-list-model-summary", action_list_summary),
             ("batch-renderer", batch_renderer),
             (
                 "reordered-batch-renderer",
@@ -15888,6 +16084,21 @@ def test_outgoing_advertisement_requires_matching_live_state():
                 f"{label} is unchanged with matching live state",
                 with_bound_state == rendered,
             )
+
+        restored_action_list = openai_chat_module._enforce_advertised_reply_contract(
+            action_list_summary,
+            conv_key,
+        )
+        restored_contract = advertised_reply_contract(restored_action_list)
+        check(
+            "action-list model summary restores its missing scoped selector",
+            restored_action_list != action_list_summary
+            and restored_contract.candidate_selection
+            and {"加入", "加入并提交"}.issubset(
+                restored_contract.batch_assent_forms
+            )
+            and set(advertised_batch_binding_pairs(restored_action_list)) == set(pairs),
+        )
 
         for label, unsafe_rendered in (
             ("unparseable-model-summary", unparseable_summary),
@@ -15945,6 +16156,249 @@ def test_outgoing_advertisement_requires_matching_live_state():
     check(
         "recommended candidate blocks expose exact binding pairs",
         advertised_batch_binding_pairs(action_list_summary) == pairs,
+    )
+
+
+def test_live_actionable_reply_advertises_complete_reply_contract():
+    """The delivery boundary restores affordances from the sealed live state."""
+    print("\n🧪 live actionable reply advertises complete reply contract")
+    context = ChatMemoryContext(
+        platform="qq",
+        user_id="affordance-user",
+        space_type="group",
+        space_id="affordance-group",
+        speaker_name="Rea",
+    )
+    conv_key = context.conversation_address
+    cases = (
+        ("老登", "lzdr", "lzdro", "老等"),
+        ("中登", "vldr", "vldro", "中等"),
+        ("小登", "xzdr", "xzdro", "小灯"),
+    )
+    items = [
+        {
+            "action": "Create",
+            "word": word,
+            "code": code,
+            "type": "Phrase",
+            "needsManualReview": True,
+        }
+        for word, code, _fallback, _occupant in cases
+    ]
+    scopes = [
+        {
+            "word": word,
+            "candidates": [[code, True], [fallback, False]],
+            "occupiedWords": {code: [occupant]},
+            "orderingAssessments": [],
+        }
+        for word, code, fallback, occupant in cases
+    ]
+    incident_reply = "\n".join((
+        "3 个词的候选：",
+        "1. 「老登」候选：1. lzdr — 已有「老等」",
+        "   自动审核：需管理员审核",
+        "2. 「中登」候选：1. vldr — 已有「中等」",
+        "   自动审核：需管理员审核",
+        "3. 「小登」候选：1. xzdr — 已有「小灯」",
+        "   自动审核：需管理员审核",
+    ))
+
+    store = MemoryConversationStateStore()
+    store.set(
+        conv_key,
+        PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={"items": items, "_candidate_scopes": scopes},
+        ),
+        space_key=conv_key.space_key,
+        owner_label="Rea",
+    )
+    with patch.object(openai_chat_module, "conversation_state_store", store):
+        restored = openai_chat_module._enforce_advertised_reply_contract(
+            incident_reply,
+            conv_key,
+        )
+
+    contract = advertised_reply_contract(restored)
+    check(
+        "live batch advertises both assent forms",
+        set(contract.batch_assent_forms) >= {"加入", "加入并提交"},
+    )
+    check(
+        "restarted numbering advertises a word-scoped selector",
+        "中登 添加" in restored or "小登 添加" in restored,
+    )
+    check(
+        "restored affordances stay within two compact lines",
+        sum(
+            1
+            for line in restored.splitlines()
+            if "回复" in line or "选码带词条" in line or "每个词的编号" in line
+        )
+        <= 2,
+    )
+    check(
+        "live batch copy contains no meta narration",
+        not any(
+            marker in restored
+            for marker in ("本次仅查询", "只读展示", "执行前系统会重新审词")
+        ),
+    )
+
+    store.arm_reconfirmation(conv_key, "加入并提交")
+    with patch.object(openai_chat_module, "conversation_state_store", store):
+        challenged_batch = openai_chat_module._append_pending_ticket_challenge(
+            restored,
+            conv_key,
+        )
+    check(
+        "candidate plus server confirmation stays within two affordance lines",
+        sum(1 for line in challenged_batch.splitlines() if "回复" in line) <= 2,
+    )
+    challenged_contract = advertised_reply_contract(challenged_batch)
+    check(
+        "compacted candidate keeps every live assent form",
+        set(challenged_contract.batch_assent_forms) >= {"加入", "加入并提交"}
+        and "确认" in challenged_contract.generic_assent_forms
+        and "「取消」" in challenged_batch,
+    )
+
+    word_set_words = (
+        "显眼包",
+        "嘴替",
+        "松弛感",
+        "电子榨菜",
+        "情绪价值",
+        "班味",
+        "泼天富贵",
+        "精神状态",
+        "职场搭子",
+        "天选打工人",
+        "沙县小吃",
+    )
+    store.delete(conv_key)
+    store.add_advertised_word_set(
+        conv_key,
+        word_set_words,
+        space_key=conv_key.space_key,
+        owner_label="Rea",
+    )
+    chunked_incident = "\n".join((
+        f"{len(word_set_words)} 个词的候选：",
+        *(f"{index}. 「{word}」\n候选：\n1. code{index} — 空位（推荐）"
+          for index, word in enumerate(word_set_words, start=1)),
+    ))
+    with patch.object(openai_chat_module, "conversation_state_store", store):
+        restored_word_set = openai_chat_module._enforce_advertised_reply_contract(
+            chunked_incident,
+            conv_key,
+        )
+    word_set_contract = advertised_reply_contract(restored_word_set)
+    check(
+        "live advertised word set restores both assent forms",
+        set(word_set_contract.batch_assent_forms) >= {"加入", "加入并提交"},
+    )
+    check(
+        "word-set fallback preserves the exact actor-owned universe",
+        all(word in restored_word_set for word in word_set_words),
+    )
+    check(
+        "word-set fallback removes unbound candidate numbering",
+        re.search(r"(?m)^\s*\d+\.\s+", restored_word_set) is None,
+    )
+    out_of_snapshot_ask = (
+        "「火星词」不在刚才的候选中，请只从「"
+        + "、".join(word_set_words)
+        + "」中选择；本次未写入。"
+    )
+    with patch.object(openai_chat_module, "conversation_state_store", store):
+        delivered_ask = openai_chat_module._enforce_advertised_reply_contract(
+            out_of_snapshot_ask,
+            conv_key,
+        )
+    check(
+        "word-set remediation ASK is not replaced by the candidate fallback",
+        delivered_ask == out_of_snapshot_ask,
+    )
+
+    store.set(
+        conv_key,
+        PendingAddWord(
+            word="中登",
+            recommended_code="vldro",
+            candidates=[("vldr", True), ("vldro", False)],
+            server_candidates=[("vldr", True), ("vldro", False)],
+            occupied_words={"vldr": ["中等"]},
+            server_occupied_words={"vldr": ["中等"]},
+        ),
+        space_key=conv_key.space_key,
+        owner_label="Rea",
+    )
+    single_without_footer = "\n".join((
+        "「中登」候选编码：",
+        "1. vldr — 已有「中等」",
+        "2. vldro — 空位（推荐）",
+        "自动审核：需管理员审核",
+    ))
+    with patch.object(openai_chat_module, "conversation_state_store", store):
+        restored_single = openai_chat_module._enforce_advertised_reply_contract(
+            single_without_footer,
+            conv_key,
+        )
+    single_contract = advertised_reply_contract(restored_single)
+    check(
+        "live single-word candidate advertises both assent forms",
+        set(single_contract.batch_assent_forms) >= {"加入", "加入并提交"},
+    )
+    check(
+        "live single-word numbering advertises its selector",
+        single_contract.candidate_selection,
+    )
+
+    store.set(
+        conv_key,
+        PendingToolConfirm(function_name="keytao_submit_batch", args={}),
+        space_key=conv_key.space_key,
+        owner_label="Rea",
+    )
+    store.arm_reconfirmation(conv_key, "确认")
+    with patch.object(openai_chat_module, "conversation_state_store", store):
+        confirmation_reply = openai_chat_module._append_pending_ticket_challenge(
+            "待确认：提交当前草稿。",
+            conv_key,
+        )
+        guarded_confirmation = openai_chat_module._enforce_advertised_reply_contract(
+            confirmation_reply,
+            conv_key,
+        )
+    check(
+        "live plan confirmation advertises its assent form",
+        "确认" in advertised_reply_contract(guarded_confirmation).generic_assent_forms
+        and "「取消」" in guarded_confirmation,
+    )
+
+    query_only = render_server_backed_batch_lookup(items, scopes)
+    store.delete(conv_key)
+    with patch.object(openai_chat_module, "conversation_state_store", store):
+        delivered_query = openai_chat_module._enforce_advertised_reply_contract(
+            openai_chat_module.ServerBackedQueryReply(query_only),
+            conv_key,
+        )
+    check("query-only candidate reply remains visible", "3 个词的候选" in delivered_query)
+    check(
+        "query-only reply advertises no actionable form",
+        not any(
+            marker in delivered_query
+            for marker in ("回复「加入」", "加入并提交", " 添加1", " 添加2")
+        ),
+    )
+    check(
+        "query-only reply contains no meta narration",
+        not any(
+            marker in delivered_query
+            for marker in ("本次仅查询", "只读展示", "执行前系统会重新审词")
+        ),
     )
 
 
@@ -20893,6 +21347,7 @@ if __name__ == "__main__":
     test_parse_pending_add_word_multitone_template()
     test_parse_pending_batch_add_two_words()
     test_parse_pending_batch_add_preserves_each_review_result()
+    test_normalize_generated_reply_drops_repeated_self_correction()
     test_parse_pending_batch_add_inline_priority_recommendation()
     test_quoted_bot_reply_never_uses_unrelated_group_pending()
     test_parse_pending_state_from_referenced_message()
@@ -20994,6 +21449,10 @@ if __name__ == "__main__":
     test_recall_only_voids_tickets_bound_to_the_recalled_batch()
     test_command_result_never_gets_word_priority_appendix()
     test_augment_simple_word_query_response_appends_priority_note()
+    test_pure_reading_question_never_gets_code_priority_appendix()
+    test_language_only_reply_composer_strips_main_model_code_diagnostics()
+    test_language_only_reply_composer_enforces_known_contextual_reading()
+    test_code_priority_appendix_dedupes_existing_word_facts_and_caps_details()
     test_augment_simple_word_query_response_keeps_usage_comparison_when_response_already_mentions_priority()
     test_augment_simple_word_query_response_handles_multiple_words()
     test_referenced_word_presence_query_extracts_quoted_words()
@@ -21121,6 +21580,7 @@ if __name__ == "__main__":
     test_visual_handler_blocks_pending_injection()
     test_generic_ai_prose_does_not_persist_pending()
     test_outgoing_advertisement_requires_matching_live_state()
+    test_live_actionable_reply_advertises_complete_reply_contract()
     test_short_add_submit_copy_distinguishes_quote_without_live_state()
     test_refusal_remediation_copy_uses_bound_executable_suggestions()
     test_s38_shift_suggestion_closes_over_the_reviewed_encode_record()
