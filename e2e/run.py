@@ -60,6 +60,10 @@ from .scenarios import (
     S44_OCCUPANT,
     S44_OCCUPIED_CODE,
     S44_WORD,
+    S45_FIRST_CODE,
+    S45_FIRST_WORD,
+    S45_SECOND_CODE,
+    S45_SECOND_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -1746,6 +1750,72 @@ async def ensure_s44_fixture(
     }
 
 
+async def ensure_s45_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed the two exact candidate-chain rows used by the S45 code swap."""
+    expected = (
+        (S45_FIRST_WORD, S45_FIRST_CODE),
+        (S45_SECOND_WORD, S45_SECOND_CODE),
+    )
+    encodings: dict[str, list[str]] = {}
+    for word, required_code in expected:
+        codes = ordered_candidate_codes(await client.encode(word))
+        encodings[word] = codes
+        if required_code not in codes:
+            raise RigInfrastructureError(
+                f"S45 {word} does not encode to required {required_code}: {codes}"
+            )
+    for _word, code in expected:
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if exact_rows:
+            raise RigInfrastructureError(
+                f"S45 requires an empty exact {code} slot before seeding: "
+                f"{exact_rows}"
+            )
+
+    seed_batch_ids: list[str] = []
+    for word, code in expected:
+        seeded = await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word=word,
+            code=code,
+            weight=100,
+        )
+        seed_batch_ids.append(str(seeded.get("batchId") or ""))
+
+    rows: dict[str, dict[str, Any]] = {}
+    for word, code in expected:
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if not (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == word
+            and exact_rows[0].get("type") == "Phrase"
+            and exact_rows[0].get("weight") == 100
+            and str(
+                (exact_rows[0].get("user") or {}).get("name") or ""
+            ).startswith(RESERVED_BINDING_PREFIX)
+        ):
+            raise RigInfrastructureError(
+                f"S45 requires sole rig-owned {word}@{code} weight 100: "
+                f"{exact_rows}"
+            )
+        rows[word] = exact_rows[0]
+    return {
+        "encodings": encodings,
+        "rows": rows,
+        "seedBatchIds": seed_batch_ids,
+    }
+
+
 async def ensure_s39_fixture(
     *,
     client: LocalNextClient,
@@ -2314,6 +2384,12 @@ async def async_main(args: argparse.Namespace) -> int:
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S44":
                         fixture_facts["s44"] = await ensure_s44_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S45":
+                        fixture_facts["s45"] = await ensure_s45_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

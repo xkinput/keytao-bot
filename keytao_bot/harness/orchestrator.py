@@ -68,7 +68,10 @@ from .state import (
 from .conversation import ConversationAddress
 from .authorization_grammar import (
     explicit_same_code_requested,
+    is_character_composition_question,
+    is_interrogative_message,
     parse_eviction_modified_add,
+    review_flow_candidates_are_plausible,
     suggestion_preserves_expressed_operation,
 )
 from .tools import (
@@ -460,6 +463,36 @@ class AgentOrchestrator:
                 self._skills_manager.get_tools(),
                 key=_tool_function_name,
             )
+            character_composition_question = is_character_composition_question(
+                message
+            )
+            if character_composition_question:
+                tools = [
+                    tool
+                    for tool in tools
+                    if _tool_function_name(tool) in {
+                        "keytao_encode",
+                        "keytao_lookup_by_word",
+                    }
+                ]
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "[系统] 这是汉字构形问句，不是词条审查或加词请求。"
+                        "先根据问题确定一个具体单字，再调用 keytao_encode 核对"
+                        "返回的 chars 字符数据；有词库记录时也可调用 "
+                        "keytao_lookup_by_word 交叉核对。最终只回答字符身份和"
+                        "可核实的读音/拆分，不展示候选编码、候选列表或任何加入"
+                        "草稿的说法。若不能确定，就直说不能确定，并提示用户给出"
+                        "具体字符后发送「查词 <字符>」核验；不得猜测。"
+                    ),
+                })
+            elif is_interrogative_message(message):
+                tools = [
+                    tool
+                    for tool in tools
+                    if _tool_function_name(tool) != "keytao_prepare_reviewed_add"
+                ]
             if resolved_advertised_words:
                 # A snapshot-minus-exclusions command is deliberately a
                 # review-and-stage turn.  The resolved list must be shown and
@@ -1828,6 +1861,10 @@ class AgentOrchestrator:
                         )
                     )
                     tool_word = str(canonical_fn_args.get("word") or "").strip()
+                    review_target_blocked = bool(
+                        fn_name == "keytao_prepare_reviewed_add"
+                        and not review_flow_candidates_are_plausible((tool_word,))
+                    )
                     encode_blocked = bool(
                         fn_name == "keytao_encode"
                         and tool_word
@@ -1836,7 +1873,21 @@ class AgentOrchestrator:
                             or tool_word in reviewed_words_in_batch
                         )
                     )
-                    if encode_blocked:
+                    if review_target_blocked:
+                        logger.warning(
+                            "Blocked implausible resolved review target: "
+                            f"word={tool_word}"
+                        )
+                        result_str = json.dumps({
+                            "success": False,
+                            "policyBlocked": True,
+                            "word": tool_word,
+                            "message": (
+                                "解析出的审词目标不是可核验的词条候选；"
+                                "本次未进入审词或加词流程。"
+                            ),
+                        }, ensure_ascii=False)
+                    elif encode_blocked:
                         logger.warning(
                             "Blocked reviewed-add encode fallback: word=%s unresolved=%s",
                             tool_word,
@@ -3133,6 +3184,21 @@ class AgentOrchestrator:
         receipts = list(successful_write_receipts or [])
         if reply is None:
             return cls._receipt_completion_reply(receipts) if receipts else None
+        if (
+            is_interrogative_message(current_message)
+            and re.search(
+                r"(?:审词[：:]|候选(?:编码|码位|列表)[：:]?|"
+                r"回复[「『“\"']?加入(?:并提交)?|写入草稿)",
+                reply,
+            )
+        ):
+            logger.error(
+                "Replacing review/add affordances emitted for an interrogative turn"
+            )
+            reply = (
+                "我还不能从现有字符数据确定这个问题的答案。"
+                "请给出一个具体字符后发送「查词 <字符>」核验。"
+            )
         from keytao_bot.plugins.chat_render import _reply_has_internal_fragment
         if _reply_has_internal_fragment(reply) and not failure_state:
             logger.error("Replacing final reply containing an internal policy fragment")

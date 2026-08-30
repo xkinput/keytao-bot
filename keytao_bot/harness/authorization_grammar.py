@@ -379,6 +379,95 @@ _COMMAND_PREFIX_PATTERN = rf"(?:{'|'.join(sorted(
 _COMMAND_PREFIX_RE = re.compile(rf"^{_COMMAND_PREFIX_PATTERN}")
 _MULTI_ADD_VERB_RE = re.compile(ADD_OPERATION_VERB_PATTERN)
 _MULTI_ADD_ADDRESS_CLAUSES = frozenset({"喵喵"})
+
+_INTERROGATIVE_MESSAGE_RE = re.compile(
+    r"(?:[?？]|是什么(?:字|词|意思)?|怎么写|如何写|什么意思|什么含义|"
+    r"读什么|读啥|念什么|念啥|是不是.{0,24}(?:吗|嘛|么)|"
+    r"(?:吗|嘛|么|呢)[。.!！~～]?$)"
+)
+_ACTIONABLE_INSTRUCTION_CLAUSE_RE = re.compile(
+    r"(?:^|[，,；;。！？!?\n])\s*"
+    r"(?:(?:喵喵|请|麻烦|帮我|帮忙|给我|然后|再|并|并且|同时)"
+    r"[，,\s]*)*"
+    r"(?:"
+    r"批量(?:检查|查询|核对)|"
+    r"只(?:列出|显示|返回)|"
+    r"(?:没|未)收录的.{0,32}(?:加进|加到|加入|添加到|写入|放入)"
+    r"(?:当前)?草稿|"
+    r"(?:加词|添加词|新增词|删词|删除词条|排序|重排|重新排序|"
+    r"排一下)(?:\s|[:：]|$)|"
+    r"(?:把|将).{1,48}(?:加入|加进|加到|添加到|写入|放入)"
+    r"(?:当前)?草稿|"
+    r"(?:把|将).{1,48}(?:删掉|删除|移除|排序|重排|重新排序|"
+    r"挪到|移到|调整到|换到)"
+    r")"
+)
+_CHARACTER_COMPOSITION_QUESTION_RE = re.compile(
+    r"(?:[\u3400-\u9fff亻]{1,12}(?:旁|部首|偏旁)?(?:加|配|组合)"
+    r"(?:个|一个)?[\u3400-\u9fff亻]{1,8}(?:字)?"
+    r"(?:是什么字|念什么|读什么)|"
+    r"[\u3400-\u9fff亻]{1,12}旁加(?:个|一个)?"
+    r"[\u3400-\u9fff亻]{1,8}字是什么字)"
+)
+_NON_LEXICAL_COMPONENT_FRAGMENT_RE = re.compile(
+    r"(?:[\u3400-\u9fff亻]{1,12}(?:旁|部首|偏旁|字根)"
+    r"(?:加|配|组合|组成)(?:个|一个)?[\u3400-\u9fff亻]{1,12}(?:字)?$|"
+    r"[\u3400-\u9fff亻]{1,12}加(?:个|一个)?[\u3400-\u9fff亻]{1,12}字$)"
+)
+_NON_LEXICAL_PROSE_FRAGMENT_RE = re.compile(
+    r"(?:^(?:请|麻烦)(?:帮|给|看)|"
+    r"^(?:我|你|他|她|它|我们|你们|他们).{1,16}(?:了|着|过|要|想|"
+    r"去|来|看|说|觉得).*$|"
+    r"^(?:今天|昨天|明天).*(?:下雨|去|来|要|想|是)|"
+    r"^(?:这|那|这个|那个).{0,16}(?:我|你|他|她|它|我们|你们|他们)"
+    r"(?:觉得|认为|感觉|看).*$|"
+    r"^(?:这|那|这个|那个).{1,16}(?:不太|比较|需要|应该|可以|不能).+$|"
+    r"如果.+(?:就|那么)|因为.+所以|虽然.+但是|"
+    r"所以|但是|然后|还是|不想|去了|看看这个问题|这个问题|"
+    r"(?:看看|处理|怎么办|行不行|好不好)$)"
+)
+
+
+def is_interrogative_message(message: str) -> bool:
+    """Recognize turns whose actionable content is only a question."""
+    source = str(message or "").strip()
+    return bool(
+        source
+        and _INTERROGATIVE_MESSAGE_RE.search(source)
+        and not _ACTIONABLE_INSTRUCTION_CLAUSE_RE.search(source)
+    )
+
+
+def is_character_composition_question(message: str) -> bool:
+    """Recognize the closed component-to-character question family."""
+    source = str(message or "").strip()
+    return bool(
+        source
+        and is_interrogative_message(source)
+        and _CHARACTER_COMPOSITION_QUESTION_RE.search(source)
+    )
+
+
+def looks_like_lexical_review_target(value: str) -> bool:
+    """Accept Han lexical shapes while rejecting questions and sentence fragments."""
+    target = str(value or "").strip()
+    return bool(
+        re.fullmatch(r"[\u3400-\u9fff]{1,20}", target)
+        and not is_interrogative_message(target)
+        and not _NON_LEXICAL_COMPONENT_FRAGMENT_RE.search(target)
+        and not _NON_LEXICAL_PROSE_FRAGMENT_RE.search(target)
+    )
+
+
+def review_flow_candidates_are_plausible(candidates: Tuple[str, ...]) -> bool:
+    """Validate resolved review targets instead of classifying the source turn."""
+    words = tuple(str(candidate or "").strip() for candidate in candidates)
+    return bool(words) and all(
+        looks_like_lexical_review_target(word)
+        for word in words
+    )
+
+
 @dataclass(frozen=True)
 class _AuthorizedAddClause:
     word: str
@@ -803,6 +892,22 @@ _ENTRY_PRIORITY_SWAP_PREFIX_RE = re.compile(
     r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
     r"的?(?:优先级|优先顺序)(?:吧|啦|了)?$"
 )
+_ENTRY_CODE_SWAP_VERB_PATTERN = r"(?:(?:对换|对调|互换|交换)(?:一下)?|换一下)"
+_ENTRY_CODE_SWAP_PREFIX_RE = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}{_ENTRY_CODE_SWAP_VERB_PATTERN}\s*(?:把|将)?\s*"
+    r"[「“]?(?P<first>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
+    r"(?:和|与|跟|、)\s*"
+    r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
+    r"的?(?:编码|码位)(?:吧|啦|了)?$"
+)
+_ENTRY_CODE_SWAP_SUFFIX_RE = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:把|将)?\s*"
+    r"[「“]?(?P<first>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
+    r"(?:和|与|跟|、)\s*"
+    r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
+    rf"的?(?:编码|码位)\s*{_ENTRY_CODE_SWAP_VERB_PATTERN}"
+    r"(?:吧|啦|了)?$"
+)
 
 _DICTIONARY_DELETE_WORD_PATTERN = r"[\u3400-\u9fff]{1,30}"
 _DICTIONARY_DELETE_PATTERNS = (
@@ -892,6 +997,8 @@ def parse_entry_swap(message: str) -> Optional[EntrySwapCommand]:
         _ENTRY_SWAP_WHOLE_RE.fullmatch(source)
         or _ENTRY_PRIORITY_SWAP_WHOLE_RE.fullmatch(source)
         or _ENTRY_PRIORITY_SWAP_PREFIX_RE.fullmatch(source)
+        or _ENTRY_CODE_SWAP_PREFIX_RE.fullmatch(source)
+        or _ENTRY_CODE_SWAP_SUFFIX_RE.fullmatch(source)
     )
     if match is None:
         return None

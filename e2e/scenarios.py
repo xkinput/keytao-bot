@@ -6466,6 +6466,174 @@ async def scenario_s44(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S45_FIRST_WORD = "财宝"
+S45_SECOND_WORD = "财报"
+S45_FIRST_CODE = "chbz"
+S45_SECOND_CODE = "chbza"
+S45_SWAP_MESSAGE = "对换财宝和财报的编码"
+S45_CHARACTER_QUESTION = "单人旁加个巨字是什么字"
+S45_CHARACTER_ANSWER = "佢"
+
+
+async def scenario_s45(ctx: ScenarioContext) -> dict[str, Any]:
+    """Swap two exact codes, then answer a character question without review."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S45 cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    swap_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S45_SWAP_MESSAGE)
+    plan_reply = await ctx.send_group(S45_SWAP_MESSAGE, to_me=True)
+    replies.append(plan_reply)
+    preview_draft = await ctx.draft()
+    preview_events = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > swap_cutoff
+    ]
+    preview_calls = [
+        event for event in preview_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and not event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    require(
+        pending_confirmation_copy() in plan_reply
+        and all(
+            marker in plan_reply
+            for marker in (
+                S45_FIRST_WORD,
+                S45_SECOND_WORD,
+                S45_FIRST_CODE,
+                S45_SECOND_CODE,
+            )
+        )
+        and len(preview_calls) == 1
+        and not preview_draft.get("items"),
+        f"S45 verbatim swap did not offer the resolved plan: "
+        f"reply={plan_reply}; calls={preview_calls}; draft={preview_draft}",
+    )
+
+    messages.append("确认")
+    confirmation_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(confirmation_reply)
+    swap_draft = await ctx.draft()
+    expected_swap_items = {
+        ("Delete", S45_FIRST_WORD, S45_FIRST_CODE),
+        ("Create", S45_FIRST_WORD, S45_SECOND_CODE),
+        ("Delete", S45_SECOND_WORD, S45_SECOND_CODE),
+        ("Create", S45_SECOND_WORD, S45_FIRST_CODE),
+    }
+    actual_swap_items = {
+        item_key(item) for item in swap_draft.get("items", [])
+    }
+    swap_events = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > swap_cutoff
+    ]
+    confirmed_calls = [
+        event for event in swap_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    swap_model_turns = [
+        event for event in swap_events
+        if event.get("kind") == "modelExchange"
+    ]
+    require(
+        actual_swap_items == expected_swap_items
+        and len(swap_draft.get("items") or []) == 4
+        and len(confirmed_calls) == 1
+        and not swap_model_turns,
+        f"S45 confirmation did not exchange both codes exactly once: "
+        f"reply={confirmation_reply}; draft={swap_draft}; "
+        f"calls={confirmed_calls}; models={swap_model_turns}",
+    )
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S45 swap cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    question_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S45_CHARACTER_QUESTION)
+    answer_reply = await ctx.send_group(S45_CHARACTER_QUESTION, to_me=True)
+    replies.append(answer_reply)
+    question_events = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > question_cutoff
+    ]
+    encode_calls = [
+        event for event in question_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_encode"
+        and event.get("arguments", {}).get("word") == S45_CHARACTER_ANSWER
+    ]
+    character_data_verified = any(
+        isinstance(event.get("result"), dict)
+        and any(
+            isinstance(char, dict)
+            and char.get("char") == S45_CHARACTER_ANSWER
+            for char in event["result"].get("chars") or []
+        )
+        for event in encode_calls
+    )
+    review_calls = [
+        event for event in question_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_prepare_reviewed_add"
+    ]
+    question_draft = await ctx.draft()
+    answer_contract = advertised_reply_contract(answer_reply)
+    require(
+        S45_CHARACTER_ANSWER in answer_reply
+        and character_data_verified
+        and not review_calls
+        and not answer_contract.requires_live_state
+        and not any(
+            marker in answer_reply
+            for marker in (
+                "审词：",
+                "候选编码",
+                "回复「加入」",
+                "加入并提交",
+                "写入草稿",
+            )
+        )
+        and not question_draft.get("items"),
+        f"S45 character question entered review/add flow or lacked data proof: "
+        f"reply={answer_reply}; encode={encode_calls}; review={review_calls}; "
+        f"draft={question_draft}",
+    )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": question_draft,
+        "facts": {
+            "swapMessage": S45_SWAP_MESSAGE,
+            "previewCalls": len(preview_calls),
+            "confirmedCalls": len(confirmed_calls),
+            "confirmationSteps": 1,
+            "swapModelTurns": len(swap_model_turns),
+            "expectedSwapItems": sorted(expected_swap_items),
+            "actualSwapItems": sorted(actual_swap_items),
+            "question": S45_CHARACTER_QUESTION,
+            "answerCharacter": S45_CHARACTER_ANSWER,
+            "characterDataVerified": character_data_verified,
+            "reviewCalls": len(review_calls),
+            "writeAdvertised": answer_contract.requires_live_state,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -6511,6 +6679,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S42", "live candidate affordances and bare assent execution", scenario_s42),
     Scenario("S43", "encode retry ladder and offline read-only degradation", scenario_s43),
     Scenario("S44", "deterministic compound candidate selection", scenario_s44),
+    Scenario("S45", "swap verbs and interrogative review boundary", scenario_s45),
 )
 
 

@@ -59,6 +59,13 @@ from .scenarios import (
     S41_WORD,
     S42_WORDS,
     S43_WORD,
+    S45_CHARACTER_ANSWER,
+    S45_CHARACTER_QUESTION,
+    S45_FIRST_CODE,
+    S45_FIRST_WORD,
+    S45_SECOND_CODE,
+    S45_SECOND_WORD,
+    S45_SWAP_MESSAGE,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -534,10 +541,28 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s44(self) -> None:
+    def test_s45_pins_swap_and_character_question_contracts(self) -> None:
+        self.assertEqual(S45_FIRST_WORD, "财宝")
+        self.assertEqual(S45_SECOND_WORD, "财报")
+        self.assertEqual(S45_FIRST_CODE, "chbz")
+        self.assertEqual(S45_SECOND_CODE, "chbza")
+        self.assertEqual(S45_SWAP_MESSAGE, "对换财宝和财报的编码")
+        self.assertEqual(S45_CHARACTER_QUESTION, "单人旁加个巨字是什么字")
+        self.assertEqual(S45_CHARACTER_ANSWER, "佢")
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S45"]
+        self.assertEqual(fixture["probe_words"], ("财宝", "财报", "佢"))
+        rows_by_key = {
+            (row["kind"], row["entry"]): row
+            for row in fixture["rows"]
+        }
+        self.assertEqual(rows_by_key[("entry", "财宝")]["pinyins"], ["cái", "bǎo"])
+        self.assertEqual(rows_by_key[("entry", "财报")]["pinyins"], ["cái", "bào"])
+        self.assertEqual(rows_by_key[("char", "佢")]["pinyins"], ["qú"])
+
+    def test_scenario_pack_is_contiguous_through_s45(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 45)],
+            [f"S{index}" for index in range(1, 46)],
         )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:

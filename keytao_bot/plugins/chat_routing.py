@@ -23,6 +23,8 @@ from ..harness.state import (
 )
 from ..harness.authorization_grammar import (
     explicit_complete_add_item,
+    is_interrogative_message,
+    looks_like_lexical_review_target,
     parse_dictionary_delete_command,
     parse_entry_move_plan,
     parse_entry_swap,
@@ -2455,6 +2457,8 @@ async def _classify_simple_word_query_intent(
 
 async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     """Return model-approved word-query targets, or empty when the main AI should handle it."""
+    if is_interrogative_message(message_text):
+        return ()
     explicit = re.fullmatch(
         r"(?:查词|查询词条)\s*[:：]?\s*(?P<word>[\u3400-\u9fff]{1,20})",
         _strip_command_message_prefixes(message_text),
@@ -2476,7 +2480,10 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
             f"intent={intent.intent} confidence={intent.confidence:.2f}"
         )
         return ()
-    return intent.words
+    return tuple(
+        word for word in intent.words
+        if looks_like_lexical_review_target(word)
+    )
 
 
 def command_intent_memoizer(
@@ -2538,9 +2545,10 @@ def _extract_explicit_reviewed_add_word(message_text: str) -> Optional[str]:
     text = _strip_command_message_prefixes(message_text)
     text = re.sub(r"\s+", " ", text).strip()
     match = _EXPLICIT_REVIEWED_ADD_WORD_RE.fullmatch(text)
-    if not match:
+    if not match or is_interrogative_message(text):
         return None
-    return match.group("word").strip()
+    word = match.group("word").strip()
+    return word if looks_like_lexical_review_target(word) else None
 
 
 _CODE_APPENDIX_CONTEXT_RE = re.compile(

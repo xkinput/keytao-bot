@@ -27,6 +27,7 @@ import nonebot
 
 nonebot.init()
 
+from keytao_bot.harness import authorization_grammar as authorization_grammar_module
 from keytao_bot.harness.conversation import ConversationAddress
 from keytao_bot.harness.orchestrator import (
     AgentOrchestrator,
@@ -70,6 +71,7 @@ from keytao_bot.harness.tools import (
     self_checked_suggested_command,
 )
 from keytao_bot.harness.authorization_grammar import (
+    is_interrogative_message,
     parse_dictionary_delete_command,
     parse_entry_swap,
     parse_entry_move_plan,
@@ -101,6 +103,33 @@ from keytao_bot.utils.web_identity import (
     verify_web_user_identity,
 )
 from pydantic import ValidationError
+
+
+class InterrogativeRoutingGuardTests(unittest.TestCase):
+    def test_gate_diverts_only_question_only_turns(self) -> None:
+        self.assertTrue(is_interrogative_message("单人旁加个巨字是什么字"))
+
+        instruction_messages = (
+            "喵喵，请批量检查这些常用词是否已收录；只列出未收录词，"
+            "并说明可以把列表中的词加入草稿：显眼包、嘴替、松弛感、"
+            "电子榨菜、情绪价值、班味、泼天富贵、精神状态、职场搭子、"
+            "天选打工人、沙县小吃",
+            "这几个词收录了吗？没收录的加进草稿",
+        )
+        for message in instruction_messages:
+            with self.subTest(message=message):
+                self.assertFalse(is_interrogative_message(message))
+
+    def test_plausibility_gate_judges_resolved_candidates(self) -> None:
+        gate = getattr(
+            authorization_grammar_module,
+            "review_flow_candidates_are_plausible",
+            None,
+        )
+        self.assertIsNotNone(gate)
+        self.assertTrue(gate(("显眼包", "图书馆", "人工智能生成内容")))
+        self.assertFalse(gate(("单人旁加个巨字",)))
+        self.assertFalse(gate(("今天下雨所以不想出门",)))
 
 
 class LlmRequestGateTests(unittest.TestCase):
@@ -6677,6 +6706,15 @@ class MutationAuthorizationTests(unittest.TestCase):
                     ("冒菜", "茂才"),
                 )
                 self.assertTrue(message_authorizes_mutation(message))
+        for verb in ("对换", "对调", "互换", "换一下", "交换"):
+            message = f"{verb}财宝和财报的编码"
+            with self.subTest(message=message):
+                parsed = parse_entry_swap(message)
+                self.assertEqual(
+                    (parsed.first_word, parsed.second_word) if parsed else None,
+                    ("财宝", "财报"),
+                )
+                self.assertTrue(message_authorizes_mutation(message))
         self.assertTrue(message_authorizes_mutation(
             "这三个词里词频最高的那个放在wtwwi上"
         ))
@@ -8089,6 +8127,58 @@ class RecentOwnDraftSubmitTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EntrySwapHandlerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_s45_code_swap_wording_stages_the_resolved_plan(self) -> None:
+        from keytao_bot.plugins import chat_commands
+        from keytao_bot.plugins.chat_routing import MessageCommandIntent
+
+        merged = {
+            "财宝": {
+                "word": "财宝", "code": "chbz", "type": "Phrase",
+                "weight": 100, "source": "live",
+            },
+            "财报": {
+                "word": "财报", "code": "chbza", "type": "Phrase",
+                "weight": 100, "source": "live",
+            },
+        }
+        shift = AsyncMock(return_value="resolved swap plan")
+        with (
+            patch.object(
+                chat_commands,
+                "_load_merged_word_entries",
+                AsyncMock(return_value=merged),
+            ) as load,
+            patch.object(chat_commands, "_execute_shift_to_code", shift),
+        ):
+            result = await chat_commands._try_handle_entry_swap_command(
+                "对换财宝和财报的编码",
+                MessageCommandIntent(
+                    intent="entry_swap",
+                    confidence=1.0,
+                    keep_words=("财宝", "财报"),
+                ),
+                "qq",
+                "garth",
+                None,
+                "Garth",
+            )
+
+        self.assertEqual(result, "resolved swap plan")
+        load.assert_awaited_once_with(("财宝", "财报"), "qq", "garth")
+        shift.assert_awaited_once_with(
+            "财宝",
+            "chbz",
+            "qq",
+            "garth",
+            None,
+            "Garth",
+            ordered_words=["财宝", "财报"],
+            listed_words=["财宝", "财报"],
+            expected_codes=["chbza", "chbz"],
+            expected_weights=[100, 100],
+            evidence_lines=["按本轮指令互换这两个词的现有编码和权重"],
+        )
+
     async def test_literal_pair_resolves_both_words_before_ring_shift(self) -> None:
         from keytao_bot.plugins import chat_commands
         from keytao_bot.plugins.chat_routing import MessageCommandIntent
@@ -16150,6 +16240,269 @@ class TrustedBatchAnchorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_s45_instruction_bearing_questions_execute_review_targets(
+        self,
+    ) -> None:
+        messages = (
+            "喵喵，请批量检查这些常用词是否已收录；只列出未收录词，"
+            "并说明可以把列表中的词加入草稿：显眼包、嘴替、松弛感、"
+            "电子榨菜、情绪价值、班味、泼天富贵、精神状态、职场搭子、"
+            "天选打工人、沙县小吃",
+            "这几个词收录了吗？没收录的加进草稿",
+        )
+
+        for index, message in enumerate(messages):
+            with self.subTest(message=message):
+                calls = []
+
+                async def dispatch(word, **_kwargs):
+                    calls.append(word)
+                    return {
+                        "success": True,
+                        "word": word,
+                        "type": "Phrase",
+                        "recommendedCode": "xyb",
+                        "candidateStatuses": [
+                            {"code": "xyb", "occupied": False},
+                        ],
+                        "preSubmitAudit": {
+                            "success": True,
+                            "verdict": "pass",
+                            "autoApprove": True,
+                            "summary": "fixture review",
+                            "issues": [],
+                        },
+                    }
+
+                client = _FakeClient([
+                    _fake_response(
+                        "tool_calls",
+                        tool_calls=[_named_tool_call(
+                            f"call-instruction-review-{index}",
+                            "keytao_prepare_reviewed_add",
+                            {"word": "显眼包"},
+                        )],
+                    ),
+                    _fake_response("stop", "已按指令检查。"),
+                ])
+                orchestrator = AgentOrchestrator(
+                    client_factory=lambda: client,
+                    runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+                    skills_manager=_ReviewedCreateSkills(),
+                    tool_executor=ToolExecutor(
+                        lambda name: (
+                            dispatch
+                            if name == "keytao_prepare_reviewed_add"
+                            else None
+                        ),
+                        frozenset({"keytao_prepare_reviewed_add"}),
+                    ),
+                    state_store=MemoryConversationStateStore(),
+                    bind_help_text="bind help",
+                    system_prompt_core="system",
+                )
+
+                result = await orchestrator.run(
+                    message,
+                    AgentRequestContext(
+                        platform="qq",
+                        user_id=f"instruction-question-{index}",
+                        mutations_allowed=False,
+                    ),
+                )
+
+                offered = {
+                    tool["function"]["name"]
+                    for tool in client.completions.calls[0].get("tools", [])
+                }
+                self.assertIn("keytao_prepare_reviewed_add", offered)
+                self.assertEqual(calls, ["显眼包"])
+                self.assertEqual(result, "已按指令检查。")
+
+    async def test_s45_review_plausibility_uses_resolved_candidate_not_source_text(
+        self,
+    ) -> None:
+        class ReviewAndEncodeSkills:
+            @staticmethod
+            def get_skill_instructions():
+                return ""
+
+            @staticmethod
+            def has_tools():
+                return True
+
+            @staticmethod
+            def get_tools():
+                return [
+                    _ReviewedCreateSkills.get_tools()[0],
+                    _ReadOnlyEncodeSkills.get_tools()[1],
+                ]
+
+        cases = (
+            ("我昨天去了图书馆", "图书馆", True),
+            ("今天下雨所以不想出门", "今天下雨所以不想出门", False),
+        )
+        for message, resolved_word, should_execute in cases:
+            with self.subTest(message=message, resolved_word=resolved_word):
+                calls = []
+
+                async def dispatch(word, **_kwargs):
+                    calls.append(word)
+                    return {
+                        "success": True,
+                        "word": word,
+                        "type": "Phrase",
+                        "recommendedCode": "fixture",
+                        "candidateStatuses": [
+                            {"code": "fixture", "occupied": False},
+                        ],
+                        "preSubmitAudit": {
+                            "success": True,
+                            "verdict": "pass",
+                            "autoApprove": True,
+                            "summary": "fixture review",
+                            "issues": [],
+                        },
+                    }
+
+                client = _FakeClient([
+                    _fake_response(
+                        "tool_calls",
+                        tool_calls=[_named_tool_call(
+                            "call-resolved-review",
+                            "keytao_prepare_reviewed_add",
+                            {"word": resolved_word},
+                        )],
+                    ),
+                    _fake_response("stop", "这是普通问答，不是词条审查。"),
+                ])
+                orchestrator = AgentOrchestrator(
+                    client_factory=lambda: client,
+                    runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+                    skills_manager=ReviewAndEncodeSkills(),
+                    tool_executor=ToolExecutor(
+                        lambda name: (
+                            dispatch
+                            if name == "keytao_prepare_reviewed_add"
+                            else None
+                        ),
+                        frozenset({"keytao_prepare_reviewed_add"}),
+                    ),
+                    state_store=MemoryConversationStateStore(),
+                    bind_help_text="bind help",
+                    system_prompt_core="system",
+                )
+
+                result = await orchestrator.run(
+                    message,
+                    AgentRequestContext(
+                        platform="qq",
+                        user_id="garth",
+                        mutations_allowed=False,
+                    ),
+                )
+
+                offered = {
+                    tool["function"]["name"]
+                    for tool in client.completions.calls[0].get("tools", [])
+                }
+                self.assertIn("keytao_prepare_reviewed_add", offered)
+                self.assertEqual(calls, [resolved_word] if should_execute else [])
+                self.assertNotRegex(result, r"候选|回复[「“]加入|写入草稿")
+
+    async def test_s45_character_question_uses_encode_data_without_review_tool(
+        self,
+    ) -> None:
+        calls = []
+
+        class CharacterQuestionSkills:
+            @staticmethod
+            def get_skill_instructions():
+                return ""
+
+            @staticmethod
+            def has_tools():
+                return True
+
+            @staticmethod
+            def get_tools():
+                return [
+                    _ReviewedCreateSkills.get_tools()[0],
+                    _ReadOnlyEncodeSkills.get_tools()[1],
+                ]
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            self.assertEqual(name, "keytao_encode")
+            self.assertEqual(kwargs, {"word": "佢"})
+            return {
+                "success": True,
+                "word": "佢",
+                "chars": [{
+                    "char": "佢",
+                    "pinyin": "qú",
+                    "c1": "人",
+                    "c2": "巨",
+                    "shapeCode": "ii",
+                }],
+            }
+
+        client = _FakeClient([
+            _fake_response(
+                "tool_calls",
+                tool_calls=[_named_tool_call(
+                    "call-character-encode",
+                    "keytao_encode",
+                    {"word": "佢"},
+                )],
+            ),
+            _fake_response(
+                "stop",
+                "单人旁（亻）加「巨」是「佢」，读 qú。",
+            ),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=CharacterQuestionSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: (
+                    (lambda **kwargs: dispatch(name, **kwargs))
+                    if name in {"keytao_encode", "keytao_prepare_reviewed_add"}
+                    else None
+                ),
+                frozenset(),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+        )
+
+        result = await orchestrator.run(
+            "单人旁加个巨字是什么字",
+            AgentRequestContext(
+                platform="qq",
+                user_id="garth",
+                mutations_allowed=False,
+            ),
+        )
+
+        offered = {
+            tool["function"]["name"]
+            for tool in client.completions.calls[0].get("tools", [])
+        }
+        system_text = "\n".join(
+            str(message.get("content") or "")
+            for message in client.completions.calls[0]["messages"]
+            if message.get("role") == "system"
+        )
+        self.assertEqual(offered, {"keytao_encode"})
+        self.assertIn("汉字构形问句", system_text)
+        self.assertIn("keytao_encode", system_text)
+        self.assertEqual(calls, [("keytao_encode", {"word": "佢"})])
+        self.assertIn("佢", result)
+        self.assertNotRegex(result, r"候选|回复[「“]加入|写入草稿")
+
     async def test_advertised_assent_modifier_names_ticket_binding_not_missing_verb(self) -> None:
         calls = []
 
@@ -17892,6 +18245,35 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalReplyLoopBreakerTests(unittest.TestCase):
+    def test_s45_interrogative_candidate_copy_is_replaced(self) -> None:
+        candidate_reply = (
+            "词库暂无收录「单人旁加个巨字」：审词：读音 dan ren pang jia ge ju zi；"
+            "候选编码 drpz；回复「加入」写入草稿。"
+        )
+
+        for question in (
+            "单人旁加个巨字是什么字",
+            "这个是什么词",
+            "这个字怎么写",
+            "这个词什么意思",
+            "畜字读什么",
+            "这是不是成语吗",
+            "这个呢",
+            "这是候选吗？",
+        ):
+            with self.subTest(question=question):
+                finalized = AgentOrchestrator._finalize_reply(
+                    question,
+                    candidate_reply,
+                    {},
+                )
+
+                self.assertIn("查词 <字符>", finalized)
+                self.assertNotRegex(
+                    finalized,
+                    r"审词|候选(?:编码|码位|列表)|回复[「“]加入|写入草稿",
+                )
+
     def test_system_template_register_uses_composer_constants(self) -> None:
         from keytao_bot.utils.pending_confirmation import (
             FAILED_WRITE_TEMPLATE_MARKER,

@@ -2074,6 +2074,175 @@ def test_get_simple_word_query_words_uses_semantic_classifier():
     asyncio.run(_run())
 
 
+def test_s45_interrogatives_and_prose_never_enter_review_flow():
+    """Questions and sentence-shaped fragments must not become add candidates."""
+    print("\n🧪 S45 interrogative and prose review routing guard")
+
+    async def _run():
+        classifier_calls = []
+        tool_calls = []
+
+        async def hostile_classifier(message_text, structural_words):
+            classifier_calls.append(message_text)
+            return SimpleWordQueryIntent(
+                should_handle=True,
+                words=tuple(structural_words),
+                intent="word_lookup",
+                confidence=0.99,
+            )
+
+        async def forbidden_tool(*args, **kwargs):
+            tool_calls.append((args, kwargs))
+            raise AssertionError("non-lexical input must stop before lookup/review")
+
+        inputs = (
+            "单人旁加个巨字是什么字",
+            "亻加巨念什么",
+            "这个是什么词",
+            "这个字怎么写",
+            "这个词什么意思",
+            "畜字读什么",
+            "这是不是成语吗",
+            "这个呢",
+            "这是候选吗？",
+            "单人旁加个巨字",
+            "今天下雨所以不想出门",
+            "我昨天去了图书馆",
+            "请帮我看看这个问题",
+            "如果可以就这样处理",
+            "严判用得多还是研判用得多",
+        )
+        with (
+            patch.object(
+                openai_chat_module,
+                "_classify_simple_word_query_intent",
+                side_effect=hostile_classifier,
+            ),
+            patch.object(
+                openai_chat_module,
+                "call_tool_function",
+                side_effect=forbidden_tool,
+            ),
+        ):
+            replies = [
+                await _try_handle_simple_single_word_query(
+                    message,
+                    "qq",
+                    "garth",
+                )
+                for message in inputs
+            ]
+
+        check("all non-lexical inputs fall through for an answer", all(
+            reply is None for reply in replies
+        ))
+        check("no lookup or review tool is called", tool_calls == [])
+        check("interrogatives are rejected before the model classifier", all(
+            question not in classifier_calls
+            for question in inputs[:9]
+        ))
+
+    asyncio.run(_run())
+
+
+def test_s45_real_long_words_still_enter_review_flow():
+    """The plausibility gate accepts idioms and longer lexical terms by shape."""
+    print("\n🧪 S45 legitimate long words remain reviewable")
+
+    async def _run():
+        review_calls = []
+
+        async def accepting_classifier(_message_text, structural_words):
+            return SimpleWordQueryIntent(
+                should_handle=True,
+                words=tuple(structural_words),
+                intent="word_lookup",
+                confidence=0.99,
+            )
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            word = str(arguments.get("word") or "")
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({
+                    "success": True,
+                    "word": word,
+                    "phrases": [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({
+                    "success": True,
+                    "complete": True,
+                    "items": [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_prepare_reviewed_add":
+                review_calls.append(word)
+                return json.dumps({
+                    "success": True,
+                    "word": word,
+                    "recommendedCode": "lexi",
+                    "preSubmitAudit": {
+                        "success": True,
+                        "verdict": "pass",
+                        "autoApprove": True,
+                        "summary": "fixture lexical review",
+                        "issues": [],
+                    },
+                    "pronunciations": [{
+                        "pinyin": "fixture",
+                        "recommendedCode": "lexi",
+                        "candidateStatuses": [
+                            {
+                                "code": "lexi",
+                                "occupied": False,
+                                "label": "空位",
+                            },
+                            {
+                                "code": "lexia",
+                                "occupied": False,
+                                "label": "空位",
+                            },
+                        ],
+                    }],
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        words = (
+            "洛阳纸贵",
+            "桃李满天下",
+            "一去不复返",
+            "诺贝尔文学奖",
+            "人工智能生成内容",
+        )
+        with (
+            patch.object(
+                openai_chat_module,
+                "_classify_simple_word_query_intent",
+                side_effect=accepting_classifier,
+            ),
+            patch.object(
+                openai_chat_module,
+                "call_tool_function",
+                side_effect=fake_call,
+            ),
+        ):
+            replies = [
+                await _try_handle_simple_single_word_query(
+                    word,
+                    "qq",
+                    "lexical-user",
+                )
+                for word in words
+            ]
+
+        check("all legitimate words are reviewed", review_calls == list(words))
+        check("all legitimate words receive normal review copy", all(
+            reply is not None and "审词：" in reply
+            for reply in replies
+        ))
+
+    asyncio.run(_run())
+
+
 def test_extract_explicit_reviewed_add_word():
     """Verify structural add-word commands enter the reviewed add path."""
     print("\n🧪 extract explicit reviewed add word")
@@ -21706,6 +21875,8 @@ if __name__ == "__main__":
     test_extract_pure_chinese_words()
     test_parse_simple_word_query_intent_payload()
     test_get_simple_word_query_words_uses_semantic_classifier()
+    test_s45_interrogatives_and_prose_never_enter_review_flow()
+    test_s45_real_long_words_still_enter_review_flow()
     test_extract_explicit_reviewed_add_word()
     test_s38_explicit_reading_turns_reenter_review_before_the_model()
     test_classify_simple_word_query_intent_calls_model()

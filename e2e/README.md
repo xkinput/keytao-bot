@@ -86,6 +86,9 @@ attempts are failed by the bounded rig-owned controller.
 S44 declares the authoritative `zài jù` readings for `载具` and `在距`. It
 removes only those rig-owned dictionary words, seeds `在距@zhjl`, and reserves
 `zhjlu` for the second selected `载具` entry while the occupant is shifted.
+S45 declares authoritative readings for `财宝`, `财报`, and the single character
+`佢`. It removes only those rig-owned dictionary words, then seeds
+`财宝@chbz` and `财报@chbza` as the exact two rows whose codes are exchanged.
 
 ## Prerequisites
 
@@ -440,6 +443,12 @@ candidate state, `1 重新编码，并加入 2` must preview `载具@zhjl`, the 
 shift, and `载具@zhjlu` in one sealed plan; one `确认` writes all four plan
 items. Free-slot modifiers, duplicate indices, and out-of-range indices must
 return deterministic ASK replies with no model turn and no draft write.
+
+S45 closes the 2026-08-30 swap-verb and question-routing incidents. The
+verbatim `对换财宝和财报的编码` must render one server-resolved swap plan and one
+`确认` must exchange both exact codes. The verbatim `单人旁加个巨字是什么字`
+must answer `佢` after a concrete `keytao_encode` data check, with no reviewed-add
+call, candidate list, add affordance, pending draft item, or write.
 
 Optional overrides:
 
