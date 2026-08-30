@@ -468,6 +468,7 @@ class MessageCommandIntent:
     current_user_only: bool = False
     choice_index: Optional[int] = None
     choice_indices: Tuple[int, ...] = ()
+    recode_indices: Tuple[int, ...] = ()
     requested_code: str = ""
     requested_codes: Tuple[str, ...] = ()
     target_word: str = ""
@@ -1471,6 +1472,7 @@ def _structural_pending_add_word_intent(
             confidence=1.0,
             submit_after=multi_selection.submit_after,
             choice_indices=multi_selection.indices,
+            recode_indices=multi_selection.recode_indices,
             requested_codes=resolved_codes,
         )
 
@@ -1582,6 +1584,8 @@ def message_authorizes_live_pending_mutation(
         return False
     if intent.intent == "pending_choice" and intent.choice_index is not None:
         return 1 <= intent.choice_index <= len(state.server_candidates)
+    if intent.intent == "pending_choice" and intent.choice_indices:
+        return True
     if intent.intent == "pending_recode":
         return _resolve_shift_target_code(state, intent) is not None
     return _message_authorizes_pending_control(message_text, intent)
@@ -1593,6 +1597,8 @@ def _closed_candidate_selection(
     """Parse the exact numbered/code selection forms advertised in discovery."""
     parsed = parse_pending_candidate_selection(text)
     if parsed is not None:
+        if parsed.recode_indices:
+            return None
         return parsed.indices, parsed.codes, parsed.submit_after
     compact = _compact_command_text(text).lower()
     if compact.startswith("回复"):
@@ -2449,6 +2455,12 @@ async def _classify_simple_word_query_intent(
 
 async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     """Return model-approved word-query targets, or empty when the main AI should handle it."""
+    explicit = re.fullmatch(
+        r"(?:查词|查询词条)\s*[:：]?\s*(?P<word>[\u3400-\u9fff]{1,20})",
+        _strip_command_message_prefixes(message_text),
+    )
+    if explicit is not None:
+        return (explicit.group("word"),)
     if (
         _is_language_only_question(message_text)
         or _is_explicit_code_question(message_text)
@@ -2734,6 +2746,7 @@ def _message_authorizes_pending_state_control(
                 and structural_intent.intent == command_intent.intent
                 and structural_intent.choice_index == command_intent.choice_index
                 and structural_intent.choice_indices == command_intent.choice_indices
+                and structural_intent.recode_indices == command_intent.recode_indices
                 and structural_intent.requested_code == command_intent.requested_code
                 and structural_intent.requested_codes == command_intent.requested_codes
                 and structural_intent.target_word == command_intent.target_word
@@ -2755,6 +2768,7 @@ def _ticket_payload_from_command_intent(
         "submit_after": bool(command_intent.submit_after),
         "choice_index": command_intent.choice_index,
         "choice_indices": list(command_intent.choice_indices),
+        "recode_indices": list(command_intent.recode_indices),
         "requested_code": command_intent.requested_code,
         "requested_codes": list(command_intent.requested_codes),
         "target_word": command_intent.target_word,
@@ -2779,6 +2793,8 @@ def _describe_pending_ticket_choice(
         elif command_intent.intent == "pending_code_request":
             target_code = command_intent.requested_code or target_code
         action = "加入并提交" if command_intent.intent == "pending_add_and_submit" else "加词"
+        if command_intent.recode_indices:
+            action = "复合选择（含重新编码）"
         if command_intent.intent == "pending_recode":
             action = "重新编码后加词"
         return f"{action}「{state.word}」→ {target_code}"

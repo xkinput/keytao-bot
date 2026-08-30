@@ -1902,6 +1902,19 @@ async def trace_sensitive_message(bot: Bot, event: Event):
 def _pending_state_binding_pairs(state: PendingState) -> Tuple[Tuple[str, str], ...]:
     """Return the exact sealed word/code pairs for delivery-time comparison."""
     if isinstance(state, PendingToolConfirm):
+        resolved_candidate_plan = state.args.get("_resolved_candidate_plan")
+        if (
+            state.function_name == "keytao_shift_phrase_code"
+            and isinstance(resolved_candidate_plan, list)
+            and _chat_commands._resolved_candidate_plan_matches(state)
+        ):
+            return tuple(
+                (
+                    str(item.get("word") or "").strip(),
+                    str(item.get("code") or "").strip().lower(),
+                )
+                for item in resolved_candidate_plan
+            )
         raw_items = state.args.get("items")
         if not isinstance(raw_items, list):
             return ()
@@ -2341,6 +2354,22 @@ def _prepare_user_facing_reply(
     conv_key = memory_context.conversation_address if memory_context else None
     platform = memory_context.platform if memory_context else "web"
     current_message = _current_turn_message.get("")
+    live_record = (
+        conversation_state_store.get_record(conv_key)
+        if conv_key is not None
+        else None
+    )
+    if (
+        current_message
+        and "连续两次没有生成可见回复或工具调用" in str(response or "")
+        and parse_pending_candidate_selection(current_message) is not None
+        and live_record is not None
+        and isinstance(live_record.state, PendingAddWord)
+        and not live_record.execution_id
+    ):
+        live_options = _render_live_single_candidate_record(live_record)
+        if live_options:
+            response = live_options
     if (
         current_message
         and "evict" in _authorization_grammar.parsed_operation_kinds(
@@ -3225,14 +3254,42 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
                 if replacement_response is not None:
                     ctx.scoped_pending_response = replacement_response
                     return False
-            (
-                ctx.scoped_pending_state,
-                ctx.scoped_pending_intent,
-                ctx.scoped_pending_response,
-            ) = _resolve_multi_word_pending_candidate_selection(
-                ctx.current_pending_record.state,
-                ctx.normalized_message_text,
+            structural_pending_intent = (
+                _structural_pending_add_word_intent(
+                    ctx.normalized_message_text,
+                    ctx.current_pending_record.state,
+                )
+                if isinstance(ctx.current_pending_record.state, PendingAddWord)
+                else None
             )
+            if structural_pending_intent is not None:
+                # A live server-backed candidate selector is already a closed
+                # command. Bind it before generic routing so no intent-model
+                # turn can sit in front of the deterministic ticket handler.
+                (
+                    canonical_pending_intent,
+                    canonical_pending_error,
+                ) = await _canonicalize_pending_ticket_intent(
+                    ctx.current_pending_record.state,
+                    ctx.normalized_message_text,
+                    structural_pending_intent,
+                    ctx.platform,
+                    ctx.user_id,
+                )
+                if canonical_pending_intent is None:
+                    ctx.scoped_pending_response = canonical_pending_error
+                else:
+                    ctx.scoped_pending_state = ctx.current_pending_record.state
+                    ctx.scoped_pending_intent = canonical_pending_intent
+            else:
+                (
+                    ctx.scoped_pending_state,
+                    ctx.scoped_pending_intent,
+                    ctx.scoped_pending_response,
+                ) = _resolve_multi_word_pending_candidate_selection(
+                    ctx.current_pending_record.state,
+                    ctx.normalized_message_text,
+                )
             if (
                 ctx.scoped_pending_response is None
                 and ctx.scoped_pending_intent is None

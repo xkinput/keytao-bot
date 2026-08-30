@@ -58,6 +58,7 @@ from .scenarios import (
     S41_READING_MESSAGE,
     S41_WORD,
     S42_WORDS,
+    S43_WORD,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -85,6 +86,7 @@ from .scenarios import (
 )
 from .run import (
     S9_ZDIC_WARMUP_BACKOFF_SECONDS,
+    _encoded_matches_zdic_fixture,
     abort_record_for_error,
     build_bot_reference_fixture,
     collect_local_socket_stats,
@@ -100,6 +102,7 @@ from .run import (
 from .runtime import E2EBotHarness, LocalNextClient, NextServer, RigInfrastructureError
 from .safety import (
     BLOCKED_EXTERNAL_DOMAINS,
+    EncodeDelayController,
     NetworkAllowlist,
     PronunciationPoisonController,
     SafetyViolation,
@@ -109,7 +112,12 @@ from .safety import (
     validate_next_database_url,
     validate_test_binding,
 )
-from .zdic_seed import ZDIC_FIXTURES_BY_SCENARIO, seed_s9_zdic_cache, seed_zdic_cache
+from .zdic_seed import (
+    ZDIC_FIXTURES_BY_SCENARIO,
+    seed_s9_zdic_cache,
+    seed_zdic_cache,
+    zdic_cache_rows_for_scenarios,
+)
 
 
 class NextServerRuntimeTests(unittest.TestCase):
@@ -519,15 +527,17 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S40 closes the 2026-08-25 assent-execution incident round", readme)
         self.assertIn("S41 closes the 2026-08-26 reading-reply duplication incident", readme)
         self.assertIn("S42 closes the 2026-08-26 missing-affordance incident", readme)
+        self.assertIn("S43 closes the 2026-08-28 encode-timeout incident", readme)
+        self.assertIn("S44 closes the 2026-08-29 compound-selection incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
 
-    def test_scenario_pack_is_contiguous_through_s42(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s44(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 43)],
+            [f"S{index}" for index in range(1, 45)],
         )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:
@@ -618,6 +628,87 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(
             entries,
             {word: ("absent", []) for word in S42_WORDS},
+        )
+
+    def test_s43_pins_encode_timeout_recovery_and_degradation(self) -> None:
+        self.assertEqual(S43_WORD, "钉选")
+        self.assertIn("S43", {scenario.scenario_id for scenario in SCENARIOS})
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S43"]
+        self.assertEqual(fixture["probe_words"], (S43_WORD,))
+        controller = EncodeDelayController(0.20, 0.05)
+        controller.arm("S43", injections=3)
+        decisions = [
+            controller.should_inject(
+                scenario_id="S43",
+                method="GET",
+                path="/api/phrases/encode",
+            )
+            for _ in range(4)
+        ]
+        self.assertEqual(decisions, [True, True, True, False])
+        self.assertEqual(controller.injection_count, 3)
+
+    def test_s44_pins_compound_selection_and_owned_fixture(self) -> None:
+        from . import scenarios as scenario_module
+
+        self.assertEqual(scenario_module.S44_WORD, "载具")
+        self.assertEqual(scenario_module.S44_OCCUPANT, "在距")
+        self.assertEqual(scenario_module.S44_OCCUPIED_CODE, "zhjl")
+        self.assertEqual(scenario_module.S44_FREE_CODE, "zhjlu")
+        self.assertEqual(
+            scenario_module.S44_COMMAND,
+            "1 重新编码，并加入 2",
+        )
+        self.assertEqual(scenario_module.S44_DISCOVERY, "加词 载具")
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S44"]
+        self.assertEqual(
+            fixture["probe_words"],
+            (scenario_module.S44_WORD, scenario_module.S44_OCCUPANT),
+        )
+        characters = {
+            row["entry"]: row["pinyins"]
+            for row in fixture["rows"]
+            if row["kind"] == "char"
+        }
+        self.assertEqual(characters["载"], ["zǎi", "zài"])
+        rows_by_key = {
+            (row["kind"], row["entry"]): row
+            for row in fixture["rows"]
+        }
+        self.assertTrue(_encoded_matches_zdic_fixture(
+            word="载具",
+            encoded={
+                "pronunciationSource": "zdic-phrase",
+                "standardPronunciationStatus": "found",
+                "semanticPronunciationNeeded": False,
+                "chars": [
+                    {
+                        "char": "载",
+                        "pinyin": "zài",
+                        "pinyins": ["zài", "zǎi"],
+                        "pronunciationLookupStatus": "found",
+                    },
+                    {
+                        "char": "具",
+                        "pinyin": "jù",
+                        "pinyins": ["jù"],
+                        "pronunciationLookupStatus": "found",
+                    },
+                ],
+            },
+            rows_by_key=rows_by_key,
+        ))
+
+    def test_all_scenario_zdic_declarations_merge_without_conflicts(self) -> None:
+        scenario_ids = tuple(scenario.scenario_id for scenario in SCENARIOS)
+        rows = zdic_cache_rows_for_scenarios(scenario_ids)
+        self.assertTrue(rows)
+        self.assertEqual(
+            sum(
+                row["kind"] == "char" and row["entry"] == "载"
+                for row in rows
+            ),
+            1,
         )
 
     def test_recommended_empty_code_accepts_executable_opt_out(self) -> None:

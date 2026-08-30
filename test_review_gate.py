@@ -4683,9 +4683,13 @@ def test_audit_budget_nesting_and_timeout_retains_review():
         for retry_index in range(review_module.KEYTAO_ENCODE_MAX_ATTEMPTS - 1)
     )
     encode_worst_case = (
-        review_module.KEYTAO_ENCODE_REQUEST_TIMEOUT
-        * review_module.KEYTAO_ENCODE_MAX_ATTEMPTS
+        sum(review_module.KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER)
         + encode_retry_backoff
+    )
+    check(
+        "encode retries use the measured cold-path budget ladder",
+        review_module.KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER
+        == (10.0, 20.0, 30.0),
     )
     lookup_retry_backoff = sum(
         0.5 * (2 ** retry_index)

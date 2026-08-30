@@ -56,6 +56,10 @@ from .scenarios import (
     S39_WORD,
     S41_EXISTING_CODES,
     S41_WORD,
+    S44_FREE_CODE,
+    S44_OCCUPANT,
+    S44_OCCUPIED_CODE,
+    S44_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -619,7 +623,12 @@ def _encoded_matches_zdic_fixture(
         and actual.get("char") == char
         and expected is not None
         and actual.get("pinyin") == expected_pinyin
-        and actual.get("pinyins") == expected["pinyins"]
+        # The encode route moves the context-selected reading to the front of
+        # a single character's alternatives. The available-reading fact is a
+        # set; the selected ``pinyin`` above remains strictly ordered by word.
+        and isinstance(actual.get("pinyins"), list)
+        and len(actual["pinyins"]) == len(expected["pinyins"])
+        and set(actual["pinyins"]) == set(expected["pinyins"])
         and actual.get("pronunciationLookupStatus") == expected["status"]
         for char, actual, expected_pinyin in zip(
             word,
@@ -1656,6 +1665,87 @@ async def ensure_s37_fixture(
     }
 
 
+async def ensure_s44_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed the sole occupant and prove both compound-selection destinations."""
+    newcomer_codes = ordered_candidate_codes(await client.encode(S44_WORD))
+    occupant_codes = ordered_candidate_codes(await client.encode(S44_OCCUPANT))
+    if newcomer_codes[:2] != [S44_OCCUPIED_CODE, S44_FREE_CODE]:
+        raise RigInfrastructureError(
+            f"S44 {S44_WORD} candidate chain does not start at "
+            f"{S44_OCCUPIED_CODE}, {S44_FREE_CODE}: {newcomer_codes}"
+        )
+    if not occupant_codes or occupant_codes[0] != S44_OCCUPIED_CODE:
+        raise RigInfrastructureError(
+            f"S44 {S44_OCCUPANT} candidate chain does not start at "
+            f"{S44_OCCUPIED_CODE}: {occupant_codes}"
+        )
+    for code in (S44_OCCUPIED_CODE, S44_FREE_CODE):
+        exact_rows = [
+            row
+            for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if exact_rows:
+            raise RigInfrastructureError(
+                f"S44 requires an empty exact {code} slot before seeding: "
+                f"{exact_rows}"
+            )
+    await client.clean_draft(seed_identity["platform_id"])
+    seeded = await client.seed_phrase(
+        platform_id=seed_identity["platform_id"],
+        word=S44_OCCUPANT,
+        code=S44_OCCUPIED_CODE,
+    )
+    exact_rows = [
+        row
+        for row in await client.phrases_by_code(S44_OCCUPIED_CODE)
+        if row.get("code") == S44_OCCUPIED_CODE
+    ]
+    if not (
+        len(exact_rows) == 1
+        and exact_rows[0].get("word") == S44_OCCUPANT
+        and exact_rows[0].get("type") == "Phrase"
+        and str((exact_rows[0].get("user") or {}).get("name") or "").startswith(
+            RESERVED_BINDING_PREFIX
+        )
+    ):
+        raise RigInfrastructureError(
+            f"S44 did not seed sole rig-owned {S44_OCCUPANT}@"
+            f"{S44_OCCUPIED_CODE}: {exact_rows}"
+        )
+    shifted_code = ""
+    for code in occupant_codes[1:]:
+        if code == S44_FREE_CODE:
+            continue
+        occupied = [
+            row
+            for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if not occupied:
+            shifted_code = code
+            break
+    if not shifted_code:
+        raise RigInfrastructureError(
+            f"S44 {S44_OCCUPANT} has no free shift slot after reserving "
+            f"{S44_FREE_CODE}: {occupant_codes}"
+        )
+    return {
+        "word": S44_WORD,
+        "occupantWord": S44_OCCUPANT,
+        "occupiedCode": S44_OCCUPIED_CODE,
+        "additionalCode": S44_FREE_CODE,
+        "newcomerCandidateCodes": newcomer_codes,
+        "occupantCandidateCodes": occupant_codes,
+        "shiftedCode": shifted_code,
+        "seedBatchId": seeded.get("batchId"),
+    }
+
+
 async def ensure_s39_fixture(
     *,
     client: LocalNextClient,
@@ -2220,6 +2310,12 @@ async def async_main(args: argparse.Namespace) -> int:
                             client=client,
                             seed_identity=seed_identity,
                             encode_word=encode_word,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S44":
+                        fixture_facts["s44"] = await ensure_s44_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     await client.clean_draft(identities[scenario.scenario_id]["platform_id"])

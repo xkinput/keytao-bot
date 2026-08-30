@@ -79,6 +79,13 @@ S35 declares authoritative readings for the isolated `发布会`/`重病号`,
 `计算机`/`建三江`, and `无事忙` controls. It clears only those declared
 rig-owned words, seeds the exact `重病号@fbh` and `建三江@jsj` occupants, and
 uses the vendored commonness reference for both front-insert verdicts.
+S43 declares the authoritative whole-word `dīng xuǎn` reading for `钉选` and
+both known `钉` character readings. The normal half exercises the seeded local
+encode result; the outage half never dispatches encode because all three bot
+attempts are failed by the bounded rig-owned controller.
+S44 declares the authoritative `zài jù` readings for `载具` and `在距`. It
+removes only those rig-owned dictionary words, seeds `在距@zhjl`, and reserves
+`zhjlu` for the second selected `载具` entry while the occupant is shifted.
 
 ## Prerequisites
 
@@ -422,6 +429,18 @@ and a word-scoped numbered selection without meta narration. A following bare
 `加入并提交` must write and submit the exact displayed pairs in that turn, while a
 query-only reading reply with no live action must advertise no reply form.
 
+S43 closes the 2026-08-28 encode-timeout incident. Its first query fails only
+the 10-second rung and requires the 20-second retry to finish through the normal
+flow. Its second query fails all three rungs and must return vendored offline
+readings plus the derivable `dgxt` audio-code base, label them as unconfirmed,
+offer only the executable `查词 钉选` retry, and leave the draft untouched.
+
+S44 closes the 2026-08-29 compound-selection incident. From one live `载具`
+candidate state, `1 重新编码，并加入 2` must preview `载具@zhjl`, the `在距`
+shift, and `载具@zhjlu` in one sealed plan; one `确认` writes all four plan
+items. Free-slot modifiers, duplicate indices, and out-of-range indices must
+return deterministic ASK replies with no model turn and no draft write.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`
@@ -430,9 +449,9 @@ Optional overrides:
 - `E2E_ARTIFACT_RETENTION` (default: `5`, minimum: `1`)
 - `E2E_ENCODE_DELAY_ONCE_SECONDS`, `E2E_ENCODE_ATTEMPT_TIMEOUT_SECONDS`
 
-The encode delay is armed only by S7. Its first matching GET is delayed and
-failed before dispatch, so the production retry path must issue the subsequent
-real localhost request and emit a retry log.
+The encode delay is armed only by S7 and S43. S7 fails one matching GET; S43
+first fails one and then, in its degraded half, exactly three. Every injection
+happens before dispatch, and the controller cannot affect another scenario.
 
 ## Add a scenario
 

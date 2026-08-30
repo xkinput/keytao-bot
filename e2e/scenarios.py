@@ -6186,6 +6186,286 @@ async def scenario_s42(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S43_WORD = "钉选"
+
+
+async def scenario_s43(ctx: ScenarioContext) -> dict[str, Any]:
+    """Recover on a longer retry, then degrade read-only after full outage."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    retry_message = f"喵喵 查词 {S43_WORD}"
+    ctx.encode_delay.arm(ctx.scenario_id, injections=1)
+    try:
+        messages.append(retry_message)
+        recovered_reply = await ctx.send_group(retry_message, to_me=True)
+        replies.append(recovered_reply)
+        recovered_injections = ctx.encode_delay.injection_count
+    finally:
+        ctx.encode_delay.disarm()
+    require(
+        recovered_injections == 1,
+        f"S43 did not inject exactly the first encode attempt: {recovered_injections}",
+    )
+    require(
+        S43_WORD in recovered_reply
+        and "编码服务重试后仍不可用" not in recovered_reply
+        and "未经编码服务确认" not in recovered_reply,
+        f"S43 longer retry did not complete through the normal flow: {recovered_reply}",
+    )
+    recovery_retry_logs = [
+        str(event.get("message") or "")
+        for event in ctx.attempt_events()
+        if event.get("kind") == "log"
+        and "[http_client] retry" in str(event.get("message") or "")
+        and "next_timeout=20s" in str(event.get("message") or "")
+    ]
+    require(
+        recovery_retry_logs,
+        "S43 recovered without logging the longer second-attempt budget",
+    )
+
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    ctx.encode_delay.arm(ctx.scenario_id, injections=3)
+    try:
+        messages.append(retry_message)
+        degraded_reply = await ctx.send_group(retry_message, to_me=True)
+        replies.append(degraded_reply)
+        failure_injections = ctx.encode_delay.injection_count
+    finally:
+        ctx.encode_delay.disarm()
+    require(
+        failure_injections == 3,
+        f"S43 did not exhaust all three encode attempts: {failure_injections}",
+    )
+    degraded_contract = advertised_reply_contract(degraded_reply)
+    require(
+        S43_WORD in degraded_reply
+        and "上游暂时不可用" in degraded_reply
+        and "未经编码服务确认" in degraded_reply
+        and "dīng xuǎn" in degraded_reply
+        and "dgxt" in degraded_reply,
+        f"S43 degraded reply omitted offline evidence: {degraded_reply}",
+    )
+    require(
+        f"查词 {S43_WORD}" in degraded_reply
+        and "查看草稿" not in degraded_reply,
+        f"S43 degraded reply advertised the wrong next step: {degraded_reply}",
+    )
+    require(
+        "本次不提供写入" in degraded_reply
+        and not degraded_contract.requires_live_state
+        and not any(
+            marker in degraded_reply
+            for marker in ("回复「加入」", "加入并提交", " 添加1", " 添加2")
+        ),
+        f"S43 degraded reply exposed a write affordance: {degraded_reply}",
+    )
+    draft = await ctx.draft()
+    require(not draft.get("items"), f"S43 query path wrote to the draft: {draft}")
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "recoveredInjections": recovered_injections,
+            "failureInjections": failure_injections,
+            "longerRetryLogged": True,
+            "degradedReadings": ["dīng xuǎn"],
+            "degradedCandidateBase": "dgxt",
+            "retryCommand": f"查词 {S43_WORD}",
+            "writeAdvertised": degraded_contract.requires_live_state,
+        },
+    }
+
+
+S44_WORD = "载具"
+S44_OCCUPANT = "在距"
+S44_OCCUPIED_CODE = "zhjl"
+S44_FREE_CODE = "zhjlu"
+S44_DISCOVERY = f"加词 {S44_WORD}"
+S44_COMMAND = "1 重新编码，并加入 2"
+
+
+async def scenario_s44(ctx: ScenarioContext) -> dict[str, Any]:
+    """Execute one compound selection and keep invalid controls read-only."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(cleanup.get("success") is True, f"S44 cleanup failed: {cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    fixture = ctx.fixture_facts.get("s44") or {}
+    shifted_code = str(fixture.get("shiftedCode") or "").strip()
+    require(
+        shifted_code
+        and shifted_code not in {S44_OCCUPIED_CODE, S44_FREE_CODE},
+        f"S44 fixture omitted a post-reservation shift slot: {fixture}",
+    )
+
+    messages.append(S44_DISCOVERY)
+    discovery = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(discovery)
+    require(
+        f"1. {S44_OCCUPIED_CODE} — 已有「{S44_OCCUPANT}」" in discovery
+        and f"2. {S44_FREE_CODE} — 空位" in discovery,
+        f"S44 discovery did not expose the exact live slots: {discovery}",
+    )
+
+    controls = (
+        ("2 重新编码 + 1", ("编号 2", "空位", "不能使用「重新编码」")),
+        ("1 重新编码 + 1", ("编号 1", "重复")),
+        ("1 重新编码 + 4", ("编号 4", "超出当前候选范围 1-3")),
+    )
+    control_facts: list[dict[str, Any]] = []
+    for command, markers in controls:
+        cutoff = max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+        messages.append(command)
+        reply = await ctx.send_group(command, to_me=True)
+        replies.append(reply)
+        turn_events = [
+            event
+            for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > cutoff
+        ]
+        model_turns = [
+            event for event in turn_events
+            if event.get("kind") == "modelExchange"
+        ]
+        mutation_tools = [
+            event for event in turn_events
+            if event.get("kind") == "tool"
+            and event.get("name") in {
+                "keytao_batch_add_to_draft",
+                "keytao_create_phrase",
+                "keytao_shift_phrase_code",
+            }
+        ]
+        draft = await ctx.draft()
+        require(
+            all(marker in reply for marker in markers)
+            and "本次未写入" in reply
+            and not draft.get("items")
+            and not model_turns
+            and not mutation_tools,
+            f"S44 control was not a deterministic read-only ASK: "
+            f"command={command}; reply={reply}; draft={draft}; "
+            f"models={model_turns}; tools={mutation_tools}",
+        )
+        control_facts.append({
+            "command": command,
+            "markers": list(markers),
+            "modelTurns": len(model_turns),
+            "mutationTools": len(mutation_tools),
+            "draftItems": len(draft.get("items") or []),
+        })
+
+    happy_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append(S44_COMMAND)
+    plan_reply = await ctx.send_group(S44_COMMAND, to_me=True)
+    replies.append(plan_reply)
+    preview_draft = await ctx.draft()
+    preview_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > happy_cutoff
+    ]
+    preview_calls = [
+        event for event in preview_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and not event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    preview_model_turns = [
+        event for event in preview_events
+        if event.get("kind") == "modelExchange"
+    ]
+    require(
+        f"「{S44_WORD}」→ {S44_OCCUPIED_CODE}" in plan_reply
+        and f"「{S44_OCCUPANT}」顺延至 {shifted_code}" in plan_reply
+        and f"「{S44_WORD}」→ {S44_FREE_CODE}" in plan_reply
+        and plan_reply.count(pending_confirmation_copy()) == 1
+        and len(preview_calls) == 1
+        and not preview_model_turns
+        and not preview_draft.get("items"),
+        f"S44 compound selection was not one deterministic preview: "
+        f"reply={plan_reply}; draft={preview_draft}; "
+        f"calls={preview_calls}; models={preview_model_turns}",
+    )
+
+    messages.append("确认")
+    confirmation_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(confirmation_reply)
+    draft = await ctx.draft()
+    expected_items = {
+        ("Delete", S44_OCCUPANT, S44_OCCUPIED_CODE),
+        ("Create", S44_WORD, S44_OCCUPIED_CODE),
+        ("Create", S44_OCCUPANT, shifted_code),
+        ("Create", S44_WORD, S44_FREE_CODE),
+    }
+    actual_items = {item_key(item) for item in draft.get("items", [])}
+    happy_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > happy_cutoff
+    ]
+    confirmed_calls = [
+        event for event in happy_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    happy_model_turns = [
+        event for event in happy_events
+        if event.get("kind") == "modelExchange"
+    ]
+    require(
+        actual_items == expected_items
+        and len(draft.get("items", [])) == 4
+        and len(confirmed_calls) == 1
+        and not happy_model_turns,
+        f"S44 confirmation did not write the exact sealed plan once: "
+        f"reply={confirmation_reply}; draft={draft}; "
+        f"calls={confirmed_calls}; models={happy_model_turns}",
+    )
+
+    final_cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(
+        final_cleanup.get("success") is True,
+        f"S44 final cleanup failed: {final_cleanup}",
+    )
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": draft,
+        "facts": {
+            "word": S44_WORD,
+            "occupant": S44_OCCUPANT,
+            "occupiedCode": S44_OCCUPIED_CODE,
+            "additionalCode": S44_FREE_CODE,
+            "shiftedCode": shifted_code,
+            "controlAsks": control_facts,
+            "previewCalls": len(preview_calls),
+            "confirmedCalls": len(confirmed_calls),
+            "selectionModelTurns": len(happy_model_turns),
+            "confirmationSteps": 1,
+            "expectedItems": sorted(expected_items),
+            "actualItems": sorted(actual_items),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -6229,6 +6509,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S40", "assent execution and existing-word incident closure", scenario_s40),
     Scenario("S41", "reading focus and code explanation deduplication", scenario_s41),
     Scenario("S42", "live candidate affordances and bare assent execution", scenario_s42),
+    Scenario("S43", "encode retry ladder and offline read-only degradation", scenario_s43),
+    Scenario("S44", "deterministic compound candidate selection", scenario_s44),
 )
 
 

@@ -31,7 +31,7 @@ from .keytao_encoding import (
     pinyin_to_phonetic_code,
 )
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
-from .observability import current_turn_id, observe_model_call
+from .observability import current_turn_id, observe_model_call, record_encode_call
 from .pending_confirmation import render_remediation_reply
 from .llm_request_gate import RequestWindowGate
 from .pinyin_reference import (
@@ -219,8 +219,11 @@ PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT = 2.25
 PRONUNCIATION_FETCH_MAX_ATTEMPTS = 2
 PRONUNCIATION_FETCH_RETRYABLE_STATUSES = (408, 425, 429, 500, 502, 503, 504)
 PRONUNCIATION_WORD_BINDING_WINDOW_CHARS = 80
-KEYTAO_ENCODE_REQUEST_TIMEOUT = 10.0
-KEYTAO_ENCODE_MAX_ATTEMPTS = 2
+KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER = (10.0, 20.0, 30.0)
+# Backward-compatible name for callers that need the first interactive budget.
+KEYTAO_ENCODE_REQUEST_TIMEOUT = KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER[0]
+KEYTAO_ENCODE_MAX_ATTEMPTS = len(KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER)
+KEYTAO_ENCODE_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 REVIEW_LOOKUP_REQUEST_TIMEOUT = 3.0
 REVIEW_LOOKUP_MAX_ATTEMPTS = 2
 ENTITY_DIRECT_FETCH_TIMEOUT = 3.0
@@ -1635,6 +1638,142 @@ async def collect_pronunciation_evidence_limited(word: str) -> Dict[str, Any]:
         }
 
 
+def _offline_candidate_base(normalized: Sequence[str]) -> List[str]:
+    """Derive only the shape-independent prefix of a KeyTao candidate chain."""
+    phonetic_codes = [pinyin_to_phonetic_code(syllable) for syllable in normalized]
+    if not phonetic_codes or any(not code for code in phonetic_codes):
+        return []
+    concrete_codes = [str(code) for code in phonetic_codes]
+    if len(concrete_codes) <= 2:
+        base = "".join(concrete_codes)
+    elif len(concrete_codes) == 3:
+        base = "".join(code[:1] for code in concrete_codes)
+    else:
+        base = "".join(
+            concrete_codes[index][:1]
+            for index in (0, 1, 2, len(concrete_codes) - 1)
+        )
+    return [base] if re.fullmatch(r"[a-z]+", base) else []
+
+
+def _offline_encode_reference(word: str) -> Dict[str, Any]:
+    """Return bounded read-only evidence; never manufacture write capability."""
+    key = str(word or "").strip()
+    reading_groups: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = []
+    try:
+        exact_rows = query_reference_readings(key)
+    except PinyinReferenceUnavailable as error:
+        logger.warning("Offline pronunciation reference unavailable: %s", error)
+        exact_rows = []
+
+    for row in exact_rows:
+        normalized = tuple(row.normalized)
+        if len(normalized) != len(key) or not all(normalized):
+            continue
+        reading_groups.append((
+            str(row.display).strip(),
+            normalized,
+            (str(row.dataset),),
+        ))
+
+    if not reading_groups and key:
+        composed: List[Tuple[List[str], List[str], List[str]]] = [([], [], [])]
+        for character in key:
+            try:
+                rows = query_reference_readings(character)
+            except PinyinReferenceUnavailable as error:
+                logger.warning("Offline pronunciation reference unavailable: %s", error)
+                rows = []
+            character_options: Dict[Tuple[str, str], List[str]] = {}
+            for row in rows:
+                normalized = tuple(row.normalized)
+                display = str(row.display).strip()
+                if len(normalized) != 1 or not normalized[0] or not display:
+                    continue
+                character_options.setdefault(
+                    (display, normalized[0]),
+                    [],
+                ).append(str(row.dataset))
+            if not character_options:
+                composed = []
+                break
+            next_groups: List[Tuple[List[str], List[str], List[str]]] = []
+            for displays, normalized_values, datasets in composed:
+                for (display, normalized), option_datasets in character_options.items():
+                    next_groups.append((
+                        [*displays, display],
+                        [*normalized_values, normalized],
+                        [*datasets, *option_datasets],
+                    ))
+                    if len(next_groups) >= 8:
+                        break
+                if len(next_groups) >= 8:
+                    break
+            composed = next_groups
+        reading_groups.extend(
+            (
+                " ".join(displays),
+                tuple(normalized_values),
+                tuple(dict.fromkeys(datasets)),
+            )
+            for displays, normalized_values, datasets in composed
+        )
+
+    readings: List[Dict[str, Any]] = []
+    seen_readings: set[Tuple[str, Tuple[str, ...]]] = set()
+    for display, normalized, datasets in reading_groups:
+        identity = (display, normalized)
+        if not display or identity in seen_readings:
+            continue
+        seen_readings.add(identity)
+        readings.append({
+            "pinyin": display,
+            "normalized": list(normalized),
+            "candidateCodes": _offline_candidate_base(normalized),
+            "datasets": list(datasets),
+        })
+        if len(readings) >= 8:
+            break
+
+    try:
+        frequency = _query_commonness_reference(key)
+    except Exception as error:  # pragma: no cover - defensive read-only fallback
+        logger.warning(
+            "Offline commonness reference unavailable for %s: %s",
+            key,
+            type(error).__name__,
+        )
+        frequency = {
+            "available": False,
+            "attested": False,
+            "word": key,
+            "corpusFrequency": None,
+            "partOfSpeech": None,
+            "dictionaryPresenceCount": 0,
+        }
+    return {
+        "available": bool(readings or frequency.get("attested")),
+        "readings": readings,
+        "frequency": frequency,
+    }
+
+
+def _encode_failure_payload(
+    word: str,
+    message: str,
+    *,
+    upstream_transient: bool,
+) -> Dict[str, Any]:
+    return {
+        "success": False,
+        "word": word,
+        "message": message,
+        "upstreamTransient": upstream_transient,
+        "encodeServiceConfirmed": False,
+        "offlineReference": _offline_encode_reference(word),
+    }
+
+
 async def _call_keytao_api(config: ReviewHttpConfig, path: str, payload: Optional[Dict] = None, method: str = "POST") -> Dict:
     """Authenticated KeyTao API call.
 
@@ -1670,35 +1809,63 @@ async def fetch_keytao_encode(
 ) -> Dict:
     path = "/api/phrases/encode"
     params = {"word": word}
-    try:
-        data = await http_client.keytao_json(
-            "GET",
-            path,
-            params=params,
-            timeout=KEYTAO_ENCODE_REQUEST_TIMEOUT,
-            retries=KEYTAO_ENCODE_MAX_ATTEMPTS,
-            require_token=False,
-        )
-    except KeytaoApiError as error:
-        if error.status_code is None:
-            return {
-                "success": False,
-                "message": render_remediation_reply(
-                    f"编码服务重试后仍不可用：{error.message}"
-                ),
-            }
-        return {"success": False, "message": f"编码服务返回错误: {error.message}"}
-    except Exception as error:
-        logger.warning(
-            "Encoding service failed unexpectedly for %s: %s",
-            word,
-            type(error).__name__,
-        )
-        return {
-            "success": False,
-            "message": render_remediation_reply("编码服务暂时不可用"),
-        }
-    return normalize_contextual_phrase_encoding(word, data)
+    for attempt, timeout in enumerate(KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER, start=1):
+        attempt_started_at = time.monotonic()
+        try:
+            data = await http_client.keytao_json(
+                "GET",
+                path,
+                params=params,
+                timeout=timeout,
+                # The encode lane owns its escalating retry schedule. Keeping
+                # the shared client to one attempt prevents hidden same-budget
+                # retries inside each rung.
+                retries=1,
+                require_token=False,
+            )
+            return normalize_contextual_phrase_encoding(word, data)
+        except KeytaoApiError as error:
+            retryable = (
+                error.status_code is None
+                or error.status_code in KEYTAO_ENCODE_RETRYABLE_STATUSES
+            )
+            if retryable and attempt < KEYTAO_ENCODE_MAX_ATTEMPTS:
+                next_timeout = KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER[attempt]
+                logger.info(
+                    f"[http_client] retry {attempt}/"
+                    f"{KEYTAO_ENCODE_MAX_ATTEMPTS - 1} GET {path}: "
+                    f"{error.message}; next_timeout={next_timeout:.0f}s"
+                )
+                await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
+                continue
+            if error.status_code is None:
+                return _encode_failure_payload(
+                    word,
+                    f"编码服务重试后仍不可用：{error.message}",
+                    upstream_transient=True,
+                )
+            return _encode_failure_payload(
+                word,
+                f"编码服务返回错误: {error.message}",
+                upstream_transient=retryable,
+            )
+        except Exception as error:
+            logger.warning(
+                "Encoding service failed unexpectedly for %s: %s",
+                word,
+                type(error).__name__,
+            )
+            return _encode_failure_payload(
+                word,
+                "编码服务暂时不可用",
+                upstream_transient=False,
+            )
+        finally:
+            record_encode_call(
+                time.monotonic() - attempt_started_at,
+                retry=attempt > 1,
+            )
+    raise RuntimeError("Encode timeout ladder exited without a result")  # pragma: no cover
 
 
 async def lookup_codes(config: ReviewHttpConfig, codes: Sequence[str]) -> Dict[str, List[Dict]]:
@@ -2658,7 +2825,9 @@ async def prepare_reviewed_word(
 
     if not encode_data.get("success", True) and not encode_data.get("codes"):
         return apply_review_disposition({
+            **encode_data,
             "success": False,
+            "word": word,
             "message": encode_data.get("message", "编码服务未返回有效结果"),
         }, "code_unresolved")
 
@@ -5663,7 +5832,7 @@ def _chain_recommendation_text(priority_review: Dict) -> str:
 
 
 AUDIT_ITEM_CONCURRENCY = 3
-AUDIT_REVIEW_STAGE_TIMEOUT = 28.0
+AUDIT_REVIEW_STAGE_TIMEOUT = 72.0
 AUDIT_COMMONNESS_STAGE_TIMEOUT = 5.0
 AUDIT_PRIORITY_STAGE_TIMEOUT = 5.0
 AUDIT_WORST_CASE_SEQUENTIAL_SECONDS = (
@@ -5671,7 +5840,7 @@ AUDIT_WORST_CASE_SEQUENTIAL_SECONDS = (
     + AUDIT_COMMONNESS_STAGE_TIMEOUT
     + AUDIT_PRIORITY_STAGE_TIMEOUT
 )
-AUDIT_ITEM_TIMEOUT = 40.0
+AUDIT_ITEM_TIMEOUT = 85.0
 
 AUDIT_STAGE_POLICIES = {
     "review": {"label": "读音与编码核验", "classification": "gating"},

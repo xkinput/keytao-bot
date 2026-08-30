@@ -4,6 +4,7 @@
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -35,6 +36,11 @@ sys.modules["nonebot.log"] = _fake_log
 
 from keytao_bot.utils import http_client, keytao_review
 from keytao_bot.utils.keytao_review import ReviewHttpConfig
+from keytao_bot.utils.observability import (
+    begin_turn_metrics,
+    emit_turn_metrics,
+    end_turn_metrics,
+)
 
 
 CONFIG = ReviewHttpConfig(api_base="https://fake", bot_token="fake")
@@ -76,7 +82,7 @@ class _EncodingService:
     async def request(self, method, url, **kwargs):
         self.attempts += 1
         self.timeouts.append(float(kwargs["timeout"]))
-        if self.always_timeout or self.attempts == 1 or kwargs["timeout"] < 25.0:
+        if self.always_timeout or kwargs["timeout"] < 20.0:
             raise httpx.ReadTimeout(
                 "" if self.always_timeout else "simulated slow encoder",
                 request=httpx.Request(method, url),
@@ -192,21 +198,121 @@ class EncodingRetryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.get("codes"), ["tpyp", "tpypo", "tpypoi"])
         self.assertEqual(service.attempts, 2)
-        self.assertTrue(all(timeout >= 25.0 for timeout in service.timeouts))
+        self.assertEqual(service.timeouts, [10.0, 20.0])
 
-    async def test_reviewed_add_reports_bounded_retry_failure_clearly(self):
-        service = _EncodingService(always_timeout=True)
+    async def test_encode_retry_log_resolves_the_next_timeout_budget(self):
+        service = _EncodingService()
 
         with patch.object(
             keytao_review.http_client,
             "get_keytao_client",
             AsyncMock(return_value=service),
-        ), patch.object(keytao_review.http_client.asyncio, "sleep", return_value=None):
+        ), patch.object(
+            keytao_review.http_client.asyncio,
+            "sleep",
+            return_value=None,
+        ), patch.object(keytao_review.logger, "info") as log_info:
             result = await keytao_review.fetch_keytao_encode(CONFIG, "唐扬")
 
-        self.assertEqual(service.attempts, 4)
+        self.assertEqual(result.get("codes"), ["tpyp", "tpypo", "tpypoi"])
+        self.assertTrue(
+            any(
+                len(call.args) == 1
+                and "retry 1/2" in str(call.args[0])
+                and "next_timeout=20s" in str(call.args[0])
+                for call in log_info.call_args_list
+            ),
+            log_info.call_args_list,
+        )
+
+    async def test_reviewed_add_reports_bounded_retry_failure_clearly(self):
+        service = _EncodingService(always_timeout=True)
+
+        def reference_readings(word):
+            rows = {
+                "钉": [
+                    SimpleNamespace(
+                        display="dīng", normalized=("ding",), dataset="cedict",
+                    ),
+                    SimpleNamespace(
+                        display="dìng", normalized=("ding",), dataset="cedict",
+                    ),
+                ],
+                "选": [
+                    SimpleNamespace(
+                        display="xuǎn", normalized=("xuan",), dataset="cedict",
+                    ),
+                ],
+            }
+            return rows.get(word, [])
+
+        with patch.object(
+            keytao_review.http_client,
+            "get_keytao_client",
+            AsyncMock(return_value=service),
+        ), patch.object(
+            keytao_review.http_client.asyncio,
+            "sleep",
+            return_value=None,
+        ), patch.object(
+            keytao_review,
+            "query_reference_readings",
+            side_effect=reference_readings,
+        ), patch.object(
+            keytao_review,
+            "_query_commonness_reference",
+            return_value={
+                "available": True,
+                "attested": True,
+                "word": "钉选",
+                "corpusFrequency": 12,
+                "partOfSpeech": "n",
+                "dictionaryPresenceCount": 0,
+            },
+        ):
+            result = await keytao_review.fetch_keytao_encode(CONFIG, "钉选")
+
+        self.assertEqual(service.attempts, 3)
+        self.assertEqual(service.timeouts, [10.0, 20.0, 30.0])
         self.assertIn("重试后仍不可用", result.get("message", ""))
         self.assertIn("ReadTimeout", result.get("message", ""))
+        self.assertTrue(result.get("upstreamTransient"))
+        self.assertFalse(result.get("encodeServiceConfirmed"))
+        offline = result.get("offlineReference", {})
+        self.assertEqual(
+            [item.get("pinyin") for item in offline.get("readings", [])],
+            ["dīng xuǎn", "dìng xuǎn"],
+        )
+        self.assertEqual(
+            [item.get("candidateCodes") for item in offline.get("readings", [])],
+            [["dgxt"], ["dgxt"]],
+        )
+        self.assertEqual(offline.get("frequency", {}).get("corpusFrequency"), 12)
+
+    async def test_encode_attempt_latencies_join_the_turn_metrics_line(self):
+        service = _EncodingService()
+        metrics_token = begin_turn_metrics("qq", "group")
+        try:
+            with patch.object(
+                keytao_review.http_client,
+                "get_keytao_client",
+                AsyncMock(return_value=service),
+            ), patch.object(
+                keytao_review.http_client.asyncio,
+                "sleep",
+                return_value=None,
+            ):
+                result = await keytao_review.fetch_keytao_encode(CONFIG, "唐扬")
+            metrics_line = emit_turn_metrics(types.SimpleNamespace(info=lambda _line: None))
+        finally:
+            end_turn_metrics(metrics_token)
+
+        self.assertEqual(result.get("codes"), ["tpyp", "tpypo", "tpypoi"])
+        self.assertIn("encode_calls=2", metrics_line or "")
+        self.assertIn("encode_retry_calls=1", metrics_line or "")
+        per_call = (metrics_line or "").split("encode_call_seconds=", 1)[1].split(" ", 1)[0]
+        self.assertEqual(len(per_call.split(",")), 2)
+        self.assertIn("encode_retry_flags=0,1", metrics_line or "")
 
 
 if __name__ == "__main__":

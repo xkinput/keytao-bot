@@ -201,16 +201,20 @@ def validate_admin_identity(
 
 @dataclass
 class EncodeDelayController:
-    """Inject one pre-dispatch timeout into an encode GET when explicitly armed."""
+    """Inject bounded pre-dispatch timeouts into encode GETs when armed."""
 
     delay_seconds: float
     attempt_timeout_seconds: float
     armed_scenario: str = ""
     injected: bool = False
+    max_injections: int = 1
+    injection_count: int = 0
 
-    def arm(self, scenario_id: str) -> None:
+    def arm(self, scenario_id: str, *, injections: int = 1) -> None:
         self.armed_scenario = scenario_id
         self.injected = False
+        self.max_injections = max(1, int(injections))
+        self.injection_count = 0
 
     def disarm(self) -> None:
         self.armed_scenario = ""
@@ -218,13 +222,14 @@ class EncodeDelayController:
     def should_inject(self, *, scenario_id: str, method: str, path: str) -> bool:
         if (
             not self.armed_scenario
-            or self.injected
+            or self.injection_count >= self.max_injections
             or scenario_id != self.armed_scenario
             or method.upper() != "GET"
         ):
             return False
         if path not in {"/api/phrases/encode", "/api/bot/phrases/encode"}:
             return False
+        self.injection_count += 1
         self.injected = True
         return True
 

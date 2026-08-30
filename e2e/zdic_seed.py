@@ -446,6 +446,27 @@ ZDIC_FIXTURES_BY_SCENARIO["S42"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S43"] = {
+    "probe_words": ("钉选",),
+    "rows": (
+        {"kind": "char", "entry": "钉", "status": "found", "pinyins": ["dīng", "dìng"]},
+        {"kind": "char", "entry": "选", "status": "found", "pinyins": ["xuǎn"]},
+        {"kind": "entry", "entry": "钉选", "status": "found", "pinyins": ["dīng", "xuǎn"]},
+    ),
+}
+
+ZDIC_FIXTURES_BY_SCENARIO["S44"] = {
+    "probe_words": ("载具", "在距"),
+    "rows": (
+        {"kind": "char", "entry": "载", "status": "found", "pinyins": ["zǎi", "zài"]},
+        {"kind": "char", "entry": "具", "status": "found", "pinyins": ["jù"]},
+        {"kind": "char", "entry": "在", "status": "found", "pinyins": ["zài"]},
+        {"kind": "char", "entry": "距", "status": "found", "pinyins": ["jù"]},
+        {"kind": "entry", "entry": "载具", "status": "found", "pinyins": ["zài", "jù"]},
+        {"kind": "entry", "entry": "在距", "status": "found", "pinyins": ["zài", "jù"]},
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

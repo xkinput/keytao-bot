@@ -10,7 +10,7 @@ import tempfile
 import types
 import unittest
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
@@ -2951,6 +2951,287 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(state_store.get_record(conv_key))
         finally:
             chat_module.conversation_state_store = old_state_store
+
+    async def test_compound_candidate_selection_stages_one_exact_shift_plan_without_model(self) -> None:
+        from keytao_bot.plugins import chat_commands as commands_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        old_state_store = chat_module.conversation_state_store
+        state_store = MemoryConversationStateStore()
+        chat_module.conversation_state_store = state_store
+        conv_key = ConversationAddress.private("qq", "compound-user")
+        calls = []
+        plan_digest = "a" * 64
+        warning_digest = "b" * 64
+        shift_plan = {
+            "items": [
+                {"action": "Delete", "word": "在距", "code": "zhjl", "type": "Phrase"},
+                {"action": "Create", "word": "载具", "code": "zhjl", "type": "Phrase"},
+                {"action": "Create", "word": "在距", "code": "zhjla", "type": "Phrase"},
+                {"action": "Create", "word": "载具", "code": "zhjlu", "type": "Phrase"},
+            ],
+            "shifted": [
+                {"word": "在距", "fromCode": "zhjl", "toCode": "zhjla"},
+            ],
+        }
+
+        async def fake_call(tool_name, arguments, *_args, **_kwargs):
+            calls.append((tool_name, dict(arguments)))
+            if not arguments.get("confirmed_plan_digest"):
+                return json.dumps({
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "planDigest": plan_digest,
+                    "warningDigest": warning_digest,
+                    "warnings": [],
+                    "shiftPlan": shift_plan,
+                }, ensure_ascii=False)
+            return json.dumps({
+                "success": True,
+                "successCount": 4,
+                "batchId": "compound-batch",
+                "batchUrl": "https://keytao.test/batch/compound-batch",
+                "contentVersion": 1,
+                "shiftPlan": shift_plan,
+                "receipts": [{
+                    "step": "dictionary",
+                    "status": "applied",
+                    "changes": [{
+                        "word": "在距",
+                        "fromCode": "zhjl",
+                        "toCode": "zhjla",
+                    }],
+                }],
+            }, ensure_ascii=False)
+
+        state = PendingAddWord(
+            word="载具",
+            recommended_code="zhjlu",
+            candidates=[("zhjl", True), ("zhjlu", False)],
+            occupied_words={"zhjl": ["在距"]},
+            server_candidates=[("zhjl", True), ("zhjlu", False)],
+            server_occupied_words={"zhjl": ["在距"]},
+            needs_manual_review=False,
+        )
+        classifier = AsyncMock(side_effect=AssertionError("selection reached model"))
+        try:
+            with (
+                patch.object(commands_module, "call_tool_function", side_effect=fake_call),
+                patch.object(chat_module, "_classify_message_command_intent", classifier),
+            ):
+                for message in (
+                    "1 重新编码，并加入 2",
+                    "1 重新编码 + 2",
+                    "加入 1（重新编码）和 2",
+                    "1 重新编码、2",
+                ):
+                    with self.subTest(message=message):
+                        state_store.set(conv_key, state, owner_label="～×！@")
+                        call_start = len(calls)
+                        plan_reply = await chat_module.handle_pending_message_core(
+                            message,
+                            "qq",
+                            "compound-user",
+                            conv_key,
+                            history=[],
+                            owner_label="～×！@",
+                        )
+                        self.assertIn(
+                            "「载具」→ zhjl（「在距」顺延至 zhjla）",
+                            plan_reply,
+                        )
+                        self.assertIn("「载具」→ zhjlu", plan_reply)
+                        self.assertIn(pending_confirmation_copy(), plan_reply)
+                        self.assertEqual(len(calls), call_start + 1)
+                        preview_name, preview_args = calls[call_start]
+                        self.assertEqual(preview_name, "keytao_shift_phrase_code")
+                        self.assertEqual(preview_args["word"], "载具")
+                        self.assertEqual(preview_args["target_code"], "zhjl")
+                        self.assertEqual(
+                            [
+                                (item["word"], item["code"])
+                                for item in preview_args["additional_items"]
+                            ],
+                            [("载具", "zhjlu")],
+                        )
+
+                        result = await chat_module.handle_pending_message_core(
+                            "确认",
+                            "qq",
+                            "compound-user",
+                            conv_key,
+                            history=[],
+                            owner_label="～×！@",
+                        )
+                        self.assertIn("操作已完成", result)
+                        self.assertEqual(len(calls), call_start + 2)
+                        confirmed_args = calls[call_start + 1][1]
+                        self.assertEqual(
+                            confirmed_args["confirmed_plan_digest"],
+                            plan_digest,
+                        )
+                        self.assertEqual(
+                            confirmed_args["additional_items"],
+                            preview_args["additional_items"],
+                        )
+                        self.assertIsNone(state_store.get_record(conv_key))
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(classifier.await_count, 0)
+
+    async def test_compound_candidate_selection_grammar_and_conflicts_are_deterministic(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state = PendingAddWord(
+            word="载具",
+            recommended_code="zhjlu",
+            candidates=[("zhjl", True), ("zhjlu", False)],
+            occupied_words={"zhjl": ["在距"]},
+            server_candidates=[("zhjl", True), ("zhjlu", False)],
+            server_occupied_words={"zhjl": ["在距"]},
+        )
+        for message in (
+            "1 重新编码，并加入 2",
+            "1 重新编码 + 2",
+            "加入 1（重新编码）和 2",
+            "1 重新编码、2",
+        ):
+            with self.subTest(message=message):
+                intent = chat_module._structural_pending_add_word_intent(
+                    message,
+                    state,
+                )
+                self.assertIsNotNone(intent)
+                self.assertEqual(intent.choice_indices, (1, 2))
+                self.assertEqual(intent.recode_indices, (1,))
+                self.assertEqual(intent.requested_codes, ("zhjl", "zhjlu"))
+                self.assertTrue(
+                    chat_module._message_authorizes_pending_state_control(
+                        state,
+                        message,
+                        intent,
+                    )
+                )
+
+        old_state_store = chat_module.conversation_state_store
+        state_store = MemoryConversationStateStore()
+        chat_module.conversation_state_store = state_store
+        conv_key = ConversationAddress.private("qq", "compound-control-user")
+        classifier = AsyncMock(side_effect=AssertionError("control reached model"))
+        execute = AsyncMock(side_effect=AssertionError("control reached write path"))
+        try:
+            with (
+                patch.object(chat_module, "_classify_message_command_intent", classifier),
+                patch.object(chat_module, "_execute_shift_to_code", execute),
+            ):
+                controls = (
+                    ("2 重新编码 + 1", ("编号 2", "空位", "不能使用「重新编码」")),
+                    ("1 重新编码 + 1", ("编号 1", "重复")),
+                    ("1 重新编码 + 3", ("编号 3", "超出当前候选范围 1-2")),
+                )
+                for message, expected_fragments in controls:
+                    with self.subTest(message=message):
+                        state_store.set(conv_key, state, owner_label="～×！@")
+                        response = await chat_module.handle_pending_message_core(
+                            message,
+                            "qq",
+                            "compound-control-user",
+                            conv_key,
+                            history=[],
+                            owner_label="～×！@",
+                        )
+                        for fragment in expected_fragments:
+                            self.assertIn(fragment, response)
+                        self.assertIsNotNone(state_store.get_record(conv_key))
+
+                same_code_state = replace(
+                    state,
+                    candidates=[("zhjl", True), ("zhjl", False)],
+                    server_candidates=[("zhjl", True), ("zhjl", False)],
+                )
+                state_store.set(
+                    conv_key,
+                    same_code_state,
+                    owner_label="～×！@",
+                )
+                same_code_response = await chat_module.handle_pending_message_core(
+                    "1 重新编码 + 2",
+                    "qq",
+                    "compound-control-user",
+                    conv_key,
+                    history=[],
+                    owner_label="～×！@",
+                )
+                self.assertIn("编码 zhjl", same_code_response)
+                self.assertIn("重复", same_code_response)
+                self.assertIn("本次未写入", same_code_response)
+                self.assertIsNotNone(state_store.get_record(conv_key))
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+        self.assertEqual(classifier.await_count, 0)
+        self.assertEqual(execute.await_count, 0)
+
+    async def test_compound_candidate_confirmation_rejects_exact_set_tampering(self) -> None:
+        from keytao_bot.plugins import chat_commands as commands_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        old_state_store = chat_module.conversation_state_store
+        state_store = MemoryConversationStateStore()
+        chat_module.conversation_state_store = state_store
+        conv_key = ConversationAddress.private("qq", "compound-tamper-user")
+        state_store.set(
+            conv_key,
+            PendingToolConfirm(
+                function_name="keytao_shift_phrase_code",
+                confirmation_source="server_warning",
+                args={
+                    "word": "载具",
+                    "target_code": "zhjl",
+                    "additional_items": [
+                        {"action": "Create", "word": "载具", "code": "zhjlu"},
+                        {"action": "Create", "word": "越权词", "code": "fake"},
+                    ],
+                    "_resolved_candidate_plan": [
+                        {
+                            "index": 1,
+                            "word": "载具",
+                            "code": "zhjl",
+                            "modifier": "recode",
+                            "occupants": ["在距"],
+                        },
+                        {"index": 2, "word": "载具", "code": "zhjlu", "modifier": ""},
+                    ],
+                    "confirmed_plan_digest": "a" * 64,
+                    "expected_warning_digest": "b" * 64,
+                    "expected_content_version": 0,
+                    "batch_id": "",
+                },
+            ),
+            owner_label="～×！@",
+        )
+        tool_call = AsyncMock(side_effect=AssertionError("tampered plan reached tool"))
+        try:
+            with patch.object(commands_module, "call_tool_function", tool_call):
+                response = await chat_module.handle_pending_message_core(
+                    "确认",
+                    "qq",
+                    "compound-tamper-user",
+                    conv_key,
+                    history=[],
+                    owner_label="～×！@",
+                )
+        finally:
+            chat_module.conversation_state_store = old_state_store
+
+        self.assertIn("复合候选计划校验失败", response)
+        self.assertIn("本次未写入", response)
+        self.assertEqual(tool_call.await_count, 0)
 
     async def test_batch_sink_binds_exact_multi_selection_to_candidate_capability(self) -> None:
         delivered = []
@@ -17248,6 +17529,48 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
+    def test_selection_runaway_restates_the_live_candidate_commands(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        old_state_store = chat_module.conversation_state_store
+        state_store = MemoryConversationStateStore()
+        chat_module.conversation_state_store = state_store
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id="compound-runaway",
+            space_type="private",
+            space_id="compound-runaway",
+            speaker_name="～×！@",
+        )
+        state_store.set(
+            memory_context.conversation_address,
+            PendingAddWord(
+                word="载具",
+                recommended_code="zhjlu",
+                candidates=[("zhjl", True), ("zhjlu", False)],
+                occupied_words={"zhjl": ["在距"]},
+                server_candidates=[("zhjl", True), ("zhjlu", False)],
+                server_occupied_words={"zhjl": ["在距"]},
+            ),
+            owner_label="～×！@",
+        )
+        token = chat_module._current_turn_message.set("1 重新编码，并加入 2")
+        try:
+            delivered = chat_module._prepare_user_facing_reply(
+                "连续两次没有生成可见回复或工具调用，已停止扩大处理预算；"
+                "本次未执行任何新写入。可发送「查看草稿」。",
+                memory_context,
+            )
+        finally:
+            chat_module._current_turn_message.reset(token)
+            chat_module.conversation_state_store = old_state_store
+
+        self.assertIn("「载具」候选", delivered)
+        self.assertIn("1. zhjl — 已有「在距」", delivered)
+        self.assertIn("添加1、2", delivered)
+        self.assertNotIn("连续两次没有生成", delivered)
+        self.assertNotIn("查看草稿", delivered)
+
     def test_compound_eviction_failure_cannot_advertise_a_narrowed_add(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 

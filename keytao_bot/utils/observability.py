@@ -9,9 +9,9 @@ import sqlite3
 import time
 import uuid
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 
 from .llm_policy import chat_usage_metrics
 
@@ -62,6 +62,7 @@ class TurnMetrics:
     system_prompt_chars: int = 0
     history_messages: int = 0
     model_tool_result_chars: int = 0
+    encode_calls: List[Tuple[float, bool]] = field(default_factory=list)
     outcome: str = "replied"
     emitted: bool = False
 
@@ -149,6 +150,14 @@ def record_model_tool_result_chars(chars: int) -> None:
     metrics.model_tool_result_chars += max(0, int(chars))
 
 
+def record_encode_call(seconds: float, *, retry: bool) -> None:
+    """Retain bounded, content-free latency for each encode HTTP attempt."""
+    metrics = current_turn_metrics()
+    if metrics is None or len(metrics.encode_calls) >= 32:
+        return
+    metrics.encode_calls.append((max(0.0, float(seconds)), bool(retry)))
+
+
 T = TypeVar("T")
 
 
@@ -223,6 +232,14 @@ def emit_turn_metrics(logger: Any, *, ended_at: Optional[float] = None) -> Optio
         return None
     metrics.emitted = True
     finished_at = time.monotonic() if ended_at is None else float(ended_at)
+    encode_call_seconds = (
+        ",".join(f"{seconds:.3f}" for seconds, _retry in metrics.encode_calls)
+        or "-"
+    )
+    encode_retry_flags = (
+        ",".join("1" if retry else "0" for _seconds, retry in metrics.encode_calls)
+        or "-"
+    )
     line = (
         "[turn_metrics] "
         f"turn_id={metrics.turn_id} platform={metrics.platform} "
@@ -235,6 +252,10 @@ def emit_turn_metrics(logger: Any, *, ended_at: Optional[float] = None) -> Optio
         f"system_prompt_chars={metrics.system_prompt_chars} "
         f"history_messages={metrics.history_messages} "
         f"model_tool_result_chars={metrics.model_tool_result_chars} "
+        f"encode_calls={len(metrics.encode_calls)} "
+        f"encode_retry_calls={sum(1 for _seconds, retry in metrics.encode_calls if retry)} "
+        f"encode_call_seconds={encode_call_seconds} "
+        f"encode_retry_flags={encode_retry_flags} "
         f"outcome={metrics.outcome}"
     )
     logger.info(line)

@@ -2533,6 +2533,119 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
     asyncio.run(_run())
 
 
+def test_s43_encode_failure_degrades_to_offline_read_only_reply():
+    """A failed query keeps offline facts but cannot advertise a write."""
+    print("\n🧪 S43 encode failure degrades to offline read-only reply")
+
+    async def _run():
+        tool_calls = []
+        offline_available = True
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            tool_calls.append((tool_name, arguments))
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({
+                    "success": True,
+                    "word": "钉选",
+                    "phrases": [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []})
+            if tool_name == "keytao_prepare_reviewed_add":
+                if not offline_available:
+                    return json.dumps({
+                        "success": False,
+                        "word": "钉选",
+                        "message": "编码服务重试后仍不可用：ReadTimeout",
+                        "upstreamTransient": True,
+                        "encodeServiceConfirmed": False,
+                        "offlineReference": {
+                            "available": False,
+                            "readings": [],
+                            "frequency": {
+                                "available": True,
+                                "attested": False,
+                                "corpusFrequency": None,
+                                "dictionaryPresenceCount": 0,
+                            },
+                        },
+                    }, ensure_ascii=False)
+                return json.dumps({
+                    "success": False,
+                    "word": "钉选",
+                    "message": "编码服务重试后仍不可用：ReadTimeout",
+                    "upstreamTransient": True,
+                    "encodeServiceConfirmed": False,
+                    "offlineReference": {
+                        "readings": [{
+                            "pinyin": "dīng xuǎn",
+                            "normalized": ["ding", "xuan"],
+                            "candidateCodes": ["dgxt"],
+                            "datasets": ["cedict"],
+                        }],
+                        "frequency": {
+                            "available": True,
+                            "attested": True,
+                            "corpusFrequency": 12,
+                            "dictionaryPresenceCount": 0,
+                        },
+                    },
+                }, ensure_ascii=False)
+            raise AssertionError((tool_name, arguments))
+
+        classifier = AsyncMock(side_effect=AssertionError("explicit retry must bypass the model"))
+        with patch.object(
+            chat_routing_module,
+            "_classify_simple_word_query_intent",
+            classifier,
+        ), patch.object(
+            openai_chat_module,
+            "call_tool_function",
+            side_effect=fake_call,
+        ):
+            result = await _try_handle_simple_single_word_query(
+                "查词 钉选", "qq", "123",
+            )
+            offline_available = False
+            empty_result = await _try_handle_simple_single_word_query(
+                "查词 钉选", "qq", "123",
+            )
+
+        check("explicit retry bypasses semantic routing", classifier.await_count == 0)
+        check(
+            "retry command reaches the requested word",
+            tool_calls[0] == ("keytao_lookup_by_word", {"word": "钉选"}),
+        )
+        check("offline reading remains visible", result is not None and "dīng xuǎn" in result)
+        check("derivable base code remains visible", result is not None and "dgxt" in result)
+        check(
+            "degraded evidence is labeled unconfirmed",
+            result is not None and "未经编码服务确认" in result,
+        )
+        check("transient upstream failure is stated", result is not None and "上游暂时不可用" in result)
+        check("retry copy is executable", result is not None and "查词 钉选" in result)
+        check("query failure never points at draft", result is not None and "查看草稿" not in result)
+        check(
+            "degraded query advertises no write",
+            result is not None
+            and "本次不提供写入" in result
+            and "回复「加入」" not in result
+            and "加入并提交" not in result
+            and " 添加1" not in result,
+        )
+        check(
+            "empty offline reference is reported honestly",
+            print("S43 empty offline reply:", repr(empty_result)) is None
+            and
+            empty_result is not None
+            and "离线参考也未找到可用读音、词频或候选编码" in empty_result
+            and "查词 钉选" in empty_result
+            and "查看草稿" not in empty_result,
+        )
+
+    asyncio.run(_run())
+
+
 def test_pending_submitted_word_query_leads_with_reminder_without_new_ticket():
     """A repeated lookup must expose the actor's submitted item, not restart add."""
     print("\n🧪 submitted word lookup is pending-aware")
@@ -18366,6 +18479,106 @@ def test_eviction_modified_add_bypasses_pending_assent_classifier():
     asyncio.run(_run())
 
 
+def test_compound_pending_selection_bypasses_command_intent_model_in_production_stages():
+    """A live structural selection is bound before generic model classification."""
+    print("\n🧪 compound pending selection production routing")
+
+    async def _run():
+        store = MemoryConversationStateStore()
+        address = ConversationAddress.group("qq", "865189947", "s44-user")
+        state = PendingAddWord(
+            word="载具",
+            recommended_code="zhjl",
+            candidates=[("zhjl", True), ("zhjlu", False)],
+            occupied_words={"zhjl": ["在距"]},
+            server_candidates=[("zhjl", True), ("zhjlu", False)],
+            server_occupied_words={"zhjl": ["在距"]},
+            server_entries_by_code={"zhjl": [("在距", 100)]},
+            needs_manual_review=True,
+        )
+        store.set(address, state)
+        classifier = AsyncMock(
+            side_effect=AssertionError(
+                "structural candidate selection must not use intent model"
+            )
+        )
+        ctx = openai_chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="s44-user",
+            normalized_message_text="1 重新编码 + 2",
+            conv_key=address,
+            space_key=address.space_key,
+            owner_label="Rea",
+            command_intent_for=classifier,
+        )
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(
+                openai_chat_module,
+                "draft_operation_coordinator",
+                DraftOperationCoordinator(),
+            ),
+        ):
+            await openai_chat_module._stage_resolve_current_pending_scope(ctx)
+            await openai_chat_module._stage_apply_scoped_pending_intent(ctx)
+
+        check("structural selection binds the live pending state", ctx.scoped_pending_state is state)
+        check(
+            "structural selection preserves ordered compound operands",
+            ctx.scoped_pending_intent is not None
+            and ctx.scoped_pending_intent.choice_indices == (1, 2)
+            and ctx.scoped_pending_intent.recode_indices == (1,),
+        )
+        check(
+            "structural selection becomes the generic routed intent",
+            ctx.generic_command_intent is ctx.scoped_pending_intent,
+        )
+        check(
+            "structural selection never invokes the intent classifier",
+            classifier.await_count == 0,
+        )
+
+        conflict_classifier = AsyncMock(
+            side_effect=AssertionError(
+                "invalid structural selection must not use intent model"
+            )
+        )
+        conflict_ctx = openai_chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="s44-user",
+            normalized_message_text="2 重新编码 + 1",
+            conv_key=address,
+            space_key=address.space_key,
+            owner_label="Rea",
+            command_intent_for=conflict_classifier,
+        )
+        with (
+            patch.object(openai_chat_module, "conversation_state_store", store),
+            patch.object(
+                openai_chat_module,
+                "draft_operation_coordinator",
+                DraftOperationCoordinator(),
+            ),
+        ):
+            await openai_chat_module._stage_resolve_current_pending_scope(conflict_ctx)
+
+        check(
+            "invalid structural selection is rejected before pending execution",
+            "编号 2 对应空位 zhjlu" in (conflict_ctx.scoped_pending_response or "")
+            and "本次未写入" in (conflict_ctx.scoped_pending_response or ""),
+        )
+        check(
+            "invalid structural selection never invokes the intent classifier",
+            conflict_classifier.await_count == 0,
+        )
+
+    asyncio.run(_run())
+
+
 def test_orchestrator_empty_response_retry():
     """Verify empty final model content does not become a generic request failure."""
     print("\n🧪 AgentOrchestrator empty response retry")
@@ -20042,6 +20255,120 @@ def test_shift_phrase_code_works_with_no_draft_batch():
     asyncio.run(_run())
 
 
+def test_shift_same_word_companion_requires_one_reviewed_candidate_chain():
+    """Compound multi-code adds may share a word only under reviewed-code proof."""
+    print("\n🧪 reviewed same-word shift companion")
+
+    async def _run():
+        companion = [{
+            "action": "Create",
+            "word": "载具",
+            "code": "zhjlu",
+            "type": "Phrase",
+            "needsManualReview": False,
+        }]
+        lookup = AsyncMock(return_value={
+            "success": False,
+            "message": "reviewed same-word companion reached lookup",
+        })
+        with patch.object(_draft_tools, "_lookup_words_raw", lookup):
+            reviewed = await _draft_tools.keytao_shift_phrase_code(
+                "qq",
+                "s44",
+                "载具",
+                "zhjl",
+                additional_items=companion,
+                _reviewed_pinyin="zai ju",
+                _reviewed_candidate_codes=["zhjl", "zhjlu", "zhjlui"],
+            )
+        check(
+            "reviewed same-word companion passes the local argument gate",
+            reviewed.get("message") == "reviewed same-word companion reached lookup"
+            and lookup.await_count == 1,
+        )
+
+        unreviewed_lookup = AsyncMock(
+            side_effect=AssertionError("unreviewed companion must stop before lookup")
+        )
+        with patch.object(_draft_tools, "_lookup_words_raw", unreviewed_lookup):
+            unreviewed = await _draft_tools.keytao_shift_phrase_code(
+                "qq",
+                "s44",
+                "载具",
+                "zhjl",
+                additional_items=companion,
+            )
+        check(
+            "unreviewed same-word companion is rejected",
+            unreviewed.get("message") == "同批附加词条集合无效"
+            and unreviewed_lookup.await_count == 0,
+        )
+
+        sealed = PendingToolConfirm(
+            function_name="keytao_shift_phrase_code",
+            args={
+                "word": "载具",
+                "target_code": "zhjl",
+                "additional_items": companion,
+                "_resolved_candidate_plan": [
+                    {
+                        "index": 1,
+                        "word": "载具",
+                        "code": "zhjl",
+                        "modifier": "recode",
+                        "occupants": ["在距"],
+                    },
+                    {
+                        "index": 2,
+                        "word": "载具",
+                        "code": "zhjlu",
+                        "modifier": "",
+                    },
+                ],
+                "_reviewed_pinyin": "zai ju",
+                "_reviewed_candidate_codes": ["zhjl", "zhjlu", "zhjlui"],
+            },
+            confirmation_source="local_preview",
+        )
+        dispatch = AsyncMock(return_value=json.dumps({
+            "success": False,
+            "message": "sealed bridge probe",
+        }, ensure_ascii=False))
+        with patch.object(chat_commands_module, "call_tool_function", dispatch):
+            await chat_commands_module._execute_confirmed_tool(
+                sealed,
+                "qq",
+                "s44",
+            )
+        trusted = dispatch.await_args.kwargs.get("trusted_reviewed_items_by_key")
+        check(
+            "sealed shift dispatch remints the reviewed chain for the tool boundary",
+            isinstance(trusted, dict)
+            and trusted.get(("载具", "zhjl"), {}).get("candidate_codes")
+            == ("zhjl", "zhjlu", "zhjlui"),
+        )
+
+        record_store = MemoryConversationStateStore()
+        record_key = ConversationAddress.private("qq", "s44-display")
+        record_store.set(record_key, sealed)
+        record = record_store.get_record(record_key)
+        compound_preview = (
+            "🔁 调整计划：\n"
+            "• 「载具」→ zhjl（「在距」顺延至 zhjlv）\n"
+            "• 「载具」→ zhjlu\n"
+            "回复「确认」执行，或「取消」。"
+        )
+        check(
+            "sealed compound preview accepts two distinct codes for one word",
+            openai_chat_module._advertised_reply_matches_live_record(
+                compound_preview,
+                record,
+            ),
+        )
+
+    asyncio.run(_run())
+
+
 def test_shift_phrase_code_plans_real_occupant_move():
     """Verify keytao_shift_phrase_code keeps occupant moves in the final write plan."""
     print("\n🧪 keytao_shift_phrase_code keeps occupant move")
@@ -21387,6 +21714,7 @@ if __name__ == "__main__":
     test_build_existing_word_priority_note()
     test_extract_prior_occupied_candidates()
     test_simple_single_word_query_uses_review_tool_before_ai()
+    test_s43_encode_failure_degrades_to_offline_read_only_reply()
     test_pending_submitted_word_query_leads_with_reminder_without_new_ticket()
     test_pending_submitted_duplicate_is_blocked_at_single_and_batch_sinks()
     test_pending_items_query_filters_submitted_batches_to_bound_actor()

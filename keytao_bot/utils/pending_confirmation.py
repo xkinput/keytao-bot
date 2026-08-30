@@ -364,6 +364,7 @@ class PendingCandidateSelection:
 
     indices: tuple[int, ...] = ()
     codes: tuple[str, ...] = ()
+    recode_indices: tuple[int, ...] = ()
     submit_after: bool = False
 
 
@@ -947,6 +948,50 @@ _MULTI_CODE_SELECTION_RE = re.compile(
     rf"[a-z]{{2,12}}(?:{_SELECTION_SEPARATORS}[a-z]{{2,12}})+",
     re.IGNORECASE,
 )
+_COMPOUND_NUMBER_SEPARATOR_RE = re.compile(
+    r"\s*(?:[+＋、,，]|和)\s*(?:(?:并)?(?:加入|添加|加词|加))?\s*"
+)
+_COMPOUND_NUMBER_OPERAND_RE = re.compile(
+    r"(?P<index>[1-9]\d{0,2})\s*"
+    r"(?P<modifier>(?:\(\s*)?重新编码(?:\s*\))?)?"
+)
+
+
+def _parse_compound_number_selection(
+    source: str,
+) -> PendingCandidateSelection | None:
+    """Parse ordered numbered operands carrying an optional per-item recode."""
+    submit_after = False
+    selector = source.strip()
+    if selector.endswith("并提交"):
+        selector = selector[:-3].strip()
+        submit_after = True
+    selector = re.sub(
+        r"^(?:加入|添加|加词|加)\s*",
+        "",
+        selector,
+        count=1,
+    )
+    parts = _COMPOUND_NUMBER_SEPARATOR_RE.split(selector)
+    if len(parts) < 2:
+        return None
+    indices: list[int] = []
+    recode_indices: list[int] = []
+    for part in parts:
+        operand = _COMPOUND_NUMBER_OPERAND_RE.fullmatch(part.strip())
+        if operand is None:
+            return None
+        index = int(operand.group("index"))
+        indices.append(index)
+        if operand.group("modifier"):
+            recode_indices.append(index)
+    if not recode_indices:
+        return None
+    return PendingCandidateSelection(
+        indices=tuple(indices),
+        recode_indices=tuple(recode_indices),
+        submit_after=submit_after,
+    )
 
 
 def _strip_selection_action(text: str) -> tuple[str, bool]:
@@ -975,6 +1020,9 @@ def parse_pending_candidate_selection(text: str) -> PendingCandidateSelection | 
         or re.search(r"(?:不要|别|取消|删除|移除|解释|复述|他说)", source)
     ):
         return None
+    compound = _parse_compound_number_selection(source)
+    if compound is not None:
+        return compound
     selector, submit_after = _strip_selection_action(source)
     selector = selector.strip()
     if _MULTI_NUMBER_SELECTION_RE.fullmatch(selector):

@@ -1481,15 +1481,30 @@ async def _canonicalize_pending_ticket_intent(
     )
     if multi_selection is not None:
         if multi_selection.indices:
-            if (
-                len(set(multi_selection.indices)) != len(multi_selection.indices)
-                or any(
-                    not 1 <= index <= len(state.candidates)
+            duplicate_indices = tuple(
+                dict.fromkeys(
+                    index
                     for index in multi_selection.indices
+                    if multi_selection.indices.count(index) > 1
                 )
-            ):
+            )
+            if duplicate_indices:
                 return None, render_remediation_reply(
-                    f"只接受 1-{len(state.candidates)} 之间的编号",
+                    "编号 " + "、".join(map(str, duplicate_indices))
+                    + " 在同一计划中重复；每个编号只能出现一次；本次未写入",
+                    command="加入",
+                    words=(state.word,),
+                )
+            out_of_range = tuple(
+                index
+                for index in multi_selection.indices
+                if not 1 <= index <= len(state.candidates)
+            )
+            if out_of_range:
+                return None, render_remediation_reply(
+                    "编号 " + "、".join(map(str, out_of_range))
+                    + f" 超出当前候选范围 1-{len(state.candidates)}；"
+                    + f"只接受 1-{len(state.candidates)}；本次未写入",
                     command="加入",
                     words=(state.word,),
                 )
@@ -1497,12 +1512,62 @@ async def _canonicalize_pending_ticket_intent(
                 state.candidates[index - 1][0]
                 for index in multi_selection.indices
             )
+            duplicate_codes = tuple(
+                dict.fromkeys(
+                    code
+                    for code in requested_codes
+                    if requested_codes.count(code) > 1
+                )
+            )
+            if duplicate_codes:
+                return None, render_remediation_reply(
+                    "编码 " + "、".join(duplicate_codes)
+                    + " 由多个所选编号重复解析；同一计划不能重复写入同一码；本次未写入",
+                    command="加入",
+                    words=(state.word,),
+                )
+            if multi_selection.recode_indices:
+                if not (
+                    state.server_candidates
+                    and state.server_candidates == state.candidates
+                ):
+                    return None, render_remediation_reply(
+                        "重新编码项缺少当前服务端候选记录；本次未写入",
+                        command=f"加词 {state.word}",
+                        words=(state.word,),
+                    )
+                if len(multi_selection.recode_indices) != 1:
+                    return None, render_remediation_reply(
+                        "一次复合选择只能包含一个「重新编码」项；本次未写入",
+                        command="加入",
+                        words=(state.word,),
+                    )
+                recode_index = multi_selection.recode_indices[0]
+                recode_code, occupied = state.candidates[recode_index - 1]
+                if not occupied:
+                    return None, render_remediation_reply(
+                        f"编号 {recode_index} 对应空位 {recode_code}，"
+                        "不能使用「重新编码」；本次未写入",
+                        command=f"加入 {recode_index}",
+                        words=(state.word,),
+                    )
         else:
             candidate_codes = {code for code, _occupied in state.candidates}
-            if (
-                len(set(multi_selection.codes)) != len(multi_selection.codes)
-                or any(code not in candidate_codes for code in multi_selection.codes)
-            ):
+            duplicate_codes = tuple(
+                dict.fromkeys(
+                    code
+                    for code in multi_selection.codes
+                    if multi_selection.codes.count(code) > 1
+                )
+            )
+            if duplicate_codes:
+                return None, render_remediation_reply(
+                    "编码 " + "、".join(duplicate_codes)
+                    + " 在同一计划中重复；本次未写入",
+                    command="加入",
+                    words=(state.word,),
+                )
+            if any(code not in candidate_codes for code in multi_selection.codes):
                 return None, render_remediation_reply(
                     "所选编码不全在当前候选中",
                     command="加入",
@@ -1519,6 +1584,7 @@ async def _canonicalize_pending_ticket_intent(
             submit_after=multi_selection.submit_after,
             choice_index=None,
             choice_indices=multi_selection.indices,
+            recode_indices=multi_selection.recode_indices,
             requested_code="",
             requested_codes=requested_codes,
         ), None
@@ -2860,6 +2926,60 @@ async def _try_handle_simple_single_word_query(
         actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
         return append_unbound_binding_notice(reviewed_prompt, actor_is_bound)
 
+    offline_reference = review.get("offlineReference")
+    if (
+        review.get("encodeServiceConfirmed") is False
+        and isinstance(offline_reference, dict)
+    ):
+        readings = tuple(dict.fromkeys(
+            str(item.get("pinyin") or "").strip()
+            for item in offline_reference.get("readings") or []
+            if isinstance(item, dict) and str(item.get("pinyin") or "").strip()
+        ))
+        candidate_codes = tuple(dict.fromkeys(
+            str(code or "").strip().lower()
+            for item in offline_reference.get("readings") or []
+            if isinstance(item, dict)
+            for code in item.get("candidateCodes") or []
+            if re.fullmatch(r"[a-z]+", str(code or "").strip().lower())
+        ))
+        frequency = offline_reference.get("frequency")
+        corpus_frequency = (
+            frequency.get("corpusFrequency")
+            if isinstance(frequency, dict)
+            else None
+        )
+        failure_label = (
+            "编码服务上游暂时不可用"
+            if review.get("upstreamTransient") is True
+            else "编码服务当前不可用"
+        )
+        lines = [f"「{word}」{failure_label}。"]
+        if readings:
+            lines.append(f"离线参考读音：{' / '.join(readings)}。")
+        if candidate_codes:
+            lines.append(
+                "离线可推导候选链："
+                f"{'、'.join(candidate_codes)}（仅音码基码；形码扩展无法离线确认）。"
+            )
+        elif readings:
+            lines.append("离线参考无法可靠推导候选编码。")
+        if (
+            isinstance(corpus_frequency, int)
+            and not isinstance(corpus_frequency, bool)
+            and corpus_frequency > 0
+        ):
+            lines.append(f"离线词频：{corpus_frequency}（jieba）。")
+        if not readings and not candidate_codes and not (
+            isinstance(corpus_frequency, int) and corpus_frequency > 0
+        ):
+            lines.append("离线参考也未找到可用读音、词频或候选编码。")
+        lines.append("以上均未经编码服务确认；本次不提供写入。")
+        retry_copy = render_executable_suggestion(f"查词 {word}")
+        if retry_copy:
+            lines.append(retry_copy)
+        return "\n".join(lines)
+
     review_message = str(
         review.get("message")
         or review.get("error")
@@ -4029,6 +4149,7 @@ async def _execute_shift_to_code(
     expected_codes: Optional[List[str]] = None,
     expected_weights: Optional[List[int]] = None,
     evidence_lines: Optional[List[str]] = None,
+    resolved_candidate_plan: Optional[List[Dict[str, Any]]] = None,
     reviewed_pinyin: str = "",
     reviewed_candidate_codes: Tuple[str, ...] = (),
     auto_confirm_shift_plan: bool = False,
@@ -4079,6 +4200,15 @@ async def _execute_shift_to_code(
                 **(
                     {"evidence_lines": list(evidence_lines)}
                     if evidence_lines
+                    else {}
+                ),
+                **(
+                    {
+                        "_resolved_candidate_plan": [
+                            dict(item) for item in resolved_candidate_plan
+                        ],
+                    }
+                    if resolved_candidate_plan
                     else {}
                 ),
                 **(
@@ -4298,6 +4428,74 @@ def _resolved_advertised_items_match(state: PendingToolConfirm) -> bool:
             return False
         actual.append(str(item["word"]).strip())
     return actual == expected
+
+
+def _resolved_candidate_plan_matches(state: PendingToolConfirm) -> bool:
+    """Keep a compound candidate selection identical through preview and confirm."""
+    if "_resolved_candidate_plan" not in state.args:
+        return True
+    plan = state.args.get("_resolved_candidate_plan")
+    additional_items = state.args.get("additional_items")
+    if (
+        state.function_name != "keytao_shift_phrase_code"
+        or not isinstance(plan, list)
+        or len(plan) < 2
+        or not isinstance(additional_items, list)
+    ):
+        return False
+    normalized: List[Tuple[int, str, str, str]] = []
+    for raw_item in plan:
+        if not isinstance(raw_item, dict):
+            return False
+        index = raw_item.get("index")
+        word = str(raw_item.get("word") or "").strip()
+        code = str(raw_item.get("code") or "").strip().lower()
+        modifier = str(raw_item.get("modifier") or "").strip()
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 1
+            or not word
+            or not re.fullmatch(r"[a-z]{1,12}", code)
+            or modifier not in {"", "recode"}
+        ):
+            return False
+        normalized.append((index, word, code, modifier))
+    if (
+        len({index for index, _word, _code, _modifier in normalized})
+        != len(normalized)
+        or len({code for _index, _word, code, _modifier in normalized})
+        != len(normalized)
+    ):
+        return False
+    recode_items = [item for item in normalized if item[3] == "recode"]
+    if len(recode_items) != 1:
+        return False
+    _index, recode_word, recode_code, _modifier = recode_items[0]
+    if (
+        recode_word != str(state.args.get("word") or "").strip()
+        or recode_code != str(state.args.get("target_code") or "").strip().lower()
+    ):
+        return False
+    expected_additional = [
+        (word, code)
+        for _index, word, code, modifier in normalized
+        if modifier != "recode"
+    ]
+    actual_additional: List[Tuple[str, str]] = []
+    for item in additional_items:
+        if (
+            not isinstance(item, dict)
+            or str(item.get("action") or "Create") != "Create"
+            or item.get("old_word")
+            or item.get("oldWord")
+        ):
+            return False
+        actual_additional.append((
+            str(item.get("word") or "").strip(),
+            str(item.get("code") or "").strip().lower(),
+        ))
+    return actual_additional == expected_additional
 
 
 def _chain_reorder_plan_digest(plan: Dict[str, Any]) -> str:
@@ -4591,6 +4789,66 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     if function_name == "keytao_shift_phrase_code":
         shift_plan = data.get("shiftPlan") if isinstance(data.get("shiftPlan"), dict) else {}
         items = shift_plan.get("items") if isinstance(shift_plan.get("items"), list) else []
+        resolved_candidate_plan = (
+            data.get("resolvedCandidatePlan")
+            if isinstance(data.get("resolvedCandidatePlan"), list)
+            else []
+        )
+        if resolved_candidate_plan:
+            shifted = [
+                item
+                for item in shift_plan.get("shifted") or []
+                if isinstance(item, dict)
+            ]
+            lines = ["🔁 调整计划："]
+            for item in resolved_candidate_plan:
+                if not isinstance(item, dict):
+                    continue
+                word = str(item.get("word") or "").strip()
+                code = str(item.get("code") or "").strip().lower()
+                if not word or not code:
+                    continue
+                line = f"• 「{word}」→ {code}"
+                if item.get("modifier") == "recode":
+                    change = next(
+                        (
+                            candidate
+                            for candidate in shifted
+                            if str(candidate.get("fromCode") or "").strip().lower()
+                            == code
+                        ),
+                        None,
+                    )
+                    if change is not None:
+                        occupant = str(change.get("word") or "").strip()
+                        destination = str(change.get("toCode") or "").strip().lower()
+                        if occupant and destination:
+                            line += f"（「{occupant}」顺延至 {destination}）"
+                        else:
+                            line += "（原占用词顺延）"
+                    else:
+                        occupants = [
+                            str(value or "").strip()
+                            for value in item.get("occupants") or []
+                            if str(value or "").strip()
+                        ]
+                        line += (
+                            "（" + "、".join(f"「{value}」" for value in occupants)
+                            + "顺延）"
+                            if occupants
+                            else "（原占用词顺延）"
+                        )
+                lines.append(line)
+            warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+            lines.extend(
+                f"提示：{_plain_warning_message(warning)}"
+                for warning in warnings
+            )
+            lines.append(pending_confirmation_copy())
+            batch_url = _trusted_batch_url(data)
+            if batch_url:
+                lines.append(f"草稿地址：{batch_url}")
+            return _assert_plain_user_facing_reply("\n".join(lines))
         current_state = (
             shift_plan.get("currentState")
             if isinstance(shift_plan.get("currentState"), list)
@@ -4914,6 +5172,10 @@ async def _execute_confirmed_tool(
             command=("加词 " + " ".join(invalid_words)) if invalid_words else "",
             words=invalid_words,
         )
+    if not _resolved_candidate_plan_matches(state):
+        return render_remediation_reply(
+            "复合候选计划校验失败，当前确认已失效；本次未写入"
+        )
     if not _resolved_chain_reorder_items_match(state):
         return render_remediation_reply(
             "编码链重排集合校验失败，当前确认已失效；本次未写入",
@@ -4923,6 +5185,7 @@ async def _execute_confirmed_tool(
     args.pop("preview_only", None)
     args.pop("_candidate_scopes", None)
     args.pop("_resolved_advertised_words", None)
+    resolved_candidate_plan = args.pop("_resolved_candidate_plan", None)
     replace_char_continuation = args.pop(
         _REPLACE_CHAR_CONTINUATION_KEY,
         None,
@@ -5049,11 +5312,21 @@ async def _execute_confirmed_tool(
     reviewed_capability = (
         _reviewed_create_capability(
             str(args.get("word") or "").strip(),
-            str(args.get("code") or "").strip().lower(),
+            str(
+                args.get(
+                    "target_code"
+                    if state.function_name == "keytao_shift_phrase_code"
+                    else "code"
+                )
+                or ""
+            ).strip().lower(),
             reviewed_pinyin,
             reviewed_candidate_codes,
         )
-        if state.function_name == "keytao_create_phrase"
+        if state.function_name in {
+            "keytao_create_phrase",
+            "keytao_shift_phrase_code",
+        }
         else None
     )
     if (
@@ -5186,6 +5459,11 @@ async def _execute_confirmed_tool(
         display_data = {
             **data,
             "submitAfter": submit_after,
+            **(
+                {"resolvedCandidatePlan": resolved_candidate_plan}
+                if isinstance(resolved_candidate_plan, list)
+                else {}
+            ),
             **(
                 {"pendingItems": list(args.get("items") or [])}
                 if state.function_name == "keytao_batch_add_to_draft"
@@ -8609,6 +8887,82 @@ async def _handle_pending_add_word(
     requested_codes = list(command_intent.requested_codes)
     if not requested_codes and _is_sensitive_pending_control_intent(command_intent):
         requested_codes = _requested_codes_from_pending_message(msg, state)
+    if command_intent.recode_indices:
+        if (
+            len(command_intent.recode_indices) != 1
+            or len(command_intent.choice_indices) != len(requested_codes)
+            or command_intent.recode_indices[0] not in command_intent.choice_indices
+        ):
+            return render_remediation_reply(
+                "复合候选计划不完整；本次未写入",
+                command="加入",
+                words=(state.word,),
+            )
+        recode_index = command_intent.recode_indices[0]
+        recode_position = command_intent.choice_indices.index(recode_index)
+        shift_code = requested_codes[recode_position]
+        occupancy = dict(state.candidates)
+        additional_items: List[Dict[str, Any]] = []
+        resolved_plan: List[Dict[str, Any]] = []
+        for index, code in zip(command_intent.choice_indices, requested_codes):
+            modifier = "recode" if index == recode_index else ""
+            resolved_plan.append({
+                "index": index,
+                "word": state.word,
+                "code": code,
+                "modifier": modifier,
+                **(
+                    {
+                        "occupants": list(
+                            state.server_occupied_words.get(code, [])
+                        ),
+                    }
+                    if modifier
+                    else {}
+                ),
+            })
+            if modifier:
+                continue
+            item: Dict[str, Any] = {
+                "word": state.word,
+                "code": code,
+                "action": "Create",
+            }
+            remark = state.code_remarks.get(code)
+            if remark:
+                item["remark"] = remark
+            if occupancy.get(code) is True:
+                item["needsManualReview"] = True
+                item["manualReviewReason"] = "重码添加需管理员审核"
+            elif state.needs_manual_review is not None:
+                item["needsManualReview"] = bool(state.needs_manual_review)
+            additional_items.append(item)
+
+        create_args = _create_phrase_args(state, shift_code)
+        reviewed_pinyin, reviewed_candidate_codes = _pending_reviewed_reading(
+            state,
+            shift_code,
+        )
+        return await _execute_shift_to_code(
+            state.word,
+            shift_code,
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+            submit_after=submit_after_add,
+            target_item={
+                "type": "Phrase",
+                "remark": str(create_args.get("remark") or ""),
+                "needsManualReview": bool(
+                    create_args.get("needs_manual_review", True)
+                ),
+            },
+            additional_items=additional_items,
+            resolved_candidate_plan=resolved_plan,
+            reviewed_pinyin=reviewed_pinyin,
+            reviewed_candidate_codes=reviewed_candidate_codes,
+        )
     if len(requested_codes) > 1:
         return await _execute_add_multiple_codes_to_draft(
             state,

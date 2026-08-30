@@ -5671,11 +5671,18 @@ async def keytao_shift_phrase_code(
     if not word or not target_code:
         return {"success": False, "message": "必须提供词条和目标编码"}
 
+    trusted_reviewed_codes = _clean_code_list(_reviewed_candidate_codes)
+    trusted_reviewed_code_set = set(trusted_reviewed_codes)
+    reviewed_same_word_plan = bool(
+        _reviewed_pinyin.strip()
+        and target_code in trusted_reviewed_code_set
+    )
     companion_items: List[Dict] = []
     if additional_items is not None:
         if not isinstance(additional_items, list) or len(additional_items) > 20:
             return {"success": False, "message": "同批附加词条集合无效"}
         seen_companion_words: set[str] = set()
+        seen_companion_keys: set[Tuple[str, str]] = set()
         for raw_item in additional_items:
             if not isinstance(raw_item, dict):
                 return {"success": False, "message": "同批附加词条集合无效"}
@@ -5686,8 +5693,19 @@ async def keytao_shift_phrase_code(
             if (
                 str(raw_item.get("action") or "Create") != "Create"
                 or not companion_word
-                or companion_word == word
-                or companion_word in seen_companion_words
+                or (
+                    companion_word == word
+                    and (
+                        not reviewed_same_word_plan
+                        or companion_code == target_code
+                        or companion_code not in trusted_reviewed_code_set
+                    )
+                )
+                or (
+                    companion_word != word
+                    and companion_word in seen_companion_words
+                )
+                or (companion_word, companion_code) in seen_companion_keys
                 or re.fullmatch(r"[a-z]{1,12}", companion_code) is None
                 or companion_type not in PHRASE_TYPE_BASE_WEIGHTS
                 or not isinstance(needs_manual_review, bool)
@@ -5708,6 +5726,7 @@ async def keytao_shift_phrase_code(
                 companion_item["manualReviewReason"] = manual_reason
             companion_items.append(companion_item)
             seen_companion_words.add(companion_word)
+            seen_companion_keys.add((companion_word, companion_code))
 
     if ordered_words is not None:
         if companion_items:
@@ -6032,7 +6051,6 @@ async def keytao_shift_phrase_code(
         write_result["planDigest"] = plan_digest
         return _inject_known_batch_url(write_result, str(write_result.get("batchId") or current_batch_id))
 
-    trusted_reviewed_codes = _clean_code_list(_reviewed_candidate_codes)
     if _reviewed_pinyin.strip() and target_code in trusted_reviewed_codes:
         target_encode = {
             "success": True,
@@ -6168,7 +6186,15 @@ async def keytao_shift_phrase_code(
         if str(item.get("code") or "").strip()
     }
     if any(
-        item["word"] in shift_words or item["code"] in shift_codes
+        item["code"] in shift_codes
+        or (
+            item["word"] in shift_words
+            and not (
+                reviewed_same_word_plan
+                and item["word"] == word
+                and item["code"] in trusted_reviewed_code_set
+            )
+        )
         for item in companion_items
     ):
         return {"success": False, "message": "同批附加词条与顺延计划冲突"}
