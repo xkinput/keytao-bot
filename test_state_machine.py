@@ -4248,6 +4248,446 @@ def test_incomplete_shift_modified_add_preserves_compound_refusal():
     asyncio.run(_run())
 
 
+def test_multiline_compound_eviction_plan_round_trips_one_shared_plan():
+    """Two add-and-shift lines share one literal, replayable plan object."""
+    print("\n🧪 multiline compound eviction plan round trip")
+    from keytao_bot.harness.authorization_grammar import (
+        parse_compound_eviction_add_plan,
+        render_compound_eviction_add_command,
+    )
+
+    incident = (
+        '加词 哲思 fesk，并且为"这厮 fesk"重新编码\n'
+        '加词 哲思 qesk，并且为"这厮 qesk"顺延编码'
+    )
+    plan = parse_compound_eviction_add_plan(incident)
+    check("multiline compound eviction plan parses", plan is not None)
+    if plan is None:
+        return
+    check(
+        "the ordered plan retains both literal add-and-shift clauses",
+        tuple(
+            (item.word, item.code, item.named_occupant)
+            for item in plan.items
+        )
+        == (
+            ("哲思", "fesk", "这厮"),
+            ("哲思", "qesk", "这厮"),
+        ),
+    )
+    command = render_compound_eviction_add_command(plan)
+    check(
+        "the plan emits shift-preserving commands rather than bare adds",
+        command
+        == '添加「哲思」 fesk，这厮顺延\n添加「哲思」 qesk，这厮顺延',
+    )
+    check(
+        "the emitted command reproduces the exact same plan",
+        parse_compound_eviction_add_plan(command) == plan,
+    )
+
+
+def test_multiline_compound_eviction_builds_one_reviewed_shift_preview():
+    """Both lines enter one deterministic preview with no duplicate fallback."""
+    print("\n🧪 multiline compound eviction reviewed preview")
+
+    async def _run():
+        command = (
+            '加词 哲思 fesk，并且为"这厮 fesk"重新编码\n'
+            '加词 哲思 qesk，并且为"这厮 qesk"顺延编码'
+        )
+        conv_key = ConversationAddress.private("qq", "garth-s46")
+        state = PendingAddWord(
+            word="哲思",
+            recommended_code="fesk",
+            candidates=[
+                ("fesk", True),
+                ("feski", False),
+                ("qesk", True),
+                ("qeski", False),
+            ],
+            occupied_words={"fesk": ["这厮"], "qesk": ["这厮"]},
+            server_candidates=[
+                ("fesk", True),
+                ("feski", False),
+                ("qesk", True),
+                ("qeski", False),
+            ],
+            server_occupied_words={"fesk": ["这厮"], "qesk": ["这厮"]},
+            pronunciation_codes={
+                "fesk": "zhé sī",
+                "feski": "zhé sī",
+                "qesk": "zhé sī",
+                "qeski": "zhé sī",
+            },
+            needs_manual_review=False,
+        )
+        old_store = chat_commands_module.conversation_state_store
+        store = MemoryConversationStateStore()
+        chat_commands_module.conversation_state_store = store
+
+        async def fake_review(*_args, **_kwargs):
+            store.set(conv_key, state)
+            return "reviewed"
+
+        preview = AsyncMock(return_value="one compound shift preview")
+        try:
+            with patch.object(
+                chat_commands_module,
+                "_try_handle_simple_single_word_query",
+                side_effect=fake_review,
+            ), patch.object(
+                chat_commands_module,
+                "_execute_shift_to_code",
+                preview,
+            ):
+                result = await chat_commands_module._try_handle_compound_shift_modified_add_command(
+                    command,
+                    "qq",
+                    "garth-s46",
+                    conv_key,
+                )
+        finally:
+            chat_commands_module.conversation_state_store = old_store
+
+        check("compound handler returns one preview", result == "one compound shift preview")
+        check("compound handler invokes the eviction machinery once", preview.await_count == 1)
+        kwargs = preview.await_args.kwargs if preview.await_count else {}
+        check(
+            "both recode targets stay in the sealed candidate plan",
+            [
+                (item.get("word"), item.get("code"), item.get("modifier"))
+                for item in kwargs.get("resolved_candidate_plan", [])
+            ]
+            == [
+                ("哲思", "fesk", "recode"),
+                ("哲思", "qesk", "recode"),
+            ],
+        )
+        check(
+            "the second target is another shift, never a plain companion add",
+            kwargs.get("additional_shift_items", [{}])[0].get("code") == "qesk"
+            and not kwargs.get("additional_items"),
+        )
+
+    asyncio.run(_run())
+
+
+def test_multi_code_shift_plan_moves_two_rows_of_the_same_occupant():
+    """The same dictionary word may be displaced independently from two codes."""
+    print("\n🧪 same-occupant multi-code shift plan")
+    plan = _draft_tools._build_multi_code_shift_plan(
+        target_items=[
+            {"word": "哲思", "code": "fesk", "type": "Phrase"},
+            {"word": "哲思", "code": "qesk", "type": "Phrase"},
+        ],
+        code_phrase_map={
+            "fesk": [{"word": "这厮", "code": "fesk", "type": "Phrase"}],
+            "fesko": [],
+            "qesk": [{"word": "这厮", "code": "qesk", "type": "Phrase"}],
+            "qesko": [],
+        },
+        word_candidate_code_map={
+            "哲思": ["fesk", "qesk"],
+            "这厮": ["fesk", "fesko", "qesk", "qesko"],
+        },
+    )
+    check("same-occupant multi-code plan succeeds", plan.get("success") is True)
+    shifts = {
+        (item.get("word"), item.get("fromCode"), item.get("toCode"))
+        for item in plan.get("shifted", [])
+    }
+    check(
+        "each occupied row shifts along its own code position",
+        shifts
+        == {
+            ("这厮", "fesk", "fesko"),
+            ("这厮", "qesk", "qesko"),
+        },
+    )
+    items = {
+        (item.get("action"), item.get("word"), item.get("code"))
+        for item in plan.get("items", [])
+    }
+    check(
+        "the atomic set contains both deletes, both adds, and both shifts",
+        items
+        == {
+            ("Delete", "这厮", "fesk"),
+            ("Delete", "这厮", "qesk"),
+            ("Create", "哲思", "fesk"),
+            ("Create", "哲思", "qesk"),
+            ("Create", "这厮", "fesko"),
+            ("Create", "这厮", "qesko"),
+        },
+    )
+
+
+def test_multi_code_shift_tool_seals_both_evictions_in_one_preview():
+    """The public shift machinery binds the six-item set to one server ticket."""
+    print("\n🧪 multi-code shift tool emits one sealed preview")
+
+    async def _run():
+        rows = {
+            "fesk": [{"word": "这厮", "code": "fesk", "type": "Phrase"}],
+            "fesko": [],
+            "qesk": [{"word": "这厮", "code": "qesk", "type": "Phrase"}],
+            "qesko": [],
+        }
+
+        async def fake_encode(word, _requested_code=None):
+            if word != "这厮":
+                raise AssertionError(f"reviewed targets must not be re-encoded: {word}")
+            return {
+                "success": True,
+                "word": word,
+                "candidateCodes": ["fesk", "fesko", "qesk", "qesko"],
+            }
+
+        async def fake_words(words):
+            return {
+                "success": True,
+                "results": [{"word": word, "phrases": []} for word in words],
+            }
+
+        async def fake_codes(codes):
+            return {
+                "success": True,
+                "results": [
+                    {"code": code, "phrases": rows[code]}
+                    for code in codes
+                ],
+            }
+
+        strict = AsyncMock(return_value={
+            "success": False,
+            "requiresConfirmation": True,
+            "warningDigest": "d" * 64,
+            "warnings": [],
+        })
+        with (
+            patch.object(_draft_tools, "_fetch_encode_candidates", side_effect=fake_encode),
+            patch.object(_draft_tools, "_lookup_words_raw", side_effect=fake_words),
+            patch.object(_draft_tools, "_lookup_codes_raw", side_effect=fake_codes),
+            patch.object(
+                _draft_tools,
+                "keytao_list_draft_items",
+                AsyncMock(return_value={
+                    "success": True,
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "items": [],
+                }),
+            ),
+            patch.object(_draft_tools, "_keytao_strict_batch_add_to_draft", strict),
+        ):
+            preview = await _draft_tools.keytao_shift_phrase_code(
+                "qq",
+                "garth-s46",
+                "哲思",
+                "fesk",
+                target_needs_manual_review=False,
+                additional_shift_items=[{
+                    "action": "Create",
+                    "word": "哲思",
+                    "code": "qesk",
+                    "type": "Phrase",
+                    "needsManualReview": False,
+                    "_reviewed_pinyin": "zhé sī",
+                    "_reviewed_candidate_codes": ["qesk", "qeski"],
+                }],
+                _reviewed_pinyin="zhé sī",
+                _reviewed_candidate_codes=["fesk", "feski"],
+                _expected_occupants_by_code={
+                    "fesk": ["这厮"],
+                    "qesk": ["这厮"],
+                },
+            )
+
+        check(
+            "the multi-code tool returns one confirmation ticket",
+            preview.get("requiresConfirmation") is True
+            and preview.get("warningDigest") == "d" * 64,
+        )
+        item_keys = {
+            (item.get("action"), item.get("word"), item.get("code"))
+            for item in preview.get("shiftPlan", {}).get("items", [])
+        }
+        check(
+            "the sealed tool plan is the exact six-item end-state delta",
+            item_keys
+            == {
+                ("Delete", "这厮", "fesk"),
+                ("Delete", "这厮", "qesk"),
+                ("Create", "哲思", "fesk"),
+                ("Create", "哲思", "qesk"),
+                ("Create", "这厮", "fesko"),
+                ("Create", "这厮", "qesko"),
+            }
+            and strict.await_count == 1,
+        )
+
+    asyncio.run(_run())
+
+
+def test_multi_code_shift_review_caps_cross_internal_tool_boundary():
+    """Deterministic dispatch must bind review seals for every shift target."""
+    print("\n🧪 multi-code shift review capabilities cross internal boundary")
+
+    async def _run():
+        captured = []
+
+        async def shift_tool(**kwargs):
+            captured.append(kwargs)
+            return {"success": False, "message": "capability probe"}
+
+        executor = ToolExecutor(
+            lambda name: shift_tool if name == "keytao_shift_phrase_code" else None,
+            frozenset({"keytao_shift_phrase_code"}),
+        )
+        trusted = {
+            ("哲思", "fesk"): {
+                "type": "Phrase",
+                "pinyin": "zhe si",
+                "candidate_codes": ("fesk", "feski", "feskii"),
+            },
+            ("哲思", "qesk"): {
+                "type": "Phrase",
+                "pinyin": "zhe si",
+                "candidate_codes": ("qesk", "qeski", "qeskii"),
+            },
+        }
+        await executor.call(
+            "keytao_shift_phrase_code",
+            {
+                "word": "哲思",
+                "target_code": "fesk",
+                "additional_shift_items": [{
+                    "action": "Create",
+                    "word": "哲思",
+                    "code": "qesk",
+                    "type": "Phrase",
+                    "needsManualReview": False,
+                    "namedOccupant": "这厮",
+                    "_reviewed_pinyin": "forged",
+                    "_reviewed_candidate_codes": ["forged"],
+                }],
+            },
+            ToolContext(
+                platform="qq",
+                user_id="garth-s46",
+                trusted_reviewed_items_by_key=trusted,
+            ),
+        )
+        check("internal multi-shift dispatch reaches the tool", len(captured) == 1)
+        primary = captured[0] if captured else {}
+        additional = primary.get("additional_shift_items", [{}])[0]
+        check(
+            "primary review seal is reminted from the trusted capability",
+            primary.get("_reviewed_candidate_codes")
+            == ["fesk", "feski", "feskii"],
+        )
+        check(
+            "nested review seal is reminted and presentation fields are stripped",
+            additional.get("_reviewed_pinyin") == "zhe si"
+            and additional.get("_reviewed_candidate_codes")
+            == ["qesk", "qeski", "qeskii"]
+            and "namedOccupant" not in additional,
+        )
+
+    asyncio.run(_run())
+
+
+def test_suggestion_promise_mismatch_restores_the_sealed_shift_plan():
+    """A bare-add suggestion cannot survive beside a promised eviction."""
+    print("\n🧪 suggestion and promise restore one sealed shift plan")
+    conv_key = ConversationAddress.private("qq", "garth-s46-guard")
+    state = PendingToolConfirm(
+        function_name="keytao_shift_phrase_code",
+        args={
+            "word": "哲思",
+            "target_code": "fesk",
+            "additional_shift_items": [{
+                "action": "Create",
+                "word": "哲思",
+                "code": "qesk",
+                "type": "Phrase",
+                "needsManualReview": False,
+                "reviewedPinyin": "zhé sī",
+                "reviewedCandidateCodes": ["qesk", "qeski"],
+            }],
+            "_resolved_candidate_plan": [
+                {
+                    "index": 1,
+                    "word": "哲思",
+                    "code": "fesk",
+                    "modifier": "recode",
+                    "occupants": ["这厮"],
+                },
+                {
+                    "index": 2,
+                    "word": "哲思",
+                    "code": "qesk",
+                    "modifier": "recode",
+                    "occupants": ["这厮"],
+                },
+            ],
+            "_pending_display": {
+                "requiresConfirmation": True,
+                "confirmationKind": "shiftPlan",
+                "batchId": "",
+                "contentVersion": 0,
+                "planDigest": "a" * 64,
+                "warningDigest": "b" * 64,
+                "warnings": [],
+                "shiftPlan": {
+                    "items": [],
+                    "shifted": [
+                        {"word": "这厮", "fromCode": "fesk", "toCode": "fesko"},
+                        {"word": "这厮", "fromCode": "qesk", "toCode": "qesko"},
+                    ],
+                },
+            },
+        },
+        confirmation_source="server_warning",
+    )
+    store = MemoryConversationStateStore()
+    store.set(conv_key, state)
+    old_store = openai_chat_module.conversation_state_store
+    openai_chat_module.conversation_state_store = store
+    try:
+        model_reply = (
+            "请按以下命令发送：\n"
+            "“添加「哲思」 fesk”\n"
+            "执行后会是 哲思 → fesk（这厮顺延至 feski）。"
+        )
+        guarded = openai_chat_module._enforce_advertised_reply_contract(
+            model_reply,
+            conv_key,
+        )
+    finally:
+        openai_chat_module.conversation_state_store = old_store
+
+    check(
+        "the mismatched bare-add suggestion is removed",
+        "请按以下命令" not in guarded
+        and "添加「哲思」 fesk" not in guarded,
+    )
+    check(
+        "the reply promise is regenerated from the complete sealed plan",
+        all(
+            marker in guarded
+            for marker in (
+                "「哲思」→ fesk",
+                "「这厮」顺延至 fesko",
+                "「哲思」→ qesk",
+                "「这厮」顺延至 qesko",
+            )
+        )
+        and guarded.count(pending_confirmation_copy()) == 1,
+    )
+
+
 def test_word_discovery_prechecks_binding_without_blocking_review():
     """Unbound candidate copy warns early while bound copy stays unchanged."""
     print("\n🧪 word discovery binding precheck notice")
@@ -21897,6 +22337,12 @@ if __name__ == "__main__":
     test_recommended_reorder_submit_chains_after_one_plan_confirmation()
     test_explicit_add_word_query_uses_review_tool_before_ai()
     test_incomplete_shift_modified_add_preserves_compound_refusal()
+    test_multiline_compound_eviction_plan_round_trips_one_shared_plan()
+    test_multiline_compound_eviction_builds_one_reviewed_shift_preview()
+    test_multi_code_shift_plan_moves_two_rows_of_the_same_occupant()
+    test_multi_code_shift_tool_seals_both_evictions_in_one_preview()
+    test_multi_code_shift_review_caps_cross_internal_tool_boundary()
+    test_suggestion_promise_mismatch_restores_the_sealed_shift_plan()
     test_word_discovery_prechecks_binding_without_blocking_review()
     test_reviewed_add_prompt_explains_fallback_review_policy()
     test_reviewed_add_prompt_shows_pre_submit_audit_result()

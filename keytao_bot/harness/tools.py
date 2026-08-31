@@ -1563,6 +1563,39 @@ class ToolExecutor:
                 target["_reviewed_pinyin"] = pinyin
                 target["_reviewed_candidate_codes"] = candidate_codes
 
+        def bind_additional_shift_items() -> None:
+            raw_additional = call_args.get("additional_shift_items")
+            if not isinstance(raw_additional, list):
+                return
+            sanitized_additional: List[Dict[str, Any]] = []
+            all_bound = bool(raw_additional)
+            for raw_item in raw_additional:
+                if not isinstance(raw_item, dict):
+                    all_bound = False
+                    continue
+                item = dict(raw_item)
+                item.pop("_reviewed_pinyin", None)
+                item.pop("_reviewed_candidate_codes", None)
+                item.pop("reviewedPinyin", None)
+                item.pop("reviewedCandidateCodes", None)
+                item.pop("namedOccupant", None)
+                item_word = str(item.get("word") or "").strip()
+                item_code = str(item.get("code") or "").strip().lower()
+                item_capability = (
+                    context.trusted_reviewed_items_by_key or {}
+                ).get((item_word, item_code))
+                if item_capability is None:
+                    all_bound = False
+                inject_reviewed_validation(
+                    item,
+                    item_capability,
+                    item_code,
+                )
+                sanitized_additional.append(item)
+            call_args["additional_shift_items"] = (
+                sanitized_additional if all_bound else []
+            )
+
         if not context.current_message:
             if tool_name == "keytao_batch_add_to_draft" and internal_same_code:
                 call_args["_allow_same_code"] = True
@@ -1578,6 +1611,8 @@ class ToolExecutor:
                     (word, code)
                 )
                 inject_reviewed_validation(call_args, capability, code)
+                if tool_name == "keytao_shift_phrase_code":
+                    bind_additional_shift_items()
             return call_args
         message = _mutation_authorization_view(context.current_message or "")
         if (
@@ -1593,6 +1628,7 @@ class ToolExecutor:
                 (word, code)
             )
             inject_reviewed_validation(call_args, capability, code)
+            bind_additional_shift_items()
             return call_args
 
         if (

@@ -895,6 +895,163 @@ def _build_code_shift_plan(
     }
 
 
+def _build_multi_code_shift_plan(
+    *,
+    target_items: List[Dict],
+    code_phrase_map: Dict[str, List[Dict]],
+    word_candidate_code_map: Dict[str, List[str]],
+) -> Dict:
+    """Build one atomic plan for multiple occupied target-code inserts."""
+    targets = [dict(item) for item in target_items if isinstance(item, dict)]
+    target_keys = [
+        (
+            str(item.get("word") or "").strip(),
+            str(item.get("code") or "").strip().lower(),
+        )
+        for item in targets
+    ]
+    if (
+        len(targets) != len(target_items)
+        or len(targets) < 2
+        or any(
+            not word or re.fullmatch(r"[a-z]{1,12}", code) is None
+            for word, code in target_keys
+        )
+        or len(set(target_keys)) != len(target_keys)
+        or len({code for _word, code in target_keys}) != len(target_keys)
+    ):
+        return {"success": False, "message": "多目标顺延计划参数不完整"}
+
+    target_words = {word for word, _code in target_keys}
+    reserved_codes = {code for _word, code in target_keys}
+    for word, code in target_keys:
+        if code not in word_candidate_code_map.get(word, []):
+            return {
+                "success": False,
+                "message": f"{code} 不是「{word}」的有效候选编码",
+            }
+        if code not in code_phrase_map:
+            return {"success": False, "message": f"编码 {code} 的占用快照不完整"}
+
+    occupants_by_code = {
+        code: _ordered_code_occupants(phrases, target_words)
+        for code, phrases in code_phrase_map.items()
+    }
+    queue = [
+        occupant
+        for _word, code in target_keys
+        for occupant in occupants_by_code.get(code, [])
+    ]
+    for _word, code in target_keys:
+        occupants_by_code[code] = []
+
+    deletes: List[Dict] = []
+    shifted_creates: List[Dict] = []
+    shifted: List[Dict] = []
+    displaced_records: set[Tuple[str, str]] = set()
+    while queue:
+        occupant = queue.pop(0)
+        occupant_word = str(occupant.get("word") or "").strip()
+        probe_code = str(occupant.get("code") or "").strip().lower()
+        record_key = (occupant_word, probe_code)
+        if (
+            not occupant_word
+            or not probe_code
+            or record_key in displaced_records
+        ):
+            return {"success": False, "message": "顺延链出现重复或空词条记录"}
+        occupant_codes = word_candidate_code_map.get(occupant_word, [])
+        if probe_code not in occupant_codes:
+            return {
+                "success": False,
+                "message": (
+                    f"无法顺延「{occupant_word}」：当前编码 {probe_code} "
+                    "不在它自己的候选编码中"
+                ),
+            }
+        next_code = next(
+            (
+                candidate_code
+                for candidate_code in occupant_codes[
+                    occupant_codes.index(probe_code) + 1:
+                ]
+                if candidate_code not in reserved_codes
+            ),
+            None,
+        )
+        if not next_code:
+            return {
+                "success": False,
+                "message": (
+                    f"无法顺延「{occupant_word}」：{probe_code} "
+                    "之后没有可用候选编码"
+                ),
+            }
+        if next_code not in code_phrase_map:
+            return {
+                "success": False,
+                "message": f"编码 {next_code} 的占用快照不完整",
+            }
+
+        occupant_type = str(occupant.get("type") or "Phrase")
+        if occupant_type not in PHRASE_TYPE_BASE_WEIGHTS:
+            return {
+                "success": False,
+                "message": f"无法验证「{occupant_word}」的词条类型",
+            }
+        displaced_records.add(record_key)
+        deletes.append({
+            "action": "Delete",
+            "word": occupant_word,
+            "code": probe_code,
+            "type": occupant_type,
+        })
+        shifted_creates.append({
+            "action": "Create",
+            "word": occupant_word,
+            "code": next_code,
+            "type": occupant_type,
+        })
+        shifted.append({
+            "word": occupant_word,
+            "fromCode": probe_code,
+            "toCode": next_code,
+            "candidateCodes": list(occupant_codes),
+        })
+        reserved_codes.add(next_code)
+        evicted = list(occupants_by_code.get(next_code, []))
+        if evicted:
+            queue.extend(evicted)
+            occupants_by_code[next_code] = []
+
+    creates: List[Dict] = []
+    for target, (word, code) in zip(targets, target_keys):
+        phrase_type = str(target.get("type") or "Phrase")
+        if phrase_type not in PHRASE_TYPE_BASE_WEIGHTS:
+            return {"success": False, "message": f"无法验证「{word}」的词条类型"}
+        create = {
+            "action": "Create",
+            "word": word,
+            "code": code,
+            "type": phrase_type,
+        }
+        remark = str(target.get("remark") or "").strip()
+        if remark:
+            create["remark"] = remark
+        needs_manual_review = target.get("needsManualReview")
+        if needs_manual_review is not None:
+            if not isinstance(needs_manual_review, bool):
+                return {"success": False, "message": "人工审核标记必须是布尔值"}
+            review_flags.apply_manual_review_flag(create, needs_manual_review)
+        creates.append(create)
+
+    return {
+        "success": True,
+        "items": [*deletes, *creates, *shifted_creates],
+        "shifted": shifted,
+    }
+
+
 def _format_preview_text(preview: Dict) -> str:
     """Convert preview API response into a unified-diff text block."""
     changes = preview.get("changes", [])
@@ -5657,6 +5814,7 @@ async def keytao_shift_phrase_code(
     target_remark: str = "",
     target_needs_manual_review: Optional[bool] = None,
     additional_items: Optional[List[Dict]] = None,
+    additional_shift_items: Optional[List[Dict]] = None,
     ordered_words: Optional[List[str]] = None,
     listed_words: Optional[List[str]] = None,
     expected_codes: Optional[List[str]] = None,
@@ -5664,6 +5822,7 @@ async def keytao_shift_phrase_code(
     evidence_lines: Optional[List[str]] = None,
     _reviewed_pinyin: str = "",
     _reviewed_candidate_codes: Optional[List[str]] = None,
+    _expected_occupants_by_code: Optional[Dict[str, List[str]]] = None,
 ) -> Dict:
     """Preview, bind, then CAS-write a complete code-shift plan."""
     word = word.strip()
@@ -5677,6 +5836,55 @@ async def keytao_shift_phrase_code(
         _reviewed_pinyin.strip()
         and target_code in trusted_reviewed_code_set
     )
+    multi_shift_items: List[Dict] = []
+    if additional_shift_items is not None:
+        if (
+            not isinstance(additional_shift_items, list)
+            or not additional_shift_items
+            or len(additional_shift_items) > 19
+            or additional_items
+        ):
+            return {"success": False, "message": "同批附加顺延集合无效"}
+        seen_shift_keys = {(word, target_code)}
+        seen_shift_codes = {target_code}
+        for raw_item in additional_shift_items:
+            if not isinstance(raw_item, dict):
+                return {"success": False, "message": "同批附加顺延集合无效"}
+            item_word = str(raw_item.get("word") or "").strip()
+            item_code = str(raw_item.get("code") or "").strip().lower()
+            item_type = str(raw_item.get("type") or "Phrase").strip()
+            item_review = raw_item.get("needsManualReview", True)
+            item_pinyin = str(raw_item.get("_reviewed_pinyin") or "").strip()
+            item_codes = _clean_code_list(
+                raw_item.get("_reviewed_candidate_codes")
+            )
+            if (
+                str(raw_item.get("action") or "Create") != "Create"
+                or not item_word
+                or re.fullmatch(r"[a-z]{1,12}", item_code) is None
+                or (item_word, item_code) in seen_shift_keys
+                or item_code in seen_shift_codes
+                or item_type not in PHRASE_TYPE_BASE_WEIGHTS
+                or not isinstance(item_review, bool)
+                or not item_pinyin
+                or item_code not in item_codes
+            ):
+                return {"success": False, "message": "同批附加顺延集合无效"}
+            normalized = {
+                "action": "Create",
+                "word": item_word,
+                "code": item_code,
+                "type": item_type,
+                "needsManualReview": item_review,
+                "_reviewed_pinyin": item_pinyin,
+                "_reviewed_candidate_codes": item_codes,
+            }
+            remark = str(raw_item.get("remark") or "").strip()
+            if remark:
+                normalized["remark"] = remark
+            multi_shift_items.append(normalized)
+            seen_shift_keys.add((item_word, item_code))
+            seen_shift_codes.add(item_code)
     companion_items: List[Dict] = []
     if additional_items is not None:
         if not isinstance(additional_items, list) or len(additional_items) > 20:
@@ -5729,7 +5937,7 @@ async def keytao_shift_phrase_code(
             seen_companion_keys.add((companion_word, companion_code))
 
     if ordered_words is not None:
-        if companion_items:
+        if companion_items or multi_shift_items:
             return {
                 "success": False,
                 "message": "常用度重排不接受额外的同批加词",
@@ -6072,11 +6280,46 @@ async def keytao_shift_phrase_code(
             "requestedCodeAnalysis": requested_analysis,
         }
 
-    word_lookup = await _lookup_words_raw([word])
+    target_specs: List[Dict] = [{
+        "action": "Create",
+        "word": word,
+        "code": target_code,
+        "type": str(target_type or "Phrase"),
+        "remark": target_remark,
+        "needsManualReview": target_needs_manual_review,
+        "_reviewed_pinyin": _reviewed_pinyin.strip(),
+        "_reviewed_candidate_codes": list(target_candidate_codes),
+    }]
+    target_specs.extend(multi_shift_items)
+    target_words = tuple(dict.fromkeys(
+        str(item.get("word") or "").strip()
+        for item in target_specs
+    ))
+    word_candidate_code_map: Dict[str, List[str]] = {}
+    for item in target_specs:
+        item_word = str(item.get("word") or "").strip()
+        item_codes = _clean_code_list(item.get("_reviewed_candidate_codes"))
+        combined = word_candidate_code_map.setdefault(item_word, [])
+        combined.extend(code for code in item_codes if code not in combined)
+
+    word_lookup = await _lookup_words_raw(list(target_words))
     if not word_lookup.get("success"):
         return word_lookup
-    word_result = next((item for item in word_lookup.get("results", []) if item.get("word") == word), {})
-    current_phrase = _select_current_phrase(word, word_result.get("phrases", []))
+    word_results = {
+        str(item.get("word") or "").strip(): item
+        for item in word_lookup.get("results", [])
+        if isinstance(item, dict) and str(item.get("word") or "").strip()
+    }
+    if any(target_word not in word_results for target_word in target_words):
+        return {"success": False, "message": "多目标顺延缺少完整词条快照"}
+    current_phrases = {
+        target_word: _select_current_phrase(
+            target_word,
+            word_results[target_word].get("phrases", []),
+        )
+        for target_word in target_words
+    }
+    current_phrase = current_phrases.get(word)
     if (
         target_needs_manual_review is not None
         and not isinstance(target_needs_manual_review, bool)
@@ -6084,10 +6327,18 @@ async def keytao_shift_phrase_code(
         return {"success": False, "message": "人工审核标记必须是布尔值"}
     if current_phrase is None and target_needs_manual_review is None:
         target_needs_manual_review = True
+        target_specs[0]["needsManualReview"] = True
+    if multi_shift_items and any(
+        current_phrases.get(target_word) is not None
+        for target_word in target_words
+    ):
+        return {
+            "success": False,
+            "message": "多目标添加顺延要求目标新词尚未收录；本次未写入",
+        }
 
-    ignored_words = {word}
+    ignored_words = set(target_words)
     code_phrase_map: Dict[str, List[Dict]] = {}
-    word_candidate_code_map: Dict[str, List[str]] = {word: target_candidate_codes}
     pending_occupants_by_code: Dict[str, List[Dict]] = {}
 
     async def ensure_code_lookup(code: str) -> Dict:
@@ -6105,13 +6356,23 @@ async def keytao_shift_phrase_code(
         pending_occupants_by_code.setdefault(code, [])
         return {"success": True}
 
-    lookup_result = await ensure_code_lookup(target_code)
-    if not lookup_result.get("success"):
-        return lookup_result
+    target_codes = tuple(
+        str(item.get("code") or "").strip().lower()
+        for item in target_specs
+    )
+    for requested_target_code in target_codes:
+        lookup_result = await ensure_code_lookup(requested_target_code)
+        if not lookup_result.get("success"):
+            return lookup_result
 
-    reserved_codes = {target_code}
-    queue: List[Dict] = list(pending_occupants_by_code.get(target_code, []))
-    pending_occupants_by_code[target_code] = []
+    reserved_codes = set(target_codes)
+    queue: List[Dict] = [
+        occupant
+        for requested_target_code in target_codes
+        for occupant in pending_occupants_by_code.get(requested_target_code, [])
+    ]
+    for requested_target_code in target_codes:
+        pending_occupants_by_code[requested_target_code] = []
 
     while queue:
         occupant = queue.pop(0)
@@ -6156,17 +6417,48 @@ async def keytao_shift_phrase_code(
                 "candidateCodes": occupant_codes,
             }
 
-    plan = _build_code_shift_plan(
-        word,
-        target_code,
-        target_candidate_codes,
-        current_phrase,
-        code_phrase_map,
-        word_candidate_code_map,
-        target_type=target_type,
-        target_remark=target_remark,
-        target_needs_manual_review=target_needs_manual_review,
-    )
+    expected_occupants = _expected_occupants_by_code
+    if multi_shift_items:
+        if not isinstance(expected_occupants, dict) or set(
+            str(code or "").strip().lower() for code in expected_occupants
+        ) != set(target_codes):
+            return {"success": False, "message": "多目标顺延缺少占用者绑定"}
+        for requested_target_code in target_codes:
+            expected = tuple(dict.fromkeys(
+                str(value or "").strip()
+                for value in expected_occupants.get(requested_target_code, [])
+                if str(value or "").strip()
+            ))
+            actual = tuple(
+                str(item.get("word") or "").strip()
+                for item in code_phrase_map.get(requested_target_code, [])
+                if str(item.get("word") or "").strip()
+            )
+            if not expected or actual != expected:
+                return {
+                    "success": False,
+                    "message": (
+                        f"编码 {requested_target_code} 的占用者已变化；"
+                        "多目标顺延计划未建立，本次未写入"
+                    ),
+                }
+        plan = _build_multi_code_shift_plan(
+            target_items=target_specs,
+            code_phrase_map=code_phrase_map,
+            word_candidate_code_map=word_candidate_code_map,
+        )
+    else:
+        plan = _build_code_shift_plan(
+            word,
+            target_code,
+            target_candidate_codes,
+            current_phrase,
+            code_phrase_map,
+            word_candidate_code_map,
+            target_type=target_type,
+            target_remark=target_remark,
+            target_needs_manual_review=target_needs_manual_review,
+        )
     if not plan.get("success"):
         return plan
 
@@ -6231,6 +6523,7 @@ async def keytao_shift_phrase_code(
                 "word": word,
                 "targetCode": target_code,
                 "candidateCodes": target_candidate_codes,
+                **({"targetItems": target_specs} if multi_shift_items else {}),
                 "items": plan.get("items", []),
                 "shifted": plan.get("shifted", []),
                 "removedDraftIds": [],
@@ -6259,6 +6552,7 @@ async def keytao_shift_phrase_code(
         "word": word,
         "targetCode": target_code,
         "candidateCodes": target_candidate_codes,
+        **({"targetItems": target_specs} if multi_shift_items else {}),
         "items": plan_items,
         "shifted": plan.get("shifted", []),
         "removedDraftIds": [],

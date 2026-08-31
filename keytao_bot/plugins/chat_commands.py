@@ -25,6 +25,7 @@ from ..harness.authorization_grammar import (
     explicit_same_code_requested,
     explicit_complete_add_item,
     explicit_shift_modified_add_item,
+    parse_compound_eviction_add_plan,
     parse_dictionary_delete_command,
     parse_entry_move_plan,
     parse_entry_swap,
@@ -1118,6 +1119,155 @@ async def _try_handle_complete_add_command(
         owner_label,
     )
     return completed or refreshed
+
+
+async def _try_handle_compound_shift_modified_add_command(
+    message_text: str,
+    platform: str,
+    user_id: str,
+    conv_key: Optional[ConversationKey] = None,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    """Review every line, then start one sealed multi-eviction plan."""
+    plan = parse_compound_eviction_add_plan(message_text)
+    if plan is None:
+        return None
+    if conv_key is None:
+        return (
+            "已识别两行添加并顺延指令，但当前会话无法保存共同确认票据；"
+            "本次未写入。"
+        )
+
+    def refuse(message: str) -> str:
+        conversation_state_store.delete(conv_key)
+        return message
+
+    base_reviewed_states: Dict[str, PendingAddWord] = {}
+    for item in plan.items:
+        if item.word in base_reviewed_states:
+            continue
+        refreshed = await _try_handle_simple_single_word_query(
+            f"加词 {item.word}",
+            platform,
+            user_id,
+            conv_key,
+            space_key,
+            owner_label,
+        )
+        record = conversation_state_store.get_record(conv_key)
+        state = record.state if record is not None else None
+        if not isinstance(state, PendingAddWord) or not state.server_candidates:
+            reason = re.split(
+                r"(?:请|回复|可复制)",
+                str(refreshed or "服务端审词没有返回完整候选"),
+                maxsplit=1,
+            )[0].strip().rstrip("；;。")
+            return refuse(
+                f"无法为「{item.word}」建立两行共同顺延计划；"
+                f"原因：{reason or '服务端审词没有返回完整候选'}；本次未写入。"
+            )
+        base_reviewed_states[item.word] = state
+
+    reviewed_states: Dict[Tuple[str, str], PendingAddWord] = {}
+    for item in plan.items:
+        state = base_reviewed_states[item.word]
+        if item.code not in dict(state.server_candidates):
+            encode_json = await call_tool_function(
+                "keytao_encode",
+                {"word": item.word, "requested_code": item.code},
+                platform,
+                user_id,
+            )
+            try:
+                encoding = json.loads(encode_json)
+            except Exception:
+                encoding = {}
+            requested_state = (
+                _pending_from_requested_encode(item.word, item.code, encoding)
+                if isinstance(encoding, dict) and encoding.get("success") is True
+                else None
+            )
+            if (
+                not isinstance(requested_state, PendingAddWord)
+                or not requested_state.server_candidates
+            ):
+                return refuse(
+                    f"第 {len(reviewed_states) + 1} 行的编码 {item.code} "
+                    f"不在「{item.word}」当前服务端审词候选中；本次未写入。"
+                )
+            state = requested_state
+        reviewed_states[(item.word, item.code)] = state
+
+    resolved_plan: List[Dict[str, Any]] = []
+    shift_targets: List[Dict[str, Any]] = []
+    for index, item in enumerate(plan.items, start=1):
+        state = reviewed_states[(item.word, item.code)]
+        candidates = dict(state.server_candidates)
+        if item.code not in candidates:
+            return refuse(
+                f"第 {index} 行的编码 {item.code} 不在「{item.word}」"
+                "本轮服务端候选中；本次未写入。"
+            )
+        occupants = tuple(dict.fromkeys(
+            str(value or "").strip()
+            for value in state.server_occupied_words.get(item.code, [])
+            if str(value or "").strip()
+        ))
+        if candidates[item.code] is not True or occupants != (
+            item.named_occupant,
+        ):
+            actual = "、".join(f"「{value}」" for value in occupants) or "空位"
+            return refuse(
+                f"第 {index} 行的占用快照与指令不一致：{item.code} 当前为{actual}，"
+                f"不能按「{item.named_occupant}」顺延；本次未写入。"
+            )
+        reviewed_pinyin, reviewed_codes = _pending_reviewed_reading(
+            state,
+            item.code,
+        )
+        if not reviewed_pinyin or item.code not in reviewed_codes:
+            return refuse(
+                f"第 {index} 行的「{item.word}」→ {item.code} "
+                "没有保留对应的服务端读音候选；本次未写入。"
+            )
+        create_args = _create_phrase_args(state, item.code)
+        target = {
+            "action": "Create",
+            "word": item.word,
+            "code": item.code,
+            "type": "Phrase",
+            "remark": str(create_args.get("remark") or ""),
+            "needsManualReview": bool(
+                create_args.get("needs_manual_review", True)
+            ),
+            "namedOccupant": item.named_occupant,
+            "reviewedPinyin": reviewed_pinyin,
+            "reviewedCandidateCodes": list(reviewed_codes),
+        }
+        shift_targets.append(target)
+        resolved_plan.append({
+            "index": index,
+            "word": item.word,
+            "code": item.code,
+            "modifier": "recode",
+            "occupants": [item.named_occupant],
+        })
+
+    primary = shift_targets[0]
+    return await _execute_shift_to_code(
+        str(primary["word"]),
+        str(primary["code"]),
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+        target_item=primary,
+        additional_shift_items=shift_targets[1:],
+        resolved_candidate_plan=resolved_plan,
+        reviewed_pinyin=str(primary["reviewedPinyin"]),
+        reviewed_candidate_codes=tuple(primary["reviewedCandidateCodes"]),
+    )
 
 
 async def _try_handle_shift_modified_add_command(
@@ -4144,6 +4294,7 @@ async def _execute_shift_to_code(
     submit_after: bool = False,
     target_item: Optional[Dict[str, Any]] = None,
     additional_items: Optional[List[Dict[str, Any]]] = None,
+    additional_shift_items: Optional[List[Dict[str, Any]]] = None,
     ordered_words: Optional[List[str]] = None,
     listed_words: Optional[List[str]] = None,
     expected_codes: Optional[List[str]] = None,
@@ -4155,6 +4306,17 @@ async def _execute_shift_to_code(
     auto_confirm_shift_plan: bool = False,
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
+    expected_occupants_by_code = {
+        str(item.get("code") or "").strip().lower(): [
+            str(value or "").strip()
+            for value in item.get("occupants") or []
+            if str(value or "").strip()
+        ]
+        for item in resolved_candidate_plan or []
+        if isinstance(item, dict)
+        and str(item.get("modifier") or "").strip() == "recode"
+        and str(item.get("code") or "").strip()
+    }
     return await _execute_confirmed_tool(
         PendingToolConfirm(
             function_name="keytao_shift_phrase_code",
@@ -4175,6 +4337,15 @@ async def _execute_shift_to_code(
                 **(
                     {"additional_items": [dict(item) for item in additional_items]}
                     if additional_items
+                    else {}
+                ),
+                **(
+                    {
+                        "additional_shift_items": [
+                            dict(item) for item in additional_shift_items
+                        ]
+                    }
+                    if additional_shift_items
                     else {}
                 ),
                 **(
@@ -4209,6 +4380,15 @@ async def _execute_shift_to_code(
                         ],
                     }
                     if resolved_candidate_plan
+                    else {}
+                ),
+                **(
+                    {
+                        "_expected_occupants_by_code": (
+                            expected_occupants_by_code
+                        ),
+                    }
+                    if additional_shift_items and expected_occupants_by_code
                     else {}
                 ),
                 **(
@@ -4436,11 +4616,15 @@ def _resolved_candidate_plan_matches(state: PendingToolConfirm) -> bool:
         return True
     plan = state.args.get("_resolved_candidate_plan")
     additional_items = state.args.get("additional_items")
+    additional_shift_items = state.args.get("additional_shift_items")
     if (
         state.function_name != "keytao_shift_phrase_code"
         or not isinstance(plan, list)
         or len(plan) < 2
-        or not isinstance(additional_items, list)
+        or (
+            not isinstance(additional_items, list)
+            and not isinstance(additional_shift_items, list)
+        )
     ):
         return False
     normalized: List[Tuple[int, str, str, str]] = []
@@ -4469,13 +4653,37 @@ def _resolved_candidate_plan_matches(state: PendingToolConfirm) -> bool:
     ):
         return False
     recode_items = [item for item in normalized if item[3] == "recode"]
-    if len(recode_items) != 1:
+    if not recode_items:
         return False
     _index, recode_word, recode_code, _modifier = recode_items[0]
     if (
         recode_word != str(state.args.get("word") or "").strip()
         or recode_code != str(state.args.get("target_code") or "").strip().lower()
     ):
+        return False
+    if isinstance(additional_shift_items, list):
+        if len(recode_items) != len(normalized):
+            return False
+        expected_shifts = [
+            (word, code)
+            for _index, word, code, _modifier in normalized[1:]
+        ]
+        actual_shifts: List[Tuple[str, str]] = []
+        for item in additional_shift_items:
+            if (
+                not isinstance(item, dict)
+                or str(item.get("action") or "Create") != "Create"
+                or item.get("old_word")
+                or item.get("oldWord")
+            ):
+                return False
+            actual_shifts.append((
+                str(item.get("word") or "").strip(),
+                str(item.get("code") or "").strip().lower(),
+            ))
+        return actual_shifts == expected_shifts
+
+    if len(recode_items) != 1 or not isinstance(additional_items, list):
         return False
     expected_additional = [
         (word, code)
@@ -4949,6 +5157,28 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     )
 
 
+def render_pending_shift_plan(state: PendingToolConfirm) -> str:
+    """Render promise and confirmation solely from one sealed shift ticket."""
+    pending_display = state.args.get("_pending_display")
+    resolved_plan = state.args.get("_resolved_candidate_plan")
+    if (
+        state.function_name != "keytao_shift_phrase_code"
+        or not isinstance(pending_display, dict)
+        or not isinstance(resolved_plan, list)
+        or not _resolved_candidate_plan_matches(state)
+    ):
+        return ""
+    return _format_server_warning_confirmation(
+        state.function_name,
+        {
+            **pending_display,
+            "resolvedCandidatePlan": [
+                dict(item) for item in resolved_plan if isinstance(item, dict)
+            ],
+        },
+    )
+
+
 _RANKED_SHIFT_CONTINUATION_COMMAND = "继续调整"
 _RANKED_SHIFT_SEMANTIC_ARGS = (
     "word",
@@ -5211,6 +5441,35 @@ async def _execute_confirmed_tool(
         for value in args.pop("_reviewed_candidate_codes", [])
         if str(value or "").strip()
     )
+    additional_shift_capabilities: Dict[
+        Tuple[str, str], Dict[str, Any]
+    ] = {}
+    raw_additional_shift_items = args.get("additional_shift_items")
+    if isinstance(raw_additional_shift_items, list):
+        sanitized_shift_items: List[Dict[str, Any]] = []
+        for raw_item in raw_additional_shift_items:
+            if not isinstance(raw_item, dict):
+                sanitized_shift_items.append({})
+                continue
+            item = dict(raw_item)
+            item_pinyin = str(item.pop("reviewedPinyin", "") or "").strip()
+            item_codes = tuple(
+                str(value or "").strip().lower()
+                for value in item.pop("reviewedCandidateCodes", [])
+                if str(value or "").strip()
+            )
+            item_word = str(item.get("word") or "").strip()
+            item_code = str(item.get("code") or "").strip().lower()
+            capability = _reviewed_create_capability(
+                item_word,
+                item_code,
+                item_pinyin,
+                item_codes,
+            )
+            if capability is not None:
+                additional_shift_capabilities.update(capability)
+            sanitized_shift_items.append(item)
+        args["additional_shift_items"] = sanitized_shift_items
     submit_after = bool(args.pop("_submit_after", False))
     expected_keep_words = tuple(
         str(word)
@@ -5329,6 +5588,8 @@ async def _execute_confirmed_tool(
         }
         else None
     )
+    reviewed_capabilities = dict(reviewed_capability or {})
+    reviewed_capabilities.update(additional_shift_capabilities)
     if (
         state.function_name == "keytao_shift_phrase_code"
         and reviewed_pinyin
@@ -5336,13 +5597,13 @@ async def _execute_confirmed_tool(
     ):
         args["_reviewed_pinyin"] = reviewed_pinyin
         args["_reviewed_candidate_codes"] = list(reviewed_candidate_codes)
-    if reviewed_capability is not None:
+    if reviewed_capabilities:
         result_json = await call_tool_function(
             state.function_name,
             args,
             platform,
             user_id,
-            trusted_reviewed_items_by_key=reviewed_capability,
+            trusted_reviewed_items_by_key=reviewed_capabilities,
         )
     else:
         result_json = await call_tool_function(
@@ -9623,7 +9884,10 @@ async def handle_pending_message_core(
     allow_intent_model: bool = True,
 ) -> Optional[str]:
     """Consume or re-arm one pending ticket outside an adapter-specific handler."""
-    if parse_eviction_modified_add(message) is not None:
+    if (
+        parse_eviction_modified_add(message) is not None
+        or parse_compound_eviction_add_plan(message) is not None
+    ):
         return None
     state_record = conversation_state_store.get_record(conv_key)
     if state_record is None or state_record.state is None:

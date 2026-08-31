@@ -1848,7 +1848,7 @@ _QUOTED_WORD_SET_COMMAND_RE = re.compile(
     r"(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿[」”』]"
 )
 _COMMAND_SUGGESTION_LEAD_RE = re.compile(
-    r"(?:确认执行)?请发|请发送|发送下面|比如|例如"
+    r"(?:确认执行)?请发|请发送|请按以下命令(?:逐条)?发送|发送下面|比如|例如"
 )
 _COMMAND_SUGGESTION_VERB_RE = re.compile(
     rf"(?:{ADD_OPERATION_VERB_PATTERN}|提交|删除|移除|修改|改成|改为|"

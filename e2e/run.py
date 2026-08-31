@@ -64,6 +64,12 @@ from .scenarios import (
     S45_FIRST_WORD,
     S45_SECOND_CODE,
     S45_SECOND_WORD,
+    S46_FIRST_CODE,
+    S46_FIRST_SHIFTED_CODE,
+    S46_OCCUPANT,
+    S46_SECOND_CODE,
+    S46_SECOND_SHIFTED_CODE,
+    S46_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -1816,6 +1822,94 @@ async def ensure_s45_fixture(
     }
 
 
+async def ensure_s46_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed one occupant at both target codes and prove both next slots."""
+    newcomer_codes = ordered_candidate_codes(await client.encode(S46_WORD))
+    occupant_codes = ordered_candidate_codes(await client.encode(S46_OCCUPANT))
+    required_targets = (S46_FIRST_CODE, S46_SECOND_CODE)
+    required_shifted = (S46_FIRST_SHIFTED_CODE, S46_SECOND_SHIFTED_CODE)
+    if not all(code in newcomer_codes for code in required_targets):
+        raise RigInfrastructureError(
+            f"S46 {S46_WORD} lacks required target codes {required_targets}: "
+            f"{newcomer_codes}"
+        )
+    if not all(
+        code in occupant_codes
+        for code in (*required_targets, *required_shifted)
+    ):
+        raise RigInfrastructureError(
+            f"S46 {S46_OCCUPANT} lacks target/shift codes "
+            f"{(*required_targets, *required_shifted)}: {occupant_codes}"
+        )
+    for source, destination in zip(required_targets, required_shifted):
+        if occupant_codes.index(destination) <= occupant_codes.index(source):
+            raise RigInfrastructureError(
+                f"S46 {S46_OCCUPANT} destination {destination} does not follow "
+                f"{source}: {occupant_codes}"
+            )
+    for code in (*required_targets, *required_shifted):
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if exact_rows:
+            raise RigInfrastructureError(
+                f"S46 requires an empty exact {code} slot before seeding: "
+                f"{exact_rows}"
+            )
+
+    await client.clean_draft(seed_identity["platform_id"])
+    seed_results = []
+    for code in required_targets:
+        seed_results.append(await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word=S46_OCCUPANT,
+            code=code,
+        ))
+    seeded_rows: dict[str, dict[str, Any]] = {}
+    for code in required_targets:
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if not (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == S46_OCCUPANT
+            and exact_rows[0].get("type") == "Phrase"
+            and str((exact_rows[0].get("user") or {}).get("name") or "").startswith(
+                RESERVED_BINDING_PREFIX
+            )
+        ):
+            raise RigInfrastructureError(
+                f"S46 did not seed sole rig-owned {S46_OCCUPANT}@{code}: "
+                f"{exact_rows}"
+            )
+        seeded_rows[code] = exact_rows[0]
+    for code in required_shifted:
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if exact_rows:
+            raise RigInfrastructureError(
+                f"S46 shifted destination {code} is not empty: {exact_rows}"
+            )
+    return {
+        "word": S46_WORD,
+        "occupantWord": S46_OCCUPANT,
+        "targetCodes": list(required_targets),
+        "shiftedCodes": list(required_shifted),
+        "newcomerCandidateCodes": newcomer_codes,
+        "occupantCandidateCodes": occupant_codes,
+        "seedBatchIds": [result.get("batchId") for result in seed_results],
+        "seededRows": seeded_rows,
+    }
+
+
 async def ensure_s39_fixture(
     *,
     client: LocalNextClient,
@@ -2390,6 +2484,12 @@ async def async_main(args: argparse.Namespace) -> int:
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S45":
                         fixture_facts["s45"] = await ensure_s45_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S46":
+                        fixture_facts["s46"] = await ensure_s46_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

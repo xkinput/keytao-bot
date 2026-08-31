@@ -715,6 +715,13 @@ class EvictionModifiedAdd:
 
 
 @dataclass(frozen=True)
+class CompoundEvictionAddPlan:
+    """Ordered add-and-evict clauses that share one confirmation boundary."""
+
+    items: Tuple[EvictionModifiedAdd, ...]
+
+
+@dataclass(frozen=True)
 class ExistingEntryMove:
     """One existing entry moved to a literal code, with an optional occupant."""
 
@@ -826,6 +833,14 @@ _UNNAMED_EVICTION_MODIFIED_ADD_RE = re.compile(
     r"(?:重新编码|腾位|顺延(?:其他|其余|相关)?(?:的)?(?:词|词条)?|"
     r"顶掉(?:其他|其余|相关)?(?:的)?(?:词|词条)?|"
     r"挪开(?:其他|其余|相关)?(?:的)?(?:词|词条)?)$",
+    re.IGNORECASE,
+)
+_EXPLICIT_QUOTED_EVICTION_ADD_LINE_RE = re.compile(
+    r"^(?P<add>.+?)[，,；;]\s*"
+    r"(?:(?:并且|而且|同时)\s*)?为\s*"
+    r"[\"“「](?P<occupant>[\u3400-\u9fff]{1,16})\s+"
+    rf"(?P<occupant_code>{_POSITIONAL_REORDER_CODE_PATTERN})[\"”」]\s*"
+    r"(?P<modifier>重新编码|顺延(?:编码)?)$",
     re.IGNORECASE,
 )
 
@@ -1157,6 +1172,64 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
     if parsed.word == parsed.named_occupant:
         return None
     return parsed
+
+
+def parse_compound_eviction_add_plan(
+    message: str,
+) -> Optional[CompoundEvictionAddPlan]:
+    """Parse two or more complete add-and-evict lines as one ordered plan."""
+    source = _LEADING_MENTION_RE.sub(
+        "",
+        trusted_mutation_source(message),
+        count=1,
+    ).strip()
+    if not source or re.search(r"[?？]", source):
+        return None
+    lines = tuple(line.strip() for line in source.splitlines() if line.strip())
+    if len(lines) < 2 or len(lines) > 20:
+        return None
+
+    items: list[EvictionModifiedAdd] = []
+    for line in lines:
+        parsed = parse_eviction_modified_add(line)
+        if parsed is None:
+            match = _EXPLICIT_QUOTED_EVICTION_ADD_LINE_RE.fullmatch(line)
+            if match is None:
+                return None
+            add_clause = _parse_complete_add_clause(match.group("add"))
+            occupant_code = match.group("occupant_code").strip().lower()
+            occupant = match.group("occupant").strip()
+            if (
+                add_clause is None
+                or not add_clause.code
+                or add_clause.code != occupant_code
+                or add_clause.word == occupant
+            ):
+                return None
+            parsed = EvictionModifiedAdd(
+                word=add_clause.word,
+                code=add_clause.code,
+                named_occupant=occupant,
+                modifier="顺延",
+            )
+        if not parsed.code or not parsed.named_occupant:
+            return None
+        items.append(parsed)
+
+    exact_targets = tuple((item.word, item.code) for item in items)
+    if len(set(exact_targets)) != len(exact_targets):
+        return None
+    return CompoundEvictionAddPlan(items=tuple(items))
+
+
+def render_compound_eviction_add_command(plan: CompoundEvictionAddPlan) -> str:
+    """Render the exact executable command from the shared plan object."""
+    if not isinstance(plan, CompoundEvictionAddPlan) or len(plan.items) < 2:
+        return ""
+    return "\n".join(
+        f"添加「{item.word}」 {item.code}，{item.named_occupant}顺延"
+        for item in plan.items
+    )
 
 
 _EXISTING_ENTRY_MOVE_RE = re.compile(
@@ -2394,6 +2467,8 @@ def message_authorizes_mutation(message: str) -> bool:
     # the command. The closed parser has already rejected report prefixes,
     # questions, negation, extra actions, and malformed operands.
     if parse_eviction_modified_add(message) is not None:
+        return True
+    if parse_compound_eviction_add_plan(message) is not None:
         return True
     if parse_existing_entry_move(message) is not None:
         return True

@@ -66,6 +66,14 @@ from .scenarios import (
     S45_SECOND_CODE,
     S45_SECOND_WORD,
     S45_SWAP_MESSAGE,
+    S46_FIRST_CODE,
+    S46_FIRST_SHIFTED_CODE,
+    S46_MESSAGE,
+    S46_OCCUPANT,
+    S46_PLAN_COMMAND,
+    S46_SECOND_CODE,
+    S46_SECOND_SHIFTED_CODE,
+    S46_WORD,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -536,6 +544,8 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S42 closes the 2026-08-26 missing-affordance incident", readme)
         self.assertIn("S43 closes the 2026-08-28 encode-timeout incident", readme)
         self.assertIn("S44 closes the 2026-08-29 compound-selection incident", readme)
+        self.assertIn("S45 closes the 2026-08-30 swap-verb", readme)
+        self.assertIn("S46 closes the 2026-08-31 promise-preserving", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
@@ -559,10 +569,36 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(rows_by_key[("entry", "财报")]["pinyins"], ["cái", "bào"])
         self.assertEqual(rows_by_key[("char", "佢")]["pinyins"], ["qú"])
 
-    def test_scenario_pack_is_contiguous_through_s45(self) -> None:
+    def test_s46_pins_promise_preserving_double_eviction_contract(self) -> None:
+        self.assertEqual(S46_WORD, "哲思")
+        self.assertEqual(S46_OCCUPANT, "这厮")
+        self.assertEqual(S46_FIRST_CODE, "fesk")
+        self.assertEqual(S46_FIRST_SHIFTED_CODE, "fesko")
+        self.assertEqual(S46_SECOND_CODE, "qesk")
+        self.assertEqual(S46_SECOND_SHIFTED_CODE, "qesko")
+        self.assertEqual(
+            S46_MESSAGE,
+            '加词 哲思 fesk，并且为"这厮 fesk"顺延\n'
+            '加词 哲思 qesk，并且为"这厮 qesk"顺延',
+        )
+        self.assertEqual(
+            S46_PLAN_COMMAND,
+            "添加「哲思」 fesk，这厮顺延\n添加「哲思」 qesk，这厮顺延",
+        )
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S46"]
+        self.assertEqual(fixture["probe_words"], (S46_WORD, S46_OCCUPANT))
+        entries = {
+            row["entry"]: row["pinyins"]
+            for row in fixture["rows"]
+            if row["kind"] == "entry"
+        }
+        self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
+        self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
+
+    def test_scenario_pack_is_contiguous_through_s46(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 46)],
+            [f"S{index}" for index in range(1, 47)],
         )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:

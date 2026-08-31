@@ -6634,6 +6634,157 @@ async def scenario_s45(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S46_WORD = "哲思"
+S46_OCCUPANT = "这厮"
+S46_FIRST_CODE = "fesk"
+S46_FIRST_SHIFTED_CODE = "fesko"
+S46_SECOND_CODE = "qesk"
+S46_SECOND_SHIFTED_CODE = "qesko"
+S46_MESSAGE = (
+    '加词 哲思 fesk，并且为"这厮 fesk"顺延\n'
+    '加词 哲思 qesk，并且为"这厮 qesk"顺延'
+)
+S46_PLAN_COMMAND = (
+    "添加「哲思」 fesk，这厮顺延\n"
+    "添加「哲思」 qesk，这厮顺延"
+)
+
+
+async def scenario_s46(ctx: ScenarioContext) -> dict[str, Any]:
+    """Execute and replay one two-line plan with the same occupant twice."""
+    messages: list[str] = []
+    replies: list[str] = []
+    expected_items = {
+        ("Delete", S46_OCCUPANT, S46_FIRST_CODE),
+        ("Create", S46_WORD, S46_FIRST_CODE),
+        ("Create", S46_OCCUPANT, S46_FIRST_SHIFTED_CODE),
+        ("Delete", S46_OCCUPANT, S46_SECOND_CODE),
+        ("Create", S46_WORD, S46_SECOND_CODE),
+        ("Create", S46_OCCUPANT, S46_SECOND_SHIFTED_CODE),
+    }
+
+    async def execute_plan(command: str, label: str) -> dict[str, Any]:
+        cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(cleanup.get("success") is True, f"S46 {label} cleanup failed: {cleanup}")
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+        cutoff = max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+
+        messages.append(command)
+        plan_reply = await ctx.send_group(command, to_me=True)
+        replies.append(plan_reply)
+        preview_draft = await ctx.draft()
+        preview_events = [
+            event
+            for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > cutoff
+        ]
+        preview_calls = [
+            event
+            for event in preview_events
+            if event.get("kind") == "tool"
+            and event.get("name") == "keytao_shift_phrase_code"
+            and not event.get("arguments", {}).get("confirmed_plan_digest")
+        ]
+        preview_model_turns = [
+            event
+            for event in preview_events
+            if event.get("kind") == "modelExchange"
+        ]
+        contract = advertised_reply_contract(plan_reply)
+        require(
+            all(
+                marker in plan_reply
+                for marker in (
+                    f"「{S46_WORD}」→ {S46_FIRST_CODE}",
+                    f"「{S46_OCCUPANT}」顺延至 {S46_FIRST_SHIFTED_CODE}",
+                    f"「{S46_WORD}」→ {S46_SECOND_CODE}",
+                    f"「{S46_OCCUPANT}」顺延至 {S46_SECOND_SHIFTED_CODE}",
+                )
+            )
+            and plan_reply.count(pending_confirmation_copy()) == 1
+            and not contract.command_suggestions
+            and len(preview_calls) == 1
+            and not preview_model_turns
+            and not preview_draft.get("items"),
+            f"S46 {label} did not produce one plan-only preview: "
+            f"reply={plan_reply}; calls={preview_calls}; "
+            f"models={preview_model_turns}; draft={preview_draft}",
+        )
+
+        messages.append("确认")
+        confirmation_reply = await ctx.send_group("确认", to_me=True)
+        replies.append(confirmation_reply)
+        draft = await ctx.draft()
+        actual_items = {item_key(item) for item in draft.get("items", [])}
+        all_events = [
+            event
+            for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > cutoff
+        ]
+        confirmed_calls = [
+            event
+            for event in all_events
+            if event.get("kind") == "tool"
+            and event.get("name") == "keytao_shift_phrase_code"
+            and event.get("arguments", {}).get("confirmed_plan_digest")
+        ]
+        model_turns = [
+            event for event in all_events if event.get("kind") == "modelExchange"
+        ]
+        require(
+            actual_items == expected_items
+            and len(draft.get("items") or []) == len(expected_items)
+            and len(confirmed_calls) == 1
+            and not model_turns,
+            f"S46 {label} confirmation diverged from the promised end state: "
+            f"reply={confirmation_reply}; draft={draft}; "
+            f"calls={confirmed_calls}; models={model_turns}",
+        )
+        return {
+            "planReply": plan_reply,
+            "confirmationReply": confirmation_reply,
+            "draft": draft,
+            "actualItems": sorted(actual_items),
+            "previewCalls": len(preview_calls),
+            "confirmedCalls": len(confirmed_calls),
+            "modelTurns": len(model_turns),
+        }
+
+    incident = await execute_plan(S46_MESSAGE, "incident")
+    replay = await execute_plan(S46_PLAN_COMMAND, "plan-command replay")
+    require(
+        incident["actualItems"] == replay["actualItems"] == sorted(expected_items),
+        f"S46 plan-object command did not reproduce the promised state: "
+        f"incident={incident}; replay={replay}",
+    )
+
+    final_cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+    require(final_cleanup.get("success") is True, f"S46 final cleanup failed: {final_cleanup}")
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": replay["draft"],
+        "facts": {
+            "word": S46_WORD,
+            "occupant": S46_OCCUPANT,
+            "targetCodes": [S46_FIRST_CODE, S46_SECOND_CODE],
+            "shiftedCodes": [S46_FIRST_SHIFTED_CODE, S46_SECOND_SHIFTED_CODE],
+            "sameOccupantShiftCount": 2,
+            "confirmationStepsPerRun": 1,
+            "advertisedCommandCount": 0,
+            "planCommand": S46_PLAN_COMMAND,
+            "planCommandReproducedPromise": True,
+            "incident": incident,
+            "replay": replay,
+            "expectedItems": sorted(expected_items),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -6680,6 +6831,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S43", "encode retry ladder and offline read-only degradation", scenario_s43),
     Scenario("S44", "deterministic compound candidate selection", scenario_s44),
     Scenario("S45", "swap verbs and interrogative review boundary", scenario_s45),
+    Scenario("S46", "multi-line promise-preserving double eviction", scenario_s46),
 )
 
 

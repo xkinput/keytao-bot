@@ -277,6 +277,7 @@ from .chat_commands import (
     _try_handle_draft_submit_command,
     _try_handle_draft_view_command,
     _try_handle_complete_add_command,
+    _try_handle_compound_shift_modified_add_command,
     _try_handle_shift_modified_add_command,
     _try_handle_explicit_reading_disambiguation,
     _try_handle_keep_only_draft_items_command,
@@ -2065,6 +2066,17 @@ def _render_live_batch_record(record: Optional[PendingStateRecord]) -> str:
     )
 
 
+def _render_live_shift_record(record: Optional[PendingStateRecord]) -> str:
+    """Project a sealed shift ticket without preserving model-authored prose."""
+    if (
+        record is None
+        or record.execution_id
+        or not isinstance(record.state, PendingToolConfirm)
+    ):
+        return ""
+    return _chat_commands.render_pending_shift_plan(record.state)
+
+
 def _render_live_word_set_record(record: Optional[PendingStateRecord]) -> str:
     """Project one unambiguous actor-owned lookup snapshot for delivery."""
     if (
@@ -2315,12 +2327,13 @@ def _enforce_advertised_reply_contract(
         return text
 
     replacement = (
-        _render_live_word_set_record(record)
+        _render_live_shift_record(record)
+        or _render_live_word_set_record(record)
         if contract.word_set_advertisement
         and not contract.binding_advertisement
         else _render_live_single_candidate_record(record)
         if contract.code_choice_advertisement
-        else _render_live_batch_record(record)
+        else _render_live_shift_record(record) or _render_live_batch_record(record)
     )
     if replacement and _advertised_reply_matches_live_record(replacement, record):
         logger.warning(
@@ -2900,6 +2913,9 @@ class TurnContext:
     eviction_modified_add: Optional[
         _authorization_grammar.EvictionModifiedAdd
     ] = None
+    compound_eviction_add_plan: Optional[
+        _authorization_grammar.CompoundEvictionAddPlan
+    ] = None
     message_is_prefixed_fresh_word_query: bool = False
     memory_context: Optional[ChatMemoryContext] = None
     conv_key: Optional[ConversationKey] = None
@@ -3159,6 +3175,11 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     ctx.eviction_modified_add = _authorization_grammar.parse_eviction_modified_add(
         ctx.normalized_message_text
     )
+    ctx.compound_eviction_add_plan = (
+        _authorization_grammar.parse_compound_eviction_add_plan(
+            ctx.normalized_message_text
+        )
+    )
     ctx.scoped_pending_state: Optional[PendingToolConfirm] = None
     ctx.scoped_pending_intent: Optional[MessageCommandIntent] = None
     ctx.scoped_pending_response: Optional[str] = None
@@ -3209,6 +3230,7 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
         return False
     if (
         ctx.eviction_modified_add is None
+        and ctx.compound_eviction_add_plan is None
         and ctx.current_pending_record is not None
         and not ctx.current_pending_record.execution_id
     ):
@@ -3381,7 +3403,10 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
         ctx.current_pending_record.state if ctx.current_pending_record is not None else None,
         ctx.normalized_message_text,
     )
-    if ctx.eviction_modified_add is not None:
+    if (
+        ctx.eviction_modified_add is not None
+        or ctx.compound_eviction_add_plan is not None
+    ):
         # This is a complete fresh mutation command. Its second clause is the
         # positional modifier for the add, not assent to an older ticket and
         # not a second independent action requiring model classification.
@@ -3675,7 +3700,10 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
     ) or ctx.message_is_prefixed_fresh_word_query
     if ctx.resolved_advertised_words:
         ctx.generic_intent_is_fresh_command = True
-    if ctx.eviction_modified_add is not None:
+    if (
+        ctx.eviction_modified_add is not None
+        or ctx.compound_eviction_add_plan is not None
+    ):
         ctx.generic_intent_is_fresh_command = True
     if (
         ctx.current_pending_record is not None
@@ -4829,6 +4857,15 @@ async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
             ctx.owner_label,
         )
     if ctx.response is None and ctx.current_pending_record is None:
+        ctx.response = await _try_handle_compound_shift_modified_add_command(
+            ctx.normalized_message_text,
+            ctx.platform,
+            ctx.user_id,
+            ctx.conv_key,
+            ctx.space_key,
+            ctx.owner_label,
+        )
+    if ctx.response is None and ctx.current_pending_record is None:
         ctx.response = await _try_handle_shift_modified_add_command(
             ctx.normalized_message_text,
             ctx.platform,
@@ -5480,6 +5517,7 @@ _CHAT_COMPAT_NAMES = (
     "_try_handle_draft_submit_command",
     "_try_handle_draft_view_command",
     "_try_handle_complete_add_command",
+    "_try_handle_compound_shift_modified_add_command",
     "_try_handle_shift_modified_add_command",
     "_try_handle_explicit_reading_disambiguation",
     "_try_handle_keep_only_draft_items_command",

@@ -89,6 +89,9 @@ removes only those rig-owned dictionary words, seeds `在距@zhjl`, and reserves
 S45 declares authoritative readings for `财宝`, `财报`, and the single character
 `佢`. It removes only those rig-owned dictionary words, then seeds
 `财宝@chbz` and `财报@chbza` as the exact two rows whose codes are exchanged.
+S46 declares authoritative readings for `哲思` and `这厮`. It removes only those
+rig-owned words, seeds `这厮@fesk` and `这厮@qesk`, and reserves `fesko` and
+`qesko` as the exact two shift destinations returned by the encoder.
 
 ## Prerequisites
 
@@ -449,6 +452,13 @@ verbatim `对换财宝和财报的编码` must render one server-resolved swap p
 `确认` must exchange both exact codes. The verbatim `单人旁加个巨字是什么字`
 must answer `佢` after a concrete `keytao_encode` data check, with no reviewed-add
 call, candidate list, add affordance, pending draft item, or write.
+
+S46 closes the 2026-08-31 promise-preserving multi-line eviction incident. Two
+add-with-shift lines for `哲思@fesk` and `哲思@qesk`, both occupied by `这厮`,
+must render one server-resolved plan and take one confirmation. The sealed plan
+must move the two original `这厮` rows independently to `fesko` and `qesko`.
+Replaying the plan's advertised command through the public message path must
+produce exactly the same six-item draft end state as the promise.
 
 Optional overrides:
 
