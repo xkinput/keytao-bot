@@ -26,6 +26,7 @@ from ..harness.authorization_grammar import (
     is_interrogative_message,
     looks_like_lexical_review_target,
     parse_dictionary_delete_command,
+    parse_dictionary_recode_command,
     parse_entry_move_plan,
     parse_entry_swap,
     parse_eviction_modified_add,
@@ -491,6 +492,7 @@ _DRAFT_FLOW_INTENTS = frozenset({
     "entry_swap",
     "entry_move_plan",
     "dictionary_delete",
+    "dictionary_recode",
 })
 
 
@@ -1945,6 +1947,14 @@ def _is_fresh_current_user_command_intent(
             and (command.word,) == command_intent.keep_words
             and command.code == command_intent.requested_code
         )
+    if command_intent.intent == "dictionary_recode":
+        command = parse_dictionary_recode_command(message_text)
+        return bool(
+            command is not None
+            and (command.word,) == command_intent.keep_words
+            and command.old_code == command_intent.requested_code
+            and (command.new_code,) == command_intent.requested_codes
+        )
     if command_intent.intent == "entry_swap":
         command = parse_entry_swap(message_text)
         return bool(
@@ -2207,6 +2217,15 @@ def _structural_draft_management_intent(
             intent="word_list_reorder",
             confidence=1.0,
             keep_words=word_list_reorder.words,
+        )
+    dictionary_recode = parse_dictionary_recode_command(message_text)
+    if dictionary_recode is not None:
+        return MessageCommandIntent(
+            intent="dictionary_recode",
+            confidence=1.0,
+            keep_words=(dictionary_recode.word,),
+            requested_code=dictionary_recode.old_code,
+            requested_codes=(dictionary_recode.new_code,),
         )
     entry_move_plan = parse_entry_move_plan(message_text)
     if entry_move_plan is not None:

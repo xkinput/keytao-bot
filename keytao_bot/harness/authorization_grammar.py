@@ -757,6 +757,15 @@ class DictionaryDeleteCommand:
 
 
 @dataclass(frozen=True)
+class DictionaryRecodeCommand:
+    """One literal delete/create pair for the same dictionary word."""
+
+    word: str
+    old_code: str
+    new_code: str
+
+
+@dataclass(frozen=True)
 class EntryMovePlanCommand:
     """Two literal existing-entry moves that must share one sealed plan."""
 
@@ -957,6 +966,17 @@ _DICTIONARY_DELETE_PATTERNS = (
     ),
 )
 
+_DICTIONARY_RECODE_WHOLE_RE = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:删除|删掉|移除)\s*"
+    rf"(?P<delete_word>{_DICTIONARY_DELETE_WORD_PATTERN})\s+"
+    rf"(?P<old_code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*[；;]\s*"
+    rf"(?:添加|新增|加入)\s*"
+    rf"(?P<create_word>{_DICTIONARY_DELETE_WORD_PATTERN})\s+"
+    rf"(?P<new_code>{_POSITIONAL_REORDER_CODE_PATTERN})"
+    r"(?:吧|啦|了)?$",
+    re.IGNORECASE,
+)
+
 _ENTRY_MOVE_PLAN_CLAUSE_RE = re.compile(
     r"^(?:把|将)\s*[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
     r"(?:调整到|改到|移到|挪到|换到)\s*"
@@ -1049,6 +1069,60 @@ def parse_dictionary_delete_command(
     if not word or (code and re.fullmatch(_POSITIONAL_REORDER_CODE_PATTERN, code) is None):
         return None
     return DictionaryDeleteCommand(word=word, code=code)
+
+
+def parse_dictionary_recode_command(
+    message: str,
+) -> Optional[DictionaryRecodeCommand]:
+    """Parse one explicit same-word delete/create pair as an atomic plan."""
+    source = _safe_whole_entry_command_source(message)
+    if not source:
+        return None
+    match = _DICTIONARY_RECODE_WHOLE_RE.fullmatch(
+        source.rstrip("。.!！").strip()
+    )
+    if match is None:
+        return None
+    delete_word = match.group("delete_word").strip()
+    create_word = match.group("create_word").strip()
+    old_code = match.group("old_code").strip().lower()
+    new_code = match.group("new_code").strip().lower()
+    if delete_word != create_word or old_code == new_code:
+        return None
+    return DictionaryRecodeCommand(
+        word=delete_word,
+        old_code=old_code,
+        new_code=new_code,
+    )
+
+
+def dictionary_recode_items_match(
+    command: DictionaryRecodeCommand,
+    items: object,
+    *,
+    phrase_type: str = "",
+) -> bool:
+    """Bind a parsed recode to exactly one typed Delete+Create item pair."""
+    if not isinstance(items, list) or len(items) != 2:
+        return False
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        item_type = str(item.get("type") or "").strip()
+        if phrase_type and item_type != phrase_type:
+            return False
+        normalized.append((
+            str(item.get("action") or "Create").strip(),
+            str(item.get("word") or "").strip(),
+            str(item.get("code") or "").strip().lower(),
+            item_type,
+        ))
+    expected_type = phrase_type or normalized[0][3]
+    return normalized == [
+        ("Delete", command.word, command.old_code, expected_type),
+        ("Create", command.word, command.new_code, expected_type),
+    ]
 
 
 def parse_entry_move_plan(message: str) -> Optional[EntryMovePlanCommand]:
@@ -2475,6 +2549,8 @@ def message_authorizes_mutation(message: str) -> bool:
     if parse_entry_swap(message) is not None:
         return True
     if parse_dictionary_delete_command(message) is not None:
+        return True
+    if parse_dictionary_recode_command(message) is not None:
         return True
     if parse_entry_move_plan(message) is not None:
         return True
@@ -4816,8 +4892,38 @@ def _validate_current_message_binding(
         dictionary_delete = parse_dictionary_delete_command(
             context.current_message or ""
         )
+        dictionary_recode = parse_dictionary_recode_command(
+            context.current_message or ""
+        )
         dictionary_delete_is_bound = False
-        if dictionary_delete is not None and len(items) == 1:
+        dictionary_recode_is_bound = False
+        if dictionary_recode is not None:
+            trusted_type = ToolExecutor._trusted_phrase_type(
+                context,
+                dictionary_recode.word,
+                dictionary_recode.old_code,
+            )
+            dictionary_recode_is_bound = bool(
+                trusted_type
+                and dictionary_recode.old_code
+                in trusted_word_lookup_codes.get(
+                    dictionary_recode.word,
+                    frozenset(),
+                )
+                and dictionary_recode_items_match(
+                    dictionary_recode,
+                    items,
+                    phrase_type=trusted_type,
+                )
+            )
+            if not dictionary_recode_is_bound:
+                return policy_block(
+                    BLOCK_REASON_BINDING_INCOMPLETE,
+                    f"{POLICY_BLOCK_TEMPLATE_PREFIX}改码计划与本轮删除、添加操作数"
+                    "或服务端词库记录不一致；整批均未写入。",
+                    missing=["exactDictionaryRecodeSet"],
+                )
+        elif dictionary_delete is not None and len(items) == 1:
             delete_item = items[0] if isinstance(items[0], dict) else {}
             delete_word = str(delete_item.get("word") or "").strip()
             delete_code = str(delete_item.get("code") or "").strip().lower()
@@ -4907,7 +5013,11 @@ def _validate_current_message_binding(
         blocked_items: List[str] = []
         for item in (
             []
-            if pending_batch_is_bound or dictionary_delete_is_bound
+            if (
+                pending_batch_is_bound
+                or dictionary_delete_is_bound
+                or dictionary_recode_is_bound
+            )
             else items
         ):
             if not isinstance(item, dict):

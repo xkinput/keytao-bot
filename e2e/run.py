@@ -2488,8 +2488,9 @@ async def async_main(args: argparse.Namespace) -> int:
                             seed_identity=seed_identity,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
-                    if scenario.scenario_id == "S46":
-                        fixture_facts["s46"] = await ensure_s46_fixture(
+                    if scenario.scenario_id in {"S46", "S47"}:
+                        fixture_key = scenario.scenario_id.lower()
+                        fixture_facts[fixture_key] = await ensure_s46_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

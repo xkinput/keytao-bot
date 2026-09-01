@@ -30,6 +30,7 @@ from .keytao_encoding import (
     normalize_contextual_phrase_encoding,
     pinyin_to_phonetic_code,
 )
+from .keytao_candidate_preference import apply_zhe_fe_chain_preference
 from .llm_policy import log_chat_usage, with_deepseek_chat_policy
 from .observability import current_turn_id, observe_model_call, record_encode_call
 from .pending_confirmation import render_remediation_reply
@@ -2773,6 +2774,12 @@ async def prepare_reviewed_word(
         evidence = {"success": False, "groups": [], "sources": []}
     if isinstance(encode_data, BaseException):
         encode_data = {"success": False, "message": str(encode_data)}
+    else:
+        encode_data = apply_zhe_fe_chain_preference(
+            word,
+            encode_data,
+            include_alternative_in_codes=True,
+        )
 
     collector_source_outcomes = [
         outcome

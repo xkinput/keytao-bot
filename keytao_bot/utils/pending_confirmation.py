@@ -9,6 +9,10 @@ import unicodedata
 from urllib.parse import urlsplit
 
 
+class ServerBackedQueryReply(str):
+    """Internal provenance for an exact server-rendered read-only reply."""
+
+
 PENDING_CONFIRM_ADVERTISED_FORMS = ("确认",)
 PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     *PENDING_CONFIRM_ADVERTISED_FORMS,
@@ -1678,16 +1682,16 @@ def render_server_backed_single_word_lookup(
     if not body or advertised_single_word_candidate_codes(body) != expected_codes:
         return ""
     if has_reorder_copy:
-        return "\n".join((
+        return ServerBackedQueryReply("\n".join((
             body,
             "本次仅查询，不建立写入确认。",
             single_word_candidate_footer(len(expected_codes)),
-        ))
-    return "\n".join((
+        )))
+    return ServerBackedQueryReply("\n".join((
         body,
         f"推荐编码：{recommended}（本次仅查询）",
         single_word_candidate_footer(len(expected_codes)),
-    ))
+    )))
 
 
 def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
@@ -1848,17 +1852,24 @@ _QUOTED_WORD_SET_COMMAND_RE = re.compile(
     r"(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿[」”』]"
 )
 _COMMAND_SUGGESTION_LEAD_RE = re.compile(
-    r"(?:确认执行)?请发|请发送|请按以下命令(?:逐条)?发送|发送下面|比如|例如"
+    r"(?:确认执行)?请发|请发送|请按以下命令(?:逐条)?发送|"
+    r"请按(?:下面|以下)格式(?:重发|发送)|发送下面|直接回复|"
+    r"可以改为|比如|例如"
 )
 _COMMAND_SUGGESTION_VERB_RE = re.compile(
     rf"(?:{ADD_OPERATION_VERB_PATTERN}|提交|删除|移除|修改|改成|改为|"
     r"改到|调整到|移到|挪到|换到|顺延|重新编码|调整权重)"
 )
+_UNQUOTED_COMMAND_SUGGESTION_RE = re.compile(
+    r"(?:请按(?:下面|以下)格式(?:重发|发送)|直接回复|"
+    r"可以改为|比如|例如)[ \t]*[:：][ \t]*"
+    r"(?P<command>[^\n。！？]{1,256})"
+)
 
 
 def advertised_command_suggestions(text: str) -> tuple[str, ...]:
     """Extract copyable model suggestions from explicit advertisement frames."""
-    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    normalized = str(text or "")
     positioned: list[tuple[int, str]] = []
     for left, right in _ADVERTISED_QUOTE_PAIRS:
         depth = 0
@@ -1884,6 +1895,13 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
                 and re.search(r"[\u3400-\u9fff]", command)
             ):
                 positioned.append((start, command))
+    for match in _UNQUOTED_COMMAND_SUGGESTION_RE.finditer(normalized):
+        command = match.group("command").strip()
+        if command and (
+            _COMMAND_SUGGESTION_VERB_RE.search(command) is not None
+            or re.fullmatch(r"执行方案\s*[AB]", command, re.IGNORECASE)
+        ):
+            positioned.append((match.start("command"), command))
     suggestions: list[str] = []
     seen: set[str] = set()
     for _position, command in sorted(positioned):

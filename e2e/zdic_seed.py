@@ -492,6 +492,11 @@ ZDIC_FIXTURES_BY_SCENARIO["S46"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S47"] = {
+    "probe_words": ("哲思", "这厮"),
+    "rows": ZDIC_FIXTURES_BY_SCENARIO["S46"]["rows"],
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

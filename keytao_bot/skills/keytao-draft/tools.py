@@ -5801,6 +5801,81 @@ async def _prepare_ranked_reorder_plan(
     }
 
 
+_SHIFT_DRAFT_SEMANTIC_KEYS = (
+    "action",
+    "word",
+    "code",
+    "type",
+    "oldWord",
+    "old_word",
+    "weight",
+    "remark",
+    "needsManualReview",
+)
+
+
+def _shift_draft_semantics(item: Dict) -> Dict:
+    """Return only plan-bearing fields from a server draft row."""
+    normalized = {
+        key: item.get(key)
+        for key in _SHIFT_DRAFT_SEMANTIC_KEYS
+        if key in item
+    }
+    normalized["action"] = str(item.get("action") or "Create").strip()
+    normalized["word"] = str(item.get("word") or "").strip()
+    normalized["code"] = str(item.get("code") or "").strip().lower()
+    normalized["type"] = str(item.get("type") or "Phrase").strip()
+    return normalized
+
+
+def _shift_draft_row_matches_plan(draft_item: Dict, planned_item: Dict) -> bool:
+    """Allow server metadata while requiring every planned semantic field."""
+    draft = _shift_draft_semantics(draft_item)
+    planned = _shift_draft_semantics(planned_item)
+    base_keys = {"action", "word", "code", "type"}
+    if any(draft.get(key) != planned.get(key) for key in base_keys):
+        return False
+    return all(
+        draft.get(key) == value
+        for key, value in planned.items()
+        if key not in base_keys
+    )
+
+
+def _merge_existing_shift_draft_rows(
+    planned_items: List[Dict],
+    related_draft_items: List[Dict],
+) -> Dict:
+    """Subtract exact existing rows while refusing ambiguous or changed rows."""
+    remaining_indices = set(range(len(planned_items)))
+    merged_rows: List[Dict] = []
+    conflicting_rows: List[Dict] = []
+    for draft_item in related_draft_items:
+        matches = [
+            index
+            for index in remaining_indices
+            if _shift_draft_row_matches_plan(
+                draft_item,
+                planned_items[index],
+            )
+        ]
+        if len(matches) != 1:
+            conflicting_rows.append(dict(draft_item))
+            continue
+        remaining_indices.remove(matches[0])
+        merged_rows.append(dict(draft_item))
+    return {
+        "success": not conflicting_rows,
+        "remainingItems": [
+            dict(item)
+            for index, item in enumerate(planned_items)
+            if index in remaining_indices
+        ],
+        "mergedDraftItems": merged_rows,
+        "conflictingDraftItems": conflicting_rows,
+    }
+
+
 async def keytao_shift_phrase_code(
     platform: str,
     platform_id: str,
@@ -6508,27 +6583,44 @@ async def keytao_shift_phrase_code(
         item for item in existing_draft.get("items", [])
         if isinstance(item, dict) and item.get("word") in planned_words
     ]
-    if related_draft_items:
+    full_plan_items = [dict(item) for item in plan_items]
+    merge_result = _merge_existing_shift_draft_rows(
+        full_plan_items,
+        related_draft_items,
+    )
+    if not merge_result.get("success"):
+        conflict_lines = "；".join(
+            f"{item.get('action') or 'Create'} 「{item.get('word') or '未知词条'}」"
+            f"@{item.get('code') or '未知编码'}"
+            for item in merge_result.get("conflictingDraftItems", [])[:8]
+        )
         return _inject_known_batch_url({
             "success": False,
             "policyBlocked": True,
             "requiresDraftCleanup": True,
             "message": render_remediation_reply(
-                "相关词条已存在于草稿中；为避免非原子地先删后写，"
-                "本次顺延未修改草稿；必须由你决定如何处理旧草稿条目",
+                "现有草稿行与本轮顺延计划冲突："
+                f"{conflict_lines or '草稿行内容不完整'}；本次未修改草稿",
                 command="查看草稿",
             ),
             "relatedDraftItems": related_draft_items[:20],
+            "conflictingDraftItems": merge_result.get(
+                "conflictingDraftItems", []
+            )[:20],
             "shiftPlan": {
                 "word": word,
                 "targetCode": target_code,
                 "candidateCodes": target_candidate_codes,
                 **({"targetItems": target_specs} if multi_shift_items else {}),
-                "items": plan.get("items", []),
+                "items": full_plan_items,
                 "shifted": plan.get("shifted", []),
                 "removedDraftIds": [],
             },
+            "batchId": str(existing_draft.get("batchId") or batch_id or ""),
+            "contentVersion": existing_draft.get("contentVersion"),
         }, str(existing_draft.get("batchId") or batch_id or ""))
+    plan_items = list(merge_result.get("remainingItems") or [])
+    merged_draft_items = list(merge_result.get("mergedDraftItems") or [])
 
     current_batch_id = str(existing_draft.get("batchId") or "")
     current_content_version = existing_draft.get("contentVersion")
@@ -6554,11 +6646,23 @@ async def keytao_shift_phrase_code(
         "candidateCodes": target_candidate_codes,
         **({"targetItems": target_specs} if multi_shift_items else {}),
         "items": plan_items,
+        "plannedItems": full_plan_items,
+        "mergedDraftItems": merged_draft_items,
+        "remainingItems": plan_items,
         "shifted": plan.get("shifted", []),
         "removedDraftIds": [],
     }
     warning_digest = str(expected_warning_digest or "").strip().lower()
     warnings: List[Any] = []
+    if not plan_items:
+        return _inject_known_batch_url({
+            "success": True,
+            "noWrite": True,
+            "message": "本轮顺延计划已完整存在于当前草稿，无需重复写入",
+            "batchId": current_batch_id,
+            "contentVersion": current_content_version,
+            "shiftPlan": shift_plan,
+        }, current_batch_id)
     if plan_items and not confirmed_plan_digest:
         strict_preview = await _keytao_strict_batch_add_to_draft(
             platform,
@@ -6716,8 +6820,8 @@ TOOLS += [
             "description": (
                 "将一个词改到指定编码，并按每个被挤走词自己的 keytao_encode 候选编码链逐个顺延。"
                 "会检查目标编码是否是目标词的有效编码、每个顺延目标是否可继续挪动或为空，"
-                "仅在没有相关旧草稿条目时，通过严格事务一次性写入 Delete+Create；"
-                "如已有相关草稿则安全拒绝，不会先删后写。返回 shiftPlan.shifted 说明顺延了哪些词。"
+                "会把与完整计划精确相同的现有草稿行合并为已满足项，只对剩余 delta 做严格预览；"
+                "内容不同的相关草稿行会逐条报告冲突并要求选择处理方式。返回 shiftPlan.shifted 说明顺延了哪些词。"
                 "用户要求插入到已占用编码、抢占某码位、把某词改到某个已占用编码时优先使用此工具。"
             ),
             "parameters": {

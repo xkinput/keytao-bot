@@ -92,6 +92,8 @@ S45 declares authoritative readings for `财宝`, `财报`, and the single chara
 S46 declares authoritative readings for `哲思` and `这厮`. It removes only those
 rig-owned words, seeds `这厮@fesk` and `这厮@qesk`, and reserves `fesko` and
 `qesko` as the exact two shift destinations returned by the encoder.
+S47 reuses the same isolated dictionary fixture to exercise choice binding,
+plan-rendered refusal commands, deterministic recoding, and merge-into-draft.
 
 ## Prerequisites
 
@@ -459,6 +461,12 @@ must render one server-resolved plan and take one confirmation. The sealed plan
 must move the two original `这厮` rows independently to `fesko` and `qesko`.
 Replaying the plan's advertised command through the public message path must
 produce exactly the same six-item draft end state as the promise.
+
+S47 closes the 2026-09-01 choice-closure incident. A bare `A` must execute the
+live option record; every refusal command copied verbatim must enter its
+deterministic plan; `删除 这厮 fesk；添加 这厮 fesko` must bypass the model; and an
+exact existing occupant draft row must be merged so only the remaining shift
+delta is previewed and confirmed.
 
 Optional overrides:
 

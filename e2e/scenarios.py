@@ -6785,6 +6785,221 @@ async def scenario_s46(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S47_EVICTION_MESSAGE = "加词 哲思 fesk 重新编码"
+S47_RECODE_COMMAND = "删除 这厮 fesk；添加 这厮 fesko"
+
+
+async def scenario_s47(ctx: ScenarioContext) -> dict[str, Any]:
+    """Close choice, suggestion, deterministic recode, and draft-merge paths."""
+    messages: list[str] = []
+    replies: list[str] = []
+
+    async def reset() -> None:
+        cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(cleanup.get("success") is True, f"S47 cleanup failed: {cleanup}")
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    def cutoff() -> int:
+        return max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+
+    def events_after(sequence: int) -> list[dict[str, Any]]:
+        return [
+            event for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > sequence
+        ]
+
+    await reset()
+    messages.append("删词 这厮")
+    refusal = await ctx.send_group("删词 这厮", to_me=True)
+    replies.append(refusal)
+    suggested_match = re.search(
+        r"[-•]\s*[「“『](删词\s+这厮\s+[a-z]+)[」”』]",
+        refusal,
+    )
+    require(
+        suggested_match is not None,
+        f"S47 refusal did not expose a plan-rendered exact command: {refusal}",
+    )
+    suggested_command = suggested_match.group(1)
+    suggestion_cutoff = cutoff()
+    messages.append(suggested_command)
+    suggestion_reply = await ctx.send_group(suggested_command, to_me=True)
+    replies.append(suggestion_reply)
+    suggestion_events = events_after(suggestion_cutoff)
+    suggestion_models = [
+        event for event in suggestion_events if event.get("kind") == "modelExchange"
+    ]
+    suggestion_batch_calls = [
+        event for event in suggestion_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(
+        suggestion_batch_calls
+        and not suggestion_models
+        and pending_confirmation_copy() in suggestion_reply,
+        f"S47 advertised command did not execute deterministically: "
+        f"command={suggested_command}; reply={suggestion_reply}; "
+        f"events={suggestion_events}",
+    )
+
+    await reset()
+    recode_cutoff = cutoff()
+    messages.append(S47_RECODE_COMMAND)
+    recode_reply = await ctx.send_group(S47_RECODE_COMMAND, to_me=True)
+    replies.append(recode_reply)
+    if pending_confirmation_copy() in recode_reply:
+        messages.append("确认")
+        recode_reply = await ctx.send_group("确认", to_me=True)
+        replies.append(recode_reply)
+    recode_events = events_after(recode_cutoff)
+    recode_models = [
+        event for event in recode_events if event.get("kind") == "modelExchange"
+    ]
+    recode_batch_calls = [
+        event for event in recode_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    recode_draft = await ctx.draft()
+    recode_items = {item_key(item) for item in recode_draft.get("items", [])}
+    require(
+        not recode_models
+        and recode_batch_calls
+        and {
+            ("Delete", "这厮", "fesk"),
+            ("Create", "这厮", "fesko"),
+        }.issubset(recode_items),
+        f"S47 explicit recode was not one deterministic plan: "
+        f"reply={recode_reply}; draft={recode_draft}; events={recode_events}",
+    )
+
+    await reset()
+    await ctx.next_client.add_draft_items(
+        platform_id=ctx.platform_id,
+        items=[{
+            "action": "Create",
+            "word": "哲思",
+            "code": "fesko",
+            "type": "Phrase",
+            "needsManualReview": False,
+        }],
+    )
+    messages.append(S47_EVICTION_MESSAGE)
+    choice_reply = await ctx.send_group(S47_EVICTION_MESSAGE, to_me=True)
+    replies.append(choice_reply)
+    require(
+        all(marker in choice_reply for marker in (
+            "A. 删除上述冲突草稿行",
+            "B. 保留当前草稿",
+            "回复 A 或 B 即可",
+        )),
+        f"S47 conflict did not create a live choice offer: {choice_reply}",
+    )
+    choice_a_cutoff = cutoff()
+    messages.append("A")
+    choice_a_reply = await ctx.send_group("A", to_me=True)
+    replies.append(choice_a_reply)
+    choice_events = events_after(choice_a_cutoff)
+    choice_remove_calls = [
+        event for event in choice_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_remove_draft_items"
+    ]
+    require(
+        choice_remove_calls
+        and not any(
+            event.get("kind") == "modelExchange" for event in choice_events
+        ),
+        f"S47 bare A did not execute the recorded cleanup option: "
+        f"reply={choice_a_reply}; events={choice_events}",
+    )
+    if pending_confirmation_copy() in choice_a_reply:
+        messages.append("确认")
+        cleanup_reply = await ctx.send_group("确认", to_me=True)
+        replies.append(cleanup_reply)
+    require(
+        not (await ctx.draft()).get("items"),
+        f"S47 selected cleanup did not remove the conflicting row: {await ctx.draft()}",
+    )
+
+    await reset()
+    await ctx.next_client.add_draft_items(
+        platform_id=ctx.platform_id,
+        items=[{
+            "action": "Delete",
+            "word": "这厮",
+            "code": "fesk",
+            "type": "Phrase",
+        }],
+    )
+    seeded_merge_draft = await ctx.draft()
+    merge_cutoff = cutoff()
+    messages.append(S47_EVICTION_MESSAGE)
+    merge_reply = await ctx.send_group(S47_EVICTION_MESSAGE, to_me=True)
+    replies.append(merge_reply)
+    merge_events = events_after(merge_cutoff)
+    shift_previews = [
+        event for event in merge_events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_shift_phrase_code"
+        and not event.get("arguments", {}).get("confirmed_plan_digest")
+    ]
+    merge_plan = next((
+        event.get("result", {}).get("shiftPlan", {})
+        for event in shift_previews
+        if isinstance(event.get("result"), dict)
+        and isinstance(event.get("result", {}).get("shiftPlan"), dict)
+    ), {})
+    require(
+        merge_plan.get("mergedDraftItems")
+        and merge_plan.get("remainingItems")
+        and not any(
+            isinstance(event.get("result"), dict)
+            and event.get("result", {}).get("requiresDraftCleanup") is True
+            for event in shift_previews
+        )
+        and pending_confirmation_copy() in merge_reply,
+        f"S47 exact occupant draft row was not merged into the delta: "
+        f"reply={merge_reply}; plan={merge_plan}; events={merge_events}",
+    )
+    messages.append("确认")
+    merge_confirmation = await ctx.send_group("确认", to_me=True)
+    replies.append(merge_confirmation)
+    final_draft = await ctx.draft()
+    final_items = {item_key(item) for item in final_draft.get("items", [])}
+    require(
+        {
+            ("Delete", "这厮", "fesk"),
+            ("Create", "哲思", "fesk"),
+            ("Create", "这厮", "fesko"),
+        }.issubset(final_items)
+        and len(final_draft.get("items", [])) == 3,
+        f"S47 merged plan did not reach the promised draft: {final_draft}",
+    )
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": final_draft,
+        "facts": {
+            "suggestedCommand": suggested_command,
+            "suggestedCommandExecuted": True,
+            "explicitRecodeDeterministic": True,
+            "choiceAExecuted": True,
+            "mergedDraftItemIds": [
+                item.get("id") for item in merge_plan.get("mergedDraftItems") or []
+            ],
+            "seededMergeDraft": seeded_merge_draft,
+            "remainingDelta": merge_plan.get("remainingItems"),
+            "finalItems": sorted(final_items),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -6832,6 +7047,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S44", "deterministic compound candidate selection", scenario_s44),
     Scenario("S45", "swap verbs and interrogative review boundary", scenario_s45),
     Scenario("S46", "multi-line promise-preserving double eviction", scenario_s46),
+    Scenario("S47", "choice and executable-suggestion closure", scenario_s47),
 )
 
 

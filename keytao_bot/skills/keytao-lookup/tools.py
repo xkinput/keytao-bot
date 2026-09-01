@@ -15,6 +15,9 @@ from keytao_bot.utils.keytao_encoding import (
     normalize_contextual_phrase_encoding,
 )
 from keytao_bot.utils.pending_confirmation import render_remediation_reply
+from keytao_bot.utils.keytao_candidate_preference import (
+    apply_zhe_fe_chain_preference,
+)
 
 
 TYPE_LABELS = {
@@ -237,7 +240,7 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
             command=f"加词 {word}",
             words=(word,),
         )
-    return result
+    return apply_zhe_fe_chain_preference(word, result)
 
 
 def _format_candidate_status(code: str, phrases: List[Dict]) -> Dict:
@@ -392,7 +395,10 @@ def _apply_candidate_occupancy(encoding: Dict, lookup_result: Dict) -> Dict:
     display_groups = _build_candidate_display_groups(encoding, statuses)
     if display_groups:
         encoding["candidateDisplayGroups"] = display_groups
-    return encoding
+    return apply_zhe_fe_chain_preference(
+        str(encoding.get("word") or ""),
+        encoding,
+    )
 
 
 async def _call_bot_lookup_api(path: str, payload: Dict) -> Dict:

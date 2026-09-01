@@ -38,6 +38,7 @@ from keytao_bot.utils.pending_confirmation import (
     advertised_reply_contract,
     command_suggestions_are_closed_candidate_selections,
     ensure_multi_word_candidate_copy,
+    parse_pending_assent_phrase,
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
@@ -62,6 +63,7 @@ from .state import (
     PendingTrustedWordRecord,
     PendingToolConfirm,
     create_pending_trusted_word_record,
+    pending_batch_display_pairs,
     server_warning_pending_state,
     server_warning_ticket_is_complete,
 )
@@ -87,6 +89,39 @@ from .tools import (
     front_insert_batch_warning_confirmation_binding,
     project_tool_result_for_model,
 )
+
+
+def _command_suggestions_match_pending_batch(
+    text: str,
+    state: object,
+) -> bool:
+    """Accept only real-parser assent forms bound to the displayed sealed batch."""
+    if (
+        not isinstance(state, PendingToolConfirm)
+        or state.function_name != "keytao_batch_add_to_draft"
+    ):
+        return False
+    contract = advertised_reply_contract(text)
+    suggestions = contract.command_suggestions
+    displayed_pairs = advertised_batch_binding_pairs(text)
+    sealed_pairs = pending_batch_display_pairs(state)
+    if (
+        not suggestions
+        or not displayed_pairs
+        or not same_unique_binding_set(displayed_pairs, sealed_pairs)
+    ):
+        return False
+    advertised_assent = set(contract.batch_assent_forms)
+    for suggestion in suggestions:
+        parsed = parse_pending_assent_phrase(suggestion)
+        if (
+            suggestion not in advertised_assent
+            or not parsed.matched
+            or not parsed.add_requested
+            or parsed.cancel_requested
+        ):
+            return False
+    return True
 
 
 AUTHORITATIVE_LINK_TOOLS = frozenset({
@@ -358,7 +393,6 @@ class AgentOrchestrator:
             reply = render_remediation_reply(
                 "后续处理发生异常，已停止本轮剩余步骤；"
                 "本轮没有成功写入任何数据",
-                command=message,
             )
         finalized = self._finalize_reply(
             message,
@@ -538,10 +572,19 @@ class AgentOrchestrator:
         def candidate_reply(text: str) -> str:
             rendered = str(text or "")
             contract = advertised_reply_contract(rendered)
+            record = self._state_store.get_record(conv_key)
             if (
                 contract.command_suggestions
                 and not command_suggestions_are_closed_candidate_selections(
                     contract.command_suggestions
+                )
+                and not (
+                    record is not None
+                    and not record.execution_id
+                    and _command_suggestions_match_pending_batch(
+                        rendered,
+                        record.state,
+                    )
                 )
             ):
                 logger.warning(
@@ -899,7 +942,6 @@ class AgentOrchestrator:
                         render_remediation_reply(
                             "AI 服务暂时未能完成这轮处理；"
                             "本轮没有成功写入任何数据",
-                            command=message,
                         ),
                         authoritative_result_links,
                     )
@@ -912,7 +954,6 @@ class AgentOrchestrator:
                         render_remediation_reply(
                             "AI 服务没有返回可用回复；"
                             "本轮没有成功写入任何数据",
-                            command=message,
                         ),
                         authoritative_result_links,
                     )
@@ -1945,7 +1986,6 @@ class AgentOrchestrator:
                         render_remediation_reply(
                             "后续工具处理暂时中断；"
                             "本轮没有成功写入任何数据",
-                            command=message,
                         ),
                         authoritative_result_links,
                     )
@@ -3186,11 +3226,7 @@ class AgentOrchestrator:
             return cls._receipt_completion_reply(receipts) if receipts else None
         if (
             is_interrogative_message(current_message)
-            and re.search(
-                r"(?:审词[：:]|候选(?:编码|码位|列表)[：:]?|"
-                r"回复[「『“\"']?加入(?:并提交)?|写入草稿)",
-                reply,
-            )
+            and advertised_reply_contract(reply).requires_live_state
         ):
             logger.error(
                 "Replacing review/add affordances emitted for an interrogative turn"
@@ -3206,20 +3242,6 @@ class AgentOrchestrator:
                 "后续操作未完成；本轮状态以服务端写入回执为准。"
                 if receipts
                 else "后续处理未能生成安全回复；本次未执行新的写入。"
-            )
-        if failure_state and parse_eviction_modified_add(current_message) is not None:
-            # A failed echoed front-insert must never degrade to the pending
-            # candidate's recommended (and possibly occupied) bare add. Keep
-            # every operand of the operation the user actually expressed.
-            failure_state = dict(failure_state)
-            clean_command = re.sub(
-                r"^\s*@[^\s]+\s*",
-                "",
-                str(current_message or "").strip(),
-                count=1,
-            )
-            failure_state["suggestedCommand"] = (
-                f"@我 {clean_command}" if clean_command else ""
             )
         narrowed_suggestion = str(
             failure_state.get("suggestedCommand") or ""

@@ -207,6 +207,7 @@ from keytao_bot.harness.orchestrator import (
     AgentOrchestrator,
     AgentRequestContext,
     AgentRuntimeConfig,
+    _command_suggestions_match_pending_batch,
     build_system_prompt,
 )
 from keytao_bot.utils.history_store import HistoryStore
@@ -228,6 +229,7 @@ from keytao_bot.utils.observability import (
 )
 from keytao_bot.utils.pending_confirmation import (
     SYSTEM_REPLY_TEMPLATE_MARKERS,
+    advertised_command_suggestions,
     advertised_reply_contract,
     advertised_command_has_placeholder,
     advertised_batch_binding_pairs,
@@ -3891,10 +3893,13 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
             == ("eefj", "eefju"),
         )
         check(
-            "read-only ordering advice carries no pending write capability",
+            "read-only ordering advice carries provenance but no suggested command",
             record is None
             and response is not None
-            and "回复「1 重新编码」执行" not in response,
+            and isinstance(response, openai_chat_module.ServerBackedQueryReply)
+            and advertised_command_suggestions(response) == ()
+            and "可多选，如「添加1、2」" in response
+            and "重新编码" not in response,
         )
 
     asyncio.run(_run())
@@ -4224,25 +4229,91 @@ def test_incomplete_shift_modified_add_preserves_compound_refusal():
     )
 
     async def _run():
-        with patch.object(
-            chat_commands_module,
-            "_try_handle_simple_single_word_query",
-            new=AsyncMock(side_effect=AssertionError(
-                "an incomplete shift command must stop before review or write"
-            )),
+        conv_key = ConversationAddress.private("qq", "compound-owner")
+        with (
+            patch.object(
+                chat_commands_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps({
+                    "success": True,
+                    "phrases": [],
+                })),
+            ),
+            patch.object(
+                chat_commands_module,
+                "_try_handle_simple_single_word_query",
+                new=AsyncMock(side_effect=AssertionError(
+                    "an unresolved shift command must stop before review or write"
+                )),
+            ),
         ):
             result = await chat_commands_module._try_handle_shift_modified_add_command(
                 command,
                 "qq",
                 "compound-owner",
-                ConversationAddress.private("qq", "compound-owner"),
+                conv_key,
             )
         check(
-            "incomplete shift command explains the preserved compound failure",
-            "不能保留你要求的添加并腾位操作" in (result or "")
-            and "出圈" in (result or "")
-            and "jjqt" in (result or "")
-            and "本次未写入" in (result or ""),
+            "unresolved shift command reports the exact live conflict",
+            "jjqt" in (result or "")
+            and "无现有词条" in (result or "")
+            and "本次未执行添加或顺延" in (result or ""),
+        )
+
+        store = MemoryConversationStateStore()
+
+        async def review(*_args, **_kwargs):
+            store.set(
+                conv_key,
+                PendingAddWord(
+                    word="出圈",
+                    recommended_code="jjqt",
+                    candidates=[("jjqt", True), ("jjqto", False)],
+                    server_candidates=[("jjqt", True), ("jjqto", False)],
+                    server_occupied_words={"jjqt": ["旧圈"]},
+                    pronunciation_codes={
+                        "jjqt": "chu quan",
+                        "jjqto": "chu quan",
+                    },
+                ),
+            )
+            return "reviewed"
+
+        shift = AsyncMock(return_value="resolved unique occupant")
+        with (
+            patch.object(chat_commands_module, "conversation_state_store", store),
+            patch.object(
+                chat_commands_module,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps({
+                    "success": True,
+                    "phrases": [{
+                        "word": "旧圈",
+                        "code": "jjqt",
+                        "type": "Phrase",
+                    }],
+                }, ensure_ascii=False)),
+            ),
+            patch.object(
+                chat_commands_module,
+                "_try_handle_simple_single_word_query",
+                AsyncMock(side_effect=review),
+            ),
+            patch.object(
+                chat_commands_module,
+                "_execute_shift_to_code",
+                shift,
+            ),
+        ):
+            resolved = await chat_commands_module._try_handle_shift_modified_add_command(
+                command,
+                "qq",
+                "compound-owner",
+                conv_key,
+            )
+        check(
+            "unique live occupant closes the omitted-occupant command",
+            resolved == "resolved unique occupant" and shift.await_count == 1,
         )
 
     asyncio.run(_run())
@@ -16668,11 +16739,10 @@ def test_generic_ai_prose_does_not_persist_pending():
         check("generic model prose creates no structured pending", store.get_record(conv_key) is None)
         delivered = str(finish_response.await_args.args[4])
         check(
-            "generic model prose is reduced to an explicit rereview command",
+            "generic model prose is reduced to the honest no-command line",
             finish_response.await_count == 1
-            and "加词 伪造词" in delivered
-            and "（伪造词）" in delivered
-            and "当前没有可安全执行" + "的后续命令" not in delivered,
+            and "没有对应的可执行计划" in delivered
+            and "加词 伪造词" not in delivered,
         )
 
     asyncio.run(_run())
@@ -16757,13 +16827,12 @@ def test_outgoing_advertisement_requires_matching_live_state():
         )
         check(
             "orphan advertisement is replaced before delivery",
-            "加入并提交" not in replaced and "服务端候选记录" in replaced,
+            "加入并提交" not in replaced and "没有对应的可执行计划" in replaced,
         )
         check(
-            "orphan replacement re-reviews only displayed operands",
-            all(word in replaced for word, _code in pairs)
-            and "加词 显眼包 嘴替" in replaced
-            and "当前没有可安全执行" + "的后续命令" not in replaced,
+            "orphan replacement emits no invented command or operands",
+            all(word not in replaced for word, _code in pairs)
+            and "加词" not in replaced,
         )
         check(
             "orphan replacement branch is observable",
@@ -16780,12 +16849,11 @@ def test_outgoing_advertisement_requires_matching_live_state():
         check(
             "orphan action-list advertisement is replaced before delivery",
             "加入并提交" not in action_list_replaced
-            and "服务端候选记录" in action_list_replaced,
+            and "没有对应的可执行计划" in action_list_replaced,
         )
 
         store.set(conv_key, batch_state, owner_label="Rea")
         for label, rendered in (
-            ("incident-model-summary", incident_summary),
             ("batch-renderer", batch_renderer),
             (
                 "reordered-batch-renderer",
@@ -16806,6 +16874,16 @@ def test_outgoing_advertisement_requires_matching_live_state():
                 f"{label} is unchanged with matching live state",
                 with_bound_state == rendered,
             )
+
+        replaced_incident = openai_chat_module._enforce_advertised_reply_contract(
+            incident_summary,
+            conv_key,
+        )
+        check(
+            "incident-model-summary is replaced by the live-state renderer",
+            replaced_incident != incident_summary
+            and set(advertised_batch_binding_pairs(replaced_incident)) == set(pairs),
+        )
 
         restored_action_list = openai_chat_module._enforce_advertised_reply_contract(
             action_list_summary,
@@ -16862,13 +16940,13 @@ def test_outgoing_advertisement_requires_matching_live_state():
             ),
         )
         check(
-            "unparseable and mismatched displays use deterministic replacement",
+            "model prose and mismatched displays use deterministic replacement",
             sum(
                 "branch=replace_from_live_state" in str(call.args[0])
                 for call in warning_log.call_args_list
                 if call.args
             )
-            == 2,
+            == 3,
         )
 
     check(
@@ -17489,13 +17567,12 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
         log_context="closure_test",
     )
     check("draft failure helper hides exception details", internal_detail not in draft_failure)
+    check(
+        "delivery-contract refusal emits the honest no-command line",
+        "没有对应的可执行计划" in delivery_refusal
+        and suggestion_pattern.search(delivery_refusal) is None,
+    )
     converted_template_cases = (
-        (
-            "delivery-contract-rereview",
-            delivery_refusal,
-            "加词 显眼包 嘴替",
-            expected_words,
-        ),
         (
             "short-control",
             short_refusal,
@@ -17667,6 +17744,115 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
     check(
         "operandless refusal offers plain recovery guidance",
         "查看草稿" in no_command_reply,
+    )
+
+
+def test_model_batch_assent_suggestion_requires_exact_sealed_record():
+    """Model assent copy survives only when the real parser and batch bind it."""
+    print("\n🧪 model batch assent suggestion binds exact sealed record")
+    response = (
+        "复核完成：\n"
+        "- 「显眼包」→ xyb\n"
+        "- 「嘴替」→ zbtk\n"
+        "可直接回复「加入并提交」写入并提交。"
+    )
+    state = PendingToolConfirm(
+        function_name="keytao_batch_add_to_draft",
+        args={
+            "items": [
+                {"action": "Create", "word": "显眼包", "code": "xyb"},
+                {"action": "Create", "word": "嘴替", "code": "zbtk"},
+            ],
+        },
+    )
+    mismatched = PendingToolConfirm(
+        function_name="keytao_batch_add_to_draft",
+        args={
+            "items": [
+                {"action": "Create", "word": "显眼包", "code": "forged"},
+                {"action": "Create", "word": "嘴替", "code": "zbtk"},
+            ],
+        },
+    )
+    check(
+        "real assent parser accepts the exact displayed sealed batch",
+        _command_suggestions_match_pending_batch(response, state),
+    )
+    check(
+        "a mismatched sealed batch cannot authorize the suggestion",
+        not _command_suggestions_match_pending_batch(response, mismatched),
+    )
+    check(
+        "unsealed command prose cannot piggyback on the batch record",
+        not _command_suggestions_match_pending_batch(
+            response.replace("加入并提交", "删除 显眼包 xyb"),
+            state,
+        ),
+    )
+
+
+def test_reviewed_recode_suggestion_preserves_the_exact_pending_record():
+    """A rendered recode control must keep the reviewed reading explanation."""
+    print("\n🧪 reviewed recode suggestion binds the live candidate record")
+    response = (
+        "词库暂无收录「出圈」：\n"
+        "审词：读音 chū quān；来源 用户当前指定 + 编码服务；\n"
+        "自动审核：指定读音与整词权威读音不同，需要管理员审核\n"
+        "候选编码:\n"
+        "1. jjqt — 已有「除权」\n"
+        "2. jjqta — 空位\n"
+        "3. jjqtai — 空位\n"
+        "• 「出圈」→ jjqta（推荐）\n"
+        "回复编号或编码选择（可多选，如「添加1、2」）；\n"
+        "回复「加入」写入草稿，或回复「加入并提交」写入并提交。\n"
+        "若要挪开已有词「除权」，回复“1 重新编码”。"
+    )
+    state = PendingAddWord(
+        word="出圈",
+        recommended_code="jjqta",
+        candidates=[("jjqt", True), ("jjqta", False), ("jjqtai", False)],
+        occupied_words={"jjqt": ["除权"]},
+        server_candidates=[("jjqt", True), ("jjqta", False), ("jjqtai", False)],
+        server_occupied_words={"jjqt": ["除权"]},
+    )
+    store = MemoryConversationStateStore()
+    conv_key = ConversationAddress.private("qq", "s39-guard")
+    store.set(conv_key, state, owner_label="Garth")
+    with patch.object(
+        openai_chat_module,
+        "conversation_state_store",
+        store,
+    ):
+        delivered = openai_chat_module._enforce_advertised_reply_contract(
+            response,
+            conv_key,
+        )
+    check(
+        "exact bound recode keeps the selected reading explanation",
+        delivered == response and "chū quān" in delivered,
+    )
+    check(
+        "the advertised recode is accepted by the real structural parser",
+        openai_chat_module._chat_routing.message_authorizes_live_pending_mutation(
+            "1 重新编码",
+            state,
+        ),
+    )
+    shift_preview = chat_commands_module._format_server_warning_confirmation(
+        "keytao_shift_phrase_code",
+        {
+            "shiftPlan": {
+                "items": [
+                    {"action": "Delete", "word": "除权", "code": "jjqt"},
+                    {"action": "Create", "word": "出圈", "code": "jjqt"},
+                    {"action": "Create", "word": "除权", "code": "jjqta"},
+                ],
+            },
+        },
+    )
+    check(
+        "fallback shift preview names both add and eviction semantics",
+        "添加" in shift_preview and "顺延" in shift_preview,
     )
 
 
@@ -19301,6 +19487,45 @@ def test_keytao_encode_exposes_only_one_pass_reading_groups():
     asyncio.run(_run())
 
 
+def test_zhe_fe_chain_is_bot_presentation_default():
+    """The bot overrides the currently reversed service chain for 哲(zhe)."""
+    result = _normalize_encode_response(
+        "哲思",
+        {
+            "success": True,
+            "input": "哲思",
+            "type": "Phrase",
+            "codes": ["qesk", "qesko"],
+            "altCodes": ["fesk", "fesko"],
+            "chars": [
+                {"char": "哲", "pinyin": "zhé"},
+                {"char": "思", "pinyin": "sī"},
+            ],
+        },
+    )
+
+    check("fe chain leads candidates", result.get("candidateCodes")[:2] == ["fesk", "fesko"])
+    check("qe chain remains available", result.get("altCodes")[:2] == ["qesk", "qesko"])
+    check("recommended code follows fe default", result.get("recommendedCode") == "fesk")
+
+    occupied = _apply_candidate_occupancy(
+        result,
+        {
+            "success": True,
+            "results": [
+                {"code": "fesk", "phrases": [{"word": "这厮"}]},
+                {"code": "fesko", "phrases": [{"word": "旧词"}]},
+                {"code": "qesk", "phrases": []},
+                {"code": "qesko", "phrases": []},
+            ],
+        },
+    )
+    check(
+        "occupied fe default is not demoted behind a free qe alternative",
+        occupied.get("recommendedCode") == "fesk",
+    )
+
+
 def test_normalize_encode_response_infer_fallback():
     """Verify invalid x? codes can be replaced by infer fallback candidates."""
     print("\n🧪 keytao_encode normalization (infer fallback)")
@@ -20862,6 +21087,43 @@ def test_shift_phrase_code_works_with_no_draft_batch():
         check("a wrong digest is still refused", stale.get("staleConfirmation") is True)
 
     asyncio.run(_run())
+
+
+def test_shift_phrase_code_merges_exact_existing_draft_delta():
+    """Existing exact plan rows are satisfied state, not an opaque blocker."""
+    planned = [
+        {"action": "Delete", "word": "这厮", "code": "fesk", "type": "Phrase"},
+        {
+            "action": "Create", "word": "哲思", "code": "fesk",
+            "type": "Phrase", "needsManualReview": False,
+        },
+        {
+            "action": "Create", "word": "这厮", "code": "fesko",
+            "type": "Phrase", "weight": 100,
+        },
+    ]
+    existing = [{
+        "id": 81, "action": "Delete", "word": "这厮",
+        "code": "fesk", "type": "Phrase",
+    }]
+
+    merged = _draft_tools._merge_existing_shift_draft_rows(planned, existing)
+    conflicting = _draft_tools._merge_existing_shift_draft_rows(
+        [planned[1]],
+        [{
+            "id": 82, "action": "Create", "word": "哲思",
+            "code": "fesko", "type": "Phrase",
+        }],
+    )
+
+    check("exact existing rows are merged", merged.get("success") is True)
+    check("only the remaining delta is planned", merged.get("remainingItems") == planned[1:])
+    check("merged rows stay visible", merged.get("mergedDraftItems") == existing)
+    check(
+        "a conflicting related row remains an explicit blocker",
+        conflicting.get("success") is False
+        and conflicting.get("conflictingDraftItems", [{}])[0].get("id") == 82,
+    )
 
 
 def test_shift_same_word_companion_requires_one_reviewed_candidate_chain():
@@ -22528,6 +22790,7 @@ if __name__ == "__main__":
     test_live_actionable_reply_advertises_complete_reply_contract()
     test_short_add_submit_copy_distinguishes_quote_without_live_state()
     test_refusal_remediation_copy_uses_bound_executable_suggestions()
+    test_model_batch_assent_suggestion_requires_exact_sealed_record()
     test_s38_shift_suggestion_closes_over_the_reviewed_encode_record()
     test_partial_batch_add_never_uses_success_header()
     test_stale_confirmation_short_circuits_only_without_live_state()
@@ -22543,6 +22806,7 @@ if __name__ == "__main__":
     test_eviction_modified_add_bypasses_pending_assent_classifier()
     test_normalize_encode_response_codes_first()
     test_keytao_encode_exposes_only_one_pass_reading_groups()
+    test_zhe_fe_chain_is_bot_presentation_default()
     test_normalize_encode_response_infer_fallback()
     test_apply_candidate_occupancy_updates_recommendation()
     test_normalize_encode_response_includes_alternate_pronunciation_candidates()
@@ -22559,6 +22823,7 @@ if __name__ == "__main__":
     test_incident_ranked_shift_exact_shape_completes_and_retries_remaining_delta()
     test_build_code_shift_plan_rejects_invalid_occupant_code()
     test_shift_phrase_code_works_with_no_draft_batch()
+    test_shift_phrase_code_merges_exact_existing_draft_delta()
     test_shift_phrase_code_plans_real_occupant_move()
     test_strict_shift_batch_payload_preserves_item_level_seal()
     test_absence_batch_preview_never_formats_provisional_url()

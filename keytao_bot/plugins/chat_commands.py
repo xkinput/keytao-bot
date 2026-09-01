@@ -22,11 +22,13 @@ from ..harness.conversation import (
 )
 from ..harness.authorization_grammar import (
     _PHRASE_TYPE_BASE_WEIGHTS,
+    dictionary_recode_items_match,
     explicit_same_code_requested,
     explicit_complete_add_item,
     explicit_shift_modified_add_item,
     parse_compound_eviction_add_plan,
     parse_dictionary_delete_command,
+    parse_dictionary_recode_command,
     parse_entry_move_plan,
     parse_entry_swap,
     parse_eviction_modified_add,
@@ -63,6 +65,7 @@ from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
+    ServerBackedQueryReply,
     already_existing_word_copy,
     append_unbound_binding_notice,
     advertised_batch_binding_pairs,
@@ -1286,11 +1289,41 @@ async def _try_handle_shift_modified_add_command(
             return None
         word = str(incomplete.get("word") or "").strip()
         code = str(incomplete.get("code") or "").strip().lower()
-        return (
-            "这条指令缺少要重新编码或顺延的现有词条，"
-            "不能保留你要求的添加并腾位操作；本次未写入。"
-            f"请明确要为「{word}」腾出 {code} 的现有词条。"
-        )
+        try:
+            occupant_data = json.loads(await call_tool_function(
+                "keytao_lookup_by_code",
+                {"code": code},
+                platform,
+                user_id,
+            ))
+        except Exception:
+            occupant_data = {}
+        raw_occupants = occupant_data.get("phrases")
+        if occupant_data.get("success") is not True or not isinstance(
+            raw_occupants,
+            list,
+        ):
+            return (
+                f"无法取得 {code} 的完整占位记录；"
+                "本次未执行添加或顺延。"
+            )
+        occupants = list(dict.fromkeys(
+            str(item.get("word") or "").strip()
+            for item in raw_occupants
+            if isinstance(item, dict)
+            and str(item.get("code") or "").strip().lower() == code
+            and str(item.get("word") or "").strip()
+        ))
+        if len(occupants) != 1 or occupants[0] == word:
+            conflict = "、".join(f"「{value}」" for value in occupants) or "无现有词条"
+            return (
+                f"{code} 的现有占位无法唯一解析为待顺延词条：{conflict}；"
+                "本次未执行添加或顺延。"
+            )
+        command = {
+            **incomplete,
+            "namedOccupant": occupants[0],
+        }
     if conv_key is None:
         return None
     word = str(command.get("word") or "").strip()
@@ -3074,7 +3107,12 @@ async def _try_handle_simple_single_word_query(
                 )
                 reviewed_prompt = read_only_candidates
         actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
-        return append_unbound_binding_notice(reviewed_prompt, actor_is_bound)
+        rendered_reply = append_unbound_binding_notice(reviewed_prompt, actor_is_bound)
+        return (
+            ServerBackedQueryReply(rendered_reply)
+            if isinstance(reviewed_prompt, ServerBackedQueryReply)
+            else rendered_reply
+        )
 
     offline_reference = review.get("offlineReference")
     if (
@@ -5072,7 +5110,29 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             for word in shift_plan.get("listedWords") or []
             if str(word).strip()
         ]
-        lines = ["🔁 调整计划："]
+        deleted_words = {
+            str(item.get("word") or "").strip()
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("action") or "").strip() == "Delete"
+        }
+        created_words = {
+            str(item.get("word") or "").strip()
+            for item in items
+            if isinstance(item, dict)
+            and str(item.get("action") or "").strip() == "Create"
+        }
+        add_with_eviction = bool(
+            deleted_words & created_words
+            and created_words - deleted_words
+        )
+        lines = [
+            "🔁 添加并顺延计划："
+            if add_with_eviction
+            else "🔁 调整计划："
+        ]
+        if add_with_eviction:
+            lines.append("调整计划如下：")
         if current_state and proposed_state:
             current_by_word = {
                 str(entry.get("word") or "").strip(): entry
@@ -5123,10 +5183,14 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                action = str(item.get("action") or "变更")
+                raw_action = str(item.get("action") or "").strip()
+                action = {
+                    "Create": "添加",
+                    "Delete": "删除",
+                }.get(raw_action, "变更")
                 word = str(item.get("word") or "")
                 code = str(item.get("code") or "")
-                lines.append(f"• {word}：{action} {code}")
+                lines.append(f"• {word}：{raw_action or 'Change'} {code}（{action}）")
         warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
         if warnings:
             rendered_warnings = [
@@ -5647,6 +5711,94 @@ async def _execute_confirmed_tool(
 
     if data.get("not_bound"):
         return _BIND_HELP_TEXT
+
+    if (
+        state.function_name == "keytao_shift_phrase_code"
+        and data.get("requiresDraftCleanup") is True
+    ):
+        conflict_items = data.get("conflictingDraftItems")
+        if not isinstance(conflict_items, list):
+            conflict_items = data.get("relatedDraftItems")
+        conflict_items = [
+            item for item in (conflict_items or []) if isinstance(item, dict)
+        ]
+        conflict_ids = list(dict.fromkeys(
+            int(item["id"])
+            for item in conflict_items
+            if isinstance(item.get("id"), int)
+            and not isinstance(item.get("id"), bool)
+            and item["id"] > 0
+        ))
+        conflict_labels = "、".join(
+            f"{str(item.get('action') or 'Create')} 「{str(item.get('word') or '未知词条')}」"
+            f"@{str(item.get('code') or '未知编码')}"
+            for item in conflict_items[:8]
+        )
+        reason = (
+            "现有草稿行与本轮顺延计划冲突"
+            + (f"：{conflict_labels}" if conflict_labels else "")
+            + "；本次未修改草稿"
+        )
+        cleanup_plan: Optional[PendingToolConfirm] = None
+        if conflict_ids:
+            cleanup_args: Dict[str, Any] = {"ids": conflict_ids}
+            if str(data.get("batchId") or "").strip():
+                cleanup_args["batch_id"] = str(data["batchId"])
+            try:
+                cleanup_preview = json.loads(await call_tool_function(
+                    "keytao_batch_remove_draft_items",
+                    cleanup_args,
+                    platform,
+                    user_id,
+                ))
+            except Exception:
+                cleanup_preview = {}
+            if cleanup_preview.get("requiresConfirmation") is True:
+                candidate_plan = _pending_state_from_server_warning(
+                    PendingToolConfirm(
+                        function_name="keytao_batch_remove_draft_items",
+                        args=cleanup_args,
+                    ),
+                    cleanup_preview,
+                )
+                expected_targets = candidate_plan.args.get("expected_targets")
+                expected_ids = {
+                    int(target.get("id"))
+                    for target in expected_targets or []
+                    if isinstance(target, dict)
+                    and str(target.get("id") or "").isdigit()
+                }
+                if (
+                    server_warning_ticket_is_complete(candidate_plan)
+                    and expected_ids == set(conflict_ids)
+                    and len(expected_targets) == len(conflict_ids)
+                ):
+                    cleanup_plan = candidate_plan
+        offer = _build_pending_choice_offer(
+            (
+                (
+                    "A",
+                    "删除上述冲突草稿行；删除成功后可重新执行原顺延指令",
+                    cleanup_plan,
+                ),
+                ("B", "保留当前草稿并停止本次顺延", None),
+            ),
+            protected_add_pairs=((
+                str(state.args.get("word") or "").strip(),
+                str(state.args.get("target_code") or "").strip().lower(),
+            ),),
+        ) if cleanup_plan is not None else None
+        target_key: ConversationKey = conv_key or (platform, user_id)
+        if offer is None or not conversation_state_store.set(
+            target_key,
+            offer,
+            space_key=space_key,
+            owner_label=owner_label,
+        ):
+            return render_remediation_reply(reason)
+        return _assert_plain_user_facing_reply(
+            reason + "。\n" + render_pending_choice_offer(offer)
+        )
 
     if data.get("requiresConfirmation"):
         pending_state = _pending_state_from_server_warning(state, data)
@@ -7706,10 +7858,23 @@ async def _try_handle_dictionary_delete_command(
         choices = "、".join(
             f"{entry['code']}（{entry['type']}）" for entry in matches
         )
-        return _assert_plain_user_facing_reply(
-            f"「{command.word}」对应多条词库记录：{choices}。"
-            f"请用“删词 {command.word} 编码”指定一条；本次未写入。"
-        )
+        suggestions = [
+            render_executable_plan_suggestion(PendingToolConfirm(
+                function_name="keytao_batch_add_to_draft",
+                args={"items": [{
+                    "action": "Delete",
+                    "word": entry["word"],
+                    "code": entry["code"],
+                    "type": entry["type"],
+                }]},
+            ))
+            for entry in matches
+        ]
+        suggestions = [value for value in suggestions if value]
+        return _assert_plain_user_facing_reply("\n".join([
+            f"「{command.word}」对应多条词库记录：{choices}；本次未写入。",
+            *(suggestions or ["请先发送「查看草稿」核对现状。"]),
+        ]))
     target = matches[0]
     return await _execute_confirmed_tool(
         PendingToolConfirm(
@@ -7721,6 +7886,75 @@ async def _try_handle_dictionary_delete_command(
                     "code": target["code"],
                     "type": target["type"],
                 }],
+            },
+            confirmation_source="local_preview",
+        ),
+        platform,
+        user_id,
+        (platform, user_id),
+        space_key,
+        owner_label,
+    )
+
+
+async def _try_handle_dictionary_recode_command(
+    message_text: str,
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    """Stage an explicit same-word delete/create pair without model routing."""
+    command = parse_dictionary_recode_command(message_text)
+    if (
+        command is None
+        or command_intent.intent != "dictionary_recode"
+        or command_intent.keep_words != (command.word,)
+        or command_intent.requested_code != command.old_code
+        or command_intent.requested_codes != (command.new_code,)
+    ):
+        return None
+    set_turn_flow("draft-op")
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_word",
+        {"word": command.word},
+        platform,
+        user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+    entries = _validated_dictionary_delete_entries(lookup_data, command.word)
+    if entries is None:
+        return render_remediation_reply(
+            f"无法取得「{command.word}」的完整词库记录；本次未生成改码草稿"
+        )
+    matches = [entry for entry in entries if entry["code"] == command.old_code]
+    if len(matches) != 1:
+        return _assert_plain_user_facing_reply(
+            f"词库无法唯一锁定「{command.word}」@{command.old_code}；本次未写入。"
+        )
+    target = matches[0]
+    return await _execute_confirmed_tool(
+        PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [
+                    {
+                        "action": "Delete",
+                        "word": target["word"],
+                        "code": target["code"],
+                        "type": target["type"],
+                    },
+                    {
+                        "action": "Create",
+                        "word": target["word"],
+                        "code": command.new_code,
+                        "type": target["type"],
+                    },
+                ],
             },
             confirmation_source="local_preview",
         ),
@@ -8735,6 +8969,17 @@ async def _try_handle_draft_management_command(
     if command_intent is None:
         command_intent = await _classify_message_command_intent(message_text)
 
+    response = await _try_handle_dictionary_recode_command(
+        message_text,
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
+
     response = await _try_handle_dictionary_delete_command(
         message_text,
         command_intent,
@@ -9479,6 +9724,228 @@ def _compact_reviewed_reading_options(review: Dict) -> str:
     return "；".join(summaries)
 
 
+_PENDING_CHOICE_OFFER_FUNCTION = "keytao_choice_offer"
+_PENDING_CHOICE_LABEL_RE = re.compile(
+    r"^(?:(?:选择?|方案)\s*)?([AB])$",
+    re.IGNORECASE,
+)
+
+
+def render_executable_plan_suggestion(state: PendingToolConfirm) -> str:
+    """Render only a command that round-trips through the real plan grammar."""
+    if state.function_name != "keytao_batch_add_to_draft":
+        return ""
+    items = state.args.get("items")
+    if not isinstance(items, list):
+        return ""
+    if len(items) == 1 and isinstance(items[0], dict):
+        item = items[0]
+        command_text = (
+            f"删词 {str(item.get('word') or '').strip()} "
+            f"{str(item.get('code') or '').strip().lower()}"
+        )
+        parsed_delete = parse_dictionary_delete_command(command_text)
+        if (
+            parsed_delete is None
+            or str(item.get("action") or "Create").strip() != "Delete"
+            or parsed_delete.word != str(item.get("word") or "").strip()
+            or parsed_delete.code
+            != str(item.get("code") or "").strip().lower()
+            or not str(item.get("type") or "").strip()
+        ):
+            return ""
+        return render_executable_suggestion(
+            command_text,
+            words=(parsed_delete.word,),
+        )
+    if len(items) != 2:
+        return ""
+    delete_item = items[0] if isinstance(items[0], dict) else {}
+    create_item = items[1] if isinstance(items[1], dict) else {}
+    command_text = (
+        f"删除 {str(delete_item.get('word') or '').strip()} "
+        f"{str(delete_item.get('code') or '').strip().lower()}；"
+        f"添加 {str(create_item.get('word') or '').strip()} "
+        f"{str(create_item.get('code') or '').strip().lower()}"
+    )
+    parsed = parse_dictionary_recode_command(command_text)
+    if parsed is None or not dictionary_recode_items_match(parsed, items):
+        return ""
+    return render_executable_suggestion(command_text, words=(parsed.word,))
+
+
+def _pending_choice_options(state: PendingToolConfirm) -> Optional[List[Dict[str, Any]]]:
+    """Validate and return the exact plans carried by one live A/B offer."""
+    if state.function_name != _PENDING_CHOICE_OFFER_FUNCTION:
+        return None
+    raw_options = state.args.get("options")
+    if not isinstance(raw_options, list) or len(raw_options) != 2:
+        return None
+    options: List[Dict[str, Any]] = []
+    labels: List[str] = []
+    for raw in raw_options:
+        if not isinstance(raw, dict):
+            return None
+        label = str(raw.get("label") or "").strip().upper()
+        description = str(raw.get("description") or "").strip()
+        plan = raw.get("plan")
+        if label not in {"A", "B"} or not description or len(description) > 240:
+            return None
+        if plan is not None:
+            if (
+                not isinstance(plan, dict)
+                or not str(plan.get("function_name") or "").strip()
+                or str(plan.get("function_name") or "").strip()
+                == _PENDING_CHOICE_OFFER_FUNCTION
+                or not isinstance(plan.get("args"), dict)
+                or str(plan.get("confirmation_source") or "")
+                != "server_warning"
+            ):
+                return None
+            sealed_plan = PendingToolConfirm(
+                function_name=str(plan["function_name"]),
+                args=dict(plan["args"]),
+                confirmation_source="server_warning",
+            )
+            if not server_warning_ticket_is_complete(sealed_plan):
+                return None
+        labels.append(label)
+        options.append({
+            "label": label,
+            "description": description,
+            "plan": dict(plan) if isinstance(plan, dict) else None,
+        })
+    return options if labels == ["A", "B"] else None
+
+
+def _build_pending_choice_offer(
+    options: Tuple[Tuple[str, str, Optional[PendingToolConfirm]], ...],
+    *,
+    protected_add_pairs: Tuple[Tuple[str, str], ...] = (),
+) -> Optional[PendingToolConfirm]:
+    """Seal the same option plans used by both the renderer and resolver."""
+    state = PendingToolConfirm(
+        function_name=_PENDING_CHOICE_OFFER_FUNCTION,
+        args={
+            "options": [
+                {
+                    "label": str(label or "").strip().upper(),
+                    "description": str(description or "").strip(),
+                    "plan": (
+                        {
+                            "function_name": plan.function_name,
+                            "args": dict(plan.args),
+                            "confirmation_source": plan.confirmation_source,
+                        }
+                        if isinstance(plan, PendingToolConfirm)
+                        else None
+                    ),
+                }
+                for label, description, plan in options
+            ],
+            "protected_add_pairs": [
+                [str(word or "").strip(), str(code or "").strip().lower()]
+                for word, code in protected_add_pairs
+                if str(word or "").strip() and str(code or "").strip()
+            ],
+        },
+    )
+    return state if _pending_choice_options(state) is not None else None
+
+
+def render_pending_choice_offer(state: PendingToolConfirm) -> str:
+    """Render only the A/B labels and descriptions sealed in the live record."""
+    options = _pending_choice_options(state)
+    if options is None:
+        return ""
+    return "\n".join([
+        "请确认怎么处理，二选一：",
+        *(f"{option['label']}. {option['description']}" for option in options),
+        "回复 A 或 B 即可。",
+    ])
+
+
+def _parse_pending_choice_label(message: str) -> str:
+    """Parse only the exact answer forms advertised by a live A/B offer."""
+    source = re.sub(
+        r"^\s*@[^\s]+\s*",
+        "",
+        trusted_mutation_source(message),
+        count=1,
+    ).strip()
+    match = _PENDING_CHOICE_LABEL_RE.fullmatch(source)
+    return match.group(1).upper() if match is not None else ""
+
+
+async def _handle_pending_choice_offer(
+    state_record: PendingStateRecord,
+    message: str,
+    platform: str,
+    user_id: str,
+    conv_key: ConversationKey,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    state = state_record.state
+    if not isinstance(state, PendingToolConfirm):
+        return None
+    options = _pending_choice_options(state)
+    if options is None:
+        return None
+    label = _parse_pending_choice_label(message)
+    if not label:
+        add_item = explicit_complete_add_item(message)
+        protected_pairs = {
+            (str(value[0]).strip(), str(value[1]).strip().lower())
+            for value in state.args.get("protected_add_pairs") or []
+            if isinstance(value, list) and len(value) == 2
+        }
+        if (
+            add_item is not None
+            and (
+                str(add_item.get("word") or "").strip(),
+                str(add_item.get("code") or "").strip().lower(),
+            ) in protected_pairs
+        ):
+            return _assert_plain_user_facing_reply(
+                "当前仍有该词的腾位处理方案待选择；"
+                "不会把腾位意图降级为普通重复添加。\n"
+                + render_pending_choice_offer(state)
+            )
+        return None
+    selected = next(
+        (option for option in options if option["label"] == label),
+        None,
+    )
+    if selected is None:
+        return None
+    if not conversation_state_store.begin_execution(state_record):
+        return render_remediation_reply("当前选择正在处理中", command="查看草稿")
+    raw_plan = selected.get("plan")
+    if raw_plan is None:
+        conversation_state_store.complete_execution(state_record)
+        return _assert_plain_user_facing_reply(
+            f"已选择方案 {label}：{selected['description']}。"
+        )
+    plan = PendingToolConfirm(
+        function_name=str(raw_plan["function_name"]),
+        args=dict(raw_plan["args"]),
+        confirmation_source=str(
+            raw_plan.get("confirmation_source") or "local_preview"
+        ),
+    )
+    response = await _execute_confirmed_tool(
+        plan,
+        platform,
+        user_id,
+        conv_key,
+        space_key,
+        owner_label,
+    )
+    conversation_state_store.complete_execution(state_record)
+    return response
+
+
 def _pending_from_requested_encode(
     word: str,
     code: str,
@@ -9895,6 +10362,19 @@ async def handle_pending_message_core(
     state = state_record.state
     if isinstance(state, PendingTrustedWordRecord):
         return await _resolve_pending_trusted_word_action(
+            state_record,
+            message,
+            platform,
+            user_id,
+            conv_key,
+            space_key,
+            owner_label,
+        )
+    if (
+        isinstance(state, PendingToolConfirm)
+        and state.function_name == _PENDING_CHOICE_OFFER_FUNCTION
+    ):
+        return await _handle_pending_choice_offer(
             state_record,
             message,
             platform,

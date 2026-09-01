@@ -546,6 +546,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S44 closes the 2026-08-29 compound-selection incident", readme)
         self.assertIn("S45 closes the 2026-08-30 swap-verb", readme)
         self.assertIn("S46 closes the 2026-08-31 promise-preserving", readme)
+        self.assertIn("S47 closes the 2026-09-01 choice-closure incident", readme)
         self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
@@ -595,10 +596,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s46(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s47(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 47)],
+            [f"S{index}" for index in range(1, 48)],
         )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:

@@ -90,6 +90,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
+    ServerBackedQueryReply,
     append_unbound_binding_notice as _append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_single_word_candidate_codes,
@@ -1572,10 +1573,6 @@ async def _try_handle_encoding_rule_question(
     return "\n".join(lines)
 
 
-class ServerBackedQueryReply(str):
-    """Internal provenance for an exact server-rendered read-only reply."""
-
-
 async def get_ai_response_core(
     message: str,
     platform: str,
@@ -1944,21 +1941,34 @@ def _advertised_reply_matches_live_record(
     contract = advertised_reply_contract(response)
     if not contract.requires_live_state:
         return True
+    if record is None or record.execution_id or record.state is None:
+        return False
+
+    state = record.state
     # Arbitrary model-authored command prose has no durable source marker at
-    # the final delivery boundary. It must therefore be replaced or stripped;
-    # executable remediation is emitted separately by the deterministic
-    # renderer after the real parser/binding checks.
+    # the final delivery boundary. The one additional accepted family is a
+    # PendingAddWord control that the real structural parser resolves against
+    # this exact actor-owned, server-backed candidate record (for example the
+    # deterministic renderer's ``1 重新编码`` control).
+    pending_add_suggestions_are_bound = bool(
+        contract.command_suggestions
+        and isinstance(state, PendingAddWord)
+        and all(
+            _chat_routing.message_authorizes_live_pending_mutation(
+                suggestion,
+                state,
+            )
+            for suggestion in contract.command_suggestions
+        )
+    )
     if (
         contract.command_suggestions
         and not command_suggestions_are_closed_candidate_selections(
             contract.command_suggestions
         )
+        and not pending_add_suggestions_are_bound
     ):
         return False
-    if record is None or record.execution_id or record.state is None:
-        return False
-
-    state = record.state
     if (
         contract.deictic_batch_command
         and isinstance(state, PendingToolConfirm)
@@ -2353,9 +2363,7 @@ def _enforce_advertised_reply_contract(
     if query_words:
         return render_query_retry_reply(query_words)
     return render_remediation_reply(
-        "这条消息没有可用的服务端候选记录，本次不会写入",
-        command=("加词 " + " ".join(displayed_words)) if displayed_words else "",
-        words=displayed_words,
+        "这条回复里的建议没有对应的可执行计划，因此未发送该命令；本次不会写入"
     )
 
 
@@ -2383,20 +2391,6 @@ def _prepare_user_facing_reply(
         live_options = _render_live_single_candidate_record(live_record)
         if live_options:
             response = live_options
-    if (
-        current_message
-        and "evict" in _authorization_grammar.parsed_operation_kinds(
-            current_message
-        )
-        and re.search(
-            r"(?:无法执行|未写入|没有执行|本次未执行|本次未添加|安全拦截|已停止)",
-            str(response or ""),
-        )
-    ):
-        response = (
-            "当前无法完整执行你要求的添加并腾位操作；"
-            "本次未写入。"
-        )
     prepared = _enforce_advertised_reply_contract(response, conv_key)
     if (
         conv_key is not None
@@ -3276,14 +3270,27 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
                 if replacement_response is not None:
                     ctx.scoped_pending_response = replacement_response
                     return False
-            structural_pending_intent = (
-                _structural_pending_add_word_intent(
-                    ctx.normalized_message_text,
-                    ctx.current_pending_record.state,
+            if (
+                isinstance(ctx.current_pending_record.state, PendingToolConfirm)
+                and ctx.current_pending_record.state.function_name
+                == _chat_commands._PENDING_CHOICE_OFFER_FUNCTION
+                and _chat_commands._parse_pending_choice_label(
+                    ctx.normalized_message_text
                 )
-                if isinstance(ctx.current_pending_record.state, PendingAddWord)
-                else None
-            )
+            ):
+                structural_pending_intent = MessageCommandIntent(
+                    intent="pending_choice",
+                    confidence=1.0,
+                )
+            else:
+                structural_pending_intent = (
+                    _structural_pending_add_word_intent(
+                        ctx.normalized_message_text,
+                        ctx.current_pending_record.state,
+                    )
+                    if isinstance(ctx.current_pending_record.state, PendingAddWord)
+                    else None
+                )
             if structural_pending_intent is not None:
                 # A live server-backed candidate selector is already a closed
                 # command. Bind it before generic routing so no intent-model
@@ -4378,6 +4385,21 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                 restore_pending_state()
             return False
 
+        if (
+            isinstance(state, PendingToolConfirm)
+            and state.function_name == _chat_commands._PENDING_CHOICE_OFFER_FUNCTION
+        ):
+            ctx.response = await _chat_commands._handle_pending_choice_offer(
+                state_record,
+                ctx.normalized_message_text,
+                ctx.platform,
+                ctx.user_id,
+                ctx.conv_key,
+                state_space_key,
+                ctx.owner_label,
+            )
+            return False
+
         if state is not None:
             try:
                 pending_command_intent = (
@@ -5189,6 +5211,7 @@ _CHAT_COMPAT_NAMES = (
     "PendingStateRecord",
     "PendingTrustedWordRecord",
     "PendingToolConfirm",
+    "ServerBackedQueryReply",
     "SQLiteConversationStateStore",
     "ToolContext",
     "ToolExecutor",
