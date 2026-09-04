@@ -991,6 +991,7 @@ from .authorization_grammar import (
     BLOCK_REASON_SOURCE_UNTRUSTED,
     BLOCK_REASON_VERB_NOT_MATCHED,
     BLOCK_REASON_BINDING_INCOMPLETE,
+    BLOCK_REASON_INTENT_MISMATCH,
     BLOCK_REASON_CANDIDATE_RECORD_MISSING,
     BLOCK_REASON_TICKET_REQUIRED,
     BLOCK_REASON_BULK_DELETE_NOT_REQUESTED,
@@ -1025,6 +1026,7 @@ from .authorization_grammar import (
     _record_frame_is_mutation_operand,
     _has_complete_mutation_instruction,
     _record_frame_wraps_complete_mutation,
+    parse_dictionary_delete_command,
     message_authorizes_mutation,
     _POSITIONAL_CHANGE_RE,
     _CHANGE_VERB_RE,
@@ -1798,6 +1800,28 @@ class ToolExecutor:
             guard_error = self._mutation_guard(context, tool_name, arguments)
             if guard_error:
                 return guard_error
+        dictionary_delete = (
+            parse_dictionary_delete_command(message) if message else None
+        )
+        if dictionary_delete is not None and tool_name in {
+            "keytao_create_phrase",
+            "keytao_shift_phrase_code",
+        }:
+            selected_action = (
+                "新增" if tool_name == "keytao_create_phrase" else "改码"
+            )
+            target = (
+                f"「{dictionary_delete.word}」@{dictionary_delete.code}"
+                if dictionary_delete.code
+                else f"「{dictionary_delete.word}」"
+            )
+            return policy_block(
+                BLOCK_REASON_INTENT_MISMATCH,
+                f"这条消息要求删除 {target}，但所选工具会执行"
+                f"{selected_action}；已拒绝该工具，改由确定性删除流程处理。",
+                missing=["matchingDeleteTool"],
+                retryDeterministicRoute=True,
+            )
         if (
             message
             and tool_name in MUTATING_TOOL_NAMES

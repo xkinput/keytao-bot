@@ -100,6 +100,9 @@ chain moves it to `dffna` when `单份` takes the occupied slot.
 S50 declares the five transcript words `小像`, `小象`, `销项`, `肖像`, and
 `小箱`. It seeds only the three exact rig-owned occupants at `xcxx`, `xcxxi`,
 and `xcxxiu`, while the final successor remains empty for the server planner.
+S52 declares the authoritative `xì pǐn` reading for `细品`. It keeps the
+recommended `xkpb` slot empty, while the scenario fixture reuses or seeds sole
+rig-owned `哪里@nsl` and `哪里@nslko` rows for exact delete-scope checks.
 
 ## Prerequisites
 
@@ -365,10 +368,11 @@ question against the same summary remains on the presence-lookup route and
 cannot change that draft.
 
 S30 pins three intent-coverage boundaries in one actor flow. A bare `吃席`
-lookup followed by `好` must make zero mutation calls; a fresh reviewed-add
-ticket followed by `先别加` must cancel without advertising an add command;
-and a second fresh ticket must accept `那就加入并提交吧`, preserving its exact
-displayed word/code pair through submission.
+lookup must persist and advertise its first-render candidates, and a following
+`好` must add only the displayed recommendation. After cleanup, a fresh
+reviewed-add ticket followed by `先别加` must cancel without advertising an add
+command; a second fresh ticket must accept `那就加入并提交吧`, preserving its
+exact displayed word/code pair through submission.
 
 S31 executes the verbatim incident command
 `把 幂等 放到 米等 前面，米等顺延到下一个空位`. The rig seeds only the declared
@@ -511,6 +515,16 @@ rejects confirmation affordances without a live ticket, raw literal dumps,
 internal mechanism or future-block wording, and any semantic-routing model call
 on this deterministic command route. The normal new-word review may still use
 its bounded review model. No production endpoint is used.
+
+S52 closes the 2026-09-04 deploy-gap and first-render incident. It sends the
+plain `喵喵 细品` query, requires the first candidate reply to persist the
+trusted `xkpb` recommendation and expose its selector, then sends bare
+`加入并提交` and requires that exact candidate to reach one submitted local
+batch without regeneration. The same scenario exercises six spacing and quote
+variants of the possessive delete grammar. Each must use the deterministic
+route, seal and confirm only `Delete 哪里@nsl`, leave the `nslko` row out of the
+receipt, and make no semantic-routing model request. Startup replay itself is
+covered offline because the real rig does not connect to OneBot or production.
 
 Optional overrides:
 

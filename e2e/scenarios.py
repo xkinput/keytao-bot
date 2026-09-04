@@ -1392,6 +1392,11 @@ def _recommended_empty_code(reply: str, *, word: str) -> str:
             r"(?P<code>[a-z]{2,12})[）)]。?\s*$",
             reply,
         )
+    if match is None:
+        match = re.search(
+            r"(?m)^推荐编码[：:]\s*(?P<code>[a-z]{2,12})\s*$",
+            reply,
+        )
     require(match is not None, f"{word} discovery omitted a recommended empty code: {reply}")
     code = match.group("code")
     require(
@@ -3836,7 +3841,7 @@ S30_NATURAL_ASSENT = "那就加入并提交吧"
 
 
 async def scenario_s30(ctx: ScenarioContext) -> dict[str, Any]:
-    """Pin read-only lookup, cancel-negation, and tolerant natural assent."""
+    """Pin first-render assent, cancel-negation, and tolerant natural assent."""
     messages: list[str] = []
     replies: list[str] = []
     await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
@@ -3848,7 +3853,11 @@ async def scenario_s30(ctx: ScenarioContext) -> dict[str, Any]:
     messages.append(S30_WORD)
     read_reply = await ctx.send(S30_WORD)
     replies.append(read_reply)
-    assert_reply_mentions(read_reply, S30_WORD)
+    assert_reply_mentions(read_reply, S30_WORD, "候选编码", "回复编号或编码选择")
+    read_recommended_code = _recommended_empty_code(
+        read_reply,
+        word=S30_WORD,
+    ).lower()
     require(
         not (await ctx.draft()).get("items"),
         f"S30 bare lookup wrote a draft item: {await ctx.draft()}",
@@ -3869,11 +3878,22 @@ async def scenario_s30(ctx: ScenarioContext) -> dict[str, Any]:
             "keytao_shift_phrase_code",
         }
     ]
-    require(not read_events, f"S30 read lookup armed a later write: {read_events}")
+    read_assent_draft = await ctx.draft()
+    read_assent_items = [
+        item_key(item)
+        for item in read_assent_draft.get("items", [])
+        if isinstance(item, dict)
+    ]
     require(
-        not (await ctx.draft()).get("items"),
-        f"S30 bare 好 after lookup wrote a draft item: {await ctx.draft()}",
+        read_events
+        and read_assent_items
+        == [("Create", S30_WORD, read_recommended_code)],
+        "S30 first-render bare assent did not write only its recommended "
+        f"candidate: reply={stale_reply}; draft={read_assent_draft}; "
+        f"events={read_events}",
     )
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
 
     messages.append(f"加词 {S30_WORD}")
     cancel_candidate = await ctx.send(f"加词 {S30_WORD}")
@@ -3965,7 +3985,8 @@ async def scenario_s30(ctx: ScenarioContext) -> dict[str, Any]:
         "replies": replies,
         "draft": draft,
         "facts": {
-            "readQueryMutationCalls": len(read_events),
+            "firstRenderAssentItems": read_assent_items,
+            "firstRenderMutationCalls": len(read_events),
             "cancelMutationCalls": len(cancel_writes),
             "naturalAssent": S30_NATURAL_ASSENT,
             "recommendedCode": recommended_code,
@@ -7834,6 +7855,198 @@ async def scenario_s51(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S52_WORD = "细品"
+S52_RECOMMENDED_CODE = "xkpb"
+S52_DELETE_WORD = "哪里"
+S52_DELETE_CODE = "nsl"
+S52_REMAINING_CODE = "nslko"
+S52_DELETE_FORMS = (
+    "删除 nsl 的 哪里",
+    "删除nsl的哪里",
+    "删掉 nsl 上的哪里",
+    "把 nsl 的哪里删了",
+    "把「nsl」的「哪里」删掉",
+    "删掉 “nsl” 上的 “哪里”",
+)
+
+
+async def scenario_s52(ctx: ScenarioContext) -> dict[str, Any]:
+    """Close first-render binding and possessive delete incident paths."""
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import PendingAddWord, PendingToolConfirm
+
+    fixture = ctx.fixture_facts.get("s52") or {}
+    require(
+        fixture.get("recommendedCode") == S52_RECOMMENDED_CODE
+        and fixture.get("deleteCodes")
+        == [S52_DELETE_CODE, S52_REMAINING_CODE],
+        f"S52 fixture is incomplete: {fixture}",
+    )
+    address = ConversationAddress.group(
+        "qq",
+        str(ctx.bot._group_id(ctx.platform_id)),
+        ctx.platform_id,
+    )
+    messages: list[str] = []
+    replies: list[str] = []
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    query = f"喵喵 {S52_WORD}"
+    messages.append(query)
+    discovery = await ctx.send_group(query, to_me=True)
+    replies.append(discovery)
+    record = ctx.bot.openai_chat.conversation_state_store.get_record(address)
+    require(
+        record is not None
+        and isinstance(record.state, PendingAddWord)
+        and record.state.word == S52_WORD
+        and record.state.recommended_code == S52_RECOMMENDED_CODE
+        and record.state.server_candidates,
+        f"S52 first render did not persist its trusted candidate record: {record}",
+    )
+    require(
+        S52_RECOMMENDED_CODE in discovery
+        and "回复编号或编码选择" in discovery
+        and "加入并提交" in discovery
+        and "本次仅查询" not in discovery,
+        f"S52 first render was not executable: {discovery}",
+    )
+
+    submit_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+    messages.append("加入并提交")
+    submit_reply = await ctx.send_group("加入并提交", to_me=True)
+    replies.append(submit_reply)
+    submit_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > submit_cutoff
+    ]
+    submitted_batch_id = _successful_submit_batch_id(
+        ctx.attempt_events(),
+        after_sequence=submit_cutoff,
+    )
+    require(
+        submitted_batch_id
+        and "候选记录已失效" not in submit_reply
+        and not any(
+            event.get("kind") == "tool"
+            and event.get("name") == "keytao_prepare_reviewed_add"
+            for event in submit_events
+        ),
+        "S52 bare add-and-submit regenerated instead of consuming the first "
+        f"record: reply={submit_reply}; events={submit_events}",
+    )
+    submitted_batch = await ctx.next_client.get_admin_batch(
+        batch_id=submitted_batch_id,
+        admin_token=ctx.admin_token,
+    )
+    submitted_items = [
+        item_key(item)
+        for item in submitted_batch.get("pullRequests", [])
+        if isinstance(item, dict)
+    ]
+    require(
+        submitted_batch.get("status") in {"Submitted", "Approved"}
+        and submitted_items == [
+            ("Create", S52_WORD, S52_RECOMMENDED_CODE),
+        ],
+        f"S52 bare assent submitted the wrong candidate: {submitted_batch}",
+    )
+
+    submitted_cleanup = await ctx.next_client.clean_submitted_batches(
+        ctx.platform_id
+    )
+    dictionary_cleanup = await ctx.next_client.remove_rig_owned_dictionary_words(
+        platform_id=ctx.platform_id,
+        admin_token=ctx.admin_token,
+        scenario_id="S52",
+        fixture_words=(S52_WORD,),
+    )
+    require(
+        dictionary_cleanup.get("verified") is True,
+        f"S52 candidate cleanup was not verified: {dictionary_cleanup}",
+    )
+
+    delete_cases: list[dict[str, Any]] = []
+    expected_delete = [("Delete", S52_DELETE_WORD, S52_DELETE_CODE)]
+    for command in S52_DELETE_FORMS:
+        await ctx.next_client.clean_draft(ctx.platform_id)
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+        cutoff = max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+        messages.append(command)
+        preview = await ctx.send_group(command, to_me=True)
+        replies.append(preview)
+        delete_record = (
+            ctx.bot.openai_chat.conversation_state_store.get_record(address)
+        )
+        require(
+            delete_record is not None
+            and isinstance(delete_record.state, PendingToolConfirm)
+            and [
+                item_key(item)
+                for item in delete_record.state.args.get("items", [])
+                if isinstance(item, dict)
+            ] == expected_delete
+            and pending_confirmation_copy() in preview,
+            f"S52 possessive delete did not seal only 哪里@nsl: "
+            f"command={command}; reply={preview}; record={delete_record}",
+        )
+        messages.append("确认")
+        receipt = await ctx.send_group("确认", to_me=True)
+        replies.append(receipt)
+        draft = await ctx.draft()
+        turn_events = [
+            event
+            for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > cutoff
+        ]
+        require(
+            [
+                item_key(item)
+                for item in draft.get("items", [])
+                if isinstance(item, dict)
+            ] == expected_delete
+            and S52_DELETE_WORD in receipt
+            and S52_DELETE_CODE in receipt
+            and S52_REMAINING_CODE not in receipt
+            and not any(
+                event.get("kind") == "modelExchange" for event in turn_events
+            ),
+            f"S52 possessive delete escaped the deterministic nsl row: "
+            f"command={command}; receipt={receipt}; draft={draft}; "
+            f"events={turn_events}",
+        )
+        delete_cases.append({
+            "command": command,
+            "items": expected_delete,
+            "modelRequests": 0,
+        })
+
+    await ctx.next_client.clean_draft(ctx.platform_id)
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "firstRenderRecommendedCode": S52_RECOMMENDED_CODE,
+            "firstRenderRecordPersisted": True,
+            "bareAssentSubmittedInOneTurn": True,
+            "candidateRegenerationsAfterAssent": 0,
+            "submittedBatchId": submitted_batch_id,
+            "submittedCleanup": submitted_cleanup,
+            "dictionaryCleanup": dictionary_cleanup,
+            "deleteCases": delete_cases,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -7886,6 +8099,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S49", "reasoning-only exhaustion bounded recovery", scenario_s49),
     Scenario("S50", "relative-position grammar and honest confirmation", scenario_s50),
     Scenario("S51", "replace-at-code grammar and honest confirmation", scenario_s51),
+    Scenario("S52", "first-render binding and possessive delete closure", scenario_s52),
 )
 
 

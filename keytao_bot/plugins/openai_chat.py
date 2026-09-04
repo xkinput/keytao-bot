@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Optional, List, Dict, Tuple
 
 from nonebot import on_message, on_command, get_driver
 from nonebot.adapters import Bot, Event
+from nonebot.exception import FinishedException
 from nonebot.rule import Rule, to_me
 from nonebot.log import logger
 
@@ -1632,6 +1633,20 @@ async def get_ai_response_core(
             )
             if pending_reply is not None:
                 return pending_reply
+            draft_intent = _structural_draft_management_intent(
+                fallback_message
+            )
+            if draft_intent is not None:
+                draft_reply = await _try_handle_draft_management_command(
+                    fallback_message,
+                    fallback_context.platform,
+                    fallback_context.user_id,
+                    fallback_context.space_key,
+                    fallback_context.speaker_name,
+                    draft_intent,
+                )
+                if draft_reply is not None:
+                    return draft_reply
             return await _try_handle_encoding_rule_question(
                 fallback_message,
                 fallback_context.platform,
@@ -5308,6 +5323,25 @@ async def _handle_ai_chat_serialized(
             return
 
 
+def _mark_handled_group_message(event: Event) -> None:
+    """Advance replay state only after this turn reached a reply boundary."""
+    group_id = str(getattr(event, "group_id", "") or "").strip()
+    message_id = str(getattr(event, "message_id", "") or "").strip()
+    message_timestamp = getattr(event, "time", None)
+    marker = getattr(
+        conversation_state_store,
+        "mark_group_message_processed",
+        None,
+    )
+    if not group_id or not message_id or message_timestamp is None or not callable(marker):
+        return
+    if not marker(group_id, message_id, message_timestamp):
+        logger.warning(
+            "[startup_replay] marker_failed "
+            f"group={group_id} message_id={message_id}"
+        )
+
+
 
 @ai_chat.handle()
 async def handle_ai_chat(bot: Bot, event: Event):
@@ -5345,11 +5379,16 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 current_draft_delivery_claims.reset(delivery_token)
                 current_history_generation.reset(history_token)
                 current_memory_generation.reset(memory_token)
+    except FinishedException:
+        _mark_handled_group_message(event)
+        raise
     except BaseException:
         if not turn_metrics_emitted():
             mark_turn_outcome("error")
             emit_turn_metrics(logger)
         raise
+    else:
+        _mark_handled_group_message(event)
     finally:
         keytao_review.end_commonness_evidence_turn(commonness_token)
         end_turn_metrics(metrics_token)

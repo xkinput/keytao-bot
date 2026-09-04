@@ -3251,13 +3251,6 @@ async def _try_handle_simple_single_word_query(
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     explicit_add_word = _extract_explicit_reviewed_add_word(message_text)
-    prefixed_review = re.match(
-        r"^\s*(?:键道|喵喵)(?:\s+|[:：,，])",
-        message_text,
-    ) is not None
-    actionable_candidates = bool(
-        explicit_add_word or prefixed_review or actionable_lookup
-    )
     words = (explicit_add_word,) if explicit_add_word else await _get_simple_word_query_words(message_text)
     if len(words) != 1:
         return None
@@ -3417,18 +3410,18 @@ async def _try_handle_simple_single_word_query(
                 if current_memory_context.get() is not None
                 else ConversationAddress.private(platform, user_id)
             )
-            # Only an explicit add/review turn mints an actionable ordinal
-            # record. A bare lexical lookup remains read-only on later turns.
-            if actionable_candidates:
-                if not conversation_state_store.set(
-                    target_key,
-                    pending,
-                    space_key=space_key,
-                    owner_label=owner_label,
-                ):
-                    return (
-                        f"「{word}」的候选编码暂时无法保存，请重新查询后再选择。"
-                    )
+            # Every displayed candidate selector is an executable contract.
+            # Persist the exact shared inventory before rendering any form of
+            # it, including a plain lexical lookup.
+            if not conversation_state_store.set(
+                target_key,
+                pending,
+                space_key=space_key,
+                owner_label=owner_label,
+            ):
+                return (
+                    f"「{word}」的候选编码暂时无法保存，请重新查询后再选择。"
+                )
             if not explicit_add_word:
                 read_only_candidates = render_server_backed_single_word_lookup(
                     pending.word,
@@ -3436,7 +3429,7 @@ async def _try_handle_simple_single_word_query(
                     pending.server_candidates,
                     pending.server_occupied_words,
                     reviewed_prompt=reviewed_prompt,
-                    actionable_controls=actionable_candidates,
+                    actionable_controls=True,
                 )
                 reviewed_prompt = read_only_candidates
         actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)

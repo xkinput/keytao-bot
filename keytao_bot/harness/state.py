@@ -60,6 +60,170 @@ class PendingAddWord:
     manual_review_reason: str = ""
 
 
+def _pending_add_word_payload(state: PendingAddWord) -> Dict[str, object]:
+    """Return the complete JSON-safe candidate capability payload."""
+    return {
+        "word": state.word,
+        "recommendedCode": state.recommended_code,
+        "candidates": state.candidates,
+        "occupiedWords": state.occupied_words,
+        "serverCandidates": state.server_candidates,
+        "serverOccupiedWords": state.server_occupied_words,
+        "serverEntriesByCode": state.server_entries_by_code,
+        "serverOrderingAssessments": state.server_ordering_assessments,
+        "codeRemarks": state.code_remarks,
+        "pronunciationCodes": state.pronunciation_codes,
+        "pronunciationRecommendedCodes": state.pronunciation_recommended_codes,
+        "needsManualReview": state.needs_manual_review,
+        "manualReviewReason": state.manual_review_reason,
+    }
+
+
+def _pending_add_word_from_payload(payload: object) -> PendingAddWord:
+    """Rebuild a candidate capability while rejecting malformed disk rows."""
+    if not isinstance(payload, dict):
+        raise ValueError("invalid candidate record payload")
+
+    def candidate_pairs(name: str) -> List[Tuple[str, bool]]:
+        raw_pairs = payload.get(name)
+        if not isinstance(raw_pairs, list):
+            raise ValueError(f"invalid candidate pair list: {name}")
+        pairs: List[Tuple[str, bool]] = []
+        for raw_pair in raw_pairs:
+            if (
+                not isinstance(raw_pair, list)
+                or len(raw_pair) != 2
+                or not isinstance(raw_pair[0], str)
+                or re.fullmatch(r"[a-z]{1,12}", raw_pair[0]) is None
+                or not isinstance(raw_pair[1], bool)
+            ):
+                raise ValueError(f"invalid candidate pair: {name}")
+            pairs.append((raw_pair[0], raw_pair[1]))
+        if len({code for code, _occupied in pairs}) != len(pairs):
+            raise ValueError(f"duplicate candidate code: {name}")
+        return pairs
+
+    def string_list_map(name: str) -> Dict[str, List[str]]:
+        raw_mapping = payload.get(name)
+        if not isinstance(raw_mapping, dict):
+            raise ValueError(f"invalid string-list map: {name}")
+        mapping: Dict[str, List[str]] = {}
+        for code, raw_values in raw_mapping.items():
+            if (
+                not isinstance(code, str)
+                or re.fullmatch(r"[a-z]{1,12}", code) is None
+                or not isinstance(raw_values, list)
+                or any(not isinstance(value, str) for value in raw_values)
+            ):
+                raise ValueError(f"invalid string-list entry: {name}")
+            mapping[code] = list(raw_values)
+        return mapping
+
+    def string_map(name: str) -> Dict[str, str]:
+        raw_mapping = payload.get(name)
+        if not isinstance(raw_mapping, dict):
+            raise ValueError(f"invalid string map: {name}")
+        mapping: Dict[str, str] = {}
+        for code, value in raw_mapping.items():
+            if (
+                not isinstance(code, str)
+                or re.fullmatch(r"[a-z]{1,12}", code) is None
+                or not isinstance(value, str)
+            ):
+                raise ValueError(f"invalid string-map entry: {name}")
+            mapping[code] = value
+        return mapping
+
+    raw_entries = payload.get("serverEntriesByCode")
+    if not isinstance(raw_entries, dict):
+        raise ValueError("invalid candidate entry map")
+    entries_by_code: Dict[str, List[Tuple[str, int]]] = {}
+    for code, raw_values in raw_entries.items():
+        if (
+            not isinstance(code, str)
+            or re.fullmatch(r"[a-z]{1,12}", code) is None
+            or not isinstance(raw_values, list)
+        ):
+            raise ValueError("invalid candidate entry map")
+        values: List[Tuple[str, int]] = []
+        for raw_value in raw_values:
+            if (
+                not isinstance(raw_value, list)
+                or len(raw_value) != 2
+                or not isinstance(raw_value[0], str)
+                or not raw_value[0]
+                or not isinstance(raw_value[1], int)
+                or isinstance(raw_value[1], bool)
+            ):
+                raise ValueError("invalid candidate entry")
+            values.append((raw_value[0], raw_value[1]))
+        entries_by_code[code] = values
+
+    raw_assessments = payload.get("serverOrderingAssessments")
+    if not isinstance(raw_assessments, list):
+        raise ValueError("invalid candidate ordering assessments")
+    assessments: List[Dict[str, str]] = []
+    for raw_assessment in raw_assessments:
+        if (
+            not isinstance(raw_assessment, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in raw_assessment.items()
+            )
+        ):
+            raise ValueError("invalid candidate ordering assessment")
+        assessments.append(dict(raw_assessment))
+
+    raw_recommended_codes = payload.get("pronunciationRecommendedCodes")
+    if (
+        not isinstance(raw_recommended_codes, list)
+        or any(
+            not isinstance(code, str)
+            or re.fullmatch(r"[a-z]{1,12}", code) is None
+            for code in raw_recommended_codes
+        )
+    ):
+        raise ValueError("invalid pronunciation recommendations")
+    needs_manual_review = payload.get("needsManualReview")
+    if needs_manual_review is not None and not isinstance(
+        needs_manual_review,
+        bool,
+    ):
+        raise ValueError("invalid manual-review verdict")
+    word = payload.get("word")
+    recommended_code = payload.get("recommendedCode")
+    manual_review_reason = payload.get("manualReviewReason")
+    if (
+        not isinstance(word, str)
+        or not word
+        or not isinstance(recommended_code, str)
+        or re.fullmatch(r"[a-z]{1,12}", recommended_code) is None
+        or not isinstance(manual_review_reason, str)
+    ):
+        raise ValueError("invalid candidate record identity")
+    candidates = candidate_pairs("candidates")
+    if recommended_code not in {code for code, _occupied in candidates}:
+        raise ValueError("recommended code is not a candidate")
+    server_candidates = candidate_pairs("serverCandidates")
+    if server_candidates and server_candidates != candidates:
+        raise ValueError("server candidates differ from displayed candidates")
+    return PendingAddWord(
+        word=word,
+        recommended_code=recommended_code,
+        candidates=candidates,
+        occupied_words=string_list_map("occupiedWords"),
+        server_candidates=server_candidates,
+        server_occupied_words=string_list_map("serverOccupiedWords"),
+        server_entries_by_code=entries_by_code,
+        server_ordering_assessments=assessments,
+        code_remarks=string_map("codeRemarks"),
+        pronunciation_codes=string_map("pronunciationCodes"),
+        pronunciation_recommended_codes=list(raw_recommended_codes),
+        needs_manual_review=needs_manual_review,
+        manual_review_reason=manual_review_reason,
+    )
+
+
 @dataclass
 class PendingToolConfirm:
     """A staged mutation or server warning waiting for user confirmation."""
@@ -1291,7 +1455,7 @@ class MemoryConversationStateStore:
 
 
 class SQLiteConversationStateStore(MemoryConversationStateStore):
-    """SQLite-backed tool-confirmation tickets with process-local claims."""
+    """SQLite-backed pending capabilities and group replay boundaries."""
 
     def __init__(
         self,
@@ -1404,6 +1568,135 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                 CREATE INDEX IF NOT EXISTS idx_pending_confirmations_expiry
                 ON pending_confirmations(expires_at)
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS startup_replay_markers (
+                    group_id TEXT PRIMARY KEY,
+                    message_id TEXT NOT NULL,
+                    message_timestamp REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            """)
+
+    @staticmethod
+    def _validated_group_message_marker(
+        group_id: object,
+        message_id: object,
+        message_timestamp: object,
+    ) -> Optional[Tuple[str, str, float, int]]:
+        normalized_group_id = str(group_id or "").strip()
+        normalized_message_id = str(message_id or "").strip()
+        try:
+            timestamp = float(message_timestamp)
+            numeric_message_id = int(normalized_message_id)
+        except (TypeError, ValueError):
+            return None
+        if (
+            re.fullmatch(r"[1-9][0-9]{4,19}", normalized_group_id) is None
+            or re.fullmatch(r"-?[0-9]{1,20}", normalized_message_id) is None
+            or not math.isfinite(timestamp)
+            or timestamp <= 0
+        ):
+            return None
+        return (
+            normalized_group_id,
+            normalized_message_id,
+            timestamp,
+            numeric_message_id,
+        )
+
+    def mark_group_message_processed(
+        self,
+        group_id: object,
+        message_id: object,
+        message_timestamp: object,
+    ) -> bool:
+        """Advance one group's durable replay boundary without regressing it."""
+        marker = self._validated_group_message_marker(
+            group_id,
+            message_id,
+            message_timestamp,
+        )
+        if marker is None:
+            return False
+        normalized_group_id, normalized_message_id, timestamp, numeric_id = marker
+        try:
+            with self._connect() as conn:
+                current = conn.execute(
+                    """
+                    SELECT message_id, message_timestamp
+                    FROM startup_replay_markers
+                    WHERE group_id = ?
+                    """,
+                    (normalized_group_id,),
+                ).fetchone()
+                if current is not None:
+                    current_order = (float(current[1]), int(str(current[0])))
+                    if (timestamp, numeric_id) <= current_order:
+                        return True
+                conn.execute(
+                    """
+                    INSERT INTO startup_replay_markers (
+                        group_id, message_id, message_timestamp, updated_at
+                    ) VALUES (?, ?, ?, ?)
+                    ON CONFLICT(group_id) DO UPDATE SET
+                        message_id = excluded.message_id,
+                        message_timestamp = excluded.message_timestamp,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        normalized_group_id,
+                        normalized_message_id,
+                        timestamp,
+                        float(self._clock()),
+                    ),
+                )
+            return True
+        except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+            logger.error(f"Failed to persist startup replay marker: {error}")
+            return False
+
+    def last_processed_group_message(
+        self,
+        group_id: object,
+    ) -> Optional[Tuple[str, float]]:
+        normalized_group_id = str(group_id or "").strip()
+        if re.fullmatch(r"[1-9][0-9]{4,19}", normalized_group_id) is None:
+            return None
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT message_id, message_timestamp
+                    FROM startup_replay_markers
+                    WHERE group_id = ?
+                    """,
+                    (normalized_group_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            marker = self._validated_group_message_marker(
+                normalized_group_id,
+                row[0],
+                row[1],
+            )
+            return (marker[1], marker[2]) if marker is not None else None
+        except (OSError, sqlite3.Error):
+            return None
+
+    def served_group_ids(self) -> Tuple[str, ...]:
+        """Return groups with a durable handled-message boundary."""
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT group_id
+                    FROM startup_replay_markers
+                    ORDER BY length(group_id), group_id
+                    """
+                ).fetchall()
+            return tuple(str(row[0]) for row in rows)
+        except (OSError, sqlite3.Error):
+            return ()
 
     @staticmethod
     def _canonical_json(value: object) -> Tuple[str, object]:
@@ -1420,32 +1713,28 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
         address = normalize_conversation_key(record.owner_key, record.space_key)
         if not isinstance(
             record.state,
-            (PendingTrustedWordRecord, PendingToolConfirm),
+            (PendingAddWord, PendingTrustedWordRecord, PendingToolConfirm),
         ):
-            # Candidate selection and other conversational state remain
-            # intentionally process-local in this round. Replacing a durable
-            # tool ticket must still remove the old authorization from disk.
+            # Replacing a durable ticket with unrelated conversational state
+            # must still remove the old authorization from disk.
             return self._delete_persisted(address)
-        state_type = (
-            "trusted_word_record"
-            if isinstance(record.state, PendingTrustedWordRecord)
-            else "tool_confirm"
-        )
-        persisted_arguments: object = (
-            record.state.args
-            if isinstance(record.state, PendingToolConfirm)
-            else {
+        if isinstance(record.state, PendingAddWord):
+            state_type = "pending_add_word"
+            persisted_arguments: object = _pending_add_word_payload(record.state)
+            confirmation_source = "candidate_record"
+        elif isinstance(record.state, PendingTrustedWordRecord):
+            state_type = "trusted_word_record"
+            persisted_arguments = {
                 "word": record.state.word,
                 "code": record.state.code,
                 "phraseType": record.state.phrase_type,
                 "recordDigest": record.state.record_digest,
             }
-        )
-        confirmation_source = (
-            "trusted_word_record"
-            if isinstance(record.state, PendingTrustedWordRecord)
-            else str(record.state.confirmation_source)
-        )
+            confirmation_source = "trusted_word_record"
+        else:
+            state_type = "tool_confirm"
+            persisted_arguments = record.state.args
+            confirmation_source = str(record.state.confirmation_source)
         try:
             arguments_json, canonical_arguments = self._canonical_json(
                 persisted_arguments
@@ -1462,7 +1751,14 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
             canonical_intent, dict
         ):
             return False
-        if isinstance(record.state, PendingTrustedWordRecord):
+        if isinstance(record.state, PendingAddWord):
+            try:
+                canonical_state = _pending_add_word_from_payload(
+                    canonical_arguments
+                )
+            except ValueError:
+                return False
+        elif isinstance(record.state, PendingTrustedWordRecord):
             canonical_state: PendingState = PendingTrustedWordRecord(
                 word=str(canonical_arguments.get("word") or ""),
                 code=str(canonical_arguments.get("code") or ""),
@@ -1591,7 +1887,9 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                         str(row["reconfirmation_intent_json"])
                     )
                     state_type = str(row["state_type"] or "tool_confirm")
-                    if state_type == "trusted_word_record":
+                    if state_type == "pending_add_word":
+                        state = _pending_add_word_from_payload(arguments)
+                    elif state_type == "trusted_word_record":
                         if not isinstance(arguments, dict):
                             raise ValueError("invalid trusted word record payload")
                         state: PendingState = PendingTrustedWordRecord(
@@ -1628,6 +1926,11 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                             isinstance(state, PendingToolConfirm)
                             and state.confirmation_source
                             not in {"local_preview", "server_warning"}
+                        )
+                        or (
+                            isinstance(state, PendingAddWord)
+                            and str(row["confirmation_source"])
+                            != "candidate_record"
                         )
                         or (
                             isinstance(state, PendingTrustedWordRecord)

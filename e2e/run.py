@@ -86,6 +86,11 @@ from .scenarios import (
     S51_OLD_WORD,
     S51_REMAINING_CODE,
     S51_TARGET_CODE,
+    S52_DELETE_CODE,
+    S52_DELETE_WORD,
+    S52_RECOMMENDED_CODE,
+    S52_REMAINING_CODE,
+    S52_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -2138,6 +2143,66 @@ async def ensure_s51_fixture(
     }
 
 
+async def ensure_s52_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Verify the incident recommendation and seed its scoped delete rows."""
+    candidate_codes = ordered_candidate_codes(await client.encode(S52_WORD))
+    if not candidate_codes or candidate_codes[0] != S52_RECOMMENDED_CODE:
+        raise RigInfrastructureError(
+            f"S52 {S52_WORD} recommendation drifted: {candidate_codes}"
+        )
+    recommended_rows = [
+        row for row in await client.phrases_by_code(S52_RECOMMENDED_CODE)
+        if str(row.get("code") or "").strip().lower() == S52_RECOMMENDED_CODE
+    ]
+    if recommended_rows:
+        raise RigInfrastructureError(
+            f"S52 requires an empty exact {S52_RECOMMENDED_CODE} slot: "
+            f"{recommended_rows}"
+        )
+
+    seeds: list[dict[str, Any]] = []
+    for code in (S52_DELETE_CODE, S52_REMAINING_CODE):
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if str(row.get("code") or "").strip().lower() == code
+        ]
+        if not exact_rows:
+            await client.clean_draft(seed_identity["platform_id"])
+            seeds.append(await client.seed_phrase(
+                platform_id=seed_identity["platform_id"],
+                word=S52_DELETE_WORD,
+                code=code,
+            ))
+            exact_rows = [
+                row for row in await client.phrases_by_code(code)
+                if str(row.get("code") or "").strip().lower() == code
+            ]
+        if not (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == S52_DELETE_WORD
+            and exact_rows[0].get("type") == "Phrase"
+            and str((exact_rows[0].get("user") or {}).get("name") or "").startswith(
+                RESERVED_BINDING_PREFIX
+            )
+        ):
+            raise RigInfrastructureError(
+                f"S52 requires sole rig-owned {S52_DELETE_WORD}@{code}: "
+                f"{exact_rows}"
+            )
+    return {
+        "word": S52_WORD,
+        "recommendedCode": S52_RECOMMENDED_CODE,
+        "candidateCodes": candidate_codes,
+        "deleteWord": S52_DELETE_WORD,
+        "deleteCodes": [S52_DELETE_CODE, S52_REMAINING_CODE],
+        "seedBatchIds": [seed.get("batchId") for seed in seeds],
+    }
+
+
 async def ensure_s39_fixture(
     *,
     client: LocalNextClient,
@@ -2708,6 +2773,12 @@ async def async_main(args: argparse.Namespace) -> int:
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S51":
                         fixture_facts["s51"] = await ensure_s51_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S52":
+                        fixture_facts["s52"] = await ensure_s52_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

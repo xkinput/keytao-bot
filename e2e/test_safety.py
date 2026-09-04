@@ -101,6 +101,12 @@ from .scenarios import (
     S51_OLD_WORD,
     S51_REMAINING_CODE,
     S51_TARGET_CODE,
+    S52_DELETE_CODE,
+    S52_DELETE_FORMS,
+    S52_DELETE_WORD,
+    S52_RECOMMENDED_CODE,
+    S52_REMAINING_CODE,
+    S52_WORD,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -646,6 +652,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             readme,
         )
         self.assertIn(
+            "S52 closes the 2026-09-04 deploy-gap and first-render incident",
+            readme,
+        )
+        self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
@@ -694,10 +704,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s51(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s52(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 52)],
+            [f"S{index}" for index in range(1, 53)],
         )
 
     def test_s51_pins_replace_at_code_incident_transcript(self) -> None:
@@ -717,6 +727,27 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         )
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S51"]
         self.assertEqual(fixture["probe_words"], ("哪里", "那算了"))
+
+    def test_s52_pins_first_render_and_possessive_delete_incidents(self) -> None:
+        self.assertEqual(S52_WORD, "细品")
+        self.assertEqual(S52_RECOMMENDED_CODE, "xkpb")
+        self.assertEqual(
+            (S52_DELETE_WORD, S52_DELETE_CODE, S52_REMAINING_CODE),
+            ("哪里", "nsl", "nslko"),
+        )
+        self.assertEqual(
+            S52_DELETE_FORMS,
+            (
+                "删除 nsl 的 哪里",
+                "删除nsl的哪里",
+                "删掉 nsl 上的哪里",
+                "把 nsl 的哪里删了",
+                "把「nsl」的「哪里」删掉",
+                "删掉 “nsl” 上的 “哪里”",
+            ),
+        )
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S52"]
+        self.assertEqual(fixture["probe_words"], ("细品",))
 
     def test_s48_pins_numbered_create_with_eviction_contract(self) -> None:
         self.assertEqual((S48_WORD, S48_OCCUPANT), ("单份", "蛋粉"))

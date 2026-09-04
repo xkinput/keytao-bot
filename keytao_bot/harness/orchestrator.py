@@ -247,6 +247,7 @@ _BLOCK_REASON_USER_LABELS = {
     "source_untrusted": "消息来源不受信任",
     "verb_not_matched": "当前消息没有明确要求执行操作",
     "binding_incomplete": "当前操作缺少明确的词条或编码",
+    "intent_mismatch": "所选工具与删除意图不一致",
     "candidate_record_missing": "候选记录已失效",
     "ticket_required": "缺少有效确认",
     "bulk_delete_not_requested": "未明确授权批量删除",
@@ -2246,6 +2247,26 @@ class AgentOrchestrator:
                         ):
                             if failure_state is not None:
                                 failure_state.clear()
+                        if (
+                            result_data.get("blockReason") == "intent_mismatch"
+                            and result_data.get("retryDeterministicRoute") is True
+                            and self._deterministic_fallback_handler is not None
+                        ):
+                            deterministic_reply = await self._deterministic_fallback_handler(
+                                message,
+                                context,
+                            )
+                            if deterministic_reply:
+                                if failure_state is not None:
+                                    failure_state.clear()
+                                logger.info(
+                                    "Resolved tool intent mismatch through "
+                                    "the deterministic fallback handler"
+                                )
+                                return self._append_authoritative_result_links(
+                                    deterministic_reply,
+                                    authoritative_result_links,
+                                )
                     # Learn the batch the server just named before replaying the
                     # call against it, so the replay passes the anchor check.
                     self._collect_trusted_batch_ids(

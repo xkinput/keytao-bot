@@ -967,6 +967,14 @@ _ENTRY_CODE_SWAP_SUFFIX_RE = re.compile(
 )
 
 _DICTIONARY_DELETE_WORD_PATTERN = r"[\u3400-\u9fff]{1,30}"
+_DICTIONARY_DELETE_CODE_TOKEN = (
+    rf"[「“\"'『‘]?(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})"
+    r"[」”\"'』’]?"
+)
+_DICTIONARY_DELETE_WORD_TOKEN = (
+    rf"[「“\"'『‘]?(?P<word>{_DICTIONARY_DELETE_WORD_PATTERN})"
+    r"[」”\"'』’]?"
+)
 _DICTIONARY_DELETE_PATTERNS = (
     re.compile(
         rf"^{_COMMAND_PREFIX_PATTERN}(?:删词|删除词条)\s*"
@@ -985,9 +993,16 @@ _DICTIONARY_DELETE_PATTERNS = (
     ),
     re.compile(
         rf"^{_COMMAND_PREFIX_PATTERN}(?:把|将)\s*"
-        rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*的\s*"
-        rf"[「“]?(?P<word>{_DICTIONARY_DELETE_WORD_PATTERN})[」”]?\s*"
+        rf"{_DICTIONARY_DELETE_CODE_TOKEN}\s*(?:的|上的)\s*"
+        rf"{_DICTIONARY_DELETE_WORD_TOKEN}\s*"
         r"(?:删除|删掉|删了|移除)(?:吧|啦|了)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^{_COMMAND_PREFIX_PATTERN}(?:删除|删掉|移除)\s*"
+        rf"{_DICTIONARY_DELETE_CODE_TOKEN}\s*(?:的|上的)\s*"
+        rf"{_DICTIONARY_DELETE_WORD_TOKEN}"
+        r"(?:吧|啦|了)?$",
         re.IGNORECASE,
     ),
     re.compile(
@@ -1117,6 +1132,22 @@ def parse_dictionary_delete_command(
 ) -> Optional[DictionaryDeleteCommand]:
     """Parse a positive whole-message delete of one live dictionary row."""
     source = _safe_whole_entry_command_source(message)
+    if not source:
+        # Quoted operands are still command operands for this closed grammar.
+        # Reported speech and explanatory/data frames remain excluded by the
+        # same whole-message guards below and by the anchored patterns.
+        quoted_source = _LEADING_MENTION_RE.sub(
+            "", trusted_mutation_source(message), count=1
+        ).strip()
+        if not (
+            not quoted_source
+            or _NEGATIVE_MODAL_RE.search(quoted_source)
+            or _NEGATED_NON_POSITIONAL_MUTATION_RE.search(quoted_source)
+            or _has_standalone_negation_before_mutation(quoted_source)
+            or _POSITIONAL_REPORTED_CONTEXT_RE.search(quoted_source)
+            or _DATA_CONTEXT_RE.search(quoted_source)
+        ):
+            source = quoted_source
     if not source:
         return None
     source = source.rstrip("。.!！").strip()
@@ -2023,6 +2054,7 @@ _WORD_RIGHT_SUFFIXES = (
 BLOCK_REASON_SOURCE_UNTRUSTED = "source_untrusted"
 BLOCK_REASON_VERB_NOT_MATCHED = "verb_not_matched"
 BLOCK_REASON_BINDING_INCOMPLETE = "binding_incomplete"
+BLOCK_REASON_INTENT_MISMATCH = "intent_mismatch"
 BLOCK_REASON_CANDIDATE_RECORD_MISSING = "candidate_record_missing"
 BLOCK_REASON_TICKET_REQUIRED = "ticket_required"
 BLOCK_REASON_BULK_DELETE_NOT_REQUESTED = "bulk_delete_not_requested"

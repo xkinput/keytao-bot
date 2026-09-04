@@ -979,6 +979,48 @@ class PendingPersistenceTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    def test_candidate_record_survives_store_reload(self) -> None:
+        store = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        candidate = PendingAddWord(
+            word="细品",
+            recommended_code="xkpb",
+            candidates=[("xkpb", False), ("xkpba", False), ("xkpbao", False)],
+            occupied_words={},
+            server_candidates=[
+                ("xkpb", False),
+                ("xkpba", False),
+                ("xkpbao", False),
+            ],
+            server_occupied_words={},
+            server_entries_by_code={"xkpb": []},
+            server_ordering_assessments=[{
+                "code": "xkpb",
+                "status": "recommended",
+            }],
+            code_remarks={"xkpb": "reviewed"},
+            pronunciation_codes={
+                "xkpb": "xi pin",
+                "xkpba": "xi pin",
+                "xkpbao": "xi pin",
+            },
+            pronunciation_recommended_codes=["xkpb"],
+            needs_manual_review=False,
+            manual_review_reason="",
+        )
+        self.assertTrue(store.set(self.owner, candidate, owner_label="汤汤"))
+        original = store.get_record(self.owner)
+
+        restored = SQLiteConversationStateStore(self.db_path, clock=self.clock)
+        record = restored.get_record(self.owner)
+
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingAddWord)
+        self.assertEqual(record.state, candidate)
+        self.assertEqual(record.nonce, original.nonce)
+        self.assertEqual(record.owner_key, self.owner)
+        self.assertTrue(record.requires_reconfirmation)
+        self.assertTrue(record.confirmation_armed)
+
     async def test_pending_confirmation_survives_restart_with_exact_server_bindings(
         self,
     ) -> None:
@@ -1204,6 +1246,151 @@ class PendingPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored_record.execution_id, "")
         self.assertEqual(restored_record.execution_started_at, 0.0)
         self.assertTrue(restored.begin_execution(restored_record))
+
+
+class StartupReplayTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restart_replays_only_unanswered_addressed_messages_once(
+        self,
+    ) -> None:
+        from keytao_bot.plugins.startup_replay import replay_group_history
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            group_id = "865189947"
+            store = SQLiteConversationStateStore(
+                os.path.join(temp_dir, "pending-confirmations.db"),
+                clock=lambda: 1_000.0,
+            )
+            self.assertTrue(store.mark_group_message_processed(group_id, "5", 900.0))
+            history = [
+                {"message_id": 4, "time": 899, "user_id": 100, "addressed": True},
+                {"message_id": 6, "time": 950, "user_id": 100, "addressed": True},
+                {"message_id": 7, "time": 951, "user_id": 3785773770},
+                {"message_id": 8, "time": 952, "user_id": 101, "addressed": False},
+                {"message_id": 9, "time": 953, "user_id": 102, "addressed": True},
+            ]
+
+            class FakeBot:
+                self_id = "3785773770"
+
+                def __init__(self) -> None:
+                    self.calls = []
+
+                async def get_group_msg_history(self, **kwargs):
+                    self.calls.append(dict(kwargs))
+                    return {"messages": list(reversed(history))}
+
+            processed = []
+
+            async def addressed(_bot, event):
+                return event.get("addressed") is True
+
+            async def process(_bot, event):
+                processed.append(event["message_id"])
+                store.mark_group_message_processed(
+                    group_id,
+                    str(event["message_id"]),
+                    float(event["time"]),
+                )
+
+            first_bot = FakeBot()
+            first = await replay_group_history(
+                first_bot,
+                group_id,
+                state_store=store,
+                history_count=50,
+                max_age_seconds=600,
+                now=1_000.0,
+                event_factory=lambda _bot, _group_id, row: row,
+                is_addressed=addressed,
+                process_event=process,
+            )
+
+            self.assertEqual(
+                first_bot.calls,
+                [{"group_id": int(group_id), "count": 50}],
+            )
+            self.assertEqual(processed, [9])
+            self.assertEqual(first.replayed, 1)
+            self.assertEqual(first.skipped_answered, 1)
+            self.assertEqual(first.skipped_not_addressed, 1)
+            self.assertEqual(
+                store.last_processed_group_message(group_id),
+                ("9", 953.0),
+            )
+
+            restored_store = SQLiteConversationStateStore(
+                os.path.join(temp_dir, "pending-confirmations.db"),
+                clock=lambda: 1_000.0,
+            )
+            second_bot = FakeBot()
+            second = await replay_group_history(
+                second_bot,
+                group_id,
+                state_store=restored_store,
+                history_count=50,
+                max_age_seconds=600,
+                now=1_000.0,
+                event_factory=lambda _bot, _group_id, row: row,
+                is_addressed=addressed,
+                process_event=process,
+            )
+
+            self.assertEqual(
+                second_bot.calls,
+                [{"group_id": int(group_id), "count": 50}],
+            )
+            self.assertEqual(processed, [9])
+            self.assertEqual(second.replayed, 0)
+
+    async def test_replay_stops_at_first_processing_failure(self) -> None:
+        from keytao_bot.plugins.startup_replay import replay_group_history
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            group_id = "865189947"
+            store = SQLiteConversationStateStore(
+                os.path.join(temp_dir, "pending-confirmations.db"),
+                clock=lambda: 1_000.0,
+            )
+            self.assertTrue(store.mark_group_message_processed(group_id, "5", 900.0))
+            history = [
+                {"message_id": 9, "time": 953, "user_id": 102, "addressed": True},
+                {"message_id": 10, "time": 954, "user_id": 103, "addressed": True},
+            ]
+
+            class FakeBot:
+                self_id = "3785773770"
+
+                async def get_group_msg_history(self, **_kwargs):
+                    return {"messages": history}
+
+            attempted = []
+
+            async def addressed(_bot, event):
+                return event.get("addressed") is True
+
+            async def process(_bot, event):
+                attempted.append(event["message_id"])
+                raise RuntimeError("synthetic delivery failure")
+
+            counts = await replay_group_history(
+                FakeBot(),
+                group_id,
+                state_store=store,
+                history_count=50,
+                max_age_seconds=600,
+                now=1_000.0,
+                event_factory=lambda _bot, _group_id, row: row,
+                is_addressed=addressed,
+                process_event=process,
+            )
+
+            self.assertEqual(attempted, [9])
+            self.assertEqual(counts.replayed, 0)
+            self.assertEqual(counts.failed, 1)
+            self.assertEqual(
+                store.last_processed_group_message(group_id),
+                ("5", 900.0),
+            )
 
 
 class WebIdentityVerificationTests(unittest.TestCase):

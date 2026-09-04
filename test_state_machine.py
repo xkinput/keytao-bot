@@ -3445,6 +3445,133 @@ def test_read_word_query_persists_server_candidate_record():
     asyncio.run(_run())
 
 
+def test_plain_query_then_bare_add_and_submit_uses_first_render_record():
+    """A plain lookup must make its first rendered recommendation executable."""
+    print("\n🧪 plain query → bare add-and-submit uses first-render record")
+
+    async def _run():
+        review = {
+            "success": True,
+            "word": "细品",
+            "recommendedCode": "xkpb",
+            "preSubmitAudit": {
+                "success": True,
+                "verdict": "pass",
+                "autoApprove": True,
+                "summary": "读音和编码候选链一致",
+                "issues": [],
+            },
+            "pronunciations": [{
+                "pinyin": "xi pin",
+                "recommendedCode": "xkpb",
+                "sources": [{"source": "汉典"}],
+                "candidateStatuses": [
+                    {"code": "xkpb", "occupied": False, "label": "空位"},
+                    {"code": "xkpba", "occupied": False, "label": "空位"},
+                    {"code": "xkpbao", "occupied": False, "label": "空位"},
+                ],
+            }],
+        }
+        prepare_calls = 0
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            nonlocal prepare_calls
+            if tool_name == "keytao_lookup_by_word":
+                return json.dumps({
+                    "success": True,
+                    "word": "细品",
+                    "phrases": [],
+                }, ensure_ascii=False)
+            if tool_name == "keytao_pending_items_by_words":
+                return json.dumps({"success": True, "complete": True, "items": []})
+            if tool_name == "keytao_prepare_reviewed_add":
+                prepare_calls += 1
+                return json.dumps(review, ensure_ascii=False)
+            raise AssertionError(f"unexpected tool call: {tool_name}")
+
+        from keytao_bot.plugins import chat_commands as chat_commands_module
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "865189947", "tangtang")
+        space_key = ("qq", "qq:group:865189947")
+        execute = AsyncMock(return_value="写入草稿，已提交审核")
+        old_store = openai_chat_module.conversation_state_store
+        old_command_store = chat_commands_module.conversation_state_store
+        openai_chat_module.conversation_state_store = store
+        chat_commands_module.conversation_state_store = store
+        try:
+            with (
+                patch.object(
+                    openai_chat_module,
+                    "_classify_simple_word_query_intent",
+                    new=AsyncMock(return_value=SimpleWordQueryIntent(
+                        True,
+                        ("细品",),
+                        "word_lookup",
+                        0.99,
+                    )),
+                ),
+                patch.object(
+                    chat_commands_module,
+                    "call_tool_function",
+                    side_effect=fake_call,
+                ),
+                patch.object(
+                    chat_commands_module.user_resolver,
+                    "resolve_actor_binding",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch.object(
+                    chat_commands_module,
+                    "_execute_add_to_draft_and_submit",
+                    execute,
+                ),
+            ):
+                first_reply = await _try_handle_simple_single_word_query(
+                    "细品",
+                    "qq",
+                    "tangtang",
+                    conv_key,
+                    space_key,
+                    "汤汤",
+                    actionable_lookup=False,
+                )
+                result = await openai_chat_module.handle_pending_message_core(
+                    "加入并提交",
+                    "qq",
+                    "tangtang",
+                    conv_key,
+                    history=[],
+                    space_key=space_key,
+                    owner_label="汤汤",
+                    allow_intent_model=False,
+                )
+        finally:
+            openai_chat_module.conversation_state_store = old_store
+            chat_commands_module.conversation_state_store = old_command_store
+
+        check(
+            "first plain query renders a selector instead of read-only candidates",
+            first_reply is not None
+            and "回复编号或编码选择" in first_reply
+            and "本次仅查询" not in first_reply,
+        )
+        check(
+            "first plain query persists the exact trusted candidate record",
+            isinstance(store.get(conv_key), type(None))
+            and execute.await_count == 1,
+        )
+        check(
+            "bare add-and-submit uses xkpb",
+            execute.await_args is not None
+            and execute.await_args.args[:2] == ("细品", "xkpb"),
+        )
+        check("bare add-and-submit completes in the next turn", result == "写入草稿，已提交审核")
+        check("no candidate regeneration occurs", prepare_calls == 1)
+
+    asyncio.run(_run())
+
+
 def test_s38_query_candidate_controls_all_use_record_first_recovery():
     print("\n🧪 S38 query candidate controls use record-first recovery")
 
@@ -15931,6 +16058,113 @@ def test_tool_executor_draft_policy_guards():
     asyncio.run(_run_tool_executor_policy_checks())
 
 
+def test_delete_at_code_possessive_grammar_and_wrong_tool_guard():
+    """Possessive deletes bind one row and reject create/shift improvisation."""
+    print("\n🧪 delete-at-code possessive grammar and wrong-tool guard")
+    from keytao_bot.harness.authorization_grammar import (
+        parse_dictionary_delete_command,
+    )
+
+    variants = (
+        "删除 nsl 的 哪里",
+        "删除nsl的哪里",
+        "删掉 nsl 上的哪里",
+        "把 nsl 的哪里删了",
+        "把「nsl」的「哪里」删掉",
+        "删掉 “nsl” 上的 “哪里”",
+    )
+    parsed = [parse_dictionary_delete_command(value) for value in variants]
+    check(
+        "all possessive delete variants bind 哪里@nsl",
+        all(
+            command is not None
+            and command.word == "哪里"
+            and command.code == "nsl"
+            for command in parsed
+        ),
+    )
+
+    async def _run():
+        calls = []
+
+        async def wrong_tool_sink(**kwargs):
+            calls.append(dict(kwargs))
+            return {"success": True}
+
+        executor = ToolExecutor(
+            lambda name: (
+                wrong_tool_sink
+                if name in {"keytao_create_phrase", "keytao_shift_phrase_code"}
+                else None
+            ),
+            frozenset(),
+        )
+        blocked = json.loads(await executor.call(
+            "keytao_create_phrase",
+            {"word": "哪里", "code": "nsl"},
+            ToolContext(
+                platform="qq",
+                user_id="evo",
+                current_message="删除nsl的哪里",
+                writes_allowed=True,
+            ),
+        ))
+        check("delete intent rejects a create tool", blocked.get("blockReason") == "intent_mismatch")
+        check("wrong-tool reason says delete vs create", "要求删除" in blocked.get("message", "") and "新增" in blocked.get("message", ""))
+        check("wrong-tool copy does not claim missing literals", "词条或编码与这条消息不一致" not in blocked.get("message", ""))
+        blocked_shift = json.loads(await executor.call(
+            "keytao_shift_phrase_code",
+            {"word": "哪里", "target_code": "nsl"},
+            ToolContext(
+                platform="qq",
+                user_id="evo",
+                current_message="删除nsl的哪里",
+                writes_allowed=True,
+            ),
+        ))
+        check("delete intent also rejects a shift tool", blocked_shift.get("blockReason") == "intent_mismatch" and "改码" in blocked_shift.get("message", ""))
+        check("wrong create tool never executes", calls == [])
+
+        staged = AsyncMock(return_value="已锁定删除 哪里@nsl")
+
+        async def fake_call(tool_name, arguments, platform=None, user_id=None):
+            check("deterministic delete only looks up 哪里", tool_name == "keytao_lookup_by_word" and arguments == {"word": "哪里"})
+            return json.dumps({
+                "success": True,
+                "word": "哪里",
+                "phrases": [
+                    {"word": "哪里", "code": "nsl", "type": "Phrase"},
+                    {"word": "哪里", "code": "nslko", "type": "Phrase"},
+                ],
+            }, ensure_ascii=False)
+
+        with (
+            patch.object(chat_commands_module, "call_tool_function", side_effect=fake_call),
+            patch.object(chat_commands_module, "_execute_confirmed_tool", staged),
+        ):
+            response = await chat_commands_module._try_handle_draft_management_command(
+                "删除nsl的哪里",
+                "qq",
+                "evo",
+                ("qq", "qq:group:delete-test"),
+                "EVO",
+            )
+        plan = staged.await_args.args[0] if staged.await_args is not None else None
+        check("deterministic delete route claims the turn", response == "已锁定删除 哪里@nsl")
+        check(
+            "delete plan targets only the nsl row",
+            isinstance(plan, PendingToolConfirm)
+            and plan.args.get("items") == [{
+                "action": "Delete",
+                "word": "哪里",
+                "code": "nsl",
+                "type": "Phrase",
+            }],
+        )
+
+    asyncio.run(_run())
+
+
 class _FakeAIMessage:
     def __init__(self, content=None, tool_calls=None, reasoning_content=None):
         self.content = content
@@ -15995,6 +16229,91 @@ class _FakeToolSkillsManager:
                 },
             },
         }]
+
+
+def test_wrong_delete_tool_falls_back_to_deterministic_route():
+    """An intent-mismatch block is handed to the deterministic command route."""
+    print("\n🧪 wrong delete tool falls back to deterministic route")
+
+    async def _run():
+        tool_call = types.SimpleNamespace(
+            id="call_wrong_create",
+            type="function",
+            function=types.SimpleNamespace(
+                name="keytao_create_phrase",
+                arguments=json.dumps({"word": "哪里", "code": "nsl"}),
+            ),
+        )
+        client = _FakeClient([
+            _FakeAIResponse("tool_calls", "", [tool_call]),
+            _FakeAIResponse("stop", "请重新说明要做什么。"),
+        ])
+        sink_calls = []
+
+        async def create_sink(**kwargs):
+            sink_calls.append(dict(kwargs))
+            return {"success": True}
+
+        class DeleteToolSkills:
+            def get_skill_instructions(self):
+                return ""
+
+            def has_tools(self):
+                return True
+
+            def get_tools(self):
+                return [{
+                    "type": "function",
+                    "function": {
+                        "name": "keytao_create_phrase",
+                        "description": "Create one phrase",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "word": {"type": "string"},
+                                "code": {"type": "string"},
+                            },
+                            "required": ["word", "code"],
+                        },
+                    },
+                }]
+
+        fallback = AsyncMock(return_value="已进入确定性删除流程：哪里@nsl")
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="fake-model",
+                max_tokens=1000,
+                temperature=0.0,
+                timeout=10.0,
+            ),
+            skills_manager=DeleteToolSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: create_sink if name == "keytao_create_phrase" else None,
+                frozenset(),
+            ),
+            state_store=MemoryConversationStateStore(),
+            bind_help_text="bind help",
+            system_prompt_core="system",
+            deterministic_fallback_handler=fallback,
+        )
+
+        response = await orchestrator.run(
+            "删除nsl的哪里",
+            AgentRequestContext(
+                platform="qq",
+                user_id="evo",
+                mutations_allowed=True,
+            ),
+        )
+
+        check("wrong create never reaches its sink", sink_calls == [])
+        check("intent mismatch invokes deterministic fallback once", fallback.await_count == 1)
+        check("fallback receives the original delete turn", fallback.await_args is not None and fallback.await_args.args[0] == "删除nsl的哪里")
+        check("turn returns the deterministic delete result", response == "已进入确定性删除流程：哪里@nsl")
+        check("model is not asked to improvise again", len(client.completions.calls) == 1)
+
+    asyncio.run(_run())
 
 
 async def _run_orchestrator_empty_response_retry_checks():
@@ -22718,6 +23037,7 @@ if __name__ == "__main__":
     test_different_code_proceeds_through_both_sinks_with_pending_fact()
     test_model_batch_pending_fact_leads_and_arms_one_local_confirmation()
     test_read_word_query_persists_server_candidate_record()
+    test_plain_query_then_bare_add_and_submit_uses_first_render_record()
     test_s38_query_candidate_controls_all_use_record_first_recovery()
     test_candidate_commonness_copy_snapshot_and_zero_writes()
     test_recommended_reorder_submit_chains_after_one_plan_confirmation()
@@ -22903,6 +23223,8 @@ if __name__ == "__main__":
     test_draft_encode_candidates_include_alternate_pronunciations()
     test_draft_encode_candidates_include_phrase_polyphone_candidates()
     test_tool_executor_draft_policy_guards()
+    test_delete_at_code_possessive_grammar_and_wrong_tool_guard()
+    test_wrong_delete_tool_falls_back_to_deterministic_route()
     test_orchestrator_empty_response_retry()
     test_orchestrator_deepseek_policy()
     test_orchestrator_preserves_authoritative_batch_link()
