@@ -769,6 +769,15 @@ class DictionaryRecodeCommand:
 
 
 @dataclass(frozen=True)
+class ReplaceAtCodeCommand:
+    """Replace one exact live word with another at one literal code."""
+
+    code: str
+    old_word: str
+    new_word: str
+
+
+@dataclass(frozen=True)
 class EntryMovePlanCommand:
     """Two literal existing-entry moves that must share one sealed plan."""
 
@@ -1001,6 +1010,39 @@ _DICTIONARY_RECODE_WHOLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_REPLACE_AT_CODE_ENTRY_PATTERN = (
+    r'(?:「[^」\r\n]{1,16}」|“[^”\r\n]{1,16}”|'
+    r'‘[^’\r\n]{1,16}’|『[^』\r\n]{1,16}』|'
+    r'"[^"\r\n]{1,16}"|\'[^\'\r\n]{1,16}\'|'
+    r'[\u3400-\u9fff]{1,16})'
+)
+_REPLACE_AT_CODE_PATTERNS = (
+    re.compile(
+        rf"^(?:把|将)\s*(?:编码|代码)?\s*"
+        rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*的\s*"
+        rf"(?P<old>{_REPLACE_AT_CODE_ENTRY_PATTERN})\s*"
+        rf"(?:改成|改为|换成)\s*"
+        rf"(?P<new>{_REPLACE_AT_CODE_ENTRY_PATTERN})$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^(?:编码|代码)\s*"
+        rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*(?:的\s*)?"
+        rf"(?P<old>{_REPLACE_AT_CODE_ENTRY_PATTERN})\s*"
+        rf"(?:改成|改为|换成)\s*"
+        rf"(?P<new>{_REPLACE_AT_CODE_ENTRY_PATTERN})$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^(?:修改|替换)\s*(?:编码|代码)?\s*"
+        rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*[：:]\s*"
+        rf"(?P<old>{_REPLACE_AT_CODE_ENTRY_PATTERN})\s*"
+        r"(?:→|->|=>|⇒|⟶|➡)\s*"
+        rf"(?P<new>{_REPLACE_AT_CODE_ENTRY_PATTERN})$",
+        re.IGNORECASE,
+    ),
+)
+
 _ENTRY_MOVE_PLAN_CLAUSE_RE = re.compile(
     r"^(?:把|将)\s*[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
     r"(?:调整到|改到|移到|挪到|换到)\s*"
@@ -1117,6 +1159,111 @@ def parse_dictionary_recode_command(
         word=delete_word,
         old_code=old_code,
         new_code=new_code,
+    )
+
+
+def _replace_at_code_word(value: str) -> str:
+    raw = str(value or "").strip()
+    quote_pairs = {
+        "「": "」",
+        "“": "”",
+        "‘": "’",
+        "『": "』",
+        '"': '"',
+        "'": "'",
+    }
+    closing = quote_pairs.get(raw[:1])
+    if closing is not None:
+        if len(raw) < 3 or not raw.endswith(closing):
+            return ""
+        raw = raw[1:-1].strip()
+    return raw if re.fullmatch(r"[\u3400-\u9fff]{1,16}", raw) else ""
+
+
+def parse_replace_at_code(message: str) -> Optional[ReplaceAtCodeCommand]:
+    """Parse one closed code-scoped replacement as Delete old + Create new."""
+    raw = str(message or "")
+    if not (
+        (
+            re.search(r"(?:改成|改为|换成)", raw)
+            and re.search(r"(?:把|将|编码|代码)", raw)
+        )
+        or (
+            re.search(r"(?:修改|替换)", raw)
+            and re.search(r"(?:→|->|=>|⇒|⟶|➡)", raw)
+        )
+    ):
+        return None
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(raw), count=1
+    ).strip()
+    if (
+        not source
+        or re.search(r"[?？]", source)
+        or _NEGATIVE_MODAL_RE.search(source)
+        or _NEGATED_NON_POSITIONAL_MUTATION_RE.search(source)
+        or _has_standalone_negation_before_mutation(source)
+        or _POSITIONAL_REPORTED_CONTEXT_RE.search(source)
+        or _DATA_CONTEXT_RE.search(source)
+        or _META_DISCUSSION_RE.search(source)
+        or _EXPLANATION_ONLY_RE.search(source)
+        or _TEXT_TRANSFORM_RE.search(source)
+    ):
+        return None
+    source = re.sub(
+        r"^\s*(?:确认执行)\s*[：:]\s*",
+        "",
+        source,
+        count=1,
+    )
+    source = _COMMAND_PREFIX_RE.sub("", source, count=1)
+    source = source.rstrip("。.!！").strip()
+    match = next(
+        (
+            candidate.fullmatch(source)
+            for candidate in _REPLACE_AT_CODE_PATTERNS
+            if candidate.fullmatch(source) is not None
+        ),
+        None,
+    )
+    if match is None:
+        return None
+    code = str(match.group("code") or "").strip().lower()
+    old_word = _replace_at_code_word(match.group("old"))
+    new_word = _replace_at_code_word(match.group("new"))
+    if not code or not old_word or not new_word or old_word == new_word:
+        return None
+    return ReplaceAtCodeCommand(
+        code=code,
+        old_word=old_word,
+        new_word=new_word,
+    )
+
+
+def replace_at_code_items_match(
+    command: ReplaceAtCodeCommand,
+    items: object,
+    *,
+    phrase_type: str = "",
+) -> bool:
+    """Bind a replacement to exactly one typed Delete+Create item pair."""
+    if not isinstance(items, list) or len(items) != 2:
+        return False
+    delete_item, create_item = items
+    if not isinstance(delete_item, dict) or not isinstance(create_item, dict):
+        return False
+    delete_type = str(delete_item.get("type") or "").strip()
+    create_type = str(create_item.get("type") or "").strip()
+    expected_type = phrase_type or delete_type
+    return bool(
+        expected_type
+        and delete_type == create_type == expected_type
+        and str(delete_item.get("action") or "").strip() == "Delete"
+        and str(delete_item.get("word") or "").strip() == command.old_word
+        and str(delete_item.get("code") or "").strip().lower() == command.code
+        and str(create_item.get("action") or "Create").strip() == "Create"
+        and str(create_item.get("word") or "").strip() == command.new_word
+        and str(create_item.get("code") or "").strip().lower() == command.code
     )
 
 
@@ -2732,6 +2879,8 @@ def message_authorizes_mutation(message: str) -> bool:
         return True
     if parse_dictionary_delete_command(message) is not None:
         return True
+    if parse_replace_at_code(message) is not None:
+        return True
     if parse_dictionary_recode_command(message) is not None:
         return True
     if parse_entry_move_plan(message) is not None:
@@ -2747,6 +2896,32 @@ def message_authorizes_mutation(message: str) -> bool:
         return False
     multi_add = _multi_add_authorization_contract(message)
     return multi_add is None or multi_add.valid
+
+
+def looks_like_mutation_grammar_gap(message: str) -> bool:
+    """Flag a positive write-shaped turn after authorization already failed."""
+    source = _LEADING_MENTION_RE.sub(
+        "", trusted_mutation_source(message), count=1
+    ).strip()
+    compact = re.sub(r"\s+", "", source)
+    if (
+        not compact
+        or re.search(r"[?？]", compact)
+        or _NEGATIVE_MODAL_RE.search(compact)
+        or _NEGATED_NON_POSITIONAL_MUTATION_RE.search(compact)
+        or _has_standalone_negation_before_mutation(source)
+        or _POSITIONAL_REPORTED_CONTEXT_RE.search(compact)
+        or _DATA_CONTEXT_RE.search(compact)
+        or _META_DISCUSSION_RE.search(compact)
+        or _EXPLANATION_ONLY_RE.search(compact)
+        or _TEXT_TRANSFORM_RE.search(compact)
+    ):
+        return False
+    return bool(
+        _MUTATION_INTENT_RE.search(compact)
+        and re.search(r"[a-z]{1,12}", compact, re.IGNORECASE)
+        and re.search(r"[\u3400-\u9fff]{1,16}", compact)
+    )
 
 
 # Verbs that express "change where this code sits" in everyday Chinese.  Most
@@ -5077,9 +5252,49 @@ def _validate_current_message_binding(
         dictionary_recode = parse_dictionary_recode_command(
             context.current_message or ""
         )
+        replace_at_code = parse_replace_at_code(
+            context.current_message or ""
+        )
         dictionary_delete_is_bound = False
         dictionary_recode_is_bound = False
-        if dictionary_recode is not None:
+        replace_at_code_is_bound = False
+        if replace_at_code is not None:
+            trusted_type = ToolExecutor._trusted_phrase_type(
+                context,
+                replace_at_code.old_word,
+                replace_at_code.code,
+            )
+            reviewed_create = (
+                context.trusted_reviewed_items_by_key or {}
+            ).get((replace_at_code.new_word, replace_at_code.code))
+            replace_at_code_is_bound = bool(
+                trusted_type
+                and isinstance(reviewed_create, dict)
+                and str(reviewed_create.get("word") or "").strip()
+                == replace_at_code.new_word
+                and str(reviewed_create.get("code") or "").strip().lower()
+                == replace_at_code.code
+                and str(reviewed_create.get("type") or "").strip()
+                == trusted_type
+                and replace_at_code.code
+                in trusted_word_lookup_codes.get(
+                    replace_at_code.old_word,
+                    frozenset(),
+                )
+                and replace_at_code_items_match(
+                    replace_at_code,
+                    items,
+                    phrase_type=trusted_type,
+                )
+            )
+            if not replace_at_code_is_bound:
+                return policy_block(
+                    BLOCK_REASON_BINDING_INCOMPLETE,
+                    f"{POLICY_BLOCK_TEMPLATE_PREFIX}替换计划与本轮词条、编码"
+                    "或服务端词库记录不一致；整批均未写入。",
+                    missing=["exactReplaceAtCodeSet"],
+                )
+        elif dictionary_recode is not None:
             trusted_type = ToolExecutor._trusted_phrase_type(
                 context,
                 dictionary_recode.word,
@@ -5199,6 +5414,7 @@ def _validate_current_message_binding(
                 pending_batch_is_bound
                 or dictionary_delete_is_bound
                 or dictionary_recode_is_bound
+                or replace_at_code_is_bound
             )
             else items
         ):

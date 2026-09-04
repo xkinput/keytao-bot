@@ -31,6 +31,7 @@ from ..harness.authorization_grammar import (
     parse_entry_swap,
     parse_eviction_modified_add,
     parse_pending_positional_add,
+    parse_replace_at_code,
 )
 from ..harness.tools import (
     _COMMAND_PREFIX_PATTERN,
@@ -493,6 +494,7 @@ _DRAFT_FLOW_INTENTS = frozenset({
     "entry_move_plan",
     "dictionary_delete",
     "dictionary_recode",
+    "replace_at_code",
 })
 
 
@@ -2046,6 +2048,13 @@ def _is_fresh_current_user_command_intent(
             and command.old_code == command_intent.requested_code
             and (command.new_code,) == command_intent.requested_codes
         )
+    if command_intent.intent == "replace_at_code":
+        command = parse_replace_at_code(message_text)
+        return bool(
+            command is not None
+            and (command.old_word, command.new_word) == command_intent.keep_words
+            and command.code == command_intent.requested_code
+        )
     if command_intent.intent == "entry_swap":
         command = parse_entry_swap(message_text)
         return bool(
@@ -2308,6 +2317,14 @@ def _structural_draft_management_intent(
             intent="word_list_reorder",
             confidence=1.0,
             keep_words=word_list_reorder.words,
+        )
+    replace_at_code = parse_replace_at_code(message_text)
+    if replace_at_code is not None:
+        return MessageCommandIntent(
+            intent="replace_at_code",
+            confidence=1.0,
+            keep_words=(replace_at_code.old_word, replace_at_code.new_word),
+            requested_code=replace_at_code.code,
         )
     dictionary_recode = parse_dictionary_recode_command(message_text)
     if dictionary_recode is not None:

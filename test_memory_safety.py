@@ -20486,5 +20486,317 @@ class ActorBindingResolverTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class ReplaceAtCodeS51RegressionTests(unittest.IsolatedAsyncioTestCase):
+    def _replace_ticket(self) -> PendingToolConfirm:
+        items = [
+            {
+                "action": "Delete",
+                "word": "哪里",
+                "code": "nsl",
+                "type": "Phrase",
+            },
+            {
+                "action": "Create",
+                "word": "那算了",
+                "code": "nsl",
+                "type": "Phrase",
+                "needsManualReview": False,
+            },
+        ]
+        return PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": items,
+                "batch_id": "s51-batch",
+                "expected_content_version": 3,
+                "expected_warning_digest": "a" * 64,
+                "_replace_at_code": {
+                    "code": "nsl",
+                    "oldWord": "哪里",
+                    "newWord": "那算了",
+                    "remainingCodes": ["nslko"],
+                },
+                "_pending_display": {
+                    "items": items,
+                    "warnings": [],
+                },
+            },
+            confirmation_source="server_warning",
+        )
+
+    def test_replace_at_code_advertised_forms_close_through_real_parser(self) -> None:
+        forms = (
+            '编码nsl  "哪里"改为"那算了"',
+            "把 nsl 的「哪里」改成「那算了」",
+            "确认执行：把 nsl 的「哪里」改成「那算了」",
+            "把nsl的“哪里”换成“那算了”",
+            "修改 nsl：哪里 → 那算了",
+            "修改nsl: 哪里 -> 那算了",
+            "修改 nsl：'哪里' => '那算了'",
+        )
+        for message in forms:
+            with self.subTest(message=message):
+                parsed = authorization_grammar_module.parse_replace_at_code(message)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(
+                    (parsed.code, parsed.old_word, parsed.new_word),
+                    ("nsl", "哪里", "那算了"),
+                )
+                self.assertTrue(message_authorizes_mutation(message))
+
+        for unsafe in (
+            "能先删除再添加吗？",
+            "不要把 nsl 的「哪里」改成「那算了」",
+            "他说：修改 nsl：哪里 → 那算了",
+            "解释一下『修改 nsl：哪里 → 那算了』",
+            "修改 nsl：哪里 → 哪里",
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertIsNone(
+                    authorization_grammar_module.parse_replace_at_code(unsafe)
+                )
+
+    async def test_replace_at_code_stages_one_exact_reviewed_ticket(self) -> None:
+        from keytao_bot.plugins import chat_commands
+        from keytao_bot.plugins.chat_routing import MessageCommandIntent
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "865189947", "EVO")
+        pending_new = PendingAddWord(
+            word="那算了",
+            recommended_code="nsl",
+            candidates=[("nsl", True), ("nslo", False)],
+            code_remarks={"nsl": "喵喵审词：读音 nà suàn le"},
+            pronunciation_codes={"nsl": "na suan le", "nslo": "na suan le"},
+            server_candidates=[("nsl", True), ("nslo", False)],
+            needs_manual_review=False,
+        )
+
+        async def review(*_args, **_kwargs):
+            store.set(conv_key, pending_new, owner_label="EVO")
+            return "reviewed"
+
+        execute = AsyncMock(return_value="replace preview")
+        with (
+            patch.object(chat_commands, "conversation_state_store", store),
+            patch.object(
+                chat_commands,
+                "call_tool_function",
+                AsyncMock(return_value=json.dumps({
+                    "success": True,
+                    "phrases": [
+                        {"word": "哪里", "code": "nsl", "type": "Phrase"},
+                        {"word": "哪里", "code": "nslko", "type": "Phrase"},
+                    ],
+                }, ensure_ascii=False)),
+            ),
+            patch.object(
+                chat_commands,
+                "_try_handle_simple_single_word_query",
+                side_effect=review,
+            ) as reviewed,
+            patch.object(chat_commands, "_execute_confirmed_tool", execute),
+        ):
+            result = await chat_commands._try_handle_replace_at_code_command(
+                "把 nsl 的「哪里」改成「那算了」",
+                MessageCommandIntent(
+                    intent="replace_at_code",
+                    confidence=1.0,
+                    keep_words=("哪里", "那算了"),
+                    requested_code="nsl",
+                ),
+                "qq",
+                "EVO",
+                conv_key.space_key,
+                "EVO",
+            )
+
+        self.assertEqual(result, "replace preview")
+        reviewed.assert_awaited_once()
+        ticket = execute.await_args.args[0]
+        self.assertEqual(ticket.function_name, "keytao_batch_add_to_draft")
+        self.assertEqual(ticket.args["items"], [
+            {
+                "action": "Delete",
+                "word": "哪里",
+                "code": "nsl",
+                "type": "Phrase",
+            },
+            {
+                "action": "Create",
+                "word": "那算了",
+                "code": "nsl",
+                "type": "Phrase",
+                "remark": "喵喵审词：读音 nà suàn le",
+                "needsManualReview": False,
+            },
+        ])
+        self.assertEqual(ticket.args["_replace_at_code"], {
+            "code": "nsl",
+            "oldWord": "哪里",
+            "newWord": "那算了",
+            "remainingCodes": ["nslko"],
+        })
+
+    def test_replace_ticket_renders_exact_plan_and_remaining_location(self) -> None:
+        from keytao_bot.plugins import chat_commands
+
+        ticket = self._replace_ticket()
+        rendered = chat_commands.render_pending_replace_at_code_plan(ticket)
+        suggestion = chat_commands.render_executable_plan_suggestion(ticket)
+
+        self.assertIn("删除「哪里」@ nsl", rendered)
+        self.assertIn("创建「那算了」@ nsl", rendered)
+        self.assertIn("仍保留在 nslko", rendered)
+        self.assertIn(pending_confirmation_copy(), rendered)
+        self.assertNotRegex(rendered, r"只读轮|安全层|写工具|写轮|执行器")
+        self.assertIn("修改 nsl：哪里 → 那算了", suggestion)
+        advertised = advertised_command_suggestions(suggestion)
+        self.assertEqual(advertised, ("修改 nsl：哪里 → 那算了",))
+        self.assertIsNotNone(
+            authorization_grammar_module.parse_replace_at_code(advertised[0])
+        )
+
+    def test_pending_fact_placeholder_is_not_mistaken_for_a_live_ticket(self) -> None:
+        reply = (
+            "「开团」已在待审核批次中（→ khtt，审核中）："
+            "https://keytao.vercel.app/batch/s34-batch\n\n"
+            "若要再加其他编码，可发送「添加 开团 <编码>」；"
+            "若需撤回，可发送「撤回提交」。"
+        )
+
+        self.assertEqual(advertised_command_suggestions(reply), ())
+        self.assertFalse(advertised_reply_contract(reply).requires_live_state)
+
+    def test_replace_at_code_sink_requires_exact_lookup_and_review_bindings(self) -> None:
+        items = self._replace_ticket().args["items"]
+        command = '编码nsl "哪里"改为"那算了"'
+        context = ToolContext(
+            current_message=command,
+            writes_allowed=True,
+            trusted_word_lookup_codes_by_word={
+                "哪里": frozenset({"nsl", "nslko"}),
+            },
+            trusted_phrase_types_by_key={
+                ("哪里", "nsl"): frozenset({"Phrase"}),
+            },
+            trusted_reviewed_items_by_key={
+                ("那算了", "nsl"): {
+                    "word": "那算了",
+                    "code": "nsl",
+                    "type": "Phrase",
+                },
+            },
+        )
+
+        self.assertIsNone(ToolExecutor._validate_current_message_binding(
+            "keytao_batch_add_to_draft",
+            {"items": items},
+            context,
+        ))
+        missing_review = replace(context, trusted_reviewed_items_by_key={})
+        self.assertIsNotNone(ToolExecutor._validate_current_message_binding(
+            "keytao_batch_add_to_draft",
+            {"items": items},
+            missing_review,
+        ))
+        self.assertIsNotNone(ToolExecutor._validate_current_message_binding(
+            "keytao_batch_add_to_draft",
+            {"items": [*items, {
+                "action": "Create",
+                "word": "夹带",
+                "code": "jd",
+                "type": "Phrase",
+            }]},
+            context,
+        ))
+
+    def test_delivery_boundary_redraws_literal_dump_from_live_ticket(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        store = MemoryConversationStateStore()
+        memory_context = ChatMemoryContext(
+            platform="qq",
+            user_id="EVO",
+            space_type="group",
+            space_id="865189947",
+            speaker_name="EVO",
+        )
+        store.set(
+            memory_context.conversation_address,
+            self._replace_ticket(),
+            owner_label="EVO",
+        )
+        raw_replies = (
+            "{'word': '哪里', 'code': 'nsl'}",
+            '[{"action":"Delete","word":"哪里","code":"nsl"}]',
+        )
+        with patch.object(chat_module, "conversation_state_store", store):
+            for raw in raw_replies:
+                with self.subTest(raw=raw):
+                    delivered = chat_module._prepare_user_facing_reply(
+                        raw,
+                        memory_context,
+                    )
+                    self.assertIn("删除「哪里」@ nsl", delivered)
+                    self.assertIn("创建「那算了」@ nsl", delivered)
+                    self.assertNotIn(raw, delivered)
+
+    def test_no_ticket_strips_incident_confirmation_and_mechanism_copy(self) -> None:
+        from keytao_bot.harness import orchestrator as orchestrator_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "865189947", "EVO")
+        advertised_without_ticket = (
+            "可发送「确认执行：把 nsl 的「哪里」改成「那算了」」"
+        )
+        despair = (
+            "本轮为只读轮，写工具会被安全层拦截。"
+            "以后也无法执行，能不能执行由执行器决定。"
+        )
+        with patch.object(chat_module, "conversation_state_store", store):
+            stripped = chat_module._enforce_advertised_reply_contract(
+                advertised_without_ticket,
+                conv_key,
+            )
+            delivered = chat_module._prepare_user_facing_reply(
+                despair,
+                ChatMemoryContext(
+                    platform="qq",
+                    user_id="EVO",
+                    space_type="group",
+                    space_id="865189947",
+                ),
+            )
+
+        self.assertNotIn("确认执行", stripped)
+        self.assertNotIn("确认/取消", stripped)
+        self.assertNotRegex(
+            delivered,
+            r"只读轮|安全层|写工具|写轮|执行器|以后也无法执行",
+        )
+        self.assertNotRegex(
+            orchestrator_module.READ_ONLY_TURN_GUIDANCE,
+            r"只读轮|安全层|写工具|写轮|执行器|解析器",
+        )
+        self.assertIn("suggestedCommand", orchestrator_module.READ_ONLY_TURN_GUIDANCE)
+
+    def test_plain_write_intent_without_closed_grammar_logs_gap(self) -> None:
+        from keytao_bot.harness import orchestrator as orchestrator_module
+
+        with patch.object(orchestrator_module.logger, "warning") as warning:
+            marked = orchestrator_module.log_grammar_gap_if_needed(
+                "请修改 nsl 的哪里并同步处理旧词",
+                mutations_allowed=False,
+            )
+
+        self.assertTrue(marked)
+        self.assertTrue(any(
+            "[grammar_gap]" in str(call.args[0])
+            for call in warning.call_args_list
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

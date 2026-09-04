@@ -7629,6 +7629,211 @@ async def scenario_s50(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S51_OLD_WORD = "哪里"
+S51_NEW_WORD = "那算了"
+S51_TARGET_CODE = "nsl"
+S51_REMAINING_CODE = "nslko"
+S51_DISCOVERY = f"喵喵 {S51_OLD_WORD}"
+S51_COMMAND = f'编码{S51_TARGET_CODE}  "{S51_OLD_WORD}"改为"{S51_NEW_WORD}"'
+S51_ADVERTISED_FORMS = (
+    f"把 {S51_TARGET_CODE} 的「{S51_OLD_WORD}」改成「{S51_NEW_WORD}」",
+    f"确认执行：把 {S51_TARGET_CODE} 的「{S51_OLD_WORD}」改成「{S51_NEW_WORD}」",
+    f"修改 {S51_TARGET_CODE}：{S51_OLD_WORD} → {S51_NEW_WORD}",
+)
+
+
+async def scenario_s51(ctx: ScenarioContext) -> dict[str, Any]:
+    """Replace one exact code row and preserve the old word at another code."""
+    from keytao_bot.harness.authorization_grammar import (
+        message_authorizes_mutation,
+        parse_replace_at_code,
+        replace_at_code_items_match,
+    )
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import (
+        PendingToolConfirm,
+        server_warning_ticket_is_complete,
+    )
+    from keytao_bot.plugins.chat_commands import (
+        render_pending_replace_at_code_plan,
+    )
+    from keytao_bot.plugins.chat_render import (
+        _reply_has_raw_literal_dump,
+    )
+
+    fixture = ctx.fixture_facts.get("s51") or {}
+    require(
+        fixture.get("targetCode") == S51_TARGET_CODE
+        and fixture.get("remainingCode") == S51_REMAINING_CODE
+        and S51_TARGET_CODE in fixture.get("newWordCandidateCodes", []),
+        f"S51 fixture is incomplete: {fixture}",
+    )
+    address = ConversationAddress.group(
+        "qq",
+        str(ctx.bot._group_id(ctx.platform_id)),
+        ctx.platform_id,
+    )
+    messages: list[str] = []
+    replies: list[str] = []
+    messages.append(S51_DISCOVERY)
+    discovery = await ctx.send_group(S51_DISCOVERY, to_me=True)
+    replies.append(discovery)
+    assert_reply_mentions(
+        discovery,
+        S51_OLD_WORD,
+        S51_TARGET_CODE,
+        S51_REMAINING_CODE,
+    )
+    discovery_record = ctx.bot.openai_chat.conversation_state_store.get_record(
+        address
+    )
+    require(
+        not isinstance(
+            discovery_record.state if discovery_record is not None else None,
+            PendingToolConfirm,
+        )
+        and pending_confirmation_copy() not in discovery,
+        f"S51 lookup advertised confirmation without a ticket: {discovery}",
+    )
+    model_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
+
+    messages.append(S51_COMMAND)
+    preview = await ctx.send_group(S51_COMMAND, to_me=True)
+    replies.append(preview)
+    record = ctx.bot.openai_chat.conversation_state_store.get_record(address)
+    require(
+        record is not None
+        and isinstance(record.state, PendingToolConfirm)
+        and record.state.function_name == "keytao_batch_add_to_draft"
+        and server_warning_ticket_is_complete(record.state),
+        f"S51 replacement did not create a complete ticket in one turn: {record}",
+    )
+    parsed = parse_replace_at_code(S51_COMMAND)
+    require(
+        parsed is not None
+        and replace_at_code_items_match(parsed, record.state.args.get("items")),
+        f"S51 ticket was not bound to the exact replacement: {record.state.args}",
+    )
+    metadata = record.state.args.get("_replace_at_code")
+    planned_items = {
+        item_key(item)
+        for item in record.state.args.get("items") or []
+        if isinstance(item, dict)
+    }
+    expected_items = {
+        ("Delete", S51_OLD_WORD, S51_TARGET_CODE),
+        ("Create", S51_NEW_WORD, S51_TARGET_CODE),
+    }
+    require(
+        planned_items == expected_items
+        and isinstance(metadata, dict)
+        and metadata.get("remainingCodes") == [S51_REMAINING_CODE],
+        f"S51 replacement ticket changed scope: {record.state.args}",
+    )
+    require(
+        render_pending_replace_at_code_plan(record.state)
+        and preview.startswith("🔁 替换计划：")
+        and pending_confirmation_copy() in preview
+        and f"仍保留在 {S51_REMAINING_CODE}" in preview,
+        f"S51 preview was not the trusted replacement rendering: {preview}",
+    )
+    require(
+        (await ctx.draft()).get("items", []) == [],
+        "S51 replacement wrote before assent",
+    )
+
+    messages.append("确认")
+    receipt = await ctx.send_group("确认", to_me=True)
+    replies.append(receipt)
+    final_draft = await ctx.draft()
+    final_items = {
+        item_key(item)
+        for item in final_draft.get("items") or []
+        if isinstance(item, dict)
+    }
+    require(
+        final_items == expected_items
+        and len(final_draft.get("items") or []) == 2,
+        f"S51 assent did not write the sealed replacement: {final_draft}",
+    )
+    assert_reply_mentions(
+        receipt,
+        f"删除「{S51_OLD_WORD}」@ {S51_TARGET_CODE}",
+        f"创建「{S51_NEW_WORD}」@ {S51_TARGET_CODE}",
+        f"仍保留在 {S51_REMAINING_CODE}",
+    )
+
+    live_old_codes = sorted({
+        str(row.get("code") or "").strip().lower()
+        for row in await ctx.next_client.phrases_by_word(S51_OLD_WORD)
+        if str(row.get("code") or "").strip().lower()
+    })
+    require(
+        live_old_codes == sorted((S51_TARGET_CODE, S51_REMAINING_CODE)),
+        f"S51 live dictionary fixture drifted before draft approval: {live_old_codes}",
+    )
+
+    closure = (S51_COMMAND, *S51_ADVERTISED_FORMS)
+    for command in closure:
+        parsed_form = parse_replace_at_code(command)
+        require(
+            parsed_form is not None
+            and message_authorizes_mutation(command)
+            and (
+                parsed_form.code,
+                parsed_form.old_word,
+                parsed_form.new_word,
+            ) == (S51_TARGET_CODE, S51_OLD_WORD, S51_NEW_WORD),
+            f"S51 advertised form failed real-parser closure: {command}",
+        )
+    banned_copy = re.compile(
+        r"只读轮|安全层|写工具|写轮|执行器|解析器|以后.{0,12}(?:拦截|无法|不能执行)"
+    )
+    require(
+        not any(_reply_has_internal_fragment(reply) for reply in replies)
+        and not any(_reply_has_raw_literal_dump(reply) for reply in replies)
+        and not any(banned_copy.search(reply) for reply in replies),
+        f"S51 leaked internal, despairing, or raw-literal copy: {replies}",
+    )
+    model_events = [
+        event
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > model_cutoff
+        and event.get("kind") == "modelExchange"
+    ]
+    routing_model_events = [
+        event
+        for event in model_events
+        if "轻量语义路由器" in str(
+            ((event.get("request") or {}).get("messages") or [{}])[0].get(
+                "content", ""
+            )
+        )
+    ]
+    require(
+        routing_model_events == [],
+        "S51 deterministic route unexpectedly called a semantic router: "
+        f"{routing_model_events}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": final_draft,
+        "facts": {
+            "ticketComplete": True,
+            "previewedItems": sorted(planned_items),
+            "finalItems": sorted(final_items),
+            "remainingCodes": [S51_REMAINING_CODE],
+            "advertisedClosure": list(closure),
+            "routingModelRequests": 0,
+            "reviewModelRequests": len(model_events),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -7680,6 +7885,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S48", "numbered candidate create-with-eviction", scenario_s48),
     Scenario("S49", "reasoning-only exhaustion bounded recovery", scenario_s49),
     Scenario("S50", "relative-position grammar and honest confirmation", scenario_s50),
+    Scenario("S51", "replace-at-code grammar and honest confirmation", scenario_s51),
 )
 
 

@@ -2134,6 +2134,11 @@ def _render_live_batch_record(record: Optional[PendingStateRecord]) -> str:
         or record.state.function_name != "keytao_batch_add_to_draft"
     ):
         return ""
+    replace_at_code = _chat_commands.render_pending_replace_at_code_plan(
+        record.state
+    )
+    if replace_at_code:
+        return replace_at_code
     return render_server_backed_batch_candidates(
         record.state.args.get("items"),
         record.state.args.get("_candidate_scopes"),
@@ -2469,6 +2474,20 @@ def _prepare_user_facing_reply(
             {},
             history=history,
         ) or prepared
+        prepared = _enforce_advertised_reply_contract(prepared, conv_key)
+    if _chat_render._reply_requires_deterministic_redraw(prepared):
+        logger.error(
+            "Replacing unsafe generated reply at the final delivery boundary"
+        )
+        record_backed = (
+            _render_live_shift_record(live_record)
+            or _render_live_batch_record(live_record)
+            or _render_live_word_set_record(live_record)
+            or _render_live_single_candidate_record(live_record)
+        )
+        prepared = record_backed or (
+            "这次没有生成可发送的回复；本次未写入。"
+        )
         prepared = _enforce_advertised_reply_contract(prepared, conv_key)
     prepared = strip_warning_count_copy(prepared)
     prepared = render_platform_public_links(prepared, platform)

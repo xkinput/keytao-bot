@@ -33,6 +33,8 @@ from ..harness.authorization_grammar import (
     parse_entry_swap,
     parse_contextual_relative_position,
     parse_eviction_modified_add,
+    parse_replace_at_code,
+    replace_at_code_items_match,
     unnamed_eviction_modified_add_item,
 )
 from ..harness.state import (
@@ -5319,6 +5321,84 @@ def _compact_ranked_shift_evidence(evidence_lines: List[str]) -> str:
     return "关键证据：" + decisive
 
 
+def _replace_at_code_ticket_details(
+    state: PendingToolConfirm,
+) -> Optional[Dict[str, Any]]:
+    if state.function_name != "keytao_batch_add_to_draft":
+        return None
+    raw = state.args.get("_replace_at_code")
+    if not isinstance(raw, dict):
+        return None
+    code = str(raw.get("code") or "").strip().lower()
+    old_word = str(raw.get("oldWord") or "").strip()
+    new_word = str(raw.get("newWord") or "").strip()
+    remaining = raw.get("remainingCodes")
+    if not isinstance(remaining, list):
+        return None
+    remaining_codes = tuple(dict.fromkeys(
+        str(value or "").strip().lower()
+        for value in remaining
+        if str(value or "").strip()
+    ))
+    if (
+        len(remaining_codes) != len(remaining)
+        or any(
+            re.fullmatch(r"[a-z]{1,12}", value) is None or value == code
+            for value in remaining_codes
+        )
+    ):
+        return None
+    command = parse_replace_at_code(
+        f"修改 {code}：{old_word} → {new_word}"
+    )
+    items = state.args.get("items")
+    if command is None or not replace_at_code_items_match(command, items):
+        return None
+    create_item = items[1]
+    return {
+        "code": code,
+        "oldWord": old_word,
+        "newWord": new_word,
+        "remainingCodes": remaining_codes,
+        "needsManualReview": bool(create_item.get("needsManualReview", True)),
+    }
+
+
+def render_pending_replace_at_code_plan(state: PendingToolConfirm) -> str:
+    """Render a code replacement only from one complete server ticket."""
+    details = _replace_at_code_ticket_details(state)
+    if details is None or not server_warning_ticket_is_complete(state):
+        return ""
+    old_word = details["oldWord"]
+    new_word = details["newWord"]
+    code = details["code"]
+    lines = [
+        "🔁 替换计划：",
+        f"• 删除「{old_word}」@ {code}",
+        (
+            f"• 创建「{new_word}」@ {code}（需管理员审核）"
+            if details["needsManualReview"]
+            else f"• 创建「{new_word}」@ {code}（可自动通过）"
+        ),
+    ]
+    remaining_codes = details["remainingCodes"]
+    if remaining_codes:
+        lines.append(
+            f"「{old_word}」仍保留在 " + "、".join(remaining_codes) + "。"
+        )
+    warnings = state.args.get("_pending_display", {}).get("warnings", [])
+    if isinstance(warnings, list):
+        lines.extend(
+            f"提示：{_plain_warning_message(warning)}"
+            for warning in warnings
+        )
+    lines.append(pending_confirmation_copy())
+    batch_url = _trusted_batch_url(state.args.get("_pending_display", {}))
+    if batch_url:
+        lines.append(f"草稿地址：{batch_url}")
+    return _assert_plain_user_facing_reply("\n".join(lines))
+
+
 def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     if function_name in {"keytao_remove_draft_item", "keytao_batch_remove_draft_items"}:
         targets = data.get("targets") if isinstance(data.get("targets"), list) else []
@@ -5826,6 +5906,7 @@ async def _execute_confirmed_tool(
             "编码链重排集合校验失败，当前确认已失效；本次未写入",
         )
 
+    replace_at_code_details = _replace_at_code_ticket_details(state)
     args = _pending_execution_args(state)
     args.pop("preview_only", None)
     args.pop("_candidate_scopes", None)
@@ -6266,11 +6347,14 @@ async def _execute_confirmed_tool(
             ),
         }
         warning_prompt = (
-            _format_changed_server_confirmation_prompt(state, pending_state)
-            if state.confirmation_source == "server_warning"
-            else _format_server_warning_confirmation(
-                state.function_name,
-                display_data,
+            render_pending_replace_at_code_plan(pending_state)
+            or (
+                _format_changed_server_confirmation_prompt(state, pending_state)
+                if state.confirmation_source == "server_warning"
+                else _format_server_warning_confirmation(
+                    state.function_name,
+                    display_data,
+                )
             )
         )
         if len(warning_prompt) > MAX_REPLACE_CONFIRMATION_CHARS:
@@ -6451,6 +6535,32 @@ async def _execute_confirmed_tool(
                     suffix += "，已停止后续提交"
                 return prepend_pending_word_reminders(
                     response + suffix + "。",
+                    data.get("pendingItems"),
+                )
+            if replace_at_code_details is not None:
+                old_word = replace_at_code_details["oldWord"]
+                new_word = replace_at_code_details["newWord"]
+                code = replace_at_code_details["code"]
+                receipt = (
+                    "✅ 已按确认计划写入草稿："
+                    f"删除「{old_word}」@ {code}；"
+                    f"创建「{new_word}」@ {code}。"
+                )
+                remaining_codes = replace_at_code_details["remainingCodes"]
+                if remaining_codes:
+                    receipt += (
+                        f"\n「{old_word}」仍保留在 "
+                        + "、".join(remaining_codes)
+                        + "。"
+                    )
+                response = receipt + "\n" + await _format_draft_response(
+                    data,
+                    platform,
+                    user_id,
+                    compact=True,
+                )
+                return prepend_pending_word_reminders(
+                    response,
                     data.get("pendingItems"),
                 )
             response = stage_next_replace_char_chunk(response)
@@ -8279,6 +8389,140 @@ async def _try_handle_dictionary_delete_command(
     )
 
 
+async def _try_handle_replace_at_code_command(
+    message_text: str,
+    command_intent: MessageCommandIntent,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> Optional[str]:
+    """Review and seal one exact Delete old + Create new replacement."""
+    command = parse_replace_at_code(message_text)
+    if (
+        command is None
+        or command_intent.intent != "replace_at_code"
+        or command_intent.keep_words != (command.old_word, command.new_word)
+        or command_intent.requested_code != command.code
+    ):
+        return None
+    set_turn_flow("draft-op")
+    conv_key = normalize_conversation_key((platform, user_id), space_key)
+    lookup_json = await call_tool_function(
+        "keytao_lookup_by_word",
+        {"word": command.old_word},
+        platform,
+        user_id,
+    )
+    try:
+        lookup_data = json.loads(lookup_json)
+    except Exception:
+        lookup_data = {}
+    entries = _validated_dictionary_delete_entries(
+        lookup_data,
+        command.old_word,
+    )
+    if entries is None:
+        return render_remediation_reply(
+            f"无法取得「{command.old_word}」的完整词库记录；"
+            "本次未生成替换计划"
+        )
+    matches = [entry for entry in entries if entry["code"] == command.code]
+    if len(matches) != 1:
+        return _assert_plain_user_facing_reply(
+            f"词库无法唯一锁定「{command.old_word}」@{command.code}；"
+            "本次未写入。"
+        )
+    target = matches[0]
+    remaining_codes = list(dict.fromkeys(
+        entry["code"]
+        for entry in entries
+        if entry["code"] != command.code
+    ))
+
+    reviewed_reply = await _try_handle_simple_single_word_query(
+        f"加词 {command.new_word}",
+        platform,
+        user_id,
+        conv_key,
+        space_key,
+        owner_label,
+    )
+    record = conversation_state_store.get_record(conv_key)
+    reviewed_state = record.state if record is not None else None
+    if (
+        not isinstance(reviewed_state, PendingAddWord)
+        or reviewed_state.word != command.new_word
+        or not reviewed_state.server_candidates
+    ):
+        return reviewed_reply or render_remediation_reply(
+            f"无法取得「{command.new_word}」的完整审词记录；"
+            "本次未生成替换计划"
+        )
+    candidates = dict(reviewed_state.server_candidates)
+    reviewed_pinyin, _reviewed_codes = _pending_reviewed_reading(
+        reviewed_state,
+        command.code,
+    )
+    if command.code not in candidates or not reviewed_pinyin:
+        conversation_state_store.delete(conv_key)
+        return _assert_plain_user_facing_reply(
+            f"编码 {command.code} 不在「{command.new_word}」"
+            "本轮服务端已核验的读音候选中；本次未生成替换计划。"
+        )
+    create_args = _create_phrase_args(reviewed_state, command.code)
+    create_item: Dict[str, Any] = {
+        "action": "Create",
+        "word": command.new_word,
+        "code": command.code,
+        "type": target["type"],
+        "needsManualReview": bool(
+            create_args.get("needs_manual_review", True)
+        ),
+    }
+    remark = str(create_args.get("remark") or "").strip()
+    if remark:
+        create_item["remark"] = remark
+    items = [
+        {
+            "action": "Delete",
+            "word": command.old_word,
+            "code": command.code,
+            "type": target["type"],
+        },
+        create_item,
+    ]
+    if not replace_at_code_items_match(
+        command,
+        items,
+        phrase_type=target["type"],
+    ):
+        conversation_state_store.delete(conv_key)
+        return render_remediation_reply(
+            "替换计划未能与本轮词库记录完整对应；本次未写入"
+        )
+    return await _execute_confirmed_tool(
+        PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": items,
+                "_replace_at_code": {
+                    "code": command.code,
+                    "oldWord": command.old_word,
+                    "newWord": command.new_word,
+                    "remainingCodes": remaining_codes,
+                },
+            },
+            confirmation_source="local_preview",
+        ),
+        platform,
+        user_id,
+        conv_key,
+        space_key,
+        owner_label,
+    )
+
+
 async def _try_handle_dictionary_recode_command(
     message_text: str,
     command_intent: MessageCommandIntent,
@@ -9351,6 +9595,17 @@ async def _try_handle_draft_management_command(
     if command_intent is None:
         command_intent = await _classify_message_command_intent(message_text)
 
+    response = await _try_handle_replace_at_code_command(
+        message_text,
+        command_intent,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+    )
+    if response is not None:
+        return response
+
     response = await _try_handle_dictionary_recode_command(
         message_text,
         command_intent,
@@ -10220,6 +10475,20 @@ def render_executable_plan_suggestion(state: PendingToolConfirm) -> str:
         return ""
     delete_item = items[0] if isinstance(items[0], dict) else {}
     create_item = items[1] if isinstance(items[1], dict) else {}
+    replace_command_text = (
+        f"修改 {str(delete_item.get('code') or '').strip().lower()}："
+        f"{str(delete_item.get('word') or '').strip()} → "
+        f"{str(create_item.get('word') or '').strip()}"
+    )
+    parsed_replace = parse_replace_at_code(replace_command_text)
+    if (
+        parsed_replace is not None
+        and replace_at_code_items_match(parsed_replace, items)
+    ):
+        return render_executable_suggestion(
+            replace_command_text,
+            words=(parsed_replace.old_word, parsed_replace.new_word),
+        )
     command_text = (
         f"删除 {str(delete_item.get('word') or '').strip()} "
         f"{str(delete_item.get('code') or '').strip().lower()}；"

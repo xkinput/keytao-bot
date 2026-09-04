@@ -75,6 +75,7 @@ from .authorization_grammar import (
     explicit_same_code_requested,
     is_character_composition_question,
     is_interrogative_message,
+    looks_like_mutation_grammar_gap,
     parse_eviction_modified_add,
     review_flow_candidates_are_plausible,
     suggestion_preserves_expressed_operation,
@@ -92,6 +93,31 @@ from .tools import (
     front_insert_batch_warning_confirmation_binding,
     project_tool_result_for_model,
 )
+
+
+READ_ONLY_TURN_GUIDANCE = (
+    "请用普通语言说明你理解的当前请求。"
+    "只有当可信结果明确提供 suggestedCommand 时，才可逐字给出这一个命令；"
+    "不得自行发明、改写或追加命令。"
+    "若没有 suggestedCommand，只说明还缺少哪项具体信息。"
+    "不要描述内部处理方式、权限判断或实现细节，不要预测后续结果，"
+    "也不要概括之前的失败。"
+    "除非当前存在完整确认内容，否则不要建议确认或取消。"
+)
+
+
+def log_grammar_gap_if_needed(
+    message: str,
+    *,
+    mutations_allowed: bool,
+) -> bool:
+    """Emit one measurable marker for positive write syntax with no grammar."""
+    if mutations_allowed or not looks_like_mutation_grammar_gap(message):
+        return False
+    logger.warning(
+        "[grammar_gap] plain_write_intent=True authorization=False"
+    )
+    return True
 
 
 def _command_suggestions_match_pending_batch(
@@ -497,6 +523,10 @@ class AgentOrchestrator:
     ) -> Optional[str]:
         """Emit every final reply through one same-turn loop breaker."""
         self._server_backed_query_reply = None
+        log_grammar_gap_if_needed(
+            message,
+            mutations_allowed=context.mutations_allowed,
+        )
         failure_state: Dict[str, Any] = {}
         termination_state: Dict[str, Any] = {}
         successful_write_receipts: List[Dict[str, Any]] = []
@@ -680,13 +710,10 @@ class AgentOrchestrator:
                     ),
                 })
             if not context.mutations_allowed:
-                guidance = (
-                    "本轮为只读轮：用户这条消息没有构成明确的写操作授权，"
-                    "写工具即使被调用也只会被安全层拦截，不会写入数据。"
-                    "若工具返回 suggestedCommand，必须原样转述；"
-                    "否则直接说明需要明确指令，不要自创格式。"
-                )
-                messages.append({"role": "system", "content": guidance})
+                messages.append({
+                    "role": "system",
+                    "content": READ_ONLY_TURN_GUIDANCE,
+                })
         tool_schemas: Dict[str, Dict[str, Any]] = {}
         for tool in tools or []:
             function = tool.get("function") if isinstance(tool, dict) else None
@@ -4851,8 +4878,7 @@ class AgentOrchestrator:
                     )
                 else:
                     duplicate_hint = (
-                        f"工具 {fn_name} 首次调用未写入"
-                        "（已被安全层拦截或执行未成功）。"
+                        f"工具 {fn_name} 首次调用未写入。"
                         "禁止重复调用。请直接根据上方结果回复用户。"
                     )
             else:

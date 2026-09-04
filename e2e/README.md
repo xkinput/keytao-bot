@@ -500,6 +500,18 @@ entire server plan and requires the completion receipt to name every displaced
 word and destination. It also runs every advertised incident string through
 the real authorization parser; no production endpoint is used.
 
+S51 replays the 2026-09-04 replace-at-code incident end to end. It seeds
+`哪里@nsl` and `哪里@nslko`, queries both live locations, then sends
+`编码nsl  "哪里"改为"那算了"`. The same turn must create a complete server-backed
+two-item ticket for deleting `哪里@nsl` and creating `那算了@nsl`, while its
+trusted preview states that `哪里` remains at `nslko`. A following `确认` must
+write exactly that sealed draft and return an exact receipt. The scenario also
+passes all three previously advertised command forms through the real parser,
+rejects confirmation affordances without a live ticket, raw literal dumps,
+internal mechanism or future-block wording, and any semantic-routing model call
+on this deterministic command route. The normal new-word review may still use
+its bounded review model. No production endpoint is used.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`

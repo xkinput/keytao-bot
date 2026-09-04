@@ -1970,11 +1970,16 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
                 r"(?:^|\n)\s*[-•]\s*$",
                 prefix,
             ) is not None
+            confirm_execution_lead = bool(
+                command.startswith("确认执行")
+                and re.search(r"(?:可|可以)发送\s*$", prefix)
+            )
             if (
                 0 < len(command) <= 256
                 and "\n" not in command
                 and (
                     _COMMAND_SUGGESTION_LEAD_RE.search(prefix) is not None
+                    or confirm_execution_lead
                     or renderer_bullet
                 )
                 and _COMMAND_SUGGESTION_VERB_RE.search(command) is not None

@@ -94,6 +94,13 @@ from .scenarios import (
     S50_INITIAL_FREE_CODE,
     S50_OCCUPANT,
     S50_REPLACEMENT_WORD,
+    S51_ADVERTISED_FORMS,
+    S51_COMMAND,
+    S51_DISCOVERY,
+    S51_NEW_WORD,
+    S51_OLD_WORD,
+    S51_REMAINING_CODE,
+    S51_TARGET_CODE,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -635,6 +642,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             readme,
         )
         self.assertIn(
+            "S51 replays the 2026-09-04 replace-at-code incident",
+            readme,
+        )
+        self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
@@ -683,11 +694,29 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s50(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s51(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 51)],
+            [f"S{index}" for index in range(1, 52)],
         )
+
+    def test_s51_pins_replace_at_code_incident_transcript(self) -> None:
+        self.assertEqual(S51_DISCOVERY, "喵喵 哪里")
+        self.assertEqual(S51_COMMAND, '编码nsl  "哪里"改为"那算了"')
+        self.assertEqual(
+            (S51_OLD_WORD, S51_NEW_WORD, S51_TARGET_CODE, S51_REMAINING_CODE),
+            ("哪里", "那算了", "nsl", "nslko"),
+        )
+        self.assertEqual(
+            S51_ADVERTISED_FORMS,
+            (
+                "把 nsl 的「哪里」改成「那算了」",
+                "确认执行：把 nsl 的「哪里」改成「那算了」",
+                "修改 nsl：哪里 → 那算了",
+            ),
+        )
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S51"]
+        self.assertEqual(fixture["probe_words"], ("哪里", "那算了"))
 
     def test_s48_pins_numbered_create_with_eviction_contract(self) -> None:
         self.assertEqual((S48_WORD, S48_OCCUPANT), ("单份", "蛋粉"))

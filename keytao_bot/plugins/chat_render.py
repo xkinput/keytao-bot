@@ -1,5 +1,6 @@
 """Render deterministic chat replies and post-process platform-safe text."""
 
+import ast
 import json
 import re
 import unicodedata
@@ -107,6 +108,12 @@ def _split_telegram_text(text: str, limit: int = 4000) -> List[str]:
 
 
 _RAW_PYTHON_REPLY_MARKERS = ("{'", "': '", "dataclass(")
+_MECHANISM_LEAK_RE = re.compile(
+    r"(?:只读轮|安全层|写工具|写轮|执行器|解析器|工具调用|调用工具|"
+    r"系统提示|内部机制|会话环境.{0,24}放行|"
+    r"(?:以后|之后|后续|未来|下次).{0,32}(?:被?拦截|无法执行|不能执行|不会执行)|"
+    r"(?:会|仍会|还是会).{0,20}被?拦截|能不能执行由)"
+)
 _RETIRED_NO_COMMAND_COPY = "当前没有可安全执行" + "的后续命令"
 
 _DEFAULT_PUBLIC_BASE_BY_PLATFORM = {
@@ -253,17 +260,52 @@ def _reply_has_internal_fragment(text: str) -> bool:
     )
 
 
+def _reply_has_raw_literal_dump(text: str) -> bool:
+    """Detect Python or JSON containers accidentally exposed as reply text."""
+    reply = str(text or "")
+    if any(marker in reply for marker in _RAW_PYTHON_REPLY_MARKERS):
+        return True
+    candidates: List[str] = []
+    stripped = reply.strip()
+    if stripped[:1] in "[{" and stripped[-1:] in "]}":
+        candidates.append(stripped)
+    for line in reply.splitlines():
+        for opener in ("{", "["):
+            index = line.find(opener)
+            if index >= 0:
+                candidate = line[index:].strip()
+                if candidate[-1:] in "]}":
+                    candidates.append(candidate)
+    for candidate in dict.fromkeys(candidates):
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                value = loader(candidate)
+            except (SyntaxError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, (dict, list, tuple, set)):
+                return True
+    return False
+
+
+def _reply_requires_deterministic_redraw(text: str) -> bool:
+    """Reject literal dumps and implementation narration at delivery."""
+    reply = str(text or "")
+    return bool(
+        _reply_has_raw_literal_dump(reply)
+        or _MECHANISM_LEAK_RE.search(reply)
+    )
+
+
 def _assert_plain_user_facing_reply(text: str) -> str:
     reply = str(text or "")
     if _RETIRED_NO_COMMAND_COPY in reply:
         logger.error("Refusing retired user-facing copy")
         raise ValueError("User-facing reply contains retired user-facing copy")
-    marker = next(
-        (candidate for candidate in _RAW_PYTHON_REPLY_MARKERS if candidate in reply),
-        "",
-    )
-    if marker:
-        logger.error("Refusing user-facing reply with raw Python repr marker %r", marker)
+    if _reply_has_raw_literal_dump(reply):
+        logger.error("Refusing user-facing reply with a literal container dump")
+        raise ValueError("User-facing reply contains a raw Python representation")
+    if _MECHANISM_LEAK_RE.search(reply):
+        logger.error("Refusing user-facing reply with implementation narration")
         raise ValueError("User-facing reply contains a raw Python representation")
     if _reply_has_internal_fragment(reply):
         logger.error("Refusing user-facing reply with an internal policy identifier")

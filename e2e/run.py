@@ -82,6 +82,10 @@ from .scenarios import (
     S50_INITIAL_FREE_CODE,
     S50_OCCUPANT,
     S50_REPLACEMENT_WORD,
+    S51_NEW_WORD,
+    S51_OLD_WORD,
+    S51_REMAINING_CODE,
+    S51_TARGET_CODE,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -2077,6 +2081,63 @@ async def ensure_s50_fixture(
     }
 
 
+async def ensure_s51_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed the incident word at two exact codes for a scoped replacement."""
+    new_word_codes = ordered_candidate_codes(await client.encode(S51_NEW_WORD))
+    if S51_TARGET_CODE not in new_word_codes:
+        raise RigInfrastructureError(
+            f"S51 {S51_NEW_WORD} does not include {S51_TARGET_CODE}: "
+            f"{new_word_codes}"
+        )
+    for code in (S51_TARGET_CODE, S51_REMAINING_CODE):
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if str(row.get("code") or "").strip().lower() == code
+        ]
+        if exact_rows:
+            raise RigInfrastructureError(
+                f"S51 requires an empty exact {code} slot before seeding: "
+                f"{exact_rows}"
+            )
+
+    await client.clean_draft(seed_identity["platform_id"])
+    seeds: list[dict[str, Any]] = []
+    for code in (S51_TARGET_CODE, S51_REMAINING_CODE):
+        seeds.append(await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word=S51_OLD_WORD,
+            code=code,
+        ))
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if str(row.get("code") or "").strip().lower() == code
+        ]
+        if not (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == S51_OLD_WORD
+            and exact_rows[0].get("type") == "Phrase"
+            and str((exact_rows[0].get("user") or {}).get("name") or "").startswith(
+                RESERVED_BINDING_PREFIX
+            )
+        ):
+            raise RigInfrastructureError(
+                f"S51 did not seed sole rig-owned {S51_OLD_WORD}@{code}: "
+                f"{exact_rows}"
+            )
+    return {
+        "oldWord": S51_OLD_WORD,
+        "newWord": S51_NEW_WORD,
+        "targetCode": S51_TARGET_CODE,
+        "remainingCode": S51_REMAINING_CODE,
+        "newWordCandidateCodes": new_word_codes,
+        "seedBatchIds": [seed.get("batchId") for seed in seeds],
+    }
+
+
 async def ensure_s39_fixture(
     *,
     client: LocalNextClient,
@@ -2641,6 +2702,12 @@ async def async_main(args: argparse.Namespace) -> int:
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S50":
                         fixture_facts["s50"] = await ensure_s50_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S51":
+                        fixture_facts["s51"] = await ensure_s51_fixture(
                             client=client,
                             seed_identity=seed_identity,
                         )

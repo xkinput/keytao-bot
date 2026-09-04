@@ -360,6 +360,7 @@ def pending_execution_args(state: PendingToolConfirm) -> Dict:
     args = dict(state.args)
     args.pop("_pending_display", None)
     args.pop("_continuation_command", None)
+    args.pop("_replace_at_code", None)
     return args
 
 
