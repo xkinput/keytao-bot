@@ -197,7 +197,11 @@ class NextServer:
 
     async def _probe(self) -> bool:
         try:
-            async with httpx.AsyncClient(timeout=2.0, follow_redirects=False) as client:
+            async with httpx.AsyncClient(
+                timeout=2.0,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
                 response = await client.get(
                     f"{self.base_url}/api/phrases/by-word",
                     params={"word": "赤溪", "page": 1},
@@ -295,6 +299,7 @@ class LocalNextClient:
                     max_keepalive_connections=10,
                     keepalive_expiry=30.0,
                 ),
+                trust_env=False,
             )
         return self._client
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -74,6 +75,14 @@ from .scenarios import (
     S46_SECOND_CODE,
     S46_SECOND_SHIFTED_CODE,
     S46_WORD,
+    S48_EXPLICIT_EVICTION,
+    S48_NUMBERED_EVICTION,
+    S48_NUMBERED_RECODE,
+    S48_OCCUPANT,
+    S48_RECOMMENDED_CODE,
+    S48_SHIFTED_CODE,
+    S48_TARGET_CODE,
+    S48_WORD,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -136,6 +145,44 @@ from .zdic_seed import (
 
 
 class NextServerRuntimeTests(unittest.TestCase):
+    def test_local_http_clients_ignore_system_proxy_settings(self) -> None:
+        local_client = LocalNextClient(
+            base_url="http://localhost:3100",
+            bot_token="test",
+        )
+        pooled = local_client._pooled_client()
+        try:
+            self.assertFalse(pooled._trust_env)
+        finally:
+            asyncio.run(local_client.close())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            server = NextServer(
+                next_dir=root,
+                base_url="http://localhost:3100",
+                artifact_dir=root,
+                start_timeout=1,
+                child_env={},
+            )
+            response = MagicMock(status_code=200)
+            response.json.return_value = {
+                "phrases": [],
+                "pagination": {},
+            }
+            session = MagicMock()
+            session.get = AsyncMock(return_value=response)
+            context = MagicMock()
+            context.__aenter__ = AsyncMock(return_value=session)
+            context.__aexit__ = AsyncMock(return_value=None)
+            with patch("e2e.runtime.httpx.AsyncClient", return_value=context) as ctor:
+                self.assertTrue(asyncio.run(server._probe()))
+            ctor.assert_called_once_with(
+                timeout=2.0,
+                follow_redirects=False,
+                trust_env=False,
+            )
+
     def test_runtime_dir_keeps_read_only_source_and_owns_next_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -246,6 +293,27 @@ class ArtifactRetentionTests(unittest.TestCase):
 
 
 class SafetyRailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bot_environment_bypasses_system_proxy_for_local_rig(self) -> None:
+        from .run import apply_bot_environment
+
+        config = {
+            "keytao_base": "http://localhost:3100",
+            "bot_token": "local-token",
+            "llm": {
+                "api_key": "local-llm-key",
+                "base_url": "https://api.deepseek.com/",
+                "model": "deepseek-v4-flash",
+            },
+            "bot_values": {},
+        }
+        with patch.dict(os.environ, {}, clear=True):
+            apply_bot_environment(config)
+            self.assertEqual(
+                os.environ["NO_PROXY"],
+                "localhost,127.0.0.1,::1",
+            )
+            self.assertEqual(os.environ["no_proxy"], os.environ["NO_PROXY"])
+
     async def test_batch_link_host_guard_enforces_platform_public_host(self) -> None:
         assert_batch_link_hosts(
             "草稿地址：https://keytao.rea.ink/batch/batch-local",
@@ -548,6 +616,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertIn("S46 closes the 2026-08-31 promise-preserving", readme)
         self.assertIn("S47 closes the 2026-09-01 choice-closure incident", readme)
         self.assertIn(
+            "S48 closes the 2026-09-03 numbered-candidate binding incident",
+            readme,
+        )
+        self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
@@ -596,11 +668,29 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s47(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s49(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 48)],
+            [f"S{index}" for index in range(1, 50)],
         )
+
+    def test_s48_pins_numbered_create_with_eviction_contract(self) -> None:
+        self.assertEqual((S48_WORD, S48_OCCUPANT), ("单份", "蛋粉"))
+        self.assertEqual(S48_TARGET_CODE, "dffn")
+        self.assertEqual(S48_RECOMMENDED_CODE, "dffno")
+        self.assertEqual(S48_SHIFTED_CODE, "dffna")
+        self.assertEqual(S48_NUMBERED_EVICTION, "加入1，挤掉蛋粉")
+        self.assertEqual(S48_NUMBERED_RECODE, "添加1，并为蛋粉重新编码")
+        self.assertEqual(S48_EXPLICIT_EVICTION, "添加 单份 dffn，挤掉蛋粉")
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S48"]
+        self.assertEqual(fixture["probe_words"], (S48_WORD, S48_OCCUPANT))
+        entries = {
+            row["entry"]: row["pinyins"]
+            for row in fixture["rows"]
+            if row["kind"] == "entry"
+        }
+        self.assertEqual(entries[S48_WORD], ["dān", "fèn"])
+        self.assertEqual(entries[S48_OCCUPANT], ["dàn", "fěn"])
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S37"]

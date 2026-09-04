@@ -94,6 +94,9 @@ rig-owned words, seeds `这厮@fesk` and `这厮@qesk`, and reserves `fesko` and
 `qesko` as the exact two shift destinations returned by the encoder.
 S47 reuses the same isolated dictionary fixture to exercise choice binding,
 plan-rendered refusal commands, deterministic recoding, and merge-into-draft.
+S48 declares authoritative readings for `单份` and `蛋粉`. It removes only those
+rig-owned words, seeds `蛋粉@dffn`, and verifies that the occupant's own encoded
+chain moves it to `dffna` when `单份` takes the occupied slot.
 
 ## Prerequisites
 
@@ -467,6 +470,22 @@ live option record; every refusal command copied verbatim must enter its
 deterministic plan; `删除 这厮 fesk；添加 这厮 fesko` must bypass the model; and an
 exact existing occupant draft row must be merged so only the remaining shift
 delta is previewed and confirmed.
+
+S48 closes the 2026-09-03 numbered-candidate binding incident. After rendering
+the `单份` candidate list, reply-quoted `加入1，挤掉蛋粉`, `添加1，并为蛋粉重新编码`,
+and bare occupied `添加1` must each use the live server-owned ordinal record and,
+in one deterministic turn, draft `单份@dffn` while shifting `蛋粉` along its own
+encoded chain to `dffna`. The explicit advertised form
+`添加 单份 dffn，挤掉蛋粉` must reach the same plan without a prior discovery turn.
+Every case asserts the three exact draft operations, both movements in the
+reply, no model exchange, and no internal policy jargon.
+
+S49 is the synthetic exception to the normal no-stub scenario rule: it drives
+the shared orchestrator with two DeepSeek-shaped `length` responses whose
+output is entirely reasoning. It proves the retry keeps the same output limit,
+lowers reasoning effort, removes stale history and the large prompt, emits only
+a parser- and binding-checked command from the trusted candidate record, and
+performs no write.
 
 Optional overrides:
 

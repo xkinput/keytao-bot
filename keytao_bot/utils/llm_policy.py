@@ -11,7 +11,7 @@ _SAMPLING_PARAMETERS = (
     "presence_penalty",
     "frequency_penalty",
 )
-_REASONING_EFFORTS = frozenset({"high", "max"})
+_REASONING_EFFORTS = frozenset({"low", "high", "max"})
 
 
 def is_deepseek_model(model: Any) -> bool:

@@ -1376,6 +1376,66 @@ _PENDING_OCCUPANT_RECODE_RES = (
     ),
 )
 
+_PENDING_NUMBERED_EVICTION_RES = (
+    re.compile(
+        rf"^(?:添加|加入|加词|加)?\s*"
+        rf"(?P<selector>{_PENDING_NUMBERED_SELECTOR_PATTERN})\s*"
+        r"[，,；;]?\s*(?:并\s*)?(?:为|把|将)?\s*"
+        rf"(?P<occupant>{_PENDING_OCCUPANT_WORD_PATTERN})\s*"
+        r"(?P<modifier>重新编码|顺延|挪开|挪走)$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^(?:添加|加入|加词|加)?\s*"
+        rf"(?P<selector>{_PENDING_NUMBERED_SELECTOR_PATTERN})\s*"
+        r"[，,；;]?\s*(?:并\s*)?"
+        r"(?P<modifier>挤掉|顶掉|顶下去|挪开|挪走|换下来|顺延)\s*"
+        rf"(?P<occupant>{_PENDING_OCCUPANT_WORD_PATTERN})$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _pending_numbered_eviction_intent(
+    message_text: str,
+    state: PendingAddWord,
+) -> Optional[MessageCommandIntent]:
+    """Bind an eviction selector only to its exact trusted candidate occupant."""
+    if (
+        not state.server_candidates
+        or state.server_candidates != state.candidates
+    ):
+        return None
+    source = _strip_command_message_prefixes(
+        trusted_mutation_source(message_text)
+    ).strip()
+    if not source or re.search(r"[?？\"'“”‘’「」『』]", source):
+        return None
+    match = next(
+        (
+            candidate.fullmatch(source)
+            for candidate in _PENDING_NUMBERED_EVICTION_RES
+            if candidate.fullmatch(source) is not None
+        ),
+        None,
+    )
+    if match is None:
+        return None
+    choice_index = _parse_pending_choice_index(match.group("selector"))
+    if choice_index is None or not 1 <= choice_index <= len(state.candidates):
+        return None
+    code, occupied = state.candidates[choice_index - 1]
+    occupant = match.group("occupant").strip()
+    trusted_occupants = tuple(state.server_occupied_words.get(code, ()))
+    if not occupied or trusted_occupants != (occupant,):
+        return None
+    return MessageCommandIntent(
+        intent="pending_recode",
+        confidence=1.0,
+        choice_index=choice_index,
+        requested_code=code,
+    )
+
 
 def _occupant_perspective_pending_recode_intent(
     message_text: str,
@@ -1432,6 +1492,12 @@ def _structural_pending_add_word_intent(
     )
     if occupant_recode is not None:
         return occupant_recode
+    numbered_eviction = _pending_numbered_eviction_intent(
+        message_text,
+        state,
+    )
+    if numbered_eviction is not None:
+        return numbered_eviction
     if (
         not stripped
         or re.search(r"[?？\"'“”‘’「」『』]", stripped)
@@ -1458,6 +1524,12 @@ def _structural_pending_add_word_intent(
         )
         if not server_backed:
             return None
+        candidate_codes = {code for code, _occupied in state.candidates}
+        if (
+            multi_selection.codes
+            and any(code not in candidate_codes for code in multi_selection.codes)
+        ):
+            return None
         resolved_codes = multi_selection.codes
         if multi_selection.indices and all(
             1 <= index <= len(state.candidates)
@@ -1466,6 +1538,25 @@ def _structural_pending_add_word_intent(
             resolved_codes = tuple(
                 state.candidates[index - 1][0]
                 for index in multi_selection.indices
+            )
+        if (
+            not multi_selection.submit_after
+            and not multi_selection.recode_indices
+            and len(multi_selection.indices) == 1
+        ):
+            return MessageCommandIntent(
+                intent="pending_choice",
+                confidence=1.0,
+                choice_index=multi_selection.indices[0],
+            )
+        if (
+            not multi_selection.submit_after
+            and len(multi_selection.codes) == 1
+        ):
+            return MessageCommandIntent(
+                intent="pending_code_request",
+                confidence=1.0,
+                requested_code=multi_selection.codes[0],
             )
         return MessageCommandIntent(
             intent=(

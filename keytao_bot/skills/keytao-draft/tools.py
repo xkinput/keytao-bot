@@ -1611,7 +1611,7 @@ async def _lookup_words_raw(words: List[str]) -> Dict:
     KEYTAO_API_BASE = get_keytao_url()
     BOT_API_TOKEN = get_bot_token()
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1649,7 +1649,7 @@ async def _lookup_codes_raw(codes: List[str]) -> Dict:
     KEYTAO_API_BASE = get_keytao_url()
     BOT_API_TOKEN = get_bot_token()
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1780,7 +1780,7 @@ async def _keytao_create_phrase_after_pending_check(
     if not BOT_API_TOKEN:
         return {
             "success": False,
-            "message": "喵喵配置错误：缺少API token"
+            "message": "喵喵配置错误：缺少服务访问凭据"
         }
     
     # Get or create draft batch
@@ -2422,7 +2422,7 @@ async def keytao_submit_batch(
     if not BOT_API_TOKEN:
         return {
             "success": False,
-            "message": "喵喵配置错误：缺少API token"
+            "message": "喵喵配置错误：缺少服务访问凭据"
         }
     
     if confirmed and (
@@ -2819,7 +2819,7 @@ async def keytao_get_batch_preview(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     batch_id = str(batch_id or "").strip() or None
     if not batch_id:
@@ -2899,7 +2899,7 @@ async def keytao_recall_batch(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     try:
         existing_claim = _draft_mutation_claims().get(platform, platform_id)
@@ -3269,7 +3269,7 @@ async def keytao_list_draft_items(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     if platform == "web-anon":
         return {"success": False, "not_bound": True, "message": _not_bound_message(platform)}
@@ -3373,7 +3373,7 @@ async def keytao_pending_items_by_words(
         return {
             "success": False,
             "complete": False,
-            "message": "喵喵配置错误：缺少API token",
+            "message": "喵喵配置错误：缺少服务访问凭据",
         }
 
     find_body = _json_request_body({
@@ -4216,7 +4216,7 @@ async def keytao_remove_draft_item(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     safe_pr_id = _safe_numeric_id(pr_id)
     if safe_pr_id is None:
@@ -4811,7 +4811,7 @@ async def _keytao_batch_add_to_draft_after_pending_check(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     if not batch_id:
         try:
@@ -5033,7 +5033,7 @@ async def keytao_batch_remove_draft_items(
     BOT_API_TOKEN = get_bot_token()
 
     if not BOT_API_TOKEN:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     safe_ids: List[int] = []
     invalid_ids: List[object] = []
@@ -5254,7 +5254,7 @@ async def _keytao_strict_batch_add_to_draft(
     """Write one all-or-nothing plan through the strict batch endpoint."""
     bot_api_token = get_bot_token()
     if not bot_api_token:
-        return {"success": False, "message": "喵喵配置错误：缺少API token"}
+        return {"success": False, "message": "喵喵配置错误：缺少服务访问凭据"}
 
     # A caller that already carries an expected version has a baseline - which
     # may legitimately be "there was no draft" (batch_id None, version 0).

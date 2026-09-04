@@ -1447,15 +1447,14 @@ async def _call_llm(batch: Dict[str, Any], items: Sequence[ReviewItem], audit: D
 
         if finish_reason != "stop":
             last_error = RuntimeError(
-                "喵喵 LLM 审查响应未完整结束"
-                f"（finish_reason={finish_reason or 'unknown'}）"
+                "喵喵审查没有完整返回结果"
             )
             if finish_reason == "length" and current_max_tokens < config["max_tokens_cap"]:
                 current_max_tokens = min(current_max_tokens * 2, config["max_tokens_cap"])
             continue
 
         if not content:
-            last_error = RuntimeError(f"喵喵 LLM 没有返回审查内容（finish_reason={finish_reason or 'unknown'}）")
+            last_error = RuntimeError("喵喵审查没有返回内容")
             continue
 
         try:

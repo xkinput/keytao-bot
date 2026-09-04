@@ -67,7 +67,7 @@ class DeepSeekChatPolicyTests(unittest.TestCase):
         self.assertIsNot(request, original)
 
     def test_invalid_reasoning_effort_fails_fast(self):
-        for effort in ("low", "medium"):
+        for effort in ("none", "medium"):
             with self.subTest(effort=effort):
                 with self.assertRaisesRegex(ValueError, "Unsupported DeepSeek reasoning effort"):
                     with_deepseek_chat_policy(
@@ -75,6 +75,17 @@ class DeepSeekChatPolicyTests(unittest.TestCase):
                         thinking=True,
                         reasoning_effort=effort,
                     )
+
+    def test_low_reasoning_effort_is_available_for_bounded_retries(self):
+        request = with_deepseek_chat_policy(
+            {"model": "deepseek-v4-flash", "temperature": 0.7},
+            thinking=True,
+            reasoning_effort="low",
+        )
+
+        self.assertEqual(request["reasoning_effort"], "low")
+        self.assertEqual(request["extra_body"]["thinking"], {"type": "enabled"})
+        self.assertNotIn("temperature", request)
 
     def test_openai_sdk_serializes_deepseek_fields(self):
         captured = {}

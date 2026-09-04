@@ -70,6 +70,9 @@ from .scenarios import (
     S46_SECOND_CODE,
     S46_SECOND_SHIFTED_CODE,
     S46_WORD,
+    S48_OCCUPANT,
+    S48_TARGET_CODE,
+    S48_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -335,30 +338,30 @@ def load_configuration(args: argparse.Namespace) -> dict[str, Any]:
     bot_token = _nonempty(next_values.get("BOT_API_TOKEN"))
     if not bot_token:
         raise SafetyViolation("keytao-next .env has no BOT_API_TOKEN")
+    primary_api_key = _first_value(
+        os.getenv("E2E_OPENAI_API_KEY"),
+        bot_values.get("OPENAI_API_KEY"),
+    )
+    if not primary_api_key:
+        raise SafetyViolation(
+            "E2E_OPENAI_API_KEY or OPENAI_API_KEY is required; "
+            "provider-key fallback is disabled"
+        )
     llm = {
-        "api_key": _first_value(
-            os.getenv("E2E_OPENAI_API_KEY"),
-            bot_values.get("OPENAI_API_KEY"),
-            bot_values.get("ARK_API_KEY"),
-            bot_values.get("GEMINI_API_KEY"),
-        ),
+        "api_key": primary_api_key,
         "base_url": validate_llm_base(
             _first_value(
                 os.getenv("E2E_OPENAI_BASE_URL"),
                 bot_values.get("OPENAI_BASE_URL"),
-                bot_values.get("ARK_BASE_URL"),
-                bot_values.get("GEMINI_BASE_URL"),
             )
         ),
         "model": _first_value(
             os.getenv("E2E_OPENAI_MODEL"),
             bot_values.get("OPENAI_MODEL"),
-            bot_values.get("ARK_MODEL"),
-            bot_values.get("GEMINI_MODEL"),
         ),
     }
-    if not llm["api_key"] or not llm["model"]:
-        raise SafetyViolation("A real E2E LLM key and model are required")
+    if not llm["model"]:
+        raise SafetyViolation("A real E2E LLM model is required")
     port = int(args.port)
     if port < 1024 or port > 65535:
         raise SafetyViolation("The local keytao-next port must be between 1024 and 65535")
@@ -402,6 +405,11 @@ def apply_bot_environment(config: dict[str, Any]) -> None:
             "OPENAI_API_KEY": llm["api_key"],
             "OPENAI_BASE_URL": llm["base_url"],
             "OPENAI_MODEL": llm["model"],
+            # urllib/httpx can inherit the macOS system proxy even when no
+            # shell proxy variable is present. Keep local rig traffic direct;
+            # external LLM traffic remains eligible for the configured proxy.
+            "NO_PROXY": "localhost,127.0.0.1,::1",
+            "no_proxy": "localhost,127.0.0.1,::1",
         }
     )
     optional = {
@@ -1602,52 +1610,56 @@ async def ensure_s37_fixture(
     *,
     client: LocalNextClient,
     seed_identity: dict[str, str],
+    scenario_id: str = "S37",
+    newcomer_word: str = S37_WORD,
+    occupant_word: str = S37_OCCUPANT,
+    target_code: str = S37_TARGET_CODE,
 ) -> dict[str, Any]:
     """Seed the sole live occupant required by the eviction incident."""
-    newcomer_codes = ordered_candidate_codes(await client.encode(S37_WORD))
-    occupant_codes = ordered_candidate_codes(await client.encode(S37_OCCUPANT))
-    if S37_TARGET_CODE not in newcomer_codes:
+    newcomer_codes = ordered_candidate_codes(await client.encode(newcomer_word))
+    occupant_codes = ordered_candidate_codes(await client.encode(occupant_word))
+    if target_code not in newcomer_codes:
         raise RigInfrastructureError(
-            f"S37 {S37_WORD} does not encode to {S37_TARGET_CODE}: "
+            f"{scenario_id} {newcomer_word} does not encode to {target_code}: "
             f"{newcomer_codes}"
         )
-    if not occupant_codes or occupant_codes[0] != S37_TARGET_CODE:
+    if not occupant_codes or occupant_codes[0] != target_code:
         raise RigInfrastructureError(
-            f"S37 {S37_OCCUPANT} candidate chain does not start at "
-            f"{S37_TARGET_CODE}: {occupant_codes}"
+            f"{scenario_id} {occupant_word} candidate chain does not start at "
+            f"{target_code}: {occupant_codes}"
         )
     exact_rows = [
         row
-        for row in await client.phrases_by_code(S37_TARGET_CODE)
-        if row.get("code") == S37_TARGET_CODE
+        for row in await client.phrases_by_code(target_code)
+        if row.get("code") == target_code
     ]
     if exact_rows:
         raise RigInfrastructureError(
-            f"S37 requires an empty exact {S37_TARGET_CODE} slot before seeding: "
+            f"{scenario_id} requires an empty exact {target_code} slot before seeding: "
             f"{exact_rows}"
         )
     await client.clean_draft(seed_identity["platform_id"])
     seeded = await client.seed_phrase(
         platform_id=seed_identity["platform_id"],
-        word=S37_OCCUPANT,
-        code=S37_TARGET_CODE,
+        word=occupant_word,
+        code=target_code,
     )
     exact_rows = [
         row
-        for row in await client.phrases_by_code(S37_TARGET_CODE)
-        if row.get("code") == S37_TARGET_CODE
+        for row in await client.phrases_by_code(target_code)
+        if row.get("code") == target_code
     ]
     if not (
         len(exact_rows) == 1
-        and exact_rows[0].get("word") == S37_OCCUPANT
+        and exact_rows[0].get("word") == occupant_word
         and exact_rows[0].get("type") == "Phrase"
         and str((exact_rows[0].get("user") or {}).get("name") or "").startswith(
             RESERVED_BINDING_PREFIX
         )
     ):
         raise RigInfrastructureError(
-            f"S37 did not seed sole rig-owned {S37_OCCUPANT}@"
-            f"{S37_TARGET_CODE}: {exact_rows}"
+            f"{scenario_id} did not seed sole rig-owned {occupant_word}@"
+            f"{target_code}: {exact_rows}"
         )
     shifted_code = ""
     for code in occupant_codes[1:]:
@@ -1661,13 +1673,13 @@ async def ensure_s37_fixture(
             break
     if not shifted_code:
         raise RigInfrastructureError(
-            f"S37 {S37_OCCUPANT} candidate chain has no free shift slot: "
+            f"{scenario_id} {occupant_word} candidate chain has no free shift slot: "
             f"{occupant_codes}"
         )
     return {
-        "word": S37_WORD,
-        "occupantWord": S37_OCCUPANT,
-        "targetCode": S37_TARGET_CODE,
+        "word": newcomer_word,
+        "occupantWord": occupant_word,
+        "targetCode": target_code,
         "newcomerCandidateCodes": newcomer_codes,
         "occupantCandidateCodes": occupant_codes,
         "shiftedCode": shifted_code,
@@ -2460,6 +2472,16 @@ async def async_main(args: argparse.Namespace) -> int:
                         fixture_facts["s37"] = await ensure_s37_fixture(
                             client=client,
                             seed_identity=seed_identity,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S48":
+                        fixture_facts["s48"] = await ensure_s37_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
+                            scenario_id="S48",
+                            newcomer_word=S48_WORD,
+                            occupant_word=S48_OCCUPANT,
+                            target_code=S48_TARGET_CODE,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S39":

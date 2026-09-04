@@ -202,11 +202,15 @@ def strip_bare_batch_ids(text: str) -> str:
 
 _INTERNAL_REPLY_FRAGMENT_RE = re.compile(
     r"(?:\bboundTarget\b|\bblockReason\b|\bbinding_incomplete\b|"
+    r"批次票据|动词识别失败|"
+    r"未与用户本轮原始文字中的完整目标绑定|"
+    r"这条回复里的建议没有对应的可执行计划|"
     r"PR#\d+|"
     r"禁止(?:再次|重复)?调用|"
     r"请直接(?:根据|使用)[^\r\n。！？]{0,80}(?:回复用户|继续下一步操作)|"
     r"[（(]\s*缺少\s*[：:]\s*[^）)]*"
-    r"(?:[a-z]+[A-Z_][A-Za-z0-9_]*|[a-z]+_[a-z0-9_]+)[^）)]*[）)])"
+    r"(?:[a-z]+[A-Z_][A-Za-z0-9_]*|[a-z]+_[a-z0-9_]+)[^）)]*[）)])",
+    re.IGNORECASE,
 )
 
 _INTERNAL_TOOL_IDENTIFIERS = (

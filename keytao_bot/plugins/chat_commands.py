@@ -846,7 +846,7 @@ async def _try_recover_reviewed_add_from_history(
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
 ) -> Optional[str]:
-    """Re-review an explicitly selected read snapshot, then finish the intent."""
+    """Re-review a stale display, but never execute its old selector this turn."""
     assent = parse_pending_assent_phrase(message_text)
     selection = _closed_candidate_selection(message_text)
     if selection is None and not (assent.matched and assent.add_requested):
@@ -880,60 +880,17 @@ async def _try_recover_reviewed_add_from_history(
     record = conversation_state_store.get_record(conv_key)
     state = record.state if record is not None else None
     if not isinstance(state, PendingAddWord) or not state.server_candidates:
-        return refreshed
-    current_codes = tuple(code for code, _occupied in state.server_candidates)
-    if current_codes != displayed_codes:
-        return refreshed
-
-    execution_message = message_text
-    if selection is not None:
-        indices, codes, _submit_after = selection
-        if (
-            any(index < 1 or index > len(displayed_codes) for index in indices)
-            or any(code not in displayed_codes for code in codes)
-        ):
-            return refreshed
-    else:
-        recommended = re.search(
-            r"(?m)^推荐编码[：:]\s*(?P<code>[a-z]{1,12})"
-            r"(?:（本次仅查询）|\(本次仅查询\))\s*$",
-            latest_assistant,
-            re.IGNORECASE,
+        return (
+            "刚才的候选记录已失效，暂时无法重新生成；请重新查询这个词条。"
         )
-        if recommended is None:
-            recommended = re.search(
-                r"(?m)^推荐[：:]\s*「[^」\r\n]+」\s*占\s*"
-                r"(?P<code>[a-z]{1,12})\s*、\s*「[^」\r\n]+」顺延",
-                latest_assistant,
-                re.IGNORECASE,
-            )
-        if recommended is None:
-            recommended = re.search(
-                r"(?m)^-\s*[“\"]?「[^」\r\n]+」\s*占\s*"
-                r"(?P<code>[a-z]{1,12})\s*、\s*"
-                r"「[^」\r\n]+」\s*顺延[”\"]?",
-                latest_assistant,
-                re.IGNORECASE,
-            )
-        displayed_recommended = (
-            displayed.recommended_code
-            if isinstance(displayed, PendingAddWord)
-            else recommended.group("code").lower() if recommended is not None else ""
-        )
-        if displayed_recommended != state.recommended_code:
-            return refreshed
 
-    executed = await handle_pending_message_core(
-        execution_message,
-        platform,
-        user_id,
-        conv_key,
-        history=history,
-        space_key=space_key,
-        owner_label=owner_label,
-        allow_intent_model=False,
+    # The current selector came from a display whose actor-owned record is gone.
+    # The fresh server snapshot above may mint authority only for a later turn;
+    # carrying the stale ordinal/code into it would silently retarget a write.
+    return ServerBackedQueryReply(
+        "刚才的候选记录已失效，已重新生成；请按下面的新列表重新选择。\n"
+        + str(refreshed or "")
     )
-    return executed or refreshed
 
 
 _EXPLICIT_READING_TOKEN_PATTERN = (
@@ -1282,6 +1239,15 @@ async def _try_handle_shift_modified_add_command(
     owner_label: str = "",
 ) -> Optional[str]:
     """Re-review a closed add-plus-shift command and start its bound shift plan."""
+    parsed_command = parse_eviction_modified_add(message_text)
+    explicitly_named_occupant = str(
+        parsed_command.named_occupant if parsed_command is not None else ""
+    ).strip()
+    if re.fullmatch(
+        r"其他(?:相关(?:的)?)?词条",
+        explicitly_named_occupant,
+    ):
+        explicitly_named_occupant = ""
     command = explicit_shift_modified_add_item(message_text)
     if command is None:
         incomplete = unnamed_eviction_modified_add_item(message_text)
@@ -1346,6 +1312,31 @@ async def _try_handle_shift_modified_add_command(
             f"{code} 不是「{word}」本轮服务端审词记录中的候选编码；"
             "本次未执行添加或顺延"
         )
+    named_occupant = str(
+        command.get("namedOccupant")
+        or (
+            parsed_command.named_occupant
+            if parsed_command is not None
+            else ""
+        )
+        or ""
+    ).strip()
+    if re.fullmatch(r"其他(?:相关(?:的)?)?词条", named_occupant):
+        named_occupant = ""
+    if named_occupant:
+        actual_occupants = tuple(dict.fromkeys(
+            str(value or "").strip()
+            for value in state.server_occupied_words.get(code, [])
+            if str(value or "").strip()
+        ))
+        if actual_occupants != (named_occupant,):
+            actual = "、".join(
+                f"「{value}」" for value in actual_occupants
+            ) or "空位"
+            return (
+                f"{code} 的当前占位为{actual}，与指令中的"
+                f"「{named_occupant}」不一致；本次未执行添加或顺延"
+            )
     reviewed_pinyin, reviewed_candidate_codes = _pending_reviewed_reading(
         state,
         code,
@@ -1369,7 +1360,7 @@ async def _try_handle_shift_modified_add_command(
             reviewed_pinyin=reviewed_pinyin,
             reviewed_candidate_codes=reviewed_candidate_codes,
         )
-    return await _execute_shift_to_code(
+    response = await _execute_shift_to_code(
         word,
         code,
         platform,
@@ -1385,7 +1376,16 @@ async def _try_handle_shift_modified_add_command(
         },
         reviewed_pinyin=reviewed_pinyin,
         reviewed_candidate_codes=reviewed_candidate_codes,
+        auto_confirm_shift_plan=bool(explicitly_named_occupant),
+        auto_confirm_expected_shifted_words=(
+            (explicitly_named_occupant,)
+            if explicitly_named_occupant
+            else ()
+        ),
     )
+    if response.startswith("✅ 操作已完成"):
+        conversation_state_store.complete_execution(record)
+    return response
 
 
 def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
@@ -1751,12 +1751,57 @@ async def _canonicalize_pending_ticket_intent(
                     words=(state.word,),
                 )
             if any(code not in candidate_codes for code in multi_selection.codes):
+                natural_assent = parse_pending_assent_phrase(message_text)
+                if natural_assent.matched:
+                    return replace(
+                        command_intent,
+                        intent=(
+                            "pending_add_and_submit"
+                            if natural_assent.submit_after
+                            else "pending_confirm"
+                        ),
+                        submit_after=natural_assent.submit_after,
+                        choice_index=None,
+                        choice_indices=(),
+                        recode_indices=(),
+                        requested_code="",
+                        requested_codes=(),
+                    ), None
                 return None, render_remediation_reply(
                     "所选编码不全在当前候选中",
                     command="加入",
                     words=(state.word,),
                 )
             requested_codes = multi_selection.codes
+        if (
+            not multi_selection.submit_after
+            and not multi_selection.recode_indices
+            and len(multi_selection.indices) == 1
+        ):
+            return replace(
+                command_intent,
+                intent="pending_choice",
+                submit_after=False,
+                choice_index=multi_selection.indices[0],
+                choice_indices=(),
+                recode_indices=(),
+                requested_code="",
+                requested_codes=(),
+            ), None
+        if (
+            not multi_selection.submit_after
+            and len(multi_selection.codes) == 1
+        ):
+            return replace(
+                command_intent,
+                intent="pending_code_request",
+                submit_after=False,
+                choice_index=None,
+                choice_indices=(),
+                recode_indices=(),
+                requested_code=multi_selection.codes[0],
+                requested_codes=(),
+            ), None
         return replace(
             command_intent,
             intent=(
@@ -2930,9 +2975,17 @@ async def _try_handle_simple_single_word_query(
     *,
     requested_reading: str = "",
     requested_meaning: str = "",
+    actionable_lookup: bool = False,
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     explicit_add_word = _extract_explicit_reviewed_add_word(message_text)
+    prefixed_review = re.match(
+        r"^\s*(?:键道|喵喵)(?:\s+|[:：,，])",
+        message_text,
+    ) is not None
+    actionable_candidates = bool(
+        explicit_add_word or prefixed_review or actionable_lookup
+    )
     words = (explicit_add_word,) if explicit_add_word else await _get_simple_word_query_words(message_text)
     if len(words) != 1:
         return None
@@ -3058,12 +3111,14 @@ async def _try_handle_simple_single_word_query(
         pending = _parse_pending_add_word(reviewed_prompt)
         if pending is not None:
             inventory = select_candidate_inventory(review)
-            server_statuses = [
-                status
-                for pronunciation in review.get("pronunciations") or []
-                if isinstance(pronunciation, dict)
-                for status in pronunciation.get("candidateStatuses") or []
-            ]
+            # Seal exactly the inventory chosen by the shared selector.  A
+            # flattened payload can mix pronunciation groups and would make
+            # the persisted ordinal map differ from the rendered list.
+            server_statuses = (
+                [dict(status) for status in inventory.statuses]
+                if inventory is not None
+                else []
+            )
             _attach_server_candidate_snapshot(
                 pending,
                 server_statuses,
@@ -3085,25 +3140,31 @@ async def _try_handle_simple_single_word_query(
             pending.pronunciation_recommended_codes = (
                 [group_recommended] if group_recommended else []
             )
-            if explicit_add_word:
-                target_key = conv_key or (
-                    current_memory_context.get().conversation_address
-                    if current_memory_context.get() is not None
-                    else ConversationAddress.private(platform, user_id)
-                )
-                conversation_state_store.set(
+            target_key = conv_key or (
+                current_memory_context.get().conversation_address
+                if current_memory_context.get() is not None
+                else ConversationAddress.private(platform, user_id)
+            )
+            # Only an explicit add/review turn mints an actionable ordinal
+            # record. A bare lexical lookup remains read-only on later turns.
+            if actionable_candidates:
+                if not conversation_state_store.set(
                     target_key,
                     pending,
                     space_key=space_key,
                     owner_label=owner_label,
-                )
-            else:
+                ):
+                    return (
+                        f"「{word}」的候选编码暂时无法保存，请重新查询后再选择。"
+                    )
+            if not explicit_add_word:
                 read_only_candidates = render_server_backed_single_word_lookup(
                     pending.word,
                     pending.recommended_code,
                     pending.server_candidates,
                     pending.server_occupied_words,
                     reviewed_prompt=reviewed_prompt,
+                    actionable_controls=actionable_candidates,
                 )
                 reviewed_prompt = read_only_candidates
         actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
@@ -4342,6 +4403,7 @@ async def _execute_shift_to_code(
     reviewed_pinyin: str = "",
     reviewed_candidate_codes: Tuple[str, ...] = (),
     auto_confirm_shift_plan: bool = False,
+    auto_confirm_expected_shifted_words: Tuple[str, ...] = (),
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
     expected_occupants_by_code = {
@@ -4440,6 +4502,15 @@ async def _execute_shift_to_code(
                     else {}
                 ),
                 **({"_submit_after": True} if submit_after else {}),
+                **(
+                    {
+                        "_auto_confirm_expected_shifted_words": list(
+                            auto_confirm_expected_shifted_words
+                        ),
+                    }
+                    if auto_confirm_expected_shifted_words
+                    else {}
+                ),
             },
             confirmation_source="local_preview",
         ),
@@ -5343,6 +5414,9 @@ def _format_ranked_shift_partial_failure(
 def _format_ranked_shift_success(data: Dict[str, Any]) -> str:
     """Render applied shift receipts without repeating the full draft."""
     changes: List[str] = []
+    shift_plan = data.get("shiftPlan") if isinstance(data.get("shiftPlan"), dict) else {}
+    target_word = str(shift_plan.get("word") or "").strip()
+    target_code = str(shift_plan.get("targetCode") or "").strip()
     receipts = data.get("receipts") if isinstance(data.get("receipts"), list) else []
     for receipt in receipts:
         if not isinstance(receipt, dict) or receipt.get("status") not in {
@@ -5367,7 +5441,6 @@ def _format_ranked_shift_success(data: Dict[str, Any]) -> str:
                 f"{receipt.get('fromWeight')}→{receipt.get('toWeight')}"
             )
     if not changes:
-        shift_plan = data.get("shiftPlan") if isinstance(data.get("shiftPlan"), dict) else {}
         changes.extend(
             f"{str(change.get('word') or '').strip()} "
             f"{str(change.get('fromCode') or '').strip()}→"
@@ -5385,6 +5458,8 @@ def _format_ranked_shift_success(data: Dict[str, Any]) -> str:
             for update in shift_plan.get("draftUpdates") or []
             if isinstance(update, dict) and str(update.get("word") or "").strip()
         )
+    if target_word and target_code:
+        changes.insert(0, f"{target_word} → {target_code}")
     lines = ["✅ 操作已完成"]
     if changes:
         lines.append("已变更：" + "、".join(OrderedDict.fromkeys(changes)))
@@ -5503,6 +5578,11 @@ async def _execute_confirmed_tool(
     reviewed_candidate_codes = tuple(
         str(value or "").strip().lower()
         for value in args.pop("_reviewed_candidate_codes", [])
+        if str(value or "").strip()
+    )
+    auto_confirm_expected_shifted_words = tuple(
+        str(value or "").strip()
+        for value in args.pop("_auto_confirm_expected_shifted_words", [])
         if str(value or "").strip()
     )
     additional_shift_capabilities: Dict[
@@ -5817,6 +5897,19 @@ async def _execute_confirmed_tool(
             auto_confirm_shift_plan
             and state.function_name == "keytao_shift_phrase_code"
             and server_warning_ticket_is_complete(pending_state)
+            and (
+                not auto_confirm_expected_shifted_words
+                or tuple(
+                    str(item.get("word") or "").strip()
+                    for item in (
+                        data.get("shiftPlan", {}).get("shifted", [])
+                        if isinstance(data.get("shiftPlan"), dict)
+                        else []
+                    )
+                    if isinstance(item, dict)
+                    and str(item.get("word") or "").strip()
+                ) == auto_confirm_expected_shifted_words
+            )
             and (
                 (
                     state.confirmation_source == "local_preview"
@@ -9494,6 +9587,7 @@ async def _handle_pending_add_word(
             user_id,
             space_key,
             owner_label,
+            submit_after=submit_after_add,
             target_item={
                 "type": "Phrase",
                 "remark": str(create_args.get("remark") or ""),
@@ -9553,6 +9647,30 @@ async def _handle_pending_add_word(
                     state.needs_manual_review,
                     **reviewed_validation(direct_code),
                 )
+            if len(direct_code) < 6:
+                create_args = _create_phrase_args(state, direct_code)
+                reviewed_pinyin, reviewed_candidate_codes = (
+                    _pending_reviewed_reading(state, direct_code)
+                )
+                return await _execute_shift_to_code(
+                    state.word,
+                    direct_code,
+                    platform,
+                    user_id,
+                    space_key,
+                    owner_label,
+                    submit_after=submit_after_add,
+                    target_item={
+                        "type": "Phrase",
+                        "remark": str(create_args.get("remark") or ""),
+                        "needsManualReview": bool(
+                            create_args.get("needs_manual_review", True)
+                        ),
+                    },
+                    reviewed_pinyin=reviewed_pinyin,
+                    reviewed_candidate_codes=reviewed_candidate_codes,
+                    auto_confirm_shift_plan=True,
+                )
             return await _execute_confirmed_tool(
                 PendingToolConfirm(
                     function_name="keytao_create_phrase",
@@ -9599,6 +9717,31 @@ async def _handle_pending_add_word(
                 state.code_remarks.get(target_code, ""),
                 state.needs_manual_review,
                 **reviewed_validation(target_code),
+            )
+        if len(target_code) < 6:
+            create_args = _create_phrase_args(state, target_code)
+            reviewed_pinyin, reviewed_candidate_codes = _pending_reviewed_reading(
+                state,
+                target_code,
+            )
+            return await _execute_shift_to_code(
+                state.word,
+                target_code,
+                platform,
+                user_id,
+                space_key,
+                owner_label,
+                submit_after=submit_after_add,
+                target_item={
+                    "type": "Phrase",
+                    "remark": str(create_args.get("remark") or ""),
+                    "needsManualReview": bool(
+                        create_args.get("needs_manual_review", True)
+                    ),
+                },
+                reviewed_pinyin=reviewed_pinyin,
+                reviewed_candidate_codes=reviewed_candidate_codes,
+                auto_confirm_shift_plan=True,
             )
         return await _execute_confirmed_tool(
             PendingToolConfirm(
@@ -9669,6 +9812,32 @@ async def _handle_pending_add_word(
             state.code_remarks.get(target_code, ""),
             state.needs_manual_review,
             **reviewed_validation(target_code),
+        )
+
+    if is_occupied and len(target_code) < 6:
+        create_args = _create_phrase_args(state, target_code)
+        reviewed_pinyin, reviewed_candidate_codes = _pending_reviewed_reading(
+            state,
+            target_code,
+        )
+        return await _execute_shift_to_code(
+            state.word,
+            target_code,
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+            submit_after=submit_after_add,
+            target_item={
+                "type": "Phrase",
+                "remark": str(create_args.get("remark") or ""),
+                "needsManualReview": bool(
+                    create_args.get("needs_manual_review", True)
+                ),
+            },
+            reviewed_pinyin=reviewed_pinyin,
+            reviewed_candidate_codes=reviewed_candidate_codes,
+            auto_confirm_shift_plan=True,
         )
 
     if submit_after_add:

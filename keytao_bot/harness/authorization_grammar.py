@@ -786,7 +786,28 @@ _EVICTION_ADD_HEAD_RE = re.compile(
     r"[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
     r"(?:的\s*)?(?:编码|代码)?\s*"
     rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*"
-    r"[，,；;]\s*(?P<tail>.+?)\s*$",
+    r"(?:[，,；;]\s*(?:并(?:且)?\s*)?|并(?:且)?\s*)"
+    r"(?P<tail>.+?)\s*$",
+    re.IGNORECASE,
+)
+_EVICTION_CHANGE_HEAD_RE = re.compile(
+    rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
+    r"(?:把|将)\s*[「“]?\s*"
+    r"(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
+    r"(?:的\s*)?(?:编码|代码)?\s*"
+    r"改到\s*"
+    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*"
+    r"(?:[，,；;]\s*(?:并(?:且)?\s*)?|并(?:且)?\s*)"
+    r"(?P<tail>.+?)\s*$",
+    re.IGNORECASE,
+)
+_EVICTION_USE_HEAD_RE = re.compile(
+    rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
+    r"[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
+    r"(?:的\s*)?(?:编码|代码)?\s*(?:用|占)\s*"
+    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})\s*"
+    r"(?:[，,；;]\s*(?:并(?:且)?\s*)?|并(?:且)?\s*)"
+    r"(?P<tail>.+?)\s*$",
     re.IGNORECASE,
 )
 _ECHOED_EVICTION_ADD_RE = re.compile(
@@ -799,7 +820,7 @@ _ECHOED_EVICTION_ADD_RE = re.compile(
     re.IGNORECASE,
 )
 _EVICTION_ADD_OCCUPANT_PATTERN = r"(?![把将])[\u3400-\u9fff]{1,16}"
-_EVICTION_MODIFIER_PATTERN = r"顺延|挪开|往后排|重新编码|顶掉|顶下去|挤掉|换下来"
+_EVICTION_MODIFIER_PATTERN = r"顺延|挪开|挪走|往后排|重新编码|顶掉|顶下去|挤掉|换下来"
 _EVICTION_ADD_TAIL_RES = (
     re.compile(
         rf"^(?:让\s*)?(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})\s*"
@@ -810,7 +831,7 @@ _EVICTION_ADD_TAIL_RES = (
         rf"(?P<modifier>{_EVICTION_MODIFIER_PATTERN})$"
     ),
     re.compile(
-        rf"^(?P<modifier>挪开)\s*"
+        rf"^(?P<modifier>{_EVICTION_MODIFIER_PATTERN})\s*"
         rf"(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})$"
     ),
 )
@@ -1226,7 +1247,18 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
         )
         return parsed if parsed.word != parsed.named_occupant else None
 
-    match = _EVICTION_ADD_HEAD_RE.fullmatch(source)
+    match = next(
+        (
+            candidate.fullmatch(source)
+            for candidate in (
+                _EVICTION_ADD_HEAD_RE,
+                _EVICTION_CHANGE_HEAD_RE,
+                _EVICTION_USE_HEAD_RE,
+            )
+            if candidate.fullmatch(source) is not None
+        ),
+        None,
+    )
     if match is None:
         return None
     tail = re.sub(r"\s+", "", match.group("tail"))
@@ -1695,6 +1727,7 @@ _WORD_RIGHT_SUFFIXES = (
 BLOCK_REASON_SOURCE_UNTRUSTED = "source_untrusted"
 BLOCK_REASON_VERB_NOT_MATCHED = "verb_not_matched"
 BLOCK_REASON_BINDING_INCOMPLETE = "binding_incomplete"
+BLOCK_REASON_CANDIDATE_RECORD_MISSING = "candidate_record_missing"
 BLOCK_REASON_TICKET_REQUIRED = "ticket_required"
 BLOCK_REASON_BULK_DELETE_NOT_REQUESTED = "bulk_delete_not_requested"
 BLOCK_REASON_MANUAL_SHIFT_FORBIDDEN = "manual_shift_forbidden"
@@ -4876,8 +4909,8 @@ def _validate_current_message_binding(
         )):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                f"{POLICY_BLOCK_TEMPLATE_PREFIX}{action} 操作的动作、词条或编码"
-                "未与用户本轮原始文字中的完整目标绑定。",
+                f"{POLICY_BLOCK_TEMPLATE_PREFIX}当前操作中的词条或编码"
+                "与这条消息不一致。",
                 missing=["boundTarget"],
                 unboundTargets=missing_targets[:12],
             )

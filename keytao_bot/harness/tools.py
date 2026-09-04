@@ -10,6 +10,7 @@ from nonebot.log import logger
 from keytao_bot.utils.observability import observe_tool_call
 from keytao_bot.utils.pending_confirmation import (
     advertised_batch_assent_verb,
+    parse_pending_candidate_selection,
     parse_pending_assent_phrase,
     pending_confirmation_copy,
     render_remediation_reply,
@@ -990,6 +991,7 @@ from .authorization_grammar import (
     BLOCK_REASON_SOURCE_UNTRUSTED,
     BLOCK_REASON_VERB_NOT_MATCHED,
     BLOCK_REASON_BINDING_INCOMPLETE,
+    BLOCK_REASON_CANDIDATE_RECORD_MISSING,
     BLOCK_REASON_TICKET_REQUIRED,
     BLOCK_REASON_BULK_DELETE_NOT_REQUESTED,
     BLOCK_REASON_MANUAL_SHIFT_FORBIDDEN,
@@ -1836,6 +1838,17 @@ class ToolExecutor:
             if binding_error:
                 if binding_error.get("blockReason") == BLOCK_REASON_BINDING_INCOMPLETE:
                     capability = context.pending_candidate
+                    # A number/code selector may derive its operands only from
+                    # our actor-owned candidate record.  Quoted or user-written
+                    # display text is never a substitute for that server record.
+                    if (
+                        capability is None
+                        and parse_pending_candidate_selection(message) is not None
+                    ):
+                        return policy_block(
+                            BLOCK_REASON_CANDIDATE_RECORD_MISSING,
+                            "刚才的候选记录已失效，请重新查询后再选择；本次未写入。",
+                        )
                     live_candidate_selected = bool(
                         tool_name == "keytao_create_phrase"
                         and capability is not None
@@ -1849,7 +1862,7 @@ class ToolExecutor:
                     if live_candidate_selected and assent.recognized:
                         binding_error["liveCandidateSelected"] = True
                         binding_error["message"] = (
-                            "当前候选状态仍有效，但这次模型工具调用没有通过"
+                            "当前候选状态仍有效，但这次操作请求没有通过"
                             "受信的候选确认路由；系统不会从消息文字补造或改写"
                             "词条和编码，本次未写入。"
                         )
@@ -1908,7 +1921,10 @@ class ToolExecutor:
             "success": False,
             "policyBlocked": True,
             "blockReason": BLOCK_REASON_MANUAL_SHIFT_FORBIDDEN,
-            "message": "安全拦截：禁止手工迁移未点名词条。需要插入已占用编码并顺延时，必须调用 keytao_shift_phrase_code，让工具按每个被挤词自己的 encode 候选链计算。",
+            "message": (
+                "不能手工指定未点名词条的新编码。插入已占用编码时，"
+                "系统会按每个原词自己的候选链自动顺延；本次未写入。"
+            ),
             "blockedReassignments": blocked_labels,
         }
 

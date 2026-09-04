@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from nonebot.log import logger
 
 from keytao_bot.utils.llm_policy import (
+    chat_usage_metrics,
     is_deepseek_model,
     log_chat_usage,
     with_deepseek_chat_policy,
@@ -35,6 +36,7 @@ from keytao_bot.utils.pending_confirmation import (
     append_unbound_binding_notice,
     already_existing_word_copy,
     advertised_batch_binding_pairs,
+    advertised_command_suggestions,
     advertised_reply_contract,
     command_suggestions_are_closed_candidate_selections,
     ensure_multi_word_candidate_copy,
@@ -52,6 +54,7 @@ from keytao_bot.utils.pending_confirmation import (
     render_remediation_reply,
     same_unique_binding_set,
     render_server_backed_single_word_candidates,
+    server_backed_front_insert_commands,
     system_reply_template_marker,
     validated_front_insert_recommendation,
 )
@@ -95,7 +98,7 @@ def _command_suggestions_match_pending_batch(
     text: str,
     state: object,
 ) -> bool:
-    """Accept only real-parser assent forms bound to the displayed sealed batch."""
+    """Accept only real-parser commands bound to the displayed sealed batch."""
     if (
         not isinstance(state, PendingToolConfirm)
         or state.function_name != "keytao_batch_add_to_draft"
@@ -105,23 +108,83 @@ def _command_suggestions_match_pending_batch(
     suggestions = contract.command_suggestions
     displayed_pairs = advertised_batch_binding_pairs(text)
     sealed_pairs = pending_batch_display_pairs(state)
-    if (
-        not suggestions
-        or not displayed_pairs
-        or not same_unique_binding_set(displayed_pairs, sealed_pairs)
-    ):
+    if not suggestions or not sealed_pairs:
         return False
+    displayed_pairs_match = bool(
+        displayed_pairs
+        and same_unique_binding_set(displayed_pairs, sealed_pairs)
+    )
+    sealed_words = tuple(word for word, _code in sealed_pairs)
     advertised_assent = set(contract.batch_assent_forms)
+    front_insert_commands = set(server_backed_front_insert_commands(
+        state.args.get("_candidate_scopes"),
+    ))
     for suggestion in suggestions:
+        if suggestion in front_insert_commands:
+            if not displayed_pairs_match:
+                return False
+            continue
+        set_reference = parse_advertised_set_reference(suggestion)
+        if (
+            set_reference.matched
+            and not set_reference.exclusions
+            and set_reference.expected_count == len(sealed_words)
+            and render_executable_suggestion(
+                suggestion,
+                words=sealed_words,
+            ) in text
+        ):
+            continue
         parsed = parse_pending_assent_phrase(suggestion)
         if (
-            suggestion not in advertised_assent
+            not displayed_pairs_match
+            or suggestion not in advertised_assent
             or not parsed.matched
             or not parsed.add_requested
             or parsed.cancel_requested
         ):
             return False
     return True
+
+
+def _strip_unbound_command_suggestions(
+    text: str,
+    suggestions: tuple[str, ...],
+) -> str:
+    """Remove copyable examples while preserving surrounding read-only facts."""
+    rendered = str(text or "")
+    for suggestion in dict.fromkeys(
+        str(item or "").strip() for item in suggestions if str(item or "").strip()
+    ):
+        escaped = re.escape(suggestion)
+        quoted = rf"(?:「{escaped}」|“{escaped}”|『{escaped}』)"
+        rendered = re.sub(
+            rf"[（(][^（）()\r\n]{{0,32}}(?:比如|例如)"
+            rf"[^（）()\r\n]{{0,16}}{quoted}[^（）()\r\n]{{0,16}}[）)]",
+            "",
+            rendered,
+        )
+        rendered = re.sub(
+            rf"(?m)^[ \t]*[-•][ \t]*{quoted}"
+            rf"(?:（[^\r\n）]*）)?[ \t]*(?:\r?\n|$)",
+            "",
+            rendered,
+        )
+    rendered = re.sub(r"[ \t]+([。；，！？])", r"\1", rendered)
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+    return rendered.strip()
+
+
+def _is_multi_word_add_candidate_discovery(message: str) -> bool:
+    """Recognize a code-less multi-word add request that still needs selection."""
+    normalized = unicodedata.normalize("NFKC", str(message or ""))
+    if parse_eviction_modified_add(normalized) is not None:
+        return False
+    return re.search(
+        r"(?:^|\s)(?:请)?加词\s+"
+        r"[\u3400-\u9fff]{1,32}(?:\s+[\u3400-\u9fff]{1,32})+\s*$",
+        normalized,
+    ) is not None
 
 
 AUTHORITATIVE_LINK_TOOLS = frozenset({
@@ -146,8 +209,9 @@ _LOCK_BEFORE_PROMPT_TOOL_NAMES = frozenset({
 
 _BLOCK_REASON_USER_LABELS = {
     "source_untrusted": "消息来源不受信任",
-    "verb_not_matched": "未识别到明确执行动作",
-    "binding_incomplete": "操作目标绑定不完整",
+    "verb_not_matched": "当前消息没有明确要求执行操作",
+    "binding_incomplete": "当前操作缺少明确的词条或编码",
+    "candidate_record_missing": "候选记录已失效",
     "ticket_required": "缺少有效确认",
     "bulk_delete_not_requested": "未明确授权批量删除",
     "manual_shift_forbidden": "不允许手工指定顺延计划",
@@ -157,8 +221,12 @@ _BLOCK_REASON_USER_LABELS = {
 }
 
 _FUTURE_BATCH_ASSENT_OFFER_RE = re.compile(
+    r"(?:"
     r"(?:末尾|最后|结尾)[^\r\n]{0,48}(?:说明|注明|写明)[^\r\n]{0,32}"
     r"(?:可|可以)(?:直接)?回复[「『“\"']?加入(?:并提交)?[」』”\"']?"
+    r"|"
+    r"(?:说明|注明|写明)(?:可|可以)(?:把|将)列表中的词加入草稿"
+    r")"
 )
 
 
@@ -281,6 +349,53 @@ class _InternalToolCall:
 _MAX_TOOL_CALLS_PER_RESPONSE = 8
 _MAX_TOOL_CALLS_PER_RUN = 40
 _MAX_CONSECUTIVE_REASONING_ONLY_EMPTY_RESPONSES = 2
+_REASONING_ONLY_RATIO_PERCENT = 95
+_REASONING_RETRY_SYSTEM_PROMPT = (
+    "你是键道助手。只处理下方这一条当前请求和本轮已经取得的可信结果；"
+    "不要依赖更早的对话。优先使用现有结果完成操作；"
+    "不能安全完成时，简短说明没有写入，不要声称未发生的操作。"
+)
+
+
+def _is_reasoning_only_exhaustion(
+    response: Any,
+    *,
+    finish_reason: object,
+    content: object,
+    tool_calls: object,
+) -> bool:
+    """Identify a length stop whose entire output was effectively reasoning."""
+    if (
+        str(finish_reason or "") != "length"
+        or str(content or "").strip()
+        or bool(tool_calls)
+    ):
+        return False
+    usage = chat_usage_metrics(response)
+    output_tokens = usage.get("output_tokens", 0)
+    reasoning_tokens = usage.get("reasoning_tokens", 0)
+    return bool(
+        output_tokens > 0
+        and reasoning_tokens * 100
+        >= output_tokens * _REASONING_ONLY_RATIO_PERCENT
+    )
+
+
+def _compact_reasoning_retry_messages(
+    messages: List[Dict],
+    current_request_index: int,
+) -> List[Dict]:
+    """Keep the current request and same-turn records, dropping old context."""
+    if not 0 <= current_request_index < len(messages):
+        return list(messages)
+    return [
+        {"role": "system", "content": _REASONING_RETRY_SYSTEM_PROMPT},
+        *[
+            dict(item)
+            for item in messages[current_request_index:]
+            if isinstance(item, dict)
+        ],
+    ]
 
 
 @dataclass(frozen=True)
@@ -472,6 +587,7 @@ class AgentOrchestrator:
         history_span = self._history_span_annotation(context.history)
         if history_span:
             current_request += f"\n\n{history_span}"
+        current_request_index = len(messages)
         messages.append({
             "role": "user",
             "content": current_request,
@@ -536,6 +652,23 @@ class AgentOrchestrator:
                     for tool in tools
                     if _tool_function_name(tool) not in MUTATING_TOOL_NAMES
                 ]
+            if _is_multi_word_add_candidate_discovery(message):
+                # The codes and any occupied-code ordering decision are not
+                # bound until review finishes. Keep discovery read-only and
+                # persist one sealed candidate ticket for the next turn.
+                tools = [
+                    tool
+                    for tool in tools
+                    if _tool_function_name(tool) not in MUTATING_TOOL_NAMES
+                ]
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "[系统] 当前请求包含多个未指定编码的加词目标。"
+                        "本轮只逐词审查并展示完整候选，不得写入、提交或顺延；"
+                        "候选会由执行器绑定，等待用户下一条选择。"
+                    ),
+                })
             if not context.mutations_allowed:
                 guidance = (
                     "本轮为只读轮：用户这条消息没有构成明确的写操作授权，"
@@ -587,14 +720,27 @@ class AgentOrchestrator:
                     )
                 )
             ):
-                logger.warning(
-                    "[advertised_reply_contract] branch=strip_model_command "
-                    f"count={len(contract.command_suggestions)}"
+                sanitized = _strip_unbound_command_suggestions(
+                    rendered,
+                    contract.command_suggestions,
                 )
-                return render_remediation_reply(
-                    "回复中的操作说法没有可验证的服务端绑定记录，已移除；"
-                    "本次不会写入"
-                )
+                sanitized_contract = advertised_reply_contract(sanitized)
+                if not sanitized_contract.command_suggestions:
+                    logger.warning(
+                        "[advertised_reply_contract] branch=strip_model_command "
+                        f"count={len(contract.command_suggestions)} preserved_reply=true"
+                    )
+                    rendered = sanitized
+                    contract = sanitized_contract
+                else:
+                    logger.warning(
+                        "[advertised_reply_contract] branch=strip_model_command "
+                        f"count={len(contract.command_suggestions)} preserved_reply=false"
+                    )
+                    return render_remediation_reply(
+                        "回复中的操作说法没有可验证的服务端绑定记录，已移除；"
+                        "本次不会写入"
+                    )
             if not contract.requires_live_state:
                 return rendered
             return append_unbound_binding_notice(
@@ -603,6 +749,7 @@ class AgentOrchestrator:
             )
 
         current_max_tokens = self._initial_max_tokens(message)
+        current_reasoning_effort = "high"
         seen_tool_calls: Dict[tuple, tuple[int, bool]] = {}
         seen_tool_call_ids: set[str] = set()
         total_tool_calls = 0
@@ -651,6 +798,7 @@ class AgentOrchestrator:
         while True:
             replaying_queued_calls = bool(queued_tool_calls)
             response_reasoning_content = None
+            response = None
             if eviction_terminal_reply is not None:
                 return self._append_authoritative_result_links(
                     eviction_terminal_reply,
@@ -910,7 +1058,7 @@ class AgentOrchestrator:
                         "temperature": self._runtime.temperature,
                     },
                     thinking=True,
-                    reasoning_effort="high",
+                    reasoning_effort=current_reasoning_effort,
                 )
                 if tools:
                     call_kwargs["tools"] = tools
@@ -1038,10 +1186,22 @@ class AgentOrchestrator:
                 f"tool_calls={tool_call_count} content_len={len(content)} elapsed={elapsed:.1f}s"
             )
 
+            reasoning_exhausted = bool(
+                response is not None
+                and _is_reasoning_only_exhaustion(
+                    response,
+                    finish_reason=finish_reason,
+                    content=content,
+                    tool_calls=response_tool_calls,
+                )
+            )
             reasoning_only_empty = bool(
                 not response_tool_calls
                 and not content.strip()
-                and str(response_reasoning_content or "").strip()
+                and (
+                    reasoning_exhausted
+                    or str(response_reasoning_content or "").strip()
+                )
             )
             if reasoning_only_empty:
                 reasoning_only_empty_responses += 1
@@ -1104,12 +1264,37 @@ class AgentOrchestrator:
                         if termination_state is not None:
                             termination_state["reason"] = "reasoning_runaway"
                         return self._append_authoritative_result_links(
-                            render_remediation_reply(
-                                "连续两次没有生成可见回复或工具调用，已停止扩大处理预算；"
-                                "本次未执行任何新写入"
+                            self._reasoning_exhaustion_reply(
+                                message,
+                                context,
+                                trusted_candidate_slots_by_word=(
+                                    trusted_candidate_slots_by_word
+                                ),
+                                trusted_entries_by_code=trusted_entries_by_code,
+                                trusted_reviewed_items_by_key=(
+                                    trusted_reviewed_items_by_key
+                                ),
                             ),
                             authoritative_result_links,
                         )
+                if reasoning_exhausted and reasoning_only_empty_responses:
+                    before_chars = len(json.dumps(messages, ensure_ascii=False))
+                    messages = _compact_reasoning_retry_messages(
+                        messages,
+                        current_request_index,
+                    )
+                    after_chars = len(json.dumps(messages, ensure_ascii=False))
+                    if is_deepseek_model(self._runtime.model):
+                        current_reasoning_effort = "low"
+                    logger.warning(
+                        "Reasoning-only output exhausted the response: "
+                        f"retry={reasoning_only_empty_responses + 1}/"
+                        f"{_MAX_CONSECUTIVE_REASONING_ONLY_EMPTY_RESPONSES} "
+                        f"max_tokens={current_max_tokens} "
+                        f"reasoning_effort={current_reasoning_effort} "
+                        f"input_chars={before_chars}->{after_chars}"
+                    )
+                    continue
             else:
                 reasoning_only_empty_responses = 0
 
@@ -1127,7 +1312,7 @@ class AgentOrchestrator:
                     termination_state["reason"] = "response_budget_exhausted"
                 return self._append_authoritative_result_links(
                     render_remediation_reply(
-                        "回复太长且已达到处理预算上限，本轮不能生成安全的拆分命令"
+                        "回复内容过长，仍未能完整生成；本轮不能安全拆分后续操作"
                     ),
                     authoritative_result_links,
                 )
@@ -2406,7 +2591,7 @@ class AgentOrchestrator:
 
             continue
 
-        completed_text = "、".join(completed_run_labels) or "无工具调用"
+        completed_text = "、".join(completed_run_labels) or "无已完成操作"
         if termination_state is not None:
             termination_state["reason"] = "iteration_cap"
         return self._append_authoritative_result_links(
@@ -3095,7 +3280,7 @@ class AgentOrchestrator:
         from keytao_bot.plugins.chat_render import _reply_has_internal_fragment
 
         reason = str(value or "").strip()
-        return fallback if _reply_has_internal_fragment(reason) else reason
+        return fallback if not reason or _reply_has_internal_fragment(reason) else reason
 
     @staticmethod
     def _submit_snapshot_binding(
@@ -3388,13 +3573,13 @@ class AgentOrchestrator:
                     "transport_failure": "后续 AI 服务调用失败",
                     "empty_model_response": "后续 AI 服务没有返回可用回复",
                     "reasoning_runaway": "后续汇总因连续空回复而停止",
-                    "response_budget_exhausted": "后续汇总达到回复预算上限",
+                    "response_budget_exhausted": "后续汇总内容过长，未能完整生成",
                     "incomplete_model_response": "后续 AI 回复不完整",
                     "incomplete_tool_request": "后续工具请求不完整",
                     "empty_final_response": "后续 AI 汇总连续为空",
-                    "tool_budget_exhausted": "后续处理达到工具调用预算上限",
+                    "tool_budget_exhausted": "后续操作过多，已停止继续处理",
                     "invalid_tool_request": "后续工具请求未通过校验",
-                    "duplicate_tool_runaway": "后续处理因重复工具调用而停止",
+                    "duplicate_tool_runaway": "后续处理因重复操作而停止",
                     "tool_dispatch_exception": "后续工具分发发生异常",
                     "confirmation_save_failure": "后续确认请求未能安全保存",
                     "iteration_cap": "后续处理达到模型轮次上限",
@@ -3465,6 +3650,11 @@ class AgentOrchestrator:
                 f"{FAILED_WRITE_TEMPLATE_PREFIX}，{FAILED_WRITE_TEMPLATE_MARKER}；原因：{reason}",
                 command=suggestion,
             )
+        if is_interrogative_message(current_message) and not failure_state and not receipts:
+            # A direct meta/process answer may legitimately mention retrying a
+            # previous candidate. It is not asking the user to resend this
+            # interrogative turn, so the refusal-loop breaker must not replace it.
+            return reply
         resend = re.search(
             r"(?:重新|再次|再|原样|重复).{0,10}(?:发送|发一遍|发|输入|说一遍|提交)",
             reply,
@@ -4211,6 +4401,164 @@ class AgentOrchestrator:
             return f"（历史跨度：最早一条约{seconds // 3600}小时前）"
         return f"（历史跨度：最早一条约{seconds // 86400}天前）"
 
+    def _reasoning_exhaustion_reply(
+        self,
+        message: str,
+        context: AgentRequestContext,
+        *,
+        trusted_candidate_slots_by_word: Dict[
+            str,
+            tuple[tuple[str, bool], ...],
+        ],
+        trusted_entries_by_code: Dict[
+            str,
+            tuple[tuple[str, int], ...],
+        ],
+        trusted_reviewed_items_by_key: Dict[
+            tuple[str, str],
+            Dict[str, Any],
+        ],
+    ) -> str:
+        """Offer only a parser- and binding-checked retry from trusted records."""
+        parsed = parse_eviction_modified_add(message)
+        if parsed is None:
+            return "这次服务没有完成处理，本次未写入。"
+
+        candidate_slots = {
+            word: tuple(slots)
+            for word, slots in trusted_candidate_slots_by_word.items()
+        }
+        entries_by_code = {
+            code: tuple(entries)
+            for code, entries in trusted_entries_by_code.items()
+        }
+        reviewed_items = {
+            key: dict(item)
+            for key, item in trusted_reviewed_items_by_key.items()
+        }
+        record = self._state_store.get_record(context.conversation_address)
+        state = (
+            record.state
+            if record is not None
+            and not record.execution_id
+            and isinstance(record.state, PendingAddWord)
+            and record.state.word == parsed.word
+            and record.state.server_candidates
+            and record.state.server_candidates == record.state.candidates
+            else None
+        )
+        if state is not None:
+            candidate_slots.setdefault(
+                state.word,
+                tuple(
+                    (str(code).strip().lower(), bool(occupied))
+                    for code, occupied in state.server_candidates
+                ),
+            )
+            for code, raw_entries in state.server_entries_by_code.items():
+                normalized_entries = tuple(
+                    (str(word).strip(), int(weight))
+                    for word, weight in raw_entries
+                    if (
+                        str(word).strip()
+                        and isinstance(weight, int)
+                        and not isinstance(weight, bool)
+                        and weight >= 0
+                    )
+                )
+                if normalized_entries:
+                    entries_by_code.setdefault(
+                        str(code).strip().lower(),
+                        normalized_entries,
+                    )
+
+        target_code = str(parsed.code or "").strip().lower()
+        if not target_code:
+            matching_codes = [
+                code
+                for code, occupied in candidate_slots.get(parsed.word, ())
+                if (
+                    occupied is True
+                    and sum(
+                        word == parsed.named_occupant
+                        for word, _weight in entries_by_code.get(code, ())
+                    )
+                    == 1
+                )
+            ]
+            if len(matching_codes) == 1:
+                target_code = matching_codes[0]
+        if (
+            state is not None
+            and state.needs_manual_review is not None
+            and target_code
+            and any(
+                code == target_code
+                for code, _occupied in candidate_slots.get(state.word, ())
+            )
+        ):
+            reviewed_items.setdefault(
+                (state.word, target_code),
+                {
+                    "word": state.word,
+                    "code": target_code,
+                    "type": "Phrase",
+                    "needsManualReview": state.needs_manual_review,
+                },
+            )
+
+        command = (
+            f"加词 {parsed.word} {target_code}，顺延 {parsed.named_occupant}"
+            if target_code
+            else ""
+        )
+        reparsed = parse_eviction_modified_add(command)
+        arguments = {
+            "word": parsed.word,
+            "code": target_code,
+            "action": "Create",
+        }
+        binding_error = (
+            ToolExecutor._validate_current_message_binding(
+                "keytao_create_phrase",
+                arguments,
+                ToolContext(
+                    platform=context.platform,
+                    user_id=context.user_id,
+                    current_message=command,
+                    writes_allowed=True,
+                    trusted_candidate_slots_by_word=candidate_slots,
+                    trusted_entries_by_code=entries_by_code,
+                    trusted_reviewed_items_by_key=reviewed_items,
+                    pending_candidate=(
+                        _pending_candidate_capability(state)
+                        if state is not None
+                        else None
+                    ),
+                ),
+            )
+            if reparsed is not None
+            else {"blockReason": "retry_command_not_parsed"}
+        )
+        if (
+            reparsed is None
+            or reparsed.word != parsed.word
+            or reparsed.code != target_code
+            or reparsed.named_occupant != parsed.named_occupant
+            or binding_error is not None
+        ):
+            return "这次服务没有完成处理，本次未写入。"
+
+        reply = render_remediation_reply(
+            "这次服务没有完成你要求的添加和顺延，本次未写入；"
+            "请发送下面这条完整指令再试",
+            command=command,
+            words=(parsed.word, parsed.named_occupant),
+        )
+        if advertised_command_suggestions(reply) != (command,):
+            return "这次服务没有完成处理，本次未写入。"
+        return reply
+
     def _initial_max_tokens(self, message: str) -> int:
         line_count = message.count("\n") + 1
         return max(self._runtime.max_tokens, min(line_count * 200 + 500, self._runtime.max_tokens_cap))
@@ -4282,7 +4630,7 @@ class AgentOrchestrator:
         completed_text = "、".join(completed_labels) or "无"
         remaining_text = "、".join(remaining_labels) or "无"
         return (
-            f"本轮工具调用已达到 {_MAX_TOOL_CALLS_PER_RUN} 次上限；"
+            f"本轮操作已达到 {_MAX_TOOL_CALLS_PER_RUN} 次上限；"
             f"当前这批已完成 {completed}/{total}：{completed_text}。"
             f"尚有 {len(remaining_labels)} 项未执行：{remaining_text}。"
             "已完成结果会保留。\n"
@@ -4324,7 +4672,7 @@ class AgentOrchestrator:
             )
         if error.cause == "duplicate_id":
             return render_remediation_reply(
-                "AI 返回了重复的工具调用编号；本批没有执行"
+                "AI 返回了重复的操作编号；本批没有执行"
             )
         if error.cause == "invalid_json":
             return render_remediation_reply(
@@ -4335,7 +4683,7 @@ class AgentOrchestrator:
                 "AI 返回的工具参数不符合该操作的字段要求；本批没有执行"
             )
         return render_remediation_reply(
-            "AI 返回了不完整的工具调用；本批没有执行"
+            "AI 返回了不完整的操作请求；本批没有执行"
         )
 
     def _parse_tool_calls(

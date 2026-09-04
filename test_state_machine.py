@@ -2680,6 +2680,7 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
                         conv_key,
                         ("qq", "qq:group:word-group"),
                         "Alice",
+                        actionable_lookup=True,
                     )
             stored_pending = store.get_record(conv_key)
         finally:
@@ -2692,9 +2693,18 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
         check("source shown", result is not None and "汉典" in result)
         check("valid code shown", result is not None and "lyfg" in result)
         check("invalid hallucinated code absent", result is not None and "loyfg" not in result)
-        check("read response does not parse as a write ticket", _parse_pending_add_word(result or "") is None)
-        check("read response labels its no-ticket boundary", result is not None and "本次仅查询" in result)
-        check("deterministic read stores no pending capability", stored_pending is None)
+        check("read response does not mint authority by parsing display text", _parse_pending_add_word(result or "") is None)
+        check(
+            "displayed candidates persist one server-backed selection record",
+            stored_pending is not None
+            and isinstance(stored_pending.state, PendingAddWord)
+            and stored_pending.owner_key == conv_key
+            and stored_pending.state.word == "洛阳纸贵"
+            and stored_pending.state.server_candidates
+            == [("lyfg", False), ("lyfga", False), ("lyfgb", True)]
+            and stored_pending.state.server_occupied_words
+            == {"lyfgb": ["洛阳"]},
+        )
         check(
             "read response still shows trusted candidate occupancy",
             result is not None
@@ -3165,9 +3175,9 @@ def test_model_batch_pending_fact_leads_and_arms_one_local_confirmation():
           and record.state.args.get("_pending_submitted_confirmed") is True)
 
 
-def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
-    """A read lookup may show candidates, but a later bare assent must not write."""
-    print("\n🧪 read word query never arms an add ticket")
+def test_read_word_query_persists_server_candidate_record():
+    """Every actionable lookup owns one server record; stale selectors only refresh."""
+    print("\n🧪 read word query persists a server candidate record")
 
     async def _run():
         review = {
@@ -3249,6 +3259,7 @@ def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
                     conv_key,
                     space_key,
                     "Rea",
+                    actionable_lookup=True,
                 )
             query_record = store.get_record(conv_key)
             delivered_lookup_response = (
@@ -3257,23 +3268,6 @@ def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
                     conv_key,
                 )
             )
-            short_submit_ctx = openai_chat_module.TurnContext(
-                bot=object(),
-                event=object(),
-                platform="qq",
-                user_id="read-query-user",
-                normalized_message_text="添加并提交",
-                history=[{"role": "assistant", "content": lookup_response}],
-                conv_key=conv_key,
-                space_key=space_key,
-                owner_label="Rea",
-            )
-            short_submit_finished = await (
-                openai_chat_module._stage_apply_scoped_pending_intent(
-                    short_submit_ctx
-                )
-            )
-
             with (
                 patch.object(openai_chat_module, "OPENAI_API_KEY", ""),
                 patch.object(openai_chat_module, "AsyncOpenAI", None),
@@ -3293,7 +3287,9 @@ def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
                     owner_label="Rea",
                 )
             bare_assent_write_count = execute_add.await_count
+            execute_add.reset_mock()
 
+            store.delete(conv_key)
             recovery_ctx = openai_chat_module.TurnContext(
                 bot=object(),
                 event=object(),
@@ -3397,34 +3393,35 @@ def test_read_word_query_never_arms_add_ticket_through_pending_execution_path():
             and "lyfg" in lookup_response,
         )
         check(
-            "read candidates survive the production delivery guard without a ticket",
+            "read candidates survive the production delivery guard with their record",
             "洛阳纸贵" in delivered_lookup_response
             and "lyfg" in delivered_lookup_response
-            and "本次仅查询" in delivered_lookup_response,
+            and "本次仅查询" not in delivered_lookup_response,
         )
         check(
-            "read-backed add-submit bypasses only the missing-ticket prefilter",
-            short_submit_finished is False
-            and short_submit_ctx.response is None,
+            "read query stores one PendingAddWord capability",
+            query_record is not None
+            and isinstance(query_record.state, PendingAddWord)
+            and query_record.state.server_candidates
+            == [("lyfg", False), ("lyfga", False)],
         )
+        check("bare assent after read uses the trusted recommended slot", bare_assent_write_count == 1)
+        check("bare assent after read reports its pending action", assent_response == "已加入草稿")
         check(
-            "read query leaves no PendingAddWord capability",
-            query_record is None,
-        )
-        check("bare assent after read performs zero writes", bare_assent_write_count == 0)
-        check("bare assent after read has no pending action", assent_response is None)
-        check(
-            "explicit add assent re-runs review and completes the current intent",
-            recovery_ctx.response == "已加入草稿"
-            and recovered_record is None
-            and execute_add.await_count == 1
+            "missing candidate record re-renders without executing the stale selector",
+            recovery_ctx.response is not None
+            and "候选记录已失效" in recovery_ctx.response
+            and "lyfg" in recovery_ctx.response
+            and recovered_record is not None
+            and isinstance(recovered_record.state, PendingAddWord)
+            and execute_add.await_count == 0
             and sum(
                 1
                 for name, arguments in tool_calls
                 if name == "keytao_prepare_reviewed_add"
                 and arguments == {"word": "洛阳纸贵"}
             )
-            >= 3,
+            >= 2,
         )
         check(
             "reported-speech add never recovers a capability",
@@ -3487,7 +3484,8 @@ def test_s38_query_candidate_controls_all_use_record_first_recovery():
         "回复1 is accepted by the live pending selector parser",
         reply_intent is not None
         and reply_intent.intent == "pending_choice"
-        and reply_intent.choice_index == 1,
+        and reply_intent.choice_index == 1
+        and reply_intent.requested_codes == (),
     )
 
     async def _run():
@@ -3515,7 +3513,8 @@ def test_s38_query_candidate_controls_all_use_record_first_recovery():
                 "回复1 survives pending-ticket canonicalization",
                 canonical_error is None
                 and canonical_intent is not None
-                and canonical_intent.choice_index == 1,
+                and canonical_intent.choice_index == 1
+                and canonical_intent.requested_codes == (),
             )
             for control in ("1", "回复1", "加入"):
                 store.delete(conv_key)
@@ -3555,9 +3554,11 @@ def test_s38_query_candidate_controls_all_use_record_first_recovery():
                         conv_key,
                     )
                 check(
-                    f"query control recovers and proceeds: {control}",
-                    result == f"EXECUTED:{control}"
-                    and execute.await_count == 1,
+                    f"stale query control only refreshes candidates: {control}",
+                    result is not None
+                    and "候选记录已失效" in result
+                    and "REFRESHED" in result
+                    and execute.await_count == 0,
                 )
         finally:
             chat_commands_module.conversation_state_store = old_store
@@ -3745,7 +3746,8 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
                     intent="pending_add_and_submit",
                     confidence=1.0,
                     submit_after=True,
-                    choice_index=2,
+                    choice_indices=(2,),
+                    requested_codes=("eefju",),
                 ),
             )
         check("numbered fallback remains an opt-out", fallback_result == "fallback added")
@@ -3877,6 +3879,7 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
                     "qq",
                     "commonness-user",
                     conv_key,
+                    actionable_lookup=True,
                 )
             record = store.get_record(conv_key)
         finally:
@@ -3893,11 +3896,14 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
             == ("eefj", "eefju"),
         )
         check(
-            "read-only ordering advice carries provenance but no suggested command",
-            record is None
+            "ordering advice carries a server record and one parsed suggestion",
+            record is not None
+            and isinstance(record.state, PendingAddWord)
+            and record.state.server_candidates
+            == [("eefj", True), ("eefju", False)]
             and response is not None
             and isinstance(response, openai_chat_module.ServerBackedQueryReply)
-            and advertised_command_suggestions(response) == ()
+            and len(advertised_command_suggestions(response)) == 1
             and "可多选，如「添加1、2」" in response
             and "重新编码" not in response,
         )
@@ -4135,6 +4141,22 @@ def test_explicit_add_word_query_uses_review_tool_before_ai():
             "submitAfter": False,
         },
     )
+    incident_eviction_commands = (
+        "添加 单份 dffn，挤掉蛋粉",
+        "添加 单份 dffn 并挤掉蛋粉",
+        "加词 单份 dffn，顺延 蛋粉",
+        "把 单份 改到 dffn，顺延 蛋粉",
+        "单份 用 dffn，把 蛋粉 挪走",
+    )
+    for command in incident_eviction_commands:
+        parsed = parse_eviction_modified_add(command)
+        check(
+            f"incident add-with-eviction grammar is closed: {command}",
+            parsed is not None
+            and parsed.word == "单份"
+            and parsed.code == "dffn"
+            and parsed.named_occupant == "蛋粉",
+        )
 
     async def _run():
         tool_calls = []
@@ -9982,6 +10004,13 @@ def test_exact_numeric_pending_reply_executes_without_intent_model():
                 ("mjbfa", False),
                 ("mjbfau", False),
             ],
+            occupied_words={"mjbf": ["木板"]},
+            server_candidates=[
+                ("mjbf", True),
+                ("mjbfa", False),
+                ("mjbfau", False),
+            ],
+            server_occupied_words={"mjbf": ["木板"]},
         )
         old_store = openai_chat_module.conversation_state_store
         store = MemoryConversationStateStore()
@@ -10143,6 +10172,12 @@ def test_exact_pending_selection_syntax_is_structural_and_fail_closed():
             ("mjbfau", False),
         ],
         occupied_words={"mjbf": ["木板"]},
+        server_candidates=[
+            ("mjbf", True),
+            ("mjbfa", False),
+            ("mjbfau", False),
+        ],
+        server_occupied_words={"mjbf": ["木板"]},
     )
 
     async def _run():
@@ -10286,8 +10321,8 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
 
         check("exact code executes direct add", code_response == "added")
         check("exact code binds advertised empty slot", add_mock.await_args.args[:2] == ("母版", "mjbfa"))
-        check("occupied number executes duplicate path", duplicate_response == "duplicated")
-        check("occupied number binds one create target", duplicate_mock.await_count == 1)
+        check("occupied number executes the shift path", duplicate_response == "shifted")
+        check("occupied number never creates a duplicate", duplicate_mock.await_count == 0)
         check("numbered recode executes shift", numbered_shift_response == "shifted")
         check("named recode executes shift", named_shift_response == "shifted")
         check("occupant-first recode executes shift", occupant_first_response == "shifted")
@@ -10295,7 +10330,7 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
         check("shift-occupant form executes shift", shift_occupant_response == "shifted")
         check(
             "all recode forms bind the occupied code for the live newcomer",
-            shift_mock.await_count == 5
+            shift_mock.await_count == 6
             and all(call.args[1] == "mjbf" for call in shift_mock.await_args_list),
         )
         check("all-add executes reviewed multi-code path", multi_response == "multi-added")
@@ -10309,7 +10344,7 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
             and "没有可安全执行的后续命令" not in invalid_response,
         )
         check("question does not execute a pending mutation", question_response is None)
-        check("unsafe selectors add no extra writes", add_mock.await_count == 1 and duplicate_mock.await_count == 1 and shift_mock.await_count == 5 and multi_mock.await_count == 1)
+        check("unsafe selectors add no extra writes", add_mock.await_count == 1 and duplicate_mock.await_count == 0 and shift_mock.await_count == 6 and multi_mock.await_count == 1)
 
     asyncio.run(_run())
 
@@ -10414,9 +10449,9 @@ def test_pending_recode_selection_completes_its_server_plan_in_one_message():
     asyncio.run(_run())
 
 
-def test_occupied_numeric_choice_means_duplicate_confirm():
-    """Verify selecting an occupied candidate directly means duplicate-code insertion."""
-    print("\n🧪 occupied numeric choice means duplicate confirm")
+def test_occupied_numeric_choice_means_create_with_eviction():
+    """Selecting an occupied candidate applies the default shift policy."""
+    print("\n🧪 occupied numeric choice means create with eviction")
 
     state = PendingAddWord(
         word="增香",
@@ -10427,6 +10462,12 @@ def test_occupied_numeric_choice_means_duplicate_confirm():
             ("zrxxvu", False),
         ],
         occupied_words={"zrxx": ["增翔"]},
+        server_candidates=[
+            ("zrxx", True),
+            ("zrxxv", False),
+            ("zrxxvu", False),
+        ],
+        server_occupied_words={"zrxx": ["增翔"]},
     )
 
     async def _run():
@@ -10434,11 +10475,15 @@ def test_occupied_numeric_choice_means_duplicate_confirm():
             with patch.object(openai_chat_module, "_execute_shift_to_code", AsyncMock(return_value="shifted")) as shift_mock:
                 result = await _handle_pending_add_word(
                     state, "1", "qq", "123", [],
-                    command_intent=MessageCommandIntent(intent="pending_choice", choice_index=1, confidence=0.96),
+                    command_intent=MessageCommandIntent(
+                        intent="pending_choice",
+                        choice_index=1,
+                        confidence=0.96,
+                    ),
                 )
-        check("occupied choice returns duplicate result", result == "duplicate")
-        check("duplicate helper called once", duplicate_mock.await_count == 1)
-        check("shift helper not called", shift_mock.await_count == 0)
+        check("occupied choice returns shift result", result == "shifted")
+        check("duplicate helper is not called", duplicate_mock.await_count == 0)
+        check("shift helper is called once", shift_mock.await_count == 1)
 
     asyncio.run(_run())
 
@@ -11087,8 +11132,8 @@ def test_inline_unquoted_add_submit_requires_live_or_target_binding():
             response = str(finish.await_args.args[0]) if finish.await_args else ""
             check("inline short command schedules no mutation", schedule.call_count == 0)
             check(
-                "inline short command offers executable re-review without a code",
-                "加词 窨茶" in response and "xwwso" not in response,
+                "inline short command without a server record fails closed",
+                response == "当前没有可验证的可执行操作，本次未写入。",
             )
             check(
                 "inline short command preserves pending target",
@@ -11460,12 +11505,20 @@ def test_native_quoted_batch_assent_executes_only_the_live_payload():
 
         check("tampered native quote performs zero writes", tampered["tool_call"].await_count == 0)
         check("tampered native quote preserves the live ticket", tampered["record"] is not None)
+        tampered_suggestions = advertised_command_suggestions(
+            tampered["response"]
+        )
         check(
-            f"tampered native quote names the mismatch: {tampered['response']}",
-            "不一致" in tampered["response"]
-            and "jlbar" in tampered["response"]
-            and "jlfoo" in tampered["response"]
-            and "未执行" in tampered["response"],
+            f"tampered native quote emits only a live-record command: {tampered['response']}",
+            tampered["response"].startswith(
+                "引用的批量加词与当前内容不一致：引用显示 「炒冷饭」→ jlbar；"
+                "当前显示 「炒冷饭」→ jlfoo；本次未执行。"
+            )
+            and tampered_suggestions == ("将这 4 个词加入草稿",)
+            and _command_suggestions_match_pending_batch(
+                tampered["response"],
+                tampered["record"].state,
+            ),
         )
         check("tampered native quote bypasses the main model", tampered["main_model"].await_count == 0)
 
@@ -12332,6 +12385,8 @@ def test_bot_quoted_candidate_accepts_exact_selectors_only():
         recommended_code="mjbfa",
         candidates=[("mjbf", True), ("mjbfa", False), ("mjbfau", False)],
         occupied_words={"mjbf": ["木板"]},
+        server_candidates=[("mjbf", True), ("mjbfa", False), ("mjbfau", False)],
+        server_occupied_words={"mjbf": ["木板"]},
     )
 
     numeric = openai_chat_module._quoted_pending_add_control_intent("2", state)
@@ -16021,7 +16076,7 @@ async def _run_orchestrator_empty_response_retry_checks():
     )
     check(
         "reasoning-only cap returns an honest deterministic fallback",
-        "本次未执行" in reasoning_only_result,
+        "本次未写入" in reasoning_only_result,
     )
 
 
@@ -16741,7 +16796,7 @@ def test_generic_ai_prose_does_not_persist_pending():
         check(
             "generic model prose is reduced to the honest no-command line",
             finish_response.await_count == 1
-            and "没有对应的可执行计划" in delivered
+            and "当前没有可验证的可执行操作" in delivered
             and "加词 伪造词" not in delivered,
         )
 
@@ -16827,7 +16882,7 @@ def test_outgoing_advertisement_requires_matching_live_state():
         )
         check(
             "orphan advertisement is replaced before delivery",
-            "加入并提交" not in replaced and "没有对应的可执行计划" in replaced,
+            "加入并提交" not in replaced and "当前没有可验证的可执行操作" in replaced,
         )
         check(
             "orphan replacement emits no invented command or operands",
@@ -16849,7 +16904,7 @@ def test_outgoing_advertisement_requires_matching_live_state():
         check(
             "orphan action-list advertisement is replaced before delivery",
             "加入并提交" not in action_list_replaced
-            and "没有对应的可执行计划" in action_list_replaced,
+            and "当前没有可验证的可执行操作" in action_list_replaced,
         )
 
         store.set(conv_key, batch_state, owner_label="Rea")
@@ -17569,7 +17624,7 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
     check("draft failure helper hides exception details", internal_detail not in draft_failure)
     check(
         "delivery-contract refusal emits the honest no-command line",
-        "没有对应的可执行计划" in delivery_refusal
+        "当前没有可验证的可执行操作" in delivery_refusal
         and suggestion_pattern.search(delivery_refusal) is None,
     )
     converted_template_cases = (
@@ -19196,6 +19251,39 @@ def test_eviction_modified_add_bypasses_pending_assent_classifier():
         check(
             "shift modifier is a fresh command and bypasses old pending execution",
             ctx.generic_intent_is_fresh_command is True,
+        )
+        direct_shift = AsyncMock(return_value="shifted")
+        with (
+            patch.object(
+                openai_chat_module,
+                "_try_handle_explicit_reading_disambiguation",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_try_handle_compound_shift_modified_add_command",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_try_handle_shift_modified_add_command",
+                direct_shift,
+            ),
+            patch.object(
+                openai_chat_module,
+                "_try_handle_complete_add_command",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                openai_chat_module,
+                "_try_handle_simple_single_word_query",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            await openai_chat_module._stage_handle_simple_word_query(ctx)
+        check(
+            "fresh eviction command executes even while its candidate record is live",
+            ctx.response == "shifted" and direct_shift.await_count == 1,
         )
 
         echo_address = ConversationAddress.group(
@@ -22593,7 +22681,7 @@ if __name__ == "__main__":
     test_pending_items_query_filters_submitted_batches_to_bound_actor()
     test_different_code_proceeds_through_both_sinks_with_pending_fact()
     test_model_batch_pending_fact_leads_and_arms_one_local_confirmation()
-    test_read_word_query_never_arms_add_ticket_through_pending_execution_path()
+    test_read_word_query_persists_server_candidate_record()
     test_s38_query_candidate_controls_all_use_record_first_recovery()
     test_candidate_commonness_copy_snapshot_and_zero_writes()
     test_recommended_reorder_submit_chains_after_one_plan_confirmation()
@@ -22685,7 +22773,7 @@ if __name__ == "__main__":
     test_natural_add_negation_cancels_the_one_live_ticket()
     test_exact_pending_selection_syntax_is_structural_and_fail_closed()
     test_exact_pending_selectors_execute_only_the_bound_action()
-    test_occupied_numeric_choice_means_duplicate_confirm()
+    test_occupied_numeric_choice_means_create_with_eviction()
     test_shift_request_can_target_by_number_or_word()
     test_pending_add_word_confirm_uses_recommended()
     test_pending_add_word_add_and_submit_uses_recommended()

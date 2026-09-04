@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 
 class ServerBackedQueryReply(str):
-    """Internal provenance for an exact server-rendered read-only reply."""
+    """Internal provenance for an exact server-rendered query reply."""
 
 
 PENDING_CONFIRM_ADVERTISED_FORMS = ("确认",)
@@ -672,6 +672,19 @@ _PLACEHOLDER_OPERAND_RE = re.compile(
     re.IGNORECASE,
 )
 
+_FAILURE_COPY_JARGON_RE = re.compile(
+    r"\b(?:budget|tokens?|reasoning|tool_calls|finish_reason)\b|预算|工具调用",
+    re.IGNORECASE,
+)
+
+
+def assert_plain_failure_copy(text: str) -> str:
+    """Reject internal model mechanics from deterministic failure copy."""
+    rendered = str(text or "")
+    if _FAILURE_COPY_JARGON_RE.search(rendered):
+        raise ValueError("Failure copy contains internal model jargon")
+    return rendered
+
 
 def advertised_command_has_placeholder(command: str) -> bool:
     """Reject operand-shaped placeholders from copyable user commands."""
@@ -712,7 +725,9 @@ def render_remediation_reply(
     words: tuple[str, ...] = (),
 ) -> str:
     """Render a refusal with one concrete next step or short fallback guidance."""
-    clean_reason = str(reason or "").strip().rstrip("；;。")
+    clean_reason = assert_plain_failure_copy(
+        str(reason or "").strip().rstrip("；;。")
+    )
     suggestion = render_executable_suggestion(command, words=words)
     if suggestion:
         return f"{clean_reason}。\n{suggestion}"
@@ -946,10 +961,10 @@ _SELECTION_ADD_SUBMIT_FORMS = _selection_action_forms(
 )
 _SELECTION_SEPARATORS = r"(?:\s+|[、,]|和)+"
 _MULTI_NUMBER_SELECTION_RE = re.compile(
-    rf"[1-9]\d{{0,2}}(?:{_SELECTION_SEPARATORS}[1-9]\d{{0,2}})+"
+    rf"[1-9]\d{{0,2}}(?:{_SELECTION_SEPARATORS}[1-9]\d{{0,2}})*"
 )
 _MULTI_CODE_SELECTION_RE = re.compile(
-    rf"[a-z]{{2,12}}(?:{_SELECTION_SEPARATORS}[a-z]{{2,12}})+",
+    rf"[a-z]{{2,12}}(?:{_SELECTION_SEPARATORS}[a-z]{{2,12}})*",
     re.IGNORECASE,
 )
 _COMPOUND_NUMBER_SEPARATOR_RE = re.compile(
@@ -1024,6 +1039,7 @@ def parse_pending_candidate_selection(text: str) -> PendingCandidateSelection | 
         or re.search(r"(?:不要|别|取消|删除|移除|解释|复述|他说)", source)
     ):
         return None
+    source = re.sub(r"^回复\s*", "", source, count=1)
     compound = _parse_compound_number_selection(source)
     if compound is not None:
         return compound
@@ -1443,6 +1459,34 @@ def validated_front_insert_recommendation(
     return None
 
 
+def server_backed_front_insert_commands(
+    candidate_scopes: object,
+) -> tuple[str, ...]:
+    """Rebuild the exact front-insert commands sealed by candidate scopes."""
+    if not isinstance(candidate_scopes, (list, tuple)):
+        return ()
+    commands: list[str] = []
+    for raw_scope in candidate_scopes:
+        if not isinstance(raw_scope, dict):
+            return ()
+        recommendation = validated_front_insert_recommendation(
+            raw_scope.get("word"),
+            raw_scope.get("candidates"),
+            raw_scope.get("occupiedWords"),
+            raw_scope.get("orderingAssessments"),
+        )
+        if recommendation is None:
+            continue
+        command = (
+            f'「{recommendation["newWord"]}」占 '
+            f'{recommendation["occupantCode"]}、'
+            f'「{recommendation["occupantWord"]}」顺延'
+        )
+        if command not in commands:
+            commands.append(command)
+    return tuple(commands)
+
+
 def front_insert_recommendation_copy(
     recommendation: dict[str, str],
     fallback_selector: object = None,
@@ -1616,8 +1660,9 @@ def render_server_backed_single_word_lookup(
     occupied_words: object,
     *,
     reviewed_prompt: object = "",
+    actionable_controls: bool = False,
 ) -> str:
-    """Render a rich trusted read snapshot without minting write capability."""
+    """Render a rich query snapshot backed by the persisted candidate record."""
     actionable = render_server_backed_single_word_candidates(
         word,
         recommended_code,
@@ -1682,23 +1727,26 @@ def render_server_backed_single_word_lookup(
     if not body or advertised_single_word_candidate_codes(body) != expected_codes:
         return ""
     if has_reorder_copy:
-        return ServerBackedQueryReply("\n".join((
-            body,
-            "本次仅查询，不建立写入确认。",
-            single_word_candidate_footer(len(expected_codes)),
-        )))
-    return ServerBackedQueryReply("\n".join((
-        body,
-        f"推荐编码：{recommended}（本次仅查询）",
-        single_word_candidate_footer(len(expected_codes)),
-    )))
+        trailer = (
+            single_word_candidate_footer(len(expected_codes))
+            if actionable_controls
+            else "本次仅查询，不建立写入确认。"
+        )
+        return ServerBackedQueryReply("\n".join((body, trailer)))
+    recommendation = f"推荐编码：{recommended}"
+    if not actionable_controls:
+        recommendation += "（本次仅查询）"
+    lines = [body, recommendation]
+    if actionable_controls:
+        lines.append(single_word_candidate_footer(len(expected_codes)))
+    return ServerBackedQueryReply("\n".join(lines))
 
 
 def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
-    """Return ordered codes only from the deterministic read-only contract."""
+    """Return ordered codes only from the deterministic server-backed contract."""
     normalized = unicodedata.normalize("NFKC", str(text or ""))
     recommended = re.search(
-        r"(?m)^推荐编码:(?P<code>[a-z]{1,12})\(本次仅查询\)\s*$",
+        r"(?m)^推荐编码:(?P<code>[a-z]{1,12})(?:\(本次仅查询\))?\s*$",
         normalized,
         re.IGNORECASE,
     )
@@ -1887,10 +1935,17 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
                 continue
             command = normalized[start + 1:index].strip()
             prefix = normalized[max(0, start - 120):start]
+            renderer_bullet = re.search(
+                r"(?:^|\n)\s*[-•]\s*$",
+                prefix,
+            ) is not None
             if (
                 0 < len(command) <= 256
                 and "\n" not in command
-                and _COMMAND_SUGGESTION_LEAD_RE.search(prefix) is not None
+                and (
+                    _COMMAND_SUGGESTION_LEAD_RE.search(prefix) is not None
+                    or renderer_bullet
+                )
                 and _COMMAND_SUGGESTION_VERB_RE.search(command) is not None
                 and re.search(r"[\u3400-\u9fff]", command)
             ):

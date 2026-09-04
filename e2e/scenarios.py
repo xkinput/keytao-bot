@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
+import types
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
@@ -12,6 +14,7 @@ from keytao_bot.utils.pending_confirmation import (
     SYSTEM_REPLY_TEMPLATE_MARKERS,
     UNBOUND_BINDING_PRECHECK_NOTICE,
     advertised_batch_binding_pairs,
+    advertised_command_suggestions,
     advertised_reply_contract,
     pending_confirmation_copy,
 )
@@ -1130,7 +1133,7 @@ async def scenario_s15(ctx: ScenarioContext) -> dict[str, Any]:
         expected_code_match = re.search(
             r"(?:推荐编码[：:]|是否以编码)\s*"
             r"(?P<code>[a-z]{2,12})"
-            r"(?:（本次仅查询）|\s+将「亮面」加入草稿)",
+            r"(?=（本次仅查询）|\s+将「亮面」加入草稿|[\r\n]|$)",
             discovery_reply,
         )
         require(
@@ -2706,7 +2709,7 @@ async def scenario_s24(ctx: ScenarioContext) -> dict[str, Any]:
     binding = re.search(
         rf"(?:推荐编码[：:]|是否以编码)\s*"
         rf"(?P<code>[a-z]{{1,12}})"
-        rf"(?:（本次仅查询）|\s+将「{re.escape(S24_WORD)}」加入草稿)",
+        rf"(?=（本次仅查询）|\s+将「{re.escape(S24_WORD)}」加入草稿|[\r\n]|$)",
         discovery,
     )
     require(binding is not None, f"S24 discovery omitted its exact candidate: {discovery}")
@@ -3450,7 +3453,7 @@ def _rendered_recommended_code(reply: str) -> str:
     )
     read_only = re.search(
         r"(?m)^推荐编码[：:]\s*(?P<code>[a-z]{1,12})"
-        r"(?:（本次仅查询）|\(本次仅查询\))\s*$",
+        r"(?=（本次仅查询）|\(本次仅查询\)|[\r\n]|$)",
         reply,
         re.IGNORECASE,
     )
@@ -5490,11 +5493,15 @@ async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
         messages.append(f"喵喵 {S37_WORD}")
         query_reply = await ctx.send_group(messages[-1], to_me=True)
         replies.append(query_reply)
+        query_contract = advertised_reply_contract(query_reply)
         require(
             S37_WORD in query_reply
             and S37_TARGET_CODE in query_reply
-            and "本次仅查询" in query_reply,
-            f"S38 query did not render a read-only candidate record: {query_reply}",
+            and query_contract.code_choice_advertisement
+            and {"加入", "加入并提交"}.issubset(
+                query_contract.batch_assent_forms
+            ),
+            f"S38 query did not render a live candidate record: {query_reply}",
         )
         messages.append(control)
         control_reply = await ctx.send_group(messages[-1], to_me=True)
@@ -7000,6 +7007,351 @@ async def scenario_s47(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S48_WORD = "单份"
+S48_OCCUPANT = "蛋粉"
+S48_TARGET_CODE = "dffn"
+S48_RECOMMENDED_CODE = "dffno"
+S48_SHIFTED_CODE = "dffna"
+S48_DISCOVERY = f"喵喵 {S48_WORD}"
+S48_NUMBERED_EVICTION = "加入1，挤掉蛋粉"
+S48_NUMBERED_RECODE = "添加1，并为蛋粉重新编码"
+S48_EXPLICIT_EVICTION = "添加 单份 dffn，挤掉蛋粉"
+
+
+async def scenario_s48(ctx: ScenarioContext) -> dict[str, Any]:
+    """Bind rendered ordinals and execute new-word create-with-eviction."""
+    fixture = ctx.fixture_facts.get("s48") or {}
+    require(
+        fixture.get("shiftedCode") == S48_SHIFTED_CODE,
+        f"S48 fixture did not preserve the occupant's own next code: {fixture}",
+    )
+    expected = {
+        ("Delete", S48_OCCUPANT, S48_TARGET_CODE),
+        ("Create", S48_WORD, S48_TARGET_CODE),
+        ("Create", S48_OCCUPANT, S48_SHIFTED_CODE),
+    }
+    messages: list[str] = []
+    replies: list[str] = []
+    cases: list[dict[str, Any]] = []
+
+    async def execute_case(
+        label: str,
+        command: str,
+        *,
+        discover: bool,
+        reply_quote: bool = False,
+    ) -> dict[str, Any]:
+        cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(cleanup.get("success") is True, f"S48 {label} cleanup failed: {cleanup}")
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+        discovery = ""
+        reply_message_id = 0
+        if discover:
+            messages.append(S48_DISCOVERY)
+            discovery = await ctx.send_group(S48_DISCOVERY, to_me=True)
+            replies.append(discovery)
+            require(
+                f"1. {S48_TARGET_CODE} — 已有「{S48_OCCUPANT}」" in discovery
+                and f"2. {S48_RECOMMENDED_CODE} —" in discovery
+                and "回复编号或编码选择" in discovery,
+                f"S48 {label} discovery did not expose the trusted ordinal map: {discovery}",
+            )
+            if reply_quote:
+                reply_message_id = ctx.inject_bot_message(discovery)
+        cutoff = max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+        messages.append(command)
+        reply = (
+            await ctx.send_group_reply(
+                command,
+                reply_message_id=reply_message_id,
+                to_me=True,
+            )
+            if reply_message_id
+            else await ctx.send_group(command, to_me=True)
+        )
+        replies.append(reply)
+        draft = await ctx.draft()
+        actual = {item_key(item) for item in draft.get("items", [])}
+        events = [
+            event
+            for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > cutoff
+        ]
+        require(
+            actual == expected and len(draft.get("items", [])) == 3,
+            f"S48 {label} did not create and evict in one turn: "
+            f"reply={reply}; draft={draft}; events={events}",
+        )
+        require(
+            pending_confirmation_copy() not in reply
+            and any(
+                event.get("kind") == "tool"
+                and event.get("name") == "keytao_shift_phrase_code"
+                for event in events
+            )
+            and not any(event.get("kind") == "modelExchange" for event in events),
+            f"S48 {label} left the deterministic create-with-eviction path: {events}",
+        )
+        assert_reply_mentions(
+            reply,
+            S48_WORD,
+            S48_TARGET_CODE,
+            S48_OCCUPANT,
+            S48_SHIFTED_CODE,
+        )
+        require(
+            not _reply_has_internal_fragment(reply)
+            and not any(
+                marker in reply
+                for marker in (
+                    "批次票据",
+                    "动词识别失败",
+                    "缺少可绑定的完整目标",
+                    "没有对应的可执行计划",
+                )
+            ),
+            f"S48 {label} leaked internal failure wording: {reply}",
+        )
+        return {
+            "label": label,
+            "command": command,
+            "replyQuoted": reply_quote,
+            "modelExchanges": sum(
+                event.get("kind") == "modelExchange" for event in events
+            ),
+            "items": sorted(actual),
+        }
+
+    cases.append(await execute_case(
+        "quoted-numbered-eviction",
+        S48_NUMBERED_EVICTION,
+        discover=True,
+        reply_quote=True,
+    ))
+    cases.append(await execute_case(
+        "numbered-recode",
+        S48_NUMBERED_RECODE,
+        discover=True,
+    ))
+    cases.append(await execute_case(
+        "bare-occupied-selection",
+        "添加1",
+        discover=True,
+    ))
+    cases.append(await execute_case(
+        "explicit-advertised-form",
+        S48_EXPLICIT_EVICTION,
+        discover=False,
+    ))
+
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {
+            "expectedItems": sorted(expected),
+            "cases": cases,
+        },
+    }
+
+
+S49_COMMAND = "加词 单份 dffn，顺延 蛋粉"
+S49_BANNED_FAILURE_TERMS = (
+    "预算",
+    "budget",
+    "token",
+    "reasoning",
+    "tool_calls",
+    "工具调用",
+    "finish_reason",
+)
+
+
+async def scenario_s49(ctx: ScenarioContext) -> dict[str, Any]:
+    """Force the exact reasoning-only exhaustion signature without a write."""
+    # Keep these imports inside the synthetic scenario. Importing the full bot
+    # harness while e2e.run is still parsing its CLI would freeze pre-config
+    # defaults before apply_bot_environment() installs the local rig values.
+    from keytao_bot.harness.authorization_grammar import (
+        parse_eviction_modified_add,
+    )
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.orchestrator import (
+        AgentOrchestrator,
+        AgentRequestContext,
+        AgentRuntimeConfig,
+    )
+    from keytao_bot.harness.state import (
+        MemoryConversationStateStore,
+        PendingAddWord,
+    )
+    from keytao_bot.harness.tools import ToolContext, ToolExecutor
+
+    class NoToolSkills:
+        @staticmethod
+        def get_skill_instructions() -> str:
+            return ""
+
+        @staticmethod
+        def has_tools() -> bool:
+            return False
+
+    class StubCompletions:
+        def __init__(self, responses: list[Any]):
+            self.responses = iter(responses)
+            self.calls: list[dict[str, Any]] = []
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            return next(self.responses)
+
+    def exhausted_response() -> Any:
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(
+                finish_reason="length",
+                message=types.SimpleNamespace(
+                    content=None,
+                    tool_calls=[],
+                    reasoning_content="internal analysis",
+                ),
+            )],
+            usage=types.SimpleNamespace(
+                prompt_tokens=26408,
+                completion_tokens=1800,
+                total_tokens=28208,
+                completion_tokens_details=types.SimpleNamespace(
+                    reasoning_tokens=1800,
+                ),
+            ),
+        )
+
+    draft_before = await ctx.draft()
+    state_store = MemoryConversationStateStore()
+    address = ConversationAddress.private("qq", ctx.platform_id)
+    require(
+        state_store.set(
+            address,
+            PendingAddWord(
+                word="单份",
+                recommended_code="dffn",
+                candidates=[("dffn", True), ("dffno", False)],
+                occupied_words={"dffn": ["蛋粉"]},
+                server_candidates=[("dffn", True), ("dffno", False)],
+                server_occupied_words={"dffn": ["蛋粉"]},
+                server_entries_by_code={"dffn": [("蛋粉", 100)]},
+                needs_manual_review=False,
+            ),
+        ),
+        "S49 could not establish the trusted candidate record",
+    )
+    completions = StubCompletions([exhausted_response(), exhausted_response()])
+    client = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=completions),
+    )
+    tool_lookups: list[str] = []
+    orchestrator = AgentOrchestrator(
+        client_factory=lambda: client,
+        runtime=AgentRuntimeConfig(
+            model="deepseek-v4-flash",
+            max_tokens=1800,
+            temperature=0.0,
+            timeout=10.0,
+            max_tokens_cap=7200,
+        ),
+        skills_manager=NoToolSkills(),
+        tool_executor=ToolExecutor(
+            lambda name: tool_lookups.append(name),
+            frozenset(),
+        ),
+        state_store=state_store,
+        bind_help_text="bind help",
+        system_prompt_core="large-system-prompt\n" * 2000,
+    )
+    history = [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"contaminated-history-{index}-" + ("x" * 200),
+        }
+        for index in range(24)
+    ]
+    reply = await orchestrator.run(
+        S49_COMMAND,
+        AgentRequestContext(
+            platform="qq",
+            user_id=ctx.platform_id,
+            history=history,
+            mutations_allowed=False,
+        ),
+    )
+    calls = completions.calls
+    require(len(calls) == 2, f"S49 sent {len(calls)} model attempts instead of 2")
+    token_limits = [call.get("max_tokens") for call in calls]
+    efforts = [call.get("reasoning_effort") for call in calls]
+    input_chars = [
+        len(json.dumps(call.get("messages"), ensure_ascii=False))
+        for call in calls
+    ]
+    require(token_limits == [1800, 1800], f"S49 expanded output limits: {token_limits}")
+    require(efforts == ["high", "low"], f"S49 did not lower effort: {efforts}")
+    require(
+        input_chars[1] < input_chars[0] // 2,
+        f"S49 retry did not shrink input: {input_chars}",
+    )
+    require(not tool_lookups, f"S49 reached a write-capable tool: {tool_lookups}")
+    lowered_reply = reply.lower()
+    require(
+        not any(term in lowered_reply for term in S49_BANNED_FAILURE_TERMS),
+        f"S49 leaked internal failure wording: {reply}",
+    )
+    suggestions = advertised_command_suggestions(reply)
+    require(suggestions == (S49_COMMAND,), f"S49 returned an unbound retry: {reply}")
+    parsed = parse_eviction_modified_add(suggestions[0])
+    require(parsed is not None, f"S49 retry did not pass the real parser: {reply}")
+    binding_error = ToolExecutor._validate_current_message_binding(
+        "keytao_create_phrase",
+        {"word": "单份", "code": "dffn", "action": "Create"},
+        ToolContext(
+            current_message=suggestions[0],
+            writes_allowed=True,
+            trusted_candidate_slots_by_word={
+                "单份": (("dffn", True), ("dffno", False)),
+            },
+            trusted_entries_by_code={"dffn": (("蛋粉", 100),)},
+            trusted_reviewed_items_by_key={
+                ("单份", "dffn"): {
+                    "word": "单份",
+                    "code": "dffn",
+                    "type": "Phrase",
+                },
+            },
+        ),
+    )
+    require(binding_error is None, f"S49 retry failed binding: {binding_error}")
+    draft_after = await ctx.draft()
+    require(
+        draft_after.get("items", []) == draft_before.get("items", []) == [],
+        f"S49 changed the draft: before={draft_before}; after={draft_after}",
+    )
+    return {
+        "messages": [S49_COMMAND],
+        "replies": [reply],
+        "draft": draft_after,
+        "facts": {
+            "attempts": len(calls),
+            "maxTokens": token_limits,
+            "reasoningEfforts": efforts,
+            "inputCharacters": input_chars,
+            "suggestedCommand": suggestions[0],
+            "parserMatched": True,
+            "bindingMatched": True,
+            "writeCount": 0,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -7048,6 +7400,8 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S45", "swap verbs and interrogative review boundary", scenario_s45),
     Scenario("S46", "multi-line promise-preserving double eviction", scenario_s46),
     Scenario("S47", "choice and executable-suggestion closure", scenario_s47),
+    Scenario("S48", "numbered candidate create-with-eviction", scenario_s48),
+    Scenario("S49", "reasoning-only exhaustion bounded recovery", scenario_s49),
 )
 
 

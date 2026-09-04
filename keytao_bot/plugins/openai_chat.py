@@ -25,6 +25,7 @@ from ..harness.orchestrator import (
     AgentOrchestrator,
     AgentRequestContext,
     AgentRuntimeConfig,
+    _command_suggestions_match_pending_batch,
     build_system_prompt,
 )
 from ..harness.conversation import (
@@ -103,12 +104,15 @@ from ..utils.pending_confirmation import (
     pending_batch_confirmation_copy,
     pending_confirmation_copy,
     pending_confirmation_prompt_instruction,
+    parse_pending_assent_phrase,
+    render_executable_suggestion,
     render_remediation_reply,
     render_query_retry_reply,
     render_server_backed_batch_candidates,
     render_server_backed_single_word_candidates,
     render_server_backed_word_set,
     same_unique_binding_set,
+    server_backed_front_insert_commands,
     strip_warning_count_copy,
     validated_front_insert_recommendation as _validated_front_insert_recommendation_from_record,
 )
@@ -1945,19 +1949,67 @@ def _advertised_reply_matches_live_record(
         return False
 
     state = record.state
+    if (
+        isinstance(state, PendingToolConfirm)
+        and state.function_name == "keytao_batch_add_to_draft"
+        and isinstance(state.args.get("_candidate_scopes"), list)
+        and state.args.get("_candidate_scopes")
+        and contract.batch_assent_forms
+        and not contract.candidate_selection
+        and pending_batch_confirmation_copy() not in response
+    ):
+        # A candidate-scoped batch must use the complete deterministic trailer.
+        # Exact operands alone do not make a model-authored one-line assent safe.
+        return False
     # Arbitrary model-authored command prose has no durable source marker at
     # the final delivery boundary. The one additional accepted family is a
     # PendingAddWord control that the real structural parser resolves against
     # this exact actor-owned, server-backed candidate record (for example the
     # deterministic renderer's ``1 重新编码`` control).
+    pending_add_front_insert_commands = set(
+        server_backed_front_insert_commands(({
+            "word": state.word,
+            "candidates": state.server_candidates,
+            "occupiedWords": state.server_occupied_words,
+            "orderingAssessments": state.server_ordering_assessments,
+        },))
+        if isinstance(state, PendingAddWord)
+        else ()
+    )
     pending_add_suggestions_are_bound = bool(
         contract.command_suggestions
         and isinstance(state, PendingAddWord)
+        and state.server_candidates
+        and state.server_candidates == state.candidates
         and all(
-            _chat_routing.message_authorizes_live_pending_mutation(
-                suggestion,
-                state,
+            suggestion in pending_add_front_insert_commands
+            or _chat_routing.message_authorizes_live_pending_mutation(
+                suggestion, state,
             )
+            or (
+                (assent := parse_pending_assent_phrase(suggestion)).matched
+                and assent.add_requested
+                and not assent.cancel_requested
+                and render_executable_suggestion(
+                    suggestion,
+                    words=(state.word,),
+                ) in response
+            )
+            for suggestion in contract.command_suggestions
+        )
+    )
+    pending_batch_suggestions_are_bound = bool(
+        contract.command_suggestions
+        and isinstance(state, PendingToolConfirm)
+        and _command_suggestions_match_pending_batch(response, state)
+    )
+    pending_word_set_suggestions_are_bound = bool(
+        contract.command_suggestions
+        and isinstance(state, PendingAdvertisedWordSets)
+        and len(state.snapshots) == 1
+        and all(
+            suggestion
+            == "加词 " + " ".join(state.snapshots[0].words)
             for suggestion in contract.command_suggestions
         )
     )
@@ -1967,6 +2019,8 @@ def _advertised_reply_matches_live_record(
             contract.command_suggestions
         )
         and not pending_add_suggestions_are_bound
+        and not pending_batch_suggestions_are_bound
+        and not pending_word_set_suggestions_are_bound
     ):
         return False
     if (
@@ -2033,6 +2087,7 @@ def _advertised_reply_matches_live_record(
         )
     ):
         return False
+    displayed_pairs = advertised_batch_binding_pairs(response)
     if contract.code_choice_advertisement:
         if not (
             isinstance(state, PendingAddWord)
@@ -2045,8 +2100,13 @@ def _advertised_reply_matches_live_record(
             code for code, _occupied in state.server_candidates
         ):
             return False
+        if displayed_pairs and not same_unique_binding_set(
+            displayed_pairs,
+            _pending_state_binding_pairs(state),
+        ):
+            return False
+        return True
 
-    displayed_pairs = advertised_batch_binding_pairs(response)
     sealed_pairs = _pending_state_binding_pairs(state)
     if advertises_batch_action or contract.candidate_selection:
         return same_unique_binding_set(
@@ -2296,10 +2356,7 @@ def _enforce_advertised_reply_contract(
         if conv_key is not None
         else None
     )
-    carries_live_candidates = (
-        not server_backed_query
-        and _reply_carries_live_candidate_state(text, record)
-    )
+    carries_live_candidates = _reply_carries_live_candidate_state(text, record)
     if (
         carries_live_candidates
         and not _live_candidate_affordances_are_complete(text, record)
@@ -2322,19 +2379,13 @@ def _enforce_advertised_reply_contract(
             return replacement
     if not contract.requires_live_state:
         return text
-    if server_backed_query:
-        logger.info(
-            "[advertised_reply_contract] "
-            "branch=send_server_backed_query"
-        )
-        return ServerBackedQueryReply(text)
     displayed_pairs = advertised_batch_binding_pairs(text)
     if _advertised_reply_matches_live_record(text, record):
         logger.info(
             "[advertised_reply_contract] branch=send_backed "
             f"state={record.state.__class__.__name__} bindings={len(displayed_pairs)}"
         )
-        return text
+        return ServerBackedQueryReply(text) if server_backed_query else text
 
     replacement = (
         _render_live_shift_record(record)
@@ -2359,12 +2410,9 @@ def _enforce_advertised_reply_contract(
         f"state={record.state.__class__.__name__ if record is not None else 'none'} "
         f"bindings={len(displayed_pairs)}"
     )
-    displayed_words = tuple(word for word, _code in displayed_pairs)
     if query_words:
         return render_query_retry_reply(query_words)
-    return render_remediation_reply(
-        "这条回复里的建议没有对应的可执行计划，因此未发送该命令；本次不会写入"
-    )
+    return "当前没有可验证的可执行操作，本次未写入。"
 
 
 def _prepare_user_facing_reply(
@@ -2372,6 +2420,13 @@ def _prepare_user_facing_reply(
     memory_context: Optional[ChatMemoryContext],
 ) -> str:
     """Apply the final copy and platform policy at every delivery boundary."""
+    retired_runaway_copy = (
+        "连续两次没有生成可见回复或工具调用，已停止扩大处理预算；"
+        "本次未执行任何新写入。可发送「查看草稿」。"
+    )
+    if "".join(str(response or "").split()) == retired_runaway_copy:
+        logger.error("Replacing retired reasoning-runaway failure copy at delivery")
+        response = "这次处理没有完成；本次未执行新的写入。"
     conv_key = memory_context.conversation_address if memory_context else None
     platform = memory_context.platform if memory_context else "web"
     current_message = _current_turn_message.get("")
@@ -2380,17 +2435,6 @@ def _prepare_user_facing_reply(
         if conv_key is not None
         else None
     )
-    if (
-        current_message
-        and "连续两次没有生成可见回复或工具调用" in str(response or "")
-        and parse_pending_candidate_selection(current_message) is not None
-        and live_record is not None
-        and isinstance(live_record.state, PendingAddWord)
-        and not live_record.execution_id
-    ):
-        live_options = _render_live_single_candidate_record(live_record)
-        if live_options:
-            response = live_options
     prepared = _enforce_advertised_reply_contract(response, conv_key)
     if (
         conv_key is not None
@@ -2421,6 +2465,7 @@ def _prepare_user_facing_reply(
             {},
             history=history,
         ) or prepared
+        prepared = _enforce_advertised_reply_contract(prepared, conv_key)
     prepared = strip_warning_count_copy(prepared)
     prepared = render_platform_public_links(prepared, platform)
     prepared = strip_bare_batch_ids(prepared)
@@ -3142,14 +3187,24 @@ async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
 
 async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     """Production scenario: bind live pending state to the current reply and actor scope."""
-    ctx.referenced_pending = (
+    current_record = conversation_state_store.get_record(ctx.conv_key)
+    parsed_referenced_pending = (
         _parse_pending_state_from_response(ctx.reply_reference.text)
         if ctx.reply_reference.is_to_bot and ctx.reply_reference.text
         else None
     )
     ctx.verified_current_pending_reply = _verified_bot_reply_matches_record(
         ctx.reply_reference,
-        conversation_state_store.get_record(ctx.conv_key),
+        current_record,
+    )
+    ctx.referenced_pending = (
+        current_record.state
+        if (
+            ctx.verified_current_pending_reply
+            and current_record is not None
+            and isinstance(current_record.state, PendingAddWord)
+        )
+        else parsed_referenced_pending
     )
     ctx.quoted_pending_add_intent = (
         _quoted_pending_add_control_intent(
@@ -3165,7 +3220,7 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
         and isinstance(ctx.referenced_pending, PendingAddWord)
         and ctx.quoted_pending_add_intent is not None
     )
-    ctx.current_pending_record = conversation_state_store.get_record(ctx.conv_key)
+    ctx.current_pending_record = current_record
     ctx.eviction_modified_add = _authorization_grammar.parse_eviction_modified_add(
         ctx.normalized_message_text
     )
@@ -4472,6 +4527,27 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                     pending_command_intent.intent == "pending_add_and_submit"
                     and len(pending_command_intent.requested_codes) <= 1
                     and not (
+                        len(pending_command_intent.requested_codes) == 1
+                        and dict(state.candidates).get(
+                            pending_command_intent.requested_codes[0]
+                        ) is True
+                    )
+                    and not (
+                        pending_command_intent.choice_index is not None
+                        and 1 <= pending_command_intent.choice_index <= len(
+                            state.candidates
+                        )
+                        and state.candidates[
+                            pending_command_intent.choice_index - 1
+                        ][1]
+                    )
+                    and not (
+                        pending_command_intent.choice_index is None
+                        and dict(state.candidates).get(
+                            state.recommended_code
+                        ) is True
+                    )
+                    and not (
                         pending_command_intent.choice_index is None
                         and not pending_command_intent.requested_codes
                         and _validated_front_insert_recommendation_from_record(
@@ -4496,7 +4572,9 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                         )
                     else:
                         target_code = (
-                            state.candidates[choice_index - 1][0]
+                            pending_command_intent.requested_codes[0]
+                            if pending_command_intent.requested_codes
+                            else state.candidates[choice_index - 1][0]
                             if choice_index is not None
                             else state.recommended_code
                         )
@@ -4878,7 +4956,10 @@ async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
             ctx.space_key,
             ctx.owner_label,
         )
-    if ctx.response is None and ctx.current_pending_record is None:
+    if ctx.response is None and (
+        ctx.current_pending_record is None
+        or ctx.compound_eviction_add_plan is not None
+    ):
         ctx.response = await _try_handle_compound_shift_modified_add_command(
             ctx.normalized_message_text,
             ctx.platform,
@@ -4887,7 +4968,10 @@ async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
             ctx.space_key,
             ctx.owner_label,
         )
-    if ctx.response is None and ctx.current_pending_record is None:
+    if ctx.response is None and (
+        ctx.current_pending_record is None
+        or ctx.eviction_modified_add is not None
+    ):
         ctx.response = await _try_handle_shift_modified_add_command(
             ctx.normalized_message_text,
             ctx.platform,
@@ -4925,6 +5009,7 @@ async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
             ctx.conv_key,
             ctx.space_key,
             ctx.owner_label,
+            actionable_lookup=ctx.message_is_prefixed_fresh_word_query,
         )
     return False
 
@@ -5241,11 +5326,13 @@ _CHAT_COMPAT_NAMES = (
     "PENDING_CONFIRM_ASSENT_TEXTS",
     "advertised_batch_binding_pairs",
     "ensure_multi_word_candidate_copy",
+    "parse_pending_assent_phrase",
     "parse_pending_candidate_selection",
     "pending_batch_confirmation_copy",
     "pending_confirmation_copy",
     "pending_confirmation_prompt_instruction",
     "render_remediation_reply",
+    "render_executable_suggestion",
     "render_platform_public_links",
     "strip_bare_batch_ids",
     "ChatMemoryContext",

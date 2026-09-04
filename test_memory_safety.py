@@ -1486,6 +1486,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "安全拦截：boundTarget 未绑定",
             "安全拦截（缺少：boundTarget）",
             "blockReason=binding_incomplete",
+            "这个操作需要批次票据",
+            "动词识别失败",
+            "未与用户本轮原始文字中的完整目标绑定",
+            "这条回复里的建议没有对应的可执行计划",
         ):
             with self.subTest(raw_fragment=raw_fragment):
                 with self.assertRaisesRegex(ValueError, "raw Python representation"):
@@ -1616,6 +1620,209 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
         )
+
+    async def test_incident_candidate_forms_bind_to_create_with_eviction(self) -> None:
+        from keytao_bot.plugins import chat_commands as command_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state = PendingAddWord(
+            word="单份",
+            recommended_code="dffno",
+            candidates=[
+                ("dffn", True),
+                ("dffno", False),
+                ("dffnoi", False),
+            ],
+            occupied_words={"dffn": ["蛋粉"]},
+            server_candidates=[
+                ("dffn", True),
+                ("dffno", False),
+                ("dffnoi", False),
+            ],
+            server_occupied_words={"dffn": ["蛋粉"]},
+            pronunciation_codes={
+                "dffn": "dān fèn",
+                "dffno": "dān fèn",
+                "dffnoi": "dān fèn",
+            },
+            pronunciation_recommended_codes=["dffno"],
+            needs_manual_review=False,
+        )
+        bound_forms = (
+            "1",
+            "添加1",
+            "加入1",
+            "加入并提交1",
+            "加入 2",
+            "dffn",
+            "加入 dffn",
+            "添加1、2",
+            "加入1，挤掉蛋粉",
+            "添加1，并为蛋粉重新编码",
+        )
+        for message in bound_forms:
+            with self.subTest(message=message):
+                intent = chat_module._structural_pending_add_word_intent(
+                    message,
+                    state,
+                )
+                self.assertIsNotNone(intent)
+                if intent is None:
+                    continue
+                canonical, error = await chat_module._canonicalize_pending_ticket_intent(
+                    state,
+                    message,
+                    intent,
+                    "qq",
+                    "garth",
+                )
+                self.assertIsNone(error)
+                self.assertIsNotNone(canonical)
+
+        quote_only = replace(
+            state,
+            server_candidates=[],
+            server_occupied_words={},
+        )
+        self.assertIsNone(
+            chat_module._structural_pending_add_word_intent(
+                "加入1，挤掉蛋粉",
+                quote_only,
+            )
+        )
+
+        shift = AsyncMock(return_value="shifted")
+        unexpected_create = AsyncMock(return_value="unexpected-create")
+        for message, submit_after in (
+            ("添加1", False),
+            ("加入1，挤掉蛋粉", False),
+            ("添加1，并为蛋粉重新编码", False),
+            ("加入并提交1", True),
+            ("dffn", False),
+            ("加入 dffn", False),
+        ):
+            with self.subTest(execute=message):
+                intent = chat_module._structural_pending_add_word_intent(
+                    message,
+                    state,
+                )
+                self.assertIsNotNone(intent)
+                if intent is None:
+                    continue
+                canonical, error = await chat_module._canonicalize_pending_ticket_intent(
+                    state,
+                    message,
+                    intent,
+                    "qq",
+                    "garth",
+                )
+                self.assertIsNone(error)
+                shift.reset_mock()
+                with (
+                    patch.object(command_module, "_execute_shift_to_code", shift),
+                    patch.object(
+                        command_module,
+                        "_execute_confirmed_tool",
+                        unexpected_create,
+                    ),
+                ):
+                    response = await command_module._handle_pending_add_word(
+                        state,
+                        message,
+                        "qq",
+                        "garth",
+                        [],
+                        command_intent=canonical,
+                    )
+                self.assertEqual(response, "shifted")
+                shift.assert_awaited_once()
+                self.assertEqual(shift.await_args.args[:2], ("单份", "dffn"))
+                self.assertEqual(
+                    shift.await_args.kwargs.get("submit_after", False),
+                    submit_after,
+                )
+                self.assertTrue(
+                    shift.await_args.kwargs.get("auto_confirm_shift_plan")
+                )
+
+    async def test_occupied_numbered_add_and_submit_uses_shift_plan(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state = PendingAddWord(
+            word="单份",
+            recommended_code="dffno",
+            candidates=[("dffn", True), ("dffno", False)],
+            occupied_words={"dffn": ["蛋粉"]},
+            server_candidates=[("dffn", True), ("dffno", False)],
+            server_occupied_words={"dffn": ["蛋粉"]},
+            pronunciation_codes={"dffn": "dān fèn", "dffno": "dān fèn"},
+            pronunciation_recommended_codes=["dffno"],
+            needs_manual_review=False,
+        )
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "865189947", "garth")
+        self.assertTrue(store.set(conv_key, state, owner_label="Garth"))
+        record = store.get_record(conv_key)
+        intent = chat_module._structural_pending_add_word_intent(
+            "加入并提交1",
+            state,
+        )
+        self.assertIsNotNone(intent)
+        canonical, error = await chat_module._canonicalize_pending_ticket_intent(
+            state,
+            "加入并提交1",
+            intent,
+            "qq",
+            "garth",
+        )
+        self.assertIsNone(error)
+        ctx = chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="garth",
+            normalized_message_text="加入并提交1",
+            memory_context=ChatMemoryContext(
+                platform="qq",
+                user_id="garth",
+                space_type="group",
+                space_id="865189947",
+                speaker_name="Garth",
+            ),
+            conv_key=conv_key,
+            space_key=conv_key.space_key,
+            owner_label="Garth",
+            current_pending_record=record,
+            scoped_pending_state=state,
+            scoped_pending_intent=canonical,
+            generic_intent_is_fresh_command=False,
+            history=[],
+            command_intent_for=AsyncMock(return_value=canonical),
+        )
+        execute_pending = AsyncMock(return_value="shifted-and-submitted")
+        with (
+            patch.object(chat_module, "conversation_state_store", store),
+            patch.object(
+                chat_module,
+                "draft_operation_coordinator",
+                DraftOperationCoordinator(),
+            ),
+            patch.object(
+                chat_module,
+                "_schedule_background_draft_operation",
+                return_value=True,
+            ),
+            patch.object(
+                chat_module,
+                "_handle_pending_add_word",
+                execute_pending,
+            ),
+        ):
+            consumed = await chat_module._stage_execute_pending_state(ctx)
+
+        self.assertFalse(consumed)
+        self.assertEqual(ctx.response, "shifted-and-submitted")
+        execute_pending.assert_awaited_once()
 
     async def test_multi_candidate_selection_grammar_binds_exact_live_slots(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
@@ -3350,7 +3557,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         no_state = __import__("json").loads(raw)
-        self.assertEqual(no_state.get("blockReason"), "binding_incomplete")
+        self.assertEqual(no_state.get("blockReason"), "candidate_record_missing")
         self.assertEqual(len(delivered), 1)
 
     async def test_multi_selection_applies_review_verdict_per_selected_slot(self) -> None:
@@ -3467,6 +3674,21 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                             ("hbbki", False),
                             ("hbbkiv", False),
                         ],
+                        server_candidates=(
+                            []
+                            if request_suggestion
+                            else [
+                                ("hbbk", True),
+                                ("hbbki", False),
+                                ("hbbkiv", False),
+                            ]
+                        ),
+                        occupied_words=(
+                            {} if request_suggestion else {"hbbk": ["占位词"]}
+                        ),
+                        server_occupied_words=(
+                            {} if request_suggestion else {"hbbk": ["占位词"]}
+                        ),
                     ),
                 )
                 incoming = message
@@ -4374,7 +4596,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("将冒菜调整到 mzch", delivered)
         self.assertNotIn("把冒菜改到 mzch", delivered)
-        self.assertIn("本次不会写入", delivered)
+        self.assertIn("本次未写入", delivered)
 
         code_less = "比如：\n- 「提交草稿」\n- 「删除「冒菜」」"
         self.assertEqual(
@@ -10873,6 +11095,63 @@ class PendingPositionalCreateAuthorizationTests(unittest.IsolatedAsyncioTestCase
 
 
 class ExactMutationBindingTests(unittest.IsolatedAsyncioTestCase):
+    def test_incident_advertised_commands_pass_parser_and_binding_checker(self) -> None:
+        context = ToolContext(
+            current_message="",
+            trusted_candidate_slots_by_word={
+                "单份": (("dffn", True), ("dffno", False)),
+            },
+            trusted_entries_by_code={"dffn": (("蛋粉", 100),)},
+            trusted_reviewed_items_by_key={
+                ("单份", "dffn"): {
+                    "word": "单份",
+                    "code": "dffn",
+                    "type": "Phrase",
+                },
+            },
+        )
+        commands = (
+            "添加 单份 dffn 并挤掉蛋粉",
+            "添加 单份 dffn，挤掉蛋粉",
+            "加词 单份 dffn，顺延 蛋粉",
+            "把 单份 改到 dffn，顺延 蛋粉",
+            "单份 用 dffn，把 蛋粉 挪走",
+        )
+        for command in commands:
+            with self.subTest(command=command):
+                parsed = parse_eviction_modified_add(command)
+                self.assertIsNotNone(parsed)
+                error = ToolExecutor._validate_current_message_binding(
+                    "keytao_create_phrase",
+                    {"word": "单份", "code": "dffn", "action": "Create"},
+                    replace(context, current_message=command),
+                )
+                self.assertIsNone(error)
+
+    async def test_selector_without_server_record_has_distinct_block_reason(self) -> None:
+        calls = []
+
+        async def create(**kwargs):
+            calls.append(kwargs)
+            return {"success": True}
+
+        executor = ToolExecutor(
+            lambda name: create if name == "keytao_create_phrase" else None,
+            frozenset(),
+        )
+        payload = json.loads(await executor.call(
+            "keytao_create_phrase",
+            {"word": "单份", "code": "dffn"},
+            ToolContext(
+                current_message="加入1",
+                writes_allowed=True,
+            ),
+        ))
+
+        self.assertEqual(payload.get("blockReason"), "candidate_record_missing")
+        self.assertIn("候选记录已失效", payload.get("message", ""))
+        self.assertEqual(calls, [])
+
     async def asyncSetUp(self) -> None:
         self.calls = []
 
@@ -12589,6 +12868,13 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             for call in delivery_log.call_args_list
         ))
         self.assertEqual(review_calls, ["载流", "载流子"])
+        for call in client.completions.calls:
+            exposed_tools = {
+                str(tool.get("function", {}).get("name") or "")
+                for tool in call.get("tools") or []
+                if isinstance(tool, dict)
+            }
+            self.assertNotIn("keytao_batch_add_to_draft", exposed_tools)
         self.assertEqual(result, advertised_reply)
         self.assertEqual(record.owner_key, context.conversation_address)
         self.assertIsInstance(record.state, PendingToolConfirm)
@@ -12811,6 +13097,9 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(orchestrator_module.requests_future_batch_assent_offer(
             "请只重新复核这两个词；末尾说明可直接回复「加入并提交」"
+        ))
+        self.assertTrue(orchestrator_module.requests_future_batch_assent_offer(
+            "只列出未收录词，并说明可以把列表中的词加入草稿"
         ))
         for message in (
             "缩手 所售",
@@ -13780,7 +14069,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(state_store.get_record(context.conversation_address))
         self.assertNotIn(model_only_word, delivered)
-        self.assertIn("查看草稿", delivered)
+        self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
 
     async def test_server_advertised_set_subtraction_stages_exact_confirmed_batch(
         self,
@@ -14735,6 +15024,108 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertIn("「米等」 mkdr → mkdro", result)
         self.assertIn("s26-materialized", result)
         self.assertNotIn("重码", result)
+
+    async def test_s48_incident_command_never_enters_the_main_model_loop(self) -> None:
+        calls = []
+        shift_plan = {
+            "word": "单份",
+            "targetCode": "dffn",
+            "items": [
+                {"action": "Delete", "word": "蛋粉", "code": "dffn", "type": "Phrase"},
+                {"action": "Create", "word": "单份", "code": "dffn", "type": "Phrase"},
+                {"action": "Create", "word": "蛋粉", "code": "dffna", "type": "Phrase"},
+            ],
+            "shifted": [{
+                "word": "蛋粉",
+                "fromCode": "dffn",
+                "toCode": "dffna",
+            }],
+        }
+
+        async def dispatch(name, **kwargs):
+            calls.append((name, kwargs))
+            if name == "keytao_prepare_reviewed_add":
+                return {
+                    "success": True,
+                    "word": "单份",
+                    "recommendedCode": "dffno",
+                    "candidateCodes": ["dffn", "dffno", "dffnoi"],
+                    "candidateStatuses": [
+                        {
+                            "code": "dffn",
+                            "occupied": True,
+                            "words": ["蛋粉"],
+                            "phrases": [{"word": "蛋粉", "weight": 100}],
+                        },
+                        {"code": "dffno", "occupied": False, "words": []},
+                        {"code": "dffnoi", "occupied": False, "words": []},
+                    ],
+                    "type": "Phrase",
+                    "preSubmitAudit": {"autoApprove": True, "issues": []},
+                }
+            if name == "keytao_lookup_by_code":
+                return {
+                    "success": True,
+                    "code": "dffn",
+                    "phrases": [{
+                        "word": "蛋粉",
+                        "code": "dffn",
+                        "type": "Phrase",
+                        "weight": 100,
+                    }],
+                }
+            if not kwargs.get("confirmed_plan_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "confirmationKind": "shiftPlan",
+                    "batchId": "",
+                    "contentVersion": 0,
+                    "planDigest": "a" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            if not kwargs.get("expected_warning_digest"):
+                return {
+                    "success": False,
+                    "requiresConfirmation": True,
+                    "warnings": [],
+                    "batchId": "s48-provisional",
+                    "contentVersion": 0,
+                    "planDigest": "a" * 64,
+                    "warningDigest": "b" * 64,
+                    "shiftPlan": shift_plan,
+                }
+            return {
+                "success": True,
+                "batchId": "s48-materialized",
+                "contentVersion": 1,
+                "shiftPlan": shift_plan,
+            }
+
+        client = _FakeClient([])
+        reply = await self._eviction_orchestrator(client, dispatch).run(
+            "加词 单份 dffn，顺延 蛋粉",
+            AgentRequestContext(
+                platform="qq",
+                user_id="garth",
+                mutations_allowed=True,
+            ),
+        )
+
+        self.assertEqual(client.completions.calls, [])
+        self.assertEqual(
+            [name for name, _kwargs in calls],
+            [
+                "keytao_prepare_reviewed_add",
+                "keytao_lookup_by_code",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+                "keytao_shift_phrase_code",
+            ],
+        )
+        self.assertIn("「单份」 → dffn", reply)
+        self.assertIn("「蛋粉」 dffn → dffna", reply)
+        self.assertNotIn(pending_confirmation_copy(), reply)
 
     async def test_verbatim_occupant_eviction_derives_code_from_server_records(self) -> None:
         calls = []
@@ -17147,8 +17538,9 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
     def test_repeated_block_reasons_use_user_facing_labels(self) -> None:
         labels = {
             "source_untrusted": "消息来源不受信任",
-            "verb_not_matched": "未识别到明确执行动作",
-            "binding_incomplete": "操作目标绑定不完整",
+            "verb_not_matched": "当前消息没有明确要求执行操作",
+            "binding_incomplete": "当前操作缺少明确的词条或编码",
+            "candidate_record_missing": "候选记录已失效",
             "ticket_required": "缺少有效确认",
             "bulk_delete_not_requested": "未明确授权批量删除",
             "manual_shift_forbidden": "不允许手工指定顺延计划",
@@ -18059,6 +18451,131 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
             [1800, 3600],
         )
 
+    async def test_reasoning_only_exhaustion_retries_smaller_and_returns_bound_command(self) -> None:
+        command = "加词 单份 dffn，顺延 蛋粉"
+
+        class NoToolSkills:
+            @staticmethod
+            def get_skill_instructions():
+                return ""
+
+            @staticmethod
+            def has_tools():
+                return False
+
+        responses = [
+            _fake_response("length", None),
+            _fake_response("length", None),
+        ]
+        for response in responses:
+            response.choices[0].message.reasoning_content = "internal analysis"
+            response.usage = types.SimpleNamespace(
+                prompt_tokens=26408,
+                completion_tokens=1800,
+                total_tokens=28208,
+                completion_tokens_details=types.SimpleNamespace(
+                    reasoning_tokens=1800,
+                ),
+            )
+        client = _FakeClient(responses)
+        state_store = MemoryConversationStateStore()
+        address = ConversationAddress.private("qq", "reasoning-s49")
+        state_store.set(
+            address,
+            PendingAddWord(
+                word="单份",
+                recommended_code="dffn",
+                candidates=[("dffn", True), ("dffno", False)],
+                occupied_words={"dffn": ["蛋粉"]},
+                server_candidates=[("dffn", True), ("dffno", False)],
+                server_occupied_words={"dffn": ["蛋粉"]},
+                server_entries_by_code={"dffn": [("蛋粉", 100)]},
+                needs_manual_review=False,
+            ),
+        )
+        writes = []
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(
+                model="deepseek-v4-flash",
+                max_tokens=1800,
+                temperature=0.0,
+                timeout=10.0,
+                max_tokens_cap=7200,
+            ),
+            skills_manager=NoToolSkills(),
+            tool_executor=ToolExecutor(
+                lambda name: writes.append(name),
+                frozenset(),
+            ),
+            state_store=state_store,
+            bind_help_text="bind help",
+            system_prompt_core="large-system-prompt\n" * 2000,
+        )
+        history = [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"contaminated-history-{index}-" + ("x" * 200),
+            }
+            for index in range(24)
+        ]
+
+        reply = await orchestrator.run(
+            command,
+            AgentRequestContext(
+                platform="qq",
+                user_id="reasoning-s49",
+                history=history,
+                mutations_allowed=False,
+            ),
+        )
+
+        calls = client.completions.calls
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call["max_tokens"] for call in calls], [1800, 1800])
+        self.assertEqual(
+            [call.get("reasoning_effort") for call in calls],
+            ["high", "low"],
+        )
+        self.assertLess(
+            len(json.dumps(calls[1]["messages"], ensure_ascii=False)),
+            len(json.dumps(calls[0]["messages"], ensure_ascii=False)) // 2,
+        )
+        self.assertEqual(writes, [])
+        self.assertIn(command, reply)
+        for banned in (
+            "预算",
+            "budget",
+            "token",
+            "reasoning",
+            "tool_calls",
+            "工具调用",
+            "finish_reason",
+        ):
+            self.assertNotIn(banned, reply.lower())
+        self.assertEqual(advertised_command_suggestions(reply), (command,))
+        parsed = parse_eviction_modified_add(command)
+        self.assertIsNotNone(parsed)
+        self.assertIsNone(ToolExecutor._validate_current_message_binding(
+            "keytao_create_phrase",
+            {"word": "单份", "code": "dffn", "action": "Create"},
+            ToolContext(
+                current_message=command,
+                writes_allowed=True,
+                trusted_candidate_slots_by_word={
+                    "单份": (("dffn", True), ("dffno", False)),
+                },
+                trusted_entries_by_code={"dffn": (("蛋粉", 100),)},
+                trusted_reviewed_items_by_key={
+                    ("单份", "dffn"): {
+                        "word": "单份",
+                        "code": "dffn",
+                        "type": "Phrase",
+                    },
+                },
+            ),
+        ))
+
     async def test_memory_and_quote_cannot_authorize_model_requested_write(self) -> None:
         real_calls = []
 
@@ -18286,7 +18803,7 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
-    def test_selection_runaway_restates_the_live_candidate_commands(self) -> None:
+    def test_retired_runaway_copy_is_removed_at_delivery(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
         old_state_store = chat_module.conversation_state_store
@@ -18322,11 +18839,11 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
             chat_module._current_turn_message.reset(token)
             chat_module.conversation_state_store = old_state_store
 
-        self.assertIn("「载具」候选", delivered)
-        self.assertIn("1. zhjl — 已有「在距」", delivered)
-        self.assertIn("添加1、2", delivered)
         self.assertNotIn("连续两次没有生成", delivered)
+        self.assertNotIn("预算", delivered)
+        self.assertNotIn("工具调用", delivered)
         self.assertNotIn("查看草稿", delivered)
+        self.assertIn("本次未执行新的写入", delivered)
 
     def test_compound_eviction_failure_cannot_advertise_a_narrowed_add(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
@@ -18352,8 +18869,8 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
         finally:
             chat_module._current_turn_message.reset(token)
 
-        self.assertIn("没有对应的可执行计划", delivered)
-        self.assertIn("本次不会写入", delivered)
+        self.assertIn("当前没有可验证的可执行操作", delivered)
+        self.assertIn("本次未写入", delivered)
         self.assertNotIn("添加「出圈」 jjqt", delivered)
 
     def test_delivery_choke_point_breaks_identical_deterministic_refusal(self) -> None:
@@ -18588,7 +19105,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("已写入草稿", reply)
         self.assertNotIn("batch-budget", reply)
-        self.assertIn("工具调用预算上限", reply)
+        self.assertIn("后续操作过多", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
 
     async def test_outer_exception_after_write_reports_receipt(self) -> None:
@@ -18649,6 +19166,48 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalReplyLoopBreakerTests(unittest.TestCase):
+    def test_unbound_batch_example_is_removed_without_erasing_read_only_results(self) -> None:
+        from keytao_bot.harness.orchestrator import (
+            _strip_unbound_command_suggestions,
+        )
+
+        words = ("显眼包", "嘴替", "松弛感")
+        example = "加入 " + "、".join(words)
+        reply = (
+            "查完了，这 3 个词目前都未收录：\n\n"
+            + "\n".join(f"- {word}" for word in words)
+            + "\n\n如果想加入草稿，可以回复「加入」或指定其中部分词"
+            f"（比如「{example}」）。"
+        )
+
+        sanitized = _strip_unbound_command_suggestions(reply, (example,))
+
+        self.assertTrue(all(word in sanitized for word in words))
+        self.assertIn("加入草稿", sanitized)
+        self.assertIn("回复「加入」", sanitized)
+        self.assertNotIn(example, sanitized)
+        self.assertEqual(advertised_command_suggestions(sanitized), ())
+
+    def test_renderer_bullet_is_revalidated_at_the_delivery_guard(self) -> None:
+        from keytao_bot.plugins.openai_chat import (
+            _enforce_advertised_reply_contract,
+        )
+        from keytao_bot.utils.pending_confirmation import render_remediation_reply
+
+        command = "添加 单份 dffn，挤掉蛋粉"
+        reply = render_remediation_reply(
+            "当前操作未完成",
+            command=command,
+            words=("单份", "蛋粉"),
+        )
+        self.assertIn(command, advertised_command_suggestions(reply))
+        guarded = _enforce_advertised_reply_contract(reply, None)
+        self.assertNotIn(command, guarded)
+        self.assertEqual(
+            guarded,
+            "当前没有可验证的可执行操作，本次未写入。",
+        )
+
     def test_unquoted_refusal_commands_are_detected_before_delivery(self) -> None:
         from keytao_bot.plugins.openai_chat import (
             _enforce_advertised_reply_contract,
@@ -18668,7 +19227,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
                 self.assertIn(expected, advertised_command_suggestions(reply))
                 guarded = _enforce_advertised_reply_contract(reply, None)
                 self.assertNotIn(expected, guarded)
-                self.assertIn("本次不会写入", guarded)
+                self.assertIn("本次未写入", guarded)
 
     def test_failed_eviction_does_not_invent_a_same_turn_retry_command(self) -> None:
         command = "把「这厮 fesk」删除，并添加「这厮 → fesko」"
@@ -18719,6 +19278,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         direct_reply = (
             "是的，会先确认。未绑定时可以查词和算编码，"
             "但写入草稿和提交会被后端拦住，需要先绑定。"
+            "另外，刚才的候选已失效，绑定后可重新发一次词。"
         )
 
         finalized = AgentOrchestrator._finalize_reply(
@@ -18730,6 +19290,12 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertEqual(finalized, direct_reply)
         self.assertIn("绑定", finalized)
         self.assertNotIn("查词 <字符>", finalized)
+
+    def test_empty_public_failure_reason_uses_its_plain_fallback(self) -> None:
+        self.assertEqual(
+            AgentOrchestrator._public_failure_reason("", "后续工具没有成功"),
+            "后续工具没有成功",
+        )
 
     def test_system_template_register_uses_composer_constants(self) -> None:
         from keytao_bot.utils.pending_confirmation import (
@@ -18779,6 +19345,22 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 with self.assertRaises(ValueError):
                     _assert_plain_user_facing_reply(fragment)
+
+    def test_failure_copy_guard_rejects_reasoning_failure_jargon(self) -> None:
+        from keytao_bot.utils.pending_confirmation import assert_plain_failure_copy
+
+        for fragment in (
+            "处理预算已用完",
+            "budget exhausted",
+            "token exhausted",
+            "reasoning exhausted",
+            "tool_calls was empty",
+            "没有工具调用",
+            "finish_reason was length",
+        ):
+            with self.subTest(fragment=fragment):
+                with self.assertRaises(ValueError):
+                    assert_plain_failure_copy(fragment)
 
     def test_internal_duplicate_hint_is_replaced_but_partial_receipt_is_reported(self) -> None:
         receipt = AgentOrchestrator._successful_write_receipt(
