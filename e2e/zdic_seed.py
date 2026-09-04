@@ -509,6 +509,24 @@ ZDIC_FIXTURES_BY_SCENARIO["S48"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S50"] = {
+    "probe_words": ("小像", "小象", "销项", "肖像", "小箱"),
+    "rows": (
+        {"kind": "char", "entry": "小", "status": "found", "pinyins": ["xiǎo"]},
+        {"kind": "char", "entry": "像", "status": "found", "pinyins": ["xiàng"]},
+        {"kind": "char", "entry": "象", "status": "found", "pinyins": ["xiàng"]},
+        {"kind": "char", "entry": "销", "status": "found", "pinyins": ["xiāo"]},
+        {"kind": "char", "entry": "项", "status": "found", "pinyins": ["xiàng"]},
+        {"kind": "char", "entry": "肖", "status": "found", "pinyins": ["xiào", "xiāo"]},
+        {"kind": "char", "entry": "箱", "status": "found", "pinyins": ["xiāng"]},
+        {"kind": "entry", "entry": "小像", "status": "absent", "pinyins": []},
+        {"kind": "entry", "entry": "小象", "status": "found", "pinyins": ["xiǎo", "xiàng"]},
+        {"kind": "entry", "entry": "销项", "status": "found", "pinyins": ["xiāo", "xiàng"]},
+        {"kind": "entry", "entry": "肖像", "status": "found", "pinyins": ["xiào", "xiàng"]},
+        {"kind": "entry", "entry": "小箱", "status": "found", "pinyins": ["xiǎo", "xiāng"]},
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

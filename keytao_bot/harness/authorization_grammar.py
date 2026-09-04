@@ -176,6 +176,9 @@ _POSITIONAL_REORDER_TRAILING_MODIFIER_RE = re.compile(
     r"劳驾|拜托|有劳|谢啦|"
     r"目标编码请你自己查清楚后直接完成|不要问我)[。.!！]?$"
 )
+_POSITIONAL_REDUNDANT_SHIFT_TAIL_RE = re.compile(
+    r"^(?:(?:并且|而且|同时))?顺延后面的(?:词|词条)$"
+)
 _POSITIONAL_REORDER_EVICTION_TAIL_RE = re.compile(
     r"^(?:让\s*|把\s*|将\s*)?"
     r"(?P<occupant>[㐀-鿿]{1,16})\s*"
@@ -1247,6 +1250,35 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
         )
         return parsed if parsed.word != parsed.named_occupant else None
 
+    positional = _positional_create_operands(source)
+    if positional is not None:
+        word, destination_word, relation = positional
+        if (
+            relation in (
+                _POSITIONAL_CREATE_FRONT_RELATIONS
+                | _POSITIONAL_CREATE_BACK_RELATIONS
+            )
+            and word != destination_word
+            and not _NEGATED_POSITIONAL_REORDER_RE.search(source)
+            and not _POSITIONAL_CONTEXT_NEGATION_RE.search(source)
+            and not _POSITIONAL_BARE_DATA_CONTEXT_RE.search(source)
+            and not _POSITIONAL_REPORTED_CONTEXT_RE.search(source)
+            and not _POSITIONAL_REORDER_EXPLANATION_RE.search(source)
+            and not _POSITIONAL_REORDER_LOCATIVE_DESTINATION_RE.search(source)
+            and not _has_positional_choice_question(source)
+            and not _POSITIONAL_REORDER_NARRATIVE_TAIL_RE.search(source)
+            and not _META_DISCUSSION_RE.search(source)
+            and not _DATA_CONTEXT_RE.search(source)
+            and not _EXPLANATION_ONLY_RE.search(source)
+            and not _TEXT_TRANSFORM_RE.search(source)
+        ):
+            return EvictionModifiedAdd(
+                word=word,
+                code="",
+                named_occupant=destination_word,
+                modifier=relation,
+            )
+
     match = next(
         (
             candidate.fullmatch(source)
@@ -1278,6 +1310,118 @@ def parse_eviction_modified_add(message: str) -> Optional[EvictionModifiedAdd]:
     if parsed.word == parsed.named_occupant:
         return None
     return parsed
+
+
+_CONTEXTUAL_RELATIVE_POSITION_RE = re.compile(
+    r"^(?P<correction>(?:错了|不对)\s*[，,]?\s*是\s*)?"
+    r"(?P<word>(?:「[^」]{1,16}」|“[^”]{1,16}”|‘[^’]{1,16}’|"
+    r"[\u3400-\u9fff]{1,16}?))\s*在\s*"
+    r"(?P<destination>(?:「[^」]{1,16}」|“[^”]{1,16}”|‘[^’]{1,16}’|"
+    r"[\u3400-\u9fff]{1,16}?))\s*"
+    r"(?P<relation>前面|后面|之前|之后|前|后)"
+    r"(?:一下|吧|了)?[。.!！]?$"
+)
+_CONTEXTUAL_FRONT_PREFERENCE_TAIL_RE = re.compile(
+    r"(?:[，,；;]\s*)?"
+    r"(?:(?:把|将)\s*(?:它|这个词|该词)\s*)?"
+    r"(?:换|放|挪|移|调)(?:到|在)?\s*前面"
+    r"(?:一下|吧|了)?[。.!！]?$"
+)
+_CONTEXTUAL_FRONT_PREFERENCE_NEGATION_RE = re.compile(
+    r"(?:不要|别|不应|不该|不能|不可|无需|不用|先不|暂时不|"
+    r"不必|不再|不需要).{0,24}"
+    r"(?:换|放|挪|移|调)(?:到|在)?\s*前面"
+)
+
+
+def contextual_front_preference_matches(
+    message: str,
+    expected_word: str,
+) -> bool:
+    """Match a read-only front preference against one live reviewed word."""
+    expected = str(expected_word or "").strip()
+    source = _LEADING_MENTION_RE.sub(
+        "",
+        trusted_mutation_source(message),
+        count=1,
+    ).strip()
+    if (
+        not expected
+        or not source
+        or re.search(r"[?？\"'“”‘’「」『』]", source)
+        or _CONTEXTUAL_FRONT_PREFERENCE_NEGATION_RE.search(source)
+        or _POSITIONAL_REPORTED_CONTEXT_RE.match(source)
+        or _DATA_CONTEXT_RE.match(source)
+    ):
+        return False
+    subject = re.match(re.escape(expected), source)
+    if subject is None:
+        return False
+    return bool(
+        _CONTEXTUAL_FRONT_PREFERENCE_TAIL_RE.search(
+            source[subject.end():]
+        )
+    )
+
+
+def parse_contextual_relative_position(
+    message: str,
+    expected_word: str,
+) -> Optional[EvictionModifiedAdd]:
+    """Claim a complete verbless position only from one live word context."""
+    expected = str(expected_word or "").strip()
+    source = _LEADING_MENTION_RE.sub(
+        "",
+        trusted_mutation_source(message),
+        count=1,
+    ).strip()
+    if not expected or not source or re.search(r"[?？]", source):
+        return None
+    match = _CONTEXTUAL_RELATIVE_POSITION_RE.fullmatch(source)
+    if match is None:
+        return None
+    raw_word = match.group("word").strip()
+    raw_destination = match.group("destination").strip()
+    word = _unquote_positional_entry(raw_word) or raw_word
+    destination = _unquote_positional_entry(raw_destination) or raw_destination
+    correction = bool(match.group("correction"))
+    if (
+        word == destination
+        or (word != expected and not correction)
+    ):
+        return None
+    return EvictionModifiedAdd(
+        word=word,
+        code="",
+        named_occupant=destination,
+        modifier=match.group("relation"),
+    )
+
+
+_CONTEXTUAL_WORD_CORRECTION_RE = re.compile(
+    r"^(?:错了|不对)\s*[，,]?\s*是\s*"
+    r"(?P<word>[\u3400-\u9fff]{1,16})[。.!！]?$"
+)
+
+
+def parse_contextual_word_correction(
+    message: str,
+    expected_word: str,
+) -> Optional[str]:
+    """Claim one explicit lexical correction against a live word target."""
+    expected = str(expected_word or "").strip()
+    source = _LEADING_MENTION_RE.sub(
+        "",
+        trusted_mutation_source(message),
+        count=1,
+    ).strip()
+    if not expected or not source or re.search(r"[?？]", source):
+        return None
+    match = _CONTEXTUAL_WORD_CORRECTION_RE.fullmatch(source)
+    if match is None:
+        return None
+    corrected = match.group("word").strip()
+    return corrected if corrected != expected else None
 
 
 def parse_compound_eviction_add_plan(
@@ -1441,7 +1585,12 @@ def _positional_command_clauses(
     ]
     while (
         len(clauses) > 1
-        and _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(clauses[-1])
+        and (
+            _POSITIONAL_REORDER_TRAILING_MODIFIER_RE.fullmatch(clauses[-1])
+            or _POSITIONAL_REDUNDANT_SHIFT_TAIL_RE.fullmatch(
+                re.sub(r"\s+", "", clauses[-1])
+            )
+        )
     ):
         clauses.pop()
     trailing_occupant = ""

@@ -20271,6 +20271,42 @@ def test_build_code_shift_plan_cascades_until_empty():
     check("second word shifts by own chain", result["shifted"][1]["toCode"] == "hxci")
 
 
+def test_build_code_shift_plan_preserves_six_code_duplicate():
+    """A full six-code occupant stays in place because no longer code exists."""
+    print("\n🧪 code shift plan preserves six-code duplicate")
+
+    result = _build_code_shift_plan(
+        word="小象",
+        target_code="xcxxiu",
+        target_candidate_codes=["xcxx", "xcxxi", "xcxxiu"],
+        current_phrase=None,
+        code_phrase_map={
+            "xcxxiu": [{
+                "word": "小箱",
+                "code": "xcxxiu",
+                "type": "Phrase",
+                "weight": 100,
+            }],
+        },
+        word_candidate_code_map={
+            "小象": ["xcxx", "xcxxi", "xcxxiu"],
+            "小箱": ["xcxx", "xcxxi", "xcxxiu"],
+        },
+    )
+
+    check("six-code duplicate plan succeeds", result.get("success") is True)
+    check("six-code occupant is not falsely shifted", result.get("shifted") == [])
+    check(
+        "only the new six-code row is added",
+        result.get("items") == [{
+            "action": "Create",
+            "word": "小象",
+            "code": "xcxxiu",
+            "type": "Phrase",
+        }],
+    )
+
+
 def test_build_code_shift_plan_reuses_vacated_slot_for_circular_swap():
     """冒菜 mzchi -> mzch lets 茂才 reuse the target's vacated mzchi slot."""
     print("\n🧪 circular shift reuses the target's vacated slot")
@@ -22903,6 +22939,7 @@ if __name__ == "__main__":
     test_pending_pronunciation_correction_updates_live_ticket()
     test_build_code_shift_plan_uses_occupant_encode_chain()
     test_build_code_shift_plan_cascades_until_empty()
+    test_build_code_shift_plan_preserves_six_code_duplicate()
     test_build_code_shift_plan_reuses_vacated_slot_for_circular_swap()
     test_build_code_shift_plan_generalizes_ring_to_ranked_n_entries()
     test_build_code_shift_plan_swaps_same_code_weights_exactly()

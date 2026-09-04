@@ -31,6 +31,7 @@ from ..harness.authorization_grammar import (
     parse_dictionary_recode_command,
     parse_entry_move_plan,
     parse_entry_swap,
+    parse_contextual_relative_position,
     parse_eviction_modified_add,
     unnamed_eviction_modified_add_item,
 )
@@ -1240,6 +1241,37 @@ async def _try_handle_shift_modified_add_command(
 ) -> Optional[str]:
     """Re-review a closed add-plus-shift command and start its bound shift plan."""
     parsed_command = parse_eviction_modified_add(message_text)
+    if parsed_command is None and conv_key is not None:
+        contextual_record = conversation_state_store.get_record(conv_key)
+        contextual_state = (
+            contextual_record.state if contextual_record is not None else None
+        )
+        if (
+            contextual_record is not None
+            and not contextual_record.execution_id
+            and isinstance(contextual_state, PendingAddWord)
+        ):
+            parsed_command = parse_contextual_relative_position(
+                message_text,
+                contextual_state.word,
+            )
+    if (
+        parsed_command is not None
+        and not parsed_command.code
+        and not explicit_same_code_requested(message_text)
+        and parsed_command.modifier
+        in {"前面", "之前", "前", "后面", "之后", "后"}
+    ):
+        if conv_key is None:
+            return None
+        return await _handle_relative_position_command(
+            parsed_command,
+            platform,
+            user_id,
+            conv_key,
+            space_key,
+            owner_label,
+        )
     explicitly_named_occupant = str(
         parsed_command.named_occupant if parsed_command is not None else ""
     ).strip()
@@ -1386,6 +1418,244 @@ async def _try_handle_shift_modified_add_command(
     if response.startswith("✅ 操作已完成"):
         conversation_state_store.complete_execution(record)
     return response
+
+
+def _exact_word_codes(data: Dict[str, Any], word: str) -> Tuple[str, ...]:
+    """Keep only unique exact-word codes from one server lookup response."""
+    phrases = data.get("phrases")
+    if data.get("success") is not True or not isinstance(phrases, list):
+        return ()
+    return tuple(dict.fromkeys(
+        str(item.get("code") or "").strip().lower()
+        for item in phrases
+        if isinstance(item, dict)
+        and str(item.get("word") or "").strip() == word
+        and re.fullmatch(
+            r"[a-z]{1,6}",
+            str(item.get("code") or "").strip().lower(),
+        )
+    ))
+
+
+def _server_relative_chain(
+    encoding: Dict[str, Any],
+    current_code: str,
+) -> Tuple[str, ...]:
+    """Return the server series that contains the destination's current code."""
+    for key in ("requestedCandidateCodes", "candidateCodes"):
+        raw_codes = encoding.get(key)
+        if not isinstance(raw_codes, list):
+            continue
+        codes = tuple(dict.fromkeys(
+            str(value or "").strip().lower()
+            for value in raw_codes
+            if re.fullmatch(
+                r"[a-z]{1,6}",
+                str(value or "").strip().lower(),
+            )
+        ))
+        if current_code in codes:
+            return codes
+    return ()
+
+
+async def _resolve_relative_target_code(
+    command: Any,
+    platform: str,
+    user_id: str,
+) -> Tuple[str, str]:
+    """Resolve before/after to an exact server-returned code, never a suffix."""
+    word = str(command.word or "").strip()
+    destination = str(command.named_occupant or "").strip()
+    try:
+        lookup = json.loads(await call_tool_function(
+            "keytao_lookup_by_word",
+            {"word": destination},
+            platform,
+            user_id,
+        ))
+    except Exception:
+        lookup = {}
+    destination_codes = _exact_word_codes(lookup, destination)
+    if len(destination_codes) != 1:
+        actual = "、".join(destination_codes) or "无现有编码"
+        return "", (
+            f"无法唯一确定「{destination}」的当前位置（{actual}）；"
+            "本次未执行添加或顺延"
+        )
+    destination_code = destination_codes[0]
+    if command.modifier in {"前面", "之前", "前"}:
+        return destination_code, ""
+
+    try:
+        encoding = json.loads(await call_tool_function(
+            "keytao_encode",
+            {"word": word, "requested_code": destination_code},
+            platform,
+            user_id,
+        ))
+    except Exception:
+        encoding = {}
+    chain = (
+        _server_relative_chain(encoding, destination_code)
+        if encoding.get("success") is True
+        else ()
+    )
+    if not chain or chain.index(destination_code) + 1 >= len(chain):
+        return "", (
+            f"服务端没有返回「{word}」在「{destination}」当前位置 "
+            f"{destination_code} 后面的候选位；"
+            "本次未执行添加或顺延"
+        )
+    return chain[chain.index(destination_code) + 1], ""
+
+
+async def _handle_relative_position_command(
+    command: Any,
+    platform: str,
+    user_id: str,
+    conv_key: ConversationKey,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> str:
+    """Bind a relative phrase placement to the existing server shift planner."""
+    word = str(command.word or "").strip()
+    destination = str(command.named_occupant or "").strip()
+    if not word or not destination or word == destination:
+        return "相对位置中的词条无法唯一确定；本次未执行添加或顺延"
+
+    initial_record = conversation_state_store.get_record(conv_key)
+    initial_state = initial_record.state if initial_record is not None else None
+    had_live_subject = bool(
+        initial_record is not None
+        and not initial_record.execution_id
+        and isinstance(initial_state, (PendingAddWord, PendingTrustedWordRecord))
+        and initial_state.word == word
+    )
+
+    target_code, target_error = await _resolve_relative_target_code(
+        command,
+        platform,
+        user_id,
+    )
+    if target_error:
+        return target_error
+
+    record = conversation_state_store.get_record(conv_key)
+    state = record.state if record is not None else None
+    if not (
+        record is not None
+        and not record.execution_id
+        and isinstance(state, (PendingAddWord, PendingTrustedWordRecord))
+        and state.word == word
+    ):
+        if record is not None and not record.execution_id:
+            conversation_state_store.delete(conv_key)
+        refreshed = await _try_handle_simple_single_word_query(
+            f"加词 {word}",
+            platform,
+            user_id,
+            conv_key,
+            space_key,
+            owner_label,
+        )
+        record = conversation_state_store.get_record(conv_key)
+        state = record.state if record is not None else None
+        if not isinstance(state, (PendingAddWord, PendingTrustedWordRecord)):
+            return refreshed or (
+                f"无法取得「{word}」的服务端词条或审词记录；"
+                "本次未执行添加或顺延"
+            )
+
+    if isinstance(state, PendingAddWord):
+        candidates = dict(state.server_candidates)
+        if target_code not in candidates:
+            return (
+                f"{target_code} 不是「{word}」本轮服务端审词记录中的候选编码；"
+                "本次未执行添加或顺延"
+            )
+        reviewed_pinyin, reviewed_candidate_codes = _pending_reviewed_reading(
+            state,
+            target_code,
+        )
+        if (
+            not reviewed_pinyin
+            or target_code not in reviewed_candidate_codes
+        ):
+            return (
+                f"「{word}」的候选编码 {target_code} 没有保留对应读音；"
+                "本次未执行添加或顺延"
+            )
+        create_args = _create_phrase_args(state, target_code)
+        return await _execute_shift_to_code(
+            word,
+            target_code,
+            platform,
+            user_id,
+            space_key,
+            owner_label,
+            target_item={
+                "type": "Phrase",
+                "remark": str(create_args.get("remark") or ""),
+                "needsManualReview": bool(
+                    create_args.get("needs_manual_review", True)
+                ),
+            },
+            reviewed_pinyin=reviewed_pinyin,
+            reviewed_candidate_codes=reviewed_candidate_codes,
+            auto_confirm_shift_plan=not had_live_subject,
+            auto_confirm_expected_shifted_words=(
+                (destination,)
+                if (
+                    not had_live_subject
+                    and command.modifier in {"前面", "之前", "前"}
+                )
+                else ()
+            ),
+            auto_confirm_only_if_no_shifts=bool(
+                not had_live_subject
+                and command.modifier in {"后面", "之后", "后"}
+            ),
+        )
+
+    try:
+        encoding = json.loads(await call_tool_function(
+            "keytao_encode",
+            {"word": word, "requested_code": target_code},
+            platform,
+            user_id,
+        ))
+    except Exception:
+        encoding = {}
+    if (
+        encoding.get("success") is not True
+        or target_code not in _server_relative_chain(encoding, target_code)
+    ):
+        return (
+            f"{target_code} 不是「{word}」当前服务端编码链中的候选；"
+            "本次未执行移动或顺延"
+        )
+    return await _execute_shift_to_code(
+        word,
+        target_code,
+        platform,
+        user_id,
+        space_key,
+        owner_label,
+        auto_confirm_shift_plan=not had_live_subject,
+        auto_confirm_expected_shifted_words=(
+            (destination,)
+            if (
+                not had_live_subject
+                and command.modifier in {"前面", "之前", "前"}
+            )
+            else ()
+        ),
+        auto_confirm_only_if_no_shifts=bool(
+            not had_live_subject
+            and command.modifier in {"后面", "之后", "后"}
+        ),
+    )
 
 
 def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
@@ -4404,6 +4674,7 @@ async def _execute_shift_to_code(
     reviewed_candidate_codes: Tuple[str, ...] = (),
     auto_confirm_shift_plan: bool = False,
     auto_confirm_expected_shifted_words: Tuple[str, ...] = (),
+    auto_confirm_only_if_no_shifts: bool = False,
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
     expected_occupants_by_code = {
@@ -4509,6 +4780,11 @@ async def _execute_shift_to_code(
                         ),
                     }
                     if auto_confirm_expected_shifted_words
+                    else {}
+                ),
+                **(
+                    {"_auto_confirm_only_if_no_shifts": True}
+                    if auto_confirm_only_if_no_shifts
                     else {}
                 ),
             },
@@ -5585,6 +5861,9 @@ async def _execute_confirmed_tool(
         for value in args.pop("_auto_confirm_expected_shifted_words", [])
         if str(value or "").strip()
     )
+    auto_confirm_only_if_no_shifts = bool(
+        args.pop("_auto_confirm_only_if_no_shifts", False)
+    )
     additional_shift_capabilities: Dict[
         Tuple[str, str], Dict[str, Any]
     ] = {}
@@ -5893,22 +6172,32 @@ async def _execute_confirmed_tool(
                     "确认内容未变化，原确认未执行",
                     command="查看草稿",
                 )
+        shifted_words = tuple(
+            str(item.get("word") or "").strip()
+            for item in (
+                data.get("shiftPlan", {}).get("shifted", [])
+                if isinstance(data.get("shiftPlan"), dict)
+                else []
+            )
+            if isinstance(item, dict)
+            and str(item.get("word") or "").strip()
+        )
         should_auto_confirm_shift = bool(
             auto_confirm_shift_plan
             and state.function_name == "keytao_shift_phrase_code"
             and server_warning_ticket_is_complete(pending_state)
             and (
-                not auto_confirm_expected_shifted_words
-                or tuple(
-                    str(item.get("word") or "").strip()
-                    for item in (
-                        data.get("shiftPlan", {}).get("shifted", [])
-                        if isinstance(data.get("shiftPlan"), dict)
-                        else []
+                (
+                    auto_confirm_only_if_no_shifts
+                    and not shifted_words
+                )
+                or (
+                    not auto_confirm_only_if_no_shifts
+                    and (
+                        not auto_confirm_expected_shifted_words
+                        or shifted_words == auto_confirm_expected_shifted_words
                     )
-                    if isinstance(item, dict)
-                    and str(item.get("word") or "").strip()
-                ) == auto_confirm_expected_shifted_words
+                )
             )
             and (
                 (

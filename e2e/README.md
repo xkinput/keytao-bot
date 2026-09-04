@@ -97,6 +97,9 @@ plan-rendered refusal commands, deterministic recoding, and merge-into-draft.
 S48 declares authoritative readings for `单份` and `蛋粉`. It removes only those
 rig-owned words, seeds `蛋粉@dffn`, and verifies that the occupant's own encoded
 chain moves it to `dffna` when `单份` takes the occupied slot.
+S50 declares the five transcript words `小像`, `小象`, `销项`, `肖像`, and
+`小箱`. It seeds only the three exact rig-owned occupants at `xcxx`, `xcxxi`,
+and `xcxxiu`, while the final successor remains empty for the server planner.
 
 ## Prerequisites
 
@@ -486,6 +489,16 @@ output is entirely reasoning. It proves the retry keeps the same output limit,
 lowers reasoning effort, removes stale history and the large prompt, emits only
 a parser- and binding-checked command from the trusted candidate record, and
 performs no write.
+
+S50 replays the 2026-09-04 relative-position incident end to end. It queries
+`小像`, sends the conversational `换到前面` follow-up, copies the advertised
+`把 小像 放在 销项 前面` command verbatim, and requires a complete server shift
+ticket before any `确认` affordance is visible. It then corrects the word with
+`错了 是小象`, sends the verb-free but context-complete `小象在肖像后面`, and
+confirms that sealed plan. The scenario compares the final local draft with the
+entire server plan and requires the completion receipt to name every displaced
+word and destination. It also runs every advertised incident string through
+the real authorization parser; no production endpoint is used.
 
 Optional overrides:
 

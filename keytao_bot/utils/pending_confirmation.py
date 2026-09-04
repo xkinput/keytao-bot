@@ -1487,6 +1487,36 @@ def server_backed_front_insert_commands(
     return tuple(commands)
 
 
+def server_backed_relative_front_commands(
+    candidate_scopes: object,
+) -> tuple[str, ...]:
+    """Rebuild the closed add-and-shift commands from comparator snapshots."""
+    if not isinstance(candidate_scopes, (list, tuple)):
+        return ()
+    commands: list[str] = []
+    for raw_scope in candidate_scopes:
+        if not isinstance(raw_scope, dict):
+            return ()
+        recommendation = validated_front_insert_recommendation(
+            raw_scope.get("word"),
+            raw_scope.get("candidates"),
+            raw_scope.get("occupiedWords"),
+            raw_scope.get("orderingAssessments"),
+        )
+        if recommendation is None:
+            continue
+        word = recommendation["newWord"]
+        occupant = recommendation["occupantWord"]
+        code = recommendation["occupantCode"]
+        for command in (
+            f"添加 {word} {code}，把 {occupant} 顺延",
+            f"把 {word} 放在 {occupant} 前面",
+        ):
+            if command not in commands:
+                commands.append(command)
+    return tuple(commands)
+
+
 def front_insert_recommendation_copy(
     recommendation: dict[str, str],
     fallback_selector: object = None,
@@ -1906,7 +1936,8 @@ _COMMAND_SUGGESTION_LEAD_RE = re.compile(
 )
 _COMMAND_SUGGESTION_VERB_RE = re.compile(
     rf"(?:{ADD_OPERATION_VERB_PATTERN}|提交|删除|移除|修改|改成|改为|"
-    r"改到|调整到|移到|挪到|换到|顺延|重新编码|调整权重)"
+    r"改到|调整到|移到|挪到|换到|放在|放到|排在|排到|"
+    r"顺延|重新编码|调整权重)"
 )
 _UNQUOTED_COMMAND_SUGGESTION_RE = re.compile(
     r"(?:请按(?:下面|以下)格式(?:重发|发送)|直接回复|"

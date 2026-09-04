@@ -769,6 +769,8 @@ def _build_code_shift_plan(
                 None,
             )
             if not next_code:
+                if len(probe_code) == 6:
+                    continue
                 return {
                     "success": False,
                     "message": f"无法顺延「{occupant_word}」：{probe_code} 之后没有可用候选编码",
@@ -868,6 +870,8 @@ def _build_code_shift_plan(
             next_code = candidate_code
             break
         if not next_code:
+            if len(probe_code) == 6:
+                continue
             return {
                 "success": False,
                 "message": f"无法顺延「{occupant_word}」：{probe_code} 之后没有可用候选编码",
@@ -980,6 +984,8 @@ def _build_multi_code_shift_plan(
             None,
         )
         if not next_code:
+            if len(probe_code) == 6:
+                continue
             return {
                 "success": False,
                 "message": (
@@ -6485,6 +6491,8 @@ async def keytao_shift_phrase_code(
             break
 
         if not found_next:
+            if len(probe_code) == 6:
+                continue
             return {
                 "success": False,
                 "message": f"无法顺延「{occupant_word}」：{probe_code} 之后没有可用候选编码",

@@ -73,6 +73,15 @@ from .scenarios import (
     S48_OCCUPANT,
     S48_TARGET_CODE,
     S48_WORD,
+    S50_AFTER_TARGET_CODE,
+    S50_DESTINATION,
+    S50_DESTINATION_CODE,
+    S50_FRONT_CODE,
+    S50_FRONT_DESTINATION,
+    S50_INITIAL_WORD,
+    S50_INITIAL_FREE_CODE,
+    S50_OCCUPANT,
+    S50_REPLACEMENT_WORD,
     ScenarioContext,
     ordered_candidate_codes,
     run_scenario,
@@ -1922,6 +1931,152 @@ async def ensure_s46_fixture(
     }
 
 
+async def ensure_s50_fixture(
+    *,
+    client: LocalNextClient,
+    seed_identity: dict[str, str],
+) -> dict[str, Any]:
+    """Seed the exact three-slot homophone chain from the S50 transcript."""
+    words = (
+        S50_INITIAL_WORD,
+        S50_REPLACEMENT_WORD,
+        S50_FRONT_DESTINATION,
+        S50_DESTINATION,
+        S50_OCCUPANT,
+    )
+    encodings = {
+        word: ordered_candidate_codes(await client.encode(word))
+        for word in words
+    }
+    if not all(
+        code in encodings[S50_INITIAL_WORD]
+        for code in (
+            S50_FRONT_CODE,
+            S50_DESTINATION_CODE,
+            S50_INITIAL_FREE_CODE,
+        )
+    ):
+        raise RigInfrastructureError(
+            f"S50 {S50_INITIAL_WORD} lacks the incident candidates: "
+            f"{encodings[S50_INITIAL_WORD]}"
+        )
+    if not all(
+        code in encodings[S50_REPLACEMENT_WORD]
+        for code in (
+            S50_FRONT_CODE,
+            S50_DESTINATION_CODE,
+            S50_AFTER_TARGET_CODE,
+        )
+    ):
+        raise RigInfrastructureError(
+            f"S50 {S50_REPLACEMENT_WORD} lacks the incident candidates: "
+            f"{encodings[S50_REPLACEMENT_WORD]}"
+        )
+    replacement_requested = await client.encode(
+        S50_REPLACEMENT_WORD,
+        requested_code=S50_DESTINATION_CODE,
+    )
+    replacement_chain = [
+        str(value or "").strip().lower()
+        for value in replacement_requested.get("requestedCandidateCodes") or []
+        if str(value or "").strip()
+    ]
+    if S50_DESTINATION_CODE not in replacement_chain:
+        replacement_chain = ordered_candidate_codes(replacement_requested)
+    if (
+        S50_DESTINATION_CODE not in replacement_chain
+        or replacement_chain.index(S50_DESTINATION_CODE) + 1
+        >= len(replacement_chain)
+        or replacement_chain[
+            replacement_chain.index(S50_DESTINATION_CODE) + 1
+        ] != S50_AFTER_TARGET_CODE
+    ):
+        raise RigInfrastructureError(
+            "S50 小象 server chain does not place xcxxiu immediately after "
+            f"肖像@xcxxi: {replacement_chain}"
+        )
+    if S50_FRONT_CODE not in encodings[S50_FRONT_DESTINATION]:
+        raise RigInfrastructureError(
+            f"S50 销项 does not include {S50_FRONT_CODE}: "
+            f"{encodings[S50_FRONT_DESTINATION]}"
+        )
+    occupant_chain = encodings[S50_OCCUPANT]
+    if S50_AFTER_TARGET_CODE not in occupant_chain:
+        raise RigInfrastructureError(
+            f"S50 小箱 does not include {S50_AFTER_TARGET_CODE}: {occupant_chain}"
+        )
+
+    source_codes = (
+        S50_FRONT_CODE,
+        S50_DESTINATION_CODE,
+        S50_AFTER_TARGET_CODE,
+    )
+    for code in source_codes:
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if exact_rows:
+            raise RigInfrastructureError(
+                f"S50 requires an empty exact {code} slot before seeding: "
+                f"{exact_rows}"
+            )
+
+    if (
+        len(S50_AFTER_TARGET_CODE) != 6
+        or occupant_chain[-1] != S50_AFTER_TARGET_CODE
+    ):
+        raise RigInfrastructureError(
+            f"S50 小箱 does not terminate at the six-code collision slot "
+            f"{S50_AFTER_TARGET_CODE}: "
+            f"{occupant_chain}"
+        )
+
+    await client.clean_draft(seed_identity["platform_id"])
+    seeds = []
+    for word, code in (
+        (S50_FRONT_DESTINATION, S50_FRONT_CODE),
+        (S50_DESTINATION, S50_DESTINATION_CODE),
+        (S50_OCCUPANT, S50_AFTER_TARGET_CODE),
+    ):
+        seeds.append(await client.seed_phrase(
+            platform_id=seed_identity["platform_id"],
+            word=word,
+            code=code,
+        ))
+        exact_rows = [
+            row for row in await client.phrases_by_code(code)
+            if row.get("code") == code
+        ]
+        if not (
+            len(exact_rows) == 1
+            and exact_rows[0].get("word") == word
+            and exact_rows[0].get("type") == "Phrase"
+            and str((exact_rows[0].get("user") or {}).get("name") or "").startswith(
+                RESERVED_BINDING_PREFIX
+            )
+        ):
+            raise RigInfrastructureError(
+                f"S50 did not seed sole rig-owned {word}@{code}: {exact_rows}"
+            )
+
+    return {
+        "initialWord": S50_INITIAL_WORD,
+        "replacementWord": S50_REPLACEMENT_WORD,
+        "frontDestination": S50_FRONT_DESTINATION,
+        "destination": S50_DESTINATION,
+        "occupant": S50_OCCUPANT,
+        "frontCode": S50_FRONT_CODE,
+        "destinationCode": S50_DESTINATION_CODE,
+        "initialFreeCode": S50_INITIAL_FREE_CODE,
+        "afterTargetCode": S50_AFTER_TARGET_CODE,
+        "sixCodeCollisionCode": S50_AFTER_TARGET_CODE,
+        "encodings": encodings,
+        "replacementRequestedChain": replacement_chain,
+        "seedBatchIds": [seed.get("batchId") for seed in seeds],
+    }
+
+
 async def ensure_s39_fixture(
     *,
     client: LocalNextClient,
@@ -2482,6 +2637,12 @@ async def async_main(args: argparse.Namespace) -> int:
                             newcomer_word=S48_WORD,
                             occupant_word=S48_OCCUPANT,
                             target_code=S48_TARGET_CODE,
+                        )
+                        recorder.write_json("fixture-facts.json", fixture_facts)
+                    if scenario.scenario_id == "S50":
+                        fixture_facts["s50"] = await ensure_s50_fixture(
+                            client=client,
+                            seed_identity=seed_identity,
                         )
                         recorder.write_json("fixture-facts.json", fixture_facts)
                     if scenario.scenario_id == "S39":

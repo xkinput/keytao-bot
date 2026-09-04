@@ -7352,6 +7352,283 @@ async def scenario_s49(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S50_INITIAL_WORD = "小像"
+S50_REPLACEMENT_WORD = "小象"
+S50_FRONT_DESTINATION = "销项"
+S50_DESTINATION = "肖像"
+S50_OCCUPANT = "小箱"
+S50_FRONT_CODE = "xcxx"
+S50_DESTINATION_CODE = "xcxxi"
+S50_INITIAL_FREE_CODE = "xcxxii"
+S50_AFTER_TARGET_CODE = "xcxxiu"
+S50_DISCOVERY = f"喵喵 {S50_INITIAL_WORD}"
+S50_CONTEXT = "小像确实比较常用，属于美团超市这块，换到前面"
+S50_FRONT = "把 小像 放在 销项 前面"
+S50_COMPOSITE_FRONT = "把小象放在销项前面，顺延后面的词"
+S50_CORRECTION = "错了 是小象"
+S50_AFTER = "小象在肖像后面"
+
+
+async def scenario_s50(ctx: ScenarioContext) -> dict[str, Any]:
+    """Replay the relative-position transcript through one final assent."""
+    from keytao_bot.harness.authorization_grammar import (
+        message_authorizes_mutation,
+        parse_contextual_relative_position,
+        parse_eviction_modified_add,
+    )
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import (
+        PendingToolConfirm,
+        server_warning_ticket_is_complete,
+    )
+
+    fixture = ctx.fixture_facts.get("s50") or {}
+    front_code = str(fixture.get("frontCode") or "")
+    destination_code = str(fixture.get("destinationCode") or "")
+    after_target_code = str(fixture.get("afterTargetCode") or "")
+    six_code_collision = str(fixture.get("sixCodeCollisionCode") or "")
+    initial_free_code = str(fixture.get("initialFreeCode") or "")
+    require(
+        front_code
+        and destination_code
+        and initial_free_code
+        and after_target_code
+        and six_code_collision == after_target_code
+        and len(six_code_collision) == 6,
+        f"S50 fixture is incomplete: {fixture}",
+    )
+    address = ConversationAddress.group(
+        "qq",
+        str(ctx.bot._group_id(ctx.platform_id)),
+        ctx.platform_id,
+    )
+    messages: list[str] = []
+    replies: list[str] = []
+
+    def live_shift_plan() -> dict[str, Any]:
+        record = ctx.bot.openai_chat.conversation_state_store.get_record(address)
+        require(record is not None, "S50 expected a live confirmation record")
+        require(
+            isinstance(record.state, PendingToolConfirm)
+            and record.state.function_name == "keytao_shift_phrase_code"
+            and server_warning_ticket_is_complete(record.state),
+            f"S50 confirmation was not backed by a complete shift ticket: {record}",
+        )
+        pending_display = record.state.args.get("_pending_display")
+        shift_plan = (
+            pending_display.get("shiftPlan")
+            if isinstance(pending_display, dict)
+            else None
+        )
+        require(
+            isinstance(shift_plan, dict),
+            f"S50 ticket omitted its server shift plan: {record.state.args}",
+        )
+        return shift_plan
+
+    def assert_honest_affordance(reply: str) -> None:
+        contract = advertised_reply_contract(reply)
+        if not contract.generic_assent_forms:
+            return
+        live_shift_plan()
+
+    messages.append(S50_DISCOVERY)
+    discovery = await ctx.send_group(S50_DISCOVERY, to_me=True)
+    replies.append(discovery)
+    assert_honest_affordance(discovery)
+    assert_reply_mentions(
+        discovery,
+        S50_INITIAL_WORD,
+        front_code,
+        S50_FRONT_DESTINATION,
+        destination_code,
+        S50_DESTINATION,
+        initial_free_code,
+    )
+    require(
+        pending_confirmation_copy() not in discovery,
+        f"S50 discovery advertised confirmation without a plan: {discovery}",
+    )
+
+    messages.append(S50_CONTEXT)
+    context_reply = await ctx.send_group(S50_CONTEXT, to_me=True)
+    replies.append(context_reply)
+    assert_honest_affordance(context_reply)
+    suggestions = advertised_command_suggestions(context_reply)
+    require(
+        S50_FRONT in suggestions,
+        f"S50 context reply omitted its executable positional form: {context_reply}",
+    )
+    require(
+        pending_confirmation_copy() not in context_reply,
+        f"S50 context reply advertised confirmation without a plan: {context_reply}",
+    )
+
+    messages.append(S50_FRONT)
+    front_reply = await ctx.send_group(S50_FRONT, to_me=True)
+    replies.append(front_reply)
+    assert_honest_affordance(front_reply)
+    front_plan = live_shift_plan()
+    front_shifted = [
+        item for item in front_plan.get("shifted") or []
+        if isinstance(item, dict)
+    ]
+    require(
+        front_plan.get("word") == S50_INITIAL_WORD
+        and front_plan.get("targetCode") == front_code
+        and len(front_shifted) >= 2,
+        f"S50 verbatim advertised command did not produce a shift preview: "
+        f"reply={front_reply}; plan={front_plan}",
+    )
+    require(
+        (await ctx.draft()).get("items", []) == [],
+        "S50 front preview wrote before confirmation",
+    )
+
+    messages.append(S50_CORRECTION)
+    correction_reply = await ctx.send_group(S50_CORRECTION, to_me=True)
+    replies.append(correction_reply)
+    assert_honest_affordance(correction_reply)
+    assert_reply_mentions(
+        correction_reply,
+        S50_REPLACEMENT_WORD,
+        destination_code,
+        S50_DESTINATION,
+        after_target_code,
+        S50_OCCUPANT,
+    )
+    require(
+        pending_confirmation_copy() not in correction_reply,
+        f"S50 correction kept an obsolete confirm affordance: {correction_reply}",
+    )
+
+    messages.append(S50_AFTER)
+    after_reply = await ctx.send_group(S50_AFTER, to_me=True)
+    replies.append(after_reply)
+    assert_honest_affordance(after_reply)
+    after_plan = live_shift_plan()
+    shifted = [
+        item for item in after_plan.get("shifted") or []
+        if isinstance(item, dict)
+    ]
+    require(
+        after_plan.get("word") == S50_REPLACEMENT_WORD
+        and after_plan.get("targetCode") == after_target_code
+        and shifted == []
+        and any(
+            item.get("action") == "Create"
+            and item.get("word") == S50_REPLACEMENT_WORD
+            and item.get("code") == after_target_code
+            for item in after_plan.get("items") or []
+            if isinstance(item, dict)
+        ),
+        f"S50 contextual after-position did not bind the server plan: "
+        f"reply={after_reply}; plan={after_plan}",
+    )
+    planned_items = {
+        item_key(item)
+        for item in after_plan.get("items") or []
+        if isinstance(item, dict)
+    }
+    require(
+        planned_items,
+        f"S50 final preview had no complete item plan: {after_plan}",
+    )
+    require(
+        (await ctx.draft()).get("items", []) == [],
+        "S50 contextual position wrote before assent",
+    )
+
+    messages.append("确认")
+    confirmation = await ctx.send_group("确认", to_me=True)
+    replies.append(confirmation)
+    assert_honest_affordance(confirmation)
+    final_draft = await ctx.draft()
+    final_items = {
+        item_key(item) for item in final_draft.get("items") or []
+    }
+    require(
+        final_items == planned_items
+        and len(final_draft.get("items") or []) == len(planned_items),
+        f"S50 assent did not write the exact sealed plan: "
+        f"planned={sorted(planned_items)}; draft={final_draft}",
+    )
+    for change in shifted:
+        assert_reply_mentions(
+            confirmation,
+            str(change.get("word") or ""),
+            str(change.get("fromCode") or ""),
+            str(change.get("toCode") or ""),
+        )
+    assert_reply_mentions(
+        confirmation,
+        S50_REPLACEMENT_WORD,
+        after_target_code,
+    )
+
+    explicit_closure = (
+        f"添加 {S50_INITIAL_WORD} {front_code}，把 {S50_FRONT_DESTINATION} 顺延",
+        S50_FRONT,
+        S50_COMPOSITE_FRONT,
+        f"把{S50_REPLACEMENT_WORD}放在{S50_DESTINATION}后面",
+    )
+    parsed_closure = []
+    for command in explicit_closure:
+        parsed = parse_eviction_modified_add(command)
+        require(
+            parsed is not None and message_authorizes_mutation(command),
+            f"S50 advertised command failed parser/binding closure: {command}",
+        )
+        parsed_closure.append({
+            "command": command,
+            "word": parsed.word,
+            "destination": parsed.named_occupant,
+            "modifier": parsed.modifier,
+        })
+    contextual = parse_contextual_relative_position(
+        S50_AFTER,
+        S50_REPLACEMENT_WORD,
+    )
+    require(
+        contextual is not None
+        and contextual.named_occupant == S50_DESTINATION,
+        "S50 contextual advertised form failed its live-word parser",
+    )
+    require(
+        not any(_reply_has_internal_fragment(reply) for reply in replies)
+        and not any(
+            marker in reply
+            for reply in replies
+            for marker in (
+                "这条回复里的建议没有对应的可执行计划",
+                "绑定成完整目标",
+                "缺少明确的执行动词",
+            )
+        ),
+        f"S50 leaked internal or robot-language copy: {replies}",
+    )
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": final_draft,
+        "facts": {
+            "advertisedFrontCommand": S50_FRONT,
+            "frontPreviewShifted": front_shifted,
+            "afterTargetCode": after_target_code,
+            "sixCodeCollisionCode": six_code_collision,
+            "finalShifted": shifted,
+            "receiptMentionsEveryShift": True,
+            "advertisedClosure": parsed_closure,
+            "contextualClosure": {
+                "word": contextual.word,
+                "destination": contextual.named_occupant,
+                "modifier": contextual.modifier,
+            },
+            "finalItems": sorted(final_items),
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -7402,6 +7679,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S47", "choice and executable-suggestion closure", scenario_s47),
     Scenario("S48", "numbered candidate create-with-eviction", scenario_s48),
     Scenario("S49", "reasoning-only exhaustion bounded recovery", scenario_s49),
+    Scenario("S50", "relative-position grammar and honest confirmation", scenario_s50),
 )
 
 

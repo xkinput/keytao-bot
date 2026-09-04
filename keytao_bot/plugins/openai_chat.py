@@ -113,6 +113,7 @@ from ..utils.pending_confirmation import (
     render_server_backed_word_set,
     same_unique_binding_set,
     server_backed_front_insert_commands,
+    server_backed_relative_front_commands,
     strip_warning_count_copy,
     validated_front_insert_recommendation as _validated_front_insert_recommendation_from_record,
 )
@@ -1966,16 +1967,19 @@ def _advertised_reply_matches_live_record(
     # PendingAddWord control that the real structural parser resolves against
     # this exact actor-owned, server-backed candidate record (for example the
     # deterministic renderer's ``1 重新编码`` control).
-    pending_add_front_insert_commands = set(
-        server_backed_front_insert_commands(({
-            "word": state.word,
-            "candidates": state.server_candidates,
-            "occupiedWords": state.server_occupied_words,
-            "orderingAssessments": state.server_ordering_assessments,
-        },))
-        if isinstance(state, PendingAddWord)
-        else ()
-    )
+    pending_add_scope = ({
+        "word": state.word,
+        "candidates": state.server_candidates,
+        "occupiedWords": state.server_occupied_words,
+        "orderingAssessments": state.server_ordering_assessments,
+    },) if isinstance(state, PendingAddWord) else ()
+    pending_add_front_insert_commands = {
+        unicodedata.normalize("NFKC", command)
+        for command in (
+            *server_backed_front_insert_commands(pending_add_scope),
+            *server_backed_relative_front_commands(pending_add_scope),
+        )
+    }
     pending_add_suggestions_are_bound = bool(
         contract.command_suggestions
         and isinstance(state, PendingAddWord)
@@ -3224,6 +3228,18 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     ctx.eviction_modified_add = _authorization_grammar.parse_eviction_modified_add(
         ctx.normalized_message_text
     )
+    if (
+        ctx.eviction_modified_add is None
+        and current_record is not None
+        and not current_record.execution_id
+        and isinstance(current_record.state, PendingAddWord)
+    ):
+        ctx.eviction_modified_add = (
+            _authorization_grammar.parse_contextual_relative_position(
+                ctx.normalized_message_text,
+                current_record.state.word,
+            )
+        )
     ctx.compound_eviction_add_plan = (
         _authorization_grammar.parse_compound_eviction_add_plan(
             ctx.normalized_message_text
@@ -3234,6 +3250,33 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     ctx.scoped_pending_response: Optional[str] = None
     ctx.resolved_advertised_words = ()
     ctx.advertised_snapshot_token = ""
+    if (
+        current_record is not None
+        and not current_record.execution_id
+        and isinstance(current_record.state, PendingToolConfirm)
+        and current_record.state.function_name == "keytao_shift_phrase_code"
+    ):
+        corrected_word = _authorization_grammar.parse_contextual_word_correction(
+            ctx.normalized_message_text,
+            str(current_record.state.args.get("word") or "").strip(),
+        )
+        if corrected_word:
+            conversation_state_store.delete(ctx.conv_key)
+            ctx.scoped_pending_response = (
+                await _try_handle_simple_single_word_query(
+                    f"加词 {corrected_word}",
+                    ctx.platform,
+                    ctx.user_id,
+                    ctx.conv_key,
+                    ctx.space_key,
+                    ctx.owner_label,
+                )
+                or f"无法取得「{corrected_word}」的审词结果，本次未写入。"
+            )
+            ctx.current_pending_record = conversation_state_store.get_record(
+                ctx.conv_key
+            )
+            return False
     recent_write_state = (
         ctx.current_pending_record.state
         if (
@@ -3313,8 +3356,45 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
                 isinstance(ctx.current_pending_record.state, PendingAddWord)
                 and draft_operation_coordinator.get(ctx.conv_key) is None
             ):
+                pending_state = ctx.current_pending_record.state
+                reorder_recommendation = (
+                    _chat_commands._pending_add_reorder_recommendation(
+                        pending_state
+                    )
+                )
+                if (
+                    reorder_recommendation is not None
+                    and _authorization_grammar.contextual_front_preference_matches(
+                        ctx.normalized_message_text,
+                        pending_state.word,
+                    )
+                ):
+                    word = reorder_recommendation["newWord"]
+                    occupant = reorder_recommendation["occupantWord"]
+                    commands = server_backed_relative_front_commands(({
+                        "word": pending_state.word,
+                        "candidates": pending_state.server_candidates,
+                        "occupiedWords": pending_state.server_occupied_words,
+                        "orderingAssessments": (
+                            pending_state.server_ordering_assessments
+                        ),
+                    },))
+                    rendered = tuple(
+                        render_executable_suggestion(
+                            command,
+                            words=(word, occupant),
+                        )
+                        for command in commands
+                    )
+                    if all(rendered):
+                        ctx.scoped_pending_response = (
+                            "可以按这个顺序生成服务端顺延计划；"
+                            "选择任一完整命令发送：\n"
+                            + "\n".join(rendered)
+                        )
+                        return False
                 replacement_response = await _try_handle_explicit_pending_replacement(
-                    ctx.current_pending_record.state,
+                    pending_state,
                     ctx.normalized_message_text,
                     ctx.platform,
                     ctx.user_id,

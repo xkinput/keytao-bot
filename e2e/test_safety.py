@@ -83,6 +83,17 @@ from .scenarios import (
     S48_SHIFTED_CODE,
     S48_TARGET_CODE,
     S48_WORD,
+    S50_AFTER,
+    S50_COMPOSITE_FRONT,
+    S50_CONTEXT,
+    S50_CORRECTION,
+    S50_DESTINATION,
+    S50_DISCOVERY,
+    S50_FRONT,
+    S50_INITIAL_WORD,
+    S50_INITIAL_FREE_CODE,
+    S50_OCCUPANT,
+    S50_REPLACEMENT_WORD,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -620,6 +631,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             readme,
         )
         self.assertIn(
+            "S50 replays the 2026-09-04 relative-position incident",
+            readme,
+        )
+        self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
@@ -668,10 +683,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s49(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s50(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 50)],
+            [f"S{index}" for index in range(1, 51)],
         )
 
     def test_s48_pins_numbered_create_with_eviction_contract(self) -> None:
@@ -691,6 +706,35 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         }
         self.assertEqual(entries[S48_WORD], ["dān", "fèn"])
         self.assertEqual(entries[S48_OCCUPANT], ["dàn", "fěn"])
+
+    def test_s50_pins_relative_position_incident_transcript(self) -> None:
+        self.assertEqual(S50_DISCOVERY, "喵喵 小像")
+        self.assertEqual(
+            S50_CONTEXT,
+            "小像确实比较常用，属于美团超市这块，换到前面",
+        )
+        self.assertEqual(S50_FRONT, "把 小像 放在 销项 前面")
+        self.assertEqual(
+            S50_COMPOSITE_FRONT,
+            "把小象放在销项前面，顺延后面的词",
+        )
+        self.assertEqual(S50_CORRECTION, "错了 是小象")
+        self.assertEqual(S50_AFTER, "小象在肖像后面")
+        self.assertEqual(S50_INITIAL_FREE_CODE, "xcxxii")
+        self.assertEqual(
+            (
+                S50_INITIAL_WORD,
+                S50_REPLACEMENT_WORD,
+                S50_DESTINATION,
+                S50_OCCUPANT,
+            ),
+            ("小像", "小象", "肖像", "小箱"),
+        )
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S50"]
+        self.assertEqual(
+            fixture["probe_words"],
+            ("小像", "小象", "销项", "肖像", "小箱"),
+        )
 
     def test_s37_declares_owned_eviction_fixture_readings(self) -> None:
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S37"]

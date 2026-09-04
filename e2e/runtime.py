@@ -508,11 +508,18 @@ class LocalNextClient:
             raise RigInfrastructureError("by-code response has no phrase list")
         return [item for item in values if isinstance(item, dict)]
 
-    async def encode(self, word: str) -> dict[str, Any]:
+    async def encode(
+        self,
+        word: str,
+        requested_code: str = "",
+    ) -> dict[str, Any]:
+        params = {"word": word}
+        if requested_code:
+            params["code"] = requested_code
         _status, payload = await self._json(
             "GET",
             "/api/phrases/encode",
-            params={"word": word},
+            params=params,
             authenticated=False,
         )
         return payload

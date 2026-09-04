@@ -187,6 +187,16 @@ def _is_multi_word_add_candidate_discovery(message: str) -> bool:
     ) is not None
 
 
+def _is_relative_position_add(command: object) -> bool:
+    """Keep named before/after forms on the existing positional planner path."""
+    return bool(
+        command is not None
+        and not str(getattr(command, "code", "") or "").strip()
+        and str(getattr(command, "modifier", "") or "").strip()
+        in {"前面", "之前", "前", "后面", "之后", "后"}
+    )
+
+
 AUTHORITATIVE_LINK_TOOLS = frozenset({
     "keytao_create_phrase",
     "keytao_submit_batch",
@@ -683,7 +693,12 @@ class AgentOrchestrator:
             if isinstance(function, dict):
                 tool_schemas[str(function.get("name") or "")] = function.get("parameters", {})
         exact_multi_add_items = authorized_multi_add_items(message)
-        eviction_add = parse_eviction_modified_add(message)
+        parsed_eviction_add = parse_eviction_modified_add(message)
+        eviction_add = (
+            None
+            if _is_relative_position_add(parsed_eviction_add)
+            else parsed_eviction_add
+        )
         if resolved_advertised_words:
             messages.append({
                 "role": "system",
@@ -5100,9 +5115,12 @@ class AgentOrchestrator:
             or result_data.get("collisionReplanned") is True
         ):
             return None
+        parsed_eviction_add = parse_eviction_modified_add(
+            tool_context.current_message or ""
+        )
         if (
-            parse_eviction_modified_add(tool_context.current_message or "")
-            is not None
+            parsed_eviction_add is not None
+            and not _is_relative_position_add(parsed_eviction_add)
         ):
             logger.warning(
                 "Refusing add-preview auto-confirm because the current "

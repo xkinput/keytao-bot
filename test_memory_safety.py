@@ -77,6 +77,8 @@ from keytao_bot.harness.authorization_grammar import (
     parse_entry_swap,
     parse_entry_move_plan,
     parse_eviction_modified_add,
+    parse_contextual_relative_position,
+    parse_contextual_word_correction,
     parse_existing_entry_move,
     parse_indirect_entry_move,
 )
@@ -7106,6 +7108,64 @@ class MutationAuthorizationTests(unittest.TestCase):
             with self.subTest(blocked=blocked):
                 self.assertFalse(message_authorizes_mutation(blocked))
                 self.assertIsNone(_positional_create_operands(blocked))
+
+    def test_relative_position_commands_are_first_class_eviction_shapes(self) -> None:
+        expected = {
+            "把 小像 放在 销项 前面": ("小像", "销项", "前面"),
+            "把小像放到销项前面": ("小像", "销项", "前面"),
+            "小像 放在 销项 前面": ("小像", "销项", "前面"),
+            "把小象放在销项前面，顺延后面的词": ("小象", "销项", "前面"),
+            "把\u3000小象\u3000放在\u3000肖像\u3000后面": ("小象", "肖像", "后面"),
+        }
+        for message, operands in expected.items():
+            with self.subTest(message=message):
+                parsed = parse_eviction_modified_add(message)
+                self.assertIsNotNone(parsed)
+                self.assertEqual(
+                    (parsed.word, parsed.named_occupant, parsed.modifier),
+                    operands,
+                )
+                self.assertEqual(parsed.code, "")
+                self.assertTrue(message_authorizes_mutation(message))
+
+    def test_verbless_relative_position_requires_matching_live_word_context(self) -> None:
+        message = "小象在肖像后面"
+        self.assertIsNone(parse_eviction_modified_add(message))
+        parsed = parse_contextual_relative_position(message, "小象")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(
+            (parsed.word, parsed.named_occupant, parsed.modifier),
+            ("小象", "肖像", "后面"),
+        )
+
+        corrected = parse_contextual_relative_position(
+            "错了，是小象在肖像后面",
+            "小像",
+        )
+        self.assertIsNotNone(corrected)
+        self.assertEqual(corrected.word, "小象")
+
+        for blocked in (
+            "小象在肖像后面",
+            "他说小象在肖像后面",
+            "不要小象在肖像后面",
+            "小象在肖像后面？",
+        ):
+            with self.subTest(blocked=blocked):
+                self.assertIsNone(
+                    parse_contextual_relative_position(blocked, "小像")
+                )
+
+        self.assertEqual(
+            parse_contextual_word_correction("错了 是小象", "小像"),
+            "小象",
+        )
+        self.assertIsNone(
+            parse_contextual_word_correction("错了 是小像", "小像")
+        )
+        self.assertIsNone(
+            parse_contextual_word_correction("他说错了 是小象", "小像")
+        )
 
     def test_eviction_modified_add_is_one_closed_operation(self) -> None:
         expected = {
@@ -19166,6 +19226,20 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FinalReplyLoopBreakerTests(unittest.TestCase):
+    def test_incident_confirm_affordance_requires_a_live_ticket(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        bare = chat_module.ServerBackedQueryReply(
+            "本次仅查询，没有执行写入。\n回复「确认」执行，或「取消」。"
+        )
+        guarded = chat_module._enforce_advertised_reply_contract(bare, None)
+
+        self.assertNotIn(pending_confirmation_copy(), guarded)
+        self.assertNotIn("回复「确认」", guarded)
+        self.assertNotIn("这条回复里的建议没有对应的可执行计划", guarded)
+        self.assertNotIn("绑定成完整目标", guarded)
+        self.assertIn("本次未写入", guarded)
+
     def test_unbound_batch_example_is_removed_without_erasing_read_only_results(self) -> None:
         from keytao_bot.harness.orchestrator import (
             _strip_unbound_command_suggestions,
@@ -19923,6 +19997,449 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         )
         self.assertNotIn("提交草稿", incident_reply)
         self.assertIn("批量加入", incident_reply)
+
+
+class RelativePositionCommandTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _pending(word: str) -> PendingAddWord:
+        return PendingAddWord(
+            word=word,
+            recommended_code="xcxxiu",
+            candidates=[
+                ("xcxx", True),
+                ("xcxxi", True),
+                ("xcxxiu", True),
+                ("xcxxiua", False),
+            ],
+            occupied_words={
+                "xcxx": ["销项"],
+                "xcxxi": ["肖像"],
+                "xcxxiu": ["小箱"],
+            },
+            server_candidates=[
+                ("xcxx", True),
+                ("xcxxi", True),
+                ("xcxxiu", True),
+                ("xcxxiua", False),
+            ],
+            server_occupied_words={
+                "xcxx": ["销项"],
+                "xcxxi": ["肖像"],
+                "xcxxiu": ["小箱"],
+            },
+            server_ordering_assessments=[{
+                "verdict": "front_more_common",
+                "newWord": word,
+                "occupantWord": "销项",
+                "occupantCode": "xcxx",
+                "freeCode": "xcxxiua",
+                "newCode": "xcxx",
+                "summary": "小像在当前使用场景中更常用",
+            }],
+            pronunciation_codes={
+                "xcxx": "xiao xiang",
+                "xcxxi": "xiao xiang",
+                "xcxxiu": "xiao xiang",
+                "xcxxiua": "xiao xiang",
+            },
+            pronunciation_recommended_codes=["xcxxiu"],
+            needs_manual_review=False,
+        )
+
+    async def test_live_pending_front_preference_advertises_closed_commands_only(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        message = "小像确实比较常用，属于美团超市这块，换到前面"
+        self.assertTrue(
+            authorization_grammar_module.contextual_front_preference_matches(
+                message,
+                "小像",
+            )
+        )
+        for blocked in (
+            "小象确实比较常用，换到前面",
+            "小像确实比较常用，不要换到前面",
+            "有人说小像确实比较常用，换到前面",
+            "小像确实比较常用，换到前面？",
+        ):
+            with self.subTest(blocked=blocked):
+                self.assertFalse(
+                    authorization_grammar_module.contextual_front_preference_matches(
+                        blocked,
+                        "小像",
+                    )
+                )
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group(
+            "qq", "865189947", "incident-front-preference"
+        )
+        self.assertTrue(
+            store.set(conv_key, self._pending("小像"), owner_label="朝歌")
+        )
+        ctx = chat_module.TurnContext(
+            bot=object(),
+            event=object(),
+            platform="qq",
+            user_id="incident-front-preference",
+            normalized_message_text=message,
+            conv_key=conv_key,
+            space_key=conv_key.space_key,
+            owner_label="朝歌",
+        )
+        with patch.object(chat_module, "conversation_state_store", store):
+            stopped = await chat_module._stage_resolve_current_pending_scope(ctx)
+
+        self.assertFalse(stopped)
+        reply = ctx.scoped_pending_response or ""
+        self.assertEqual(
+            advertised_command_suggestions(reply),
+            (
+                "添加 小像 xcxx，把 销项 顺延",
+                "把 小像 放在 销项 前面",
+            ),
+        )
+        self.assertFalse(advertised_reply_contract(reply).generic_assent_forms)
+        with patch.object(chat_module, "conversation_state_store", store):
+            self.assertEqual(
+                chat_module._enforce_advertised_reply_contract(reply, conv_key),
+                reply,
+            )
+        record = store.get_record(conv_key)
+        self.assertIsNotNone(record)
+        self.assertIsInstance(record.state, PendingAddWord)
+        self.assertEqual(record.state.word, "小像")
+
+    async def test_advertised_front_command_binds_to_shift_preview(self) -> None:
+        from keytao_bot.plugins import chat_commands as command_module
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group(
+            "qq", "865189947", "incident-front"
+        )
+        store.set(conv_key, self._pending("小像"), owner_label="朝歌")
+
+        async def lookup(name, arguments, *_args, **_kwargs):
+            self.assertEqual(name, "keytao_lookup_by_word")
+            self.assertEqual(arguments, {"word": "销项"})
+            return json.dumps({
+                "success": True,
+                "phrases": [{
+                    "word": "销项",
+                    "code": "xcxx",
+                    "type": "Phrase",
+                }],
+            }, ensure_ascii=False)
+
+        shift = AsyncMock(return_value="完整顺延计划；回复「确认」执行，或「取消」。")
+        with (
+            patch.object(command_module, "conversation_state_store", store),
+            patch.object(command_module, "call_tool_function", side_effect=lookup),
+            patch.object(command_module, "_execute_shift_to_code", shift),
+        ):
+            result = await command_module._try_handle_shift_modified_add_command(
+                "把 小像 放在 销项 前面",
+                "qq",
+                "incident-front",
+                conv_key,
+                conv_key.space_key,
+                "朝歌",
+            )
+
+        self.assertEqual(result, shift.return_value)
+        shift.assert_awaited_once()
+        self.assertEqual(shift.await_args.args[:2], ("小像", "xcxx"))
+        self.assertFalse(
+            shift.await_args.kwargs.get("auto_confirm_shift_plan", False)
+        )
+        self.assertEqual(
+            shift.await_args.kwargs["reviewed_candidate_codes"],
+            ("xcxx", "xcxxi", "xcxxiu", "xcxxiua"),
+        )
+
+    async def test_same_code_position_stays_on_weight_ordering_path(self) -> None:
+        from keytao_bot.plugins import chat_commands as command_module
+
+        relative_handler = AsyncMock(
+            side_effect=AssertionError("same-code ordering is not a code shift")
+        )
+        with patch.object(
+            command_module,
+            "_handle_relative_position_command",
+            relative_handler,
+        ):
+            result = await command_module._try_handle_shift_modified_add_command(
+                "把吃席同码放在赤溪前面",
+                "qq",
+                "same-code-position",
+                ConversationAddress.private("qq", "same-code-position"),
+            )
+
+        self.assertIsNone(result)
+        relative_handler.assert_not_awaited()
+
+    async def test_cold_explicit_front_command_keeps_single_turn_execution(self) -> None:
+        from keytao_bot.plugins import chat_commands as command_module
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("qq", "cold-front")
+
+        async def server(name, arguments, *_args, **_kwargs):
+            self.assertEqual(name, "keytao_lookup_by_word")
+            self.assertEqual(arguments, {"word": "销项"})
+            return json.dumps({
+                "success": True,
+                "phrases": [{"word": "销项", "code": "xcxx"}],
+            }, ensure_ascii=False)
+
+        async def review(*_args, **_kwargs):
+            store.set(conv_key, self._pending("小像"))
+            return "reviewed"
+
+        shift = AsyncMock(return_value="已执行")
+        with (
+            patch.object(command_module, "conversation_state_store", store),
+            patch.object(command_module, "call_tool_function", side_effect=server),
+            patch.object(
+                command_module,
+                "_try_handle_simple_single_word_query",
+                side_effect=review,
+            ),
+            patch.object(command_module, "_execute_shift_to_code", shift),
+        ):
+            result = await command_module._try_handle_shift_modified_add_command(
+                "把小像放在销项前面",
+                "qq",
+                "cold-front",
+                conv_key,
+            )
+
+        self.assertEqual(result, "已执行")
+        self.assertTrue(shift.await_args.kwargs["auto_confirm_shift_plan"])
+        self.assertEqual(
+            shift.await_args.kwargs["auto_confirm_expected_shifted_words"],
+            ("销项",),
+        )
+
+    async def test_cold_explicit_after_auto_confirms_only_an_empty_shift_plan(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import chat_commands as command_module
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.private("qq", "cold-after")
+
+        async def server(name, arguments, *_args, **_kwargs):
+            if name == "keytao_lookup_by_word":
+                self.assertEqual(arguments, {"word": "销项"})
+                return json.dumps({
+                    "success": True,
+                    "phrases": [{"word": "销项", "code": "xcxx"}],
+                }, ensure_ascii=False)
+            if name == "keytao_encode":
+                self.assertEqual(
+                    arguments,
+                    {"word": "小像", "requested_code": "xcxx"},
+                )
+                return json.dumps({
+                    "success": True,
+                    "requestedCandidateCodes": [
+                        "xcxx", "xcxxi", "xcxxiu", "xcxxiua"
+                    ],
+                }, ensure_ascii=False)
+            raise AssertionError((name, arguments))
+
+        async def review(*_args, **_kwargs):
+            store.set(conv_key, self._pending("小像"))
+            return "reviewed"
+
+        shift = AsyncMock(return_value="已执行")
+        with (
+            patch.object(command_module, "conversation_state_store", store),
+            patch.object(command_module, "call_tool_function", side_effect=server),
+            patch.object(
+                command_module,
+                "_try_handle_simple_single_word_query",
+                side_effect=review,
+            ),
+            patch.object(command_module, "_execute_shift_to_code", shift),
+        ):
+            result = await command_module._try_handle_shift_modified_add_command(
+                "把小像放在销项后面",
+                "qq",
+                "cold-after",
+                conv_key,
+            )
+
+        self.assertEqual(result, "已执行")
+        self.assertEqual(shift.await_args.args[:2], ("小像", "xcxxi"))
+        self.assertTrue(shift.await_args.kwargs["auto_confirm_shift_plan"])
+        self.assertTrue(
+            shift.await_args.kwargs["auto_confirm_only_if_no_shifts"]
+        )
+        self.assertEqual(
+            shift.await_args.kwargs["auto_confirm_expected_shifted_words"],
+            (),
+        )
+
+    async def test_live_pending_word_claims_verbless_after_position(self) -> None:
+        from keytao_bot.plugins import chat_commands as command_module
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group(
+            "qq", "865189947", "incident-after"
+        )
+        store.set(conv_key, self._pending("小象"), owner_label="朝歌")
+        calls = []
+
+        async def server(name, arguments, *_args, **_kwargs):
+            calls.append((name, dict(arguments)))
+            if name == "keytao_lookup_by_word":
+                return json.dumps({
+                    "success": True,
+                    "phrases": [{
+                        "word": "肖像",
+                        "code": "xcxxi",
+                        "type": "Phrase",
+                    }],
+                }, ensure_ascii=False)
+            if name == "keytao_encode":
+                self.assertEqual(
+                    arguments,
+                    {"word": "小象", "requested_code": "xcxxi"},
+                )
+                return json.dumps({
+                    "success": True,
+                    "requestedCandidateCodes": [
+                        "xcxx", "xcxxi", "xcxxiu", "xcxxiua"
+                    ],
+                    "candidateCodes": [
+                        "xcxx", "xcxxi", "xcxxiu", "xcxxiua"
+                    ],
+                }, ensure_ascii=False)
+            raise AssertionError((name, arguments))
+
+        shift = AsyncMock(return_value="完整顺延计划；回复「确认」执行，或「取消」。")
+        with (
+            patch.object(command_module, "conversation_state_store", store),
+            patch.object(command_module, "call_tool_function", side_effect=server),
+            patch.object(command_module, "_execute_shift_to_code", shift),
+        ):
+            result = await command_module._try_handle_shift_modified_add_command(
+                "小象在肖像后面",
+                "qq",
+                "incident-after",
+                conv_key,
+                conv_key.space_key,
+                "朝歌",
+            )
+
+        self.assertEqual(result, shift.return_value)
+        self.assertEqual(
+            calls,
+            [
+                ("keytao_lookup_by_word", {"word": "肖像"}),
+                (
+                    "keytao_encode",
+                    {"word": "小象", "requested_code": "xcxxi"},
+                ),
+            ],
+        )
+        shift.assert_awaited_once()
+        self.assertEqual(shift.await_args.args[:2], ("小象", "xcxxiu"))
+        self.assertFalse(
+            shift.await_args.kwargs.get("auto_confirm_shift_plan", False)
+        )
+
+    async def test_verbless_position_without_live_word_context_is_not_claimed(self) -> None:
+        from keytao_bot.plugins import chat_commands as command_module
+
+        conv_key = ConversationAddress.private("qq", "no-live-position")
+        with (
+            patch.object(
+                command_module,
+                "conversation_state_store",
+                MemoryConversationStateStore(),
+            ),
+            patch.object(
+                command_module,
+                "call_tool_function",
+                new=AsyncMock(side_effect=AssertionError(
+                    "a verbless statement without live context stays unclaimed"
+                )),
+            ),
+        ):
+            result = await command_module._try_handle_shift_modified_add_command(
+                "小象在肖像后面",
+                "qq",
+                "no-live-position",
+                conv_key,
+            )
+
+        self.assertIsNone(result)
+
+    async def test_correction_replaces_a_relative_shift_ticket_with_new_word_context(
+        self,
+    ) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group(
+            "qq", "865189947", "incident-correction"
+        )
+        store.set(
+            conv_key,
+            PendingToolConfirm(
+                function_name="keytao_shift_phrase_code",
+                args={"word": "小像", "target_code": "xcxx"},
+                confirmation_source="server_warning",
+            ),
+            owner_label="朝歌",
+        )
+
+        async def review(
+            message,
+            platform,
+            user_id,
+            reviewed_conv_key,
+            *_args,
+            **_kwargs,
+        ):
+            self.assertEqual(message, "加词 小象")
+            self.assertEqual((platform, user_id), ("qq", "incident-correction"))
+            self.assertEqual(reviewed_conv_key, conv_key)
+            store.set(conv_key, self._pending("小象"), owner_label="朝歌")
+            return "已按「小象」重新审词。"
+
+        ctx = chat_module.TurnContext(
+            bot=None,
+            event=None,
+            platform="qq",
+            user_id="incident-correction",
+            normalized_message_text="错了 是小象",
+            conv_key=conv_key,
+            space_key=conv_key.space_key,
+            owner_label="朝歌",
+        )
+        with (
+            patch.object(chat_module, "conversation_state_store", store),
+            patch.object(
+                chat_module,
+                "_try_handle_simple_single_word_query",
+                side_effect=review,
+            ) as reviewed,
+        ):
+            stopped = await chat_module._stage_resolve_current_pending_scope(ctx)
+
+        self.assertFalse(stopped)
+        self.assertEqual(ctx.scoped_pending_response, "已按「小象」重新审词。")
+        reviewed.assert_awaited_once()
+        replacement = store.get_record(conv_key)
+        self.assertIsNotNone(replacement)
+        self.assertIsInstance(replacement.state, PendingAddWord)
+        self.assertEqual(replacement.state.word, "小象")
 
 
 class ActorBindingResolverTests(unittest.IsolatedAsyncioTestCase):
