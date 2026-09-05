@@ -103,6 +103,11 @@ and `xcxxiu`, while the final successor remains empty for the server planner.
 S52 declares the authoritative `xì pǐn` reading for `细品`. It keeps the
 recommended `xkpb` slot empty, while the scenario fixture reuses or seeds sole
 rig-owned `哪里@nsl` and `哪里@nslko` rows for exact delete-scope checks.
+S53 keeps `薄肌`, the weak-evidence control `薄肌腱`, the non-polyphone
+control `肌群`, the disagreement control `校肌`, and the compositional target
+`着陆` absent as whole-word ZDIC entries. Its separate search fixture serves only
+the six declared `拼音` / `读音`
+queries; it never opens a browser or socket and records every registry call.
 
 ## Prerequisites
 
@@ -525,6 +530,21 @@ variants of the possessive delete grammar. Each must use the deterministic
 route, seal and confirm only `Delete 哪里@nsl`, leave the `nslko` row out of the
 receipt, and make no semantic-routing model request. Startup replay itself is
 covered offline because the real rig does not connect to OneBot or production.
+
+S53 closes the 2026-09-05 unknown-polyphone reading incident. It requires
+`薄肌` to resolve as `bó jī` from two canned independent non-high-trust web
+domains plus the real model's independent per-character linguistic judgment,
+names only the validated domains in the review line, and exposes only the
+`bljk*` chain. `薄肌腱` supplies two results from one untrusted domain and must
+remain `model_only` with a manual-review seal even if the model agrees. `肌群`
+proves the polyphone gate makes zero web-registry calls. `着陆` proves that a
+fixed longer local carrier (`不着陆飞行`) can stop the ladder, while shorter
+compounds can no longer donate readings to larger unknown words. Finally,
+intentionally conflicting snippets for `校肌`
+must expose the `jiào jī` and `xiào jī` code chains and ask the user to choose; only
+shared six-character terminal codes may appear in both chains. The fixture
+replaces only the outbound web-search boundary because the rig allowlist blocks
+external search; the chat and semantic-pronunciation model calls remain real.
 
 Optional overrides:
 

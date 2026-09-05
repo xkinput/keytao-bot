@@ -1145,7 +1145,13 @@ async def web_fetch(url: str, max_chars: int = 4000) -> Dict[str, Any]:
     }
 
 
-async def web_search(query: str, max_results: int = 5, fetch_top_n: int = 0) -> Dict[str, Any]:
+async def web_search(
+    query: str,
+    max_results: int = 5,
+    fetch_top_n: int = 0,
+    *,
+    channel: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Search the web and return structured result snippets.
 
@@ -1166,7 +1172,9 @@ async def web_search(query: str, max_results: int = 5, fetch_top_n: int = 0) -> 
             "results": [],
         }
 
-    channel = detect_query_channel(normalized_query)
+    channel = channel or detect_query_channel(normalized_query)
+    if channel not in CHANNEL_REGISTRY:
+        channel = "web"
     channel_spec = CHANNEL_REGISTRY[channel]
     if not channel_spec.get("enabled"):
         return _disabled_channel_result(channel, query=normalized_query)

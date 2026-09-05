@@ -21,6 +21,9 @@ from dotenv import dotenv_values
 
 from keytao_bot.utils.pinyin_reference import PINYIN_REFERENCE_DB_ENV
 from keytao_bot.utils.pinyin_reference_build import build_reference_database
+from keytao_bot.utils.pronunciation_resolution import (
+    PRONUNCIATION_RESOLUTION_CACHE_DB_ENV,
+)
 
 from .recording import ArtifactRecorder
 from .runtime import (
@@ -100,6 +103,7 @@ from .zdic_seed import (
     dictionary_fixture_words_for_scenario,
     seed_zdic_cache,
 )
+from .web_evidence_seed import WebPronunciationEvidenceController
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -640,7 +644,7 @@ def _encoded_matches_zdic_fixture(
         expected_pinyins = entry_row["pinyins"]
         expected_source = "zdic-phrase"
     else:
-        expected_pinyins = [
+        expected_pinyins = entry_row.get("expected_selected_pinyins") or [
             rows_by_key[("char", char)]["pinyins"][0]
             for char in word
             if ("char", char) in rows_by_key
@@ -2485,6 +2489,10 @@ async def async_main(args: argparse.Namespace) -> int:
         attempt_timeout_seconds=float(os.getenv("E2E_ENCODE_ATTEMPT_TIMEOUT_SECONDS", "0.05")),
     )
     pronunciation_poison = PronunciationPoisonController()
+    web_pronunciation = WebPronunciationEvidenceController()
+    os.environ[PRONUNCIATION_RESOLUTION_CACHE_DB_ENV] = str(
+        artifact_dir / "pronunciation-resolution-cache.db"
+    )
     guard = NetworkAllowlist(
         llm_base_url=config["llm"]["base_url"],
         recorder=recorder,
@@ -2829,6 +2837,7 @@ async def async_main(args: argparse.Namespace) -> int:
                         recorder=recorder,
                         encode_delay=encode_delay,
                         pronunciation_poison=pronunciation_poison,
+                        web_pronunciation=web_pronunciation,
                         fixture_facts=fixture_facts,
                         admin_identity=admin_identity,
                         admin_user=admin_session["user"],

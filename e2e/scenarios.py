@@ -31,6 +31,7 @@ from .safety import (
     PronunciationPoisonController,
     SafetyViolation,
 )
+from .web_evidence_seed import WebPronunciationEvidenceController
 
 
 PHRASE_TYPE_BASE_WEIGHTS = {
@@ -219,6 +220,7 @@ class ScenarioContext:
     recorder: ArtifactRecorder
     encode_delay: EncodeDelayController
     pronunciation_poison: PronunciationPoisonController
+    web_pronunciation: WebPronunciationEvidenceController
     fixture_facts: dict[str, Any]
     admin_identity: dict[str, str]
     admin_user: dict[str, Any]
@@ -7869,6 +7871,15 @@ S52_DELETE_FORMS = (
     "删掉 “nsl” 上的 “哪里”",
 )
 
+S53_WORD = "薄肌"
+S53_UNTRUSTED_AGREEMENT_WORD = "薄荷味糖"
+S53_WEAK_WORD = "薄肌腱"
+S53_NON_POLYPHONE_CONTROL = "肌群"
+S53_DISAGREEMENT_WORD = "校肌"
+S53_COMPOSITIONAL_CASES = (
+    ("不着陆", "bu zhuo lu", "不着陆飞行"),
+)
+
 
 async def scenario_s52(ctx: ScenarioContext) -> dict[str, Any]:
     """Close first-render binding and possessive delete incident paths."""
@@ -8047,6 +8058,295 @@ async def scenario_s52(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+async def scenario_s53(ctx: ScenarioContext) -> dict[str, Any]:
+    """Resolve absent polyphones without letting an encode default become truth."""
+    from unittest.mock import patch
+
+    from keytao_bot.utils import keytao_review as review_module
+
+    async def review_word(word: str) -> tuple[str, dict[str, Any]]:
+        await ctx.next_client.clean_draft(ctx.platform_id)
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+        cutoff = max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+        reply = await ctx.send_group(f"喵喵 {word}", to_me=True)
+        events = [
+            event
+            for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > cutoff
+            and event.get("kind") == "tool"
+            and event.get("name") == "keytao_prepare_reviewed_add"
+            and isinstance(event.get("result"), dict)
+            and event.get("arguments", {}).get("word") == word
+        ]
+        require(events, f"S53 did not review {word} through the public tool: {reply}")
+        return reply, events[-1]["result"]
+
+    review_module._clear_review_caches()
+    ctx.web_pronunciation.reset(ctx.scenario_id)
+    before = await ctx.draft()
+    messages: list[str] = []
+    replies: list[str] = []
+    reviews: dict[str, dict[str, Any]] = {}
+    with patch.object(
+        review_module,
+        "_registered_web_search",
+        new=ctx.web_pronunciation.search,
+    ):
+        thin_reply, thin_review = await review_word(S53_WORD)
+        messages.append(f"喵喵 {S53_WORD}")
+        replies.append(thin_reply)
+        reviews[S53_WORD] = thin_review
+        thin_pronunciations = [
+            item
+            for item in thin_review.get("pronunciations") or []
+            if isinstance(item, dict)
+        ]
+        thin_resolution = thin_review.get("pronunciationResolution") or {}
+        thin_sequences = {
+            tuple(item.get("normalized") or [])
+            for item in thin_pronunciations
+        }
+        thin_code_sets = [
+            {
+                str(code or "").strip().lower()
+                for code in item.get("codes") or []
+                if str(code or "").strip()
+            }
+            for item in thin_pronunciations
+        ]
+        thin_shared_codes = (
+            set.intersection(*thin_code_sets) if len(thin_code_sets) >= 2 else set()
+        )
+        thin_web = thin_resolution.get("web") or {}
+        thin_domains = {
+            str(item.get("domain") or "").strip()
+            for item in ((thin_web.get("selected") or {}).get("evidence") or [])
+            if isinstance(item, dict) and str(item.get("domain") or "").strip()
+        }
+        require(
+            thin_resolution.get("status") == "disagreement"
+            and thin_review.get("autoReviewable") is False
+            and thin_review.get("pronunciationUnresolved") is True
+            and thin_sequences == {("bao", "ji"), ("bo", "ji")}
+            and len(thin_code_sets) == 2
+            and all(thin_code_sets)
+            and all(len(code) == 6 for code in thin_shared_codes)
+            and thin_web.get("status") == "resolved"
+            and thin_domains == {"lexicon-a.example", "lexicon-b.example"}
+            and "请明确要采用的读音或具体含义" in thin_reply,
+            f"S53 did not keep the 薄肌 web/model conflict manual: {thin_review}",
+        )
+        require(
+            "https://" not in thin_reply
+            and "lexicon-a.example" not in thin_reply
+            and "lexicon-b.example" not in thin_reply,
+            f"S53 exposed untrusted URLs in the rendered conflict: {thin_reply}",
+        )
+
+        agreement_reply, agreement_review = await review_word(
+            S53_UNTRUSTED_AGREEMENT_WORD
+        )
+        messages.append(f"喵喵 {S53_UNTRUSTED_AGREEMENT_WORD}")
+        replies.append(agreement_reply)
+        reviews[S53_UNTRUSTED_AGREEMENT_WORD] = agreement_review
+        agreement_resolution = agreement_review.get("pronunciationResolution") or {}
+        agreement_pronunciations = [
+            item
+            for item in agreement_review.get("pronunciations") or []
+            if isinstance(item, dict)
+        ]
+        agreement_sources = [
+            str(source.get("source") or "").strip()
+            for item in agreement_pronunciations
+            for source in item.get("sources") or []
+            if isinstance(source, dict)
+        ]
+        require(
+            len(agreement_pronunciations) == 1
+            and agreement_pronunciations[0].get("normalized")
+            == ["bo", "he", "wei", "tang"]
+            and agreement_resolution.get("status") == "web_model_agreement"
+            and agreement_review.get("autoReviewable") is True
+            and agreement_review.get("autoReviewReason")
+            == "网络读音证据与独立语义判断一致"
+            and ctx.web_pronunciation.calls_for(S53_UNTRUSTED_AGREEMENT_WORD) == 2,
+            "S53 did not accept independently agreeing two-domain web evidence: "
+            f"{agreement_review}",
+        )
+        require(
+            "网络（mint-a.example）" in agreement_sources
+            and "网络（mint-b.example）" in agreement_sources
+            and "审词：读音 bò he wèi táng；来源 网络（mint-a.example）" in agreement_reply
+            and "；语义判断；" in agreement_reply
+            and "https://" not in agreement_reply,
+            "S53 did not render the web/model agreement safely: "
+            f"{agreement_reply}",
+        )
+
+        weak_reply, weak_review = await review_word(S53_WEAK_WORD)
+        messages.append(f"喵喵 {S53_WEAK_WORD}")
+        replies.append(weak_reply)
+        reviews[S53_WEAK_WORD] = weak_review
+        weak_resolution = weak_review.get("pronunciationResolution") or {}
+        weak_web = weak_resolution.get("web") or {}
+        weak_pronunciations = [
+            item
+            for item in weak_review.get("pronunciations") or []
+            if isinstance(item, dict)
+        ]
+        weak_status = weak_resolution.get("status")
+        weak_kinds = {
+            str(item.get("readingEvidenceKind") or "")
+            for item in weak_pronunciations
+        }
+        require(
+            weak_web.get("status") == "weak"
+            and weak_web.get("selected") is None
+            and weak_status in {"model_only", "unresolved"}
+            and weak_review.get("autoReviewable") is False
+            and weak_review.get("requiresManualPronunciationReview") is True
+            and weak_pronunciations
+            and all(
+                item.get("requiresManualReview") is True
+                for item in weak_pronunciations
+            )
+            and (
+                (
+                    weak_status == "model_only"
+                    and weak_kinds == {"weak_web_model_only"}
+                )
+                or (
+                    weak_status == "unresolved"
+                    and weak_kinds == {"unresolved_polyphone_alternative"}
+                )
+            )
+            and ctx.web_pronunciation.calls_for(S53_WEAK_WORD) == 2,
+            f"S53 weak web evidence escaped manual review: {weak_review}",
+        )
+
+        web_calls_before_control = len(ctx.web_pronunciation.queries)
+        control_reply, control_review = await review_word(S53_NON_POLYPHONE_CONTROL)
+        messages.append(f"喵喵 {S53_NON_POLYPHONE_CONTROL}")
+        replies.append(control_reply)
+        reviews[S53_NON_POLYPHONE_CONTROL] = control_review
+        require(
+            len(ctx.web_pronunciation.queries) == web_calls_before_control
+            and ctx.web_pronunciation.calls_for(S53_NON_POLYPHONE_CONTROL) == 0,
+            "S53 non-polyphone control entered the web-reading rung: "
+            f"{ctx.web_pronunciation.queries}",
+        )
+
+        compositional_facts: list[dict[str, Any]] = []
+        for word, expected_pinyin, carrier in S53_COMPOSITIONAL_CASES:
+            reply, review = await review_word(word)
+            messages.append(f"喵喵 {word}")
+            replies.append(reply)
+            reviews[word] = review
+            resolution = review.get("pronunciationResolution") or {}
+            pronunciations = [
+                item
+                for item in review.get("pronunciations") or []
+                if isinstance(item, dict)
+            ]
+            require(
+                resolution.get("status") == "composition"
+                and len(pronunciations) == 1
+                and " ".join(pronunciations[0].get("normalized") or [])
+                == expected_pinyin
+                and pronunciations[0].get("sourceSummary")
+                == f"组合推断（{carrier}）"
+                and f"来源 组合推断（{carrier}）" in reply
+                and ctx.web_pronunciation.calls_for(word) == 0,
+                f"S53 compositional rung failed for {word}: review={review}; reply={reply}",
+            )
+            compositional_facts.append({
+                "word": word,
+                "pinyin": expected_pinyin,
+                "carrier": carrier,
+                "webCalls": 0,
+            })
+
+        disagreement_reply, disagreement_review = await review_word(
+            S53_DISAGREEMENT_WORD
+        )
+        messages.append(f"喵喵 {S53_DISAGREEMENT_WORD}")
+        replies.append(disagreement_reply)
+        reviews[S53_DISAGREEMENT_WORD] = disagreement_review
+        disagreement_resolution = (
+            disagreement_review.get("pronunciationResolution") or {}
+        )
+        disagreement_pronunciations = [
+            item
+            for item in disagreement_review.get("pronunciations") or []
+            if isinstance(item, dict)
+        ]
+        sequences = {
+            tuple(item.get("normalized") or [])
+            for item in disagreement_pronunciations
+        }
+        code_sets = [
+            {
+                str(code or "").strip().lower()
+                for code in item.get("codes") or []
+                if str(code or "").strip()
+            }
+            for item in disagreement_pronunciations
+        ]
+        shared_codes = set.intersection(*code_sets) if len(code_sets) >= 2 else set()
+        require(
+            disagreement_resolution.get("status") == "disagreement"
+            and disagreement_review.get("pronunciationUnresolved") is True
+            and sequences == {("jiao", "ji"), ("xiao", "ji")}
+            and len(code_sets) == 2
+            and all(code_sets)
+            and all(len(code) == 6 for code in shared_codes)
+            and "请明确要采用的读音或具体含义" in disagreement_reply,
+            "S53 disagreement did not expose both reading-bound chains: "
+            f"review={disagreement_review}; reply={disagreement_reply}",
+        )
+
+    after = await ctx.draft()
+    require(
+        before.get("items") == after.get("items") == [],
+        f"S53 read-only review mutated the local draft: before={before}, after={after}",
+    )
+    web = (reviews[S53_WORD].get("pronunciationResolution") or {}).get("web") or {}
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": after,
+        "facts": {
+            "thinMuscleResolution": thin_resolution.get("status"),
+            "thinMuscleReadings": sorted(" ".join(item) for item in thin_sequences),
+            "thinMuscleCodeChains": [sorted(codes) for codes in thin_code_sets],
+            "thinMuscleWebDomains": sorted(thin_domains),
+            "thinMuscleResolutionSeconds": (
+                reviews[S53_WORD].get("pronunciationResolution") or {}
+            ).get("elapsedSeconds"),
+            "webRegistryCalls": web.get("registryCalls"),
+            "webOutboundAttempts": web.get("outboundAttempts"),
+            "untrustedAgreementWord": S53_UNTRUSTED_AGREEMENT_WORD,
+            "untrustedAgreementStatus": agreement_resolution.get("status"),
+            "untrustedAgreementSources": agreement_sources,
+            "weakWord": S53_WEAK_WORD,
+            "weakStatus": weak_resolution.get("status"),
+            "weakWebStatus": weak_web.get("status"),
+            "weakAutoReviewable": weak_review.get("autoReviewable"),
+            "weakWebCalls": ctx.web_pronunciation.calls_for(S53_WEAK_WORD),
+            "nonPolyphoneWebCalls": ctx.web_pronunciation.calls_for(
+                S53_NON_POLYPHONE_CONTROL
+            ),
+            "compositionalCases": compositional_facts,
+            "disagreementReadings": sorted(" ".join(item) for item in sequences),
+            "disagreementCodeChains": [sorted(codes) for codes in code_sets],
+            "draftUnchanged": True,
+        },
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -8100,6 +8400,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S50", "relative-position grammar and honest confirmation", scenario_s50),
     Scenario("S51", "replace-at-code grammar and honest confirmation", scenario_s51),
     Scenario("S52", "first-render binding and possessive delete closure", scenario_s52),
+    Scenario("S53", "unknown-polyphone reading resolution", scenario_s53),
 )
 
 

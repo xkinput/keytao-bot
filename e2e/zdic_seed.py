@@ -549,6 +549,59 @@ ZDIC_FIXTURES_BY_SCENARIO["S52"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S53"] = {
+    "probe_words": (
+        "薄肌",
+        "薄荷味糖",
+        "薄肌腱",
+        "肌群",
+        "校肌",
+        "不着陆",
+    ),
+    "rows": (
+        {"kind": "char", "entry": "薄", "status": "found", "pinyins": ["báo", "bó", "bò"]},
+        {"kind": "char", "entry": "肌", "status": "found", "pinyins": ["jī"]},
+        {"kind": "char", "entry": "荷", "status": "found", "pinyins": ["he", "hé", "hè"]},
+        {"kind": "char", "entry": "味", "status": "found", "pinyins": ["wèi"]},
+        {"kind": "char", "entry": "糖", "status": "found", "pinyins": ["táng"]},
+        {"kind": "char", "entry": "腱", "status": "found", "pinyins": ["jiàn"]},
+        {"kind": "char", "entry": "群", "status": "found", "pinyins": ["qún"]},
+        {"kind": "char", "entry": "校", "status": "found", "pinyins": ["jiào", "xiào"]},
+        {"kind": "char", "entry": "不", "status": "found", "pinyins": ["bù"]},
+        {"kind": "char", "entry": "着", "status": "found", "pinyins": ["zhāo", "zháo", "zhe", "zhuó"]},
+        {"kind": "char", "entry": "陆", "status": "found", "pinyins": ["lù", "liù"]},
+        {"kind": "entry", "entry": "薄肌", "status": "absent", "pinyins": []},
+        {
+            "kind": "entry",
+            "entry": "薄荷味糖",
+            "status": "absent",
+            "pinyins": [],
+            "expected_selected_pinyins": ["bò", "he", "wèi", "táng"],
+        },
+        {"kind": "entry", "entry": "薄肌腱", "status": "absent", "pinyins": []},
+        {"kind": "entry", "entry": "肌群", "status": "absent", "pinyins": []},
+        {
+            "kind": "entry",
+            "entry": "校肌",
+            "status": "absent",
+            "pinyins": [],
+            "expected_pronunciation_source": "zdic-character-default",
+            "expected_semantic_pronunciation_needed": True,
+            "expected_context_pinyins": ["xiào", "jī"],
+        },
+        {
+            "kind": "entry",
+            "entry": "不着陆",
+            "status": "absent",
+            "pinyins": [],
+            "expected_selected_pinyins": ["bù", "zhāo", "lù"],
+            "expected_pronunciation_source": "zdic-character-default",
+            "expected_semantic_pronunciation_needed": True,
+            "expected_context_pinyins": ["bù", "zhuó", "lù"],
+        },
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

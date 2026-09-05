@@ -49,7 +49,7 @@ REFERENCE_DATASET_POLICY_BY_ID = {
     str(policy["id"]): policy for policy in REFERENCE_DATASET_POLICIES
 }
 
-_PINYIN_CHAR_CLASS = (
+PINYIN_CHAR_CLASS = (
     "A-Za-z"
     "üÜvV:"
     "āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜ"
@@ -57,7 +57,7 @@ _PINYIN_CHAR_CLASS = (
     "ńňǹḿ"
     "012345"
 )
-PINYIN_TOKEN_RE = re.compile(rf"^[{_PINYIN_CHAR_CLASS}]+$")
+PINYIN_TOKEN_RE = re.compile(rf"^[{PINYIN_CHAR_CLASS}]+$")
 
 
 class PinyinReferenceUnavailable(RuntimeError):
@@ -142,6 +142,76 @@ def query_reference_readings(
     except sqlite3.Error as error:
         raise PinyinReferenceUnavailable(
             f"Pronunciation reference query failed: {error}"
+        ) from error
+    finally:
+        connection.close()
+
+    readings: list[ReferenceReading] = []
+    for row_word, normalized, display, source_reading, dataset in rows:
+        dataset_id = str(dataset)
+        if dataset_id not in REFERENCE_DATASET_POLICY_BY_ID:
+            raise PinyinReferenceUnavailable(
+                f"Pronunciation reference contains unknown dataset: {dataset_id}"
+            )
+        readings.append(ReferenceReading(
+            word=str(row_word),
+            normalized=tuple(str(normalized).split()),
+            display=str(display),
+            source_reading=str(source_reading),
+            dataset=dataset_id,
+        ))
+    return readings
+
+
+def query_overlapping_reference_readings(
+    word: str,
+    *,
+    db_path: Optional[Path | str] = None,
+    max_container_extra_chars: int = 8,
+) -> list[ReferenceReading]:
+    """Return multi-character entries that contain or are contained by ``word``.
+
+    Proper substrings use indexed exact-key lookups. The reverse direction
+    (a longer known entry containing the target) is bounded by length so a
+    short unknown word cannot pull arbitrarily long source rows into the
+    compositional resolver.
+    """
+    key = str(word or "").strip()
+    if len(key) < 2:
+        return []
+    substrings = sorted({
+        key[start:end]
+        for start in range(len(key))
+        for end in range(start + 2, len(key) + 1)
+        if end - start < len(key)
+    })
+    connection = _read_only_connection(reference_db_path(db_path))
+    try:
+        clauses = [
+            "(length(word) > ? AND length(word) <= ? AND instr(word, ?) > 0)"
+        ]
+        parameters: list[object] = [
+            len(key),
+            len(key) + max(0, int(max_container_extra_chars)),
+            key,
+        ]
+        if substrings:
+            placeholders = ",".join("?" for _ in substrings)
+            clauses.append(f"word IN ({placeholders})")
+            parameters.extend(substrings)
+        rows = connection.execute(
+            f"""
+            SELECT word, normalized, display, source_reading, dataset
+            FROM readings
+            WHERE length(word) > 1 AND ({' OR '.join(clauses)})
+            ORDER BY length(word) DESC, word, normalized, dataset, display,
+                source_reading
+            """,
+            parameters,
+        ).fetchall()
+    except sqlite3.Error as error:
+        raise PinyinReferenceUnavailable(
+            f"Pronunciation overlap query failed: {error}"
         ) from error
     finally:
         connection.close()

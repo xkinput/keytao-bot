@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -107,6 +107,12 @@ from .scenarios import (
     S52_RECOMMENDED_CODE,
     S52_REMAINING_CODE,
     S52_WORD,
+    S53_COMPOSITIONAL_CASES,
+    S53_DISAGREEMENT_WORD,
+    S53_NON_POLYPHONE_CONTROL,
+    S53_WEAK_WORD,
+    S53_WORD,
+    S53_UNTRUSTED_AGREEMENT_WORD,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -165,6 +171,10 @@ from .zdic_seed import (
     seed_s9_zdic_cache,
     seed_zdic_cache,
     zdic_cache_rows_for_scenarios,
+)
+from .web_evidence_seed import (
+    WEB_PRONUNCIATION_FIXTURES_BY_SCENARIO,
+    WebPronunciationEvidenceController,
 )
 
 
@@ -656,6 +666,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             readme,
         )
         self.assertIn(
+            "S53 closes the 2026-09-05 unknown-polyphone reading incident",
+            readme,
+        )
+        self.assertIn(
             "whole-word `corpus_frequency` and `common_characters_and_llm` routes",
             readme,
         )
@@ -704,11 +718,109 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s52(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s53(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 53)],
+            [f"S{index}" for index in range(1, 54)],
         )
+
+    def test_s53_declares_absent_polyphone_and_control_fixtures(self) -> None:
+        self.assertEqual(S53_WORD, "薄肌")
+        self.assertEqual(S53_UNTRUSTED_AGREEMENT_WORD, "薄荷味糖")
+        self.assertEqual(S53_WEAK_WORD, "薄肌腱")
+        self.assertEqual(S53_NON_POLYPHONE_CONTROL, "肌群")
+        self.assertEqual(S53_DISAGREEMENT_WORD, "校肌")
+        self.assertEqual(
+            S53_COMPOSITIONAL_CASES,
+            (
+                ("不着陆", "bu zhuo lu", "不着陆飞行"),
+            ),
+        )
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S53"]
+        expected_words = (
+            S53_WORD,
+            S53_UNTRUSTED_AGREEMENT_WORD,
+            S53_WEAK_WORD,
+            S53_NON_POLYPHONE_CONTROL,
+            S53_DISAGREEMENT_WORD,
+            *(case[0] for case in S53_COMPOSITIONAL_CASES),
+        )
+        self.assertEqual(fixture["probe_words"], expected_words)
+        declared = {
+            (row["kind"], row["entry"]): (row["status"], tuple(row["pinyins"]))
+            for row in fixture["rows"]
+        }
+        for word in expected_words:
+            self.assertEqual(declared[("entry", word)], ("absent", ()))
+        agreement_entry = next(
+            row
+            for row in fixture["rows"]
+            if row["kind"] == "entry"
+            and row["entry"] == S53_UNTRUSTED_AGREEMENT_WORD
+        )
+        self.assertEqual(
+            agreement_entry["expected_selected_pinyins"],
+            ["bò", "he", "wèi", "táng"],
+        )
+        self.assertEqual(declared[("char", "薄")], ("found", ("báo", "bó", "bò")))
+        self.assertEqual(declared[("char", "荷")], ("found", ("he", "hé", "hè")))
+        self.assertEqual(declared[("char", "味")], ("found", ("wèi",)))
+        self.assertEqual(declared[("char", "糖")], ("found", ("táng",)))
+        self.assertEqual(declared[("char", "腱")], ("found", ("jiàn",)))
+        self.assertEqual(declared[("char", "校")], ("found", ("jiào", "xiào")))
+        self.assertEqual(declared[("char", "不")], ("found", ("bù",)))
+        self.assertEqual(declared[("char", "着")], ("found", ("zhāo", "zháo", "zhe", "zhuó")))
+        self.assertEqual(declared[("char", "陆")], ("found", ("lù", "liù")))
+
+    async def test_s53_web_fixture_serves_two_independent_results_and_tracks_calls(self) -> None:
+        fixture = WEB_PRONUNCIATION_FIXTURES_BY_SCENARIO["S53"]
+        self.assertEqual(
+            set(fixture),
+            {
+                f"{S53_WORD} 拼音",
+                f"{S53_WORD} 读音",
+                f"{S53_UNTRUSTED_AGREEMENT_WORD} 拼音",
+                f"{S53_UNTRUSTED_AGREEMENT_WORD} 读音",
+                f"{S53_WEAK_WORD} 拼音",
+                f"{S53_WEAK_WORD} 读音",
+                f"{S53_DISAGREEMENT_WORD} 拼音",
+                f"{S53_DISAGREEMENT_WORD} 读音",
+            },
+        )
+        controller = WebPronunciationEvidenceController()
+        controller.reset("S53")
+        first = await controller.search(f"{S53_WORD} 拼音")
+        second = await controller.search(f"{S53_WORD} 读音")
+        domains = {
+            urlparse(item["url"]).hostname
+            for payload in (first, second)
+            for item in payload["results"]
+        }
+        self.assertEqual(domains, {"lexicon-a.example", "lexicon-b.example"})
+        self.assertEqual(controller.calls_for(S53_WORD), 2)
+        agreement_first = await controller.search(
+            f"{S53_UNTRUSTED_AGREEMENT_WORD} 拼音"
+        )
+        agreement_second = await controller.search(
+            f"{S53_UNTRUSTED_AGREEMENT_WORD} 读音"
+        )
+        agreement_domains = {
+            urlparse(item["url"]).hostname
+            for payload in (agreement_first, agreement_second)
+            for item in payload["results"]
+        }
+        self.assertEqual(agreement_domains, {"mint-a.example", "mint-b.example"})
+        self.assertEqual(controller.calls_for(S53_UNTRUSTED_AGREEMENT_WORD), 2)
+        weak_first = await controller.search(f"{S53_WEAK_WORD} 拼音")
+        weak_second = await controller.search(f"{S53_WEAK_WORD} 读音")
+        weak_domains = {
+            urlparse(item["url"]).hostname
+            for payload in (weak_first, weak_second)
+            for item in payload["results"]
+        }
+        self.assertEqual(weak_domains, {"weak-lexicon.example"})
+        self.assertEqual(controller.calls_for(S53_WEAK_WORD), 2)
+        self.assertEqual(controller.calls_for(S53_NON_POLYPHONE_CONTROL), 0)
 
     def test_s51_pins_replace_at_code_incident_transcript(self) -> None:
         self.assertEqual(S51_DISCOVERY, "喵喵 哪里")

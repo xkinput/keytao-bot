@@ -1071,6 +1071,8 @@ def _format_tool_encoded_add_prompt(word: str, encoding: Dict) -> Optional[str]:
 
 def _review_source_label(source: Dict) -> str:
     label = str(source.get("source") or "").strip()
+    if source.get("category") == "web_pronunciation":
+        return label
     url = str(source.get("url") or "").strip()
     if label and url:
         return f"{label} {url}"
@@ -1204,7 +1206,14 @@ def _format_pronunciation_source(pronunciation: Dict) -> str:
         if isinstance(source, dict)
     ]
     if sources:
-        return _format_source_summary(sources)
+        summary = _format_source_summary(sources)
+        if (
+            pronunciation.get("semanticPronunciation") is True
+            and str(pronunciation.get("readingEvidenceKind") or "")
+            == "web_semantic_agreement"
+        ):
+            return f"{summary}；语义判断"
+        return summary
     summary = str(pronunciation.get("sourceSummary") or "").strip()
     if not summary or "暂无权威页" in summary:
         return "暂无"
