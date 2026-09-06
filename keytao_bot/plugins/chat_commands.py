@@ -26,6 +26,8 @@ from ..harness.authorization_grammar import (
     explicit_same_code_requested,
     explicit_complete_add_item,
     explicit_shift_modified_add_item,
+    looks_like_lexical_review_target,
+    message_mentions_change_request,
     parse_compound_eviction_add_plan,
     parse_dictionary_delete_command,
     parse_dictionary_recode_command,
@@ -47,6 +49,8 @@ from ..harness.state import (
     PendingTrustedWordRecord,
     PendingToolConfirm,
     SQLiteConversationStateStore,
+    _pending_add_word_payload,
+    _pending_add_word_from_payload,
     create_pending_trusted_word_record,
     pending_batch_display_pairs,
     pending_execution_args as _pending_execution_args,
@@ -76,6 +80,7 @@ from ..utils.pending_confirmation import (
     advertised_single_word_lookup_word,
     ensure_single_word_candidate_copy,
     ensure_multi_word_candidate_copy,
+    parse_advertised_set_reference,
     parse_pending_assent_phrase,
     parse_pending_candidate_selection,
     pending_batch_confirmation_copy,
@@ -83,6 +88,7 @@ from ..utils.pending_confirmation import (
     pending_word_reminder_lines,
     prepend_pending_word_reminders,
     render_executable_suggestion,
+    render_server_backed_batch_candidates,
     render_remediation_reply,
     render_server_backed_single_word_lookup,
     single_word_candidate_footer,
@@ -627,7 +633,10 @@ def _pending_batch_front_insert_plan(
     state: PendingToolConfirm,
 ) -> Optional[Dict[str, Any]]:
     """Bind one comparator front insert to its sealed companion additions."""
-    if state.function_name != "keytao_batch_add_to_draft":
+    if (
+        state.function_name != "keytao_batch_add_to_draft"
+        or state.confirmation_source == "server_warning"
+    ):
         return None
     items = state.args.get("items")
     scopes = state.args.get("_candidate_scopes")
@@ -661,9 +670,46 @@ def _pending_batch_front_insert_plan(
         recommendations.append((recommendation, item))
     if not recommendations:
         return None
-    if len(recommendations) != 1:
+    if len(recommendations) != 1 and state.args.get("_reviewed_multi_word") is not True:
         return {"unsupportedCount": len(recommendations)}
     recommendation, target_item = recommendations[0]
+    if state.args.get("_reviewed_multi_word") is True:
+        capabilities = _reviewed_multi_word_capabilities(state)
+        scopes_by_word = {scope["word"]: scope for scope in scopes}
+        reorder_words = {value[0]["newWord"] for value in recommendations}
+        ordered_items = [target_item, *(item for item in items if item is not target_item)]
+        expected_occupants: Dict[str, List[str]] = {}
+        additional_shifts: List[Dict[str, Any]] = []
+        companions: List[Dict[str, Any]] = []
+        selected_codes: set[str] = set()
+        for item in ordered_items:
+            word, code = item["word"], item["code"]
+            capability = capabilities.get((word, code))
+            scope = scopes_by_word.get(word, {})
+            occupancy = dict(scope.get("candidates", []))
+            occupants = scope.get("occupiedWords", {}).get(code, [])
+            if (
+                not capability or code not in occupancy or code in selected_codes
+                or not isinstance(occupants, list)
+                or bool(occupants) != occupancy[code]
+            ):
+                return {"invalid": True}
+            selected_codes.add(code)
+            if word in reorder_words:
+                expected_occupants[code] = list(occupants)
+            if item is not target_item:
+                destination = additional_shifts if word in reorder_words else companions
+                destination.append({
+                    **item, "reviewedPinyin": capability["pinyin"],
+                    "reviewedCandidateCodes": list(capability["candidate_codes"]),
+                })
+        return {
+            "recommendation": recommendation, "targetItem": dict(target_item),
+            "additionalItems": companions, "additionalShiftItems": additional_shifts,
+            "reviewedCapability": capabilities[(target_item["word"], target_item["code"])],
+            "expectedOccupantsByCode": expected_occupants,
+            "expectedShiftedWords": tuple(word for words in expected_occupants.values() for word in words),
+        }
     return {
         "recommendation": recommendation,
         "targetItem": dict(target_item),
@@ -672,7 +718,46 @@ def _pending_batch_front_insert_plan(
             for item in items
             if isinstance(item, dict) and item is not target_item
         ],
+        "additionalShiftItems": [],
+        "reviewedCapability": {},
+        "expectedOccupantsByCode": {},
+        "expectedShiftedWords": (),
     }
+
+
+def _reviewed_multi_word_capabilities(state: PendingToolConfirm) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Project selected codes from persisted per-word reviews into tool seals."""
+    saved = state.args.get("_reviewed_batch_readings")
+    if isinstance(saved, list):
+        capabilities = {}
+        for item in state.args.get("items", []):
+            matches = [row for row in saved if isinstance(row, dict) and row.get("word") == item.get("word")]
+            if len(matches) != 1:
+                return {}
+            capability = _reviewed_create_capability(
+                item["word"], item["code"], str(matches[0].get("pinyin") or ""),
+                tuple(matches[0].get("candidate_codes") or ()),
+            )
+            if capability is None:
+                return {}
+            capabilities.update(capability)
+        return capabilities
+    if state.args.get("_reviewed_multi_word") is not True:
+        return {}
+    scopes = {scope["word"]: scope for scope in state.args.get("_candidate_scopes", [])}
+    capabilities: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for item in state.args.get("items", []):
+        word, code = item["word"], item["code"]
+        try:
+            reviewed = _pending_add_word_from_payload(json.loads(json.dumps(scopes[word]["reviewedState"])))
+        except (KeyError, TypeError, ValueError):
+            return {}
+        pinyin, codes = _pending_reviewed_reading(reviewed, code)
+        capability = _reviewed_create_capability(word, code, pinyin, codes)
+        if capability is None:
+            return {}
+        capabilities.update(capability)
+    return capabilities
 
 
 def _create_phrase_args(state: PendingAddWord, code: str) -> Dict:
@@ -3237,6 +3322,95 @@ async def _try_handle_referenced_word_presence_query(
     return _format_referenced_word_presence_response(words, lookup_data)
 
 
+_MAX_BARE_MULTI_WORD_QUERY_ITEMS = 10
+
+
+def _bare_multi_word_query_words(message_text: str) -> Tuple[str, ...]:
+    """Recognize a bounded lexical list without asking a model to route it."""
+    source = _strip_command_message_prefixes(message_text).strip()
+    if not re.fullmatch(r"[\u3400-\u9fff]+(?:[\s、，,]+[\u3400-\u9fff]+)+", source):
+        return ()
+    if (
+        parse_advertised_set_reference(source).matched
+        or message_mentions_change_request(source)
+    ):
+        return ()
+    words = tuple(dict.fromkeys(re.split(r"[\s、，,]+", source)))
+    if len(words) < 2 or any(
+        not looks_like_lexical_review_target(word)
+        or word in {"加", "删", "查", "审词", "提交", "确认", "取消"}
+        or re.match(r"^(?:加词|添加|加入|删除|删掉|提交|查询|查词|查看|解释|比较|批量|请|不要|取消|确认)", word)
+        or re.search(r"(?:先|暂时|也)?(?:不要|不加|别加|保留|取消)$", word)
+        for word in words
+    ):
+        return ()
+    return words
+
+
+async def _prepare_multi_word_query(
+    words: Tuple[str, ...],
+    platform: str,
+    user_id: str,
+    conv_key: Optional[ConversationKey],
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> str:
+    """Collect the single-word pipeline into one durable candidate capability."""
+    if len(words) > _MAX_BARE_MULTI_WORD_QUERY_ITEMS:
+        return f"一次最多查询 {_MAX_BARE_MULTI_WORD_QUERY_ITEMS} 个词，请拆分后重新发送。"
+    scopes: List[Dict[str, Any]] = []
+    other_blocks: List[str] = []
+    for word in words:
+        count = len(scopes)
+        response = await _try_handle_simple_single_word_query(
+            word, platform, user_id, conv_key, space_key, owner_label,
+            _prepared_scopes=scopes,
+        )
+        if len(scopes) == count:
+            other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
+
+    if not scopes:
+        if conv_key is not None:
+            conversation_state_store.delete(conv_key)
+        return "\n\n".join(other_blocks)
+    items: List[Dict[str, Any]] = []
+    for scope in scopes:
+        reviewed = scope["reviewedState"]
+        code = reviewed["recommendedCode"]
+        item = {
+            "action": "Create", "word": scope["word"], "code": code,
+            "type": "Phrase", "remark": reviewed["codeRemarks"].get(code, ""),
+        }
+        review_flags.apply_manual_review_flag(
+            item,
+            reviewed["needsManualReview"] is not False,
+            reviewed["manualReviewReason"],
+        )
+        items.append(item)
+    pending = PendingToolConfirm(
+        function_name="keytao_batch_add_to_draft",
+        args={
+            "items": items, "_candidate_scopes": scopes,
+            "_reviewed_multi_word": True, "_query_words": list(words),
+            "_query_other_blocks": other_blocks,
+        },
+    )
+    target_key = conv_key or (
+        current_memory_context.get().conversation_address
+        if current_memory_context.get() is not None
+        else ConversationAddress.private(platform, user_id)
+    )
+    if not conversation_state_store.set(
+        target_key, pending, space_key=space_key, owner_label=owner_label,
+    ):
+        return "这批词的候选编码暂时无法保存，请重新查询后再选择。"
+    rendered = render_server_backed_batch_candidates(items, scopes)
+    if not rendered:
+        conversation_state_store.delete(target_key)
+        return "这批词的候选展示校验未通过，本次未写入，请重新查询。"
+    return ServerBackedQueryReply("\n\n".join([*other_blocks, rendered]))
+
+
 async def _try_handle_simple_single_word_query(
     message_text: str,
     platform: str,
@@ -3248,10 +3422,21 @@ async def _try_handle_simple_single_word_query(
     requested_reading: str = "",
     requested_meaning: str = "",
     actionable_lookup: bool = False,
+    _prepared_scopes: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
+    multi_words = _bare_multi_word_query_words(message_text) if _prepared_scopes is None else ()
+    if multi_words:
+        set_turn_flow("word-discovery")
+        return await _prepare_multi_word_query(
+            multi_words, platform, user_id, conv_key, space_key, owner_label,
+        )
     explicit_add_word = _extract_explicit_reviewed_add_word(message_text)
-    words = (explicit_add_word,) if explicit_add_word else await _get_simple_word_query_words(message_text)
+    words = (
+        (message_text,) if _prepared_scopes is not None
+        else (explicit_add_word,) if explicit_add_word
+        else await _get_simple_word_query_words(message_text)
+    )
     if len(words) != 1:
         return None
     set_turn_flow("word-discovery")
@@ -3289,6 +3474,8 @@ async def _try_handle_simple_single_word_query(
         words=(word,),
     )
     if reminder_lines and not explicit_add_word:
+        if _prepared_scopes is not None:
+            return prepend_pending_word_reminders("", pending_items, words=(word,))
         has_submitted = any(
             isinstance(item, dict) and item.get("source") == "submitted"
             for item in pending_items
@@ -3319,7 +3506,7 @@ async def _try_handle_simple_single_word_query(
             for phrase in matching_rows
         ))
         if existing_codes:
-            if len(existing_codes) == 1 and conv_key is not None:
+            if len(existing_codes) == 1 and conv_key is not None and _prepared_scopes is None:
                 phrase_types = tuple(dict.fromkeys(
                     str(phrase.get("type") or "").strip()
                     for phrase in matching_rows
@@ -3349,7 +3536,7 @@ async def _try_handle_simple_single_word_query(
             return already_existing_word_copy(
                 word,
                 existing_codes,
-                can_choose_other_code=True,
+                can_choose_other_code=_prepared_scopes is None,
             )
         return "词库查询返回了不完整的已有词条记录；本次未继续。"
 
@@ -3405,6 +3592,16 @@ async def _try_handle_simple_single_word_query(
             pending.pronunciation_recommended_codes = (
                 [group_recommended] if group_recommended else []
             )
+            if _prepared_scopes is not None:
+                _prepared_scopes.append({
+                    "word": pending.word,
+                    "candidates": list(pending.server_candidates),
+                    "occupiedWords": dict(pending.server_occupied_words),
+                    "orderingAssessments": list(pending.server_ordering_assessments),
+                    "reviewedState": _pending_add_word_payload(pending),
+                    "reviewedPrompt": reviewed_prompt,
+                })
+                return ""
             target_key = conv_key or (
                 current_memory_context.get().conversation_address
                 if current_memory_context.get() is not None
@@ -4417,6 +4614,7 @@ async def _perform_batch_add_to_draft_and_submit(
     expected_warning_digest: str = "",
     auto_confirm: bool = False,
     allow_same_code: bool = False,
+    reviewed_capabilities: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
 ) -> DraftActionResult:
     """Add every confirmed reviewed item, then submit exactly that batch."""
     requested_items = [dict(item) for item in items if isinstance(item, dict)]
@@ -4443,6 +4641,7 @@ async def _perform_batch_add_to_draft_and_submit(
         add_arguments,
         platform,
         user_id,
+        **({"trusted_reviewed_items_by_key": reviewed_capabilities} if reviewed_capabilities else {}),
     )
     add_data = json.loads(add_json)
     pending_items = add_data.get("pendingItems") or []
@@ -4521,6 +4720,12 @@ async def _perform_batch_add_to_draft_and_submit(
                 else {}
             ),
         }
+        if reviewed_capabilities:
+            pending_args["_reviewed_batch_readings"] = [
+                {"word": word, "pinyin": capability["pinyin"],
+                 "candidate_codes": list(capability["candidate_codes"])}
+                for (word, _code), capability in reviewed_capabilities.items()
+            ]
         if add_data.get("pendingDuplicateConfirmation") is True:
             pending_args["_pending_submitted_confirmed"] = True
             pending_state = PendingToolConfirm(
@@ -4560,6 +4765,7 @@ async def _perform_batch_add_to_draft_and_submit(
                 ),
                 auto_confirm=True,
                 allow_same_code=allow_same_code,
+                reviewed_capabilities=reviewed_capabilities,
             )
             return _preserve_action_result_link(
                 confirmed_result,
@@ -4670,9 +4876,10 @@ async def _execute_shift_to_code(
     auto_confirm_shift_plan: bool = False,
     auto_confirm_expected_shifted_words: Tuple[str, ...] = (),
     auto_confirm_only_if_no_shifts: bool = False,
+    expected_occupants_by_code: Optional[Dict[str, List[str]]] = None,
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
-    expected_occupants_by_code = {
+    expected_occupants_by_code = expected_occupants_by_code or {
         str(item.get("code") or "").strip().lower(): [
             str(value or "").strip()
             for value in item.get("occupants") or []
@@ -5199,10 +5406,13 @@ def _prepend_resolved_advertised_words(
     words = [str(word).strip() for word in expected if str(word).strip()]
     if len(words) != len(expected):
         return response
-    return (
-        f"词：{'、'.join(words)}\n"
-        + str(response or "")
+    unselected = state.args.get("_unselected_words")
+    remainder = (
+        "\n未选择：" + "、".join(f"「{word}」" for word in unselected)
+        + "；这些词本次未添加。"
+        if isinstance(unselected, list) and unselected else ""
     )
+    return f"词：{'、'.join(words)}{remainder}\n" + str(response or "")
 
 
 def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
@@ -5866,6 +6076,34 @@ async def _stage_ranked_shift_continuation(
     )
 
 
+def _shift_plan_warnings_are_bound(data: Dict, args: Dict) -> bool:
+    """Allow informational warnings only for the exact requested additions."""
+    from ..harness.authorization_grammar import _AUTO_CONFIRM_CREATE_WARNING_TYPES
+
+    warnings = data.get("warnings")
+    if not isinstance(warnings, list):
+        return False
+    requested = [{"word": args.get("word"), "code": args.get("target_code")}]
+    for key in ("additional_items", "additional_shift_items"):
+        requested.extend(item for item in args.get(key) or [] if isinstance(item, dict))
+    identities = {
+        ("Create", str(item.get("word") or "").strip(), str(item.get("code") or "").strip().lower())
+        for item in requested
+        if str(item.get("action") or "Create") == "Create"
+    }
+    for warning in warnings:
+        if not isinstance(warning, dict) or warning.get("warningType") not in _AUTO_CONFIRM_CREATE_WARNING_TYPES:
+            return False
+        source = warning.get("item") if isinstance(warning.get("item"), dict) else warning
+        if (
+            str(source.get("action") or "Create").strip(),
+            str(source.get("word") or "").strip(),
+            str(source.get("code") or "").strip().lower(),
+        ) not in identities:
+            return False
+    return True
+
+
 async def _execute_confirmed_tool(
     state: PendingToolConfirm,
     platform: str,
@@ -5903,6 +6141,11 @@ async def _execute_confirmed_tool(
     args = _pending_execution_args(state)
     args.pop("preview_only", None)
     args.pop("_candidate_scopes", None)
+    args.pop("_reviewed_multi_word", None)
+    args.pop("_reviewed_batch_readings", None)
+    args.pop("_query_words", None)
+    args.pop("_query_other_blocks", None)
+    args.pop("_unselected_words", None)
     args.pop("_resolved_advertised_words", None)
     resolved_candidate_plan = args.pop("_resolved_candidate_plan", None)
     replace_char_continuation = args.pop(
@@ -5941,8 +6184,10 @@ async def _execute_confirmed_tool(
     additional_shift_capabilities: Dict[
         Tuple[str, str], Dict[str, Any]
     ] = {}
-    raw_additional_shift_items = args.get("additional_shift_items")
-    if isinstance(raw_additional_shift_items, list):
+    for argument_name in ("additional_shift_items", "additional_items"):
+        raw_additional_shift_items = args.get(argument_name)
+        if not isinstance(raw_additional_shift_items, list):
+            continue
         sanitized_shift_items: List[Dict[str, Any]] = []
         for raw_item in raw_additional_shift_items:
             if not isinstance(raw_item, dict):
@@ -5966,7 +6211,7 @@ async def _execute_confirmed_tool(
             if capability is not None:
                 additional_shift_capabilities.update(capability)
             sanitized_shift_items.append(item)
-        args["additional_shift_items"] = sanitized_shift_items
+        args[argument_name] = sanitized_shift_items
     submit_after = bool(args.pop("_submit_after", False))
     expected_keep_words = tuple(
         str(word)
@@ -6087,6 +6332,7 @@ async def _execute_confirmed_tool(
     )
     reviewed_capabilities = dict(reviewed_capability or {})
     reviewed_capabilities.update(additional_shift_capabilities)
+    reviewed_capabilities.update(_reviewed_multi_word_capabilities(state))
     if (
         state.function_name == "keytao_shift_phrase_code"
         and reviewed_pinyin
@@ -6260,6 +6506,7 @@ async def _execute_confirmed_tool(
             auto_confirm_shift_plan
             and state.function_name == "keytao_shift_phrase_code"
             and server_warning_ticket_is_complete(pending_state)
+            and _shift_plan_warnings_are_bound(data, args)
             and (
                 (
                     auto_confirm_only_if_no_shifts
@@ -11274,9 +11521,9 @@ async def handle_pending_message_core(
             batch_front_insert.get("invalid") is True
             or batch_front_insert.get("unsupportedCount")
         ):
+            preserve_pending_state()
             response = render_remediation_reply(
-                "这批候选包含无法唯一锁定的重排计划，本次未写入",
-                command="逐词重新查询",
+                "这批候选包含无法唯一锁定的重排计划，本次未写入；候选仍有效，请逐词处理",
             )
         elif batch_front_insert is not None:
             recommendation = batch_front_insert["recommendation"]
@@ -11292,6 +11539,12 @@ async def handle_pending_message_core(
                 ),
                 target_item=batch_front_insert["targetItem"],
                 additional_items=batch_front_insert["additionalItems"],
+                additional_shift_items=batch_front_insert["additionalShiftItems"],
+                reviewed_pinyin=batch_front_insert["reviewedCapability"].get("pinyin", ""),
+                reviewed_candidate_codes=tuple(batch_front_insert["reviewedCapability"].get("candidate_codes", ())),
+                auto_confirm_shift_plan=state.args.get("_reviewed_multi_word") is True,
+                expected_occupants_by_code=batch_front_insert["expectedOccupantsByCode"],
+                auto_confirm_expected_shifted_words=batch_front_insert["expectedShiftedWords"],
             )
         elif (
             state.function_name == "keytao_batch_add_to_draft"
@@ -11314,6 +11567,7 @@ async def handle_pending_message_core(
                     state.args.get("_allow_same_code") is True
                     or explicit_same_code_requested(message)
                 ),
+                reviewed_capabilities=_reviewed_multi_word_capabilities(state),
             )
             if result.pending_state is not None:
                 conversation_state_store.set(

@@ -270,11 +270,29 @@ _FUTURE_BATCH_ASSENT_OFFER_RE = re.compile(
 def requests_future_batch_assent_offer(message: object) -> bool:
     """Match only an explicit request to advertise a future batch assent."""
     normalized = unicodedata.normalize("NFKC", str(message or "")).strip()
-    return bool(
-        normalized
-        and len(normalized) <= 1000
-        and _FUTURE_BATCH_ASSENT_OFFER_RE.search(normalized)
-    )
+    if not normalized or len(normalized) > 1000:
+        return False
+    quoted_spans = tuple(re.finditer(
+        r"```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|"
+        r'''「[^」]*」|『[^』]*』|“[^”]*”|"[^"\r\n]*"|'[^'\r\n]*' ''',
+        normalized,
+        re.VERBOSE,
+    ))
+    for match in _FUTURE_BATCH_ASSENT_OFFER_RE.finditer(normalized):
+        if any(span.start() <= match.start() < span.end() for span in quoted_spans):
+            continue
+        prefix = re.split(r"[，,；;。！？!?\r\n]|但是|不过|但", normalized[:match.start()])[-1]
+        suffix = re.split(r"[，,；;。\r\n]", normalized[match.end():], maxsplit=1)[0]
+        if is_interrogative_message(prefix + match.group(0) + suffix):
+            continue
+        if re.search(
+            r"不要|不用|无需|不必|禁止|别|不可以|不可|不能|不应|不需要|不允许|"
+            r"并非|不是|他说|她说|转述|原话|引用|举例|示例",
+            prefix + match.group(0),
+        ):
+            continue
+        return True
+    return False
 
 
 def build_system_prompt(
@@ -1696,7 +1714,7 @@ class AgentOrchestrator:
                         or matching_word_sets
                     )
                     if (
-                        advertises_word_set_from_records
+                        (advertises_word_set_from_records or future_batch_assent_requested)
                         and trusted_absent_word_sets
                         and not trusted_candidate_slots_by_word
                     ):
@@ -1704,13 +1722,10 @@ class AgentOrchestrator:
                             trusted_absent_word_sets[0]
                             if len(trusted_absent_word_sets) == 1
                             else matching_word_sets[0]
-                            if len(matching_word_sets) == 1
+                            if len(matching_word_sets) == 1 and not future_batch_assent_requested
                             else ()
                         )
-                        rendered_word_set = render_server_backed_word_set(
-                            trusted_word_set,
-                        )
-                        if not rendered_word_set:
+                        if not trusted_word_set:
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
                                     "本轮有多组服务端查询结果，无法把这条列表广告"
@@ -1729,6 +1744,12 @@ class AgentOrchestrator:
                                 render_remediation_reply(
                                     "本轮未收录词记录无法保存，本次不会写入"
                                 ),
+                                authoritative_result_links,
+                            )
+                        rendered_word_set = render_server_backed_word_set(trusted_word_set)
+                        if not rendered_word_set:
+                            return self._append_authoritative_result_links(
+                                render_remediation_reply("本轮未收录词记录无法展示，本次不会写入"),
                                 authoritative_result_links,
                             )
                         logger.info(
@@ -3479,7 +3500,7 @@ class AgentOrchestrator:
             logger.error(
                 "Replacing review/add affordances emitted for an interrogative turn"
             )
-            reply = (
+            reply = cls._binding_meta_question_reply(current_message) or (
                 "我还不能从现有字符数据确定这个问题的答案。"
                 "请给出一个具体字符后发送「查词 <字符>」核验。"
             )
@@ -3768,12 +3789,11 @@ class AgentOrchestrator:
         )
 
     @classmethod
-    def _replace_model_authored_system_template(
+    def _binding_meta_question_reply(
         cls,
         current_message: str,
-        reply: str,
-    ) -> str:
-        """Remove model-written deterministic templates from ordinary turns."""
+    ) -> Optional[str]:
+        """Answer binding-process questions without reviving prior candidates."""
         normalized_question = cls._normalize_loop_text(current_message)
         if (
             "绑定" in normalized_question
@@ -3790,10 +3810,22 @@ class AgentOrchestrator:
                 )
             )
         ):
+            return "会的：写入前会校验绑定；未绑定会给出绑定引导。"
+        return None
+
+    @classmethod
+    def _replace_model_authored_system_template(
+        cls,
+        current_message: str,
+        reply: str,
+    ) -> str:
+        """Remove model-written deterministic templates from ordinary turns."""
+        binding_answer = cls._binding_meta_question_reply(current_message)
+        if binding_answer is not None:
             logger.warning(
                 "[system_template_impersonation] replaced binding meta answer"
             )
-            return "会的：写入前会校验绑定；未绑定会给出绑定引导。"
+            return binding_answer
 
         clean_segments = [
             segment

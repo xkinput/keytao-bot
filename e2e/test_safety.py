@@ -718,10 +718,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s53(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s54(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 54)],
+            [f"S{index}" for index in range(1, 55)],
         )
 
     def test_s53_declares_absent_polyphone_and_control_fixtures(self) -> None:
@@ -1507,17 +1507,17 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(S33_EXTERNAL_QUERY, "缩手 所售")
         self.assertEqual(
             S33_EXTERNAL_EXPECTED,
-            (("缩手", "sleda"), ("所售", "sledu")),
+            (("缩手", "sled"), ("所售", "sledu")),
         )
         self.assertEqual(
             _s33_external_query_pairs(
-                "缩手（suō shǒu）\n"
-                "推荐编码：sleda\n"
+                "1. 「缩手」\n候选：\n"
                 "1. sled — 已有「所受」\n"
-                "2. sleda — 空位 ✅（推荐）\n"
-                "所售（suǒ shòu）\n"
+                "2. sleda — 空位\n"
+                "推荐：「缩手」占 sled、「所受」顺延\n"
+                "2. 「所售」\n候选：\n"
                 "1. sled — 已有「所受」\n"
-                "2. sledu — 空位 ✅\n"
+                "2. sledu — 空位（推荐）\n"
             ),
             S33_EXTERNAL_EXPECTED,
         )

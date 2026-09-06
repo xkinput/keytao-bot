@@ -602,6 +602,26 @@ ZDIC_FIXTURES_BY_SCENARIO["S53"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S54"] = {
+    "probe_words": ("大端", "小端", "肌群"),
+    "rows": (
+        {"kind": "char", "entry": "大", "status": "found", "pinyins": ["dà", "dài", "tài"]},
+        {"kind": "char", "entry": "小", "status": "found", "pinyins": ["xiǎo"]},
+        {"kind": "char", "entry": "端", "status": "found", "pinyins": ["duān"]},
+        {"kind": "char", "entry": "打", "status": "found", "pinyins": ["dǎ"]},
+        {"kind": "char", "entry": "断", "status": "found", "pinyins": ["duàn"]},
+        {"kind": "char", "entry": "段", "status": "found", "pinyins": ["duàn"]},
+        {"kind": "char", "entry": "肌", "status": "found", "pinyins": ["jī"]},
+        {"kind": "char", "entry": "群", "status": "found", "pinyins": ["qún"]},
+        {"kind": "entry", "entry": "大端", "status": "found", "pinyins": ["dà", "duān"]},
+        {"kind": "entry", "entry": "小端", "status": "found", "pinyins": ["xiǎo", "duān"]},
+        {"kind": "entry", "entry": "打断", "status": "found", "pinyins": ["dǎ", "duàn"]},
+        {"kind": "entry", "entry": "大段", "status": "found", "pinyins": ["dà", "duàn"]},
+        {"kind": "entry", "entry": "小段", "status": "found", "pinyins": ["xiǎo", "duàn"]},
+        {"kind": "entry", "entry": "肌群", "status": "absent", "pinyins": []},
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

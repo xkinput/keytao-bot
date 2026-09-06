@@ -17559,7 +17559,12 @@ def test_live_actionable_reply_advertises_complete_reply_contract():
             openai_chat_module.ServerBackedQueryReply(query_only),
             conv_key,
         )
-    check("query-only candidate reply remains visible", "3 个词的候选" in delivered_query)
+    check(
+        "recordless query candidates are refused at the delivery boundary",
+        "3 个词的候选" not in delivered_query
+        and re.search(r"(?m)^\s*\d+[.、]\s*[a-z]{1,12}\b", delivered_query) is None
+        and "本次未写入" in delivered_query,
+    )
     check(
         "query-only reply advertises no actionable form",
         not any(

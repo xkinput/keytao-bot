@@ -13295,7 +13295,8 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         record = state_store.get_record(context.conversation_address)
         self.assertIsNone(record)
-        self.assertEqual(delivered, result)
+        self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertNotRegex(delivered, r"(?m)^\s*[1-9]\d*[.)、]\s*[a-z]+\s*—")
         self.assertEqual(
             advertised_batch_binding_pairs(result),
             (("缩手", "sleda"), ("所售", "sledu")),
@@ -13348,11 +13349,29 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(orchestrator_module.requests_future_batch_assent_offer(
             "只列出未收录词，并说明可以把列表中的词加入草稿"
         ))
+        self.assertTrue(orchestrator_module.requests_future_batch_assent_offer(
+            "只查询，不要写入；最后说明可直接回复「加入」"
+        ))
+        self.assertTrue(orchestrator_module.requests_future_batch_assent_offer(
+            "请批量检查这些常用词是否已收录；只列出未收录词，并说明可以把列表中的词加入草稿"
+        ))
         for message in (
             "缩手 所售",
             "请只重新复核这两个词",
             "为什么回复里出现了加入并提交？",
             "他说可以直接回复「加入并提交」",
+            "只查询，不要说明可以把列表中的词加入草稿",
+            "不要在末尾说明可以直接回复「加入」",
+            "最后不要说明可以直接回复「加入」",
+            "最后说明不可以直接回复「加入」",
+            "他说最后说明可以直接回复「加入」",
+            "他说：说明可以把列表中的词加入草稿",
+            "引用：最后说明可以直接回复「加入」",
+            "你是否会在末尾说明可以直接回复「加入」？",
+            "```\n说明可以把列表中的词加入草稿\n```",
+            "~~~\n说明可以把列表中的词加入草稿\n~~~",
+            "请解释「最后说明可以直接回复加入」是什么意思",
+            '原话是 "说明可以把列表中的词加入草稿"',
         ):
             with self.subTest(message=message):
                 self.assertFalse(
@@ -13932,7 +13951,8 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNone(record)
-        self.assertEqual(delivered, result)
+        self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertNotRegex(delivered, r"(?m)^\s*[1-9]\d*[.)、]\s*[a-z]+\s*—")
         self.assertEqual(
             set(advertised_batch_binding_pairs(result)),
             set(codes.items()),
@@ -14077,7 +14097,8 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                         result,
                         context.conversation_address,
                     )
-                self.assertEqual(delivered, result)
+                self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+                self.assertNotRegex(delivered, r"(?m)^\s*[1-9]\d*[.)、]\s*[a-z]+\s*—")
                 self.assertEqual(state_store.set_count, 0)
                 establishment_logs = [
                     str(call.args[0])
@@ -14266,7 +14287,8 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNone(record)
-        self.assertEqual(delivered, result)
+        self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertNotRegex(delivered, r"(?m)^\s*[1-9]\d*[.)、]\s*[a-z]+\s*—")
         self.assertEqual(
             set(advertised_batch_binding_pairs(result)),
             set(candidate_codes.items()),
@@ -14322,6 +14344,18 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         """The incident sentence resolves server snapshot minus two exclusions."""
+        await self._assert_server_advertised_set_subtraction()
+
+    async def test_explicit_future_offer_survives_full4_model_wording(self) -> None:
+        """An explicitly requested offer uses lookup records before model copy."""
+        await self._assert_server_advertised_set_subtraction(explicit_offer=True)
+
+    async def _assert_server_advertised_set_subtraction(
+        self, *, explicit_offer=False,
+    ) -> None:
+        from keytao_bot.harness import orchestrator as orchestrator_module
+        from keytao_bot.plugins import openai_chat as chat_module
+
         words = (
             "显眼包", "嘴替", "松弛感", "电子榨菜", "情绪价值", "班味",
             "泼天富贵", "精神状态", "职场搭子", "天选打工人", "沙县小吃",
@@ -14355,6 +14389,18 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             + "\n".join(f"- {word}" for word in words)
             + "\n这些词都能加入草稿。回复「加入」或回复「加入并提交」。"
         )
+        scan_message = "扫描这些常用词"
+        if explicit_offer:
+            advertised = (
+                "这 11 个词都还没有被收录：\n\n"
+                + "、".join(words)
+                + "\n\n如果你想把这些词加入词库，我可以先逐个核读音、生成候选编码并评估空位占用，"
+                "再请你确认后写入草稿。需要的话直接说「把这几个词加词」就行。"
+            )
+            scan_message = (
+                "喵喵，请批量检查这些常用词是否已收录；只列出未收录词，"
+                "并说明可以把列表中的词加入草稿：" + "、".join(words)
+            )
         scan_client = _FakeClient([
             _fake_response(
                 "tool_calls",
@@ -14386,12 +14432,35 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             system_prompt_core="system",
         )
 
-        scan_reply = await scan_orchestrator.run("扫描这些常用词", context)
+        if explicit_offer:
+            def render_after_record(rendered_words):
+                snapshots = state_store.advertised_word_sets(context.conversation_address)
+                self.assertEqual(len(snapshots), 1)
+                self.assertEqual(snapshots[0].words, words)
+                return render_server_backed_word_set(rendered_words)
+
+            with patch.object(
+                orchestrator_module, "render_server_backed_word_set",
+                side_effect=render_after_record,
+            ):
+                scan_reply = await scan_orchestrator.run(scan_message, context)
+        else:
+            scan_reply = await scan_orchestrator.run(scan_message, context)
 
         self.assertEqual(scan_reply, render_server_backed_word_set(words))
         snapshots = state_store.advertised_word_sets(context.conversation_address)
         self.assertEqual(len(snapshots), 1)
         self.assertEqual(snapshots[0].words, words)
+
+        invalid = _resolve_advertised_word_set_selection(
+            state_store.get(context.conversation_address), "火星词先不要，其他都加",
+        )
+        self.assertTrue(invalid.matched)
+        self.assertIn("火星词", invalid.ask)
+        self.assertEqual(invalid.resolved_words, ())
+        self.assertEqual(
+            state_store.advertised_word_sets(context.conversation_address), snapshots,
+        )
 
         selection = _resolve_advertised_word_set_selection(
             state_store.get(context.conversation_address),
@@ -14474,6 +14543,71 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(pending_batch_confirmation_copy(), review_reply)
         self.assertNotIn("参数格式错误", review_reply)
+        if explicit_offer:
+            async def execute_bound_batch(name, arguments, *_args, **_kwargs):
+                if name == "keytao_get_batch_preview":
+                    return json.dumps({
+                        "success": True,
+                        "batchId": "s19-offline-confirmed",
+                    })
+                self.assertEqual(name, "keytao_batch_add_to_draft")
+                write_calls.append(arguments["items"])
+                return json.dumps({
+                    "success": True,
+                    "batchId": "s19-offline-confirmed",
+                    "count": len(arguments["items"]),
+                    "draft_snapshot": {
+                        "count": len(arguments["items"]),
+                        "items": arguments["items"],
+                        "summary": {"added": len(arguments["items"])},
+                    },
+                })
+
+            with patch.object(
+                chat_module, "conversation_state_store", state_store,
+            ), patch.object(chat_module, "call_tool_function", execute_bound_batch):
+                self.assertEqual(
+                    chat_module._enforce_advertised_reply_contract(
+                        review_reply, context.conversation_address,
+                    ),
+                    review_reply,
+                )
+                await chat_module.handle_pending_message_core(
+                    "加入", "qq", context.user_id, context.conversation_address,
+                    space_key=context.space_key, allow_intent_model=False,
+                )
+            self.assertEqual(len(write_calls), 1)
+            self.assertEqual([item["word"] for item in write_calls[0]], list(expected))
+
+    async def test_future_offer_does_not_guess_among_lookup_sets(self) -> None:
+        """A future-offer request cannot select a set using model prose."""
+        groups = (("显眼包", "嘴替"), ("松弛感", "班味"))
+        store = MemoryConversationStateStore()
+        context = AgentRequestContext(platform="qq", user_id="ambiguous-future-offer")
+
+        async def lookup(words=None, **_kwargs):
+            return {"success": True, "count": len(words), "results": [
+                {"success": True, "word": word, "phrases": []} for word in words
+            ]}
+
+        client = _FakeClient([
+            _fake_response("tool_calls", tool_calls=[
+                _named_tool_call(f"lookup-set-{index}", "keytao_lookup_by_words_batch", {"words": list(words)})
+                for index, words in enumerate(groups)
+            ]),
+            _fake_response("stop", "显眼包、嘴替未收录，可以把列表中的词加入草稿。"),
+        ])
+        orchestrator = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig("fake-model", 500, 0.0, 10.0),
+            skills_manager=_AdvertisedSetSkills(),
+            tool_executor=ToolExecutor(lambda _name: lookup, frozenset({"keytao_lookup_by_words_batch"})),
+            state_store=store, bind_help_text="bind help", system_prompt_core="system",
+        )
+        reply = await orchestrator.run("只查询，并说明可以把列表中的词加入草稿", context)
+        self.assertIsNone(store.get_record(context.conversation_address))
+        self.assertIn("无法", reply)
+        self.assertNotIn(pending_batch_confirmation_copy(), reply)
 
     async def test_unrendered_or_incomplete_lookup_set_mints_no_snapshot(self) -> None:
         words = ("显眼包", "嘴替", "松弛感")
@@ -19536,21 +19670,69 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
 
     def test_s27_meta_question_keeps_a_direct_binding_answer(self) -> None:
         question = "你是否会先确认对方有没有绑定账号？"
-        direct_reply = (
-            "是的，会先确认。未绑定时可以查词和算编码，"
-            "但写入草稿和提交会被后端拦住，需要先绑定。"
-            "另外，刚才的候选已失效，绑定后可重新发一次词。"
+        direct_replies = (
+            (
+                "是的，会先确认。未绑定时可以查词和算编码，"
+                "但写入草稿和提交会被后端拦住，需要先绑定。"
+                "另外，刚才的候选已失效，绑定后可重新发一次词。"
+            ),
+            (
+                "是的。凡是涉及你个人词库的操作（查词不受影响，但加词、改码、"
+                "删词、提交这些写入草稿的动作），都会先核验当前发送者有没有绑定键道账号。\n\n"
+                "- 已绑定：正常进入审词、候选、加入草稿、提交流程\n"
+                "- 未绑定：不会执行任何写入，会提示你先去绑定，并给出绑定步骤\n\n"
+                "绑定动作本身也认当前发送者本人，不能由群里其他人代绑或代确认。"
+            ),
+            *(f"这些写入草稿的{noun}会先检查绑定。" for noun in ("动作", "操作", "行为", "流程")),
         )
 
-        finalized = AgentOrchestrator._finalize_reply(
-            question,
-            direct_reply,
-            {},
-        )
+        for direct_reply in direct_replies:
+            with self.subTest(reply=direct_reply):
+                finalized = AgentOrchestrator._finalize_reply(
+                    question,
+                    direct_reply,
+                    {},
+                )
+                self.assertFalse(advertised_reply_contract(direct_reply).requires_live_state)
+                self.assertEqual(finalized, direct_reply)
+                self.assertIn("绑定", finalized)
+                self.assertNotIn("查词 <字符>", finalized)
 
-        self.assertEqual(finalized, direct_reply)
-        self.assertIn("绑定", finalized)
-        self.assertNotIn("查词 <字符>", finalized)
+    def test_s27_stale_candidate_tail_keeps_a_truthful_binding_answer(self) -> None:
+        question = "你是否会先确认对方有没有绑定账号？"
+        reply = (
+            "是的，会先确认。\n\n"
+            "所有涉及草稿写入、提交审核这类词库操作，都需要你先绑定键道平台账号。"
+            "工具层在执行时会校验绑定状态，未绑定的话操作是执行不了的，"
+            "所以我会在展示候选前就提示你完成绑定。\n\n"
+            "绑定方式很简单：\n"
+            "1. 打开 https://keytao.vercel.app/profile 的【机器人账号绑定】生成绑定码\n"
+            "2. 在这里发送：/bind [绑定码]\n\n"
+            "绑定一次后，后续加词、提交就都能正常走了。"
+            "刚才「来都来了」的候选还在，等你绑定完回复「加入并提交」就行。"
+        )
+        self.assertTrue(advertised_reply_contract(reply).requires_live_state)
+        finalized = AgentOrchestrator._finalize_reply(question, reply, {})
+        self.assertEqual(finalized, "会的：写入前会校验绑定；未绑定会给出绑定引导。")
+        self.assertFalse(advertised_reply_contract(finalized).requires_live_state)
+        self.assertNotRegex(finalized, r"来都来了|候选|回复|加入并提交|查词 <字符>")
+
+    def test_s27_description_guard_keeps_real_advertisements_stateful(self) -> None:
+        candidate_reply = render_server_backed_single_word_candidates(
+            "大端", "dsdtvo", [("dsdt", True), ("dsdtvo", False)],
+            {"dsdt": ["打断"]},
+        )
+        self.assertRegex(candidate_reply, r"(?m)^1\.\s*dsdt")
+        for reply in (
+            "这些词加入草稿。",
+            "把这些加入草稿。",
+            "回复「加入」。",
+            candidate_reply,
+        ):
+            with self.subTest(reply=reply):
+                self.assertTrue(advertised_reply_contract(reply).requires_live_state)
+                finalized = AgentOrchestrator._finalize_reply("这个字怎么写？", reply, {})
+                self.assertIn("查词 <字符>", finalized)
 
     def test_empty_public_failure_reason_uses_its_plain_fallback(self) -> None:
         self.assertEqual(

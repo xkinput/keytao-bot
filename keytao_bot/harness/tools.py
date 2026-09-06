@@ -1567,8 +1567,8 @@ class ToolExecutor:
                 target["_reviewed_pinyin"] = pinyin
                 target["_reviewed_candidate_codes"] = candidate_codes
 
-        def bind_additional_shift_items() -> None:
-            raw_additional = call_args.get("additional_shift_items")
+        def bind_additional_items(argument_name: str, *, require_all: bool) -> None:
+            raw_additional = call_args.get(argument_name)
             if not isinstance(raw_additional, list):
                 return
             sanitized_additional: List[Dict[str, Any]] = []
@@ -1596,13 +1596,41 @@ class ToolExecutor:
                     item_code,
                 )
                 sanitized_additional.append(item)
-            call_args["additional_shift_items"] = (
-                sanitized_additional if all_bound else []
+            call_args[argument_name] = (
+                sanitized_additional if all_bound or not require_all else []
             )
 
         if not context.current_message:
             if tool_name == "keytao_batch_add_to_draft" and internal_same_code:
                 call_args["_allow_same_code"] = True
+            if (
+                tool_name == "keytao_batch_add_to_draft"
+                and isinstance(call_args.get("items"), list)
+            ):
+                sanitized_items = []
+                for raw_item in call_args["items"]:
+                    if not isinstance(raw_item, dict):
+                        sanitized_items.append(raw_item)
+                        continue
+                    item = dict(raw_item)
+                    for field in (
+                        "_reviewed_pinyin", "_reviewed_candidate_codes",
+                        "reviewedPinyin", "reviewedCandidateCodes",
+                    ):
+                        item.pop(field, None)
+                    word = str(item.get("word") or "").strip()
+                    code = str(item.get("code") or "").strip().lower()
+                    if (
+                        str(item.get("action") or "Create") == "Create"
+                        and not item.get("old_word")
+                        and not item.get("oldWord")
+                    ):
+                        capability = (context.trusted_reviewed_items_by_key or {}).get(
+                            (word, code)
+                        )
+                        inject_reviewed_validation(item, capability, code)
+                    sanitized_items.append(item)
+                call_args["items"] = sanitized_items
             if tool_name in {"keytao_create_phrase", "keytao_shift_phrase_code"}:
                 word = str(call_args.get("word") or "").strip()
                 code = str(
@@ -1616,7 +1644,8 @@ class ToolExecutor:
                 )
                 inject_reviewed_validation(call_args, capability, code)
                 if tool_name == "keytao_shift_phrase_code":
-                    bind_additional_shift_items()
+                    bind_additional_items("additional_shift_items", require_all=True)
+                    bind_additional_items("additional_items", require_all=False)
             return call_args
         message = _mutation_authorization_view(context.current_message or "")
         if (
@@ -1632,7 +1661,8 @@ class ToolExecutor:
                 (word, code)
             )
             inject_reviewed_validation(call_args, capability, code)
-            bind_additional_shift_items()
+            bind_additional_items("additional_shift_items", require_all=True)
+            bind_additional_items("additional_items", require_all=False)
             return call_args
 
         if (

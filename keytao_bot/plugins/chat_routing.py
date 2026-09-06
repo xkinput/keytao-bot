@@ -18,6 +18,7 @@ from ..harness.state import (
     PendingStateRecord,
     PendingTrustedWordRecord,
     PendingToolConfirm,
+    _pending_add_word_from_payload,
     pending_batch_display_pairs,
     trusted_word_record_is_complete,
 )
@@ -32,6 +33,7 @@ from ..harness.authorization_grammar import (
     parse_eviction_modified_add,
     parse_pending_positional_add,
     parse_replace_at_code,
+    parse_reviewed_multi_word_selection,
 )
 from ..harness.tools import (
     _COMMAND_PREFIX_PATTERN,
@@ -1661,9 +1663,28 @@ def _structural_pending_add_word_intent(
 
 def message_authorizes_live_pending_mutation(
     message_text: str,
-    state: PendingAddWord,
+    state: PendingState,
 ) -> bool:
     """Treat a closed selector as write intent only for one live server record."""
+    if (
+        isinstance(state, PendingToolConfirm)
+        and state.args.get("_reviewed_multi_word") is True
+    ):
+        if state.confirmation_source != "local_preview":
+            return False
+        items, scopes = _multi_word_candidate_scope_rows(state)
+        if not items or not scopes:
+            return False
+        derived, intent, _error = _resolve_reviewed_multi_word_selection(
+            state, message_text, items, scopes,
+        )
+        if derived is not None and intent is not None:
+            return True
+        assent_intent = _pending_tool_assent_intent(state, message_text)
+        return bool(
+            assent_intent is not None
+            and assent_intent.intent in {"pending_confirm", "pending_add_and_submit"}
+        )
     if not (
         isinstance(state, PendingAddWord)
         and state.server_candidates
@@ -1733,7 +1754,7 @@ def _multi_word_candidate_scope_rows(
     words = [str(item.get("word") or "").strip() for item in clean_items]
     if (
         len(clean_items) != len(items)
-        or len(words) < 2
+        or len(words) < (1 if state.args.get("_reviewed_multi_word") is True else 2)
         or any(not word for word in words)
         or len(set(words)) != len(words)
     ):
@@ -1783,10 +1804,106 @@ def _multi_word_candidate_scope_rows(
         ).strip().lower()
         if current_code not in seen_codes:
             return clean_items, {}
+        if state.args.get("_reviewed_multi_word") is True:
+            try:
+                reviewed = _pending_add_word_from_payload(
+                    json.loads(json.dumps(raw_scope.get("reviewedState")))
+                )
+            except (TypeError, ValueError):
+                return clean_items, {}
+            if (
+                reviewed.word != word
+                or reviewed.server_candidates != candidates
+                or reviewed.candidates != candidates
+                or reviewed.recommended_code != current_code
+                or reviewed.server_occupied_words != raw_scope.get("occupiedWords")
+                or reviewed.server_ordering_assessments != raw_scope.get("orderingAssessments")
+            ):
+                return clean_items, {}
         scopes[word] = candidates
     if set(scopes) != set(words):
         return clean_items, {}
     return clean_items, scopes
+
+
+def _resolve_reviewed_multi_word_selection(
+    state: PendingToolConfirm,
+    message_text: str,
+    items: List[Dict[str, Any]],
+    scopes: Dict[str, List[Tuple[str, bool]]],
+) -> Tuple[Optional[PendingToolConfirm], Optional[MessageCommandIntent], Optional[str]]:
+    """Bind each canonical pair to its own sealed review; omit every other word."""
+    source = _strip_command_message_prefixes(message_text).strip()
+    live_words = tuple(str(item["word"]).strip() for item in items)
+    unquoted = _whole_message_unquoted_source(source, live_words)
+    if unquoted is not None:
+        source = unquoted
+    pairs = parse_reviewed_multi_word_selection(source)
+    if not items or not scopes:
+        assent = _pending_tool_assent_intent(state, message_text)
+        if pairs is not None or (
+            assent is not None and assent.intent in {"pending_confirm", "pending_add_and_submit"}
+        ):
+            return None, None, "当前多词候选记录不完整，请重新查询；本次未写入。"
+        return None, None, None
+    if pairs is None:
+        if (
+            re.search(r"[\u3400-\u9fff]+[ \t]+(?:[0-9]+|[a-zA-Z]+)", source)
+            or any(re.match(rf"{re.escape(word)}\s+", source) for word in live_words)
+            or re.fullmatch(r"[1-9][0-9]{0,2}", source)
+        ):
+            return None, None, "选择格式应为词条加编号或编码，多个词用逗号分隔；本次未写入。"
+        return None, None, None
+    items_by_word = {str(item["word"]).strip(): item for item in items}
+    selected_items: List[Dict[str, Any]] = []
+    selected_words: List[str] = []
+    for word, selector in pairs:
+        candidates = scopes.get(word)
+        if candidates is None:
+            return None, None, f"「{word}」不在当前候选中，本次未写入。"
+        if selector.isdecimal():
+            index = int(selector)
+            if not 1 <= index <= len(candidates):
+                return None, None, f"「{word}」只接受 1-{len(candidates)} 之间的编号；本次未写入。"
+            code = candidates[index - 1][0]
+        else:
+            code = selector
+            if code not in dict(candidates):
+                return None, None, f"所选编码不在「{word}」当前候选中，本次未写入。"
+        item = dict(items_by_word[word])
+        item["code"] = code
+        raw_scope = next(
+            scope for scope in state.args["_candidate_scopes"]
+            if scope["word"] == word
+        )
+        item["remark"] = (
+            raw_scope["reviewedState"].get("codeRemarks", {}).get(code, "")
+        )
+        if dict(candidates)[code]:
+            item["needsManualReview"] = True
+            item["manualReviewReason"] = "重码添加需管理员审核"
+        selected_items.append(item)
+        selected_words.append(word)
+    derived_args = dict(state.args)
+    derived_args["items"] = selected_items
+    derived_args["_resolved_advertised_words"] = selected_words
+    derived_args["_unselected_words"] = [
+        word for word in items_by_word if word not in selected_words
+    ]
+    derived_args["_candidate_scopes"] = [
+        {**scope, "orderingAssessments": []}
+        for scope in state.args["_candidate_scopes"]
+        if scope["word"] in selected_words
+    ]
+    return (
+        PendingToolConfirm(
+            function_name=state.function_name,
+            args=derived_args,
+            confirmation_source=state.confirmation_source,
+        ),
+        MessageCommandIntent(intent="pending_confirm", confidence=1.0),
+        None,
+    )
 
 
 def _resolve_multi_word_pending_candidate_selection(
@@ -1795,6 +1912,18 @@ def _resolve_multi_word_pending_candidate_selection(
 ) -> Tuple[Optional[PendingToolConfirm], Optional[MessageCommandIntent], Optional[str]]:
     """Require word scope when several live candidate lists reuse numbers."""
     items, scopes = _multi_word_candidate_scope_rows(state)
+    if (
+        isinstance(state, PendingToolConfirm)
+        and state.args.get("_reviewed_multi_word") is True
+    ):
+        if state.confirmation_source != "local_preview":
+            if parse_reviewed_multi_word_selection(message_text) is not None:
+                return None, None, (
+                    "当前已进入风险确认，不能再按候选编号或编码换选；本次未写入。\n"
+                    + pending_confirmation_copy()
+                )
+            return None, None, None
+        return _resolve_reviewed_multi_word_selection(state, message_text, items, scopes)
     if len(items) < 2:
         return None, None, None
     words = tuple(str(item["word"]).strip() for item in items)

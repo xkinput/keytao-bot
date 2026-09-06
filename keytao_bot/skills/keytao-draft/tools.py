@@ -5923,7 +5923,6 @@ async def keytao_shift_phrase_code(
             not isinstance(additional_shift_items, list)
             or not additional_shift_items
             or len(additional_shift_items) > 19
-            or additional_items
         ):
             return {"success": False, "message": "同批附加顺延集合无效"}
         seen_shift_keys = {(word, target_code)}
@@ -6013,6 +6012,11 @@ async def keytao_shift_phrase_code(
                 companion_item["remark"] = remark
             if manual_reason:
                 companion_item["manualReviewReason"] = manual_reason
+            companion_pinyin = str(raw_item.get("_reviewed_pinyin") or "").strip()
+            companion_codes = _clean_code_list(raw_item.get("_reviewed_candidate_codes"))
+            if companion_pinyin and companion_code in companion_codes:
+                companion_item["_reviewed_pinyin"] = companion_pinyin
+                companion_item["_reviewed_candidate_codes"] = companion_codes
             companion_items.append(companion_item)
             seen_companion_words.add(companion_word)
             seen_companion_keys.add((companion_word, companion_code))
@@ -6550,6 +6554,12 @@ async def keytao_shift_phrase_code(
         for item in plan.get("items", [])
         if isinstance(item, dict)
     ]
+    reviewed_targets = {(item["word"], item["code"]): item for item in target_specs}
+    for item in plan_items:
+        target = reviewed_targets.get((item.get("word"), item.get("code")))
+        if item.get("action") == "Create" and target and target.get("_reviewed_pinyin"):
+            item["_reviewed_pinyin"] = target["_reviewed_pinyin"]
+            item["_reviewed_candidate_codes"] = list(target["_reviewed_candidate_codes"])
     shift_words = {
         str(item.get("word") or "").strip()
         for item in plan_items

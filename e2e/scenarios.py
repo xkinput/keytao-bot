@@ -4362,7 +4362,7 @@ S33_DISCOVERY = "喵喵 加词 洒漏 撒漏"
 S33_EXTERNAL_WORDS = ("缩手", "所售")
 S33_EXTERNAL_OCCUPANT = ("所受", "sled")
 S33_EXTERNAL_QUERY = "缩手 所售"
-S33_EXTERNAL_EXPECTED = (("缩手", "sleda"), ("所售", "sledu"))
+S33_EXTERNAL_EXPECTED = (("缩手", "sled"), ("所售", "sledu"))
 
 
 def _s33_external_query_pairs(reply: str) -> tuple[tuple[str, str], ...]:
@@ -4407,6 +4407,9 @@ def _s33_external_query_pairs(reply: str) -> tuple[tuple[str, str], ...]:
 
 async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
     """Pin batch-aware homophone allocation and the sink collision controls."""
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import PendingToolConfirm
+
     messages: list[str] = []
     replies: list[str] = []
     dictionary_cleanups: list[dict[str, Any]] = []
@@ -4491,12 +4494,92 @@ async def scenario_s33(ctx: ScenarioContext) -> dict[str, Any]:
         code=S33_EXTERNAL_OCCUPANT[1],
     )
     await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+    external_cutoff = max(
+        (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+        default=0,
+    )
     external_reply = await ctx.send(S33_EXTERNAL_QUERY)
     external_replies.append(external_reply)
     external_pairs = _s33_external_query_pairs(external_reply)
     require(
         external_pairs == S33_EXTERNAL_EXPECTED,
         f"S33 external occupant was not allocated by priority: {external_reply}",
+    )
+    external_record = ctx.bot.openai_chat.conversation_state_store.get_record(
+        ConversationAddress.private("qq", ctx.platform_id)
+    )
+    require(
+        external_record is not None
+        and not external_record.execution_id
+        and isinstance(external_record.state, PendingToolConfirm)
+        and external_record.state.function_name == "keytao_batch_add_to_draft"
+        and external_record.state.args.get("_reviewed_multi_word") is True,
+        f"S33 reviewed query did not preserve a live multi-word record: {external_record}",
+    )
+    external_scopes = external_record.state.args.get("_candidate_scopes") or []
+    external_scope_by_word = {scope.get("word"): scope for scope in external_scopes}
+    external_reviews = {
+        (event.get("arguments") or {}).get("word"): event["result"]
+        for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > external_cutoff
+        and event.get("kind") == "tool"
+        and event.get("name") == "keytao_prepare_reviewed_add"
+        and isinstance(event.get("result"), dict)
+    }
+    require(
+        len(external_scopes) == len(S33_EXTERNAL_WORDS)
+        and set(external_scope_by_word) == set(external_reviews) == set(S33_EXTERNAL_WORDS)
+        and tuple(
+            (item.get("word"), item.get("code"))
+            for item in external_record.state.args.get("items") or []
+        ) == S33_EXTERNAL_EXPECTED
+        and ctx.bot.openai_chat._advertised_reply_matches_live_record(external_reply, external_record),
+        f"S33 external query lost its reviewed inventories or binding: {external_record}; {external_reviews}",
+    )
+    ordering_fields = (
+        "verdict", "newWord", "occupantWord", "occupantCode", "freeCode", "newCode",
+    )
+    for word, code in S33_EXTERNAL_EXPECTED:
+        scope = external_scope_by_word[word]
+        reviewed_state = scope.get("reviewedState") or {}
+        expected_ordering = [
+            {field: assessment.get(field) for field in ordering_fields}
+            for assessment in external_reviews[word].get("candidateOrderingAssessments") or []
+        ]
+        auto_review_line = next((
+            line for line in str(scope.get("reviewedPrompt") or "").splitlines()
+            if line.startswith("自动审核：")
+        ), "")
+        require(
+            reviewed_state.get("word") == word
+            and reviewed_state.get("recommendedCode") == code
+            and external_reviews[word].get("recommendedCode") == code
+            and scope.get("orderingAssessments") == expected_ordering
+            and reviewed_state.get("serverOrderingAssessments") == scope.get("orderingAssessments")
+            and auto_review_line
+            and auto_review_line in external_reply,
+            f"S33 external recommendation diverged from its actual review: {word}; {scope}; {external_reviews[word]}",
+        )
+    front_assessment = next((
+        assessment
+        for assessment in external_reviews["缩手"].get("candidateOrderingAssessments") or []
+        if assessment.get("newWord") == "缩手"
+        and assessment.get("occupantWord") == "所受"
+        and assessment.get("occupantCode") == "sled"
+        and assessment.get("freeCode") == "sleda"
+        and assessment.get("newCode") == "sled"
+        and assessment.get("verdict") == "front_more_common"
+        and assessment.get("decisionReason") == "frequency_ratio"
+    ), None)
+    require(
+        front_assessment is not None
+        and "语料频次 126 vs 3" in str(front_assessment.get("summary") or "")
+        and str(front_assessment.get("summary") or "")
+        in str(external_scope_by_word["缩手"].get("reviewedPrompt") or "")
+        and "常用度推荐（需重排）" in external_reply
+        and "推荐调序：「缩手」占 sled，「所受」顺延" in external_reply
+        and "不调序备选编码：sleda" in external_reply,
+        f"S33 shared review lost the evidence for its default reorder: {front_assessment}; {external_reply}",
     )
     require(
         S33_EXTERNAL_OCCUPANT[0] in external_reply
@@ -8347,6 +8430,347 @@ async def scenario_s53(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S54_WORDS = ("大端", "小端")
+S54_UNKNOWN_WORD = "肌群"
+S54_CANDIDATE_CODES = {
+    "大端": ("dsdt", "dsdtv", "dsdtvo"),
+    "小端": ("xcdt", "xcdti", "xcdtio"),
+}
+S54_OCCUPANTS = (("打断", "dsdt"), ("大段", "dsdtv"), ("小段", "xcdt"))
+
+
+async def scenario_s54(ctx: ScenarioContext) -> dict[str, Any]:
+    """Close bare multi-word discovery through one persisted reviewed inventory."""
+    from unittest.mock import patch
+
+    from keytao_bot.harness.authorization_grammar import parse_reviewed_multi_word_selection
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import PendingAddWord, PendingToolConfirm
+    from keytao_bot.plugins.chat_routing import (
+        _resolve_multi_word_pending_candidate_selection,
+        message_authorizes_live_pending_mutation,
+    )
+    from keytao_bot.utils import keytao_review as review_module
+    from keytao_bot.utils.pending_confirmation import parse_pending_assent_phrase
+
+    store = ctx.bot.openai_chat.conversation_state_store
+    address = ConversationAddress.group(
+        "qq", str(ctx.bot._group_id(ctx.platform_id)), ctx.platform_id,
+    )
+    messages: list[str] = []
+    replies: list[str] = []
+    cases: list[dict[str, Any]] = []
+    candidate_row = re.compile(r"(?m)^\s*\d+[.)、]\s*[a-z]{2,12}\s*[—–-]")
+
+    def cutoff() -> int:
+        return max(
+            (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
+            default=0,
+        )
+
+    def later_events(sequence: int) -> list[dict[str, Any]]:
+        return [
+            event for event in ctx.attempt_events()
+            if int(event.get("sequence") or 0) > sequence
+        ]
+
+    async def send(message: str) -> str:
+        messages.append(message)
+        reply = await ctx.send_group(message, to_me=True)
+        replies.append(reply)
+        return reply
+
+    async def reset() -> None:
+        await ctx.next_client.clean_draft(ctx.platform_id)
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    async def clean_words(words: tuple[str, ...]) -> dict[str, Any]:
+        result = await ctx.next_client.remove_rig_owned_dictionary_words(
+            platform_id=ctx.platform_id,
+            admin_token=ctx.admin_token,
+            scenario_id="S54",
+            fixture_words=words,
+        )
+        require(result.get("verified") is True, f"S54 cleanup failed: {result}")
+        return result
+
+    async def discover(
+        text: str,
+        expected_words: tuple[str, ...],
+        *,
+        existing_word: str = "",
+    ) -> tuple[str, PendingToolConfirm, dict[str, Any]]:
+        await reset()
+        candidate_sets: list[object] = []
+        deliveries: list[dict[str, Any]] = []
+        original_set = store.set
+        original_record_message = ctx.recorder.record_message
+
+        def observe_set(key: object, state: object, *args: Any, **kwargs: Any) -> bool:
+            saved = original_set(key, state, *args, **kwargs)
+            if saved and (
+                isinstance(state, PendingAddWord)
+                or (
+                    isinstance(state, PendingToolConfirm)
+                    and state.args.get("_reviewed_multi_word") is True
+                )
+            ):
+                candidate_sets.append(state)
+            return saved
+
+        def observe_delivery(**kwargs: Any) -> None:
+            if kwargs.get("direction") == "reply" and candidate_row.search(
+                str(kwargs.get("text") or "")
+            ):
+                live = store.get_record(address)
+                state = live.state if live is not None else None
+                deliveries.append({
+                    "nonce": live.nonce if live is not None else "",
+                    "recordFirst": bool(
+                        isinstance(state, PendingToolConfirm)
+                        and state.args.get("_reviewed_multi_word") is True
+                        and state.args.get("_candidate_scopes")
+                    ),
+                })
+            original_record_message(**kwargs)
+
+        sequence = cutoff()
+        with patch.object(store, "set", new=observe_set), patch.object(
+            ctx.recorder, "record_message", new=observe_delivery,
+        ):
+            reply = await send(text)
+        record = store.get_record(address)
+        require(
+            record is not None
+            and isinstance(record.state, PendingToolConfirm)
+            and record.state.function_name == "keytao_batch_add_to_draft"
+            and record.state.args.get("_reviewed_multi_word") is True,
+            f"S54 bare query did not persist a reviewed multi record: {record}; {reply}",
+        )
+        state = record.state
+        require(
+            len(candidate_sets) == 1
+            and deliveries
+            and all(row["recordFirst"] and row["nonce"] == record.nonce for row in deliveries),
+            f"S54 record-first boundary failed: writes={len(candidate_sets)}, deliveries={deliveries}",
+        )
+        scopes = state.args.get("_candidate_scopes") or []
+        scope_by_word = {scope.get("word"): scope for scope in scopes}
+        require(
+            len(scopes) == len(expected_words) and set(scope_by_word) == set(expected_words),
+            f"S54 persisted the wrong per-word inventories: {scopes}",
+        )
+        reviews = {
+            event.get("arguments", {}).get("word"): event["result"]
+            for event in later_events(sequence)
+            if event.get("kind") == "tool"
+            and event.get("name") == "keytao_prepare_reviewed_add"
+            and isinstance(event.get("result"), dict)
+        }
+        require(
+            set(reviews) == set(expected_words),
+            f"S54 did not use one public reviewed-add pipeline per absent word: {reviews}; {reply}",
+        )
+        for word, scope in scope_by_word.items():
+            reviewed_state = scope.get("reviewedState") or {}
+            require(
+                reviewed_state.get("word") == word
+                and reviewed_state.get("serverCandidates")
+                and "审词：" in str(scope.get("reviewedPrompt") or ""),
+                f"S54 scope lost its single-word state or reading rendering: {scope}",
+            )
+            codes = [str(row[0]) for row in reviewed_state.get("serverCandidates", [])]
+            if word in S54_CANDIDATE_CODES:
+                require(
+                    codes == list(S54_CANDIDATE_CODES[word]),
+                    f"S54 flattened alternate readings or changed ordinal bindings: {word}={codes}",
+                )
+                # The shared renderer may receive either marked or normalized pinyin.
+                expected_reading = {
+                    "大端": ("da", "duan"),
+                    "小端": ("xiao", "duan"),
+                }[word]
+                reading_line = re.search(
+                    r"(?m)^审词：读音 ([^；;\n]+)[；;]来源",
+                    str(scope.get("reviewedPrompt") or ""),
+                )
+                require(
+                    reading_line is not None
+                    and reading_line.group(0) in reply
+                    and review_module.normalize_pinyin_sequence(reading_line.group(1)) == expected_reading
+                    and {
+                        review_module.normalize_pinyin_sequence(str(pronunciation.get("pinyin") or ""))
+                        for pronunciation in reviews[word].get("pronunciations") or []
+                        if isinstance(pronunciation, dict)
+                    } == {expected_reading},
+                    f"S54 lost the resolved {word} reading or rendered source: {reply}; {reviews[word]}",
+                )
+        require(
+            reply.count("审词：") == len(expected_words)
+            and reply.count("自动审核：") >= len(expected_words)
+            and "需管理员审核\n" not in reply
+            and "需管理员审核。\n" not in reply
+            and "dhdt" not in reply and "thdt" not in reply
+            and "本次仅查询" not in reply
+            and "加入并提交" in reply,
+            f"S54 rendered raw encode narration or omitted review/action evidence: {reply}",
+        )
+        if existing_word:
+            require(
+                existing_word in reply and "已在词库" in reply
+                and existing_word not in scope_by_word,
+                f"S54 existing-word block was missing or actionable: {reply}; {scopes}",
+            )
+        suggestion_lines = re.findall(r"(?m)^\s*[-•]\s*[「“『].+[」”』].*$", reply)
+        suggestions: list[str] = []
+        for line in suggestion_lines:
+            match = re.match(r"\s*[-•]\s*[「“『](.+)[」”』]", line)
+            require(match is not None, f"S54 malformed renderer suggestion: {line}")
+            command = match.group(1)
+            suggestions.append(command)
+            selected = parse_reviewed_multi_word_selection(command)
+            assent = parse_pending_assent_phrase(command)
+            require(
+                selected is not None or (assent.matched and assent.add_requested and not assent.cancel_requested),
+                f"S54 advertised a command outside its canonical parser: {line}",
+            )
+            require(
+                message_authorizes_live_pending_mutation(command, state)
+                and message_authorizes_live_pending_mutation(line, state),
+                f"S54 advertised a parser-valid but unbound command: {line}; {state.args}",
+            )
+            if selected is not None:
+                derived, intent, error = _resolve_multi_word_pending_candidate_selection(state, command)
+                require(
+                    derived is not None and intent is not None and error is None,
+                    f"S54 advertised selection did not derive a bound target: {line}; {error}",
+                )
+        require(
+            "加入" in suggestions and "加入并提交" in suggestions
+            and any(parse_reviewed_multi_word_selection(command) is not None for command in suggestions)
+            and ctx.bot.openai_chat._advertised_reply_matches_live_record(reply, record),
+            f"S54 canonical advertisements did not close through the live boundary: {suggestions}; {reply}",
+        )
+        require(not (await ctx.draft()).get("items"), "S54 bare discovery mutated the draft")
+        return reply, state, {
+            "query": text,
+            "words": list(expected_words),
+            "candidateRecordWrites": len(candidate_sets),
+            "recordFirst": True,
+            "reviewedWords": sorted(reviews),
+            "advertisedClosure": suggestions,
+            "candidateCodes": {
+                word: [row[0] for row in scope["reviewedState"]["serverCandidates"]]
+                for word, scope in scope_by_word.items()
+            },
+        }
+
+    review_module._clear_review_caches()
+    await reset()
+    all_fixture_words = (*S54_WORDS, S54_UNKNOWN_WORD, *(word for word, _code in S54_OCCUPANTS))
+    for word, code in S54_OCCUPANTS:
+        exact_rows = [
+            row for row in await ctx.next_client.phrases_by_code(code)
+            if str(row.get("code") or "") == code
+        ]
+        require(not exact_rows, f"S54 requires an empty fixture slot before seeding {word}@{code}: {exact_rows}")
+        await ctx.next_client.seed_phrase(platform_id=ctx.platform_id, word=word, code=code)
+    try:
+        discovery, state, facts = await discover("大端 小端", S54_WORDS)
+        assert_reply_mentions(discovery, *(word for word, _code in S54_OCCUPANTS))
+        expected_items = [
+            item_key(item) for item in state.args.get("items") or []
+            if isinstance(item, dict)
+        ]
+        require(
+            {word for action, word, _code in expected_items if action == "Create"} == set(S54_WORDS),
+            f"S54 recommendations omitted a word: {state.args}",
+        )
+        sequence = cutoff()
+        receipt = await send("加入并提交")
+        batch_id = _successful_submit_batch_id(ctx.attempt_events(), after_sequence=sequence)
+        require(
+            batch_id and batch_id in batch_link_ids(receipt)
+            and not any(
+                event.get("kind") == "tool" and event.get("name") == "keytao_prepare_reviewed_add"
+                for event in later_events(sequence)
+            ),
+            f"S54 add-and-submit did not consume the record in one turn with its batch link: {receipt}",
+        )
+        submitted = await ctx.next_client.get_admin_batch(batch_id=batch_id, admin_token=ctx.admin_token)
+        submitted_items = [item_key(item) for item in submitted.get("pullRequests") or []]
+        require(
+            submitted.get("status") in {"Submitted", "Approved"}
+            and same_unique_item_set(submitted_items, expected_items),
+            f"S54 submitted a different recommendation set: expected={expected_items}; actual={submitted}",
+        )
+        assert_batch_link_hosts(receipt, "qq")
+        facts.update({"action": "加入并提交", "submittedItems": submitted_items, "batchId": batch_id})
+        cases.append(facts)
+        await ctx.next_client.clean_submitted_batches(ctx.platform_id)
+        await clean_words(S54_WORDS)
+
+        _reply, _state, facts = await discover("大端、小端", S54_WORDS)
+        await send("大端 3，小端 2")
+        selected_draft = await ctx.draft()
+        selected_items = [item_key(item) for item in selected_draft.get("items") or []]
+        require(
+            same_unique_item_set(selected_items, (("Create", "大端", "dsdtvo"), ("Create", "小端", "xcdti"))),
+            f"S54 explicit word/ordinal selection wrote the wrong rows: {selected_draft}",
+        )
+        facts.update({"action": "大端 3，小端 2", "selectedItems": selected_items})
+        cases.append(facts)
+
+        _reply, _state, facts = await discover("大端，小端", S54_WORDS)
+        partial_reply = await send("大端 3")
+        partial_draft = await ctx.draft()
+        require(
+            [item_key(item) for item in partial_draft.get("items") or []] == [("Create", "大端", "dsdtvo")]
+            and "小端" in partial_reply
+            and any(marker in partial_reply for marker in ("未选择", "未选", "未加入")),
+            f"S54 partial selection added an unselected word or hid its omission: {partial_draft}; {partial_reply}",
+        )
+        facts.update({"action": "大端 3", "unselectedWords": ["小端"]})
+        cases.append(facts)
+
+        await reset()
+        await ctx.next_client.seed_phrase(platform_id=ctx.platform_id, word="小端", code="xcdtio")
+        _reply, _state, facts = await discover("大端 小端", ("大端",), existing_word="小端")
+        await send("大端 3")
+        existing_draft = await ctx.draft()
+        require(
+            [item_key(item) for item in existing_draft.get("items") or []] == [("Create", "大端", "dsdtvo")],
+            f"S54 existing-word case re-added 小端: {existing_draft}",
+        )
+        facts.update({"existingWord": "小端", "selectedItems": [("Create", "大端", "dsdtvo")]})
+        cases.append(facts)
+        await reset()
+        await clean_words(("小端",))
+
+        _reply, state, facts = await discover("大端 小端 肌群", (*S54_WORDS, S54_UNKNOWN_WORD))
+        expected_items = [item_key(item) for item in state.args.get("items") or []]
+        await send("加入")
+        three_draft = await ctx.draft()
+        actual_items = [item_key(item) for item in three_draft.get("items") or []]
+        require(
+            same_unique_item_set(actual_items, expected_items)
+            and {word for action, word, _code in actual_items if action == "Create"} == {*S54_WORDS, S54_UNKNOWN_WORD},
+            f"S54 three-word unknown control did not consume every recommendation: {three_draft}",
+        )
+        facts.update({"action": "加入", "selectedItems": actual_items, "unknownWord": S54_UNKNOWN_WORD})
+        cases.append(facts)
+    finally:
+        await reset()
+        await ctx.next_client.clean_submitted_batches(ctx.platform_id)
+        cleanup = await clean_words(all_fixture_words)
+    return {
+        "messages": messages,
+        "replies": replies,
+        "draft": await ctx.draft(),
+        "facts": {"cases": cases, "fixtureOccupants": S54_OCCUPANTS, "cleanup": cleanup},
+    }
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -8401,6 +8825,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S51", "replace-at-code grammar and honest confirmation", scenario_s51),
     Scenario("S52", "first-render binding and possessive delete closure", scenario_s52),
     Scenario("S53", "unknown-polyphone reading resolution", scenario_s53),
+    Scenario("S54", "bare multi-word reviewed candidate and selection closure", scenario_s54),
 )
 
 

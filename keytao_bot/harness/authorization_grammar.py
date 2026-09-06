@@ -2930,6 +2930,29 @@ def message_authorizes_mutation(message: str) -> bool:
     return multi_add is None or multi_add.valid
 
 
+def parse_reviewed_multi_word_selection(
+    message: str,
+) -> Optional[Tuple[Tuple[str, str], ...]]:
+    """Parse canonical word/selector pairs; permission still needs a live record."""
+    source = str(message or "").strip()
+    if not source or len(source) > 4096:
+        return None
+    pairs: List[Tuple[str, str]] = []
+    seen_words: set[str] = set()
+    for clause in re.split(r"[，、,]", source):
+        match = re.fullmatch(
+            r"\s*(?P<word>[\u3400-\u9fff]{1,32})[ \t]+"
+            r"(?P<selector>[1-9][0-9]{0,2}|[a-zA-Z]{1,12})\s*",
+            clause,
+        )
+        if match is None or match.group("word") in seen_words:
+            return None
+        word = match.group("word")
+        seen_words.add(word)
+        pairs.append((word, match.group("selector").lower()))
+    return tuple(pairs)
+
+
 def looks_like_mutation_grammar_gap(message: str) -> bool:
     """Flag a positive write-shaped turn after authorization already failed."""
     source = _LEADING_MENTION_RE.sub(

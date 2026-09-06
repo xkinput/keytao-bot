@@ -331,6 +331,12 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
             continue
         candidate = recommended_candidate.search(block)
         if candidate is None:
+            candidate = re.search(
+                r"(?m)^推荐编码:(?P<code>[a-z]{1,12})\s*$",
+                block,
+                re.IGNORECASE,
+            )
+        if candidate is None:
             continue
         positioned_pairs.append(
             (heading.start(), heading.group("word"), candidate.group("code"))
@@ -1138,11 +1144,13 @@ def advertised_word_set_words(text: str) -> tuple[str, ...]:
 def render_server_backed_batch_candidates(
     items: object,
     candidate_scopes: object,
+    *,
+    include_controls: bool = True,
 ) -> str:
     """Render one complete batch solely from sealed server-record fields."""
     if (
         not isinstance(items, list)
-        or len(items) < 2
+        or not items
         or not isinstance(candidate_scopes, list)
     ):
         return ""
@@ -1150,6 +1158,7 @@ def render_server_backed_batch_candidates(
     scopes_by_word: dict[str, tuple[tuple[str, bool], ...]] = {}
     occupied_words_by_scope: dict[str, dict[str, tuple[str, ...]]] = {}
     ordering_assessments_by_scope: dict[str, list[dict[str, object]]] = {}
+    reviewed_scopes_by_word: dict[str, dict[str, object]] = {}
     for raw_scope in candidate_scopes:
         if not isinstance(raw_scope, dict):
             return ""
@@ -1220,6 +1229,30 @@ def render_server_backed_batch_candidates(
         ordering_assessments_by_scope[word] = [
             dict(value) for value in raw_ordering[:2]
         ]
+        if "reviewedState" in raw_scope or "reviewedPrompt" in raw_scope:
+            state = raw_scope.get("reviewedState")
+            prompt = raw_scope.get("reviewedPrompt")
+            if (
+                not isinstance(state, dict)
+                or state.get("word") != word
+                or not isinstance(prompt, str)
+                or not prompt.strip()
+                or not isinstance(state.get("serverCandidates"), list)
+                or state.get("serverOccupiedWords") != raw_occupied_words
+                or state.get("serverOrderingAssessments") != raw_ordering
+            ):
+                return ""
+            state_candidates = state["serverCandidates"]
+            if any(
+                not isinstance(pair, (list, tuple)) or len(pair) != 2
+                for pair in state_candidates
+            ) or tuple(tuple(pair) for pair in state_candidates) != tuple(candidates):
+                return ""
+            if advertised_single_word_candidate_codes(prompt) != tuple(
+                code for code, _occupied in candidates
+            ):
+                return ""
+            reviewed_scopes_by_word[word] = raw_scope
 
     normalized_items: list[tuple[str, str, bool]] = []
     seen_words: set[str] = set()
@@ -1249,6 +1282,61 @@ def render_server_backed_batch_candidates(
         )
         seen_words.add(word)
     if seen_words != set(scopes_by_word):
+        return ""
+
+    if reviewed_scopes_by_word:
+        if seen_words != set(reviewed_scopes_by_word):
+            return ""
+        lines = [f"{len(normalized_items)} 个词的候选："]
+        selections: list[tuple[str, str]] = []
+        for index, (word, recommended_code, _needs_review) in enumerate(
+            normalized_items, start=1,
+        ):
+            scope = reviewed_scopes_by_word[word]
+            if scope["reviewedState"].get("recommendedCode") != recommended_code:
+                return ""
+            block = render_server_backed_single_word_lookup(
+                word,
+                recommended_code,
+                scopes_by_word[word],
+                occupied_words_by_scope[word],
+                reviewed_prompt=scope["reviewedPrompt"],
+                ordering_assessments=ordering_assessments_by_scope[word],
+                actionable_controls=True,
+                include_controls=False,
+            )
+            if not block:
+                return ""
+            lines.extend((f"{index}. 「{word}」", block))
+            selected_index = next(
+                candidate_index
+                for candidate_index, (code, _occupied) in enumerate(
+                    scopes_by_word[word], start=1,
+                )
+                if code == recommended_code
+            )
+            selections.append((word, str(selected_index)))
+        if include_controls:
+            from keytao_bot.harness.authorization_grammar import (
+                parse_reviewed_multi_word_selection,
+            )
+
+            selection_command = "，".join(
+                f"{word} {selector}" for word, selector in selections
+            )
+            if parse_reviewed_multi_word_selection(selection_command) != tuple(selections):
+                return ""
+            lines.append("回复以下任一项；直接加入时，每个词采用推荐方案（含推荐调序）：")
+            for command in ("加入", "加入并提交"):
+                if not parse_pending_assent_phrase(command).matched:
+                    return ""
+                lines.append(render_executable_suggestion(command))
+            lines.append("按词选择（词名加空格，再写编号或编码；多词用逗号分隔）：")
+            lines.append(render_executable_suggestion(selection_command))
+            lines.append("可只写其中部分词；未选择的词保持未选，不会加入。")
+        return "\n".join(lines)
+
+    if len(normalized_items) < 2:
         return ""
 
     lines = [f"{len(normalized_items)} 个词的候选："]
@@ -1326,12 +1414,13 @@ def render_server_backed_batch_candidates(
         review_copy = "需管理员审核" if needs_review else "可自动通过"
         lines.append(f"   自动审核：{review_copy}")
 
-    lines.append(pending_batch_confirmation_copy())
-    scoped_copy = scoped_multi_word_candidate_copy(tuple(
-        word for word, _code, _needs_review in normalized_items
-    ))
-    if scoped_copy:
-        lines.append(scoped_copy)
+    if include_controls:
+        lines.append(pending_batch_confirmation_copy())
+        scoped_copy = scoped_multi_word_candidate_copy(tuple(
+            word for word, _code, _needs_review in normalized_items
+        ))
+        if scoped_copy:
+            lines.append(scoped_copy)
     return "\n".join(lines)
 
 
@@ -1340,19 +1429,9 @@ def render_server_backed_batch_lookup(
     candidate_scopes: object,
 ) -> str:
     """Render a multi-word candidate snapshot without minting write controls."""
-    rendered = render_server_backed_batch_candidates(items, candidate_scopes)
-    words = tuple(
-        str(item.get("word") or "").strip()
-        for item in items or []
-        if isinstance(item, dict) and str(item.get("word") or "").strip()
+    return render_server_backed_batch_candidates(
+        items, candidate_scopes, include_controls=False,
     )
-    footer = "\n".join(filter(None, (
-        pending_batch_confirmation_copy(),
-        scoped_multi_word_candidate_copy(words),
-    )))
-    if not rendered.endswith(footer):
-        return ""
-    return rendered[: -len(footer)].rstrip()
 
 
 def render_query_retry_reply(words: object) -> str:
@@ -1520,6 +1599,8 @@ def server_backed_relative_front_commands(
 def front_insert_recommendation_copy(
     recommendation: dict[str, str],
     fallback_selector: object = None,
+    *,
+    include_controls: bool = True,
 ) -> str:
     """Render one parser-checked recommendation plus its opt-out."""
     word = str(recommendation.get("newWord") or "").strip()
@@ -1527,6 +1608,12 @@ def front_insert_recommendation_copy(
     occupant_code = str(recommendation.get("occupantCode") or "").strip().lower()
     free_code = str(recommendation.get("freeCode") or "").strip().lower()
     summary = str(recommendation.get("summary") or "").strip()
+    if not include_controls:
+        lines = [f"推荐调序：「{word}」占 {occupant_code}，「{occupant}」顺延"]
+        if summary:
+            lines.append(f"依据：{summary}")
+        lines.append(f"不调序备选编码：{free_code}")
+        return "\n".join(lines)
     command = (
         f"「{word}」占 {occupant_code}、「{occupant}」顺延"
     )
@@ -1585,6 +1672,8 @@ def render_server_backed_single_word_candidates(
     candidates: object,
     occupied_words: object,
     ordering_assessments: object = None,
+    *,
+    include_controls: bool = True,
 ) -> str:
     """Render one candidate interface solely from trusted same-turn records."""
     normalized_word = str(word or "").strip()
@@ -1675,11 +1764,13 @@ def render_server_backed_single_word_candidates(
             front_insert_recommendation_copy(
                 reorder_recommendation,
                 fallback_index,
+                include_controls=include_controls,
             )
         )
     else:
         lines.append(f"• 「{normalized_word}」→ {recommended}（推荐）")
-    lines.append(single_word_candidate_footer(len(normalized_candidates)))
+    if include_controls:
+        lines.append(single_word_candidate_footer(len(normalized_candidates)))
     return "\n".join(lines)
 
 
@@ -1691,6 +1782,8 @@ def render_server_backed_single_word_lookup(
     *,
     reviewed_prompt: object = "",
     actionable_controls: bool = False,
+    ordering_assessments: object = None,
+    include_controls: bool = True,
 ) -> str:
     """Render a rich query snapshot backed by the persisted candidate record."""
     actionable = render_server_backed_single_word_candidates(
@@ -1698,6 +1791,8 @@ def render_server_backed_single_word_lookup(
         recommended_code,
         candidates,
         occupied_words,
+        ordering_assessments,
+        include_controls=include_controls,
     )
     if not actionable:
         return ""
@@ -1727,7 +1822,20 @@ def render_server_backed_single_word_lookup(
                 re.IGNORECASE,
             )
         if reorder_copy is not None:
-            body = source[:reorder_copy.end()].rstrip()
+            if include_controls:
+                body = source[:reorder_copy.end()].rstrip()
+            else:
+                recommendation = validated_front_insert_recommendation(
+                    normalized_word, candidates, occupied_words, ordering_assessments,
+                )
+                if recommendation is None:
+                    return ""
+                body = "\n".join((
+                    source[:reorder_copy.start()].rstrip(),
+                    front_insert_recommendation_copy(
+                        recommendation, include_controls=False,
+                    ),
+                ))
             has_reorder_copy = True
         else:
             confirmation = re.search(
@@ -1757,6 +1865,10 @@ def render_server_backed_single_word_lookup(
     if not body or advertised_single_word_candidate_codes(body) != expected_codes:
         return ""
     if has_reorder_copy:
+        if not include_controls:
+            return ServerBackedQueryReply("\n".join((
+                body, f"推荐编码：{recommended}",
+            )))
         trailer = (
             single_word_candidate_footer(len(expected_codes))
             if actionable_controls
@@ -1767,7 +1879,7 @@ def render_server_backed_single_word_lookup(
     if not actionable_controls:
         recommendation += "（本次仅查询）"
     lines = [body, recommendation]
-    if actionable_controls:
+    if actionable_controls and include_controls:
         lines.append(single_word_candidate_footer(len(expected_codes)))
     return ServerBackedQueryReply("\n".join(lines))
 
@@ -1923,6 +2035,7 @@ _WORD_SET_ADVERTISEMENT_RE = re.compile(
     r"(?:列表中(?:的)?|上述|以上|这些|这批|其余|剩下(?:的)?)"
     r"(?:词|词条)?(?:都|全部)?"
     r"(?:加入|添加|加到|放入|写入)(?:到|进|入)?草稿"
+    r"(?!的(?:动作|操作|行为|流程))"
 )
 _QUOTED_WORD_SET_COMMAND_RE = re.compile(
     r"(?:回复|发送|直接发|可直接发)[^\n]{0,32}"
@@ -1974,6 +2087,19 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
                 command.startswith("确认执行")
                 and re.search(r"(?:可|可以)发送\s*$", prefix)
             )
+            scoped_selection = False
+            if renderer_bullet and re.fullmatch(
+                r"[\u3400-\u9fff]{1,32}\s+(?:[1-9]\d{0,2}|[a-z]{1,12})"
+                r"(?:\s*[，,、]\s*[\u3400-\u9fff]{1,32}\s+"
+                r"(?:[1-9]\d{0,2}|[a-z]{1,12}))*",
+                command,
+                re.IGNORECASE,
+            ):
+                from keytao_bot.harness.authorization_grammar import (
+                    parse_reviewed_multi_word_selection,
+                )
+
+                scoped_selection = parse_reviewed_multi_word_selection(command) is not None
             if (
                 0 < len(command) <= 256
                 and "\n" not in command
@@ -1982,7 +2108,10 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
                     or confirm_execution_lead
                     or renderer_bullet
                 )
-                and _COMMAND_SUGGESTION_VERB_RE.search(command) is not None
+                and (
+                    _COMMAND_SUGGESTION_VERB_RE.search(command) is not None
+                    or scoped_selection
+                )
                 and re.search(r"[\u3400-\u9fff]", command)
             ):
                 positioned.append((start, command))
@@ -2030,6 +2159,10 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
                 f"回复{left}{form}{right}" in normalized
                 or f"发送{left}{form}{right}" in normalized
                 or f"或{left}{form}{right}" in normalized
+                or re.search(
+                    rf"(?m)^\s*[-•]\s*{re.escape(left + form + right)}\s*$",
+                    normalized,
+                ) is not None
                 for left, right in _ADVERTISED_QUOTE_PAIRS
             )
             action_list_advertisement = False

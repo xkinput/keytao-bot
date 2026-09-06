@@ -1953,11 +1953,29 @@ def _pending_state_binding_pairs(state: PendingState) -> Tuple[Tuple[str, str], 
     return ()
 
 
+def _candidate_render_lines(text: str) -> Tuple[str, ...]:
+    """Ignore blank-line cleanup performed by the platform text adapter."""
+    return tuple(line.strip() for line in str(text).splitlines() if line.strip())
+
+
 def _advertised_reply_matches_live_record(
     response: str,
     record: Optional[PendingStateRecord],
 ) -> bool:
     """Prove that every advertised stateful form has an actor-owned live target."""
+    if (
+        record is not None and not record.execution_id
+        and isinstance(record.state, PendingToolConfirm)
+        and record.state.args.get("_reviewed_multi_word") is True
+        and record.state.confirmation_source == "local_preview"
+    ):
+        rendered = _render_live_batch_record(record)
+        if not rendered or _candidate_render_lines(response) != _candidate_render_lines(rendered):
+            return False
+        return all(
+            _chat_routing.message_authorizes_live_pending_mutation(command, record.state)
+            for command in advertised_reply_contract(rendered).command_suggestions
+        )
     contract = advertised_reply_contract(response)
     if not contract.requires_live_state:
         return True
@@ -2154,10 +2172,22 @@ def _render_live_batch_record(record: Optional[PendingStateRecord]) -> str:
     )
     if replace_at_code:
         return replace_at_code
-    return render_server_backed_batch_candidates(
+    if (
+        record.state.args.get("_reviewed_multi_word") is True
+        and record.state.confirmation_source == "server_warning"
+    ):
+        if not _state.server_warning_ticket_is_complete(record.state):
+            return ""
+        return _chat_render._format_server_bound_confirmation_prompt(record.state)
+    rendered = render_server_backed_batch_candidates(
         record.state.args.get("items"),
         record.state.args.get("_candidate_scopes"),
     )
+    if rendered and record.state.args.get("_reviewed_multi_word") is True:
+        return "\n\n".join([
+            *record.state.args.get("_query_other_blocks", []), rendered,
+        ])
+    return rendered
 
 
 def _render_live_shift_record(record: Optional[PendingStateRecord]) -> str:
@@ -2212,6 +2242,12 @@ def _reply_carries_live_candidate_state(
     if record is None or record.execution_id or "候选" not in response:
         return False
     state = record.state
+    if (
+        isinstance(state, PendingToolConfirm)
+        and state.args.get("_reviewed_multi_word") is True
+        and state.confirmation_source == "server_warning"
+    ):
+        return False
     if isinstance(state, PendingAdvertisedWordSets):
         return bool(
             len(state.snapshots) == 1
@@ -2285,6 +2321,11 @@ def _live_candidate_affordances_are_complete(
 ) -> bool:
     """Require whole-state assent plus selection whenever candidates are numbered."""
     contract = advertised_reply_contract(response)
+    if (
+        isinstance(record.state, PendingToolConfirm)
+        and record.state.args.get("_reviewed_multi_word") is True
+    ):
+        return _advertised_reply_matches_live_record(response, record)
     if not {"加入", "加入并提交"}.issubset(contract.batch_assent_forms):
         return False
     if isinstance(record.state, PendingAdvertisedWordSets):
@@ -2362,6 +2403,34 @@ def _strip_unbacked_commonness_copy(
     return "\n".join(kept)
 
 
+_NUMBERED_CANDIDATE_ROW_RE = re.compile(
+    r"(?mi)^\s*\d+\s*[.．、)）]\s*(?:`|\*\*)?([a-z]{1,12})(?:`|\*\*)?"
+    r"\s*(?:[—–\-:：]|\s)\s*[^\n]*"
+    r"(?:已有|占用|占位|空位|推荐)"
+)
+
+
+def _numbered_candidates_match_record(text: str, record: Optional[PendingStateRecord]) -> bool:
+    """Numbered occupancy rows need the exact trusted inventory, even sans footer."""
+    codes = tuple(match.group(1).lower() for match in _NUMBERED_CANDIDATE_ROW_RE.finditer(text))
+    if not codes:
+        return True
+    if record is None or record.execution_id:
+        return False
+    state = record.state
+    if isinstance(state, PendingAddWord):
+        return bool(
+            state.server_candidates and state.server_candidates == state.candidates
+            and state.word in text
+            and codes == tuple(code for code, _occupied in state.server_candidates)
+        )
+    if isinstance(state, PendingToolConfirm):
+        rendered = _render_live_batch_record(record)
+        expected = tuple(match.group(1).lower() for match in _NUMBERED_CANDIDATE_ROW_RE.finditer(rendered))
+        return bool(expected and codes == expected and _candidate_render_lines(text) == _candidate_render_lines(rendered))
+    return False
+
+
 def _enforce_advertised_reply_contract(
     response: str,
     conv_key: Optional[ConversationKey],
@@ -2380,6 +2449,15 @@ def _enforce_advertised_reply_contract(
         if conv_key is not None
         else None
     )
+    if not _numbered_candidates_match_record(text, record):
+        replacement = (
+            _render_live_single_candidate_record(record)
+            or _render_live_batch_record(record)
+        )
+        if replacement and _advertised_reply_matches_live_record(replacement, record):
+            return replacement
+        logger.warning("[advertised_reply_contract] branch=unbacked_numbered_candidates")
+        return "当前没有可验证的可执行操作，本次未写入。"
     carries_live_candidates = _reply_carries_live_candidate_state(text, record)
     if (
         carries_live_candidates
@@ -4503,6 +4581,26 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
         state_record = conversation_state_store.get_record(ctx.conv_key)
         state = state_record.state if state_record else None
         if (
+            isinstance(state, PendingToolConfirm)
+            and state.function_name == "keytao_batch_add_to_draft"
+            and (
+                state.args.get("_reviewed_multi_word") is True
+                or isinstance(state.args.get("_reviewed_batch_readings"), list)
+            )
+        ):
+            # All adapters consume the same record-bound multiword executor.
+            # Re-entering the legacy batch branch would drop review seals.
+            active = draft_operation_coordinator.get(ctx.conv_key)
+            if active is not None:
+                ctx.response = _format_active_draft_operation_message(active, state)
+            else:
+                ctx.response = await handle_pending_message_core(
+                    ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
+                    history=ctx.history, space_key=ctx.space_key,
+                    owner_label=ctx.owner_label, allow_intent_model=False,
+                )
+            return False
+        if (
             ctx.scoped_pending_state is not None
             and state_record is ctx.current_pending_record
         ):
@@ -5174,7 +5272,9 @@ async def _stage_normalize_response(ctx: TurnContext) -> bool:
     if isinstance(ctx.response, ServerBackedQueryReply):
         return False
     ctx.response = _normalize_generated_review_copy(ctx.response)
-    ctx.response = _ensure_pending_add_word_guidance(ctx.response)
+    record = conversation_state_store.get_record(ctx.conv_key)
+    if _reply_carries_live_candidate_state(ctx.response, record):
+        ctx.response = _ensure_pending_add_word_guidance(ctx.response)
     return False
 
 
@@ -5413,6 +5513,7 @@ _CHAT_COMPAT_STDLIB_TYPING_WHITELIST = frozenset({
 # New cross-module shared names must be registered here so legacy
 # ``patch.object(openai_chat, ...)`` writes reach every extracted owner.
 _CHAT_COMPAT_NAMES = (
+    "render_server_backed_batch_candidates",
     "get_driver",
     "Bot",
     "Event",
