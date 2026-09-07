@@ -612,6 +612,11 @@ def _pending_tool_assent_intent(
     message_text: str,
 ) -> Optional[MessageCommandIntent]:
     """Resolve shared natural assent against one server-backed live state."""
+    from ..utils.offered_options import offered_option_intent
+
+    offered_intent = offered_option_intent(message_text, state)
+    if offered_intent:
+        return MessageCommandIntent(intent=f"pending_{offered_intent}", confidence=1.0)
     if isinstance(state, PendingToolConfirm):
         continuation_command = str(
             state.args.get("_continuation_command") or ""
@@ -693,6 +698,7 @@ def _pending_trusted_word_action_matches(
     return bool(
         isinstance(state, PendingTrustedWordRecord)
         and trusted_word_record_is_complete(state)
+        and not getattr(state, "context_only", False)
         and not re.search(r"[?？]", message_text)
         and normalized in _TRUSTED_WORD_ACTION_NAMES
     )
@@ -1706,6 +1712,21 @@ def message_authorizes_live_pending_mutation(
     state: PendingState,
 ) -> bool:
     """Treat a closed selector as write intent only for one live server record."""
+    if isinstance(state, PendingTrustedWordRecord):
+        return bool(
+            trusted_word_record_is_complete(state)
+            and parse_explicit_code_request(
+                _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
+            ) is not None
+        )
+    if isinstance(state, PendingToolConfirm):
+        from ..utils.offered_options import offered_option_intent, is_force_assent
+        from ..harness.state import server_warning_ticket_is_complete
+
+        if offered_option_intent(message_text, state) == "confirm":
+            return True
+        if is_force_assent(message_text) and server_warning_ticket_is_complete(state):
+            return True
     if (
         isinstance(state, PendingToolConfirm)
         and state.args.get("_reviewed_multi_word") is True
@@ -1731,6 +1752,13 @@ def message_authorizes_live_pending_mutation(
         and state.server_candidates == state.candidates
     ):
         return False
+    from ..utils.offered_options import is_force_assent
+
+    if is_force_assent(message_text):
+        return bool(
+            state.recommended_code in {code for code, _occupied in state.server_candidates}
+            or len(state.server_candidates) == 1
+        )
     explicit = parse_explicit_code_request(
         _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
     )
@@ -2551,6 +2579,9 @@ async def _classify_message_command_intent(
     """Use the configured flash/intent model for command and pending-control semantics."""
     if not message_text.strip():
         return MessageCommandIntent()
+    from ..utils.same_code_reorder import parse_same_code_reorder
+    from ..utils.explicit_code import parse_explicit_entry_code_request
+
     pending_positional_add = _pending_positional_add_intent(
         pending_state,
         message_text,
@@ -2615,6 +2646,11 @@ async def _classify_message_command_intent(
     structural_draft_intent = _structural_draft_management_intent(message_text)
     if structural_draft_intent is not None:
         return structural_draft_intent
+    if isinstance(pending_state, PendingTrustedWordRecord) and message_authorizes_live_pending_mutation(message_text, pending_state):
+        # The trusted-word handler owns contextual code validation and execution.
+        return MessageCommandIntent()
+    if parse_same_code_reorder(message_text) is not None or parse_explicit_entry_code_request(message_text) is not None:
+        return MessageCommandIntent()
     if not OPENAI_API_KEY or not AsyncOpenAI:
         logger.warning("Command intent model unavailable; falling through to main AI flow")
         return MessageCommandIntent()

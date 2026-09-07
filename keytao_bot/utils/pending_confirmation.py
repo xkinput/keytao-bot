@@ -588,6 +588,10 @@ def parse_pending_assent_phrase(
     source = unicodedata.normalize("NFKC", str(text or "")).strip()
     source = re.sub(r"^\s*@\S+\s*", "", source, count=1)
     source = re.sub(r"^\s*(?:喵喵|键道)\s*", "", source, count=1)
+    from .offered_options import is_force_assent
+
+    if is_force_assent(source):
+        return PendingAssentPhrase(recognized=True, matched=True)
     submit_after = bool(
         _NATURAL_SUBMIT_RE.search(source)
         or any(
@@ -844,7 +848,10 @@ def already_existing_word_copy(
         if actions
         else "当前没有必须执行的变更；若保留现状，无需操作。"
     )
-    return f"「{word}」已在词库（{'、'.join(clean_codes)}）。\n{action_copy}"
+    return (
+        f"「{word}」已在词库（{'、'.join(clean_codes)}）。\n{action_copy}\n"
+        "回复「加入编码 <code>」可再追加一个编码（将 <code> 换成实际编码）。"
+    )
 
 
 _WARNING_COUNT_COPY_RE = re.compile(
@@ -2308,7 +2315,11 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         advertised_single_word_candidate_codes(normalized)
         and len(displayed_binding_pairs) <= 1
     )
-    generic_assent_forms = advertised_forms(PENDING_CONFIRM_ADVERTISED_FORMS)
+    from .offered_options import FORCE_ASSENT_TEXTS
+
+    generic_assent_forms = advertised_forms((
+        *PENDING_CONFIRM_ADVERTISED_FORMS, *sorted(FORCE_ASSENT_TEXTS),
+    ))
     batch_assent_forms = advertised_forms((
             *PENDING_BATCH_ADD_ADVERTISED_FORMS,
             *PENDING_BATCH_ADD_AND_SUBMIT_ADVERTISED_FORMS,

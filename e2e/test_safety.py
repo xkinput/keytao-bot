@@ -737,7 +737,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
     def test_scenario_pack_is_contiguous_through_s56(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 57)],
+            [f"S{index}" for index in range(1, 58)],
         )
 
     def test_s56_declares_exact_single_cascade_and_weaker_word_control(self) -> None:

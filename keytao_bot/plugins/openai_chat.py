@@ -2456,16 +2456,59 @@ def _enforce_advertised_reply_contract(
 ) -> str:
     """Single delivery guard for the advertisement-implies-live-state invariant."""
     server_backed_query = isinstance(response, ServerBackedQueryReply)
-    text = _strip_unbacked_commonness_copy(
-        str(response or ""),
-        keytao_review.current_commonness_evidence(),
-    )
-    contract = advertised_reply_contract(text)
     record = (
         conversation_state_store.get_record(conv_key)
         if conv_key is not None
         else None
     )
+    evidence = keytao_review.current_commonness_evidence()
+    if record is not None and not record.execution_id and isinstance(record.state, PendingToolConfirm) and _state.server_warning_ticket_is_complete(record.state):
+        plan = (record.state.args.get("_pending_display") or {}).get("shiftPlan") or {}
+        evidence = (*evidence, *(
+            line for line in plan.get("evidenceLines", [])
+            if isinstance(line, str) and line.startswith("常用度提示：")
+        ))
+    text = _strip_unbacked_commonness_copy(
+        str(response or ""),
+        evidence,
+    )
+    contract = advertised_reply_contract(text)
+    from ..utils.offered_options import (
+        is_force_assent,
+        option_questions_bind_live_state,
+        structural_option_questions,
+    )
+    from ..utils.explicit_code import parse_explicit_entry_code_request
+    from ..utils.same_code_reorder import parse_same_code_reorder
+
+    current_message = _current_turn_message.get("")
+    write_flow = bool(
+        not current_message
+        or message_authorizes_mutation(current_message)
+        or _authorization_grammar.looks_like_mutation_grammar_gap(current_message)
+        or parse_explicit_entry_code_request(current_message) is not None
+        or parse_same_code_reorder(current_message) is not None
+        or is_force_assent(current_message)
+        or contract.requires_live_state
+        or (
+            record is not None
+            and _pending_tool_assent_intent(record.state, current_message) is not None
+        )
+    )
+    if write_flow and structural_option_questions(text) and not (
+        record is not None
+        and not record.execution_id
+        and option_questions_bind_live_state(text, record.state)
+    ):
+        replacement = (
+            _render_live_shift_record(record)
+            or _render_live_single_candidate_record(record)
+            or _render_live_batch_record(record)
+        )
+        if replacement and not structural_option_questions(replacement) and _advertised_reply_matches_live_record(replacement, record):
+            return replacement
+        logger.warning("[advertised_reply_contract] branch=unbacked_option_question")
+        return "当前没有可验证的可执行操作，本次未写入。"
     if not _numbered_candidates_match_record(text, record):
         replacement = (
             _render_live_single_candidate_record(record)
@@ -3351,6 +3394,51 @@ async def _stage_handle_completed_draft_undo(ctx: TurnContext) -> bool:
     return True
 
 
+async def _stage_claim_offered_answer(ctx: TurnContext) -> bool:
+    """Keep the actor's previous offered answer out of word discovery."""
+    from ..utils.offered_options import (
+        is_force_assent,
+        matches_previous_bot_option,
+        offered_option_intent,
+        render_missing_option_ticket,
+    )
+
+    history = get_history(ctx.conv_key)
+    force = is_force_assent(ctx.normalized_message_text)
+    offered = matches_previous_bot_option(ctx.normalized_message_text, history)
+    if not force and not offered:
+        return False
+    record = conversation_state_store.get_record(ctx.conv_key)
+    if record is not None and not record.execution_id and isinstance(record.state, (PendingAddWord, PendingToolConfirm)):
+        if force or offered_option_intent(ctx.normalized_message_text, record.state):
+            return False
+    ctx.response = render_missing_option_ticket(history)
+    set_turn_flow("pending-confirmation")
+    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+    await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment)
+    return True
+
+
+async def _stage_handle_explicit_entry_operation(ctx: TurnContext) -> bool:
+    """Resolve explicit requests after arbitration and before pending dispatch."""
+    from ..utils.same_code_reorder import try_handle_same_code_reorder
+
+    response = await try_handle_same_code_reorder(
+        ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.space_key, ctx.owner_label,
+    )
+    if response is None:
+        response = await _chat_commands.try_handle_explicit_entry_code_command(
+            ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
+            ctx.space_key, ctx.owner_label,
+        )
+    if response is None:
+        return False
+    ctx.response = response
+    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, response)
+    await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment)
+    return True
+
+
 async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     """Production scenario: bind live pending state to the current reply and actor scope."""
     current_record = conversation_state_store.get_record(ctx.conv_key)
@@ -3507,9 +3595,15 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
         ):
             # The lookup snapshot applies only to the immediately following
             # turn. Any non-action consumes it before ordinary routing.
-            if not _pending_trusted_word_action_matches(
-                ctx.current_pending_record.state,
-                ctx.normalized_message_text,
+            if not (
+                _pending_trusted_word_action_matches(
+                    ctx.current_pending_record.state,
+                    ctx.normalized_message_text,
+                )
+                or _chat_routing.message_authorizes_live_pending_mutation(
+                    ctx.normalized_message_text,
+                    ctx.current_pending_record.state,
+                )
             ):
                 conversation_state_store.delete(ctx.conv_key)
                 ctx.current_pending_record = None
@@ -3717,6 +3811,14 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
         ctx.generic_command_intent = MessageCommandIntent()
     elif ctx.scoped_pending_intent is not None:
         ctx.generic_command_intent = ctx.scoped_pending_intent
+    elif (
+        ctx.current_pending_record is not None
+        and isinstance(ctx.current_pending_record.state, PendingTrustedWordRecord)
+        and _chat_routing.message_authorizes_live_pending_mutation(
+            ctx.normalized_message_text, ctx.current_pending_record.state,
+        )
+    ):
+        ctx.generic_command_intent = MessageCommandIntent()
     elif ctx.resolved_advertised_words:
         ctx.generic_command_intent = MessageCommandIntent()
     elif ctx.quoted_pending_add_control:
@@ -5449,6 +5551,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_visual_probe_timeout,
     _stage_initialize_conversation,
     _stage_handle_completed_draft_undo,
+    _stage_claim_offered_answer,
     _stage_resolve_current_pending_scope,
     _stage_finish_scoped_pending_response,
     _stage_guard_stale_confirmation,
@@ -5464,6 +5567,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_arbitrate_other_owner_pending,
     _stage_handle_referenced_word_presence,
     _stage_recall_active_operation,
+    _stage_handle_explicit_entry_operation,
     _stage_execute_pending_state,
     _stage_submit_current_draft,
     _stage_handle_draft_management,

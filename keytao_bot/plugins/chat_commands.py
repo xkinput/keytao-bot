@@ -37,6 +37,7 @@ from ..harness.authorization_grammar import (
     parse_eviction_modified_add,
     parse_replace_at_code,
     replace_at_code_items_match,
+    server_warning_confirmation_binding,
     unnamed_eviction_modified_add_item,
 )
 from ..harness.state import (
@@ -68,7 +69,12 @@ from ..harness.tools import (
 from ..utils.history_store import HistoryGenerationToken, get_history_store
 from ..utils.draft_mutation_store import get_default_draft_mutation_claim_store
 from ..utils.candidate_inventory import select_candidate_inventory, protected_candidate_occupants
-from ..utils.explicit_code import parse_explicit_code_request, validate_explicit_code
+from ..utils.explicit_code import (
+    ExplicitEntryCodeRequest,
+    parse_explicit_code_request,
+    parse_explicit_entry_code_request,
+    validate_explicit_code,
+)
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import observe_model_call, set_turn_flow
@@ -260,6 +266,19 @@ memory_compaction_tasks: Dict[Tuple[str, str], asyncio.Task[Any]] = {}
 current_memory_context: ContextVar[Optional[ChatMemoryContext]] = ContextVar(
     "current_memory_context",
     default=None,
+)
+
+
+@dataclass(frozen=True)
+class _ExplicitAdditionalCodeCapability:
+    word: str
+    code: str
+    phrase_type: str
+    existing_codes: Tuple[str, ...]
+
+
+_current_explicit_additional_code: ContextVar[Optional[_ExplicitAdditionalCodeCapability]] = ContextVar(
+    "current_explicit_additional_code", default=None,
 )
 
 
@@ -3589,7 +3608,7 @@ async def _try_handle_simple_single_word_query(
             for phrase in matching_rows
         ))
         if existing_codes:
-            if len(existing_codes) == 1 and conv_key is not None and _prepared_scopes is None:
+            if conv_key is not None and _prepared_scopes is None:
                 phrase_types = tuple(dict.fromkeys(
                     str(phrase.get("type") or "").strip()
                     for phrase in matching_rows
@@ -3602,13 +3621,17 @@ async def _try_handle_simple_single_word_query(
                         word,
                         existing_codes[0],
                         phrase_types[0],
+                        context_only=len(existing_codes) > 1,
                     )
                     if len(phrase_types) == 1
                     else None
                 )
                 if (
                     trusted_row is not None
-                    and conversation_state_store.get_record(conv_key) is None
+                    and (
+                        conversation_state_store.get_record(conv_key) is None
+                        or isinstance(conversation_state_store.get(conv_key), PendingTrustedWordRecord)
+                    )
                 ):
                     conversation_state_store.set(
                         conv_key,
@@ -4430,7 +4453,40 @@ def _create_preview_can_auto_confirm(
     return bool(
         _create_preview_has_no_new_warnings(preview_data)
         or create_warning_confirmation_binding(preview_data, arguments)
+        or _explicit_additional_code_warning_matches(preview_data, arguments)
     )
+
+
+def _explicit_additional_code_warning_matches(preview_data: Dict, arguments: Dict) -> bool:
+    """A same-turn explicit additional code acknowledges only that exact warning."""
+    capability = _current_explicit_additional_code.get()
+    if (
+        capability is None
+        or (arguments.get("word"), arguments.get("code")) != (capability.word, capability.code)
+        or arguments.get("action", "Create") != "Create"
+        or arguments.get("type", capability.phrase_type) != capability.phrase_type
+        or server_warning_confirmation_binding(preview_data) is None
+        or not preview_data.get("warnings")
+    ):
+        return False
+    for warning in preview_data["warnings"]:
+        if not isinstance(warning, dict) or warning.get("warningType") != "multiple_code":
+            return False
+        item, existing = warning.get("item"), warning.get("existing")
+        if (
+            not isinstance(item, dict) or not isinstance(existing, dict)
+            or (item.get("action"), item.get("word"), item.get("code"), item.get("type"))
+            != ("Create", capability.word, capability.code, capability.phrase_type)
+            or item.get("oldWord") not in (None, "")
+            or item.get("remark", "") != arguments.get("remark", "")
+            or item.get("needsManualReview") is not arguments.get("needs_manual_review")
+            or existing.get("word") != capability.word
+            or existing.get("code") not in capability.existing_codes
+            or existing.get("code") == capability.code
+            or existing.get("type", capability.phrase_type) != capability.phrase_type
+        ):
+            return False
+    return True
 
 
 def _create_warning_ordering_summary(data: Dict, arguments: Dict) -> str:
@@ -5896,9 +5952,15 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 for line in shift_plan.get("evidenceLines") or []
                 if str(line).strip()
             ]
-            decisive_evidence = _compact_ranked_shift_evidence(evidence_lines)
-            if decisive_evidence:
-                evidence_summary.append(decisive_evidence)
+            if any(line.startswith("将把 ") for line in evidence_lines) and any(
+                line.startswith("常用度提示：") for line in evidence_lines
+            ):
+                evidence_summary = []
+                lines.extend(evidence_lines)
+            else:
+                decisive_evidence = _compact_ranked_shift_evidence(evidence_lines)
+                if decisive_evidence:
+                    evidence_summary.append(decisive_evidence)
             if evidence_summary:
                 lines.append("依据：" + "；".join(evidence_summary))
         else:
@@ -6068,6 +6130,45 @@ def _format_ranked_shift_success(data: Dict[str, Any]) -> str:
     shift_plan = data.get("shiftPlan") if isinstance(data.get("shiftPlan"), dict) else {}
     target_word = str(shift_plan.get("word") or "").strip()
     target_code = str(shift_plan.get("targetCode") or "").strip()
+    snapshot = data.get("draft_snapshot")
+    if (
+        data.get("success") is True
+        and shift_plan.get("scope") == "same_code"
+        and isinstance(snapshot, dict)
+        and snapshot.get("success") is True
+        and data.get("batchId")
+        and snapshot.get("batchId") == data.get("batchId")
+    ):
+        current = {
+            (entry.get("word"), entry.get("code"), entry.get("type")): entry
+            for entry in shift_plan.get("currentState") or []
+            if isinstance(entry, dict) and entry.get("source") == "live"
+        }
+        for proposed in shift_plan.get("proposedState") or []:
+            if not isinstance(proposed, dict):
+                continue
+            identity = (proposed.get("word"), proposed.get("code"), proposed.get("type"))
+            previous = current.get(identity)
+            if previous is None or previous.get("weight") == proposed.get("weight"):
+                continue
+            matches = [
+                row for row in snapshot.get("items") or []
+                if isinstance(row, dict)
+                and (row.get("word"), row.get("code"), row.get("type")) == identity
+                and row.get("action") == "Change"
+                and (row.get("oldWord") or row.get("old_word")) == identity[0]
+            ]
+            if (
+                len(matches) == 1
+                and matches[0].get("weight") == proposed.get("weight")
+                and all(isinstance(weight, int) and not isinstance(weight, bool) for weight in (
+                    previous.get("weight"), proposed.get("weight"),
+                ))
+            ):
+                changes.append(
+                    f"{identity[0]} {identity[1]} 权重 "
+                    f"{previous['weight']}→{proposed['weight']}"
+                )
     receipts = data.get("receipts") if isinstance(data.get("receipts"), list) else []
     for receipt in receipts:
         if not isinstance(receipt, dict) or receipt.get("status") not in {
@@ -6109,7 +6210,7 @@ def _format_ranked_shift_success(data: Dict[str, Any]) -> str:
             for update in shift_plan.get("draftUpdates") or []
             if isinstance(update, dict) and str(update.get("word") or "").strip()
         )
-    if target_word and target_code:
+    if target_word and target_code and shift_plan.get("scope") != "same_code":
         changes.insert(0, f"{target_word} → {target_code}")
     lines = ["✅ 操作已完成"]
     if changes:
@@ -9892,6 +9993,12 @@ async def _try_handle_draft_management_command(
     owner_label: str = "",
     command_intent: Optional[MessageCommandIntent] = None,
 ) -> Optional[str]:
+    from ..utils.same_code_reorder import try_handle_same_code_reorder
+    reorder_reply = await try_handle_same_code_reorder(
+        message_text, platform, user_id, space_key, owner_label,
+    )
+    if reorder_reply is not None:
+        return reorder_reply
     compact_command = re.sub(
         r"[\s，,。.!！~～]+",
         "",
@@ -10393,7 +10500,15 @@ async def _handle_pending_add_word(
         and source_intent.target_word
         and source_intent.target_word in state.server_occupied_words.get(selected_code, [])
     )
-    if (protected and not named_eviction) or (
+    from ..utils.offered_options import is_force_assent
+    forced_selection = bool(
+        is_force_assent(msg)
+        and len(selected_codes) == 1
+        and state.server_candidates == state.candidates
+        and selected_code in dict(state.server_candidates)
+        and "" not in protected
+    )
+    if (protected and not named_eviction and not forced_selection) or (
         not selected_code and command_intent.intent in {"pending_confirm", "pending_add_and_submit"}
     ):
         if restore_pending is not None:
@@ -11353,6 +11468,14 @@ async def _resolve_pending_trusted_word_action(
         or state_record.owner_key.actor_id != str(user_id)
     ):
         return None
+    explicit = parse_explicit_code_request(
+        _strip_command_message_prefixes(trusted_mutation_source(message)), state.word,
+    )
+    if explicit is not None and trusted_word_record_is_complete(state):
+        return await _execute_explicit_entry_code_request(
+            ExplicitEntryCodeRequest(state.word, explicit.code, explicit.submit_after),
+            message, platform, user_id, conv_key, space_key, owner_label,
+        )
     if not _pending_trusted_word_action_matches(state, message):
         conversation_state_store.delete(conv_key)
         return None
@@ -11476,6 +11599,8 @@ async def _bind_explicit_pending_code(state, request, platform, user_id):
     derived.candidates = [(value, occupied) for value, occupied in derived.candidates if value != code]
     derived.candidates.append((code, bool(rows)))
     derived.server_candidates = list(derived.candidates)
+    derived.recommended_code = code
+    derived.pronunciation_recommended_codes = [code]
     occupants = list(dict.fromkeys(row["word"] for row in rows))
     derived.occupied_words[code] = occupants
     derived.server_occupied_words[code] = occupants
@@ -11499,6 +11624,124 @@ async def _bind_explicit_pending_code(state, request, platform, user_id):
     elif code not in derived.code_remarks:
         derived.code_remarks[code] = f"喵喵审词：读音 {validation.pinyin}；{derived.manual_review_reason}"
     return derived, ""
+
+
+async def _execute_explicit_entry_code_request(
+    request: ExplicitEntryCodeRequest,
+    message: str,
+    platform: str,
+    user_id: str,
+    conv_key: ConversationKey,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> str:
+    """Review the named item before granting its additional-code capability."""
+    raw = await call_tool_function(
+        "keytao_prepare_reviewed_add", {"word": request.word}, platform, user_id,
+    )
+    try:
+        review = json.loads(raw)
+    except (TypeError, ValueError):
+        review = {}
+    phrase_type = "Single" if len(request.word) == 1 else "Phrase"
+    if (
+        not isinstance(review, dict)
+        or review.get("success") is not True
+        or review.get("word") != request.word
+        or str(review.get("type") or "Phrase") != phrase_type
+    ):
+        return f"未能取得「{request.word}」的已审读音和正确词条类型，本次未写入。"
+    inventory = select_candidate_inventory(review)
+    if inventory is None or any(
+        not str(inventory.readings.get(code) or "").strip()
+        for code, _occupied in inventory.candidates
+    ):
+        return f"「{request.word}」缺少可核验的读音候选，本次未写入。"
+    manual_reason = str(review.get("manualReviewReason") or "")
+    reviewed = PendingAddWord(
+        word=request.word,
+        recommended_code=str(review.get("recommendedCode") or ""),
+        candidates=list(inventory.candidates),
+        occupied_words={status["code"]: list(status["words"]) for status in inventory.statuses},
+        pronunciation_codes=dict(inventory.readings),
+        phrase_type=phrase_type,
+        needs_manual_review=review.get("needsManualReview") is not False,
+        manual_review_reason=manual_reason,
+        code_remarks={code: f"喵喵审词：读音 {pinyin}；{manual_reason}" for code, pinyin in inventory.readings.items()},
+    )
+    _attach_server_candidate_snapshot(
+        reviewed, [dict(status) for status in inventory.statuses],
+        review.get("candidateOrderingAssessments"),
+    )
+    derived, failure = await _bind_explicit_pending_code(reviewed, request, platform, user_id)
+    if failure:
+        return failure
+    if not conversation_state_store.set(conv_key, derived, space_key=space_key, owner_label=owner_label):
+        return "指定编码的核验记录未能保存，本次未写入。"
+    existing_codes = tuple(dict.fromkeys(
+        row["code"] for row in review.get("existing", [])
+        if isinstance(row, dict) and row.get("word") == request.word
+        and row.get("type") == phrase_type
+        and isinstance(row.get("code"), str)
+        and re.fullmatch(r"[a-z]{1,6}", row["code"])
+        and row["code"] != request.code
+    )) if isinstance(review.get("existing"), list) else ()
+    capability = (
+        _ExplicitAdditionalCodeCapability(request.word, request.code, phrase_type, existing_codes)
+        if existing_codes and dict(derived.server_candidates).get(request.code) is False
+        else None
+    )
+    capability_token = _current_explicit_additional_code.set(capability)
+    try:
+        response = await handle_pending_message_core(
+            message, platform, user_id, conv_key,
+            space_key=space_key, owner_label=owner_label, allow_intent_model=False,
+        )
+    finally:
+        _current_explicit_additional_code.reset(capability_token)
+    if response is None:
+        return "指定编码未能与已审记录绑定，本次未写入。"
+    note = (
+        f"审词：读音 {derived.pronunciation_codes[request.code]}；{derived.manual_review_reason}\n"
+        if derived.manual_review_reason else ""
+    )
+    return note + response
+
+
+async def try_handle_explicit_entry_code_command(
+    message: str,
+    platform: str,
+    user_id: str,
+    conv_key: ConversationKey,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> Optional[str]:
+    """Claim only a complete word-and-code command before lexical discovery."""
+    source = _strip_command_message_prefixes(trusted_mutation_source(message))
+    request = parse_explicit_entry_code_request(source)
+    if request is None:
+        return None
+    record = conversation_state_store.get_record(conv_key)
+    if record is not None:
+        if record.execution_id:
+            return "上一项操作仍在处理中，本次未追加编码。"
+        if isinstance(record.state, PendingAddWord):
+            if record.state.word == request.word:
+                return await handle_pending_message_core(
+                    message, platform, user_id, conv_key, space_key=space_key,
+                    owner_label=owner_label, allow_intent_model=False,
+                )
+        elif isinstance(record.state, PendingToolConfirm):
+            recent_write_receipt = bool(
+                record.state.function_name == "keytao_submit_batch"
+                and record.state.args.get("_recent_own_write") is True
+            )
+            if not recent_write_receipt:
+                return _format_live_ticket_precedence_message(record.state)
+    set_turn_flow("explicit-code")
+    return await _execute_explicit_entry_code_request(
+        request, message, platform, user_id, conv_key, space_key, owner_label,
+    )
 
 
 async def handle_pending_message_core(

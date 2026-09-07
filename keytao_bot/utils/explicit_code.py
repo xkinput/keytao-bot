@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import re
+import unicodedata
 
 from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code
 
@@ -10,6 +11,44 @@ from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code
 class ExplicitCodeRequest:
     code: str
     submit_after: bool = False
+
+
+@dataclass(frozen=True)
+class ExplicitEntryCodeRequest:
+    word: str
+    code: str
+    submit_after: bool = False
+
+
+def parse_explicit_entry_code_request(message: str):
+    """Bind a complete add-code command to its explicitly named item."""
+    source = unicodedata.normalize("NFKC", message).strip()
+    if re.match(r"加入\s*编码", source):
+        return None
+    word = r'[\u3400-\u9fff\U00020000-\U0003134f]{1,32}'
+    code = r'[^\s，,；;。？?「」『』“”\"\']+?'
+
+    def operand(pattern):
+        return rf'(?:{pattern}|"\s*{pattern}\s*"|“\s*{pattern}\s*”|「\s*{pattern}\s*」|『\s*{pattern}\s*』)'
+
+    word_operand = operand(word)
+    code_operand = operand(code)
+    patterns = (
+        rf'(?:添加|加入)\s*(?P<type>单字|词组|词条)?\s*(?P<word>{word_operand})'
+        rf'(?:\s*[,，]?\s*编码\s*(?:为|是)?\s*[:：]?\s*|\s+)(?P<code>{code_operand})',
+        rf'给\s*(?P<word>{word_operand})\s*加(?:一个|个)?\s*(?:编码|码)\s*(?P<code>{code_operand})',
+        rf'(?P<word>{word_operand})\s*也放到\s*(?P<code>{code_operand})',
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern + r'\s*(?P<submit>并提交)?', source)
+        if match is None:
+            continue
+        selected_word = match.group("word").strip(' "“”「」『』')
+        selected_code = match.group("code").strip(' "“”「」『』')
+        if match.groupdict().get("type") == "单字" and len(selected_word) != 1:
+            return None
+        return ExplicitEntryCodeRequest(selected_word, selected_code, bool(match.group("submit")))
+    return None
 
 
 @dataclass(frozen=True)
@@ -27,6 +66,9 @@ class ExplicitCodeValidation:
 
 def parse_explicit_code_request(message: str, word: str):
     """Consume one direct command; never discard an extra target or clause."""
+    entry = parse_explicit_entry_code_request(message)
+    if entry is not None:
+        return ExplicitCodeRequest(entry.code, entry.submit_after) if entry.word == word else None
     match = re.fullmatch(
         rf"(?:加入\s*编码\s*|加入\s+|添加\s+{re.escape(word)}\s+|用\s+)"
         r"(?P<code>[^\s，,；;。？?「」“”]+?)(?:\s*(?P<submit>并提交))?",

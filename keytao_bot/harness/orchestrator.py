@@ -21,6 +21,10 @@ from keytao_bot.utils.llm_policy import (
 from keytao_bot.utils.history_store import _parse_stored_timestamp
 from keytao_bot.utils import keytao_review, review_flags
 from keytao_bot.utils.candidate_inventory import select_candidate_inventory
+from keytao_bot.utils.offered_options import (
+    option_questions_bind_live_state,
+    structural_option_questions,
+)
 from keytao_bot.utils.observability import (
     mark_turn_outcome,
     observe_model_call,
@@ -767,6 +771,31 @@ class AgentOrchestrator:
             rendered = str(text or "")
             contract = advertised_reply_contract(rendered)
             record = self._state_store.get_record(conv_key)
+            if context.mutations_allowed and structural_option_questions(rendered) and not (
+                record is not None
+                and not record.execution_id
+                and option_questions_bind_live_state(rendered, record.state)
+            ):
+                logger.warning("[advertised_reply_contract] branch=unbacked_model_option_question")
+                if termination_state is not None:
+                    termination_state["model_authored_reply"] = False
+                from keytao_bot.plugins import chat_commands
+                state = record.state if record is not None and not record.execution_id else None
+                replacement = (
+                    chat_commands.render_pending_shift_plan(state)
+                    if isinstance(state, PendingToolConfirm)
+                    else ""
+                )
+                if not replacement and isinstance(state, PendingAddWord):
+                    replacement = render_server_backed_single_word_candidates(
+                        state.word, state.recommended_code, state.server_candidates,
+                        state.server_occupied_words, state.server_ordering_assessments,
+                    ) if state.server_candidates == state.candidates else ""
+                if not replacement and isinstance(state, PendingToolConfirm):
+                    replacement = render_server_backed_batch_candidates(
+                        state.args.get("items"), state.args.get("_candidate_scopes"),
+                    )
+                return replacement or "当前没有可验证的可执行操作，本次未写入。"
             if (
                 contract.command_suggestions
                 and not command_suggestions_are_closed_candidate_selections(

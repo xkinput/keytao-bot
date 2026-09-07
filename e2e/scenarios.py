@@ -9330,8 +9330,11 @@ S56_WORD_CONTROL = ("发布会", "重病号", "fbh")
 
 def _s56_advertised_reply_commands(reply: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """Collect concrete advertised controls without inventing placeholder inputs."""
+    from keytao_bot.utils.offered_options import structural_option_questions
+
     contract = advertised_reply_contract(reply)
     commands = [*contract.generic_assent_forms, *contract.batch_assent_forms, *contract.command_suggestions]
+    commands.extend(option for question in structural_option_questions(reply) for option in question.options)
     for match in re.finditer(r"(?:回复|发送|或|如)\s*[「“『]([^」”』\n]+)[」”』]", reply):
         command = match.group(1).strip()
         if command in {"确认", "取消", "提交", "撤销", "撤回", "回滚", "是", "否"} or re.fullmatch(
@@ -9356,8 +9359,17 @@ async def _assert_s56_advertised_reply_closure(
     from keytao_bot.harness.state import PendingAddWord, PendingToolConfirm
     from keytao_bot.plugins import chat_routing as routing
     from keytao_bot.utils import completed_draft_undo as undo
+    from keytao_bot.utils.offered_options import (
+        offered_option_intent, option_questions_bind_live_state, structural_option_questions,
+    )
 
     commands, envelopes = _s56_advertised_reply_commands(reply)
+    if structural_option_questions(reply):
+        require(
+            record is not None and not record.execution_id
+            and option_questions_bind_live_state(reply, record.state),
+            f"Advertised options lack a complete live ticket and exact option bindings: {reply}",
+        )
     if not commands:
         return None
     state = record.state if record is not None else None
@@ -9426,7 +9438,7 @@ async def _assert_s56_advertised_reply_closure(
             continue
 
         require(record is not None, f"S56 advertised commands without a live record: {reply}")
-        if command == "取消":
+        if command == "取消" or offered_option_intent(command, state) == "cancel":
             require(
                 intent.intent == "pending_cancel"
                 and routing._message_authorizes_pending_state_control(state, command, intent),
@@ -9871,6 +9883,9 @@ async def scenario_s56(ctx: ScenarioContext) -> dict[str, Any]:
         facts["cleanup"] = await cleanup()
 
 
+from .s57 import scenario_s57
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -9928,6 +9943,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S54", "bare multi-word reviewed candidate and selection closure", scenario_s54),
     Scenario("S55", "Single review, failure traceback, and tripped search backend", scenario_s55),
     Scenario("S56", "explicit codes, commonness-guarded eviction, and completed-write undo", scenario_s56),
+    Scenario("S57", "same-code reorder, offered answers, and existing-item extra code", scenario_s57),
 )
 
 

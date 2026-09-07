@@ -244,26 +244,31 @@ class PendingTrustedWordRecord:
 
     This record contains no action name or tool route and therefore grants no
     write authority.  A later bare action may use it only to request a fresh
-    server preview, which still requires its own confirmation.
+    server preview, which still requires its own confirmation. With
+    ``context_only=True`` the actual row supplies only the word/type identity
+    for an explicit additional-code request; no unique location is implied.
     """
 
     word: str
     code: str
     phrase_type: str
     record_digest: str
+    context_only: bool = False
 
 
 def _canonical_trusted_word_record(
     word: str,
     code: str,
     phrase_type: str,
+    context_only: bool = False,
 ) -> Optional[Tuple[str, str, str, str]]:
     """Normalize and seal one exact row captured from a successful lookup."""
     normalized_word = unicodedata.normalize("NFKC", str(word or "")).strip()
     normalized_code = str(code or "").strip().lower()
     normalized_type = str(phrase_type or "").strip()
     if (
-        not normalized_word
+        not isinstance(context_only, bool)
+        or not normalized_word
         or len(normalized_word.encode("utf-8")) > 512
         or not re.fullmatch(r"[a-z]{1,12}", normalized_code)
         or normalized_type not in {
@@ -277,6 +282,7 @@ def _canonical_trusted_word_record(
             "word": normalized_word,
             "code": normalized_code,
             "type": normalized_type,
+            **({"contextOnly": True} if context_only else {}),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -290,9 +296,11 @@ def create_pending_trusted_word_record(
     word: str,
     code: str,
     phrase_type: str,
+    *,
+    context_only: bool = False,
 ) -> Optional[PendingTrustedWordRecord]:
     """Build a non-authorizing previous-turn snapshot from trusted operands."""
-    canonical = _canonical_trusted_word_record(word, code, phrase_type)
+    canonical = _canonical_trusted_word_record(word, code, phrase_type, context_only)
     if canonical is None:
         return None
     normalized_word, normalized_code, normalized_type, digest = canonical
@@ -301,6 +309,7 @@ def create_pending_trusted_word_record(
         code=normalized_code,
         phrase_type=normalized_type,
         record_digest=digest,
+        context_only=context_only,
     )
 
 
@@ -310,6 +319,7 @@ def trusted_word_record_is_complete(state: PendingTrustedWordRecord) -> bool:
         state.word,
         state.code,
         state.phrase_type,
+        state.context_only,
     )
     if canonical is None:
         return False
@@ -530,6 +540,7 @@ def pending_execution_args(state: PendingToolConfirm) -> Dict:
     args = dict(state.args)
     args.pop("_pending_display", None)
     args.pop("_continuation_command", None)
+    args.pop("_offered_options", None)
     args.pop("_replace_at_code", None)
     return args
 
@@ -1736,6 +1747,7 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                 "code": record.state.code,
                 "phraseType": record.state.phrase_type,
                 "recordDigest": record.state.record_digest,
+                "contextOnly": record.state.context_only,
             }
             confirmation_source = "trusted_word_record"
         else:
@@ -1771,6 +1783,7 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                 code=str(canonical_arguments.get("code") or ""),
                 phrase_type=str(canonical_arguments.get("phraseType") or ""),
                 record_digest=str(canonical_arguments.get("recordDigest") or ""),
+                context_only=canonical_arguments.get("contextOnly", False),
             )
         else:
             canonical_state = PendingToolConfirm(
@@ -1904,6 +1917,7 @@ class SQLiteConversationStateStore(MemoryConversationStateStore):
                             code=str(arguments.get("code") or ""),
                             phrase_type=str(arguments.get("phraseType") or ""),
                             record_digest=str(arguments.get("recordDigest") or ""),
+                            context_only=arguments.get("contextOnly", False),
                         )
                     elif state_type == "tool_confirm":
                         state = PendingToolConfirm(

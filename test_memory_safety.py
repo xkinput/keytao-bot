@@ -13013,7 +13013,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_advertised_candidate_reply_persists_sealed_live_batch_ticket(
         self,
     ) -> None:
-        """A displayed multi-word candidate becomes one server-backed live ticket."""
+        """Unbound option questions redraw from the same sealed candidate ticket."""
         from keytao_bot.harness import orchestrator as orchestrator_module
         from keytao_bot.plugins import openai_chat as chat_module
 
@@ -13034,8 +13034,15 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             "是否以编码 zlzu 将「载流子」加入草稿？"
         )
         advertised_reply = (
-            model_reply
-            + "\n\n"
+            "2 个词的候选：\n"
+            "1. 「载流」\n"
+            "   候选：\n"
+            "   1. zhlq — 空位（推荐）\n"
+            "   自动审核：需管理员审核\n"
+            "2. 「载流子」\n"
+            "   候选：\n"
+            "   1. zlzu — 空位（推荐）\n"
+            "   自动审核：可自动通过\n"
             + pending_batch_confirmation_copy()
             + "\n每个词的编号都从 1 开始；回复「载流子 添加1」，"
             "多选回复「载流子 添加2、4」。"

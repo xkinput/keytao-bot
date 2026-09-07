@@ -5473,8 +5473,18 @@ async def _prepare_ranked_reorder_plan(
     ):
         return {"success": False, "message": "常用度重排需要至少两个唯一词条"}
 
+    same_code_weight_scope = bool(
+        expected_codes is not None
+        and len(expected_codes) == len(ordered_words)
+        and set(expected_codes) == {target_code}
+    )
     candidate_map: Dict[str, List[str]] = {}
     for ordered_word in ordered_words:
+        if same_code_weight_scope:
+            # The exact live/draft identity is re-read below. Reweighting an
+            # existing code does not need a new pronunciation or shape code.
+            candidate_map[ordered_word] = [target_code]
+            continue
         encoded = await _fetch_encode_candidates(ordered_word, target_code)
         if not encoded.get("success"):
             return encoded
@@ -5541,6 +5551,10 @@ async def _prepare_ranked_reorder_plan(
                 "source": "live",
             })
         matches = [*effective_live, *projected_by_word.get(ordered_word, [])]
+        if same_code_weight_scope:
+            # An in-place same-code reorder addresses that exact existing
+            # location; other codes of the same word are outside its scope.
+            matches = [entry for entry in matches if entry["code"] == target_code]
         if len(matches) != 1:
             return {
                 "success": False,
@@ -5562,6 +5576,7 @@ async def _prepare_ranked_reorder_plan(
     current_codes = [entry["code"] for entry in current_by_word.values()]
     if len(phrase_types) != 1:
         return {"success": False, "message": "这些词的类型不同，不能共用一条重排计划"}
+    same_code_type = next(iter(phrase_types)) if same_code_weight_scope else None
     same_code_scope = len(set(current_codes)) == 1
     if expected_codes is not None:
         if (
@@ -5656,6 +5671,7 @@ async def _prepare_ranked_reorder_plan(
         for entry in projected
         if entry["word"] not in desired_word_set
         and entry["code"] in desired_code_set
+        and (same_code_type is None or entry["type"] == same_code_type)
     ]
     if unrelated_draft_chain_rows:
         return {
@@ -5684,6 +5700,7 @@ async def _prepare_ranked_reorder_plan(
                 dict(phrase)
                 for phrase in phrases
                 if isinstance(phrase, dict)
+                and (same_code_type is None or phrase.get("type") == same_code_type)
                 and (
                     str(phrase.get("type") or "").strip(),
                     str(phrase.get("code") or result_code).strip().lower(),
@@ -5751,6 +5768,7 @@ async def _prepare_ranked_reorder_plan(
         for entry in projected
         if entry["word"] not in desired_word_set
         and entry["code"] in reserved_codes
+        and (same_code_type is None or entry["type"] == same_code_type)
     ]
     if downstream_draft_chain_rows:
         return {
