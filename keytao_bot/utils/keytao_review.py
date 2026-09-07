@@ -2827,6 +2827,7 @@ async def _search_pronunciation_web_evidence(word: str) -> Dict[str, Any]:
             attempt
             for attempt in payload.get("attempts") or []
             if isinstance(attempt, dict)
+            and attempt.get("status") != "skipped"
         ])
 
     scored = score_web_pronunciations(word, results)
@@ -3357,6 +3358,58 @@ def _build_statuses_for_codes(
     return statuses
 
 
+async def _prepare_reviewed_single_character(
+    config: ReviewHttpConfig,
+    word: str,
+    *,
+    requested_reading: str = "",
+    requested_meaning: str = "",
+) -> Dict:
+    """Keep character encoding, table occupancy, and approval in one Single lane."""
+    from .keytao_single_char import single_character_encoding
+
+    encoding = await fetch_keytao_encode(config, word)
+    result = single_character_encoding(
+        word, encoding,
+        requested_reading=requested_reading,
+        requested_meaning=requested_meaning,
+    )
+    if not result.get("success"):
+        return apply_review_disposition(result, "code_unresolved")
+    codes = result["pronunciations"][0]["codes"]
+    try:
+        existing, code_map = await asyncio.gather(
+            lookup_words(config, [word]), lookup_codes(config, codes),
+        )
+    except KeytaoApiError as error:
+        logger.warning(f"Single occupancy lookup failed for {word}: {error}")
+        return apply_review_disposition({
+            **result, "success": False, "lookupFailed": True,
+            "message": f"「{word}」的单字词库占用未能核验，本次不推荐编码。",
+        }, "lookup_unavailable")
+    result["existing"] = _same_type_phrases(existing.get(word, []), "Single")
+    statuses = _build_statuses_for_codes(codes, {
+        code: _same_type_phrases(code_map.get(code, []), "Single")
+        for code in codes
+    })
+    pronunciation = result["pronunciations"][0]
+    pronunciation["candidateStatuses"] = statuses
+    pronunciation["characterReadings"] = _character_reading_evidence(
+        word, pronunciation["normalized"], encoding,
+    )
+    recommended = next((item["code"] for item in statuses if not item["occupied"]), codes[0])
+    pronunciation["recommendedCode"] = recommended
+    reason = "单字读音与编码已核验，字形收录需复核"
+    result.update({
+        "recommendedCode": recommended, "autoReviewable": False,
+        "autoReviewReason": reason, "lookupFailed": False,
+        "requiresManualPronunciationReview": True,
+    })
+    return apply_review_disposition(
+        apply_manual_review_flag(result, True, reason), "pre_submit_judgement",
+    )
+
+
 async def prepare_reviewed_word(
     config: ReviewHttpConfig,
     word: str,
@@ -3370,6 +3423,12 @@ async def prepare_reviewed_word(
         return apply_review_disposition(
             {"success": False, "message": "词不能为空"},
             "empty_word",
+        )
+    if len(word) == 1:
+        return await _prepare_reviewed_single_character(
+            config, word,
+            requested_reading=requested_reading,
+            requested_meaning=requested_meaning,
         )
     requested_character_hint: Optional[Tuple[str, str]] = None
     character_hint_match = re.fullmatch(
@@ -7152,6 +7211,13 @@ async def _audit_single_item(
         if code not in candidate_codes:
             available = ", ".join(sorted(candidate_codes)[:8])
             outcome.issues.append(f"「{word}」编码 {code} 不在读音候选链中，可选：{available or '无'}")
+            return outcome
+
+        if phrase_type == "Single" and review.get("type") == "Single":
+            reason = str(review.get("manualReviewReason") or review.get("autoReviewReason") or "单字字形收录需复核").strip()
+            issue = f"「{word}」@{code} {reason}，需要管理员审核"
+            outcome.issues.append(issue)
+            outcome.sealed_issues.append(issue)
             return outcome
 
         if review.get("requiresManualPronunciationReview"):

@@ -52,7 +52,7 @@ def _preview_create_item(word: str, code: str) -> Dict[str, Any]:
         "action": "Create",
         "word": word,
         "code": code,
-        "type": "Phrase",
+        "type": "Single" if len(word) == 1 else "Phrase",
     }
 
 

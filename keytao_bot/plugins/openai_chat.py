@@ -86,6 +86,7 @@ from ..utils.observability import (
     set_turn_flow,
     suspend_turn_metrics,
     turn_metrics_emitted,
+    turn_failure_reply,
 )
 from ..utils.pending_confirmation import (
     PENDING_ASSENT_TEXTS,
@@ -1734,9 +1735,10 @@ async def get_ai_response_core(
             return result
         return _normalize_generated_review_copy(result) if result else result
 
-    except Exception as e:
-        logger.error(f"API error: {e}")
-        return "AI 服务暂时不可用，请稍后再试。"
+    except Exception as error:
+        return turn_failure_reply(
+            logger, error, stage="get_ai_response_core", step="生成回答",
+        )
 
 
 async def get_openai_response(
@@ -3233,7 +3235,7 @@ async def _stage_handle_image_turn(ctx: TurnContext) -> bool:
                 visual_image_count=ctx.vision_result.image_count,
             )
             if not ctx.response:
-                ctx.response = "处理请求失败，请重试。"
+                ctx.response = _empty_response_failure("_stage_handle_image_turn", "生成图片回答")
             ctx.response = _normalize_generated_review_copy(ctx.response)
             if ctx.vision_result.warnings:
                 ctx.response += "\n\n图片处理提示：" + "；".join(
@@ -5259,12 +5261,22 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
 
 
 async def _stage_reject_empty_response(ctx: TurnContext) -> bool:
-    """Production scenario: an empty model result emits the existing deterministic error."""
+    """An empty response is a deterministic contract failure, never a blind retry."""
     if not ctx.response:
-        mark_turn_outcome("error")
-        await _finish_ai_chat_matcher("处理请求失败，请重试。")
+        from ..utils.observability import current_turn_metrics
+
+        metrics = current_turn_metrics()
+        step = "审词和生成候选" if metrics and metrics.flow == "word-discovery" else "生成回答"
+        await _finish_ai_chat_matcher(_empty_response_failure("_stage_reject_empty_response", step))
         return True
     return False
+
+
+def _empty_response_failure(stage: str, step: str) -> str:
+    try:
+        raise RuntimeError("response contract returned empty content")
+    except RuntimeError as error:
+        return turn_failure_reply(logger, error, stage=stage, step=step)
 
 
 async def _stage_normalize_response(ctx: TurnContext) -> bool:
@@ -5419,7 +5431,25 @@ async def _handle_ai_chat_serialized(
         user_id=user_id,
     )
     for stage in STAGES:
-        if await stage(ctx):
+        try:
+            if await stage(ctx):
+                return
+        except FinishedException:
+            raise
+        except Exception as error:
+            stage_name = stage.__name__
+            step = {
+                "_stage_handle_simple_word_query": "审词和生成候选",
+                "_stage_execute_pending_state": "执行所选操作",
+                "_stage_submit_current_draft": "提交草稿",
+                "_stage_handle_draft_management": "处理草稿",
+                "_stage_generate_ai_response": "生成回答",
+                "_stage_finish_platform_response": "发送回复",
+                "_stage_persist_conversation": "保存对话",
+                "_stage_enforce_advertised_reply_contract": "核验候选和操作提示",
+            }.get(stage_name, "整理请求和回复")
+            response = turn_failure_reply(logger, error, stage=stage_name, step=step)
+            await _finish_ai_chat_matcher(response)
             return
 
 

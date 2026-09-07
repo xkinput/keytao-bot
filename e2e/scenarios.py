@@ -2030,6 +2030,63 @@ S21_BATCH_WORDS = (
 )
 
 
+def _assert_s21_unrelated_turn_unchanged(
+    events: list[dict[str, Any]],
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    next_base_url: str,
+) -> dict[str, Any]:
+    """Distinguish rejected model attempts from dispatch or state mutation."""
+    attempts = [
+        event for event in events
+        if event.get("kind") == "tool"
+        and event.get("name") == "keytao_batch_add_to_draft"
+    ]
+    require(
+        all(
+            isinstance(event.get("result"), dict)
+            and event["result"].get("success") is False
+            and event["result"].get("policyBlocked") is True
+            for event in attempts
+        ),
+        f"S21 unrelated text reached a batch attempt without a policy refusal: {attempts}",
+    )
+    next_origin = urlsplit(next_base_url)
+    next_port = next_origin.port or (443 if next_origin.scheme == "https" else 80)
+    next_hosts = {next_origin.hostname}
+    if next_origin.hostname in {"localhost", "127.0.0.1", "::1"}:
+        next_hosts.update({"localhost", "127.0.0.1", "::1"})
+    dispatches = []
+    for event in events:
+        if event.get("kind") != "http":
+            continue
+        origin = urlsplit(str(event.get("url") or ""))
+        if (
+            origin.hostname in next_hosts
+            and (origin.port or (443 if origin.scheme == "https" else 80)) == next_port
+            and str(event.get("method") or "").upper() not in {"GET", "HEAD", "OPTIONS"}
+        ):
+            dispatches.append(event)
+    require(
+        not dispatches,
+        f"S21 unrelated text dispatched a mutating local Next request: {dispatches}",
+    )
+    snapshot_keys = ("batchId", "contentVersion", "items")
+    require(
+        all(key in snapshot for snapshot in (before, after) for key in snapshot_keys)
+        and all(before[key] == after[key] for key in snapshot_keys),
+        f"S21 unrelated text changed the exact draft snapshot: before={before}; after={after}",
+    )
+    return {
+        "policyBlockedBatchAttempts": len(attempts),
+        "localNextMutatingRequests": 0,
+        "snapshotUnchanged": True,
+        "batchId": after["batchId"],
+        "contentVersion": after["contentVersion"],
+    }
+
+
 async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     async def discover() -> tuple[str, tuple[tuple[str, str], ...]]:
         message = "喵喵 加词 " + " ".join(S21_BATCH_WORDS)
@@ -2161,18 +2218,24 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
     rendered_line = "确认"
 
     unrelated = "请阅读" + rendered_line
+    unrelated_before = await ctx.draft()
     unrelated_cutoff = max(
         (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
         default=0,
     )
     messages.append(unrelated)
     replies.append(await ctx.send_group(unrelated, to_me=True))
-    require(
-        not batch_write_events(unrelated_cutoff),
-        "S21 unrelated text outside the quote authorized a batch write",
+    unrelated_events = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > unrelated_cutoff
+    ]
+    unrelated_after = await ctx.draft()
+    unrelated_evidence = _assert_s21_unrelated_turn_unchanged(
+        unrelated_events, unrelated_before, unrelated_after,
+        next_base_url=ctx.next_client.base_url,
     )
     require(
-        not (await ctx.draft()).get("items"),
+        not unrelated_after.get("items"),
         "S21 unrelated quote envelope changed the draft",
     )
 
@@ -2237,6 +2300,7 @@ async def scenario_s21(ctx: ScenarioContext) -> dict[str, Any]:
             "renderedConfirmationSteps": rendered_confirmation_steps,
             "outOfTicketControl": "ASK-without-write",
             "unrelatedQuoteControl": "blocked-without-write",
+            "unrelatedQuoteEvidence": unrelated_evidence,
             "renderedBatchId": rendered_draft.get("batchId"),
             "preconditionCleanups": {
                 "first": first_precondition_cleanup,
@@ -8771,6 +8835,271 @@ async def scenario_s54(ctx: ScenarioContext) -> dict[str, Any]:
     }
 
 
+S55_WORD = "鎗"
+S55_EXISTING_WORD = "一"
+S55_EXISTING_CODE = "ykv"
+
+
+async def scenario_s55(ctx: ScenarioContext) -> dict[str, Any]:
+    """Close a one-candidate Single review, existing lookup, and incident boundaries."""
+    import logging
+    from unittest.mock import patch
+
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import PendingAddWord, PendingTrustedWordRecord
+    from keytao_bot.plugins.chat_routing import (
+        _pending_assent_phrase_for_state,
+        message_authorizes_live_pending_mutation,
+    )
+    from keytao_bot.utils import keytao_review as review_module
+    from keytao_bot.utils.observability import current_turn_id, set_turn_flow
+    from keytao_bot.utils.pending_confirmation import single_word_candidate_footer
+
+    from .web_evidence_seed import exercise_tripped_pronunciation_backend
+
+    chat = ctx.bot.openai_chat
+    store = chat.conversation_state_store
+    address = ConversationAddress.group(
+        "qq", str(ctx.bot._group_id(ctx.platform_id)), ctx.platform_id,
+    )
+    messages: list[str] = []
+    replies: list[str] = []
+    facts: dict[str, Any] = {}
+    candidate_row = re.compile(r"(?m)^\s*\d+[.)、]\s*[a-z]{1,12}\s*[—–-]")
+
+    def cutoff() -> int:
+        return max((int(event.get("sequence") or 0) for event in ctx.attempt_events()), default=0)
+
+    def later_events(sequence: int) -> list[dict[str, Any]]:
+        return [event for event in ctx.attempt_events() if int(event.get("sequence") or 0) > sequence]
+
+    async def send(message: str) -> str:
+        messages.append(message)
+        reply = await ctx.send_group(message, to_me=True)
+        replies.append(reply)
+        return reply
+
+    async def reset() -> None:
+        await ctx.next_client.clean_draft(ctx.platform_id)
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    async def cleanup() -> dict[str, Any]:
+        result = await ctx.next_client.remove_rig_owned_dictionary_words(
+            platform_id=ctx.platform_id,
+            admin_token=ctx.admin_token,
+            scenario_id="S55",
+            fixture_words=(S55_WORD, S55_EXISTING_WORD),
+        )
+        require(result.get("verified") is True, f"S55 fixture cleanup failed: {result}")
+        return result
+
+    review_module._clear_review_caches()
+    await reset()
+    await cleanup()
+    try:
+        encode = await ctx.next_client.encode(S55_WORD)
+        require(
+            encode.get("type") == "单字"
+            and encode.get("chars")
+            and encode["chars"][0].get("char") == S55_WORD
+            and encode.get("codes") == ["qx"],
+            f"S55 did not reproduce the actual one-candidate Single encoding: {encode}",
+        )
+        candidate_sets: list[object] = []
+        deliveries: list[dict[str, Any]] = []
+        original_set = store.set
+        original_record_message = ctx.recorder.record_message
+
+        def observe_set(key: object, state: object, *args: Any, **kwargs: Any) -> bool:
+            saved = original_set(key, state, *args, **kwargs)
+            if saved and isinstance(state, PendingAddWord):
+                candidate_sets.append(state)
+            return saved
+
+        def observe_delivery(**kwargs: Any) -> None:
+            if kwargs.get("direction") == "reply" and candidate_row.search(str(kwargs.get("text") or "")):
+                live = store.get_record(address)
+                state = live.state if live is not None else None
+                deliveries.append({
+                    "nonce": live.nonce if live is not None else "",
+                    "recordFirst": bool(
+                        isinstance(state, PendingAddWord)
+                        and state.word == S55_WORD
+                        and state.phrase_type == "Single"
+                        and state.server_candidates
+                    ),
+                })
+            original_record_message(**kwargs)
+
+        sequence = cutoff()
+        started = time.monotonic()
+        with patch.object(store, "set", new=observe_set), patch.object(
+            ctx.recorder, "record_message", new=observe_delivery,
+        ):
+            discovery = await send(f"喵喵 {S55_WORD}")
+        discovery_seconds = time.monotonic() - started
+        record = store.get_record(address)
+        require(
+            record is not None and isinstance(record.state, PendingAddWord)
+            and record.state.phrase_type == "Single"
+            and record.state.word == S55_WORD,
+            f"S55 did not persist a typed Single candidate record: {record}; {discovery}",
+        )
+        state = record.state
+        require(
+            len(candidate_sets) == 1 and deliveries
+            and all(row["recordFirst"] and row["nonce"] == record.nonce for row in deliveries),
+            f"S55 candidate record was absent at delivery: {candidate_sets}; {deliveries}",
+        )
+        review_events = [
+            event for event in later_events(sequence)
+            if event.get("kind") == "tool" and event.get("name") == "keytao_prepare_reviewed_add"
+            and event.get("arguments", {}).get("word") == S55_WORD
+            and isinstance(event.get("result"), dict)
+        ]
+        require(len(review_events) == 1, f"S55 bypassed or repeated the public Single review: {review_events}")
+        review = review_events[0]["result"]
+        require(
+            review.get("type") == "Single" and review.get("encodingType") == "单字"
+            and review.get("chars") == encode["chars"]
+            and [row[0] for row in state.server_candidates] == encode["codes"]
+            and state.recommended_code == "qx",
+            f"S55 changed Single type, char facts, or the returned candidate scope: {review}; {state}",
+        )
+        reading_line = re.search(r"(?m)^审词：读音 ([^；;\n]+)", discovery)
+        require(
+            reading_line is not None
+            and review_module.normalize_pinyin_sequence(reading_line.group(1)) == ("qiang",)
+            and "枪" in discovery and "异体" in discovery
+            and "单字" in discovery and "自动审核：" in discovery
+            and "处理请求失败" not in discovery,
+            f"S55 omitted Single reading, variant relation, or review evidence: {discovery}",
+        )
+        contract = advertised_reply_contract(discovery)
+        suggestions = tuple(dict.fromkeys((*contract.batch_assent_forms, *contract.command_suggestions)))
+        async def assert_command_bound(command: str) -> None:
+            assent = _pending_assent_phrase_for_state(state, command)
+            if assent.matched and assent.add_requested and not assent.cancel_requested:
+                intent = await chat._classify_message_command_intent(command, state)
+                require(
+                    intent.intent in {"pending_confirm", "pending_add_and_submit"},
+                    f"S55 advertised assent did not resolve against its record: {command}; {intent}",
+                )
+            else:
+                require(
+                    message_authorizes_live_pending_mutation(command, state),
+                    f"S55 advertised structural selection did not bind: {command}",
+                )
+
+        require(
+            "加入" in suggestions and "加入并提交" in suggestions
+            and single_word_candidate_footer(len(state.server_candidates)) in discovery
+            and chat._advertised_reply_matches_live_record(discovery, record),
+            f"S55 advertised an unbound Single operation: {suggestions}; {discovery}",
+        )
+        for command in suggestions:
+            await assert_command_bound(command)
+        for line in re.findall(r"(?m)^\s*[-•]\s*[「“『].+[」”』].*$", discovery):
+            await assert_command_bound(line)
+        require(not (await ctx.draft()).get("items"), "S55 discovery wrote before assent")
+        facts["singleReview"] = {
+            "encode": encode, "review": review,
+            "candidateRecordWrites": len(candidate_sets), "recordFirst": True,
+            "persistedType": state.phrase_type,
+            "candidateCodes": [row[0] for row in state.server_candidates],
+            "advertisedClosure": list(suggestions),
+            "e2eSeconds": round(discovery_seconds, 6),
+            "toolSeconds": round(sum(float(event.get("elapsedSeconds") or 0) for event in later_events(sequence) if event.get("kind") == "tool"), 6),
+            "incidentToolSecondsRange": [13, 23],
+        }
+        sequence = cutoff()
+        receipt = await send("加入")
+        draft = await ctx.draft()
+        items = draft.get("items") or []
+        require(
+            len(items) == 1 and item_key(items[0]) == ("Create", S55_WORD, "qx")
+            and items[0].get("type") == "Single"
+            and not any(event.get("kind") == "tool" and event.get("name") == "keytao_prepare_reviewed_add" for event in later_events(sequence)),
+            f"S55 加入 regenerated review or wrote the wrong Single item: {draft}; {receipt}",
+        )
+        facts["singleAdd"] = {"action": "加入", "items": items, "reviewRegenerated": False}
+
+        await reset()
+        existing_encode = await ctx.next_client.encode(S55_EXISTING_WORD)
+        require(existing_encode.get("type") == "单字" and S55_EXISTING_CODE in existing_encode.get("codes", []), f"S55 invalid common Single fixture: {existing_encode}")
+        await ctx.next_client.seed_phrase(
+            platform_id=ctx.platform_id, word=S55_EXISTING_WORD,
+            code=S55_EXISTING_CODE, phrase_type="Single",
+        )
+        await reset()
+        sequence = cutoff()
+        existing_reply = await send(f"喵喵 {S55_EXISTING_WORD}")
+        existing_rows = [row for row in await ctx.next_client.phrases_by_word(S55_EXISTING_WORD) if row.get("word") == S55_EXISTING_WORD]
+        existing_record = store.get_record(address)
+        existing_state = existing_record.state if existing_record is not None else None
+        require(
+            any(row.get("type") == "Single" and row.get("code") == S55_EXISTING_CODE for row in existing_rows)
+            and "已在词库" in existing_reply and S55_EXISTING_CODE in existing_reply
+            and not candidate_row.search(existing_reply)
+            and (
+                existing_state is None
+                or (
+                    isinstance(existing_state, PendingTrustedWordRecord)
+                    and existing_state.phrase_type == "Single"
+                    and existing_state.word == S55_EXISTING_WORD
+                    and existing_state.code == S55_EXISTING_CODE
+                )
+            )
+            and not advertised_command_suggestions(existing_reply)
+            and not (await ctx.draft()).get("items")
+            and not any(event.get("kind") == "tool" and event.get("name") == "keytao_prepare_reviewed_add" for event in later_events(sequence)),
+            f"S55 existing Single was re-reviewed or became an add target: {existing_reply}; {existing_rows}",
+        )
+        facts["existingSingle"] = {"word": S55_EXISTING_WORD, "code": S55_EXISTING_CODE, "type": "Single", "recordType": type(existing_state).__name__ if existing_state is not None else None, "candidateRecordCreated": False, "draftUnchanged": True}
+        facts["trippedWebBackend"] = await exercise_tripped_pronunciation_backend()
+
+        await reset()
+        log_records: list[logging.LogRecord] = []
+        failure_turn: dict[str, str] = {}
+
+        class Capture(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                log_records.append(record)
+
+        async def fail_discovery(*args: Any, **kwargs: Any) -> None:
+            set_turn_flow("word-discovery")
+            failure_turn["turnId"] = current_turn_id()
+            raise ValueError("S55 deterministic discovery fixture")
+
+        capture = Capture()
+        boundary_logger = logging.getLogger(f"e2e.s55.failure.{ctx.platform_id}")
+        boundary_logger.setLevel(logging.ERROR)
+        boundary_logger.addHandler(capture)
+        try:
+            with patch.object(chat, "_try_handle_simple_single_word_query", new=fail_discovery), patch.object(chat, "logger", new=boundary_logger):
+                failure_reply = await send(f"喵喵 {S55_WORD}")
+        finally:
+            boundary_logger.removeHandler(capture)
+        error_log = "\n".join(row.getMessage() for row in log_records if row.levelno >= logging.ERROR)
+        require(
+            failure_turn.get("turnId") not in {None, "-"}
+            and all(marker in error_log for marker in (
+                "Traceback (most recent call last)", "ValueError: S55 deterministic discovery fixture",
+                f"turn_id={failure_turn['turnId']}", "flow=word-discovery", "stage=_stage_handle_simple_word_query",
+            ))
+            and "审词" in failure_reply and "这一步失败" in failure_reply
+            and "请重试" not in failure_reply and "处理请求失败" not in failure_reply
+            and not (await ctx.draft()).get("items"),
+            f"S55 exception boundary omitted traceback/context or truthful copy: {error_log}; {failure_reply}",
+        )
+        facts["failureBoundary"] = {"turnId": failure_turn["turnId"], "level": "ERROR", "stage": "_stage_handle_simple_word_query", "flow": "word-discovery", "traceback": error_log, "reply": failure_reply, "draftUnchanged": True}
+    finally:
+        await reset()
+        await ctx.next_client.clean_submitted_batches(ctx.platform_id)
+        facts["cleanup"] = await cleanup()
+    return {"messages": messages, "replies": replies, "draft": await ctx.draft(), "facts": facts}
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -8826,6 +9155,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S52", "first-render binding and possessive delete closure", scenario_s52),
     Scenario("S53", "unknown-polyphone reading resolution", scenario_s53),
     Scenario("S54", "bare multi-word reviewed candidate and selection closure", scenario_s54),
+    Scenario("S55", "Single review, failure traceback, and tripped search backend", scenario_s55),
 )
 
 

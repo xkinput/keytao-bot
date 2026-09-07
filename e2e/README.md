@@ -546,6 +546,28 @@ shared six-character terminal codes may appear in both chains. The fixture
 replaces only the outbound web-search boundary because the rig allowlist blocks
 external search; the chat and semantic-pronunciation model calls remain real.
 
+S55 closes the 2026-09-07 Single-character incident. The local Next encoder
+returns `鎗` as `单字`, with the real character facts and the one-candidate
+`qx` inventory. The scenario requires a typed `Single` reviewed result, its
+`qiāng` reading and locally sourced variant relation to `枪`, a persisted
+candidate record before delivery, and live binding for every advertised command
+and complete suggestion bullet. Bare `加入` must create exactly
+`Single 鎗@qx` without regenerating review. The common-character control seeds
+rig-owned `Single 一@ykv`, verifies the existing-word block and zero candidate
+record or draft write, then removes only the declared rig-owned fixture rows.
+An informational `PendingTrustedWordRecord` may retain that exact existing
+Single identity for follow-up commands, using the existing word convention.
+
+S55 also exercises the actual S53 pronunciation rung and channel registry with
+in-process backend fixtures: three recorded `so360` failures open the real
+breaker, both pronunciation searches reach fixture Bing immediately, and no
+call reaches `so360` or an external search host. A separate real chat turn
+injects a deterministic discovery exception and requires an ERROR log containing
+the complete traceback, current turn ID, flow, and failing stage. Its reply must
+name the failed review step and must not suggest retrying. These fault fixtures
+do not replace model responses. The artifact records incident review/tool
+latency separately from the subsecond fixture web-rung measurement.
+
 Optional overrides:
 
 - `E2E_OPENAI_API_KEY`, `E2E_OPENAI_BASE_URL`, `E2E_OPENAI_MODEL`

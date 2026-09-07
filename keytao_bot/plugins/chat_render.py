@@ -1419,6 +1419,8 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         if existing_copy
         else [f"词库暂无收录「{word}」："]
     )
+    if review.get("type") == "Single":
+        lines.append("类型：单字")
     candidate_index = 1
     candidate_indexes: Dict[str, int] = {}
     pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)
@@ -1429,6 +1431,10 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             f"读音 {pinyin}" if pinyin else "读音待确认",
             f"来源 {_format_pronunciation_source(pronunciation)}",
         ]
+        if review.get("type") == "Single" and review.get("variantNote"):
+            review_parts.append(str(review["variantNote"]))
+        if review.get("type") == "Single" and review.get("encodingNote"):
+            review_parts.append(str(review["encodingNote"]))
         lines.append("审词：" + "；".join(review_parts) + "；")
         lines.append(pre_submit_preview or "自动审核：预审未完成")
         lines.append("候选编码:")

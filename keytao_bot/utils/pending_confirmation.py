@@ -1657,7 +1657,7 @@ def advertised_single_word_candidate_codes(text: str) -> tuple[str, ...]:
         unicodedata.normalize("NFKC", str(text or "")),
         re.IGNORECASE,
     ))
-    if len(matches) < 2:
+    if not matches:
         return ()
     indexes = [int(match.group("index")) for match in matches]
     codes = tuple(match.group("code").lower() for match in matches)
@@ -1701,7 +1701,7 @@ def render_server_backed_single_word_candidates(
             return ""
         normalized_candidates.append((code, occupied))
         seen.add(code)
-    if len(normalized_candidates) < 2 or recommended not in seen:
+    if not normalized_candidates or recommended not in seen:
         return ""
     reorder_recommendation = validated_front_insert_recommendation(
         normalized_word,

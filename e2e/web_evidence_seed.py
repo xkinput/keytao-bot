@@ -110,7 +110,79 @@ class WebPronunciationEvidenceController:
         }
 
 
+async def exercise_tripped_pronunciation_backend() -> dict[str, Any]:
+    """Exercise the real S53 registry/rung with isolated in-memory backend fixtures."""
+    import importlib.util
+    import time
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from keytao_bot.utils import keytao_review as review_module
+
+    spec = importlib.util.spec_from_file_location(
+        "e2e_s55_web_search_tools",
+        Path(__file__).resolve().parents[1] / "keytao_bot/skills/web-search/tools.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("S55 could not load the actual search registry")
+    web = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(web)
+    calls: list[dict[str, str]] = []
+
+    async def backend(provider: str, query: str, max_results: int) -> list[dict[str, str]]:
+        calls.append({"backend": provider, "query": query})
+        if provider == "so360":
+            raise AssertionError("S55 dispatched a tripped backend")
+        if provider != "bing":
+            return []
+        return [{
+            "title": "鎗字读音",
+            "url": f"https://single-{index}.example/qiang",
+            "snippet": "鎗 拼音：qiāng；是枪的异体字。",
+            "provider": provider,
+        } for index in range(max_results)]
+
+    with patch.object(web, "_SEARCH_BACKEND_HEALTH", {}), patch.object(
+        web, "_search_with_provider", new=backend,
+    ), patch.object(web, "_exa_api_key", return_value=None), patch.object(
+        review_module, "_registered_web_search_function", new=web.web_search,
+    ), patch.object(
+        review_module.PronunciationResolutionCache, "get", return_value=None,
+    ), patch.object(review_module.PronunciationResolutionCache, "set"):
+        for _ in range(web.SEARCH_FAILURE_THRESHOLD):
+            generation = web._acquire_search_backend("so360")
+            if generation is None:
+                raise AssertionError("S55 breaker tripped before its configured threshold")
+            web._record_search_outcome("so360", generation, success=False, elapsed=2.0)
+        health = web._SEARCH_BACKEND_HEALTH["so360"]
+        if health.state != "open":
+            raise AssertionError("S55 fixture did not open the real circuit breaker")
+        started = time.monotonic()
+        evidence = await review_module._search_pronunciation_web_evidence("鎗")
+        elapsed = time.monotonic() - started
+        if (
+            not calls
+            or any(row["backend"] == "so360" for row in calls)
+            or evidence.get("status") != "resolved"
+            or evidence.get("registryCalls") != 2
+            or evidence.get("timedOut") is not False
+            or elapsed >= 1.0
+        ):
+            raise AssertionError(f"S55 dead backend consumed the web rung: {calls}; {evidence}")
+        return {
+            "backend": "so360",
+            "breakerState": health.state,
+            "consecutiveFailures": health.failures,
+            "deadBackendCalls": 0,
+            "fixtureBackendCalls": calls,
+            "elapsedSeconds": round(elapsed, 6),
+            "evidence": evidence,
+            "externalSearchRequests": 0,
+        }
+
+
 __all__ = [
     "WEB_PRONUNCIATION_FIXTURES_BY_SCENARIO",
     "WebPronunciationEvidenceController",
+    "exercise_tripped_pronunciation_backend",
 ]

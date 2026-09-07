@@ -58,6 +58,7 @@ class PendingAddWord:
     # model rewords its answer, nor forged when it happens to echo the prefix.
     needs_manual_review: Optional[bool] = None
     manual_review_reason: str = ""
+    phrase_type: str = "Phrase"
 
 
 def _pending_add_word_payload(state: PendingAddWord) -> Dict[str, object]:
@@ -76,6 +77,7 @@ def _pending_add_word_payload(state: PendingAddWord) -> Dict[str, object]:
         "pronunciationRecommendedCodes": state.pronunciation_recommended_codes,
         "needsManualReview": state.needs_manual_review,
         "manualReviewReason": state.manual_review_reason,
+        "phraseType": state.phrase_type,
     }
 
 
@@ -193,12 +195,15 @@ def _pending_add_word_from_payload(payload: object) -> PendingAddWord:
     word = payload.get("word")
     recommended_code = payload.get("recommendedCode")
     manual_review_reason = payload.get("manualReviewReason")
+    phrase_type = payload.get("phraseType", "Phrase")
     if (
         not isinstance(word, str)
         or not word
         or not isinstance(recommended_code, str)
         or re.fullmatch(r"[a-z]{1,12}", recommended_code) is None
         or not isinstance(manual_review_reason, str)
+        or phrase_type not in {"Single", "Phrase"}
+        or (phrase_type == "Single" and len(word) != 1)
     ):
         raise ValueError("invalid candidate record identity")
     candidates = candidate_pairs("candidates")
@@ -221,6 +226,7 @@ def _pending_add_word_from_payload(payload: object) -> PendingAddWord:
         pronunciation_recommended_codes=list(raw_recommended_codes),
         needs_manual_review=needs_manual_review,
         manual_review_reason=manual_review_reason,
+        phrase_type=phrase_type,
     )
 
 
@@ -1193,6 +1199,7 @@ class MemoryConversationStateStore:
         if isinstance(left, PendingAddWord) and isinstance(right, PendingAddWord):
             display_fields_match = (
                 left.word == right.word
+                and left.phrase_type == right.phrase_type
                 and left.recommended_code == right.recommended_code
                 and left.candidates == right.candidates
                 and left.occupied_words == right.occupied_words

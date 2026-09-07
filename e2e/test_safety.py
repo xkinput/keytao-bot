@@ -22,6 +22,7 @@ from .scenarios import (
     S19_ADVERTISED_WORDS,
     S20_BATCH_WORDS,
     S21_BATCH_WORDS,
+    _assert_s21_unrelated_turn_unchanged,
     S22_BATCH_WORDS,
     S23_BATCH_WORDS,
     S24_NATURAL_ASSENT,
@@ -113,6 +114,9 @@ from .scenarios import (
     S53_WEAK_WORD,
     S53_WORD,
     S53_UNTRUSTED_AGREEMENT_WORD,
+    S55_WORD,
+    S55_EXISTING_WORD,
+    S55_EXISTING_CODE,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -718,11 +722,34 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s54(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s55(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 55)],
+            [f"S{index}" for index in range(1, 56)],
         )
+
+    def test_s55_single_fixtures_preserve_actual_encoding_inputs(self) -> None:
+        self.assertEqual((S55_WORD, S55_EXISTING_WORD, S55_EXISTING_CODE), ("鎗", "一", "ykv"))
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S55"]
+        self.assertEqual(fixture["probe_words"], (S55_WORD, S55_EXISTING_WORD))
+        rows = {(row["kind"], row["entry"]): row for row in fixture["rows"]}
+        self.assertEqual(rows[("char", S55_WORD)]["pinyins"], ["qiāng", "chēng"])
+        self.assertEqual(rows[("entry", S55_WORD)]["status"], "absent")
+        self.assertEqual(rows[("entry", S55_EXISTING_WORD)]["status"], "absent")
+        self.assertTrue(all(set(row) == {"kind", "entry", "status", "pinyins"} for row in fixture["rows"]))
+
+    async def test_s55_real_pronunciation_rung_skips_tripped_fixture_backend(self) -> None:
+        from .web_evidence_seed import exercise_tripped_pronunciation_backend
+
+        facts = await exercise_tripped_pronunciation_backend()
+        self.assertEqual(facts["breakerState"], "open")
+        self.assertEqual(facts["consecutiveFailures"], 3)
+        self.assertEqual(facts["deadBackendCalls"], 0)
+        self.assertEqual(facts["externalSearchRequests"], 0)
+        self.assertEqual(facts["evidence"]["status"], "resolved")
+        self.assertEqual(facts["evidence"]["registryCalls"], 2)
+        self.assertEqual([row["backend"] for row in facts["fixtureBackendCalls"]], ["bing", "bing"])
+        self.assertLess(facts["elapsedSeconds"], 1.0)
 
     def test_s53_declares_absent_polyphone_and_control_fixtures(self) -> None:
         self.assertEqual(S53_WORD, "薄肌")
@@ -2330,6 +2357,54 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(result["facts"]["additionalConfirmationSteps"], 0)
         self.assertEqual(result["facts"]["batchId"], "batch-s20")
 
+    def test_s21_unrelated_turn_allows_only_explicit_policy_refusals(self) -> None:
+        snapshot = {"batchId": "batch-s21", "contentVersion": 2, "items": []}
+        event = {
+            "kind": "tool", "name": "keytao_batch_add_to_draft",
+            "result": {"success": False, "policyBlocked": True, "blockReason": "verb_not_matched"},
+        }
+        for events in ([], [event]):
+            facts = _assert_s21_unrelated_turn_unchanged(events, snapshot, dict(snapshot), next_base_url="http://localhost:3100")
+            self.assertEqual(facts["policyBlockedBatchAttempts"], len(events))
+            self.assertTrue(facts["snapshotUnchanged"])
+        for result in (
+            {"success": False},
+            {"success": False, "policyBlocked": False},
+            {"success": True, "policyBlocked": True},
+            {"success": False, "policyBlocked": 1},
+            {"success": 0, "policyBlocked": True},
+            {"success": False, "requiresConfirmation": True, "previewOnly": True},
+            None,
+        ):
+            with self.subTest(result=result), self.assertRaises(AssertionError):
+                _assert_s21_unrelated_turn_unchanged([{**event, "result": result}], snapshot, dict(snapshot), next_base_url="http://localhost:3100")
+
+    def test_s21_unrelated_turn_rejects_backend_dispatch_even_if_state_is_restored(self) -> None:
+        snapshot = {"batchId": "batch-s21", "contentVersion": 2, "items": []}
+        blocked = {"kind": "tool", "name": "keytao_batch_add_to_draft", "result": {"success": False, "policyBlocked": True}}
+        for method, host in (("POST", "localhost"), ("PATCH", "127.0.0.1"), ("DELETE", "[::1]")):
+            with self.subTest(method=method, host=host), self.assertRaises(AssertionError):
+                _assert_s21_unrelated_turn_unchanged(
+                    [blocked, {"kind": "http", "method": method, "url": f"http://{host}:3100/api/bot/pull-requests/batch-draft", "responseBody": {"success": False}}],
+                    snapshot, dict(snapshot), next_base_url="http://localhost:3100",
+                )
+        facts = _assert_s21_unrelated_turn_unchanged(
+            [blocked, {"kind": "http", "method": "GET", "url": "http://localhost:3100/api/bot/batches/latest-draft/items"}, {"kind": "http", "method": "POST", "url": "https://api.deepseek.com/chat/completions"}],
+            snapshot, dict(snapshot), next_base_url="http://localhost:3100",
+        )
+        self.assertEqual(facts["localNextMutatingRequests"], 0)
+
+    def test_s21_unrelated_turn_rejects_any_snapshot_change_or_missing_evidence(self) -> None:
+        snapshot = {"batchId": "batch-s21", "contentVersion": 2, "items": []}
+        for after in (
+            {**snapshot, "batchId": "another-batch"},
+            {**snapshot, "contentVersion": 3},
+            {**snapshot, "items": [{"action": "Create", "word": "显眼包", "code": "xyb"}]},
+            {"batchId": "batch-s21", "items": []},
+        ):
+            with self.subTest(after=after), self.assertRaises(AssertionError):
+                _assert_s21_unrelated_turn_unchanged([], snapshot, after, next_base_url="http://localhost:3100")
+
     async def test_s21_offline_replays_modifier_and_real_rendered_copy(self) -> None:
         from keytao_bot.harness.state import PendingToolConfirm
         from keytao_bot.plugins.chat_routing import (
@@ -2353,6 +2428,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 self.next_client = self
                 self.bot = self
                 self.platform_id = "739497722"
+                self.base_url = "http://localhost:3100"
                 self.rendered_line = ""
                 self.reset_calls = 0
 

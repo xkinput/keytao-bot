@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import time
+import traceback
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
@@ -105,6 +106,36 @@ def current_turn_metrics() -> Optional[TurnMetrics]:
 def current_turn_id() -> str:
     metrics = current_turn_metrics()
     return metrics.turn_id if metrics is not None else "-"
+
+
+def turn_failure_reply(logger: Any, error: Exception, *, stage: str, step: str) -> str:
+    """Log the original traceback without locals and describe the failed step."""
+    metrics = current_turn_metrics()
+    mark_turn_outcome("error")
+    logger.error(
+        f"[turn_failure] turn_id={current_turn_id()} "
+        f"flow={metrics.flow if metrics is not None else 'general'} "
+        f"stage={stage}\n"
+        + "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    )
+    import httpx
+
+    transient_types = (TimeoutError, ConnectionError, httpx.TimeoutException, httpx.ConnectError)
+    cause: Optional[BaseException] = error
+    transient = False
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        status = getattr(cause, "status_code", None)
+        if isinstance(cause, transient_types) or (
+            isinstance(status, int) and (status == 429 or 500 <= status < 600)
+        ):
+            transient = True
+            break
+        cause = cause.__cause__ or cause.__context__
+    if transient:
+        return f"{step}这一步暂时失败，服务连接异常或超时，请稍后重试。"
+    return f"{step}这一步失败，已记录错误供排查。"
 
 
 def turn_metrics_emitted() -> bool:

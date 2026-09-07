@@ -31,6 +31,7 @@ import re
 import socket
 import xml.etree.ElementTree as ElementTree
 import zlib
+from time import monotonic
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
@@ -209,6 +210,79 @@ _QUERY_INTENTS = (
 
 _LAST_BACKEND_STATUS: Dict[str, Dict[str, str]] = {}
 
+SEARCH_FAILURE_THRESHOLD = 3
+SEARCH_CIRCUIT_COOLDOWN = 600.0
+SEARCH_BACKEND_TIMEOUT = 2.0
+
+
+class _SearchBackendHealth:
+    def __init__(self) -> None:
+        self.failures = 0
+        self.state = "closed"
+        self.open_until = 0.0
+        self.generation = 0
+        self.last_success: Optional[float] = None
+        self.latency: Optional[float] = None
+
+
+# Shared across channels, bounded by the configured backend names, process-only.
+_SEARCH_BACKEND_HEALTH: Dict[str, _SearchBackendHealth] = {}
+
+
+def _acquire_search_backend(backend: str) -> Optional[int]:
+    """Claim one recovery probe synchronously before the next coroutine can run."""
+    health = _SEARCH_BACKEND_HEALTH.setdefault(backend, _SearchBackendHealth())
+    if health.state == "half_open":
+        return None
+    if health.state == "open":
+        if monotonic() < health.open_until:
+            return None
+        health.state = "half_open"
+        health.generation += 1
+        logger.info(f"[search_breaker] backend={backend} state=open->half_open probe=1")
+    return health.generation
+
+
+def _record_search_outcome(backend: str, generation: int, *, success: bool, elapsed: float) -> None:
+    health = _SEARCH_BACKEND_HEALTH[backend]
+    # An older concurrent request must not close a circuit opened after it began.
+    if generation != health.generation:
+        return
+    if success:
+        health.failures = 0
+        health.last_success = monotonic()
+        health.latency = elapsed if health.latency is None else 0.5 * elapsed + 0.5 * health.latency
+        if health.state == "half_open":
+            health.state = "closed"
+            health.open_until = 0.0
+            logger.info(f"[search_breaker] backend={backend} state=half_open->closed")
+        return
+    health.failures += 1
+    if health.state == "half_open" or health.failures >= SEARCH_FAILURE_THRESHOLD:
+        previous_state = health.state
+        health.state = "open"
+        health.open_until = monotonic() + SEARCH_CIRCUIT_COOLDOWN
+        health.generation += 1
+        logger.warning(
+            f"[search_breaker] backend={backend} state={previous_state}->open "
+            f"failures={health.failures} cooldown_seconds={SEARCH_CIRCUIT_COOLDOWN:g}"
+        )
+
+
+def _search_backend_rank(backend: str, index: int, now: float) -> tuple:
+    health = _SEARCH_BACKEND_HEALTH.get(backend)
+    if health is None:
+        return (1, 1, float("inf"), index)
+    if health.state == "open" and now >= health.open_until:
+        return (0, 0, 0.0, index)  # One bounded recovery probe, then normal routing.
+    if health.state != "closed":
+        return (3, 0, 0.0, index)
+    if health.failures:
+        return (2, health.failures, health.latency if health.latency is not None else float("inf"), index)
+    if health.last_success is not None and now - health.last_success < SEARCH_CIRCUIT_COOLDOWN:
+        return (1, 0, health.latency if health.latency is not None else float("inf"), index)
+    return (1, 1, float("inf"), index)
+
 
 BlockedUrlError = http_client.BlockedUrlError
 
@@ -264,7 +338,7 @@ def search_backend_chain(
     channel: str = "web",
     exa_enabled: Optional[bool] = None,
 ) -> List[str]:
-    """Return the ordered search chain while preserving the legacy CJK order."""
+    """Prefer recent successful, fast backends; use the cold order only for ties."""
     legacy = (
         ["so360", "bing", "duckduckgo-html", "duckduckgo-lite"]
         if _has_cjk(query)
@@ -274,7 +348,9 @@ def search_backend_chain(
     prefix = list(CHANNEL_REGISTRY.get(channel, {}).get("search_backends", ()))
     if configured:
         prefix.append("exa")
-    return [*prefix, *legacy]
+    chain = list(dict.fromkeys([*prefix, *legacy]))
+    now = monotonic()
+    return sorted(chain, key=lambda backend: _search_backend_rank(backend, chain.index(backend), now))
 
 
 def _record_backend_status(channel: str, backend: str, status: str, reason: str) -> None:
@@ -458,7 +534,9 @@ async def _guarded_request(
 
 async def _get_text(url: str, *, params: Optional[Dict[str, str]] = None) -> Tuple[int, str]:
     """Search-provider fetch through the guarded, IP-pinned egress."""
-    response = await _guarded_request(url, params=params)
+    # so.com anti-bot redirects are not search results; do not follow their chain.
+    options = {"max_hops": 0} if url == SO360_ENDPOINT else {}
+    response = await _guarded_request(url, params=params, **options)
     return response.status_code, response.text
 
 
@@ -721,7 +799,7 @@ async def _search_with_provider(provider: str, query: str, max_results: int) -> 
         return _extract_bing(text, max_results)
     if provider == "so360":
         status, text = await _get_text(SO360_ENDPOINT, params={"q": query})
-        if status >= 400:
+        if not 200 <= status < 300:
             raise RuntimeError(f"HTTP {status}")
         return _extract_so360(text, max_results)
     return []
@@ -1185,15 +1263,28 @@ async def web_search(
     provider_errors: Dict[str, str] = {}
     merged: List[Dict[str, str]] = []
     attempts: List[Dict[str, str]] = []
+    providers_tried: List[str] = []
 
     try:
         for provider in providers:
+            generation = _acquire_search_backend(provider)
+            if generation is None:
+                attempts.append({"backend": provider, "status": "skipped", "reason": "后端熔断冷却或探测中"})
+                continue
+            providers_tried.append(provider)
+            started = monotonic()
+            succeeded = False
             try:
-                results = await _search_with_provider(provider, normalized_query, max_results)
+                results = await asyncio.wait_for(
+                    _search_with_provider(provider, normalized_query, max_results),
+                    timeout=SEARCH_BACKEND_TIMEOUT,
+                )
+                results = _dedupe_results(results, max_results)
                 if not results:
                     attempts.append({"backend": provider, "status": "empty", "reason": "未返回结果"})
                     _record_backend_status(channel, provider, "empty", "未返回结果")
                     continue
+                succeeded = True
                 previous_count = len(merged)
                 merged = _dedupe_results(merged + results, max_results)
                 added = len(merged) - previous_count
@@ -1211,11 +1302,17 @@ async def web_search(
                 attempts.append({"backend": provider, "status": "empty", "reason": reason})
                 _record_backend_status(channel, provider, "empty", reason)
             except Exception as exc:
-                reason = _safe_reason(exc)
+                reason = _safe_reason(exc) if str(exc).strip() else type(exc).__name__
                 provider_errors[provider] = reason
                 attempts.append({"backend": provider, "status": "error", "reason": reason})
                 _record_backend_status(channel, provider, "error", reason)
-                logger.warning(f"Web search provider {provider} failed for {normalized_query}: {exc}")
+                logger.warning(f"Web search provider {provider} failed for {normalized_query}: {reason}")
+            finally:
+                # Caller deadlines cancel with CancelledError (a BaseException).
+                # Count that incomplete attempt, release a probe, and propagate it.
+                _record_search_outcome(
+                    provider, generation, success=succeeded, elapsed=max(0.0, monotonic() - started),
+                )
 
         if not merged:
             return {
@@ -1223,7 +1320,7 @@ async def web_search(
                 "query": normalized_query,
                 "channel": channel,
                 "provider": "multi",
-                "providersTried": providers,
+                "providersTried": providers_tried,
                 "providerErrors": provider_errors,
                 "error": "没有拿到可用搜索结果，可能是搜索引擎限制或网络异常",
                 "results": [],
@@ -1246,7 +1343,7 @@ async def web_search(
             "query": normalized_query,
             "channel": channel,
             "provider": "multi",
-            "providersTried": providers,
+            "providersTried": providers_tried,
             "providerErrors": provider_errors,
             "results": merged,
             "fetchedPages": fetched_pages,

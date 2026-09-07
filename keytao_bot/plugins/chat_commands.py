@@ -763,6 +763,8 @@ def _reviewed_multi_word_capabilities(state: PendingToolConfirm) -> Dict[Tuple[s
 def _create_phrase_args(state: PendingAddWord, code: str) -> Dict:
     """Build mutation arguments without losing the structured review verdict."""
     args: Dict = {"word": state.word, "code": code}
+    if state.phrase_type == "Single":
+        args["type"] = "Single"
     remark = state.code_remarks.get(code)
     if remark:
         args["remark"] = remark
@@ -808,7 +810,7 @@ def _reviewed_create_capability(
         return None
     return {
         (word, code): {
-            "type": "Phrase",
+            "type": "Single" if len(word) == 1 and re.fullmatch(r"[\u3400-\u9fff\U00020000-\U0002fa1f]", word) else "Phrase",
             "pinyin": pinyin,
             "candidate_codes": candidate_codes,
         },
@@ -2652,6 +2654,9 @@ async def _revalidate_referenced_add_pending(
             f"当前审词结果指向「{current_word or '未知词条'}」，"
             f"不再是「{referenced_state.word}」"
         )
+    current_type = str(review.get("type") or "Phrase")
+    if current_type != referenced_state.phrase_type:
+        return reject("当前审词条目类型与原候选不一致")
 
     referenced_recommended = str(
         referenced_state.recommended_code or ""
@@ -2769,6 +2774,7 @@ async def _revalidate_referenced_add_pending(
         pronunciation_recommended_codes=current_pronunciation_recommended_codes,
         needs_manual_review=bool(current_needs_manual_review),
         manual_review_reason=review_flags.manual_review_reason(review),
+        phrase_type=current_type,
     ), current_statuses, review.get("candidateOrderingAssessments"))
 
     def reject_with_refresh(reason: str) -> None:
@@ -3379,7 +3385,7 @@ async def _prepare_multi_word_query(
         code = reviewed["recommendedCode"]
         item = {
             "action": "Create", "word": scope["word"], "code": code,
-            "type": "Phrase", "remark": reviewed["codeRemarks"].get(code, ""),
+            "type": reviewed.get("phraseType", "Phrase"), "remark": reviewed["codeRemarks"].get(code, ""),
         }
         review_flags.apply_manual_review_flag(
             item,
@@ -3500,6 +3506,7 @@ async def _try_handle_simple_single_word_query(
             if isinstance(phrase, dict)
             and str(phrase.get("word") or word).strip() == word
             and str(phrase.get("code") or "").strip()
+            and (len(word) != 1 or phrase.get("type") == "Single")
         )
         existing_codes = tuple(dict.fromkeys(
             str(phrase.get("code") or "").strip().lower()
@@ -3533,12 +3540,14 @@ async def _try_handle_simple_single_word_query(
                         space_key=space_key,
                         owner_label=owner_label,
                     )
-            return already_existing_word_copy(
+            existing_reply = already_existing_word_copy(
                 word,
                 existing_codes,
                 can_choose_other_code=_prepared_scopes is None,
             )
-        return "词库查询返回了不完整的已有词条记录；本次未继续。"
+            return ("类型：单字\n" + existing_reply) if len(word) == 1 else existing_reply
+        if matching_rows or len(word) != 1:
+            return "词库查询返回了不完整的已有词条记录；本次未继续。"
 
     review_args = {"word": word}
     if requested_reading:
@@ -3562,6 +3571,9 @@ async def _try_handle_simple_single_word_query(
         )
         pending = _parse_pending_add_word(reviewed_prompt)
         if pending is not None:
+            pending.phrase_type = str(review.get("type") or "Phrase")
+            if len(word) == 1 and pending.phrase_type != "Single":
+                return f"「{word}」未取得可核验的单字编码，本次不展示可执行候选。"
             inventory = select_candidate_inventory(review)
             # Seal exactly the inventory chosen by the shared selector.  A
             # flattened payload can mix pronunciation groups and would make
@@ -3629,6 +3641,9 @@ async def _try_handle_simple_single_word_query(
                     actionable_controls=True,
                 )
                 reviewed_prompt = read_only_candidates
+                if not reviewed_prompt:
+                    conversation_state_store.delete(target_key)
+                    raise ValueError("persisted candidate inventory could not be rendered")
         actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
         rendered_reply = append_unbound_binding_notice(reviewed_prompt, actor_is_bound)
         return (
