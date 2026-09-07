@@ -94,6 +94,87 @@ class DraftMutationClaimStore:
                 connection.execute(
                     "ALTER TABLE draft_mutation_fence ADD COLUMN result_json TEXT"
                 )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS completed_draft_operation ("
+                "scope TEXT PRIMARY KEY, platform TEXT NOT NULL, actor TEXT NOT NULL, "
+                "operation_id TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS draft_operation_turn ("
+                "scope TEXT PRIMARY KEY, turn_id TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS draft_operation_actor_write ("
+                "platform TEXT NOT NULL, actor TEXT NOT NULL, operation_id TEXT NOT NULL, "
+                "PRIMARY KEY (platform, actor))"
+            )
+
+    def note_operation_turn(self, scope: str, turn_id: str) -> str:
+        """Persist immediate-turn identity without interpreting chat history."""
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT turn_id FROM draft_operation_turn WHERE scope = ?", (scope,),
+            ).fetchone()
+            connection.execute(
+                "INSERT INTO draft_operation_turn VALUES (?, ?) "
+                "ON CONFLICT(scope) DO UPDATE SET turn_id = excluded.turn_id",
+                (scope, turn_id),
+            )
+        return str(row[0]) if row else ""
+
+    def save_completed_operation(self, scope: str, platform: str, actor: str, payload: Dict) -> None:
+        """Save exact server evidence before the operation receipt is delivered."""
+        serialized = self._serialize_result(payload)
+        operation_id = str(payload["operationId"])
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO completed_draft_operation VALUES (?, ?, ?, ?, 'ready', ?) "
+                "ON CONFLICT(scope) DO UPDATE SET operation_id = excluded.operation_id, "
+                "status = 'ready', payload_json = excluded.payload_json",
+                (scope, platform, actor, operation_id, serialized),
+            )
+            connection.execute(
+                "INSERT INTO draft_operation_actor_write VALUES (?, ?, ?) "
+                "ON CONFLICT(platform, actor) DO UPDATE SET operation_id = excluded.operation_id",
+                (platform, actor, operation_id),
+            )
+
+    def completed_operation(self, scope: str) -> Optional[Dict]:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT status, payload_json, platform, actor FROM completed_draft_operation WHERE scope = ?",
+                (scope,),
+            ).fetchone()
+            if row is None:
+                return None
+            latest = connection.execute(
+                "SELECT operation_id FROM draft_operation_actor_write WHERE platform = ? AND actor = ?",
+                (row[2], row[3]),
+            ).fetchone()
+        return {
+            **json.loads(row[1]), "status": str(row[0]),
+            "latestActorWrite": str(latest[0]) if latest else "",
+        }
+
+    def update_completed_operation(self, scope: str, operation_id: str, before_status: str, status: str, payload: Dict) -> bool:
+        """CAS claim or advance the durable undo without changing its target."""
+        serialized = self._serialize_result(payload)
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE completed_draft_operation SET status = ?, payload_json = ? "
+                "WHERE scope = ? AND operation_id = ? AND status = ?",
+                (status, serialized, scope, operation_id, before_status),
+            )
+            return cursor.rowcount == 1
+
+    def actor_has_running_undo(self, platform: str, actor: str) -> bool:
+        with self._lock, self._connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM completed_draft_operation WHERE platform = ? AND actor = ? AND status = 'undoing' LIMIT 1",
+                (platform, actor),
+            ).fetchone() is not None
 
     @staticmethod
     def _serialize(payload: Dict) -> tuple[str, str]:

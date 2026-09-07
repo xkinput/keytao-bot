@@ -4420,6 +4420,12 @@ def test_incomplete_shift_modified_add_preserves_compound_refusal():
                     candidates=[("jjqt", True), ("jjqto", False)],
                     server_candidates=[("jjqt", True), ("jjqto", False)],
                     server_occupied_words={"jjqt": ["旧圈"]},
+                    # Synthetic weaker-occupant evidence for this parser fixture.
+                    server_ordering_assessments=[{
+                        "verdict": "front_more_common", "newWord": "出圈",
+                        "occupantWord": "旧圈", "occupantCode": "jjqt",
+                        "freeCode": "jjqto", "newCode": "jjqt",
+                    }],
                     pronunciation_codes={
                         "jjqt": "chu quan",
                         "jjqto": "chu quan",
@@ -10326,7 +10332,7 @@ def test_exact_pending_selection_syntax_is_structural_and_fail_closed():
                 "把 木板 从 mjbf 挪走": (
                     "pending_recode", None, "mjbf", "木板"
                 ),
-                "顺延 木板": ("pending_recode", None, "", "木板"),
+                "顺延 木板": ("pending_recode", None, "mjbf", "木板"),
             }
             for message, expected in cases.items():
                 intent = await openai_chat_module._classify_message_command_intent(
@@ -10448,16 +10454,16 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
 
         check("exact code executes direct add", code_response == "added")
         check("exact code binds advertised empty slot", add_mock.await_args.args[:2] == ("母版", "mjbfa"))
-        check("occupied number executes the shift path", duplicate_response == "shifted")
+        check("occupied number protects the unnamed occupant", duplicate_response is not None and "木板" in duplicate_response and "本次未写入" in duplicate_response)
         check("occupied number never creates a duplicate", duplicate_mock.await_count == 0)
-        check("numbered recode executes shift", numbered_shift_response == "shifted")
+        check("numbered recode protects the unnamed occupant", numbered_shift_response is not None and "木板" in numbered_shift_response and "本次未写入" in numbered_shift_response)
         check("named recode executes shift", named_shift_response == "shifted")
         check("occupant-first recode executes shift", occupant_first_response == "shifted")
         check("move-away form executes shift", move_away_response == "shifted")
         check("shift-occupant form executes shift", shift_occupant_response == "shifted")
         check(
             "all recode forms bind the occupied code for the live newcomer",
-            shift_mock.await_count == 6
+            shift_mock.await_count == 4
             and all(call.args[1] == "mjbf" for call in shift_mock.await_args_list),
         )
         check("all-add executes reviewed multi-code path", multi_response == "multi-added")
@@ -10471,7 +10477,7 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
             and "没有可安全执行的后续命令" not in invalid_response,
         )
         check("question does not execute a pending mutation", question_response is None)
-        check("unsafe selectors add no extra writes", add_mock.await_count == 1 and duplicate_mock.await_count == 0 and shift_mock.await_count == 6 and multi_mock.await_count == 1)
+        check("unsafe selectors add no extra writes", add_mock.await_count == 1 and duplicate_mock.await_count == 0 and shift_mock.await_count == 4 and multi_mock.await_count == 1)
 
     asyncio.run(_run())
 
@@ -10577,8 +10583,8 @@ def test_pending_recode_selection_completes_its_server_plan_in_one_message():
 
 
 def test_occupied_numeric_choice_means_create_with_eviction():
-    """Selecting an occupied candidate applies the default shift policy."""
-    print("\n🧪 occupied numeric choice means create with eviction")
+    """A bare numeric choice cannot evict an occupant without a weaker verdict."""
+    print("\n🧪 occupied numeric choice protects the unnamed occupant")
 
     state = PendingAddWord(
         word="增香",
@@ -10608,9 +10614,26 @@ def test_occupied_numeric_choice_means_create_with_eviction():
                         confidence=0.96,
                     ),
                 )
-        check("occupied choice returns shift result", result == "shifted")
+        check("occupied choice explains that no write occurred", result is not None and "增翔" in result and "本次未写入" in result)
         check("duplicate helper is not called", duplicate_mock.await_count == 0)
-        check("shift helper is called once", shift_mock.await_count == 1)
+        check("shift helper is not called", shift_mock.await_count == 0)
+
+        stronger_state = replace(state, server_ordering_assessments=[{
+            "newWord": "增香", "occupantWord": "增翔", "occupantCode": "zrxx",
+            "freeCode": "zrxxv", "newCode": "zrxx", "verdict": "front_more_common",
+        }])
+        for message, intent in (
+            ("1", MessageCommandIntent(intent="pending_choice", choice_index=1, confidence=1.0)),
+            ("1 重新编码", MessageCommandIntent(intent="pending_recode", choice_index=1, confidence=1.0)),
+        ):
+            with patch.object(openai_chat_module, "_execute_confirmed_tool", AsyncMock(return_value="duplicate")) as duplicate_mock:
+                with patch.object(openai_chat_module, "_execute_shift_to_code", AsyncMock(return_value="shifted")) as shift_mock:
+                    result = await _handle_pending_add_word(
+                        stronger_state, message, "qq", "123", [], command_intent=intent,
+                    )
+            check(f"bound weaker occupant still shifts: {message}", result == "shifted" and shift_mock.await_count == 1)
+            check(f"weaker-occupant shift keeps exact target: {message}", shift_mock.await_count == 1 and shift_mock.await_args.args[:2] == ("增香", "zrxx"))
+            check(f"weaker-occupant selection never duplicate-adds: {message}", duplicate_mock.await_count == 0)
 
     asyncio.run(_run())
 

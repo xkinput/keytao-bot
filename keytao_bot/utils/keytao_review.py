@@ -5788,11 +5788,14 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
 
 def _candidate_commonness_pairs(review: Dict) -> List[Dict[str, str]]:
     word = str(review.get("word") or "").strip()
-    free_code = str(review.get("recommendedCode") or "").strip().lower()
-    if not word or not free_code:
+    recommended_code = str(review.get("recommendedCode") or "").strip().lower()
+    if not word:
         return []
 
-    statuses: List[Dict] = []
+    statuses: List[Dict] = [
+        status for status in review.get("candidateStatuses") or []
+        if isinstance(status, dict)
+    ]
     for pronunciation in review.get("pronunciations") or []:
         if not isinstance(pronunciation, dict):
             continue
@@ -5801,10 +5804,10 @@ def _candidate_commonness_pairs(review: Dict) -> List[Dict[str, str]]:
             for status in pronunciation.get("candidateStatuses") or []
             if isinstance(status, dict)
         ]
-        if any(
-            str(status.get("code") or "").strip().lower() == free_code
+        if not statuses and (not recommended_code or any(
+            str(status.get("code") or "").strip().lower() == recommended_code
             for status in candidate_statuses
-        ):
+        )):
             statuses = candidate_statuses
             break
     if not statuses:
@@ -5814,17 +5817,20 @@ def _candidate_commonness_pairs(review: Dict) -> List[Dict[str, str]]:
         (
             index
             for index, status in enumerate(statuses)
-            if str(status.get("code") or "").strip().lower() == free_code
-            and status.get("occupied") is False
+            if status.get("occupied") is False
         ),
         -1,
     )
-    if free_index <= 0:
+    if free_index == 0:
         return []
+    free_code = (
+        str(statuses[free_index].get("code") or "").strip().lower()
+        if free_index >= 0 else ""
+    )
 
     pairs: List[Dict[str, str]] = []
     seen_words: set[str] = set()
-    for status in statuses[:free_index]:
+    for status in (statuses[:free_index] if free_index >= 0 else statuses):
         if status.get("occupied") is not True:
             continue
         occupant_code = str(status.get("code") or "").strip().lower()
@@ -5832,7 +5838,8 @@ def _candidate_commonness_pairs(review: Dict) -> List[Dict[str, str]]:
             str(phrase.get("word") or "").strip()
             for phrase in status.get("phrases") or []
             if isinstance(phrase, dict)
-            and str(phrase.get("type") or "Phrase") == "Phrase"
+            and str(phrase.get("type") or review.get("type") or "Phrase")
+            == str(review.get("type") or "Phrase")
             and str(phrase.get("word") or "").strip()
         ]
         if not occupant_words:
@@ -5894,9 +5901,39 @@ def apply_candidate_ordering_recommendation(
     review: Dict[str, Any],
     assessments: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Make a validated comparator front verdict the review's one default."""
+    """Recommend an empty slot or a comparator-backed weaker occupant."""
+    from .candidate_inventory import protected_candidate_occupants
+
     review["candidateOrderingAssessments"] = assessments
     pairs = _candidate_commonness_pairs(review)
+    statuses = [
+        status
+        for pronunciation in review.get("pronunciations") or []
+        if isinstance(pronunciation, dict)
+        for status in pronunciation.get("candidateStatuses") or []
+        if isinstance(status, dict)
+    ]
+    if not statuses:
+        statuses = [status for status in review.get("candidateStatuses") or [] if isinstance(status, dict)]
+    candidates = [(str(status.get("code") or ""), status.get("occupied")) for status in statuses]
+    occupied_words = {
+        str(status.get("code") or ""): list(dict.fromkeys([
+            *[str(value or "").strip() for value in status.get("words") or [] if str(value or "").strip()],
+            *[str(phrase.get("word") or "").strip() for phrase in status.get("phrases") or []
+              if isinstance(phrase, dict) and str(phrase.get("word") or "").strip()],
+        ]))
+        for status in statuses if status.get("occupied") is True
+    }
+    for payload in [review, *[item for item in review.get("pronunciations") or [] if isinstance(item, dict)]]:
+        recommended = str(payload.get("recommendedCode") or "").strip().lower()
+        if recommended and protected_candidate_occupants(
+            review.get("word"), recommended, candidates, occupied_words, assessments,
+        ):
+            payload["recommendedCode"] = next((
+                str(status.get("code") or "").strip().lower()
+                for status in payload.get("candidateStatuses") or statuses
+                if isinstance(status, dict) and status.get("occupied") is False
+            ), "")
     for assessment in assessments[:2]:
         if (
             not isinstance(assessment, dict)
@@ -5917,7 +5954,12 @@ def apply_candidate_ordering_recommendation(
             or assessment.get("recommendedCode")
             or ""
         ).strip().lower()
-        if matching_pair is not None and new_code == occupant_code:
+        if (
+            matching_pair is not None and new_code == occupant_code
+            and not protected_candidate_occupants(
+                review.get("word"), occupant_code, candidates, occupied_words, assessments,
+            )
+        ):
             review["recommendedCode"] = occupant_code
             free_code = str(assessment.get("freeCode") or "").strip().lower()
             for pronunciation in review.get("pronunciations") or []:
@@ -5928,7 +5970,7 @@ def apply_candidate_ordering_recommendation(
                     for status in pronunciation.get("candidateStatuses") or []
                     if isinstance(status, dict)
                 }
-                if {occupant_code, free_code}.issubset(status_codes):
+                if occupant_code in status_codes and (not free_code or free_code in status_codes):
                     pronunciation["recommendedCode"] = occupant_code
                     break
             break
@@ -6031,7 +6073,7 @@ async def assess_candidate_chain_commonness(
     *,
     timeout: float = CANDIDATE_COMMONNESS_TIMEOUT_SECONDS,
 ) -> List[Dict[str, Any]]:
-    """Compare a new word with at most two occupants ahead of its free slot."""
+    """Compare up to two occupants, including chains without an empty slot."""
     pairs = _candidate_commonness_pairs(review)
     if not pairs:
         return []
@@ -6090,6 +6132,33 @@ async def assess_candidate_chain_commonness(
             ))
     record_commonness_evidence(assessments)
     return assessments
+
+
+async def assess_explicit_code_commonness(
+    word: str,
+    code: str,
+    occupants: List[Dict[str, Any]],
+    *,
+    phrase_type: str = "Phrase",
+) -> List[Dict[str, Any]]:
+    """Use the same bounded comparator for a freshly queried explicit code."""
+    typed_occupants = [
+        occupant for occupant in occupants
+        if isinstance(occupant, dict)
+        and str(occupant.get("type") or phrase_type) == phrase_type
+        and str(occupant.get("word") or "").strip()
+    ]
+    return await assess_candidate_chain_commonness({
+        "word": word,
+        "type": phrase_type,
+        "recommendedCode": code,
+        "candidateStatuses": [{
+            "code": code,
+            "occupied": bool(typed_occupants),
+            "words": [str(occupant["word"]).strip() for occupant in typed_occupants],
+            "phrases": typed_occupants,
+        }],
+    })
 
 
 def _reverse_commonness_comparison(comparison: Dict[str, Any]) -> Dict[str, Any]:

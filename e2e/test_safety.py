@@ -23,6 +23,8 @@ from .scenarios import (
     S20_BATCH_WORDS,
     S21_BATCH_WORDS,
     _assert_s21_unrelated_turn_unchanged,
+    _assert_s56_advertised_reply_closure,
+    _s56_advertised_reply_commands,
     S22_BATCH_WORDS,
     S23_BATCH_WORDS,
     S24_NATURAL_ASSENT,
@@ -45,7 +47,10 @@ from .scenarios import (
     S38_EXPLICIT_READING_MESSAGE,
     S38_EXPLANATION_MESSAGE,
     S38_NEGATIVE_MODIFIER_MESSAGE,
+    S38_NAMED_QUERY_OVERRIDE,
+    S38_POSITIVE_MODIFIER_MESSAGE,
     S38_QUERY_CONTROLS,
+    S38_UNNAMED_POSITIVE_MODIFIER_MESSAGE,
     S39_COMMAND,
     S39_OCCUPANT,
     S39_SELECTION,
@@ -117,6 +122,13 @@ from .scenarios import (
     S55_WORD,
     S55_EXISTING_WORD,
     S55_EXISTING_CODE,
+    S56_WORD,
+    S56_EXPLICIT_CODE,
+    S56_SINGLE_CHAIN,
+    S56_EXPLICIT_FORMS,
+    S56_BARE_FORMS,
+    S56_INVALID_CODES,
+    S56_WORD_CONTROL,
     S27_ASSENT,
     S27_META_QUESTION,
     S27_WORD,
@@ -722,11 +734,170 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s55(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s56(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 56)],
+            [f"S{index}" for index in range(1, 57)],
         )
+
+    def test_s56_declares_exact_single_cascade_and_weaker_word_control(self) -> None:
+        self.assertEqual((S56_WORD, S56_EXPLICIT_CODE), ("鎗", "qxioio"))
+        self.assertEqual(S56_SINGLE_CHAIN, (("强", "qx", "qxa"), ("戕", "qxa", "qxai")))
+        self.assertEqual(S56_WORD_CONTROL, ("发布会", "重病号", "fbh"))
+        self.assertEqual(S56_EXPLICIT_FORMS, ("加入编码qxioio", "加入 qxioio", "添加 鎗 qxioio", "用 qxioio"))
+        self.assertEqual(S56_BARE_FORMS, ("加入", "加入并提交", "好"))
+        self.assertEqual(tuple(code for code, _reason in S56_INVALID_CODES), ("qxio1o", "qxioioa", "qkioio"))
+        fixture = ZDIC_FIXTURES_BY_SCENARIO["S56"]
+        self.assertEqual(fixture["probe_words"], ("鎗", "强", "戕", "发布会", "重病号"))
+        rows = {(row["kind"], row["entry"]): row for row in fixture["rows"]}
+        self.assertEqual(len(rows), len(fixture["rows"]))
+        self.assertEqual(rows[("char", "鎗")]["pinyins"], ["qiāng", "chēng"])
+        self.assertEqual(rows[("char", "强")]["pinyins"][0], "qiáng")
+        self.assertEqual(rows[("char", "戕")]["pinyins"], ["qiāng"])
+        self.assertTrue(all(rows[("entry", word)]["status"] == "absent" for word in ("鎗", "强", "戕")))
+        self.assertEqual(rows[("entry", "发布会")]["pinyins"], ["fā", "bù", "huì"])
+        self.assertEqual(rows[("entry", "重病号")]["pinyins"], ["zhòng", "bìng", "hào"])
+
+    async def test_s56_advertised_shift_cancel_uses_real_parser_without_model(self) -> None:
+        from keytao_bot.harness.state import PendingToolConfirm
+        from keytao_bot.plugins import chat_routing as routing
+
+        state = PendingToolConfirm(
+            function_name="keytao_shift_phrase_code",
+            args={"word": "发布会", "target_code": "fbh"},
+            confirmation_source="local_preview",
+        )
+        with patch.object(routing, "OPENAI_API_KEY", ""), patch.object(routing, "AsyncOpenAI") as model:
+            intent = await routing._classify_message_command_intent("取消", state)
+            self.assertEqual(intent.intent, "pending_cancel")
+            self.assertTrue(routing._message_authorizes_pending_state_control(state, "取消", intent))
+            model.assert_not_called()
+        for command in ("取消？", "不要取消", "他说取消", "如果取消"):
+            with self.subTest(command=command):
+                parsed = routing._pending_tool_assent_intent(state, command)
+                self.assertTrue(parsed is None or parsed.intent != "pending_cancel")
+
+    async def test_s56_closes_actual_multi_select_fallback_and_shift_controls(self) -> None:
+        from keytao_bot.harness.conversation import ConversationAddress
+        from keytao_bot.harness.state import PendingAddWord, PendingStateRecord, PendingToolConfirm
+        from keytao_bot.plugins import chat_routing as routing, openai_chat as chat
+
+        address = ConversationAddress.private("qq", "s56-advertised")
+        # These are the exact advertised blocks in the accepted S56 replies.
+        candidate_reply = (
+            "候选编码:\n1. fbh — 已有「重病号」 ← 常用度推荐（需重排）\n"
+            "2. fbha — 空位\n3. fbhav — 空位\n4. fbhavi — 空位\n推荐：\n"
+            "- “「发布会」占 fbh、「重病号」顺延”（发布会、重病号）\n"
+            "依据：「发布会」较「重病号」更常用：语料频次 4417 vs 2，词典收录 2 vs 1\n"
+            "不重排选 2（fbha）。\n回复编号或编码选择（可多选，如「添加2、4」）；\n"
+            "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
+        )
+        candidates = [("fbh", True), ("fbha", False), ("fbhav", False), ("fbhavi", False)]
+        state = PendingAddWord(
+            word="发布会", recommended_code="fbh", candidates=candidates, server_candidates=candidates,
+            occupied_words={"fbh": ["重病号"]}, server_occupied_words={"fbh": ["重病号"]},
+            server_ordering_assessments=[{
+                "newWord": "发布会", "occupantWord": "重病号", "occupantCode": "fbh",
+                "freeCode": "fbha", "newCode": "fbh", "verdict": "front_more_common",
+            }],
+        )
+        record = PendingStateRecord(state=state, owner_key=address, nonce="candidate")
+        shift_reply = (
+            "🔁 添加并顺延计划：\n调整计划如下：\n• 重病号：Delete fbh（删除）\n"
+            "• 发布会：Create fbh（添加）\n• 重病号：Create fbhu（添加）\n"
+            "回复「确认」执行，或「取消」。"
+        )
+        shift_record = PendingStateRecord(
+            state=PendingToolConfirm(function_name="keytao_shift_phrase_code", args={"word": "发布会", "target_code": "fbh"}),
+            owner_key=address, nonce="shift",
+        )
+        no_read = AsyncMock(side_effect=AssertionError("candidate closure must not read a draft"))
+        with patch.object(routing, "OPENAI_API_KEY", ""), patch.object(routing, "AsyncOpenAI") as model:
+            candidate_facts = await _assert_s56_advertised_reply_closure(candidate_reply, chat=chat, record=record, address=address, read_draft=no_read)
+            shift_facts = await _assert_s56_advertised_reply_closure(shift_reply, chat=chat, record=shift_record, address=address, read_draft=no_read)
+            self.assertTrue({"添加2、4", "2", "加入", "加入并提交"}.issubset(candidate_facts["commands"]))
+            self.assertEqual(shift_facts["commands"], ("确认", "取消"))
+            self.assertEqual([row["parser"] for row in shift_facts["bindings"]], ["pending_confirm", "pending_cancel"])
+            self.assertTrue(any(row["command"].startswith("- “") for row in candidate_facts["bindings"]))
+            model.assert_not_called()
+            for invalid_reply, invalid_record in (
+                (candidate_reply.replace("不重排选 2（fbha）", "不重排选 2（fbh）"), record),
+                (candidate_reply.replace("添加2、4", "添加2、9"), record),
+                (shift_reply, None),
+                (shift_reply, PendingStateRecord(state=shift_record.state, owner_key=ConversationAddress.private("qq", "other"))),
+            ):
+                with self.subTest(reply=invalid_reply, record=invalid_record), self.assertRaises(AssertionError):
+                    await _assert_s56_advertised_reply_closure(invalid_reply, chat=chat, record=invalid_record, address=address, read_draft=no_read)
+
+    async def test_s56_advertised_submit_binds_the_actual_actor_draft(self) -> None:
+        from keytao_bot.harness.conversation import ConversationAddress
+        from keytao_bot.harness.state import PendingStateRecord, PendingToolConfirm
+        from keytao_bot.plugins import chat_routing as routing, openai_chat as chat
+
+        address = ConversationAddress.private("qq", "s56-submit")
+        reply = (
+            "✅ 已将「鎗」qxioio 的权重调整为 11（单字类型）。\n"
+            "草稿地址： localhost 地址，正式环境以实际返回为准）\n"
+            "发送「提交」以提交该草稿，也可继续加改动。\n"
+            "草稿/批次地址：https://keytao.rea.ink/batch/31487900-5ba1-4476-aba5-8d5c2c029f85"
+        )
+        batch_id = "31487900-5ba1-4476-aba5-8d5c2c029f85"
+        record = PendingStateRecord(
+            state=PendingToolConfirm(function_name="keytao_submit_batch", args={"batch_id": batch_id, "_recent_own_write": True, "_recent_batch_ids": [batch_id]}),
+            owner_key=address, nonce="receipt",
+        )
+        snapshot = {"success": True, "batchId": batch_id, "contentVersion": 2, "items": [{"id": 17527, "word": "鎗", "code": "qxioio", "type": "Single", "action": "Create", "weight": 11, "needsManualReview": True}]}
+        with patch.object(routing, "OPENAI_API_KEY", ""), patch.object(routing, "AsyncOpenAI") as model:
+            facts = await _assert_s56_advertised_reply_closure(reply, chat=chat, record=record, address=address, read_draft=AsyncMock(return_value=snapshot))
+            self.assertEqual(facts["commands"], ("提交",))
+            self.assertEqual(facts["bindings"][0]["batchId"], batch_id)
+            model.assert_not_called()
+            with self.assertRaises(AssertionError):
+                await _assert_s56_advertised_reply_closure(reply, chat=chat, record=record, address=address, read_draft=AsyncMock(return_value={**snapshot, "batchId": "other-batch"}))
+        self.assertEqual(_s56_advertised_reply_commands("✅ 已撤销整笔操作：新增 鎗@qxioio。"), ((), ()))
+
+    async def test_s56_advertised_submit_binds_enriched_actor_journal_without_ticket(self) -> None:
+        from keytao_bot.harness.conversation import ConversationAddress
+        from keytao_bot.plugins import chat_routing as routing, openai_chat as chat
+        from keytao_bot.utils import completed_draft_undo as undo
+        from keytao_bot.utils.draft_mutation_store import DraftMutationClaimStore
+
+        address = ConversationAddress.private("qq", "s56-journal-submit")
+        batch_id = "d5417486-bdc0-4c7f-9704-3ee292439a9f"
+        reply = (
+            "已调整完成：\n「鎗」qxioio 的权重已从 10 调整为 11（单字类型，不低于基础值 10）。\n"
+            "可以发送「提交」发起审核，也可继续修改。\n"
+            f"草稿/批次地址：https://keytao.rea.ink/batch/{batch_id}"
+        )
+        items = [
+            {"id": 17904, "word": "鎗", "code": "qxioio", "type": "Single", "action": "Create", "oldWord": None, "weight": 11, "remark": "S56 original manually reviewed draft row", "needsManualReview": True},
+            {"id": 17905, "word": "鎗", "code": "qxioi", "type": "Single", "action": "Create", "oldWord": None, "weight": 10, "remark": "S56 unrelated same-word draft row", "needsManualReview": True},
+        ]
+        snapshot = {"success": True, "batchId": batch_id, "contentVersion": 8, "items": items}
+        operation = {
+            "operationId": "e500e922c1bb4bf39bf1a06182228dfc", "batchId": batch_id,
+            "after": {**snapshot, "items": [{**row, "_targetPhraseId": None, "_targetFingerprint": None} for row in items]},
+        }
+        with tempfile.TemporaryDirectory() as temp, patch.object(routing, "OPENAI_API_KEY", ""), patch.object(routing, "AsyncOpenAI") as model:
+            store = DraftMutationClaimStore(str(Path(temp) / "journal.db"))
+            store.save_completed_operation(undo.conversation_scope(address), address.platform, address.actor_id, operation)
+            with patch.object(undo, "get_default_draft_mutation_claim_store", return_value=store):
+                facts = await _assert_s56_advertised_reply_closure(reply, chat=chat, record=None, address=address, read_draft=AsyncMock(return_value=snapshot))
+                self.assertEqual(facts["commands"], ("提交",))
+                self.assertEqual(facts["bindings"], [{"command": "提交", "parser": "draft_submit", "batchId": batch_id}])
+                invalid_snapshots = [
+                    {**snapshot, "batchId": "other-batch"},
+                    {**snapshot, "contentVersion": 9},
+                    {**snapshot, "items": items[:1]},
+                ]
+                for field, value in (("id", 17906), ("word", "枪"), ("code", "qxioia"), ("type", "Word"), ("action", "Delete"), ("oldWord", "枪"), ("weight", 12), ("remark", "changed"), ("needsManualReview", False)):
+                    invalid_snapshots.append({**snapshot, "items": [{**items[0], field: value}, items[1]]})
+                for invalid in invalid_snapshots:
+                    with self.subTest(snapshot=invalid), self.assertRaises(AssertionError):
+                        await _assert_s56_advertised_reply_closure(reply, chat=chat, record=None, address=address, read_draft=AsyncMock(return_value=invalid))
+                with self.assertRaises(AssertionError):
+                    await _assert_s56_advertised_reply_closure(reply, chat=chat, record=None, address=ConversationAddress.private("qq", "other"), read_draft=AsyncMock(return_value=snapshot))
+            model.assert_not_called()
 
     def test_s55_single_fixtures_preserve_actual_encoding_inputs(self) -> None:
         self.assertEqual((S55_WORD, S55_EXISTING_WORD, S55_EXISTING_CODE), ("鎗", "一", "ykv"))
@@ -957,6 +1128,9 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             "加词 耙耙柑 ppg，不要顺延其他相关的词条",
         )
         self.assertEqual(S38_QUERY_CONTROLS, ("1", "回复1", "加入"))
+        self.assertEqual(S38_NAMED_QUERY_OVERRIDE, "加入1，顶替 琵琶骨")
+        self.assertEqual(S38_POSITIVE_MODIFIER_MESSAGE, "加词 耙耙柑 ppg，顺延琵琶骨")
+        self.assertEqual(S38_UNNAMED_POSITIVE_MODIFIER_MESSAGE, "加词 耙耙柑 ppg，顺延其他词条")
         fixture = ZDIC_FIXTURES_BY_SCENARIO["S38"]
         self.assertEqual(fixture["probe_words"], ("出圈", S37_WORD, S37_OCCUPANT))
         entries = {
@@ -979,7 +1153,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
 
     def test_s39_pins_reading_selection_and_occupant_fixture(self) -> None:
         self.assertEqual(S39_COMMAND, "加词 出圈 圈字读quan")
-        self.assertEqual(S39_SELECTION, "1 重新编码")
+        self.assertEqual(S39_SELECTION, "加入1，挤掉除权")
         self.assertEqual((S39_WORD, S39_OCCUPANT, S39_TARGET_CODE), (
             "出圈", "除权", "jjqt",
         ))
@@ -2394,6 +2568,28 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         )
         self.assertEqual(facts["localNextMutatingRequests"], 0)
 
+    def test_s21_unrelated_turn_allows_only_exact_post_user_lookup(self) -> None:
+        snapshot = {"batchId": "batch-s21", "contentVersion": 2, "items": []}
+        event = {"kind": "http", "method": "POST", "url": "http://localhost:3100/api/bot/user/find"}
+        facts = _assert_s21_unrelated_turn_unchanged(
+            [event], snapshot, dict(snapshot), next_base_url="http://localhost:3100",
+        )
+        self.assertEqual(facts["localNextMutatingRequests"], 0)
+        self.assertTrue(facts["snapshotUnchanged"])
+        for method, path in (
+            ("PUT", "/api/bot/user/find"),
+            ("PATCH", "/api/bot/user/find"),
+            ("DELETE", "/api/bot/user/find"),
+            ("POST", "/api/bot/user/find/"),
+            ("POST", "/api/bot/user/find-extra"),
+            ("POST", "/api/bot/user/find/anything"),
+        ):
+            with self.subTest(method=method, path=path), self.assertRaises(AssertionError):
+                _assert_s21_unrelated_turn_unchanged(
+                    [{**event, "method": method, "url": f"http://localhost:3100{path}"}],
+                    snapshot, dict(snapshot), next_base_url="http://localhost:3100",
+                )
+
     def test_s21_unrelated_turn_rejects_any_snapshot_change_or_missing_evidence(self) -> None:
         snapshot = {"batchId": "batch-s21", "contentVersion": 2, "items": []}
         for after in (
@@ -3367,7 +3563,12 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(context.reset_calls, 4)
         self.assertIn("zzzz", context.injected)
 
-    async def test_s39_offline_collapses_reading_selection_to_two_turns(self) -> None:
+    async def test_s39_offline_requires_named_eviction_after_guarded_numeric_recode(self) -> None:
+        from types import SimpleNamespace
+        from keytao_bot.harness.conversation import ConversationAddress
+        from keytao_bot.harness.state import PendingAddWord, PendingStateRecord
+        from keytao_bot.plugins import chat_routing as routing, openai_chat as chat
+
         scenario = next(item for item in SCENARIOS if item.scenario_id == "S39")
 
         class FakeContext:
@@ -3379,6 +3580,25 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 self.items = []
                 self.events = []
                 self.sequence = 0
+                candidates = [("jjqt", True), ("jjqta", False), ("jjqtai", False)]
+                record = PendingStateRecord(
+                    owner_key=ConversationAddress.group("qq", "s39-group", self.platform_id), nonce="compound",
+                    state=PendingAddWord(
+                        word=S39_WORD, recommended_code="jjqta", candidates=candidates, server_candidates=candidates,
+                        occupied_words={S39_TARGET_CODE: [S39_OCCUPANT]}, server_occupied_words={S39_TARGET_CODE: [S39_OCCUPANT]},
+                        needs_manual_review=True,
+                    ),
+                )
+                self.openai_chat = SimpleNamespace(
+                    conversation_state_store=MagicMock(get_record=MagicMock(return_value=record)),
+                    _classify_message_command_intent=chat._classify_message_command_intent,
+                    _chat_commands=chat._chat_commands,
+                    _advertised_reply_matches_live_record=chat._advertised_reply_matches_live_record,
+                )
+
+            @staticmethod
+            def _group_id(platform_id: str) -> str:
+                return "s39-group"
 
             async def clean_draft(self, platform_id: str):
                 self.assert_equal(platform_id, self.platform_id)
@@ -3421,8 +3641,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                         f"1. {S39_TARGET_CODE} — 已有「{S39_OCCUPANT}」\n"
                         "2. jjqta — 空位\n"
                         "3. jjqtai — 空位\n"
-                        "回复编号或编码选择；回复“1 重新编码”挪开已有词。"
+                        "回复编号或编码选择；点名顶替可执行“加入1，挤掉除权”。"
                     )
+                if text == "1 重新编码":
+                    return "「除权」的常用度不弱于「出圈」，本次未写入。若要顶替，请点名：加入1，挤掉除权。"
                 if text in {S39_SELECTION, '重新编码 "除权" jjqt'}:
                     self._record("keytao_shift_phrase_code", {
                         "word": S39_WORD,
@@ -3446,14 +3668,16 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                     )
                 if text == "加词 出圈 jjqt 重新编码":
                     return (
-                        "现有建议不能保留你要求的添加并腾位操作，"
-                        "因此不提供缩窄后的命令；本次未写入。"
+                        "「除权」的常用度不弱于「出圈」，保留现有位置；本次未写入。\n"
+                        "可指定形码后的完整编码，格式为：加入编码 jjqt+形码（请替换形码部分）。\n"
+                        "若要顶替，请点名：\n- 「加入，顶替 除权」"
                     )
                 raise AssertionError(text)
 
             async def draft(self):
                 return {
                     "batchId": "batch-s39" if self.items else None,
+                    "contentVersion": 1 if self.items else 0,
                     "items": list(self.items),
                 }
 
@@ -3470,12 +3694,22 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 if not value:
                     raise AssertionError(value)
 
-        result = await scenario.execute(FakeContext())
+        with patch(
+            "keytao_bot.utils.keytao_review.compare_word_commonness",
+            AsyncMock(return_value={"verdict": "behind_more_common", "decisionReason": "frequency_ratio"}),
+        ), patch.object(routing, "OPENAI_API_KEY", ""), patch.object(routing, "AsyncOpenAI") as model:
+            result = await scenario.execute(FakeContext())
+            model.assert_not_called()
 
-        self.assertEqual(result["facts"]["happyPathTurnCount"], 2)
+        self.assertEqual(result["facts"]["happyPathTurnCount"], 3)
+        self.assertTrue(result["facts"]["protectedNumericDraftUnchanged"])
         self.assertEqual(result["facts"]["selectionConfirmations"], 1)
         self.assertTrue(result["facts"]["unmatchedReadingListedAvailable"])
         self.assertTrue(result["facts"]["compoundSuggestionClosed"])
+        self.assertTrue(result["facts"]["compoundDraftUnchanged"])
+        self.assertEqual(result["facts"]["compoundShiftCalls"], 0)
+        self.assertEqual(result["facts"]["compoundParserModelExchanges"], 0)
+        self.assertEqual(result["facts"]["compoundAdvertisedCommands"], ("加入，顶替 除权",))
         self.assertTrue(result["facts"]["occupantPerspectiveResolved"])
 
     async def test_s27_offline_replays_binding_precheck_and_meta_answer(self) -> None:

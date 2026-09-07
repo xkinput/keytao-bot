@@ -632,6 +632,22 @@ ZDIC_FIXTURES_BY_SCENARIO["S55"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S56"] = {
+    "probe_words": ("鎗", "强", "戕", "发布会", "重病号"),
+    "rows": (
+        {"kind": "char", "entry": "鎗", "status": "found", "pinyins": ["qiāng", "chēng"]},
+        {"kind": "char", "entry": "强", "status": "found", "pinyins": ["qiáng", "qiǎng", "jiàng"]},
+        {"kind": "char", "entry": "戕", "status": "found", "pinyins": ["qiāng"]},
+        {"kind": "entry", "entry": "鎗", "status": "absent", "pinyins": []},
+        {"kind": "entry", "entry": "强", "status": "absent", "pinyins": []},
+        {"kind": "entry", "entry": "戕", "status": "absent", "pinyins": []},
+        *(
+            row for row in ZDIC_FIXTURES_BY_SCENARIO["S35"]["rows"]
+            if row["entry"] in {"发", "布", "会", "重", "病", "号", "发布会", "重病号"}
+        ),
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

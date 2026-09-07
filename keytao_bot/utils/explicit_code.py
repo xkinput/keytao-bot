@@ -1,0 +1,99 @@
+"""Validate user-supplied codes against a persisted reviewed pronunciation."""
+
+from dataclasses import dataclass
+import re
+
+from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code
+
+
+@dataclass(frozen=True)
+class ExplicitCodeRequest:
+    code: str
+    submit_after: bool = False
+
+
+@dataclass(frozen=True)
+class ExplicitCodeValidation:
+    code: str
+    pinyin: str = ""
+    reason: str = ""
+    manual_reason: str = ""
+    known_candidate: bool = False
+
+    @property
+    def valid(self) -> bool:
+        return bool((self.pinyin or self.known_candidate) and not self.reason)
+
+
+def parse_explicit_code_request(message: str, word: str):
+    """Consume one direct command; never discard an extra target or clause."""
+    match = re.fullmatch(
+        rf"(?:加入\s*编码\s*|加入\s+|添加\s+{re.escape(word)}\s+|用\s+)"
+        r"(?P<code>[^\s，,；;。？?「」“”]+?)(?:\s*(?P<submit>并提交))?",
+        message.strip(),
+    )
+    if match is None:
+        return None
+    if match.group("code").isdigit() and not re.match(
+        rf"(?:加入\s*编码|添加\s+{re.escape(word)}\s+)", message.strip(),
+    ):
+        return None
+    return ExplicitCodeRequest(match.group("code"), bool(match.group("submit")))
+
+
+def validate_explicit_code(state, code: str) -> ExplicitCodeValidation:
+    """A shape suffix absent from the review is unknown, not an invalid code."""
+    fail = lambda reason: ExplicitCodeValidation(code, reason=reason)
+    if not state.server_candidates or state.server_candidates != state.candidates:
+        return fail("当前没有已核验的候选记录，请先查询该词")
+    if re.fullmatch(r"[a-z]+", code) is None:
+        return fail(f"编码 {code} 只能包含小写字母 a-z")
+    if len(code) > 6:
+        return fail(f"编码 {code} 有 {len(code)} 位；单字和词组最多 6 位")
+    if state.phrase_type not in {"Single", "Phrase"}:
+        return fail("当前词条类型不支持按读音核验指定编码")
+    inventory = dict(state.server_candidates)
+    if code in inventory:
+        # Existing inventory membership remains its own reviewed capability;
+        # legacy records without a reading cannot authorize any new suffix.
+        return ExplicitCodeValidation(code, pinyin=state.pronunciation_codes.get(code) or "", known_candidate=True)
+    readings = list(dict.fromkeys(
+        str(state.pronunciation_codes.get(candidate) or "").strip()
+        for candidate in inventory
+        if str(state.pronunciation_codes.get(candidate) or "").strip()
+    ))
+    matches = []
+    bases = []
+    for pinyin in readings:
+        syllables = pinyin.split()
+        if len(syllables) != len(state.word):
+            continue
+        phonetics = [pinyin_to_phonetic_code(syllable) for syllable in syllables]
+        if not all(phonetics):
+            continue
+        chain = build_phrase_code_chain(
+            [{"char": char, "phoneticCode": phonetic, "shapeCode": ""} for char, phonetic in zip(state.word, phonetics)],
+            phonetics,
+        )
+        if not chain:
+            continue
+        base_length = len(chain[0])
+        reviewed_bases = list(dict.fromkeys(
+            candidate[:base_length] for candidate in inventory
+            if state.pronunciation_codes.get(candidate) == pinyin and len(candidate) >= base_length
+        ))
+        bases.extend(reviewed_bases)
+        matches.extend((pinyin, base) for base in reviewed_bases if code.startswith(base))
+    if not matches:
+        return fail(
+            f"编码 {code} 的音码前缀不符；已审读音对应 {' / '.join(bases)}"
+            if bases else "当前记录缺少可核验的读音，请先重新查询"
+        )
+    if len(matches) != 1:
+        return fail("该编码对应多个待定读音，请先指定读音")
+    pinyin, base = matches[0]
+    suffix = code[len(base):]
+    return ExplicitCodeValidation(
+        code, pinyin=pinyin,
+        manual_reason=f"形码 {suffix} 未能核验，需管理员复核" if suffix else "指定音码需管理员复核",
+    )

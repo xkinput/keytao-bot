@@ -1317,7 +1317,11 @@ class ToolExecutor:
                 return {"error": "内部错误：无法获取用户平台信息"}
             call_args["platform"] = context.platform
             call_args["platform_id"] = context.user_id
-        return await tool_func(**call_args)
+        from keytao_bot.utils.completed_draft_undo import invoke_with_operation_journal
+
+        return await invoke_with_operation_journal(
+            tool_name, call_args, tool_func, self._get_tool_function,
+        )
 
     async def replay_shift_plan(
         self,

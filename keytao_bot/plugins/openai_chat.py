@@ -62,6 +62,11 @@ from ..utils.history_store import HistoryGenerationToken, get_history_store
 from ..utils.draft_mutation_store import (
     get_default_draft_mutation_claim_store,
 )
+from ..utils.completed_draft_undo import (
+    current_operation_capture,
+    handle_completed_undo,
+    start_operation_turn,
+)
 from ..utils.image_input import (
     ImageAttachment,
     ImageInputError,
@@ -2321,13 +2326,23 @@ def _live_candidate_affordances_are_complete(
     response: str,
     record: PendingStateRecord,
 ) -> bool:
-    """Require whole-state assent plus selection whenever candidates are numbered."""
+    """Require the controls supported by this record's safe default, if any."""
     contract = advertised_reply_contract(response)
     if (
         isinstance(record.state, PendingToolConfirm)
         and record.state.args.get("_reviewed_multi_word") is True
     ):
         return _advertised_reply_matches_live_record(response, record)
+    if isinstance(record.state, PendingAddWord) and not record.state.recommended_code:
+        expected = _render_live_single_candidate_record(record)
+        expected_contract = advertised_reply_contract(expected)
+        return bool(
+            "推荐编码：暂无（现有候选均需点名顶替）" in response
+            and expected_contract.command_suggestions
+            and set(expected_contract.command_suggestions).issubset(contract.command_suggestions)
+            and not contract.batch_assent_forms
+            and _advertised_reply_matches_live_record(response, record)
+        )
     if not {"加入", "加入并提交"}.issubset(contract.batch_assent_forms):
         return False
     if isinstance(record.state, PendingAdvertisedWordSets):
@@ -2581,7 +2596,8 @@ def _prepare_user_facing_reply(
             or _render_live_single_candidate_record(live_record)
         )
         prepared = record_backed or (
-            "这次没有生成可发送的回复；本次未写入。"
+            AgentOrchestrator._binding_meta_question_reply(current_message)
+            or "这次没有生成可发送的回复；本次未写入。"
         )
         prepared = _enforce_advertised_reply_contract(prepared, conv_key)
     prepared = strip_warning_count_copy(prepared)
@@ -3289,6 +3305,7 @@ async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
     ctx.memory_context = await extract_memory_context(ctx.bot, ctx.event, ctx.reply_reference)
     current_memory_context.set(ctx.memory_context)
     ctx.conv_key = ctx.memory_context.conversation_address
+    start_operation_turn(ctx.conv_key)
     ctx.space_key = get_space_key(ctx.memory_context)
     ctx.owner_label = ctx.memory_context.speaker_name or ctx.user_id
     ctx.response: Optional[str] = None
@@ -3301,6 +3318,37 @@ async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
         ctx.normalized_message_text,
     )
     return False
+
+
+async def _stage_handle_completed_draft_undo(ctx: TurnContext) -> bool:
+    """Bind recent-operation cancellation before pending classifiers or models."""
+    record = conversation_state_store.get_record(ctx.conv_key)
+    recent_write_capability = bool(
+        record is not None and isinstance(record.state, PendingToolConfirm)
+        and record.state.function_name == "keytao_submit_batch"
+        and record.state.args.get("_recent_own_write") is True
+    )
+    if record is not None and not isinstance(record.state, PendingTrustedWordRecord) and not recent_write_capability:
+        return False
+    if draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is not None:
+        return False
+    response = await handle_completed_undo(
+        normalize_conversation_key(ctx.conv_key), ctx.normalized_message_text,
+        ctx.reply_reference, skills_manager.get_tool_function,
+    )
+    if response is None:
+        return False
+    if recent_write_capability:
+        conversation_state_store.delete(ctx.conv_key)
+    ctx.response = response
+    set_turn_flow("completed-write-undo")
+    _capture_resolved_mutation_delivery("keytao_batch_remove_draft_items", ctx.platform, ctx.user_id)
+    _capture_resolved_mutation_delivery("keytao_recall_batch", ctx.platform, ctx.user_id)
+    if ctx.memory_context is None:
+        return False
+    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, response)
+    await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment)
+    return True
 
 
 async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
@@ -4580,14 +4628,29 @@ async def _stage_recall_active_operation(ctx: TurnContext) -> bool:
 async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
     """Production scenarios S8-S11 and S16-S17: pending add/tool tickets retain CAS and one-time execution semantics."""
     if ctx.response is None and not ctx.generic_intent_is_fresh_command:
+        from ..utils.explicit_code import parse_explicit_code_request
+
         state_record = conversation_state_store.get_record(ctx.conv_key)
         state = state_record.state if state_record else None
         if (
-            isinstance(state, PendingToolConfirm)
-            and state.function_name == "keytao_batch_add_to_draft"
-            and (
-                state.args.get("_reviewed_multi_word") is True
-                or isinstance(state.args.get("_reviewed_batch_readings"), list)
+            (
+                isinstance(state, PendingToolConfirm)
+                and state.function_name == "keytao_batch_add_to_draft"
+                and (
+                    state.args.get("_reviewed_multi_word") is True
+                    or isinstance(state.args.get("_reviewed_batch_readings"), list)
+                )
+            )
+            or (
+                isinstance(state, PendingAddWord)
+                and state.server_candidates
+                and state.server_candidates == state.candidates
+                and (
+                    state.phrase_type == "Single"
+                    or not state.recommended_code
+                    or dict(state.candidates).get(state.recommended_code) is True
+                    or parse_explicit_code_request(ctx.normalized_message_text, state.word) is not None
+                )
             )
         ):
             # All adapters consume the same record-bound multiword executor.
@@ -5385,6 +5448,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_image_turn,
     _stage_handle_visual_probe_timeout,
     _stage_initialize_conversation,
+    _stage_handle_completed_draft_undo,
     _stage_resolve_current_pending_scope,
     _stage_finish_scoped_pending_response,
     _stage_guard_stale_confirmation,
@@ -5503,9 +5567,11 @@ async def handle_ai_chat(bot: Bot, event: Event):
                 memory_store.capture_generation(generation_context)
             )
             delivery_token = current_draft_delivery_claims.set([])
+            completed_operation_token = current_operation_capture.set(None)
             try:
                 await _handle_ai_chat_serialized(bot, event, platform, user_id)
             finally:
+                current_operation_capture.reset(completed_operation_token)
                 current_draft_delivery_claims.reset(delivery_token)
                 current_history_generation.reset(history_token)
                 current_memory_generation.reset(memory_token)

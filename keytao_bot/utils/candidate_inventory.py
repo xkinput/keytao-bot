@@ -17,6 +17,52 @@ class CandidateInventory:
     group_recommended_code: str = ""
 
 
+def protected_candidate_occupants(
+    word: object,
+    code: object,
+    candidates: object,
+    occupied_words: object,
+    assessments: object,
+) -> Tuple[str, ...]:
+    """Name protected occupants; an empty name marks unverifiable occupancy."""
+    normalized_word = str(word or "").strip()
+    normalized_code = str(code or "").strip().lower()
+    if not isinstance(candidates, (list, tuple)) or not isinstance(occupied_words, dict):
+        return ()
+    occupied = any(
+        isinstance(candidate, (list, tuple))
+        and len(candidate) == 2
+        and str(candidate[0] or "").strip().lower() == normalized_code
+        and candidate[1] is True
+        for candidate in candidates
+    )
+    if not occupied:
+        return ()
+    raw_occupants = occupied_words.get(normalized_code, ())
+    if (
+        not isinstance(raw_occupants, (list, tuple)) or not raw_occupants
+        or any(not isinstance(value, str) or not value.strip() for value in raw_occupants)
+    ):
+        return ("",)
+    occupants = tuple(dict.fromkeys(
+        str(value or "").strip()
+        for value in raw_occupants
+        if str(value or "").strip() and str(value or "").strip() != normalized_word
+    ))
+    trusted_assessments = assessments if isinstance(assessments, (list, tuple)) else ()
+    return tuple(
+        occupant for occupant in occupants
+        if not any(
+            isinstance(assessment, dict)
+            and assessment.get("newWord") == normalized_word
+            and assessment.get("occupantWord") == occupant
+            and assessment.get("occupantCode") == normalized_code
+            and assessment.get("verdict") == "front_more_common"
+            for assessment in trusted_assessments
+        )
+    )
+
+
 def select_candidate_inventory(
     payload: Mapping[str, Any],
 ) -> Optional[CandidateInventory]:

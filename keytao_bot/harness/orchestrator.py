@@ -3739,10 +3739,21 @@ class AgentOrchestrator:
             # previous candidate. It is not asking the user to resend this
             # interrogative turn, so the refusal-loop breaker must not replace it.
             return reply
+        normalized_message = cls._normalize_loop_text(current_message)
+        normalized_reply = cls._normalize_loop_text(reply)
+        repeats_literal = bool(
+            normalized_message
+            and len(normalized_message) >= 4
+            and normalized_message in normalized_reply
+        )
         resend = re.search(
             r"(?:重新|再次|再|原样|重复).{0,10}(?:发送|发一遍|发|输入|说一遍|提交)",
             reply,
         )
+        if not resend and repeats_literal:
+            resend = re.search(
+                r"(?:重新|再次|再|原样|重复).{0,10}(?:使用|用)", reply,
+            )
         if not resend:
             return reply
         reference_matches = list(re.finditer(
@@ -3754,13 +3765,6 @@ class AgentOrchestrator:
             reference.start() <= resend.end() + 12
             and resend.start() <= reference.end() + 12
             for reference in reference_matches
-        )
-        normalized_message = cls._normalize_loop_text(current_message)
-        normalized_reply = cls._normalize_loop_text(reply)
-        repeats_literal = bool(
-            normalized_message
-            and len(normalized_message) >= 4
-            and normalized_message in normalized_reply
         )
         if not same_reference and not repeats_literal:
             return reply

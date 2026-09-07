@@ -6,6 +6,7 @@ import json
 import re
 import time
 import types
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
@@ -2062,10 +2063,14 @@ def _assert_s21_unrelated_turn_unchanged(
         if event.get("kind") != "http":
             continue
         origin = urlsplit(str(event.get("url") or ""))
+        method = str(event.get("method") or "").upper()
+        # This exact POST route authenticates and performs only user.findFirst.
+        read_only_user_lookup = method == "POST" and origin.path == "/api/bot/user/find"
         if (
             origin.hostname in next_hosts
             and (origin.port or (443 if origin.scheme == "https" else 80)) == next_port
-            and str(event.get("method") or "").upper() not in {"GET", "HEAD", "OPTIONS"}
+            and method not in {"GET", "HEAD", "OPTIONS"}
+            and not read_only_user_lookup
         ):
             dispatches.append(event)
     require(
@@ -3693,7 +3698,7 @@ async def scenario_s28(ctx: ScenarioContext) -> dict[str, Any]:
     replies.append(invalid_reply)
     invalid_draft = await ctx.draft()
     require(not invalid_draft.get("items"), f"S28 invalid control wrote a draft: {invalid_draft}")
-    assert_reply_mentions(invalid_reply, S28_INVALID_CODE, "可选读音链", "没有执行添加")
+    assert_reply_mentions(invalid_reply, S28_INVALID_CODE, "音码前缀不符", "htje", "htwe", "本次未写入")
     require(
         "草稿地址：https://keytao.vercel.app" not in invalid_reply
         and "草稿地址：http://localhost" not in invalid_reply,
@@ -5580,14 +5585,30 @@ async def scenario_s36(ctx: ScenarioContext) -> dict[str, Any]:
 S38_EXPLICIT_READING_MESSAGE = "加词 出圈，读音是 chū quān"
 S38_EXPLANATION_MESSAGE = "耙耙柑为pá pá gān，因此这三个字的声母分别为p, p, g"
 S38_NEGATIVE_MODIFIER_MESSAGE = "加词 耙耙柑 ppg，不要顺延其他相关的词条"
-S38_POSITIVE_MODIFIER_MESSAGE = "加词 耙耙柑 ppg，顺延其他词条"
+S38_UNNAMED_POSITIVE_MODIFIER_MESSAGE = "加词 耙耙柑 ppg，顺延其他词条"
+S38_POSITIVE_MODIFIER_MESSAGE = "加词 耙耙柑 ppg，顺延琵琶骨"
 S38_QUERY_CONTROLS = ("1", "回复1", "加入")
+S38_NAMED_QUERY_OVERRIDE = "加入1，顶替 琵琶骨"
 
 
 async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
     """Close explicit-reading, query recovery, modifier, and suggestion incidents."""
+    from copy import deepcopy
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import PendingAddWord
+    from keytao_bot.utils.keytao_review import compare_word_commonness
+
     messages: list[str] = []
     replies: list[str] = []
+    store = ctx.bot.openai_chat.conversation_state_store
+    address = ConversationAddress.group("qq", str(ctx.bot._group_id(ctx.platform_id)), ctx.platform_id)
+    shifted_code = str((ctx.fixture_facts.get("s37") or {}).get("shiftedCode") or "").strip()
+    require(shifted_code and shifted_code != S37_TARGET_CODE, f"S38 fixture omitted the occupant's next free slot: {ctx.fixture_facts}")
+    commonness = await compare_word_commonness(S37_WORD, S37_OCCUPANT)
+    require(
+        commonness.get("verdict") == "behind_more_common",
+        f"S38 fixture did not establish the stronger occupant required by its guarded controls: {commonness}",
+    )
 
     async def clean_and_reset(label: str) -> None:
         cleaned = await ctx.next_client.clean_draft(ctx.platform_id)
@@ -5658,24 +5679,54 @@ async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
     replies.append(await ctx.send_group(messages[-1], to_me=True))
 
     recovered_controls: list[str] = []
+    protected_controls: list[str] = []
     for control in S38_QUERY_CONTROLS:
         await clean_and_reset(f"query recovery {control}")
         messages.append(f"喵喵 {S37_WORD}")
         query_reply = await ctx.send_group(messages[-1], to_me=True)
         replies.append(query_reply)
         query_contract = advertised_reply_contract(query_reply)
+        safe_code = _rendered_recommended_code(query_reply)
         require(
             S37_WORD in query_reply
             and S37_TARGET_CODE in query_reply
+            and re.search(rf"(?m)^1\.\s*{S37_TARGET_CODE}\s*—\s*已有「{S37_OCCUPANT}」", query_reply)
+            and safe_code != S37_TARGET_CODE
+            and re.search(rf"(?m)^\d+\.\s*{re.escape(safe_code)}\s*—[^\n]*空位", query_reply)
             and query_contract.code_choice_advertisement
             and {"加入", "加入并提交"}.issubset(
                 query_contract.batch_assent_forms
             ),
             f"S38 query did not render a live candidate record: {query_reply}",
         )
+        control_before = await ctx.draft()
+        control_cutoff = max((int(event.get("sequence") or 0) for event in ctx.attempt_events()), default=0)
         messages.append(control)
         control_reply = await ctx.send_group(messages[-1], to_me=True)
         replies.append(control_reply)
+        if control in {"1", "回复1"}:
+            control_after = await ctx.draft()
+            control_events = [event for event in ctx.attempt_events() if int(event.get("sequence") or 0) > control_cutoff]
+            require(
+                all(key in snapshot for snapshot in (control_before, control_after) for key in ("batchId", "contentVersion", "items"))
+                and all(control_before[key] == control_after[key] for key in ("batchId", "contentVersion", "items"))
+                and S37_OCCUPANT in control_reply
+                and "本次未写入" in control_reply and "完整编码" in control_reply
+                and any(marker in control_reply for marker in ("顶替", "挤掉"))
+                and not any(event.get("kind") == "modelExchange" for event in control_events)
+                and not any(
+                    event.get("kind") == "tool" and event.get("name") in {
+                        "keytao_batch_add_to_draft", "keytao_create_phrase", "keytao_shift_phrase_code", "keytao_submit_batch",
+                    }
+                    or event.get("kind") == "http" and str(event.get("method") or "").upper() not in {"GET", "HEAD", "OPTIONS"}
+                    for event in control_events
+                ),
+                f"S38 unnamed occupied selection displaced the stronger occupant: {control}; {control_before}; {control_after}; {control_reply}",
+            )
+            protected_controls.append(control)
+            messages.append(S38_NAMED_QUERY_OVERRIDE)
+            control_reply = await ctx.send_group(messages[-1], to_me=True)
+            replies.append(control_reply)
         control_reply, control_draft = await finish_one_control(
             control_reply,
             label=f"query recovery {control}",
@@ -5686,6 +5737,20 @@ async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
             and "引用候选没有保留编码" not in control_reply
             and "没有执行添加" not in control_reply,
             f"S38 query control {control} dead-ended: {control_reply}; {control_draft}",
+        )
+        expected_items = (
+            {
+                ("Delete", S37_OCCUPANT, S37_TARGET_CODE),
+                ("Create", S37_WORD, S37_TARGET_CODE),
+                ("Create", S37_OCCUPANT, shifted_code),
+            }
+            if control in {"1", "回复1"}
+            else {("Create", S37_WORD, safe_code)}
+        )
+        require(
+            {item_key(item) for item in control_draft.get("items", [])} == expected_items
+            and len(control_draft.get("items", [])) == len(expected_items),
+            f"S38 query recovery changed the wrong rows: {control}; {control_draft}",
         )
         recovered_controls.append(control)
 
@@ -5704,7 +5769,46 @@ async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
         f"S38 negative modifier shifted or lost the add verb: {negative_reply}; {negative_draft}",
     )
 
-    await clean_and_reset("positive modifier")
+    await clean_and_reset("unnamed positive modifier")
+    messages.append(f"喵喵 {S37_WORD}")
+    replies.append(await ctx.send_group(messages[-1], to_me=True))
+    unnamed_record = deepcopy(store.get_record(address))
+    require(
+        unnamed_record is not None and isinstance(unnamed_record.state, PendingAddWord)
+        and unnamed_record.state.word == S37_WORD
+        and unnamed_record.state.server_occupied_words.get(S37_TARGET_CODE) == [S37_OCCUPANT]
+        and isinstance(unnamed_record.state.needs_manual_review, bool),
+        f"S38 generic modifier lacked its reviewed candidate record: {unnamed_record!r}",
+    )
+    unnamed_before = await ctx.draft()
+    unnamed_cutoff = max((int(event.get("sequence") or 0) for event in ctx.attempt_events()), default=0)
+    messages.append(S38_UNNAMED_POSITIVE_MODIFIER_MESSAGE)
+    unnamed_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(unnamed_reply)
+    unnamed_after = await ctx.draft()
+    retained_record = store.get_record(address)
+    unnamed_shift_calls = [
+        event for event in ctx.attempt_events()
+        if int(event.get("sequence") or 0) > unnamed_cutoff
+        and event.get("kind") == "tool" and event.get("name") == "keytao_shift_phrase_code"
+    ]
+    require(
+        all(key in snapshot for snapshot in (unnamed_before, unnamed_after) for key in ("batchId", "contentVersion", "items"))
+        and all(unnamed_before[key] == unnamed_after[key] for key in ("batchId", "contentVersion", "items"))
+        and retained_record is not None and isinstance(retained_record.state, PendingAddWord)
+        and retained_record.owner_key == unnamed_record.owner_key
+        and not retained_record.execution_id
+        and retained_record.state.word == unnamed_record.state.word
+        and retained_record.state.phrase_type == unnamed_record.state.phrase_type
+        and retained_record.state.server_candidates == unnamed_record.state.server_candidates
+        and retained_record.state.server_occupied_words == unnamed_record.state.server_occupied_words
+        and isinstance(retained_record.state.needs_manual_review, bool)
+        and not unnamed_shift_calls
+        and S37_OCCUPANT in unnamed_reply and "本次未写入" in unnamed_reply,
+        f"S38 unnamed generic shift bypassed the candidate guard: {unnamed_before}; {unnamed_after}; {unnamed_reply}; record={retained_record!r}; shifts={unnamed_shift_calls}",
+    )
+    current_review_state = deepcopy(retained_record.state)
+
     positive_cutoff = max(
         (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
         default=0,
@@ -5712,28 +5816,7 @@ async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
     messages.append(S38_POSITIVE_MODIFIER_MESSAGE)
     positive_reply = await ctx.send_group(messages[-1], to_me=True)
     replies.append(positive_reply)
-    require(
-        "执行动词" not in positive_reply
-        and "缺少明确" not in positive_reply
-        and "连续两次没有生成可见回复或工具调用" not in positive_reply
-        and "调整计划" in positive_reply
-        and f"{S37_WORD}：Create {S37_TARGET_CODE}" in positive_reply
-        and f"{S37_OCCUPANT}：Delete {S37_TARGET_CODE}" in positive_reply,
-        f"S38 positive modifier lost its explicit add verb: {positive_reply}",
-    )
-    advertised = re.search(
-        rf"顺延「{re.escape(S37_WORD)}」到\s*{re.escape(S37_TARGET_CODE)}",
-        positive_reply,
-    )
-    if advertised is not None:
-        messages.append(advertised.group(0))
-        replay = await ctx.send_group(messages[-1], to_me=True)
-        replies.append(replay)
-        require(
-            "不是「耙耙柑」的有效候选编码" not in replay
-            and "不在它的候选链里" not in replay,
-            f"S38 advertised shift failed its own validator: {replay}",
-        )
+    positive_draft = await ctx.draft()
     shift_calls = [
         event for event in ctx.attempt_events()
         if int(event.get("sequence") or 0) > positive_cutoff
@@ -5741,11 +5824,39 @@ async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
         and event.get("name") == "keytao_shift_phrase_code"
         and event.get("arguments", {}).get("word") == S37_WORD
         and event.get("arguments", {}).get("target_code") == S37_TARGET_CODE
+        and event.get("arguments", {}).get("confirmed_plan_digest")
     ]
+    expected_positive_items = {
+        ("Delete", S37_OCCUPANT, S37_TARGET_CODE),
+        ("Create", S37_WORD, S37_TARGET_CODE),
+        ("Create", S37_OCCUPANT, shifted_code),
+    }
+    require(len(shift_calls) == 1, f"S38 named modifier did not execute one confirmed shift plan: {shift_calls}")
+    shift_result = shift_calls[0].get("result") or {}
+    shift_plan = shift_result.get("shiftPlan") or {}
+    plan_items = shift_plan.get("items") or []
+    newcomer = next((item for item in positive_draft.get("items", []) if item_key(item) == ("Create", S37_WORD, S37_TARGET_CODE)), {})
+    planned_newcomer = next((item for item in plan_items if item_key(item) == ("Create", S37_WORD, S37_TARGET_CODE)), {})
     require(
-        bool(shift_calls),
-        f"S38 positive modifier did not reach its same-record shift validator: {positive_reply}",
+        {item_key(item) for item in positive_draft.get("items", [])} == expected_positive_items
+        and len(positive_draft.get("items", [])) == 3
+        and all(item.get("type") == "Phrase" for item in positive_draft.get("items", []))
+        and shift_result.get("success") is True
+        and shift_result.get("pullRequestCount") == 3
+        and shift_result.get("batchId") == positive_draft.get("batchId")
+        and shift_plan.get("word") == S37_WORD and shift_plan.get("targetCode") == S37_TARGET_CODE
+        and {item_key(item) for item in plan_items} == expected_positive_items and len(plan_items) == 3
+        and all(item.get("type") == "Phrase" for item in plan_items)
+        and newcomer.get("needsManualReview") is current_review_state.needs_manual_review
+        and planned_newcomer.get("needsManualReview") is current_review_state.needs_manual_review
+        and shift_calls[0].get("arguments", {}).get("target_needs_manual_review") is current_review_state.needs_manual_review
+        and "喵喵审词" in str(newcomer.get("remark") or "")
+        and batch_link_ids(positive_reply) == {positive_draft.get("batchId")}
+        and pending_confirmation_copy() not in positive_reply,
+        f"S38 named modifier did not materialize its reviewed three-row plan and receipt: {positive_reply}; {positive_draft}; {shift_calls}",
     )
+    assert_reply_mentions(positive_reply, S37_WORD, S37_OCCUPANT, S37_TARGET_CODE, shifted_code, "操作已完成")
+    assert_only_materialized_batch_links([positive_reply], positive_draft)
     await clean_and_reset("final")
     return {
         "messages": messages,
@@ -5757,9 +5868,17 @@ async def scenario_s38(ctx: ScenarioContext) -> dict[str, Any]:
             "readingReviewBound": True,
             "completedExplicitReadingAdd": True,
             "recoveredQueryControls": recovered_controls,
+            "protectedQueryControls": protected_controls,
+            "namedQueryOverride": S38_NAMED_QUERY_OVERRIDE,
+            "commonness": commonness,
+            "unnamedModifierDraftUnchanged": True,
+            "unnamedModifierRecordPreserved": True,
+            "unnamedModifierShiftCalls": len(unnamed_shift_calls),
             "negativeModifierDuplicate": negative_items,
-            "advertisedShiftCount": 1 if advertised is not None else 0,
-            "advertisedShiftValidated": advertised is None or bool(shift_calls),
+            "namedModifierConfirmedShiftCalls": len(shift_calls),
+            "namedModifierItems": sorted(expected_positive_items),
+            "namedModifierBatchId": positive_draft.get("batchId"),
+            "namedModifierReviewSeal": newcomer.get("needsManualReview"),
         },
     }
 
@@ -5768,12 +5887,17 @@ S39_WORD = "出圈"
 S39_OCCUPANT = "除权"
 S39_TARGET_CODE = "jjqt"
 S39_COMMAND = "加词 出圈 圈字读quan"
-S39_SELECTION = "1 重新编码"
+S39_SELECTION = "加入1，挤掉除权"
 S39_OCCUPANT_COMMAND = '重新编码 "除权" jjqt'
 
 
 async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
-    """Collapse reading selection and occupant eviction into two user turns."""
+    """Keep reading-bound eviction while protecting a stronger unnamed occupant."""
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import PendingAddWord
+    from keytao_bot.plugins import chat_routing as routing
+    from keytao_bot.utils.keytao_review import compare_word_commonness
+
     messages: list[str] = []
     replies: list[str] = []
     fixture = ctx.fixture_facts["s39"]
@@ -5781,6 +5905,11 @@ async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
     require(
         shifted_code and shifted_code != S39_TARGET_CODE,
         f"S39 fixture omitted the occupant's next free slot: {fixture}",
+    )
+    commonness = await compare_word_commonness(S39_WORD, S39_OCCUPANT)
+    require(
+        commonness.get("verdict") == "behind_more_common",
+        f"S39 fixture did not establish the stronger occupant required by its guarded control: {commonness}",
     )
 
     async def clean_and_reset(label: str) -> None:
@@ -5821,7 +5950,6 @@ async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
         and re.search(r"(?m)^3\.\s*jjqtai\s*—\s*.*空位", reading_reply)
         and "管理员审核" in reading_reply
         and "回复编号或编码选择" in reading_reply
-        and S39_SELECTION in reading_reply
         and "复算" not in reading_reply
         and "网页端人工处理" not in reading_reply,
         f"S39 first turn did not render the selected reading group: {reading_reply}",
@@ -5840,6 +5968,26 @@ async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
         f"S39 reading selection did not use one reviewed-add request: {review_calls}",
     )
 
+    protected_before = await ctx.draft()
+    protected_cutoff = max((int(event.get("sequence") or 0) for event in ctx.attempt_events()), default=0)
+    messages.append("1 重新编码")
+    protected_reply = await ctx.send_group(messages[-1], to_me=True)
+    replies.append(protected_reply)
+    protected_after = await ctx.draft()
+    protected_events = [event for event in ctx.attempt_events() if int(event.get("sequence") or 0) > protected_cutoff]
+    require(
+        all(key in snapshot for snapshot in (protected_before, protected_after) for key in ("batchId", "contentVersion", "items"))
+        and all(protected_before[key] == protected_after[key] for key in ("batchId", "contentVersion", "items"))
+        and S39_OCCUPANT in protected_reply and "本次未写入" in protected_reply
+        and any(marker in protected_reply for marker in ("顶替", "挤掉"))
+        and not any(event.get("kind") == "modelExchange" for event in protected_events)
+        and not any(
+            event.get("kind") == "http" and str(event.get("method") or "").upper() not in {"GET", "HEAD", "OPTIONS"}
+            for event in protected_events
+        ),
+        f"S39 unnamed numeric recode displaced the stronger occupant: {protected_before}; {protected_after}; {protected_reply}; {protected_events}",
+    )
+    selection_cutoff = max((int(event.get("sequence") or 0) for event in ctx.attempt_events()), default=0)
     messages.append(S39_SELECTION)
     selection_reply = await ctx.send_group(messages[-1], to_me=True)
     replies.append(selection_reply)
@@ -5874,8 +6022,9 @@ async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
         and isinstance(newcomer_item, dict)
         and newcomer_item.get("needsManualReview") is True
         and len(confirmed_shift_calls) == 1
+        and not any(event.get("kind") == "modelExchange" and int(event.get("sequence") or 0) > selection_cutoff for event in ctx.attempt_events())
         and pending_confirmation_copy() not in selection_reply,
-        f"S39 second turn did not finish the sealed eviction: "
+        f"S39 named selection did not finish the sealed eviction in one turn: "
         f"reply={selection_reply}; draft={happy_draft}; calls={confirmed_shift_calls}",
     )
 
@@ -5894,27 +6043,59 @@ async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
     )
 
     await clean_and_reset("compound suggestion closure")
+    compound_before = await ctx.draft()
+    compound_cutoff = max((int(event.get("sequence") or 0) for event in ctx.attempt_events()), default=0)
     messages.append("加词 出圈 jjqt 重新编码")
     compound_reply = await ctx.send_group(messages[-1], to_me=True)
     replies.append(compound_reply)
+    compound_after = await ctx.draft()
+    compound_events = [event for event in ctx.attempt_events() if int(event.get("sequence") or 0) > compound_cutoff]
     narrowed_suggestion = bool(re.search(
         r"(?:可执行命令|可以改为)[\s\S]{0,80}添加「出圈」\s*jjqt"
         r"(?![\s\S]{0,24}(?:重新编码|顺延|腾位))",
         compound_reply,
     ))
     compound_closed = bool(
-        "加词 出圈 jjqt 重新编码" in compound_reply
-        or "不能保留你要求的添加并腾位操作" in compound_reply
-        or (
-            "添加" in compound_reply
-            and any(marker in compound_reply for marker in ("重新编码", "顺延", "腾位"))
-        )
+        all(marker in compound_reply for marker in (S39_WORD, S39_OCCUPANT, S39_TARGET_CODE, "不弱于", "保留现有位置", "本次未写入", "顶替", "点名"))
     )
     require(
         compound_closed
         and not narrowed_suggestion
-        and not (await ctx.draft()).get("items"),
-        f"S39 compound remediation silently narrowed the request: {compound_reply}",
+        and all(key in snapshot for snapshot in (compound_before, compound_after) for key in ("batchId", "contentVersion", "items"))
+        and all(compound_before[key] == compound_after[key] for key in ("batchId", "contentVersion", "items"))
+        and not any(
+            event.get("kind") == "tool" and event.get("name") not in {
+                "keytao_lookup_by_code", "keytao_lookup_by_word", "keytao_pending_items_by_words", "keytao_prepare_reviewed_add",
+            }
+            for event in compound_events
+        ),
+        f"S39 unnamed compound request bypassed protection or narrowed its suggestion: {compound_reply}; {compound_before}; {compound_after}; {compound_events}",
+    )
+    chat = ctx.bot.openai_chat
+    address = ConversationAddress.group("qq", str(ctx.bot._group_id(ctx.platform_id)), ctx.platform_id)
+    record = chat.conversation_state_store.get_record(address)
+    suggestions = advertised_command_suggestions(compound_reply)
+    require(
+        record is not None and record.owner_key == address and not record.execution_id
+        and isinstance(record.state, PendingAddWord) and record.state.word == S39_WORD
+        and record.state.server_occupied_words.get(S39_TARGET_CODE) == [S39_OCCUPANT]
+        and suggestions and chat._advertised_reply_matches_live_record(compound_reply, record),
+        f"S39 protected compound suggestion lacks its exact live candidate binding: {compound_reply}; {record!r}",
+    )
+    parser_cutoff = max((int(event.get("sequence") or 0) for event in ctx.attempt_events()), default=0)
+    envelopes = tuple(line.strip() for line in compound_reply.splitlines() if line.strip().startswith("- 「"))
+    for command in (*suggestions, *envelopes):
+        intent = await chat._classify_message_command_intent(command, record.state)
+        canonical, failure = await chat._chat_commands._canonicalize_pending_ticket_intent(record.state, command, intent, address.platform, address.actor_id)
+        require(
+            S39_OCCUPANT in command and canonical is not None and failure is None
+            and canonical.intent == "pending_recode"
+            and routing.message_authorizes_live_pending_mutation(command, record.state),
+            f"S39 named compound suggestion failed its real parser/binding: {command}; {intent}; {failure}",
+        )
+    require(
+        not any(event.get("kind") == "modelExchange" and int(event.get("sequence") or 0) > parser_cutoff for event in ctx.attempt_events()),
+        "S39 advertised compound parser/binding closure used a model",
     )
 
     await clean_and_reset("occupant perspective")
@@ -5949,12 +6130,20 @@ async def scenario_s39(ctx: ScenarioContext) -> dict[str, Any]:
             "selection": S39_SELECTION,
             "selectedReading": "chū quān",
             "selectedCandidateCodes": ["jjqt", "jjqta", "jjqtai"],
-            "happyPathTurnCount": 2,
+            "happyPathTurnCount": 3,
             "selectionConfirmations": 1,
+            "protectedNumericSelection": "1 重新编码",
+            "protectedNumericDraftUnchanged": True,
+            "commonness": commonness,
             "shiftedCode": shifted_code,
             "manualReviewSealed": True,
             "unmatchedReadingListedAvailable": True,
             "compoundSuggestionClosed": compound_closed,
+            "compoundDraftUnchanged": True,
+            "compoundShiftCalls": 0,
+            "compoundModelExchanges": sum(event.get("kind") == "modelExchange" for event in compound_events),
+            "compoundAdvertisedCommands": suggestions,
+            "compoundParserModelExchanges": 0,
             "occupantPerspectiveResolved": True,
         },
     }
@@ -7210,6 +7399,7 @@ async def scenario_s48(ctx: ScenarioContext) -> dict[str, Any]:
         *,
         discover: bool,
         reply_quote: bool = False,
+        guarded_assent: bool = False,
     ) -> dict[str, Any]:
         cleanup = await ctx.next_client.clean_draft(ctx.platform_id)
         require(cleanup.get("success") is True, f"S48 {label} cleanup failed: {cleanup}")
@@ -7228,6 +7418,7 @@ async def scenario_s48(ctx: ScenarioContext) -> dict[str, Any]:
             )
             if reply_quote:
                 reply_message_id = ctx.inject_bot_message(discovery)
+        before = await ctx.draft()
         cutoff = max(
             (int(event.get("sequence") or 0) for event in ctx.attempt_events()),
             default=0,
@@ -7250,6 +7441,24 @@ async def scenario_s48(ctx: ScenarioContext) -> dict[str, Any]:
             for event in ctx.attempt_events()
             if int(event.get("sequence") or 0) > cutoff
         ]
+        if guarded_assent:
+            from keytao_bot.utils.keytao_review import compare_word_commonness
+
+            comparison = await compare_word_commonness(S48_WORD, S48_OCCUPANT)
+            require(
+                comparison.get("verdict") == "behind_more_common"
+                and all(before.get(key) == draft.get(key) for key in ("batchId", "contentVersion", "items"))
+                and not any(event.get("kind") == "modelExchange" for event in events)
+                and not any(
+                    event.get("kind") == "http"
+                    and str(event.get("method") or "").upper() not in {"GET", "HEAD", "OPTIONS"}
+                    for event in events
+                )
+                and S48_OCCUPANT in reply
+                and any(marker in reply for marker in ("顶替", "挤掉", "顺延")),
+                f"S48 {label} evicted the stronger occupant without naming it: {comparison}; {before}; {draft}; {reply}",
+            )
+            return {"label": label, "command": command, "commonness": comparison, "modelExchanges": 0, "draftUnchanged": True}
         require(
             actual == expected and len(draft.get("items", [])) == 3,
             f"S48 {label} did not create and evict in one turn: "
@@ -7310,6 +7519,7 @@ async def scenario_s48(ctx: ScenarioContext) -> dict[str, Any]:
         "bare-occupied-selection",
         "添加1",
         discover=True,
+        guarded_assent=True,
     ))
     cases.append(await execute_case(
         "explicit-advertised-form",
@@ -9100,6 +9310,567 @@ async def scenario_s55(ctx: ScenarioContext) -> dict[str, Any]:
     return {"messages": messages, "replies": replies, "draft": await ctx.draft(), "facts": facts}
 
 
+S56_WORD = "鎗"
+S56_EXPLICIT_CODE = "qxioio"
+S56_SINGLE_CHAIN = (("强", "qx", "qxa"), ("戕", "qxa", "qxai"))
+S56_EXPLICIT_FORMS = (
+    "加入编码qxioio",
+    "加入 qxioio",
+    "添加 鎗 qxioio",
+    "用 qxioio",
+)
+S56_BARE_FORMS = ("加入", "加入并提交", "好")
+S56_INVALID_CODES = (
+    ("qxio1o", "小写字母"),
+    ("qxioioa", "最多 6 位"),
+    ("qkioio", "音码前缀"),
+)
+S56_WORD_CONTROL = ("发布会", "重病号", "fbh")
+
+
+def _s56_advertised_reply_commands(reply: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Collect concrete advertised controls without inventing placeholder inputs."""
+    contract = advertised_reply_contract(reply)
+    commands = [*contract.generic_assent_forms, *contract.batch_assent_forms, *contract.command_suggestions]
+    for match in re.finditer(r"(?:回复|发送|或|如)\s*[「“『]([^」”』\n]+)[」”』]", reply):
+        command = match.group(1).strip()
+        if command in {"确认", "取消", "提交", "撤销", "撤回", "回滚", "是", "否"} or re.fullmatch(
+            r"(?:添加|加入|用|选)?[1-9]\d*(?:[、,，][1-9]\d*)*(?:并提交)?", command,
+        ):
+            commands.append(command)
+    commands.extend(match.group(1) for match in re.finditer(r"(?m)^不重排选\s+([1-9]\d*)\s*[（(][a-z]+[）)]", reply))
+    commands = tuple(dict.fromkeys(commands))
+    envelopes = tuple(
+        line.strip() for line in reply.splitlines()
+        if re.match(r"\s*[-•]\s*[「“『]", line)
+        and any(unicodedata.normalize("NFKC", command) in unicodedata.normalize("NFKC", line) for command in commands)
+    )
+    return commands, envelopes
+
+
+async def _assert_s56_advertised_reply_closure(
+    reply: str, *, chat: Any, record: Any, address: Any,
+    read_draft: Callable[[], Awaitable[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """Bind every advertised input through its real parser and live capability."""
+    from keytao_bot.harness.state import PendingAddWord, PendingToolConfirm
+    from keytao_bot.plugins import chat_routing as routing
+    from keytao_bot.utils import completed_draft_undo as undo
+
+    commands, envelopes = _s56_advertised_reply_commands(reply)
+    if not commands:
+        return None
+    state = record.state if record is not None else None
+    if record is not None:
+        require(record.owner_key == address and not record.execution_id, f"S56 advertised a foreign or executing ticket: {record!r}")
+    recent_submit = bool(
+        isinstance(state, PendingToolConfirm) and state.function_name == "keytao_submit_batch"
+        and state.args.get("_recent_own_write") is True
+    )
+    bindings: list[dict[str, Any]] = []
+    for command in (*commands, *envelopes):
+        completed_undo = undo._clean_command(command) in undo._UNDO_WORDS and (record is None or recent_submit)
+        if completed_undo or command in {"是", "否"}:
+            operation = undo.get_default_draft_mutation_claim_store().completed_operation(undo.conversation_scope(address))
+            snapshot = undo._snapshot(await read_draft())
+            require(
+                operation is not None and operation.get("status") == "ready"
+                and operation.get("operationId") == operation.get("latestActorWrite")
+                and snapshot is not None and operation.get("batchId") == snapshot["batchId"]
+                and all((operation.get("after") or {}).get(key) == snapshot[key] for key in ("batchId", "contentVersion", "items"))
+                and operation.get("batchId") in batch_link_ids(reply),
+                f"S56 advertised undo lacks the exact actor operation and current rows: {command}; {operation}; {snapshot}",
+            )
+            if completed_undo:
+                require(0 <= time.time() - operation.get("completedAt", 0) <= undo.UNDO_WINDOW_SECONDS, f"S56 advertised immediate undo outside its window: {operation}")
+            else:
+                require(
+                    undo._clean_command(command) in undo._YES_WORDS | undo._NO_WORDS
+                    and operation.get("confirmationPrompt") == reply
+                    and operation.get("confirmationVersion") == snapshot["contentVersion"],
+                    f"S56 advertised quote confirmation lacks its exact saved prompt/version: {command}; {operation}",
+                )
+            bindings.append({"command": command, "parser": "completed_undo", "operationId": operation["operationId"], "batchId": snapshot["batchId"]})
+            continue
+
+        intent = await chat._classify_message_command_intent(command, state)
+        if isinstance(state, PendingAddWord):
+            canonical, failure = await chat._chat_commands._canonicalize_pending_ticket_intent(
+                state, command, intent, address.platform, address.actor_id,
+            )
+            require(canonical is not None and failure is None, f"S56 advertised selector failed exact candidate binding: {command}; {failure}")
+            intent = canonical
+        if command == "提交":
+            snapshot = undo._snapshot(await read_draft())
+            require(snapshot is not None and snapshot["batchId"] and snapshot["items"] and batch_link_ids(reply) == {snapshot["batchId"]}, f"S56 advertised submit lacks its actual draft: {reply}; {snapshot}")
+            if recent_submit:
+                require(
+                    intent.intent == "pending_confirm"
+                    and state.args.get("batch_id") == snapshot["batchId"]
+                    and routing._message_authorizes_pending_state_control(state, command, intent),
+                    f"S56 submit failed its exact recent-write ticket: {command}; {state}; {intent}",
+                )
+            else:
+                operation = undo.get_default_draft_mutation_claim_store().completed_operation(undo.conversation_scope(address))
+                operation_after = undo._snapshot({"success": True, **(operation.get("after") or {})}) if operation is not None else None
+                require(
+                    intent.intent == "draft_submit" and routing._is_explicit_draft_submit_request(command)
+                    and operation is not None and operation.get("status") == "ready"
+                    and operation.get("operationId") == operation.get("latestActorWrite")
+                    and operation.get("batchId") == snapshot["batchId"]
+                    and operation_after is not None
+                    and all(operation_after[key] == snapshot[key] for key in ("batchId", "contentVersion", "items")),
+                    f"S56 submit failed its actor-owned completed-write binding: {intent}; {operation}; {snapshot}",
+                )
+            bindings.append({"command": command, "parser": intent.intent, "batchId": snapshot["batchId"]})
+            continue
+
+        require(record is not None, f"S56 advertised commands without a live record: {reply}")
+        if command == "取消":
+            require(
+                intent.intent == "pending_cancel"
+                and routing._message_authorizes_pending_state_control(state, command, intent),
+                f"S56 advertised cancellation failed its real pending parser/binding: {command}; {intent}; {state}",
+            )
+        elif command == "确认":
+            require(
+                isinstance(state, PendingToolConfirm) and intent.intent == "pending_confirm"
+                and routing._message_authorizes_pending_state_control(state, command, intent),
+                f"S56 advertised confirmation failed its exact pending ticket: {command}; {intent}; {state}",
+            )
+        else:
+            require(
+                intent.intent in {"pending_confirm", "pending_add_and_submit", "pending_choice", "pending_recode", "pending_code_request"}
+                and (
+                    routing.message_authorizes_live_pending_mutation(command, state)
+                    or routing._message_authorizes_pending_state_control(state, command, intent)
+                ),
+                f"S56 advertised command or complete envelope failed its parser/binding: {command}; {intent}; {state}",
+            )
+        bindings.append({"command": command, "parser": intent.intent, "owner": str(record.owner_key), "nonce": record.nonce})
+
+    for match in re.finditer(r"(?m)^不重排选\s+([1-9]\d*)\s*[（(]([a-z]+)[）)]", reply):
+        index, code = int(match.group(1)), match.group(2)
+        require(
+            isinstance(state, PendingAddWord) and 1 <= index <= len(state.server_candidates)
+            and state.server_candidates[index - 1] == (code, False),
+            f"S56 advertised fallback number is not its stated empty code: {match.group(0)}; {state}",
+        )
+    if record is not None:
+        require(chat._advertised_reply_matches_live_record(reply, record), f"S56 complete advertised reply did not bind to its live record: {reply}")
+    return {"commands": commands, "envelopes": envelopes, "bindings": bindings, "modelExchanges": 0}
+
+
+async def scenario_s56(ctx: ScenarioContext) -> dict[str, Any]:
+    """Replay explicit Single codes, guarded eviction, and whole-operation recent undo."""
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import PendingAddWord, PendingToolConfirm
+    from keytao_bot.utils import keytao_review as review_module
+
+    chat = ctx.bot.openai_chat
+    store = chat.conversation_state_store
+    address = ConversationAddress.group(
+        "qq", str(ctx.bot._group_id(ctx.platform_id)), ctx.platform_id,
+    )
+    fixture_words = (S56_WORD, *(row[0] for row in S56_SINGLE_CHAIN), *S56_WORD_CONTROL[:2])
+    messages: list[str] = []
+    replies: list[str] = []
+    facts: dict[str, Any] = {"advertisedClosure": [], "explicitCodeCases": [], "bareAssentCases": []}
+
+    def cutoff() -> int:
+        return max((int(event.get("sequence") or 0) for event in ctx.attempt_events()), default=0)
+
+    def later_events(sequence: int) -> list[dict[str, Any]]:
+        return [event for event in ctx.attempt_events() if int(event.get("sequence") or 0) > sequence]
+
+    def assert_deterministic(sequence: int, label: str) -> None:
+        model_calls = [{
+            "sequence": event.get("sequence"),
+            "model": (event.get("request") or {}).get("model"),
+            "status": event.get("status"),
+            "elapsedSeconds": event.get("elapsedSeconds"),
+        } for event in later_events(sequence) if event.get("kind") == "modelExchange"]
+        require(
+            not model_calls,
+            f"S56 {label} used {len(model_calls)} model exchanges: {model_calls}",
+        )
+
+    def successful_deletes(sequence: int, expected_ids: set[int]) -> list[dict[str, Any]]:
+        events = [
+            event for event in later_events(sequence)
+            if event.get("kind") == "http" and event.get("method") == "DELETE"
+            and urlsplit(str(event.get("url") or "")).path == "/api/bot/pull-requests/batch-draft"
+            and event.get("status") == 200
+        ]
+        require(
+            len(events) == 1
+            and set((events[0].get("requestBody") or {}).get("ids") or []) == expected_ids
+            and (events[0].get("responseBody") or {}).get("success") is True
+            and (events[0].get("responseBody") or {}).get("successCount") == len(expected_ids),
+            f"S56 undo lacked one successful exact server deletion receipt: {events}; {expected_ids}",
+        )
+        return events
+
+    async def assert_closure(reply: str) -> None:
+        sequence = cutoff()
+        result = await _assert_s56_advertised_reply_closure(
+            reply, chat=chat, record=store.get_record(address), address=address,
+            read_draft=ctx.draft,
+        )
+        assert_deterministic(sequence, "advertised parser/binding closure")
+        if result is not None:
+            facts["advertisedClosure"].append(result)
+
+    async def send(message: str) -> str:
+        messages.append(message)
+        reply = await ctx.send_group(message, to_me=True)
+        replies.append(reply)
+        require(
+            "当前候选之外" not in reply and "系统不会用这些文字改写候选" not in reply
+            and not _reply_has_internal_fragment(reply),
+            f"S56 reply retained internal rejection copy: {reply}",
+        )
+        await assert_closure(reply)
+        return reply
+
+    async def reset() -> None:
+        cleaned = await ctx.next_client.clean_draft(ctx.platform_id)
+        require(cleaned.get("success") is True, f"S56 draft reset failed: {cleaned}")
+        await ctx.bot.reset_conversation(platform_id=ctx.platform_id)
+
+    async def cleanup() -> dict[str, Any]:
+        result = await ctx.next_client.remove_rig_owned_dictionary_words(
+            platform_id=ctx.platform_id, admin_token=ctx.admin_token,
+            scenario_id="S56", fixture_words=fixture_words,
+        )
+        require(result.get("verified") is True, f"S56 fixture cleanup failed: {result}")
+        return result
+
+    async def dictionary_snapshot() -> dict[str, list[dict[str, Any]]]:
+        return {
+            word: [row for row in await ctx.next_client.phrases_by_word(word) if row.get("word") == word]
+            for word in fixture_words
+        }
+
+    async def discover_single() -> tuple[str, PendingAddWord]:
+        reply = await send(f"喵喵 {S56_WORD}")
+        record = store.get_record(address)
+        require(
+            record is not None and isinstance(record.state, PendingAddWord)
+            and record.state.word == S56_WORD and record.state.phrase_type == "Single"
+            and tuple(record.state.server_candidates) == (("qx", True),),
+            f"S56 did not persist the incident's sole occupied Single candidate: {record}; {reply}",
+        )
+        require(
+            "qx — 已有「强」" in reply and "推荐编码：qx" not in reply
+            and "形码" in reply and any(marker in reply for marker in ("完整编码", "完整的编码"))
+            and any(marker in reply for marker in ("顶替", "挤掉")),
+            f"S56 advertised an unsafe occupied recommendation or omitted the usable alternatives: {reply}",
+        )
+        return reply, record.state
+
+    review_module._clear_review_caches()
+    await reset()
+    await cleanup()
+    try:
+        encode = await ctx.next_client.encode(S56_WORD)
+        require(
+            encode.get("type") == "单字" and encode.get("codes") == ["qx"]
+            and encode.get("chars") and encode["chars"][0].get("phoneticCode") == "qx"
+            and not encode["chars"][0].get("shapeCode"),
+            f"S56 Single fixture did not reproduce missing shape data: {encode}",
+        )
+        for word, occupied_code, shifted_code in S56_SINGLE_CHAIN:
+            occupant_encode = await ctx.next_client.encode(word)
+            codes = ordered_candidate_codes(occupant_encode)
+            require(
+                occupied_code in codes and shifted_code in codes
+                and codes.index(occupied_code) < codes.index(shifted_code),
+                f"S56 occupant's actual encoder cannot supply the required shift: {word}; {occupant_encode}",
+            )
+            await ctx.next_client.seed_phrase(
+                platform_id=ctx.platform_id, word=word, code=occupied_code,
+                phrase_type="Single", weight=10,
+            )
+        comparison = await review_module.compare_word_commonness(S56_WORD, S56_SINGLE_CHAIN[0][0])
+        require(
+            comparison.get("verdict") in {"behind_more_common", "close"},
+            f"S56 fixture failed to establish the stronger existing occupant: {comparison}",
+        )
+        initial_dictionary = await dictionary_snapshot()
+        facts["singleFixture"] = {"encode": encode, "commonness": comparison, "dictionary": initial_dictionary}
+
+        for command in S56_EXPLICIT_FORMS:
+            await reset()
+            await discover_single()
+            sequence = cutoff()
+            receipt = await send(command)
+            draft = await ctx.draft()
+            items = draft.get("items") or []
+            require(
+                len(items) == 1 and item_key(items[0]) == ("Create", S56_WORD, S56_EXPLICIT_CODE)
+                and items[0].get("type") == "Single" and items[0].get("needsManualReview") is True
+                and re.search(r"(?m)^审词：.*形码\s*ioio.*(?:未能核验|无法核验|未核验).*管理员复核", receipt)
+                and batch_link_ids(receipt) == {draft.get("batchId")}
+                and await dictionary_snapshot() == initial_dictionary,
+                f"S56 explicit code did not create one manually sealed Single without eviction: {command}; {draft}; {receipt}",
+            )
+            assert_deterministic(sequence, command)
+            facts["explicitCodeCases"].append({"command": command, "items": items, "modelExchanges": 0})
+
+        await reset()
+        await discover_single()
+        facts["invalidCodeCases"] = []
+        for code, reason in S56_INVALID_CODES:
+            before = await ctx.draft()
+            sequence = cutoff()
+            rejection = await send(f"加入编码{code}")
+            after = await ctx.draft()
+            require(
+                all(before.get(key) == after.get(key) for key in ("batchId", "contentVersion", "items"))
+                and code in rejection and reason in rejection
+                and "本次未写入" in rejection,
+                f"S56 invalid code did not identify its objective error without a write: {code}; {rejection}; {after}",
+            )
+            assert_deterministic(sequence, f"invalid code {code}")
+            facts["invalidCodeCases"].append({"code": code, "reason": reason, "draftUnchanged": True, "modelExchanges": 0})
+
+        await reset()
+        await discover_single()
+        await ctx.next_client.seed_phrase(
+            platform_id=ctx.platform_id, word=S56_WORD, code=S56_EXPLICIT_CODE,
+            phrase_type="Single", weight=10,
+        )
+        duplicate_before = await ctx.draft()
+        duplicate_dictionary = await dictionary_snapshot()
+        sequence = cutoff()
+        duplicate_reply = await send(S56_EXPLICIT_FORMS[0])
+        duplicate_after = await ctx.draft()
+        require(
+            all(duplicate_before.get(key) == duplicate_after.get(key) for key in ("batchId", "contentVersion", "items"))
+            and await dictionary_snapshot() == duplicate_dictionary
+            and S56_WORD in duplicate_reply and S56_EXPLICIT_CODE in duplicate_reply
+            and "重复" in duplicate_reply and "本次未写入" in duplicate_reply,
+            f"S56 exact same-word six-code duplicate was not rejected: {duplicate_reply}; {duplicate_after}",
+        )
+        assert_deterministic(sequence, "exact same-word six-code duplicate")
+        facts["exactSixCodeDuplicate"] = {"word": S56_WORD, "code": S56_EXPLICIT_CODE, "draftUnchanged": True, "modelExchanges": 0}
+        duplicate_cleanup = await ctx.next_client.remove_rig_owned_dictionary_words(
+            platform_id=ctx.platform_id, admin_token=ctx.admin_token,
+            scenario_id="S56", fixture_words=(S56_WORD,),
+        )
+        require(duplicate_cleanup.get("verified") is True, f"S56 duplicate control cleanup failed: {duplicate_cleanup}")
+        require(await dictionary_snapshot() == initial_dictionary, "S56 duplicate control changed an unrelated fixture")
+
+        await reset()
+        await discover_single()
+        sequence = cutoff()
+        submitted_reply = await send("加入编码qxioio并提交")
+        submitted_batch_id = _successful_submit_batch_id(ctx.attempt_events(), after_sequence=sequence)
+        require(submitted_batch_id, f"S56 explicit-code submit did not submit in one turn: {submitted_reply}")
+        submitted = await ctx.next_client.get_admin_batch(batch_id=submitted_batch_id, admin_token=ctx.admin_token)
+        submitted_items = submitted.get("pullRequests") or []
+        require(
+            submitted.get("status") == "Submitted" and len(submitted_items) == 1
+            and item_key(submitted_items[0]) == ("Create", S56_WORD, S56_EXPLICIT_CODE)
+            and submitted_items[0].get("needsManualReview") is True,
+            f"S56 explicit-code submission lost its manual seal: {submitted}",
+        )
+        assert_deterministic(sequence, "explicit-code submission")
+        sequence = cutoff()
+        submitted_undo = await send("撤销")
+        recalled = await ctx.next_client.get_admin_batch(batch_id=submitted_batch_id, admin_token=ctx.admin_token)
+        require(
+            recalled.get("status") == "Draft" and not recalled.get("pullRequests")
+            and batch_link_ids(submitted_undo) == {submitted_batch_id}
+            and "撤回提审" in submitted_undo and "撤销" in submitted_undo
+            and not re.search(r"[？?]|全部.*还是|哪一|哪几", submitted_undo)
+            and await dictionary_snapshot() == initial_dictionary,
+            f"S56 submitted undo did not recall then revert the exact operation: {recalled}; {submitted_undo}",
+        )
+        assert_deterministic(sequence, "submitted undo")
+        successful_deletes(sequence, {int(row["id"]) for row in submitted_items})
+        facts["submittedUndo"] = {"batchId": submitted_batch_id, "beforeStatus": "Submitted", "afterStatus": "Draft", "remainingItems": [], "modelExchanges": 0}
+
+        for command in S56_BARE_FORMS:
+            await reset()
+            await discover_single()
+            before = await ctx.draft()
+            sequence = cutoff()
+            refusal = await send(command)
+            after = await ctx.draft()
+            require(
+                before.get("items") == after.get("items") == []
+                and before.get("batchId") == after.get("batchId")
+                and before.get("contentVersion") == after.get("contentVersion")
+                and "强" in refusal and "形码" in refusal
+                and any(marker in refusal for marker in ("顶替", "挤掉"))
+                and await dictionary_snapshot() == initial_dictionary,
+                f"S56 bare assent displaced a stronger occupant or failed to explain next steps: {command}; {before}; {after}; {refusal}",
+            )
+            assert_deterministic(sequence, command)
+            facts["bareAssentCases"].append({"command": command, "draftUnchanged": True, "modelExchanges": 0})
+
+        await reset()
+        await discover_single()
+        sequence = cutoff()
+        eviction_reply = await send("加入，顶替 强")
+        eviction_draft = await ctx.draft()
+        expected = [("Create", S56_WORD, "qx")]
+        for word, old_code, new_code in S56_SINGLE_CHAIN:
+            expected.extend((("Delete", word, old_code), ("Create", word, new_code)))
+        require(
+            same_unique_item_set([item_key(row) for row in eviction_draft.get("items") or []], expected)
+            and all(row.get("type") == "Single" for row in eviction_draft.get("items") or [])
+            and batch_link_ids(eviction_reply) == {eviction_draft.get("batchId")},
+            f"S56 explicit named eviction did not atomically materialize the complete Single chain: {eviction_draft}; {eviction_reply}",
+        )
+        assert_reply_mentions(eviction_reply, S56_WORD, "强", "戕", "qx", "qxa", "qxai")
+        assert_deterministic(sequence, "named eviction")
+        completed_record = store.get_record(address)
+        completed_state = completed_record.state if completed_record is not None else None
+        recent_submit_hint = bool(
+            completed_record is not None and completed_record.owner_key == address
+            and not completed_record.execution_id
+            and isinstance(completed_state, PendingToolConfirm)
+            and completed_state.function_name == "keytao_submit_batch"
+            and completed_state.confirmation_source == "local_preview"
+            and completed_state.args == {
+                "batch_id": eviction_draft.get("batchId"), "_recent_own_write": True,
+                "_recent_batch_ids": [eviction_draft.get("batchId")],
+            }
+        )
+        require(
+            completed_record is None or recent_submit_hint,
+            "S56 completed eviction left an executable pending ticket: "
+            f"record={completed_record!r}; stateType={type(completed_state).__name__}; "
+            f"args={getattr(completed_state, 'args', None)!r}",
+        )
+        sequence = cutoff()
+        undo_reply = await send("取消")
+        reverted = await ctx.draft()
+        require(
+            not reverted.get("items") and await dictionary_snapshot() == initial_dictionary
+            and batch_link_ids(undo_reply) == {eviction_draft.get("batchId")}
+            and not re.search(r"[？?]|全部.*还是|哪一|哪几", undo_reply)
+            and any(marker in undo_reply for marker in ("已撤销", "已回滚", "已撤回")),
+            f"S56 immediate undo did not restore the entire operation with a truthful receipt: {reverted}; {undo_reply}",
+        )
+        assert_reply_mentions(undo_reply, S56_WORD, "强", "戕", "qx", "qxa", "qxai")
+        assert_deterministic(sequence, "recent undo")
+        successful_deletes(sequence, {int(row["id"]) for row in eviction_draft.get("items") or []})
+        require(store.get_record(address) is None, f"S56 undo did not consume the original receipt hint: {store.get_record(address)!r}")
+        facts["namedEvictionAndUndo"] = {
+            "writtenItems": eviction_draft.get("items"), "batchId": eviction_draft.get("batchId"),
+            "revertedItems": reverted.get("items"), "dictionaryRestored": True, "modelExchanges": 0,
+            "recentSubmitHintOnly": recent_submit_hint, "receiptHintConsumed": True,
+        }
+
+        await reset()
+        seeded_rows = [{
+            "action": "Create", "word": S56_WORD, "code": code, "type": "Single",
+            "weight": 10, "needsManualReview": True, "remark": remark,
+        } for code, remark in (
+            (S56_EXPLICIT_CODE, "S56 original manually reviewed draft row"),
+            ("qxioi", "S56 unrelated same-word draft row"),
+        )]
+        await ctx.next_client.add_draft_items(platform_id=ctx.platform_id, items=seeded_rows)
+        original_draft = await ctx.draft()
+        original_target = next((row for row in original_draft.get("items") or [] if row.get("code") == S56_EXPLICIT_CODE), None)
+        original_other = next((row for row in original_draft.get("items") or [] if row.get("code") == "qxioi"), None)
+        semantic_fields = ("word", "code", "action", "type", "oldWord", "weight", "remark", "needsManualReview")
+        require(
+            len(original_draft.get("items") or []) == 2
+            and original_target is not None and original_other is not None
+            and all(original_target.get(key) == seeded_rows[0].get(key) for key in semantic_fields)
+            and all(original_other.get(key) == seeded_rows[1].get(key) for key in semantic_fields),
+            f"S56 old-draft restore fixture did not preserve exact seeded rows: {original_draft}",
+        )
+        sequence = cutoff()
+        weight_reply = await send(f"将草稿中「{S56_WORD}」{S56_EXPLICIT_CODE} 的权重调整为 11")
+        changed_draft = await ctx.draft()
+        changed_target = next((row for row in changed_draft.get("items") or [] if row.get("id") == original_target["id"]), None)
+        changed_other = next((row for row in changed_draft.get("items") or [] if row.get("id") == original_other["id"]), None)
+        require(
+            len(changed_draft.get("items") or []) == 2
+            and changed_target is not None and changed_target.get("weight") == 11
+            and all(changed_target.get(key) == original_target.get(key) for key in semantic_fields if key != "weight")
+            and changed_other == original_other
+            and batch_link_ids(weight_reply) == {original_draft.get("batchId")},
+            f"S56 exact weight command changed the wrong draft fields or failed to complete: {changed_draft}; {weight_reply}",
+        )
+        weight_write_model_exchanges = sum(event.get("kind") == "modelExchange" for event in later_events(sequence))
+        sequence = cutoff()
+        restored_reply = await send("取消")
+        restored_draft = await ctx.draft()
+        restored_target = next((row for row in restored_draft.get("items") or [] if row.get("code") == S56_EXPLICIT_CODE), None)
+        restored_other = next((row for row in restored_draft.get("items") or [] if row.get("id") == original_other["id"]), None)
+        require(
+            len(restored_draft.get("items") or []) == 2
+            and restored_draft.get("batchId") == original_draft.get("batchId")
+            and restored_target is not None
+            and all(restored_target.get(key) == original_target.get(key) for key in semantic_fields)
+            and restored_other == original_other
+            and await dictionary_snapshot() == initial_dictionary
+            and batch_link_ids(restored_reply) == {original_draft.get("batchId")}
+            and "撤销" in restored_reply and S56_EXPLICIT_CODE in restored_reply
+            and not re.search(r"[？?]|全部.*还是|哪一|哪几", restored_reply),
+            f"S56 weight undo did not restore the original draft row and preserve the unrelated row: {original_draft}; {restored_draft}; {restored_reply}",
+        )
+        assert_deterministic(sequence, "existing draft weight undo")
+        successful_deletes(sequence, {int(original_target["id"])})
+        restore_posts = [
+            event for event in later_events(sequence)
+            if event.get("kind") == "http" and event.get("method") == "POST"
+            and urlsplit(str(event.get("url") or "")).path == "/api/bot/pull-requests/batch"
+            and (event.get("requestBody") or {}).get("confirmed") is True
+        ]
+        expected_restore = {key: original_target[key] for key in semantic_fields if original_target.get(key) is not None}
+        require(
+            len(restore_posts) == 1 and restore_posts[0].get("status") == 200
+            and (restore_posts[0].get("requestBody") or {}).get("items") == [expected_restore]
+            and (restore_posts[0].get("responseBody") or {}).get("success") is True
+            and (restore_posts[0].get("responseBody") or {}).get("batchId") == original_draft.get("batchId")
+            and (restore_posts[0].get("responseBody") or {}).get("pullRequestCount") == 1,
+            f"S56 weight undo lacked a successful exact restore POST receipt: {restore_posts}",
+        )
+        facts["existingDraftWeightUndo"] = {
+            "batchId": original_draft.get("batchId"), "originalTarget": original_target,
+            "changedTarget": changed_target, "restoredTarget": restored_target,
+            "unrelatedRowUnchanged": True, "restorePostConfirmed": True,
+            "originalManualSealRestored": True,
+            "writeModelExchanges": weight_write_model_exchanges, "undoModelExchanges": 0,
+        }
+
+        await reset()
+        word, occupant, occupied_code = S56_WORD_CONTROL
+        occupant_codes = ordered_candidate_codes(await ctx.next_client.encode(occupant))
+        require(occupant_codes, f"S56 weaker-word encoder has no chain: {occupant_codes}")
+        shifted_code = next((code for code in occupant_codes if code != occupied_code), "")
+        require(shifted_code, f"S56 weaker-word fixture has no successor: {occupant_codes}")
+        await ctx.next_client.seed_phrase(platform_id=ctx.platform_id, word=occupant, code=occupied_code)
+        word_comparison = await review_module.compare_word_commonness(word, occupant)
+        require(word_comparison.get("verdict") == "front_more_common", f"S56 word control is not stronger: {word_comparison}")
+        await send(f"喵喵 {word}")
+        sequence = cutoff()
+        word_reply = await send("加入")
+        if pending_confirmation_copy() in word_reply:
+            word_reply = await send("确认")
+        word_draft = await ctx.draft()
+        expected_word_items = (("Create", word, occupied_code), ("Delete", occupant, occupied_code), ("Create", occupant, shifted_code))
+        require(
+            same_unique_item_set([item_key(row) for row in word_draft.get("items") or []], expected_word_items),
+            f"S56 stronger word lost the existing default shift: {word_draft}; {word_reply}",
+        )
+        assert_reply_mentions(word_reply, word, occupant, occupied_code, shifted_code)
+        assert_deterministic(sequence, "weaker-word default shift")
+        facts["weakerWordDefault"] = {"commonness": word_comparison, "items": word_draft.get("items"), "modelExchanges": 0}
+        return {"messages": messages, "replies": replies, "draft": word_draft, "facts": facts}
+    finally:
+        await reset()
+        facts["cleanup"] = await cleanup()
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S1", "cold eviction default", scenario_s1),
     Scenario("S2", "explicit duplicate", scenario_s2),
@@ -9156,6 +9927,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S53", "unknown-polyphone reading resolution", scenario_s53),
     Scenario("S54", "bare multi-word reviewed candidate and selection closure", scenario_s54),
     Scenario("S55", "Single review, failure traceback, and tripped search backend", scenario_s55),
+    Scenario("S56", "explicit codes, commonness-guarded eviction, and completed-write undo", scenario_s56),
 )
 
 

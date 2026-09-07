@@ -8,6 +8,8 @@ from typing import Any, Iterable, Optional
 import unicodedata
 from urllib.parse import urlsplit
 
+from .candidate_inventory import protected_candidate_occupants
+
 
 class ServerBackedQueryReply(str):
     """Internal provenance for an exact server-rendered query reply."""
@@ -1516,16 +1518,25 @@ def validated_front_insert_recommendation(
             if str(value or "").strip()
         )
         ordered_codes = tuple(occupancy)
+        valid_fallback = (
+            occupancy.get(free_code) is False
+            and ordered_codes.index(occupant_code) < ordered_codes.index(free_code)
+        ) if free_code and occupant_code in occupancy else (
+            not free_code and all(occupancy.values())
+        )
         if (
             new_word != normalized_word
             or not occupant_word
             or occupancy.get(occupant_code) is not True
-            or occupancy.get(free_code) is not False
-            or ordered_codes.index(occupant_code) >= ordered_codes.index(free_code)
+            or not valid_fallback
             or occupant_word not in bound_occupants
             or new_code != occupant_code
         ):
             return None
+        if protected_candidate_occupants(
+            normalized_word, occupant_code, candidates, occupied_words, assessments,
+        ):
+            continue
         return {
             "verdict": "front_more_common",
             "newWord": new_word,
@@ -1612,7 +1623,8 @@ def front_insert_recommendation_copy(
         lines = [f"推荐调序：「{word}」占 {occupant_code}，「{occupant}」顺延"]
         if summary:
             lines.append(f"依据：{summary}")
-        lines.append(f"不调序备选编码：{free_code}")
+        if free_code:
+            lines.append(f"不调序备选编码：{free_code}")
         return "\n".join(lines)
     command = (
         f"「{word}」占 {occupant_code}、「{occupant}」顺延"
@@ -1632,7 +1644,8 @@ def front_insert_recommendation_copy(
     lines = ["推荐：", recommendation_line]
     if summary:
         lines.append(f"依据：{summary}")
-    lines.append(opt_out)
+    if free_code:
+        lines.append(opt_out)
     return "\n".join(lines)
 
 
@@ -1647,6 +1660,58 @@ def single_word_candidate_footer(candidate_count: int) -> str:
             "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
         )
     return pending_single_candidate_confirmation_copy()
+
+
+def candidate_commonness_guard_copy(
+    word: object,
+    candidates: object,
+    occupied_words: object,
+    assessments: object,
+    *,
+    include_controls: bool = True,
+) -> str:
+    """Explain why an occupied-only inventory has no default add operation."""
+    normalized_word = str(word or "").strip()
+    if not isinstance(candidates, (list, tuple)) or not isinstance(occupied_words, dict):
+        return ""
+    protected = [
+        (str(code), occupant)
+        for code, occupied in candidates if occupied is True
+        for occupant in protected_candidate_occupants(
+            normalized_word, code, candidates, occupied_words, assessments,
+        )
+    ]
+    if not protected or any(occupied is False for _code, occupied in candidates):
+        return ""
+    if any(not occupant for _code, occupant in protected):
+        return "候选编码的占用词条未能核验，请重新查询；本次未写入。"
+    lines = ["推荐编码：暂无（现有候选均需点名顶替）"]
+    for code, occupant in protected:
+        assessment = next((
+            item for item in (assessments or [])
+            if isinstance(item, dict)
+            and item.get("newWord") == normalized_word
+            and item.get("occupantWord") == occupant
+            and item.get("occupantCode") == code
+        ), {})
+        if assessment.get("verdict") in {"behind_more_common", "close"}:
+            lines.append(f"常用度评估：「{occupant}」不弱于「{normalized_word}」，维持现有排序。")
+        else:
+            lines.append(f"「{normalized_word}」与「{occupant}」的常用度证据不足，暂不自动挪动「{occupant}」。")
+    base_code = str(candidates[0][0]) if candidates else ""
+    lines.append(f"当前候选没有空位；可指定形码后的完整编码，格式为：加入编码 {base_code}+形码（请替换形码部分）。")
+    if include_controls:
+        code, occupant = protected[0]
+        lines.append("若要顶替，请点名现有词条：")
+        lines.append(render_executable_suggestion(
+            f"添加 {normalized_word} {code}，挤掉 {occupant}",
+            words=(normalized_word, occupant),
+        ))
+        lines.append(render_executable_suggestion(
+            f"添加 {normalized_word} {code}，顶替 {occupant}",
+            words=(normalized_word, occupant),
+        ))
+    return "\n".join(lines)
 
 
 def advertised_single_word_candidate_codes(text: str) -> tuple[str, ...]:
@@ -1701,7 +1766,17 @@ def render_server_backed_single_word_candidates(
             return ""
         normalized_candidates.append((code, occupied))
         seen.add(code)
-    if not normalized_candidates or recommended not in seen:
+    if not normalized_candidates or (recommended and recommended not in seen):
+        return ""
+    guard_copy = candidate_commonness_guard_copy(
+        normalized_word, normalized_candidates, occupied_words, ordering_assessments,
+        include_controls=include_controls,
+    )
+    if guard_copy and (not recommended or protected_candidate_occupants(
+        normalized_word, recommended, normalized_candidates, occupied_words, ordering_assessments,
+    )):
+        recommended = ""
+    if not recommended and not guard_copy:
         return ""
     reorder_recommendation = validated_front_insert_recommendation(
         normalized_word,
@@ -1752,14 +1827,14 @@ def render_server_backed_single_word_candidates(
             label += "（推荐）"
         lines.append(f"{index}. {code} — {label}")
     if reorder_recommendation is not None:
-        fallback_index = next(
+        fallback_index = next((
             index
             for index, (code, _occupied) in enumerate(
                 normalized_candidates,
                 start=1,
             )
             if code == reorder_recommendation["freeCode"]
-        )
+        ), None)
         lines.append(
             front_insert_recommendation_copy(
                 reorder_recommendation,
@@ -1767,9 +1842,11 @@ def render_server_backed_single_word_candidates(
                 include_controls=include_controls,
             )
         )
-    else:
+    elif recommended:
         lines.append(f"• 「{normalized_word}」→ {recommended}（推荐）")
-    if include_controls:
+    else:
+        lines.append(guard_copy)
+    if include_controls and recommended:
         lines.append(single_word_candidate_footer(len(normalized_candidates)))
     return "\n".join(lines)
 
@@ -1800,6 +1877,24 @@ def render_server_backed_single_word_lookup(
     recommended = str(recommended_code or "").strip().lower()
     expected_codes = advertised_single_word_candidate_codes(actionable)
     source = str(reviewed_prompt or "").strip()
+    guard_copy = candidate_commonness_guard_copy(
+        word, candidates, occupied_words, ordering_assessments,
+        include_controls=include_controls and actionable_controls,
+    )
+    if guard_copy and (not recommended or protected_candidate_occupants(
+        word, recommended, candidates, occupied_words, ordering_assessments,
+    )):
+        prefix = ""
+        first_candidate = re.search(r"(?m)^\s*1[.)、]\s*[a-z]+\s*(?:—|–|-)", source)
+        if first_candidate is not None:
+            prefix = re.sub(r"(?m)^\s*候选编码\s*[:：]\s*$", "", source[:first_candidate.start()]).strip()
+        guarded_body = render_server_backed_single_word_candidates(
+            word, "", candidates, occupied_words, ordering_assessments,
+            include_controls=include_controls and actionable_controls,
+        )
+        if not guarded_body:
+            return ""
+        return ServerBackedQueryReply("\n".join(filter(None, (prefix, guarded_body))))
     body = ""
     has_reorder_copy = False
     if source and advertised_single_word_candidate_codes(source) == expected_codes:
@@ -1887,6 +1982,12 @@ def render_server_backed_single_word_lookup(
 def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
     """Return ordered codes only from the deterministic server-backed contract."""
     normalized = unicodedata.normalize("NFKC", str(text or ""))
+    blocked = re.search(
+        r"(?m)^推荐编码:暂无\(现有候选均需点名顶替\)\s*$",
+        normalized,
+    )
+    if blocked is not None:
+        return advertised_single_word_candidate_codes(normalized[:blocked.start()])
     recommended = re.search(
         r"(?m)^推荐编码:(?P<code>[a-z]{1,12})(?:\(本次仅查询\))?\s*$",
         normalized,

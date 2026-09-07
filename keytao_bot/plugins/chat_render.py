@@ -24,6 +24,7 @@ from ..utils.pending_confirmation import (
     _BIND_HELP_TEXT,
     _humanize_warning_text,
     already_existing_word_copy,
+    candidate_commonness_guard_copy,
     pending_confirmation_copy,
     plain_warning_message,
     front_insert_recommendation_copy,
@@ -1348,7 +1349,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         item for item in review.get("pronunciations", [])
         if isinstance(item, dict) and item.get("candidateStatuses")
     ]
-    if not word or not recommended_code or not pronunciations:
+    if not word or not pronunciations:
         return None
 
     ordering_assessments = [
@@ -1387,6 +1388,11 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         snapshot_occupied_words,
         ordering_assessments,
     )
+    guard_copy = candidate_commonness_guard_copy(
+        word, snapshot_candidates, snapshot_occupied_words, ordering_assessments,
+    ) if not recommended_code else ""
+    if not recommended_code and not guard_copy:
+        return None
     ordering_recommended_code = (
         reorder_recommendation["occupantCode"]
         if reorder_recommendation is not None
@@ -1482,14 +1488,18 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
                 candidate_indexes,
             )
         )
-    elif ordering_assessments:
+    elif ordering_assessments and not guard_copy:
         lines.extend(
             _format_candidate_ordering_assessment(assessment, candidate_indexes)
             for assessment in ordering_assessments
+            if assessment.get("verdict") != "front_more_common"
         )
-    if reorder_recommendation is None:
+    if guard_copy:
+        lines.append(guard_copy)
+    elif reorder_recommendation is None:
         lines.append(f"• 「{word}」→ {recommended_code}（推荐）")
-    lines.append(single_word_candidate_footer(candidate_index - 1))
+    if not guard_copy:
+        lines.append(single_word_candidate_footer(candidate_index - 1))
     occupied_choice = next(
         (
             (
@@ -1510,7 +1520,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         ),
         None,
     )
-    if reorder_recommendation is None and occupied_choice and occupied_choice[0]:
+    if not guard_copy and reorder_recommendation is None and occupied_choice and occupied_choice[0]:
         occupied_index, occupied_word = occupied_choice
         target_copy = f"已有词「{occupied_word}」" if occupied_word else "该已有词"
         lines.append(

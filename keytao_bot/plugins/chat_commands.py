@@ -67,7 +67,8 @@ from ..harness.tools import (
 )
 from ..utils.history_store import HistoryGenerationToken, get_history_store
 from ..utils.draft_mutation_store import get_default_draft_mutation_claim_store
-from ..utils.candidate_inventory import select_candidate_inventory
+from ..utils.candidate_inventory import select_candidate_inventory, protected_candidate_occupants
+from ..utils.explicit_code import parse_explicit_code_request, validate_explicit_code
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import observe_model_call, set_turn_flow
@@ -333,6 +334,12 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     elif compact_match is not None:
         recommended_code = compact_match.group("code")
         word = compact_match.group("word")
+    elif "推荐编码：暂无（现有候选均需点名顶替）" in response:
+        blocked_word = re.search(r"(?:词库暂无收录「([^」]+)」|「([^」]+)」候选编码：)", response)
+        if blocked_word is None:
+            return None
+        word = blocked_word.group(1) or blocked_word.group(2)
+        recommended_code = ""
     else:
         return None
 
@@ -563,7 +570,9 @@ def _server_ordering_snapshot(
             or new_word != state.word
             or not occupant_word
             or occupied_by_code.get(occupant_code) is not True
-            or occupied_by_code.get(free_code) is not False
+            or (occupied_by_code.get(free_code) is not False and not (
+                not free_code and all(occupied_by_code.values())
+            ))
             or occupant_word not in occupied_words.get(occupant_code, [])
             or new_code != expected_new_code
         ):
@@ -615,6 +624,35 @@ def _pending_add_ordering_summary(state: PendingAddWord, code: str) -> str:
             "（新词按默认权重排在后）"
         )
     return ""
+
+
+def _protected_eviction_response(
+    state: PendingAddWord, code: str, protected: Tuple[str, ...],
+) -> str:
+    """Share the same protected-slot advice across pending and complete commands."""
+    if "" in protected:
+        return f"编码 {code} 的占用词条未能核验，请重新查询；本次未写入。"
+    occupants = protected or tuple(dict.fromkeys(
+        word for words in state.server_occupied_words.values() for word in words
+    ))
+    names = "、".join(occupants)
+    base = next(iter(state.server_candidates), ("", False))[0]
+    suggestions = "\n".join(f"- 「加入，顶替 {word}」" for word in occupants)
+    assessed = all(any(
+        assessment.get("newWord") == state.word
+        and assessment.get("occupantWord") == word
+        and assessment.get("verdict") in {"behind_more_common", "close"}
+        for assessment in state.server_ordering_assessments
+    ) for word in occupants)
+    reason = (
+        f"「{names}」的常用度不弱于「{state.word}」"
+        if assessed else f"没有足够常用度证据支持顶替「{names}」"
+    )
+    return (
+        reason + "，保留现有位置；本次未写入。\n"
+        f"可指定形码后的完整编码，格式为：加入编码 {base}+形码（请替换形码部分）。"
+        + ("\n若要顶替，请点名：\n" + suggestions if suggestions else "")
+    )
 
 
 def _pending_add_reorder_recommendation(
@@ -1481,6 +1519,12 @@ async def _try_handle_shift_modified_add_command(
             reviewed_pinyin=reviewed_pinyin,
             reviewed_candidate_codes=reviewed_candidate_codes,
         )
+    protected = protected_candidate_occupants(
+        state.word, code, state.server_candidates,
+        state.server_occupied_words, state.server_ordering_assessments,
+    )
+    if protected and not explicitly_named_occupant:
+        return _protected_eviction_response(state, code, protected)
     response = await _execute_shift_to_code(
         word,
         code,
@@ -1489,7 +1533,7 @@ async def _try_handle_shift_modified_add_command(
         space_key,
         owner_label,
         target_item={
-            "type": "Phrase",
+            "type": state.phrase_type,
             "remark": str(create_args.get("remark") or ""),
             "needsManualReview": bool(
                 create_args.get("needs_manual_review", True)
@@ -2017,6 +2061,14 @@ async def _canonicalize_pending_ticket_intent(
     """Freeze the exact action and target that the ticket will later execute."""
     if not isinstance(state, PendingAddWord):
         return command_intent, None
+    explicit = parse_explicit_code_request(
+        _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
+    )
+    if explicit is not None and state.server_candidates:
+        validation = validate_explicit_code(state, explicit.code)
+        if validation.valid:
+            return command_intent, None
+        return None, validation.reason + "；本次未写入。"
 
     multi_selection = parse_pending_candidate_selection(
         _strip_command_message_prefixes(trusted_mutation_source(message_text))
@@ -3375,6 +3427,30 @@ async def _prepare_multi_word_query(
         if len(scopes) == count:
             other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
 
+    actionable_scopes: List[Dict[str, Any]] = []
+    for scope in scopes:
+        if scope["reviewedState"]["recommendedCode"]:
+            actionable_scopes.append(scope)
+            continue
+        diagnostic = render_server_backed_single_word_lookup(
+            scope["word"], "", scope["candidates"], scope["occupiedWords"],
+            reviewed_prompt=scope["reviewedPrompt"],
+            ordering_assessments=scope["orderingAssessments"],
+            actionable_controls=False, include_controls=False,
+        )
+        diagnostic_lines = []
+        for line in diagnostic.splitlines():
+            if "格式为：加入编码" in line:
+                continue
+            line = re.sub(r"^\s*\d+[.)、]\s*(?=[a-z]+\s*[—–-])", "", line)
+            line = line.replace(f"「{scope['word']}」候选编码：", f"「{scope['word']}」占用情况：")
+            diagnostic_lines.append(line)
+        diagnostic_lines.append(
+            f"「{scope['word']}」本次未选中；请单独查询此词，再指定完整编码或点名顶替。"
+        )
+        other_blocks.append("\n".join(diagnostic_lines))
+    scopes = actionable_scopes
+
     if not scopes:
         if conv_key is not None:
             conversation_state_store.delete(conv_key)
@@ -3637,6 +3713,7 @@ async def _try_handle_simple_single_word_query(
                     pending.recommended_code,
                     pending.server_candidates,
                     pending.server_occupied_words,
+                    ordering_assessments=pending.server_ordering_assessments,
                     reviewed_prompt=reviewed_prompt,
                     actionable_controls=True,
                 )
@@ -10285,6 +10362,43 @@ async def _handle_pending_add_word(
     requested_codes = list(command_intent.requested_codes)
     if not requested_codes and _is_sensitive_pending_control_intent(command_intent):
         requested_codes = _requested_codes_from_pending_message(msg, state)
+    if requested_codes:
+        selected_codes = requested_codes
+    elif command_intent.choice_index is not None:
+        selected_codes = ([state.candidates[command_intent.choice_index - 1][0]]
+                          if 1 <= command_intent.choice_index <= len(state.candidates) else [])
+    else:
+        target = (_resolve_shift_target_code(state, command_intent)
+                  or command_intent.requested_code or state.recommended_code)
+        selected_codes = [target] if target else []
+    selected_code = selected_codes[0] if selected_codes else ""
+    if command_intent.recode_indices:
+        eviction_codes = [
+            state.candidates[index - 1][0]
+            for index in command_intent.recode_indices
+            if 1 <= index <= len(state.candidates)
+        ]
+    else:
+        # Multiple ordinary additions preserve existing occupants in place.
+        eviction_codes = selected_codes if len(requested_codes) <= 1 else []
+    protected = tuple(dict.fromkeys(
+        word for code in eviction_codes for word in protected_candidate_occupants(
+            state.word, code, state.server_candidates,
+            state.server_occupied_words, state.server_ordering_assessments,
+        )
+    ))
+    source_intent = _structural_pending_add_word_intent(msg, state)
+    named_eviction = bool(
+        source_intent is not None and source_intent.intent == "pending_recode"
+        and source_intent.target_word
+        and source_intent.target_word in state.server_occupied_words.get(selected_code, [])
+    )
+    if (protected and not named_eviction) or (
+        not selected_code and command_intent.intent in {"pending_confirm", "pending_add_and_submit"}
+    ):
+        if restore_pending is not None:
+            restore_pending()
+        return _protected_eviction_response(state, selected_code, protected)
     if command_intent.recode_indices:
         if (
             len(command_intent.recode_indices) != 1
@@ -10350,7 +10464,7 @@ async def _handle_pending_add_word(
             owner_label,
             submit_after=submit_after_add,
             target_item={
-                "type": "Phrase",
+                "type": state.phrase_type,
                 "remark": str(create_args.get("remark") or ""),
                 "needsManualReview": bool(
                     create_args.get("needs_manual_review", True)
@@ -10388,7 +10502,7 @@ async def _handle_pending_add_word(
             owner_label,
             submit_after=submit_after_add,
             target_item={
-                "type": "Phrase",
+                "type": state.phrase_type,
                 "remark": str(create_args.get("remark") or ""),
                 "needsManualReview": bool(
                     create_args.get("needs_manual_review", True)
@@ -10415,6 +10529,14 @@ async def _handle_pending_add_word(
             space_key,
             owner_label,
             submit_after=submit_after_add,
+            target_item={
+                "type": state.phrase_type,
+                "remark": state.code_remarks.get(state.recommended_code, ""),
+                # Keep the existing manual seal for default front insertion.
+                "needsManualReview": True,
+            },
+            reviewed_pinyin=_pending_reviewed_reading(state, state.recommended_code)[0],
+            reviewed_candidate_codes=_pending_reviewed_reading(state, state.recommended_code)[1],
         )
 
     if len(requested_codes) == 1:
@@ -10460,7 +10582,7 @@ async def _handle_pending_add_word(
                     owner_label,
                     submit_after=submit_after_add,
                     target_item={
-                        "type": "Phrase",
+                        "type": state.phrase_type,
                         "remark": str(create_args.get("remark") or ""),
                         "needsManualReview": bool(
                             create_args.get("needs_manual_review", True)
@@ -10532,7 +10654,7 @@ async def _handle_pending_add_word(
                 owner_label,
                 submit_after=submit_after_add,
                 target_item={
-                    "type": "Phrase",
+                    "type": state.phrase_type,
                     "remark": str(create_args.get("remark") or ""),
                     "needsManualReview": bool(
                         create_args.get("needs_manual_review", True)
@@ -10628,7 +10750,7 @@ async def _handle_pending_add_word(
             owner_label,
             submit_after=submit_after_add,
             target_item={
-                "type": "Phrase",
+                "type": state.phrase_type,
                 "remark": str(create_args.get("remark") or ""),
                 "needsManualReview": bool(
                     create_args.get("needs_manual_review", True)
@@ -11061,6 +11183,14 @@ async def _try_handle_explicit_pending_replacement(
     code = str(command.get("code") or "").strip().lower()
     if word != state.word:
         return None
+    explicit = parse_explicit_code_request(
+        _strip_command_message_prefixes(trusted_mutation_source(message)), state.word,
+    )
+    if explicit is not None and state.server_candidates and state.pronunciation_codes:
+        return await handle_pending_message_core(
+            message, platform, user_id, conv_key, space_key=space_key,
+            owner_label=owner_label, allow_intent_model=False,
+        )
 
     review_json = await call_tool_function(
         "keytao_prepare_reviewed_add",
@@ -11321,6 +11451,56 @@ async def _resolve_pending_trusted_word_action(
     )
 
 
+async def _bind_explicit_pending_code(state, request, platform, user_id):
+    """Seal a direct user's code only after reading and exact typed occupancy checks."""
+    validation = validate_explicit_code(state, request.code)
+    if not validation.valid:
+        return None, validation.reason + "；本次未写入。"
+    raw = await call_tool_function(
+        "keytao_lookup_by_code", {"code": request.code}, platform, user_id,
+    )
+    try:
+        lookup = json.loads(raw)
+    except (ValueError, TypeError):
+        lookup = {}
+    if lookup.get("success") is not True or not isinstance(lookup.get("phrases"), list):
+        return None, f"未能核验编码 {request.code} 是否有占用，本次未写入。"
+    rows = [row for row in lookup["phrases"] if isinstance(row, dict)
+            and row.get("code") == request.code and row.get("type") == state.phrase_type]
+    if any(row.get("word") == state.word for row in rows):
+        return None, f"「{state.word}」已有编码 {request.code}，不能重复添加同一词条和编码；本次未写入。"
+    if any(not isinstance(row.get("word"), str) or not row["word"] for row in rows):
+        return None, f"编码 {request.code} 的占用记录不完整，本次未写入。"
+    derived = _pending_add_word_from_payload(json.loads(json.dumps(_pending_add_word_payload(state))))
+    code = request.code
+    derived.candidates = [(value, occupied) for value, occupied in derived.candidates if value != code]
+    derived.candidates.append((code, bool(rows)))
+    derived.server_candidates = list(derived.candidates)
+    occupants = list(dict.fromkeys(row["word"] for row in rows))
+    derived.occupied_words[code] = occupants
+    derived.server_occupied_words[code] = occupants
+    derived.pronunciation_codes[code] = validation.pinyin
+    derived.server_entries_by_code[code] = [(row["word"], row["weight"]) for row in rows
+                                          if isinstance(row.get("weight"), int)]
+    if rows:
+        from ..utils.keytao_review import assess_candidate_chain_commonness
+        assessments = await assess_candidate_chain_commonness({
+            "word": state.word, "type": state.phrase_type, "recommendedCode": code,
+            "candidateStatuses": [{"code": code, "occupied": True, "words": occupants, "phrases": rows}],
+        })
+        derived.server_ordering_assessments = [
+            assessment for assessment in derived.server_ordering_assessments
+            if assessment.get("occupantCode") != code
+        ] + assessments
+    if validation.manual_reason:
+        derived.needs_manual_review = True
+        derived.manual_review_reason = validation.manual_reason
+        derived.code_remarks[code] = f"喵喵审词：读音 {validation.pinyin}；{validation.manual_reason}"
+    elif code not in derived.code_remarks:
+        derived.code_remarks[code] = f"喵喵审词：读音 {validation.pinyin}；{derived.manual_review_reason}"
+    return derived, ""
+
+
 async def handle_pending_message_core(
     message: str,
     platform: str,
@@ -11373,6 +11553,24 @@ async def handle_pending_message_core(
         if uncertain_action == "read":
             return None
         return uncertain_response
+
+    explicit_review_line = ""
+    if isinstance(state, PendingAddWord):
+        explicit = parse_explicit_code_request(
+            _strip_command_message_prefixes(trusted_mutation_source(message)), state.word,
+        )
+        if explicit is not None and state.server_candidates and explicit.code not in dict(state.server_candidates):
+            derived, failure = await _bind_explicit_pending_code(state, explicit, platform, user_id)
+            if failure:
+                return failure
+            if not conversation_state_store.set(conv_key, derived, space_key=space_key, owner_label=owner_label):
+                return "指定编码的核验记录未能保存，本次未写入。"
+            state_record = conversation_state_store.get_record(conv_key)
+            state = state_record.state
+            if state.manual_review_reason:
+                explicit_review_line = (
+                    f"审词：读音 {state.pronunciation_codes[explicit.code]}；{state.manual_review_reason}\n"
+                )
 
     scoped_state, scoped_intent, scoped_response = (
         _resolve_multi_word_pending_candidate_selection(state, message)
@@ -11510,7 +11708,7 @@ async def handle_pending_message_core(
             conversation_state_store.abort_execution(state_record)
         else:
             conversation_state_store.complete_execution(state_record)
-        return _append_pending_ticket_challenge(response, conv_key)
+        return explicit_review_line + _append_pending_ticket_challenge(response, conv_key)
 
     if (
         isinstance(state, PendingToolConfirm)

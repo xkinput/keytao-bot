@@ -200,14 +200,14 @@ def _pending_add_word_from_payload(payload: object) -> PendingAddWord:
         not isinstance(word, str)
         or not word
         or not isinstance(recommended_code, str)
-        or re.fullmatch(r"[a-z]{1,12}", recommended_code) is None
+        or (recommended_code and re.fullmatch(r"[a-z]{1,12}", recommended_code) is None)
         or not isinstance(manual_review_reason, str)
         or phrase_type not in {"Single", "Phrase"}
         or (phrase_type == "Single" and len(word) != 1)
     ):
         raise ValueError("invalid candidate record identity")
     candidates = candidate_pairs("candidates")
-    if recommended_code not in {code for code, _occupied in candidates}:
+    if recommended_code and recommended_code not in {code for code, _occupied in candidates}:
         raise ValueError("recommended code is not a candidate")
     server_candidates = candidate_pairs("serverCandidates")
     if server_candidates and server_candidates != candidates:

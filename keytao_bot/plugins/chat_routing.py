@@ -42,6 +42,7 @@ from ..harness.tools import (
     trusted_mutation_source,
 )
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
+from ..utils.explicit_code import parse_explicit_code_request, validate_explicit_code
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     PENDING_ASSENT_TEXTS,
@@ -637,18 +638,8 @@ def _pending_tool_assent_intent(
         # the latter happens to be live in the same conversation.
         return None
     assent = _pending_assent_phrase_for_state(state, message_text)
-    add_ticket = bool(
-        isinstance(state, PendingAddWord)
-        or (
-            isinstance(state, PendingToolConfirm)
-            and state.function_name in {
-                "keytao_create_phrase",
-                "keytao_batch_add_to_draft",
-            }
-        )
-    )
     if (
-        add_ticket
+        isinstance(state, (PendingAddWord, PendingToolConfirm))
         and assent.rejection == "negation"
         and assent.cancel_requested
     ):
@@ -659,8 +650,8 @@ def _pending_tool_assent_intent(
         server_backed = bool(
             state.server_candidates
             and state.server_candidates == state.candidates
-            and state.recommended_code
-            in {code for code, _occupied in state.server_candidates}
+            and (not state.recommended_code or state.recommended_code
+            in {code for code, _occupied in state.server_candidates})
         )
         if not server_backed:
             return None
@@ -790,6 +781,16 @@ def _pending_assent_rejection_response(
     message_text: str,
 ) -> Optional[str]:
     """Explain why assent-like text did not authorize the one live state."""
+    complete_add = explicit_complete_add_item(message_text)
+    if complete_add is not None and isinstance(state, PendingAddWord) and not state.pronunciation_codes:
+        return None
+    if isinstance(state, PendingAddWord):
+        explicit = parse_explicit_code_request(
+            _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
+        )
+        if explicit is not None:
+            validation = validate_explicit_code(state, explicit.code)
+            return None if validation.valid else validation.reason + "；本次未写入。"
     if (
         parse_eviction_modified_add(message_text) is not None
         or explicit_complete_add_item(message_text) is not None
@@ -834,8 +835,7 @@ def _pending_assent_rejection_response(
         "framed": "这条回复是引用或转述，不是当前发送者的直接确认；本次未写入",
         "other_action": "这条回复还包含加入候选之外的其他动作；本次未写入",
         "extra_content": (
-            "这条回复还包含当前候选之外的词条、编码或第二目标；"
-            "系统不会用这些文字改写候选；本次未写入"
+            "没有识别出要添加的完整词条和编码，请一次说明一个目标；本次未写入"
         ),
     }
     live_words = (
@@ -1393,7 +1393,7 @@ _PENDING_NUMBERED_EVICTION_RES = (
         rf"^(?:添加|加入|加词|加)?\s*"
         rf"(?P<selector>{_PENDING_NUMBERED_SELECTOR_PATTERN})\s*"
         r"[，,；;]?\s*(?:并\s*)?"
-        r"(?P<modifier>挤掉|顶掉|顶下去|挪开|挪走|换下来|顺延)\s*"
+        r"(?P<modifier>挤掉|顶替|顶掉|顶下去|挪开|挪走|换下来|顺延)\s*"
         rf"(?P<occupant>{_PENDING_OCCUPANT_WORD_PATTERN})$",
         re.IGNORECASE,
     ),
@@ -1438,6 +1438,7 @@ def _pending_numbered_eviction_intent(
         confidence=1.0,
         choice_index=choice_index,
         requested_code=code,
+        target_word=occupant,
     )
 
 
@@ -1463,11 +1464,16 @@ def _occupant_perspective_pending_recode_intent(
         return None
     occupant = str(match.group("occupant") or "").strip()
     requested_code = str(match.groupdict().get("code") or "").strip().lower()
+    occupied_words = (
+        state.server_occupied_words
+        if state.server_candidates == state.candidates
+        else state.occupied_words
+    )
     matching_codes = {
         code
         for code, occupied in state.candidates
         if occupied
-        and occupant in state.occupied_words.get(code, [])
+        and occupant in occupied_words.get(code, [])
         and (not requested_code or requested_code == code)
     }
     if not matching_codes:
@@ -1487,9 +1493,43 @@ def _structural_pending_add_word_intent(
     state: PendingAddWord,
 ) -> Optional[MessageCommandIntent]:
     """Parse exact selectors advertised by a live add-word prompt."""
+    envelope = _whole_message_unquoted_source(message_text, (state.word,))
+    if envelope is not None:
+        message_text = envelope
     stripped = _strip_command_message_prefixes(
         trusted_mutation_source(message_text)
     ).strip()
+    complete_eviction = parse_eviction_modified_add(stripped)
+    if (
+        complete_eviction is not None
+        and state.server_candidates and state.server_candidates == state.candidates
+        and complete_eviction.word == state.word
+        and dict(state.server_candidates).get(complete_eviction.code) is True
+        and state.server_occupied_words.get(complete_eviction.code) == [complete_eviction.named_occupant]
+    ):
+        return MessageCommandIntent(
+            intent="pending_recode", confidence=1.0,
+            requested_code=complete_eviction.code, target_word=complete_eviction.named_occupant,
+        )
+    eviction = re.fullmatch(
+        r"(?:加入|添加)?\s*[，,]?\s*(?:顶替|挤掉|顺延)\s*(?P<word>[^\s，,；;。？?「」“”]+)", stripped,
+    )
+    if eviction is not None and state.server_candidates == state.candidates and state.server_candidates:
+        occupant = eviction.group("word")
+        codes = [code for code, occupied in state.server_candidates
+                 if occupied and state.server_occupied_words.get(code) == [occupant]]
+        if len(codes) == 1:
+            return MessageCommandIntent(
+                intent="pending_recode", confidence=1.0,
+                requested_code=codes[0], target_word=occupant,
+            )
+    explicit = parse_explicit_code_request(stripped, state.word)
+    if explicit is not None and validate_explicit_code(state, explicit.code).valid:
+        return MessageCommandIntent(
+            intent="pending_add_and_submit" if explicit.submit_after else "pending_code_request",
+            confidence=1.0, requested_code=explicit.code,
+            requested_codes=(explicit.code,), submit_after=explicit.submit_after,
+        )
     occupant_recode = _occupant_perspective_pending_recode_intent(
         message_text,
         state,
@@ -1691,6 +1731,11 @@ def message_authorizes_live_pending_mutation(
         and state.server_candidates == state.candidates
     ):
         return False
+    explicit = parse_explicit_code_request(
+        _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
+    )
+    if explicit is not None:
+        return validate_explicit_code(state, explicit.code).valid
     intent = _structural_pending_add_word_intent(message_text, state)
     if intent is None or intent.intent not in {
         "pending_confirm",
@@ -3183,6 +3228,11 @@ def _resolve_shift_target_code(
     if command_intent.intent != "pending_recode":
         return None
 
+    occupied_words = (
+        state.server_occupied_words
+        if state.server_candidates == state.candidates
+        else state.occupied_words
+    )
     requested_code = str(command_intent.requested_code or "").strip().lower()
     if requested_code:
         requested_slot = next(
@@ -3195,7 +3245,7 @@ def _resolve_shift_target_code(
         )
         if requested_slot is None or not requested_slot[1]:
             return None
-        occupants = state.occupied_words.get(requested_code, [])
+        occupants = occupied_words.get(requested_code, [])
         if (
             command_intent.target_word
             and command_intent.target_word not in occupants
@@ -3215,7 +3265,7 @@ def _resolve_shift_target_code(
         for code, occupied in state.candidates
         if occupied
         and command_intent.target_word
-        and command_intent.target_word in state.occupied_words.get(code, [])
+        and command_intent.target_word in occupied_words.get(code, [])
     }
     if len(word_matching_codes) == 1:
         return next(iter(word_matching_codes))

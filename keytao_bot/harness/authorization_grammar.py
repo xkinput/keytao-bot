@@ -832,7 +832,7 @@ _ECHOED_EVICTION_ADD_RE = re.compile(
     re.IGNORECASE,
 )
 _EVICTION_ADD_OCCUPANT_PATTERN = r"(?![把将])[\u3400-\u9fff]{1,16}"
-_EVICTION_MODIFIER_PATTERN = r"顺延|挪开|挪走|往后排|重新编码|顶掉|顶下去|挤掉|换下来"
+_EVICTION_MODIFIER_PATTERN = r"顺延|挪开|挪走|往后排|重新编码|顶替|顶掉|顶下去|挤掉|换下来"
 _EVICTION_ADD_TAIL_RES = (
     re.compile(
         rf"^(?:让\s*)?(?P<occupant>{_EVICTION_ADD_OCCUPANT_PATTERN})\s*"

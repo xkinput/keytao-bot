@@ -1835,6 +1835,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 "dffnoi": "dān fèn",
             },
             pronunciation_recommended_codes=["dffno"],
+            server_ordering_assessments=[{
+                "newWord": "单份", "occupantWord": "蛋粉", "occupantCode": "dffn",
+                "freeCode": "dffno", "newCode": "dffno", "verdict": "behind_more_common",
+            }],
             needs_manual_review=False,
         )
         bound_forms = (
@@ -1882,13 +1886,13 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
 
         shift = AsyncMock(return_value="shifted")
         unexpected_create = AsyncMock(return_value="unexpected-create")
-        for message, submit_after in (
-            ("添加1", False),
-            ("加入1，挤掉蛋粉", False),
-            ("添加1，并为蛋粉重新编码", False),
-            ("加入并提交1", True),
-            ("dffn", False),
-            ("加入 dffn", False),
+        for message, submit_after, named_eviction in (
+            ("添加1", False, False),
+            ("加入1，挤掉蛋粉", False, True),
+            ("添加1，并为蛋粉重新编码", False, True),
+            ("加入并提交1", True, False),
+            ("dffn", False, False),
+            ("加入 dffn", False, False),
         ):
             with self.subTest(execute=message):
                 intent = chat_module._structural_pending_add_word_intent(
@@ -1923,6 +1927,13 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                         [],
                         command_intent=canonical,
                     )
+                if not named_eviction:
+                    self.assertIn("蛋粉", response)
+                    self.assertIn("本次未写入", response)
+                    self.assertIn("顶替 蛋粉", response)
+                    shift.assert_not_awaited()
+                    unexpected_create.assert_not_awaited()
+                    continue
                 self.assertEqual(response, "shifted")
                 shift.assert_awaited_once()
                 self.assertEqual(shift.await_args.args[:2], ("单份", "dffn"))
@@ -2952,10 +2963,10 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                         add_submit.reset_mock()
 
                 rejected = {
-                    "加入别词，然后就提交。": "候选之外",
-                    "加入好。": "候选之外",
-                    "加入行。": "候选之外",
-                    "加入达致 zzzzz，然后就提交。": "候选之外",
+                    "加入别词，然后就提交。": "没有识别出要添加的完整词条和编码",
+                    "加入好。": "没有识别出要添加的完整词条和编码",
+                    "加入行。": "没有识别出要添加的完整词条和编码",
+                    "加入达致 zzzzz，然后就提交。": "没有识别出要添加的完整词条和编码",
                     "加入草稿，然后删除大致。": "其他动作",
                     "加入草稿然后提交吗？": "问句",
                     "他说「加入草稿，然后就提交」。": "转述",
@@ -2974,7 +2985,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                         )
                         self.assertIn("本次未写入", response)
                         self.assertIn(marker, response)
-                        self.assertNotIn("完整", response)
+                        self.assertNotIn("系统不会用这些文字改写候选", response)
                         self.assertIsNotNone(state_store.get_record(conv_key))
                         add_only.assert_not_awaited()
                         add_submit.assert_not_awaited()
@@ -3441,6 +3452,12 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             occupied_words={"zhjl": ["在距"]},
             server_candidates=[("zhjl", True), ("zhjlu", False)],
             server_occupied_words={"zhjl": ["在距"]},
+            server_ordering_assessments=[{
+                "newWord": "载具", "occupantWord": "在距", "occupantCode": "zhjl",
+                "freeCode": "zhjlu", "newCode": "zhjl", "recommendedCode": "zhjl",
+                "verdict": "front_more_common", "decisionReason": "dictionary_presence_margin",
+                "summary": "「载具」较「在距」更常用：语料频次 无 vs 无，词典收录 2 vs 0",
+            }],
             needs_manual_review=False,
         )
         classifier = AsyncMock(side_effect=AssertionError("selection reached model"))
