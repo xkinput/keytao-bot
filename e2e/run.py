@@ -346,7 +346,44 @@ def _first_value(*values: Any) -> str:
     return ""
 
 
+def _resolve_e2e_api_key(next_dir: Path) -> str:
+    """Require a dedicated key and reject credentials visible to the bot."""
+
+    api_key = _nonempty(os.getenv("E2E_OPENAI_API_KEY"))
+    if not api_key:
+        raise SafetyViolation(
+            "E2E_OPENAI_API_KEY is required; bot/provider-key fallback is disabled"
+        )
+
+    def reject_bot_key(values: Any) -> None:
+        for name, value in values.items():
+            if str(name).lower() == "openai_api_key" and _nonempty(value) == api_key:
+                raise SafetyViolation(
+                    "E2E_OPENAI_API_KEY matches a bot OPENAI_API_KEY; "
+                    "refusing to spend the bot credential. Use a separate E2E key."
+                )
+
+    reject_bot_key(os.environ)
+    try:
+        # The rig reads REPO_ROOT/.env and next_dir/.env; nonebot.init reads CWD/.env and
+        # CWD/.env.<environment>. Check every visible variant, including
+        # inactive environments, without ever using their keys as a fallback.
+        for directory in {REPO_ROOT.resolve(), Path.cwd().resolve(), next_dir.resolve()}:
+            for path in sorted(directory.iterdir()):
+                if (
+                    path.name == ".env" or path.name.startswith(".env.")
+                ) and path.is_file():
+                    reject_bot_key(dotenv_values(path))
+    except (OSError, UnicodeError):
+        raise SafetyViolation(
+            "Cannot verify bot OPENAI_API_KEY separation from visible dotenv files; "
+            "refusing to start E2E."
+        ) from None
+    return api_key
+
+
 def load_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    primary_api_key = _resolve_e2e_api_key(args.next_dir)
     bot_env_path = REPO_ROOT / ".env"
     next_env_path = args.next_dir / ".env"
     if not bot_env_path.is_file():
@@ -360,15 +397,6 @@ def load_configuration(args: argparse.Namespace) -> dict[str, Any]:
     bot_token = _nonempty(next_values.get("BOT_API_TOKEN"))
     if not bot_token:
         raise SafetyViolation("keytao-next .env has no BOT_API_TOKEN")
-    primary_api_key = _first_value(
-        os.getenv("E2E_OPENAI_API_KEY"),
-        bot_values.get("OPENAI_API_KEY"),
-    )
-    if not primary_api_key:
-        raise SafetyViolation(
-            "E2E_OPENAI_API_KEY or OPENAI_API_KEY is required; "
-            "provider-key fallback is disabled"
-        )
     llm = {
         "api_key": primary_api_key,
         "base_url": validate_llm_base(

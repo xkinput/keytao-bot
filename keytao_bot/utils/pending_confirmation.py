@@ -18,6 +18,8 @@ class ServerBackedQueryReply(str):
 PENDING_CONFIRM_ADVERTISED_FORMS = ("确认",)
 PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     *PENDING_CONFIRM_ADVERTISED_FORMS,
+    "确认调整",
+    "确认执行",
     "执行",
     "确定",
     "好的",
@@ -221,8 +223,7 @@ _BIND_HELP_TEXT = (
     "1. 登录：https://keytao.vercel.app\n"
     "2. 打开【我的资料】：https://keytao.vercel.app/profile\n"
     "3. 在【机器人账号绑定】生成并复制绑定码\n"
-    "4. 发送：/bind [绑定码]\n"
-    "示例：/bind AB12CD\n\n"
+    "4. 使用 /bind 命令和页面生成的实际绑定码完成绑定\n\n"
     "群聊中请 @我 或回复我的消息。"
 )
 
@@ -243,7 +244,7 @@ SYSTEM_REPLY_TEMPLATE_MARKERS = (
 
 UNBOUND_BINDING_PRECHECK_NOTICE = (
     "提示：你还未绑定键道账号，提交前请先绑定"
-    "（发送 /bind 绑定码，详见 https://keytao.vercel.app/profile）。"
+    "（请在账号页面生成实际绑定码；绑定说明：https://keytao.vercel.app/profile）。"
 )
 
 
@@ -831,6 +832,7 @@ def already_existing_word_copy(
     *,
     can_choose_other_code: bool,
     can_reorder: bool = False,
+    advertise_controls: bool = True,
 ) -> str:
     """Lead with an exact existing fact, then state only live options."""
     clean_codes = tuple(dict.fromkeys(
@@ -840,9 +842,9 @@ def already_existing_word_copy(
         return ""
     actions: list[str] = []
     if can_choose_other_code:
-        actions.append("选择其他编码（回复「换码」）")
+        actions.append("选择其他编码（回复「换码」）" if advertise_controls else "选择其他编码")
     if can_reorder:
-        actions.append("调整现有排序（回复「重排」）")
+        actions.append("调整现有排序（回复「重排」）" if advertise_controls else "按下列选项调整现有排序")
     action_copy = (
         "仍可" + "或".join(actions) + "；若保留现状，无需操作。"
         if actions
@@ -850,7 +852,7 @@ def already_existing_word_copy(
     )
     return (
         f"「{word}」已在词库（{'、'.join(clean_codes)}）。\n{action_copy}\n"
-        "回复「加入编码 <code>」可再追加一个编码（将 <code> 换成实际编码）。"
+        "可再追加一个编码，格式为：加入编码 <code>（将 <code> 换成实际编码）。"
     )
 
 
@@ -1377,6 +1379,7 @@ def render_server_backed_batch_candidates(
                 code not in existing_codes for code, _occupied in scopes_by_word[word]
             ),
             can_reorder=reorder_recommendation is not None,
+            advertise_controls=False,
         )
         if existing_copy:
             lines.extend(f"   {line}" for line in existing_copy.splitlines())
@@ -1427,7 +1430,7 @@ def render_server_backed_batch_candidates(
         lines.append(pending_batch_confirmation_copy())
         scoped_copy = scoped_multi_word_candidate_copy(tuple(
             word for word, _code, _needs_review in normalized_items
-        ))
+        ), candidate_counts={word: len(candidates) for word, candidates in scopes_by_word.items()})
         if scoped_copy:
             lines.append(scoped_copy)
     return "\n".join(lines)
@@ -1809,6 +1812,7 @@ def render_server_backed_single_word_candidates(
             code not in existing_codes for code, _occupied in normalized_candidates
         ),
         can_reorder=reorder_recommendation is not None,
+        advertise_controls=False,
     )
     if existing_copy:
         lines.extend(existing_copy.splitlines())
@@ -2073,7 +2077,9 @@ def ensure_single_word_candidate_copy(text: str, candidate_count: int) -> str:
     return response.strip()
 
 
-def scoped_multi_word_candidate_copy(words: tuple[str, ...]) -> str:
+def scoped_multi_word_candidate_copy(
+    words: tuple[str, ...], *, candidate_counts: Optional[dict[str, int]] = None,
+) -> str:
     """Advertise only word-scoped numbered selection for repeated lists."""
     clean_words = tuple(dict.fromkeys(
         str(word or "").strip()
@@ -2082,11 +2088,25 @@ def scoped_multi_word_candidate_copy(words: tuple[str, ...]) -> str:
     ))
     if len(clean_words) < 2:
         return ""
-    example = clean_words[-1]
+    counts = candidate_counts or {}
+    example = next((word for word in reversed(clean_words) if counts.get(word, 0) >= 2), clean_words[-1])
+    if counts.get(example, 0) >= 2:
+        return (
+            "每个词的编号都从 1 开始；"
+            f"回复「{example} 添加1」，多选回复「{example} 添加1、2」。"
+        )
     return (
         "每个词的编号都从 1 开始；"
-        f"回复「{example} 添加1」，多选回复「{example} 添加2、4」。"
+        f"回复「{example} 添加1」；多选时，用顿号分隔该词列表中实际存在的编号。"
     )
+
+
+def is_closed_draft_view_request(text: str) -> bool:
+    """Recognize complete read-only draft syntax used by the real dispatcher."""
+    source = unicodedata.normalize("NFKC", str(text or "")).strip().rstrip("。.!！")
+    return re.fullmatch(
+        r"(?:查看|查询|显示|列出)\s*(?:我的|当前)?\s*草稿(?:列表|条目|内容)?", source,
+    ) is not None
 
 
 @dataclass(frozen=True)
@@ -2105,15 +2125,19 @@ class AdvertisedReplyContract:
 
     @property
     def requires_live_state(self) -> bool:
+        stateful_suggestions = tuple(
+            command for command in self.command_suggestions
+            if not is_closed_draft_view_request(command)
+        )
         if self.read_only_single_word_lookup:
             return bool(
                 self.generic_assent_forms
                 or self.deictic_batch_command
                 or self.word_set_advertisement
                 or (
-                    self.command_suggestions
+                    stateful_suggestions
                     and not command_suggestions_are_closed_candidate_selections(
-                        self.command_suggestions
+                        stateful_suggestions
                     )
                 )
             )
@@ -2125,13 +2149,16 @@ class AdvertisedReplyContract:
             or self.deictic_batch_command
             or self.binding_advertisement
             or self.word_set_advertisement
-            or self.command_suggestions
+            or stateful_suggestions
         )
 
 _ADVERTISED_QUOTE_PAIRS = (
     ("「", "」"),
     ("“", "”"),
     ("『", "』"),
+    ('"', '"'),
+    ("'", "'"),
+    ("＂", "＂"),
 )
 _DEICTIC_BATCH_ADVERTISEMENT_RE = re.compile(
     r"(?<!已)(?:将|把)这\s*[1-9]\d{0,2}\s*个词"
@@ -2153,7 +2180,11 @@ _QUOTED_WORD_SET_COMMAND_RE = re.compile(
 _COMMAND_SUGGESTION_LEAD_RE = re.compile(
     r"(?:确认执行)?请发|请发送|请按以下命令(?:逐条)?发送|"
     r"请按(?:下面|以下)格式(?:重发|发送)|发送下面|直接回复|"
-    r"可以改为|比如|例如"
+    # The actor noun is not an instruction introducing a later quoted operation.
+    r"可以改为|比如|例如|回复|发送(?!者)"
+)
+_REPORTED_QUOTED_COMMAND_PREFIX_RE = re.compile(
+    r"(?:刚才发送了|上一条回复提到了)\s*$"
 )
 _COMMAND_SUGGESTION_VERB_RE = re.compile(
     rf"(?:{ADD_OPERATION_VERB_PATTERN}|提交|删除|移除|修改|改成|改为|"
@@ -2162,20 +2193,24 @@ _COMMAND_SUGGESTION_VERB_RE = re.compile(
 )
 _UNQUOTED_COMMAND_SUGGESTION_RE = re.compile(
     r"(?:请按(?:下面|以下)格式(?:重发|发送)|直接回复|"
-    r"可以改为|比如|例如)[ \t]*[:：][ \t]*"
-    r"(?P<command>[^\n。！？]{1,256})"
+    r"可以改为|比如|例如|请回复|可发送|回复|发送)"
+    r"(?:[ \t]*[:：][ \t]*|[ \t]+|\r?\n[ \t]*)(?:\r?\n[ \t]*)?"
+    r"(?P<command>[^\r\n。！？]+)"
+)
+_EXECUTION_LINE_SUGGESTION_RE = re.compile(
+    r"(?m)^[ \t]*(?P<command>执行[ \t]*[:：][^\r\n]+)"
 )
 
 
 def advertised_command_suggestions(text: str) -> tuple[str, ...]:
-    """Extract copyable model suggestions from explicit advertisement frames."""
+    """Extract advertisements by their framing, independently of verb grammar."""
     normalized = str(text or "")
     positioned: list[tuple[int, str]] = []
     for left, right in _ADVERTISED_QUOTE_PAIRS:
         depth = 0
         start = -1
         for index, character in enumerate(normalized):
-            if character == left:
+            if character == left and not (left == right and depth):
                 if depth == 0:
                     start = index
                 depth += 1
@@ -2186,7 +2221,14 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
             if depth != 0 or start < 0:
                 continue
             command = normalized[start + 1:index].strip()
-            prefix = normalized[max(0, start - 120):start]
+            prefix = re.split(r"[。！？]", normalized[max(0, start - 120):start])[-1]
+            reported_prefix = _REPORTED_QUOTED_COMMAND_PREFIX_RE.search(prefix)
+            # Skip only the past report's verb; other introducers remain active.
+            command_lead = any(
+                reported_prefix is None
+                or not reported_prefix.start() <= lead.start() < reported_prefix.end()
+                for lead in _COMMAND_SUGGESTION_LEAD_RE.finditer(prefix)
+            )
             renderer_bullet = re.search(
                 r"(?:^|\n)\s*[-•]\s*$",
                 prefix,
@@ -2209,27 +2251,35 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
 
                 scoped_selection = parse_reviewed_multi_word_selection(command) is not None
             if (
-                0 < len(command) <= 256
+                command
                 and "\n" not in command
                 and (
-                    _COMMAND_SUGGESTION_LEAD_RE.search(prefix) is not None
+                    command_lead
                     or confirm_execution_lead
-                    or renderer_bullet
+                    or (renderer_bullet and (
+                        _COMMAND_SUGGESTION_VERB_RE.search(command) is not None
+                        or scoped_selection
+                    ))
                 )
-                and (
-                    _COMMAND_SUGGESTION_VERB_RE.search(command) is not None
-                    or scoped_selection
-                )
-                and re.search(r"[\u3400-\u9fff]", command)
             ):
-                positioned.append((start, command))
+                positioned.extend((start + offset, part.strip()) for offset, part in enumerate(re.split(r"[/／]", command)) if part.strip())
     for match in _UNQUOTED_COMMAND_SUGGESTION_RE.finditer(normalized):
         command = match.group("command").strip()
-        if command and (
-            _COMMAND_SUGGESTION_VERB_RE.search(command) is not None
-            or re.fullmatch(r"执行方案\s*[AB]", command, re.IGNORECASE)
-        ):
-            positioned.append((match.start("command"), command))
+        quoted_command = re.sub(r"^[-•]\s*", "", command)
+        if command and not any(quoted_command.startswith(left) for left, _right in _ADVERTISED_QUOTE_PAIRS):
+            label_options = re.fullmatch(
+                r"(?P<labels>[A-Za-z](?:\s*(?:或|[/／])\s*[A-Za-z])+)(?:\s*即可)?",
+                command,
+            )
+            if label_options is not None:
+                positioned.extend((match.start("command") + index, label)
+                                  for index, label in enumerate(re.split(r"\s*(?:或|[/／])\s*", label_options["labels"])))
+            else:
+                positioned.append((match.start("command"), command))
+    positioned.extend(
+        (match.start("command"), match.group("command").strip())
+        for match in _EXECUTION_LINE_SUGGESTION_RE.finditer(normalized)
+    )
     suggestions: list[str] = []
     seen: set[str] = set()
     for _position, command in sorted(positioned):

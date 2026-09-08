@@ -734,10 +734,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
         self.assertEqual(entries[S46_WORD], ["zhé", "sī"])
         self.assertEqual(entries[S46_OCCUPANT], ["zhè", "sī"])
 
-    def test_scenario_pack_is_contiguous_through_s56(self) -> None:
+    def test_scenario_pack_is_contiguous_through_s58(self) -> None:
         self.assertEqual(
             [scenario.scenario_id for scenario in SCENARIOS],
-            [f"S{index}" for index in range(1, 58)],
+            [f"S{index}" for index in range(1, 59)],
         )
 
     def test_s56_declares_exact_single_cascade_and_weaker_word_control(self) -> None:
@@ -779,7 +779,10 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
 
     async def test_s56_closes_actual_multi_select_fallback_and_shift_controls(self) -> None:
         from keytao_bot.harness.conversation import ConversationAddress
-        from keytao_bot.harness.state import PendingAddWord, PendingStateRecord, PendingToolConfirm
+        from keytao_bot.harness.state import (
+            PendingAddWord, PendingStateRecord, PendingToolConfirm,
+            server_warning_pending_state, server_warning_ticket_is_complete,
+        )
         from keytao_bot.plugins import chat_routing as routing, openai_chat as chat
 
         address = ConversationAddress.private("qq", "s56-advertised")
@@ -807,8 +810,26 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
             "• 发布会：Create fbh（添加）\n• 重病号：Create fbhu（添加）\n"
             "回复「确认」执行，或「取消」。"
         )
+        incomplete_shift = PendingToolConfirm(
+            function_name="keytao_shift_phrase_code", args={"word": "发布会", "target_code": "fbh"},
+        )
+        shift_state = server_warning_pending_state(incomplete_shift, {
+            "success": False, "requiresConfirmation": True,
+            "confirmationKind": "shiftPlan", "batchId": "", "contentVersion": 0,
+            "planDigest": "a" * 64, "warningDigest": "b" * 64,
+            "shiftPlan": {
+                "word": "发布会", "targetCode": "fbh",
+                "items": [
+                    {"action": "Delete", "word": "重病号", "code": "fbh", "type": "Phrase"},
+                    {"action": "Create", "word": "发布会", "code": "fbh", "type": "Phrase"},
+                    {"action": "Create", "word": "重病号", "code": "fbhu", "type": "Phrase"},
+                ],
+                "shifted": [{"word": "重病号", "fromCode": "fbh", "toCode": "fbhu"}],
+            },
+        })
+        self.assertTrue(server_warning_ticket_is_complete(shift_state))
         shift_record = PendingStateRecord(
-            state=PendingToolConfirm(function_name="keytao_shift_phrase_code", args={"word": "发布会", "target_code": "fbh"}),
+            state=shift_state,
             owner_key=address, nonce="shift",
         )
         no_read = AsyncMock(side_effect=AssertionError("candidate closure must not read a draft"))
@@ -824,6 +845,7 @@ tcp4  0  0  127.0.0.1.3100   127.0.0.1.49155 ESTABLISHED
                 (candidate_reply.replace("不重排选 2（fbha）", "不重排选 2（fbh）"), record),
                 (candidate_reply.replace("添加2、4", "添加2、9"), record),
                 (shift_reply, None),
+                (shift_reply, PendingStateRecord(state=incomplete_shift, owner_key=address, nonce="incomplete")),
                 (shift_reply, PendingStateRecord(state=shift_record.state, owner_key=ConversationAddress.private("qq", "other"))),
             ):
                 with self.subTest(reply=invalid_reply, record=invalid_record), self.assertRaises(AssertionError):

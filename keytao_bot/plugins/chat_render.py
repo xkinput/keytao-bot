@@ -17,6 +17,7 @@ from ..harness.state import (
     PendingTrustedWordRecord,
     PendingToolConfirm,
     pending_batch_display_pairs,
+    pending_duplicate_confirmation_is_complete,
 )
 from ..utils import review_flags
 from ..utils import http_client
@@ -26,6 +27,7 @@ from ..utils.pending_confirmation import (
     already_existing_word_copy,
     candidate_commonness_guard_copy,
     pending_confirmation_copy,
+    prepend_pending_word_reminders,
     plain_warning_message,
     front_insert_recommendation_copy,
     render_executable_suggestion,
@@ -109,11 +111,17 @@ def _split_telegram_text(text: str, limit: int = 4000) -> List[str]:
 
 
 _RAW_PYTHON_REPLY_MARKERS = ("{'", "': '", "dataclass(")
+_RETIRED_AUTHORIZATION_COPY_RE = re.compile(
+    r"(?:缺少|没有|缺乏).{0,8}明确.{0,6}执行(?:动词|指令)|"
+    r"(?:词条|目标编码).{0,16}未.{0,4}精确绑定|"
+    r"(?:回复|操作说法).{0,24}(?:没有|缺少).{0,12}(?:服务端绑定记录|可验证)"
+)
 _MECHANISM_LEAK_RE = re.compile(
     r"(?:只读轮|安全层|写工具|写轮|执行器|解析器|工具调用|调用工具|"
     r"系统提示|内部机制|会话环境.{0,24}放行|"
     r"(?:以后|之后|后续|未来|下次).{0,32}(?:被?拦截|无法执行|不能执行|不会执行)|"
-    r"(?:会|仍会|还是会).{0,20}被?拦截|能不能执行由)"
+    r"(?:会|仍会|还是会).{0,20}被?拦截|能不能执行由)|"
+    + _RETIRED_AUTHORIZATION_COPY_RE.pattern
 )
 _RETIRED_NO_COMMAND_COPY = "当前没有可安全执行" + "的后续命令"
 
@@ -653,6 +661,37 @@ def _format_pending_item_line(
     return line
 
 
+def _format_pending_entry_action(item: Dict[str, Any]) -> str:
+    """Keep the operation and both replacement identities visible."""
+    action = str(item.get("action") or "Create")
+    word = str(item.get("word") or "").strip()
+    code = str(item.get("code") or "").strip().lower()
+    if action == "Change":
+        old_word = str(item.get("oldWord") or item.get("old_word") or "").strip()
+        return f"替换「{old_word}」→「{word}」@ {code}"
+    if action == "Delete":
+        return f"删除「{word}」@ {code}"
+    return f"加词「{word}」→ {code}"
+
+
+def _format_pending_candidate_review_details(state: PendingAddWord) -> str:
+    """Keep saved readings and the manual-review seal visible during redraw."""
+    reading_codes: Dict[str, List[str]] = {}
+    for code, _occupied in state.server_candidates:
+        reading = state.pronunciation_codes.get(code)
+        if isinstance(reading, str) and reading.strip():
+            reading_codes.setdefault(reading.strip(), []).append(code)
+    lines = [
+        f"读音：{reading}" if len(reading_codes) == 1 and len(codes) == len(state.server_candidates)
+        else f"读音 {reading}：{'、'.join(codes)}"
+        for reading, codes in reading_codes.items()
+    ]
+    if state.needs_manual_review is True:
+        reason = _compact_review_reason(state.manual_review_reason)
+        lines.append(f"审核：{reason}；需要管理员审核。" if reason else "需要管理员审核。")
+    return "\n".join(lines)
+
+
 def _format_pending_state_details(state: PendingState) -> str:
     """Verbalize only facts persisted in one live pending record."""
     if isinstance(state, PendingAddWord):
@@ -691,22 +730,26 @@ def _format_pending_state_details(state: PendingState) -> str:
         ).strip()
         if collision_replan_line:
             lines.append(collision_replan_line)
-        lines.append("批量加词：")
-        pairs = pending_batch_display_pairs(state)
-        items = [{"word": word, "code": code} for word, code in pairs]
+        entry_items = args.get("items") if isinstance(args.get("items"), list) else []
+        actions = {
+            str(item.get("action") or "Create")
+            for item in entry_items if isinstance(item, dict)
+        }
+        if actions <= {"Create"}:
+            lines.append("批量加词：")
+            pairs = pending_batch_display_pairs(state)
+            items = [{"word": word, "code": code} for word, code in pairs]
+        else:
+            label = {frozenset({"Delete"}): "批量删除", frozenset({"Change"}): "批量替换"}.get(
+                frozenset(actions), "批量修改",
+            )
+            lines.append(f"{label}：")
+            lines.extend(
+                f"- {_format_pending_entry_action(item)}"
+                for item in entry_items if isinstance(item, dict)
+            )
     elif function_name == "keytao_create_phrase":
-        action_label = {
-            "Create": "加词",
-            "Change": "修改",
-            "Delete": "删除",
-        }.get(str(args.get("action") or "Create"), "加词")
-        word = str(args.get("word") or "").strip()
-        code = str(args.get("code") or "").strip().lower()
-        lines.append(
-            f"{action_label}「{word}」→ {code}"
-            if word and code
-            else action_label
-        )
+        lines.append(_format_pending_entry_action(args))
     elif function_name == "keytao_submit_batch":
         lines.append("提交草稿：")
         items = (
@@ -717,13 +760,12 @@ def _format_pending_state_details(state: PendingState) -> str:
         if not items:
             lines[0] = "提交草稿"
     elif function_name == "keytao_shift_phrase_code":
-        lines.append("顺延调码：")
         shift_plan = (
             display.get("shiftPlan")
             if isinstance(display.get("shiftPlan"), dict)
             else {}
         )
-        items = (
+        plan_items = (
             shift_plan.get("items")
             if isinstance(shift_plan.get("items"), list)
             else []
@@ -733,20 +775,62 @@ def _format_pending_state_details(state: PendingState) -> str:
             if isinstance(shift_plan.get("shifted"), list)
             else []
         )
-        for shifted_item in shifted:
-            if not isinstance(shifted_item, dict):
+
+        def codes_by_word(rows: Any, field: str = "code") -> Dict[str, List[str]]:
+            result: Dict[str, List[str]] = {}
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                word = str(row.get("word") or "").strip()
+                code = str(row.get(field) or "").strip().lower()
+                if word and code and code not in result.setdefault(word, []):
+                    result[word].append(code)
+            return result
+
+        current_codes = codes_by_word(shift_plan.get("currentState"))
+        proposed_codes = codes_by_word(shift_plan.get("proposedState"))
+        deleted_codes = codes_by_word([
+            item for item in plan_items
+            if isinstance(item, dict) and item.get("action") == "Delete"
+        ])
+        created_codes = codes_by_word([
+            item for item in plan_items
+            if isinstance(item, dict) and item.get("action", "Create") in {"Create", "Change"}
+        ])
+        shifted_from = codes_by_word(shifted, "fromCode")
+        shifted_to = codes_by_word(shifted, "toCode")
+        main_word = str(shift_plan.get("word") or args.get("word") or "").strip()
+        words = dict.fromkeys([
+            main_word, *deleted_codes, *created_codes, *shifted_from,
+            *shifted_to, *proposed_codes,
+        ])
+        changes = []
+        for word in words:
+            if not word:
                 continue
-            shifted_word = str(shifted_item.get("word") or "").strip()
-            from_code = str(shifted_item.get("fromCode") or "").strip().lower()
-            to_code = str(shifted_item.get("toCode") or "").strip().lower()
-            if shifted_word and from_code and to_code:
-                shifted_lines.append(
-                    f"- 「{shifted_word}」：{from_code} → {to_code}"
-                )
-        if not items:
-            word = str(args.get("word") or "").strip()
-            code = str(args.get("target_code") or "").strip().lower()
-            items = [{"word": word, "code": code}] if word and code else []
+            before = current_codes.get(word) or deleted_codes.get(word) or shifted_from.get(word) or []
+            after = proposed_codes.get(word) or created_codes.get(word) or shifted_to.get(word) or []
+            if not after and word == main_word and word not in deleted_codes:
+                code = str(shift_plan.get("targetCode") or args.get("target_code") or "").strip().lower()
+                if before and code:
+                    after = [code]
+                elif code:
+                    changes.append(f"调码「{word}」→ {code}")
+                    continue
+            if before == after and word not in deleted_codes and word not in created_codes:
+                continue
+            old_code, new_code = "、".join(before), "、".join(after)
+            if old_code and new_code:
+                changes.append(f"「{word}」：{old_code} → {new_code}")
+            elif new_code:
+                changes.append(f"加词「{word}」→ {new_code}")
+            elif old_code:
+                changes.append(f"删除「{word}」@ {old_code}")
+        if not changes:
+            code = str(shift_plan.get("targetCode") or args.get("target_code") or "").strip().lower()
+            if main_word and code:
+                changes.append(f"调码「{main_word}」→ {code}")
+        lines.append("将执行：" + "、".join(changes) + "。" if changes else "顺延调码")
     elif function_name in {
         "keytao_remove_draft_item",
         "keytao_batch_remove_draft_items",
@@ -807,6 +891,18 @@ def _format_pending_state_details(state: PendingState) -> str:
     if batch_url:
         lines.append(f"草稿地址：{batch_url}")
     return "\n".join(lines)
+
+
+def _format_pending_duplicate_confirmation(state: PendingToolConfirm) -> str:
+    """Show all requested operations before confirming a submitted duplicate."""
+    if not pending_duplicate_confirmation_is_complete(state):
+        return ""
+    return _assert_plain_user_facing_reply(prepend_pending_word_reminders(
+        _format_pending_state_details(state)
+        + "\n该词已在审核中，确认再提交一条相同词条吗？\n"
+        + pending_confirmation_copy(),
+        state.args["_pending_display"]["pendingItems"],
+    ))
 
 
 def _format_server_bound_confirmation_prompt(state: PendingToolConfirm) -> str:
@@ -1419,6 +1515,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             code not in exact_existing_codes for code, _occupied in snapshot_candidates
         ),
         can_reorder=reorder_recommendation is not None,
+        advertise_controls=False,
     )
     lines = (
         [*existing_copy.splitlines(), f"「{word}」候选编码："]

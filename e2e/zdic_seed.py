@@ -663,6 +663,23 @@ ZDIC_FIXTURES_BY_SCENARIO["S57"] = {
     ),
 }
 
+ZDIC_FIXTURES_BY_SCENARIO["S58"] = {
+    "probe_words": ("奈飞", "浓厚氛围", "浓厚风味"),
+    "rows": (
+        {"kind": "char", "entry": "奈", "status": "found", "pinyins": ["nài"]},
+        {"kind": "char", "entry": "飞", "status": "found", "pinyins": ["fēi"]},
+        {"kind": "char", "entry": "浓", "status": "found", "pinyins": ["nóng"]},
+        {"kind": "char", "entry": "厚", "status": "found", "pinyins": ["hòu"]},
+        {"kind": "char", "entry": "氛", "status": "found", "pinyins": ["fēn"]},
+        {"kind": "char", "entry": "围", "status": "found", "pinyins": ["wéi"]},
+        {"kind": "char", "entry": "风", "status": "found", "pinyins": ["fēng"]},
+        {"kind": "char", "entry": "味", "status": "found", "pinyins": ["wèi"]},
+        {"kind": "entry", "entry": "奈飞", "status": "found", "pinyins": ["nài", "fēi"]},
+        {"kind": "entry", "entry": "浓厚氛围", "status": "found", "pinyins": ["nóng", "hòu", "fēn", "wéi"]},
+        {"kind": "entry", "entry": "浓厚风味", "status": "found", "pinyins": ["nóng", "hòu", "fēng", "wèi"]},
+    ),
+}
+
 S9_ZDIC_CACHE_ROWS = ZDIC_FIXTURES_BY_SCENARIO["S9"]["rows"]
 
 

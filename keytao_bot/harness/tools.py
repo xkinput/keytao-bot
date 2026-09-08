@@ -1451,6 +1451,11 @@ class ToolExecutor:
         call_args = self.canonicalize_arguments(tool_name, arguments, context)
         policy_error = self._validate_policy(tool_name, call_args, context)
         if policy_error:
+            proposal = await self._bridge_grammar_gap(
+                tool_name, arguments, context, policy_error,
+            )
+            if proposal is not None:
+                return json.dumps(proposal, ensure_ascii=False)
             logger.warning(f"Tool {tool_name} blocked by policy: {policy_error}")
             return json.dumps(policy_error, ensure_ascii=False)
 
@@ -1528,6 +1533,335 @@ class ToolExecutor:
                 f"{type(error).__name__}: {error}"
             )
             return json.dumps(_tool_exception_payload(error), ensure_ascii=False)
+
+    async def _bridge_grammar_gap(
+        self, tool_name: str, arguments: Dict, context: ToolContext,
+        policy_error: Dict,
+    ) -> Optional[Dict]:
+        """Offer a server plan for literal unrecognized syntax; never grant writes."""
+        from .authorization_grammar import looks_like_mutation_grammar_gap
+
+        message = context.current_message or ""
+        if (
+            tool_name not in MUTATING_TOOL_NAMES
+            or policy_error.get("blockReason") != BLOCK_REASON_VERB_NOT_MATCHED
+            or context.attachment_context
+            or message_authorizes_mutation(message)
+            or not looks_like_mutation_grammar_gap(message)
+        ):
+            return None
+        refusal = {
+            "success": False, "policyBlocked": True,
+            "grammar_gap_rejected": True,
+            "blockReason": BLOCK_REASON_BINDING_INCOMPLETE,
+            "message": "看到了操作请求，但词条、编码或草稿条目无法核对；本次未写入。",
+        }
+        if tool_name != "keytao_shift_phrase_code":
+            return await self._bridge_literal_mutation_preview(
+                tool_name, arguments, context, refusal,
+            )
+        # A proposal is derived from operands only. In particular, a model
+        # cannot smuggle a digest, batch, additional item or reviewed seal.
+        if set(arguments) != {"word", "target_code"}:
+            return refusal
+        word, code = arguments.get("word"), arguments.get("target_code")
+        if (
+            not isinstance(word, str) or not re.fullmatch(r"[\u3400-\u9fff]{1,16}", word)
+            or not isinstance(code, str) or not re.fullmatch(r"[a-z]{1,6}", code)
+        ):
+            return refusal
+        source = trusted_mutation_source(message)
+        if (
+            not _contains_exact_target(source, word)
+            or not re.search(r"(?<![A-Za-z0-9_])" + re.escape(code) + r"(?![A-Za-z0-9_])", source)
+            or _is_word_protected(source, word)
+            or _has_protection_outside_target(source, word)
+        ):
+            return refusal
+        if self._mutation_guard is not None:
+            guard_error = self._mutation_guard(context, tool_name, arguments)
+            if guard_error:
+                return guard_error
+        try:
+            lookup = await self._invoke_effective_tool(
+                "keytao_lookup_by_words_batch", {"words": [word]}, context,
+            )
+            results = lookup.get("results") if isinstance(lookup, dict) else None
+            if (
+                not isinstance(lookup, dict) or lookup.get("success") is not True
+                or not isinstance(results, list) or len(results) != 1
+                or not isinstance(results[0], dict) or results[0].get("word") != word
+                or not isinstance(results[0].get("phrases"), list)
+            ):
+                return refusal
+            entries = results[0]["phrases"]
+            if (
+                len(entries) != 1 or not isinstance(entries[0], dict)
+                or entries[0].get("word") != word
+                or entries[0].get("type") not in _PHRASE_TYPES
+                or not re.fullmatch(r"[a-z]{1,6}", str(entries[0].get("code") or ""))
+            ):
+                return {**refusal, "message": f"想把「{word}」调到 {code}，但没有查到唯一的现有词条；本次未写入。"}
+            # No confirmed digest is supplied. The registered shift function
+            # re-reads encoding, occupancy and draft CAS and only previews.
+            proposal = await self._invoke_effective_tool(tool_name, {
+                "word": word, "target_code": code,
+                "target_type": entries[0]["type"],
+            }, context)
+            if not isinstance(proposal, dict):
+                return refusal
+            from .state import PendingToolConfirm, server_warning_pending_state, server_warning_ticket_is_complete
+
+            state = server_warning_pending_state(
+                PendingToolConfirm(function_name=tool_name, args=dict(arguments)), proposal,
+            )
+            plan = proposal.get("shiftPlan")
+            if (
+                proposal.get("success") is not False
+                or proposal.get("requiresConfirmation") is not True
+                or proposal.get("confirmationKind") != "shiftPlan"
+                or not re.fullmatch(r"[0-9a-f]{64}", str(proposal.get("warningDigest") or ""))
+                or not isinstance(plan, dict)
+                or plan.get("word") != word or plan.get("targetCode") != code
+                or not isinstance(plan.get("items"), list) or not plan["items"]
+                or not server_warning_ticket_is_complete(state)
+            ):
+                return {**refusal, "message": f"想把「{word}」调到 {code}，但当前词条、编码或占用情况未通过核对；本次未写入。"}
+            logger.info("[grammar_gap] grammar_gap_bridged=True proposal_only=True")
+            return {
+                **proposal, "grammar_gap_bridged": True,
+                "grammarGapArguments": {
+                    "word": word, "target_code": code,
+                    "target_type": entries[0]["type"],
+                },
+            }
+        except Exception as error:
+            logger.warning("Grammar-gap proposal failed: %s", type(error).__name__)
+            return refusal
+
+    async def _bridge_literal_mutation_preview(
+        self, tool_name: str, arguments: Dict, context: ToolContext,
+        refusal: Dict,
+    ) -> Dict:
+        """Adapt only existing read-only preview protocols to proposal tickets."""
+        from .state import PendingToolConfirm, server_warning_pending_state, server_warning_ticket_is_complete
+
+        protocols = {
+            "keytao_create_phrase": frozenset({"word", "code", "action", "old_word", "type"}),
+            "keytao_batch_add_to_draft": frozenset({"items"}),
+            "keytao_remove_draft_item": frozenset({"pr_id"}),
+            "keytao_batch_remove_draft_items": frozenset({"ids"}),
+        }
+        allowed = protocols.get(tool_name)
+        if allowed is None:
+            return {
+                **refusal,
+                "message": "看到了操作请求，但这类操作还不能生成只供核对的完整方案；本次未写入。",
+            }
+        if set(arguments) - allowed:
+            return refusal
+        source = trusted_mutation_source(context.current_message or "")
+        if self._mutation_guard is not None:
+            guard_error = self._mutation_guard(context, tool_name, arguments)
+            if guard_error:
+                return {**guard_error, "grammar_gap_rejected": True}
+        try:
+            if tool_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"}:
+                preview_args = await self._grammar_gap_entry_preview_arguments(
+                    tool_name, arguments, context,
+                )
+                if preview_args is None:
+                    return refusal
+                proposal = await self._invoke_effective_tool(
+                    tool_name,
+                    {**preview_args, "preview_only": True, "confirmed": False},
+                    context,
+                )
+                if (
+                    not isinstance(proposal, dict)
+                    or proposal.get("collisionReplanned") is True
+                    or proposal.get("failedCount", 0) != 0
+                    or proposal.get("skippedCount", 0) != 0
+                    or proposal.get("failed")
+                    or proposal.get("skipped")
+                ):
+                    return refusal
+            else:
+                key = "pr_id" if tool_name == "keytao_remove_draft_item" else "ids"
+                raw_ids = [arguments.get(key)] if key == "pr_id" else arguments.get(key)
+                if (
+                    not isinstance(raw_ids, list) or not raw_ids or len(raw_ids) > 50
+                    or any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in raw_ids)
+                    or len(set(raw_ids)) != len(raw_ids)
+                    or any(not re.search(r"(?<![0-9A-Za-z_])" + str(value) + r"(?![0-9A-Za-z_])", source) for value in raw_ids)
+                    or re.search(_PROTECTED_WORD_RE, source)
+                ):
+                    return refusal
+                snapshot = await self._invoke_effective_tool(
+                    "keytao_list_draft_items", {}, context,
+                )
+                if (
+                    not isinstance(snapshot, dict) or snapshot.get("success") is not True
+                    or not isinstance(snapshot.get("items"), list)
+                    or not isinstance(snapshot.get("batchId"), str) or not snapshot["batchId"]
+                    or not isinstance(snapshot.get("contentVersion"), int)
+                    or isinstance(snapshot["contentVersion"], bool) or snapshot["contentVersion"] < 0
+                ):
+                    return refusal
+                rows = snapshot["items"]
+                targets = []
+                for item_id in raw_ids:
+                    matches = [
+                        row for row in rows
+                        if isinstance(row, dict) and str(row.get("id")) == str(item_id)
+                    ]
+                    if len(matches) != 1:
+                        return refusal
+                    row = matches[0]
+                    if (
+                        not isinstance(row.get("word"), str) or not row["word"]
+                        or not isinstance(row.get("code"), str) or not re.fullmatch(r"[a-z]{1,6}", row["code"])
+                        or row.get("type") not in _PHRASE_TYPES
+                        or row.get("action") not in {"Create", "Change", "Delete"}
+                    ):
+                        return refusal
+                    targets.append({
+                        "id": item_id, "word": row["word"], "code": row["code"],
+                        "action": row["action"], "type": row["type"],
+                    })
+                preview_args = {key: arguments[key], "batch_id": snapshot["batchId"]}
+                proposal = await self._invoke_effective_tool(tool_name, preview_args, context)
+                if (
+                    not isinstance(proposal, dict)
+                    or proposal.get("confirmationKind") != "deleteTargets"
+                    or proposal.get("batchId") != snapshot["batchId"]
+                    or proposal.get("contentVersion") != snapshot["contentVersion"]
+                    or proposal.get("targets") != targets
+                ):
+                    return refusal
+            state = server_warning_pending_state(
+                PendingToolConfirm(function_name=tool_name, args=preview_args), proposal,
+            )
+            if (
+                proposal.get("success") is not False
+                or proposal.get("requiresConfirmation") is not True
+                or not server_warning_ticket_is_complete(state)
+            ):
+                return refusal
+            logger.info("[grammar_gap] grammar_gap_bridged=True proposal_only=True tool=%s", tool_name)
+            return {
+                **proposal, "grammar_gap_bridged": True,
+                "grammarGapArguments": preview_args,
+            }
+        except Exception as error:
+            logger.warning("Grammar-gap preview failed: %s", type(error).__name__)
+            return refusal
+
+    async def _grammar_gap_entry_preview_arguments(
+        self, tool_name: str, arguments: Dict, context: ToolContext,
+    ) -> Optional[Dict]:
+        """Bind raw entry operands to reviewed readings and current dictionary rows."""
+        source = trusted_mutation_source(context.current_message or "")
+        batch = tool_name == "keytao_batch_add_to_draft"
+        raw_items = arguments.get("items") if batch else [arguments]
+        if not isinstance(raw_items, list) or not raw_items or len(raw_items) > 50:
+            return None
+        planned = []
+        lookup_words = []
+        old_key = "oldWord" if batch else "old_word"
+        allowed = {"word", "code", "action", "old_word", "type"}
+        for raw in raw_items:
+            if not isinstance(raw, dict) or set(raw) - allowed:
+                return None
+            word, code, action = raw.get("word"), raw.get("code"), raw.get("action", "Create")
+            old_word = raw.get("old_word")
+            if (
+                not isinstance(word, str) or not re.fullmatch(r"[\u3400-\u9fff]{1,16}", word)
+                or not isinstance(code, str) or not re.fullmatch(r"[a-z]{1,6}", code)
+                or action not in {"Create", "Change", "Delete"}
+                or not _contains_exact_target(source, word)
+                or not _code_is_bound_to_target(source, word, code, frozenset())
+                or _is_word_protected(source, word)
+                or _has_protection_outside_target(source, word)
+                or (action != "Change" and old_word is not None)
+            ):
+                return None
+            if action == "Change" and (
+                not isinstance(old_word, str)
+                or not re.fullmatch(r"[\u3400-\u9fff]{1,16}", old_word)
+                or old_word == word or not _contains_exact_target(source, old_word)
+                or _is_word_protected(source, old_word)
+            ):
+                return None
+            item = {"word": word, "code": code, "action": action}
+            if action != "Delete":
+                capability = (context.trusted_reviewed_items_by_key or {}).get((word, code))
+                if not isinstance(capability, dict):
+                    return None
+                phrase_type = capability.get("type")
+                pinyin = capability.get("pinyin")
+                candidates = capability.get("candidate_codes")
+                if (
+                    phrase_type not in _PHRASE_TYPES
+                    or not isinstance(pinyin, str) or not pinyin.strip()
+                    or not isinstance(candidates, (list, tuple)) or code not in candidates
+                    or any(not isinstance(value, str) or not re.fullmatch(r"[a-z]{1,6}", value) for value in candidates)
+                    or len(set(candidates)) != len(candidates)
+                    or not isinstance(capability.get("needs_manual_review"), bool)
+                    or ("type" in raw and raw["type"] != phrase_type)
+                ):
+                    return None
+                item.update({
+                    "type": phrase_type,
+                    "_reviewed_pinyin": pinyin,
+                    "_reviewed_candidate_codes": list(candidates),
+                    "needsManualReview" if batch else "needs_manual_review": capability["needs_manual_review"],
+                })
+                if isinstance(capability.get("remark"), str) and capability["remark"]:
+                    item["remark"] = capability["remark"]
+            if action == "Change":
+                item[old_key] = old_word
+            planned.append(item)
+            lookup_words.append(old_word if action == "Change" else word)
+        identities = [(item["word"], item["code"], item["action"]) for item in planned]
+        if len(set(identities)) != len(identities):
+            return None
+        words = list(dict.fromkeys(lookup_words))
+        lookup = await self._invoke_effective_tool(
+            "keytao_lookup_by_words_batch", {"words": words}, context,
+        )
+        groups = lookup.get("results") if isinstance(lookup, dict) else None
+        if (
+            not isinstance(lookup, dict) or lookup.get("success") is not True
+            or not isinstance(groups, list) or len(groups) != len(words)
+            or any(
+                not isinstance(group, dict) or group.get("word") != word
+                or not isinstance(group.get("phrases"), list)
+                for word, group in zip(words, groups)
+            )
+        ):
+            return None
+        entries_by_word = dict(zip(words, (group["phrases"] for group in groups)))
+        for raw, item, lookup_word in zip(raw_items, planned, lookup_words):
+            entries = entries_by_word[lookup_word]
+            if any(
+                not isinstance(entry, dict) or entry.get("word") != lookup_word
+                or entry.get("type") not in _PHRASE_TYPES
+                or not isinstance(entry.get("code"), str) or not re.fullmatch(r"[a-z]{1,6}", entry["code"])
+                for entry in entries
+            ):
+                return None
+            matches = [entry for entry in entries if entry["code"] == item["code"]]
+            if item["action"] == "Create":
+                if any(entry["type"] == item["type"] for entry in matches):
+                    return None
+            else:
+                if len(matches) != 1 or ("type" in raw and raw["type"] != matches[0]["type"]):
+                    return None
+                if "type" in item and item["type"] != matches[0]["type"]:
+                    return None
+                item["type"] = matches[0]["type"]
+        return {"items": planned} if batch else planned[0]
 
     @staticmethod
     def _trusted_phrase_type(
@@ -1624,11 +1958,9 @@ class ToolExecutor:
                         item.pop(field, None)
                     word = str(item.get("word") or "").strip()
                     code = str(item.get("code") or "").strip().lower()
-                    if (
-                        str(item.get("action") or "Create") == "Create"
-                        and not item.get("old_word")
-                        and not item.get("oldWord")
-                    ):
+                    action = str(item.get("action") or "Create")
+                    old_word = item.get("old_word") or item.get("oldWord")
+                    if (action == "Create" and not old_word) or (action == "Change" and old_word):
                         capability = (context.trusted_reviewed_items_by_key or {}).get(
                             (word, code)
                         )
@@ -1824,7 +2156,7 @@ class ToolExecutor:
                 )
             return policy_block(
                 BLOCK_REASON_VERB_NOT_MATCHED,
-                "这条消息没有明确的执行指令，本次未写入。",
+                "看到了操作请求，但还没有核对出可执行的词条和编码；本次未写入。",
                 missing=["executionVerb"],
                 suggestion=self_checked_suggested_command(
                     tool_name, arguments, context

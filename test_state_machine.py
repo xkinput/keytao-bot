@@ -4023,14 +4023,21 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
             == ("eefj", "eefju"),
         )
         check(
-            "ordering advice carries a server record and one parsed suggestion",
+            "ordering advice carries a server record and every parsed suggestion binds",
             record is not None
             and isinstance(record.state, PendingAddWord)
             and record.state.server_candidates
             == [("eefj", True), ("eefju", False)]
             and response is not None
             and isinstance(response, openai_chat_module.ServerBackedQueryReply)
-            and len(advertised_command_suggestions(response)) == 1
+            and all(
+                openai_chat_module._chat_routing.message_authorizes_live_pending_mutation(command, record.state)
+                or (
+                    (intent := openai_chat_module._chat_routing._pending_tool_assent_intent(record.state, command)) is not None
+                    and openai_chat_module._chat_routing._message_authorizes_pending_state_control(record.state, command, intent)
+                )
+                for command in advertised_command_suggestions(response)
+            )
             and "可多选，如「添加1、2」" in response
             and "重新编码" not in response,
         )
@@ -4877,6 +4884,9 @@ def test_suggestion_promise_mismatch_restores_the_sealed_shift_plan():
         },
         confirmation_source="server_warning",
     )
+    from keytao_bot.harness.state import server_warning_pending_state
+
+    state = server_warning_pending_state(state, state.args["_pending_display"])
     store = MemoryConversationStateStore()
     store.set(conv_key, state)
     old_store = openai_chat_module.conversation_state_store
@@ -5007,10 +5017,9 @@ def test_word_discovery_prechecks_binding_without_blocking_review():
         finally:
             openai_chat_module.conversation_state_store = old_store
 
-        notice = (
-            "提示：你还未绑定键道账号，提交前请先绑定"
-            "（发送 /bind 绑定码，详见 https://keytao.vercel.app/profile）。"
-        )
+        from keytao_bot.utils.pending_confirmation import UNBOUND_BINDING_PRECHECK_NOTICE
+
+        notice = UNBOUND_BINDING_PRECHECK_NOTICE
         check("unbound review still renders candidates", unbound is not None and "候选编码" in unbound)
         check("unbound first candidate reply carries one short notice", unbound is not None and unbound.count(notice) == 1)
         check("bound candidate reply carries no binding notice", bound is not None and notice not in bound)
@@ -17145,6 +17154,17 @@ def test_generic_ai_prose_does_not_persist_pending():
     asyncio.run(_run())
 
 
+def _sealed_submit_advertisement_ticket():
+    from keytao_bot.harness.state import server_warning_pending_state
+
+    return server_warning_pending_state(
+        PendingToolConfirm(function_name="keytao_submit_batch", args={}),
+        {"batchId": "advertisement-batch", "contentVersion": 0,
+         "snapshotDigest": "a" * 64, "warningDigest": "b" * 64,
+         "auditDigest": "c" * 64},
+    )
+
+
 def test_outgoing_advertisement_requires_matching_live_state():
     """Every shared assent/selection rendering must be backed at delivery."""
     print("\n🧪 outgoing advertisement requires matching live state")
@@ -17317,7 +17337,7 @@ def test_outgoing_advertisement_requires_matching_live_state():
 
         store.set(
             conv_key,
-            PendingToolConfirm(function_name="keytao_submit_batch", args={}),
+            _sealed_submit_advertisement_ticket(),
             owner_label="Rea",
         )
         check(
@@ -17555,7 +17575,7 @@ def test_live_actionable_reply_advertises_complete_reply_contract():
 
     store.set(
         conv_key,
-        PendingToolConfirm(function_name="keytao_submit_batch", args={}),
+        _sealed_submit_advertisement_ticket(),
         space_key=conv_key.space_key,
         owner_label="Rea",
     )
@@ -18465,10 +18485,10 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
 
     async def _run():
         bare = await run_case("确认", ReplyReferenceInfo())
-        check("bare confirm without an invitation reaches intent model", bare["classifier_calls"] == 1)
-        check("bare confirm without an invitation reaches main model", bare["main_calls"] == 1)
+        check("bare confirm without a ticket bypasses intent model", bare["classifier_calls"] == 0)
+        check("bare confirm without a ticket bypasses main model", bare["main_calls"] == 0)
         check("bare confirm without an invitation reaches no tool sink", bare["tool_calls"] == 0)
-        check("bare confirm without an invitation stays ordinary chat", bare["response"] == "normal pipeline response")
+        check("bare confirm without a ticket reports no operation in one line", "当前没有待执行的操作" in bare["response"] and len(bare["response"].splitlines()) == 1)
 
         invited = await run_case(
             "确认",
@@ -18485,11 +18505,11 @@ def test_stale_confirmation_short_circuits_only_without_live_state():
         check("invited stale confirm reaches no tool sink", invited["tool_calls"] == 0)
         check(
             "stale reply explains expiry or absence",
-            "过期或不存在" in invited["response"],
+            "没有可执行的确认记录" in invited["response"],
         )
         check(
             "stale reply offers plain recovery guidance",
-            "查看草稿" in invited["response"],
+            "引用原提议" in invited["response"] and len(invited["response"].splitlines()) == 1,
         )
         check(
             "stale reply never recommends confirming again",

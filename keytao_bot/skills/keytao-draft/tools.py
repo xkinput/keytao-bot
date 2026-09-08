@@ -5456,6 +5456,42 @@ def _ranked_reorder_draft_projection(
     return projected, removed
 
 
+async def _validate_ranked_explicit_destination(word: str, phrase_type: str, code: str) -> Dict:
+    """Reuse reviewed-code validation for one explicit noncandidate destination."""
+    from keytao_bot.harness.state import PendingAddWord
+    from keytao_bot.utils.candidate_inventory import select_candidate_inventory
+    from keytao_bot.utils.explicit_code import validate_explicit_code
+
+    review = await prepare_reviewed_word(_review_config(), word)
+    if (
+        not isinstance(review, dict) or review.get("success") is not True
+        or review.get("word") != word
+        or str(review.get("type") or "Phrase") != phrase_type
+        or review.get("pronunciationUnresolved") is True
+        or review_flags.review_blocks_write(review)
+    ):
+        return {"success": False, "message": f"未能取得「{word}」的已审读音和正确词条类型；本次未写入。"}
+    inventory = select_candidate_inventory(review)
+    if inventory is None or any(
+        not str(inventory.readings.get(candidate) or "").strip()
+        for candidate, _occupied in inventory.candidates
+    ):
+        return {"success": False, "message": f"「{word}」缺少可核验的读音候选；本次未写入。"}
+    candidates = list(inventory.candidates)
+    validation = validate_explicit_code(PendingAddWord(
+        word=word, recommended_code=str(review.get("recommendedCode") or ""),
+        candidates=candidates, server_candidates=list(candidates),
+        pronunciation_codes=dict(inventory.readings), phrase_type=phrase_type,
+    ), code)
+    if not validation.valid:
+        return {"success": False, "message": validation.reason + "；本次未写入。"}
+    return {
+        "success": True,
+        "pinyin": validation.pinyin,
+        "manualReason": validation.manual_reason,
+    }
+
+
 async def _prepare_ranked_reorder_plan(
     platform: str,
     platform_id: str,
@@ -5578,6 +5614,18 @@ async def _prepare_ranked_reorder_plan(
         return {"success": False, "message": "这些词的类型不同，不能共用一条重排计划"}
     same_code_type = next(iter(phrase_types)) if same_code_weight_scope else None
     same_code_scope = len(set(current_codes)) == 1
+    explicit_destination_reviews: Dict[str, Dict] = {}
+    if expected_codes is not None and len(expected_codes) == len(ordered_words) and not same_code_weight_scope:
+        for ordered_word, expected_code in zip(ordered_words, expected_codes):
+            if expected_code in candidate_map[ordered_word]:
+                continue
+            validation = await _validate_ranked_explicit_destination(
+                ordered_word, current_by_word[ordered_word]["type"], expected_code,
+            )
+            if validation.get("success") is not True:
+                return validation
+            explicit_destination_reviews[ordered_word] = validation
+            candidate_map[ordered_word] = [*candidate_map[ordered_word], expected_code]
     if expected_codes is not None:
         if (
             len(expected_codes) != len(ordered_words)
@@ -5805,6 +5853,16 @@ async def _prepare_ranked_reorder_plan(
     )
     if not plan.get("success"):
         return plan
+    for item in plan.get("items", []):
+        validation = explicit_destination_reviews.get(item.get("word"))
+        if item.get("action") != "Create" or validation is None:
+            continue
+        item["_reviewed_pinyin"] = validation["pinyin"]
+        item["_reviewed_candidate_codes"] = [item["code"]]
+        if validation["manualReason"]:
+            item["needsManualReview"] = True
+            item["manualReviewReason"] = validation["manualReason"]
+            item["remark"] = f"喵喵审词：读音 {validation['pinyin']}；{validation['manualReason']}"
     current_batch_id = str(existing_draft.get("batchId") or "")
     current_version = existing_draft.get("contentVersion")
     if not current_batch_id:
@@ -5821,6 +5879,11 @@ async def _prepare_ranked_reorder_plan(
         "contentVersion": current_version,
         "candidateCodes": candidate_map[ordered_words[0]],
         "scope": "same_code" if same_code_scope else "prefix_chain",
+        "explicitDestinationReviewNotes": [
+            f"「{word}」：{validation['manualReason']}"
+            for word, validation in explicit_destination_reviews.items()
+            if validation["manualReason"]
+        ],
         **plan,
     }
 
@@ -6120,7 +6183,7 @@ async def keytao_shift_phrase_code(
             "currentState": prepared.get("currentState", []),
             "proposedState": prepared.get("proposedState", []),
             "listedWords": normalized_listed,
-            "evidenceLines": normalized_evidence,
+            "evidenceLines": [*normalized_evidence, *prepared.get("explicitDestinationReviewNotes", [])],
         }
         current_batch_id = str(prepared.get("batchId") or "")
         current_content_version = int(prepared.get("contentVersion") or 0)

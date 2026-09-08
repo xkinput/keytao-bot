@@ -99,6 +99,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
     ServerBackedQueryReply,
+    UNBOUND_BINDING_PRECHECK_NOTICE,
     append_unbound_binding_notice as _append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_single_word_candidate_codes,
@@ -1965,11 +1966,35 @@ def _candidate_render_lines(text: str) -> Tuple[str, ...]:
     return tuple(line.strip() for line in str(text).splitlines() if line.strip())
 
 
+def _without_binding_precheck_notice(response: str) -> str:
+    """Account notices never establish candidate or command authority."""
+    text = str(response or "")
+    for notice in {
+        UNBOUND_BINDING_PRECHECK_NOTICE,
+        render_platform_public_links(UNBOUND_BINDING_PRECHECK_NOTICE, "qq"),
+    }:
+        text = text.replace(notice, "")
+    return text.strip()
+
+
 def _advertised_reply_matches_live_record(
     response: str,
     record: Optional[PendingStateRecord],
 ) -> bool:
     """Prove that every advertised stateful form has an actor-owned live target."""
+    response = _without_binding_precheck_notice(response)
+    if (
+        record is not None and not record.execution_id
+        and isinstance(record.state, PendingToolConfirm)
+        and record.state.args.get("_pending_submitted_confirmed") is True
+    ):
+        return _command_suggestions_match_pending_batch(response, record.state)
+    if (
+        record is not None and not record.execution_id
+        and isinstance(record.state, PendingToolConfirm)
+        and record.state.function_name == "keytao_choice_offer"
+    ):
+        return _command_suggestions_match_pending_batch(response, record.state)
     if (
         record is not None and not record.execution_id
         and isinstance(record.state, PendingToolConfirm)
@@ -1978,10 +2003,15 @@ def _advertised_reply_matches_live_record(
     ):
         rendered = _render_live_batch_record(record)
         if not rendered or _candidate_render_lines(response) != _candidate_render_lines(rendered):
-            return False
+            return bool(
+                _candidate_render_lines(response) == _candidate_render_lines(
+                    _chat_routing._format_live_ticket_precedence_message(record.state)
+                )
+                and _command_suggestions_match_pending_batch(response, record.state)
+            )
         return all(
             _chat_routing.message_authorizes_live_pending_mutation(command, record.state)
-            for command in advertised_reply_contract(rendered).command_suggestions
+            for command in advertised_reply_contract(response).command_suggestions
         )
     contract = advertised_reply_contract(response)
     if not contract.requires_live_state:
@@ -2031,6 +2061,10 @@ def _advertised_reply_matches_live_record(
                 suggestion, state,
             )
             or (
+                (intent := _chat_routing._pending_tool_assent_intent(state, suggestion)) is not None
+                and _chat_routing._message_authorizes_pending_state_control(state, suggestion, intent)
+            )
+            or (
                 (assent := parse_pending_assent_phrase(suggestion)).matched
                 and assent.add_requested
                 and not assent.cancel_requested
@@ -2052,8 +2086,21 @@ def _advertised_reply_matches_live_record(
         and isinstance(state, PendingAdvertisedWordSets)
         and len(state.snapshots) == 1
         and all(
-            suggestion
-            == "加词 " + " ".join(state.snapshots[0].words)
+            suggestion == "加词 " + " ".join(state.snapshots[0].words)
+            or (
+                (selection := _chat_routing._resolve_advertised_word_set_selection(state, suggestion)).matched
+                and not selection.ask
+                and selection.snapshot_token == state.snapshots[0].token
+                and selection.resolved_words == state.snapshots[0].words
+            )
+            for suggestion in contract.command_suggestions
+        )
+    )
+    pending_trusted_word_suggestions_are_bound = bool(
+        contract.command_suggestions
+        and isinstance(state, PendingTrustedWordRecord)
+        and all(
+            _chat_routing._pending_trusted_word_action_matches(state, suggestion)
             for suggestion in contract.command_suggestions
         )
     )
@@ -2065,6 +2112,7 @@ def _advertised_reply_matches_live_record(
         and not pending_add_suggestions_are_bound
         and not pending_batch_suggestions_are_bound
         and not pending_word_set_suggestions_are_bound
+        and not pending_trusted_word_suggestions_are_bound
     ):
         return False
     if (
@@ -2152,6 +2200,8 @@ def _advertised_reply_matches_live_record(
         return True
 
     sealed_pairs = _pending_state_binding_pairs(state)
+    if isinstance(state, PendingToolConfirm) and state.function_name == "keytao_shift_phrase_code":
+        sealed_pairs = advertised_batch_binding_pairs(_render_live_shift_record(record))
     if advertises_batch_action or contract.candidate_selection:
         return same_unique_binding_set(
             displayed_pairs,
@@ -2163,6 +2213,24 @@ def _advertised_reply_matches_live_record(
             sealed_pairs,
         )
     return True
+
+
+def _render_live_duplicate_record(record: Optional[PendingStateRecord]) -> str:
+    """Project only a complete actor-owned duplicate warning record."""
+    if record is None or record.execution_id or not isinstance(record.state, PendingToolConfirm):
+        return ""
+    return _chat_render._format_pending_duplicate_confirmation(record.state)
+
+
+def _render_live_choice_record(record: Optional[PendingStateRecord]) -> str:
+    """Render a live choice together with its persisted server explanation."""
+    if (
+        record is None or record.execution_id
+        or not isinstance(record.state, PendingToolConfirm)
+        or record.state.function_name != "keytao_choice_offer"
+    ):
+        return ""
+    return _chat_commands.render_pending_choice_offer(record.state)
 
 
 def _render_live_batch_record(record: Optional[PendingStateRecord]) -> str:
@@ -2232,13 +2300,17 @@ def _render_live_single_candidate_record(
         or record.state.server_candidates != record.state.candidates
     ):
         return ""
-    return render_server_backed_single_word_candidates(
+    rendered = render_server_backed_single_word_candidates(
         record.state.word,
         record.state.recommended_code,
         record.state.server_candidates,
         record.state.server_occupied_words,
         record.state.server_ordering_assessments,
     )
+    if not rendered:
+        return ""
+    details = _chat_render._format_pending_candidate_review_details(record.state)
+    return f"{details}\n{rendered}" if details else rendered
 
 
 def _reply_carries_live_candidate_state(
@@ -2454,6 +2526,29 @@ def _enforce_advertised_reply_contract(
     *,
     query_words: Tuple[str, ...] = (),
 ) -> str:
+    """Validate commands first, then append this actor's verified account notice."""
+    body = _without_binding_precheck_notice(response)
+    if isinstance(response, ServerBackedQueryReply):
+        body = ServerBackedQueryReply(body)
+    rendered = _enforce_candidate_reply_contract(body, conv_key, query_words=query_words)
+    record = conversation_state_store.get_record(conv_key) if conv_key is not None else None
+    if (
+        record is not None and not record.execution_id
+        and _user_resolver.resolved_binding_for_notice(record.owner_key.platform, record.owner_key.actor_id) is False
+        and advertised_reply_contract(rendered).requires_live_state
+        and _advertised_reply_matches_live_record(rendered, record)
+    ):
+        with_notice = _append_unbound_binding_notice(rendered, False)
+        return ServerBackedQueryReply(with_notice) if isinstance(rendered, ServerBackedQueryReply) else with_notice
+    return rendered
+
+
+def _enforce_candidate_reply_contract(
+    response: str,
+    conv_key: Optional[ConversationKey],
+    *,
+    query_words: Tuple[str, ...] = (),
+) -> str:
     """Single delivery guard for the advertisement-implies-live-state invariant."""
     server_backed_query = isinstance(response, ServerBackedQueryReply)
     record = (
@@ -2472,7 +2567,22 @@ def _enforce_advertised_reply_contract(
         str(response or ""),
         evidence,
     )
+    if _chat_render._RETIRED_AUTHORIZATION_COPY_RE.search(text):
+        replacement = (
+            _render_live_shift_record(record)
+            or _render_live_single_candidate_record(record)
+            or _render_live_batch_record(record)
+        )
+        if replacement and _advertised_reply_matches_live_record(replacement, record):
+            return replacement
+        move = _authorization_grammar.parse_existing_entry_move(_current_turn_message.get(""))
+        understood = f"想把「{move.word}」调到 {move.target_code}" if move is not None else "看到了操作请求"
+        return f"{understood}，但还没有可确认的计划；本次未写入。"
     contract = advertised_reply_contract(text)
+    if contract.command_suggestions:
+        replacement = _render_live_shift_record(record) or _render_live_choice_record(record) or _render_live_duplicate_record(record)
+        if replacement and _advertised_reply_matches_live_record(replacement, record):
+            return replacement
     from ..utils.offered_options import (
         is_force_assent,
         option_questions_bind_live_state,
@@ -3405,14 +3515,29 @@ async def _stage_claim_offered_answer(ctx: TurnContext) -> bool:
 
     history = get_history(ctx.conv_key)
     force = is_force_assent(ctx.normalized_message_text)
+    closed_assent = ctx.normalized_message_text.strip().rstrip("。.!！") in {
+        "确认调整", "确认执行", "确认", "执行", "好",
+    }
     offered = matches_previous_bot_option(ctx.normalized_message_text, history)
-    if not force and not offered:
+    if not force and not offered and not closed_assent:
         return False
     record = conversation_state_store.get_record(ctx.conv_key)
     if record is not None and not record.execution_id and isinstance(record.state, (PendingAddWord, PendingToolConfirm)):
-        if force or offered_option_intent(ctx.normalized_message_text, record.state):
+        if force or closed_assent or offered_option_intent(ctx.normalized_message_text, record.state):
             return False
-    ctx.response = render_missing_option_ticket(history)
+    reply_reference = getattr(ctx, "reply_reference", None)
+    if (
+        (reply_reference is not None and reply_reference.is_reply)
+        or draft_operation_coordinator.get(ctx.conv_key) is not None
+        or (
+            ctx.memory_context is not None
+            and ctx.memory_context.space_type == "group"
+            and _can_use_unrelated_group_pending(reply_reference or ReplyReferenceInfo())
+            and conversation_state_store.find_pending_for_other_owner(ctx.space_key, ctx.conv_key) is not None
+        )
+    ):
+        return False
+    ctx.response = render_missing_option_ticket(history).replace("\n", " ")
     set_turn_flow("pending-confirmation")
     remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
     await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment)
@@ -3426,6 +3551,11 @@ async def _stage_handle_explicit_entry_operation(ctx: TurnContext) -> bool:
     response = await try_handle_same_code_reorder(
         ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.space_key, ctx.owner_label,
     )
+    if response is None:
+        response = await _chat_commands.try_handle_move_to_code_command(
+            ctx.normalized_message_text, ctx.platform, ctx.user_id,
+            ctx.space_key, ctx.owner_label,
+        )
     if response is None:
         response = await _chat_commands.try_handle_explicit_entry_code_command(
             ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
@@ -5592,6 +5722,7 @@ async def _handle_ai_chat_serialized(
     user_id: str,
 ) -> None:
     """Run one serialized chat turn through the reviewable stage order."""
+    _user_resolver.reset_binding_notice_fact()
     ctx = TurnContext(
         bot=bot,
         event=event,

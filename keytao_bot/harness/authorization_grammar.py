@@ -312,12 +312,15 @@ _UNTRUSTED_DATA_TAIL_RE = re.compile(
 )
 _INLINE_CODE_RE = re.compile(r"`[^`]*`")
 _COMMAND_CLAUSE_SPLIT_RE = re.compile(r"[，,。.!！?？;；\n]+")
-# A leading platform mention is routing metadata, not part of the command.
-# In this repo the plugin already strips it (openai_chat._LEADING_COMMAND_PREFIX_RE),
-# so on the production path this never matches.  It exists so that the
-# "@我 ..." remediation command self-checks through exactly the validators it
-# will face, instead of through a stripped variant of itself.
-_LEADING_MENTION_RE = re.compile(r"^\s*@[^\s@]{1,24}[\s:：]+")
+# Platform mentions and the keyword trigger are routing metadata. Normalize
+# them in the shared source, including tool binding and advertised commands.
+_LEADING_MENTION_RE = re.compile(
+    r"^\s*(?:@[^\s@]{1,24}|喵喵)[\s:：]+"
+)
+_IMPERATIVE_COMMAND_WRAPPER_RE = re.compile(
+    r"^(?:(?:请\s*)?执行|请帮我|帮我|麻烦(?:你|帮我)?)"
+    r"(?:\s*[:：]\s*|\s+)(?=\S)"
+)
 _WHOLE_MESSAGE_ADDRESS_PATTERN = (
     r"(?:@[^\s@]{1,24}|键道|喵喵)[\s:：，,]*"
 )
@@ -592,6 +595,10 @@ def _multi_add_authorization_contract(
     )
     if add_intent_count < 2:
         return None
+    if re.search(r"[?？]", source):
+        return _MultiAddAuthorization(
+            clauses=(), valid=False, refused_clauses=(source[:120],),
+        )
 
     parsed: List[_AuthorizedAddClause] = []
     refused: List[str] = []
@@ -1058,12 +1065,6 @@ _REPLACE_AT_CODE_PATTERNS = (
     ),
 )
 
-_ENTRY_MOVE_PLAN_CLAUSE_RE = re.compile(
-    r"^(?:把|将)\s*[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
-    r"(?:调整到|改到|移到|挪到|换到)\s*"
-    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})$",
-    re.IGNORECASE,
-)
 _INDIRECT_ENTRY_MOVE_WHOLE_RE = re.compile(
     rf"^{_COMMAND_PREFIX_PATTERN}"
     r"(?:把|将)?(?:这|上述|上面|前面)(?P<count>[二两三四五六七八九十]|[2-9]|1[0-9])"
@@ -1329,33 +1330,26 @@ def dictionary_recode_items_match(
 
 def parse_entry_move_plan(message: str) -> Optional[EntryMovePlanCommand]:
     """Parse exactly two literal existing-entry moves as one instruction."""
-    source = _safe_whole_entry_command_source(message)
-    if not source:
+    source = trusted_mutation_source(message).strip().rstrip("。.!！").strip()
+    if not source or re.search(r"[?？]", source):
         return None
-    source = source.rstrip("。.!！").strip()
-    clauses = [
-        clause.strip()
-        for clause in re.split(r"[，,；;]", source)
-        if clause.strip()
-    ]
-    if len(clauses) != 2:
-        return None
-    moves: List[ExistingEntryMove] = []
-    for clause in clauses:
-        match = _ENTRY_MOVE_PLAN_CLAUSE_RE.fullmatch(clause)
-        if match is None:
-            return None
-        moves.append(ExistingEntryMove(
-            word=match.group("word").strip(),
-            target_code=match.group("code").strip().lower(),
-            verb="换到",
-        ))
-    if (
-        moves[0].word == moves[1].word
-        or moves[0].target_code == moves[1].target_code
+    # Try separators only when both complete sides parse. A separator-like
+    # character inside a quoted entry cannot accidentally split that entry.
+    for separator in re.finditer(
+        r"[，,；;、]\s*(?:(?:和|并且)\s*)?|并且|和", source
     ):
-        return None
-    return EntryMovePlanCommand(moves=(moves[0], moves[1]))
+        first = _parse_existing_entry_move_clause(source[:separator.start()])
+        second = _parse_existing_entry_move_clause(source[separator.end():])
+        if (
+            first is not None
+            and second is not None
+            and not first.named_occupant
+            and not second.named_occupant
+            and first.word != second.word
+            and first.target_code != second.target_code
+        ):
+            return EntryMovePlanCommand(moves=(first, second))
+    return None
 
 
 def parse_indirect_entry_move(message: str) -> Optional[IndirectEntryMove]:
@@ -1660,41 +1654,86 @@ def render_compound_eviction_add_command(plan: CompoundEvictionAddPlan) -> str:
     )
 
 
+_EXISTING_ENTRY_MOVE_VERB_PATTERN = (
+    r"调整到|调到|调至|挪到|挪至|移到|移至|换到|放到|放在|改到|换成|用"
+)
+_MOVE_CODE_TOKEN_PATTERN = (
+    rf"(?:「\s*{_POSITIONAL_REORDER_CODE_PATTERN}\s*」|"
+    rf"“\s*{_POSITIONAL_REORDER_CODE_PATTERN}\s*”|"
+    rf"‘\s*{_POSITIONAL_REORDER_CODE_PATTERN}\s*’|"
+    rf"『\s*{_POSITIONAL_REORDER_CODE_PATTERN}\s*』|"
+    rf"\"\s*{_POSITIONAL_REORDER_CODE_PATTERN}\s*\"|"
+    rf"'\s*{_POSITIONAL_REORDER_CODE_PATTERN}\s*'|"
+    rf"{_POSITIONAL_REORDER_CODE_PATTERN})"
+)
 _EXISTING_ENTRY_MOVE_RE = re.compile(
     rf"^(?:(?:请|请你|请帮我|帮我|麻烦|麻烦你|麻烦帮我|劳驾|拜托|给我)\s*)?"
-    r"(?:把|将)\s*[「“]?\s*(?P<word>[\u3400-\u9fff]{1,16})\s*[」”]?\s*"
-    r"(?P<verb>调整到|改到|移到|挪到|换到)\s*"
-    rf"(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})"
-    r"(?:\s*[，,；;]\s*[「“]?\s*"
-    r"(?P<occupant>[\u3400-\u9fff]{1,16})\s*[」”]?\s*顺延)?\s*$",
+    rf"(?:把\s*|将\s*)?(?P<word>{_REPLACE_AT_CODE_ENTRY_PATTERN})\s*"
+    rf"(?P<verb>{_EXISTING_ENTRY_MOVE_VERB_PATTERN})\s*"
+    rf"(?P<code>{_MOVE_CODE_TOKEN_PATTERN})"
+    r"(?P<tail>.*)$",
     re.IGNORECASE,
 )
+_EXISTING_ENTRY_MOVE_TAIL_RE = re.compile(
+    r"^(?:[，,；;、]\s*(?:并(?:且)?\s*)?|并(?:且)?\s*)"
+    rf"(?:(?:顺延|挤掉|顶替)\s*(?P<before>{_REPLACE_AT_CODE_ENTRY_PATTERN})?"
+    rf"|(?P<after>{_REPLACE_AT_CODE_ENTRY_PATTERN})\s*顺延)$"
+)
+
+
+def _parse_existing_entry_move_clause(source: str) -> Optional[ExistingEntryMove]:
+    source = source.strip()
+    guard_source = _COMMAND_PREFIX_RE.sub("", source, count=1)
+    if (
+        _NEGATIVE_MODAL_RE.match(guard_source)
+        or any(
+            re.match(
+                r"^(?:先不要|暂时不|没|未|尚未|并非|无须|毋须|绝不能|甭|勿)",
+                candidate,
+            )
+            for candidate in (source, guard_source)
+        )
+        or _POSITIONAL_REPORTED_CONTEXT_RE.search(guard_source)
+        or _DATA_CONTEXT_RE.search(guard_source)
+        or _META_DISCUSSION_RE.search(guard_source)
+        or _EXPLANATION_ONLY_RE.search(guard_source)
+        or _POSITIONAL_REORDER_EXPLANATION_RE.search(guard_source)
+        or _TEXT_TRANSFORM_RE.search(guard_source)
+    ):
+        return None
+    match = _EXISTING_ENTRY_MOVE_RE.fullmatch(source)
+    if match is None:
+        return None
+    word = _replace_at_code_word(match.group("word"))
+    code = match.group("code").strip().strip("「」“”‘’『』\"'").strip().lower()
+    if not word or re.fullmatch(_POSITIONAL_REORDER_CODE_PATTERN, code) is None:
+        return None
+    occupant = ""
+    tail = match.group("tail").strip()
+    if tail:
+        tail_match = _EXISTING_ENTRY_MOVE_TAIL_RE.fullmatch(tail)
+        if tail_match is None:
+            return None
+        raw_occupant = tail_match.group("before") or tail_match.group("after") or ""
+        occupant = _replace_at_code_word(raw_occupant) if raw_occupant else ""
+        if (raw_occupant and not occupant) or occupant == word:
+            return None
+        if not occupant and not re.fullmatch(r"(?:[，,；;、]\s*)?并(?:且)?\s*顺延", tail):
+            return None
+    return ExistingEntryMove(
+        word=word, target_code=code, named_occupant=occupant,
+        verb=match.group("verb").strip(),
+    )
 
 
 def parse_existing_entry_move(message: str) -> Optional[ExistingEntryMove]:
     """Parse the closed existing-entry move family advertised to users."""
-    source = _LEADING_MENTION_RE.sub(
-        "",
-        trusted_mutation_source(message),
-        count=1,
-    ).strip()
+    source = trusted_mutation_source(message).strip()
     if not source or re.search(r"[?？]", source):
         return None
     source = _EVICTION_ADD_TRAILING_FILLER_RE.sub("", source).strip()
     source = source.rstrip("。.!！").strip()
-    match = _EXISTING_ENTRY_MOVE_RE.fullmatch(source)
-    if match is None:
-        return None
-    word = match.group("word").strip()
-    occupant = str(match.group("occupant") or "").strip()
-    if occupant and occupant == word:
-        return None
-    return ExistingEntryMove(
-        word=word,
-        target_code=match.group("code").strip().lower(),
-        named_occupant=occupant,
-        verb=match.group("verb").strip(),
-    )
+    return _parse_existing_entry_move_clause(source)
 
 def _unquote_positional_entry(value: str) -> Optional[str]:
     pairs = {"「": "」", "“": "”", "‘": "’"}
@@ -2230,9 +2269,15 @@ def _whole_message_unquoted_source(
     return content
 
 
+def normalize_mutation_command_source(message: str) -> str:
+    """Remove routing metadata and explicit imperative wrappers once, upstream."""
+    source = _LEADING_MENTION_RE.sub("", str(message or ""), count=1).strip()
+    return _IMPERATIVE_COMMAND_WRAPPER_RE.sub("", source, count=1).strip()
+
+
 def trusted_mutation_source(message: str) -> str:
     """Preserve line structure while removing quoted or marked untrusted data."""
-    text = str(message or "")
+    text = normalize_mutation_command_source(message)
     unquoted = _whole_message_unquoted_source(text)
     if unquoted is not None:
         text = unquoted
@@ -2324,6 +2369,7 @@ def _mutation_authorization_view(message: str) -> str:
                 candidate,
             )
             or _positive_bare_entry_mutation(clause)
+            or parse_existing_entry_move(clause) is not None
             or parse_entry_swap(clause) is not None
             or parse_indirect_entry_move(clause) is not None
         )
@@ -2963,6 +3009,7 @@ def looks_like_mutation_grammar_gap(message: str) -> bool:
         not compact
         or re.search(r"[?？]", compact)
         or _NEGATIVE_MODAL_RE.search(compact)
+        or re.match(r"^(?:先不要|暂时不|没|未|尚未|并非|无须|毋须|绝不能|甭|勿)", compact)
         or _NEGATED_NON_POSITIONAL_MUTATION_RE.search(compact)
         or _has_standalone_negation_before_mutation(source)
         or _POSITIONAL_REPORTED_CONTEXT_RE.search(compact)
@@ -2973,7 +3020,16 @@ def looks_like_mutation_grammar_gap(message: str) -> bool:
     ):
         return False
     return bool(
-        _MUTATION_INTENT_RE.search(compact)
+        (
+            _MUTATION_INTENT_RE.search(compact)
+            or re.fullmatch(
+                rf"(?:把|将)\s*{_REPLACE_AT_CODE_ENTRY_PATTERN}\s*"
+                rf"[\u3400-\u9fff]{{1,6}}(?:到|至)\s*"
+                rf"{_MOVE_CODE_TOKEN_PATTERN}[。.!！]?",
+                source,
+                re.IGNORECASE,
+            )
+        )
         and re.search(r"[a-z]{1,12}", compact, re.IGNORECASE)
         and re.search(r"[\u3400-\u9fff]{1,16}", compact)
     )
@@ -5559,6 +5615,28 @@ def _validate_current_message_binding(
         word = str(arguments.get("word") or "").strip()
         target_code = str(arguments.get("target_code") or "").strip()
         raw_message = context.current_message or ""
+        entry_plan = parse_entry_move_plan(raw_message)
+        if entry_plan is not None:
+            expected_words = [move.word for move in entry_plan.moves]
+            expected_codes = [move.target_code for move in entry_plan.moves]
+            expected_root = min(expected_codes, key=lambda code: (len(code), code))
+            lookup_codes = context.trusted_word_lookup_codes_by_word or {}
+            plan_bound = bool(
+                word == expected_words[0]
+                and target_code == expected_root
+                and arguments.get("ordered_words") == expected_words
+                and arguments.get("listed_words") == expected_words
+                and arguments.get("expected_codes") == expected_codes
+                and all(lookup_codes.get(item) for item in expected_words)
+            )
+            if plan_bound:
+                return None
+            return policy_block(
+                BLOCK_REASON_BINDING_INCOMPLETE,
+                f"你要同时移动「{'」和「'.join(expected_words)}」，"
+                "但收到的操作没有保留两条词的完整去向；本次未移动。",
+                missing=["completeMovePlan"],
+            )
         existing_move = parse_existing_entry_move(
             raw_message
         )
@@ -5587,6 +5665,12 @@ def _validate_current_message_binding(
                 ) == 1
             )
             existing_move_bound = target_known and occupant_bound
+        # The closed parser already binds the exact complete command. Its
+        # destination is a user-selected code for an existing live entry,
+        # rather than an inferred positional candidate. The shared planner
+        # still validates its reading, occupancy and complete shift chain.
+        if existing_move_bound:
+            return None
         lookup_codes = context.trusted_word_lookup_codes_by_word or {}
         swap = parse_entry_swap(raw_message)
         swap_bound = False
@@ -5641,7 +5725,8 @@ def _validate_current_message_binding(
         ):
             return policy_block(
                 BLOCK_REASON_BINDING_INCOMPLETE,
-                f"{POLICY_BLOCK_TEMPLATE_PREFIX}顺延操作的词条或目标编码未精确绑定。",
+                "看到了位置调整请求，但现有词条、目标编码或占位词"
+                "还无法逐项核对；本次未移动。",
                 missing=["boundWord", "boundCode"],
             )
     return None

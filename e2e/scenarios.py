@@ -7018,6 +7018,11 @@ S46_PLAN_COMMAND = (
 
 async def scenario_s46(ctx: ScenarioContext) -> dict[str, Any]:
     """Execute and replay one two-line plan with the same occupant twice."""
+    from keytao_bot.harness.conversation import ConversationAddress
+    from keytao_bot.harness.state import PendingToolConfirm, server_warning_ticket_is_complete
+
+    chat = ctx.bot.openai_chat
+    address = ConversationAddress.group("qq", str(ctx.bot._group_id(ctx.platform_id)), ctx.platform_id)
     messages: list[str] = []
     replies: list[str] = []
     expected_items = {
@@ -7071,13 +7076,24 @@ async def scenario_s46(ctx: ScenarioContext) -> dict[str, Any]:
                 )
             )
             and plan_reply.count(pending_confirmation_copy()) == 1
-            and not contract.command_suggestions
+            and contract.command_suggestions == ("确认", "取消")
             and len(preview_calls) == 1
             and not preview_model_turns
             and not preview_draft.get("items"),
             f"S46 {label} did not produce one plan-only preview: "
             f"reply={plan_reply}; calls={preview_calls}; "
             f"models={preview_model_turns}; draft={preview_draft}",
+        )
+        record = chat.conversation_state_store.get_record(address)
+        require(
+            record is not None and record.owner_key == address and not record.execution_id
+            and isinstance(record.state, PendingToolConfirm)
+            and record.state.function_name == "keytao_shift_phrase_code"
+            and server_warning_ticket_is_complete(record.state),
+            f"S46 {label} confirmation controls lack their complete actor-owned plan: {record}",
+        )
+        closure = await _assert_s56_advertised_reply_closure(
+            plan_reply, chat=chat, record=record, address=address, read_draft=ctx.draft,
         )
 
         messages.append("确认")
@@ -7117,6 +7133,7 @@ async def scenario_s46(ctx: ScenarioContext) -> dict[str, Any]:
             "previewCalls": len(preview_calls),
             "confirmedCalls": len(confirmed_calls),
             "modelTurns": len(model_turns),
+            "advertisementClosure": closure,
         }
 
     incident = await execute_plan(S46_MESSAGE, "incident")
@@ -7141,7 +7158,7 @@ async def scenario_s46(ctx: ScenarioContext) -> dict[str, Any]:
             "shiftedCodes": [S46_FIRST_SHIFTED_CODE, S46_SECOND_SHIFTED_CODE],
             "sameOccupantShiftCount": 2,
             "confirmationStepsPerRun": 1,
-            "advertisedCommandCount": 0,
+            "advertisedCommandCount": len(incident["advertisementClosure"]["commands"]),
             "planCommand": S46_PLAN_COMMAND,
             "planCommandReproducedPromise": True,
             "incident": incident,
@@ -9884,6 +9901,7 @@ async def scenario_s56(ctx: ScenarioContext) -> dict[str, Any]:
 
 
 from .s57 import scenario_s57
+from .s58 import scenario_s58
 
 
 SCENARIOS: tuple[Scenario, ...] = (
@@ -9944,6 +9962,7 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("S55", "Single review, failure traceback, and tripped search backend", scenario_s55),
     Scenario("S56", "explicit codes, commonness-guarded eviction, and completed-write undo", scenario_s56),
     Scenario("S57", "same-code reorder, offered answers, and existing-item extra code", scenario_s57),
+    Scenario("S58", "move-to-code grammar, imperative wrappers, and structured proposal bridge", scenario_s58),
 )
 
 

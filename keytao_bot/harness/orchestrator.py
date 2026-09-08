@@ -16,6 +16,7 @@ from keytao_bot.utils.llm_policy import (
     chat_usage_metrics,
     is_deepseek_model,
     log_chat_usage,
+    supports_thinking_control,
     with_deepseek_chat_policy,
 )
 from keytao_bot.utils.history_store import _parse_stored_timestamp
@@ -34,6 +35,7 @@ from keytao_bot.utils.observability import (
     set_turn_flow,
 )
 from keytao_bot.utils.pending_confirmation import (
+    _ADVERTISED_QUOTE_PAIRS,
     FAILED_WRITE_TEMPLATE_MARKER,
     FAILED_WRITE_TEMPLATE_PREFIX,
     SYSTEM_REPLY_TEMPLATE_MARKERS,
@@ -44,6 +46,7 @@ from keytao_bot.utils.pending_confirmation import (
     advertised_reply_contract,
     command_suggestions_are_closed_candidate_selections,
     ensure_multi_word_candidate_copy,
+    is_closed_draft_view_request,
     parse_pending_assent_phrase,
     parse_advertised_set_reference,
     pending_batch_confirmation_copy,
@@ -71,6 +74,8 @@ from .state import (
     PendingToolConfirm,
     create_pending_trusted_word_record,
     pending_batch_display_pairs,
+    pending_duplicate_confirmation_state,
+    pending_duplicate_confirmation_is_complete,
     server_warning_pending_state,
     server_warning_ticket_is_complete,
 )
@@ -80,6 +85,7 @@ from .authorization_grammar import (
     is_character_composition_question,
     is_interrogative_message,
     looks_like_mutation_grammar_gap,
+    message_authorizes_mutation,
     parse_eviction_modified_add,
     review_flow_candidates_are_plausible,
     suggestion_preserves_expressed_operation,
@@ -129,6 +135,76 @@ def _command_suggestions_match_pending_batch(
     state: object,
 ) -> bool:
     """Accept only real-parser commands bound to the displayed sealed batch."""
+    suggestions = advertised_reply_contract(text).command_suggestions
+    from keytao_bot.plugins import chat_routing
+
+    if isinstance(state, PendingToolConfirm) and pending_duplicate_confirmation_is_complete(state):
+        from keytao_bot.plugins.chat_render import _format_pending_duplicate_confirmation, render_platform_public_links
+
+        rendered = _format_pending_duplicate_confirmation(state)
+        public_renderings = {
+            tuple(line.strip() for line in value.splitlines() if line.strip())
+            for value in (rendered, *(render_platform_public_links(rendered, platform)
+                                     for platform in ("qq", "telegram", "web")))
+        }
+        return bool(
+            suggestions and tuple(line.strip() for line in text.splitlines() if line.strip()) in public_renderings
+            and all((intent := chat_routing._pending_tool_assent_intent(state, command)) is not None
+                    and chat_routing._message_authorizes_pending_state_control(state, command, intent)
+                    for command in suggestions)
+        )
+    if isinstance(state, PendingToolConfirm) and state.function_name == "keytao_choice_offer":
+        from keytao_bot.plugins import chat_commands
+
+        options = chat_commands._pending_choice_options(state)
+        return bool(
+            options and suggestions
+            and any(option["plan"] is not None for option in options)
+            and all("plan" in option for option in state.args["options"])
+            and text.strip() == chat_commands.render_pending_choice_offer(state).strip()
+            and all(chat_commands._parse_pending_choice_label(command) in {option["label"] for option in options}
+                    for command in suggestions)
+        )
+    if suggestions and all(chat_routing.parse_draft_view_command(command) is not None for command in suggestions):
+        return True
+    if suggestions and isinstance(state, PendingAddWord) and state.server_candidates and state.server_candidates == state.candidates:
+        return all(
+            chat_routing.message_authorizes_live_pending_mutation(command, state)
+            or (
+                (intent := chat_routing._pending_tool_assent_intent(state, command)) is not None
+                and chat_routing._message_authorizes_pending_state_control(state, command, intent)
+            )
+            for command in suggestions
+        )
+    if suggestions and isinstance(state, PendingTrustedWordRecord):
+        return all(chat_routing._pending_trusted_word_action_matches(state, command) for command in suggestions)
+    if suggestions and isinstance(state, PendingAdvertisedWordSets) and len(state.snapshots) == 1:
+        return all(
+            (selection := chat_routing._resolve_advertised_word_set_selection(state, command)).matched
+            and not selection.ask
+            and selection.snapshot_token == state.snapshots[0].token
+            and selection.resolved_words == state.snapshots[0].words
+            for command in suggestions
+        )
+    if (
+        suggestions and isinstance(state, PendingToolConfirm)
+        and state.function_name == "keytao_submit_batch"
+        and state.args.get("_recent_own_write") is True
+        and state.args.get("batch_id")
+        and state.args["batch_id"] in state.args.get("_recent_batch_ids", [])
+    ):
+        from keytao_bot.plugins import chat_routing
+
+        return all(chat_routing._is_explicit_draft_submit_request(suggestion) for suggestion in suggestions)
+    if suggestions and isinstance(state, PendingToolConfirm) and server_warning_ticket_is_complete(state):
+        from keytao_bot.plugins import chat_routing
+
+        if all(
+            (intent := chat_routing._pending_tool_assent_intent(state, suggestion)) is not None
+            and chat_routing._message_authorizes_pending_state_control(state, suggestion, intent)
+            for suggestion in suggestions
+        ):
+            return True
     if (
         not isinstance(state, PendingToolConfirm)
         or state.function_name != "keytao_batch_add_to_draft"
@@ -144,16 +220,42 @@ def _command_suggestions_match_pending_batch(
         displayed_pairs
         and same_unique_binding_set(displayed_pairs, sealed_pairs)
     )
+    reviewed_candidate_confirmation = False
+    if (
+        displayed_pairs_match
+        and state.confirmation_source == "local_preview"
+    ):
+        from keytao_bot.plugins.chat_commands import _resolved_advertised_items_match
+
+        resolved_items, resolved_scopes = chat_routing._multi_word_candidate_scope_rows(state)
+        reviewed_candidate_confirmation = bool(
+            resolved_items and resolved_scopes
+            and all(isinstance(item.get("type"), str) and item["type"].strip()
+                    and isinstance(item.get("needsManualReview"), bool) for item in resolved_items)
+            and ("_resolved_advertised_words" not in state.args or _resolved_advertised_items_match(state))
+        )
     sealed_words = tuple(word for word, _code in sealed_pairs)
     advertised_assent = set(contract.batch_assent_forms)
     front_insert_commands = set(server_backed_front_insert_commands(
         state.args.get("_candidate_scopes"),
     ))
     for suggestion in suggestions:
+        if reviewed_candidate_confirmation:
+            intent = chat_routing._pending_tool_assent_intent(state, suggestion)
+            if intent is not None and chat_routing._message_authorizes_pending_state_control(state, suggestion, intent):
+                continue
         if suggestion in front_insert_commands:
             if not displayed_pairs_match:
                 return False
             continue
+        if displayed_pairs_match:
+            from keytao_bot.plugins import chat_routing
+
+            selected, selection_intent, selection_error = chat_routing._resolve_multi_word_pending_candidate_selection(
+                state, suggestion,
+            )
+            if selected is not None and selection_intent is not None and not selection_error:
+                continue
         set_reference = parse_advertised_set_reference(suggestion)
         if (
             set_reference.matched
@@ -183,9 +285,11 @@ def _strip_unbound_command_suggestions(
 ) -> str:
     """Remove copyable examples while preserving surrounding read-only facts."""
     rendered = str(text or "")
-    for suggestion in dict.fromkeys(
-        str(item or "").strip() for item in suggestions if str(item or "").strip()
-    ):
+    unbound = tuple(dict.fromkeys(
+        str(item or "").strip() for item in suggestions
+        if str(item or "").strip() and not is_closed_draft_view_request(str(item).strip())
+    ))
+    for suggestion in unbound:
         escaped = re.escape(suggestion)
         quoted = rf"(?:「{escaped}」|“{escaped}”|『{escaped}』)"
         rendered = re.sub(
@@ -200,6 +304,24 @@ def _strip_unbound_command_suggestions(
             "",
             rendered,
         )
+    quote_pairs = dict(_ADVERTISED_QUOTE_PAIRS)
+    quote_stack: List[str] = []
+    sentences: List[str] = []
+    start = 0
+    for index, character in enumerate(rendered):
+        if quote_stack and character == quote_stack[-1]:
+            quote_stack.pop()
+        elif character in quote_pairs:
+            quote_stack.append(quote_pairs[character])
+        elif character in "。！？!?" and not quote_stack:
+            sentences.append(rendered[start:index + 1])
+            start = index + 1
+    sentences.append(rendered[start:])
+    # Keep multiline introducers together and never split inside a quoted command.
+    rendered = "".join(
+        sentence for sentence in sentences
+        if not set(unbound).intersection(advertised_command_suggestions(sentence))
+    )
     rendered = re.sub(r"[ \t]+([。；，！？])", r"\1", rendered)
     rendered = re.sub(r"\n{3,}", "\n\n", rendered)
     return rendered.strip()
@@ -422,6 +544,7 @@ def _is_reasoning_only_exhaustion(
     finish_reason: object,
     content: object,
     tool_calls: object,
+    model: object = None,
 ) -> bool:
     """Identify a length stop whose entire output was effectively reasoning."""
     if (
@@ -431,8 +554,14 @@ def _is_reasoning_only_exhaustion(
     ):
         return False
     usage = chat_usage_metrics(response)
-    output_tokens = usage.get("output_tokens", 0)
-    reasoning_tokens = usage.get("reasoning_tokens", 0)
+    output_tokens = usage.get("output_tokens")
+    reasoning_tokens = usage.get("reasoning_tokens")
+    if output_tokens is None or reasoning_tokens is None:
+        response_model = (response.get("model") if isinstance(response, dict)
+                          else getattr(response, "model", None))
+        # Missing provider accounting is unknown, not zero. Keep empty length
+        # responses on the bounded rung without claiming measured reasoning.
+        return supports_thinking_control(model or response_model)
     return bool(
         output_tokens > 0
         and reasoning_tokens * 100
@@ -697,7 +826,7 @@ class AgentOrchestrator:
                         "keytao_lookup_by_word 交叉核对。最终只回答字符身份和"
                         "可核实的读音/拆分，不展示候选编码、候选列表或任何加入"
                         "草稿的说法。若不能确定，就直说不能确定，并提示用户给出"
-                        "具体字符后发送「查词 <字符>」核验；不得猜测。"
+                        "需要具体字符才能继续核验；不得猜测。"
                     ),
                 })
             elif is_interrogative_message(message):
@@ -771,6 +900,21 @@ class AgentOrchestrator:
             rendered = str(text or "")
             contract = advertised_reply_contract(rendered)
             record = self._state_store.get_record(conv_key)
+            if contract.command_suggestions and record is not None and not record.execution_id:
+                from keytao_bot.plugins import chat_commands
+
+                state = record.state
+                replacement = (
+                    chat_commands.render_pending_shift_plan(state)
+                    if isinstance(state, PendingToolConfirm)
+                    and server_warning_ticket_is_complete(state)
+                    else ""
+                )
+                if replacement and _command_suggestions_match_pending_batch(replacement, state):
+                    if termination_state is not None:
+                        termination_state["model_authored_reply"] = False
+                    logger.warning("[advertised_reply_contract] branch=redraw_sealed_shift_plan")
+                    return replacement
             if context.mutations_allowed and structural_option_questions(rendered) and not (
                 record is not None
                 and not record.execution_id
@@ -798,6 +942,7 @@ class AgentOrchestrator:
                 return replacement or "当前没有可验证的可执行操作，本次未写入。"
             if (
                 contract.command_suggestions
+                and contract.requires_live_state
                 and not command_suggestions_are_closed_candidate_selections(
                     contract.command_suggestions
                 )
@@ -815,7 +960,7 @@ class AgentOrchestrator:
                     contract.command_suggestions,
                 )
                 sanitized_contract = advertised_reply_contract(sanitized)
-                if not sanitized_contract.command_suggestions:
+                if sanitized and not sanitized_contract.requires_live_state:
                     logger.warning(
                         "[advertised_reply_contract] branch=strip_model_command "
                         f"count={len(contract.command_suggestions)} preserved_reply=true"
@@ -827,10 +972,9 @@ class AgentOrchestrator:
                         "[advertised_reply_contract] branch=strip_model_command "
                         f"count={len(contract.command_suggestions)} preserved_reply=false"
                     )
-                    return render_remediation_reply(
-                        "回复中的操作说法没有可验证的服务端绑定记录，已移除；"
-                        "本次不会写入"
-                    )
+                    if termination_state is not None:
+                        termination_state["model_authored_reply"] = False
+                    return "这次调整还没有可确认的计划，本次未写入。"
             if not contract.requires_live_state:
                 return rendered
             return append_unbound_binding_notice(
@@ -1283,6 +1427,7 @@ class AgentOrchestrator:
                     finish_reason=finish_reason,
                     content=content,
                     tool_calls=response_tool_calls,
+                    model=self._runtime.model,
                 )
             )
             reasoning_only_empty = bool(
@@ -1374,7 +1519,7 @@ class AgentOrchestrator:
                         current_request_index,
                     )
                     after_chars = len(json.dumps(messages, ensure_ascii=False))
-                    if is_deepseek_model(self._runtime.model):
+                    if supports_thinking_control(self._runtime.model):
                         current_reasoning_effort = "low"
                     logger.warning(
                         "Reasoning-only output exhausted the response: "
@@ -1447,6 +1592,8 @@ class AgentOrchestrator:
                 )
 
             if not response_tool_calls:
+                from keytao_bot.plugins import chat_routing
+
                 existing_fact_blocks = [
                     (
                         already_existing_word_copy(
@@ -1458,7 +1605,12 @@ class AgentOrchestrator:
                         else already_existing_word_copy(
                             word,
                             tuple(sorted(codes)),
-                            can_choose_other_code=True,
+                            can_choose_other_code=(
+                                len(trusted_word_lookup_codes_by_word) == 1 and len(codes) == 1
+                                and (lookup_record := self._state_store.get_record(conv_key)) is not None
+                                and isinstance(lookup_record.state, PendingTrustedWordRecord)
+                                and chat_routing._pending_trusted_word_action_matches(lookup_record.state, "换码")
+                            ),
                         )
                     )
                     for word, codes in trusted_word_lookup_codes_by_word.items()
@@ -2231,7 +2383,12 @@ class AgentOrchestrator:
                     else:
                         result_str = await self._call_tool_once(
                             fn_name,
-                            canonical_fn_args,
+                            (
+                                fn_args
+                                if not message_authorizes_mutation(message)
+                                and looks_like_mutation_grammar_gap(message)
+                                else canonical_fn_args
+                            ),
                             tool_context,
                             seen_tool_calls,
                         )
@@ -2271,6 +2428,26 @@ class AgentOrchestrator:
                 try:
                     result_data = json.loads(result_str)
                     if isinstance(result_data, dict):
+                        if result_data.get("grammar_gap_rejected") is True:
+                            if termination_state is not None:
+                                termination_state["model_authored_reply"] = False
+                            return str(result_data["message"])
+                        if result_data.get("grammar_gap_bridged") is True:
+                            proposal_args = result_data.get("grammarGapArguments")
+                            saved = isinstance(proposal_args, dict) and self._save_pending_tool_confirm(
+                                conv_key, context.space_key, context.speaker_name,
+                                fn_name, proposal_args, result_data,
+                            )
+                            proposal_record = self._state_store.get_record(conv_key) if saved else None
+                            if proposal_record is not None and server_warning_ticket_is_complete(proposal_record.state):
+                                from keytao_bot.plugins.chat_render import _format_server_bound_confirmation_prompt
+
+                                if failure_state is not None:
+                                    failure_state.clear()
+                                if termination_state is not None:
+                                    termination_state["model_authored_reply"] = False
+                                return _format_server_bound_confirmation_prompt(proposal_record.state)
+                            return "已核对改码方案，但暂时无法保存待确认操作；本次未写入。"
                         observe_tool_result(result_data)
                         if (
                             termination_state is not None
@@ -3531,7 +3708,7 @@ class AgentOrchestrator:
             )
             reply = cls._binding_meta_question_reply(current_message) or (
                 "我还不能从现有字符数据确定这个问题的答案。"
-                "请给出一个具体字符后发送「查词 <字符>」核验。"
+                "请提供具体字符，以便继续核验。"
             )
         from keytao_bot.plugins.chat_render import _reply_has_internal_fragment
         if _reply_has_internal_fragment(reply) and not failure_state:
@@ -5426,11 +5603,8 @@ class AgentOrchestrator:
             if key not in ("confirmed", "platform", "platform_id")
         }
         if result_data.get("pendingDuplicateConfirmation") is True:
-            saved["_pending_submitted_confirmed"] = True
-            pending_state = PendingToolConfirm(
-                function_name=fn_name,
-                args=saved,
-                confirmation_source="local_preview",
+            pending_state = pending_duplicate_confirmation_state(
+                PendingToolConfirm(fn_name, saved), result_data,
             )
             saved_ok = self._state_store.set(
                 conv_key,

@@ -152,23 +152,38 @@ def option_questions_bind_live_state(text: str, state: object) -> bool:
 
 def render_missing_option_ticket(history: Sequence[Mapping[str, object]]) -> str:
     """Recall display context without reviving a mutation from assistant prose."""
+    empty = "当前没有待执行的操作；本次未写入。需要引用原提议确认后重新核对。"
+    missing = "当前没有可执行的确认记录；本次未写入。需要引用原提议确认后重新核对。"
+    stale_missing = "当前没有可执行的确认记录；之前的确认已过期或记录已不存在；本次未写入。需要引用原提议确认后重新核对。"
     previous = (
         str(history[-1].get("content") or "").strip()
         if history and history[-1].get("role") == "assistant"
         else ""
     )
-    if not previous:
-        return "当前没有待执行的操作；本次未写入。需要引用原提议确认后重新核对。"
+    if not previous or previous == empty:
+        return empty
+    if previous.startswith(("上一条提议是：", "上一条提议的选项是：")) and previous.endswith((missing, stale_missing)):
+        return previous
     options = previous_bot_options(history)
     if options:
         proposal = "、".join(f"「{option}」" for option in options)
         return (
             f"上一条提议的选项是：{proposal}。"
-            "当前没有可执行的确认记录；本次未写入。需要引用原提议确认后重新核对。"
+            f"{missing}"
         )
-    first_line = next((line.strip() for line in previous.splitlines() if line.strip()), "")
-    proposal = first_line[:180].replace("？", "。").replace("?", ".")
+    from .pending_confirmation import advertised_command_suggestions, parse_pending_assent_phrase
+
+    suggestions = advertised_command_suggestions(previous)
+    if any(parse_pending_assent_phrase(command).matched for command in suggestions):
+        missing = stale_missing
+    if not suggestions and not re.search(r"计划|方案|将执行|将把|是否|建议|要不要", previous):
+        return empty
+    display_lines = [
+        line.strip() for line in previous.splitlines()
+        if line.strip() and not advertised_command_suggestions(line)
+    ]
+    proposal = "；".join((display_lines or list(suggestions))[:4])[:240].replace("？", "。").replace("?", ".")
     return (
-        f"上一条提议是：{proposal}\n"
-        "当前没有可执行的确认记录；本次未写入。需要引用原提议确认后重新核对。"
+        f"上一条提议是：{proposal}。"
+        f"{missing}"
     )

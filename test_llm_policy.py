@@ -1,5 +1,6 @@
-"""Tests for DeepSeek-specific request policy and usage normalization."""
+"""Offline tests for provider request policy and usage normalization."""
 
+import copy
 import importlib.util
 import json
 import unittest
@@ -127,6 +128,67 @@ class DeepSeekChatPolicyTests(unittest.TestCase):
         self.assertEqual(captured["reasoning_effort"], "high")
         self.assertEqual(captured["response_format"], {"type": "json_object"})
         self.assertNotIn("temperature", captured)
+
+
+class ProviderRequestBodyTests(unittest.TestCase):
+    def test_exact_serialized_provider_bodies_with_fake_transport(self):
+        cases = (
+            ("glm-5.3", False, "high", {"thinking": {"type": "disabled"},
+                "temperature": 0.0, "response_format": {"type": "json_object"}}),
+            ("glm-5.3", True, "high", {"thinking": {"type": "enabled"},
+                "reasoning_effort": "high", "temperature": 0.0,
+                "response_format": {"type": "json_object"}}),
+            ("glm-5.3", True, "low", {"thinking": {"type": "enabled"},
+                "reasoning_effort": "low", "temperature": 0.0,
+                "response_format": {"type": "json_object"}}),
+            ("deepseek-v4-flash", False, "high", {"thinking": {"type": "disabled"},
+                "temperature": 0.0, "response_format": {"type": "json_object"}}),
+            ("deepseek-v4-flash", True, "high", {"thinking": {"type": "enabled"},
+                "reasoning_effort": "high", "response_format": {"type": "json_object"}}),
+            ("deepseek-v4-flash", True, "low", {"thinking": {"type": "enabled"},
+                "reasoning_effort": "low", "response_format": {"type": "json_object"}}),
+            ("other-model", False, "high", {"temperature": 0.0}),
+            ("other-model", True, "low", {"temperature": 0.0}),
+        )
+        for model, thinking, effort, expected_options in cases:
+            with self.subTest(model=model, thinking=thinking, effort=effort):
+                original = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Return JSON."}],
+                    "max_tokens": 180,
+                    "temperature": 0.0,
+                    "extra_body": {"trace_id": "fixture"},
+                }
+                before = copy.deepcopy(original)
+                expected = {
+                    "model": model,
+                    "messages": original["messages"],
+                    "max_tokens": 180,
+                    "trace_id": "fixture",
+                    **expected_options,
+                }
+                bodies = []
+
+                def handle(request):
+                    self.assertEqual(str(request.url),
+                        "https://provider.invalid/api/coding/paas/v4/chat/completions")
+                    body = json.loads(request.content)
+                    self.assertEqual(body, expected)
+                    bodies.append(body)
+                    return httpx.Response(200, json={
+                        "id": "fixture", "object": "chat.completion", "created": 0,
+                        "model": model, "choices": [{"index": 0, "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "{}"}}],
+                    })
+
+                with httpx.Client(transport=httpx.MockTransport(handle)) as transport:
+                    with OpenAI(api_key="fixture-key", http_client=transport, max_retries=0,
+                                base_url="https://provider.invalid/api/coding/paas/v4") as client:
+                        client.chat.completions.create(**with_deepseek_chat_policy(
+                            original, thinking=thinking, reasoning_effort=effort, json_output=True,
+                        ))
+                self.assertEqual(len(bodies), 1)
+                self.assertEqual(original, before)
 
 
 class UsageMetricsTests(unittest.TestCase):

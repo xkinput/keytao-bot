@@ -700,10 +700,10 @@ async def _describe_images_for_deepseek(
 
 
 def _vision_unavailable_reply() -> str:
-    return render_remediation_reply(
-        "我收到图片了，但当前主模型 DeepSeek V4 Flash 是纯文本模型，"
+    return (
+        "我收到图片了，但当前主模型不支持图片输入，"
         "独立图片理解服务还没有启用，所以这次不能可靠地看图。"
-        "配置视觉代理属于管理员站外操作"
+        "配置视觉代理属于管理员站外操作。"
     )
 
 

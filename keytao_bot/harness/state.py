@@ -17,7 +17,7 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional,
 from nonebot.log import logger
 
 from keytao_bot.utils.observability import mark_turn_outcome
-from keytao_bot.utils.pending_confirmation import pending_confirmation_copy
+from keytao_bot.utils.pending_confirmation import pending_confirmation_copy, trusted_pending_word_items
 
 from .conversation import (
     ConversationAddress,
@@ -378,6 +378,71 @@ def _server_confirmation_display(data: Dict) -> Dict:
     ):
         display["collisionReplanLine"] = collision_replan_line
     return display
+
+
+def pending_duplicate_confirmation_state(state: PendingToolConfirm, data: Dict) -> PendingToolConfirm:
+    """Preserve a local duplicate warning's server facts and exact requested batch."""
+    args = dict(state.args)
+    args.pop("_pending_display", None)
+    args["_pending_submitted_confirmed"] = True
+    if data.get("pendingDuplicateConfirmation") is True and data.get("requiresConfirmation") is True:
+        args["_pending_display"] = {
+            "pendingItems": trusted_pending_word_items(data.get("pendingItems")),
+            "duplicateArguments": json.loads(json.dumps(args, ensure_ascii=False)),
+        }
+    return PendingToolConfirm(state.function_name, args, confirmation_source="local_preview")
+
+
+def pending_duplicate_confirmation_is_complete(state: PendingToolConfirm) -> bool:
+    """Bind duplicate assent to the unchanged full request and submitted facts."""
+    if (
+        state.confirmation_source != "local_preview"
+        or state.function_name not in {"keytao_create_phrase", "keytao_batch_add_to_draft"}
+        or state.args.get("_pending_submitted_confirmed") is not True
+    ):
+        return False
+    display = state.args.get("_pending_display")
+    args = {key: value for key, value in state.args.items() if key != "_pending_display"}
+    if not isinstance(display, dict) or display.get("duplicateArguments") != args:
+        return False
+    pending_items = trusted_pending_word_items(display.get("pendingItems"))
+    if pending_items != display.get("pendingItems"):
+        return False
+    items = [args] if state.function_name == "keytao_create_phrase" else args.get("items")
+    if not isinstance(items, list) or not items or any(not isinstance(item, dict) for item in items):
+        return False
+    if any(
+        not isinstance(item.get("action", "Create"), str)
+        or item.get("action", "Create") not in {"Create", "Change", "Delete"}
+        or not isinstance(item.get("word"), str) or not item["word"].strip()
+        or not isinstance(item.get("code"), str) or not re.fullmatch(r"[a-z]{1,6}", item["code"])
+        or not isinstance(item.get("type", "Phrase"), str)
+        or item.get("type", "Phrase") not in {
+            "Single", "Phrase", "Supplement", "Symbol", "Link", "CSS", "CSSSingle", "English",
+        }
+        for item in items
+    ):
+        return False
+    for item in items:
+        old_identities = [item[key] for key in ("old_word", "oldWord") if key in item]
+        if item.get("action", "Create") == "Change":
+            if (
+                not old_identities
+                or any(not isinstance(value, str) or not value.strip() for value in old_identities)
+                or any(value != old_identities[0] for value in old_identities)
+            ):
+                return False
+        elif any(value is not None and value != "" for value in old_identities):
+            return False
+    submitted = {
+        (item["word"], item["code"], item["type"])
+        for item in pending_items if item["source"] == "submitted" and item["action"] == "Create"
+    }
+    return any(
+        item.get("action", "Create") == "Create"
+        and (item.get("word"), item.get("code"), item.get("type", "Phrase")) in submitted
+        for item in items
+    )
 
 
 def server_warning_pending_state(

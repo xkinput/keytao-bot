@@ -1,4 +1,4 @@
-"""DeepSeek-aware Chat Completions request policy and usage metrics."""
+"""Provider-aware Chat Completions request policy and usage metrics."""
 
 from __future__ import annotations
 
@@ -12,6 +12,24 @@ _SAMPLING_PARAMETERS = (
     "frequency_penalty",
 )
 _REASONING_EFFORTS = frozenset({"low", "high", "max"})
+_PROVIDER_POLICIES = {
+    "deepseek-": {"name": "DeepSeek", "ignored_sampling": _SAMPLING_PARAMETERS},
+    # https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3 lists low/high/max.
+    # The Coding endpoint's disabled shape is retained per the verified contract;
+    # the general GLM-5.3 docs currently describe enabled-only thinking.
+    "glm-": {"name": "GLM", "ignored_sampling": ()},
+}
+
+
+def _provider_policy(model: Any) -> Optional[Dict[str, Any]]:
+    normalized = str(model or "").strip().lower()
+    return next((policy for prefix, policy in _PROVIDER_POLICIES.items()
+                 if normalized.startswith(prefix)), None)
+
+
+def supports_thinking_control(model: Any) -> bool:
+    """Return whether the model has a declared thinking request policy."""
+    return _provider_policy(model) is not None
 
 
 def is_deepseek_model(model: Any) -> bool:
@@ -19,16 +37,17 @@ def is_deepseek_model(model: Any) -> bool:
     return str(model or "").strip().lower().startswith("deepseek-")
 
 
-def with_deepseek_chat_policy(
+def with_chat_policy(
     request: Mapping[str, Any],
     *,
     thinking: Optional[bool] = None,
     reasoning_effort: str = "high",
     json_output: bool = False,
 ) -> Dict[str, Any]:
-    """Apply task-specific DeepSeek options without changing other providers."""
+    """Apply declared provider options; unknown model prefixes pass through."""
     configured = dict(request)
-    if not is_deepseek_model(configured.get("model")):
+    policy = _provider_policy(configured.get("model"))
+    if policy is None:
         return configured
 
     if thinking is not None:
@@ -39,9 +58,9 @@ def with_deepseek_chat_policy(
         if thinking:
             normalized_effort = str(reasoning_effort or "high").strip().lower()
             if normalized_effort not in _REASONING_EFFORTS:
-                raise ValueError(f"Unsupported DeepSeek reasoning effort: {reasoning_effort}")
+                raise ValueError(f"Unsupported {policy['name']} reasoning effort: {reasoning_effort}")
             configured["reasoning_effort"] = normalized_effort
-            for parameter in _SAMPLING_PARAMETERS:
+            for parameter in policy["ignored_sampling"]:
                 configured.pop(parameter, None)
         else:
             configured.pop("reasoning_effort", None)
@@ -50,6 +69,10 @@ def with_deepseek_chat_policy(
         configured["response_format"] = {"type": "json_object"}
 
     return configured
+
+
+# Keep existing imports and patch seams while sharing one provider table.
+with_deepseek_chat_policy = with_chat_policy
 
 
 def _value(source: Any, *names: str) -> Any:

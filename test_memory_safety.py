@@ -2832,7 +2832,8 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
         )
         rendered = chat_module._ensure_pending_add_word_guidance(multi_word)
-        self.assertIn("载流子 添加2、4", rendered)
+        self.assertIn("载流子 添加1", rendered)
+        self.assertNotIn("载流子 添加2、4", rendered)
         self.assertNotIn("可多选，如「添加2、4」", rendered)
         self.assertNotIn("直接回复该编号表示添加重码", rendered)
 
@@ -4634,7 +4635,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(rendered_candidate.count(advertised_copy), 1)
         self.assertIn("载流子 添加1", rendered_candidate)
-        self.assertIn("载流子 添加2、4", rendered_candidate)
+        self.assertNotIn("载流子 添加2、4", rendered_candidate)
         self.assertNotIn("可多选，如「添加2、4」", rendered_candidate)
         parsed_candidate = chat_module._parse_pending_batch_add(rendered_candidate)
         self.assertIsInstance(parsed_candidate, PendingToolConfirm)
@@ -10048,7 +10049,8 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(verb_miss.get("policyBlocked"))
         self.assertEqual(verb_miss.get("blockReason"), "verb_not_matched")
         self.assertNotIn("不能授权修改草稿", verb_miss["message"])
-        self.assertIn("没有明确的执行指令", verb_miss["message"])
+        self.assertIn("未写入", verb_miss["message"])
+        self.assertNotIn("没有明确的执行指令", verb_miss["message"])
         self.assertEqual(self.calls, [])
 
         # A user-written ASCII destination still lacks server provenance, so
@@ -10101,6 +10103,7 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         ]
         for message, tool_name, arguments, context_kwargs in cases:
             with self.subTest(tool=tool_name):
+                previous_calls = len(self.calls)
                 blocked = await self._call(
                     tool_name,
                     arguments,
@@ -10109,6 +10112,24 @@ class ShiftAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(blocked.get("policyBlocked"), tool_name)
                 suggestion = blocked.get("suggestedCommand", "")
+                if tool_name in {
+                    "keytao_create_phrase", "keytao_update_draft_item_weight",
+                    "keytao_batch_add_to_draft",
+                }:
+                    # A grammar gap cannot advertise a ticket without its live
+                    # preview inputs. Keep the renderer closure check separate.
+                    self.assertTrue(blocked.get("grammar_gap_rejected"), blocked)
+                    self.assertFalse(suggestion)
+                    self.assertFalse(blocked.get("grammar_gap_bridged"))
+                    self.assertEqual(len(self.calls), previous_calls)
+                    suggestion = self_checked_suggested_command(
+                        tool_name, arguments,
+                        ToolContext(
+                            current_message=message,
+                            writes_allowed=message_authorizes_mutation(message),
+                            **context_kwargs,
+                        ),
+                    )
                 self.assertTrue(suggestion.startswith("@我 "), f"{tool_name}: {message}")
                 rendered = render_executable_suggestion(suggestion)
                 self.assertRegex(rendered, r"^- [「“『].+[」”』]$")
@@ -13044,8 +13065,8 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             "   1. zlzu — 空位（推荐）\n"
             "   自动审核：可自动通过\n"
             + pending_batch_confirmation_copy()
-            + "\n每个词的编号都从 1 开始；回复「载流子 添加1」，"
-            "多选回复「载流子 添加2、4」。"
+            + "\n每个词的编号都从 1 开始；回复「载流子 添加1」；"
+            "多选时，用顿号分隔该词列表中实际存在的编号。"
         )
         client = _FakeClient([
             _fake_response(
@@ -19605,7 +19626,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertIn("加入草稿", sanitized)
         self.assertIn("回复「加入」", sanitized)
         self.assertNotIn(example, sanitized)
-        self.assertEqual(advertised_command_suggestions(sanitized), ())
+        self.assertEqual(advertised_command_suggestions(sanitized), ("加入",))
 
     def test_renderer_bullet_is_revalidated_at_the_delivery_guard(self) -> None:
         from keytao_bot.plugins.openai_chat import (
@@ -19686,7 +19707,8 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
                     {},
                 )
 
-                self.assertIn("查词 <字符>", finalized)
+                self.assertIn("具体字符", finalized)
+                self.assertFalse(advertised_command_suggestions(finalized))
                 self.assertNotRegex(
                     finalized,
                     r"审词|候选(?:编码|码位|列表)|回复[「“]加入|写入草稿",
@@ -19756,7 +19778,8 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             with self.subTest(reply=reply):
                 self.assertTrue(advertised_reply_contract(reply).requires_live_state)
                 finalized = AgentOrchestrator._finalize_reply("这个字怎么写？", reply, {})
-                self.assertIn("查词 <字符>", finalized)
+                self.assertIn("具体字符", finalized)
+                self.assertFalse(advertised_command_suggestions(finalized))
 
     def test_empty_public_failure_reason_uses_its_plain_fallback(self) -> None:
         self.assertEqual(
@@ -21058,8 +21081,16 @@ class ReplaceAtCodeS51RegressionTests(unittest.IsolatedAsyncioTestCase):
             "若需撤回，可发送「撤回提交」。"
         )
 
-        self.assertEqual(advertised_command_suggestions(reply), ())
-        self.assertFalse(advertised_reply_contract(reply).requires_live_state)
+        self.assertEqual(
+            advertised_command_suggestions(reply),
+            ("添加 开团 <编码>", "撤回提交"),
+        )
+        self.assertTrue(advertised_reply_contract(reply).requires_live_state)
+        from keytao_bot.plugins.openai_chat import _enforce_advertised_reply_contract
+
+        delivered = _enforce_advertised_reply_contract(reply, None)
+        self.assertNotIn("可发送", delivered)
+        self.assertIn("未写入", delivered)
 
     def test_replace_at_code_sink_requires_exact_lookup_and_review_bindings(self) -> None:
         items = self._replace_ticket().args["items"]

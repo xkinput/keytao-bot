@@ -54,6 +54,7 @@ from ..harness.state import (
     _pending_add_word_from_payload,
     create_pending_trusted_word_record,
     pending_batch_display_pairs,
+    pending_duplicate_confirmation_state,
     pending_execution_args as _pending_execution_args,
     server_warning_pending_state as _pending_state_from_server_warning,
     server_warning_ticket_is_complete,
@@ -784,6 +785,49 @@ def _pending_batch_front_insert_plan(
 
 def _reviewed_multi_word_capabilities(state: PendingToolConfirm) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """Project selected codes from persisted per-word reviews into tool seals."""
+    items = state.args.get("items")
+    if (
+        state.function_name == "keytao_batch_add_to_draft"
+        and isinstance(items, list)
+        and not isinstance(state.args.get("_reviewed_batch_readings"), list)
+        and state.args.get("_reviewed_multi_word") is not True
+        and any(isinstance(item, dict) and (
+            "_reviewed_pinyin" in item or "_reviewed_candidate_codes" in item
+        ) for item in items)
+    ):
+        if not server_warning_ticket_is_complete(state):
+            return {}
+        capabilities = {}
+        for item in items:
+            if not isinstance(item, dict) or item.get("action", "Create") not in {"Create", "Change", "Delete"}:
+                return {}
+            if item.get("action") == "Delete":
+                continue
+            word, code = item.get("word"), item.get("code")
+            pinyin = item.get("_reviewed_pinyin")
+            codes = item.get("_reviewed_candidate_codes")
+            if (
+                not isinstance(word, str) or not word
+                or not isinstance(code, str) or not re.fullmatch(r"[a-z]{1,6}", code)
+                or not isinstance(pinyin, str) or not pinyin.strip()
+                or not isinstance(codes, list) or code not in codes
+                or any(not isinstance(value, str) or not re.fullmatch(r"[a-z]{1,6}", value) for value in codes)
+                or len(set(codes)) != len(codes)
+                or item.get("type") not in _PHRASE_TYPE_BASE_WEIGHTS
+                or not isinstance(item.get("needsManualReview"), bool)
+            ):
+                return {}
+            capability = {
+                "type": item["type"], "pinyin": pinyin,
+                "candidate_codes": tuple(codes),
+                "needs_manual_review": item["needsManualReview"],
+                "remark": str(item.get("remark") or ""),
+            }
+            key = (word, code)
+            if key in capabilities and capabilities[key] != capability:
+                return {}
+            capabilities[key] = capability
+        return capabilities
     saved = state.args.get("_reviewed_batch_readings")
     if isinstance(saved, list):
         capabilities = {}
@@ -2486,7 +2530,7 @@ def _append_pending_ticket_challenge(
         )
         return text
 
-    if isinstance(record.state, PendingAddWord):
+    if isinstance(record.state, PendingAddWord) or record.state.function_name == _PENDING_CHOICE_OFFER_FUNCTION:
         return bind_prompt(response)
     challenge = pending_confirmation_copy()
     if pending_batch_confirmation_copy() in response:
@@ -2984,7 +3028,7 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
         )
     target_copy = f"已有词「{occupied_word}」" if occupied_word else "该已有词"
     guidance = (
-        f"第 {occupied_index} 项已被占用；直接回复“{occupied_index}”表示添加重码；"
+        f"第 {occupied_index} 项已被占用；直接回复“{occupied_index}”表示添加重码。"
         f"若要挪开{target_copy}，回复“{occupied_index} 重新编码”。"
     )
     if guidance in response:
@@ -3582,11 +3626,11 @@ async def _try_handle_simple_single_word_query(
             for item in pending_items
         )
         action_copy = (
-            f"若要再加其他编码，可发送「添加 {word} <编码>」；"
-            "若需撤回，可发送「撤回提交」。"
+            "若要再加其他编码，需要提供实际编码；"
+            "若需撤回，请先核对上述待审核批次。"
             if has_submitted
-            else f"若要再加其他编码，可发送「添加 {word} <编码>」；"
-            "也可发送「查看草稿」或「提交」。"
+            else "若要再加其他编码，需要提供实际编码；"
+            "提交前请先核对上述当前草稿。"
         )
         return prepend_pending_word_reminders(
             action_copy,
@@ -3642,7 +3686,7 @@ async def _try_handle_simple_single_word_query(
             existing_reply = already_existing_word_copy(
                 word,
                 existing_codes,
-                can_choose_other_code=_prepared_scopes is None,
+                can_choose_other_code=_prepared_scopes is None and len(existing_codes) == 1,
             )
             return ("类型：单字\n" + existing_reply) if len(word) == 1 else existing_reply
         if matching_rows or len(word) != 1:
@@ -4311,11 +4355,8 @@ async def _execute_add_to_draft(
                 reviewed_candidate_codes
             )
         if data.get("pendingDuplicateConfirmation") is True:
-            pending_args["_pending_submitted_confirmed"] = True
-            pending_state = PendingToolConfirm(
-                function_name="keytao_create_phrase",
-                args=pending_args,
-                confirmation_source="local_preview",
+            pending_state = pending_duplicate_confirmation_state(
+                PendingToolConfirm("keytao_create_phrase", pending_args), data,
             )
         else:
             pending_state = _pending_state_from_server_warning(
@@ -4601,11 +4642,8 @@ async def _perform_add_to_draft_and_submit(
                 reviewed_candidate_codes
             )
         if create_data.get("pendingDuplicateConfirmation") is True:
-            pending_args["_pending_submitted_confirmed"] = True
-            pending_state = PendingToolConfirm(
-                function_name="keytao_create_phrase",
-                args=pending_args,
-                confirmation_source="local_preview",
+            pending_state = pending_duplicate_confirmation_state(
+                PendingToolConfirm("keytao_create_phrase", pending_args), create_data,
             )
         else:
             pending_state = _pending_state_from_server_warning(
@@ -4875,11 +4913,8 @@ async def _perform_batch_add_to_draft_and_submit(
                 for (word, _code), capability in reviewed_capabilities.items()
             ]
         if add_data.get("pendingDuplicateConfirmation") is True:
-            pending_args["_pending_submitted_confirmed"] = True
-            pending_state = PendingToolConfirm(
-                function_name="keytao_batch_add_to_draft",
-                args=pending_args,
-                confirmation_source="local_preview",
+            pending_state = pending_duplicate_confirmation_state(
+                PendingToolConfirm("keytao_batch_add_to_draft", pending_args), add_data,
             )
         else:
             pending_state = _pending_state_from_server_warning(
@@ -5918,6 +5953,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 if isinstance(entry, dict)
                 and str(entry.get("word") or "").strip()
             }
+            displayed_words: set[str] = set()
             for entry in proposed_state:
                 if not isinstance(entry, dict):
                     continue
@@ -5936,6 +5972,16 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                     f"• {word}：{old_code} / {old_weight}（{source}）"
                     f"→ {new_code} / {new_weight}"
                 )
+                displayed_words.add(word)
+            for shifted in shift_plan.get("shifted") or []:
+                if not isinstance(shifted, dict):
+                    continue
+                word = str(shifted.get("word") or "").strip()
+                old_code = str(shifted.get("fromCode") or "").strip()
+                new_code = str(shifted.get("toCode") or "").strip()
+                if word and old_code and new_code and word not in displayed_words:
+                    lines.append(f"• {word}：{old_code}→{new_code}（顺延）")
+                    displayed_words.add(word)
             proposed_words = [
                 str(entry.get("word") or "").strip()
                 for entry in proposed_state
@@ -5975,6 +6021,12 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                 word = str(item.get("word") or "")
                 code = str(item.get("code") or "")
                 lines.append(f"• {word}：{raw_action or 'Change'} {code}（{action}）")
+        for item in items:
+            if not isinstance(item, dict) or item.get("needsManualReview") is not True:
+                continue
+            reason = str(item.get("manualReviewReason") or "").strip()
+            if reason:
+                lines.append(f"提示：「{item.get('word', '')}」@ {item.get('code', '')}：{reason}")
         warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
         if warnings:
             rendered_warnings = [
@@ -6007,11 +6059,20 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
 
 def render_pending_shift_plan(state: PendingToolConfirm) -> str:
     """Render promise and confirmation solely from one sealed shift ticket."""
+    if state.function_name != "keytao_shift_phrase_code" or not server_warning_ticket_is_complete(state):
+        return ""
     pending_display = state.args.get("_pending_display")
     resolved_plan = state.args.get("_resolved_candidate_plan")
+    if resolved_plan is None:
+        if not isinstance(pending_display, dict) or not isinstance(pending_display.get("shiftPlan"), dict):
+            return ""
+        if pending_display["shiftPlan"].get("scope") in {"same_code", "prefix_chain"}:
+            return _format_server_warning_confirmation(state.function_name, pending_display)
+        from .chat_render import _format_server_bound_confirmation_prompt
+
+        return _format_server_bound_confirmation_prompt(state)
     if (
-        state.function_name != "keytao_shift_phrase_code"
-        or not isinstance(pending_display, dict)
+        not isinstance(pending_display, dict)
         or not isinstance(resolved_plan, list)
         or not _resolved_candidate_plan_matches(state)
     ):
@@ -6659,6 +6720,7 @@ async def _execute_confirmed_tool(
                 str(state.args.get("word") or "").strip(),
                 str(state.args.get("target_code") or "").strip().lower(),
             ),),
+            reason=reason + "。",
         ) if cleanup_plan is not None else None
         target_key: ConversationKey = conv_key or (platform, user_id)
         if offer is None or not conversation_state_store.set(
@@ -6668,9 +6730,7 @@ async def _execute_confirmed_tool(
             owner_label=owner_label,
         ):
             return render_remediation_reply(reason)
-        return _assert_plain_user_facing_reply(
-            reason + "。\n" + render_pending_choice_offer(offer)
-        )
+        return _assert_plain_user_facing_reply(render_pending_choice_offer(offer))
 
     if data.get("requiresConfirmation"):
         pending_state = _pending_state_from_server_warning(state, data)
@@ -9070,6 +9130,46 @@ async def _load_merged_word_entries(
     return resolved
 
 
+async def try_handle_move_to_code_command(
+    message_text: str, platform: str, user_id: str,
+    space_key: Optional[Tuple[str, str]] = None, owner_label: str = "",
+) -> Optional[str]:
+    """Resolve a literal existing-item move before model routing and preview it."""
+    from ..harness.authorization_grammar import parse_existing_entry_move
+
+    plan = parse_entry_move_plan(message_text)
+    if plan is not None:
+        return await _try_handle_entry_move_plan_command(
+            message_text,
+            MessageCommandIntent(
+                intent="entry_move_plan", confidence=1.0,
+                keep_words=tuple(move.word for move in plan.moves),
+                requested_codes=tuple(move.target_code for move in plan.moves),
+            ), platform, user_id, space_key, owner_label,
+        )
+    move = parse_existing_entry_move(message_text)
+    if move is None:
+        return None
+    set_turn_flow("draft-op")
+    resolved = await _load_merged_word_entries((move.word,), platform, user_id)
+    if resolved is None:
+        return f"想把「{move.word}」调到 {move.target_code}，但没有查到唯一的现有词条；本次未写入。"
+    if move.named_occupant:
+        lookup = json.loads(await call_tool_function(
+            "keytao_lookup_by_code", {"code": move.target_code}, platform, user_id,
+        ))
+        occupants = lookup.get("phrases") if lookup.get("success") is True else None
+        if not isinstance(occupants, list) or sum(
+            isinstance(row, dict) and row.get("word") == move.named_occupant
+            for row in occupants
+        ) != 1:
+            return f"想把「{move.word}」调到 {move.target_code}，但该位置没有唯一的「{move.named_occupant}」；本次未写入。"
+    return await _execute_shift_to_code(
+        move.word, move.target_code, platform, user_id, space_key, owner_label,
+        target_item={"type": resolved[move.word]["type"]},
+    )
+
+
 async def _try_handle_entry_move_plan_command(
     message_text: str,
     command_intent: MessageCommandIntent,
@@ -9103,22 +9203,6 @@ async def _try_handle_entry_move_plan_command(
         return render_remediation_reply(
             "两个词的词库类型不同，不能共用一张调整计划"
         )
-    candidate_codes_by_word: Dict[str, Tuple[str, ...]] = {}
-    for word in words:
-        encode_json = await call_tool_function(
-            "keytao_encode",
-            {"word": word, "requested_code": target_by_word[word]},
-            platform,
-            user_id,
-        )
-        try:
-            encode_data = json.loads(encode_json)
-        except Exception:
-            encode_data = {}
-        candidate_codes_by_word[word] = _candidate_codes_from_encode(
-            encode_data,
-            word,
-        )
     target_root = min(
         target_by_word.values(),
         key=lambda value: (len(value), value),
@@ -9128,12 +9212,7 @@ async def _try_handle_entry_move_plan_command(
         for word in words
     ]
     if (
-        any(
-            target_by_word[word]
-            not in candidate_codes_by_word.get(word, ())
-            for word in words
-        )
-        or len(set(target_by_word.values())) != len(words)
+        len(set(target_by_word.values())) != len(words)
         or any(not code.startswith(target_root) for code in target_by_word.values())
         or any(not code.startswith(target_root) for code in current_codes)
     ):
@@ -10997,6 +11076,9 @@ def _pending_choice_options(state: PendingToolConfirm) -> Optional[List[Dict[str
     """Validate and return the exact plans carried by one live A/B offer."""
     if state.function_name != _PENDING_CHOICE_OFFER_FUNCTION:
         return None
+    reason = state.args.get("_choice_reason", "")
+    if not isinstance(reason, str) or len(reason) > 2048:
+        return None
     raw_options = state.args.get("options")
     if not isinstance(raw_options, list) or len(raw_options) != 2:
         return None
@@ -11041,11 +11123,13 @@ def _build_pending_choice_offer(
     options: Tuple[Tuple[str, str, Optional[PendingToolConfirm]], ...],
     *,
     protected_add_pairs: Tuple[Tuple[str, str], ...] = (),
+    reason: str = "",
 ) -> Optional[PendingToolConfirm]:
     """Seal the same option plans used by both the renderer and resolver."""
     state = PendingToolConfirm(
         function_name=_PENDING_CHOICE_OFFER_FUNCTION,
         args={
+            **({"_choice_reason": reason.strip()} if reason else {}),
             "options": [
                 {
                     "label": str(label or "").strip().upper(),
@@ -11078,6 +11162,7 @@ def render_pending_choice_offer(state: PendingToolConfirm) -> str:
     if options is None:
         return ""
     return "\n".join([
+        *([state.args["_choice_reason"]] if state.args.get("_choice_reason") else []),
         "请确认怎么处理，二选一：",
         *(f"{option['label']}. {option['description']}" for option in options),
         "回复 A 或 B 即可。",

@@ -108,14 +108,23 @@ control `肌群`, the disagreement control `校肌`, and the compositional targe
 `着陆` absent as whole-word ZDIC entries. Its separate search fixture serves only
 the six declared `拼音` / `读音`
 queries; it never opens a browser or socket and records every registry call.
+S58 declares `nài fēi` for `奈飞`, `nóng hòu fēn wéi` for `浓厚氛围`, and
+`nóng hòu fēng wèi` for the occupied-destination control `浓厚风味`.
+It seeds only the rig-owned `奈飞@nhfwv` and `浓厚氛围@nhfw` Phrase rows,
+requires empty `nhfwa`, `nhfwav` and noncandidate `nhfwzz` destinations, then
+temporarily seeds `浓厚风味@nhfwa` and derives its successor from the real
+encoder. Cleanup touches only these declared words through the existing
+owner-checked local APIs.
 
 ## Prerequisites
 
 - `keytao-next` exists at `../keytao-next`, has dependencies installed, and its
   `.env` points to a running localhost PostgreSQL development database.
 - `BOT_API_TOKEN` exists in `keytao-next/.env`.
-- The bot `.env` contains the real OpenAI-compatible key, base URL, and model.
-  The current repository configuration uses the Doubao endpoint.
+- A separate `E2E_OPENAI_API_KEY` is required. The rig rejects a key matching
+  `OPENAI_API_KEY` in the process or any visible bot/local dotenv variant;
+  bot credentials are never used as a fallback. Base URL and model come from
+  `E2E_OPENAI_BASE_URL` / `E2E_OPENAI_MODEL`, falling back to the bot `.env`.
 - keytao-next's local `node_modules/.bin/next` and `tsx`, plus this repository's
   `.venv`, are available. The rig never invokes Corepack or a package registry.
 - The local dictionary is either empty at `wkxk` or already contains exactly
@@ -579,6 +588,29 @@ Optional overrides:
 The encode delay is armed only by S7 and S43. S7 fails one matching GET; S43
 first fails one and then, in its degraded half, exactly three. Every injection
 happens before dispatch, and the controller cannot affect another scenario.
+
+S58 replays the move-to-code incident through real group messages: keyword
+trigger with `to_me=False`, one two-clause plan, an imperative wrapper with
+native quoted confirmation, and an explicitly different validated occupant
+destination. Each preview must persist one complete actor-owned server ticket,
+leave the draft unchanged, and execute exactly its four Create/Delete rows on
+one assent. A noncandidate `nhfwzz` destination must retain its verified reading
+and unknown-shape manual-review seal through confirmation. An occupied second
+destination must include the third word's complete two-row eviction in the
+same ticket and receipt. Known-candidate commands and confirmation must make
+zero actual provider requests, including attempted requests that fail transport;
+the noncandidate path separately records its ordinary reviewed-reading calls.
+
+The unknown `迁到` control uses the configured real model and inspects its
+actual structured `keytao_shift_phrase_code` call, the grammar-gap and bridge
+logs, the server plan and the final draft. It cannot pass from model prose.
+Three explicitly synthetic executor-boundary controls cover a nonliteral
+word, malformed code and absent word using the real registered executor and
+local server; they never replace the model in a message-path test. Structural
+advertisement samples exercise the real detector and final delivery redraw
+against the actual ticket. Every advertised string then uses the real parser
+and binding check. Recordless assent remains a deterministic one-line no-write
+control. These are local rig results, not production or QQ gateway proof.
 
 ## Add a scenario
 

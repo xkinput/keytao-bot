@@ -2572,6 +2572,21 @@ def _structural_draft_management_intent(
     return _canonical_draft_management_command(message_text)
 
 
+def parse_draft_view_command(message_text: str) -> Optional[MessageCommandIntent]:
+    """Parse one complete read-only draft request without inferring operands."""
+    from ..utils.pending_confirmation import is_closed_draft_view_request
+
+    if re.search(r"[?？]", str(message_text or "")):
+        return None
+    unwrapped = _whole_message_unquoted_source(message_text)
+    source = _strip_command_message_prefixes(
+        unwrapped if unwrapped is not None else message_text
+    ).strip().rstrip("。.!！")
+    if not is_closed_draft_view_request(source):
+        return None
+    return MessageCommandIntent(intent="draft_view", confidence=1.0)
+
+
 async def _classify_message_command_intent(
     message_text: str,
     pending_state: Optional[PendingState] = None,
@@ -2579,6 +2594,9 @@ async def _classify_message_command_intent(
     """Use the configured flash/intent model for command and pending-control semantics."""
     if not message_text.strip():
         return MessageCommandIntent()
+    draft_view = parse_draft_view_command(message_text)
+    if draft_view is not None:
+        return draft_view
     from ..utils.same_code_reorder import parse_same_code_reorder
     from ..utils.explicit_code import parse_explicit_entry_code_request
 
@@ -2649,7 +2667,12 @@ async def _classify_message_command_intent(
     if isinstance(pending_state, PendingTrustedWordRecord) and message_authorizes_live_pending_mutation(message_text, pending_state):
         # The trusted-word handler owns contextual code validation and execution.
         return MessageCommandIntent()
-    if parse_same_code_reorder(message_text) is not None or parse_explicit_entry_code_request(message_text) is not None:
+    from ..harness.authorization_grammar import parse_existing_entry_move
+    if (
+        parse_same_code_reorder(message_text) is not None
+        or parse_explicit_entry_code_request(message_text) is not None
+        or parse_existing_entry_move(message_text) is not None
+    ):
         return MessageCommandIntent()
     if not OPENAI_API_KEY or not AsyncOpenAI:
         logger.warning("Command intent model unavailable; falling through to main AI flow")
