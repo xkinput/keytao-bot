@@ -516,12 +516,31 @@ MODEL_TOOL_RESULT_LARGE_RAW_WHITELIST = frozenset({
     "keytao_batch_remove_draft_items",
     "keytao_recall_batch",
     "keytao_audit_draft_items",
+    # At most 12 local rows and 66 comparator pairs; retain all tie evidence.
+    "keytao_word_commonness",
     "web_search",
     "web_fetch",
 })
 MODEL_TOOL_RESULT_SMALL_RAW_WHITELIST = frozenset({
     "get_current_datetime",
 })
+
+
+_MODEL_COPY_FIELD_LABELS = {
+    "suggestedCommand": "可执行命令",
+    "blockReason": "未执行原因",
+    "boundTarget": "已核验目标",
+    "policyBlocked": "本次操作已拒绝",
+    "requiresTextFollowUp": "需要补充说明",
+}
+_MODEL_COPY_FIELDS_RE = re.compile("|".join(_MODEL_COPY_FIELD_LABELS))
+
+
+def _plain_model_result_copy(result: str) -> str:
+    """Rename implementation labels only in the serialized model-facing copy."""
+    return _MODEL_COPY_FIELDS_RE.sub(
+        lambda match: _MODEL_COPY_FIELD_LABELS[match.group(0)], result,
+    )
 
 
 def project_tool_result_for_model(
@@ -532,25 +551,27 @@ def project_tool_result_for_model(
     """Project only the copy serialized into a model ``tool`` message."""
     projection = MODEL_TOOL_RESULT_PROJECTIONS.get(tool_name)
     if projection is None:
-        return result_json
+        return _plain_model_result_copy(result_json)
     try:
         payload = json.loads(result_json)
     except (TypeError, ValueError):
-        return result_json
+        return _plain_model_result_copy(result_json)
     if not isinstance(payload, Mapping):
-        return result_json
+        return _plain_model_result_copy(result_json)
     if (
         payload.get("success") is False
         or payload.get("policyBlocked") is True
         or "error" in payload
     ):
-        return result_json
+        return _plain_model_result_copy(result_json)
     projected = (
         projection.projector(payload, arguments)
         if tool_name == "keytao_list_draft_items"
         else projection.projector(payload)
     )
-    return json.dumps(projected, ensure_ascii=False, separators=(",", ":"))
+    return _plain_model_result_copy(
+        json.dumps(projected, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 def large_model_tool_result_has_policy(tool_name: str, result_json: str) -> bool:
@@ -2269,8 +2290,8 @@ class ToolExecutor:
                         if suggestion:
                             binding_error["suggestedCommand"] = suggestion
                             binding_error["modelInstruction"] = (
-                                "使用 suggestedCommand 字段向用户提供可执行命令，"
-                                "不要改写命令内容。"
+                                "只有执行器给出了可执行命令时才逐字转述那一条；"
+                                "否则只说明缺少什么，不要自行编写或改写命令。"
                             )
                 return binding_error
         if tool_name == "keytao_batch_remove_draft_items" and message:

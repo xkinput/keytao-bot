@@ -16606,8 +16606,8 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             if message.get("role") == "tool"
         ]
         follow_up = __import__("json").loads(tool_messages[1]["content"])
-        self.assertTrue(follow_up.get("requiresTextFollowUp"))
-        self.assertFalse(follow_up.get("policyBlocked", False))
+        self.assertTrue(follow_up.get("需要补充说明"))
+        self.assertFalse(follow_up.get("本次操作已拒绝", False))
         self.assertEqual(follow_up.get("reason"), "code_required")
         self.assertTrue(result.startswith("「赤溪」已在词库（wkxk、wkxka）。"))
         self.assertIn("若保留现状，无需操作", result)
@@ -16703,7 +16703,7 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             for message in client.completions.calls[-1]["messages"]
             if message.get("role") == "tool"
         ]
-        self.assertTrue(tool_payloads[1].get("requiresTextFollowUp"))
+        self.assertTrue(tool_payloads[1].get("需要补充说明"))
         self.assertEqual(tool_payloads[1].get("reason"), "code_required")
         self.assertTrue(tool_payloads[3].get("success"))
         self.assertIn("positioned after lookup", result)
@@ -16821,8 +16821,8 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                     if item.get("role") == "tool"
                 ]
                 blocked = __import__("json").loads(tool_messages[-1]["content"])
-                self.assertTrue(blocked.get("policyBlocked"))
-                self.assertEqual(blocked.get("blockReason"), "binding_incomplete")
+                self.assertTrue(blocked.get("本次操作已拒绝"))
+                self.assertEqual(blocked.get("未执行原因"), "binding_incomplete")
 
     async def test_back_relation_uses_next_free_served_candidate(self) -> None:
         calls = []
@@ -16962,8 +16962,8 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             for message in client.completions.calls[-1]["messages"]
             if message.get("role") == "tool"
         ))
-        self.assertTrue(payload.get("requiresTextFollowUp"))
-        self.assertFalse(payload.get("policyBlocked", False))
+        self.assertTrue(payload.get("需要补充说明"))
+        self.assertFalse(payload.get("本次操作已拒绝", False))
         self.assertEqual(payload.get("reason"), "following_candidate_unavailable")
         self.assertIsNotNone(store.get_record(address))
         self.assertEqual(result, "no free code")
@@ -17280,7 +17280,7 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             if message.get("role") == "tool"
         ]
         block = __import__("json").loads(tool_messages[-1]["content"])
-        self.assertTrue(block.get("policyBlocked"))
+        self.assertTrue(block.get("本次操作已拒绝"))
         self.assertIsNotNone(store.get_record(address))
         self.assertEqual(result, "change blocked")
 
@@ -17373,8 +17373,8 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 follow_up = __import__("json").loads(
                     tool_messages[-1]["content"]
                 )
-                self.assertTrue(follow_up.get("requiresTextFollowUp"))
-                self.assertFalse(follow_up.get("policyBlocked", False))
+                self.assertTrue(follow_up.get("需要补充说明"))
+                self.assertFalse(follow_up.get("本次操作已拒绝", False))
                 self.assertEqual(result, "blocked")
 
 
@@ -17924,8 +17924,10 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
             if item.get("role") == "tool"
         )
         payload = __import__("json").loads(tool_reply["content"])
-        self.assertEqual(payload["blockReason"], "verb_not_matched")
+        self.assertEqual(payload["未执行原因"], "verb_not_matched")
+        self.assertNotIn("blockReason", payload)
         self.assertNotIn("suggestedCommand", payload)
+        self.assertNotIn("可执行命令", payload)
         self.assertEqual(calls, [])
         self.assertEqual(result, "本轮只读，已说明需要的指令。")
 
@@ -18874,7 +18876,7 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         fallback.assert_awaited_once_with("都加 跳过嘴替", context)
         self.assertEqual(
             [call["max_tokens"] for call in client.completions.calls],
-            [1800, 3600],
+            [1800, 1800],
         )
 
     async def test_reasoning_only_exhaustion_retries_smaller_and_returns_bound_command(self) -> None:
@@ -21204,7 +21206,8 @@ class ReplaceAtCodeS51RegressionTests(unittest.IsolatedAsyncioTestCase):
             orchestrator_module.READ_ONLY_TURN_GUIDANCE,
             r"只读轮|安全层|写工具|写轮|执行器|解析器",
         )
-        self.assertIn("suggestedCommand", orchestrator_module.READ_ONLY_TURN_GUIDANCE)
+        self.assertNotIn("suggestedCommand", orchestrator_module.READ_ONLY_TURN_GUIDANCE)
+        self.assertIn("可执行命令", orchestrator_module.READ_ONLY_TURN_GUIDANCE)
 
     def test_plain_write_intent_without_closed_grammar_logs_gap(self) -> None:
         from keytao_bot.harness import orchestrator as orchestrator_module

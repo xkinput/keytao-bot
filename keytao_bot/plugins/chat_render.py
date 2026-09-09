@@ -124,6 +124,9 @@ _MECHANISM_LEAK_RE = re.compile(
     + _RETIRED_AUTHORIZATION_COPY_RE.pattern
 )
 _RETIRED_NO_COMMAND_COPY = "当前没有可安全执行" + "的后续命令"
+_INTERNAL_FIELD_COPY_RE = re.compile(
+    r"suggestedCommand|blockReason|boundTarget|policyBlocked|requiresTextFollowUp|keytao_word_commonness", re.IGNORECASE,
+)
 
 _DEFAULT_PUBLIC_BASE_BY_PLATFORM = {
     "qq": "https://keytao.rea.ink",
@@ -250,6 +253,7 @@ _INTERNAL_TOOL_IDENTIFIERS = (
     "keytao_shift_phrase_code",
     "keytao_submit_batch",
     "keytao_update_draft_item_weight",
+    "keytao_word_commonness",
 )
 _NORMALIZED_INTERNAL_TOOL_IDENTIFIERS = tuple(
     re.sub(r"[\W_]+", "", identifier).lower()
@@ -302,11 +306,14 @@ def _reply_requires_deterministic_redraw(text: str) -> bool:
     return bool(
         _reply_has_raw_literal_dump(reply)
         or _MECHANISM_LEAK_RE.search(reply)
+        or _INTERNAL_FIELD_COPY_RE.search(reply)
     )
 
 
 def _assert_plain_user_facing_reply(text: str) -> str:
     reply = str(text or "")
+    if _INTERNAL_FIELD_COPY_RE.search(reply):
+        raise ValueError("User-facing reply contains a raw Python representation")
     if _RETIRED_NO_COMMAND_COPY in reply:
         logger.error("Refusing retired user-facing copy")
         raise ValueError("User-facing reply contains retired user-facing copy")

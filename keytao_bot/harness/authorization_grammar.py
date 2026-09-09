@@ -3481,8 +3481,8 @@ def policy_block(
     if suggestion:
         payload["suggestedCommand"] = suggestion
         payload["modelInstruction"] = (
-            "使用 suggestedCommand 字段向用户提供可执行命令，"
-            "不要改写命令内容。"
+            "只有执行器给出了可执行命令时才逐字转述那一条；"
+            "否则只说明缺少什么，不要自行编写或改写命令。"
         )
     payload.update(extra)
     if reason == BLOCK_REASON_SOURCE_UNTRUSTED:

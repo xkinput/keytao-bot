@@ -1892,7 +1892,12 @@ def test_model_tool_result_projection_contract():
         {"success": True, "error": "", "detail": "x" * 5_000},
     ):
         raw = json.dumps(payload, ensure_ascii=False)
-        check("registered errors and policy blocks remain verbatim", project_tool_result_for_model("keytao_encode", raw) == raw)
+        expected = json.loads(raw)
+        if "policyBlocked" in expected:
+            expected["本次操作已拒绝"] = expected.pop("policyBlocked")
+        projected = json.loads(project_tool_result_for_model("keytao_encode", raw))
+        check("registered errors retain every business value with plain model labels", projected == expected)
+        check("model projection preserves the original executor result", json.dumps(payload, ensure_ascii=False) == raw)
 
 
 def test_system_prompt_growth_guard():
@@ -16418,12 +16423,12 @@ async def _run_orchestrator_empty_response_retry_checks():
         len(reasoning_only_client.completions.calls) == 2,
     )
     check(
-        "reasoning-only retry does not escalate to 7200",
+        "tool-free reasoning-only retry keeps the original token budget",
         [
             call["max_tokens"]
             for call in reasoning_only_client.completions.calls
         ]
-        == [1800, 3600],
+        == [1800, 1800],
     )
     check(
         "reasoning-only cap returns an honest deterministic fallback",

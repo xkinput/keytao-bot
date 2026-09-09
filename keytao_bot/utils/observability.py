@@ -18,6 +18,7 @@ from .llm_policy import chat_usage_metrics
 
 
 TURN_FLOWS = frozenset({
+    "word-commonness",
     "word-discovery",
     "pending-confirmation",
     "multi-add",
@@ -32,6 +33,7 @@ TURN_OUTCOMES = frozenset({
 })
 _FLOW_PRIORITY = {
     "general": 0,
+    "word-commonness": 1,
     "word-discovery": 1,
     "draft-op": 2,
     "multi-add": 3,

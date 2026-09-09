@@ -2527,6 +2527,9 @@ def _enforce_advertised_reply_contract(
     query_words: Tuple[str, ...] = (),
 ) -> str:
     """Validate commands first, then append this actor's verified account notice."""
+    from ..utils.commonness_query import matches_commonness_delivery
+    if matches_commonness_delivery(response, conv_key, _current_turn_message.get("")):
+        return response
     body = _without_binding_precheck_notice(response)
     if isinstance(response, ServerBackedQueryReply):
         body = ServerBackedQueryReply(body)
@@ -3471,6 +3474,24 @@ async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
         ctx.normalized_message_text,
     )
     return False
+
+
+async def _stage_handle_commonness_query(ctx: TurnContext) -> bool:
+    """Answer bounded commonness queries before any intent-model call."""
+    from ..utils.commonness_query import commonness_query_reply
+
+    response = await commonness_query_reply(
+        ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
+    )
+    if response is None:
+        return False
+    ctx.response = response
+    set_turn_flow("word-commonness")
+    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, response)
+    await _finish_ai_chat_response(
+        ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment,
+    )
+    return True
 
 
 async def _stage_handle_completed_draft_undo(ctx: TurnContext) -> bool:
@@ -5587,6 +5608,11 @@ async def _stage_normalize_response(ctx: TurnContext) -> bool:
 
 async def _stage_augment_word_query(ctx: TurnContext) -> bool:
     """Production scenario: only ordinary Q&A receives simple-word augmentation."""
+    from ..utils.observability import current_turn_metrics
+
+    metrics = current_turn_metrics()
+    if metrics is not None and metrics.tool_calls == 0 and metrics.model_calls >= 2:
+        return False
     if isinstance(ctx.response, ServerBackedQueryReply):
         return False
     if (
@@ -5680,6 +5706,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_image_turn,
     _stage_handle_visual_probe_timeout,
     _stage_initialize_conversation,
+    _stage_handle_commonness_query,
     _stage_handle_completed_draft_undo,
     _stage_claim_offered_answer,
     _stage_resolve_current_pending_scope,
@@ -5722,6 +5749,9 @@ async def _handle_ai_chat_serialized(
     user_id: str,
 ) -> None:
     """Run one serialized chat turn through the reviewable stage order."""
+    from ..utils.commonness_query import reset_commonness_delivery
+
+    reset_commonness_delivery()
     _user_resolver.reset_binding_notice_fact()
     ctx = TurnContext(
         bot=bot,

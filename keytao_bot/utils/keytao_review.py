@@ -6232,6 +6232,36 @@ def _commonness_comparison_has_evidence(comparison: Dict[str, Any]) -> bool:
     return False
 
 
+def _stable_commonness_order(
+    words: Sequence[str],
+    edges: Dict[str, set[str]],
+    *,
+    stable_words: Optional[Sequence[str]] = None,
+) -> Optional[List[str]]:
+    """Order strict comparator edges while preserving unresolved input order."""
+    original_index = {
+        word: index for index, word in enumerate(stable_words or words)
+    }
+    indegree = {word: 0 for word in words}
+    for followers in edges.values():
+        for follower in followers:
+            indegree[follower] += 1
+    available = sorted(
+        (word for word in words if indegree[word] == 0),
+        key=original_index.__getitem__,
+    )
+    ordered: List[str] = []
+    while available:
+        word = available.pop(0)
+        ordered.append(word)
+        for follower in sorted(edges[word], key=original_index.__getitem__):
+            indegree[follower] -= 1
+            if indegree[follower] == 0:
+                available.append(follower)
+                available.sort(key=original_index.__getitem__)
+    return ordered if len(ordered) == len(words) else None
+
+
 async def rank_code_chain_by_commonness(
     entries: Sequence[Dict[str, Any]],
     *,
@@ -6303,7 +6333,6 @@ async def rank_code_chain_by_commonness(
     comparisons: List[Dict[str, Any]] = []
     evidence_by_word: Dict[str, str] = {}
     edges: Dict[str, set[str]] = {word: set() for word in words}
-    indegree: Dict[str, int] = {word: 0 for word in words}
 
     for left_index, left_word in enumerate(words):
         for right_word in words[left_index + 1:]:
@@ -6403,24 +6432,11 @@ async def rank_code_chain_by_commonness(
             )
             if loser not in edges[winner]:
                 edges[winner].add(loser)
-                indegree[loser] += 1
 
-    stable_words = tie_break_order or words
-    original_index = {word: index for index, word in enumerate(stable_words)}
-    available = sorted(
-        (word for word in words if indegree[word] == 0),
-        key=original_index.__getitem__,
+    proposed_words = _stable_commonness_order(
+        words, edges, stable_words=tie_break_order or words,
     )
-    proposed_words: List[str] = []
-    while available:
-        word = available.pop(0)
-        proposed_words.append(word)
-        for follower in sorted(edges[word], key=original_index.__getitem__):
-            indegree[follower] -= 1
-            if indegree[follower] == 0:
-                available.append(follower)
-                available.sort(key=original_index.__getitem__)
-    if len(proposed_words) != len(words):
+    if proposed_words is None:
         return {
             "status": "ask",
             "reason": "conflicting_evidence",

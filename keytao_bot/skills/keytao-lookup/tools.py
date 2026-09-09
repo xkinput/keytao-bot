@@ -816,8 +816,40 @@ async def keytao_encode(
         }
 
 
+async def keytao_word_commonness(words: List[str]) -> Dict:
+    """Read the same local commonness evidence used by the review comparator."""
+    from keytao_bot.utils.word_commonness import lookup_word_commonness
+
+    return lookup_word_commonness(words)
+
+
 # Tool definitions for OpenAI Function Calling
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "keytao_word_commonness",
+            "description": "只读查询1至12个词的本地语料频次、词典收录和常用度比较。使用审词的统一证据与排序规则；并列保留，无数据逐词标明，不把缺失当零。不调用模型或网络，不修改词库或草稿。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "words": {
+                        "type": "array",
+                        "items": {
+                            "type": "string", "minLength": 1, "maxLength": 64,
+                            "pattern": "^[^\\r\\n\\t]+$",
+                        },
+                        "minItems": 1,
+                        "maxItems": 12,
+                        "uniqueItems": True,
+                        "description": "要查询的1至12个不同词语；每词不超过64字，不得为空。",
+                    }
+                },
+                "required": ["words"],
+                "additionalProperties": False,
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -918,6 +950,7 @@ TOOLS = [
 
 # Tool registry for dynamic calling
 TOOL_FUNCTIONS = {
+    "keytao_word_commonness": keytao_word_commonness,
     "keytao_lookup_by_codes_batch": keytao_lookup_by_codes_batch,
     "keytao_lookup_by_words_batch": keytao_lookup_by_words_batch,
     "keytao_lookup_by_code": keytao_lookup_by_code,
