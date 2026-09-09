@@ -147,16 +147,164 @@ async def _read_snapshot(listed: Callable, identity: Dict, batch_id: str = "", *
     return {**snapshot, "items": rows, "batchStatus": next(iter(batch_statuses)) if len(batch_statuses) == 1 else ""}
 
 
+def _requested_receipt_items(name: str, args: Dict, result: Dict) -> list:
+    """Keep requested rows only as labels; they are never proof of a write."""
+    if name == "keytao_shift_phrase_code":
+        plan = result.get("shiftPlan") or {}
+        rows = (plan.get("plannedItems") or plan.get("items")) if isinstance(plan, dict) else None
+        if not isinstance(rows, list) or not rows:
+            rows = [{"word": args.get("word"), "code": args.get("target_code"), "action": "Create",
+                     **({"type": args["target_type"]} if args.get("target_type") else {})},
+                    *(args.get("additional_items") or []), *(args.get("additional_shift_items") or [])]
+    elif name == "keytao_batch_add_to_draft":
+        rows = args.get("items") or []
+    elif name in {"keytao_create_phrase", "keytao_update_draft_item_weight"}:
+        rows = [args]
+    else:
+        rows = []
+    requested = []
+    for row in rows:
+        if not isinstance(row, dict) or not row.get("word"):
+            continue
+        item = {field: row[field] for field in _FIELDS if field in row}
+        for source, target in (("old_word", "oldWord"), ("needs_manual_review", "needsManualReview")):
+            if source in row:
+                item[target] = row[source]
+        requested.append(item)
+    return requested
+
+
+def _receipt_delta_is_bound(name: str, args: Dict, result: Dict, before: Dict, after: Dict, written: list, updated: list) -> bool:
+    """Bind snapshot changes to the acknowledged mutation, not a later batch view."""
+    batch_id = result.get("batchId")
+    if not isinstance(batch_id, str) or not batch_id or after.get("batchId") != batch_id:
+        return False
+    absence = (before.get("batchId") in (None, "") and before.get("items") == []
+               and type(before.get("contentVersion")) is int and before["contentVersion"] == 0)
+    if before.get("batchId") != batch_id and not absence:
+        return False
+    version = result.get("contentVersion")
+    version_known = type(version) is int and version >= 0
+    if version_known and after.get("contentVersion") != version:
+        return False
+    count = result.get("pullRequestCount")
+    count_known = type(count) is int and count >= 0
+    if count_known and count != len(written):
+        return False
+    if not version_known and not count_known:
+        return False
+
+    requested = _requested_receipt_items(name, args, result)
+    for row in written:
+        match = next((index for index, item in enumerate(requested) if (
+            all(row.get(field) == item.get(field) for field in ("word", "code", "oldWord"))
+            and row.get("action") == (item.get("action") or "Create")
+            and (item.get("type") is None or row.get("type") == item["type"])
+            and (version_known or item.get("weight") is None or row.get("weight") == item["weight"])
+        )), None)
+        if match is None:
+            return False
+        requested.pop(match)
+
+    old = {row["id"]: row for row in before["items"]}
+    new = {row["id"]: row for row in after["items"]}
+    # A row count cannot authenticate intervening updates or removals.
+    if not version_known and (updated or any(item_id not in new for item_id in old)):
+        return False
+    plan = result.get("shiftPlan") or {}
+    updates = list(plan.get("draftUpdates") or []) if isinstance(plan, dict) else []
+    if name == "keytao_update_draft_item_weight":
+        updates = [{"word": args.get("word"), "code": args.get("code"), "toWeight": args.get("weight")}]
+    for row in updated:
+        previous = old[row["id"]]
+        if any(previous.get(field) != row.get(field) for field in _FIELDS if field != "weight"):
+            return False
+        match = next((index for index, item in enumerate(updates) if (
+            isinstance(item, dict) and item.get("word") == row.get("word")
+            and item.get("code") == row.get("code") and item.get("toWeight") == row.get("weight")
+            and ("fromWeight" not in item or item["fromWeight"] == previous.get("weight"))
+        )), None)
+        if match is None:
+            return False
+        updates.pop(match)
+    return True
+
+
+def _attach_receipt_delta(name: str, args: Dict, result: Dict, before: Optional[Dict], after: Optional[Dict]) -> Dict:
+    """Project this invocation's verified PR delta, independently of the undo turn."""
+    if name in {"keytao_remove_draft_item", "keytao_batch_remove_draft_items", "keytao_recall_batch"}:
+        return dict(result)
+    receipt = {**result, "requestedItems": _requested_receipt_items(name, args, result),
+               "writtenItems": [], "updatedItems": []}
+    receipt.pop("receiptItemsUnavailable", None)
+    if (name == "keytao_submit_batch"
+            or any(result.get(flag) for flag in ("noWrite", "alreadyApplied", "replayedResolvedMutation"))):
+        return receipt
+    if before is None or after is None:
+        receipt["receiptItemsUnavailable"] = True
+        return receipt
+    old = {row["id"]: row for row in before["items"]}
+    for row in after["items"]:
+        item = {field: row.get(field) for field in _FIELDS}
+        previous = old.get(row["id"])
+        if previous is None:
+            receipt["writtenItems"].append(item)
+        elif any(previous.get(field) != row.get(field) for field in _FIELDS):
+            if previous.get("weight") != row.get("weight"):
+                item["previousWeight"] = previous.get("weight")
+            receipt["updatedItems"].append(item)
+    if not _receipt_delta_is_bound(name, args, result, before, after, receipt["writtenItems"], receipt["updatedItems"]):
+        receipt.update(writtenItems=[], updatedItems=[], receiptItemsUnavailable=True)
+    return receipt
+
+
+def _has_normalized_tool_delta(result: Dict) -> bool:
+    """Only an actual tool result can supply an already verified delta without capture."""
+    if result.get("receiptItemsUnavailable") or not any(field in result for field in ("writtenItems", "updatedItems")):
+        return False
+    seen = set()
+    for field in ("writtenItems", "updatedItems"):
+        rows = result.get(field, [])
+        if not isinstance(rows, list):
+            return False
+        for row in rows:
+            if (not isinstance(row, dict) or type(row.get("id")) is not int or row["id"] <= 0
+                    or row["id"] in seen or row.get("action") not in {"Create", "Delete", "Change"}
+                    or any(not isinstance(row.get(key), str) or not row[key].strip() for key in ("word", "code", "type"))):
+                return False
+            seen.add(row["id"])
+    return True
+
+
 async def invoke_with_operation_journal(name: str, args: Dict, invoke: Callable, get_tool: Callable) -> Any:
     """Wrap the single effective-tool boundary, including model ticket replays."""
     capture = current_operation_capture.get()
-    if capture is None or name not in _MUTATION_TOOLS:
+    if name not in _MUTATION_TOOLS:
         return await invoke(**args)
+    if capture is None:
+        result = await invoke(**args)
+        if isinstance(result, dict) and (
+            any(result.get(flag) for flag in ("noWrite", "alreadyApplied", "replayedResolvedMutation"))
+            or (_will_write(name, args) and (result.get("success") is True or result.get("partialWrite")))
+        ) and result.get("requiresConfirmation") is not True:
+            if (not any(result.get(flag) for flag in ("noWrite", "alreadyApplied", "replayedResolvedMutation"))
+                    and _has_normalized_tool_delta(result)):
+                return {**result,
+                        "requestedItems": result.get("requestedItems", _requested_receipt_items(name, args, result)),
+                        "writtenItems": [dict(row) for row in result.get("writtenItems", [])],
+                        "updatedItems": [dict(row) for row in result.get("updatedItems", [])]}
+            return _attach_receipt_delta(name, args, result, None, None)
+        return result
     store = get_default_draft_mutation_claim_store()
     if store.actor_has_running_undo(capture.platform, capture.actor):
         return {"success": False, "message": "上一笔撤销仍在核验中，本次未写入；请先完成原撤销。"}
     if not _will_write(name, args):
-        return await invoke(**args)
+        result = await invoke(**args)
+        if isinstance(result, dict) and any(
+            result.get(flag) for flag in ("noWrite", "alreadyApplied", "replayedResolvedMutation")
+        ):
+            return _attach_receipt_delta(name, args, result, None, None)
+        return result
     listed = get_tool("keytao_list_draft_items")
     identity = {"platform": capture.platform, "platform_id": capture.actor}
     batch_id = str(args.get("batch_id") or "")
@@ -170,10 +318,11 @@ async def invoke_with_operation_journal(name: str, args: Dict, invoke: Callable,
         if before is None:
             return {"success": False, "message": "未能核验写入前的完整草稿，本次未写入。"}
     result = await invoke(**args)
-    if not isinstance(result, dict) or result.get("success") is not True or result.get("requiresConfirmation") is True:
+    if (not isinstance(result, dict) or result.get("requiresConfirmation") is True
+            or (result.get("success") is not True and not result.get("partialWrite"))):
         return result
-    if result.get("replayedResolvedMutation") or result.get("alreadyApplied"):
-        return result
+    if result.get("replayedResolvedMutation") or result.get("alreadyApplied") or result.get("noWrite"):
+        return _attach_receipt_delta(name, args, result, before, before)
     batch_id = str(result.get("batchId") or batch_id or "")
     if name == "keytao_submit_batch":
         after = dict(before or {})
@@ -182,6 +331,9 @@ async def invoke_with_operation_journal(name: str, args: Dict, invoke: Callable,
             after["contentVersion"] = version
     else:
         after = await _read_snapshot(listed, identity, batch_id) if batch_id else None
+    result = _attach_receipt_delta(name, args, result, before, after)
+    if result.get("success") is not True:
+        return result
     if capture.before is None:
         capture.before = before
     prior = capture.payload or {}

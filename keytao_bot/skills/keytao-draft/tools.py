@@ -6355,6 +6355,8 @@ async def keytao_shift_phrase_code(
                         for receipt in receipts
                     ),
                     "message": "计划只完成了一部分，剩余步骤需要按最新草稿重新锁定。",
+                    "contentVersion": write_result.get("contentVersion"),
+                    "pullRequestCount": write_result.get("pullRequestCount"),
                     "receipts": receipts,
                     "shiftPlan": shift_plan,
                     "planDigest": plan_digest,
@@ -6397,10 +6399,14 @@ async def keytao_shift_phrase_code(
                         for receipt in receipts
                     ),
                     "message": "计划只完成了一部分，剩余步骤需要按最新草稿重新锁定。",
+                    "contentVersion": write_result.get("contentVersion"),
+                    "pullRequestCount": write_result.get("pullRequestCount"),
                     "receipts": receipts,
                     "shiftPlan": shift_plan,
                     "planDigest": plan_digest,
                 }, exact_batch_id)
+            # Keep the final mutation acknowledgement, not a later read's version.
+            write_result["contentVersion"] = updated.get("contentVersion")
             receipts.append({
                 "step": "draftWeight",
                 "status": "applied",

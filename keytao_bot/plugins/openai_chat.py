@@ -2757,6 +2757,32 @@ def _prepare_user_facing_reply(
         )
         prepared = _enforce_advertised_reply_contract(prepared, conv_key)
     prepared = strip_warning_count_copy(prepared)
+    deliveries = [receipt for receipt in current_draft_delivery_claims.get() or []
+                  if memory_context is not None
+                  and receipt.get("platform") == platform
+                  and receipt.get("platformId") == memory_context.user_id
+                  and receipt.get("operationKind") in {"draft_write", "draft_submit"}
+                  and receipt.get("batchId")]
+    if deliveries:
+        from .chat_render import finalize_draft_receipt
+        deltas = [receipt["writeReceipt"] for receipt in deliveries if receipt.get("writeReceipt")]
+        if deltas:
+            if any(delta.get("writtenItems") or delta.get("updatedItems") for delta in deltas) and re.search(
+                r"(?:本次|本轮)(?:没有|未)(?:执行(?:任何)?(?:新的?)?写入|写入|添加)", prepared,
+            ):
+                prepared = "本轮写入结果如下。"
+            prepared = finalize_draft_receipt(prepared, *reversed(deltas), platform=platform)
+        for receipt in deliveries:
+            if receipt.get("operationKind") == "draft_submit":
+                status = ("✅ 批次已加入词库。" if receipt.get("writeReceipt", {}).get("autoApproved")
+                          else "✅ 批次已提交审核。")
+                if status not in prepared:
+                    prepared += "\n" + status
+        link_lines = list(dict.fromkeys(finalize_draft_receipt(
+            "", {"batchId": receipt["batchId"]}, platform=platform,
+        ) for receipt in deliveries))
+        prepared = _dedupe_authoritative_link_lines(prepared)
+        prepared = "\n".join([prepared, *filter(None, link_lines)])
     prepared = render_platform_public_links(prepared, platform)
     prepared = strip_bare_batch_ids(prepared)
     return _assert_plain_user_facing_reply(prepared)

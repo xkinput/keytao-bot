@@ -307,7 +307,7 @@ current_draft_result_links: ContextVar[Optional[Dict[str, str]]] = ContextVar(
 )
 
 
-current_draft_delivery_claims: ContextVar[Optional[List[Dict[str, str]]]] = ContextVar(
+current_draft_delivery_claims: ContextVar[Optional[List[Dict[str, Any]]]] = ContextVar(
     "current_draft_delivery_claims",
     default=None,
 )
@@ -4041,7 +4041,7 @@ def _capture_successful_draft_write_delivery(
         return
     is_write = tool_name in _DRAFT_WRITE_RECEIPT_TOOLS
     is_submit = tool_name == "keytao_submit_batch"
-    if not (is_write or is_submit) or result.get("success") is not True:
+    if not (is_write or is_submit) or not (result.get("success") is True or result.get("partialWrite") is True):
         return
     if result.get("requiresConfirmation") is True:
         return
@@ -4054,6 +4054,21 @@ def _capture_successful_draft_write_delivery(
         "operationKind": "draft_submit" if is_submit else "draft_write",
         "batchId": batch_id,
     }
+    if "writtenItems" in result or "updatedItems" in result:
+        receipt["writeReceipt"] = {
+            **{key: result[key] for key in (
+                "writtenItems", "updatedItems", "requestedItems", "requestedWords", "receiptItemsUnavailable",
+                "failed", "skipped", "noWrite", "batchId", "batchUrl", "warnings", "autoApproved",
+            ) if key in result},
+            "tool": tool_name,
+        }
+        for previous in deliveries:
+            if (all(previous.get(key) == receipt[key] for key in ("platform", "platformId", "operationKind", "batchId"))
+                    and previous.get("writeReceipt", {}).get("tool") == tool_name
+                    and previous.get("writeReceipt", {}).get("writtenItems") == result.get("writtenItems")
+                    and previous.get("writeReceipt", {}).get("updatedItems") == result.get("updatedItems")):
+                previous.update(receipt)
+                return
     if receipt not in deliveries:
         deliveries.append(receipt)
 
@@ -4831,6 +4846,7 @@ async def _perform_batch_add_to_draft_and_submit(
     )
     add_data = json.loads(add_json)
     pending_items = add_data.get("pendingItems") or []
+    add_data["requestedWords"] = [item["word"] for item in requested_items if item.get("word")]
 
     def with_pending_reminder(text: str) -> str:
         return prepend_pending_word_reminders(
@@ -5020,6 +5036,9 @@ async def _perform_batch_add_to_draft_and_submit(
         for item in effective_items
         if item.get("word") and item.get("code")
     )
+    if "writtenItems" in add_data:
+        from ..utils.draft_receipts import receipt_change_lines
+        item_lines = "\n".join(receipt_change_lines(add_data))
     text = submit_result.text
     if item_lines:
         text = f"{text}\n\n{item_lines}"
@@ -5060,8 +5079,10 @@ async def _execute_shift_to_code(
     auto_confirm_expected_shifted_words: Tuple[str, ...] = (),
     auto_confirm_only_if_no_shifts: bool = False,
     expected_occupants_by_code: Optional[Dict[str, List[str]]] = None,
+    receipt_requested_words: Optional[List[str]] = None,
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
+    receipt_requested_words = receipt_requested_words or listed_words or ordered_words
     expected_occupants_by_code = expected_occupants_by_code or {
         str(item.get("code") or "").strip().lower(): [
             str(value or "").strip()
@@ -5158,6 +5179,7 @@ async def _execute_shift_to_code(
                     else {}
                 ),
                 **({"_submit_after": True} if submit_after else {}),
+                **({"_receipt_requested_words": list(receipt_requested_words)} if receipt_requested_words else {}),
                 **(
                     {
                         "_auto_confirm_expected_shifted_words": list(
@@ -6168,6 +6190,10 @@ def _format_ranked_shift_partial_failure(
                 remaining.append(change)
 
     lines = ["⚠️ 计划部分完成"]
+    if "writtenItems" in data or "updatedItems" in data:
+        from ..utils.draft_receipts import receipt_change_lines
+        applied = []
+        lines.extend(receipt_change_lines(data))
     if applied:
         lines.append("已完成：" + "、".join(applied))
     if remaining:
@@ -6187,6 +6213,9 @@ def _format_ranked_shift_partial_failure(
 
 def _format_ranked_shift_success(data: Dict[str, Any]) -> str:
     """Render applied shift receipts without repeating the full draft."""
+    from .chat_render import finalize_draft_receipt
+    if "writtenItems" in data or "updatedItems" in data:
+        return _assert_plain_user_facing_reply(finalize_draft_receipt("✅ 操作已完成", data))
     changes: List[str] = []
     shift_plan = data.get("shiftPlan") if isinstance(data.get("shiftPlan"), dict) else {}
     target_word = str(shift_plan.get("word") or "").strip()
@@ -6399,6 +6428,9 @@ async def _execute_confirmed_tool(
     args.pop("_reviewed_batch_readings", None)
     args.pop("_query_words", None)
     args.pop("_query_other_blocks", None)
+    receipt_requested_words = args.pop("_receipt_requested_words", None) or state.args.get("_query_words") or [
+        item.get("word") for item in state.args.get("items", []) if isinstance(item, dict) and item.get("word")
+    ]
     args.pop("_unselected_words", None)
     args.pop("_resolved_advertised_words", None)
     resolved_candidate_plan = args.pop("_resolved_candidate_plan", None)
@@ -6607,6 +6639,9 @@ async def _execute_confirmed_tool(
             state.function_name, args, platform, user_id,
         )
     data = json.loads(result_json)
+    if receipt_requested_words:
+        data["requestedWords"] = receipt_requested_words
+        _capture_successful_draft_write_delivery(state.function_name, data, platform, user_id)
 
     if data.get("transportError") is True:
         if on_transport_failure is not None:
@@ -6630,9 +6665,10 @@ async def _execute_confirmed_tool(
             space_key,
             owner_label,
         )
-        return _format_ranked_shift_partial_failure(
-            data,
-            continuation_staged=continuation_staged,
+        from .chat_render import finalize_draft_receipt
+        return finalize_draft_receipt(
+            _format_ranked_shift_partial_failure(data, continuation_staged=continuation_staged),
+            data, platform=platform, requested_words=receipt_requested_words,
         )
 
     if data.get("success") is True and carried_warnings:
@@ -6915,8 +6951,11 @@ async def _execute_confirmed_tool(
                 space_key,
                 owner_label,
             )
-        combined = _dedupe_authoritative_link_lines(
-            response + "\n\n" + submit_response
+        from .chat_render import finalize_draft_receipt
+        combined = finalize_draft_receipt(
+            response + "\n\n" + submit_response,
+            *((submit_result.data or {},) if authorized_items else ()), data,
+            platform=platform, requested_words=receipt_requested_words,
         )
         return prepend_pending_word_reminders(
             combined,
@@ -6990,7 +7029,8 @@ async def _execute_confirmed_tool(
                 parts.append(f"\n草稿地址：{batch_url}")
             if pr_url:
                 parts.append(f"PR：{pr_url}")
-            return "\n".join(parts)
+            from .chat_render import finalize_draft_receipt
+            return finalize_draft_receipt("\n".join(parts), data, platform=platform)
         if data.get("uncertain"):
             return _append_batch_url_if_missing(
                 "⚠️ " + str(
@@ -7098,6 +7138,7 @@ async def _execute_confirmed_tool(
                         data,
                     )
             if state.function_name == "keytao_shift_phrase_code":
+                data["requestedWords"] = receipt_requested_words or [str(state.args.get("word") or "")]
                 response = _format_ranked_shift_success(data)
                 if submit_after:
                     shift_plan = (
@@ -7212,6 +7253,7 @@ async def _format_draft_response(
 
     snapshot = data.get("draft_snapshot")
     list_batch_url = ""
+    list_data = {}
     if not snapshot:
         list_json = await call_tool_function(
             "keytao_list_draft_items",
@@ -7292,7 +7334,8 @@ async def _format_draft_response(
 
     if not compact and draft_count != 0:
         parts.append("发送「提交」，或继续修改。")
-    return "\n".join(parts)
+    from .chat_render import finalize_draft_receipt
+    return finalize_draft_receipt("\n".join(parts), data, preview, list_data, platform=platform)
 
 
 async def _submit_current_draft(
@@ -7487,7 +7530,11 @@ async def _perform_submit_current_draft(
         parts.append(f"批次地址：{batch_url}")
     if pr_url:
         parts.append(f"PR：{pr_url}")
-    return DraftActionResult("\n".join(parts), success=True, data=submit_data)
+    from .chat_render import finalize_draft_receipt
+    return DraftActionResult(
+        finalize_draft_receipt("\n".join(parts), submit_data, platform=platform),
+        success=True, data=submit_data,
+    )
 
 
 async def _perform_active_operation_confirmation(
@@ -12086,6 +12133,9 @@ async def handle_pending_message_core(
                 auto_confirm_shift_plan=state.args.get("_reviewed_multi_word") is True,
                 expected_occupants_by_code=batch_front_insert["expectedOccupantsByCode"],
                 auto_confirm_expected_shifted_words=batch_front_insert["expectedShiftedWords"],
+                receipt_requested_words=state.args.get("_query_words") or [
+                    item["word"] for item in state.args.get("items", []) if isinstance(item, dict) and item.get("word")
+                ],
             )
         elif (
             state.function_name == "keytao_batch_add_to_draft"

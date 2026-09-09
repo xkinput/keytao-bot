@@ -21,6 +21,7 @@ from ..harness.state import (
 )
 from ..utils import review_flags
 from ..utils import http_client
+from ..utils.draft_receipts import merge_receipt_deltas, receipt_change_lines
 from ..utils.pending_confirmation import (
     _BIND_HELP_TEXT,
     _humanize_warning_text,
@@ -1926,6 +1927,33 @@ def _append_batch_url_if_missing(
         separator = "\n\n" if output.rstrip() else ""
         output = output.rstrip() + separator + f"{label}：待确认后生成"
     return output
+
+
+def finalize_draft_receipt(
+    text: str,
+    *sources: Dict,
+    platform: str = "",
+    requested_words=(),
+) -> str:
+    """Restore the complete local write delta and its exact trusted batch link."""
+    deltas = [source for source in sources if isinstance(source, dict)
+              and ("writtenItems" in source or "updatedItems" in source)]
+    if deltas:
+        delta = merge_receipt_deltas(list(reversed(deltas)))
+        delta["noWrite"] = all(source.get("noWrite") for source in deltas)
+        lines = receipt_change_lines(delta, requested_words)
+        body = [line for line in text.splitlines() if not line.startswith(("已变更：", "未新增变更："))]
+        new_lines = [line for line in lines if line not in body]
+        insert_at = 1 if body else 0
+        body[insert_at:insert_at] = new_lines
+        text = "\n".join(body)
+    bundle = _trusted_link_bundle(*sources)
+    batch_id = bundle.get("batchId", "")
+    if not bundle.get("batchUrl") and batch_id and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", batch_id):
+        bundle["batchUrl"] = f"{public_base_for_platform(platform or 'web')}/batch/{batch_id}"
+    if bundle.get("_provisionalBatch") == "true":
+        bundle["batchIdProvisional"] = True
+    return re.sub(r"\n{3,}", "\n\n", _append_batch_url_if_missing(text, bundle)).strip()
 
 
 _OPERATION_MEMORY_PREFIX_RE = re.compile(

@@ -15055,6 +15055,11 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 "batchId": "materialized-batch",
                 "contentVersion": 1,
                 "batchUrl": "http://localhost:3100/batch/materialized-batch",
+                "writtenItems": [
+                    {"id": 61001, "action": "Create", "word": "王中王", "code": "wfw", "type": "Phrase"},
+                    {"id": 61002, "action": "Create", "word": "微服务", "code": "wfwu", "type": "Phrase"},
+                ],
+                "updatedItems": [],
             }
 
         client = _FakeClient([
@@ -15109,7 +15114,9 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("已加入草稿", result)
+        self.assertIn("王中王 → wfw", result)
+        self.assertIn("微服务 → wfwu", result)
+        self.assertEqual(result.count("http://localhost:3100/batch/materialized-batch"), 1)
         self.assertEqual(len(batch_calls), 2)
         self.assertFalse(batch_calls[0]["confirmed"])
         self.assertTrue(batch_calls[1]["confirmed"])
@@ -15421,6 +15428,12 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "batchUrl": "https://trusted.example/batch/s26-materialized",
                 "contentVersion": 1,
                 "shiftPlan": shift_plan,
+                "writtenItems": [
+                    {"id": 61011, "action": "Create", "word": "幂等", "code": "mkdr", "type": "Phrase"},
+                    {"id": 61012, "action": "Delete", "word": "米等", "code": "mkdr", "type": "Phrase"},
+                    {"id": 61013, "action": "Create", "word": "米等", "code": "mkdro", "type": "Phrase"},
+                ],
+                "updatedItems": [],
             }
 
         client = _FakeClient([])
@@ -15446,9 +15459,10 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         )
         self.assertEqual(calls[2][1]["word"], "幂等")
         self.assertEqual(calls[2][1]["target_code"], "mkdr")
-        self.assertIn("「幂等」 → mkdr", result)
-        self.assertIn("「米等」 mkdr → mkdro", result)
+        self.assertIn("幂等 → mkdr", result)
+        self.assertIn("米等 mkdr→mkdro", result)
         self.assertIn("s26-materialized", result)
+        self.assertEqual(result.count("https://trusted.example/batch/s26-materialized"), 1)
         self.assertNotIn("重码", result)
 
     async def test_s48_incident_command_never_enters_the_main_model_loop(self) -> None:
@@ -15526,6 +15540,12 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "batchId": "s48-materialized",
                 "contentVersion": 1,
                 "shiftPlan": shift_plan,
+                "writtenItems": [
+                    {"id": 61021, "action": "Delete", "word": "蛋粉", "code": "dffn", "type": "Phrase"},
+                    {"id": 61022, "action": "Create", "word": "单份", "code": "dffn", "type": "Phrase"},
+                    {"id": 61023, "action": "Create", "word": "蛋粉", "code": "dffna", "type": "Phrase"},
+                ],
+                "updatedItems": [],
             }
 
         client = _FakeClient([])
@@ -15549,8 +15569,9 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "keytao_shift_phrase_code",
             ],
         )
-        self.assertIn("「单份」 → dffn", reply)
-        self.assertIn("「蛋粉」 dffn → dffna", reply)
+        self.assertIn("单份 → dffn", reply)
+        self.assertIn("蛋粉 dffn→dffna", reply)
+        self.assertEqual(reply.count("/batch/s48-materialized"), 1)
         self.assertNotIn(pending_confirmation_copy(), reply)
 
     async def test_verbatim_occupant_eviction_derives_code_from_server_records(self) -> None:
@@ -15705,6 +15726,12 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "batchId": "echo-materialized",
                 "contentVersion": 1,
                 "shiftPlan": shift_plan,
+                "writtenItems": [
+                    {"id": 61031, "action": "Create", "word": "亮面", "code": "lxmmov", "type": "Phrase"},
+                    {"id": 61032, "action": "Delete", "word": "粮棉", "code": "lxmmov", "type": "Phrase"},
+                    {"id": 61033, "action": "Create", "word": "粮棉", "code": "lxmmova", "type": "Phrase"},
+                ],
+                "updatedItems": [],
             }
 
         client = _FakeClient([])
@@ -15729,8 +15756,9 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             ],
         )
         self.assertEqual(calls[2][1]["target_code"], "lxmmov")
-        self.assertIn("「亮面」 → lxmmov", result)
-        self.assertIn("「粮棉」 lxmmov → lxmmova", result)
+        self.assertIn("亮面 → lxmmov", result)
+        self.assertIn("粮棉 lxmmov→lxmmova", result)
+        self.assertEqual(result.count("/batch/echo-materialized"), 1)
 
     async def test_existing_move_incident_executes_one_circular_swap_without_resend(self) -> None:
         calls = []
@@ -15803,6 +15831,13 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "batchId": "swap-materialized",
                 "contentVersion": 1,
                 "shiftPlan": shift_plan,
+                "writtenItems": [
+                    {"id": 61041, "action": "Delete", "word": "冒菜", "code": "mzchi", "type": "Phrase"},
+                    {"id": 61042, "action": "Delete", "word": "茂才", "code": "mzch", "type": "Phrase"},
+                    {"id": 61043, "action": "Create", "word": "冒菜", "code": "mzch", "type": "Phrase"},
+                    {"id": 61044, "action": "Create", "word": "茂才", "code": "mzchi", "type": "Phrase"},
+                ],
+                "updatedItems": [],
             }
 
         client = _FakeClient([
@@ -15846,7 +15881,9 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "keytao_shift_phrase_code",
             ],
         )
-        self.assertIn("顺延结果：冒菜 → mzch，茂才 → mzchi", result)
+        self.assertIn("冒菜 mzchi→mzch", result)
+        self.assertIn("茂才 mzch→mzchi", result)
+        self.assertEqual(result.count("/batch/swap-materialized"), 1)
         self.assertNotIn("回复「确认」", result)
         self.assertNotRegex(result, r"重新发送|原样发送")
 
@@ -16067,6 +16104,12 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "batchId": "materialised-positional",
                 "contentVersion": 1,
                 "shiftPlan": shift_plan,
+                "writtenItems": [
+                    {"id": 61051, "action": "Delete", "word": "赤溪", "code": "wkxk", "type": "Phrase"},
+                    {"id": 61052, "action": "Create", "word": "吃席", "code": "wkxk", "type": "Phrase", "needsManualReview": True},
+                    {"id": 61053, "action": "Create", "word": "赤溪", "code": "wkxkv", "type": "Phrase"},
+                ],
+                "updatedItems": [],
             }
 
         store = MemoryConversationStateStore()
@@ -16105,8 +16148,9 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(calls[2][1]["expected_content_version"], 0)
         self.assertEqual(calls[2][1]["expected_warning_digest"], warning_digest)
         self.assertIsNone(store.get_record(address))
-        self.assertIn("positioned", result)
-        self.assertIn("顺延结果：吃席 → wkxk，赤溪 → wkxkv", result)
+        self.assertIn("吃席 → wkxk", result)
+        self.assertIn("赤溪 wkxk→wkxkv", result)
+        self.assertEqual(result.count("/batch/materialised-positional"), 1)
 
     async def test_front_second_preview_with_new_warning_stays_pending(self) -> None:
         calls = []
@@ -16218,6 +16262,11 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                     "failedCount": 0,
                     "batchId": "materialized-duplicate",
                     "contentVersion": 1,
+                    "writtenItems": [
+                        {"id": 61061, "action": "Create", "word": "吃席", "code": "wkxk", "type": "Phrase", "weight": 100, "needsManualReview": True},
+                        {"id": 61062, "action": "Change", "oldWord": "赤溪", "word": "赤溪", "code": "wkxk", "type": "Phrase", "weight": 101},
+                    ],
+                    "updatedItems": [],
                     "draft_snapshot": {
                         "count": 2,
                         "items": expected_items,
@@ -16264,8 +16313,18 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(calls[1][1]["expected_content_version"], 0)
         self.assertEqual(calls[1][1]["expected_warning_digest"], "c" * 64)
         self.assertIsNone(store.get_record(address))
-        self.assertIn("duplicate complete", result)
-        self.assertIn("同码顺序：wkxk：吃席 → 赤溪", result)
+        self.assertIn("吃席 → wkxk", result)
+        self.assertIn("赤溪 wkxk 权重 →101", result)
+        self.assertEqual(result.count("/batch/materialized-duplicate"), 1)
+        tool_messages = [
+            message for message in client.completions.calls[-1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        receipt = __import__("json").loads(tool_messages[-1]["content"])
+        self.assertEqual(
+            [(item["word"], item["action"], item["weight"]) for item in receipt["writtenItems"]],
+            [("吃席", "Create", 100), ("赤溪", "Change", 101)],
+        )
 
     async def test_front_same_code_wider_chain_requires_explicit_confirmation(self) -> None:
         calls = []
@@ -16855,6 +16914,10 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                 "success": True,
                 "batchId": "51747df6-87a7-44d9-bd28-174c8b817429",
                 "contentVersion": 1,
+                "writtenItems": [
+                    {"id": 61071, "action": "Create", "word": "吃席", "code": "wkxko", "type": "Phrase", "needsManualReview": True},
+                ],
+                "updatedItems": [],
             }
 
         store = MemoryConversationStateStore()
@@ -16894,7 +16957,8 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
             warning_digest,
         )
         self.assertIsNone(store.get_record(address))
-        self.assertIn("positioned behind", result)
+        self.assertIn("吃席 → wkxko", result)
+        self.assertEqual(result.count("/batch/51747df6-87a7-44d9-bd28-174c8b817429"), 1)
         self.assertNotIn("同码顺序", result)
 
     async def test_back_same_code_marker_keeps_duplicate_weight_path(self) -> None:
@@ -17089,7 +17153,14 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
                         "message": "wkxk already contains 赤溪",
                     }],
                 }
-            return {"success": True, "batchId": "batch-warning"}
+            return {
+                "success": True,
+                "batchId": "batch-warning",
+                "writtenItems": [
+                    {"id": 61081, "action": "Create", "word": "吃席", "code": "wkxk", "type": "Phrase"},
+                ],
+                "updatedItems": [],
+            }
 
         store = MemoryConversationStateStore()
         address = ConversationAddress.private("qq", "candidate-user")
@@ -17123,7 +17194,8 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertEqual(payload.get("warnedCount"), 1)
         self.assertEqual(payload["warnings"][0]["warningType"], "duplicate_code")
         self.assertIsNone(store.get_record(address))
-        self.assertIn("added with warning", result)
+        self.assertIn("吃席 → wkxk", result)
+        self.assertEqual(result.count("/batch/batch-warning"), 1)
         self.assertIn("⚠️ wkxk already contains 赤溪", result)
 
     async def test_eviction_add_never_auto_confirms_duplicate_creation(self) -> None:
@@ -18091,7 +18163,17 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                     "planDigest": "a" * 64,
                     "shiftPlan": {"word": "吃席", "targetCode": "wkxk"},
                 }
-            return {"success": True, "message": "已写入草稿；顺延：赤溪 wkxk→wkxkv"}
+            return {
+                "success": True,
+                "batchId": "batch-1",
+                "message": "已写入草稿；顺延：赤溪 wkxk→wkxkv",
+                "writtenItems": [
+                    {"id": 61091, "action": "Create", "word": "吃席", "code": "wkxk", "type": "Phrase"},
+                    {"id": 61092, "action": "Delete", "word": "赤溪", "code": "wkxk", "type": "Phrase"},
+                    {"id": 61093, "action": "Create", "word": "赤溪", "code": "wkxkv", "type": "Phrase"},
+                ],
+                "updatedItems": [],
+            }
 
         client = _FakeClient([
             _fake_response("tool_calls", tool_calls=[_shift_tool_call()]),
@@ -18120,7 +18202,9 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             state_store.get_record(ConversationAddress.private("qq", "user-1"))
         )
-        self.assertEqual(result, "已完成顺延。")
+        self.assertIn("吃席 → wkxk", result)
+        self.assertIn("赤溪 wkxk→wkxkv", result)
+        self.assertEqual(result.count("/batch/batch-1"), 1)
 
     async def test_shift_without_any_draft_executes_in_one_authorization(self) -> None:
         """Both server tickets are replayed under one exact authorization."""
@@ -18206,6 +18290,12 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
                 "batchId": "materialised-1",
                 "contentVersion": 1,
                 "shiftPlan": shift_plan,
+                "writtenItems": [
+                    {"id": 61101, "action": "Delete", "word": "赤溪", "code": "wkxk", "type": "Phrase"},
+                    {"id": 61102, "action": "Create", "word": "吃席", "code": "wkxk", "type": "Phrase", "needsManualReview": True},
+                    {"id": 61103, "action": "Create", "word": "赤溪", "code": "wkxkv", "type": "Phrase"},
+                ],
+                "updatedItems": [],
                 "draft_snapshot": {
                     "count": 3,
                     "items": shift_plan["items"],
@@ -18230,8 +18320,9 @@ class ShiftSingleAuthorizationTests(unittest.IsolatedAsyncioTestCase):
 
         address = ConversationAddress.private("qq", "user-1")
         self.assertEqual(len(calls), 3)
-        self.assertIn("已完成顺延。", result)
-        self.assertIn("顺延结果：吃席 → wkxk，赤溪 → wkxkv", result)
+        self.assertIn("吃席 → wkxk", result)
+        self.assertIn("赤溪 wkxk→wkxkv", result)
+        self.assertEqual(result.count("/batch/materialised-1"), 1)
         self.assertEqual(calls[2]["batch_id"], "")
         self.assertEqual(calls[2]["expected_content_version"], 0)
         self.assertEqual(calls[2]["expected_warning_digest"], warning_digest)
@@ -18586,6 +18677,10 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 "batchId": "batch-combined",
                 "batchUrl": "http://localhost:3100/batch/batch-combined",
                 "contentVersion": 5,
+                "writtenItems": [
+                    {"id": 61111, "action": "Create", "word": "炒冷饭", "code": "wlfoo", "type": "Phrase"},
+                ],
+                "updatedItems": [],
                 "draft_snapshot": {
                     "items": [{
                         "action": "Create",
@@ -18602,6 +18697,8 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     "success": True,
                     "batchId": "batch-combined",
                     "batchUrl": "http://localhost:3100/batch/batch-combined",
+                    "writtenItems": [],
+                    "updatedItems": [],
                 }
             return {
                 "success": False,
@@ -18720,7 +18817,7 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
             calls[2][1]["expected_server_snapshot_digest"],
             snapshot_digest,
         )
-        self.assertIn("已将「炒冷饭」 → wlfoo 写入草稿", reply)
+        self.assertIn("炒冷饭 → wlfoo", reply)
         self.assertIn("已提交审核", reply)
         self.assertNotIn("batch-combined", reply.replace(
             "http://localhost:3100/batch/batch-combined",

@@ -2691,7 +2691,7 @@ class AgentOrchestrator:
                             failure_state.clear()
                     if (
                         isinstance(result_data, dict)
-                        and result_data.get("success") is True
+                        and (result_data.get("success") is True or result_data.get("partialWrite") is True)
                         and fn_name in MUTATING_TOOL_NAMES
                     ):
                         receipt = self._successful_write_receipt(
@@ -3530,8 +3530,21 @@ class AgentOrchestrator:
         result: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """Project one actual successful mutation into truthful reply evidence."""
-        if result.get("success") is not True:
+        if result.get("success") is not True and result.get("partialWrite") is not True:
             return None
+        if "writtenItems" in result or "updatedItems" in result:
+            return {
+                **{key: result[key] for key in (
+                    "writtenItems", "updatedItems", "requestedItems", "requestedWords",
+                    "receiptItemsUnavailable", "failed", "skipped", "noWrite", "warnings", "autoApproved",
+                ) if key in result},
+                "tool": tool_name,
+                "batchId": str(result.get("batchId") or "").strip(),
+                "batchUrl": str(result.get("batchUrl") or "").strip(),
+                "items": [{key: item[key] for key in ("action", "word", "code") if key in item}
+                          for item in result.get("writtenItems") or []],
+                "shifted": [],
+            }
         items: List[Dict[str, str]] = []
         shift_plan = result.get("shiftPlan")
         if tool_name == "keytao_create_phrase":
@@ -3620,6 +3633,24 @@ class AgentOrchestrator:
     @staticmethod
     def _receipt_completion_reply(receipts: List[Dict[str, Any]]) -> str:
         """Render completed writes only from authoritative same-turn receipts."""
+        if any("writtenItems" in receipt or "updatedItems" in receipt for receipt in receipts):
+            from ..utils.draft_receipts import merge_receipt_deltas, receipt_change_lines
+            from ..plugins.chat_render import finalize_draft_receipt, _plain_warning_line
+            lines = ["本轮已完成的写操作：", *receipt_change_lines(merge_receipt_deltas(receipts))]
+            for receipt in receipts:
+                if receipt.get("tool") == "keytao_submit_batch":
+                    lines.append("✅ 批次已加入词库。" if receipt.get("autoApproved") else "✅ 批次已提交审核。")
+                for warning in receipt.get("warnings") or []:
+                    line = _plain_warning_line(warning)
+                    if line and line not in lines:
+                        lines.append(line)
+            # Separate batch identities must each retain their own link.
+            links = []
+            for receipt in receipts:
+                link = finalize_draft_receipt("", {key: receipt[key] for key in ("batchId", "batchUrl") if key in receipt})
+                if link and link not in links:
+                    links.append(link)
+            return "\n".join([*lines, *links])
         written: List[tuple[str, str]] = []
         shifted: List[tuple[str, str, str]] = []
         batch_urls: List[str] = []
@@ -3870,6 +3901,9 @@ class AgentOrchestrator:
                 reply,
             )
         authorized_item = explicit_combined_add_submit_item(current_message)
+        if (any("writtenItems" in receipt or "updatedItems" in receipt for receipt in receipts)
+                and not failure_state and not (termination_state or {}).get("reason")):
+            return cls._receipt_completion_reply(receipts)
         if authorized_item is not None:
             add_receipts = [
                 receipt
@@ -3926,7 +3960,7 @@ class AgentOrchestrator:
                 for receipt in receipts
             )
             lines = cls._receipt_completion_reply(receipts).splitlines()
-            if submitted:
+            if submitted and not any("已提交审核" in line or "已加入词库" in line for line in lines):
                 lines.append("- 已提交审核。")
             if failure_state:
                 failed_tool = str(failure_state.get("_failedTool") or "")
@@ -4286,6 +4320,10 @@ class AgentOrchestrator:
     ) -> None:
         """Keep the exact successful relocation outcome visible to the user."""
         if tool_name != "keytao_shift_phrase_code" or result.get("success") is not True:
+            return
+        if "writtenItems" in result or "updatedItems" in result:
+            from ..utils.draft_receipts import receipt_change_lines
+            links["_createNotices"] = "\n".join(receipt_change_lines(result))
             return
         shift_plan = result.get("shiftPlan")
         if not isinstance(shift_plan, dict):
