@@ -7360,6 +7360,25 @@ async def _submit_current_draft(
     return result.text
 
 
+def _normalized_submit_items(
+    items: object,
+) -> Optional[List[Tuple[str, str, str]]]:
+    """Return complete action/word/code rows, or nothing when one row is unusable."""
+    if not isinstance(items, list) or not items:
+        return None
+    normalized: List[Tuple[str, str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        action = str(item.get("action") or "Create").strip()
+        word = str(item.get("word") or "").strip()
+        code = str(item.get("code") or "").strip().lower()
+        if action not in {"Create", "Change", "Delete"} or not word or not code:
+            return None
+        normalized.append((action, word, code))
+    return normalized
+
+
 def _submit_preview_matches_authorized_items(
     submit_data: Dict,
     authorized_items: Optional[List[Dict]],
@@ -7367,26 +7386,76 @@ def _submit_preview_matches_authorized_items(
     """Only auto-confirm a submit preview with the exact authorized item set."""
     if not authorized_items:
         return False
-    snapshot_items = submit_data.get("snapshotItems")
-    if not isinstance(snapshot_items, list) or not snapshot_items:
-        return False
+    expected = _normalized_submit_items(authorized_items)
+    actual = _normalized_submit_items(submit_data.get("snapshotItems"))
+    return (
+        expected is not None
+        and actual is not None
+        and sorted(actual) == sorted(expected)
+    )
 
-    def normalize(items: List[Dict]) -> Optional[List[Tuple[str, str, str]]]:
-        normalized: List[Tuple[str, str, str]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                return None
-            action = str(item.get("action") or "Create").strip()
-            word = str(item.get("word") or "").strip()
-            code = str(item.get("code") or "").strip().lower()
-            if action not in {"Create", "Change", "Delete"} or not word or not code:
-                return None
-            normalized.append((action, word, code))
-        return sorted(normalized)
 
-    expected = normalize(authorized_items)
-    actual = normalize(snapshot_items)
-    return expected is not None and actual is not None and actual == expected
+def submit_snapshot_extra_items(
+    submit_data: Dict,
+    authorized_items: Optional[List[Dict]],
+) -> List[Tuple[str, str]]:
+    """Return the draft rows a submit would carry beyond this turn's own writes."""
+    expected = _normalized_submit_items(authorized_items)
+    actual = _normalized_submit_items(submit_data.get("snapshotItems"))
+    if expected is None or actual is None:
+        return []
+    remaining = list(expected)
+    extras: List[Tuple[str, str]] = []
+    for entry in actual:
+        if entry in remaining:
+            remaining.remove(entry)
+            continue
+        extras.append((entry[1], entry[2]))
+    return extras
+
+
+_SUBMIT_SCOPE_NOTICE_LIMIT = 8
+_SUBSET_SUBMIT_RE = re.compile(
+    r"^(?:只|仅)\s*(?:提交|提审)\s*(?P<target>[^\n?？]{0,64})$"
+)
+
+
+def _submit_scope_notice(extras: List[Tuple[str, str]]) -> str:
+    """Name the rows this turn did not write, so 「确认」 is never a surprise."""
+    if not extras:
+        return ""
+    shown = extras[:_SUBMIT_SCOPE_NOTICE_LIMIT]
+    lines = ["这批草稿里还有本轮之外的内容，提交会一并提交："]
+    lines.extend(f"• {word} → {code}" for word, code in shown)
+    if len(extras) > len(shown):
+        lines.append(f"• 另有 {len(extras) - len(shown)} 条，见草稿地址")
+    lines.append(
+        "提交只能整批进行，不能只提交本轮的词；引用本条回复「确认」一并提交。"
+    )
+    return "\n".join(lines)
+
+
+def subset_submit_refusal(message: str, state: object) -> str:
+    """Answer 「只提交 X」 truthfully: a batch submit has no per-item scope."""
+    if (
+        not isinstance(state, PendingToolConfirm)
+        or state.function_name != "keytao_submit_batch"
+        or not server_warning_ticket_is_complete(state)
+        # A plain submit command is a full-batch assent, never a subset ask.
+        or _is_explicit_draft_submit_request(message)
+    ):
+        return ""
+    match = _SUBSET_SUBMIT_RE.match(
+        unicodedata.normalize("NFKC", str(message or "")).strip()
+    )
+    if match is None:
+        return ""
+    target = match.group("target").strip().strip("「」『』\"'“”‘’ ")
+    named = f"只提交「{target}」" if target else "只提交其中一部分"
+    return _assert_plain_user_facing_reply(
+        f"提交是整批操作，无法{named}。"
+        "回复「确认」提交整批，或回复「查看草稿」先整理草稿。"
+    )
 
 
 async def _perform_submit_current_draft(
@@ -7485,6 +7554,14 @@ async def _perform_submit_current_draft(
                 ),
                 data=submit_data,
             )
+        # The scope notice is a bounded prefix added after the length gate: a
+        # batch that was confirmable must not become unconfirmable because we
+        # explained what else it carries.
+        scope_notice = _submit_scope_notice(
+            submit_snapshot_extra_items(submit_data, authorized_items)
+        )
+        if scope_notice:
+            warning_prompt = scope_notice + "\n" + warning_prompt
         return DraftActionResult(
             _append_batch_url_if_missing(warning_prompt, submit_data),
             pending_state=pending_state,

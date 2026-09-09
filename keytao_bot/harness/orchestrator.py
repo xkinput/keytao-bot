@@ -200,10 +200,13 @@ def _command_suggestions_match_pending_batch(
     if suggestions and isinstance(state, PendingToolConfirm) and server_warning_ticket_is_complete(state):
         from keytao_bot.plugins import chat_routing
 
+        # A draft view is read-only and needs no ticket of its own, so offering
+        # it alongside a ticket control does not make the reply unbacked.
         if all(
             (intent := chat_routing._pending_tool_assent_intent(state, suggestion)) is not None
             and chat_routing._message_authorizes_pending_state_control(state, suggestion, intent)
             for suggestion in suggestions
+            if chat_routing.parse_draft_view_command(suggestion) is None
         ):
             return True
     if (

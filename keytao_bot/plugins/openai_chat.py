@@ -2546,6 +2546,37 @@ def _enforce_advertised_reply_contract(
     return rendered
 
 
+def _active_operation_state_record(
+    conv_key: Optional[ConversationKey],
+) -> Optional[PendingStateRecord]:
+    """Expose a background operation's confirmation ticket as live actor state.
+
+    A backgrounded draft operation parks its confirmation ticket on the
+    operation itself so a newer word can still own the conversation slot. The
+    ticket is real and this actor can consume it, so the delivery boundary must
+    see it too; otherwise every asked confirmation is replaced as unbacked.
+    """
+    operation = (
+        draft_operation_coordinator.get(conv_key)
+        if conv_key is not None
+        else None
+    )
+    if (
+        operation is None
+        or operation.status != "awaiting_confirmation"
+        or operation.pending_state is None
+    ):
+        return None
+    return PendingStateRecord(
+        state=operation.pending_state,
+        owner_key=operation.owner_key,
+        space_key=operation.owner_key.space_key,
+        created_at=time.time(),
+        expires_at=float("inf"),
+        nonce=operation.operation_id,
+    )
+
+
 def _enforce_candidate_reply_contract(
     response: str,
     conv_key: Optional[ConversationKey],
@@ -2559,6 +2590,8 @@ def _enforce_candidate_reply_contract(
         if conv_key is not None
         else None
     )
+    if record is None:
+        record = _active_operation_state_record(conv_key)
     evidence = keytao_review.current_commonness_evidence()
     if record is not None and not record.execution_id and isinstance(record.state, PendingToolConfirm) and _state.server_warning_ticket_is_complete(record.state):
         plan = (record.state.args.get("_pending_display") or {}).get("shiftPlan") or {}
@@ -2690,6 +2723,44 @@ def _enforce_candidate_reply_contract(
     return "当前没有可验证的可执行操作，本次未写入。"
 
 
+def _append_unreported_submit_status(
+    prepared: str,
+    deliveries: List[Dict[str, Any]],
+    conv_key: Optional[ConversationKey],
+) -> str:
+    """Never end a 提交 turn with a write receipt that is silent about the submit.
+
+    An instruction that asks to submit is answered by exactly one of three
+    facts: the batch was submitted, a live ticket is still asking about it, or
+    the plain reason it was not submitted.
+    """
+    asked_to_submit = parse_pending_assent_phrase(_current_turn_message.get(""))
+    if (
+        not asked_to_submit.submit_after
+        or asked_to_submit.rejection
+        or asked_to_submit.cancel_requested
+    ):
+        return prepared
+    if any(receipt.get("operationKind") == "draft_submit" for receipt in deliveries):
+        return prepared
+    if any(status in prepared for status in ("已提交审核", "已加入词库", "尚未提交审核")):
+        return prepared
+    record = (
+        conversation_state_store.get_record(conv_key)
+        if conv_key is not None
+        else None
+    ) or _active_operation_state_record(conv_key)
+    if (
+        record is not None
+        and isinstance(record.state, PendingToolConfirm)
+        and record.state.function_name == "keytao_submit_batch"
+        # A local "recent own write" pointer is not an asked submit question.
+        and _state.server_warning_ticket_is_complete(record.state)
+    ):
+        return prepared
+    return prepared + "\n本轮只写入草稿，尚未提交审核。"
+
+
 def _prepare_user_facing_reply(
     response: str,
     memory_context: Optional[ChatMemoryContext],
@@ -2783,6 +2854,7 @@ def _prepare_user_facing_reply(
         ) for receipt in deliveries))
         prepared = _dedupe_authoritative_link_lines(prepared)
         prepared = "\n".join([prepared, *filter(None, link_lines)])
+        prepared = _append_unreported_submit_status(prepared, deliveries, conv_key)
     prepared = render_platform_public_links(prepared, platform)
     prepared = strip_bare_batch_ids(prepared)
     return _assert_plain_user_facing_reply(prepared)
@@ -4334,6 +4406,21 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
                 return True
 
         if active_operation.status == "awaiting_confirmation":
+            subset_refusal = _chat_commands.subset_submit_refusal(
+                ctx.normalized_message_text,
+                active_operation.pending_state,
+            )
+            if subset_refusal:
+                # The ticket stays live: the answer is a fact, not a decision.
+                ctx.response = subset_refusal
+                remember_conversation(
+                    ctx.conv_key,
+                    ctx.memory_context,
+                    ctx.normalized_message_text,
+                    ctx.response,
+                )
+                await _finish_ai_chat_matcher(ctx.response)
+                return True
             active_structural_assent = _pending_tool_assent_intent(
                 active_operation.pending_state,
                 ctx.normalized_message_text,
@@ -5009,6 +5096,15 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                 state_space_key,
                 ctx.owner_label,
             )
+            return False
+
+        subset_refusal = _chat_commands.subset_submit_refusal(
+            ctx.normalized_message_text,
+            state,
+        )
+        if subset_refusal:
+            # The ticket stays live: the answer is a fact, not a decision.
+            ctx.response = subset_refusal
             return False
 
         if state is not None:
