@@ -3688,6 +3688,33 @@ async def _stage_handle_explicit_entry_operation(ctx: TurnContext) -> bool:
     return True
 
 
+async def _stage_prepare_fresh_code_selection(ctx: TurnContext) -> bool:
+    """Prepare a fresh exact code without restoring history or invoking a model."""
+    if ctx.response is not None or ctx.scoped_pending_response is not None:
+        return False
+    request = _chat_commands.fresh_entry_code_selection(ctx.normalized_message_text)
+    if request is None or ctx.reply_reference.is_reply:
+        return False
+    record = conversation_state_store.get_record(ctx.conv_key)
+    if record is not None:
+        # Live selection keeps its existing sealed, actor-bound executor.
+        return False
+    active = draft_operation_coordinator.get(ctx.conv_key)
+    if active is not None:
+        ctx.response = _format_active_draft_operation_message(active, active.pending_state)
+    else:
+        set_turn_flow("explicit-code")
+        ctx.response = await _chat_commands.prepare_fresh_entry_code_selection(
+            request, ctx.normalized_message_text, ctx.platform, ctx.user_id,
+            ctx.conv_key, ctx.space_key, ctx.owner_label,
+        )
+    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+    await _finish_ai_chat_response(
+        ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+    )
+    return True
+
+
 async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     """Production scenario: bind live pending state to the current reply and actor scope."""
     current_record = conversation_state_store.get_record(ctx.conv_key)
@@ -5855,6 +5882,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_completed_draft_undo,
     _stage_claim_offered_answer,
     _stage_resolve_current_pending_scope,
+    _stage_prepare_fresh_code_selection,
     _stage_finish_scoped_pending_response,
     _stage_guard_stale_confirmation,
     _stage_restore_replied_pending_reference,

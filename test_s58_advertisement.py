@@ -141,7 +141,8 @@ class S58AdvertisementTests(unittest.TestCase):
                 )
                 result = await orchestrator.run("说明上次查询结果", harness.AgentRequestContext(
                     platform="qq", user_id="s45-sanitize", mutations_allowed=False))
-                self.assertIn("未写入", result)
+                self.assertTrue(result)
+                self.assertNotIn("调整", result)
                 self.assertFalse(chat.advertised_reply_contract(result).requires_live_state)
                 self.assertNotIn("这些词加入草稿", result)
                 self.assertIsNone(store.get_record(harness.ConversationAddress.private("qq", "s45-sanitize")))

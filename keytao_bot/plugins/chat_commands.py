@@ -21,7 +21,9 @@ from ..harness.conversation import (
     normalize_conversation_key,
 )
 from ..harness.authorization_grammar import (
+    _NEGATIVE_MODAL_RE,
     _PHRASE_TYPE_BASE_WEIGHTS,
+    _POSITIONAL_REPORTED_CONTEXT_RE,
     dictionary_recode_items_match,
     explicit_same_code_requested,
     explicit_complete_add_item,
@@ -36,6 +38,7 @@ from ..harness.authorization_grammar import (
     parse_contextual_relative_position,
     parse_eviction_modified_add,
     parse_replace_at_code,
+    parse_reviewed_multi_word_selection,
     replace_at_code_items_match,
     server_warning_confirmation_binding,
     unnamed_eviction_modified_add_item,
@@ -100,6 +103,7 @@ from ..utils.pending_confirmation import (
     render_remediation_reply,
     render_server_backed_single_word_lookup,
     single_word_candidate_footer,
+    trusted_pending_word_items,
     validated_front_insert_recommendation,
 )
 from ..utils.memory_store import (
@@ -11878,6 +11882,8 @@ async def _execute_explicit_entry_code_request(
     conv_key: ConversationKey,
     space_key: Optional[Tuple[str, str]],
     owner_label: str,
+    *,
+    prepare_only: bool = False,
 ) -> str:
     """Review the named item before granting its additional-code capability."""
     raw = await call_tool_function(
@@ -11893,6 +11899,10 @@ async def _execute_explicit_entry_code_request(
         or review.get("success") is not True
         or review.get("word") != request.word
         or str(review.get("type") or "Phrase") != phrase_type
+        or (
+            prepare_only
+            and (review.get("reviewDisposition") == "BLOCK" or review.get("pronunciationUnresolved") is True)
+        )
     ):
         return f"未能取得「{request.word}」的已审读音和正确词条类型，本次未写入。"
     inventory = select_candidate_inventory(review)
@@ -11920,8 +11930,25 @@ async def _execute_explicit_entry_code_request(
     derived, failure = await _bind_explicit_pending_code(reviewed, request, platform, user_id)
     if failure:
         return failure
+    if prepare_only:
+        # This turn names a code, but carries no write capability. Keep the
+        # displayed choice and next-turn confirmation bound to that exact code.
+        derived.candidates = [(request.code, dict(derived.server_candidates)[request.code])]
+        derived.server_candidates = list(derived.candidates)
+        derived.server_ordering_assessments = [
+            assessment for assessment in derived.server_ordering_assessments
+            if assessment.get("occupantCode") == request.code
+        ]
     if not conversation_state_store.set(conv_key, derived, space_key=space_key, owner_label=owner_label):
         return "指定编码的核验记录未能保存，本次未写入。"
+    if prepare_only:
+        from .openai_chat import _render_live_single_candidate_record
+
+        rendered = _render_live_single_candidate_record(conversation_state_store.get_record(conv_key))
+        if not rendered:
+            conversation_state_store.delete(conv_key)
+            return "指定编码的候选展示未能通过核验，本次未写入。"
+        return "已重新核验指定编码，本次尚未写入。\n" + rendered
     existing_codes = tuple(dict.fromkeys(
         row["code"] for row in review.get("existing", [])
         if isinstance(row, dict) and row.get("word") == request.word
@@ -11950,6 +11977,60 @@ async def _execute_explicit_entry_code_request(
         if derived.manual_review_reason else ""
     )
     return note + response
+
+
+def fresh_entry_code_selection(message: str) -> Optional[ExplicitEntryCodeRequest]:
+    """Recognize one closed lexical pair without granting mutation authority."""
+    pairs = parse_reviewed_multi_word_selection(message)
+    if pairs is None or len(pairs) != 1:
+        return None
+    word, code = pairs[0]
+    if (
+        not code.isalpha()
+        or not looks_like_lexical_review_target(word)
+        or _NEGATIVE_MODAL_RE.match(word)
+        or _POSITIONAL_REPORTED_CONTEXT_RE.match(word)
+    ):
+        return None
+    return ExplicitEntryCodeRequest(word, code)
+
+
+async def prepare_fresh_entry_code_selection(
+    request: ExplicitEntryCodeRequest,
+    message: str,
+    platform: str,
+    user_id: str,
+    conv_key: ConversationKey,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+) -> str:
+    """Read current actor facts before preparing an unbound word/code pair."""
+    raw = await call_tool_function(
+        "keytao_pending_items_by_words", {"words": [request.word]}, platform, user_id,
+    )
+    try:
+        pending = json.loads(raw)
+    except (TypeError, ValueError):
+        pending = {}
+    if (
+        not isinstance(pending, dict)
+        or pending.get("success") is not True
+        or pending.get("complete") is not True
+        or not isinstance(pending.get("items"), list)
+    ):
+        return "暂时无法核验当前草稿和待审核批次，本次未继续。"
+    phrase_type = "Single" if len(request.word) == 1 else "Phrase"
+    matching = [
+        item for item in trusted_pending_word_items(pending.get("items"))
+        if item["word"] == request.word and item["code"] == request.code
+        and item["type"] == phrase_type and item["action"] in {"Create", "Change"}
+    ]
+    if matching:
+        return prepend_pending_word_reminders("本次未重复添加。", matching, words=(request.word,))
+    return await _execute_explicit_entry_code_request(
+        request, message, platform, user_id, conv_key, space_key, owner_label,
+        prepare_only=True,
+    )
 
 
 async def try_handle_explicit_entry_code_command(

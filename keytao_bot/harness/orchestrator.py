@@ -981,7 +981,13 @@ class AgentOrchestrator:
                     )
                     if termination_state is not None:
                         termination_state["model_authored_reply"] = False
-                    return "这次调整还没有可确认的计划，本次未写入。"
+                    if (
+                        context.mutations_allowed
+                        or message_authorizes_mutation(message)
+                        or looks_like_mutation_grammar_gap(message)
+                    ):
+                        return "这次调整还没有可确认的计划，本次未写入。"
+                    return "我在。你想聊什么，或需要我帮你查什么？"
             if not contract.requires_live_state:
                 return rendered
             return append_unbound_binding_notice(
@@ -2573,6 +2579,20 @@ class AgentOrchestrator:
                         ):
                             if failure_state is not None:
                                 failure_state.clear()
+                        if (
+                            fn_name in MUTATING_TOOL_NAMES
+                            and result_data.get("policyBlocked") is True
+                            and result_data.get("blockReason") == "verb_not_matched"
+                            and result_data.get("missing") == ["executionVerb"]
+                        ):
+                            if termination_state is not None:
+                                termination_state["model_authored_reply"] = False
+                            return self._append_authoritative_result_links(
+                                render_remediation_reply(
+                                    "当前消息没有明确要求执行这项操作；该操作未写入"
+                                ),
+                                authoritative_result_links,
+                            )
                         if (
                             result_data.get("blockReason") == "intent_mismatch"
                             and result_data.get("retryDeterministicRoute") is True
