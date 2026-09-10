@@ -4058,7 +4058,7 @@ def _capture_successful_draft_write_delivery(
         receipt["writeReceipt"] = {
             **{key: result[key] for key in (
                 "writtenItems", "updatedItems", "requestedItems", "requestedWords", "receiptItemsUnavailable",
-                "failed", "skipped", "noWrite", "batchId", "batchUrl", "warnings", "autoApproved",
+                "failed", "skipped", "noWrite", "batchId", "batchUrl", "contentVersion", "warnings", "autoApproved",
             ) if key in result},
             "tool": tool_name,
         }
@@ -4153,20 +4153,46 @@ def _acknowledge_delivered_draft_mutations() -> None:
             )
     memory_context = current_memory_context.get()
     if memory_context is not None:
+        own_deliveries = [
+            receipt for receipt in deliveries
+            if receipt.get("platform") == memory_context.platform
+            and receipt.get("platformId") == memory_context.user_id
+        ]
         submitted_ids = {
             str(receipt.get("batchId") or "").strip()
-            for receipt in deliveries
+            for receipt in own_deliveries
             if receipt.get("operationKind") == "draft_submit"
         }
         recent_batch_ids = tuple(dict.fromkeys(
             str(receipt.get("batchId") or "").strip()
-            for receipt in deliveries
+            for receipt in own_deliveries
             if receipt.get("operationKind") == "draft_write"
             and str(receipt.get("batchId") or "").strip()
             and str(receipt.get("batchId") or "").strip() not in submitted_ids
         ))
         address = memory_context.conversation_address
         if recent_batch_ids and conversation_state_store.get_record(address) is None:
+            from ..utils.draft_receipts import merge_receipt_deltas
+
+            receipts = [
+                receipt.get("writeReceipt") for receipt in own_deliveries
+                if receipt.get("operationKind") == "draft_write"
+                and receipt.get("batchId") in recent_batch_ids
+            ]
+            # Only one complete write can bind the later submit to an unchanged version.
+            recent_items = []
+            recent_version = None
+            if len(recent_batch_ids) == 1 and len(receipts) == 1 and all(
+                isinstance(receipt, dict)
+                and ("writtenItems" in receipt or "updatedItems" in receipt)
+                and not receipt.get("receiptItemsUnavailable")
+                and type(receipt.get("contentVersion")) is int
+                and receipt["contentVersion"] >= 0
+                for receipt in receipts
+            ):
+                delta = merge_receipt_deltas(receipts)
+                recent_items = [*delta["writtenItems"], *delta["updatedItems"]]
+                recent_version = receipts[0]["contentVersion"]
             conversation_state_store.set(
                 address,
                 PendingToolConfirm(
@@ -4179,6 +4205,8 @@ def _acknowledge_delivered_draft_mutations() -> None:
                         ),
                         "_recent_own_write": True,
                         "_recent_batch_ids": list(recent_batch_ids),
+                        "_recent_written_items": recent_items,
+                        "_recent_content_version": recent_version,
                     },
                     confirmation_source="local_preview",
                 ),
@@ -6428,7 +6456,7 @@ async def _execute_confirmed_tool(
     args.pop("_reviewed_batch_readings", None)
     args.pop("_query_words", None)
     args.pop("_query_other_blocks", None)
-    receipt_requested_words = args.pop("_receipt_requested_words", None) or state.args.get("_query_words") or [
+    receipt_requested_words = args.pop("_receipt_requested_words", None) or [
         item.get("word") for item in state.args.get("items", []) if isinstance(item, dict) and item.get("word")
     ]
     args.pop("_unselected_words", None)
@@ -7333,7 +7361,7 @@ async def _format_draft_response(
         parts.append(f"草稿地址：{batch_url}")
 
     if not compact and draft_count != 0:
-        parts.append("发送「提交」，或继续修改。")
+        parts.append("提交前请核对上述草稿内容。")
     from .chat_render import finalize_draft_receipt
     return finalize_draft_receipt("\n".join(parts), data, preview, list_data, platform=platform)
 
@@ -7471,6 +7499,7 @@ async def _perform_submit_current_draft(
     preview_only: bool = True,
     auto_confirm: bool = False,
     authorized_items: Optional[List[Dict]] = None,
+    authorized_content_version: Optional[int] = None,
     authorize_current_draft: bool = False,
 ) -> DraftActionResult:
     """Submit a draft without writing follow-up state into the conversation slot."""
@@ -7504,9 +7533,15 @@ async def _perform_submit_current_draft(
             auto_confirm
             and not confirmed
             and (
-                _submit_preview_matches_authorized_items(
-                    submit_data,
-                    authorized_items,
+                (
+                    _submit_preview_matches_authorized_items(submit_data, authorized_items)
+                    and (
+                        authorized_content_version is None
+                        or (
+                            type(submit_data.get("contentVersion")) is int
+                            and submit_data["contentVersion"] == authorized_content_version
+                        )
+                    )
                 )
                 or (
                     authorize_current_draft
@@ -12210,7 +12245,7 @@ async def handle_pending_message_core(
                 auto_confirm_shift_plan=state.args.get("_reviewed_multi_word") is True,
                 expected_occupants_by_code=batch_front_insert["expectedOccupantsByCode"],
                 auto_confirm_expected_shifted_words=batch_front_insert["expectedShiftedWords"],
-                receipt_requested_words=state.args.get("_query_words") or [
+                receipt_requested_words=state.args.get("_receipt_requested_words") or [
                     item["word"] for item in state.args.get("items", []) if isinstance(item, dict) and item.get("word")
                 ],
             )

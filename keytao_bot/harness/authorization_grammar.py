@@ -2979,7 +2979,7 @@ def message_authorizes_mutation(message: str) -> bool:
 def parse_reviewed_multi_word_selection(
     message: str,
 ) -> Optional[Tuple[Tuple[str, str], ...]]:
-    """Parse canonical word/selector pairs; permission still needs a live record."""
+    """Parse closed word/selector pairs; permission still needs a live record."""
     source = str(message or "").strip()
     if not source or len(source) > 4096:
         return None
@@ -2988,6 +2988,7 @@ def parse_reviewed_multi_word_selection(
     for clause in re.split(r"[，、,]", source):
         match = re.fullmatch(
             r"\s*(?P<word>[\u3400-\u9fff]{1,32})[ \t]+"
+            r"(?:添加[ \t]+)?"
             r"(?P<selector>[1-9][0-9]{0,2}|[a-zA-Z]{1,12})\s*",
             clause,
         )

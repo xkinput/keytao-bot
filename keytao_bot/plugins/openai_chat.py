@@ -3789,6 +3789,7 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     if recent_write_state is not None:
         submit_requested = bool(
             _is_explicit_draft_submit_request(ctx.normalized_message_text)
+            or _is_short_add_and_submit_request(ctx.normalized_message_text)
             or _is_pending_assent_then_submit_request(
                 ctx.normalized_message_text
             )
@@ -5322,12 +5323,20 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
                             command="查看草稿",
                         )
                     else:
+                        recent_version = state.args.get("_recent_content_version")
                         submit_result = await _perform_submit_current_draft(
                             ctx.platform,
                             ctx.user_id,
                             batch_id=recent_batch_ids[0],
                             auto_confirm=True,
-                            authorize_current_draft=True,
+                            authorized_items=(
+                                state.args.get("_recent_written_items")
+                                if type(recent_version) is int and recent_version >= 0 else None
+                            ),
+                            authorized_content_version=recent_version,
+                            authorize_current_draft=not _is_short_add_and_submit_request(
+                                ctx.normalized_message_text
+                            ),
                         )
                         if submit_result.pending_state is not None:
                             conversation_state_store.set(
@@ -5653,6 +5662,20 @@ async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
             ctx.space_key,
             ctx.owner_label,
         )
+    if ctx.response is None and conversation_state_store.get_record(ctx.conv_key) is None:
+        assent = parse_pending_assent_phrase(ctx.normalized_message_text)
+        if assent.matched and assent.add_requested and not assent.submit_after:
+            ctx.response = render_remediation_reply(
+                "当前没有待添加的候选，请先提供具体词条和编码；本次未写入",
+                command="查看草稿",
+            )
+            remember_conversation(
+                ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response,
+            )
+            await _finish_ai_chat_response(
+                ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+            )
+            return True
     if ctx.response is None:
         ctx.response = await _try_handle_simple_single_word_query(
             ctx.normalized_message_text,

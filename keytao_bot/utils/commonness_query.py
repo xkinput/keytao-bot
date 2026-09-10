@@ -16,12 +16,25 @@ _PREFIX = re.compile(
     r"(?:词频排序|按常用度排序|哪个更常用|常用度对比)\s*[:：]?\s*(.+)"
 )
 _SUFFIX = re.compile(r"(.+?)\s*(?:哪个更常用|按常用度排序|词频排序)[?？。！!]*")
+_LIST_FREQUENCY_SUFFIX = re.compile(
+    r"(.+?)[,，]\s*(?:请)?排列以上词的使用频率[?？。！!]*"
+)
+_LIST_MUTATION_VERB = r"(?:删除|删掉|移除|添加|加入|修改|写入|提交)"
+_NON_LITERAL_LIST_ITEM = re.compile(
+    r"(?:不要|别|不必|无需|禁止|他说|她说|引用|转述)"
+    rf"|(?:并且|然后|同时|并|再){_LIST_MUTATION_VERB}"
+    rf"|{_LIST_MUTATION_VERB}[\u3400-\u9fff]"
+    r"|(?:把|将).+(?:删除|删掉|移除|加入|写入|排到|放到|改为|改成)"
+)
 
 
 def parse_commonness_query(message):
     """Accept a bounded explicit comparison as a read-only word list."""
     text = unicodedata.normalize("NFKC", str(message or "")).strip()
     match = _PREFIX.fullmatch(text) or _SUFFIX.fullmatch(text)
+    list_suffix = match is None
+    if list_suffix:
+        match = _LIST_FREQUENCY_SUFFIX.fullmatch(text)
     if match is None:
         return None
     body = match.group(1).strip().rstrip("?？。！!").strip()
@@ -35,6 +48,9 @@ def parse_commonness_query(message):
     if not 2 <= len(parts) <= 12 or len(set(parts)) != len(parts):
         return None
     if any(not re.fullmatch(r"[\u3400-\u9fff]{1,32}", word) for word in parts):
+        return None
+    # A referring suffix must not consume other clauses as literal operands.
+    if list_suffix and any(_NON_LITERAL_LIST_ITEM.match(word) for word in parts):
         return None
     return tuple(parts)
 
