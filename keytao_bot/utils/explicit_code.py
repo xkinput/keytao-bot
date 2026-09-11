@@ -22,7 +22,7 @@ class ExplicitEntryCodeRequest:
 
 def parse_explicit_entry_code_request(message: str):
     """Bind a complete add-code command to its explicitly named item."""
-    source = unicodedata.normalize("NFKC", message).strip()
+    source = unicodedata.normalize("NFKC", message).strip().rstrip("。.!！").strip()
     if re.match(r"加入\s*编码", source):
         return None
     word = r'[\u3400-\u9fff\U00020000-\U0003134f]{1,32}'
@@ -33,6 +33,30 @@ def parse_explicit_entry_code_request(message: str):
 
     word_operand = operand(word)
     code_operand = operand(code)
+    trailing_action = re.fullmatch(
+        rf'(?P<word>{word_operand})\s+(?P<code>{code_operand})'
+        r'(?:\s*[,，]\s*|\s+)(?:加入|添加)(?:(?:到)?草稿)?\s*(?P<submit>并提交)?',
+        source,
+    )
+    if trailing_action is not None:
+        from ..harness.authorization_grammar import (
+            _NEGATIVE_MODAL_RE,
+            _POSITIONAL_REPORTED_CONTEXT_RE,
+            looks_like_lexical_review_target,
+        )
+
+        selected_word = trailing_action.group("word").strip(' "“”「」『』')
+        if (
+            not looks_like_lexical_review_target(selected_word)
+            or re.match(r"^(?:请)?(?:先|暂时|暂)?" + _NEGATIVE_MODAL_RE.pattern, selected_word)
+            or _POSITIONAL_REPORTED_CONTEXT_RE.match(selected_word)
+        ):
+            return None
+        return ExplicitEntryCodeRequest(
+            selected_word,
+            trailing_action.group("code").strip(' "“”「」『』'),
+            bool(trailing_action.group("submit")),
+        )
     patterns = (
         rf'(?:添加|加入)\s*(?P<type>单字|词组|词条)?\s*(?P<word>{word_operand})'
         rf'(?:\s*[,，]?\s*编码\s*(?:为|是)?\s*[:：]?\s*|\s+)(?P<code>{code_operand})',

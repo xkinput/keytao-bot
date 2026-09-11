@@ -11899,10 +11899,8 @@ async def _execute_explicit_entry_code_request(
         or review.get("success") is not True
         or review.get("word") != request.word
         or str(review.get("type") or "Phrase") != phrase_type
-        or (
-            prepare_only
-            and (review.get("reviewDisposition") == "BLOCK" or review.get("pronunciationUnresolved") is True)
-        )
+        or review.get("reviewDisposition") == "BLOCK"
+        or review.get("pronunciationUnresolved") is True
     ):
         return f"未能取得「{request.word}」的已审读音和正确词条类型，本次未写入。"
     inventory = select_candidate_inventory(review)
@@ -12003,8 +12001,10 @@ async def prepare_fresh_entry_code_selection(
     conv_key: ConversationKey,
     space_key: Optional[Tuple[str, str]] = None,
     owner_label: str = "",
+    *,
+    prepare_only: bool = True,
 ) -> str:
-    """Read current actor facts before preparing an unbound word/code pair."""
+    """Read current actor facts before preparing or executing an exact code."""
     raw = await call_tool_function(
         "keytao_pending_items_by_words", {"words": [request.word]}, platform, user_id,
     )
@@ -12026,10 +12026,36 @@ async def prepare_fresh_entry_code_selection(
         and item["type"] == phrase_type and item["action"] in {"Create", "Change"}
     ]
     if matching:
+        drafts = [item for item in matching if item["source"] == "draft"]
+        if not prepare_only and request.submit_after and len(drafts) == 1:
+            result = await _perform_submit_current_draft(
+                platform,
+                user_id,
+                batch_id=drafts[0]["batchId"],
+                auto_confirm=True,
+                authorized_items=[{
+                    "action": "Create", "word": request.word,
+                    "code": request.code, "type": phrase_type,
+                }],
+            )
+            if result.pending_state is not None:
+                saved = conversation_state_store.set(
+                    conv_key, result.pending_state,
+                    space_key=space_key, owner_label=owner_label,
+                )
+                if not saved:
+                    return _append_batch_url_if_missing(
+                        "提交确认记录未能保存，本次未提交；草稿内容仍保留。",
+                        result.data or {}, drafts[0],
+                    )
+            return (
+                f"已复用草稿中的「{request.word}」→ {request.code}，本次未重复添加。\n"
+                + result.text
+            )
         return prepend_pending_word_reminders("本次未重复添加。", matching, words=(request.word,))
     return await _execute_explicit_entry_code_request(
         request, message, platform, user_id, conv_key, space_key, owner_label,
-        prepare_only=True,
+        prepare_only=prepare_only,
     )
 
 
@@ -12064,6 +12090,11 @@ async def try_handle_explicit_entry_code_command(
             if not recent_write_receipt:
                 return _format_live_ticket_precedence_message(record.state)
     set_turn_flow("explicit-code")
+    if request.submit_after:
+        return await prepare_fresh_entry_code_selection(
+            request, message, platform, user_id, conv_key, space_key, owner_label,
+            prepare_only=False,
+        )
     return await _execute_explicit_entry_code_request(
         request, message, platform, user_id, conv_key, space_key, owner_label,
     )
