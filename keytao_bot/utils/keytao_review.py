@@ -3303,6 +3303,9 @@ def _dedupe_unresolved_reading_codes(
     pronunciations: Sequence[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """Drop ambiguous short codes; full six-codes may remain shared."""
+    chains = [tuple(pronunciation.get("codes") or []) for pronunciation in pronunciations]
+    if chains and chains[0] and all(chain == chains[0] for chain in chains):
+        return [dict(pronunciation) for pronunciation in pronunciations]
     short_code_counts: Dict[str, int] = {}
     for pronunciation in pronunciations:
         seen: set[str] = set()
@@ -4082,6 +4085,32 @@ async def prepare_reviewed_word(
     # LLM text. A resolved candidate without an authoritative page is SEAL, not
     # BLOCK: it remains writeable with needsManualReview=True.
     apply_manual_review_flag(result, not auto_reviewable, auto_review_reason)
+    candidate_chains = [tuple(pronunciation["codes"]) for pronunciation in pronunciations]
+    if (
+        multi_sense_choice.get("status") == "ambiguous"
+        and not lookup_failed
+        and len(candidate_chains) > 1
+        and candidate_chains[0]
+        and all(chain == candidate_chains[0] for chain in candidate_chains)
+    ):
+        selected = pronunciations[0]
+        reason = f"候选读音对应相同编码；采用读音 {selected['pinyin']}，需管理员复核"
+        result.update({
+            "equivalentPronunciations": pronunciations,
+            "pronunciations": [selected],
+            "multiSenseChoice": {
+                **multi_sense_choice,
+                "status": "resolved",
+                "method": "equivalent_candidate_codes",
+                "selectedPinyin": selected["pinyin"],
+            },
+            "autoReviewable": False,
+            "autoReviewReason": reason,
+            "requiresManualPronunciationReview": True,
+        })
+        return apply_review_disposition(
+            apply_manual_review_flag(result, True, reason), "pre_submit_judgement",
+        )
     if multi_sense_choice.get("status") == "ambiguous":
         reading_lines = [
             "- "

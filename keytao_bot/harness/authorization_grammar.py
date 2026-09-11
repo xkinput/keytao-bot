@@ -2976,19 +2976,34 @@ def message_authorizes_mutation(message: str) -> bool:
     return multi_add is None or multi_add.valid
 
 
-def parse_reviewed_multi_word_selection(
-    message: str,
-) -> Optional[Tuple[Tuple[str, str], ...]]:
-    """Parse closed word/selector pairs; permission still needs a live record."""
-    source = str(message or "").strip()
+@dataclass(frozen=True)
+class ReviewedSelectionCommand:
+    pairs: Tuple[Tuple[str, str], ...]
+    action: str = ""
+    readings: Tuple[Tuple[str, str], ...] = ()
+
+
+def parse_reviewed_selection_command(message: str) -> Optional[ReviewedSelectionCommand]:
+    """Consume the complete selection and optional action, without granting authority."""
+    source = str(message or "").strip().rstrip("。.").strip()
     if not source or len(source) > 4096:
         return None
+    action_pattern = r"(?:加入草稿并提交|加到草稿并提交|加入并提交|加入草稿|加到草稿|写入草稿|加入)"
+    separator = r"(?:[ \t]*[，、,；;][ \t]*|[ \t]+)"
+    action = ""
+    leading = re.fullmatch(rf"(?P<action>{action_pattern}){separator}(?P<body>.+)", source)
+    trailing = re.fullmatch(rf"(?P<body>.+?){separator}(?P<action>{action_pattern})", source)
+    if leading or trailing:
+        match = leading or trailing
+        action, source = match.group("action"), match.group("body")
     pairs: List[Tuple[str, str]] = []
+    readings: List[Tuple[str, str]] = []
     seen_words: set[str] = set()
-    for clause in re.split(r"[，、,]", source):
+    for clause in re.split(r"[，、,；;]", source):
         match = re.fullmatch(
             r"\s*(?P<word>[\u3400-\u9fff]{1,32})[ \t]+"
-            r"(?:添加[ \t]+)?"
+            r"(?P<add>添加[ \t]+)?"
+            r"(?:(?P<reading>[a-zA-ZüÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ \t]+)[:：][ \t]*)?"
             r"(?P<selector>[1-9][0-9]{0,2}|[a-zA-Z]{1,12})\s*",
             clause,
         )
@@ -2997,7 +3012,21 @@ def parse_reviewed_multi_word_selection(
         word = match.group("word")
         seen_words.add(word)
         pairs.append((word, match.group("selector").lower()))
-    return tuple(pairs)
+        if match.group("reading"):
+            if match.group("selector").isdecimal():
+                return None
+            readings.append((word, " ".join(match.group("reading").split())))
+        if match.group("add") and not action:
+            action = "加入"
+    return ReviewedSelectionCommand(tuple(pairs), action, tuple(readings))
+
+
+def parse_reviewed_multi_word_selection(
+    message: str,
+) -> Optional[Tuple[Tuple[str, str], ...]]:
+    """Compatibility projection; mutation still needs an action and live binding."""
+    parsed = parse_reviewed_selection_command(message)
+    return parsed.pairs if parsed is not None else None
 
 
 def looks_like_mutation_grammar_gap(message: str) -> bool:

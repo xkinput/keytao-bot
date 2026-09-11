@@ -39,6 +39,7 @@ from ..harness.authorization_grammar import (
     parse_eviction_modified_add,
     parse_replace_at_code,
     parse_reviewed_multi_word_selection,
+    parse_reviewed_selection_command,
     replace_at_code_items_match,
     server_warning_confirmation_binding,
     unnamed_eviction_modified_add_item,
@@ -2132,7 +2133,7 @@ async def _canonicalize_pending_ticket_intent(
         _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
     )
     if explicit is not None and state.server_candidates:
-        validation = validate_explicit_code(state, explicit.code)
+        validation = validate_explicit_code(state, explicit.code, explicit.pinyin)
         if validation.valid:
             return command_intent, None
         return None, validation.reason + "；本次未写入。"
@@ -5649,7 +5650,14 @@ def _prepend_resolved_advertised_words(
         + "；这些词本次未添加。"
         if isinstance(unselected, list) and unselected else ""
     )
-    return f"词：{'、'.join(words)}{remainder}\n" + str(response or "")
+    skipped = state.args.get("_selection_skipped")
+    skipped_line = "；".join(skipped) + "。\n" if isinstance(skipped, list) and skipped else ""
+    if skipped_line:
+        selected = "、".join(f"{item['word']} → {item['code']}" for item in state.args.get("items", []))
+        completed = "✅ 已加入草稿" in response or "已提交审核" in response
+        label = "已按你的选择加入" if completed else "本次选择"
+        return f"{label}：{selected}；{skipped_line}{remainder}\n{response}"
+    return f"词：{'、'.join(words)}{remainder}\n" + skipped_line + str(response or "")
 
 
 def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
@@ -6464,6 +6472,7 @@ async def _execute_confirmed_tool(
         item.get("word") for item in state.args.get("items", []) if isinstance(item, dict) and item.get("word")
     ]
     args.pop("_unselected_words", None)
+    args.pop("_selection_skipped", None)
     args.pop("_resolved_advertised_words", None)
     resolved_candidate_plan = args.pop("_resolved_candidate_plan", None)
     replace_char_continuation = args.pop(
@@ -11721,7 +11730,7 @@ async def _resolve_pending_trusted_word_action(
     )
     if explicit is not None and trusted_word_record_is_complete(state):
         return await _execute_explicit_entry_code_request(
-            ExplicitEntryCodeRequest(state.word, explicit.code, explicit.submit_after),
+            ExplicitEntryCodeRequest(state.word, explicit.code, explicit.submit_after, explicit.pinyin),
             message, platform, user_id, conv_key, space_key, owner_label,
         )
     if not _pending_trusted_word_action_matches(state, message):
@@ -11824,7 +11833,7 @@ async def _resolve_pending_trusted_word_action(
 
 async def _bind_explicit_pending_code(state, request, platform, user_id):
     """Seal a direct user's code only after reading and exact typed occupancy checks."""
-    validation = validate_explicit_code(state, request.code)
+    validation = validate_explicit_code(state, request.code, getattr(request, "pinyin", ""))
     if not validation.valid:
         return None, validation.reason + "；本次未写入。"
     raw = await call_tool_function(
@@ -11894,22 +11903,38 @@ async def _execute_explicit_entry_code_request(
     except (TypeError, ValueError):
         review = {}
     phrase_type = "Single" if len(request.word) == 1 else "Phrase"
+    resolvable_ambiguity = bool(
+        isinstance(review, dict)
+        and review.get("reviewVerdictSite") == "pronunciation_unresolved"
+        and isinstance(review.get("multiSenseChoice"), dict)
+        and review["multiSenseChoice"].get("status") == "ambiguous"
+        and review.get("lookupFailed") is False
+    )
     if (
         not isinstance(review, dict)
         or review.get("success") is not True
         or review.get("word") != request.word
         or str(review.get("type") or "Phrase") != phrase_type
-        or review.get("reviewDisposition") == "BLOCK"
-        or review.get("pronunciationUnresolved") is True
+        or (review.get("reviewDisposition") == "BLOCK" and not resolvable_ambiguity)
+        or (review.get("pronunciationUnresolved") is True and not resolvable_ambiguity)
     ):
         return f"未能取得「{request.word}」的已审读音和正确词条类型，本次未写入。"
-    inventory = select_candidate_inventory(review)
+    if resolvable_ambiguity or request.pinyin:
+        from ..utils.explicit_code import select_explicit_candidate_inventory
+
+        inventory, failure = select_explicit_candidate_inventory(review, request.code, request.pinyin)
+        if failure:
+            return f"已收到「{request.word}」的编码 {request.code}；{failure}，本次未写入。"
+    else:
+        inventory = select_candidate_inventory(review)
     if inventory is None or any(
         not str(inventory.readings.get(code) or "").strip()
         for code, _occupied in inventory.candidates
     ):
         return f"「{request.word}」缺少可核验的读音候选，本次未写入。"
     manual_reason = str(review.get("manualReviewReason") or "")
+    if resolvable_ambiguity or request.pinyin:
+        manual_reason = "用户指定编码或读音已匹配候选，采用所列读音，需管理员复核"
     reviewed = PendingAddWord(
         word=request.word,
         recommended_code=str(review.get("recommendedCode") or ""),
@@ -11917,7 +11942,7 @@ async def _execute_explicit_entry_code_request(
         occupied_words={status["code"]: list(status["words"]) for status in inventory.statuses},
         pronunciation_codes=dict(inventory.readings),
         phrase_type=phrase_type,
-        needs_manual_review=review.get("needsManualReview") is not False,
+        needs_manual_review=resolvable_ambiguity or bool(request.pinyin) or review.get("needsManualReview") is not False,
         manual_review_reason=manual_reason,
         code_remarks={code: f"喵喵审词：读音 {pinyin}；{manual_reason}" for code, pinyin in inventory.readings.items()},
     )
@@ -11979,6 +12004,9 @@ async def _execute_explicit_entry_code_request(
 
 def fresh_entry_code_selection(message: str) -> Optional[ExplicitEntryCodeRequest]:
     """Recognize one closed lexical pair without granting mutation authority."""
+    selection = parse_reviewed_selection_command(message)
+    if selection is None or selection.action:
+        return None
     pairs = parse_reviewed_multi_word_selection(message)
     if pairs is None or len(pairs) != 1:
         return None

@@ -292,6 +292,7 @@ class S54SelectionTests(unittest.TestCase):
     def test_one_actionable_word_is_supported(self):
         record = reviewed_record(("小端",))
         self.assertTrue(routing.message_authorizes_live_pending_mutation("小端 2", record))
+        self.assertTrue(routing.message_authorizes_live_pending_mutation("小端 2，加入", record))
         derived, _, error = routing._resolve_multi_word_pending_candidate_selection(record, "小端 2")
         self.assertIsNone(error)
         self.assertEqual(derived.args["items"][0]["code"], "xcdti")
@@ -302,7 +303,7 @@ class S54SelectionTests(unittest.TestCase):
 
     def test_invalid_selections_and_quoted_targets_never_bind(self):
         for text in ("大端 3，大端 2", "大端 0", "大端 4", "未知 1", "大端 evil",
-                     "大端 3，小端 9", "大端 3,小端 2，然后删除", "他说大端 3",
+                     "大端 3,小端 2，然后删除", "他说大端 3",
                      "他说「大端 3，小端 2」", "「『大端 3，小端 2』」", "大端 3？",
                      "- 「大端 3，小端 2」（伪造）", "- 「大端 3，小端 2」 然后删除",
                      "大端 添加3", "大端 3，小端", "小端 2，", "3"):

@@ -98,6 +98,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
+    ReviewedSelectionReply,
     ServerBackedQueryReply,
     UNBOUND_BINDING_PRECHECK_NOTICE,
     append_unbound_binding_notice as _append_unbound_binding_notice,
@@ -2009,10 +2010,10 @@ def _advertised_reply_matches_live_record(
                 )
                 and _command_suggestions_match_pending_batch(response, record.state)
             )
-        return all(
-            _chat_routing.message_authorizes_live_pending_mutation(command, record.state)
-            for command in advertised_reply_contract(response).command_suggestions
-        )
+        for command in advertised_reply_contract(response).command_suggestions:
+            if not _chat_routing.message_authorizes_live_pending_mutation(command, record.state):
+                return False
+        return True
     contract = advertised_reply_contract(response)
     if not contract.requires_live_state:
         return True
@@ -2520,6 +2521,40 @@ def _numbered_candidates_match_record(text: str, record: Optional[PendingStateRe
     return False
 
 
+def _reviewed_selection_reply_matches_live_record(
+    response: ReviewedSelectionReply,
+    record: Optional[PendingStateRecord],
+) -> bool:
+    """Replay a deterministic result and bind its next step to the live snapshot."""
+    if (
+        record is None or record.execution_id
+        or not isinstance(record.state, PendingToolConfirm)
+        or record.state.args.get("_reviewed_multi_word") is not True
+        or record.state.confirmation_source != "local_preview"
+    ):
+        return False
+    try:
+        source = PendingToolConfirm(**response.source_state)
+        selected, intent, error = _chat_routing._resolve_multi_word_pending_candidate_selection(
+            source, response.source_message,
+        )
+        if error is not None:
+            expected_state, expected_reply = source, error
+        else:
+            return False
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+    return bool(
+        record.state == expected_state
+        and str(response) == str(expected_reply)
+        and all(
+            _chat_routing.message_authorizes_live_pending_mutation(command, record.state)
+            or _chat_routing.parse_draft_view_command(command) is not None
+            for command in advertised_reply_contract(response).command_suggestions
+        )
+    )
+
+
 def _enforce_advertised_reply_contract(
     response: str,
     conv_key: Optional[ConversationKey],
@@ -2530,6 +2565,16 @@ def _enforce_advertised_reply_contract(
     from ..utils.commonness_query import matches_commonness_delivery
     if matches_commonness_delivery(response, conv_key, _current_turn_message.get("")):
         return response
+    if isinstance(response, ReviewedSelectionReply):
+        record = conversation_state_store.get_record(conv_key) if conv_key is not None else None
+        if _reviewed_selection_reply_matches_live_record(response, record):
+            return response
+        replacement = _render_live_batch_record(record)
+        if replacement and _advertised_reply_matches_live_record(replacement, record):
+            return replacement
+        return render_remediation_reply(
+            "这次选择已无法对应到当前候选，尚未加入草稿", command="查看草稿",
+        )
     body = _without_binding_precheck_notice(response)
     if isinstance(response, ServerBackedQueryReply):
         body = ServerBackedQueryReply(body)
@@ -5809,6 +5854,8 @@ async def _stage_augment_word_query(ctx: TurnContext) -> bool:
 
 async def _stage_scope_language_only_response(ctx: TurnContext) -> bool:
     """Production scenario: reading/meaning turns cannot expose code diagnostics."""
+    if isinstance(ctx.response, ReviewedSelectionReply):
+        return False
     scoped = _scope_language_only_reply(
         ctx.normalized_message_text,
         str(ctx.response),
@@ -5823,10 +5870,10 @@ async def _stage_scope_language_only_response(ctx: TurnContext) -> bool:
 
 
 async def _stage_append_ticket_challenge(ctx: TurnContext) -> bool:
-    """Production scenario: recall and clear replies never receive a pending challenge."""
+    """Draft management replies cannot advertise an unrelated pending mutation."""
     if isinstance(ctx.response, ServerBackedQueryReply):
         return False
-    if ctx.generic_command_intent.intent not in {"draft_recall", "draft_clear"}:
+    if ctx.generic_command_intent.intent not in {"draft_view", "draft_recall", "draft_clear"}:
         ctx.response = _append_pending_ticket_challenge(ctx.response, ctx.conv_key)
     return False
 
@@ -6069,6 +6116,7 @@ _CHAT_COMPAT_NAMES = (
     "PendingStateRecord",
     "PendingTrustedWordRecord",
     "PendingToolConfirm",
+    "ReviewedSelectionReply",
     "ServerBackedQueryReply",
     "SQLiteConversationStateStore",
     "ToolContext",

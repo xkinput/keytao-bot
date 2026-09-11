@@ -34,7 +34,7 @@ class ExtraCodeSecurityReviewTests(unittest.TestCase):
             self.assertEqual(chat.conversation_state_store.get_record(key), before)
         asyncio.run(run())
 
-    def test_ambiguous_reviewed_prefix_cannot_authorize_an_unknown_suffix(self):
+    def test_explicit_shared_prefix_uses_one_reading_and_keeps_manual_seal(self):
         async def run():
             key = harness.ConversationAddress.private("qq", "s57-security-reading")
             chat.conversation_state_store.delete(key)
@@ -44,18 +44,27 @@ class ExtraCodeSecurityReviewTests(unittest.TestCase):
                 "recommendedCode": "", "requiresManualReview": True,
                 "candidateStatuses": [{"code": "yeo", "occupied": False, "words": []}],
             })
-            tool = AsyncMock(return_value=json.dumps(review))
-            execute = AsyncMock(side_effect=AssertionError("ambiguous reading reached write"))
+            tool = AsyncMock(side_effect=[json.dumps(review), json.dumps({"success": True, "phrases": []})])
+            execute = AsyncMock(return_value="fixture written")
             with patch.object(commands, "call_tool_function", tool), patch.object(
                 commands, "_execute_add_to_draft", execute,
             ):
                 reply = await commands.try_handle_explicit_entry_code_command(
                     '添加单字"嘢"，编码为"yeoia"', "qq", key.actor_id, key,
                 )
-            self.assertIn("多个待定读音", reply)
-            self.assertEqual(tool.await_count, 1)
-            self.assertEqual(execute.await_count, 0)
+            self.assertIn("管理员复核", reply)
+            self.assertEqual(tool.await_count, 2)
+            self.assertEqual(execute.await_count, 1)
+            self.assertIs(execute.call_args.args[7], True)
+            self.assertEqual(execute.call_args.kwargs["reviewed_pinyin"], "yě")
             self.assertIsNone(chat.conversation_state_store.get_record(key))
+            with patch.object(commands, "call_tool_function", AsyncMock(return_value=json.dumps(review))), patch.object(
+                commands, "_execute_add_to_draft", AsyncMock(side_effect=AssertionError("wrong prefix reached write")),
+            ):
+                rejected = await commands.try_handle_explicit_entry_code_command(
+                    '添加单字"嘢"，编码为"qxoia"', "qq", key.actor_id, key,
+                )
+            self.assertIn("音码前缀不符", rejected)
         asyncio.run(run())
 
 

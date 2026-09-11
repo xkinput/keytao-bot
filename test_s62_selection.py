@@ -83,15 +83,21 @@ class S62SelectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record, original)
 
     async def test_canonical_and_spaced_number_selectors_keep_the_same_write_scope(self):
-        for message in ("加亮 jslxa", "加亮 3", "加亮 添加 3"):
+        for message in ("加亮 jslxa", "加亮 3", "加亮 添加 3",
+                        "加亮 jslxa，加入", "加亮 3，加入"):
             with self.subTest(message=message):
-                writes, calls, _response, _pending = await self.execute_selection(message)
+                writes, calls, response, pending = await self.execute_selection(message)
                 self.assertEqual([(item["word"], item["code"]) for item in writes],
                                  [("加亮", "jslxa")])
                 self.assertEqual(len(calls), 2)
+                self.assertIsNone(pending)
+                self.assertIn("加亮 → jslxa", response)
+                self.assertIn("https://keytao.rea.ink/batch/s62-selection-batch", response)
+                self.assertNotIn("已提交", response)
 
     async def test_comma_separated_choices_bind_each_words_own_inventory(self):
-        for message in ("加亮 添加 3，小端 xcdti", "加亮 jslxa、小端 添加 2"):
+        for message in ("加亮 3，小端 xcdti", "加亮 jslxa、小端 2",
+                        "加亮 添加 3，小端 xcdti", "加亮 jslxa、小端 添加 2"):
             with self.subTest(message=message):
                 writes, _calls, _response, _pending = await self.execute_selection(message)
                 self.assertEqual([(item["word"], item["code"]) for item in writes],
@@ -104,7 +110,7 @@ class S62SelectionTests(unittest.IsolatedAsyncioTestCase):
             "「『加亮 添加 jslxa』」", "加亮 添加 jslxa？",
             "加亮 添加 jslxa，然后删除", "加亮 添加 jslxa；提交", "加亮 添加 3，",
             "未知 添加 1", "加亮 添加 evil", "加亮 添加 xcdti",
-            "加亮 添加 0", "加亮 添加 4", "加亮 添加 3，小端 添加 9",
+            "加亮 添加 0", "加亮 添加 4",
         ):
             with self.subTest(message=message):
                 self.assertFalse(routing.message_authorizes_live_pending_mutation(
@@ -127,12 +133,58 @@ class S62SelectionTests(unittest.IsolatedAsyncioTestCase):
                     scope.pop("reviewedState")
                 else:
                     record.confirmation_source = "server_warning"
-                writes, calls, response, _pending = await self.execute_selection(
-                    "加亮 添加 jslxa", record,
-                )
-                self.assertEqual(writes, [])
-                self.assertEqual(calls, [])
-                self.assertIn("未写入", response)
+                for message in ("加亮 jslxa", "加亮 添加 jslxa"):
+                    writes, calls, response, _pending = await self.execute_selection(message, record)
+                    self.assertEqual(writes, [])
+                    self.assertEqual(calls, [])
+                    self.assertIn("未写入", response)
+
+    async def test_occupied_selection_requires_exact_commonness_evidence(self):
+        for verdict in ("front_more_common", "behind_more_common", "close", "uncertain", "missing", "wrong_word", "wrong_code", "unknown_occupant"):
+            with self.subTest(verdict=verdict):
+                record = incident_record()
+                scope = record.args["_candidate_scopes"][0]
+                occupants = {} if verdict == "unknown_occupant" else {"jslx": ["加量"]}
+                assessments = [] if verdict == "missing" else [{
+                    "newWord": "别词" if verdict == "wrong_word" else "加亮",
+                    "occupantWord": "加量",
+                    "occupantCode": "jslxo" if verdict == "wrong_code" else "jslx",
+                    "verdict": "front_more_common" if verdict.startswith("wrong_") else verdict,
+                }]
+                scope["occupiedWords"] = scope["reviewedState"]["serverOccupiedWords"] = occupants
+                scope["orderingAssessments"] = scope["reviewedState"]["serverOrderingAssessments"] = assessments
+                original = copy.deepcopy(record)
+                writes, calls, response, _ = await self.execute_selection("加亮 1", record)
+                if verdict == "front_more_common":
+                    self.assertEqual([(row["word"], row["code"]) for row in writes], [("加亮", "jslx")])
+                    self.assertTrue(writes[0]["needsManualReview"])
+                    self.assertIn("管理员审核", writes[0]["manualReviewReason"])
+                    self.assertEqual(len(calls), 2)
+                else:
+                    self.assertEqual(writes, [])
+                    self.assertEqual(calls, [])
+                    self.assertIn("未加入", response)
+                    self.assertIn("占用" if verdict == "unknown_occupant" else "常用度", response)
+                    if verdict != "unknown_occupant":
+                        self.assertIn("加量", response)
+                self.assertEqual(record, original)
+
+    async def test_protected_occupied_selection_does_not_block_other_selected_words(self):
+        record = incident_record()
+        scope = record.args["_candidate_scopes"][0]
+        scope["occupiedWords"] = scope["reviewedState"]["serverOccupiedWords"] = {"jslx": ["加量"]}
+        for message in ("加亮 1，小端 2", "小端 xcdti，加亮 jslx"):
+            with self.subTest(message=message):
+                writes, calls, response, pending = await self.execute_selection(message, record)
+                self.assertEqual([(row["word"], row["code"]) for row in writes], [("小端", "xcdti")])
+                self.assertEqual(len(calls), 2)
+                self.assertIsNone(pending)
+                self.assertIn("小端 → xcdti", response)
+                self.assertIn("加量", response)
+                self.assertIn("常用度", response)
+                self.assertIn("未加入", response)
+                self.assertIn("https://keytao.rea.ink/batch/s62-selection-batch", response)
+                self.assertNotIn("已提交", response)
 
     def test_parser_rejects_quoted_or_joined_add_choices(self):
         self.assertEqual(grammar.parse_reviewed_multi_word_selection("加亮 添加 JSLXA"),

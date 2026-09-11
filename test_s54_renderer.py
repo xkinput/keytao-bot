@@ -71,7 +71,8 @@ class S54RendererTests(unittest.TestCase):
         self.assertNotIn("添加1、2", rendered)
         self.assertNotIn("小端 添加1", rendered)
         self.assertIn("「大端 3，小端 2」", rendered)
-        self.assertIn("未选择的词保持未选", rendered)
+        self.assertIn("选择后即加入草稿", rendered)
+        self.assertIn("提交需明确回复", rendered)
         self.assertEqual(
             (("大端", "dsdtvo"), ("小端", "xcdti")),
             advertised_batch_binding_pairs(rendered),
@@ -85,7 +86,7 @@ class S54RendererTests(unittest.TestCase):
 
         rendered = render_server_backed_batch_candidates(self.items, self.scopes)
         commands = advertised_command_suggestions(rendered)
-        self.assertEqual(("加入", "加入并提交", "大端 3，小端 2"), commands)
+        self.assertEqual(("加入", "加入并提交", "大端 3，小端 2", "大端 3，小端 2，加入并提交"), commands)
         for command in commands:
             self.assertTrue(
                 parse_pending_assent_phrase(command).matched
@@ -132,7 +133,7 @@ class S54RendererTests(unittest.TestCase):
         self.assertIn("不调序备选编码：dsdtvo", rendered)
         self.assertNotIn("不重排选 3", rendered)
         self.assertEqual(
-            ("加入", "加入并提交", "大端 1"), advertised_command_suggestions(rendered),
+            ("加入", "加入并提交", "大端 1", "大端 1，加入并提交"), advertised_command_suggestions(rendered),
         )
 
     def test_single_word_block_without_controls_matches_batch(self):

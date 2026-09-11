@@ -3908,9 +3908,20 @@ class AgentOrchestrator:
                     reply,
                 )
             ):
-                return (
-                    "同一指令再次进入相同拒绝路径，已停止重复建议；"
-                    "本次未写入。请发「查看草稿」核对现状。"
+                from keytao_bot.plugins import chat_routing
+                from keytao_bot.plugins.chat_render import _RETIRED_AUTHORIZATION_COPY_RE
+
+                reason = re.split(
+                    r"可执行命令|可发送|请发|可直接回复|可以改为|下一步|\n\s*-",
+                    str(failure_state.get("message") or reply),
+                    maxsplit=1,
+                )[0].strip().rstrip("；;。")
+                if _RETIRED_AUTHORIZATION_COPY_RE.search(reason) or "选择格式应为词条加编号或编码" in reason:
+                    reason = "其中的选择还无法确定要写入的词条和编码"
+                command = "查看草稿"
+                return render_remediation_reply(
+                    f"已收到你再次发来的操作请求；{reason}。本次未写入，请先核对现有草稿",
+                    command=command if chat_routing.parse_draft_view_command(command) is not None else "",
                 )
         if (
             bool((termination_state or {}).get("model_authored_reply"))

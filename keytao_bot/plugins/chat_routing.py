@@ -34,6 +34,7 @@ from ..harness.authorization_grammar import (
     parse_pending_positional_add,
     parse_replace_at_code,
     parse_reviewed_multi_word_selection,
+    parse_reviewed_selection_command,
 )
 from ..harness.tools import (
     _COMMAND_PREFIX_PATTERN,
@@ -42,13 +43,15 @@ from ..harness.tools import (
     trusted_mutation_source,
 )
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
-from ..utils.explicit_code import parse_explicit_code_request, validate_explicit_code
+from ..utils.candidate_inventory import protected_candidate_occupants
+from ..utils.explicit_code import parse_explicit_code_request, readings_match, validate_explicit_code
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     PENDING_ASSENT_TEXTS,
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
+    ReviewedSelectionReply,
     parse_advertised_set_reference,
     parse_pending_assent_phrase,
     parse_pending_candidate_selection,
@@ -795,7 +798,7 @@ def _pending_assent_rejection_response(
             _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
         )
         if explicit is not None:
-            validation = validate_explicit_code(state, explicit.code)
+            validation = validate_explicit_code(state, explicit.code, explicit.pinyin)
             return None if validation.valid else validation.reason + "；本次未写入。"
     if (
         parse_eviction_modified_add(message_text) is not None
@@ -1530,7 +1533,7 @@ def _structural_pending_add_word_intent(
                 requested_code=codes[0], target_word=occupant,
             )
     explicit = parse_explicit_code_request(stripped, state.word)
-    if explicit is not None and validate_explicit_code(state, explicit.code).valid:
+    if explicit is not None and validate_explicit_code(state, explicit.code, explicit.pinyin).valid:
         return MessageCommandIntent(
             intent="pending_add_and_submit" if explicit.submit_after else "pending_code_request",
             confidence=1.0, requested_code=explicit.code,
@@ -1763,7 +1766,7 @@ def message_authorizes_live_pending_mutation(
         _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
     )
     if explicit is not None:
-        return validate_explicit_code(state, explicit.code).valid
+        return validate_explicit_code(state, explicit.code, explicit.pinyin).valid
     intent = _structural_pending_add_word_intent(message_text, state)
     if intent is None or intent.intent not in {
         "pending_confirm",
@@ -1911,7 +1914,17 @@ def _resolve_reviewed_multi_word_selection(
     unquoted = _whole_message_unquoted_source(source, live_words)
     if unquoted is not None:
         source = unquoted
-    pairs = parse_reviewed_multi_word_selection(source)
+    selection = parse_reviewed_selection_command(source)
+    pairs = selection.pairs if selection is not None else None
+
+    def explain(reason: str) -> str:
+        command = f"{live_words[0]} {items[0]['code']}，加入" if items and scopes else "查看草稿"
+        if scopes and parse_reviewed_selection_command(command) is None:
+            command = "查看草稿"
+        return ReviewedSelectionReply(
+            render_remediation_reply(reason, command=command, words=live_words),
+            source_message=message_text, source_state=state,
+        )
     if not items or not scopes:
         assent = _pending_tool_assent_intent(state, message_text)
         if pairs is not None or (
@@ -1925,30 +1938,67 @@ def _resolve_reviewed_multi_word_selection(
             or any(re.match(rf"{re.escape(word)}\s+", source) for word in live_words)
             or re.fullmatch(r"[1-9][0-9]{0,2}", source)
         ):
-            return None, None, "选择格式应为词条加编号或编码，多个词用逗号分隔；本次未写入。"
+            return None, None, explain(
+                "看到了你的选词请求，但其中有重复词条、缺少选择或无法识别的附加内容；本次未写入"
+            )
         return None, None, None
     items_by_word = {str(item["word"]).strip(): item for item in items}
+    unbound_control = re.compile(
+        r"^(?:请)?(?:(?:先|暂时|暂)?(?:不要|不必|不能|不准|不许|不用|别|莫|勿|甭)|"
+        r"(?:先|暂时|暂)不|并非|尚未|绝不能|无须|毋须|原话(?:是)?|转述|引用|"
+        r"翻译|解释|假设|比如|例如|如果|备查|留存|存证|摘记|纪要|"
+        r"[\u3400-\u9fff]{0,8}(?:说|提到|要求|表示|认为|声称|称))"
+    )
+    if any(word not in scopes and unbound_control.match(word) for word, _ in pairs):
+        return None, None, explain(
+            "看到了候选选择，但未绑定词条前带有否定或转述内容，不能确定这是你要执行的操作；本次未写入"
+        )
     selected_items: List[Dict[str, Any]] = []
     selected_words: List[str] = []
+    skipped: List[str] = []
     for word, selector in pairs:
         candidates = scopes.get(word)
         if candidates is None:
-            return None, None, f"「{word}」不在当前候选中，本次未写入。"
+            blocks = state.args.get("_query_other_blocks", [])
+            reading_blocked = any(
+                f"「{word}」" in str(block) and re.search(r"多个读音|确定读音|读音.*(?:歧义|不明|待定|冲突)", str(block))
+                for block in blocks if isinstance(blocks, list)
+            )
+            skipped.append(f"「{word}」还没确定读音，未加入" if reading_blocked
+                           else f"「{word}」没有当前可用的候选记录，未加入")
+            continue
         if selector.isdecimal():
             index = int(selector)
             if not 1 <= index <= len(candidates):
-                return None, None, f"「{word}」只接受 1-{len(candidates)} 之间的编号；本次未写入。"
+                skipped.append(f"「{word}」的编号 {selector} 超出 1-{len(candidates)}，未加入")
+                continue
             code = candidates[index - 1][0]
         else:
             code = selector
             if code not in dict(candidates):
-                return None, None, f"所选编码不在「{word}」当前候选中，本次未写入。"
+                skipped.append(f"「{word}」的编码 {code} 不在当前候选中，未加入")
+                continue
         item = dict(items_by_word[word])
         item["code"] = code
         raw_scope = next(
             scope for scope in state.args["_candidate_scopes"]
             if scope["word"] == word
         )
+        reading = dict(selection.readings).get(word)
+        if reading and not readings_match(reading, raw_scope["reviewedState"].get("pronunciationCodes", {}).get(code, "")):
+            skipped.append(f"「{word}」的读音 {reading} 与该编码的已审记录不符，未加入")
+            continue
+        protected = protected_candidate_occupants(
+            word, code, candidates, raw_scope["occupiedWords"], raw_scope["orderingAssessments"],
+        )
+        if protected:
+            if "" in protected:
+                reason = "占用信息未能完整核验"
+            else:
+                occupants = "、".join(f"「{occupant}」" for occupant in protected)
+                reason = f"占位词{occupants}尚无更弱的常用度证据"
+            skipped.append(f"「{word}」的编码 {code} {reason}，未加入")
+            continue
         item["remark"] = (
             raw_scope["reviewedState"].get("codeRemarks", {}).get(code, "")
         )
@@ -1957,14 +2007,21 @@ def _resolve_reviewed_multi_word_selection(
             item["manualReviewReason"] = "重码添加需管理员审核"
         selected_items.append(item)
         selected_words.append(word)
+    if not selected_items:
+        return None, None, explain("；".join(skipped) + "；本次未写入")
     derived_args = dict(state.args)
     derived_args["items"] = selected_items
     derived_args["_resolved_advertised_words"] = selected_words
+    derived_args["_selection_skipped"] = skipped
     derived_args["_unselected_words"] = [
         word for word in items_by_word if word not in selected_words
     ]
     derived_args["_candidate_scopes"] = [
-        {**scope, "orderingAssessments": []}
+        {**scope, "orderingAssessments": [], "reviewedState": {
+            **scope["reviewedState"],
+            "recommendedCode": next(item["code"] for item in selected_items if item["word"] == scope["word"]),
+            "serverOrderingAssessments": [],
+        }}
         for scope in state.args["_candidate_scopes"]
         if scope["word"] in selected_words
     ]
@@ -1974,7 +2031,10 @@ def _resolve_reviewed_multi_word_selection(
             args=derived_args,
             confirmation_source=state.confirmation_source,
         ),
-        MessageCommandIntent(intent="pending_confirm", confidence=1.0),
+        MessageCommandIntent(
+            intent="pending_add_and_submit" if "提交" in selection.action else "pending_confirm",
+            confidence=1.0,
+        ),
         None,
     )
 

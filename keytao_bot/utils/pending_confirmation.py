@@ -15,6 +15,16 @@ class ServerBackedQueryReply(str):
     """Internal provenance for an exact server-rendered query reply."""
 
 
+class ReviewedSelectionReply(ServerBackedQueryReply):
+    """A deterministic selection result with its original candidate snapshot."""
+
+    def __new__(cls, text: str, *, source_message: str, source_state: Any):
+        reply = super().__new__(cls, text)
+        reply.source_message = source_message
+        reply.source_state = asdict(source_state)
+        return reply
+
+
 PENDING_CONFIRM_ADVERTISED_FORMS = ("确认",)
 PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     *PENDING_CONFIRM_ADVERTISED_FORMS,
@@ -1344,7 +1354,12 @@ def render_server_backed_batch_candidates(
                 lines.append(render_executable_suggestion(command))
             lines.append("按词选择（词名加空格，再写编号或编码；多词用逗号分隔）：")
             lines.append(render_executable_suggestion(selection_command))
-            lines.append("可只写其中部分词；未选择的词保持未选，不会加入。")
+            lines.append("可只写其中部分词；选择后即加入草稿，提交需明确回复提交指令。")
+            combined_command = selection_command + "，加入并提交"
+            if parse_reviewed_multi_word_selection(combined_command) != tuple(selections):
+                return ""
+            lines.append("也可选择后直接加入并提交：")
+            lines.append(render_executable_suggestion(combined_command))
         return "\n".join(lines)
 
     if len(normalized_items) < 2:

@@ -17991,29 +17991,26 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        tool_reply = next(
-            item for item in client.completions.calls[1]["messages"]
-            if item.get("role") == "tool"
-        )
-        payload = __import__("json").loads(tool_reply["content"])
-        self.assertEqual(payload["未执行原因"], "verb_not_matched")
-        self.assertNotIn("blockReason", payload)
-        self.assertNotIn("suggestedCommand", payload)
-        self.assertNotIn("可执行命令", payload)
+        self.assertEqual(len(client.completions.calls), 1)
         self.assertEqual(calls, [])
-        self.assertEqual(result, "本轮只读，已说明需要的指令。")
+        self.assertIn("没有明确要求执行", result)
+        self.assertIn("未写入", result)
+        self.assertIn("查看草稿", result)
+        self.assertNotIn("verb_not_matched", result)
+        self.assertNotIn("blockReason", result)
 
     async def test_one_reason_is_explained_once_per_turn(self) -> None:
+        repeated_response = _fake_response("tool_calls", tool_calls=[_shift_tool_call("call-2")])
         client = _FakeClient([
             _fake_response("tool_calls", tool_calls=[_shift_tool_call("call-1")]),
-            _fake_response("tool_calls", tool_calls=[_shift_tool_call("call-2")]),
+            repeated_response,
             _fake_response("stop", "做不到，已说明原因。"),
         ])
 
         async def never(**kwargs):
             raise AssertionError("write tool must not run")
 
-        await _shift_orchestrator(client, never).run(
+        result = await _shift_orchestrator(client, never).run(
             "把吃席的编码放到 wkxk",
             AgentRequestContext(
                 platform="qq",
@@ -18022,18 +18019,13 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        tool_replies = [
-            __import__("json").loads(item["content"])
-            for item in client.completions.calls[2]["messages"]
-            if item.get("role") == "tool"
-        ]
-        self.assertEqual(len(tool_replies), 2)
-        self.assertNotIn("repeatedBlock", tool_replies[0])
-        self.assertTrue(tool_replies[1].get("repeatedBlock"))
-        self.assertNotIn("suggestedCommand", tool_replies[1])
-        self.assertIn("本轮已说明过", tool_replies[1]["message"])
-        self.assertNotIn("原样转述", tool_replies[1]["message"])
-        self.assertNotIn("原样转述", tool_replies[0]["message"])
+        self.assertEqual(len(client.completions.calls), 1)
+        self.assertIs(next(client.completions.responses), repeated_response)
+        self.assertEqual(result.count("没有明确要求执行"), 1)
+        self.assertEqual(result.count("未写入"), 1)
+        self.assertIn("查看草稿", result)
+        self.assertNotIn("repeatedBlock", result)
+        self.assertNotIn("原样转述", result)
 
     def test_repeated_block_reasons_use_user_facing_labels(self) -> None:
         labels = {
@@ -19158,7 +19150,11 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("不可信参考资料", user_message["content"])
         self.assertEqual(real_calls, [])
-        self.assertEqual(result, "这只是引用内容，不会执行提交。")
+        self.assertEqual(len(client.completions.calls), 1)
+        self.assertIn("没有明确要求执行", result)
+        self.assertIn("未写入", result)
+        self.assertIn("查看草稿", result)
+        self.assertNotIn("verb_not_matched", result)
 
     async def test_reviewed_agent_write_executes_with_canonical_arguments(self) -> None:
         writes = []
@@ -19430,7 +19426,8 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
             chat_module._current_turn_message.reset(token)
 
         self.assertNotEqual(delivered, refusal)
-        self.assertIn("同一指令再次进入相同拒绝路径", delivered)
+        self.assertIn("候选编码集合已变化", delivered)
+        self.assertNotIn("同一指令再次进入相同拒绝路径", delivered)
         self.assertIn("查看草稿", delivered)
 
     @staticmethod
@@ -20425,7 +20422,8 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
                 {"role": "assistant", "content": reply},
             ],
         )
-        self.assertIn("已停止重复建议", finalized)
+        self.assertIn("其中的选择还无法确定要写入的词条和编码", finalized)
+        self.assertNotIn("已停止重复建议", finalized)
         self.assertNotIn("顺延「冒菜」", finalized)
 
     def test_only_genuinely_different_validated_suggestion_is_offered(self) -> None:
