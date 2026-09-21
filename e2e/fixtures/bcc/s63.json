@@ -15,6 +15,30 @@
   ],
   "datasets": [
     {
+      "filename": "classical_chinese_char_freq.txt",
+      "channel": "古代汉语",
+      "token_type": "char",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "d2b9a0e984b37754e193c0aac168b2eda443a8307a919e4bf1f880e75d16b8f3",
+      "archive_sha256": "10995a91a2451fa7f65ddef096e5d4aaf5d32d217e225a5df98d0bf03391b32c",
+      "size_bytes": 169256,
+      "archive_bytes": 82379,
+      "row_count": 20138,
+      "total_count": 1432519927
+    },
+    {
+      "filename": "classical_chinese_word_freq.txt",
+      "channel": "古代汉语",
+      "token_type": "word",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "d2b9a0e984b37754e193c0aac168b2eda443a8307a919e4bf1f880e75d16b8f3",
+      "archive_sha256": "025eac682dcca6e38a6622471aa463abd073f001bbd7047b69703e5f6cc0129b",
+      "size_bytes": 169256,
+      "archive_bytes": 82379,
+      "row_count": 20138,
+      "total_count": 1432519927
+    },
+    {
       "filename": "dialogue_char_freq.txt",
       "channel": "口语",
       "token_type": "char",
@@ -61,6 +85,30 @@
       "archive_bytes": 970322,
       "row_count": 166460,
       "total_count": 105920737
+    },
+    {
+      "filename": "modern_chinese_char_freq.txt",
+      "channel": "近代汉语",
+      "token_type": "char",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "d6b6ba00927fe8b0d3d608323c5911dc24a0a321eea0f1451bde641cee7c06f6",
+      "archive_sha256": "d0dbdb1cf003b6ec2ceb57fd9069ef58c3209ccebfa8a57158b33708858cb7e0",
+      "size_bytes": 77839,
+      "archive_bytes": 43108,
+      "row_count": 8690,
+      "total_count": 1434078685
+    },
+    {
+      "filename": "modern_chinese_word_freq.txt",
+      "channel": "近代汉语",
+      "token_type": "word",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "f587b9dbcaf35b18d298895e1ae3efd6bf0c2a30b85479ba7654cba3663ae159",
+      "archive_sha256": "765f3371eb9200216af778e0f3cefce25687b3fb72950d0dd0ebf4d580d9dcf9",
+      "size_bytes": 15698705,
+      "archive_bytes": 6880860,
+      "row_count": 1377730,
+      "total_count": 835646749
     },
     {
       "filename": "multi_domain_total_char_freq.txt",
@@ -113,6 +161,34 @@
   ],
   "rows": [
     {
+      "dataset": "classical_chinese_char_freq.txt",
+      "token": "的",
+      "raw_count": 1299258,
+      "per_million": 906.9737708437476,
+      "frequency_rank": 226
+    },
+    {
+      "dataset": "classical_chinese_char_freq.txt",
+      "token": "龘",
+      "raw_count": 22,
+      "per_million": 0.015357552509634304,
+      "frequency_rank": 18087
+    },
+    {
+      "dataset": "classical_chinese_word_freq.txt",
+      "token": "的",
+      "raw_count": 1299258,
+      "per_million": 906.9737708437476,
+      "frequency_rank": 226
+    },
+    {
+      "dataset": "classical_chinese_word_freq.txt",
+      "token": "龘",
+      "raw_count": 22,
+      "per_million": 0.015357552509634304,
+      "frequency_rank": 18087
+    },
+    {
       "dataset": "dialogue_char_freq.txt",
       "token": "的",
       "raw_count": 6534801,
@@ -153,6 +229,27 @@
       "raw_count": 6144004,
       "per_million": 58005.676452194624,
       "frequency_rank": 1
+    },
+    {
+      "dataset": "modern_chinese_char_freq.txt",
+      "token": "的",
+      "raw_count": 5610065,
+      "per_million": 3911.964565598435,
+      "frequency_rank": 28
+    },
+    {
+      "dataset": "modern_chinese_word_freq.txt",
+      "token": "情报所",
+      "raw_count": 31,
+      "per_million": 0.0370970150211163,
+      "frequency_rank": 465786
+    },
+    {
+      "dataset": "modern_chinese_word_freq.txt",
+      "token": "的",
+      "raw_count": 5230487,
+      "per_million": 6259.208219572694,
+      "frequency_rank": 5
     },
     {
       "dataset": "multi_domain_total_char_freq.txt",

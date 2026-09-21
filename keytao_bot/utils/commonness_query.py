@@ -9,7 +9,7 @@ import unicodedata
 from .pending_confirmation import advertised_command_suggestions, render_executable_suggestion
 from .same_code_reorder import parse_same_code_reorder
 from ..harness.authorization_grammar import parse_eviction_modified_add
-from .bcc_reference import format_bcc
+from .bcc_reference import format_bcc, format_historical
 
 
 _PREFIX = re.compile(
@@ -72,7 +72,7 @@ def parse_commonness_query(message):
 
 
 def render_commonness_table(result):
-    lines = ["常用度排序（本地语料与词典）", "名次 | 词 | 语料频次 | 词典收录 | 判定"]
+    lines = ["常用度排序（本地语料与词典）", "名次 | 词 | 语料频次 | 词典收录 | 判定 | 历史补充"]
     labels = {"ranked": "有数据", "close": "接近（并列参考）", "unknown": "无法判断"}
     for row in result["words"]:
         known = row["known"]
@@ -83,10 +83,11 @@ def render_commonness_table(result):
             frequency = format_bcc(bcc)
         presence = row["dictionaryPresenceCount"]
         verdict = labels.get(row["verdict"], "无法判断") if known else "无数据"
-        lines.append(f"{rank} | {row['word']} | {frequency if frequency is not None else '—'} | {presence if presence is not None else '—'} | {verdict}")
+        lines.append(f"{rank} | {row['word']} | {frequency if frequency is not None else '—'} | {presence if presence is not None else '—'} | {verdict} | {format_historical(bcc)}")
     lines.append(result["orderingNote"] + "词频是语料内计数。")
     if any((row.get("bcc") or {}).get("available") for row in result["words"]):
         lines.append("BCC 取四个现代频道的最高每百万频次；字与词按各自表内排名比较。未收录不代表实际零次，单边收录不决定高低。")
+        lines.append("古代汉语、近代汉语不计入现代频次；仅在双方现代四频道均未收录且词典与 jieba 无明确方向时破平。")
         if len(result["words"]) == 2:
             lines.extend(item["summary"] for item in result["comparisons"])
     return "\n".join(lines)

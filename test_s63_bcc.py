@@ -17,6 +17,19 @@ PAIRS = (('情报所', '敲不死'), ('环境法', '户晨风'), ('五角星', '
 FIXTURE = Path(__file__).parent / 'e2e/fixtures/bcc/s63.json'
 
 
+def seed_historical(db, channel='古代汉语', counts=None, kind='word', total=10000, rows=100):
+    """Synthetic historical evidence, separate from the official corpus slice."""
+    prefix = 'classical_chinese' if channel == '古代汉语' else 'modern_chinese'
+    dataset = f'{prefix}_{kind}_freq.txt'
+    with closing(sqlite3.connect(db)) as connection, connection:
+        connection.execute('DELETE FROM bcc_frequency WHERE dataset=?', (dataset,))
+        connection.execute('INSERT OR REPLACE INTO bcc_dataset VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (dataset, channel, kind, 'synthetic', 'synthetic', 'synthetic', 1, 1, rows, total))
+        for token, (count, rank) in (counts or {}).items():
+            connection.execute('INSERT INTO bcc_frequency VALUES (?, ?, ?, ?, ?)',
+                               (dataset, token, count, count * 1000000 / total, rank))
+
+
 class BccCommonnessTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -49,6 +62,108 @@ class BccCommonnessTests(unittest.TestCase):
                     self.assertEqual(result['summary'], inverse['summary'])
         self.web.assert_not_called()
 
+    def test_tool_exposes_history_without_changing_modern_headline(self):
+        before = lookup_word_commonness(['情报所'])['words'][0]
+        seed_historical(self.db, counts={'情报所': (9000, 1)})
+        after = lookup_word_commonness(['情报所'])['words'][0]
+        self.assertEqual(after['bcc']['perMillion'], before['bcc']['perMillion'])
+        self.assertEqual(after['score'], before['score'])
+        history = {row['channel']: row for row in after['bcc']['historicalChannels']}
+        self.assertEqual(history['古代汉语']['count'], 9000)
+        self.assertEqual(history['古代汉语']['perMillion'], 900000)
+        self.assertIn('近代汉语', history)
+
+    def test_historical_tiebreak_is_last_resort_and_explicit_in_copy(self):
+        seed_historical(self.db, counts={'古例甲': (1234, 1), '古例乙': (12, 50)})
+        result = asyncio.run(review.compare_word_commonness('古例甲', '古例乙'))
+        self.assertEqual(result['verdict'], 'front_more_common')
+        self.assertEqual(result['decisionReason'], 'bcc_historical_classical_frequency_ratio')
+        self.assertIn('现代四频道均未收录', result['summary'])
+        self.assertIn('词典与 jieba 无明确方向', result['summary'])
+        self.assertIn('按古代汉语频次', result['summary'])
+        self.assertIn('1,234', result['summary'])
+        self.assertIn('12', result['summary'])
+        inverse = asyncio.run(review.compare_word_commonness('古例乙', '古例甲'))
+        self.assertEqual(inverse['verdict'], 'behind_more_common')
+        self.assertEqual(inverse['summary'], result['summary'])
+        ranked = lookup_word_commonness(['古例乙', '古例甲'])
+        self.assertEqual([row['word'] for row in ranked['words']], ['古例甲', '古例乙'])
+        self.assertIsNone(ranked['words'][0]['bcc']['perMillion'])
+        self.web.assert_not_called()
+
+    def test_history_cannot_win_a_short_code_against_modern_attestation(self):
+        seed_historical(self.db, counts={'古例甲': (9999, 1), '情报所': (1, 100)})
+        for words in (('古例甲', '情报所'), ('情报所', '古例甲')):
+            result = asyncio.run(review.compare_word_commonness(*words))
+            self.assertEqual(result['verdict'], 'not_enough_evidence')
+            self.assertNotIn('historical', result['decisionReason'])
+            self.assertNotIn('古代汉语', result['summary'])
+            chain = asyncio.run(review.rank_code_chain_by_commonness([
+                {'word': word, 'code': 'qbsi', 'type': 'Phrase', 'weight': index}
+                for index, word in enumerate(words)]))
+            self.assertEqual(chain['status'], 'ask')
+            modern_line = next(line for line in chain['evidenceLines'] if '「情报所」' in line)
+            historical_line = next(line for line in chain['evidenceLines'] if '「古例甲」' in line)
+            self.assertNotIn('古代汉语', modern_line)
+            self.assertIn('古代汉语', historical_line)
+        placement = asyncio.run(review.assess_explicit_code_commonness(
+            '古例甲', 'qbsi', [{'word': '情报所', 'type': 'Phrase'}]))
+        self.assertEqual(placement[0]['verdict'], 'not_enough_evidence')
+
+    def test_history_never_overrules_jieba_dictionary_or_modern_close(self):
+        for frequencies, presences, modern, expected in (
+            ((20, 200), (1, 1), False, 'behind_more_common'),
+            ((None, None), (0, 2), False, 'behind_more_common'),
+            ((10, 12), (0, 2), False, 'close'),
+            ((None, None), (0, 0), True, 'close'),
+            ((10, 12), (1, 1), False, 'front_more_common'),
+        ):
+            with self.subTest(frequencies=frequencies, presences=presences, modern=modern):
+                seed_historical(self.db, counts={'古例甲': (1234, 1), '古例乙': (12, 50)})
+                with closing(sqlite3.connect(self.db)) as connection, connection:
+                    connection.executemany('INSERT OR REPLACE INTO word_commonness VALUES (?, ?, ?, ?)',
+                        [(word, frequency, 'n', presence) for word, frequency, presence in
+                         zip(('古例甲', '古例乙'), frequencies, presences)])
+                    connection.execute("DELETE FROM bcc_frequency WHERE dataset='news_total_word_freq.txt' AND token IN ('古例甲', '古例乙')")
+                    if modern:
+                        connection.executemany('INSERT INTO bcc_frequency VALUES (?, ?, ?, ?, ?)',
+                            [('news_total_word_freq.txt', word, count, count / 1000, 100)
+                             for word, count in (('古例甲', 10), ('古例乙', 12))])
+                result = asyncio.run(review.compare_word_commonness('古例甲', '古例乙'))
+                self.assertEqual(result['verdict'], expected)
+                self.assertEqual(result['decisionReason'].startswith('bcc_historical_'), expected == 'front_more_common')
+
+    def test_historical_absence_incomplete_modern_and_unlike_units_defer(self):
+        seed_historical(self.db, counts={'古例甲': (1234, 1)})
+        result = lookup_word_commonness(['古例甲', '古例乙'])
+        self.assertEqual(result['comparisons'][0]['verdict'], 'not_enough_evidence')
+        self.assertIsNone(result['words'][0]['bcc']['perMillion'])
+        seed_historical(self.db, counts={'古例甲': (1234, 1), '古例乙': (12, 50)})
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("DELETE FROM bcc_dataset WHERE filename='dialogue_word_freq.txt'")
+        result = lookup_word_commonness(['古例甲', '古例乙'])
+        self.assertEqual(result['comparisons'][0]['verdict'], 'not_enough_evidence')
+        self.assertFalse(result['words'][0]['bcc']['available'])
+
+    def test_historical_cross_type_uses_own_table_rank_and_later_period_first(self):
+        seed_historical(self.db, counts={'古例甲': (20, 1)}, total=110, rows=10)
+        seed_historical(self.db, kind='char', counts={'龖': (900, 1)}, total=1000, rows=2)
+        result = asyncio.run(review.compare_word_commonness('龖', '古例甲'))
+        self.assertEqual(result['verdict'], 'behind_more_common')
+        self.assertIn('relative_rank', result['decisionReason'])
+        self.assertIn('「古例甲」前 10.00% vs 「龖」前 50.00%', result['summary'])
+        self.assertGreater(result['front']['bcc']['historicalChannels'][0]['perMillion'],
+                           result['behind']['bcc']['historicalChannels'][0]['perMillion'] * 2)
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE bcc_frequency SET frequency_rank=NULL WHERE token='龖'")
+        self.assertEqual(lookup_word_commonness(['龖', '古例甲'])['comparisons'][0]['verdict'], 'not_enough_evidence')
+        seed_historical(self.db, counts={'古例甲': (1234, 1), '古例乙': (12, 50)})
+        seed_historical(self.db, channel='近代汉语', counts={'古例甲': (12, 50), '古例乙': (1234, 1)})
+        result = asyncio.run(review.compare_word_commonness('古例甲', '古例乙'))
+        self.assertEqual(result['verdict'], 'behind_more_common')
+        self.assertIn('early_modern', result['decisionReason'])
+        self.assertIn('按近代汉语频次', result['summary'])
+
     def test_unknown_coinages_restore_web_fallback_with_bcc_installed(self):
         self.web.side_effect = None
         self.web.return_value = {'success': True, 'score': 0, 'signals': {}}
@@ -67,6 +182,9 @@ class BccCommonnessTests(unittest.TestCase):
         self.assertEqual(balanced['count'], 22900677)
         self.assertAlmostEqual(balanced['perMillion'], 35539.83070929854)
         self.assertNotEqual(balanced['count'], 22388585)
+        history = {item['channel']: item for item in row['bcc']['historicalChannels']}
+        self.assertEqual(history['近代汉语']['count'], 5610065)
+        self.assertNotEqual(history['近代汉语']['count'], 5230487)
 
     def test_small_real_signal_cannot_defeat_an_absent_word(self):
         result = asyncio.run(review.compare_word_commonness('一一化', '量子薄荷鸽跃器'))
@@ -139,13 +257,14 @@ class BccCommonnessTests(unittest.TestCase):
 
     def test_historical_channels_cannot_influence_a_modern_verdict(self):
         before = asyncio.run(review.compare_word_commonness('情报所', '敲不死'))
-        with closing(sqlite3.connect(self.db)) as connection, connection:
-            for channel in ('古代汉语', '近代汉语'):
-                connection.execute('INSERT INTO bcc_dataset VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    (channel, channel, 'word', 'fixture', 'fixture', 'fixture', 1, 1, 1, 10**12))
-                connection.execute('INSERT INTO bcc_frequency (dataset, token, raw_count, per_million) VALUES (?, ?, ?, ?)',
-                    (channel, '敲不死', 10**12, 1000000))
-        self.assertEqual(asyncio.run(review.compare_word_commonness('情报所', '敲不死')), before)
+        for channel in ('古代汉语', '近代汉语'):
+            seed_historical(self.db, channel=channel, counts={'敲不死': (10**12, 1)}, total=10**12)
+        after = asyncio.run(review.compare_word_commonness('情报所', '敲不死'))
+        for key in ('verdict', 'decisionReason', 'summary', 'scoreDelta'):
+            self.assertEqual(after[key], before[key])
+        for side in ('front', 'behind'):
+            for key in ('perMillion', 'rankFraction', 'attested', 'channels'):
+                self.assertEqual(after[side]['bcc'][key], before[side]['bcc'][key])
 
     def test_ranking_retains_pair_decision_and_all_channel_evidence(self):
         from keytao_bot.utils.commonness_query import render_commonness_table

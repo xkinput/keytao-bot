@@ -17,6 +17,20 @@ from scripts import ingest_bcc as ingest
 
 
 class BccIngestTests(unittest.TestCase):
+    def test_all_twelve_datasets_are_ingested_with_historical_labels(self):
+        prefixes = {**ingest.CHANNEL_PREFIXES, '古代汉语': 'classical_chinese',
+                    '近代汉语': 'modern_chinese'}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(ingest, 'CHANNEL_PREFIXES', prefixes):
+                db, cache, datasets = self.cached_corpus(Path(directory))
+            result = ingest.ingest(db, cache, datasets, cached_only=True)
+            self.assertEqual(len(result['datasets']), 12)
+            self.assertEqual(result['rows'], 72)
+            self.assertEqual({(row['channel'], row['token_type']) for row in result['datasets']
+                              if row['filename'].startswith(('classical_', 'modern_'))},
+                             {('古代汉语', 'char'), ('古代汉语', 'word'),
+                              ('近代汉语', 'char'), ('近代汉语', 'word')})
+
     def cached_corpus(self, root):
         db, cache = root / 'reference.db', root / 'cache'
         cache.mkdir()
@@ -69,6 +83,19 @@ class BccIngestTests(unittest.TestCase):
                   patch.object(ingest, 'download_file') as download,
                   patch.object(ingest, '_build_staging') as staging):
                 with self.assertRaisesRegex(ingest.IngestError, 'Insufficient disk headroom'):
+                    ingest.ingest(db, cache, datasets, cached_only=True)
+            download.assert_not_called()
+            staging.assert_not_called()
+            self.assertEqual(db.read_bytes(), before)
+
+    def test_wal_guard_preserves_database_before_any_dataset_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            db, cache, datasets = self.cached_corpus(Path(directory))
+            before = db.read_bytes()
+            Path(str(db) + '-wal').touch()
+            with (patch.object(ingest, 'download_file') as download,
+                  patch.object(ingest, '_build_staging') as staging):
+                with self.assertRaisesRegex(ingest.IngestError, 'has a WAL'):
                     ingest.ingest(db, cache, datasets, cached_only=True)
             download.assert_not_called()
             staging.assert_not_called()
@@ -187,20 +214,20 @@ class BccIngestTests(unittest.TestCase):
 
             with patch.object(ingest, 'download_file', side_effect=get) as download:
                 first = ingest.ingest(db, root / 'cache', datasets, timeout=30)
-                self.assertEqual(first['rows'], 16)
-                self.assertEqual(download.call_count, 8)
+                self.assertEqual(first['rows'], 24)
+                self.assertEqual(download.call_count, 12)
                 with closing(sqlite3.connect(db)) as connection:
                     self.assertEqual(connection.execute(
                         "SELECT raw_count, per_million FROM bcc_frequency WHERE token='甲' LIMIT 1"
                     ).fetchone(), (3, 750000.0))
                 digest = hashlib.sha256(db.read_bytes()).hexdigest()
                 self.assertEqual(ingest.ingest(db, root / 'cache', datasets, timeout=30)['downloaded'], [])
-                self.assertEqual(download.call_count, 8)
+                self.assertEqual(download.call_count, 12)
                 self.assertEqual(hashlib.sha256(db.read_bytes()).hexdigest(), digest)
                 # A corrupted cached ZIP must be fetched again, never trusted.
                 (root / 'cache' / (datasets[0]['filename'] + '.zip')).write_bytes(b'broken')
                 ingest.ingest(db, root / 'cache', datasets, timeout=30)
-                self.assertEqual(download.call_count, 9)
+                self.assertEqual(download.call_count, 13)
                 digest = hashlib.sha256(db.read_bytes()).hexdigest()
                 # A bad later dataset cannot publish an earlier successful update.
                 changed = [dict(row, updated_at='2026-06-01') for row in datasets]

@@ -275,3 +275,193 @@ OK
 
 **ZERO paid model calls / ZERO real-provider calls / ZERO BCC downloads（本轮）。**
 没有 `e2e.run`、`pnpm test`、生产密钥读取、生产访问、commit、push 或 deploy。
+
+## S63 follow-up：古代汉语与近代汉语（2026-09-22）
+
+本节是对上文八份现代数据结论的追加。开始时 `git log -1` 核实
+HEAD 为 `67ddb7a3124d1115aaf143cc50fa6df5da7ca4e2`，工作区干净。
+本次只在本地实施和验证；未提交、推送、部署或访问生产服务器。
+
+### 十二份数据与使用边界
+
+沿用同一 `bcc_frequency` / `bcc_dataset` 管线及独立 dataset 标签，已加入：
+
+| 文件 | TXT 字节 | 新增行 | 总计数 |
+|---|---:|---:|---:|
+| `classical_chinese_char_freq.txt` | 169,256 | 20,138 | 1,432,519,927 |
+| `classical_chinese_word_freq.txt` | 169,256 | 20,138 | 1,432,519,927 |
+| `modern_chinese_char_freq.txt` | 77,839 | 8,690 | 1,434,078,685 |
+| `modern_chinese_word_freq.txt` | 15,698,705 | 1,377,730 | 835,646,749 |
+
+官方清单仍标为 `2026-05-22T02:53:18Z`。两份古代汉语 TXT 内容 SHA-256
+完全相同（`d2b9a0e984b37754e193c0aac168b2eda443a8307a919e4bf1f880e75d16b8f3`），
+这是本次实际下载内容的事实；分别按官方 char / word 标签保留，没有合并、修正或编造词条。
+全部 12 个数据集共 **2,993,936 行**，比原 1,567,240 行增加 **1,426,696 行**。
+
+- `bcc.channels`、`perMillion`、`rankFraction`、`attested` 仍只由多领域/新闻/文学/口语决定。
+  headline 仍为现代四频道最大 ppm；历史数据不参与 score，也不改变现代未收录的 null。
+- 两个历史频道单列 `bcc.historicalChannels`，每个字段明确标注频道、数据集、原始次数、ppm、
+  自身表内排名/行数、分母、快照时间与哈希。未收录为 null，未安装为 `available=false`。
+- 仅双方现代四频道完整可用且双方均未收录、jieba 比值与词典证据没有方向结论时，
+  历史频道才可破平。原比较为 `close` 或 `not_enough_evidence` 才进入；词典 presence
+  差达到原门槛时仍禁止历史破平。双方须在**同一个历史频道**均收录，不跨时期拼接信号。
+  双方都有可比近代汉语时优先近代；否则尝试古代。近代可比但未达到两倍门槛时保留原结论，
+  不再挑古代寻找胜方。同类型沿用 2.0 比值门槛，字词混比使用各自完整表的 rank / row_count，
+  排名缺失则不硬比 ppm。
+- 单边现代收录仍不能由 BCC 单独判定高低；历史高频不能获得针对现代收录词的短码优先权。
+  原 jieba / 词典回退与现代新词语义 override 保留，未知新词的网页回退资格不变。
+- 只读 `keytao_word_commonness` 始终返回两个历史字段，词频排序固定列出「历史补充」，
+  包括未参与判定、未收录和未安装的状态。工具描述与 lookup 技能文案同步这项边界。
+  审词比较摘要和逐词审词证据仅在历史决定结果或现代无收录时显示历史数字。
+  排序序号仍是展示位置，接近/未知关系不表示严格先后。
+
+### 实测导入、幂等与磁盘 gate
+
+只访问了一次官方 `/api/datasets` GET 和四个新文件的
+`/api/datasets/<file>/download` GET；没有访问 `/api/freq`、`/api/search` 或其他网络端点。
+下载入口禁止重定向，仍按块处理 ZIP/CSV。首次隔离下载包装器因 audit 参数下标错误，
+在发出文件请求前退出，原 DB 未改变；修正包装器后完成以下测量。
+
+| 指标 | 本次实测 |
+|---|---:|
+| 更新数据集 / 下载 ZIP | 4 / 4 |
+| 导入前 DB | 162,754,560 字节（155.215 MiB） |
+| 导入后 DB | 250,372,096 字节（238.773 MiB） |
+| DB 增长 | 87,617,536 字节（83.559 MiB） |
+| 新增 ZIP 缓存 | 7,088,726 字节 |
+| 总 ZIP 缓存 | 16,470,443 字节 |
+| 导入耗时 | 13.963 秒 |
+| 峰值 RSS | 83,214,336 字节（79.359 MiB） |
+| 磁盘峰值采样 | 429,680,555 字节（409.775 MiB） |
+| 本地 gate 复验时可用磁盘 | 24,821,760,000 字节 |
+
+仍采用 SQLite backup → 同目录 staging → 整批提交 → quick_check → 原子 replace；
+WAL 和 inode/size/mtime 发布守卫、单写者限制、坏 ZIP 不发布、重建基础库保留 BCC、
+低磁盘提前拒绝及 Docker 启动非致命降级均保留并运行回归。
+
+在 DB/缓存同设备情况下，原 gate 公式不变：
+`2 × db_size + 12 × changed_txt_size + (changed_file_count + 1) × 64 MiB + 256 MiB`。
+本轮四文件增量需要 **1,122,869,568 字节**可用空间；按扩大的 DB 重新导入全部十二份，
+保守预算为 **2,084,581,984 字节**，本地实际 gate 通过。
+以用户给定生产余量 **8.3 GB（保守按 8,300,000,000 字节）**注入同一 gate，
+十二份全量刷新也通过，超出预算约 **6.215 GB**。
+若其他占用不变，扣除 DB 和缓存新增量后的生产余量估算约 **8.205 GB**。
+这只是依据给定生产快照的容量计算，**没有联网复测生产磁盘、RAM、swap 或容器数**；
+16 GB RAM / 无 swap / 约 40 容器同样来自任务提供值。本次不增加任何生产常驻负载。
+20 ms 采样峰值不是硬上界；gate 不是磁盘配额，也不解决并发写者竞态。
+
+离线幂等复验 updated/downloaded 均为空，下载函数调用 0 次，DB SHA-256 前后相同：
+`f8560eb35ca21080e21c868ea39625b14496cc7be134e91bac05bc1a4ec84ac4`。
+完整 DB `quick_check=ok`，缺失排名 0；25 条真实 fixture 的排名均以完整表重新计算核对。
+重新提取的 fixture 包含全部 12 份元数据，保留完整表分母与排名。
+
+测量与复验文件均在 `/tmp/keytao-s63-bcc/`：`followup-inventory.json`、
+`followup-ingest.json`、`followup-ingest.stderr`、`followup-data-verification.json`。
+其中文本日志可能包含应用导入日志，JSON 主体从首个 `{` 开始读取。
+
+### 破平文案与验证范围
+
+以下来自完整真实数据库的离线只读比较；两词均不在现代四频道和基础 jieba / 词典表中：
+
+```text
+「元五」较「于前」更常用：现代四频道均未收录，词典与 jieba 无明确方向，按近代汉语频次：「元五」190,661（每百万 228.16） vs 「于前」40,235（每百万 48.15）；仅作历史语料末级破平
+```
+
+古代频道分支另用明确的合成 fixture 验证（不是官方语料事实）：
+
+```text
+「古例甲」较「古例乙」更常用：现代四频道均未收录，词典与 jieba 无明确方向，按古代汉语频次：「古例甲」1,234（每百万 123400） vs 「古例乙」12（每百万 1200）；仅作历史语料末级破平
+```
+
+新增回归涵盖历史高频不能赢现代收录词的短码、正反方向、jieba/词典方向保护、现代 close
+不可被历史打破、无现代收录且旧信号 close 时可破平、单边历史缺失、现代数据集不完整、
+跨字词按自身排名、缺排名回退、近代优先、注册工具字段、最终排序路由文案、审词显示边界、
+十二份原子导入、幂等性和 WAL 拒绝。原 S63 语义 override 等断言继续保留。
+
+主要代码证据：`scripts/ingest_bcc.py:27` 扩展白名单；
+`keytao_bot/utils/bcc_reference.py:63` 隔离查询及现代聚合、`:130` 历史频道比较；
+`keytao_bot/utils/keytao_review.py:5871` 旧信号之后的末级 gate、`:5757` 明示历史依据的文案；
+`keytao_bot/utils/word_commonness.py:117` 补充工具证据、
+`keytao_bot/utils/commonness_query.py:75` 排序历史列。
+
+### 最终离线套件原始尾部
+
+沿用已检查的 `run_offline.py` / `guard/sitecustomize.py`：清空非必要环境变量，
+禁止真实 socket connect / DNS / sendto、禁止读取生产 `.env*` / `.e2e_key`，
+dotenv 使用离线替身。入口 `run_suites.py followup-final-`，清单为
+`/tmp/keytao-s63-bcc/followup-final-suites.json`，13 个入口全部 exit 0，调度器 exit 0。
+工具说明更新后另重跑状态机，通过结果覆盖同名最终日志。
+以下均直接摘自对应 `followup-final-*.log`，不是预期计数：
+
+```text
+$ .venv/bin/python test_state_machine.py
+============================================================
+Results: 2023/2023 passed, 0 failed
+✅ ALL TESTS PASSED
+============================================================
+
+$ .venv/bin/python test_memory_safety.py
+----------------------------------------------------------------------
+Ran 407 tests in 193.652s
+
+OK
+
+$ .venv/bin/python test_security_fixes.py
+============================================================
+Results: 268/268 passed, 0 failed
+============================================================
+
+$ .venv/bin/python test_review_gate.py
+============================================================
+Results: 443/443 passed
+✅ ALL TESTS PASSED
+
+$ .venv/bin/python test_llm_policy.py
+----------------------------------------------------------------------
+Ran 11 tests in 0.110s
+
+OK
+
+$ .venv/bin/python test_word_discovery.py
+============================================================
+Results: 290/290 passed
+✅ ALL TESTS PASSED
+
+$ .venv/bin/python -m e2e.test_safety
+----------------------------------------------------------------------
+Ran 107 tests in 0.630s
+
+OK
+
+$ .venv/bin/python -m e2e.s63
+Ran 22 tests in 0.170s
+
+OK
+
+Ran 10 tests in 1.283s
+
+OK
+
+Ran 3 tests in 0.034s
+
+OK
+{"scenario": "S63", "mode": "fixtures/fake-tools", "paidModelCalls": 0, "realProviderCalls": 0, "passed": true, "checks": [{"module": "test_s63_bcc", "exit": 0}, {"module": "test_s63_bcc_ingest", "exit": 0}, {"module": "test_s63_bcc_delivery", "exit": 0}]}
+
+$ .venv/bin/python -m unittest test_s63_fresh_selection test_s63_general_reply
+----------------------------------------------------------------------
+Ran 25 tests in 0.146s
+
+OK
+```
+
+相关回归 `test_s59_commonness_evidence`（9）、`test_s59_commonness_route`（9）、
+`test_s59_tool_prompt`（6）、`test_s56_commonness`（10）、`test_sep19_commonness`（6）
+也均通过。9 个变更 Python 文件经 `compile()` 检查，`git diff --check` 通过；
+再次提取 fixture 与工作区的真实切片 `cmp` 一致。
+首轮红回归分别确认旧实现只导入 8 份、缺少历史字段、历史破平落入网页回退、
+排序输出没有历史列；对应日志为 `followup-*-red.log`。
+
+**ZERO paid model calls / ZERO real-provider calls。** 网络仅有上文官方静态数据 GET；
+未运行 `pnpm test` 或付费 provider rig。HEAD 保持 `67ddb7a`，代码、测试、fixture 与报告
+均只在本地修改，未 stage / commit / push / deploy。完整 DB 和 ZIP 位于被忽略的本地 `data/`，
+生产仍未安装本轮四份新增数据；本报告不将离线通过或容量计算视为生产验证。

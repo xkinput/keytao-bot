@@ -25,7 +25,8 @@ from keytao_bot.utils.bcc_reference import create_schema
 
 BASE_URL = 'https://bcc.blcu.edu.cn/api/datasets'
 CHANNEL_PREFIXES = {'多领域': 'multi_domain_total', '新闻': 'news_total',
-                    '文学': 'literature', '口语': 'dialogue'}
+                    '文学': 'literature', '口语': 'dialogue',
+                    '古代汉语': 'classical_chinese', '近代汉语': 'modern_chinese'}
 CHUNK = 65536
 MAX_ZIP_BYTES = 64 * 1024 * 1024
 MAX_TEXT_BYTES = 128 * 1024 * 1024
@@ -46,7 +47,7 @@ def download_file(url, destination, timeout):
         f'{BASE_URL}/{prefix}_{kind}_freq.txt/download'
         for prefix in CHANNEL_PREFIXES.values() for kind in ('word', 'char')
     }:
-        raise IngestError('Only official modern BCC static dataset GETs are allowed')
+        raise IngestError('Only official BCC static dataset GETs are allowed')
     start = time.monotonic()
     size = 0
     opener = urllib.request.build_opener(NoRedirect)

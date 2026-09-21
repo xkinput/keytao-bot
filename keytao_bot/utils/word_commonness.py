@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from . import keytao_review as review
+from .bcc_reference import format_historical, historical_attested
 
 
 MAX_COMMONNESS_WORDS = 12
@@ -49,7 +50,8 @@ def lookup_word_commonness(words: Sequence[str]) -> dict[str, Any]:
     known_words = [
         word for word in normalized
         if references[word].get("available") is True
-        and references[word].get("attested") is True
+        and (references[word].get("attested") is True
+             or historical_attested(references[word].get('bcc') or {}))
     ]
     comparisons: list[dict[str, Any]] = []
     edges: dict[str, set[str]] = {word: set() for word in known_words}
@@ -112,6 +114,9 @@ def lookup_word_commonness(words: Sequence[str]) -> dict[str, Any]:
             review._comparison_evidence_line(word, estimate) if known
             else f"「{word}」：无数据"
         )
+        history = format_historical(reference.get('bcc') or {})
+        if history not in evidence_lines[-1]:
+            evidence_lines[-1] += f"；历史补充：{history}"
     result = {
         "success": True,
         "method": "offline_reference",

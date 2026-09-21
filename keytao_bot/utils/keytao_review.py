@@ -27,7 +27,9 @@ except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
 from . import http_client
-from .bcc_reference import comparison_signal, format_bcc, lookup_bcc
+from .bcc_reference import (HISTORICAL_CHANNELS, comparison_signal, format_bcc, format_frequency,
+                            format_historical, historical_attested,
+                            historical_comparison_signal, lookup_bcc)
 from .http_client import KeytaoApiError
 from .keytao_encoding import (
     build_alternate_pronunciation_codes,
@@ -5429,7 +5431,10 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
 def _query_commonness_reference(word: str) -> Dict[str, Any]:
     key = str(word or "").strip()
     bcc = {"available": False, "attested": False, "perMillion": None,
-           "tokenType": "char" if len(key) == 1 else "word", "channels": []}
+           "tokenType": "char" if len(key) == 1 else "word", "channels": [],
+           "historicalChannels": [{"channel": channel, "available": False,
+                                   "count": None, "perMillion": None, "rankFraction": None}
+                                  for channel in HISTORICAL_CHANNELS]}
     if not key:
         return {
             "available": True,
@@ -5749,7 +5754,21 @@ def _reference_comparison_summary(
     basis = f"语料频次 {frequency_basis}，词典收录 {presence_basis}"
     front_bcc = front_reference.get("bcc") or {}
     behind_bcc = behind_reference.get("bcc") or {}
-    if reason.startswith('bcc_'):
+    if reason.startswith('bcc_historical_'):
+        channel = '近代汉语' if 'early_modern' in reason else '古代汉语'
+        rows = [next(row for row in item['historicalChannels'] if row['channel'] == channel)
+                for item in (front_bcc, behind_bcc)]
+        basis = '现代四频道均未收录，词典与 jieba 无明确方向，'
+        if 'relative_rank' in reason:
+            basis += (f"按{channel}各自字/词表内排名："
+                      f"「{first_word}」前 {rows[0]['rankFraction']:.2%} vs "
+                      f"「{second_word}」前 {rows[1]['rankFraction']:.2%}（越小越靠前）")
+        else:
+            basis += (f"按{channel}频次：「{first_word}」"
+                      f"{format_frequency(rows[0]['count'], rows[0]['perMillion'])} vs "
+                      f"「{second_word}」{format_frequency(rows[1]['count'], rows[1]['perMillion'])}")
+        basis += '；仅作历史语料末级破平'
+    elif reason.startswith('bcc_'):
         basis = f"{format_bcc(front_bcc)}；「{second_word}」{format_bcc(behind_bcc)}"
         if 'balanced_tiebreak' in reason:
             basis += "；最高频道信号相同，采用多领域比较"
@@ -5770,6 +5789,10 @@ def _reference_comparison_summary(
                 basis = f"「{first_word}」{format_bcc(front_bcc)}；「{second_word}」{format_bcc(behind_bcc)}"
             if bool(front_bcc.get('attested')) != bool(behind_bcc.get('attested')):
                 basis += "；单边 BCC 收录不决定高低"
+    if (not reason.startswith('bcc_historical_')
+            and all(item.get('available') and not item.get('attested') for item in (front_bcc, behind_bcc))):
+        basis += (f"；历史补充：「{first_word}」{format_historical(front_bcc)}；"
+                  f"「{second_word}」{format_historical(behind_bcc)}（未参与判定）")
     if verdict == "front_more_common":
         return f"「{front_word}」较「{behind_word}」更常用：{basis}"
     if verdict == "behind_more_common":
@@ -5844,6 +5867,17 @@ def _compare_reference_commonness(
         elif presence_delta <= -COMMONNESS_DICTIONARY_PRESENCE_MARGIN:
             verdict = "behind_more_common"
             reason = "dictionary_presence_margin"
+
+    if (verdict in {'not_enough_evidence', 'close'}
+            and front_reference.get('available') and behind_reference.get('available')
+            and abs(front_presence - behind_presence) < COMMONNESS_DICTIONARY_PRESENCE_MARGIN):
+        historical_signal = historical_comparison_signal(front_bcc, behind_bcc)
+        if historical_signal is not None:
+            left, right, historical_reason = historical_signal
+            if left >= right * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+                verdict, reason = 'front_more_common', historical_reason
+            elif right >= left * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+                verdict, reason = 'behind_more_common', historical_reason
 
     front = _reference_commonness_result(front_word, front_reference)
     behind = _reference_commonness_result(behind_word, behind_reference)
@@ -5987,19 +6021,17 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
     reference_available = bool(
         front_reference.get("available") and behind_reference.get("available")
     )
-    if reference_available and (
-        front_reference.get("attested") or behind_reference.get("attested")
-        or (front_reference.get("bcc") or {}).get("attested")
-        or (behind_reference.get("bcc") or {}).get("attested")
-    ):
+    if reference_available:
         comparison = _compare_reference_commonness(
             front_word,
             behind_word,
             front_reference,
             behind_reference,
         )
-        record_commonness_evidence(comparison)
-        return comparison
+        if (front_reference.get('attested') or behind_reference.get('attested')
+                or comparison['decisionReason'].startswith('bcc_historical_')):
+            record_commonness_evidence(comparison)
+            return comparison
 
     front, behind = await asyncio.gather(
         _estimate_word_commonness_web_fallback(front_word),
@@ -6444,6 +6476,8 @@ def _comparison_evidence_line(word: str, value: Any) -> str:
         return (
             f"「{word}」：语料频次 "
             f"{frequency if frequency is not None else '无'}，词典收录 {presence}"
+            + (f"；现代四频道均未收录；历史补充：{format_historical(bcc)}"
+               if bcc.get('available') else '')
         )
     return f"「{word}」：当前没有可核验的语料/词典信号"
 
@@ -6458,6 +6492,7 @@ def _commonness_comparison_has_evidence(comparison: Dict[str, Any]) -> bool:
         )
         if (
             reference.get("attested") is True
+            or historical_attested(reference.get('bcc') or {})
             or reference.get("corpusFrequency") is not None
             or int(reference.get("dictionaryPresenceCount") or 0) > 0
         ):

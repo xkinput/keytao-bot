@@ -4,6 +4,7 @@ import logging
 import sqlite3
 
 CHANNELS = ("多领域", "新闻", "文学", "口语")
+HISTORICAL_CHANNELS = ("古代汉语", "近代汉语")
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS bcc_dataset (
         filename TEXT PRIMARY KEY, channel TEXT NOT NULL,
@@ -62,7 +63,11 @@ def preserve_bcc(source_path, connection):
 def lookup_bcc(connection, word):
     kind = "char" if len(word) == 1 else "word"
     result = {"available": False, "attested": False, "tokenType": kind,
-              "perMillion": None, "rankFraction": None, "channels": []}
+              "perMillion": None, "rankFraction": None, "channels": [],
+              "historicalChannels": [
+                  {"channel": channel, "available": False, "count": None,
+                   "perMillion": None, "rankFraction": None}
+                  for channel in HISTORICAL_CHANNELS]}
     if not connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bcc_dataset'"
     ).fetchone():
@@ -74,20 +79,22 @@ def lookup_bcc(connection, word):
                {'f.frequency_rank' if has_rank else 'NULL'}
         FROM bcc_dataset d LEFT JOIN bcc_frequency f
           ON f.dataset=d.filename AND f.token=?
-        WHERE d.token_type=? AND d.channel IN ('多领域', '新闻', '文学', '口语')
+        WHERE d.token_type=? AND d.channel IN ('多领域', '新闻', '文学', '口语', '古代汉语', '近代汉语')
     """, (word, kind)).fetchall()
-    # Never compare a half-installed channel set against a complete one.
-    if {row[1] for row in rows} != set(CHANNELS):
-        return result
     channels = {row[1]: {
-        "dataset": row[0], "channel": row[1], "updatedAt": row[2],
+        "dataset": row[0], "channel": row[1], "available": True, "updatedAt": row[2],
         "sha256": row[3], "totalCount": row[4], "count": row[5],
         "perMillion": row[6], "rowCount": row[7], "rank": row[8],
         "rankFraction": row[8] / row[7] if row[8] is not None else None,
     } for row in rows}
-    observed = [row for row in channels.values() if row['count'] is not None]
+    result['historicalChannels'] = [channels.get(row['channel'], row)
+                                    for row in result['historicalChannels']]
+    # Historical evidence never completes a missing modern channel set.
+    if not set(CHANNELS).issubset(channels):
+        return result
+    observed = [channels[channel] for channel in CHANNELS if channels[channel]['count'] is not None]
     ranked = [row['rankFraction'] for row in observed if row['rankFraction'] is not None]
-    result.update(available=True, attested=any(row[5] is not None for row in rows),
+    result.update(available=True, attested=bool(observed),
                   channels=[channels[channel] for channel in CHANNELS],
                   perMillion=max((row['perMillion'] for row in observed), default=None),
                   rankFraction=min(ranked) if observed and len(ranked) == len(observed) else None)
@@ -114,6 +121,37 @@ def comparison_signal(front, behind):
             if balanced[0] != balanced[1]:
                 reason += '_balanced_tiebreak'
     return (*signal, reason)
+
+
+def historical_attested(bcc):
+    return any(row.get('count') is not None for row in bcc.get('historicalChannels', []))
+
+
+def historical_comparison_signal(front, behind):
+    """Use one historical channel only after confirmed absence from modern BCC."""
+    if not all(item.get('available') and not item.get('attested') for item in (front, behind)):
+        return None
+    cross_type = front['tokenType'] != behind['tokenType']
+    key = 'rankFraction' if cross_type else 'perMillion'
+    # Prefer the later period when both are attested; never mix periods or units.
+    for channel, label in (('近代汉语', 'early_modern'), ('古代汉语', 'classical')):
+        rows = [next((row for row in item.get('historicalChannels', [])
+                      if row['channel'] == channel), {}) for item in (front, behind)]
+        if not all(row.get('count') is not None and row.get(key) is not None
+                   and row[key] > 0 for row in rows):
+            continue
+        values = [1 / row[key] if cross_type else row[key] for row in rows]
+        unit = 'relative_rank' if cross_type else 'frequency'
+        return (*values, f'bcc_historical_{label}_{unit}_ratio')
+    return None
+
+
+def format_historical(bcc):
+    rows = {row['channel']: row for row in bcc.get('historicalChannels', [])}
+    return '；'.join(
+        f"{channel} " + (format_frequency(rows[channel].get('count'), rows[channel].get('perMillion'))
+                        if rows.get(channel, {}).get('available') else '数据未安装')
+        for channel in HISTORICAL_CHANNELS)
 
 
 def format_frequency(count, rate):
