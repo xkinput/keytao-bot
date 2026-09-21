@@ -12,4 +12,4 @@ RUN uv run playwright install chromium --with-deps
 
 COPY . .
 
-CMD ["sh", "-c", "uv run python scripts/build_pinyin_reference.py && { uv run python scripts/ingest_bcc.py --timeout 15 || printf '%s\\n' 'WARNING: BCC ingest failed; starting bot with existing local signals' >&2; } && exec uv run python bot.py"]
+CMD ["sh", "-c", "uv run python scripts/build_pinyin_reference.py && { uv run python scripts/ingest_bcc.py --timeout 120 || printf '%s\\n' 'WARNING: BCC ingest failed; starting bot with existing local signals' >&2; } && exec uv run python bot.py"]
