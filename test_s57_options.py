@@ -183,6 +183,27 @@ class S57OptionStructureTests(unittest.TestCase):
 
 
 class S57OptionClaimTests(unittest.TestCase):
+    def test_quoted_sealed_options_keep_priority_over_literal_word_lookup(self):
+        async def run():
+            store = harness.MemoryConversationStateStore()
+            key = harness.ConversationAddress.private("qq", "quoted-options")
+            store.set(key, ticket({"现在落实": "confirm", "维持原样": "cancel"}))
+            for option, expected in (("现在落实", "pending_confirm"), ("维持原样", "pending_cancel")):
+                message = "「" + option + "」"
+                ctx = chat.TurnContext(
+                    bot=object(), event=object(), platform="qq", user_id=key.actor_id,
+                    conv_key=key, normalized_message_text=message,
+                    literal_phrase_word=routing.parse_literal_phrase_query(message) or "",
+                    command_intent_for=AsyncMock(side_effect=AssertionError("Unexpected classifier")),
+                )
+                with patch.object(chat, "conversation_state_store", store):
+                    await chat._stage_resolve_current_pending_scope(ctx)
+                    await chat._stage_apply_scoped_pending_intent(ctx)
+                self.assertIsNone(ctx.scoped_pending_response)
+                self.assertEqual(ctx.generic_command_intent.intent, expected)
+                self.assertFalse(ctx.literal_phrase_word)
+        asyncio.run(run())
+
     def test_live_force_and_exact_options_skip_intent_models_in_both_stages(self):
         async def run():
             state = ticket({"现在落实": "confirm", "维持原样": "cancel"})
@@ -191,6 +212,7 @@ class S57OptionClaimTests(unittest.TestCase):
                     ctx = SimpleNamespace(
                         current_pending_record=SimpleNamespace(state=state),
                         normalized_message_text=message, eviction_modified_add=None,
+                        literal_phrase_word="",
                         compound_eviction_add_plan=None, scoped_pending_intent=None,
                         resolved_advertised_words=(), quoted_pending_add_control=False,
                         command_intent_for=AsyncMock(side_effect=AssertionError("generic intent model called")),

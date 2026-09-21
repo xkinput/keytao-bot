@@ -1172,7 +1172,7 @@ def _extract_labeled_pinyin_sequences(
         sequence = normalize_pinyin_sequence(raw)
         if not sequence:
             continue
-        word_length = len(word)
+        word_length = len(_pronunciation_indexes(word))
         if word_length > 1 and len(sequence) != word_length:
             continue
         if word_length == 1 and len(sequence) != 1:
@@ -1190,7 +1190,7 @@ def _extract_labeled_pinyin_sequences(
         )
         for match in adjacent_pattern.finditer(normalized_text):
             sequence = normalize_pinyin_sequence(match.group(1))
-            if len(sequence) != len(word) or sequence in seen:
+            if len(sequence) != len(_pronunciation_indexes(word)) or sequence in seen:
                 continue
             seen.add(sequence)
             sequences.append(sequence)
@@ -1985,20 +1985,47 @@ async def lookup_words(config: ReviewHttpConfig, words: Sequence[str]) -> Dict[s
     return result
 
 
+def _pronunciation_indexes(word: str) -> Tuple[int, ...]:
+    """Keep literal identity while indexing only spoken Han characters."""
+    if (
+        len(word) <= 20
+        and re.fullmatch(r"[\u3400-\u9fff]+(?:[，,、；;][\u3400-\u9fff]+)+", word)
+    ):
+        return tuple(index for index, char in enumerate(word) if char not in "，,、；;")
+    return tuple(range(len(word)))
+
+
+def _project_phrase_syllables(word: str, values: Sequence[str]) -> Tuple[str, ...]:
+    """Project aligned punctuation placeholders, never an arbitrary extra syllable."""
+    raw = tuple(str(value or "").strip() for value in values)
+    indexes = _pronunciation_indexes(word)
+    if len(indexes) != len(word) and len(raw) == len(word):
+        spoken = set(indexes)
+        if all(
+            not raw[index]
+            or unicodedata.normalize("NFKC", raw[index]) == unicodedata.normalize("NFKC", char)
+            for index, char in enumerate(word)
+            if index not in spoken
+        ):
+            return tuple(raw[index] for index in indexes)
+    return raw
+
+
 def _encode_default_pinyin_sequence(encode_data: Dict) -> Tuple[str, ...]:
     chars = encode_data.get("chars")
     if not isinstance(chars, list):
         return ()
     result: List[str] = []
+    word = "".join(str(item.get("char") or "") for item in chars if isinstance(item, dict))
     for item in chars:
         if not isinstance(item, dict):
             return ()
         pinyin = str(item.get("pinyin") or "").strip()
         normalized = normalize_pinyin_syllable(pinyin)
-        if not normalized:
+        if not normalized and item.get("char") not in tuple("，,、；;"):
             return ()
         result.append(normalized)
-    return tuple(result)
+    return _project_phrase_syllables(word, result)
 
 
 def _pronunciation_sequence_rejection_reason(
@@ -2014,21 +2041,37 @@ def _pronunciation_sequence_rejection_reason(
     overrides a present, matching known-reading list.
     """
     word_chars = list(word)
+    indexes = _pronunciation_indexes(word)
+    if len(indexes) != len(word):
+        identities = [str(encode_data[key]).strip() for key in ("input", "word") if key in encode_data]
+        if not identities or any(identity != word for identity in identities):
+            return "encoding_word_mismatch"
     normalized_sequence = tuple(
         normalize_pinyin_syllable(str(syllable or ""))
-        for syllable in sequence
+        for syllable in _project_phrase_syllables(word, sequence)
     )
     chars = encode_data.get("chars")
-    if len(normalized_sequence) != len(word_chars) or not all(normalized_sequence):
+    if len(normalized_sequence) != len(indexes) or not all(normalized_sequence):
         return "syllable_count_mismatch"
     if not isinstance(chars, list) or len(chars) != len(word_chars):
         return "character_lookup_payload_missing"
 
-    for index, (expected_char, syllable, char_info) in enumerate(
-        zip(word_chars, normalized_sequence, chars)
-    ):
+    for index, (expected_char, char_info) in enumerate(zip(word_chars, chars)):
         if not isinstance(char_info, dict) or char_info.get("char") != expected_char:
             return f"character_{index + 1}_lookup_mismatch"
+        if index not in indexes:
+            punctuation_readings = char_info.get("pinyins")
+            if punctuation_readings is not None and not isinstance(punctuation_readings, list):
+                return f"character_{index + 1}_punctuation_reading_mismatch"
+            values = [char_info.get("pinyin", ""), *(punctuation_readings or [])]
+            if any(
+                str(value or "").strip()
+                and unicodedata.normalize("NFKC", str(value).strip()) != unicodedata.normalize("NFKC", expected_char)
+                for value in values
+            ):
+                return f"character_{index + 1}_punctuation_reading_mismatch"
+    for index, syllable in zip(indexes, normalized_sequence):
+        char_info = chars[index]
         status = str(char_info.get("pronunciationLookupStatus") or "").strip()
         if status and status != "found":
             return f"character_{index + 1}_lookup_{status}"
@@ -2056,13 +2099,27 @@ def _validated_pronunciation_groups(
     for group in groups:
         if not isinstance(group, dict):
             continue
-        sequence = tuple(group.get("normalized") or ())
+        sequence = _project_phrase_syllables(word, group.get("normalized") or ())
         reason = _pronunciation_sequence_rejection_reason(
             word,
             sequence,
             encode_data,
         )
         if not reason:
+            if len(_pronunciation_indexes(word)) != len(word):
+                original_pinyin = str(group.get("pinyin") or "")
+                display = _project_phrase_syllables(word, original_pinyin.split())
+                group = {
+                    **group,
+                    "originalPinyin": group.get("originalPinyin", original_pinyin),
+                    "originalNormalized": group.get("originalNormalized", list(group.get("normalized") or ())),
+                    "normalized": list(sequence),
+                    "pinyin": (
+                        " ".join(display)
+                        if tuple(normalize_pinyin_syllable(value) for value in display) == tuple(sequence)
+                        else pinyin_sequence_label(sequence)
+                    ),
+                }
             accepted.append(group)
             continue
         rejection = {
@@ -2089,8 +2146,11 @@ def _character_reading_evidence(
     chars = encode_data.get("chars")
     if not isinstance(chars, list) or len(chars) != len(word):
         return []
+    if any(not isinstance(item, dict) or item.get("char") != char for char, item in zip(word, chars)):
+        return []
     evidence: List[Dict[str, Any]] = []
-    for expected_char, chosen, char_info in zip(word, sequence, chars):
+    for index, chosen in zip(_pronunciation_indexes(word), sequence):
+        expected_char, char_info = word[index], chars[index]
         if not isinstance(char_info, dict) or char_info.get("char") != expected_char:
             return []
         known_readings = list(dict.fromkeys(
@@ -2106,6 +2166,7 @@ def _character_reading_evidence(
             "chosenPinyin": normalize_pinyin_syllable(str(chosen or "")),
             "knownReadings": known_readings,
             "lookupStatus": status,
+            **({"sourceIndex": index} if len(_pronunciation_indexes(word)) != len(word) else {}),
         })
     return evidence
 
@@ -2180,9 +2241,9 @@ def _encode_whole_word_zdic_group(
         return None
     sequence = tuple(
         normalize_pinyin_syllable(str(value or ""))
-        for value in raw_pinyins
+        for value in _project_phrase_syllables(word, raw_pinyins)
     )
-    if len(sequence) != len(word) or not all(sequence):
+    if len(sequence) != len(_pronunciation_indexes(word)) or not all(sequence):
         return None
     return {
         "pinyin": pinyin_sequence_label(sequence),
@@ -2620,6 +2681,9 @@ def _returned_pronunciation_groups(
 ) -> List[Dict[str, Any]]:
     """Project the reading-scoped chains already present in one encode result."""
     default_sequence = _encode_default_pinyin_sequence(encode_data)
+    indexes = _pronunciation_indexes(word)
+    spoken_count = len(indexes)
+    punctuated = spoken_count != len(word)
     candidate_codes = {
         str(code or "").strip().lower()
         for code in encode_data.get("candidateCodes") or []
@@ -2644,21 +2708,23 @@ def _returned_pronunciation_groups(
         str(value or "").strip()
         for value in encode_data.get("phrasePinyins") or []
     ]
-    if len(default_display) != len(word) or not all(default_display):
+    default_display = list(_project_phrase_syllables(word, default_display))
+    if len(default_display) != spoken_count or not all(default_display):
         default_display = [
             str(item.get("pinyin") or "").strip()
             if isinstance(item, dict)
             else ""
             for item in chars or []
         ]
+        default_display = list(_project_phrase_syllables(word, default_display))
 
     groups: List[Dict[str, Any]] = []
     default_codes = clean_codes(encode_data.get("codes"))
-    if len(default_sequence) == len(word) and all(default_sequence) and default_codes:
+    if len(default_sequence) == spoken_count and all(default_sequence) and default_codes:
         groups.append({
             "pinyin": (
                 " ".join(default_display)
-                if len(default_display) == len(word) and all(default_display)
+                if len(default_display) == spoken_count and all(default_display)
                 else pinyin_sequence_label(default_sequence)
             ),
             "normalized": list(default_sequence),
@@ -2675,13 +2741,16 @@ def _returned_pronunciation_groups(
         for variant in encode_data.get(key) or []
         if isinstance(variant, dict)
     ]
-    if not variants:
+    if not variants and not punctuated:
         variants = [
             *build_alternate_pronunciation_codes(chars),
             *build_phrase_pronunciation_codes(chars),
         ]
     for variant in variants:
-        raw_sequence = variant.get("pinyins") or variant.get("normalized")
+        provided_sequence = variant.get("pinyins") or variant.get("normalized")
+        if provided_sequence is not None and not isinstance(provided_sequence, (list, tuple)):
+            continue
+        raw_sequence = _project_phrase_syllables(word, provided_sequence or ())
         raw_display = [
             str(value or "").strip()
             for value in raw_sequence or []
@@ -2691,27 +2760,33 @@ def _returned_pronunciation_groups(
             for value in raw_sequence or []
         )
         display = list(default_display)
-        if len(sequence) == len(word) and all(raw_display):
+        if len(sequence) == spoken_count and all(raw_display):
             display = raw_display
-        elif len(sequence) != len(word):
+        elif len(sequence) != spoken_count:
+            if provided_sequence:
+                continue
             sequence_parts = list(default_sequence)
             char_index = variant.get("charIndex")
             variant_pinyin = str(variant.get("pinyin") or "").strip()
             if (
                 not isinstance(char_index, int)
                 or isinstance(char_index, bool)
-                or not 0 <= char_index < len(sequence_parts)
+                or char_index not in indexes
                 or not variant_pinyin
+                or (punctuated and variant.get("char") not in (None, word[char_index]))
             ):
                 continue
-            sequence_parts[char_index] = normalize_pinyin_syllable(variant_pinyin)
+            spoken_index = indexes.index(char_index)
+            if not 0 <= spoken_index < len(sequence_parts):
+                continue
+            sequence_parts[spoken_index] = normalize_pinyin_syllable(variant_pinyin)
             sequence = tuple(sequence_parts)
-            if len(display) == len(word):
-                display[char_index] = variant_pinyin
+            if len(display) == spoken_count:
+                display[spoken_index] = variant_pinyin
         codes = clean_codes(variant.get("codes"))
-        if len(sequence) != len(word) or not all(sequence) or not codes:
+        if len(sequence) != spoken_count or not all(sequence) or not codes:
             continue
-        label = " ".join(display) if len(display) == len(word) and all(display) else pinyin_sequence_label(sequence)
+        label = " ".join(display) if len(display) == spoken_count and all(display) else pinyin_sequence_label(sequence)
         existing = next((
             group for group in groups
             if tuple(group.get("normalized") or ()) == sequence
@@ -3078,7 +3153,9 @@ async def resolve_unknown_polyphonic_pronunciation(
         }
 
     remaining = max(0.0, deadline - time.monotonic())
-    proposal: Dict[str, Any] = {"accepted": False, "word": word}
+    proposal: Dict[str, Any] = {
+        "accepted": False, "word": word, "inferenceIncomplete": True,
+    }
     if remaining > 0:
         try:
             proposal = await asyncio.wait_for(
@@ -3089,7 +3166,10 @@ async def resolve_unknown_polyphonic_pronunciation(
                 timeout=remaining,
             )
         except asyncio.TimeoutError:
-            proposal = {"accepted": False, "word": word, "timedOut": True}
+            proposal = {
+                "accepted": False, "word": word,
+                "timedOut": True, "inferenceIncomplete": True,
+            }
     semantic_group = _semantic_pronunciation_group(
         word,
         proposal,
@@ -3262,24 +3342,12 @@ async def resolve_unknown_polyphonic_pronunciation(
                     "elapsedSeconds": round(time.monotonic() - started, 4),
                 }
 
-    alternatives = _all_returned_manual_groups(
-        word,
-        encode_data,
-        source_summary="读音未能唯一确认",
-    )
-    if len(alternatives) < 2:
-        return {
-            "status": "no_resolution",
-            "groups": [],
-            "polyphones": polyphones,
-            "web": web,
-            "semantic": proposal,
-            "elapsedSeconds": round(time.monotonic() - started, 4),
-        }
+    # Character readings constrain a whole-word proposal; their combinations
+    # do not establish that the word has multiple meanings or valid readings.
     return {
         "status": "unresolved",
-        "askUser": True,
-        "groups": alternatives,
+        "groups": [],
+        "inferenceIncomplete": bool(proposal.get("inferenceIncomplete")),
         "polyphones": polyphones,
         "web": web,
         "semantic": proposal,
@@ -3422,6 +3490,8 @@ async def prepare_reviewed_word(
     requested_meaning: str = "",
 ) -> Dict:
     word = word.strip()
+    pronunciation_indexes = _pronunciation_indexes(word)
+    punctuated_phrase = len(pronunciation_indexes) != len(word)
     if not word:
         return apply_review_disposition(
             {"success": False, "message": "词不能为空"},
@@ -3454,7 +3524,7 @@ async def prepare_reviewed_word(
         else normalize_pinyin_sequence(requested_reading)
     )
     if requested_reading and requested_character_hint is None and (
-        len(requested_sequence) != len(word)
+        len(requested_sequence) != len(pronunciation_indexes)
         or not all(requested_sequence)
     ):
         return apply_review_disposition({
@@ -3580,6 +3650,30 @@ async def prepare_reviewed_word(
         *cross_validation_rejections,
         *encode_validation_rejections,
     ]
+    if punctuated_phrase:
+        groups = [
+            group for group in groups
+            if not group.get("fallback") and any(
+                isinstance(source, dict)
+                and source.get("category") == "dictionary"
+                and isinstance(source.get("trust"), (int, float))
+                and not isinstance(source.get("trust"), bool)
+                and source["trust"] >= 3
+                for source in group.get("sources") or []
+            )
+        ]
+        if not groups:
+            return apply_review_disposition(apply_manual_review_flag({
+                "success": True,
+                "word": word,
+                "existing": existing_words.get(word, []),
+                "pronunciations": [],
+                "recommendedCode": "",
+                "pronunciationUnresolved": True,
+                "requiresManualPronunciationReview": True,
+                "pronunciationRejections": evidence_rejections,
+                "message": f"「{word}」尚无与完整原词绑定且逐字核验通过的整词读音，暂不推荐编码。",
+            }, True, "含标点词条缺少可信整词读音"), "pronunciation_unresolved")
     returned_groups = _returned_pronunciation_groups(word, encode_data)
     returned_groups_by_sequence = {
         tuple(group.get("normalized") or ()): group
@@ -3591,8 +3685,9 @@ async def prepare_reviewed_word(
             sequence
             for sequence in returned_groups_by_sequence
             if any(
-                word[index] == hint_character and sequence[index] == hint_pinyin
-                for index in range(min(len(word), len(sequence)))
+                word[source_index] == hint_character and sequence[index] == hint_pinyin
+                for index, source_index in enumerate(pronunciation_indexes)
+                if index < len(sequence)
             )
         }
         if len(matching_sequences) == 1:
@@ -3736,6 +3831,28 @@ async def prepare_reviewed_word(
             if pronunciation_resolution.get("status") == "not_applicable":
                 unknown_polyphone_ladder = False
             groups = list(pronunciation_resolution.get("groups") or [])
+            if (
+                pronunciation_resolution.get("status") in {"unresolved", "no_resolution"}
+                and not groups
+            ):
+                reason = (
+                    "本次整词读音判断未完成"
+                    if pronunciation_resolution.get("inferenceIncomplete")
+                    else "未取得能确认整词读音的证据"
+                )
+                return apply_review_disposition(apply_manual_review_flag({
+                    "success": True,
+                    "word": word,
+                    "existing": existing_words.get(word, []),
+                    "pronunciations": [],
+                    "recommendedCode": "",
+                    "autoReviewable": False,
+                    "pronunciationUnresolved": True,
+                    "requiresManualPronunciationReview": True,
+                    "standardPronunciationStatus": standard_status,
+                    "pronunciationResolution": pronunciation_resolution,
+                    "message": f"「{word}」{reason}，暂不推荐编码。",
+                }, True, reason), "pronunciation_unresolved")
             if pronunciation_resolution.get("askUser") is True:
                 forced_pronunciation_choice = {
                     "status": "ambiguous",
@@ -3963,6 +4080,10 @@ async def prepare_reviewed_word(
                 sequence,
                 encode_data,
             ),
+            **({
+                "originalPinyin": group.get("originalPinyin", group.get("pinyin", "")),
+                "originalNormalized": group.get("originalNormalized", group.get("normalized", [])),
+            } if punctuated_phrase else {}),
         })
 
     if forced_pronunciation_choice is not None:
@@ -4024,7 +4145,7 @@ async def prepare_reviewed_word(
     requires_manual_pronunciation_review = any(
         bool(pron.get("requiresManualReview"))
         for pron in pronunciations
-    ) or multi_sense_choice.get("status") == "ambiguous"
+    ) or multi_sense_choice.get("status") == "ambiguous" or punctuated_phrase
     auto_reviewable = (
         (has_authority or has_web_model_agreement)
         and evidence_lookup_complete
@@ -4057,6 +4178,8 @@ async def prepare_reviewed_word(
         auto_review_reason = (
             f"用户指定读音 {selected_label} 与{comparison_label}不同"
         )
+    if punctuated_phrase:
+        auto_review_reason = "含标点词条已按完整原词核对读音，仍需管理员审核"
 
     result = {
         "success": True,
@@ -4077,6 +4200,8 @@ async def prepare_reviewed_word(
     }
     if pronunciation_resolution:
         result["pronunciationResolution"] = pronunciation_resolution
+    if punctuated_phrase:
+        result["pronunciationCharacterIndexes"] = list(pronunciation_indexes)
     if lookup_failed:
         result["lookupFailureReason"] = LOOKUP_FAILURE_REASON
     if evidence_rejections:
@@ -4739,10 +4864,6 @@ async def _infer_semantic_pronunciation_proposal(
             "accepted": True,
             "confidence": 0.0,
             "usageType": "word_or_phrase",
-            "pinyins": [
-                f"第{index + 1}字在本词语中的拼音"
-                for index, _character in enumerate(normalized_word)
-            ],
             "characters": [
                 {
                     "char": character,
@@ -4768,7 +4889,7 @@ async def _infer_semantic_pronunciation_proposal(
             {
                 "model": config["model"],
                 "temperature": 0.0,
-                "max_tokens": 450,
+                "max_tokens": 450 + 50 * len(normalized_word),
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
@@ -4784,15 +4905,32 @@ async def _infer_semantic_pronunciation_proposal(
             model=config["model"],
         )
         if not response.choices:
-            return {"accepted": False, "word": normalized_word}
+            return {
+                "accepted": False, "word": normalized_word,
+                "inferenceIncomplete": True,
+            }
+        if getattr(response.choices[0], "finish_reason", None) == "length":
+            return {
+                "accepted": False, "word": normalized_word,
+                "inferenceIncomplete": True,
+            }
         content = response.choices[0].message.content or ""
+        payload = _load_json_object_from_model_text(content)
+        if not isinstance(payload.get("accepted"), bool):
+            return {
+                "accepted": False, "word": normalized_word,
+                "inferenceIncomplete": True,
+            }
         return _normalize_semantic_pronunciation_proposal(
             normalized_word,
-            _load_json_object_from_model_text(content),
+            payload,
         )
     except Exception as error:
         logger.debug(f"Semantic pronunciation inference failed for {normalized_word}: {error}")
-        return {"accepted": False, "word": normalized_word}
+        return {
+            "accepted": False, "word": normalized_word,
+            "inferenceIncomplete": True,
+        }
 
 
 async def _infer_requested_meaning_pronunciation_for_review(
@@ -4824,7 +4962,7 @@ def _cache_semantic_pronunciation_result(
     word: str,
     result: Dict[str, Any],
 ) -> None:
-    if result.get("capacityLimited"):
+    if result.get("capacityLimited") or result.get("inferenceIncomplete"):
         return
     ttl = (
         _SEMANTIC_ACCEPTED_CACHE_SECONDS
@@ -5574,6 +5712,8 @@ def _reference_comparison_summary(
     front_reference: Dict[str, Any],
     behind_reference: Dict[str, Any],
 ) -> str:
+    if verdict == "behind_more_common":
+        front_reference, behind_reference = behind_reference, front_reference
     front_frequency = front_reference.get("corpusFrequency")
     behind_frequency = behind_reference.get("corpusFrequency")
     frequency_basis = (

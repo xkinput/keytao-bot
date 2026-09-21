@@ -2965,7 +2965,7 @@ def test_offline_commonness_verdict_rules_and_copy():
                 and "\n" not in high_ratio.get("summary", "")
                 and "语料频次 20 vs 15，词典收录 2 vs 2"
                 in low_ratio.get("summary", "")
-                and "语料频次 无 vs 26，词典收录 2 vs 2"
+                and "语料频次 26 vs 无，词典收录 2 vs 2"
                 in s9.get("summary", ""),
             )
             assessment = review_module._candidate_commonness_assessment(

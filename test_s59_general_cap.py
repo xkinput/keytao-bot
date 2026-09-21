@@ -167,7 +167,7 @@ class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bodies[2]["messages"][-1]["tool_call_id"], "fixture-call")
         dispatch.assert_awaited_once()
 
-    async def test_routing_calls_are_charged_to_the_same_two_call_budget(self):
+    async def test_routing_calls_leave_one_bounded_answer_opportunity(self):
         for prior_calls in (0, 1, 2):
             with self.subTest(prior_calls=prior_calls):
                 token = begin_turn_metrics("qq", "group")
@@ -178,13 +178,14 @@ class GeneralCapTests(unittest.IsolatedAsyncioTestCase):
                     reply, bodies, dispatch, termination = await self.run_fake([
                         fake_response(), fake_response(),
                     ])
-                    self.assertEqual(current_turn_metrics().model_calls, 2)
-                    self.assertEqual(len(bodies), 2 - prior_calls)
+                    answer_budget = max(1, 2 - prior_calls)
+                    self.assertEqual(current_turn_metrics().model_calls, prior_calls + answer_budget)
+                    self.assertEqual(len(bodies), answer_budget)
                     self.assertEqual(current_turn_metrics().tool_calls, 0)
                     self.assertEqual(termination["reason"], "no_tool_response_exhausted")
                     self.assertTrue(reply)
                     dispatch.assert_not_awaited()
-                    if prior_calls == 1:
+                    if prior_calls:
                         self.assertEqual(bodies[0], {
                             "model": "glm-5.3", "messages": [
                                 {"role": "system", "content": _REASONING_RETRY_SYSTEM_PROMPT},

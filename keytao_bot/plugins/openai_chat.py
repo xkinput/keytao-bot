@@ -3389,6 +3389,7 @@ class TurnContext:
         _authorization_grammar.CompoundEvictionAddPlan
     ] = None
     message_is_prefixed_fresh_word_query: bool = False
+    literal_phrase_word: str = ""
     memory_context: Optional[ChatMemoryContext] = None
     conv_key: Optional[ConversationKey] = None
     space_key: Tuple[str, str] = ("", "")
@@ -3600,6 +3601,11 @@ async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
         ctx.message_text,
         ctx.normalized_message_text,
     )
+    ctx.literal_phrase_word = (
+        _chat_routing.parse_literal_phrase_query(ctx.message_text)
+        or _chat_routing.parse_explicit_single_phrase_add(ctx.message_text)
+        or ""
+    )
 
     ctx.memory_context = await extract_memory_context(ctx.bot, ctx.event, ctx.reply_reference)
     current_memory_context.set(ctx.memory_context)
@@ -3633,6 +3639,43 @@ async def _stage_handle_commonness_query(ctx: TurnContext) -> bool:
     remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, response)
     await _finish_ai_chat_response(
         ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment,
+    )
+    return True
+
+
+async def _stage_handle_explicit_draft_conversation_reset(ctx: TurnContext) -> bool:
+    """Clear an explicit current-user scope before consulting any stale ticket."""
+    if not _chat_routing._is_explicit_draft_conversation_reset(ctx.message_text):
+        return False
+    set_turn_flow("draft-conversation-reset")
+    try:
+        active_operation = draft_operation_coordinator.get(ctx.conv_key)
+        if active_operation is not None and active_operation.status in {"queued", "awaiting_confirmation"}:
+            # Retire unsent work before the fresh clear command; running writes
+            # remain registered and are refused by the existing draft helper.
+            await _clear_conversation_state(ctx.conv_key, ctx.memory_context)
+        draft_response = await _try_handle_draft_clear_command(
+            "清空草稿",
+            MessageCommandIntent(intent="draft_clear", confidence=1.0),
+            ctx.platform,
+            ctx.user_id,
+        )
+        if draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is not None:
+            draft_response = "草稿操作仍在进行中，本次未清空草稿。"
+    except Exception as error:
+        logger.warning(f"Compound reset draft clear failed: {type(error).__name__}")
+        draft_response = "草稿清理结果未能确认，请稍后查看草稿。"
+    try:
+        had_inflight_draft = await _clear_conversation_state(ctx.conv_key, ctx.memory_context)
+        conversation_response = "当前对话历史、记忆和待确认状态已清空。"
+        if had_inflight_draft:
+            conversation_response += "已发出的草稿操作未取消；操作结束后请查看草稿。"
+    except Exception as error:
+        logger.warning(f"Compound reset conversation clear failed: {type(error).__name__}")
+        conversation_response = "当前对话清理未全部完成，请稍后重试。"
+    ctx.response = "\n".join((draft_response or "本次未执行草稿清理。", conversation_response))
+    await _finish_ai_chat_response(
+        ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
     )
     return True
 
@@ -3763,6 +3806,15 @@ async def _stage_prepare_fresh_code_selection(ctx: TurnContext) -> bool:
 async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     """Production scenario: bind live pending state to the current reply and actor scope."""
     current_record = conversation_state_store.get_record(ctx.conv_key)
+    if ctx.literal_phrase_word and current_record is not None:
+        from ..utils.offered_options import offered_option_intent
+
+        if offered_option_intent(ctx.normalized_message_text, current_record.state):
+            ctx.literal_phrase_word = ""
+    if ctx.literal_phrase_word:
+        # A complete new operand cannot be assent to an older operation.
+        ctx.current_pending_record = current_record
+        return False
     parsed_referenced_pending = (
         _parse_pending_state_from_response(ctx.reply_reference.text)
         if ctx.reply_reference.is_to_bot and ctx.reply_reference.text
@@ -4062,6 +4114,8 @@ async def _stage_guard_stale_confirmation(ctx: TurnContext) -> bool:
     """Production incident S13: stale-confirm guard must never outrank a live ticket."""
     if ctx.history is None:
         ctx.history = get_history(ctx.conv_key)
+    if ctx.literal_phrase_word:
+        return False
     active_pending_operation = draft_operation_coordinator.get(ctx.conv_key)
     other_owner_pending = (
         conversation_state_store.find_pending_for_other_owner(ctx.space_key, ctx.conv_key)
@@ -4119,6 +4173,9 @@ async def _stage_restore_replied_pending_reference(ctx: TurnContext) -> bool:
 
 async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
     """Production scenario S15: quoted or numbered pending control remains target-bound."""
+    if ctx.literal_phrase_word:
+        ctx.generic_command_intent = MessageCommandIntent()
+        return False
     live_ticket_assent = _pending_tool_assent_intent(
         ctx.current_pending_record.state if ctx.current_pending_record is not None else None,
         ctx.normalized_message_text,
@@ -4425,7 +4482,7 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
     ctx.generic_intent_is_fresh_command = _is_fresh_current_user_command_intent(
         ctx.generic_command_intent,
         ctx.normalized_message_text,
-    ) or ctx.message_is_prefixed_fresh_word_query
+    ) or ctx.message_is_prefixed_fresh_word_query or bool(ctx.literal_phrase_word)
     if ctx.resolved_advertised_words:
         ctx.generic_intent_is_fresh_command = True
     if (
@@ -4436,6 +4493,7 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
     if (
         ctx.current_pending_record is not None
         and isinstance(ctx.current_pending_record.state, PendingToolConfirm)
+        and not ctx.literal_phrase_word
     ):
         ctx.generic_intent_is_fresh_command = False
     if (
@@ -4513,6 +4571,8 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
             active_command_intent = (
                 MessageCommandIntent(intent="pending_confirm", confidence=1.0)
                 if active_confirmation_matches
+                else MessageCommandIntent()
+                if ctx.literal_phrase_word
                 else await ctx.command_intent_for(active_operation.pending_state)
             )
             if (
@@ -5873,6 +5933,8 @@ async def _stage_append_ticket_challenge(ctx: TurnContext) -> bool:
     """Draft management replies cannot advertise an unrelated pending mutation."""
     if isinstance(ctx.response, ServerBackedQueryReply):
         return False
+    if not advertised_reply_contract(ctx.response).requires_live_state:
+        return False
     if ctx.generic_command_intent.intent not in {"draft_view", "draft_recall", "draft_clear"}:
         ctx.response = _append_pending_ticket_challenge(ctx.response, ctx.conv_key)
     return False
@@ -5925,6 +5987,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_image_turn,
     _stage_handle_visual_probe_timeout,
     _stage_initialize_conversation,
+    _stage_handle_explicit_draft_conversation_reset,
     _stage_handle_commonness_query,
     _stage_handle_completed_draft_undo,
     _stage_claim_offered_answer,

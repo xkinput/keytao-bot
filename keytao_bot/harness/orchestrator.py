@@ -1000,7 +1000,8 @@ class AgentOrchestrator:
         tool_free_retry_started = False
         turn_metrics = current_turn_metrics()
         prior_model_calls = turn_metrics.model_calls if turn_metrics is not None else 0
-        tool_free_model_budget = max(0, 2 - prior_model_calls)
+        # Routing must never consume the only opportunity to answer the user.
+        tool_free_model_budget = max(1, 2 - prior_model_calls)
         if (
             prior_model_calls
             and (turn_metrics is None or not turn_metrics.tool_calls)

@@ -45,6 +45,7 @@ from ..harness.tools import (
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.candidate_inventory import protected_candidate_occupants
 from ..utils.explicit_code import parse_explicit_code_request, readings_match, validate_explicit_code
+from ..utils.literal_phrase import parse_explicit_single_phrase_add, parse_literal_phrase_query
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     PENDING_ASSENT_TEXTS,
@@ -955,6 +956,18 @@ def _quoted_pending_add_control_intent(
     if structural is not None:
         return structural
     return None
+
+
+def _is_explicit_draft_conversation_reset(message_text: str) -> bool:
+    """Authorize only the complete current-user draft and conversation reset."""
+    if not isinstance(message_text, str) or re.search(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", message_text):
+        return False
+    return re.fullmatch(
+        r"(?:(?:喵喵|键道)[ ，,：:]*)?(?:请|麻烦)?[ ]*"
+        r"清空(?:我的|当前)?草稿(?:和|及)缓存[ ]*[，,；;][ ]*"
+        r"(?:并|然后)?忘记我对你说过的话[。.!！]?",
+        message_text.strip(),
+    ) is not None
 
 
 def _message_authorizes_clear_history(
@@ -2877,6 +2890,9 @@ async def _classify_simple_word_query_intent(
 
 async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     """Return model-approved word-query targets, or empty when the main AI should handle it."""
+    literal = parse_literal_phrase_query(message_text)
+    if literal is not None:
+        return (literal,)
     if is_interrogative_message(message_text):
         return ()
     explicit = re.fullmatch(
@@ -2962,6 +2978,9 @@ _EXPLICIT_REVIEWED_ADD_WORD_RE = re.compile(
 
 def _extract_explicit_reviewed_add_word(message_text: str) -> Optional[str]:
     """Return the target word for a structural `加词 X` request."""
+    literal = parse_explicit_single_phrase_add(message_text)
+    if literal is not None:
+        return literal
     text = _strip_command_message_prefixes(message_text)
     text = re.sub(r"\s+", " ", text).strip()
     match = _EXPLICIT_REVIEWED_ADD_WORD_RE.fullmatch(text)

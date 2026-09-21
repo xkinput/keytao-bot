@@ -19,6 +19,12 @@ _SUFFIX = re.compile(r"(.+?)\s*(?:哪个更常用|按常用度排序|词频排�
 _LIST_FREQUENCY_SUFFIX = re.compile(
     r"(.+?)[,，]\s*(?:请)?排列以上词的使用频率[?？。！!]*"
 )
+_PAIR_FREQUENCY_SUFFIX = re.compile(
+    r"(.+?)\s*[,，]?\s*(?:谁的词频更高|"
+    r"(?:这)?(?:两|2)个词的词频(?:如何|怎么样|怎样))[?？。！!]*"
+)
+_QUOTED_WORD = r'(?:“[\u3400-\u9fff]{1,32}”|「[\u3400-\u9fff]{1,32}」|"[\u3400-\u9fff]{1,32}")'
+_QUOTED_PAIR = re.compile(rf"({_QUOTED_WORD})\s*(?:和|与|、|,)\s*({_QUOTED_WORD})")
 _LIST_MUTATION_VERB = r"(?:删除|删掉|移除|添加|加入|修改|写入|提交)"
 _NON_LITERAL_LIST_ITEM = re.compile(
     r"(?:不要|别|不必|无需|禁止|他说|她说|引用|转述)"
@@ -35,16 +41,25 @@ def parse_commonness_query(message):
     list_suffix = match is None
     if list_suffix:
         match = _LIST_FREQUENCY_SUFFIX.fullmatch(text)
+    pair_suffix = match is None
+    if pair_suffix:
+        match = _PAIR_FREQUENCY_SUFFIX.fullmatch(text)
     if match is None:
         return None
     body = match.group(1).strip().rstrip("?？。！!").strip()
-    parts = []
-    for group in re.split(r"[、,，]+", body):
-        tokens = group.split()
-        # Explicit whitespace preserves literal words containing the conjunction.
-        if len(tokens) == 1 and re.fullmatch(r".+和.+", tokens[0]):
-            tokens = tokens[0].split("和")
-        parts.extend(token for token in tokens if token != "和")
+    quoted_pair = _QUOTED_PAIR.fullmatch(body)
+    if quoted_pair is not None:
+        parts = [word[1:-1] for word in quoted_pair.groups()]
+    else:
+        parts = []
+        for group in re.split(r"[、,，]+", body):
+            tokens = group.split()
+            # Explicit whitespace preserves literal words containing the conjunction.
+            if len(tokens) == 1 and re.fullmatch(r".+和.+", tokens[0]):
+                tokens = tokens[0].split("和")
+            parts.extend(token for token in tokens if token != "和")
+    if pair_suffix and len(parts) != 2:
+        return None
     if not 2 <= len(parts) <= 12 or len(set(parts)) != len(parts):
         return None
     if any(not re.fullmatch(r"[\u3400-\u9fff]{1,32}", word) for word in parts):
