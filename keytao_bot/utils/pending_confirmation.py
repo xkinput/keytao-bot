@@ -860,9 +860,12 @@ def already_existing_word_copy(
         if actions
         else "当前没有必须执行的变更；若保留现状，无需操作。"
     )
+    # Without a matching contextual control, name the word in the template so
+    # an older pending operation cannot supply a different omitted operand.
+    extra_code_format = "加入编码 <code>" if advertise_controls else f"给 {word} 加一个码 <code>"
     return (
         f"「{word}」已在词库（{'、'.join(clean_codes)}）。\n{action_copy}\n"
-        "可再追加一个编码，格式为：加入编码 <code>（将 <code> 换成实际编码）。"
+        f"可再追加一个编码，格式为：{extra_code_format}（将 <code> 换成实际编码）。"
     )
 
 

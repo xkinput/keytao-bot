@@ -3688,10 +3688,23 @@ async def _try_handle_simple_single_word_query(
                         space_key=space_key,
                         owner_label=owner_label,
                     )
+            live_record = (
+                conversation_state_store.get_record(conv_key)
+                if conv_key is not None and _prepared_scopes is None else None
+            )
+            can_recode = bool(
+                live_record is not None
+                and not live_record.execution_id
+                and isinstance(live_record.state, PendingTrustedWordRecord)
+                and live_record.state.word == word
+                and live_record.state.code in existing_codes
+                and _pending_trusted_word_action_matches(live_record.state, "换码")
+            )
             existing_reply = already_existing_word_copy(
                 word,
                 existing_codes,
                 can_choose_other_code=_prepared_scopes is None and len(existing_codes) == 1,
+                advertise_controls=can_recode,
             )
             return ("类型：单字\n" + existing_reply) if len(word) == 1 else existing_reply
         if matching_rows or len(word) != 1:

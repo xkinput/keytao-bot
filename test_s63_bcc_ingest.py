@@ -4,6 +4,7 @@ from contextlib import closing
 import io
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -120,9 +121,15 @@ class BccIngestTests(unittest.TestCase):
                            'BCC_TEST_LOG': str(log), 'BCC_TEST_EXIT': str(exit_code)}
                     result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=5)
                     self.assertEqual(result.returncode, 0)
-                    self.assertEqual(log.read_text().splitlines(), [
-                        'run python scripts/build_pinyin_reference.py',
-                        'run python scripts/ingest_bcc.py --timeout 15', 'run python bot.py'])
+                    steps = log.read_text().splitlines()
+                    self.assertEqual(steps[0], 'run python scripts/build_pinyin_reference.py')
+                    self.assertEqual(steps[2], 'run python bot.py')
+                    # The per-file timeout is a tunable; pin the shape and a floor that the
+                    # largest published table (15.7 MB) can actually finish within.
+                    timeout = re.fullmatch(
+                        r'run python scripts/ingest_bcc\.py --timeout (\d+)', steps[1])
+                    self.assertIsNotNone(timeout, steps[1])
+                    self.assertGreaterEqual(int(timeout.group(1)), 60)
                     self.assertEqual('WARNING: BCC ingest failed' in result.stderr, exit_code != 0)
 
     def test_ingest_cli_reports_outage_or_corrupt_cache_without_publishing(self):
