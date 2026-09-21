@@ -9,6 +9,7 @@ import unicodedata
 from .pending_confirmation import advertised_command_suggestions, render_executable_suggestion
 from .same_code_reorder import parse_same_code_reorder
 from ..harness.authorization_grammar import parse_eviction_modified_add
+from .bcc_reference import format_bcc
 
 
 _PREFIX = re.compile(
@@ -77,10 +78,17 @@ def render_commonness_table(result):
         known = row["known"]
         rank = row["rank"] if known and row["rank"] is not None else "—"
         frequency = row["corpusFrequency"]
+        bcc = row.get("bcc") or {}
+        if bcc.get("available") and bcc.get("attested"):
+            frequency = format_bcc(bcc)
         presence = row["dictionaryPresenceCount"]
         verdict = labels.get(row["verdict"], "无法判断") if known else "无数据"
         lines.append(f"{rank} | {row['word']} | {frequency if frequency is not None else '—'} | {presence if presence is not None else '—'} | {verdict}")
     lines.append(result["orderingNote"] + "词频是语料内计数。")
+    if any((row.get("bcc") or {}).get("available") for row in result["words"]):
+        lines.append("BCC 取四个现代频道的最高每百万频次；字与词按各自表内排名比较。未收录不代表实际零次，单边收录不决定高低。")
+        if len(result["words"]) == 2:
+            lines.extend(item["summary"] for item in result["comparisons"])
     return "\n".join(lines)
 
 

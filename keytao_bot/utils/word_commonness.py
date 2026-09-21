@@ -54,12 +54,18 @@ def lookup_word_commonness(words: Sequence[str]) -> dict[str, Any]:
     comparisons: list[dict[str, Any]] = []
     edges: dict[str, set[str]] = {word: set() for word in known_words}
     verdicts = {word: "ranked" for word in known_words}
-    for left_index, left_word in enumerate(known_words):
-        for right_word in known_words[left_index + 1:]:
+    for left_index, left_word in enumerate(normalized):
+        for right_word in normalized[left_index + 1:]:
+            if left_word not in edges and right_word not in edges:
+                continue
             comparison = review._compare_reference_commonness(
                 left_word, right_word, references[left_word], references[right_word],
             )
             comparisons.append(comparison)
+            # Preserve a known-vs-absent decision without assigning the absent
+            # entry a fabricated frequency or a rank.
+            if left_word not in edges or right_word not in edges:
+                continue
             verdict = comparison["verdict"]
             if verdict in {"front_more_common", "behind_more_common"}:
                 winner, loser = (
@@ -91,6 +97,8 @@ def lookup_word_commonness(words: Sequence[str]) -> dict[str, Any]:
         rows.append({
             "word": word,
             "corpusFrequency": reference.get("corpusFrequency") if known else None,
+            "bcc": reference.get("bcc", {}),
+            "corpusSource": estimate.get("corpusSource"),
             "dictionaryPresenceCount": reference.get("dictionaryPresenceCount") if known else None,
             "partOfSpeech": reference.get("partOfSpeech") if known else None,
             "known": known,

@@ -1,0 +1,274 @@
+{
+  "source": "https://bcc.blcu.edu.cn/api/datasets",
+  "tokens": [
+    "情报所",
+    "敲不死",
+    "环境法",
+    "户晨风",
+    "五角星",
+    "沃集鲜",
+    "的",
+    "龘",
+    "一一化",
+    "量子薄荷鸽跃器",
+    "星云奶酪折叠喵"
+  ],
+  "datasets": [
+    {
+      "filename": "dialogue_char_freq.txt",
+      "channel": "口语",
+      "token_type": "char",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "7e5556bb52ce3da7c67293bbc8d542d48ac25c40e58cc23d23515e7cd16f2d8a",
+      "archive_sha256": "40113004f175504b6c2dc83b11ca8ff8dc4eb760e44d0f883bda0c0b373237fb",
+      "size_bytes": 49553,
+      "archive_bytes": 27597,
+      "row_count": 5823,
+      "total_count": 209814959
+    },
+    {
+      "filename": "dialogue_word_freq.txt",
+      "channel": "口语",
+      "token_type": "word",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "3d9d56bef688c9fa7f7aba60929d1fd11e52e0416b1cdec2a0d1403e6eb874ed",
+      "archive_sha256": "9e8313786499f9ab2d3883a5f2266c21caa434718c6fef8d96d844027f21edf5",
+      "size_bytes": 1507322,
+      "archive_bytes": 718138,
+      "row_count": 136405,
+      "total_count": 147994329
+    },
+    {
+      "filename": "literature_char_freq.txt",
+      "channel": "文学",
+      "token_type": "char",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "4c9fe41203a29bc9877d44bf2137b28b9bc3a20d24e1c663ec2fbbab87366962",
+      "archive_sha256": "fd02b95568474e718c6a0cdbecfabd47785255d96932822b0bcf0564e1ab440d",
+      "size_bytes": 59429,
+      "archive_bytes": 32680,
+      "row_count": 7059,
+      "total_count": 160173470
+    },
+    {
+      "filename": "literature_word_freq.txt",
+      "channel": "文学",
+      "token_type": "word",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "74d8373a28a2774f5592f9b0f320da9e27fdc700727b7fb4141ba20c19a5a613",
+      "archive_sha256": "89dadf4a103bbef9ee83b0e29333ceda31d74bb35501c75add523fb6cabbfc3a",
+      "size_bytes": 1989087,
+      "archive_bytes": 970322,
+      "row_count": 166460,
+      "total_count": 105920737
+    },
+    {
+      "filename": "multi_domain_total_char_freq.txt",
+      "channel": "多领域",
+      "token_type": "char",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "74daae5cda8471744fc0af80c00ed39a705ed22b065302c11a0946458360e668",
+      "archive_sha256": "8f2722797092966771b452e919b7af7e94d6903d24d760b6a84b9cbf1d726fde",
+      "size_bytes": 68740,
+      "archive_bytes": 37853,
+      "row_count": 7898,
+      "total_count": 644366519
+    },
+    {
+      "filename": "multi_domain_total_word_freq.txt",
+      "channel": "多领域",
+      "token_type": "word",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "0f5aa8229d19c16d29ad5d153c551eb3b325e4e0f6620e4e02eb7888f610a539",
+      "archive_sha256": "c766254532e97b85f7e99aedfecbd5cb7877e61e42f669f19ae1387db90a9e77",
+      "size_bytes": 5542891,
+      "archive_bytes": 2588756,
+      "row_count": 448679,
+      "total_count": 403819602
+    },
+    {
+      "filename": "news_total_char_freq.txt",
+      "channel": "新闻",
+      "token_type": "char",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "cac30372f10fe577f2da2fa69a6f1a6b39163b0098eeb287dbff56da41a70848",
+      "archive_sha256": "b8e4779ebef0cad8df519fb1d3338cc7d207ef2fdc23f8059690f1c304e0aeb8",
+      "size_bytes": 73308,
+      "archive_bytes": 40395,
+      "row_count": 8360,
+      "total_count": 1671404370
+    },
+    {
+      "filename": "news_total_word_freq.txt",
+      "channel": "新闻",
+      "token_type": "word",
+      "updated_at": "2026-05-22T02:53:18Z",
+      "content_sha256": "ca713552627db53130c18e9d8a4a7feacc6e46fbc2e69c9f2ca7c04fd9492637",
+      "archive_sha256": "a14a6c1f979972871e04c122184be2bdb0211d69a4150c337ab23d0591b7689f",
+      "size_bytes": 11510206,
+      "archive_bytes": 4965976,
+      "row_count": 786556,
+      "total_count": 928179976
+    }
+  ],
+  "rows": [
+    {
+      "dataset": "dialogue_char_freq.txt",
+      "token": "的",
+      "raw_count": 6534801,
+      "per_million": 31145.543821782507,
+      "frequency_rank": 1
+    },
+    {
+      "dataset": "dialogue_word_freq.txt",
+      "token": "五角星",
+      "raw_count": 107,
+      "per_million": 0.72300067660025,
+      "frequency_rank": 25597
+    },
+    {
+      "dataset": "dialogue_word_freq.txt",
+      "token": "的",
+      "raw_count": 6146839,
+      "per_million": 41534.287438811254,
+      "frequency_rank": 1
+    },
+    {
+      "dataset": "literature_char_freq.txt",
+      "token": "的",
+      "raw_count": 6401018,
+      "per_million": 39963.03507690755,
+      "frequency_rank": 1
+    },
+    {
+      "dataset": "literature_word_freq.txt",
+      "token": "五角星",
+      "raw_count": 50,
+      "per_million": 0.47205109609462026,
+      "frequency_rank": 54683
+    },
+    {
+      "dataset": "literature_word_freq.txt",
+      "token": "的",
+      "raw_count": 6144004,
+      "per_million": 58005.676452194624,
+      "frequency_rank": 1
+    },
+    {
+      "dataset": "multi_domain_total_char_freq.txt",
+      "token": "的",
+      "raw_count": 22900677,
+      "per_million": 35539.83070929854,
+      "frequency_rank": 1
+    },
+    {
+      "dataset": "multi_domain_total_word_freq.txt",
+      "token": "一一化",
+      "raw_count": 6,
+      "per_million": 0.014858119740309188,
+      "frequency_rank": 397746
+    },
+    {
+      "dataset": "multi_domain_total_word_freq.txt",
+      "token": "五角星",
+      "raw_count": 227,
+      "per_million": 0.5621321968416977,
+      "frequency_rank": 48350
+    },
+    {
+      "dataset": "multi_domain_total_word_freq.txt",
+      "token": "情报所",
+      "raw_count": 34,
+      "per_million": 0.08419601186175207,
+      "frequency_rank": 136511
+    },
+    {
+      "dataset": "multi_domain_total_word_freq.txt",
+      "token": "环境法",
+      "raw_count": 97,
+      "per_million": 0.24020626913499854,
+      "frequency_rank": 76406
+    },
+    {
+      "dataset": "multi_domain_total_word_freq.txt",
+      "token": "的",
+      "raw_count": 22388585,
+      "per_million": 55442.046124348366,
+      "frequency_rank": 1
+    },
+    {
+      "dataset": "news_total_char_freq.txt",
+      "token": "的",
+      "raw_count": 55668083,
+      "per_million": 33306.17294006477,
+      "frequency_rank": 1
+    },
+    {
+      "dataset": "news_total_char_freq.txt",
+      "token": "龘",
+      "raw_count": 14,
+      "per_million": 0.008376189658999156,
+      "frequency_rank": 7370
+    },
+    {
+      "dataset": "news_total_word_freq.txt",
+      "token": "五角星",
+      "raw_count": 659,
+      "per_million": 0.7099916148158749,
+      "frequency_rank": 41135
+    },
+    {
+      "dataset": "news_total_word_freq.txt",
+      "token": "情报所",
+      "raw_count": 99,
+      "per_million": 0.10666034881148954,
+      "frequency_rank": 113958
+    },
+    {
+      "dataset": "news_total_word_freq.txt",
+      "token": "环境法",
+      "raw_count": 135,
+      "per_million": 0.14544593019748575,
+      "frequency_rank": 95908
+    },
+    {
+      "dataset": "news_total_word_freq.txt",
+      "token": "的",
+      "raw_count": 54924623,
+      "per_million": 59174.53987393497,
+      "frequency_rank": 1
+    }
+  ],
+  "jieba": [
+    {
+      "word": "五角星",
+      "corpus_frequency": 147,
+      "part_of_speech": "nz",
+      "dictionary_presence_count": 2
+    },
+    {
+      "word": "情报所",
+      "corpus_frequency": 8,
+      "part_of_speech": "n",
+      "dictionary_presence_count": 0
+    },
+    {
+      "word": "环境法",
+      "corpus_frequency": 26,
+      "part_of_speech": "n",
+      "dictionary_presence_count": 0
+    },
+    {
+      "word": "的",
+      "corpus_frequency": 318825,
+      "part_of_speech": "uj",
+      "dictionary_presence_count": 1
+    },
+    {
+      "word": "龘",
+      "corpus_frequency": null,
+      "part_of_speech": null,
+      "dictionary_presence_count": 1
+    }
+  ]
+}

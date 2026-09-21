@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
 from . import http_client
+from .bcc_reference import comparison_signal, format_bcc, lookup_bcc
 from .http_client import KeytaoApiError
 from .keytao_encoding import (
     build_alternate_pronunciation_codes,
@@ -90,6 +91,7 @@ COMMONNESS_WEB_FALLBACK_SIGNAL_WEIGHTS = {
 }
 COMMONNESS_FREQUENCY_RATIO_THRESHOLD = 2.0
 COMMONNESS_CORPUS_SCORE_SATURATION = 1_000
+COMMONNESS_BCC_SCORE_SATURATION_PER_MILLION = 20
 COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT = 10
 COMMONNESS_DICTIONARY_PRESENCE_MARGIN = 2
 
@@ -5426,6 +5428,8 @@ async def _estimate_entity_knowledge_signal(word: str) -> Dict[str, Any]:
 
 def _query_commonness_reference(word: str) -> Dict[str, Any]:
     key = str(word or "").strip()
+    bcc = {"available": False, "attested": False, "perMillion": None,
+           "tokenType": "char" if len(key) == 1 else "word", "channels": []}
     if not key:
         return {
             "available": True,
@@ -5434,6 +5438,7 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             "corpusFrequency": None,
             "partOfSpeech": None,
             "dictionaryPresenceCount": 0,
+            "bcc": bcc,
         }
 
     path = reference_db_path().resolve()
@@ -5452,6 +5457,7 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             """,
             (key,),
         ).fetchone()
+        bcc = lookup_bcc(connection, key)
     except sqlite3.Error as error:
         logger.warning(f"Commonness reference unavailable for {key}: {error}")
         return {
@@ -5461,6 +5467,7 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             "corpusFrequency": None,
             "partOfSpeech": None,
             "dictionaryPresenceCount": 0,
+            "bcc": bcc,
         }
     finally:
         if "connection" in locals():
@@ -5469,11 +5476,12 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
     if row is None:
         return {
             "available": True,
-            "attested": False,
+            "attested": bcc["attested"],
             "word": key,
             "corpusFrequency": None,
             "partOfSpeech": None,
             "dictionaryPresenceCount": 0,
+            "bcc": bcc,
         }
 
     raw_frequency, raw_part_of_speech, raw_presence_count = row
@@ -5492,10 +5500,11 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             "corpusFrequency": None,
             "partOfSpeech": None,
             "dictionaryPresenceCount": 0,
+            "bcc": bcc,
         }
     return {
         "available": True,
-        "attested": frequency is not None or presence_count > 0,
+        "attested": bcc["attested"] or frequency is not None or presence_count > 0,
         "word": key,
         "corpusFrequency": frequency,
         "partOfSpeech": (
@@ -5504,19 +5513,24 @@ def _query_commonness_reference(word: str) -> Dict[str, Any]:
             else None
         ),
         "dictionaryPresenceCount": presence_count,
+        "bcc": bcc,
     }
 
 
 def _reference_commonness_result(word: str, reference: Dict[str, Any]) -> Dict[str, Any]:
     frequency = reference.get("corpusFrequency")
+    bcc = reference.get("bcc") or {}
+    use_bcc = bcc.get("available") and bcc.get("attested")
+    corpus_value = bcc["perMillion"] if use_bcc else frequency
+    # 20 per million is approximately the legacy 1,000 / 60M-token ceiling.
+    saturation = COMMONNESS_BCC_SCORE_SATURATION_PER_MILLION if use_bcc else COMMONNESS_CORPUS_SCORE_SATURATION
     presence_count = int(reference.get("dictionaryPresenceCount") or 0)
     corpus_signal = (
         min(
             1.0,
-            math.log1p(float(frequency))
-            / math.log1p(COMMONNESS_CORPUS_SCORE_SATURATION),
+            math.log1p(float(corpus_value)) / math.log1p(saturation),
         )
-        if isinstance(frequency, int) and frequency > 0
+        if isinstance(corpus_value, (int, float)) and corpus_value > 0
         else 0.0
     )
     dictionary_signal = min(1.0, presence_count / 3.0)
@@ -5530,7 +5544,7 @@ def _reference_commonness_result(word: str, reference: Dict[str, Any]) -> Dict[s
     )
     evidence: Dict[str, List[str]] = {}
     if corpus_signal > 0:
-        evidence["corpus"] = ["jieba"]
+        evidence["corpus"] = ["BCC" if use_bcc else "jieba"]
     if dictionary_signal > 0:
         evidence["dictionary"] = ["offline-reference"]
     entity_knowledge = {
@@ -5546,7 +5560,7 @@ def _reference_commonness_result(word: str, reference: Dict[str, Any]) -> Dict[s
         "score": score,
         "signals": signals,
         "rawSignals": {
-            "corpus": int(frequency) if isinstance(frequency, int) else 0,
+            "corpus": corpus_value or 0,
             "dictionary": presence_count,
         },
         "evidence": evidence,
@@ -5559,6 +5573,9 @@ def _reference_commonness_result(word: str, reference: Dict[str, Any]) -> Dict[s
             "score": 0.0,
         },
         "reference": dict(reference),
+        "bcc": bcc,
+        "corpusSource": "bcc" if use_bcc else "jieba",
+        "corpusUnit": "per_million" if use_bcc else "count",
         "method": "offline_reference",
     }
 
@@ -5674,9 +5691,12 @@ async def estimate_word_commonness(word: str) -> Dict:
         return {"success": False, "word": word, "message": "词不能为空", "signals": {}, "score": 0.0}
 
     reference = _query_commonness_reference(word)
-    if reference.get("available") and reference.get("attested"):
+    if reference.get("available") and (
+        reference.get("attested") or (reference.get("bcc") or {}).get("attested")
+    ):
         cached = _cache_get(word, "commonness")
-        if cached is not None and cached.get("method") == "offline_reference":
+        if (cached is not None and cached.get("method") == "offline_reference"
+                and cached.get("reference") == reference):
             return cached
         return _cache_set(
             word,
@@ -5711,9 +5731,11 @@ def _reference_comparison_summary(
     behind_word: str,
     front_reference: Dict[str, Any],
     behind_reference: Dict[str, Any],
+    reason: str = "",
 ) -> str:
     if verdict == "behind_more_common":
         front_reference, behind_reference = behind_reference, front_reference
+    first_word, second_word = (behind_word, front_word) if verdict == "behind_more_common" else (front_word, behind_word)
     front_frequency = front_reference.get("corpusFrequency")
     behind_frequency = behind_reference.get("corpusFrequency")
     frequency_basis = (
@@ -5725,6 +5747,29 @@ def _reference_comparison_summary(
         f"{int(behind_reference.get('dictionaryPresenceCount') or 0)}"
     )
     basis = f"语料频次 {frequency_basis}，词典收录 {presence_basis}"
+    front_bcc = front_reference.get("bcc") or {}
+    behind_bcc = behind_reference.get("bcc") or {}
+    if reason.startswith('bcc_'):
+        basis = f"{format_bcc(front_bcc)}；「{second_word}」{format_bcc(behind_bcc)}"
+        if 'balanced_tiebreak' in reason:
+            basis += "；最高频道信号相同，采用多领域比较"
+        if reason.startswith('bcc_relative_rank_'):
+            ranks = [next(row['rankFraction'] for row in item['channels'] if row['channel'] == '多领域')
+                     if 'balanced_tiebreak' in reason else item['rankFraction']
+                     for item in (front_bcc, behind_bcc)]
+            basis += (f"；按各自字/词表内排名比较：前 {ranks[0]:.2%} vs "
+                      f"前 {ranks[1]:.2%}（越小越靠前）")
+    else:
+        # Display only the legacy evidence that contributed to this verdict.
+        if reason == 'dictionary_presence_margin':
+            basis = f"词典收录 {presence_basis}"
+        elif verdict in {'front_more_common', 'behind_more_common'} and int(front_reference.get('dictionaryPresenceCount') or 0) < int(behind_reference.get('dictionaryPresenceCount') or 0):
+            basis = f"语料频次 {frequency_basis}"
+        if front_bcc.get('available') and behind_bcc.get('available'):
+            if verdict == 'not_enough_evidence':
+                basis = f"「{first_word}」{format_bcc(front_bcc)}；「{second_word}」{format_bcc(behind_bcc)}"
+            if bool(front_bcc.get('attested')) != bool(behind_bcc.get('attested')):
+                basis += "；单边 BCC 收录不决定高低"
     if verdict == "front_more_common":
         return f"「{front_word}」较「{behind_word}」更常用：{basis}"
     if verdict == "behind_more_common":
@@ -5744,12 +5789,25 @@ def _compare_reference_commonness(
     behind_frequency = behind_reference.get("corpusFrequency")
     front_presence = int(front_reference.get("dictionaryPresenceCount") or 0)
     behind_presence = int(behind_reference.get("dictionaryPresenceCount") or 0)
-    front_attested = bool(front_reference.get("attested"))
-    behind_attested = bool(behind_reference.get("attested"))
+    front_attested = front_frequency is not None or front_presence > 0
+    behind_attested = behind_frequency is not None or behind_presence > 0
     verdict = "not_enough_evidence"
     reason = "local_signal_insufficient"
 
-    if isinstance(front_frequency, int) and isinstance(behind_frequency, int):
+    front_bcc = front_reference.get("bcc") or {}
+    behind_bcc = behind_reference.get("bcc") or {}
+    bcc_signal = comparison_signal(front_bcc, behind_bcc)
+    if bcc_signal is not None:
+        left, right, reason = bcc_signal
+        if left >= right * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+            verdict = "front_more_common"
+        elif right >= left * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
+            verdict = "behind_more_common"
+        else:
+            verdict = "close"
+        if verdict == "close":
+            reason += "_below_threshold"
+    elif isinstance(front_frequency, int) and isinstance(behind_frequency, int):
         if front_frequency >= behind_frequency * COMMONNESS_FREQUENCY_RATIO_THRESHOLD:
             verdict = "front_more_common"
             reason = "frequency_ratio"
@@ -5800,6 +5858,7 @@ def _compare_reference_commonness(
             behind_word,
             front_reference,
             behind_reference,
+            reason,
         ),
         "scoreDelta": float(front.get("score") or 0) - float(behind.get("score") or 0),
         "decisionReason": reason,
@@ -5930,6 +5989,8 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
     )
     if reference_available and (
         front_reference.get("attested") or behind_reference.get("attested")
+        or (front_reference.get("bcc") or {}).get("attested")
+        or (behind_reference.get("bcc") or {}).get("attested")
     ):
         comparison = _compare_reference_commonness(
             front_word,
@@ -6376,6 +6437,9 @@ def _comparison_evidence_line(word: str, value: Any) -> str:
     )
     frequency = reference.get("corpusFrequency")
     presence = int(reference.get("dictionaryPresenceCount") or 0)
+    bcc = reference.get("bcc") or {}
+    if bcc.get("available") and bcc.get("attested"):
+        return f"「{word}」：{format_bcc(bcc)}；词典收录 {presence}"
     if reference:
         return (
             f"「{word}」：语料频次 "

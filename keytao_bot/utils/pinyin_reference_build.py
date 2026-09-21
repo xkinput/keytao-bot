@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, TextIO
 
+from .bcc_reference import create_schema as create_bcc_schema, preserve_bcc
 from .pinyin_reference import (
     PINYIN_TOKEN_RE,
     REFERENCE_DATASET_POLICY_BY_ID,
@@ -397,6 +398,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             )
         ) WITHOUT ROWID;
     """)
+    create_bcc_schema(connection)
 
 
 def _batched_insert(
@@ -465,7 +467,7 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
     if temporary.exists():
         temporary.unlink()
 
-    connection = sqlite3.connect(temporary)
+    connection = sqlite3.connect(temporary, uri=True)
     dataset_counts: dict[str, DatasetBuildCount] = {}
     try:
         _create_schema(connection)
@@ -601,6 +603,7 @@ def build_reference_database(source_dir: Path | str, db_path: Path | str) -> Bui
             "INSERT INTO metadata (key, value) VALUES (?, ?)",
             sorted(metadata.items()),
         )
+        preserve_bcc(destination, connection)
         connection.commit()
         connection.execute("VACUUM")
         connection.close()

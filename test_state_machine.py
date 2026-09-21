@@ -15441,7 +15441,10 @@ def test_word_commonness_short_circuits_accepted_entity():
         with patch.object(keytao_review_module, "_estimate_entity_knowledge_signal", side_effect=fake_entity_signal):
             with patch.object(keytao_review_module, "collect_pronunciation_evidence", side_effect=fake_collect_pronunciation_evidence):
                 with patch.object(keytao_review_module, "_search_web", side_effect=fake_search_web):
-                    commonness = await keytao_review_module.estimate_word_commonness("敬德")
+                    # BCC attests 敬德; exercise fallback with a genuinely absent fixture.
+                    word = "未收录实体测试词"
+                    assert not keytao_review_module._query_commonness_reference(word)["attested"]
+                    commonness = await keytao_review_module.estimate_word_commonness(word)
 
         check("short-circuit commonness succeeds", commonness.get("success") is True)
         check("short-circuit keeps entity knowledge", commonness.get("entityKnowledge", {}).get("source") == "llm_high_confidence")
