@@ -112,10 +112,10 @@ class S59CommonnessRouteTests(unittest.TestCase):
     def test_s59_fixture_scenario_table_affordance_and_delivery_closure(self):
         async def run():
             reply, calls = await self.run_incident()
-            self.assertIn("名次 | 词 | 语料频次 | 词典收录 | 判定", reply)
-            self.assertIn("1 | 伊莎贝拉 | 1000 | 3", reply)
-            self.assertIn("2 | 夜泊 | 400 | 3", reply)
-            self.assertIn("3 | 耶博 | 100 | 2", reply)
+            self.assertIn("名次 | 词 | 语料频次 | 词典收录 | 数据收录", reply)
+            self.assertIn("1 | 伊莎贝拉 | jieba 参考 1,000 | 3", reply)
+            self.assertIn("2 | 夜泊 | jieba 参考 400 | 3", reply)
+            self.assertIn("3 | 耶博 | jieba 参考 100 | 2", reply)
             self.assertIn("— | 一身本领 | — | — | 无数据", reply)
             suggestions = self.query.advertised_command_suggestions(reply)
             self.assertEqual(suggestions, ('把 夜泊 yebo 排到 耶博 yebo 前面',))
@@ -145,7 +145,7 @@ class S59CommonnessRouteTests(unittest.TestCase):
         async def run():
             for options in ({"shared": False}, {"lookup_failure": True}):
                 reply, _calls = await self.run_incident(**options)
-                self.assertIn("夜泊 | 400 | 3", reply)
+                self.assertIn("夜泊 | jieba 参考 400 | 3", reply)
                 self.assertFalse(self.query.advertised_command_suggestions(reply))
         asyncio.run(run())
 
@@ -167,7 +167,7 @@ class S59CommonnessRouteTests(unittest.TestCase):
                         "abc", "abcxa" if args["word"] == "甲词" else "abcya",
                     ]}
                 self.assertEqual(await self.query._placement_commands(
-                    ("甲词", "乙词"), ["甲词", "乙词"], read,
+                    ("甲词", "乙词"), [{"frontWord": "甲词", "behindWord": "乙词", "verdict": "front_more_common"}], read,
                 ), ())
         asyncio.run(run())
 
@@ -175,7 +175,7 @@ class S59CommonnessRouteTests(unittest.TestCase):
         async def run():
             with patch.object(self.query, "_placement_commands", side_effect=TimeoutError):
                 reply, _calls = await self.run_incident()
-            self.assertIn("夜泊 | 400 | 3", reply)
+            self.assertIn("夜泊 | jieba 参考 400 | 3", reply)
             self.assertIn("一身本领 | — | — | 无数据", reply)
             self.assertFalse(self.query.advertised_command_suggestions(reply))
         asyncio.run(run())

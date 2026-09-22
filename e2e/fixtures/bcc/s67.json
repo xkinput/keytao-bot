@@ -1,0 +1,207 @@
+{
+  "provenance": "Local read-only data/pinyin_reference.db slice on 2026-09-22; dataset metadata verified equal to s63.json. No production database access.",
+  "words": [
+    "咽",
+    "嘢",
+    "强",
+    "鎗",
+    "之乎",
+    "敲不死",
+    "曰"
+  ],
+  "rows": [
+    {
+      "dataset": "classical_chinese_char_freq.txt",
+      "token": "咽",
+      "raw_count": 95231,
+      "per_million": 66.47795832022656,
+      "frequency_rank": 1899
+    },
+    {
+      "dataset": "dialogue_char_freq.txt",
+      "token": "咽",
+      "raw_count": 2199,
+      "per_million": 10.480663583190939,
+      "frequency_rank": 2512
+    },
+    {
+      "dataset": "literature_char_freq.txt",
+      "token": "咽",
+      "raw_count": 8431,
+      "per_million": 52.636681967369505,
+      "frequency_rank": 1798
+    },
+    {
+      "dataset": "modern_chinese_char_freq.txt",
+      "token": "咽",
+      "raw_count": 31094,
+      "per_million": 21.682213343823598,
+      "frequency_rank": 2496
+    },
+    {
+      "dataset": "multi_domain_total_char_freq.txt",
+      "token": "咽",
+      "raw_count": 19037,
+      "per_million": 29.543744807759015,
+      "frequency_rank": 2154
+    },
+    {
+      "dataset": "news_total_char_freq.txt",
+      "token": "咽",
+      "raw_count": 9439,
+      "per_million": 5.647346727949503,
+      "frequency_rank": 2926
+    },
+    {
+      "dataset": "classical_chinese_char_freq.txt",
+      "token": "嘢",
+      "raw_count": 16,
+      "per_million": 0.011169129097915858,
+      "frequency_rank": 18730
+    },
+    {
+      "dataset": "multi_domain_total_char_freq.txt",
+      "token": "嘢",
+      "raw_count": 8,
+      "per_million": 0.0124152943458566,
+      "frequency_rank": 7543
+    },
+    {
+      "dataset": "news_total_char_freq.txt",
+      "token": "嘢",
+      "raw_count": 57,
+      "per_million": 0.03410305789735371,
+      "frequency_rank": 6362
+    },
+    {
+      "dataset": "classical_chinese_char_freq.txt",
+      "token": "强",
+      "raw_count": 412893,
+      "per_million": 288.22845128911075,
+      "frequency_rank": 741
+    },
+    {
+      "dataset": "dialogue_char_freq.txt",
+      "token": "强",
+      "raw_count": 86326,
+      "per_million": 411.438728732397,
+      "frequency_rank": 385
+    },
+    {
+      "dataset": "literature_char_freq.txt",
+      "token": "强",
+      "raw_count": 61523,
+      "per_million": 384.1023110756107,
+      "frequency_rank": 464
+    },
+    {
+      "dataset": "modern_chinese_char_freq.txt",
+      "token": "强",
+      "raw_count": 496682,
+      "per_million": 346.3422231953751,
+      "frequency_rank": 670
+    },
+    {
+      "dataset": "multi_domain_total_char_freq.txt",
+      "token": "强",
+      "raw_count": 628669,
+      "per_million": 975.6388351394154,
+      "frequency_rank": 220
+    },
+    {
+      "dataset": "news_total_char_freq.txt",
+      "token": "强",
+      "raw_count": 2849945,
+      "per_million": 1705.1199884083107,
+      "frequency_rank": 117
+    },
+    {
+      "dataset": "classical_chinese_char_freq.txt",
+      "token": "鎗",
+      "raw_count": 14578,
+      "per_million": 10.176472749338586,
+      "frequency_rank": 4031
+    },
+    {
+      "dataset": "modern_chinese_char_freq.txt",
+      "token": "鎗",
+      "raw_count": 4791,
+      "per_million": 3.3408208699510795,
+      "frequency_rank": 3950
+    },
+    {
+      "dataset": "modern_chinese_word_freq.txt",
+      "token": "之乎",
+      "raw_count": 1311,
+      "per_million": 1.5688447320220473,
+      "frequency_rank": 43861
+    },
+    {
+      "dataset": "classical_chinese_char_freq.txt",
+      "token": "曰",
+      "raw_count": 7492041,
+      "per_million": 5229.973320992413,
+      "frequency_rank": 14
+    },
+    {
+      "dataset": "literature_char_freq.txt",
+      "token": "曰",
+      "raw_count": 8511,
+      "per_million": 53.13614046071425,
+      "frequency_rank": 1790
+    },
+    {
+      "dataset": "modern_chinese_char_freq.txt",
+      "token": "曰",
+      "raw_count": 363401,
+      "per_million": 253.40380817388692,
+      "frequency_rank": 843
+    },
+    {
+      "dataset": "multi_domain_total_char_freq.txt",
+      "token": "曰",
+      "raw_count": 10180,
+      "per_million": 15.798462055102524,
+      "frequency_rank": 2599
+    },
+    {
+      "dataset": "news_total_char_freq.txt",
+      "token": "曰",
+      "raw_count": 11382,
+      "per_million": 6.809842192766315,
+      "frequency_rank": 2802
+    }
+  ],
+  "jieba": [
+    {
+      "word": "咽",
+      "corpus_frequency": 1093,
+      "part_of_speech": "v",
+      "dictionary_presence_count": 1
+    },
+    {
+      "word": "嘢",
+      "corpus_frequency": null,
+      "part_of_speech": null,
+      "dictionary_presence_count": 1
+    },
+    {
+      "word": "强",
+      "corpus_frequency": 17342,
+      "part_of_speech": "a",
+      "dictionary_presence_count": 1
+    },
+    {
+      "word": "鎗",
+      "corpus_frequency": 10,
+      "part_of_speech": "zg",
+      "dictionary_presence_count": 0
+    },
+    {
+      "word": "曰",
+      "corpus_frequency": 10675,
+      "part_of_speech": "zg",
+      "dictionary_presence_count": 1
+    }
+  ]
+}

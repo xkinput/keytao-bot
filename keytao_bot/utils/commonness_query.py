@@ -9,7 +9,7 @@ import unicodedata
 from .pending_confirmation import advertised_command_suggestions, render_executable_suggestion
 from .same_code_reorder import parse_same_code_reorder
 from ..harness.authorization_grammar import parse_eviction_modified_add
-from .bcc_reference import format_bcc, format_historical
+from .bcc_reference import format_bcc, format_historical, historical_attested
 from .commonness_copy import render_commonness_summary
 
 
@@ -73,19 +73,35 @@ def parse_commonness_query(message):
 
 
 def render_commonness_table(result):
-    lines = ["常用度排序（本地语料与词典）", "名次 | 词 | 语料频次 | 词典收录 | 判定 | 历史补充"]
-    labels = {"ranked": "有数据", "close": "接近（并列参考）", "unknown": "无法判断"}
+    lines = ["常用度排序（本地语料与词典）", "名次 | 词 | 语料频次 | 词典收录 | 数据收录 | 历史补充"]
     for row in result["words"]:
         known = row["known"]
         rank = row["rank"] if known and row["rank"] is not None else "—"
         frequency = row["corpusFrequency"]
         bcc = row.get("bcc") or {}
-        if bcc.get("available") and bcc.get("attested"):
+        modern = bcc.get("available") and bcc.get("attested")
+        sources = []
+        if modern:
             frequency = format_bcc(bcc)
+        else:
+            parts = ["BCC 现代四频道未收录"] if bcc.get("available") else []
+            if frequency is not None:
+                source = row.get("corpusSource") or "jieba"
+                parts.append(f"{source} 参考 {frequency:,}")
+                sources.append(source)
+            frequency = "；".join(parts) or "—"
         presence = row["dictionaryPresenceCount"]
-        verdict = labels.get(row["verdict"], "无法判断") if known else "无数据"
-        lines.append(f"{rank} | {row['word']} | {frequency if frequency is not None else '—'} | {presence if presence is not None else '—'} | {verdict} | {format_historical(bcc)}")
+        if presence:
+            sources.append("词典")
+        if historical_attested(bcc):
+            sources.append("历史 BCC")
+        status = "现代 BCC 收录" if modern else (
+            "仅历史 BCC 收录" if sources == ["历史 BCC"] else
+            "、".join(sources) + " 收录" if sources else "无数据"
+        )
+        lines.append(f"{rank} | {row['word']} | {frequency} | {presence if presence is not None else '—'} | {status} | {format_historical(bcc)}")
     lines.append(result["orderingNote"] + "词频是语料内计数。")
+    lines.append("数据收录仅说明该词的可用来源，不代表两词能否判定高低。")
     if any((row.get("bcc") or {}).get("available") for row in result["words"]):
         lines.append("BCC 取四个现代频道的最高每百万频次；字与词按各自表内排名比较。未收录不代表实际零次，单边收录不决定高低。")
         lines.append("古代汉语、近代汉语不计入现代频次；仅在双方现代四频道均未收录且词典与 jieba 无明确方向时破平。")
@@ -109,7 +125,7 @@ def placement_command(first, second, *, same_code=False, code=""):
     return command if valid else ""
 
 
-async def _placement_commands(words, ordered_words, read):
+async def _placement_commands(words, comparisons, read):
     from ..plugins import chat_commands as commands
 
     data = await read("keytao_lookup_by_words_batch", {"words": list(words)})
@@ -131,14 +147,25 @@ async def _placement_commands(words, ordered_words, read):
             await candidates(word)
     advertised = []
     chains = set()
-    for index, first in enumerate(ordered_words):
-        for second in ordered_words[index + 1:]:
+    for comparison in comparisons:
+        verdict = comparison.get("verdict")
+        if verdict not in {"front_more_common", "behind_more_common"}:
+            continue
+        first, second = comparison["frontWord"], comparison["behindWord"]
+        if verdict == "behind_more_common":
+            first, second = second, first
+        if first in slots and second in slots:
             shared = {(row["type"], row["code"]) for row in slots[first]} & {
                 (row["type"], row["code"]) for row in slots[second]
             }
             if shared:
                 for phrase_type, code in sorted(shared):
                     if sum(shared_code == code for _kind, shared_code in shared) != 1:
+                        continue
+                    pair = [[row for row in slots[word] if (row["type"], row["code"]) == (phrase_type, code)]
+                            for word in (first, second)]
+                    # Equal/ambiguous weights do not prove an inversion.
+                    if any(len(rows) != 1 for rows in pair) or pair[0][0]["weight"] <= pair[1][0]["weight"]:
                         continue
                     if (phrase_type, code) not in chains:
                         command = placement_command(first, second, same_code=True, code=code)
@@ -165,6 +192,9 @@ async def _placement_commands(words, ordered_words, read):
                     [first_entry, second_entry], {first: first_codes, second: second_codes},
                 )
                 identity = (second_entry["type"], root)
+                # Existing entries already on a shorter prefix need no placement.
+                if slots[first] and not first_entry["code"].startswith(second_entry["code"]):
+                    continue
                 if root and identity not in chains:
                     command = placement_command(first, second)
                     if command:
@@ -217,7 +247,7 @@ async def commonness_query_reply(message, platform, user_id, owner):
 
     try:
         suggestions = () if result["ordering"] == "conflicting_evidence" else await asyncio.wait_for(
-            _placement_commands(words, [row["word"] for row in result["words"]], read), timeout=5.0,
+            _placement_commands(words, result["comparisons"], read), timeout=5.0,
         )
     except Exception:
         suggestions = ()

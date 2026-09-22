@@ -5800,6 +5800,25 @@ def _reference_comparison_summary(
     basis = f"语料频次 {frequency_basis}，词典收录 {presence_basis}"
     front_bcc = front_reference.get("bcc") or {}
     behind_bcc = behind_reference.get("bcc") or {}
+    # Keep each word's strongest decision channel, then fill the second slot.
+    # Share the table formatter so small observations and rounding stay identical.
+    rank_based = 'relative_rank' in reason
+    signal_key = 'rankFraction' if rank_based else 'perMillion'
+    strongest = [sorted(
+        (row for row in bcc.get('channels', []) if row.get('count') is not None
+         and row.get(signal_key) is not None),
+        key=lambda row: row[signal_key], reverse=not rank_based,
+    ) for bcc in (front_bcc, behind_bcc)]
+    channel_names = ['多领域'] if 'balanced_tiebreak' in reason else []
+    for row in [rows[0] for rows in strongest if rows] + [row for rows in strongest for row in rows[1:]]:
+        if row['channel'] not in channel_names:
+            channel_names.append(row['channel'])
+    summary_channels = channel_names[:2]
+
+    def bcc_summary(bcc):
+        return format_bcc({**bcc, 'channels': [row for row in bcc.get('channels', [])
+                                             if row['channel'] in summary_channels]})
+
     one_sided_bcc = (
         front_bcc.get('available') and behind_bcc.get('available')
         and bool(front_bcc.get('attested')) != bool(behind_bcc.get('attested'))
@@ -5819,8 +5838,8 @@ def _reference_comparison_summary(
                       f"「{second_word}」{format_frequency(rows[1]['count'], rows[1]['perMillion'])}")
         basis += '；仅作历史语料末级破平'
     elif reason.startswith('bcc_'):
-        basis = (f"「{first_word}」{format_bcc(front_bcc, precision=4)}；"
-                 f"「{second_word}」{format_bcc(behind_bcc, precision=4)}")
+        basis = (f"「{first_word}」{bcc_summary(front_bcc)}；"
+                 f"「{second_word}」{bcc_summary(behind_bcc)}")
         if 'balanced_tiebreak' in reason:
             basis += "；最高频道信号相同，采用多领域比较"
         if reason.startswith('bcc_relative_rank_'):
@@ -5840,11 +5859,11 @@ def _reference_comparison_summary(
             basis = f"语料频次 {frequency_basis}"
         if front_bcc.get('available') and behind_bcc.get('available'):
             if verdict == 'not_enough_evidence':
-                basis = f"「{first_word}」{format_bcc(front_bcc)}；「{second_word}」{format_bcc(behind_bcc)}"
+                basis = f"「{first_word}」{bcc_summary(front_bcc)}；「{second_word}」{bcc_summary(behind_bcc)}"
             if one_sided_bcc:
                 if verdict != 'not_enough_evidence':
-                    basis += (f"；「{first_word}」{format_bcc(front_bcc)}；"
-                              f"「{second_word}」{format_bcc(behind_bcc)}")
+                    basis += (f"；「{first_word}」{bcc_summary(front_bcc)}；"
+                              f"「{second_word}」{bcc_summary(behind_bcc)}")
                 basis += "；单边 BCC 收录不决定高低"
     if (not reason.startswith('bcc_historical_')
             and all(item.get('available') and not item.get('attested') for item in (front_bcc, behind_bcc))):
