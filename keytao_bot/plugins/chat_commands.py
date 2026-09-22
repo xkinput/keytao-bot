@@ -6499,6 +6499,7 @@ async def _execute_confirmed_tool(
     carried_ordering_summary: str = "",
     on_transport_failure: Optional[Callable[[], None]] = None,
     auto_confirm_shift_plan: bool = False,
+    require_new_confirmation: bool = False,
 ) -> str:
     """Execute one staged step without bypassing unseen server warnings."""
     if state.confirmation_source not in {"local_preview", "server_warning"}:
@@ -6871,6 +6872,14 @@ async def _execute_confirmed_tool(
         return _assert_plain_user_facing_reply(render_pending_choice_offer(offer))
 
     if data.get("requiresConfirmation"):
+        if state.confirmation_source == "local_preview" and not state.args.get("_candidate_origin"):
+            context = current_memory_context.get()
+            origin_key = (context.conversation_address if context is not None
+                          and context.platform == platform and context.user_id == user_id
+                          else conv_key or (platform, user_id))
+            origin = _candidate_origin_for_ticket(conversation_state_store.get(origin_key))
+            if origin:
+                state = replace(state, args={**state.args, "_candidate_origin": origin})
         pending_state = _pending_state_from_server_warning(state, data)
         if state.confirmation_source == "server_warning":
             if not server_warning_ticket_is_complete(pending_state):
@@ -6936,7 +6945,7 @@ async def _execute_confirmed_tool(
                 auto_confirm_shift_plan=True,
             )
         auto_confirm_binding = None
-        if state.confirmation_source == "local_preview":
+        if state.confirmation_source == "local_preview" and not require_new_confirmation:
             if state.function_name == "keytao_create_phrase":
                 auto_confirm_binding = create_warning_confirmation_binding(
                     data,
@@ -11976,6 +11985,31 @@ async def _bind_explicit_pending_code(state, request, platform, user_id):
     return derived, ""
 
 
+async def try_verify_pending_fly_proposal(message, platform, user_id, conv_key, space_key=None, owner_label=""):
+    """Verify a code correction without treating it as an instruction to write."""
+    source = _strip_command_message_prefixes(trusted_mutation_source(message)).strip()
+    proposed = re.fullmatch(r"(?:应该是|应是|应该用)\s*([a-z0-9]+)\s*(?:这个|这个编码的)?飞键[。.!！]?", source)
+    record = conversation_state_store.get_record(conv_key)
+    if proposed is None or record is None or record.execution_id:
+        return None
+    origin = _candidate_origin_for_ticket(record.state)
+    if len(origin.get("queryWords") or []) != 1:
+        return "未能把该飞键与唯一的词和读音绑定，请明确词名；本次未写入。"
+    try:
+        state = _pending_add_word_from_payload(json.loads(json.dumps(origin.get("reviewedState"))))
+    except (ValueError, TypeError, KeyError):
+        return "当前缺少完整读音记录，未能核验该飞键；请重新查询该词。"
+    code = proposed[1]
+    validation = validate_explicit_code(state, code)
+    if not validation.valid:
+        return validation.reason + "；本次未写入。"
+    # Verification grants no write or ticket replacement. A later explicit
+    # add command reuses S56's occupancy check and sealed capability.
+    return (f"核验结果：{code} 符合「{state.word}」读音 {validation.pinyin} 的编码规则。"
+            + (f"{validation.manual_reason}。" if validation.manual_reason else "")
+            + "本次仅核验，未写入。")
+
+
 async def _execute_explicit_entry_code_request(
     request: ExplicitEntryCodeRequest,
     message: str,
@@ -12221,6 +12255,74 @@ async def try_handle_explicit_entry_code_command(
     )
 
 
+def _candidate_origin_for_ticket(state) -> Dict:
+    """Retain the original numbered inventory across a server plan preview."""
+    if isinstance(state, PendingAddWord) and state.server_candidates and state.server_candidates == state.candidates:
+        return {"queryWords": [state.word], "reviewedState": json.loads(json.dumps(_pending_add_word_payload(state)))}
+    if isinstance(state, PendingToolConfirm):
+        if state.args.get("_candidate_origin"):
+            return state.args["_candidate_origin"]
+        if state.args.get("_reviewed_multi_word") is True:
+            scopes = state.args.get("_candidate_scopes") or []
+            words = state.args.get("_query_words") or [scope.get("word") for scope in scopes]
+            return {"queryWords": words, "reviewedState": scopes[0].get("reviewedState")
+                    if len(words) == len(scopes) == 1 else None}
+    return {}
+
+
+async def try_reselect_live_ticket(message, platform, user_id, conv_key, space_key=None, owner_label=""):
+    """A live ordinal replaces the preview; it never confirms the old plan."""
+    record = conversation_state_store.get_record(conv_key)
+    if not record or record.execution_id or not isinstance(record.state, PendingToolConfirm):
+        return None
+    state = record.state
+    if not server_warning_ticket_is_complete(state) or state.function_name not in {
+        "keytao_shift_phrase_code", "keytao_create_phrase", "keytao_batch_add_to_draft",
+    }:
+        return None
+    source = _strip_command_message_prefixes(trusted_mutation_source(message))
+    selection = parse_pending_candidate_selection(source)
+    if selection is None and re.fullmatch(r"[0-9\s,，、;；]+[。.!！]?", unicodedata.normalize("NFKC", source)):
+        return "候选编号无效或重复，请按原候选列表选择；本次未写入。"
+    if selection is None or not selection.indices:
+        return None
+    origin = state.args.get("_candidate_origin") or {}
+    if len(origin.get("queryWords") or []) > 1:
+        return "原候选列表包含多个词，请明确词名和编码后重新审词；本次未写入，原确认计划未执行。"
+    try:
+        reviewed = _pending_add_word_from_payload(origin.get("reviewedState"))
+    except (ValueError, TypeError, KeyError):
+        return "当前确认缺少完整的原候选记录，未能核验该编号；请重新查询，本次未写入。"
+    if (not reviewed.server_candidates or reviewed.server_candidates != reviewed.candidates
+            or origin.get("queryWords") != [reviewed.word]):
+        return "当前确认缺少完整的原候选记录，未能核验该编号；请重新查询，本次未写入。"
+    if len(selection.indices) != 1 or not 1 <= selection.indices[0] <= len(reviewed.candidates):
+        return f"请从原候选 1-{len(reviewed.candidates)} 中选择一个编号；本次未写入。"
+    code, occupied = reviewed.candidates[selection.indices[0] - 1]
+    reading, codes = _pending_reviewed_reading(reviewed, code)
+    if not reading or code not in codes:
+        return "该候选缺少完整的读音核验记录，本次未写入。"
+    args = (_create_phrase_args(reviewed, code) if not occupied else {
+        "word": reviewed.word, "target_code": code, "target_type": reviewed.phrase_type,
+        "target_remark": reviewed.code_remarks.get(code, ""), "target_needs_manual_review": True,
+    })
+    args.update(_reviewed_pinyin=reading, _reviewed_candidate_codes=list(codes),
+                _candidate_origin=origin, _submit_after=bool(state.args.get("_submit_after") or selection.submit_after))
+    if not conversation_state_store.begin_execution(record):
+        return "当前确认正在处理中，本次未改选。"
+    try:
+        response = await _execute_confirmed_tool(PendingToolConfirm(
+            function_name="keytao_shift_phrase_code" if occupied else "keytao_create_phrase", args=args,
+        ), platform, user_id, conv_key, space_key, owner_label, require_new_confirmation=True)
+    finally:
+        # A failed read-only preview leaves the old ticket available; a saved
+        # replacement has a different identity and cannot be removed here.
+        conversation_state_store.abort_execution(record)
+    if conversation_state_store.get_record(conv_key) is record:
+        return "改选预览未完成，原确认计划仍保留。\n" + response
+    return f"已改选原候选 {selection.indices[0]}：{reviewed.word} → {code}。\n" + response
+
+
 async def handle_pending_message_core(
     message: str,
     platform: str,
@@ -12273,6 +12375,10 @@ async def handle_pending_message_core(
         if uncertain_action == "read":
             return None
         return uncertain_response
+
+    reselected = await try_reselect_live_ticket(message, platform, user_id, conv_key, space_key, owner_label)
+    if reselected is not None:
+        return reselected
 
     explicit_review_line = ""
     if isinstance(state, PendingAddWord):

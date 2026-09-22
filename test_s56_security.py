@@ -207,7 +207,7 @@ class S56SecurityTests(unittest.TestCase):
                 commands, "_execute_add_multiple_codes_to_draft", execute,
             ):
                 reply = await commands.handle_pending_message_core("添加2、3", "qq", "s56-multiple-empty", key, allow_intent_model=False)
-            self.assertEqual("empty choices written", reply)
+            self.assertEqual("empty choices written\n未选择：1. 鎗 → qx；这些候选本次未添加。", reply)
             self.assertEqual(["qxi", "qxio"], execute.call_args.args[1])
         asyncio.run(run())
 

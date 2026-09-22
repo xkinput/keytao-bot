@@ -338,7 +338,7 @@ BCC 现代频次只取多领域、新闻、文学、口语的最高每百万频�
 - 当前查询字自己已占用的码显示 `已有 字 ✔️`
 - 其他词占用只显示词名
 
-用户指定编码时，调用 `keytao_encode(word="词", requested_code="ffb")`。若 `requestedCodeAnalysis.supported=false`，必须说明工具给出的原因，并列出 `seriesCodes` 或 `alternatives`，不要自行推断规则外编码。
+用户指定编码时，调用 `keytao_encode(word="词", requested_code="ffb")`。程序按全部可核验读音检查飞键规则；不能把默认读音的候选缺失推广为所有读音均不合法。`matchType=unverified` 时只说明“未能核验”，禁止断言“不是有效飞键候选”。方案规则支持而形码未核验时可接受并保留 `needsManualReview`，后续显式添加走 S56 封印流程。只有客观的长度、字符或已审音码冲突才可按工具原因拒绝。
 
 若某字无拆分数据，形码显示「—」，音码仍正常展示。
 

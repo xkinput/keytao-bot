@@ -607,6 +607,7 @@ def pending_execution_args(state: PendingToolConfirm) -> Dict:
     args.pop("_continuation_command", None)
     args.pop("_offered_options", None)
     args.pop("_replace_at_code", None)
+    args.pop("_candidate_origin", None)
     return args
 
 

@@ -6079,7 +6079,7 @@ def test_reviewed_word_preserves_encode_service_candidate_chains():
 
         codes = review.get("pronunciations", [{}])[0].get("codes", [])
         check("service standard chain is preserved", codes[:3] == ["yzgm", "yzgmi", "yzgmii"])
-        check("unscoped service alt chain is not merged into the reading", codes == ["yzgm", "yzgmi", "yzgmii"])
+        check("scheme-verified fly chain stays in the same reading", codes == ["yzgm", "yzgmi", "yzgmii", "yzgx", "yzgxi", "yzgxii"])
         check("official short code is accepted", "yzgm" in codes)
 
     asyncio.run(_run())
@@ -19883,7 +19883,7 @@ def test_normalize_encode_response_codes_first():
     check("recommendedCode is codes[0]", result["recommendedCode"] == "hyf")
     check("candidateCodes include fly key codes", result["candidateCodes"] == ["hyf", "hyfi", "hyfio", "hyfioo", "ffb", "ffbo"])
     check("flyKeyVariants preserved", result["flyKeyVariants"][0]["baseCode"] == "ffb")
-    check("requestedCodeAnalysis preserved", result["requestedCodeAnalysis"]["matchType"] == "flyKey")
+    check("incomplete ambiguous reading cannot certify requested code", result["requestedCodeAnalysis"]["matchType"] == "unverified")
     check("pronunciation source preserved", result["pronunciationSource"] == "pinyin-pro-context")
     check("phrase pinyin preserved", result["phrasePinyins"] == ["huan", "yan", "zhi"])
     check("context phrase pinyin preserved", result["contextPhrasePinyins"] == ["huan", "yan", "zhi"])

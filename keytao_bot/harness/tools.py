@@ -102,7 +102,7 @@ def _compact_candidate_statuses(values: Any, *, limit: int = 40) -> List[Dict[st
     for value in values[:limit]:
         if not isinstance(value, Mapping):
             continue
-        status = _present_fields(value, ("code", "occupied", "label"))
+        status = _present_fields(value, ("code", "occupied", "label", "flyKey"))
         words = [
             str(word).strip()
             for word in value.get("words", [])

@@ -92,6 +92,25 @@ def receipt_change_lines(data: dict, requested_words=()) -> list[str]:
     for change in changes:
         summary += (("、" if requested and change.word not in requested else "；") if summary else "") + change.text
     lines = ["已变更：" + summary] if changes else []
+    revised_words = list(dict.fromkeys(
+        str(item.get("word") or "")
+        for field in ("writtenItems", "updatedItems") for item in data.get(field) or []
+        if isinstance(item, dict) and item.get("id") is not None and item.get("word")
+        and (item.get("action") in {"Change", "Delete"} or field == "updatedItems")
+    ))
+    if revised_words:
+        states = {}
+        for word in revised_words:
+            status = next((item.get("_revisionStatus", "Draft")
+                           for field in ("writtenItems", "updatedItems") for item in data.get(field) or []
+                           if isinstance(item, dict) and item.get("word") == word), "Draft")
+            states.setdefault(status, []).append(f"「{word}」")
+        labels = {"Draft": "草稿（未发布）", "Submitted": "待审核（未发布）",
+                  "Approved": "已入库（尚未发布）", "Published": "已发布"}
+        lines.append("发布状态：" + "；".join(
+            "、".join(words) + "的本次修改现为" + labels.get(status, "状态待核验")
+            for status, words in states.items()
+        ) + "。")
     if data.get("receiptItemsUnavailable"):
         lines.append("写入结果已返回，但本轮变更明细未能完整核验；请查看原批次。")
     written_words = {change.word for change in changes}
@@ -113,6 +132,14 @@ def merge_receipt_deltas(receipts: list[dict[str, Any]]) -> dict:
     """Merge actual same-turn evidence without counting a PR again on submit."""
     merged = {"writtenItems": [], "updatedItems": [], "requestedWords": [], "failed": [], "skipped": []}
     positions = {}
+    batch_statuses = {}
+    for receipt in receipts:
+        if receipt.get("autoApproved") is True:
+            batch_statuses[receipt.get("batchId")] = "Approved"
+        elif receipt.get("tool") == "keytao_submit_batch" or receipt.get("operationKind") == "draft_submit":
+            batch_statuses[receipt.get("batchId")] = "Approved" if receipt.get("autoApproved") else "Submitted"
+        elif receipt.get("status") in {"Draft", "Submitted", "Approved", "Published"}:
+            batch_statuses[receipt.get("batchId")] = receipt["status"]
     for receipt in receipts:
         if receipt.get("noWrite"):
             words = receipt.get("requestedWords") or [
@@ -135,6 +162,7 @@ def merge_receipt_deltas(receipts: list[dict[str, Any]]) -> dict:
             for row in receipt.get(field) or []:
                 if not isinstance(row, dict) or row.get("id") is None:
                     continue
+                row = {**row, "_revisionStatus": batch_statuses.get(receipt.get("batchId"), row.get("_revisionStatus", "Draft"))}
                 identity = (receipt.get("batchId"), row["id"])
                 if identity in positions:
                     previous_field, index = positions[identity]

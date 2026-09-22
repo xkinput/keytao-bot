@@ -1,6 +1,7 @@
 """Shared helpers for deriving KeyTao candidate code chains."""
 import re
 import unicodedata
+from itertools import product
 from typing import Dict, List, Optional
 
 
@@ -226,6 +227,49 @@ def build_single_char_code_chain(phonetic_code: str, shape_code: object) -> List
     )
 
 
+def scheme_phonetic_bases(pinyins: List[str]) -> List[str]:
+    """Enumerate the scheme's three fly-key rules, scoped to one reading."""
+    choices = []
+    for syllable in pinyins:
+        split = _split_pinyin(syllable)
+        primary = pinyin_to_phonetic_code(syllable)
+        if not split or not primary:
+            return []
+        initial, final = split
+        if final == "uang":
+            primary = primary[0] + ("x" if initial in {"zh", "ch"} else "m")
+        options = [primary]
+        if initial == "zh" and final in {"ai", "ao", "e"}:
+            options.append("f" + primary[1])
+        elif initial == "ch" and final in {"ao", "e"}:
+            options.append("w" + primary[1])
+        if final == "uang":
+            options.append(primary[0] + ("m" if primary[1] == "x" else "x"))
+        choices.append(options)
+    if not choices:
+        return []
+    positions = _phrase_code_positions(len(choices))
+    return list(dict.fromkeys(
+        "".join(parts) if len(choices) <= 2 else "".join(part[0] for part in parts)
+        for parts in product(*(choices[index] for index in positions))
+    ))
+
+
+def expand_fly_key_codes(pinyins: List[str], codes: List[str]) -> List[str]:
+    """Reuse only a returned chain's shape suffix; never infer new shapes."""
+    codes = _clean_code_list(codes)
+    bases = scheme_phonetic_bases(pinyins)
+    if len(bases) < 2:
+        return codes
+    size = len(bases[0])
+    suffixes = list(dict.fromkeys(code[size:] for code in codes if code[:size] in bases))
+    expanded = list(dict.fromkeys([*codes, *(
+        base + suffix for base in bases for suffix in suffixes if len(base + suffix) <= 6
+    )]))
+    from .keytao_candidate_preference import order_reading_codes
+    return order_reading_codes(pinyins, expanded)
+
+
 def _clean_char_infos(chars: object) -> List[Dict]:
     if not isinstance(chars, list):
         return []
@@ -432,7 +476,7 @@ def build_alternate_pronunciation_codes(chars: object) -> List[Dict]:
         phonetic_code = pinyin_to_phonetic_code(pinyin)
         if not phonetic_code or phonetic_code in seen_codes:
             continue
-        code_chain = build_single_char_code_chain(phonetic_code, shape_code)
+        code_chain = expand_fly_key_codes([pinyin], build_single_char_code_chain(phonetic_code, shape_code))
         if not code_chain:
             continue
         seen_codes.add(phonetic_code)
@@ -482,7 +526,9 @@ def build_phrase_pronunciation_codes(chars: object) -> List[Dict]:
             phonetic_codes = list(default_phonetic_codes)
             phonetic_codes[index] = phonetic_code
             standard_codes = build_phrase_code_chain(char_infos, phonetic_codes)
-            codes = _clean_code_list(standard_codes)
+            readings = [str(info.get("pinyin") or "") for info in char_infos]
+            readings[index] = pinyin
+            codes = expand_fly_key_codes(readings, standard_codes)
             if not codes:
                 continue
 

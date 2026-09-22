@@ -1133,6 +1133,8 @@ def _format_candidate_status_line(index: int, status: Dict, recommended_code: st
         label = "✅ 推荐（空位）"
     else:
         label = "空位"
+    if status.get("flyKey") is True:
+        label += "（飞键）"
     return f"{index}. {code} — {label}"
 
 
@@ -1361,6 +1363,8 @@ def _format_review_candidate_line(
         )
     else:
         label = "空位"
+    if status.get("flyKey") is True:
+        label += "（飞键）"
     return f"{index}. {code} — {label}"
 
 
@@ -1935,10 +1939,10 @@ def finalize_draft_receipt(
     deltas = [source for source in sources if isinstance(source, dict)
               and ("writtenItems" in source or "updatedItems" in source)]
     if deltas:
-        delta = merge_receipt_deltas(list(reversed(deltas)))
+        delta = merge_receipt_deltas([source for source in reversed(sources) if isinstance(source, dict)])
         delta["noWrite"] = all(source.get("noWrite") for source in deltas)
         lines = receipt_change_lines(delta, requested_words)
-        body = [line for line in text.splitlines() if not line.startswith(("已变更：", "未新增变更："))]
+        body = [line for line in text.splitlines() if not line.startswith(("已变更：", "未新增变更：", "发布状态："))]
         new_lines = [line for line in lines if line not in body]
         insert_at = 1 if body else 0
         body[insert_at:insert_at] = new_lines

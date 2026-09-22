@@ -3,6 +3,21 @@
 from typing import Dict, Iterable, List
 
 
+def order_reading_codes(pinyins: Iterable[str], codes: Iterable[str]) -> List[str]:
+    """Prefer the fe chain for every initial zhe reading, independent of glyph."""
+    from .keytao_encoding import _strip_pinyin_tone
+    syllables = list(pinyins)
+    ordered = _dedupe_codes(codes)
+    if syllables and _strip_pinyin_tone(syllables[0]).rstrip("12345") == "zhe":
+        fe_prefix, qe_prefix = ("fe", "qe") if len(syllables) <= 2 else ("f", "q")
+        fe = [code for code in ordered if code.startswith(fe_prefix)]
+        qe = [code for code in ordered if code.startswith(qe_prefix)]
+        others = [code for code in ordered if not code.startswith((fe_prefix, qe_prefix))]
+        if fe and qe:
+            return [*fe, *qe, *others]
+    return ordered
+
+
 def _dedupe_codes(values: Iterable[object]) -> List[str]:
     return list(dict.fromkeys(
         str(value or "").strip().lower()

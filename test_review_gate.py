@@ -6191,8 +6191,8 @@ def test_multi_sense_agreeing_evidence_recommends_authoritative_reading():
             for group in agreed_groups
         }
         check(
-            "service-returned reading groups keep their own chains",
-            codes_by_reading.get(("huan", "che")) == ["htje", "htjev", "htjevv"]
+            "each reading retains its chain and the scheme-permitted fly alternatives",
+            codes_by_reading.get(("huan", "che")) == ["htje", "htjev", "htjevv", "htwe", "htwev", "htwevv"]
             and codes_by_reading.get(("hai", "che")) == ["htwe", "htwev", "htwevv"],
         )
 

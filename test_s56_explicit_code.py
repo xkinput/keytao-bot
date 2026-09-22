@@ -71,14 +71,17 @@ class ExplicitCodeTests(unittest.TestCase):
             self.assertIn("qxioio", execute.call_args.kwargs["reviewed_candidate_codes"])
         asyncio.run(run())
 
-    def test_alternate_phonetic_base_comes_from_reviewed_inventory(self):
+    def test_alternate_phonetic_base_is_checked_against_reviewed_reading(self):
         from keytao_bot.utils.explicit_code import validate_explicit_code
         state = harness.PendingAddWord(
             word="哲思", recommended_code="fesk", candidates=[("fesk", False)],
             server_candidates=[("fesk", False)], pronunciation_codes={"fesk": "zhé sī"},
         )
         self.assertTrue(validate_explicit_code(state, "feskio").valid)
-        self.assertFalse(validate_explicit_code(state, "qeskio").valid)
+        alternate = validate_explicit_code(state, "qeskio")
+        self.assertTrue(alternate.valid)
+        self.assertIn("管理员复核", alternate.manual_reason)
+        self.assertFalse(validate_explicit_code(state, "zeskio").valid)
 
     def test_bare_assent_preserves_protected_record_and_named_eviction_executes(self):
         async def run():

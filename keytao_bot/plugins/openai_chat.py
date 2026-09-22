@@ -3806,6 +3806,23 @@ async def _stage_prepare_fresh_code_selection(ctx: TurnContext) -> bool:
 async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     """Production scenario: bind live pending state to the current reply and actor scope."""
     current_record = conversation_state_store.get_record(ctx.conv_key)
+    if current_record is not None and draft_operation_coordinator.get(ctx.conv_key) is None:
+        verified = await _chat_commands.try_verify_pending_fly_proposal(
+            ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
+            ctx.space_key, ctx.owner_label,
+        )
+        if verified is not None:
+            ctx.current_pending_record = current_record
+            ctx.scoped_pending_response = ctx.response = verified
+            return False
+        reselected = await _chat_commands.try_reselect_live_ticket(
+            ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
+            ctx.space_key, ctx.owner_label,
+        )
+        if reselected is not None:
+            ctx.current_pending_record = conversation_state_store.get_record(ctx.conv_key)
+            ctx.scoped_pending_response = ctx.response = reselected
+            return False
     if ctx.literal_phrase_word and current_record is not None:
         from ..utils.offered_options import offered_option_intent
 

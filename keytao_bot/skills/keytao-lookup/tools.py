@@ -3,6 +3,7 @@ Keytao Lookup Skill Tools
 键道查词工具实现
 """
 import re
+from types import SimpleNamespace
 
 import httpx
 from typing import Dict, List, Optional
@@ -13,6 +14,8 @@ from keytao_bot.utils.keytao_encoding import (
     build_alternate_pronunciation_codes as _build_alternate_pronunciation_codes,
     build_phrase_pronunciation_codes as _build_phrase_pronunciation_codes,
     normalize_contextual_phrase_encoding,
+    expand_fly_key_codes,
+    scheme_phonetic_bases,
 )
 from keytao_bot.utils.pending_confirmation import render_remediation_reply
 from keytao_bot.utils.keytao_candidate_preference import (
@@ -234,6 +237,9 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
         elif key in encode_data:
             result[key] = encode_data[key]
 
+    if requested_code:
+        result["requestedCodeAnalysis"] = _scheme_requested_code_analysis(result, requested_code)
+
     if not result["success"]:
         result["message"] = render_remediation_reply(
             "编码服务未能返回有效候选编码",
@@ -241,6 +247,48 @@ def _normalize_encode_response(word: str, encode_data: Dict, infer_data: Optiona
             words=(word,),
         )
     return apply_zhe_fe_chain_preference(word, result)
+
+
+def _scheme_requested_code_analysis(result: Dict, code: str) -> Dict:
+    """A default-reading miss is not a scheme rejection of every reading."""
+    from keytao_bot.utils.explicit_code import validate_explicit_code
+    unknown = {"code": code, "supported": False, "matchType": "unverified",
+               "message": f"未能核验 {code}；当前读音或编码证据不完整，不能据此判定编码无效"}
+    if result.get("semanticPronunciationNeeded") or result.get("pronunciationSource") == "zdic-unavailable":
+        return unknown
+    syllables = [char.get("pinyin", "") for char in result["chars"]]
+    if len(syllables) != len(result["word"]) or not scheme_phonetic_bases(syllables):
+        return unknown
+    groups = [(syllables, result["codes"] + result["altCodes"])]
+    for variant in [*result["alternatePronunciationCodes"], *result["alternatePhrasePronunciationCodes"]]:
+        reading = list(syllables)
+        index = variant.get("charIndex", 0)
+        if not isinstance(index, int) or not 0 <= index < len(reading):
+            continue
+        reading[index] = variant["pinyin"]
+        groups.append((reading, variant["codes"]))
+    readings, codes = {}, []
+    for reading, chain in groups:
+        for candidate in expand_fly_key_codes(reading, chain):
+            if candidate not in readings:
+                codes.append((candidate, False))
+                readings[candidate] = " ".join(reading)
+    state = SimpleNamespace(word=result["word"], phrase_type="Single" if len(result["word"]) == 1 else "Phrase",
+                            candidates=codes, server_candidates=codes, pronunciation_codes=readings)
+    validation = validate_explicit_code(state, code)
+    if not validation.valid:
+        if not codes or not all(syllables):
+            return unknown
+        return {"code": code, "supported": False, "matchType": "unsupported", "message": validation.reason}
+    bases = scheme_phonetic_bases(validation.pinyin.split())
+    base = next((base for base in bases if code.startswith(base)), "")
+    series = [candidate for candidate, _ in codes if base and candidate.startswith(base)
+              and readings[candidate] == validation.pinyin]
+    return {"code": code, "supported": True,
+            "matchType": ("flyKey" if base in bases[1:] else "standard") if validation.known_candidate else "sameSeries",
+            "pinyin": validation.pinyin, "seriesBase": base, "seriesCodes": series,
+            "needsManualReview": not validation.known_candidate,
+            "message": f"{code} 符合读音 {validation.pinyin} 的编码规则" + (f"；{validation.manual_reason}" if validation.manual_reason else "")}
 
 
 def _format_candidate_status(code: str, phrases: List[Dict]) -> Dict:

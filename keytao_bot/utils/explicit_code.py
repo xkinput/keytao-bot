@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unicodedata
 
 from .candidate_inventory import select_candidate_inventory
-from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code
+from .keytao_encoding import build_phrase_code_chain, pinyin_to_phonetic_code, scheme_phonetic_bases
 
 
 @dataclass(frozen=True)
@@ -201,12 +201,15 @@ def validate_explicit_code(state, code: str, pinyin: str = "") -> ExplicitCodeVa
             candidate[:base_length] for candidate in inventory
             if state.pronunciation_codes.get(candidate) == pinyin and len(candidate) >= base_length
         ))
+        # Inventory absence is not scheme invalidity. Bind all allowed bases
+        # to this exact reviewed reading; an unknown shape remains sealed.
+        reviewed_bases = list(dict.fromkeys([*reviewed_bases, *scheme_phonetic_bases(syllables)]))
         bases.extend(reviewed_bases)
         matches.extend((pinyin, base) for base in reviewed_bases if code.startswith(base))
     if not matches:
         return fail(
             f"编码 {code} 的音码前缀不符；已审读音对应 {' / '.join(bases)}"
-            if bases else "当前记录缺少可核验的读音，请先重新查询"
+            if bases else "当前记录缺少可核验的读音，未能核验该编码，请先重新查询"
         )
     pinyin, base = matches[0]
     suffix = code[len(base):]

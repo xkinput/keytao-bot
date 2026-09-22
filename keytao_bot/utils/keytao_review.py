@@ -2752,7 +2752,13 @@ def _returned_pronunciation_groups(
         default_display = list(_project_phrase_syllables(word, default_display))
 
     groups: List[Dict[str, Any]] = []
-    default_codes = clean_codes(encode_data.get("codes"))
+    from .keytao_encoding import expand_fly_key_codes, scheme_phonetic_bases
+    default_bases = scheme_phonetic_bases(list(default_sequence))
+    default_codes = clean_codes([
+        *(encode_data.get("codes") or []),
+        *(code for code in encode_data.get("altCodes") or []
+          if any(str(code).startswith(base) for base in default_bases)),
+    ])
     if len(default_sequence) == spoken_count and all(default_sequence) and default_codes:
         groups.append({
             "pinyin": (
@@ -2836,6 +2842,8 @@ def _returned_pronunciation_groups(
             "codes": codes,
             "isDefault": False,
         })
+    for group in groups:
+        group["codes"] = expand_fly_key_codes(group["normalized"], group["codes"])
     return groups
 
 
@@ -4108,6 +4116,8 @@ async def prepare_reviewed_word(
             codes = sole_unscoped_alternate_codes
         if not codes:
             continue
+        from .keytao_encoding import expand_fly_key_codes
+        codes = expand_fly_key_codes(list(sequence), codes)
         for code in codes:
             if code not in all_codes:
                 all_codes.append(code)
@@ -4163,6 +4173,10 @@ async def prepare_reviewed_word(
             lookup_failed=lookup_failed,
         )
         pronunciation["candidateStatuses"] = statuses
+        from .keytao_encoding import scheme_phonetic_bases
+        bases = scheme_phonetic_bases(pronunciation["normalized"])
+        for status in statuses:
+            status["flyKey"] = any(status["code"].startswith(base) for base in bases[1:])
         if lookup_failed:
             # A failed lookup gives no evidence that any code is free, so no
             # recommendation may be derived from it.
