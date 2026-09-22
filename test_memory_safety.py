@@ -3343,7 +3343,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     space_key=space_key,
                     owner_label="Ealin",
                 )
-                self.assertEqual(response, "batch-added")
+                self.assertEqual(response, "batch-added\n未选择：1. 还车 → htje、3. 还车 → htjevu；这些候选本次未添加。")
                 self.assertEqual(execute.await_count, 1)
                 self.assertEqual(
                     execute.await_args.args[1],
@@ -3362,7 +3362,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     space_key=space_key,
                     owner_label="Ealin",
                 )
-                self.assertEqual(response, "batch-added")
+                self.assertEqual(response, "batch-added\n未选择：1. 还车 → htje、3. 还车 → htjevu；这些候选本次未添加。")
                 self.assertEqual(execute.await_count, 2)
                 self.assertEqual(
                     execute.await_args.args[1],
@@ -3380,7 +3380,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     space_key=space_key,
                     owner_label="Ealin",
                 )
-                self.assertEqual(response, "batch-added")
+                self.assertEqual(response, "batch-added\n未选择：1. 还车 → htje、3. 还车 → htjevu；这些候选本次未添加。")
                 self.assertEqual(execute.await_count, 3)
                 self.assertEqual(
                     execute.await_args.args[1],
@@ -17993,7 +17993,8 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(client.completions.calls), 1)
         self.assertEqual(calls, [])
-        self.assertIn("没有明确要求执行", result)
+        self.assertIn("还没有核对出可执行的词条和编码", result)
+        self.assertNotIn("没有明确要求执行", result)
         self.assertIn("未写入", result)
         self.assertIn("查看草稿", result)
         self.assertNotIn("verb_not_matched", result)
@@ -18021,7 +18022,8 @@ class ReadOnlyTurnToolExposureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(client.completions.calls), 1)
         self.assertIs(next(client.completions.responses), repeated_response)
-        self.assertEqual(result.count("没有明确要求执行"), 1)
+        self.assertEqual(result.count("还没有核对出可执行的词条和编码"), 1)
+        self.assertNotIn("没有明确要求执行", result)
         self.assertEqual(result.count("未写入"), 1)
         self.assertIn("查看草稿", result)
         self.assertNotIn("repeatedBlock", result)
@@ -19151,7 +19153,8 @@ class OrchestratorTrustBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("不可信参考资料", user_message["content"])
         self.assertEqual(real_calls, [])
         self.assertEqual(len(client.completions.calls), 1)
-        self.assertIn("没有明确要求执行", result)
+        self.assertIn("还没有核对出可执行的词条和编码", result)
+        self.assertNotIn("没有明确要求执行", result)
         self.assertIn("未写入", result)
         self.assertIn("查看草稿", result)
         self.assertNotIn("verb_not_matched", result)

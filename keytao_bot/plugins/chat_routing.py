@@ -1930,6 +1930,15 @@ def _resolve_reviewed_multi_word_selection(
     if unquoted is not None:
         source = unquoted
     selection = parse_reviewed_selection_command(source)
+    # Bare ordinals have a unique word only when the entire live query does.
+    bare = parse_pending_candidate_selection(source)
+    query_words = state.args.get("_query_words", live_words)
+    if selection is None and bare is not None and len(live_words) == len(query_words) == 1:
+        selectors = tuple(map(str, bare.indices)) or bare.codes
+        if len(selectors) == 1:
+            selection = parse_reviewed_selection_command(
+                f"{live_words[0]} {selectors[0]}" + ("，加入并提交" if bare.submit_after else "")
+            )
     pairs = selection.pairs if selection is not None else None
 
     def explain(reason: str) -> str:
@@ -1952,6 +1961,7 @@ def _resolve_reviewed_multi_word_selection(
             re.search(r"[\u3400-\u9fff]+[ \t]+(?:[0-9]+|[a-zA-Z]+)", source)
             or any(re.match(rf"{re.escape(word)}\s+", source) for word in live_words)
             or re.fullmatch(r"[1-9][0-9]{0,2}", source)
+            or bare is not None
         ):
             return None, None, explain(
                 "看到了你的选词请求，但其中有重复词条、缺少选择或无法识别的附加内容；本次未写入"

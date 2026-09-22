@@ -2553,7 +2553,7 @@ class AgentOrchestrator:
                                 if termination_state is not None:
                                     termination_state["model_authored_reply"] = False
                                 return _format_server_bound_confirmation_prompt(proposal_record.state)
-                            return "已核对改码方案，但暂时无法保存待确认操作；本次未写入。"
+                            return render_remediation_reply("已核对操作方案，但暂时无法保存待确认操作；本次未写入")
                         observe_tool_result(result_data)
                         if (
                             termination_state is not None
@@ -2590,7 +2590,7 @@ class AgentOrchestrator:
                                 termination_state["model_authored_reply"] = False
                             return self._append_authoritative_result_links(
                                 render_remediation_reply(
-                                    "当前消息没有明确要求执行这项操作；该操作未写入"
+                                    "看到了操作请求，但还没有核对出可执行的词条和编码；本次未写入"
                                 ),
                                 authoritative_result_links,
                             )

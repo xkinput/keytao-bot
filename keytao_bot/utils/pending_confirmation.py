@@ -990,7 +990,7 @@ _SELECTION_ADD_FORMS = _selection_action_forms(PENDING_BATCH_ADD_ASSENT_TEXTS)
 _SELECTION_ADD_SUBMIT_FORMS = _selection_action_forms(
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS
 )
-_SELECTION_SEPARATORS = r"(?:\s+|[、,]|和)+"
+_SELECTION_SEPARATORS = r"(?:\s+|[、,;]|和)+"
 _MULTI_NUMBER_SELECTION_RE = re.compile(
     rf"[1-9]\d{{0,2}}(?:{_SELECTION_SEPARATORS}[1-9]\d{{0,2}})*"
 )
@@ -1045,25 +1045,22 @@ def _parse_compound_number_selection(
 
 
 def _strip_selection_action(text: str) -> tuple[str, bool]:
-    for action in _SELECTION_ADD_SUBMIT_FORMS:
-        if text.startswith(action):
-            return text[len(action):].strip(), True
-        if text.endswith(action):
-            return text[:-len(action)].strip(), True
-    for action in _SELECTION_ADD_FORMS:
-        if text.startswith(action):
-            selection = text[len(action):].strip()
-            if selection.endswith("并提交"):
-                return selection[:-3].strip(), True
-            return selection, False
-        if text.endswith(action):
-            return text[:-len(action)].strip(), False
+    for forms, submit in ((_SELECTION_ADD_SUBMIT_FORMS, True), (_SELECTION_ADD_FORMS, False)):
+        for action in forms:
+            pattern = rf"(?:只要|只|仅|就|光)?\s*{re.escape(action)}"
+            leading = re.match(rf"^{pattern}\s*[,、;]?\s*", text)
+            trailing = re.search(rf"\s*[,、;]?\s*{pattern}$", text)
+            if leading or trailing:
+                selection = (text[leading.end():] if leading else text[:trailing.start()]).strip()
+                if selection.endswith("并提交"):
+                    return selection[:-3].strip(), True
+                return selection, submit
     return text, False
 
 
 def parse_pending_candidate_selection(text: str) -> PendingCandidateSelection | None:
     """Parse advertised multi-number or multi-code replies as a closed grammar."""
-    source = unicodedata.normalize("NFKC", str(text or "")).strip()
+    source = unicodedata.normalize("NFKC", str(text or "")).strip().rstrip("。.").strip()
     if (
         not source
         or re.search(r"[?？\"'“”‘’「」『』]", source)

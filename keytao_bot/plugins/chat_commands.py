@@ -10742,6 +10742,38 @@ async def _handle_pending_add_word(
     command_intent: Optional[MessageCommandIntent] = None,
     restore_pending: Optional[Callable[[], None]] = None,
 ) -> Optional[str]:
+    """Keep the exact selection and its exclusions visible at both entrypoints."""
+    response = await _execute_pending_add_word(
+        state, message, platform, user_id, history, space_key, owner_label,
+        command_intent, restore_pending,
+    )
+    selection = parse_pending_candidate_selection(
+        _strip_command_message_prefixes(trusted_mutation_source(message))
+    )
+    if response is not None and selection is not None and state.server_candidates == state.candidates:
+        selected = set(selection.codes) | {
+            state.candidates[index - 1][0] for index in selection.indices
+            if 1 <= index <= len(state.candidates)
+        }
+        omitted = [f"{index}. {state.word} → {code}"
+                   for index, (code, _) in enumerate(state.server_candidates, 1)
+                   if code not in selected]
+        if selected and omitted:
+            response += "\n未选择：" + "、".join(omitted) + "；这些候选本次未添加。"
+    return response
+
+
+async def _execute_pending_add_word(
+    state: PendingAddWord,
+    message: str,
+    platform: str,
+    user_id: str,
+    history: List[Dict],
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+    command_intent: Optional[MessageCommandIntent] = None,
+    restore_pending: Optional[Callable[[], None]] = None,
+) -> Optional[str]:
     """Handle user response to a pending add-word prompt.
 
     Returns a response string if handled directly, None to fall through to AI.

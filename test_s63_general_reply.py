@@ -154,7 +154,10 @@ class GeneralReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dispatches, ["keytao_encode"])
         self.assertIsNone(store.get_record(context.conversation_address))
         self.assertEqual(len(client.completions.calls), 2, "A local refusal must not request a fabricated explanation")
-        self.assertIn("没有明确要求", response)
+        self.assertIn("看到了操作请求", response)
+        self.assertIn("还没有核对出可执行的词条和编码", response)
+        self.assertIn("查看草稿", response)
+        self.assertNotIn("没有明确要求", response)
         self.assertNotIn("服务未完成", response)
 
     async def test_exclusion_binding_refusal_keeps_its_distinct_reason(self):

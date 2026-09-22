@@ -2997,7 +2997,7 @@ def parse_reviewed_selection_command(message: str) -> Optional[ReviewedSelection
     source = str(message or "").strip().rstrip("。.").strip()
     if not source or len(source) > 4096:
         return None
-    action_pattern = r"(?:加入草稿并提交|加到草稿并提交|加入并提交|加入草稿|加到草稿|写入草稿|加入)"
+    action_pattern = r"(?:只要|只|仅|就|光)?\s*(?:加入草稿并提交|加到草稿并提交|加入并提交|加入草稿|加到草稿|写入草稿|加入|添加|加词)"
     separator = r"(?:[ \t]*[，、,；;][ \t]*|[ \t]+)"
     action = ""
     leading = re.fullmatch(rf"(?P<action>{action_pattern}){separator}(?P<body>.+)", source)
@@ -3044,9 +3044,11 @@ def looks_like_mutation_grammar_gap(message: str) -> bool:
         "", trusted_mutation_source(message), count=1
     ).strip()
     compact = re.sub(r"\s+", "", source)
+    masked_source = _mask_quoted_record_frames(source)
     if (
         not compact
         or re.search(r"[?？]", compact)
+        or re.match(r"^(?:请)?(?:解释|说明|复述|翻译|引用|转述|原话)", compact)
         or _NEGATIVE_MODAL_RE.search(compact)
         or re.match(r"^(?:先不要|暂时不|没|未|尚未|并非|无须|毋须|绝不能|甭|勿)", compact)
         or _NEGATED_NON_POSITIONAL_MUTATION_RE.search(compact)
@@ -3056,6 +3058,10 @@ def looks_like_mutation_grammar_gap(message: str) -> bool:
         or _META_DISCUSSION_RE.search(compact)
         or _EXPLANATION_ONLY_RE.search(compact)
         or _TEXT_TRANSFORM_RE.search(compact)
+        # A grammar gap cannot require a fully parsed inner command before
+        # recognizing that the command is merely being recorded or relayed.
+        or any(not _record_frame_is_mutation_operand(masked_source, match)
+               for match in _RECORD_FRAME_RE.finditer(masked_source))
     ):
         return False
     return bool(
@@ -3069,7 +3075,10 @@ def looks_like_mutation_grammar_gap(message: str) -> bool:
                 re.IGNORECASE,
             )
         )
-        and re.search(r"[a-z]{1,12}", compact, re.IGNORECASE)
+        # A reviewed add may name an ordinal instead of spelling out a code.
+        # This detects intent only; the executor still validates every operand.
+        and (re.search(r"[a-z]{1,12}", compact, re.IGNORECASE)
+             or re.search(ADD_OPERATION_VERB_PATTERN, compact))
         and re.search(r"[\u3400-\u9fff]{1,16}", compact)
     )
 

@@ -1476,6 +1476,18 @@ class ToolExecutor:
                 tool_name, arguments, context, policy_error,
             )
             if proposal is not None:
+                if proposal.get("grammar_gap_rejected") is True:
+                    raw_items = arguments.get("items") if tool_name == "keytao_batch_add_to_draft" else [arguments]
+                    words = list(dict.fromkeys(
+                        item["word"] for item in raw_items
+                        if isinstance(item, dict) and isinstance(item.get("word"), str)
+                        and re.fullmatch(r"[\u3400-\u9fff]{1,16}", item["word"])
+                    )) if isinstance(raw_items, list) else []
+                    command = "加词 " + " ".join(words) if 0 < len(words) <= 10 else "查看草稿"
+                    proposal["message"] = (
+                        str(proposal["message"]).strip().rstrip("。")
+                        + f"。可发送「{command}」重新核对。"
+                    )
                 return json.dumps(proposal, ensure_ascii=False)
             logger.warning(f"Tool {tool_name} blocked by policy: {policy_error}")
             return json.dumps(policy_error, ensure_ascii=False)
@@ -1569,6 +1581,10 @@ class ToolExecutor:
             or context.attachment_context
             or message_authorizes_mutation(message)
             or not looks_like_mutation_grammar_gap(message)
+            # Only reviewed entry proposals can replace prose operands with
+            # a same-turn candidate capability. Keep other S58 families literal.
+            or (not re.search(r"[a-z]{1,12}", message, re.IGNORECASE)
+                and tool_name not in {"keytao_create_phrase", "keytao_batch_add_to_draft"})
         ):
             return None
         refusal = {
@@ -1791,6 +1807,8 @@ class ToolExecutor:
         lookup_words = []
         old_key = "oldWord" if batch else "old_word"
         allowed = {"word", "code", "action", "old_word", "type"}
+        if batch:
+            allowed.add("remark")
         for raw in raw_items:
             if not isinstance(raw, dict) or set(raw) - allowed:
                 return None
@@ -1800,8 +1818,14 @@ class ToolExecutor:
                 not isinstance(word, str) or not re.fullmatch(r"[\u3400-\u9fff]{1,16}", word)
                 or not isinstance(code, str) or not re.fullmatch(r"[a-z]{1,6}", code)
                 or action not in {"Create", "Change", "Delete"}
-                or not _contains_exact_target(source, word)
-                or not _code_is_bound_to_target(source, word, code, frozenset())
+                # Create proposals use same-turn reviewed capabilities as
+                # their operand source. Change/Delete still require literal
+                # source operands as well as current dictionary identities.
+                or (action != "Create" and (
+                    not _contains_exact_target(source, word)
+                    or not _code_is_bound_to_target(source, word, code, frozenset())
+                ))
+                or ("remark" in raw and not isinstance(raw["remark"], str))
                 or _is_word_protected(source, word)
                 or _has_protection_outside_target(source, word)
                 or (action != "Change" and old_word is not None)
