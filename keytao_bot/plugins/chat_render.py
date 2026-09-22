@@ -1540,6 +1540,9 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         if review.get("type") == "Single" and review.get("encodingNote"):
             review_parts.append(str(review["encodingNote"]))
         lines.append("审词：" + "；".join(review_parts) + "；")
+        correction = review.get("readingCorrection")
+        if isinstance(correction, dict) and correction.get("note"):
+            lines.append(str(correction["note"]))
         lines.append(pre_submit_preview or "自动审核：预审未完成")
         lines.append("候选编码:")
         for status in pronunciation.get("candidateStatuses", []):

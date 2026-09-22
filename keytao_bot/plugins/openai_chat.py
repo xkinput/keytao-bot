@@ -3874,6 +3874,20 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     ctx.resolved_advertised_words = ()
     ctx.advertised_snapshot_token = ""
     if (
+        _chat_routing.parse_parenthesised_readings(ctx.normalized_message_text)
+        and current_record is not None
+        and not current_record.execution_id
+        and isinstance(current_record.state, PendingToolConfirm)
+        and current_record.state.args.get("_reviewed_multi_word") is True
+        and current_record.state.confirmation_source != "server_warning"
+        and draft_operation_coordinator.get(ctx.conv_key) is None
+    ):
+        # A new annotated query replaces the unsent review selector. It must
+        # not be mistaken for assent to the previous pronunciation snapshot.
+        conversation_state_store.delete(ctx.conv_key)
+        ctx.current_pending_record = None
+        return False
+    if (
         current_record is not None
         and not current_record.execution_id
         and isinstance(current_record.state, PendingToolConfirm)

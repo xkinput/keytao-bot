@@ -26,6 +26,7 @@ from ..harness.authorization_grammar import (
     explicit_complete_add_item,
     is_interrogative_message,
     looks_like_lexical_review_target,
+    strip_self_mention_tokens,
     parse_dictionary_delete_command,
     parse_dictionary_recode_command,
     parse_entry_move_plan,
@@ -46,6 +47,7 @@ from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.candidate_inventory import protected_candidate_occupants
 from ..utils.explicit_code import parse_explicit_code_request, readings_match, validate_explicit_code
 from ..utils.literal_phrase import parse_explicit_single_phrase_add, parse_literal_phrase_query
+from ..utils.reading_request import parse_parenthesised_readings
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     PENDING_ASSENT_TEXTS,
@@ -514,7 +516,7 @@ def _record_flow_for_intent(command_intent: MessageCommandIntent) -> None:
 
 
 def _strip_command_message_prefixes(message_text: str) -> str:
-    text = message_text.strip()
+    text = strip_self_mention_tokens(message_text).strip()
     while text:
         stripped = _LEADING_COMMAND_PREFIX_RE.sub("", text, count=1).strip()
         if stripped == text:
@@ -2745,6 +2747,7 @@ async def _classify_message_command_intent(
         parse_same_code_reorder(message_text) is not None
         or parse_explicit_entry_code_request(message_text) is not None
         or parse_existing_entry_move(message_text) is not None
+        or parse_parenthesised_readings(message_text)
     ):
         return MessageCommandIntent()
     if not OPENAI_API_KEY or not AsyncOpenAI:

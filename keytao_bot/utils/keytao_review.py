@@ -628,6 +628,34 @@ def pinyin_sequence_label(sequence: Sequence[str]) -> str:
     return " ".join(sequence)
 
 
+def _requested_reading_context(requested: str, reviewed: str) -> Dict[str, Any]:
+    """Keep the literal annotation; correct tones only after syllable identity agrees."""
+    context: Dict[str, Any] = {"requestedReading": requested}
+    if normalize_pinyin_sequence(requested) != normalize_pinyin_sequence(reviewed):
+        return context
+
+    def tone(syllable: str) -> Optional[int]:
+        if re.search(r"[0-5]$", syllable):
+            return int(syllable[-1]) or 5
+        decomposed = unicodedata.normalize("NFD", syllable)
+        return next((number for number, mark in enumerate("\u0304\u0301\u030c\u0300", 1)
+                     if mark in decomposed), None)
+
+    corrections = [
+        {"requested": original, "reviewed": standard}
+        for original, standard in zip(requested.split(), reviewed.split())
+        if tone(standard) is not None and tone(original) != tone(standard)
+    ]
+    if corrections:
+        context["readingCorrection"] = {
+            "reviewedReading": reviewed, "corrections": corrections,
+            "note": "读音按标准 " + "/".join(row["reviewed"] for row in corrections)
+                    + "（你标注的 " + "、".join(row["requested"] for row in corrections)
+                    + " 已按此更正）",
+        }
+    return context
+
+
 def _strip_tags(value: str) -> str:
     text = _SCRIPT_STYLE_RE.sub(" ", value)
     text = _HTML_TAG_RE.sub(" ", text)
@@ -3737,15 +3765,24 @@ async def prepare_reviewed_word(
                 for group in returned_groups
             ) or "无"
             return apply_review_disposition(apply_manual_review_flag({
-                "success": False,
+                "success": True,
                 "word": word,
                 "pronunciations": [],
                 "recommendedCode": "",
                 "pronunciationUnresolved": True,
                 "requiresManualPronunciationReview": True,
+                "requestedReading": requested_reading,
                 "message": (
                     f"「{word}」的指定读音 {requested_label} 与编码服务返回的"
-                    f"候选读音都不匹配。可用读音：{available}。"
+                    f"候选读音都不匹配。可用读音：{available}。\n"
+                    + "\n".join(
+                        f"- {group['pinyin']}：{'、'.join(group['codes'])}"
+                        for group in returned_groups
+                        if not _pronunciation_sequence_rejection_reason(
+                            word, group.get("normalized") or (), encode_data,
+                        )
+                    )
+                    + "\n请明确要采用的读音或具体含义；本次未写入。"
                 ),
             }, True, "指定读音不在编码服务候选组中"), "pronunciation_unresolved")
 
@@ -3810,6 +3847,12 @@ async def prepare_reviewed_word(
                 else "user_selected_encode_group"
             ),
             "differsFromAuthoritativeReading": differs_from_authority,
+            "availableReadings": [
+                group for group in returned_groups
+                if not _pronunciation_sequence_rejection_reason(
+                    word, group.get("normalized") or (), encode_data,
+                )
+            ],
         }
     # Rejected web evidence belongs to another word (or fails this word's
     # character readings). Keep it rejected and auditable, but do not let its
@@ -4205,6 +4248,8 @@ async def prepare_reviewed_word(
     }
     if pronunciation_resolution:
         result["pronunciationResolution"] = pronunciation_resolution
+    if requested_reading and len(pronunciations) == 1:
+        result.update(_requested_reading_context(requested_reading, pronunciations[0]["pinyin"]))
     if punctuated_phrase:
         result["pronunciationCharacterIndexes"] = list(pronunciation_indexes)
     if lookup_failed:

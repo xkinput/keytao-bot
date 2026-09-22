@@ -317,6 +317,9 @@ _COMMAND_CLAUSE_SPLIT_RE = re.compile(r"[，,。.!！?？;；\n]+")
 _LEADING_MENTION_RE = re.compile(
     r"^\s*(?:@[^\s@]{1,24}|喵喵)[\s:：]+"
 )
+_SELF_MENTION_RE = re.compile(
+    r"(?:@(?:喵喵|键道)|(?<![\w@])(?:喵喵|键道))(?=$|[\s@:：，,、；;])"
+)
 _IMPERATIVE_COMMAND_WRAPPER_RE = re.compile(
     r"^(?:(?:请\s*)?执行|请帮我|帮我|麻烦(?:你|帮我)?)"
     r"(?:\s*[:：]\s*|\s+)(?=\S)"
@@ -2269,9 +2272,15 @@ def _whole_message_unquoted_source(
     return content
 
 
+def strip_self_mention_tokens(message: str) -> str:
+    """Remove repeated self-address tokens without erasing other users or word substrings."""
+    return _SELF_MENTION_RE.sub("", str(message or ""))
+
+
 def normalize_mutation_command_source(message: str) -> str:
     """Remove routing metadata and explicit imperative wrappers once, upstream."""
-    source = _LEADING_MENTION_RE.sub("", str(message or ""), count=1).strip()
+    source = strip_self_mention_tokens(message)
+    source = _LEADING_MENTION_RE.sub("", source, count=1).strip()
     return _IMPERATIVE_COMMAND_WRAPPER_RE.sub("", source, count=1).strip()
 
 

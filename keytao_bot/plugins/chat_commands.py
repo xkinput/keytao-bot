@@ -1086,8 +1086,8 @@ async def _try_recover_reviewed_add_from_history(
 
 
 _EXPLICIT_READING_TOKEN_PATTERN = (
-    r"[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ]+"
-    r"(?:\s+[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ]+){0,19}"
+    r"[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ]+[0-5]?"
+    r"(?:\s+[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ]+[0-5]?){0,19}"
 )
 
 
@@ -3476,6 +3476,8 @@ async def _prepare_multi_word_query(
     conv_key: Optional[ConversationKey],
     space_key: Optional[Tuple[str, str]],
     owner_label: str,
+    *,
+    reading_requests: tuple = (),
 ) -> str:
     """Collect the single-word pipeline into one durable candidate capability."""
     if len(words) > _MAX_BARE_MULTI_WORD_QUERY_ITEMS:
@@ -3484,9 +3486,12 @@ async def _prepare_multi_word_query(
     other_blocks: List[str] = []
     for word in words:
         count = len(scopes)
+        request = next((row for row in reading_requests if row.word == word), None)
         response = await _try_handle_simple_single_word_query(
             word, platform, user_id, conv_key, space_key, owner_label,
             _prepared_scopes=scopes,
+            requested_reading=request.reading if request else "",
+            requested_code=request.code if request else "",
         )
         if len(scopes) == count:
             other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
@@ -3567,10 +3572,20 @@ async def _try_handle_simple_single_word_query(
     *,
     requested_reading: str = "",
     requested_meaning: str = "",
+    requested_code: str = "",
     actionable_lookup: bool = False,
     _prepared_scopes: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
+    from ..utils.reading_request import parse_parenthesised_readings
+
+    reading_requests = parse_parenthesised_readings(message_text) if _prepared_scopes is None else ()
+    if reading_requests:
+        set_turn_flow("word-discovery")
+        return await _prepare_multi_word_query(
+            tuple(row.word for row in reading_requests), platform, user_id, conv_key, space_key, owner_label,
+            reading_requests=reading_requests,
+        )
     multi_words = _bare_multi_word_query_words(message_text) if _prepared_scopes is None else ()
     if multi_words:
         set_turn_flow("word-discovery")
@@ -3719,6 +3734,36 @@ async def _try_handle_simple_single_word_query(
     except Exception:
         review = {}
 
+    # An initial annotation is context, not a second confirmation of a
+    # syllable conflict. The existing explicit-reading follow-up resolves it.
+    choice = review.get("multiSenseChoice") or {}
+    if _prepared_scopes is not None and choice.get("differsFromAuthoritativeReading"):
+        chains = choice.get("availableReadings") or []
+        return (
+            f"「{word}」标注的读音 {requested_reading} 与已审读音存在音节差异。\n"
+            + "\n".join(f"- {row['pinyin']}：{'、'.join(row['codes'])}" for row in chains)
+            + "\n请明确要采用的读音或具体含义；本次未写入。"
+        )
+    if requested_code and not review.get("pronunciationUnresolved"):
+        inventory = select_candidate_inventory(review)
+        if inventory is None or requested_code not in dict(inventory.candidates):
+            chains = choice.get("availableReadings") or review.get("pronunciations") or []
+            return (
+                f"「{word}」标注的编码 {requested_code} 不在该读音的已审候选链中，本次未写入。\n"
+                + "\n".join(
+                    f"- {group.get('pinyin', '')}："
+                    + "、".join(group.get("codes") or [
+                        str(row.get("code") or "") for row in group.get("candidateStatuses") or []
+                    ])
+                    for group in chains
+                )
+                + "\n请明确要采用的读音或编码。"
+            )
+        review["recommendedCode"] = requested_code
+        for group in review.get("pronunciations") or []:
+            if any(row.get("code") == requested_code for row in group.get("candidateStatuses") or []):
+                group["recommendedCode"] = requested_code
+
     reviewed_prompt = _format_reviewed_add_prompt(review)
     if reviewed_prompt:
         reviewed_prompt = prepend_pending_word_reminders(
@@ -3755,6 +3800,12 @@ async def _try_handle_simple_single_word_query(
                     words=(word,),
                 )
             pending.pronunciation_codes = dict(inventory.readings)
+            if requested_reading:
+                for code in inventory.readings:
+                    pending.code_remarks[code] = (
+                        pending.code_remarks.get(code, "")
+                        + f"；用户标注读音 {requested_reading}"
+                    ).lstrip("；")
             group_recommended = str(
                 inventory.group_recommended_code or pending.recommended_code
             ).strip().lower()
@@ -3769,6 +3820,7 @@ async def _try_handle_simple_single_word_query(
                     "orderingAssessments": list(pending.server_ordering_assessments),
                     "reviewedState": _pending_add_word_payload(pending),
                     "reviewedPrompt": reviewed_prompt,
+                    "requestedReading": requested_reading,
                 })
                 return ""
             target_key = conv_key or (
