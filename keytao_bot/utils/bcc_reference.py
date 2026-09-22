@@ -146,23 +146,29 @@ def historical_comparison_signal(front, behind):
     return None
 
 
-def format_historical(bcc):
+def format_historical(bcc, *, other=None, observed_only=False):
     rows = {row['channel']: row for row in bcc.get('historicalChannels', [])}
+    other_rows = {row['channel']: row for row in (other or {}).get('historicalChannels', [])}
+    channels = [channel for channel in HISTORICAL_CHANNELS
+                if not observed_only or rows.get(channel, {}).get('count') is not None
+                or other_rows.get(channel, {}).get('count') is not None]
     return '；'.join(
         f"{channel} " + (format_frequency(rows[channel].get('count'), rows[channel].get('perMillion'))
                         if rows.get(channel, {}).get('available') else '数据未安装')
-        for channel in HISTORICAL_CHANNELS)
+        for channel in channels) or ('历史频道均未收录'
+            if all(rows.get(channel, {}).get('available') for channel in HISTORICAL_CHANNELS)
+            else '暂无可用历史记录')
 
 
-def format_frequency(count, rate):
+def format_frequency(count, rate, *, precision=2):
     if count is None:
         return "未收录"
     # Do not round a small but real observation down to zero.
-    value = f"{rate:.2f}".rstrip("0").rstrip(".") if rate >= 0.01 else f"{rate:.2g}"
+    value = f"{rate:.{precision}f}".rstrip("0").rstrip(".") if rate >= 0.01 else f"{rate:.{precision}g}"
     return f"{count:,}（每百万 {value}）"
 
 
-def format_bcc(bcc, other=None):
+def format_bcc(bcc, other=None, *, precision=2):
     if not bcc.get("available"):
         return ""
     other_channels = {row["channel"]: row for row in (other or {}).get("channels", [])}
@@ -171,9 +177,9 @@ def format_bcc(bcc, other=None):
         right = other_channels.get(row["channel"], {})
         if row['count'] is None and right.get('count') is None:
             continue
-        value = format_frequency(row["count"], row["perMillion"])
+        value = format_frequency(row["count"], row["perMillion"], precision=precision)
         if other is not None:
             right = other_channels.get(row["channel"], {})
-            value += " vs " + format_frequency(right.get("count"), right.get("perMillion"))
+            value += " vs " + format_frequency(right.get("count"), right.get("perMillion"), precision=precision)
         parts.append(f"{row['channel']} {value}")
-    return "BCC " + "；".join(parts) if parts else "BCC 四个现代频道均未收录（发布表最低计数为 6，未收录不等于零次）"
+    return "BCC " + "；".join(parts) if parts else "BCC 四个现代频道均未收录"

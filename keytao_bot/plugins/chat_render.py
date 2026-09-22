@@ -21,6 +21,7 @@ from ..harness.state import (
 )
 from ..utils import review_flags
 from ..utils import http_client
+from ..utils.commonness_copy import candidate_commonness_summary_copy
 from ..utils.draft_receipts import merge_receipt_deltas, receipt_change_lines
 from ..utils.pending_confirmation import (
     _BIND_HELP_TEXT,
@@ -1384,15 +1385,7 @@ def _format_candidate_ordering_assessment(
             },
             fallback_selector,
         )
-    if verdict in {"behind_more_common", "close"}:
-        return (
-            f"常用度评估：「{occupant}」不弱于「{word}」，"
-            f"维持现有排序，推荐空位 {free_code}"
-        )
-    return (
-        f"常用度评估：「{word}」与「{occupant}」的常用度信号不足，"
-        f"按空位 {free_code} 推荐"
-    )
+    return candidate_commonness_summary_copy(assessment)
 
 
 def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Optional[str]:

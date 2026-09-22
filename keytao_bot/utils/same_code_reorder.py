@@ -5,6 +5,8 @@ import json
 import re
 import unicodedata
 
+from .commonness_copy import render_commonness_summary
+
 from ..harness.authorization_grammar import (
     _DATA_CONTEXT_RE,
     _NEGATIVE_MODAL_RE,
@@ -78,15 +80,9 @@ def _advisory(first_word: str, second_word: str) -> str:
 
     first = keytao_review._query_commonness_reference(first_word)
     second = keytao_review._query_commonness_reference(second_word)
-    if not (first.get("available") and second.get("available")):
-        return "常用度提示：现有证据不足，仍按你的要求执行"
     comparison = keytao_review._compare_reference_commonness(first_word, second_word, first, second)
     keytao_review.record_commonness_evidence(comparison)
-    if comparison.get("verdict") == "behind_more_common":
-        return f"常用度提示：{second_word} 更常用，仍按你的要求执行"
-    if comparison.get("verdict") == "front_more_common":
-        return f"常用度提示：{first_word} 更常用，按你的要求执行"
-    return "常用度提示：现有证据未分出高低，仍按你的要求执行"
+    return f"常用度提示：{render_commonness_summary(comparison)}；按你的要求执行"
 
 
 async def try_handle_same_code_reorder(

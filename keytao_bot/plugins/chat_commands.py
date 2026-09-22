@@ -74,6 +74,7 @@ from ..harness.tools import (
 from ..utils.history_store import HistoryGenerationToken, get_history_store
 from ..utils.draft_mutation_store import get_default_draft_mutation_claim_store
 from ..utils.candidate_inventory import select_candidate_inventory, protected_candidate_occupants
+from ..utils.commonness_copy import render_commonness_summary
 from ..utils.explicit_code import (
     ExplicitEntryCodeRequest,
     parse_explicit_code_request,
@@ -660,19 +661,14 @@ def _protected_eviction_response(
     occupants = protected or tuple(dict.fromkeys(
         word for words in state.server_occupied_words.values() for word in words
     ))
-    names = "、".join(occupants)
     base = next(iter(state.server_candidates), ("", False))[0]
     suggestions = "\n".join(f"- 「加入，顶替 {word}」" for word in occupants)
-    assessed = all(any(
-        assessment.get("newWord") == state.word
+    reason = "；".join(render_commonness_summary(next((
+        assessment for assessment in state.server_ordering_assessments
+        if assessment.get("newWord") == state.word
         and assessment.get("occupantWord") == word
-        and assessment.get("verdict") in {"behind_more_common", "close"}
-        for assessment in state.server_ordering_assessments
-    ) for word in occupants)
-    reason = (
-        f"「{names}」的常用度不弱于「{state.word}」"
-        if assessed else f"没有足够常用度证据支持顶替「{names}」"
-    )
+        and assessment.get("occupantCode") == code
+    ), {"newWord": state.word, "occupantWord": word})) for word in occupants)
     return (
         reason + "，保留现有位置；本次未写入。\n"
         f"可指定形码后的完整编码，格式为：加入编码 {base}+形码（请替换形码部分）。"
@@ -3257,7 +3253,7 @@ async def _generate_usage_comparison_note(
             or not keytao_review._commonness_comparison_has_evidence(comparison)
         ):
             continue
-        summary = str(comparison.get("summary") or "").strip()
+        summary = render_commonness_summary(comparison)
         if summary:
             summaries.append(summary)
     if not summaries:
@@ -9707,7 +9703,7 @@ def _format_code_chain_reorder_confirmation(
         if str(line).strip()
     ]
     summaries = [
-        str(comparison.get("summary") or "").strip()
+        render_commonness_summary(comparison)
         for group in groups
         if isinstance(group, dict)
         for comparison in group.get("comparisons") or []
@@ -9740,7 +9736,7 @@ def _reorder_evidence_lines(ranking: Dict[str, Any]) -> List[str]:
         if str(line).strip()
     ]
     summaries = [
-        str(comparison.get("summary") or "").strip()
+        render_commonness_summary(comparison)
         for comparison in ranking.get("comparisons") or []
         if isinstance(comparison, dict)
         and str(comparison.get("summary") or "").strip()

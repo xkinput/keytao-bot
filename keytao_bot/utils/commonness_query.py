@@ -10,6 +10,7 @@ from .pending_confirmation import advertised_command_suggestions, render_executa
 from .same_code_reorder import parse_same_code_reorder
 from ..harness.authorization_grammar import parse_eviction_modified_add
 from .bcc_reference import format_bcc, format_historical
+from .commonness_copy import render_commonness_summary
 
 
 _PREFIX = re.compile(
@@ -89,7 +90,7 @@ def render_commonness_table(result):
         lines.append("BCC 取四个现代频道的最高每百万频次；字与词按各自表内排名比较。未收录不代表实际零次，单边收录不决定高低。")
         lines.append("古代汉语、近代汉语不计入现代频次；仅在双方现代四频道均未收录且词典与 jieba 无明确方向时破平。")
         if len(result["words"]) == 2:
-            lines.extend(item["summary"] for item in result["comparisons"])
+            lines.extend(render_commonness_summary(item) for item in result["comparisons"])
     return "\n".join(lines)
 
 

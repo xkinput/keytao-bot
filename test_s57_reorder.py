@@ -240,10 +240,10 @@ class SameCodeReorderTests(unittest.TestCase):
                 [(item["word"], item["weight"], item["type"]) for item in plan["proposedState"]],
                 [("嘢", 10, "Single"), ("咽", 11, "Single")],
             )
-            self.assertIn("常用度提示：咽 更常用，仍按你的要求执行", reply)
+            self.assertIn("常用度提示：「咽」较「嘢」更常用：语料频次 1000 vs 10", reply)
             self.assertTrue(chat._advertised_reply_matches_live_record(reply, record), reply)
             delivered = chat._enforce_advertised_reply_contract(reply, ("qq", user))
-            self.assertIn("常用度提示：咽 更常用，仍按你的要求执行", delivered)
+            self.assertIn("常用度提示：「咽」较「嘢」更常用：语料频次 1000 vs 10", delivered)
 
         asyncio.run(run())
 

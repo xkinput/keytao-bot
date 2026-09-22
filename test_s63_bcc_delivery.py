@@ -70,7 +70,8 @@ class BccDeliveryTests(unittest.TestCase):
             self.assertIn('「古例甲」较「古例乙」更常用', delivered[0])
         else:
             self.assertIn('多领域 34（每百万 0.08）', delivered[0])
-            self.assertIn('常用度信号不足', delivered[0])
+            self.assertIn('单边 BCC 收录不决定高低', delivered[0])
+            self.assertNotIn('常用度信号不足', delivered[0])
         self.assertIn('古代汉语', delivered[0])
         self.assertIn('近代汉语', delivered[0])
         self.assertIn('历史补充', delivered[0])

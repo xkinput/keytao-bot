@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover - optional dependency guard
     AsyncOpenAI = None  # type: ignore
 
 from . import http_client
+from .commonness_copy import render_commonness_summary
 from .bcc_reference import (HISTORICAL_CHANNELS, comparison_signal, format_bcc, format_frequency,
                             format_historical, historical_attested,
                             historical_comparison_signal, lookup_bcc)
@@ -5754,6 +5755,10 @@ def _reference_comparison_summary(
     basis = f"语料频次 {frequency_basis}，词典收录 {presence_basis}"
     front_bcc = front_reference.get("bcc") or {}
     behind_bcc = behind_reference.get("bcc") or {}
+    one_sided_bcc = (
+        front_bcc.get('available') and behind_bcc.get('available')
+        and bool(front_bcc.get('attested')) != bool(behind_bcc.get('attested'))
+    )
     if reason.startswith('bcc_historical_'):
         channel = '近代汉语' if 'early_modern' in reason else '古代汉语'
         rows = [next(row for row in item['historicalChannels'] if row['channel'] == channel)
@@ -5769,7 +5774,8 @@ def _reference_comparison_summary(
                       f"「{second_word}」{format_frequency(rows[1]['count'], rows[1]['perMillion'])}")
         basis += '；仅作历史语料末级破平'
     elif reason.startswith('bcc_'):
-        basis = f"{format_bcc(front_bcc)}；「{second_word}」{format_bcc(behind_bcc)}"
+        basis = (f"「{first_word}」{format_bcc(front_bcc, precision=4)}；"
+                 f"「{second_word}」{format_bcc(behind_bcc, precision=4)}")
         if 'balanced_tiebreak' in reason:
             basis += "；最高频道信号相同，采用多领域比较"
         if reason.startswith('bcc_relative_rank_'):
@@ -5778,6 +5784,9 @@ def _reference_comparison_summary(
                      for item in (front_bcc, behind_bcc)]
             basis += (f"；按各自字/词表内排名比较：前 {ranks[0]:.2%} vs "
                       f"前 {ranks[1]:.2%}（越小越靠前）")
+        else:
+            left, right, _ = comparison_signal(front_bcc, behind_bcc)
+            basis += f"；所用频次比 {left / right:.2f}×"
     else:
         # Display only the legacy evidence that contributed to this verdict.
         if reason == 'dictionary_presence_margin':
@@ -5787,18 +5796,23 @@ def _reference_comparison_summary(
         if front_bcc.get('available') and behind_bcc.get('available'):
             if verdict == 'not_enough_evidence':
                 basis = f"「{first_word}」{format_bcc(front_bcc)}；「{second_word}」{format_bcc(behind_bcc)}"
-            if bool(front_bcc.get('attested')) != bool(behind_bcc.get('attested')):
+            if one_sided_bcc:
+                if verdict != 'not_enough_evidence':
+                    basis += (f"；「{first_word}」{format_bcc(front_bcc)}；"
+                              f"「{second_word}」{format_bcc(behind_bcc)}")
                 basis += "；单边 BCC 收录不决定高低"
     if (not reason.startswith('bcc_historical_')
             and all(item.get('available') and not item.get('attested') for item in (front_bcc, behind_bcc))):
-        basis += (f"；历史补充：「{first_word}」{format_historical(front_bcc)}；"
-                  f"「{second_word}」{format_historical(behind_bcc)}（未参与判定）")
+        basis += (f"；历史补充：「{first_word}」{format_historical(front_bcc, other=behind_bcc, observed_only=True)}；"
+                  f"「{second_word}」{format_historical(behind_bcc, other=front_bcc, observed_only=True)}（未参与判定）")
     if verdict == "front_more_common":
         return f"「{front_word}」较「{behind_word}」更常用：{basis}"
     if verdict == "behind_more_common":
         return f"「{behind_word}」较「{front_word}」更常用：{basis}"
     if verdict == "close":
         return f"「{front_word}」与「{behind_word}」常用度接近：{basis}"
+    if one_sided_bcc:
+        return basis
     return f"常用度信号不足：{basis}"
 
 
@@ -7033,13 +7047,13 @@ def _purpose_review_from_commonness(word: str, code: str, phrase_type: str, comm
 def _chain_recommendation_text(priority_review: Dict) -> str:
     moves = priority_review.get("recommendedMoves") or []
     if not moves:
-        return priority_review.get("summary", "建议复核同编码链顺序")
+        return render_commonness_summary(priority_review)
     move_text = "、".join(
         f"「{move.get('word')}」→{move.get('toCode')}"
         for move in moves[:6]
         if move.get("word") and move.get("toCode")
     )
-    return f"{priority_review.get('summary', '建议重排')}：{move_text}"
+    return f"{render_commonness_summary(priority_review)}：{move_text}"
 
 
 AUDIT_ITEM_CONCURRENCY = 3
@@ -7937,7 +7951,7 @@ def build_review_note(audit: Dict) -> str:
             result = item.get("result") or {}
             lines.append(
                 f"- {item.get('frontWord')} > {item.get('behindWord')} @ {item.get('code')}："
-                f"{result.get('summary', '未给出结论')}"
+                f"{render_commonness_summary(result)}"
             )
     if audit.get("wordPurposeReviews"):
         lines.append("词语用途判断：")
@@ -7952,7 +7966,7 @@ def build_review_note(audit: Dict) -> str:
             if item.get("hasRecommendation"):
                 lines.append(f"- 「{item.get('word')}」@{item.get('code')}：{_chain_recommendation_text(item)}")
             else:
-                lines.append(f"- 「{item.get('word')}」@{item.get('code')}：{item.get('summary', '不建议调序')}")
+                lines.append(f"- 「{item.get('word')}」@{item.get('code')}：{render_commonness_summary(item)}")
     if audit.get("commonKnownItems"):
         lines.append("常见词/熟语/名人字号语言常识通过：")
         for item in audit.get("commonKnownItems", [])[:10]:

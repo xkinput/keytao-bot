@@ -9,6 +9,7 @@ import unicodedata
 from urllib.parse import urlsplit
 
 from .candidate_inventory import protected_candidate_occupants
+from .commonness_copy import candidate_commonness_summary_copy, render_commonness_summary
 
 
 class ServerBackedQueryReply(str):
@@ -1441,6 +1442,12 @@ def render_server_backed_batch_candidates(
                     fallback_index,
                 ).splitlines()
             )
+        else:
+            lines.extend(candidate_commonness_summary_copy(assessment)
+                         for assessment in ordering_assessments_by_scope[word][:2]
+                         if assessment.get("newWord") == word
+                         and assessment.get("occupantWord") in occupied_words_by_scope[word].get(
+                             assessment.get("occupantCode"), ()))
         review_copy = "需管理员审核" if needs_review else "可自动通过"
         lines.append(f"   自动审核：{review_copy}")
 
@@ -1646,7 +1653,7 @@ def front_insert_recommendation_copy(
     occupant = str(recommendation.get("occupantWord") or "").strip()
     occupant_code = str(recommendation.get("occupantCode") or "").strip().lower()
     free_code = str(recommendation.get("freeCode") or "").strip().lower()
-    summary = str(recommendation.get("summary") or "").strip()
+    summary = render_commonness_summary(recommendation)
     if not include_controls:
         lines = [f"推荐调序：「{word}」占 {occupant_code}，「{occupant}」顺延"]
         if summary:
@@ -1722,10 +1729,10 @@ def candidate_commonness_guard_copy(
             and item.get("occupantWord") == occupant
             and item.get("occupantCode") == code
         ), {})
-        if assessment.get("verdict") in {"behind_more_common", "close"}:
-            lines.append(f"常用度评估：「{occupant}」不弱于「{normalized_word}」，维持现有排序。")
-        else:
-            lines.append(f"「{normalized_word}」与「{occupant}」的常用度证据不足，暂不自动挪动「{occupant}」。")
+        lines.append(candidate_commonness_summary_copy({
+            **assessment, "newWord": normalized_word,
+            "occupantWord": occupant, "freeCode": "",
+        }))
     base_code = str(candidates[0][0]) if candidates else ""
     lines.append(f"当前候选没有空位；可指定形码后的完整编码，格式为：加入编码 {base_code}+形码（请替换形码部分）。")
     if include_controls:
@@ -1872,6 +1879,12 @@ def render_server_backed_single_word_candidates(
             )
         )
     elif recommended:
+        lines.extend(candidate_commonness_summary_copy(assessment)
+                     for assessment in (ordering_assessments or [])[:2]
+                     if isinstance(assessment, dict)
+                     and assessment.get("newWord") == normalized_word
+                     and assessment.get("occupantWord") in occupied_words.get(
+                         assessment.get("occupantCode"), ()))
         lines.append(f"• 「{normalized_word}」→ {recommended}（推荐）")
     else:
         lines.append(guard_copy)
