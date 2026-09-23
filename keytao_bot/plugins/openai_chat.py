@@ -59,6 +59,7 @@ from ..harness.tools import (
     trusted_mutation_source,
 )
 from ..utils.history_store import HistoryGenerationToken, get_history_store
+from ..utils.conversational_reply import enforce_conversational_reply
 from ..utils.draft_mutation_store import (
     get_default_draft_mutation_claim_store,
 )
@@ -1600,6 +1601,7 @@ async def get_ai_response_core(
     progress_reporter: Optional[Callable[[str], Awaitable[None]]] = None,
     resolved_advertised_words: Tuple[str, ...] = (),
     advertised_snapshot_token: str = "",
+    command_intent: Optional[MessageCommandIntent] = None,
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
 
@@ -1609,6 +1611,10 @@ async def get_ai_response_core(
         return "❌ AI 服务未配置，请联系管理员"
 
     try:
+        _current_turn_message.set(message)
+        if command_intent is None and platform in {"web", "web-anon"} and not visual_context:
+            command_intent = await _classify_message_command_intent(message)
+        _set_conversational_turn(message, history, command_intent)
         memory_block = ""
         if memory_context is not None:
             memory_sections = [
@@ -1718,11 +1724,13 @@ async def get_ai_response_core(
                 progress_reporter=progress_reporter,
                 resolved_advertised_words=resolved_advertised_words,
                 advertised_snapshot_token=advertised_snapshot_token,
+                conversation_only=_current_conversational_turn.get() is not None,
             ),
             max_iterations=max_iterations,
         )
         server_backed_query = orchestrator.is_server_backed_query_reply(result)
         if server_backed_query:
+            _current_conversational_turn.set(None)
             logger.info(
                 "[advertised_reply_contract] "
                 "branch=orchestrator_query_claim trusted=True"
@@ -1740,6 +1748,9 @@ async def get_ai_response_core(
             result = _append_unbound_binding_notice(result, actor_is_bound)
         if isinstance(result, ServerBackedQueryReply):
             return result
+        conversational_turn = _current_conversational_turn.get()
+        if conversational_turn is not None:
+            return enforce_conversational_reply(message, result, conversational_turn[1])
         return _normalize_generated_review_copy(result) if result else result
 
     except Exception as error:
@@ -2562,6 +2573,9 @@ def _enforce_advertised_reply_contract(
     query_words: Tuple[str, ...] = (),
 ) -> str:
     """Validate commands first, then append this actor's verified account notice."""
+    conversational_turn = _current_conversational_turn.get()
+    if conversational_turn is not None and conversational_turn[0] == _current_turn_message.get(""):
+        return enforce_conversational_reply(conversational_turn[0], response, conversational_turn[1])
     from ..utils.commonness_query import matches_commonness_delivery
     if matches_commonness_delivery(response, conv_key, _current_turn_message.get("")):
         return response
@@ -3272,6 +3286,24 @@ _current_turn_message: ContextVar[str] = ContextVar(
     "current_turn_message",
     default="",
 )
+_current_conversational_turn: ContextVar[Optional[Tuple[str, List[Dict]]]] = ContextVar(
+    "current_conversational_turn", default=None,
+)
+
+
+def _set_conversational_turn(message, history, intent, *, other_intents=(), query_words=()):
+    """No-intent metadata alone cannot override positive query grammar."""
+    _current_conversational_turn.set(None)
+    if (
+        intent is not None and intent.has_operation_intent is False
+        and intent.intent == "none"
+        and not any(item.intent != "none" or item.has_operation_intent is True for item in other_intents)
+        and not query_words
+        and _chat_routing.is_conversational_text(_strip_command_message_prefixes(message))
+        and not message_authorizes_mutation(message)
+        and not _authorization_grammar.looks_like_mutation_grammar_gap(message)
+    ):
+        _current_conversational_turn.set((message, list(history or [])))
 
 
 async def _finish_ai_chat_matcher(response: str) -> None:
@@ -3501,6 +3533,7 @@ async def _stage_reject_empty_input(ctx: TurnContext) -> bool:
 
 async def _stage_normalize_message_text(ctx: TurnContext) -> bool:
     """Production scenario: normalize platform command prefixes exactly once."""
+    _current_conversational_turn.set(None)
     if ctx.message_text:
         ctx.normalized_message_text = (
             _strip_command_message_prefixes(ctx.message_text) or ctx.message_text
@@ -5769,6 +5802,14 @@ async def _stage_handle_replace_character(ctx: TurnContext) -> bool:
 async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
     """Production scenario: simple word lookup runs before general model fallback."""
     if ctx.response is None:
+        _set_conversational_turn(
+            ctx.normalized_message_text, ctx.history, ctx.generic_command_intent,
+            other_intents=ctx.command_intent_cache.values(),
+            query_words=ctx.simple_word_query_words or ctx.resolved_advertised_words,
+        )
+        if _current_conversational_turn.get() is not None:
+            return False
+    if ctx.response is None:
         if ctx.history is None:
             ctx.history = get_history(ctx.conv_key)
         ctx.response = await _try_handle_explicit_reading_disambiguation(
@@ -5857,6 +5898,11 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
     if ctx.response is None:
         if ctx.history is None:
             ctx.history = get_history(ctx.conv_key)
+        _set_conversational_turn(
+            ctx.normalized_message_text, ctx.history, ctx.generic_command_intent,
+            other_intents=ctx.command_intent_cache.values(),
+            query_words=ctx.simple_word_query_words or ctx.resolved_advertised_words,
+        )
         reply_context = await build_reply_context(ctx.bot, ctx.event, ctx.reply_reference)
 
         async def report_progress(text: str) -> None:
@@ -5880,7 +5926,16 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
             progress_reporter=report_progress,
             resolved_advertised_words=ctx.resolved_advertised_words,
             advertised_snapshot_token=ctx.advertised_snapshot_token,
+            command_intent=(
+                ctx.generic_command_intent if _current_conversational_turn.get() is not None
+                else replace(ctx.generic_command_intent, has_operation_intent=None)
+            ),
         )
+        conversational_turn = _current_conversational_turn.get()
+        if conversational_turn is not None:
+            ctx.response = enforce_conversational_reply(
+                ctx.normalized_message_text, ctx.response, conversational_turn[1],
+            )
     return False
 
 
@@ -5918,6 +5973,8 @@ async def _stage_augment_word_query(ctx: TurnContext) -> bool:
     """Production scenario: only ordinary Q&A receives simple-word augmentation."""
     from ..utils.observability import current_turn_metrics
 
+    if _current_conversational_turn.get() is not None:
+        return False
     metrics = current_turn_metrics()
     if metrics is not None and metrics.tool_calls == 0 and metrics.model_calls >= 2:
         return False

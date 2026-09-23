@@ -107,10 +107,14 @@ from .tools import (
 
 
 READ_ONLY_TURN_GUIDANCE = (
-    "请用普通语言说明你理解的当前请求。"
+    "直接回应对方当下的意思，以喵喵的身份和对方说话。"
+    "整条都是明确寒暄或无任务的聊天句时，用一句简短自然的话聊天；不列服务选项，不追加操作提示。"
+    "裸单词和词列表默认查询，混合或不确定时优先查询，不能用没有操作意图跳过。"
+    "禁止以‘用户想’或‘用户发的这条消息’等第三人称旁白分析对方，"
+    "禁止报告没有命令、没有操作，或解释自己决定不做什么。"
     "只有核验结果给出了可执行命令时，才可逐字转述那一条命令；"
     "不得自行发明、改写或追加命令。"
-    "若没有可执行命令，只说明还缺少哪项具体信息。"
+    "仅当对方确实要求词库操作而目标信息不足时，直接询问缺少的具体词条或编码。"
     "不要描述内部处理方式、权限判断或实现细节，不要预测后续结果，"
     "也不要概括之前的失败。"
     "除非当前存在完整确认内容，否则不要建议确认或取消。"
@@ -621,6 +625,7 @@ class AgentRequestContext:
     resolved_advertised_words: tuple[str, ...] = ()
     advertised_snapshot_token: str = ""
     actor_is_bound: Optional[bool] = None
+    conversation_only: bool = False
 
     @property
     def actor_key(self) -> tuple:
@@ -807,7 +812,7 @@ class AgentOrchestrator:
         # Image-derived text is untrusted data. Do not expose even read/network tools:
         # a visual prompt injection could otherwise read private data and exfiltrate it.
         tools = None
-        if not context.visual_context and self._skills_manager.has_tools():
+        if not context.visual_context and not context.conversation_only and self._skills_manager.has_tools():
             tools = sorted(
                 self._skills_manager.get_tools(),
                 key=_tool_function_name,

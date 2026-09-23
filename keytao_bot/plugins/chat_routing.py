@@ -26,6 +26,7 @@ from ..harness.authorization_grammar import (
     explicit_complete_add_item,
     is_interrogative_message,
     looks_like_lexical_review_target,
+    looks_like_mutation_grammar_gap,
     strip_self_mention_tokens,
     parse_dictionary_delete_command,
     parse_dictionary_recode_command,
@@ -45,6 +46,7 @@ from ..harness.tools import (
 )
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.candidate_inventory import protected_candidate_occupants
+from ..utils.conversational_reply import is_conversational_text
 from ..utils.explicit_code import parse_explicit_code_request, readings_match, validate_explicit_code
 from ..utils.literal_phrase import parse_explicit_single_phrase_add, parse_literal_phrase_query
 from ..utils.reading_request import parse_parenthesised_readings
@@ -487,6 +489,7 @@ class MessageCommandIntent:
     target_word: str = ""
     old_char: str = ""
     new_char: str = ""
+    has_operation_intent: Optional[bool] = None
 
 
 _DRAFT_FLOW_INTENTS = frozenset({
@@ -2543,6 +2546,8 @@ def _parse_message_command_intent_payload(payload: Dict) -> MessageCommandIntent
     return MessageCommandIntent(
         intent=intent,
         confidence=confidence,
+        has_operation_intent=(payload.get("has_operation_intent")
+                              if isinstance(payload.get("has_operation_intent"), bool) else None),
         keep_words=_sanitize_command_words(payload.get("keep_words")),
         submit_after=_sanitize_optional_bool(payload.get("submit_after")),
         clear_after=_sanitize_optional_bool(payload.get("clear_after")),
@@ -2789,14 +2794,19 @@ async def _classify_message_command_intent(
         "例如“加入并提交”。这种情况绝不能归类为 draft_submit。\n"
         "pending_* 只在 pending_context 不是 none，且用户在回应该待确认操作时使用。"
         "普通提问、词义/常用度比较、泛泛讨论、如何使用功能、以及新的复杂操作都返回 none，交给主模型。"
+        "另输出独立布尔字段 has_operation_intent：消息有查词、编码、词频、规则、绑定等功能问答，"
+        "或新增/修改/删除/提交/选择等词库操作意图时为 true，即使快捷 intent 为 none 或目标信息不足。"
+        "要求查阅外部事实等实际任务也为 true。只有没有这些任务意图、只是交流聊天时为 false。"
+        "裸单词、按空白或顿号等分隔的词列表、带括号读音的词也是查询；混合或不确定时优先查询。"
+        "按完整消息和上下文语意判断，不按问候词表判断；不能因消息含寒暄而忽略同时提出的操作。"
     )
     user_prompt = (
         f"当前消息：{message_text}\n"
         f"pending_context：{pending_context}\n"
-        "请只返回 JSON，字段包括：intent, confidence, keep_words, submit_after, "
+        "请只返回 JSON，字段包括：intent, confidence, has_operation_intent, keep_words, submit_after, "
         "clear_after, current_user_only, choice_index, requested_code, target_word, old_char, new_char。\n"
         "例如："
-        '{"intent":"none","confidence":0.9,"keep_words":[],"submit_after":false,'
+        '{"intent":"none","confidence":0.9,"has_operation_intent":true,"keep_words":[],"submit_after":false,'
         '"clear_after":false,"current_user_only":false,"choice_index":null,"requested_code":"",'
         '"target_word":"","old_char":"","new_char":""}'
     )
@@ -2901,8 +2911,22 @@ async def _classify_simple_word_query_intent(
         return SimpleWordQueryIntent(False)
 
 
+def _is_bare_word_query_target(word: str) -> bool:
+    """Keep command fragments and comparison/prose clauses out of lexical lists."""
+    return bool(
+        looks_like_lexical_review_target(word)
+        and word not in {"加", "删", "查", "审词", "提交", "确认", "取消"}
+        and not re.match(
+            r"^(?:请|麻烦|帮我|帮忙|给我|加词|添加|加入|删除|删掉|提交|查询|查词|查看|解释|比较|批量|不要|取消|确认)",
+            word,
+        )
+        and not re.match(r"^(?:我|你|他|她|它|我们|你们|他们)(?:说|觉得|认为|感觉|想|要)", word)
+        and not re.search(r"(?:哪个|哪种|哪一个|用得多|(?:先|暂时|也)?(?:不要|不加|别加|保留|取消)$)", word)
+    )
+
+
 async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
-    """Return model-approved word-query targets, or empty when the main AI should handle it."""
+    """Positive lexical grammar precedes the optional semantic fallback."""
     literal = parse_literal_phrase_query(message_text)
     if literal is not None:
         return (literal,)
@@ -2914,6 +2938,8 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     )
     if explicit is not None:
         return (explicit.group("word"),)
+    if is_conversational_text(_strip_command_message_prefixes(message_text)):
+        return ()
     if (
         _is_language_only_question(message_text)
         or _is_explicit_code_question(message_text)
@@ -2922,6 +2948,13 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     structural_words = tuple(_extract_pure_chinese_words(message_text))
     if not structural_words:
         return ()
+    if (
+        len(structural_words) == 1
+        and _is_bare_word_query_target(structural_words[0])
+        and not message_authorizes_mutation(message_text)
+        and not looks_like_mutation_grammar_gap(message_text)
+    ):
+        return structural_words
     intent = await _classify_simple_word_query_intent(message_text, structural_words)
     if not intent.should_handle:
         logger.info(

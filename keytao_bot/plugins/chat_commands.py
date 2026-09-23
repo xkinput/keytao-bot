@@ -150,6 +150,7 @@ from .chat_render import (
     _trusted_batch_url,
 )
 from .chat_routing import (
+    is_conversational_text,
     KeepOnlyDraftCommand,
     MessageCommandIntent,
     _DIRECT_OWNER_PENDING_ADD_INTENTS,
@@ -164,6 +165,7 @@ from .chat_routing import (
     _extract_referenced_word_targets,
     _format_live_ticket_precedence_message,
     _get_simple_word_query_words,
+    _is_bare_word_query_target,
     _is_explicit_draft_submit_request,
     _is_pending_tool_confirm_message,
     _is_referenced_word_presence_query,
@@ -3450,19 +3452,28 @@ _MAX_BARE_MULTI_WORD_QUERY_ITEMS = 10
 def _bare_multi_word_query_words(message_text: str) -> Tuple[str, ...]:
     """Recognize a bounded lexical list without asking a model to route it."""
     source = _strip_command_message_prefixes(message_text).strip()
-    if not re.fullmatch(r"[\u3400-\u9fff]+(?:[\s、，,]+[\u3400-\u9fff]+)+", source):
+    if is_conversational_text(source):
+        return ()
+    if not re.fullmatch(r"[\u3400-\u9fff\s、，,；;]+", source):
         return ()
     if (
         parse_advertised_set_reference(source).matched
         or message_mentions_change_request(source)
     ):
         return ()
-    words = tuple(dict.fromkeys(re.split(r"[\s、，,]+", source)))
+    tokens = re.split(r"[\s、，,；;]+", source)
+    if len(tokens) == 1:
+        # Preserve lexical compounds such as Republic; an unspaced conjunction
+        # must have word-length operands on both sides. Ambiguity queries whole.
+        parts = source.split("和")
+        if len(parts) < 2 or any(len(part) < 2 for part in parts):
+            return ()
+        tokens = parts
+    elif tokens[0] == "和" or tokens[-1] == "和":
+        return ()
+    words = tuple(dict.fromkeys(token for token in tokens if token != "和"))
     if len(words) < 2 or any(
-        not looks_like_lexical_review_target(word)
-        or word in {"加", "删", "查", "审词", "提交", "确认", "取消"}
-        or re.match(r"^(?:加词|添加|加入|删除|删掉|提交|查询|查词|查看|解释|比较|批量|请|不要|取消|确认)", word)
-        or re.search(r"(?:先|暂时|也)?(?:不要|不加|别加|保留|取消)$", word)
+        not _is_bare_word_query_target(word)
         for word in words
     ):
         return ()
