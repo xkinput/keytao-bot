@@ -3530,7 +3530,8 @@ def policy_block(
         payload["suggestedCommand"] = suggestion
         payload["modelInstruction"] = (
             "只有执行器给出了可执行命令时才逐字转述那一条；"
-            "否则只说明缺少什么，不要自行编写或改写命令。"
+            "仅在对方确有操作请求时直接询问缺少的具体目标，不要自行编写或改写命令。"
+            "普通聊天自然回应，不旁述对方意图，不报告没有命令或决定不做什么。"
         )
     payload.update(extra)
     if reason == BLOCK_REASON_SOURCE_UNTRUSTED:
