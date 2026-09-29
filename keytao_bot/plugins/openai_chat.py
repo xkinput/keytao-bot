@@ -1602,6 +1602,7 @@ async def get_ai_response_core(
     resolved_advertised_words: Tuple[str, ...] = (),
     advertised_snapshot_token: str = "",
     command_intent: Optional[MessageCommandIntent] = None,
+    released_pending_turn: bool = False,
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
 
@@ -1635,7 +1636,7 @@ async def get_ai_response_core(
             fallback_context: AgentRequestContext,
         ) -> Optional[str]:
             """Resolve closed controls or an evidence-backed encoding question."""
-            pending_reply = await handle_pending_message_core(
+            pending_reply = None if released_pending_turn else await handle_pending_message_core(
                 fallback_message,
                 fallback_context.platform,
                 fallback_context.user_id,
@@ -3442,6 +3443,7 @@ class TurnContext:
     scoped_pending_state: Optional[PendingState] = None
     scoped_pending_intent: Optional[MessageCommandIntent] = None
     scoped_pending_response: Optional[str] = None
+    released_pending_turn: bool = False
     resolved_advertised_words: Tuple[str, ...] = ()
     advertised_snapshot_token: str = ""
     simple_word_query_words: Tuple[str, ...] = ()
@@ -4152,6 +4154,44 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
                 ctx.scoped_pending_response is None
                 and ctx.scoped_pending_intent is None
             ):
+                state = ctx.current_pending_record.state
+                assent = _chat_routing._pending_assent_phrase_for_state(
+                    state, ctx.normalized_message_text,
+                )
+                deictic_add = _chat_routing._is_deictic_add_command(ctx.normalized_message_text)
+                if (
+                    isinstance(state, PendingToolConfirm)
+                    and state.function_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"}
+                    and (assent.rejection == "extra_content" or deictic_add)
+                    and _compact_command_text(ctx.normalized_message_text) not in PENDING_ASSENT_TEXTS
+                    and parse_pending_candidate_selection(ctx.normalized_message_text) is None
+                    and (
+                        not deictic_add
+                        or (
+                            ctx.reply_reference.is_reply
+                            and bool(ctx.reply_reference.text)
+                            and not ctx.verified_current_pending_reply
+                        )
+                    )
+                ):
+                    operands = list(_chat_routing._pending_assent_state_operands(state))
+                    operands.extend(value for pair in _pending_state_binding_pairs(state) for value in pair)
+                    _, scopes = _chat_routing._multi_word_candidate_scope_rows(state)
+                    operands.extend(code for candidates in scopes.values() for code, _occupied in candidates)
+                    # Reviewed multi-word replies have no digest; their operands still identify the ticket.
+                    source = unicodedata.normalize(
+                        "NFKC", ctx.normalized_message_text
+                        + ("\n" + ctx.reply_reference.text if deictic_add else ""),
+                    ).lower()
+                    if not any(
+                        re.search(rf"(?<![a-z0-9_]){re.escape(value)}(?![a-z0-9_])", source)
+                        if re.fullmatch(r"[a-z]{1,12}", value) else value in source
+                        for operand in operands
+                        if (value := unicodedata.normalize("NFKC", operand).strip().lower())
+                    ):
+                        # Release this turn without consuming the actor's ticket.
+                        ctx.released_pending_turn = True
+                        return False
                 ctx.scoped_pending_response = _pending_assent_rejection_response(
                     ctx.current_pending_record.state,
                     ctx.normalized_message_text,
@@ -4240,7 +4280,7 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
     if ctx.literal_phrase_word:
         ctx.generic_command_intent = MessageCommandIntent()
         return False
-    live_ticket_assent = _pending_tool_assent_intent(
+    live_ticket_assent = None if ctx.released_pending_turn else _pending_tool_assent_intent(
         ctx.current_pending_record.state if ctx.current_pending_record is not None else None,
         ctx.normalized_message_text,
     )
@@ -4549,6 +4589,8 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
     ) or ctx.message_is_prefixed_fresh_word_query or bool(ctx.literal_phrase_word)
     if ctx.resolved_advertised_words:
         ctx.generic_intent_is_fresh_command = True
+    if ctx.released_pending_turn:
+        ctx.generic_intent_is_fresh_command = True
     if (
         ctx.eviction_modified_add is not None
         or ctx.compound_eviction_add_plan is not None
@@ -4558,6 +4600,7 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
         ctx.current_pending_record is not None
         and isinstance(ctx.current_pending_record.state, PendingToolConfirm)
         and not ctx.literal_phrase_word
+        and not ctx.released_pending_turn
     ):
         ctx.generic_intent_is_fresh_command = False
     if (
@@ -5924,6 +5967,7 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
             reply_context,
             ctx.memory_context,
             progress_reporter=report_progress,
+            released_pending_turn=ctx.released_pending_turn,
             resolved_advertised_words=ctx.resolved_advertised_words,
             advertised_snapshot_token=ctx.advertised_snapshot_token,
             command_intent=(

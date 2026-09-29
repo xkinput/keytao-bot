@@ -52,6 +52,7 @@ from ..utils.literal_phrase import parse_explicit_single_phrase_add, parse_liter
 from ..utils.reading_request import parse_parenthesised_readings
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
+    ADD_OPERATION_VERB_PATTERN,
     PENDING_ASSENT_TEXTS,
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
@@ -2911,10 +2912,26 @@ async def _classify_simple_word_query_intent(
         return SimpleWordQueryIntent(False)
 
 
+_DEICTIC_ADD_OBJECT = r"(?:这(?:两个|几个|个|些)?(?:词|句话)?|它们?|都|全部|上面的)"
+_DEICTIC_ADD_COMMAND_RE = re.compile(
+    rf"(?:把|将)?{_DEICTIC_ADD_OBJECT}*"
+    rf"(?:{ADD_OPERATION_VERB_PATTERN}|"
+    + "|".join(re.escape(verb) for verb in sorted(PENDING_BATCH_ADD_ASSENT_TEXTS))
+    + rf"){_DEICTIC_ADD_OBJECT}*(?:(?:进|到|入)?(?:词库|草稿))?[吧啊了呀哈]*[。.!！~～]*"
+)
+
+
+def _is_deictic_add_command(message_text: str) -> bool:
+    """Recognize closed operand-free add shapes, without granting write authority."""
+    source = unicodedata.normalize("NFKC", _strip_command_message_prefixes(message_text))
+    return _DEICTIC_ADD_COMMAND_RE.fullmatch(re.sub(r"\s+", "", source)) is not None
+
+
 def _is_bare_word_query_target(word: str) -> bool:
     """Keep command fragments and comparison/prose clauses out of lexical lists."""
     return bool(
         looks_like_lexical_review_target(word)
+        and not _is_deictic_add_command(word)
         and word not in {"加", "删", "查", "审词", "提交", "确认", "取消"}
         and not re.match(
             r"^(?:请|麻烦|帮我|帮忙|给我|加词|添加|加入|删除|删掉|提交|查询|查词|查看|解释|比较|批量|不要|取消|确认)",
@@ -2930,7 +2947,7 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     literal = parse_literal_phrase_query(message_text)
     if literal is not None:
         return (literal,)
-    if is_interrogative_message(message_text):
+    if is_interrogative_message(message_text) or _is_deictic_add_command(message_text):
         return ()
     explicit = re.fullmatch(
         r"(?:查词|查询词条)\s*[:：]?\s*(?P<word>[\u3400-\u9fff]{1,20})",
