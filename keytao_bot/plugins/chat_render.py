@@ -1287,7 +1287,8 @@ def _compact_review_reason(reason: str) -> str:
     for old, new in replacements:
         text = text.replace(old, new)
     text = re.sub(
-        r"(?:[，,；;]\s*)?(?:该词)?(?:需要|需)管理员(?:审核|确认)[。.]?$",
+        r"(?:^|[，,；;。])\s*(?:(?:本轮|仍|该词|预计)\s*)*"
+        r"(?:需要|需)管理员(?:审核|确认)[。.]?$",
         "",
         text,
     )
