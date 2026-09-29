@@ -1045,6 +1045,7 @@ class AgentOrchestrator:
         trusted_absent_word_sets: List[tuple[str, ...]] = []
         unresolved_pronunciation_words: set[str] = set()
         blocked_review_words: set[str] = set()
+        fresh_single_review_nonce = ""
         attempted_review_words: set[str] = set()
         multi_add_write_attempted = False
         eviction_lookup_attempted = False
@@ -1923,18 +1924,7 @@ class AgentOrchestrator:
                             trusted_candidate_readings_by_word,
                             trusted_candidate_ordering_by_word,
                         )
-                        rendered_single = (
-                            render_server_backed_single_word_candidates(
-                                pending_add.word,
-                                pending_add.recommended_code,
-                                pending_add.server_candidates,
-                                pending_add.server_occupied_words,
-                                pending_add.server_ordering_assessments,
-                            )
-                            if pending_add is not None
-                            else ""
-                        )
-                        if not rendered_single or pending_add is None:
+                        if pending_add is None or pending_add.word in blocked_review_words:
                             if not context.mutations_allowed:
                                 return self._append_authoritative_result_links(
                                     render_query_retry_reply(tuple(
@@ -1972,8 +1962,32 @@ class AgentOrchestrator:
                             "branch=establish_single_code_choice_from_records "
                             f"owner={conv_key} word={pending_add.word}"
                         )
+                        from keytao_bot.plugins.openai_chat import _render_live_single_candidate_record
+
+                        rendered_single = _render_live_single_candidate_record(
+                            self._state_store.get_record(conv_key)
+                        )
                         return self._append_authoritative_result_links(
                             candidate_reply(rendered_single),
+                            authoritative_result_links,
+                        )
+                    live_record = self._state_store.get_record(conv_key)
+                    if (
+                        reply_contract.batch_assent_forms
+                        and live_record is not None
+                        and live_record.nonce == fresh_single_review_nonce
+                        and not live_record.execution_id
+                        and isinstance(live_record.state, PendingAddWord)
+                        and len(trusted_candidate_slots_by_word) == 1
+                        and any(
+                            f"{left}{live_record.state.word}{right}" in content
+                            for left, right in _ADVERTISED_QUOTE_PAIRS
+                        )
+                    ):
+                        from keytao_bot.plugins.openai_chat import _render_live_single_candidate_record
+
+                        return self._append_authoritative_result_links(
+                            candidate_reply(_render_live_single_candidate_record(live_record)),
                             authoritative_result_links,
                         )
                     matching_word_sets = [
@@ -2757,11 +2771,6 @@ class AgentOrchestrator:
                         if unresolved_word:
                             unresolved_pronunciation_words.add(unresolved_word)
                             blocked_review_words.add(unresolved_word)
-                    if result_data.get("not_bound"):
-                        return self._append_authoritative_result_links(
-                            self._bind_help_text,
-                            authoritative_result_links,
-                        )
                     if fn_name in AUTHORITATIVE_LINK_TOOLS:
                         self._capture_authoritative_result_links(
                             result_data,
@@ -2803,6 +2812,49 @@ class AgentOrchestrator:
                         trusted_candidate_readings_by_word,
                         trusted_candidate_ordering_by_word,
                     )
+                    if fn_name == "keytao_prepare_reviewed_add":
+                        reviewed_word = str(canonical_fn_args.get("word") or "").strip()
+                        live_record = self._state_store.get_record(conv_key)
+                        if (
+                            live_record is not None
+                            and not live_record.execution_id
+                            and isinstance(live_record.state, PendingAddWord)
+                            and live_record.state.word == reviewed_word
+                        ):
+                            # A rereview supersedes only this actor's same-word ticket.
+                            inventory = select_candidate_inventory(result_data)
+                            pending_add = None
+                            if (
+                                inventory is not None
+                                and result_data.get("success") is True
+                                and result_data.get("word") == reviewed_word
+                                and not result_data.get("pronunciationUnresolved")
+                                and not result_data.get("policyBlocked")
+                                and not result_data.get("error")
+                                and not review_flags.review_blocks_write(result_data)
+                            ):
+                                pending_add = self._trusted_single_pending_add(
+                                    {reviewed_word: inventory.candidates},
+                                    {reviewed_word: inventory.statuses},
+                                    {reviewed_word: str(result_data.get("recommendedCode") or "")},
+                                    trusted_reviewed_items_by_key,
+                                    {reviewed_word: inventory.readings},
+                                    trusted_candidate_ordering_by_word,
+                                )
+                            if pending_add is None or not self._state_store.set(
+                                conv_key, pending_add,
+                                space_key=context.space_key,
+                                owner_label=context.speaker_name,
+                            ):
+                                blocked_review_words.add(reviewed_word)
+                                self._state_store.delete(conv_key)
+                            else:
+                                fresh_single_review_nonce = self._state_store.get_record(conv_key).nonce
+                    if result_data.get("not_bound"):
+                        return self._append_authoritative_result_links(
+                            self._bind_help_text,
+                            authoritative_result_links,
+                        )
                     pending_tool_name = (
                         execution_route.tool_name
                         if execution_route.tool_name != fn_name
@@ -3155,6 +3207,7 @@ class AgentOrchestrator:
         recommended = recommended_codes_by_word[word]
         if (
             len(candidates) < 2
+            or recommended not in dict(candidates)
             or [status.get("code") for status in statuses]
             != [code for code, _occupied in candidates]
         ):

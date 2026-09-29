@@ -2670,6 +2670,10 @@ def _enforce_candidate_reply_contract(
             or _render_live_batch_record(record)
         )
         if replacement and _advertised_reply_matches_live_record(replacement, record):
+            logger.info(
+                "[advertised_reply_contract] branch=replace_retired_copy "
+                f"state={record.state.__class__.__name__} word={getattr(record.state, 'word', '')}"
+            )
             return replacement
         move = _authorization_grammar.parse_existing_entry_move(_current_turn_message.get(""))
         understood = f"想把「{move.word}」调到 {move.target_code}" if move is not None else "看到了操作请求"
@@ -2712,6 +2716,10 @@ def _enforce_candidate_reply_contract(
             or _render_live_batch_record(record)
         )
         if replacement and not structural_option_questions(replacement) and _advertised_reply_matches_live_record(replacement, record):
+            logger.info(
+                "[advertised_reply_contract] branch=replace_option_question "
+                f"state={record.state.__class__.__name__} word={getattr(record.state, 'word', '')}"
+            )
             return replacement
         logger.warning("[advertised_reply_contract] branch=unbacked_option_question")
         return "当前没有可验证的可执行操作，本次未写入。"
@@ -2721,6 +2729,10 @@ def _enforce_candidate_reply_contract(
             or _render_live_batch_record(record)
         )
         if replacement and _advertised_reply_matches_live_record(replacement, record):
+            logger.info(
+                "[advertised_reply_contract] branch=replace_numbered_candidates "
+                f"state={record.state.__class__.__name__} word={getattr(record.state, 'word', '')}"
+            )
             return replacement
         logger.warning("[advertised_reply_contract] branch=unbacked_numbered_candidates")
         return "当前没有可验证的可执行操作，本次未写入。"
