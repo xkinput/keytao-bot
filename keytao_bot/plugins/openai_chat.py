@@ -3466,6 +3466,7 @@ class TurnContext:
     quoted_pending_add_control_authorized: bool = False
     other_pending_record: Optional[PendingStateRecord] = None
     current_contextual_reply: bool = False
+    operation_request: Optional[object] = None
 
 
 async def _stage_load_platform_reply_adapter(ctx: TurnContext) -> bool:
@@ -4208,6 +4209,28 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
                     ctx.current_pending_record.state,
                     ctx.normalized_message_text,
                 )
+    return False
+
+
+async def _stage_understand_operation(ctx: TurnContext) -> bool:
+    """Record the fast-path interpretation without influencing routing."""
+    try:
+        from ..harness.operation_request import understand_message
+
+        pending_state = (
+            ctx.current_pending_record.state
+            if ctx.current_pending_record is not None
+            else None
+        )
+        request = understand_message(ctx.normalized_message_text, pending_state)
+        ctx.operation_request = request
+        logger.info(
+            f"[operation_request] op={request.op} frame={request.frame} "
+            f"source={request.source} operands={request.operands!r} codes={request.codes!r}"
+        )
+    except Exception as exc:
+        ctx.operation_request = None
+        logger.warning(f"[operation_request] failed: {exc}")
     return False
 
 
@@ -6136,6 +6159,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_completed_draft_undo,
     _stage_claim_offered_answer,
     _stage_resolve_current_pending_scope,
+    _stage_understand_operation,
     _stage_prepare_fresh_code_selection,
     _stage_finish_scoped_pending_response,
     _stage_guard_stale_confirmation,
