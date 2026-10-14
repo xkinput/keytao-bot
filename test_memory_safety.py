@@ -2116,6 +2116,95 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(canonical)
                 self.assertTrue(error)
 
+    async def test_entry_swap_bypasses_reviewed_candidate_ticket(self) -> None:
+        from keytao_bot.harness.state import _pending_add_word_payload
+        from keytao_bot.plugins import chat_commands, chat_routing
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        candidates = [(code, False) for code in ("tqdh", "tqdho", "tqdhov")]
+        pending = PendingAddWord(
+            word="调整调换",
+            recommended_code="tqdh",
+            candidates=candidates,
+            server_candidates=list(candidates),
+            pronunciation_codes={code: "tiao zheng diao huan" for code, _ in candidates},
+            pronunciation_recommended_codes=["tqdh"],
+        )
+        reviewed = PendingToolConfirm(
+            function_name="keytao_batch_add_to_draft",
+            args={
+                "items": [{"action": "Create", "word": pending.word, "code": "tqdh"}],
+                "_reviewed_multi_word": True,
+                "_query_words": [pending.word],
+                "_candidate_scopes": [{
+                    "word": pending.word,
+                    "candidates": candidates,
+                    "occupiedWords": {},
+                    "orderingAssessments": [],
+                    "reviewedState": _pending_add_word_payload(pending),
+                }],
+            },
+            confirmation_source="local_preview",
+        )
+        message = "喵喵 调整调换 午时 和 务实 词条"
+        selection_error = "看到了你的选词请求"
+        store = MemoryConversationStateStore()
+        conv_key = ConversationAddress.group("qq", "swap-ticket-group", "swap-ticket-owner")
+
+        async def intent_for(state=None):
+            return await chat_routing._classify_message_command_intent(message, state)
+
+        with (
+            patch.object(chat_module, "conversation_state_store", store),
+            patch.object(chat_module, "draft_operation_coordinator", DraftOperationCoordinator()),
+            patch.object(chat_routing, "AsyncOpenAI", side_effect=AssertionError("unexpected model call")),
+            patch.object(chat_commands, "call_tool_function", new=AsyncMock(
+                side_effect=AssertionError("unexpected tool call"),
+            )),
+        ):
+            for label, state in (("reviewed-batch", reviewed), ("single-word", pending)):
+                with self.subTest(ticket=label):
+                    store.set(conv_key, state)
+                    record = store.get_record(conv_key)
+                    ctx = chat_module.TurnContext(
+                        bot=None, event=None, platform="qq", user_id=conv_key.actor_id,
+                        normalized_message_text=message, conv_key=conv_key,
+                        space_key=conv_key.space_key, history=[], command_intent_for=intent_for,
+                    )
+                    await chat_module._stage_resolve_current_pending_scope(ctx)
+                    self.assertNotIn(selection_error, ctx.scoped_pending_response or "")
+                    self.assertIsNone(ctx.scoped_pending_response)
+                    self.assertIsNone(ctx.scoped_pending_intent)
+                    await chat_module._stage_apply_scoped_pending_intent(ctx)
+                    self.assertEqual(ctx.generic_command_intent.intent, "entry_swap")
+                    self.assertEqual(ctx.generic_command_intent.keep_words, ("午时", "务实"))
+                    await chat_module._stage_arbitrate_active_operation(ctx)
+                    await chat_module._stage_execute_pending_state(ctx)
+                    self.assertIsNone(ctx.response)
+                    self.assertFalse(chat_routing.message_authorizes_live_pending_mutation(message, state))
+                    response = await chat_module.handle_pending_message_core(
+                        message, "qq", conv_key.actor_id, conv_key, allow_intent_model=False,
+                    )
+                    self.assertIsNone(response)
+                    self.assertIs(store.get_record(conv_key), record)
+
+            selected, intent, error = chat_routing._resolve_multi_word_pending_candidate_selection(
+                reviewed, "调整调换 tqdh",
+            )
+            self.assertIsNone(error)
+            self.assertEqual(intent.intent, "pending_confirm")
+            self.assertEqual(
+                [(item["word"], item["code"]) for item in selected.args["items"]],
+                [("调整调换", "tqdh")],
+            )
+            self.assertTrue(chat_routing.message_authorizes_live_pending_mutation("调整调换 tqdh", reviewed))
+            selected, intent, error = chat_routing._resolve_multi_word_pending_candidate_selection(
+                reviewed, "调整调换 1 乱写",
+            )
+            self.assertIsNone(selected)
+            self.assertIsNone(intent)
+            self.assertIn(selection_error, error)
+
     async def test_multi_word_candidate_numbers_require_word_scope(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
@@ -13741,6 +13830,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 draft_tools.httpx,
                 "AsyncClient",
                 side_effect=lambda **_kwargs: FakeClient(),
+                create=True,
             ),
         ):
             replanned = await draft_tools.keytao_batch_add_to_draft(

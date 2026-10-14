@@ -1961,6 +1961,8 @@ def _resolve_reviewed_multi_word_selection(
             return None, None, "当前多词候选记录不完整，请重新查询；本次未写入。"
         return None, None, None
     if pairs is None:
+        if parse_entry_swap(message_text) is not None:
+            return None, None, None
         if (
             re.search(r"[\u3400-\u9fff]+[ \t]+(?:[0-9]+|[a-zA-Z]+)", source)
             or any(re.match(rf"{re.escape(word)}\s+", source) for word in live_words)
