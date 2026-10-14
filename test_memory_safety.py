@@ -7126,6 +7126,65 @@ class MutationAuthorizationTests(unittest.TestCase):
         )
         self.assertTrue(message_authorizes_mutation("冒菜与茂才对调"))
         for message in (
+            "午时和务实对调",
+            "互换午时和务实的编码",
+            "@喵喵 调整调换 午时 和 务实 词条",
+            "调整调换 午时 和 务实 词条",
+            "调换 午时 和 务实",
+            "调换 午时 和务实",
+            "对调 午时 与务实",
+            "调换 午时 和务实的词条",
+            "调换午时和务实",
+            "午时 和 务实 调换",
+            "把午时和务实调换一下",
+            "调换午时和务实的位置",
+            "午时和务实的编码对调",
+            "把午时和务实的位置互换",
+            "对调 午时 和 务实 的词条",
+            "交换午时与务实",
+            "午时和务实换一下位置",
+            "调换一下 午时 务实",
+        ):
+            with self.subTest(message=message):
+                parsed = parse_entry_swap(message)
+                self.assertEqual(
+                    (parsed.first_word, parsed.second_word) if parsed else None,
+                    ("午时", "务实"),
+                )
+                self.assertTrue(message_authorizes_mutation(message))
+        for message in (
+            "午时和务实能调换吗？",
+            "不要调换午时和务实",
+            "他说调换午时和务实",
+            "调换",
+            "调换 午时 和 午时",
+            "调换 午时 和午时",
+            "调整午时",
+            "“调换午时和务实”的意思是什么？",
+            "他说“调换午时和务实”",
+            "记录这句：调换午时和务实",
+            "调换午时和务实？",
+            "调换午时和务实吗",
+            "交换午时与务实吗",
+            "调换午时和务实呢",
+            "是否调换午时和务实",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(parse_entry_swap(message))
+                self.assertFalse(message_authorizes_mutation(message))
+        for message, expected in (
+            ("调换 中和 务实 的优先级", ("中和", "务实")),
+            ("调换 午时 和平 的优先级", ("午时", "和平")),
+            ("午时和重新编码对调", ("午时", "重新编码")),
+            ("午时和操作顺序对调", ("午时", "操作顺序")),
+        ):
+            with self.subTest(message=message):
+                parsed = parse_entry_swap(message)
+                self.assertEqual(
+                    (parsed.first_word, parsed.second_word) if parsed else None,
+                    expected,
+                )
+        for message in (
             "把冒菜和茂才调换优先级",
             "冒菜和茂才换位置",
             "调换 冒菜 茂才 的优先级",

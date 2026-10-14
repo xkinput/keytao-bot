@@ -938,11 +938,13 @@ def parse_pending_positional_add(message: str) -> Optional[PendingPositionalAdd]
 
 
 _ENTRY_SWAP_WHOLE_RE = re.compile(
-    rf"^{_COMMAND_PREFIX_PATTERN}"
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:把|将)?\s*"
     r"[「“]?(?P<first>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
     r"(?:和|与|跟|、)\s*"
     r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
-    r"(?:互换(?:一下)?位置|换(?:个|一下)?位置|位置(?:互换|对调)|对调(?:一下)?)"
+    r"(?:(?:的\s*|\s+)(?:编码|码位|位置|顺序|优先级))?\s*"
+    r"(?:互换(?:一下)?位置|换(?:个|一下)?位置|位置(?:互换|对调)|"
+    r"(?:调换|对换|对调|互换|交换|换)(?:一下)?(?:位置|顺序|编码)?)"
     r"(?:吧|啦|了)?$"
 )
 _ENTRY_PRIORITY_SWAP_WHOLE_RE = re.compile(
@@ -959,13 +961,19 @@ _ENTRY_PRIORITY_SWAP_PREFIX_RE = re.compile(
     r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
     r"的?(?:优先级|优先顺序)(?:吧|啦|了)?$"
 )
-_ENTRY_CODE_SWAP_VERB_PATTERN = r"(?:(?:对换|对调|互换|交换)(?:一下)?|换一下)"
+_ENTRY_CODE_SWAP_VERB_PATTERN = r"(?:(?:调换|对换|对调|互换|交换)(?:一下)?|换一下)"
+_ENTRY_SPACE_SWAP_PREFIX_RE = re.compile(
+    rf"^{_COMMAND_PREFIX_PATTERN}{_ENTRY_CODE_SWAP_VERB_PATTERN}\s*"
+    r"[「“]?(?P<first>[\u3400-\u9fff]{1,16}?)[」”]?\s+"
+    r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
+    r"(?:吧|啦|了)?$"
+)
 _ENTRY_CODE_SWAP_PREFIX_RE = re.compile(
-    rf"^{_COMMAND_PREFIX_PATTERN}{_ENTRY_CODE_SWAP_VERB_PATTERN}\s*(?:把|将)?\s*"
+    rf"^{_COMMAND_PREFIX_PATTERN}(?:调整)?{_ENTRY_CODE_SWAP_VERB_PATTERN}\s*(?:把|将)?\s*"
     r"[「“]?(?P<first>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
     r"(?:和|与|跟|、)\s*"
     r"[「“]?(?P<second>[\u3400-\u9fff]{1,16}?)[」”]?\s*"
-    r"的?(?:编码|码位)(?:吧|啦|了)?$"
+    r"(?:的\s*)?(?:编码|码位|位置|顺序|优先级|词条)?(?:吧|啦|了)?$"
 )
 _ENTRY_CODE_SWAP_SUFFIX_RE = re.compile(
     rf"^{_COMMAND_PREFIX_PATTERN}(?:把|将)?\s*"
@@ -1113,12 +1121,15 @@ def _safe_whole_entry_command_source(message: str) -> str:
 def parse_entry_swap(message: str) -> Optional[EntrySwapCommand]:
     """Parse one positive whole-message pair swap."""
     source = _safe_whole_entry_command_source(message)
+    if not source or _QUESTION_RE.search(source):
+        return None
     match = (
         _ENTRY_SWAP_WHOLE_RE.fullmatch(source)
         or _ENTRY_PRIORITY_SWAP_WHOLE_RE.fullmatch(source)
         or _ENTRY_PRIORITY_SWAP_PREFIX_RE.fullmatch(source)
         or _ENTRY_CODE_SWAP_PREFIX_RE.fullmatch(source)
         or _ENTRY_CODE_SWAP_SUFFIX_RE.fullmatch(source)
+        or _ENTRY_SPACE_SWAP_PREFIX_RE.fullmatch(source)
     )
     if match is None:
         return None
