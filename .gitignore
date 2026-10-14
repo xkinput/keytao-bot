@@ -58,3 +58,4 @@ napcat/config/webui.json
 htmlcov/
 e2e/artifacts/
 e2e/.runtime/
+eval/routing/private/
