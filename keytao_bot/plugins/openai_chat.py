@@ -4212,6 +4212,9 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     return False
 
 
+_semantic_shadow_tasks: set[asyncio.Task] = set()
+
+
 async def _stage_understand_operation(ctx: TurnContext) -> bool:
     """Record the fast-path interpretation without influencing routing."""
     try:
@@ -4231,6 +4234,59 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
     except Exception as exc:
         ctx.operation_request = None
         logger.warning(f"[operation_request] failed: {exc}")
+
+    if os.getenv("KEYTAO_SEMANTIC_SHADOW") == "1" and ctx.normalized_message_text.strip():
+        try:
+            _semantic_shadow_tasks.difference_update(
+                task for task in tuple(_semantic_shadow_tasks) if task.done()
+            )
+            if len(_semantic_shadow_tasks) >= 2:
+                logger.info("[semantic_shadow] skipped=busy")
+            else:
+                import copy
+                from ..harness.semantic_parser import parse_operation, validate_operation
+
+                pending_snapshot = copy.deepcopy(
+                    ctx.current_pending_record.state
+                    if ctx.current_pending_record is not None else None
+                )
+                if not isinstance(pending_snapshot, (PendingAddWord, PendingToolConfirm)):
+                    pending_snapshot = None
+                pending_context = _pending_context_for_command_intent(pending_snapshot)
+                message = ctx.normalized_message_text
+                fast_op = ctx.operation_request.op if ctx.operation_request is not None else "none"
+
+                async def run_shadow() -> None:
+                    metrics_token = suspend_turn_metrics()
+                    try:
+                        async with AsyncOpenAI(
+                            api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL,
+                            timeout=15.0, max_retries=1,
+                        ) as client:
+                            raw = await parse_operation(
+                                message, pending_context, client=client,
+                                model=WORD_QUERY_INTENT_MODEL,
+                            )
+                        validated, violations = validate_operation(raw, message, pending_snapshot)
+                        logger.info(
+                            f"[semantic_shadow] fast_op={fast_op} model_op={validated.op} "
+                            f"model_frame={validated.frame} refers_to_pending={validated.refers_to_pending} "
+                            f"operands={validated.operands!r} codes={validated.codes!r} "
+                            f"violations={violations!r} agree={fast_op == validated.op or fast_op == 'none'}"
+                        )
+                    except asyncio.CancelledError:
+                        logger.info("[semantic_shadow] cancelled")
+                        raise
+                    except Exception as error:
+                        logger.warning(f"[semantic_shadow] failed={type(error).__name__}")
+                    finally:
+                        end_turn_metrics(metrics_token)
+
+                task = asyncio.create_task(run_shadow())
+                _semantic_shadow_tasks.add(task)
+                task.add_done_callback(_semantic_shadow_tasks.discard)
+        except Exception as error:
+            logger.warning(f"[semantic_shadow] failed={type(error).__name__}")
     return False
 
 
