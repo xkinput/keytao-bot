@@ -3519,6 +3519,7 @@ class TurnContext:
     semantic_pending_released: bool = False
     semantic_nonwrite_route: str = ""
     semantic_query_reply: str = ""
+    semantic_query_candidates_prepared: bool = False
     resolved_advertised_words: Tuple[str, ...] = ()
     advertised_snapshot_token: str = ""
     simple_word_query_words: Tuple[str, ...] = ()
@@ -4454,14 +4455,40 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             if validated.op == "query":
                 ctx.simple_word_query_words = validated.operands
                 replies = []
+                missing_words = []
                 for word in validated.operands:
                     replies.append(await _try_handle_simple_single_word_query(
                         word, ctx.platform, ctx.user_id, ctx.conv_key,
                         ctx.space_key, ctx.owner_label,
                         preserve_pending=True, query_only=True,
+                        _missing_words=missing_words,
                     ))
+                missing_words = list(dict.fromkeys(missing_words))
                 ctx.semantic_query_reply = "\n\n".join(reply for reply in replies if reply)
-                if message.strip() == " ".join(validated.operands):
+                if missing_words:
+                    if message.strip() != " ".join(validated.operands):
+                        ctx.semantic_query_reply += "\n\n" + "\n".join(
+                            f"「{word}」未在词库中找到。" for word in missing_words
+                        )
+                        await _stage_generate_ai_response(ctx)
+                        # Keep model prose separate from the record-backed candidate renderer.
+                        explanation = _scope_language_only_reply("词义", str(ctx.response))
+                        replies.append(_NUMBERED_CANDIDATE_ROW_RE.sub("", explanation).strip())
+                    if len(missing_words) == 1:
+                        candidates = await _try_handle_simple_single_word_query(
+                            missing_words[0], ctx.platform, ctx.user_id, ctx.conv_key,
+                            ctx.space_key, ctx.owner_label, _literal_word=True,
+                        )
+                        replies.append(candidates)
+                        ctx.semantic_query_reply = "\n\n".join(reply for reply in replies if reply)
+                    else:
+                        ctx.semantic_query_reply = await _chat_commands._prepare_multi_word_query(
+                            tuple(missing_words), ctx.platform, ctx.user_id, ctx.conv_key,
+                            ctx.space_key, ctx.owner_label,
+                            query_other_blocks=tuple(reply for reply in replies if reply),
+                        )
+                    ctx.semantic_query_candidates_prepared = True
+                if missing_words or message.strip() == " ".join(validated.operands):
                     ctx.response = ServerBackedQueryReply(ctx.semantic_query_reply)
             for stage in RESPONSE_STAGES:
                 if await stage(ctx):
@@ -6455,7 +6482,7 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
         )
         reply_context = await build_reply_context(ctx.bot, ctx.event, ctx.reply_reference)
         if ctx.semantic_query_reply:
-            reply_context += "\n\n词库查询结果（仅作查询依据，本轮不生成加词候选）：\n" + ctx.semantic_query_reply
+            reply_context += "\n\n词库查询结果（仅作解释依据，候选由系统展示，无需重写）：\n" + ctx.semantic_query_reply
 
         async def report_progress(text: str) -> None:
             await _send_event_response(
@@ -6560,6 +6587,8 @@ async def _stage_augment_word_query(ctx: TurnContext) -> bool:
 async def _stage_scope_language_only_response(ctx: TurnContext) -> bool:
     """Production scenario: reading/meaning turns cannot expose code diagnostics."""
     if isinstance(ctx.response, ReviewedSelectionReply):
+        return False
+    if getattr(ctx, "semantic_query_candidates_prepared", False):
         return False
     scoped = _scope_language_only_reply(
         ctx.normalized_message_text,

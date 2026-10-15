@@ -15,6 +15,7 @@ from keytao_bot.harness.state import (
     DraftOperationCoordinator,
     MemoryConversationStateStore,
     PendingAddWord,
+    PendingToolConfirm,
 )
 
 
@@ -36,6 +37,8 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.remember = MagicMock()
         self.tool = AsyncMock(side_effect=self.lookup)
         self.entries = {"济济": "jjes", "积极": "jjuu", "午时": "wj"}
+        self.pending_items = []
+        self.candidate_codes = {"云翻": "yjfj", "发薪": "fsxb", "发薪日": "fxr", "济济": "jjes"}
         self.history = []
         self.patches = (
             patch.dict(os.environ, {
@@ -55,6 +58,7 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.chat, "_finish_ai_chat_response", self.finish),
             patch.object(self.chat.logger, "info"),
             patch.object(self.chat.logger, "warning"),
+            patch.object(self.commands.user_resolver, "resolve_actor_binding", AsyncMock(return_value=True)),
         )
         for context in self.patches:
             context.start()
@@ -71,8 +75,34 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.chat._semantic_shadow_tasks.clear()
 
     async def lookup(self, name, args, platform, user_id, **kwargs):
-        self.assertEqual(name, "keytao_lookup_by_word", "A semantic query must never generate candidates")
         self.assertEqual((platform, user_id), ("qq", self.author.actor_id))
+        if name == "keytao_pending_items_by_words":
+            self.assertEqual(set(args), {"words"})
+            return json.dumps({
+                "success": True, "complete": True,
+                "items": [row for row in self.pending_items if row["word"] in args["words"]],
+            }, ensure_ascii=False)
+        if name == "keytao_prepare_reviewed_add":
+            self.assertEqual(set(args), {"word"})
+            word = args["word"]
+            code = self.candidate_codes[word]
+            return json.dumps({
+                "success": True, "word": word, "type": "Phrase",
+                "recommendedCode": code, "needsManualReview": False,
+                "preSubmitAudit": {
+                    "success": True, "verdict": "pass", "autoApprove": True,
+                    "summary": "Offline reviewed fixture", "issues": [],
+                },
+                "pronunciations": [{
+                    "pinyin": "offline reading", "recommendedCode": code,
+                    "sources": [{"source": "offline"}],
+                    "candidateStatuses": [
+                        {"code": value, "occupied": False, "label": "空位", "words": []}
+                        for value in (code, code + "a")
+                    ],
+                }],
+            }, ensure_ascii=False)
+        self.assertEqual(name, "keytao_lookup_by_word", "Unexpected offline tool")
         self.assertEqual(set(args), {"word"})
         word = args["word"]
         code = self.entries.get(word)
@@ -162,14 +192,168 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.tool.assert_awaited_once()
         self.assertIsNone(self.store.get_record(self.author))
 
-    async def test_missing_word_does_not_prepare_candidates_or_create_ticket(self):
+    async def test_missing_word_reuses_normal_single_word_candidates_and_ticket(self):
         ctx = self.context("云翻")
         self.set_model(operands=("云翻",))
         await self.assert_finished(ctx)
         self.assertIn("云翻", ctx.response)
-        self.assertTrue(any(marker in ctx.response for marker in ("未收录", "没有", "未找到", "未在词库", "不存在")), ctx.response)
-        self.tool.assert_awaited_once_with("keytao_lookup_by_word", {"word": "云翻"}, "qq", self.author.actor_id)
+        self.assertIn("1. yjfj", ctx.response)
+        record = self.store.get_record(self.author)
+        self.assertIsInstance(record.state, PendingAddWord)
+        self.assertEqual(record.state.word, "云翻")
+        self.assertEqual(record.owner_key, self.author)
+        self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, record))
+        self.assertEqual(self.prepared_words(), ["云翻"])
         self.main.assert_not_awaited()
+        self.client.create.assert_awaited_once()
+
+    async def test_missing_meaning_keeps_explanation_when_main_echoes_candidates(self):
+        self.entries.pop("济济")
+        ctx = self.context("济济什么意思")
+        self.set_model()
+        self.main.return_value = (
+            "济济指众多人才聚集。\n「济济」候选编码：\n"
+            "1. jjes — 空位（推荐）\n2. jjesa — 空位"
+        )
+        await self.assert_finished(ctx)
+        self.assertIn("济济指众多人才聚集。", ctx.response)
+        self.assertEqual(ctx.response.count("1. jjes"), 1)
+        self.assertEqual(self.prepared_words(), ["济济"])
+        self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, self.store.get_record(self.author)))
+
+    async def test_multiple_missing_meaning_operands_keep_explanation_in_normal_batch_reply(self):
+        ctx = self.context("发薪 发薪日什么意思")
+        self.set_model(operands=("发薪", "发薪日"))
+        await self.assert_finished(ctx)
+        self.assertIn("这是离线解释。", ctx.response)
+        self.assertEqual(self.prepared_words(), ["发薪", "发薪日"])
+        self.assertIsInstance(self.store.get(self.author), PendingToolConfirm)
+        self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, self.store.get_record(self.author)))
+        self.assert_main(ctx.normalized_message_text, "发薪", "发薪日", "未在词库")
+
+    async def test_present_code_survives_alongside_multiple_missing_candidates(self):
+        ctx = self.context("积极 发薪 发薪日")
+        self.set_model(operands=("积极", "发薪", "发薪日"))
+        await self.assert_finished(ctx)
+        self.assertIn("jjuu", ctx.response)
+        self.assertEqual(self.prepared_words(), ["发薪", "发薪日"])
+        self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, self.store.get_record(self.author)))
+        self.main.assert_not_awaited()
+
+    def prepared_words(self):
+        return [call.args[1]["word"] for call in self.tool.await_args_list
+                if call.args[0] == "keytao_prepare_reviewed_add"]
+
+    async def test_repeated_missing_operand_creates_one_single_word_ticket(self):
+        ctx = self.context("发薪 发薪")
+        self.set_model(operands=("发薪", "发薪"))
+        await self.assert_finished(ctx)
+        self.assertEqual(self.prepared_words(), ["发薪"])
+        self.assertIsInstance(self.store.get(self.author), PendingAddWord)
+        self.assertEqual(self.store.get(self.author).word, "发薪")
+        self.assertEqual(ctx.response.count("候选编码"), 1)
+        self.assertIn("1. fsxb", ctx.response)
+        self.main.assert_not_awaited()
+
+    async def test_two_missing_operands_share_one_normal_batch_ticket(self):
+        other_record, original, _prompt = self.ticket(self.other)
+        ctx = self.context("发薪 发薪日")
+        self.set_model(operands=("发薪", "发薪日"))
+        with patch.object(self.store, "set", wraps=self.store.set) as persist:
+            await self.assert_finished(ctx)
+        self.assertEqual(persist.call_count, 1)
+        record = self.store.get_record(self.author)
+        self.assertIsInstance(record.state, PendingToolConfirm)
+        self.assertEqual(record.state.function_name, "keytao_batch_add_to_draft")
+        self.assertEqual(record.owner_key, self.author)
+        self.assertEqual(record.state.args["_query_words"], ["发薪", "发薪日"])
+        self.assertEqual([scope["word"] for scope in record.state.args["_candidate_scopes"]], ["发薪", "发薪日"])
+        self.assertEqual(self.prepared_words(), ["发薪", "发薪日"])
+        self.assertEqual(ctx.response.count("候选编码"), 2)
+        self.assertNotIn("「发薪 发薪日」", ctx.response)
+        self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, record))
+        self.assert_preserved(self.other, other_record, original)
+        self.main.assert_not_awaited()
+        self.client.create.assert_awaited_once()
+        execute = AsyncMock(return_value="Offline batch saved")
+        stranger = ConversationAddress.group("qq", self.author.space_id, "stranger")
+        with patch.object(self.commands, "_execute_confirmed_tool", execute):
+            self.assertIsNone(await self.chat.handle_pending_message_core(
+                "加入", "qq", stranger.actor_id, stranger,
+                history=[], space_key=stranger.space_key, allow_intent_model=False,
+            ))
+            execute.assert_not_awaited()
+            result = await self.chat.handle_pending_message_core(
+                "加入", "qq", self.author.actor_id, self.author,
+                history=[], space_key=self.author.space_key, allow_intent_model=False,
+            )
+        self.assertIn("Offline batch saved", result)
+        execute.assert_awaited_once()
+        self.assertEqual([row["word"] for row in execute.await_args.args[0].args["items"]], ["发薪", "发薪日"])
+        self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_mixed_present_and_missing_operands_keep_code_and_normal_selection(self):
+        ctx = self.context("积极 发薪")
+        self.set_model(operands=("积极", "发薪"))
+        await self.assert_finished(ctx)
+        self.assertIn("jjuu", ctx.response)
+        self.assertIn("1. fsxb", ctx.response)
+        self.assertEqual(self.prepared_words(), ["发薪"])
+        record = self.store.get_record(self.author)
+        self.assertIsInstance(record.state, PendingAddWord)
+        self.assertEqual(record.state.word, "发薪")
+        execute = AsyncMock(return_value="Offline addition")
+        with patch.object(self.chat, "_execute_add_to_draft", execute):
+            result = await self.chat.handle_pending_message_core(
+                "2", "qq", self.author.actor_id, self.author,
+                history=[], space_key=self.author.space_key, allow_intent_model=False,
+            )
+        self.assertIn("Offline addition", result)
+        execute.assert_awaited_once()
+        self.assertEqual(execute.await_args.args[:2], ("发薪", "fsxba"))
+        self.assertIsNone(self.store.get_record(self.author))
+        self.main.assert_not_awaited()
+
+    async def test_missing_meaning_operand_keeps_explanation_and_only_operand_candidates(self):
+        self.entries.pop("济济")
+        ctx = self.context("济济啥意思")
+        self.set_model()
+        await self.assert_finished(ctx)
+        self.assert_main("济济啥意思", "济济", "未在词库")
+        self.assertNotIn("候选编码", self.main.await_args.args[4])
+        self.assertIn("这是离线解释。", ctx.response)
+        self.assertIn("1. jjes", ctx.response)
+        self.assertNotIn("「济济啥意思」", ctx.response)
+        self.assertEqual(self.prepared_words(), ["济济"])
+        self.assertEqual(self.store.get(self.author).word, "济济")
+        self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, self.store.get_record(self.author)))
+        self.client.create.assert_awaited_once()
+
+    async def test_missing_operands_keep_existing_draft_reminder(self):
+        self.pending_items = [{
+            "source": "draft", "word": "发薪日", "code": "fxr", "action": "Create",
+            "batchId": "offline-draft", "batchStatus": "Draft",
+            "batchUrl": "https://offline.invalid/batch/offline-draft",
+        }]
+        ctx = self.context("发薪 发薪日")
+        self.set_model(operands=("发薪", "发薪日"))
+        await self.assert_finished(ctx)
+        self.assertIn("当前草稿", ctx.response)
+        self.assertIn("发薪日", ctx.response)
+        self.assertEqual(self.prepared_words(), ["发薪"])
+        self.assertEqual([row["word"] for row in self.store.get(self.author).args["items"]], ["发薪"])
+
+    async def test_single_missing_operand_already_in_draft_creates_no_ticket(self):
+        self.pending_items = [{
+            "source": "draft", "word": "发薪日", "code": "fxr", "action": "Create",
+            "batchId": "offline-draft", "batchStatus": "Draft",
+            "batchUrl": "https://offline.invalid/batch/offline-draft",
+        }]
+        ctx = self.context("发薪日")
+        self.set_model(operands=("发薪日",))
+        await self.assert_finished(ctx)
+        self.assertIn("当前草稿", ctx.response)
+        self.assertEqual(self.prepared_words(), [])
         self.assertIsNone(self.store.get_record(self.author))
 
     async def test_multiword_query_uses_only_each_literal_operand_and_preserves_ticket(self):

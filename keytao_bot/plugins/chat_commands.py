@@ -3500,12 +3500,13 @@ async def _prepare_multi_word_query(
     *,
     reading_requests: tuple = (),
     preserve_pending: bool = False,
+    query_other_blocks: Tuple[str, ...] = (),
 ) -> str:
     """Collect the single-word pipeline into one durable candidate capability."""
     if len(words) > _MAX_BARE_MULTI_WORD_QUERY_ITEMS:
         return f"一次最多查询 {_MAX_BARE_MULTI_WORD_QUERY_ITEMS} 个词，请拆分后重新发送。"
     scopes: List[Dict[str, Any]] = []
-    other_blocks: List[str] = []
+    other_blocks: List[str] = list(query_other_blocks)
     for word in words:
         count = len(scopes)
         request = next((row for row in reading_requests if row.word == word), None)
@@ -3607,11 +3608,16 @@ async def _try_handle_simple_single_word_query(
     _prepared_scopes: Optional[List[Dict[str, Any]]] = None,
     preserve_pending: bool = False,
     query_only: bool = False,
+    _missing_words: Optional[List[str]] = None,
+    _literal_word: bool = False,
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     from ..utils.reading_request import parse_parenthesised_readings
 
-    reading_requests = parse_parenthesised_readings(message_text) if _prepared_scopes is None and not query_only else ()
+    reading_requests = (
+        parse_parenthesised_readings(message_text)
+        if _prepared_scopes is None and not query_only and not _literal_word else ()
+    )
     if reading_requests:
         set_turn_flow("word-discovery")
         return await _prepare_multi_word_query(
@@ -3619,16 +3625,22 @@ async def _try_handle_simple_single_word_query(
             reading_requests=reading_requests,
             preserve_pending=preserve_pending,
         )
-    multi_words = _bare_multi_word_query_words(message_text) if _prepared_scopes is None and not query_only else ()
+    multi_words = (
+        _bare_multi_word_query_words(message_text)
+        if _prepared_scopes is None and not query_only and not _literal_word else ()
+    )
     if multi_words:
         set_turn_flow("word-discovery")
         return await _prepare_multi_word_query(
             multi_words, platform, user_id, conv_key, space_key, owner_label,
             preserve_pending=preserve_pending,
         )
-    explicit_add_word = _extract_explicit_reviewed_add_word(message_text) if not query_only else ""
+    explicit_add_word = (
+        _extract_explicit_reviewed_add_word(message_text)
+        if not query_only and not _literal_word else ""
+    )
     words = (
-        (message_text,) if _prepared_scopes is not None or query_only
+        (message_text,) if _prepared_scopes is not None or query_only or _literal_word
         else (explicit_add_word,) if explicit_add_word
         else await _get_simple_word_query_words(message_text)
     )
@@ -3772,6 +3784,9 @@ async def _try_handle_simple_single_word_query(
             return "词库查询返回了不完整的已有词条记录；本次未继续。"
 
     if query_only:
+        if lookup_data.get("success") is True and _missing_words is not None:
+            _missing_words.append(word)
+            return None
         return ServerBackedQueryReply(
             f"「{word}」未在词库中找到。" if lookup_data.get("success") is True
             else f"暂时无法查询「{word}」的词库记录。"
