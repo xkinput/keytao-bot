@@ -109,7 +109,7 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
         self.add.assert_not_awaited()
         self.submit.assert_not_awaited()
 
-    async def test_stale_candidate_releases_complete_model_swap(self):
+    async def test_stale_candidate_dispatches_complete_model_swap(self):
         os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] += ",swap"
         record, _prompt = self.ticket()
         original = copy.deepcopy(record)
@@ -120,35 +120,56 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await self.chat._stage_understand_operation_early(self.ctx))
         swap.assert_awaited_once_with(
             "午时", "务实", "qq", self.author.actor_id,
-            self.author.space_key, "Offline owner", preserve_pending=True,
+            self.author.space_key, "Offline owner",
         )
-        self.assertTrue(self.ctx.released_pending_turn)
+        self.assertFalse(self.ctx.released_pending_turn)
         self.assertEqual(self.ctx.response, "offline sealed swap plan")
         self.assert_untouched(record, original)
 
-    async def test_real_swap_preview_preserves_ticket_for_both_chain_shapes(self):
+    async def test_real_swap_replaces_ticket_for_both_chain_shapes(self):
         os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] += ",swap"
         for other_code in ("wj", "wja"):
             with self.subTest(other_code=other_code):
                 record, _prompt = self.ticket()
-                original = copy.deepcopy(record)
                 self.ctx = self.context("午时和务实互换一下位置")
                 self.set_model("swap", ("午时", "务实"), refers_to_pending=False)
                 rows = {
                     "午时": {"word": "午时", "code": "wj", "type": "Phrase", "weight": 100},
                     "务实": {"word": "务实", "code": other_code, "type": "Phrase", "weight": 101},
                 }
-                execute = AsyncMock(side_effect=AssertionError("Released preview must not seal a replacement"))
+                async def seal(*args, **kwargs):
+                    self.assertTrue(self.store.set(self.author, PendingToolConfirm(
+                        "keytao_shift_phrase_code", {"word": "午时", "target_code": "wj"},
+                    )))
+                    return "offline sealed swap plan"
+
+                execute = AsyncMock(side_effect=seal)
                 with (
                     patch.object(self.commands, "_load_merged_word_entries", AsyncMock(return_value=rows)),
                     patch.object(self.commands, "_execute_shift_to_code", execute),
                 ):
                     self.assertTrue(await self.chat._stage_understand_operation_early(self.ctx))
-                self.assertIn("方案预览", self.ctx.response)
-                self.assertIn("午时 wj", self.ctx.response)
-                self.assertIn("务实 " + other_code, self.ctx.response)
-                execute.assert_not_awaited()
-                self.assert_untouched(record, original)
+                self.assertEqual(self.ctx.response, "offline sealed swap plan")
+                execute.assert_awaited_once()
+                self.assertEqual(execute.await_args.kwargs["expected_codes"], [other_code, "wj"])
+                self.assertIsNot(self.store.get_record(self.author), record)
+                self.assertEqual(self.store.get(self.author).function_name, "keytao_shift_phrase_code")
+
+    async def test_quoted_complete_swap_supersedes_wrong_model_answer(self):
+        os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] += ",swap"
+        self.ticket()
+        self.ctx = self.context("午时和务实互换一下位置")
+        self.ctx.reply_reference = harness.ReplyReferenceInfo(
+            is_reply=True, is_to_bot=True, text="另一条不相关消息",
+        )
+        self.set_model("confirm", refers_to_pending=True)
+        swap = AsyncMock(return_value="offline sealed swap plan")
+        with patch.object(self.commands, "try_handle_model_entry_swap", swap):
+            self.assertTrue(await self.chat._stage_understand_operation_early(self.ctx))
+        swap.assert_awaited_once_with(
+            "午时", "务实", "qq", self.author.actor_id, self.author.space_key, "Offline owner",
+        )
+        self.assertFalse(self.ctx.semantic_pending_released)
 
     async def test_query_release_bypasses_ticket_claims_and_reaches_query_path(self):
         record, _prompt = self.ticket()
@@ -201,18 +222,18 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_release_skips_later_mutation_and_reset_entrypoints(self):
         cases = (
-            (self.chat._stage_handle_draft_management, "清空草稿", "draft_clear"),
-            (self.chat._stage_handle_replace_character, "把午替换成晚", "replace_char"),
-            (self.chat._stage_handle_explicit_draft_conversation_reset, "清空草稿并清空对话", "draft_clear"),
-            (self.chat._stage_handle_clear_history, "清空对话", "clear_history"),
-            (self.chat._stage_submit_current_draft, "提交草稿", "draft_submit"),
-            (self.chat._stage_handle_completed_draft_undo, "撤销刚才的操作", "cancel"),
+            (self.chat._stage_handle_draft_management, "draft_clear"),
+            (self.chat._stage_handle_replace_character, "replace_char"),
+            (self.chat._stage_handle_explicit_draft_conversation_reset, "draft_clear"),
+            (self.chat._stage_handle_clear_history, "clear_history"),
+            (self.chat._stage_submit_current_draft, "draft_submit"),
+            (self.chat._stage_handle_completed_draft_undo, "cancel"),
         )
-        for stage, message, intent in cases:
+        for stage, intent in cases:
             with self.subTest(stage=stage.__name__):
                 record, _prompt = self.ticket()
                 original = copy.deepcopy(record)
-                self.ctx = self.context(message)
+                self.ctx = self.context("这个词怎么打")
                 self.ctx.generic_command_intent = self.chat.MessageCommandIntent(intent=intent, confidence=1.0)
                 self.set_model("query", frame="none", refers_to_pending=False)
                 self.assertFalse(await self.chat._stage_understand_operation_early(self.ctx))
@@ -297,8 +318,10 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
         record, _prompt = self.ticket()
         original = copy.deepcopy(record)
         self.ctx = self.context("清空草稿")
+        from keytao_bot.harness.operation_request import OperationRequest
         self.set_model("draft_clear", refers_to_pending=False)
-        self.assertFalse(await self.chat._stage_understand_operation_early(self.ctx))
+        with patch("keytao_bot.harness.operation_request.understand_message", return_value=OperationRequest()):
+            self.assertFalse(await self.chat._stage_understand_operation_early(self.ctx))
         self.assertTrue(self.ctx.released_pending_turn)
         self.assertEqual(self.chat._structural_draft_management_intent("清空草稿").intent, "draft_clear")
         seen = []

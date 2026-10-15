@@ -3755,7 +3755,18 @@ async def _try_handle_simple_single_word_query(
             )
             if query_only:
                 return ServerBackedQueryReply(existing_reply.splitlines()[0])
-            return ("类型：单字\n" + existing_reply) if len(word) == 1 else existing_reply
+            response = ("类型：单字\n" + existing_reply) if len(word) == 1 else existing_reply
+            if (
+                live_record is not None
+                and isinstance(live_record.state, PendingTrustedWordRecord)
+                and live_record.state.word == word
+                and live_record.state.code in existing_codes
+                and not preserve_pending
+            ):
+                conversation_state_store.bind_origin_prompt_digest(
+                    conv_key, _prompt_capability_digest(response),
+                )
+            return response
         if matching_rows or len(word) != 1:
             return "词库查询返回了不完整的已有词条记录；本次未继续。"
 
@@ -4237,7 +4248,7 @@ def _capture_resolved_mutation_delivery(
         deliveries.append(receipt)
 
 
-def _acknowledge_delivered_draft_mutations() -> None:
+def _acknowledge_delivered_draft_mutations(delivered_response: str = "") -> None:
     deliveries = current_draft_delivery_claims.get()
     if not deliveries:
         return
@@ -4309,7 +4320,7 @@ def _acknowledge_delivered_draft_mutations() -> None:
                 delta = merge_receipt_deltas(receipts)
                 recent_items = [*delta["writtenItems"], *delta["updatedItems"]]
                 recent_version = receipts[0]["contentVersion"]
-            conversation_state_store.set(
+            stored = conversation_state_store.set(
                 address,
                 PendingToolConfirm(
                     function_name="keytao_submit_batch",
@@ -4329,6 +4340,10 @@ def _acknowledge_delivered_draft_mutations() -> None:
                 space_key=address.space_key,
                 owner_label=memory_context.speaker_name,
             )
+            if stored and delivered_response:
+                conversation_state_store.bind_origin_prompt_digest(
+                    address, _prompt_capability_digest(delivered_response),
+                )
     deliveries.clear()
 
 
@@ -8995,8 +9010,6 @@ async def try_handle_model_entry_swap(
     user_id: str,
     space_key: Optional[Tuple[str, str]],
     owner_label: str,
-    *,
-    preserve_pending: bool = False,
 ) -> str:
     """Resolve a validated pair into the existing author-confirmed swap plan."""
     expected_words = (first_word, second_word)
@@ -9032,8 +9045,6 @@ async def try_handle_model_entry_swap(
             return render_remediation_reply(
                 "两个词当前权重无法形成唯一互换计划"
             )
-        if preserve_pending:
-            return _preserved_pending_plan(f"互换 {first_word} {first_code} 与 {second_word} {second_code} 的优先级")
         return await _execute_shift_to_code(
             first_word,
             first_code,
@@ -9060,8 +9071,6 @@ async def try_handle_model_entry_swap(
         return render_remediation_reply(
             "两个词不在同一条可验证候选链，不能共用一张换位计划"
         )
-    if preserve_pending:
-        return _preserved_pending_plan(f"互换 {first_word} {first_code} 与 {second_word} {second_code} 的编码和权重")
     return await _execute_shift_to_code(
         first_word,
         target_root,
@@ -11523,11 +11532,7 @@ def _understood_command_digest(args: Dict) -> str:
     ).encode("utf-8")).hexdigest()
 
 
-def _preserved_pending_plan(command: str) -> str:
-    return f"方案预览：{command}。\n当前候选仍保留；请先处理原候选，再重新发送这条完整指令。"
-
-
-async def try_handle_model_command(request, platform, user_id, conv_key, space_key, owner_label, *, preserve_pending=False):
+async def try_handle_model_command(request, platform, user_id, conv_key, space_key, owner_label):
     """Seal a canonical command without performing any tool call."""
     command = render_understood_command(request)
     if not command:
@@ -11535,8 +11540,6 @@ async def try_handle_model_command(request, platform, user_id, conv_key, space_k
     record = conversation_state_store.get_record(conv_key)
     if record is not None and record.execution_id:
         return "上一项操作仍在处理中，本次未替换确认计划。"
-    if preserve_pending and record is not None:
-        return _preserved_pending_plan(command)
     args = {"command_text": command, "op": request.op, "operands": list(request.operands),
             "codes": list(request.codes), "submit_after": request.submit_after}
     args["digest"] = _understood_command_digest(args)

@@ -1073,6 +1073,9 @@ def remember_conversation(
     if not history_store.is_generation_current(address, history_token):
         logger.info(f"Dropping stale history write for {address}")
         return False
+    assistant_message = _prepare_user_facing_reply(assistant_message, memory_context)
+    if memory_context.platform == "qq":
+        assistant_message = _strip_markdown(assistant_message)
     if not add_to_history(
         conv_key,
         user_message,
@@ -2967,6 +2970,21 @@ def _prepare_user_facing_reply(
         prepared = _append_unreported_submit_status(prepared, deliveries, conv_key)
     prepared = render_platform_public_links(prepared, platform)
     prepared = strip_bare_batch_ids(prepared)
+    if live_record is not None and not live_record.execution_id and (
+        (
+            advertised_reply_contract(prepared).requires_live_state
+            and _advertised_reply_matches_live_record(prepared, live_record)
+        )
+        or (
+            isinstance(response, ReviewedSelectionReply)
+            and _reviewed_selection_reply_matches_live_record(response, live_record)
+        )
+    ):
+        conversation_state_store.bind_origin_prompt_digest(
+            conv_key, _chat_routing._prompt_capability_digest(
+                _strip_markdown(prepared) if platform == "qq" else prepared,
+            ),
+        )
     return _assert_plain_user_facing_reply(prepared)
 
 
@@ -2998,6 +3016,7 @@ async def _send_event_response(
                 )
                 await bot.send(event=event, message=message)
                 if emit_metrics:
+                    _acknowledge_delivered_draft_mutations(_strip_markdown(text))
                     emit_turn_metrics(logger)
                 return True
         if "telegram" in bot_module.lower():
@@ -3008,10 +3027,12 @@ async def _send_event_response(
                 reply_to_message_id=getattr(event, "message_id", None),
             )
             if emit_metrics:
+                _acknowledge_delivered_draft_mutations(text)
                 emit_turn_metrics(logger)
             return True
         await bot.send(event=event, message=text)
         if emit_metrics:
+            _acknowledge_delivered_draft_mutations(text)
             emit_turn_metrics(logger)
         return True
     except Exception as error:
@@ -3146,7 +3167,7 @@ async def _run_background_draft_operation(
             generation_token=generation_token,
         ):
             return
-        sent = await _send_event_response(
+        await _send_event_response(
             bot,
             event,
             user_id,
@@ -3154,8 +3175,6 @@ async def _run_background_draft_operation(
             response_text,
             qq_message_segment,
         )
-        if sent:
-            _acknowledge_delivered_draft_mutations()
     current_draft_delivery_claims.reset(delivery_token)
 
 
@@ -3392,7 +3411,7 @@ async def _finish_ai_chat_response(
                 if message_id:
                     kwargs["reply_to_message_id"] = message_id
                 await bot.send(**kwargs)
-                _acknowledge_delivered_draft_mutations()
+                _acknowledge_delivered_draft_mutations(response)
                 emit_turn_metrics(logger)
                 return
             except Exception:
@@ -3407,7 +3426,7 @@ async def _finish_ai_chat_response(
         except Exception as error:
             logger.warning(f"Telegram plain-text chunk send failed: {error}")
             raise
-        _acknowledge_delivered_draft_mutations()
+        _acknowledge_delivered_draft_mutations(response)
         emit_turn_metrics(logger)
         return
 
@@ -3426,14 +3445,14 @@ async def _finish_ai_chat_response(
                         memory_context.space_type == "group",
                     ),
                 )
-                _acknowledge_delivered_draft_mutations()
+                _acknowledge_delivered_draft_mutations(qq_text)
                 emit_turn_metrics(logger)
                 return
             except Exception:
                 pass
         if callable(getattr(bot, "send", None)):
             await bot.send(event=event, message=qq_text)
-            _acknowledge_delivered_draft_mutations()
+            _acknowledge_delivered_draft_mutations(qq_text)
             emit_turn_metrics(logger)
         else:
             await _finish_ai_chat_matcher(qq_text)
@@ -3441,7 +3460,7 @@ async def _finish_ai_chat_response(
 
     if callable(getattr(bot, "send", None)):
         await bot.send(event=event, message=response)
-        _acknowledge_delivered_draft_mutations()
+        _acknowledge_delivered_draft_mutations(response)
         emit_turn_metrics(logger)
     else:
         await _finish_ai_chat_matcher(response)
@@ -3510,6 +3529,26 @@ class TurnContext:
     operation_request: Optional[object] = None
     operation_violations: Tuple[str, ...] = ()
     operation_understood_early: bool = False
+
+
+def _verified_pending_reply(ctx: TurnContext, record: Optional[PendingStateRecord]) -> bool:
+    """Bind digest-less legacy tickets only to this author's latest bot reply."""
+    reply = ctx.reply_reference
+    referenced_owner = _referenced_owner_key_from_reply_reference(reply, ctx.platform)
+    if (
+        record is None or record.execution_id
+        or record.owner_key != normalize_conversation_key(ctx.conv_key, ctx.space_key)
+        or record.owner_key.platform != ctx.platform
+        or record.owner_key.actor_id != str(ctx.user_id)
+        or referenced_owner not in {None, (ctx.platform, str(ctx.user_id))}
+    ):
+        return False
+    if record.origin_prompt_digest:
+        return _verified_bot_reply_matches_record(ctx.reply_reference, record)
+    return bool(
+        reply.is_reply and reply.is_to_bot and reply.text
+        and reply.text == _get_latest_assistant_message(get_history(ctx.conv_key))
+    )
 
 
 async def _stage_load_platform_reply_adapter(ctx: TurnContext) -> bool:
@@ -3939,10 +3978,7 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
         if ctx.reply_reference.is_to_bot and ctx.reply_reference.text
         else None
     )
-    ctx.verified_current_pending_reply = _verified_bot_reply_matches_record(
-        ctx.reply_reference,
-        current_record,
-    )
+    ctx.verified_current_pending_reply = _verified_pending_reply(ctx, current_record)
     ctx.referenced_pending = (
         current_record.state
         if (
@@ -4049,6 +4085,11 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
             or _is_short_add_and_submit_request(ctx.normalized_message_text)
             or _is_pending_assent_then_submit_request(
                 ctx.normalized_message_text
+            )
+            or (
+                ctx.verified_current_pending_reply
+                and (assent := _pending_tool_assent_intent(recent_write_state, ctx.normalized_message_text)) is not None
+                and assent.intent == "pending_confirm"
             )
         )
         if not submit_requested:
@@ -4309,7 +4350,8 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
     route_ops = _chat_commands.SEMANTIC_ROUTE_OPS & {
         token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
     }
-    fast_op = ctx.operation_request.op if ctx.operation_request is not None else "none"
+    fast_request = ctx.operation_request
+    fast_op = fast_request.op if fast_request is not None else "none"
     # Fast swaps can include suffixes in an operand (e.g. "务实的码").
     if route_ops and ctx.normalized_message_text.strip():
         try:
@@ -4354,6 +4396,44 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     pending_decision = json.loads(pending_decision)
                 except ValueError:
                     pending_decision = None
+        owned_ticket = bool(
+            pending_snapshot is not None and current_record is not None
+            and conversation_state_store.get_record(ctx.conv_key) is current_record
+            and current_record.owner_key == normalize_conversation_key(ctx.conv_key, ctx.space_key)
+            and current_record.owner_key.platform == ctx.platform
+            and current_record.owner_key.actor_id == str(ctx.user_id)
+            and not current_record.execution_id
+        )
+        complete_command = bool(
+            owned_ticket and route_ops & {"pending_release", "pending_answer"}
+            and fast_request is not None
+            and fast_request.frame == "direct" and fast_request.refers_to_pending is False
+        )
+        model_command = bool(
+            validated.op in route_ops - {"pending_release", "pending_answer", "query", "chat", "help"}
+            and all(value.startswith("frame_backstop:") for value in violations)
+            and validated.frame in {"direct", "question"}
+            and validated.refers_to_pending is False
+        )
+        if (
+            owned_ticket and route_ops & {"pending_release", "pending_answer"}
+            and (not current_record.origin_prompt_digest or complete_command)
+            and not model_command
+        ):
+            # Unbound tickets and complete commands retain the pre-B3c resolver.
+            if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, current_record):
+                if complete_command and fast_request.op in route_ops and (
+                    fast_request.op == "swap" or _chat_commands.render_understood_command(fast_request)
+                ):
+                    # A separate command may replace the ticket, never answer it.
+                    validated, model_command = fast_request, True
+                else:
+                    ctx.released_pending_turn = ctx.semantic_pending_released = True
+                    ctx.current_pending_record = current_record
+                    return False
+            else:
+                ctx.operation_request = fast_request
+                return False
         if (
             validated.op in {"query", "chat", "help"} & route_ops
             and isinstance(pending_decision, dict)
@@ -4385,15 +4465,11 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     return True
             return True
         live_owned_ticket = bool(
-            pending_snapshot is not None and current_record is not None
+            owned_ticket and current_record.origin_prompt_digest
+            and not complete_command and not model_command
             and isinstance(pending_decision, dict)
             and isinstance(pending_decision.get("refers_to_pending"), bool)
             and isinstance(pending_decision.get("submit_after"), bool)
-            and conversation_state_store.get_record(ctx.conv_key) is current_record
-            and current_record.owner_key == normalize_conversation_key(ctx.conv_key, ctx.space_key)
-            and current_record.owner_key.platform == ctx.platform
-            and current_record.owner_key.actor_id == str(ctx.user_id)
-            and not current_record.execution_id
             and all(value.startswith("frame_backstop:") for value in violations)
         )
         if live_owned_ticket:
@@ -4436,7 +4512,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 and validated.op in {"confirm", "select_candidate", "cancel", "pending_recode"}
                 and draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is None
             ):
-                if ctx.reply_reference.is_reply and not _verified_bot_reply_matches_record(ctx.reply_reference, current_record):
+                if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, current_record):
                     ctx.released_pending_turn = True
                     ctx.semantic_pending_released = True
                     ctx.current_pending_record = current_record
@@ -4463,19 +4539,12 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                             response, ctx.QQMessageSegment,
                         )
                         return True
-        if (
-            validated.op in route_ops
-            and all(value.startswith("frame_backstop:") for value in violations)
-            and validated.frame in {"direct", "question"}
-            and validated.refers_to_pending is False
-        ):
-            preserve = {"preserve_pending": True} if ctx.semantic_pending_released else {}
+        if model_command:
             if validated.op == "swap":
                 response = (
                     await _chat_commands.try_handle_model_entry_swap(
                         *validated.operands, ctx.platform, ctx.user_id,
                         ctx.space_key, ctx.owner_label,
-                        **preserve,
                     )
                     if len(validated.operands) == len(set(validated.operands)) == 2
                     and not validated.codes and not validated.submit_after else None
@@ -4484,7 +4553,6 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 response = await _chat_commands.try_handle_model_command(
                     validated, ctx.platform, ctx.user_id, ctx.conv_key,
                     ctx.space_key, ctx.owner_label,
-                    **preserve,
                 )
             if response is not None:
                 ctx.scoped_pending_response = None
@@ -4563,7 +4631,7 @@ async def _stage_handle_understood_command_control(ctx: TurnContext) -> bool:
         return False
     if _strip_command_message_prefixes(ctx.normalized_message_text).strip() not in {"确认", "取消"}:
         return False
-    if ctx.reply_reference.is_reply and not _verified_bot_reply_matches_record(ctx.reply_reference, record):
+    if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, record):
         ctx.released_pending_turn = True
         return False
     response = await _chat_commands.handle_pending_understood_command(
@@ -5635,7 +5703,7 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
         if isinstance(state, PendingToolConfirm) and state.function_name == "keytao_understood_command":
             if _strip_command_message_prefixes(ctx.normalized_message_text).strip() not in {"确认", "取消"}:
                 return False
-            if ctx.reply_reference.is_reply and not _verified_bot_reply_matches_record(ctx.reply_reference, state_record):
+            if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, state_record):
                 ctx.released_pending_turn = True
                 return False
             ctx.response = await _chat_commands.handle_pending_understood_command(
