@@ -1604,6 +1604,7 @@ async def get_ai_response_core(
     command_intent: Optional[MessageCommandIntent] = None,
     released_pending_turn: bool = False,
     preserve_pending: bool = False,
+    conversation_only: bool = False,
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
 
@@ -1637,6 +1638,8 @@ async def get_ai_response_core(
             fallback_context: AgentRequestContext,
         ) -> Optional[str]:
             """Resolve closed controls or an evidence-backed encoding question."""
+            if conversation_only:
+                return None
             pending_reply = None if released_pending_turn else await handle_pending_message_core(
                 fallback_message,
                 fallback_context.platform,
@@ -1726,7 +1729,7 @@ async def get_ai_response_core(
                 progress_reporter=progress_reporter,
                 resolved_advertised_words=resolved_advertised_words,
                 advertised_snapshot_token=advertised_snapshot_token,
-                conversation_only=_current_conversational_turn.get() is not None,
+                conversation_only=conversation_only or _current_conversational_turn.get() is not None,
             ),
             max_iterations=max_iterations,
         )
@@ -3479,6 +3482,8 @@ class TurnContext:
     scoped_pending_response: Optional[str] = None
     released_pending_turn: bool = False
     semantic_pending_released: bool = False
+    semantic_nonwrite_route: str = ""
+    semantic_query_reply: str = ""
     resolved_advertised_words: Tuple[str, ...] = ()
     advertised_snapshot_token: str = ""
     simple_word_query_words: Tuple[str, ...] = ()
@@ -4336,6 +4341,36 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     pending_decision = json.loads(pending_decision)
                 except ValueError:
                     pending_decision = None
+        if (
+            validated.op in {"query", "chat", "help"} & route_ops
+            and isinstance(pending_decision, dict)
+            and pending_decision.get("refers_to_pending") is False
+            and isinstance(pending_decision.get("submit_after"), bool)
+            and all(value.startswith("frame_backstop:") for value in violations)
+            and validated.refers_to_pending is False
+            and (validated.op != "query" or validated.operands)
+        ):
+            ctx.semantic_nonwrite_route = validated.op
+            ctx.released_pending_turn = ctx.semantic_pending_released = True
+            ctx.scoped_pending_state = ctx.scoped_pending_intent = ctx.scoped_pending_response = None
+            ctx.response = None
+            _current_conversational_turn.set(None)
+            if validated.op == "query":
+                ctx.simple_word_query_words = validated.operands
+                replies = []
+                for word in validated.operands:
+                    replies.append(await _try_handle_simple_single_word_query(
+                        word, ctx.platform, ctx.user_id, ctx.conv_key,
+                        ctx.space_key, ctx.owner_label,
+                        preserve_pending=True, query_only=True,
+                    ))
+                ctx.semantic_query_reply = "\n\n".join(reply for reply in replies if reply)
+                if message.strip() == " ".join(validated.operands):
+                    ctx.response = ServerBackedQueryReply(ctx.semantic_query_reply)
+            for stage in RESPONSE_STAGES:
+                if await stage(ctx):
+                    return True
+            return True
         live_owned_ticket = bool(
             pending_snapshot is not None and current_record is not None
             and isinstance(pending_decision, dict)
@@ -6317,6 +6352,8 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
             query_words=ctx.simple_word_query_words or ctx.resolved_advertised_words,
         )
         reply_context = await build_reply_context(ctx.bot, ctx.event, ctx.reply_reference)
+        if ctx.semantic_query_reply:
+            reply_context += "\n\n词库查询结果（仅作查询依据，本轮不生成加词候选）：\n" + ctx.semantic_query_reply
 
         async def report_progress(text: str) -> None:
             await _send_event_response(
@@ -6345,6 +6382,7 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
                 ctx.generic_command_intent if _current_conversational_turn.get() is not None
                 else replace(ctx.generic_command_intent, has_operation_intent=None)
             ),
+            **({"conversation_only": True} if ctx.semantic_nonwrite_route else {}),
         )
         conversational_turn = _current_conversational_turn.get()
         if conversational_turn is not None:
@@ -6388,6 +6426,8 @@ async def _stage_augment_word_query(ctx: TurnContext) -> bool:
     """Production scenario: only ordinary Q&A receives simple-word augmentation."""
     from ..utils.observability import current_turn_metrics
 
+    if ctx.semantic_nonwrite_route:
+        return False
     if _current_conversational_turn.get() is not None:
         return False
     metrics = current_turn_metrics()
@@ -6483,6 +6523,19 @@ async def _stage_finish_platform_response(ctx: TurnContext) -> bool:
 ChatStage = Callable[[TurnContext], Awaitable[bool]]
 
 
+RESPONSE_STAGES: Tuple[ChatStage, ...] = (
+    _stage_generate_ai_response,
+    _stage_reject_empty_response,
+    _stage_normalize_response,
+    _stage_augment_word_query,
+    _stage_scope_language_only_response,
+    _stage_append_ticket_challenge,
+    _stage_enforce_advertised_reply_contract,
+    _stage_persist_conversation,
+    _stage_finish_platform_response,
+)
+
+
 STAGES: Tuple[ChatStage, ...] = (
     _stage_load_platform_reply_adapter,
     _stage_collect_message_inputs,
@@ -6521,15 +6574,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_draft_management,
     _stage_handle_replace_character,
     _stage_handle_simple_word_query,
-    _stage_generate_ai_response,
-    _stage_reject_empty_response,
-    _stage_normalize_response,
-    _stage_augment_word_query,
-    _stage_scope_language_only_response,
-    _stage_append_ticket_challenge,
-    _stage_enforce_advertised_reply_contract,
-    _stage_persist_conversation,
-    _stage_finish_platform_response,
+    *RESPONSE_STAGES,
 )
 
 

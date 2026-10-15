@@ -3605,11 +3605,12 @@ async def _try_handle_simple_single_word_query(
     actionable_lookup: bool = False,
     _prepared_scopes: Optional[List[Dict[str, Any]]] = None,
     preserve_pending: bool = False,
+    query_only: bool = False,
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     from ..utils.reading_request import parse_parenthesised_readings
 
-    reading_requests = parse_parenthesised_readings(message_text) if _prepared_scopes is None else ()
+    reading_requests = parse_parenthesised_readings(message_text) if _prepared_scopes is None and not query_only else ()
     if reading_requests:
         set_turn_flow("word-discovery")
         return await _prepare_multi_word_query(
@@ -3617,22 +3618,22 @@ async def _try_handle_simple_single_word_query(
             reading_requests=reading_requests,
             preserve_pending=preserve_pending,
         )
-    multi_words = _bare_multi_word_query_words(message_text) if _prepared_scopes is None else ()
+    multi_words = _bare_multi_word_query_words(message_text) if _prepared_scopes is None and not query_only else ()
     if multi_words:
         set_turn_flow("word-discovery")
         return await _prepare_multi_word_query(
             multi_words, platform, user_id, conv_key, space_key, owner_label,
             preserve_pending=preserve_pending,
         )
-    explicit_add_word = _extract_explicit_reviewed_add_word(message_text)
+    explicit_add_word = _extract_explicit_reviewed_add_word(message_text) if not query_only else ""
     words = (
-        (message_text,) if _prepared_scopes is not None
+        (message_text,) if _prepared_scopes is not None or query_only
         else (explicit_add_word,) if explicit_add_word
         else await _get_simple_word_query_words(message_text)
     )
     if len(words) != 1:
         return None
-    set_turn_flow("word-discovery")
+    set_turn_flow("word-query" if query_only else "word-discovery")
 
     word = words[0]
     lookup_json = await call_tool_function(
@@ -3643,16 +3644,19 @@ async def _try_handle_simple_single_word_query(
     except Exception:
         lookup_data = {}
 
-    pending_json = await call_tool_function(
-        "keytao_pending_items_by_words",
-        {"words": [word]},
-        platform,
-        user_id,
-    )
-    try:
-        pending_data = json.loads(pending_json)
-    except Exception:
-        pending_data = {}
+    if query_only:
+        pending_data = {"success": True, "complete": True, "items": []}
+    else:
+        pending_json = await call_tool_function(
+            "keytao_pending_items_by_words",
+            {"words": [word]},
+            platform,
+            user_id,
+        )
+        try:
+            pending_data = json.loads(pending_json)
+        except Exception:
+            pending_data = {}
     if (
         pending_data.get("success") is not True
         or pending_data.get("complete") is not True
@@ -3700,7 +3704,7 @@ async def _try_handle_simple_single_word_query(
             for phrase in matching_rows
         ))
         if existing_codes:
-            if conv_key is not None and _prepared_scopes is None and not preserve_pending:
+            if conv_key is not None and _prepared_scopes is None and not preserve_pending and not query_only:
                 phrase_types = tuple(dict.fromkeys(
                     str(phrase.get("type") or "").strip()
                     for phrase in matching_rows
@@ -3749,9 +3753,17 @@ async def _try_handle_simple_single_word_query(
                 can_choose_other_code=_prepared_scopes is None and len(existing_codes) == 1,
                 advertise_controls=can_recode,
             )
+            if query_only:
+                return ServerBackedQueryReply(existing_reply.splitlines()[0])
             return ("类型：单字\n" + existing_reply) if len(word) == 1 else existing_reply
         if matching_rows or len(word) != 1:
             return "词库查询返回了不完整的已有词条记录；本次未继续。"
+
+    if query_only:
+        return ServerBackedQueryReply(
+            f"「{word}」未在词库中找到。" if lookup_data.get("success") is True
+            else f"暂时无法查询「{word}」的词库记录。"
+        )
 
     review_args = {"word": word}
     if requested_reading:
@@ -11345,7 +11357,7 @@ def _compact_reviewed_reading_options(review: Dict) -> str:
 SEMANTIC_ROUTE_OPS = frozenset({
     "swap", "delete", "recode", "move", "reorder", "batch_replace",
     "draft_submit", "draft_recall", "draft_clear", "draft_keep_only",
-    "pending_release", "pending_answer",
+    "pending_release", "pending_answer", "query", "chat", "help",
 })
 
 
