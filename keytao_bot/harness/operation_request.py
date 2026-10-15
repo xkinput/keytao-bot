@@ -19,6 +19,7 @@ class OperationRequest:
     refers_to_pending: Optional[bool] = None
     frame: str = "unknown"
     source: str = "none"
+    relation: str = ""
 
 
 def understand_message(

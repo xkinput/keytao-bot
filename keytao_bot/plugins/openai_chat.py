@@ -4543,18 +4543,34 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                         )
                         return True
         if model_command:
-            if validated.op == "swap":
+            direct = _chat_commands.semantic_direct_exec_allowed(validated, violations)
+            named_words = validated.operands
+            resolved, options, explanation = await _chat_commands.resolve_model_replace(
+                validated, ctx.platform, ctx.user_id,
+            )
+            if options:
+                response = await _chat_commands.try_handle_model_command_options(
+                    options, explanation, ctx.conv_key, ctx.space_key, ctx.owner_label,
+                )
+            elif resolved is None:
+                response = explanation
+            elif direct:
+                response = await _chat_commands.execute_model_command_direct(
+                    resolved, named_words, ctx.platform, ctx.user_id, ctx.conv_key,
+                    ctx.space_key, ctx.owner_label,
+                )
+            elif resolved.op == "swap":
                 response = (
                     await _chat_commands.try_handle_model_entry_swap(
-                        *validated.operands, ctx.platform, ctx.user_id,
+                        *resolved.operands, ctx.platform, ctx.user_id,
                         ctx.space_key, ctx.owner_label,
                     )
-                    if len(validated.operands) == len(set(validated.operands)) == 2
-                    and not validated.codes and not validated.submit_after else None
+                    if len(resolved.operands) == len(set(resolved.operands)) == 2
+                    and not resolved.codes and not resolved.submit_after else None
                 )
             else:
                 response = await _chat_commands.try_handle_model_command(
-                    validated, ctx.platform, ctx.user_id, ctx.conv_key,
+                    resolved, ctx.platform, ctx.user_id, ctx.conv_key,
                     ctx.space_key, ctx.owner_label,
                 )
             if response is not None:
@@ -4632,7 +4648,8 @@ async def _stage_handle_understood_command_control(ctx: TurnContext) -> bool:
         return False
     if record.state.function_name != "keytao_understood_command":
         return False
-    if _strip_command_message_prefixes(ctx.normalized_message_text).strip() not in {"确认", "取消"}:
+    control = _strip_command_message_prefixes(ctx.normalized_message_text).strip()
+    if control not in {"确认", "取消"} and not (control.isascii() and control.isdigit()):
         return False
     if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, record):
         ctx.released_pending_turn = True
@@ -5704,7 +5721,8 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
         state_record = conversation_state_store.get_record(ctx.conv_key)
         state = state_record.state if state_record else None
         if isinstance(state, PendingToolConfirm) and state.function_name == "keytao_understood_command":
-            if _strip_command_message_prefixes(ctx.normalized_message_text).strip() not in {"确认", "取消"}:
+            control = _strip_command_message_prefixes(ctx.normalized_message_text).strip()
+            if control not in {"确认", "取消"} and not (control.isascii() and control.isdigit()):
                 return False
             if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, state_record):
                 ctx.released_pending_turn = True

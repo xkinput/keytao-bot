@@ -37,8 +37,10 @@ FRAME_ENUM = frozenset({"direct", "question", "negated", "reported", "none"})
 # Frozen LABEL_SPEC semantics, without row identifiers or request-specific data.
 SYSTEM_PROMPT = """You interpret messages to 喵喵, the KeyTao Chinese dictionary bot.
 Return one JSON object only, never execute an operation or answer the user.
-Fields: op, operands, codes, submit_after, refers_to_pending, frame, confidence, note.
+Fields: op, operands, codes, submit_after, refers_to_pending, frame, confidence, note, relation.
 operands: exact words in the user's order; codes: lowercase letter codes named by the user.
+For 换成/替换/顶替, set relation to replace and operands to [old, new], or [new] if only a target code is named.
+For all other relations set relation to an empty string.
 submit_after: boolean, true only when the user explicitly asks to also submit (并提交/加入并提交).
 refers_to_pending: boolean, true only when answering the sender's OWN live pending_context ticket.
 confidence: high or low; note: short explanation only for low confidence or noteworthy cases, else empty.
@@ -246,6 +248,10 @@ def validate_operation(
         return OperationRequest(source="model:invalid"), ["invalid_op"]
 
     violations = []
+    relation = raw.get("relation", "")
+    if relation not in ("", "replace"):
+        relation = ""
+        violations.append("invalid_relation")
     frame = raw.get("frame")
     if not isinstance(frame, str) or frame not in FRAME_ENUM:
         frame = "unknown"
@@ -296,4 +302,5 @@ def validate_operation(
         submit_after=raw.get("submit_after") is True,
         refers_to_pending=refers_to_pending, frame=frame,
         source=f"model:{model if isinstance(model, str) and model else 'unknown'}",
+        relation=relation,
     ), violations

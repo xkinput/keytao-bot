@@ -130,6 +130,27 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
         self.tool.assert_not_awaited()
         return record
 
+    async def stage_command_family(self, op):
+        if op != "move":
+            return await self.chat._stage_understand_operation(self.ctx)
+
+        async def lookup(name, args, *_args, **_kwargs):
+            if name == "keytao_lookup_by_words_batch":
+                return json.dumps({"success": True, "results": [{"word": "午时", "phrases": [
+                    {"word": "午时", "code": "wja", "type": "Phrase"},
+                ]}]})
+            self.assertEqual((name, args), ("keytao_lookup_by_code", {"code": "wj"}))
+            return json.dumps({"success": True, "phrases": [
+                {"word": "务实", "code": "wj", "type": "Phrase"},
+            ]})
+
+        with patch.object(self.commands, "call_tool_function", side_effect=lookup) as reads:
+            handled = await self.chat._stage_understand_operation(self.ctx)
+        self.assertEqual([call.args[0] for call in reads.await_args_list], [
+            "keytao_lookup_by_words_batch", "keytao_lookup_by_code",
+        ])
+        return handled
+
     def test_understanding_precedes_every_command_and_pending_stage(self):
         stages = [stage.__name__ for stage in self.chat.STAGES]
         initialize = stages.index("_stage_initialize_conversation")
@@ -206,7 +227,7 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
                 self.store.delete(self.author)
                 self.ctx = self.context(message)
                 self.set_model(op, operands, codes)
-                self.assertTrue(await self.chat._stage_understand_operation(self.ctx))
+                self.assertTrue(await self.stage_command_family(op))
                 record = self.store.get_record(self.author)
                 self.assertIsNotNone(record, self.ctx.response)
                 self.assertEqual(record.state.function_name, "keytao_understood_command")
@@ -221,7 +242,7 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
                 self.store.delete(self.author)
                 self.ctx = self.context(message)
                 self.set_model(op, operands, codes)
-                self.assertTrue(await self.chat._stage_understand_operation(self.ctx))
+                self.assertTrue(await self.stage_command_family(op))
                 record = self.store.get_record(self.author)
                 self.assertTrue(self.chat._advertised_reply_matches_live_record(self.ctx.response, record))
                 self.assertEqual(self.chat._render_live_batch_record(record), self.ctx.response)
@@ -246,7 +267,7 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
                 self.store.delete(self.author)
                 self.ctx = self.context(message)
                 self.set_model(op, operands, codes)
-                self.assertTrue(await self.chat._stage_understand_operation(self.ctx))
+                self.assertTrue(await self.stage_command_family(op))
                 record = self.store.get_record(self.author)
                 original = self.ctx.response
 

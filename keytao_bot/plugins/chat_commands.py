@@ -5966,10 +5966,12 @@ def render_pending_replace_at_code_plan(state: PendingToolConfirm) -> str:
         )
     warnings = state.args.get("_pending_display", {}).get("warnings", [])
     if isinstance(warnings, list):
-        lines.extend(
-            f"提示：{_plain_warning_message(warning)}"
-            for warning in warnings
-        )
+        for warning in warnings:
+            try:
+                message = _assert_plain_user_facing_reply(_plain_warning_message(warning))
+            except ValueError:
+                message = "服务端风险信息无法完整展示，请查看草稿核对。"
+            lines.append(f"提示：{message}")
     lines.append(pending_confirmation_copy())
     batch_url = _trusted_batch_url(state.args.get("_pending_display", {}))
     if batch_url:
@@ -6571,6 +6573,8 @@ async def _execute_confirmed_tool(
     require_new_confirmation: bool = False,
 ) -> str:
     """Execute one staged step without bypassing unseen server warnings."""
+    semantic_direct = _semantic_direct_words.get() is not None
+    auto_confirm_shift_plan = auto_confirm_shift_plan or semantic_direct
     if state.confirmation_source not in {"local_preview", "server_warning"}:
         return render_remediation_reply("确认来源无效，已拒绝执行")
     if not _resolved_advertised_items_match(state):
@@ -6975,7 +6979,11 @@ async def _execute_confirmed_tool(
             auto_confirm_shift_plan
             and state.function_name == "keytao_shift_phrase_code"
             and server_warning_ticket_is_complete(pending_state)
-            and _shift_plan_warnings_are_bound(data, args)
+            and (
+                _semantic_warnings_are_named(data, args)
+                and set(shifted_words) <= set(_semantic_direct_words.get() or ())
+                if semantic_direct else _shift_plan_warnings_are_bound(data, args)
+            )
             and (
                 (
                     auto_confirm_only_if_no_shifts
@@ -7014,7 +7022,10 @@ async def _execute_confirmed_tool(
                 auto_confirm_shift_plan=True,
             )
         auto_confirm_binding = None
-        if state.confirmation_source == "local_preview" and not require_new_confirmation:
+        if semantic_direct and state.confirmation_source == "local_preview" and state.function_name != "keytao_shift_phrase_code":
+            if _semantic_warnings_are_named(data, args) and server_warning_ticket_is_complete(pending_state):
+                auto_confirm_binding = _pending_execution_args(pending_state)
+        elif not semantic_direct and state.confirmation_source == "local_preview" and not require_new_confirmation:
             if state.function_name == "keytao_create_phrase":
                 auto_confirm_binding = create_warning_confirmation_binding(
                     data,
@@ -7685,6 +7696,11 @@ async def _perform_submit_current_draft(
             auto_confirm
             and not confirmed
             and (
+                _semantic_direct_words.get() is None
+                or server_warning_ticket_is_complete(pending_state)
+                and _semantic_warnings_are_named(submit_data, arguments)
+            )
+            and (
                 (
                     _submit_preview_matches_authorized_items(submit_data, authorized_items)
                     and (
@@ -8056,6 +8072,11 @@ async def _perform_exact_batch_remove(
         ),
         preview_data,
     )
+    if _semantic_direct_words.get() is not None and not _semantic_warnings_are_named(preview_data, preview_args):
+        return DraftActionResult(
+            _append_batch_url_if_missing(_format_server_warning_confirmation("keytao_batch_remove_draft_items", preview_data), preview_data),
+            pending_state=pending_state, data=preview_data,
+        )
     exact_args = _pending_execution_args(pending_state)
     expected_batch_id = str(exact_args.get("batch_id") or "")
     expected_version = exact_args.get("expected_content_version")
@@ -8669,6 +8690,11 @@ async def _perform_recall_latest_batch(
             PendingToolConfirm(function_name="keytao_recall_batch", args={}),
             preview_data,
         )
+        if _semantic_direct_words.get() is not None and not _semantic_warnings_are_named(preview_data, {}):
+            return DraftActionResult(
+                _append_batch_url_if_missing(_format_server_warning_confirmation("keytao_recall_batch", preview_data), preview_data),
+                pending_state=pending_state, data=preview_data,
+            )
         exact_args = _pending_execution_args(pending_state)
         exact_batch_id = str(exact_args.get("batch_id") or "")
         exact_version = exact_args.get("expected_content_version")
@@ -8790,6 +8816,8 @@ async def _try_handle_draft_recall_command(
     command_intent: MessageCommandIntent,
     platform: str,
     user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
 ) -> Optional[str]:
     if not _message_authorizes_draft_recall(message_text, command_intent):
         return None
@@ -8808,6 +8836,8 @@ async def _try_handle_draft_recall_command(
         user_id,
         clear_after=bool(canonical is not None and canonical.clear_after),
     )
+    if result.pending_state is not None:
+        conversation_state_store.set((platform, user_id), result.pending_state, space_key=space_key, owner_label=owner_label)
     if result.success or result.invalidate_pending:
         # Only the tickets planned against the recalled batch are void; an
         # unrelated pending choice must survive the user following our own
@@ -8824,6 +8854,8 @@ async def _try_handle_draft_clear_command(
     command_intent: MessageCommandIntent,
     platform: str,
     user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
 ) -> Optional[str]:
     if not _message_authorizes_draft_clear(message_text, command_intent):
         return None
@@ -8837,6 +8869,8 @@ async def _try_handle_draft_clear_command(
             user_id,
         )
     result = await _perform_clear_current_draft(platform, user_id)
+    if result.pending_state is not None:
+        conversation_state_store.set((platform, user_id), result.pending_state, space_key=space_key, owner_label=owner_label)
     if result.success or result.invalidate_pending:
         conversation_state_store.delete_actor((platform, user_id))
     return result.text
@@ -9167,6 +9201,14 @@ async def _try_handle_dictionary_delete_command(
             f"词库没有可删除的「{command.word}」{qualifier}。"
         )
     if len(matches) != 1:
+        if _semantic_direct_words.get() is not None:
+            from ..harness.operation_request import OperationRequest
+
+            options = tuple(OperationRequest(op="delete", operands=(command.word,), codes=(entry["code"],)) for entry in matches)
+            if len({option.codes for option in options}) == len(options):
+                return await try_handle_model_command_options(
+                    options, "", normalize_conversation_key((platform, user_id), space_key), space_key, owner_label,
+                )
         choices = "、".join(
             f"{entry['code']}（{entry['type']}）" for entry in matches
         )
@@ -9321,7 +9363,7 @@ async def _try_handle_replace_at_code_command(
         return render_remediation_reply(
             "替换计划未能与本轮词库记录完整对应；本次未写入"
         )
-    return await _execute_confirmed_tool(
+    response = await _execute_confirmed_tool(
         PendingToolConfirm(
             function_name="keytao_batch_add_to_draft",
             args={
@@ -9341,6 +9383,9 @@ async def _try_handle_replace_at_code_command(
         space_key,
         owner_label,
     )
+    if conversation_state_store.get_record(conv_key) is record:
+        conversation_state_store.complete_execution(record)
+    return response
 
 
 async def _try_handle_dictionary_recode_command(
@@ -10238,6 +10283,9 @@ async def _try_handle_code_chain_reorder_command(
     if not server_warning_ticket_is_complete(pending) or not _resolved_chain_reorder_items_match(pending):
         return _chain_reorder_ask(code, "确认内容不完整")
 
+    if _semantic_direct_words.get() is not None and _semantic_warnings_are_named(preview_data, {"items": items}):
+        return await _execute_confirmed_tool(pending, platform, user_id, (platform, user_id), space_key, owner_label)
+
     confirmation = _format_code_chain_reorder_confirmation(plan, preview_data)
     if len(confirmation) > MAX_REPLACE_CONFIRMATION_CHARS:
         return _chain_reorder_ask(code, "完整计划超出单条消息展示上限")
@@ -10522,6 +10570,8 @@ async def _try_handle_draft_management_command(
         command_intent,
         platform,
         user_id,
+        space_key,
+        owner_label,
     )
     if response is not None:
         return response
@@ -10531,6 +10581,8 @@ async def _try_handle_draft_management_command(
         command_intent,
         platform,
         user_id,
+        space_key,
+        owner_label,
     )
     if response is not None:
         return response
@@ -11374,6 +11426,182 @@ SEMANTIC_ROUTE_OPS = frozenset({
 })
 
 
+_semantic_direct_words: ContextVar[Optional[Tuple[str, ...]]] = ContextVar(
+    "semantic_direct_words", default=None,
+)
+_semantic_direct_replace_entry: ContextVar[Optional[Tuple[str, str]]] = ContextVar(
+    "semantic_direct_replace_entry", default=None,
+)
+
+
+def semantic_direct_exec_allowed(request, violations=()) -> bool:
+    return bool(
+        "direct_exec" in {token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")}
+        and request.frame == "direct" and request.refers_to_pending is False
+        and not violations
+    )
+
+
+def _semantic_warnings_are_named(data: Dict, args: Dict) -> bool:
+    """Unknown warning ownership requires confirmation; prose never grants it."""
+    from ..harness.authorization_grammar import _AUTO_CONFIRM_CREATE_WARNING_TYPES
+
+    named = _semantic_direct_words.get()
+    warnings = data.get("warnings")
+    if named is None or not isinstance(warnings, list) or server_warning_confirmation_binding(data) is None:
+        return False
+    if any(data.get(key) for key in ("failedCount", "skippedCount", "failed", "skipped", "partialWrite")):
+        return False
+
+    requested = [(args.get("word"), args.get("code") or args.get("target_code"))]
+    for key in ("items", "additional_items", "additional_shift_items"):
+        requested.extend((item.get("word"), item.get("code")) for item in args.get(key) or [] if isinstance(item, dict))
+    requested.extend(zip(args.get("ordered_words") or [], args.get("expected_codes") or []))
+    allowed = {
+        (word, code) for word, code in requested
+        if isinstance(word, str) and isinstance(code, str) and word and code
+        and (word in named or (word, code) == _semantic_direct_replace_entry.get())
+    }
+    allowed_codes = {code for _, code in allowed}
+    containers = {"item", "items", "existing", "occupant", "occupants", "displaced", "shifted",
+                  "conflictWith", "phrase", "phrases", "entry", "entries"}
+    metadata = {"warningType", "action", "type", "weight", "message", "remark", "needsManualReview"}
+
+    def identities(value, inherited_codes=()):
+        if isinstance(value, str):
+            return {(value, code) for code in inherited_codes} if value and inherited_codes else None
+        if isinstance(value, list):
+            found = set()
+            for item in value:
+                affected = identities(item, inherited_codes)
+                if not affected:
+                    return None
+                found.update(affected)
+            return found or None
+        if not isinstance(value, dict) or not value:
+            return None
+        codes = []
+        for key, item in value.items():
+            if key.lower().endswith(("code", "codes")):
+                if not isinstance(item, list if key.lower().endswith("codes") else str):
+                    return None
+                values = item if isinstance(item, list) else [item]
+                if not values or any(not isinstance(code, str) or code not in allowed_codes for code in values):
+                    return None
+                codes.extend(values)
+        codes = tuple(codes) or inherited_codes
+        found = set()
+        for key, item in value.items():
+            if key.lower().endswith(("word", "words")) or key in containers:
+                if key.lower().endswith(("word", "words")) and not isinstance(
+                    item, list if key.lower().endswith("words") else str,
+                ):
+                    return None
+                affected = identities(item, codes)
+                if not affected:
+                    return None
+                found.update(affected)
+            elif key not in metadata and not key.lower().endswith(("code", "codes")):
+                return None
+            elif isinstance(item, (dict, list)) and key in metadata:
+                return None
+        return found
+
+    for warning in warnings:
+        if (
+            not isinstance(warning, dict)
+            or not isinstance(warning.get("warningType"), str)
+            or warning["warningType"] not in _AUTO_CONFIRM_CREATE_WARNING_TYPES
+        ):
+            return False
+        affected = identities(warning)
+        if not affected or not affected <= allowed:
+            return False
+    return True
+
+
+async def resolve_model_replace(request, platform, user_id):
+    """Resolve model old/new fields against exact dictionary rows, never prose."""
+    words, codes = request.operands, tuple(dict.fromkeys(request.codes))
+    candidate = (
+        request.op in {"move", "recode"}
+        or request.op == "swap" and request.relation == "replace"
+    ) and (len(words) == 2 and len(codes) <= 1 or len(words) == len(codes) == 1)
+    if not candidate:
+        return request, (), ""
+    try:
+        lookup = json.loads(await call_tool_function(
+            "keytao_lookup_by_words_batch", {"words": list(words)}, platform, user_id,
+        ))
+        results = lookup.get("results")
+        if lookup.get("success") is not True or not isinstance(results, list) or len(results) != len(words):
+            raise ValueError("incomplete lookup")
+        entries = {}
+        for result in results:
+            word = result.get("word") if isinstance(result, dict) else None
+            if word not in words or word in entries:
+                raise ValueError("unexpected word")
+            rows = _validated_dictionary_delete_entries({"success": True, "phrases": result.get("phrases")}, word)
+            if rows is None:
+                raise ValueError("invalid rows")
+            entries[word] = rows
+        occupants = None
+        if codes:
+            data = json.loads(await call_tool_function(
+                "keytao_lookup_by_code", {"code": codes[0]}, platform, user_id,
+            ))
+            occupants = data.get("phrases")
+            if data.get("success") is not True or not isinstance(occupants, list) or any(
+                not isinstance(row, dict) or not row.get("word") or row.get("code") != codes[0]
+                or row.get("type") not in _PHRASE_TYPE_BASE_WEIGHTS for row in occupants
+            ):
+                raise ValueError("invalid occupants")
+    except (ValueError, TypeError, KeyError):
+        return None, (), "无法取得完整词库记录；本次未写入。"
+
+    old, new = words if len(words) == 2 else (None, words[0])
+    if old is None and entries[new]:
+        if len(entries[new]) != 1 or len(occupants) > 1:
+            return None, (), f"「{new}」的来源或 {codes[0]} 的占位记录不唯一；请指定具体记录，本次未写入。"
+        return replace(request, op="move", codes=codes, relation=""), (), ""
+    if old is not None:
+        matches = [row for row in entries[old] if not codes or row["code"] == codes[0]]
+        if not matches:
+            return None, (), f"词库没有找到「{old}」的对应记录；本次未写入。"
+    else:
+        matches = occupants
+        if not matches:
+            return None, (), f"编码 {codes[0]} 当前没有词条可顶替；请使用普通加词指令「加词 {new} {codes[0]}」，本次未写入。"
+    if len(matches) != 1:
+        options = []
+        if old is not None and not codes and not entries[new]:
+            for row in matches:
+                option = replace(request, op="move", operands=(old, new), codes=(row["code"],), relation="replace")
+                if render_understood_command(option) and option not in options:
+                    options.append(option)
+        return None, tuple(options) if len(options) > 1 else (), "词库记录不唯一，请指定编码和词库类型；本次未写入。"
+    target = matches[0]
+    code = codes[0] if codes else target["code"]
+    if occupants is None:
+        try:
+            data = json.loads(await call_tool_function("keytao_lookup_by_code", {"code": code}, platform, user_id))
+        except (ValueError, TypeError):
+            data = {}
+        occupants = data.get("phrases") if data.get("success") is True else None
+    if not isinstance(occupants, list) or len(occupants) != 1 or not isinstance(occupants[0], dict) or (
+        occupants[0].get("word"), occupants[0].get("code"), occupants[0].get("type")
+    ) != (target["word"], code, target["type"]):
+        return None, (), f"编码 {code} 的占位记录不唯一或不一致；本次未写入。"
+    if entries[new]:
+        if len(entries[new]) != 1:
+            return None, (), f"「{new}」有多条现有记录，无法确定移位来源；本次未写入。"
+        return replace(request, op="move", operands=(new,), codes=(code,), relation=""), (), ""
+    resolved = replace(request, op="move", operands=(target["word"], new), codes=(code,), relation="replace")
+    if not render_understood_command(resolved):
+        return None, (), "替换方案无法通过现有指令校验；本次未写入。"
+    return resolved, (), ""
+
+
 def render_understood_pending_answer(request, state, prompt: str, message: str = "") -> str:
     """Round-trip a model answer through the existing ticket's closed parsers."""
     from ..harness.semantic_parser import _pending_values
@@ -11558,6 +11786,36 @@ async def try_handle_model_command(request, platform, user_id, conv_key, space_k
     )
 
 
+async def try_handle_model_command_options(options, explanation, conv_key, space_key, owner_label):
+    args = {"options": []}
+    for request in options:
+        command = render_understood_command(request)
+        if not command:
+            return explanation
+        option = {"command_text": command, "op": request.op, "operands": list(request.operands),
+                  "codes": list(request.codes), "submit_after": request.submit_after}
+        option["digest"] = _understood_command_digest(option)
+        args["options"].append(option)
+    args["digest"] = _understood_command_digest(args)
+    state = PendingToolConfirm("keytao_understood_command", args)
+    if not conversation_state_store.set(conv_key, state, space_key=space_key, owner_label=owner_label):
+        return "候选方案无法保存，本次未写入。"
+    return render_pending_understood_command(state)
+
+
+def _understood_command_options(state):
+    options = state.args.get("options")
+    if (
+        not isinstance(options, list) or len(options) < 2
+        or state.args.get("digest") != _understood_command_digest(state.args)
+        or any(not isinstance(option, dict) or _understood_command_request(
+            PendingToolConfirm("keytao_understood_command", option),
+        ) is None for option in options)
+    ):
+        return ()
+    return options
+
+
 def _understood_command_request(state):
     from ..harness.operation_request import OperationRequest
 
@@ -11578,6 +11836,14 @@ def _understood_command_request(state):
 
 def render_pending_understood_command(state) -> str:
     """Expose controls only for the exact canonical command sealed in this ticket."""
+    options = _understood_command_options(state)
+    if options:
+        return "\n".join([
+            "词库记录不唯一，请选择具体方案；本次未写入。",
+            *(f"{index}. {render_executable_suggestion(option['command_text']).removeprefix('- ')}"
+              for index, option in enumerate(options, 1)),
+            "回复方案编号执行，或「取消」。",
+        ])
     if _understood_command_request(state) is None:
         return ""
     return f"我理解为：「{state.args['command_text']}」\n回复「确认」执行，或「取消」。"
@@ -11593,18 +11859,27 @@ async def handle_pending_understood_command(record, message, platform, user_id, 
     ):
         return None
     control = _strip_command_message_prefixes(message).strip()
-    if control not in {"确认", "取消"}:
+    options = _understood_command_options(record.state)
+    selected = options[int(control) - 1] if options and control.isascii() and control.isdigit() and 1 <= int(control) <= len(options) else None
+    if control not in {"确认", "取消"} and selected is None:
         return None
+    if options and control == "确认":
+        return render_pending_understood_command(record.state)
     if not conversation_state_store.begin_execution(record):
         return "当前确认正在处理中，本次未重复执行。"
     if not conversation_state_store.complete_execution(record):
         return "确认计划无法安全消费，本次未写入。"
     if control == "取消":
         return "已取消。"
-    request = _understood_command_request(record.state)
+    state = PendingToolConfirm("keytao_understood_command", selected) if selected is not None else record.state
+    request = _understood_command_request(state)
     if request is None:
         return "确认计划校验失败，本次未写入。"
-    command = record.state.args["command_text"]
+    return await execute_understood_command(request, state.args["command_text"], platform, user_id, conv_key, space_key, owner_label)
+
+
+async def execute_understood_command(request, command, platform, user_id, conv_key, space_key, owner_label):
+    """Re-enter the existing typed handlers with one validated canonical plan."""
     active = draft_operation_coordinator.find_for_actor((platform, user_id))
     if active is not None:
         return _active_operation_message_for_request(active, platform, user_id)
@@ -11624,12 +11899,63 @@ async def handle_pending_understood_command(record, message, platform, user_id, 
     )
     if op == "batch_replace":
         intent = replace(intent, old_char=words[0], new_char=words[1])
+        previous = conversation_state_store.get_record(conv_key)
         response = await _try_handle_replace_char(command, platform, user_id, intent, conv_key, space_key, owner_label)
+        if _semantic_direct_words.get() is not None:
+            record = conversation_state_store.get_record(conv_key)
+            expected = _build_replace_char_items(command, words[0], words[1])
+            chunk, _remaining, _confirmation = _replace_char_chunk(expected, words[0], words[1])
+            if (record is not None and record is not previous
+                and isinstance(record.state, PendingToolConfirm)
+                and record.state.function_name == "keytao_batch_add_to_draft"
+                and record.state.args.get("items") == chunk):
+                if not conversation_state_store.begin_execution(record) or not conversation_state_store.complete_execution(record):
+                    return "替换计划无法安全消费，本次未写入。"
+                response = await _execute_confirmed_tool(record.state, platform, user_id, conv_key, space_key, owner_label)
     else:
         if op == "reorder" and not words:
             intent = replace(intent, intent="code_chain_reorder")
         response = await _try_handle_draft_management_command(command, platform, user_id, space_key, owner_label, intent)
     return response or "规范指令无法执行，本次未写入。"
+
+
+async def execute_model_command_direct(request, named_words, platform, user_id, conv_key, space_key, owner_label):
+    active = draft_operation_coordinator.find_for_actor((platform, user_id))
+    if active is not None:
+        return _active_operation_message_for_request(active, platform, user_id)
+    record = conversation_state_store.get_record(conv_key)
+    if record is not None and record.execution_id:
+        return "上一项操作仍在处理中，本次未执行。"
+    if record is not None and (
+        record.owner_key != normalize_conversation_key(conv_key, space_key)
+        or record.owner_key.platform != platform or record.owner_key.actor_id != str(user_id)
+        or not conversation_state_store.begin_execution(record)
+        or not conversation_state_store.complete_execution(record)
+    ):
+        return "原候选无法安全释放，本次未执行。"
+    token = _semantic_direct_words.set(tuple(named_words))
+    replacement = (
+        (request.operands[0], request.codes[0])
+        if request.relation == "replace" and len(request.operands) == 2 and len(request.codes) == 1
+        and tuple(named_words) == (request.operands[1],) else None
+    )
+    replacement_token = _semantic_direct_replace_entry.set(replacement)
+    try:
+        if request.op == "swap":
+            if len(request.operands) != 2 or len(set(request.operands)) != 2 or request.codes or request.submit_after:
+                return "还没有核对出唯一换位方案；本次未写入。"
+            return await try_handle_model_entry_swap(*request.operands, platform, user_id, space_key, owner_label)
+        command = render_understood_command(request)
+        if not command:
+            return "还没有核对出可执行的词条和编码；本次未写入。"
+        response = await execute_understood_command(request, command, platform, user_id, conv_key, space_key, owner_label)
+        reviewed = conversation_state_store.get_record(conv_key)
+        if reviewed is not record and isinstance(getattr(reviewed, "state", None), PendingAddWord):
+            conversation_state_store.complete_execution(reviewed)
+        return response
+    finally:
+        _semantic_direct_replace_entry.reset(replacement_token)
+        _semantic_direct_words.reset(token)
 
 
 _PENDING_CHOICE_OFFER_FUNCTION = "keytao_choice_offer"
