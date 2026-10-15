@@ -3480,6 +3480,15 @@ def _bare_multi_word_query_words(message_text: str) -> Tuple[str, ...]:
     return words
 
 
+def _render_pending_preserving_lookup(word, code, candidates, occupied, ordering) -> str:
+    text = render_server_backed_single_word_lookup(
+        word, code, candidates, occupied, ordering_assessments=ordering,
+        actionable_controls=False, include_controls=False,
+    )
+    text = re.sub(r"(?m)^\s*\d+[.)、]\s*(?=[a-z]+\s*[—–-])", "", text)
+    return text.replace("候选编码", "编码参考").replace("候选", "编码参考")
+
+
 async def _prepare_multi_word_query(
     words: Tuple[str, ...],
     platform: str,
@@ -3489,6 +3498,7 @@ async def _prepare_multi_word_query(
     owner_label: str,
     *,
     reading_requests: tuple = (),
+    preserve_pending: bool = False,
 ) -> str:
     """Collect the single-word pipeline into one durable candidate capability."""
     if len(words) > _MAX_BARE_MULTI_WORD_QUERY_ITEMS:
@@ -3508,6 +3518,14 @@ async def _prepare_multi_word_query(
             other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
 
     actionable_scopes: List[Dict[str, Any]] = []
+    if preserve_pending:
+        for scope in scopes:
+            other_blocks.append(_render_pending_preserving_lookup(
+                scope["word"], scope["reviewedState"]["recommendedCode"],
+                scope["candidates"], scope["occupiedWords"],
+                scope["orderingAssessments"],
+            ))
+        return ServerBackedQueryReply("\n\n".join(other_blocks))
     for scope in scopes:
         if scope["reviewedState"]["recommendedCode"]:
             actionable_scopes.append(scope)
@@ -3586,6 +3604,7 @@ async def _try_handle_simple_single_word_query(
     requested_code: str = "",
     actionable_lookup: bool = False,
     _prepared_scopes: Optional[List[Dict[str, Any]]] = None,
+    preserve_pending: bool = False,
 ) -> Optional[str]:
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     from ..utils.reading_request import parse_parenthesised_readings
@@ -3596,12 +3615,14 @@ async def _try_handle_simple_single_word_query(
         return await _prepare_multi_word_query(
             tuple(row.word for row in reading_requests), platform, user_id, conv_key, space_key, owner_label,
             reading_requests=reading_requests,
+            preserve_pending=preserve_pending,
         )
     multi_words = _bare_multi_word_query_words(message_text) if _prepared_scopes is None else ()
     if multi_words:
         set_turn_flow("word-discovery")
         return await _prepare_multi_word_query(
             multi_words, platform, user_id, conv_key, space_key, owner_label,
+            preserve_pending=preserve_pending,
         )
     explicit_add_word = _extract_explicit_reviewed_add_word(message_text)
     words = (
@@ -3679,7 +3700,7 @@ async def _try_handle_simple_single_word_query(
             for phrase in matching_rows
         ))
         if existing_codes:
-            if conv_key is not None and _prepared_scopes is None:
+            if conv_key is not None and _prepared_scopes is None and not preserve_pending:
                 phrase_types = tuple(dict.fromkeys(
                     str(phrase.get("type") or "").strip()
                     for phrase in matching_rows
@@ -3834,6 +3855,12 @@ async def _try_handle_simple_single_word_query(
                     "requestedReading": requested_reading,
                 })
                 return ""
+            if preserve_pending:
+                return ServerBackedQueryReply(_render_pending_preserving_lookup(
+                    pending.word, pending.recommended_code, pending.server_candidates,
+                    pending.server_occupied_words,
+                    pending.server_ordering_assessments,
+                ))
             target_key = conv_key or (
                 current_memory_context.get().conversation_address
                 if current_memory_context.get() is not None
@@ -8956,6 +8983,8 @@ async def try_handle_model_entry_swap(
     user_id: str,
     space_key: Optional[Tuple[str, str]],
     owner_label: str,
+    *,
+    preserve_pending: bool = False,
 ) -> str:
     """Resolve a validated pair into the existing author-confirmed swap plan."""
     expected_words = (first_word, second_word)
@@ -8991,6 +9020,8 @@ async def try_handle_model_entry_swap(
             return render_remediation_reply(
                 "两个词当前权重无法形成唯一互换计划"
             )
+        if preserve_pending:
+            return _preserved_pending_plan(f"互换 {first_word} {first_code} 与 {second_word} {second_code} 的优先级")
         return await _execute_shift_to_code(
             first_word,
             first_code,
@@ -9017,6 +9048,8 @@ async def try_handle_model_entry_swap(
         return render_remediation_reply(
             "两个词不在同一条可验证候选链，不能共用一张换位计划"
         )
+    if preserve_pending:
+        return _preserved_pending_plan(f"互换 {first_word} {first_code} 与 {second_word} {second_code} 的编码和权重")
     return await _execute_shift_to_code(
         first_word,
         target_root,
@@ -11312,7 +11345,103 @@ def _compact_reviewed_reading_options(review: Dict) -> str:
 SEMANTIC_ROUTE_OPS = frozenset({
     "swap", "delete", "recode", "move", "reorder", "batch_replace",
     "draft_submit", "draft_recall", "draft_clear", "draft_keep_only",
+    "pending_release", "pending_answer",
 })
+
+
+def render_understood_pending_answer(request, state, prompt: str, message: str = "") -> str:
+    """Round-trip a model answer through the existing ticket's closed parsers."""
+    from ..harness.semantic_parser import _pending_values
+    from ..utils.pending_confirmation import advertised_reply_contract
+    from .chat_routing import _multi_word_candidate_scope_rows
+
+    words, codes = _pending_values(state)
+    if (
+        request.frame != "direct" or request.refers_to_pending is not True
+        or any(word not in words for word in request.operands)
+        or any(code not in codes for code in request.codes)
+    ):
+        return ""
+    if request.op == "select_candidate":
+        selected = request.codes
+        message_codes = set(re.findall(r"[a-z]+", message.lower()))
+        if isinstance(state, PendingAddWord):
+            if not state.server_candidates or state.server_candidates != state.candidates:
+                return ""
+            literal = _structural_pending_add_word_intent(message, state)
+            indices = (literal.choice_indices or ((literal.choice_index,) if literal.choice_index is not None else ())) if literal else ()
+            literal_codes = tuple(state.candidates[index - 1][0] for index in indices if 1 <= index <= len(state.candidates))
+            if not selected:
+                if literal is None or not indices or literal.recode_indices or len(literal_codes) != len(indices):
+                    return ""
+                selected = literal_codes
+            if not selected or len(set(selected)) != len(selected) or any(code not in codes for code in selected):
+                return ""
+            if any(code not in message_codes and code not in literal_codes for code in selected):
+                if selected != (state.recommended_code,):
+                    return ""
+                return render_understood_pending_answer(replace(request, op="confirm", codes=()), state, prompt, message)
+            text = "、".join(selected) + ("，加入并提交" if request.submit_after else "")
+            intent = _structural_pending_add_word_intent(text, state)
+            if intent is None:
+                return ""
+            indices = intent.choice_indices or ((intent.choice_index,) if intent.choice_index is not None else ())
+            actual = intent.requested_codes or ((intent.requested_code,) if intent.requested_code else ())
+            if indices:
+                actual = tuple(state.candidates[index - 1][0] for index in indices if 1 <= index <= len(state.candidates))
+            if (
+                tuple(actual) != tuple(selected) or intent.recode_indices or intent.target_word
+                or intent.intent not in ({"pending_add_and_submit"} if request.submit_after else {"pending_choice", "pending_code_request"})
+                or bool(intent.submit_after or intent.intent == "pending_add_and_submit") != request.submit_after
+            ):
+                return ""
+            return text
+        items, scopes = _multi_word_candidate_scope_rows(state)
+        selected_words = request.operands
+        if not selected_words and len(scopes) == 1:
+            selected_words = tuple(scopes)
+        literal, _intent, error = _resolve_multi_word_pending_candidate_selection(state, message)
+        literal_codes = {item["word"]: item["code"] for item in literal.args["items"]} if literal and not error else {}
+        if not selected and all(word in literal_codes for word in selected_words):
+            selected = tuple(literal_codes[word] for word in selected_words)
+        if not selected or len(selected_words) != len(selected) or len(set(selected_words)) != len(selected_words):
+            return ""
+        if any(code not in dict(scopes.get(word, ())) for word, code in zip(selected_words, selected)):
+            return ""
+        if any(code not in message_codes and literal_codes.get(word) != code for word, code in zip(selected_words, selected)):
+            if dict(zip(selected_words, selected)) != {item["word"]: item["code"] for item in items}:
+                return ""
+            return render_understood_pending_answer(replace(request, op="confirm", codes=()), state, prompt, message)
+        text = "，".join(f"{word} {code}" for word, code in zip(selected_words, selected))
+        text += "，加入并提交" if request.submit_after else "，加入"
+        derived, intent, error = _resolve_multi_word_pending_candidate_selection(state, text)
+        actual = tuple((item.get("word"), item.get("code")) for item in (derived.args.get("items", []) if derived else []))
+        if (
+            error or intent is None or actual != tuple(zip(selected_words, selected))
+            or intent.intent != ("pending_add_and_submit" if request.submit_after else "pending_confirm")
+        ):
+            return ""
+        return text
+    if request.codes or request.submit_after and request.op != "confirm":
+        return ""
+    if request.op == "confirm":
+        contract = advertised_reply_contract(prompt)
+        forms = contract.generic_assent_forms + contract.batch_assent_forms
+        choices = ("加入并提交",) if request.submit_after else ("确认", "加入", "添加", "都加")
+        for text in choices:
+            if text not in forms:
+                continue
+            intent = _pending_tool_assent_intent(state, text)
+            if intent is not None and intent.intent == ("pending_add_and_submit" if request.submit_after else "pending_confirm"):
+                return text
+        return ""
+    if request.op == "cancel":
+        intent = _pending_tool_assent_intent(state, "取消")
+        return "取消" if intent is not None and intent.intent == "pending_cancel" else ""
+    if request.op == "pending_recode":
+        intent = _structural_pending_add_word_intent("换码", state) if isinstance(state, PendingAddWord) else None
+        return "换码" if intent is not None and intent.intent == "pending_recode" else ""
+    return ""
 
 
 def render_understood_command(request) -> str:
@@ -11382,7 +11511,11 @@ def _understood_command_digest(args: Dict) -> str:
     ).encode("utf-8")).hexdigest()
 
 
-async def try_handle_model_command(request, platform, user_id, conv_key, space_key, owner_label):
+def _preserved_pending_plan(command: str) -> str:
+    return f"方案预览：{command}。\n当前候选仍保留；请先处理原候选，再重新发送这条完整指令。"
+
+
+async def try_handle_model_command(request, platform, user_id, conv_key, space_key, owner_label, *, preserve_pending=False):
     """Seal a canonical command without performing any tool call."""
     command = render_understood_command(request)
     if not command:
@@ -11390,6 +11523,8 @@ async def try_handle_model_command(request, platform, user_id, conv_key, space_k
     record = conversation_state_store.get_record(conv_key)
     if record is not None and record.execution_id:
         return "上一项操作仍在处理中，本次未替换确认计划。"
+    if preserve_pending and record is not None:
+        return _preserved_pending_plan(command)
     args = {"command_text": command, "op": request.op, "operands": list(request.operands),
             "codes": list(request.codes), "submit_after": request.submit_after}
     args["digest"] = _understood_command_digest(args)

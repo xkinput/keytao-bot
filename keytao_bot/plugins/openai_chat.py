@@ -1603,6 +1603,7 @@ async def get_ai_response_core(
     advertised_snapshot_token: str = "",
     command_intent: Optional[MessageCommandIntent] = None,
     released_pending_turn: bool = False,
+    preserve_pending: bool = False,
 ) -> Optional[str]:
     """Call OpenAI-compatible API with function calling support.
 
@@ -1651,7 +1652,7 @@ async def get_ai_response_core(
             draft_intent = _structural_draft_management_intent(
                 fallback_message
             )
-            if draft_intent is not None:
+            if draft_intent is not None and (not preserve_pending or draft_intent.intent == "draft_view"):
                 draft_reply = await _try_handle_draft_management_command(
                     fallback_message,
                     fallback_context.platform,
@@ -1678,7 +1679,7 @@ async def get_ai_response_core(
             runtime=runtime,
             skills_manager=skills_manager,
             tool_executor=tool_executor,
-            state_store=conversation_state_store,
+            state_store=MemoryConversationStateStore() if preserve_pending else conversation_state_store,
             bind_help_text=_BIND_HELP_TEXT,
             system_prompt_core=SYSTEM_PROMPT_CORE,
             tool_receipt_recorder=_record_agent_tool_receipt,
@@ -1689,7 +1690,7 @@ async def get_ai_response_core(
             if memory_context is not None
             else ConversationAddress.private(platform, user_id)
         )
-        live_record = conversation_state_store.get_record(actor_address)
+        live_record = None if preserve_pending else conversation_state_store.get_record(actor_address)
         live_pending_authorizes_mutation = bool(
             live_record is not None
             and not live_record.execution_id
@@ -1715,7 +1716,7 @@ async def get_ai_response_core(
                 visual_context=visual_context,
                 visual_image_count=visual_image_count,
                 mutations_allowed=(
-                    not bool(visual_context)
+                    not bool(visual_context) and not preserve_pending
                     and (
                         message_authorizes_mutation(message)
                         or live_pending_authorizes_mutation
@@ -3477,6 +3478,7 @@ class TurnContext:
     scoped_pending_intent: Optional[MessageCommandIntent] = None
     scoped_pending_response: Optional[str] = None
     released_pending_turn: bool = False
+    semantic_pending_released: bool = False
     resolved_advertised_words: Tuple[str, ...] = ()
     advertised_snapshot_token: str = ""
     simple_word_query_words: Tuple[str, ...] = ()
@@ -3716,6 +3718,8 @@ async def _stage_handle_commonness_query(ctx: TurnContext) -> bool:
 
 async def _stage_handle_explicit_draft_conversation_reset(ctx: TurnContext) -> bool:
     """Clear an explicit current-user scope before consulting any stale ticket."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     if not _chat_routing._is_explicit_draft_conversation_reset(ctx.message_text):
         return False
     set_turn_flow("draft-conversation-reset")
@@ -3753,6 +3757,8 @@ async def _stage_handle_explicit_draft_conversation_reset(ctx: TurnContext) -> b
 
 async def _stage_handle_completed_draft_undo(ctx: TurnContext) -> bool:
     """Bind recent-operation cancellation before pending classifiers or models."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     record = conversation_state_store.get_record(ctx.conv_key)
     recent_write_capability = bool(
         record is not None and isinstance(record.state, PendingToolConfirm)
@@ -3784,6 +3790,8 @@ async def _stage_handle_completed_draft_undo(ctx: TurnContext) -> bool:
 
 async def _stage_claim_offered_answer(ctx: TurnContext) -> bool:
     """Keep the actor's previous offered answer out of word discovery."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     from ..utils.offered_options import (
         is_force_assent,
         matches_previous_bot_option,
@@ -3824,6 +3832,9 @@ async def _stage_claim_offered_answer(ctx: TurnContext) -> bool:
 
 async def _stage_handle_explicit_entry_operation(ctx: TurnContext) -> bool:
     """Resolve explicit requests after arbitration and before pending dispatch."""
+    if getattr(ctx, "semantic_pending_released", False):
+        # These shortcuts can re-enter the live ticket executor or replace it.
+        return False
     from ..utils.same_code_reorder import try_handle_same_code_reorder
 
     response = await try_handle_same_code_reorder(
@@ -3876,6 +3887,8 @@ async def _stage_prepare_fresh_code_selection(ctx: TurnContext) -> bool:
 
 async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     """Production scenario: bind live pending state to the current reply and actor scope."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     current_record = conversation_state_store.get_record(ctx.conv_key)
     if current_record is not None and draft_operation_coordinator.get(ctx.conv_key) is None:
         verified = await _chat_commands.try_verify_pending_fly_proposal(
@@ -4315,17 +4328,106 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
         except Exception as error:
             logger.warning(f"[semantic_shadow] failed={type(error).__name__}")
             return False
+        pending_decision = raw
+        if isinstance(raw, dict) and set(raw) - {"_model"} == {"answer"}:
+            pending_decision = raw["answer"]
+            if isinstance(pending_decision, str):
+                try:
+                    pending_decision = json.loads(pending_decision)
+                except ValueError:
+                    pending_decision = None
+        live_owned_ticket = bool(
+            pending_snapshot is not None and current_record is not None
+            and isinstance(pending_decision, dict)
+            and isinstance(pending_decision.get("refers_to_pending"), bool)
+            and isinstance(pending_decision.get("submit_after"), bool)
+            and conversation_state_store.get_record(ctx.conv_key) is current_record
+            and current_record.owner_key == normalize_conversation_key(ctx.conv_key, ctx.space_key)
+            and current_record.owner_key.platform == ctx.platform
+            and current_record.owner_key.actor_id == str(ctx.user_id)
+            and not current_record.execution_id
+            and all(value.startswith("frame_backstop:") for value in violations)
+        )
+        if live_owned_ticket:
+            history = ctx.history if ctx.history is not None else get_history(ctx.conv_key)
+            prompt = _get_latest_assistant_message(history)
+            ticket_prompt = next((
+                str(row.get("content") or "") for row in reversed(history or [])
+                if row.get("role") == "assistant" and current_record.origin_prompt_digest
+                and _chat_routing._prompt_capability_digest(str(row.get("content") or "")) == current_record.origin_prompt_digest
+            ), "")
+            if not ticket_prompt:
+                ticket_prompt = _render_live_single_candidate_record(current_record) or _render_live_batch_record(current_record)
+            contract = advertised_reply_contract(ticket_prompt)
+            closed_answer = message.strip() in (
+                *contract.generic_assent_forms, *contract.batch_assent_forms, "取消",
+            ) and _pending_tool_assent_intent(pending_snapshot, message) is not None
+            if isinstance(pending_snapshot, PendingAddWord):
+                selection = _closed_candidate_selection(message)
+                index = _chat_routing._parse_pending_choice_index(message)
+                if selection is None and index is not None:
+                    selection = ((index,), (), False)
+                if selection is not None:
+                    indices, codes, _submit = selection
+                    closed_answer = closed_answer or bool(
+                        (indices or codes)
+                        and all(1 <= index <= len(pending_snapshot.candidates) for index in indices)
+                        and all(code in dict(pending_snapshot.candidates) for code in codes)
+                    )
+            else:
+                derived, intent, error = _resolve_multi_word_pending_candidate_selection(pending_snapshot, message)
+                closed_answer = closed_answer or bool(derived is not None and intent is not None and not error)
+            if "pending_release" in route_ops and validated.refers_to_pending is False and not closed_answer:
+                ctx.released_pending_turn = True
+                ctx.semantic_pending_released = True
+                ctx.current_pending_record = current_record
+                ctx.scoped_pending_state = ctx.scoped_pending_intent = ctx.scoped_pending_response = None
+            elif (
+                "pending_answer" in route_ops and validated.refers_to_pending is True
+                and validated.frame == "direct"
+                and validated.op in {"confirm", "select_candidate", "cancel", "pending_recode"}
+                and draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is None
+            ):
+                if ctx.reply_reference.is_reply and not _verified_bot_reply_matches_record(ctx.reply_reference, current_record):
+                    ctx.released_pending_turn = True
+                    ctx.semantic_pending_released = True
+                    ctx.current_pending_record = current_record
+                    return False
+                latest_matches = bool(
+                    current_record.origin_prompt_digest
+                    and _chat_routing._prompt_capability_digest(prompt) == current_record.origin_prompt_digest
+                )
+                canonical = _chat_commands.render_understood_pending_answer(
+                    validated, pending_snapshot, prompt, message,
+                ) if latest_matches else ""
+                if canonical:
+                    response = await handle_pending_message_core(
+                        canonical, ctx.platform, ctx.user_id, ctx.conv_key,
+                        history=history, space_key=ctx.space_key,
+                        owner_label=ctx.owner_label, allow_intent_model=False,
+                    )
+                    if response is not None:
+                        ctx.response = response
+                        ctx.scoped_pending_response = None
+                        remember_conversation(ctx.conv_key, ctx.memory_context, message, response)
+                        await _finish_ai_chat_response(
+                            ctx.bot, ctx.event, ctx.user_id, ctx.memory_context,
+                            response, ctx.QQMessageSegment,
+                        )
+                        return True
         if (
             validated.op in route_ops
             and all(value.startswith("frame_backstop:") for value in violations)
             and validated.frame in {"direct", "question"}
             and validated.refers_to_pending is False
         ):
+            preserve = {"preserve_pending": True} if ctx.semantic_pending_released else {}
             if validated.op == "swap":
                 response = (
                     await _chat_commands.try_handle_model_entry_swap(
                         *validated.operands, ctx.platform, ctx.user_id,
                         ctx.space_key, ctx.owner_label,
+                        **preserve,
                     )
                     if len(validated.operands) == len(set(validated.operands)) == 2
                     and not validated.codes and not validated.submit_after else None
@@ -4334,6 +4436,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 response = await _chat_commands.try_handle_model_command(
                     validated, ctx.platform, ctx.user_id, ctx.conv_key,
                     ctx.space_key, ctx.owner_label,
+                    **preserve,
                 )
             if response is not None:
                 ctx.scoped_pending_response = None
@@ -4403,6 +4506,8 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
 
 async def _stage_handle_understood_command_control(ctx: TurnContext) -> bool:
     """Consume literal author confirmation before legacy pending claim stages."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     record = conversation_state_store.get_record(ctx.conv_key)
     if not isinstance(getattr(record, "state", None), PendingToolConfirm):
         return False
@@ -4505,6 +4610,9 @@ async def _stage_restore_replied_pending_reference(ctx: TurnContext) -> bool:
 
 async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
     """Production scenario S15: quoted or numbered pending control remains target-bound."""
+    if getattr(ctx, "semantic_pending_released", False):
+        ctx.generic_command_intent = await ctx.command_intent_for()
+        return False
     if ctx.literal_phrase_word:
         ctx.generic_command_intent = MessageCommandIntent()
         return False
@@ -4798,6 +4906,8 @@ async def _stage_record_classified_flow(ctx: TurnContext) -> bool:
 
 async def _stage_handle_clear_history(ctx: TurnContext) -> bool:
     """Production scenario: clear-history authority is checked before draft arbitration."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     if _message_authorizes_clear_history(
         ctx.normalized_message_text,
         ctx.generic_command_intent,
@@ -4871,7 +4981,7 @@ async def _stage_arbitrate_active_operation(ctx: TurnContext) -> bool:
                 await _finish_ai_chat_matcher(ctx.response)
                 return True
 
-        if active_operation.status == "awaiting_confirmation":
+        if active_operation.status == "awaiting_confirmation" and not getattr(ctx, "semantic_pending_released", False):
             subset_refusal = _chat_commands.subset_submit_refusal(
                 ctx.normalized_message_text,
                 active_operation.pending_state,
@@ -5103,6 +5213,8 @@ def _render_refreshed_single_candidate(state: PendingAddWord, reason: str) -> st
 async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
     """Production scenario: quoted pending control revalidates the referenced candidate."""
     ctx.quoted_pending_add_control_authorized = False
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     if ctx.quoted_pending_add_control:
         current_record = conversation_state_store.get_record(ctx.conv_key)
         if current_record is not None and current_record.execution_id:
@@ -5207,6 +5319,8 @@ async def _stage_handle_quoted_pending_control(ctx: TurnContext) -> bool:
 
 async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
     """Production scenario: group replies cannot claim another actor's pending mutation."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     if (
         not ctx.quoted_pending_add_control_authorized
         and not ctx.verified_current_pending_reply
@@ -5363,6 +5477,8 @@ async def _stage_handle_referenced_other_user_pending(ctx: TurnContext) -> bool:
 
 async def _stage_handle_quoted_draft_selection(ctx: TurnContext) -> bool:
     """Production scenario: quoted draft selection stays bound to the quoted bot reply."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     quoted_draft_response = await _try_handle_quoted_draft_selection(
         ctx.normalized_message_text,
         ctx.reply_reference,
@@ -5461,6 +5577,8 @@ async def _stage_recall_active_operation(ctx: TurnContext) -> bool:
 
 async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
     """Production scenarios S8-S11 and S16-S17: pending add/tool tickets retain CAS and one-time execution semantics."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     if ctx.response is None and not ctx.generic_intent_is_fresh_command:
         from ..utils.explicit_code import parse_explicit_code_request
 
@@ -6010,6 +6128,8 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
 
 async def _stage_submit_current_draft(ctx: TurnContext) -> bool:
     """Production scenario: explicit submit starts one coordinated background operation."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     if (
         ctx.response is None
         and ctx.generic_command_intent.intent == "draft_submit"
@@ -6054,6 +6174,8 @@ async def _stage_submit_current_draft(ctx: TurnContext) -> bool:
 
 async def _stage_handle_draft_management(ctx: TurnContext) -> bool:
     """Production scenario: direct draft management runs before general model fallback."""
+    if getattr(ctx, "semantic_pending_released", False) and ctx.generic_command_intent.intent != "draft_view":
+        return False
     if ctx.response is None:
         ctx.response = await _try_handle_draft_management_command(
             ctx.normalized_message_text,
@@ -6068,6 +6190,8 @@ async def _stage_handle_draft_management(ctx: TurnContext) -> bool:
 
 async def _stage_handle_replace_character(ctx: TurnContext) -> bool:
     """Production scenario: exact character replacement uses its dedicated state path."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     if ctx.response is None:
         ctx.response = await _try_handle_replace_char(
             ctx.normalized_message_text,
@@ -6083,6 +6207,13 @@ async def _stage_handle_replace_character(ctx: TurnContext) -> bool:
 
 async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
     """Production scenario: simple word lookup runs before general model fallback."""
+    if getattr(ctx, "semantic_pending_released", False):
+        if ctx.response is None:
+            ctx.response = await _try_handle_simple_single_word_query(
+                ctx.normalized_message_text, ctx.platform, ctx.user_id,
+                ctx.conv_key, ctx.space_key, ctx.owner_label, preserve_pending=True,
+            )
+        return False
     if ctx.response is None:
         _set_conversational_turn(
             ctx.normalized_message_text, ctx.history, ctx.generic_command_intent,
@@ -6207,6 +6338,7 @@ async def _stage_generate_ai_response(ctx: TurnContext) -> bool:
             ctx.memory_context,
             progress_reporter=report_progress,
             released_pending_turn=ctx.released_pending_turn,
+            preserve_pending=getattr(ctx, "semantic_pending_released", False),
             resolved_advertised_words=ctx.resolved_advertised_words,
             advertised_snapshot_token=ctx.advertised_snapshot_token,
             command_intent=(
@@ -6302,6 +6434,8 @@ async def _stage_scope_language_only_response(ctx: TurnContext) -> bool:
 
 async def _stage_append_ticket_challenge(ctx: TurnContext) -> bool:
     """Draft management replies cannot advertise an unrelated pending mutation."""
+    if getattr(ctx, "semantic_pending_released", False):
+        return False
     if isinstance(ctx.response, ServerBackedQueryReply):
         return False
     if not advertised_reply_contract(ctx.response).requires_live_state:
