@@ -4255,11 +4255,11 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             pending_context = _pending_context_for_command_intent(pending_snapshot)
             async with AsyncOpenAI(
                 api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL,
-                timeout=15.0, max_retries=1,
+                timeout=8.0, max_retries=1,
             ) as client:
                 raw = await parse_operation(
                     message, pending_context, client=client,
-                    model=WORD_QUERY_INTENT_MODEL,
+                    model=WORD_QUERY_INTENT_MODEL, timeout=8.0,
                 )
             validated, violations = validate_operation(raw, message, pending_snapshot)
             ctx.operation_request = validated
