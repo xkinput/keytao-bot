@@ -81,6 +81,7 @@ from ..utils.image_input import (
 )
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver as _user_resolver
+from ..utils.community_vote import _stage_community_vote
 from ..utils.observability import (
     begin_turn_metrics,
     emit_turn_metrics,
@@ -2970,6 +2971,8 @@ def _prepare_user_facing_reply(
         prepared = _append_unreported_submit_status(prepared, deliveries, conv_key)
     prepared = render_platform_public_links(prepared, platform)
     prepared = strip_bare_batch_ids(prepared)
+    from ..utils.community_vote import prepare_delivery
+    prepared = prepare_delivery(prepared, memory_context)
     if live_record is not None and not live_record.execution_id and (
         (
             advertised_reply_contract(prepared).requires_live_state
@@ -3752,7 +3755,7 @@ async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
         ctx.message_text,
         ctx.normalized_message_text,
     )
-    return False
+    return await _stage_community_vote(ctx)
 
 
 async def _stage_handle_commonness_query(ctx: TurnContext) -> bool:
