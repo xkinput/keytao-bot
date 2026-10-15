@@ -8943,6 +8943,22 @@ async def _try_handle_entry_swap_command(
         or command_intent.keep_words != expected_words
     ):
         return None
+    return await try_handle_model_entry_swap(
+        command.first_word, command.second_word,
+        platform, user_id, space_key, owner_label,
+    )
+
+
+async def try_handle_model_entry_swap(
+    first_word: str,
+    second_word: str,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> str:
+    """Resolve a validated pair into the existing author-confirmed swap plan."""
+    expected_words = (first_word, second_word)
     set_turn_flow("draft-op")
     resolved = await _load_merged_word_entries(
         expected_words,
@@ -8954,8 +8970,8 @@ async def _try_handle_entry_swap_command(
             "服务端无法为这两个词各锁定唯一的词库或草稿记录；"
             "本次未生成换位计划"
         )
-    first = resolved[command.first_word]
-    second = resolved[command.second_word]
+    first = resolved[first_word]
+    second = resolved[second_word]
     first_code = str(first.get("code") or "").strip().lower()
     second_code = str(second.get("code") or "").strip().lower()
     if str(first.get("type") or "") != str(second.get("type") or ""):
@@ -8976,7 +8992,7 @@ async def _try_handle_entry_swap_command(
                 "两个词当前权重无法形成唯一互换计划"
             )
         return await _execute_shift_to_code(
-            command.first_word,
+            first_word,
             first_code,
             platform,
             user_id,
@@ -9002,7 +9018,7 @@ async def _try_handle_entry_swap_command(
             "两个词不在同一条可验证候选链，不能共用一张换位计划"
         )
     return await _execute_shift_to_code(
-        command.first_word,
+        first_word,
         target_root,
         platform,
         user_id,

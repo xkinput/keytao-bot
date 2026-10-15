@@ -4216,7 +4216,7 @@ _semantic_shadow_tasks: set[asyncio.Task] = set()
 
 
 async def _stage_understand_operation(ctx: TurnContext) -> bool:
-    """Record the fast-path interpretation without influencing routing."""
+    """Record understanding and optionally route model swaps to confirmation."""
     try:
         from ..harness.operation_request import understand_message
 
@@ -4234,6 +4234,70 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
     except Exception as exc:
         ctx.operation_request = None
         logger.warning(f"[operation_request] failed: {exc}")
+
+    route_swap = "swap" in {
+        token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
+    }
+    fast_op = ctx.operation_request.op if ctx.operation_request is not None else "none"
+    # Fast swaps can include suffixes in an operand (e.g. "务实的码").
+    if route_swap and ctx.normalized_message_text.strip():
+        try:
+            import copy
+            from ..harness.semantic_parser import parse_operation, validate_operation
+
+            pending_snapshot = copy.deepcopy(
+                ctx.current_pending_record.state
+                if ctx.current_pending_record is not None else None
+            )
+            if not isinstance(pending_snapshot, (PendingAddWord, PendingToolConfirm)):
+                pending_snapshot = None
+            message = ctx.normalized_message_text
+            pending_context = _pending_context_for_command_intent(pending_snapshot)
+            async with AsyncOpenAI(
+                api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL,
+                timeout=15.0, max_retries=1,
+            ) as client:
+                raw = await parse_operation(
+                    message, pending_context, client=client,
+                    model=WORD_QUERY_INTENT_MODEL,
+                )
+            validated, violations = validate_operation(raw, message, pending_snapshot)
+            ctx.operation_request = validated
+            logger.info(
+                f"[semantic_shadow] fast_op={fast_op} model_op={validated.op} "
+                f"model_frame={validated.frame} refers_to_pending={validated.refers_to_pending} "
+                f"operands={validated.operands!r} codes={validated.codes!r} "
+                f"violations={violations!r} agree={fast_op == validated.op or fast_op == 'none'}"
+            )
+        except asyncio.CancelledError:
+            logger.info("[semantic_shadow] cancelled")
+            raise
+        except Exception as error:
+            logger.warning(f"[semantic_shadow] failed={type(error).__name__}")
+            return False
+        if (
+            validated.op == "swap"
+            and len(validated.operands) == 2
+            and len(set(validated.operands)) == 2
+            and all(value.startswith("frame_backstop:") for value in violations)
+            and validated.frame in {"direct", "question"}
+            and validated.refers_to_pending is False
+        ):
+            response = await _chat_commands.try_handle_model_entry_swap(
+                *validated.operands, ctx.platform, ctx.user_id,
+                ctx.space_key, ctx.owner_label,
+            )
+            if response is not None:
+                ctx.scoped_pending_response = None
+                ctx.response = response
+                remember_conversation(ctx.conv_key, ctx.memory_context, message, response)
+                await _finish_ai_chat_response(
+                    ctx.bot, ctx.event, ctx.user_id, ctx.memory_context,
+                    response, ctx.QQMessageSegment,
+                )
+                return True
+        # The awaited result also serves shadow mode; never call the model twice.
+        return False
 
     if os.getenv("KEYTAO_SEMANTIC_SHADOW") == "1" and ctx.normalized_message_text.strip():
         try:
