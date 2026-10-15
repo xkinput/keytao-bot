@@ -6696,7 +6696,7 @@ async def keytao_shift_phrase_code(
     if not merge_result.get("success"):
         conflict_lines = "；".join(
             f"{item.get('action') or 'Create'} 「{item.get('word') or '未知词条'}」"
-            f"@{item.get('code') or '未知编码'}"
+            f"@{item.get('code') or item.get('fromCode') or '未知编码'}"
             for item in merge_result.get("conflictingDraftItems", [])[:8]
         )
         return _inject_known_batch_url({

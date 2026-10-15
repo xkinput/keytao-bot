@@ -6814,7 +6814,7 @@ async def _execute_confirmed_tool(
         ))
         conflict_labels = "、".join(
             f"{str(item.get('action') or 'Create')} 「{str(item.get('word') or '未知词条')}」"
-            f"@{str(item.get('code') or '未知编码')}"
+            f"@{str(item.get('code') or item.get('fromCode') or '未知编码')}"
             for item in conflict_items[:8]
         )
         reason = (
@@ -11309,6 +11309,175 @@ def _compact_reviewed_reading_options(review: Dict) -> str:
     return "；".join(summaries)
 
 
+SEMANTIC_ROUTE_OPS = frozenset({
+    "swap", "delete", "recode", "move", "reorder", "batch_replace",
+    "draft_submit", "draft_recall", "draft_clear", "draft_keep_only",
+})
+
+
+def render_understood_command(request) -> str:
+    """Render model fields only when the existing grammar preserves them exactly."""
+    from ..harness.operation_request import understand_message
+
+    op, words, codes = request.op, request.operands, request.codes
+    if not isinstance(op, str) or op not in SEMANTIC_ROUTE_OPS or op == "swap":
+        return ""
+    if any(not isinstance(word, str) or not word or re.search(r"[\s\x00-\x1f\x7f]", word) for word in words):
+        return ""
+    if any(not isinstance(code, str) or re.fullmatch(r"[a-z]{1,12}", code) is None for code in codes):
+        return ""
+    if len(set(words)) != len(words):
+        return ""
+    command = ""
+    if op == "delete" and len(words) == 1 and len(codes) <= 1:
+        command = f"删词 {words[0]} {' '.join(codes)}".strip()
+    elif op == "recode" and len(words) == 1 and len(codes) == 2 and codes[0] != codes[1]:
+        command = f"删除 {words[0]} {codes[0]}；添加 {words[0]} {codes[1]}"
+    elif op == "move":
+        if len(words) == len(codes) == 1:
+            command = f"把{words[0]}调到{codes[0]}"
+        elif len(words) == 2 and len(codes) == 1:
+            command = f"修改 {codes[0]}：{words[0]} → {words[1]}"
+        elif len(words) == len(codes) == 2:
+            command = f"把{words[0]}调到{codes[0]}；把{words[1]}调到{codes[1]}"
+    elif op == "reorder":
+        if len(words) == 2 and len(codes) in {0, 2}:
+            entries = [f"{word} {codes[index]}" if codes else word for index, word in enumerate(words)]
+            command = f"{entries[0]} 优先于 {entries[1]}"
+        elif len(words) > 2 and not codes:
+            command = "重新排序 " + " ".join(words)
+        elif not words and len(codes) == 1:
+            command = "重排 " + codes[0]
+    elif op in {"draft_submit", "draft_recall", "draft_clear"} and not words and not codes:
+        command = {"draft_submit": "提交草稿", "draft_recall": "撤回提交", "draft_clear": "清空草稿"}[op]
+    elif op == "draft_keep_only" and words and not codes:
+        command = "只保留 " + " ".join(words) + "，其余删除"
+        if request.submit_after:
+            command += "，并提交"
+        parsed = _canonical_keep_only_command(command, MessageCommandIntent(
+            intent="draft_keep_only", confidence=1.0, keep_words=words,
+        ))
+        return command if parsed is not None and (parsed.keep_words, parsed.submit_after) == (words, request.submit_after) else ""
+    elif op == "batch_replace" and len(words) >= 3 and len(codes) == len(words) - 2:
+        old, new, *rows = words
+        if len(old) != 1 or len(new) != 1 or old == new or request.submit_after:
+            return ""
+        command = f"把{old}替换成{new}\n" + "\n".join(f"{word} {code}" for word, code in zip(rows, codes))
+        intent = MessageCommandIntent(intent="batch_replace_char", confidence=1.0, old_char=old, new_char=new)
+        parsed = _build_replace_char_items(command, old, new)
+        return command if (
+            _message_authorizes_replace_char(command, intent)
+            and [(item["old_word"], item["code"]) for item in parsed] == list(zip(rows, codes))
+        ) else ""
+    if not command or request.submit_after:
+        return ""
+    parsed = understand_message(command)
+    return command if (parsed.op, parsed.operands, parsed.codes, parsed.submit_after) == (op, words, codes, request.submit_after) else ""
+
+
+def _understood_command_digest(args: Dict) -> str:
+    return hashlib.sha256(json.dumps(
+        {key: value for key, value in args.items() if key != "digest"},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+async def try_handle_model_command(request, platform, user_id, conv_key, space_key, owner_label):
+    """Seal a canonical command without performing any tool call."""
+    command = render_understood_command(request)
+    if not command:
+        return None
+    record = conversation_state_store.get_record(conv_key)
+    if record is not None and record.execution_id:
+        return "上一项操作仍在处理中，本次未替换确认计划。"
+    args = {"command_text": command, "op": request.op, "operands": list(request.operands),
+            "codes": list(request.codes), "submit_after": request.submit_after}
+    args["digest"] = _understood_command_digest(args)
+    if not conversation_state_store.set(
+        conv_key, PendingToolConfirm("keytao_understood_command", args),
+        space_key=space_key, owner_label=owner_label,
+    ):
+        return "确认计划无法保存，本次未写入。"
+    return _append_pending_ticket_challenge(
+        render_pending_understood_command(PendingToolConfirm("keytao_understood_command", args)),
+        conv_key,
+    )
+
+
+def _understood_command_request(state):
+    from ..harness.operation_request import OperationRequest
+
+    if state.function_name != "keytao_understood_command" or state.confirmation_source != "local_preview":
+        return None
+    args = state.args
+    if not isinstance(args.get("operands"), list) or not isinstance(args.get("codes"), list) or not isinstance(args.get("submit_after"), bool):
+        return None
+    request = OperationRequest(
+        op=args.get("op"), operands=tuple(args["operands"]),
+        codes=tuple(args["codes"]), submit_after=args["submit_after"],
+    )
+    command = render_understood_command(request)
+    if not command or command != args.get("command_text") or args.get("digest") != _understood_command_digest(args):
+        return None
+    return request
+
+
+def render_pending_understood_command(state) -> str:
+    """Expose controls only for the exact canonical command sealed in this ticket."""
+    if _understood_command_request(state) is None:
+        return ""
+    return f"我理解为：「{state.args['command_text']}」\n回复「确认」执行，或「取消」。"
+
+
+async def handle_pending_understood_command(record, message, platform, user_id, conv_key, space_key, owner_label):
+    """Consume this exact author's ticket before re-entering explicit dispatch."""
+    if (
+        record.owner_key != normalize_conversation_key(conv_key, space_key)
+        or record.owner_key.actor_id != str(user_id)
+        or record.owner_key.platform != platform
+        or record.state.function_name != "keytao_understood_command"
+    ):
+        return None
+    control = _strip_command_message_prefixes(message).strip()
+    if control not in {"确认", "取消"}:
+        return None
+    if not conversation_state_store.begin_execution(record):
+        return "当前确认正在处理中，本次未重复执行。"
+    if not conversation_state_store.complete_execution(record):
+        return "确认计划无法安全消费，本次未写入。"
+    if control == "取消":
+        return "已取消。"
+    request = _understood_command_request(record.state)
+    if request is None:
+        return "确认计划校验失败，本次未写入。"
+    command = record.state.args["command_text"]
+    active = draft_operation_coordinator.find_for_actor((platform, user_id))
+    if active is not None:
+        return _active_operation_message_for_request(active, platform, user_id)
+    op, words, codes = request.op, request.operands, request.codes
+    if op == "move":
+        response = await try_handle_move_to_code_command(command, platform, user_id, space_key, owner_label)
+        if response is not None:
+            return response
+    intent = MessageCommandIntent(
+        intent={"delete": "dictionary_delete", "recode": "dictionary_recode",
+                "move": "replace_at_code", "reorder": "word_list_reorder",
+                "batch_replace": "batch_replace_char"}.get(op, op),
+        confidence=1.0, keep_words=words,
+        requested_code=codes[0] if codes else "",
+        requested_codes=codes[1:] if op == "recode" else codes,
+        submit_after=request.submit_after,
+    )
+    if op == "batch_replace":
+        intent = replace(intent, old_char=words[0], new_char=words[1])
+        response = await _try_handle_replace_char(command, platform, user_id, intent, conv_key, space_key, owner_label)
+    else:
+        if op == "reorder" and not words:
+            intent = replace(intent, intent="code_chain_reorder")
+        response = await _try_handle_draft_management_command(command, platform, user_id, space_key, owner_label, intent)
+    return response or "规范指令无法执行，本次未写入。"
+
+
 _PENDING_CHOICE_OFFER_FUNCTION = "keytao_choice_offer"
 _PENDING_CHOICE_LABEL_RE = re.compile(
     r"^(?:(?:选择?|方案)\s*)?([AB])$",
@@ -12371,6 +12540,10 @@ async def handle_pending_message_core(
     if state_record is None or state_record.state is None:
         return None
     state = state_record.state
+    if isinstance(state, PendingToolConfirm) and state.function_name == "keytao_understood_command":
+        return await handle_pending_understood_command(
+            state_record, message, platform, user_id, conv_key, space_key, owner_label,
+        )
     if isinstance(state, PendingTrustedWordRecord):
         return await _resolve_pending_trusted_word_action(
             state_record,

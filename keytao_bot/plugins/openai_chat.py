@@ -1997,6 +1997,13 @@ def _advertised_reply_matches_live_record(
     """Prove that every advertised stateful form has an actor-owned live target."""
     response = _without_binding_precheck_notice(response)
     if (
+        record is not None
+        and isinstance(record.state, PendingToolConfirm)
+        and record.state.function_name == "keytao_understood_command"
+    ):
+        rendered = _chat_commands.render_pending_understood_command(record.state)
+        return bool(not record.execution_id and rendered and response.strip() == rendered)
+    if (
         record is not None and not record.execution_id
         and isinstance(record.state, PendingToolConfirm)
         and record.state.args.get("_pending_submitted_confirmed") is True
@@ -2248,6 +2255,12 @@ def _render_live_choice_record(record: Optional[PendingStateRecord]) -> str:
 
 def _render_live_batch_record(record: Optional[PendingStateRecord]) -> str:
     """Project a sealed batch ticket into the deterministic display interface."""
+    if (
+        record is not None and not record.execution_id
+        and isinstance(record.state, PendingToolConfirm)
+        and record.state.function_name == "keytao_understood_command"
+    ):
+        return _chat_commands.render_pending_understood_command(record.state)
     if (
         record is None
         or record.execution_id
@@ -2652,6 +2665,14 @@ def _enforce_candidate_reply_contract(
     )
     if record is None:
         record = _active_operation_state_record(conv_key)
+    if (
+        record is not None and isinstance(record.state, PendingToolConfirm)
+        and record.state.function_name == "keytao_understood_command"
+    ):
+        if record.execution_id and str(response).startswith("我理解为：「"):
+            return "当前确认正在处理中，本次未重复执行。"
+        if _advertised_reply_matches_live_record(response, record):
+            return _chat_commands.render_pending_understood_command(record.state)
     evidence = keytao_review.current_commonness_evidence()
     if record is not None and not record.execution_id and isinstance(record.state, PendingToolConfirm) and _state.server_warning_ticket_is_complete(record.state):
         plan = (record.state.args.get("_pending_display") or {}).get("shiftPlan") or {}
@@ -3467,6 +3488,8 @@ class TurnContext:
     other_pending_record: Optional[PendingStateRecord] = None
     current_contextual_reply: bool = False
     operation_request: Optional[object] = None
+    operation_violations: Tuple[str, ...] = ()
+    operation_understood_early: bool = False
 
 
 async def _stage_load_platform_reply_adapter(ctx: TurnContext) -> bool:
@@ -4215,14 +4238,31 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
 _semantic_shadow_tasks: set[asyncio.Task] = set()
 
 
+async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
+    """Await enabled routing before command stages; retain the legacy shadow slot."""
+    enabled = _chat_commands.SEMANTIC_ROUTE_OPS & {
+        token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
+    }
+    if not enabled or not ctx.normalized_message_text.strip():
+        return False
+    handled = await _stage_understand_operation(ctx)
+    ctx.operation_understood_early = True
+    return handled
+
+
 async def _stage_understand_operation(ctx: TurnContext) -> bool:
-    """Record understanding and optionally route model swaps to confirmation."""
+    """Understand once before command parsers, then stage author-owned plans."""
+    if ctx.operation_understood_early:
+        return False
+    current_record = ctx.current_pending_record or (
+        conversation_state_store.get_record(ctx.conv_key) if ctx.conv_key is not None else None
+    )
     try:
         from ..harness.operation_request import understand_message
 
         pending_state = (
-            ctx.current_pending_record.state
-            if ctx.current_pending_record is not None
+            current_record.state
+            if current_record is not None
             else None
         )
         request = understand_message(ctx.normalized_message_text, pending_state)
@@ -4235,19 +4275,18 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
         ctx.operation_request = None
         logger.warning(f"[operation_request] failed: {exc}")
 
-    route_swap = "swap" in {
+    route_ops = _chat_commands.SEMANTIC_ROUTE_OPS & {
         token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
     }
     fast_op = ctx.operation_request.op if ctx.operation_request is not None else "none"
     # Fast swaps can include suffixes in an operand (e.g. "务实的码").
-    if route_swap and ctx.normalized_message_text.strip():
+    if route_ops and ctx.normalized_message_text.strip():
         try:
             import copy
             from ..harness.semantic_parser import parse_operation, validate_operation
 
             pending_snapshot = copy.deepcopy(
-                ctx.current_pending_record.state
-                if ctx.current_pending_record is not None else None
+                current_record.state if current_record is not None else None
             )
             if not isinstance(pending_snapshot, (PendingAddWord, PendingToolConfirm)):
                 pending_snapshot = None
@@ -4263,6 +4302,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 )
             validated, violations = validate_operation(raw, message, pending_snapshot)
             ctx.operation_request = validated
+            ctx.operation_violations = tuple(violations)
             logger.info(
                 f"[semantic_shadow] fast_op={fast_op} model_op={validated.op} "
                 f"model_frame={validated.frame} refers_to_pending={validated.refers_to_pending} "
@@ -4276,17 +4316,25 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             logger.warning(f"[semantic_shadow] failed={type(error).__name__}")
             return False
         if (
-            validated.op == "swap"
-            and len(validated.operands) == 2
-            and len(set(validated.operands)) == 2
+            validated.op in route_ops
             and all(value.startswith("frame_backstop:") for value in violations)
             and validated.frame in {"direct", "question"}
             and validated.refers_to_pending is False
         ):
-            response = await _chat_commands.try_handle_model_entry_swap(
-                *validated.operands, ctx.platform, ctx.user_id,
-                ctx.space_key, ctx.owner_label,
-            )
+            if validated.op == "swap":
+                response = (
+                    await _chat_commands.try_handle_model_entry_swap(
+                        *validated.operands, ctx.platform, ctx.user_id,
+                        ctx.space_key, ctx.owner_label,
+                    )
+                    if len(validated.operands) == len(set(validated.operands)) == 2
+                    and not validated.codes and not validated.submit_after else None
+                )
+            else:
+                response = await _chat_commands.try_handle_model_command(
+                    validated, ctx.platform, ctx.user_id, ctx.conv_key,
+                    ctx.space_key, ctx.owner_label,
+                )
             if response is not None:
                 ctx.scoped_pending_response = None
                 ctx.response = response
@@ -4311,8 +4359,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 from ..harness.semantic_parser import parse_operation, validate_operation
 
                 pending_snapshot = copy.deepcopy(
-                    ctx.current_pending_record.state
-                    if ctx.current_pending_record is not None else None
+                    current_record.state if current_record is not None else None
                 )
                 if not isinstance(pending_snapshot, (PendingAddWord, PendingToolConfirm)):
                     pending_snapshot = None
@@ -4352,6 +4399,32 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
         except Exception as error:
             logger.warning(f"[semantic_shadow] failed={type(error).__name__}")
     return False
+
+
+async def _stage_handle_understood_command_control(ctx: TurnContext) -> bool:
+    """Consume literal author confirmation before legacy pending claim stages."""
+    record = conversation_state_store.get_record(ctx.conv_key)
+    if not isinstance(getattr(record, "state", None), PendingToolConfirm):
+        return False
+    if record.state.function_name != "keytao_understood_command":
+        return False
+    if _strip_command_message_prefixes(ctx.normalized_message_text).strip() not in {"确认", "取消"}:
+        return False
+    if ctx.reply_reference.is_reply and not _verified_bot_reply_matches_record(ctx.reply_reference, record):
+        ctx.released_pending_turn = True
+        return False
+    response = await _chat_commands.handle_pending_understood_command(
+        record, ctx.normalized_message_text, ctx.platform, ctx.user_id,
+        ctx.conv_key, ctx.space_key, ctx.owner_label,
+    )
+    if response is None:
+        return False
+    ctx.response = response
+    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, response)
+    await _finish_ai_chat_response(
+        ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment,
+    )
+    return True
 
 
 async def _stage_finish_scoped_pending_response(ctx: TurnContext) -> bool:
@@ -5393,6 +5466,17 @@ async def _stage_execute_pending_state(ctx: TurnContext) -> bool:
 
         state_record = conversation_state_store.get_record(ctx.conv_key)
         state = state_record.state if state_record else None
+        if isinstance(state, PendingToolConfirm) and state.function_name == "keytao_understood_command":
+            if _strip_command_message_prefixes(ctx.normalized_message_text).strip() not in {"确认", "取消"}:
+                return False
+            if ctx.reply_reference.is_reply and not _verified_bot_reply_matches_record(ctx.reply_reference, state_record):
+                ctx.released_pending_turn = True
+                return False
+            ctx.response = await _chat_commands.handle_pending_understood_command(
+                state_record, ctx.normalized_message_text, ctx.platform, ctx.user_id,
+                ctx.conv_key, ctx.space_key, ctx.owner_label,
+            )
+            return False
         if (
             (
                 isinstance(state, PendingToolConfirm)
@@ -6274,6 +6358,8 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_image_turn,
     _stage_handle_visual_probe_timeout,
     _stage_initialize_conversation,
+    _stage_understand_operation_early,
+    _stage_handle_understood_command_control,
     _stage_handle_explicit_draft_conversation_reset,
     _stage_handle_commonness_query,
     _stage_handle_completed_draft_undo,
