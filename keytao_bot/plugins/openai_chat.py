@@ -4400,6 +4400,16 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     pending_decision = json.loads(pending_decision)
                 except ValueError:
                     pending_decision = None
+        if validated.op == "add" and "add" in route_ops:
+            if (not isinstance(pending_decision, dict)
+                or pending_decision.get("refers_to_pending") is not False
+                or not isinstance(pending_decision.get("submit_after"), bool)
+                or any(not value.startswith("frame_backstop:") for value in violations)):
+                return False
+            validated = _chat_commands.resolve_model_add(validated, message)
+            if validated is None or not _chat_commands.render_understood_command(validated):
+                return False
+            ctx.operation_request = validated
         owned_ticket = bool(
             pending_snapshot is not None and current_record is not None
             and conversation_state_store.get_record(ctx.conv_key) is current_record
@@ -4428,7 +4438,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, current_record):
                 if complete_command and fast_request.op in route_ops and (
                     fast_request.op == "swap" or _chat_commands.render_understood_command(fast_request)
-                ):
+                ) and fast_request.op != "add":
                     # A separate command may replace the ticket, never answer it.
                     validated, model_command = fast_request, True
                 else:
@@ -4581,7 +4591,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 )
             elif resolved is None:
                 response = explanation
-            elif direct:
+            elif direct or resolved.op == "add" and not any(resolved.codes):
                 response = await _chat_commands.execute_model_command_direct(
                     resolved, named_words, ctx.platform, ctx.user_id, ctx.conv_key,
                     ctx.space_key, ctx.owner_label,

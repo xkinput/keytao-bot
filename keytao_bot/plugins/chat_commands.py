@@ -11435,7 +11435,7 @@ def _compact_reviewed_reading_options(review: Dict) -> str:
 
 
 SEMANTIC_ROUTE_OPS = frozenset({
-    "swap", "delete", "recode", "move", "reorder", "batch_replace",
+    "add", "swap", "delete", "recode", "move", "reorder", "batch_replace",
     "draft_submit", "draft_recall", "draft_clear", "draft_keep_only",
     "pending_release", "pending_answer", "query", "chat", "help",
 })
@@ -11455,6 +11455,75 @@ def semantic_direct_exec_allowed(request, violations=()) -> bool:
         and request.frame == "direct" and request.refers_to_pending is False
         and not violations
     )
+
+
+def resolve_model_add(request, message):
+    """Bind unique literal codes by attachment, then by matching list order."""
+    words, codes = request.operands, request.codes
+    if (request.frame != "direct" or request.refers_to_pending is not False
+        or request.relation or not words or len(set(words)) != len(words)
+        or len(set(codes)) != len(codes)):
+        return None
+    message = _strip_command_message_prefixes(message)
+    code_matches = [(match.start(), match.end(), match.group().lower())
+                    for match in re.finditer(r"[A-Za-z]+", message)]
+    if len(code_matches) != len(codes) or {row[2] for row in code_matches} != set(codes):
+        return None
+    if codes:
+        # Keep positions while enforcing complete word tokens, not substrings.
+        word_source = re.sub(r"[A-Za-z]", " ", message)
+        word_source = "".join(" " if unicodedata.category(char).startswith("P") else char
+                              for char in word_source)
+        word_matches = [(match.start(), match.end(), match.group())
+                        for match in re.finditer(r"\S+", word_source)]
+        if word_matches and word_matches[0][0] == 0 and word_matches[0][2] in {"加词", "添加"}:
+            end = word_matches[0][1]
+            if end == len(message) or message[end].isspace() or unicodedata.category(message[end]).startswith("P"):
+                word_matches.pop(0)
+    else:
+        word_matches = [(match.start(), match.end(), word) for word in words
+                        for match in re.finditer(re.escape(word), message)]
+        # A shorter operand inside another named word is not a second occurrence.
+        word_matches = [row for row in word_matches if not any(
+            other[0] <= row[0] and row[1] <= other[1] and other[2] != row[2]
+            for other in word_matches
+        )]
+    if len(word_matches) != len(words) or {row[2] for row in word_matches} != set(words):
+        return None
+    word_matches.sort()
+    if any(start < word_end and word_start < end
+           for start, end, _code in code_matches for word_start, word_end, _word in word_matches):
+        return None
+    code_matches.sort()
+    paired = {}
+    for start, _end, code in code_matches:
+        attached = [word for _word_start, end, word in word_matches
+                    if end <= start and re.fullmatch(r"[\s\W_]*", message[end:start])]
+        if len(attached) == 1:
+            if attached[0] in paired:
+                return None
+            paired[attached[0]] = code
+    if len(paired) != len(codes):
+        same_order = (tuple(row[2] for row in word_matches) == words
+                      and tuple(row[2] for row in code_matches) == codes)
+        separate_lists = bool(code_matches) and (
+            word_matches[-1][1] <= code_matches[0][0]
+            or code_matches[-1][1] <= word_matches[0][0]
+        )
+        ordered = dict(zip(words, codes))
+        glued_conflict = any(
+            end == start and ordered.get(word) != code
+            for _word_start, end, word in word_matches for start, _code_end, code in code_matches
+        )
+        if (len(words) != len(codes) or not same_order
+            or glued_conflict
+            or not separate_lists and any(ordered[word] != code for word, code in paired.items())):
+            return None
+        paired = ordered
+    ordered_words = tuple(row[2] for row in word_matches)
+    return replace(request, operands=ordered_words,
+                   codes=tuple(paired.get(word, "") for word in ordered_words),
+                   submit_after=request.submit_after and len(words) == len(codes) == 1)
 
 
 def _semantic_warnings_are_named(data: Dict, args: Dict) -> bool:
@@ -11721,11 +11790,35 @@ def render_understood_command(request) -> str:
         return ""
     if any(not isinstance(word, str) or not word or re.search(r"[\s\x00-\x1f\x7f]", word) for word in words):
         return ""
-    if any(not isinstance(code, str) or re.fullmatch(r"[a-z]{1,12}", code) is None for code in codes):
+    if any(not isinstance(code, str) or (not code and op != "add")
+           or code and re.fullmatch(r"[a-z]{1,12}", code) is None for code in codes):
         return ""
     if len(set(words)) != len(words):
         return ""
     command = ""
+    if op == "add":
+        from ..harness.authorization_grammar import _multi_add_authorization_contract, _parse_complete_add_clause
+
+        if not words or len(words) != len(codes) or len(set(filter(None, codes))) != len(tuple(filter(None, codes))):
+            return ""
+        command = "；".join(f"添加 {word}" + (f" {code}" if code else "") for word, code in zip(words, codes))
+        if request.submit_after:
+            if len(words) != 1 or not codes[0]:
+                return ""
+            command += " 并提交"
+        if len(words) == 1 and codes[0]:
+            parsed = explicit_complete_add_item(command)
+            understood = understand_message(command)
+            return command if parsed is not None and (
+                parsed["word"], parsed["code"], parsed["submitAfter"]
+            ) == (words[0], codes[0], request.submit_after) and (
+                understood.op, understood.operands, understood.codes, understood.submit_after
+            ) == (op, words, codes, request.submit_after) else ""
+        parsed = _multi_add_authorization_contract(command) if len(words) > 1 else None
+        clauses = parsed.clauses if parsed is not None and parsed.valid else (_parse_complete_add_clause(command),)
+        return command if all(clause is not None for clause in clauses) and tuple(
+            (clause.word, clause.code) for clause in clauses
+        ) == tuple(zip(words, codes)) else ""
     if op == "delete" and len(words) == 1 and len(codes) <= 1:
         command = f"删词 {words[0]} {' '.join(codes)}".strip()
     elif op == "recode" and len(words) == 1 and len(codes) == 2 and codes[0] != codes[1]:
@@ -11899,6 +11992,70 @@ async def execute_understood_command(request, command, platform, user_id, conv_k
     if active is not None:
         return _active_operation_message_for_request(active, platform, user_id)
     op, words, codes = request.op, request.operands, request.codes
+    if op == "add":
+        if render_understood_command(request) != command:
+            return "规范加词指令校验失败，本次未写入。"
+        pairs = [(word, code) for word, code in zip(words, codes) if code]
+        missing = tuple(word for word, code in zip(words, codes) if not code)
+        replies = []
+        if len(pairs) == 1:
+            word, code = pairs[0]
+            replies.append(await _execute_explicit_entry_code_request(
+                ExplicitEntryCodeRequest(word, code, submit_after=request.submit_after),
+                f"添加 {word} {code}" + (" 并提交" if request.submit_after else ""),
+                platform, user_id, conv_key, space_key, owner_label,
+            ))
+        elif pairs:
+            items, readings = [], []
+            for word, code in pairs:
+                try:
+                    review = json.loads(await call_tool_function(
+                        "keytao_prepare_reviewed_add", {"word": word}, platform, user_id,
+                    ))
+                except (TypeError, ValueError):
+                    review = {}
+                phrase_type = "Single" if len(word) == 1 else "Phrase"
+                if (not isinstance(review, dict) or review.get("success") is not True
+                    or review.get("word") != word or review.get("type", "Phrase") != phrase_type
+                    or review.get("reviewDisposition") == "BLOCK" or review.get("pronunciationUnresolved") is True):
+                    return f"未能取得「{word}」的已审读音和正确词条类型，本次未写入。"
+                inventory = select_candidate_inventory(review)
+                if inventory is None or not all(inventory.readings.values()):
+                    return f"编码 {code} 未能与「{word}」的已审读音绑定，本次未写入。"
+                reviewed = PendingAddWord(
+                    word, str(review.get("recommendedCode") or ""), list(inventory.candidates),
+                    server_candidates=list(inventory.candidates),
+                    pronunciation_codes=dict(inventory.readings), phrase_type=phrase_type,
+                )
+                validation = validate_explicit_code(reviewed, code)
+                if not validation.valid or not validation.pinyin:
+                    return (validation.reason or f"编码 {code} 缺少已审读音") + "；本次未写入。"
+                pinyin = validation.pinyin
+                reason = validation.manual_reason or str(review.get("manualReviewReason") or "")
+                items.append({
+                    "action": "Create", "word": word, "code": code, "type": phrase_type,
+                    "needsManualReview": bool(validation.manual_reason) or review.get("needsManualReview") is not False,
+                    "remark": f"喵喵审词：读音 {pinyin}；{reason}",
+                })
+                readings.append({"word": word, "pinyin": pinyin, "candidate_codes": list(dict.fromkeys([
+                    value for value, reading in inventory.readings.items() if reading == pinyin
+                ] + [code]))})
+            replies.append(await _execute_confirmed_tool(PendingToolConfirm(
+                "keytao_batch_add_to_draft", {"items": items, "_reviewed_batch_readings": readings},
+            ), platform, user_id, conv_key, space_key, owner_label))
+        if missing:
+            preserve = bool(pairs and conversation_state_store.get_record(conv_key) is not None)
+            if len(missing) == 1:
+                replies.append(await _try_handle_simple_single_word_query(
+                    missing[0], platform, user_id, conv_key, space_key, owner_label,
+                    _literal_word=True, preserve_pending=preserve,
+                ))
+            else:
+                replies.append(await _prepare_multi_word_query(
+                    missing, platform, user_id, conv_key, space_key, owner_label,
+                    preserve_pending=preserve,
+                ))
+        return "\n\n".join(reply for reply in replies if reply)
     if op == "move":
         response = await try_handle_move_to_code_command(command, platform, user_id, space_key, owner_label)
         if response is not None:
@@ -11948,6 +12105,12 @@ async def execute_model_command_direct(request, named_words, platform, user_id, 
         or not conversation_state_store.complete_execution(record)
     ):
         return "原候选无法安全释放，本次未执行。"
+    if request.op == "add":
+        # Keep ordinary add warning confirmations, including manual review.
+        command = render_understood_command(request)
+        if not command:
+            return "还没有核对出可执行的词条和编码；本次未写入。"
+        return await execute_understood_command(request, command, platform, user_id, conv_key, space_key, owner_label)
     token = _semantic_direct_words.set(tuple(named_words))
     replacement = (
         (request.operands[0], request.codes[0])
