@@ -715,6 +715,10 @@ class ConversationLockStore:
             self._locks[address] = lock
         return lock
 
+    def is_locked(self, key: ConversationKey) -> bool:
+        lock = self._locks.get(normalize_conversation_key(key))
+        return lock is not None and lock.locked()
+
     @asynccontextmanager
     async def lock(self, key: ConversationKey) -> AsyncIterator[None]:
         """Serialize an actor and retire the lock after every queued user exits."""
@@ -1347,6 +1351,11 @@ class MemoryConversationStateStore:
 
     def contains(self, key: ConversationKey) -> bool:
         return self.get(key) is not None
+
+    def has_pending_for_actor(self, actor_key: ActorKey) -> bool:
+        """Check all spaces without creating or replacing an actor's ticket."""
+        self._purge_expired()
+        return any(record.owner_key.actor_key == actor_key for record in self._records.values())
 
     def find_pending_for_other_owner(
         self,

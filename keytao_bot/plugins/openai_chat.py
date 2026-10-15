@@ -953,6 +953,13 @@ async def should_handle(bot: Bot, event: Event) -> bool:
             if isinstance(event, QQPrivateMessageEvent):
                 return True
             if isinstance(event, QQGroupMessageEvent):
+                if os.getenv("KEYTAO_WORD_DISCOVERY") == "1":
+                    import sys
+                    from ..harness.word_discovery import discovery_reply_route
+
+                    discovery_route = await discovery_reply_route(bot, event, sys.modules[__name__])
+                    if discovery_route is not None:
+                        return discovery_route
                 if await to_me()(bot, event, {}):
                     return True
                 message_text = event.get_plaintext().strip()
@@ -1926,6 +1933,12 @@ async def trace_sensitive_message(bot: Bot, event: Event):
         is_to_bot = await to_me()(bot, event, {})
     except Exception as error:
         logger.debug(f"[message_trace] failed to evaluate to_me: {error}")
+
+    if os.getenv("KEYTAO_WORD_DISCOVERY") == "1":
+        import sys
+        from ..harness.word_discovery import schedule_discovery
+
+        schedule_discovery(bot, event, sys.modules[__name__], addressed=is_to_bot or contains_trigger)
 
     if not (is_to_bot or contains_trigger or is_sensitive_short_command):
         return
