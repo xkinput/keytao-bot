@@ -188,6 +188,94 @@ class SemanticAddRouteTests(unittest.IsolatedAsyncioTestCase):
         self.set_model()
         await self.assert_fallback("把燃面加到rfmm")
 
+    async def test_closed_leading_add_phrases_allow_spaced_and_glued_exact_pairs(self):
+        for prefix in (
+            "加词", "添加", "加", "加个词", "加一下", "帮我加词", "帮我添加",
+            "帮我加", "帮忙加词", "帮忙添加", "请加", "请添加",
+        ):
+            separators = (" ", "，") if prefix in {"加", "添加", "请加", "请添加"} else ("", " ", "，")
+            for separator in separators:
+                for pair in ("燃面rfmm", "燃面 rfmm"):
+                    message = prefix + separator + pair
+                    with self.subTest(message=message):
+                        self.calls.clear()
+                        self.writes.clear()
+                        self.set_model()
+                        handled, ctx = await self.stage(message)
+                        self.assertTrue(handled, ctx.response)
+                        self.assertEqual(self.added_pairs(), [("燃面", "rfmm")])
+                        self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_unstripped_add_prefix_words_keep_their_exact_operands(self):
+        for word, code, pinyin in (
+            ("加油站", "jyzz", "jia you zhan"),
+            ("添加剂", "tjj", "tian jia ji"),
+            ("加词燃面", "rfmm", "jia ci ran mian"),
+        ):
+            with self.subTest(word=word):
+                self.calls.clear()
+                self.writes.clear()
+                self.codes[word] = code
+                self.readings[word] = pinyin
+                self.set_model((word,), (code,))
+                handled, ctx = await self.stage(f"{word} {code}")
+                self.assertTrue(handled, ctx.response)
+                self.assertEqual(self.added_pairs(), [(word, code)])
+
+    async def test_command_prefix_cannot_expose_a_single_character_operand(self):
+        self.codes["油"] = "bwjy"
+        self.readings["油"] = "you"
+        self.review_changes["type"] = "Single"
+        self.set_model(("油",), ("bwjy",))
+        await self.assert_fallback("帮我加油 bwjy")
+
+    async def test_command_prefix_keeps_a_two_character_operand(self):
+        self.codes["油站"] = "yzfj"
+        self.readings["油站"] = "you zhan"
+        self.set_model(("油站",), ("yzfj",))
+        handled, ctx = await self.stage("帮我加油站 yzfj")
+        self.assertTrue(handled, ctx.response)
+        self.assertEqual(self.added_pairs(), [("油站", "yzfj")])
+
+    async def test_glued_short_add_prefixes_cannot_match_partial_operands(self):
+        for message, word, code, pinyin in (
+            ("加油站 jyzz", "油站", "jyzz", "you zhan"),
+            ("添加剂 tjj", "剂", "tjj", "ji"),
+            ("加燃面rfmm", "燃面", "rfmm", "ran mian"),
+            ("添加燃面rfmm", "燃面", "rfmm", "ran mian"),
+            ("请加燃面rfmm", "燃面", "rfmm", "ran mian"),
+            ("请添加燃面rfmm", "燃面", "rfmm", "ran mian"),
+        ):
+            with self.subTest(message=message):
+                self.calls.clear()
+                self.writes.clear()
+                self.codes[word] = code
+                self.readings[word] = pinyin
+                self.set_model((word,), (code,))
+                await self.assert_fallback(message)
+
+    async def test_unstripped_and_stripped_different_operands_fall_back(self):
+        self.codes["加词燃面"] = "rfmm"
+        self.readings["加词燃面"] = "jia ci ran mian"
+        self.set_model(("加词燃面", "燃面"), ("rfmm", "rfmmo"))
+        await self.assert_fallback("加词燃面rfmm 燃面rfmmo")
+
+    async def test_glued_leading_phrase_keeps_multiple_pairs_exact(self):
+        self.set_model(("燃面", "晕碳"), ("rfmm", "ywtfo"))
+        handled, ctx = await self.stage("加词燃面rfmm 晕碳ywtfo")
+        self.assertTrue(handled, ctx.response)
+        self.assertEqual(self.added_pairs(), [("燃面", "rfmm"), ("晕碳", "ywtfo")])
+
+    async def test_leading_phrase_does_not_strip_extra_words_or_latin_tokens(self):
+        for message in (
+            "帮我加一点 燃面rfmm", "请帮我加词 燃面rfmm", "帮忙加燃面rfmm",
+            "加词加词燃面rfmm", "燃面rfmm 请加", "帮我加词 AB燃面rfmm",
+            "请添加燃面rfmm abc", "请加 燃面皮rfmm",
+        ):
+            with self.subTest(message=message):
+                self.set_model()
+                await self.assert_fallback(message)
+
     async def test_single_word_without_code_uses_normal_candidate_ticket(self):
         self.set_model(codes=())
         handled, ctx = await self.stage("加个词 燃面")
@@ -207,6 +295,37 @@ class SemanticAddRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(state, PendingToolConfirm)
         self.assertEqual(state.args["_query_words"], ["燃面", "晕碳"])
         self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, self.store.get_record(self.author)))
+
+    async def test_scoped_add_ordinal_selects_only_that_words_advertised_candidate(self):
+        self.codes["晕碳"] = "ywtf"
+        self.set_model(("燃面", "晕碳"), ())
+        handled, ctx = await self.stage("加词 燃面 晕碳")
+        self.assertTrue(handled, ctx.response)
+        self.assertEqual(self.writes, [])
+        response = await self.answer("晕碳 添加2")
+        self.assertTrue(response)
+        self.assertEqual(self.added_pairs(), [("晕碳", "ywtfo")])
+        self.assertFalse(any(name == "keytao_submit_batch" for name, _args in self.calls))
+        self.assertIsNone(self.store.get_record(self.author))
+        self.client.create.assert_awaited_once()
+
+    async def test_scoped_add_ordinal_keeps_duplicate_and_extra_content_rejected(self):
+        for message in (
+            "晕碳 添加2 添加1", "晕碳 添加2 abc", "晕碳 添加2 燃面",
+            "晕碳 添加2并提交 extra", "晕碳 添加2？", "不是晕碳 添加2",
+        ):
+            with self.subTest(message=message):
+                self.calls.clear()
+                self.writes.clear()
+                self.set_model(("燃面", "晕碳"), ())
+                handled, ctx = await self.stage("加词 燃面 晕碳")
+                self.assertTrue(handled, ctx.response)
+                record = self.store.get_record(self.author)
+                original = copy.deepcopy(record)
+                await self.answer(message)
+                self.assertEqual(self.writes, [])
+                self.assertIs(self.store.get_record(self.author), record)
+                self.assertEqual(record, original)
 
     async def test_mixed_attached_pair_and_uncoded_word_keep_exact_scope(self):
         self.set_model(("燃面", "晕碳"), ("rfmm",))
@@ -296,7 +415,7 @@ class SemanticAddRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_word_tokens_must_match_whole_operands(self):
         for message in (
             "加词 燃面皮 rfmm", "加词 皮燃面rfmm", "加词 燃面2rfmm",
-            "加词燃面rfmm", "添加燃面 rfmm", "加词 燃面rfmm 清波",
+            "加词 燃面rfmm 清波",
         ):
             with self.subTest(message=message):
                 self.set_model()
@@ -338,9 +457,60 @@ class SemanticAddRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.set_model(frame=frame)
                 await self.assert_fallback(message)
 
-    async def test_pending_reference_cannot_route_as_fresh_add(self):
-        self.set_model(refers_to_pending=True)
-        await self.assert_fallback("加词 燃面rfmm")
+    async def test_pending_reference_never_routes_as_a_fresh_add(self):
+        for live_ticket in (False, True):
+            with self.subTest(live_ticket=live_ticket):
+                if live_ticket:
+                    self.store.set(self.author, PendingAddWord("晕碳", "ywtfo", [("ywtfo", False)]))
+                record = self.store.get_record(self.author)
+                original = copy.deepcopy(record)
+                self.set_model(refers_to_pending=True, confidence="high")
+                handled, ctx = await self.stage("加词 燃面rfmm")
+                self.assertFalse(handled, ctx.response)
+                if live_ticket:
+                    self.assertTrue(ctx.operation_request.refers_to_pending)
+                else:
+                    self.assertIn("no_live_ticket", ctx.operation_violations)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.writes, [])
+                self.assertIs(self.store.get_record(self.author), record)
+                self.assertEqual(record, original)
+
+    async def test_low_or_missing_confidence_exact_add_seals_plan_then_author_confirms_once(self):
+        for confidence in ("low", None):
+            with self.subTest(confidence=confidence):
+                self.calls.clear()
+                self.writes.clear()
+                payload = self.set_model(("燃面", "晕碳"), ("rfmm", "ywtfo"), confidence=confidence)
+                if confidence is None:
+                    payload.pop("confidence")
+                with patch("keytao_bot.harness.semantic_parser.parse_operation", AsyncMock(return_value=payload)):
+                    handled, ctx = await self.stage("加词 燃面rfmm 晕碳ywtfo")
+                self.assertTrue(handled, ctx.response)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.writes, [])
+                record = self.store.get_record(self.author)
+                self.assertEqual(record.owner_key, self.author)
+                self.assertEqual(record.state.function_name, "keytao_understood_command")
+                self.assertEqual(record.state.args["command_text"], "添加 燃面 rfmm；添加 晕碳 ywtfo")
+                self.assertIn("我理解为：「添加 燃面 rfmm；添加 晕碳 ywtfo」", ctx.response)
+                self.assertIsNone(await self.answer("确认", self.other))
+                self.assertIs(self.store.get_record(self.author), record)
+                self.assertEqual(self.writes, [])
+                self.assertIn("已加入草稿", await self.answer("确认"))
+                self.assertEqual(self.added_pairs(), [("燃面", "rfmm"), ("晕碳", "ywtfo")])
+                self.assertIsNone(await self.answer("确认"))
+                self.assertEqual(len(self.writes), 1)
+
+    async def test_low_or_missing_confidence_add_without_exact_pairs_keeps_fallback(self):
+        for confidence in ("low", None):
+            for codes, message in ((("rfmm",), "把燃面加到rfmm"), ((), "加词 燃面")):
+                with self.subTest(confidence=confidence, codes=codes):
+                    payload = self.set_model(codes=codes, confidence=confidence)
+                    if confidence is None:
+                        payload.pop("confidence")
+                    with patch("keytao_bot.harness.semantic_parser.parse_operation", AsyncMock(return_value=payload)):
+                        await self.assert_fallback(message)
 
     async def test_invalid_model_boolean_fields_fail_closed(self):
         for field, value in (("refers_to_pending", "false"), ("submit_after", "false")):

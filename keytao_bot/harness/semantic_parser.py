@@ -21,7 +21,8 @@ from .authorization_grammar import (
     trusted_mutation_source,
 )
 from .operation_request import OperationRequest
-from ..plugins.chat_routing import _load_json_object_from_model_text
+from .state import PendingAddWord
+from ..plugins.chat_routing import _load_json_object_from_model_text, _multi_word_candidate_scope_rows
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.observability import observe_model_call
 
@@ -40,10 +41,18 @@ Return one JSON object only, never execute an operation or answer the user.
 Fields: op, operands, codes, submit_after, refers_to_pending, frame, confidence, note, relation.
 operands: exact words in the user's order; codes: lowercase letter codes named by the user.
 For 换成/替换/顶替, set relation to replace and operands to [old, new], or [new] if only a target code is named.
+把 X 换成 Y, X 换成 Y, 把 X 替换为 Y, 把 X 替换成 Y, and 用 Y 替换 X, where X is an existing word and Y is a word,
+mean replacing entry X with Y at X's code: op recode, operands [X, Y], codes [] (or the literal code if given), relation replace.
+Example: 把春暖花开换成秋高气爽 -> op recode, operands ["春暖花开", "秋高气爽"], codes [], relation replace.
+顶替 <code> 为 X, 用 X 顶替 <code>, and X 顶替 <code> mean putting literal word X at that code,
+replacing its current occupant: op move, operands [X], codes [<code>], relation replace (spaces optional).
+Example: 顶替abcd为春暖花开 -> op move, operands ["春暖花开"], codes ["abcd"], relation replace.
 For all other relations set relation to an empty string.
 submit_after: boolean, true only when the user explicitly asks to also submit (并提交/加入并提交).
 refers_to_pending: boolean, true only when answering the sender's OWN live pending_context ticket.
 confidence: high or low; note: short explanation only for low confidence or noteworthy cases, else empty.
+Confidence reflects only certainty about the requested operation and its literal words/codes; never lower it
+because a word looks unusual, incomplete, slangy or absent from a dictionary: users add new words all the time.
 Choose exactly one primary op:
 query: look up words/codes or ask about a word's code, frequency or reading.
 Bare words/phrases listed with spaces, 、, commas or newlines, optionally with pinyin in
@@ -252,6 +261,11 @@ def validate_operation(
     if relation not in ("", "replace"):
         relation = ""
         violations.append("invalid_relation")
+    submit_command = (
+        op == "draft_submit"
+        and not isinstance(pending_state, PendingAddWord)
+        and not _multi_word_candidate_scope_rows(pending_state)[0]
+    )
     frame = raw.get("frame")
     if not isinstance(frame, str) or frame not in FRAME_ENUM:
         frame = "unknown"
@@ -260,22 +274,46 @@ def validate_operation(
         frame = _backstop_frame(message, op)
         if frame != "direct":
             violations.append(f"frame_backstop:{frame}")
+    if submit_command and frame == "direct":
+        # Submission supersedes unrelated tickets; discard inferred choices and the redundant suffix.
+        op, relation = "draft_submit", ""
+        raw = {**raw, "operands": [], "codes": [], "submit_after": False, "refers_to_pending": False}
     refers_to_pending = raw.get("refers_to_pending") is True
+    if op in {
+        "swap", "delete", "recode", "reorder", "move", "batch_replace",
+        "draft_submit", "draft_recall", "draft_clear", "draft_keep_only",
+    }:
+        # Write commands must stand on message literals, never ticket operands.
+        refers_to_pending = False
     if refers_to_pending and pending_state is None:
         refers_to_pending = False
         violations.append("no_live_ticket")
-    pending_words, pending_codes = _pending_values(pending_state) if refers_to_pending else (set(), set())
+    pending_words, pending_codes = _pending_values(pending_state) if refers_to_pending and op != "add" else (set(), set())
     text = re.sub(r"^\s*@?喵喵[\s，,:：]*", "", message, count=1)
 
-    operands = []
+    operands, operand_codes = [], {}
     raw_operands = raw.get("operands", [])
     if not isinstance(raw_operands, list):
         raw_operands = []
         violations.append("invalid_operands")
-    for operand in raw_operands:
+    for index, operand in enumerate(raw_operands):
         if not isinstance(operand, str) or not operand:
             violations.append("invalid_operand")
-        elif operand in text or operand in pending_words:
+            continue
+        suffix = re.fullmatch(r"(.+?)\s+([a-zA-Z]{3,12})", operand, re.DOTALL)
+        if suffix is None and operand in text:
+            suffix = re.fullmatch(r"([^a-zA-Z]+)([a-zA-Z]{3,12})", operand)
+        if suffix and suffix[1].strip() and re.search(
+            re.escape(suffix[1].strip()) + r"\s*(?<![a-zA-Z])" + re.escape(suffix[2].lower()) + r"(?![a-zA-Z])", text,
+        ):
+            word, code = suffix[1].strip(), suffix[2].lower()
+            logger.info(
+                f"[semantic_validate] normalization=operand_code operand={operand!r} "
+                f"word={word!r} code={code!r}"
+            )
+            operand = word
+            operand_codes.setdefault(code, index)
+        if operand in text or operand in pending_words:
             operands.append(operand)
         else:
             violations.append(f"operand_not_in_message:{operand}")
@@ -285,6 +323,10 @@ def validate_operation(
     if not isinstance(raw_codes, list):
         raw_codes = []
         violations.append("invalid_codes")
+    raw_codes = list(raw_codes)
+    for code, index in operand_codes.items():
+        if code not in raw_codes:
+            raw_codes.insert(index, code)
     for code in raw_codes:
         if not isinstance(code, str) or re.fullmatch(r"[a-z]{1,12}", code) is None:
             violations.append(f"invalid_code:{code}")

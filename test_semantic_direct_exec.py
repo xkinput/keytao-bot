@@ -11,7 +11,7 @@ import test_state_machine as harness
 from test_semantic_parser import FakeClient, raw_operation
 
 from keytao_bot.harness.conversation import ConversationAddress
-from keytao_bot.harness.operation_request import OperationRequest
+from keytao_bot.harness.operation_request import OperationRequest, understand_message
 from keytao_bot.harness.state import (
     DraftOperationCoordinator,
     MemoryConversationStateStore,
@@ -73,7 +73,8 @@ class SemanticDirectExecTests(unittest.IsolatedAsyncioTestCase):
         return {"word": word, "code": code, "type": "Phrase", "weight": weight}
 
     async def review_word(self, message, platform, user_id, conv_key, space_key, owner_label, **kwargs):
-        self.assertEqual(message, "加词 我本来就")
+        self.assertEqual(message, "我本来就")
+        self.assertIs(kwargs.get("_literal_word"), True)
         self.assertTrue(self.store.set(
             conv_key,
             PendingAddWord(
@@ -262,6 +263,34 @@ class SemanticDirectExecTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.answer("确认"))
         self.assertEqual(len(self.writes), 1)
 
+    async def test_low_confidence_replace_seals_plan_then_author_confirms_once(self):
+        handled, ctx = await self.stage(
+            "顶替wblj为我本来就", "move", ("我本来就",), ("wblj",),
+            relation="replace", confidence="low",
+        )
+        self.assertTrue(handled, ctx.response)
+        self.assertEqual(self.writes, [])
+        record = self.store.get_record(self.author)
+        self.assertEqual(record.owner_key, self.author)
+        self.assertEqual(record.state.function_name, "keytao_understood_command")
+        self.assertEqual(record.state.args["command_text"], "修改 wblj：吃饱了撑 → 我本来就")
+        self.assertIn("我理解为：「修改 wblj：吃饱了撑 → 我本来就」\n回复「确认」执行，或「取消」。", ctx.response)
+        self.review.assert_not_awaited()
+        self.assertIsNone(await self.answer("确认", self.other))
+        self.assertIs(self.store.get_record(self.author), record)
+        self.assertEqual(self.writes, [])
+        reply = self.chat.TurnContext(
+            bot=None, event=None, platform="qq", user_id=self.author.actor_id,
+            message_text="确认", normalized_message_text="确认",
+            conv_key=self.author, space_key=self.author.space_key, owner_label="Offline owner",
+            reply_reference=harness.ReplyReferenceInfo(is_reply=True, is_to_bot=True, text=ctx.response),
+        )
+        self.assertTrue(await self.chat._stage_understand_operation_early(reply), reply.response)
+        self.assert_replace_write(reply.response)
+        self.client.create.assert_awaited_once()
+        self.assertIsNone(await self.answer("确认"))
+        self.assertEqual(len(self.writes), 1)
+
     async def test_ambiguous_old_word_offers_numbered_author_owned_options(self):
         self.rows.append(self.row("吃饱了撑", "wblja"))
         handled, ctx = await self.stage("把吃饱了撑换成我本来就")
@@ -290,17 +319,16 @@ class SemanticDirectExecTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("吃饱了撑", ctx.response)
                 self.assertIsNotNone(self.store.get_record(self.author), ctx.response)
 
-    async def test_pending_reference_cannot_use_direct_execution(self):
+    async def test_complete_replace_ignores_model_pending_reference(self):
         pending = PendingAddWord("我本来就", "wblj", [("wblj", True)])
         self.assertTrue(self.store.set(self.author, pending))
-        record = self.store.get_record(self.author)
         handled, ctx = await self.stage(
             "把吃饱了撑换成我本来就", refers_to_pending=True,
         )
-        self.assertFalse(handled)
-        self.assertEqual(self.writes, [])
-        self.assertIs(self.store.get_record(self.author), record)
-        self.review.assert_not_awaited()
+        self.assertTrue(handled)
+        self.assertFalse(ctx.operation_request.refers_to_pending)
+        self.assert_replace_write(ctx.response)
+        self.assertIsNone(self.store.get_record(self.author))
 
     async def test_swap_with_model_replace_relation_uses_real_replace_handler(self):
         handled, ctx = await self.stage(
@@ -360,6 +388,87 @@ class SemanticDirectExecTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertIn("已加入草稿", ctx.response)
         self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_low_or_missing_confidence_actionable_write_ops_require_confirmation(self):
+        cases = (
+            ("把吃饱了撑换成我本来就", "move", ("吃饱了撑", "我本来就"), ()),
+            ("吃饱了撑的 wblj 改成 wblja", "recode", ("吃饱了撑",), ("wblj", "wblja")),
+            ("把午时和务实的编码对调", "swap", ("午时", "务实"), ()),
+            ("把吃饱了撑 wblj 删掉", "delete", ("吃饱了撑",), ("wblj",)),
+            ("午时优先于务实", "reorder", ("午时", "务实"), ()),
+            ("把午替换成晚，源条目午时 wj", "batch_replace", ("午", "晚", "午时"), ("wj",)),
+            ("直接提交现在草稿", "draft_submit", (), ()),
+            ("撤回当前提交", "draft_recall", (), ()),
+            ("清空当前草稿", "draft_clear", (), ()),
+            ("草稿只保留午时", "draft_keep_only", ("午时",), ()),
+        )
+        for confidence in ("low", None):
+            for message, op, operands, codes in cases:
+                with self.subTest(confidence=confidence, op=op):
+                    self.calls.clear()
+                    self.store.delete(self.author)
+                    payload = raw_operation(op=op, operands=list(operands), codes=list(codes), confidence=confidence)
+                    if confidence is None:
+                        payload.pop("confidence")
+                    with patch("keytao_bot.harness.semantic_parser.parse_operation", AsyncMock(return_value=payload)):
+                        handled, ctx = await self.stage(message, op, operands, codes)
+                    if op == "swap":
+                        self.assertFalse(handled, ctx.response)
+                        self.assertEqual(self.calls, [])
+                        self.assertIsNone(self.store.get_record(self.author))
+                    else:
+                        self.assertTrue(handled, ctx.response)
+                        record = self.store.get_record(self.author)
+                        self.assertEqual(record.owner_key, self.author)
+                        self.assertEqual(record.state.function_name, "keytao_understood_command")
+                        self.assertEqual(record.state.args["op"], op)
+                        self.assertIn("回复「确认」执行", ctx.response)
+                    self.assertEqual(self.writes, [])
+                    self.review.assert_not_awaited()
+
+    async def test_low_confidence_unresolved_replace_keeps_fallback(self):
+        for rows, message, operands, codes in (
+            ([], "顶替wblj为我本来就", ("我本来就",), ("wblj",)),
+            ([self.row("吃饱了撑", "wblj"), self.row("其他词条", "wblj")],
+             "顶替wblj为我本来就", ("我本来就",), ("wblj",)),
+            ([self.row("吃饱了撑", "wblj"), self.row("吃饱了撑", "wblja")],
+             "把吃饱了撑换成我本来就", ("吃饱了撑", "我本来就"), ()),
+        ):
+            with self.subTest(rows=rows):
+                self.rows = rows
+                handled, ctx = await self.stage(message, "move", operands, codes, confidence="low")
+                self.assertFalse(handled, ctx.response)
+                self.assertEqual(self.writes, [])
+                self.assertIsNone(self.store.get_record(self.author))
+        self.review.assert_not_awaited()
+
+    async def test_low_or_missing_confidence_nonwrite_cannot_enable_direct_exec_via_other_quote(self):
+        os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] += ",pending_release,pending_answer"
+        for confidence in ("low", None):
+            with self.subTest(confidence=confidence):
+                self.calls.clear()
+                self.writes.clear()
+                self.assertTrue(self.store.set(
+                    self.author, PendingAddWord("我本来就", "wblj", [("wblj", True)]),
+                ))
+                record = self.store.get_record(self.author)
+                original = copy.deepcopy(record)
+                self.assertEqual(understand_message("提交草稿", record.state).op, "draft_submit")
+                payload = raw_operation(op="chat", operands=[], codes=[], frame="none", confidence=confidence)
+                if confidence is None:
+                    payload.pop("confidence")
+                ctx = self.chat.TurnContext(
+                    bot=None, event=None, platform="qq", user_id=self.author.actor_id,
+                    message_text="提交草稿", normalized_message_text="提交草稿",
+                    conv_key=self.author, space_key=self.author.space_key, owner_label="Offline owner",
+                    reply_reference=harness.ReplyReferenceInfo(is_reply=True, is_to_bot=True, text="Another bot message"),
+                )
+                with patch("keytao_bot.harness.semantic_parser.parse_operation", AsyncMock(return_value=payload)):
+                    self.assertFalse(await self.chat._stage_understand_operation(ctx), ctx.response)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.writes, [])
+                self.assertIs(self.store.get_record(self.author), record)
+                self.assertEqual(record, original)
 
     async def test_ambiguous_delete_numbered_choice_is_author_owned_and_writes_once(self):
         self.rows.append(self.row("吃饱了撑", "wblja"))
@@ -507,6 +616,42 @@ class SemanticDirectExecTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("提交审核", ctx.response)
         self.assertIn("https://offline.invalid/draft/offline-batch", ctx.response)
         self.assertIsNone(self.store.get_record(self.author))
+
+    async def test_delete_with_negated_submit_never_submits_even_if_model_requests_it(self):
+        os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] += ",pending_release,pending_answer"
+        self.rows = [self.row("秋高气爽", "qgqu")]
+        for message in ("删除秋高气爽，先别提交", "删除 秋高气爽，先别提交"):
+            with self.subTest(message=message):
+                self.calls.clear()
+                self.writes.clear()
+                self.store.delete(self.author)
+                self.assertTrue(self.store.set(
+                    self.author, PendingToolConfirm("keytao_delete_from_draft", {"word": "秋高气爽"}),
+                    space_key=self.author.space_key,
+                ))
+                handled, ctx = await self.stage(message, "delete", ("秋高气爽",), (), submit_after=True)
+                self.assertNotIn("keytao_submit_batch", [name for name, args in self.calls])
+                self.assertEqual(ctx.operation_request.op, "delete")
+                self.assertEqual(ctx.operation_request.operands, ("秋高气爽",))
+
+    async def test_direct_submit_supersedes_choice_when_model_refers_to_ticket(self):
+        os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] += ",pending_release,pending_answer"
+        self.assertTrue(self.store.set(
+            self.author, PendingToolConfirm("keytao_choice_offer", {"options": [
+                {"label": "A", "description": "先修改草稿", "plan": None},
+                {"label": "B", "description": "保留当前草稿", "plan": None},
+            ]}), space_key=self.author.space_key,
+        ))
+        handled, ctx = await self.stage(
+            "直接提交现在草稿，不修改", "draft_submit", (), (), refers_to_pending=True,
+        )
+        self.assertTrue(handled)
+        self.assertFalse(ctx.operation_request.refers_to_pending)
+        self.assertEqual([name for name, args in self.writes], ["keytao_submit_batch"])
+        self.assertIn("提交审核", ctx.response)
+        self.assertIsNone(self.store.get_record(self.author))
+        self.assertIsNone(await self.answer("确认"))
+        self.assertEqual(len(self.writes), 1)
 
     async def test_direct_swap_confirms_exact_server_plan_with_one_write(self):
         self.rows = [self.row("午时", "wj", 100), self.row("务实", "wja", 101)]

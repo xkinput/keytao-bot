@@ -531,13 +531,12 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.ctx.response, "unchanged response")
                 self.tool.assert_not_awaited()
 
-    async def test_negated_reported_pending_or_unmentioned_operands_fall_through(self):
+    async def test_negated_reported_or_unmentioned_operands_fall_through(self):
         cases = (
             ("draft_submit", "提交现在草稿", (), (), {"frame": "negated"}),
             ("draft_submit", "提交现在草稿", (), (), {"frame": "reported"}),
             ("draft_submit", "不要提交现在草稿", (), (), {}),
             ("draft_submit", "他说提交现在草稿", (), (), {}),
-            ("draft_submit", "提交现在草稿", (), (), {"refers_to_pending": True}),
             ("delete", "删除午时 wj", ("不存在",), ("wj",), {}),
         )
         for op, message, operands, codes, changes in cases:

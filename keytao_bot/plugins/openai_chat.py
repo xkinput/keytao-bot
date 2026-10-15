@@ -4314,8 +4314,125 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
 _semantic_shadow_tasks: set[asyncio.Task] = set()
 
 
+async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
+    """Resolve the author's closed ticket answers before model routing."""
+    message = ctx.normalized_message_text
+    affirmative = _chat_routing.normalize_affirmative_reply(message)
+    if not message.strip() or ctx.conv_key is None:
+        return False
+    record = conversation_state_store.get_record(ctx.conv_key)
+    if (
+        record is None or record.execution_id
+        or not isinstance(record.state, (PendingAddWord, PendingToolConfirm))
+        or record.owner_key != normalize_conversation_key(ctx.conv_key, ctx.space_key)
+        or record.owner_key.platform != ctx.platform
+        or record.owner_key.actor_id != str(ctx.user_id)
+        or draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is not None
+    ):
+        return False
+    history = ctx.history if ctx.history is not None else get_history(ctx.conv_key)
+    latest = _get_latest_assistant_message(history)
+    if ctx.reply_reference.is_reply:
+        if not _verified_pending_reply(ctx, record):
+            return False
+        prompt = ctx.reply_reference.text
+    else:
+        addressed_text = ctx.message_text or message
+        addressed = bool(
+            GROUP_TRIGGER_KEYWORD_ANY in addressed_text
+            or addressed_text.lstrip().startswith((GROUP_TRIGGER_KEYWORD_START, "@" + GROUP_TRIGGER_KEYWORD_START))
+        )
+        if affirmative and not addressed and ctx.event is not None:
+            try:
+                addressed = await to_me()(ctx.bot, ctx.event, {})
+            except (AttributeError, TypeError):
+                return False
+        contract = advertised_reply_contract(latest)
+        advertised_assent = message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms)
+        if (affirmative and not addressed and not advertised_assent) or not latest:
+            return False
+        if record.origin_prompt_digest:
+            if _prompt_capability_digest(latest) != record.origin_prompt_digest:
+                return False
+        elif not (
+            advertised_reply_contract(latest).requires_live_state
+            and _advertised_reply_matches_live_record(latest, record)
+        ) and not (
+            isinstance(record.state, PendingToolConfirm)
+            and record.state.function_name == "keytao_submit_batch"
+            and _pending_tool_assent_intent(record.state, "提交") is not None
+            and "提交" in latest
+            and all(word in latest and code in latest for word, code in _pending_state_binding_pairs(record.state))
+            and _pending_state_binding_pairs(record.state)
+        ):
+            return False
+        prompt = latest
+    from ..harness.operation_request import OperationRequest
+
+    request = OperationRequest(op="confirm", frame="direct", refers_to_pending=True)
+    canonical = (
+        _chat_commands.render_understood_pending_answer(request, record.state, prompt, message)
+        if affirmative else ""
+    )
+    if affirmative and not canonical and isinstance(record.state, PendingToolConfirm) and record.state.function_name == "keytao_submit_batch":
+        canonical = "确认"
+    response = None
+    if affirmative and not canonical and isinstance(record.state, PendingToolConfirm):
+        if record.state.function_name == "keytao_choice_offer":
+            response = _chat_commands.render_pending_choice_offer(record.state) or None
+        elif record.state.function_name == "keytao_understood_command":
+            response = _chat_commands.render_pending_understood_command(record.state) or None
+    if not affirmative:
+        state = record.state
+        contract = advertised_reply_contract(prompt)
+        if (message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms, "取消")
+                and _pending_tool_assent_intent(state, message) is not None):
+            canonical = message
+        if isinstance(state, PendingAddWord):
+            intent = _structural_pending_add_word_intent(message, state)
+            if intent is not None:
+                indices = intent.choice_indices or ((intent.choice_index,) if intent.choice_index is not None else ())
+                codes = intent.requested_codes or ((intent.requested_code,) if intent.requested_code else ())
+                if (indices or codes) and all(1 <= index <= len(state.candidates) for index in indices) and all(code in dict(state.candidates) for code in codes):
+                    canonical = message
+        else:
+            derived, intent, error = _resolve_multi_word_pending_candidate_selection(state, message)
+            if derived is not None and intent is not None and not error:
+                canonical = message
+            elif state.function_name == "keytao_choice_offer" and _chat_commands._parse_pending_choice_label(message):
+                canonical = message
+            elif state.function_name == "keytao_understood_command":
+                control = _strip_command_message_prefixes(message).strip()
+                options = _chat_commands._understood_command_options(state)
+                if control in {"确认", "取消"} or (control.isascii() and control.isdigit() and 1 <= int(control) <= len(options)):
+                    canonical = message
+    if (not canonical and response is None
+            or conversation_state_store.get_record(ctx.conv_key) is not record or record.execution_id):
+        return False
+    if response is None:
+        response = await handle_pending_message_core(
+            canonical, ctx.platform, ctx.user_id, ctx.conv_key,
+            history=history, space_key=ctx.space_key, owner_label=ctx.owner_label,
+            allow_intent_model=False,
+        )
+    if response is None:
+        return False
+    ctx.operation_request = request
+    ctx.operation_understood_early = True
+    ctx.response = response
+    remember_conversation(ctx.conv_key, ctx.memory_context, message, response)
+    await _finish_ai_chat_response(
+        ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment,
+    )
+    return True
+
+
 async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     """Await enabled routing before command stages; retain the legacy shadow slot."""
+    if ctx.operation_understood_early:
+        return False
+    if await _try_bound_pending_reply(ctx):
+        return True
     enabled = _chat_commands.SEMANTIC_ROUTE_OPS & {
         token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
     }
@@ -4400,6 +4517,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     pending_decision = json.loads(pending_decision)
                 except ValueError:
                     pending_decision = None
+        high_confidence = isinstance(pending_decision, dict) and pending_decision.get("confidence") == "high"
         if validated.op == "add" and "add" in route_ops:
             if (not isinstance(pending_decision, dict)
                 or pending_decision.get("refers_to_pending") is not False
@@ -4436,7 +4554,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
         ):
             # Unbound tickets and complete commands retain the pre-B3c resolver.
             if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, current_record):
-                if complete_command and fast_request.op in route_ops and (
+                if high_confidence and complete_command and fast_request.op in route_ops and (
                     fast_request.op == "swap" or _chat_commands.render_understood_command(fast_request)
                 ) and fast_request.op != "add":
                     # A separate command may replace the ticket, never answer it.
@@ -4580,18 +4698,24 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                         )
                         return True
         if model_command:
-            direct = _chat_commands.semantic_direct_exec_allowed(validated, violations)
+            direct = high_confidence and _chat_commands.semantic_direct_exec_allowed(validated, violations)
             named_words = validated.operands
             resolved, options, explanation = await _chat_commands.resolve_model_replace(
                 validated, ctx.platform, ctx.user_id,
             )
+            if not high_confidence and (
+                resolved is None or options
+                or not _chat_commands.render_understood_command(resolved)
+                or resolved.op == "add" and not all(resolved.codes)
+            ):
+                return False
             if options:
                 response = await _chat_commands.try_handle_model_command_options(
                     options, explanation, ctx.conv_key, ctx.space_key, ctx.owner_label,
                 )
             elif resolved is None:
                 response = explanation
-            elif direct or resolved.op == "add" and not any(resolved.codes):
+            elif direct or high_confidence and resolved.op == "add" and not any(resolved.codes):
                 response = await _chat_commands.execute_model_command_direct(
                     resolved, named_words, ctx.platform, ctx.user_id, ctx.conv_key,
                     ctx.space_key, ctx.owner_label,

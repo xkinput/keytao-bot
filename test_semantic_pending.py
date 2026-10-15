@@ -477,6 +477,7 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(message=message):
                 self.add.reset_mock()
                 self.submit.reset_mock()
+                self.client.create.reset_mock()
                 record, prompt = self.ticket()
                 if message == "确认":
                     prompt += "\n回复「确认」执行，或「取消」。"
@@ -486,14 +487,11 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
                     self.history = [{"role": "assistant", "content": prompt}]
                 self.ctx = self.context(message)
                 self.set_model("chat", frame="none", refers_to_pending=False)
-                self.assertFalse(await self.chat._stage_understand_operation_early(self.ctx))
+                self.assertTrue(await self.chat._stage_understand_operation_early(self.ctx))
                 self.assertFalse(self.ctx.semantic_pending_released)
                 self.assertFalse(self.ctx.released_pending_turn)
-                response = await self.commands.handle_pending_message_core(
-                    message, "qq", self.author.actor_id, self.author,
-                    history=self.history, space_key=self.author.space_key,
-                    owner_label="Offline owner", allow_intent_model=False,
-                )
+                self.client.create.assert_not_awaited()
+                response = self.ctx.response
                 self.assertIsNotNone(response)
                 if message == "加入并提交":
                     self.submit.assert_awaited_once()
@@ -858,10 +856,11 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(self.ctx.released_pending_turn)
                     self.assert_untouched(record, original)
 
-    async def test_missing_tokens_or_failed_model_preserve_literal_resolver_path(self):
+    async def test_missing_tokens_or_failed_model_do_not_delay_literal_resolver(self):
         for scenario in ("tokens_absent", "timeout", "invalid_json"):
             with self.subTest(scenario=scenario):
                 self.add.reset_mock()
+                self.client.create.reset_mock()
                 self.ticket()
                 self.ctx = self.context("2")
                 self.set_model("select_candidate", codes=("wja",), refers_to_pending=True)
@@ -872,14 +871,10 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
                     self.client.create.side_effect = asyncio.TimeoutError()
                 else:
                     self.client.create.return_value.choices[0].message.content = "not JSON"
-                self.assertFalse(await self.chat._stage_understand_operation_early(self.ctx))
+                self.assertTrue(await self.chat._stage_understand_operation_early(self.ctx))
                 self.assertFalse(self.ctx.released_pending_turn)
-                self.add.assert_not_awaited()
-                response = await self.commands.handle_pending_message_core(
-                    "2", "qq", self.author.actor_id, self.author,
-                    history=self.history, space_key=self.author.space_key,
-                    owner_label="Offline owner", allow_intent_model=False,
-                )
+                self.client.create.assert_not_awaited()
+                response = self.ctx.response
                 self.assertIn("offline addition", response)
                 self.add.assert_awaited_once()
                 self.assertEqual(self.add.await_args.args[:2], ("午时", "wja"))

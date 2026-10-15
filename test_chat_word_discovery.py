@@ -209,6 +209,7 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.actor = ConversationAddress.group("qq", "200", "100")
         self.bot = types.SimpleNamespace(self_id="999", send=AsyncMock(return_value={"message_id": "400"}))
         self.tools = AsyncMock(side_effect=self.tool)
+        self.history = []
         onebot = types.ModuleType("nonebot.adapters.onebot.v11")
         onebot.MessageSegment = types.SimpleNamespace(at=lambda actor: f"[CQ:at,qq={actor}]")
         contexts = (
@@ -217,7 +218,10 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.chat, "conversation_state_store", self.pending),
             patch.object(self.chat, "draft_operation_coordinator", DraftOperationCoordinator()),
             patch.object(self.chat, "call_tool_function", self.tools),
-            patch.object(self.chat, "add_to_history"),
+            patch.object(self.chat, "add_to_history", side_effect=lambda key, message, response: self.history.extend([
+                {"role": "user", "content": message}, {"role": "assistant", "content": response},
+            ])),
+            patch.object(self.chat, "get_history", side_effect=lambda *args: self.history),
             patch.object(self.chat, "OPENAI_API_KEY", ""),
             patch.object(self.chat, "AsyncOpenAI", None),
             patch.object(self.commands.user_resolver, "resolve_actor_binding", AsyncMock(return_value=True)),
@@ -462,7 +466,7 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             ("@喵喵 查一下 你好", "different-message"),
             ("查一下 你好", None),
             ("查一下 你好", "different-message"),
-            *((text, None) for text in ("好的呀哈哈", "好", "可以", "加吧", "3", "unknown", "1并提交", "确认。")),
+            *((text, None) for text in ("好的呀哈哈", "加吧", "3", "unknown", "1并提交")),
         )
         for index, (text, reply_id) in enumerate(cases):
             with self.subTest(text=text, reply_id=reply_id):
@@ -538,10 +542,9 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         record = self.pending.get_record(self.actor)
         original = copy.deepcopy(record)
         messages = [FakeEvent(text) for text in ("好", "可以", "行", "对", "加吧", "1", "2", "确认")]
-        for reply_id in ("400", "different-message"):
-            unaddressed = FakeEvent("好")
-            unaddressed.reply = types.SimpleNamespace(message_id=reply_id)
-            messages.append(unaddressed)
+        unaddressed = FakeEvent("好")
+        unaddressed.reply = types.SimpleNamespace(message_id="different-message")
+        messages.append(unaddressed)
         for text in ("确认", "1", "取消"):
             wrong_quote = FakeEvent(text)
             wrong_quote.reply = types.SimpleNamespace(message_id="different-message")

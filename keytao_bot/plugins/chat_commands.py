@@ -9318,12 +9318,13 @@ async def _try_handle_replace_at_code_command(
     ))
 
     reviewed_reply = await _try_handle_simple_single_word_query(
-        f"加词 {command.new_word}",
+        command.new_word,
         platform,
         user_id,
         conv_key,
         space_key,
         owner_label,
+        _literal_word=True,
     )
     record = conversation_state_store.get_record(conv_key)
     reviewed_state = record.state if record is not None else None
@@ -11457,6 +11458,13 @@ def semantic_direct_exec_allowed(request, violations=()) -> bool:
     )
 
 
+_MODEL_ADD_COMMAND_PREFIXES = (
+    "帮我加词", "帮我添加", "帮忙加词", "帮忙添加",
+    "加个词", "加一下", "帮我加", "请添加",
+    "加词", "添加", "请加", "加",
+)
+
+
 def resolve_model_add(request, message):
     """Bind unique literal codes by attachment, then by matching list order."""
     words, codes = request.operands, request.codes
@@ -11464,23 +11472,40 @@ def resolve_model_add(request, message):
         or request.relation or not words or len(set(words)) != len(words)
         or len(set(codes)) != len(codes)):
         return None
+
+    def literal_words(source):
+        source = re.sub(r"[A-Za-z]", " ", source)
+        source = "".join(" " if unicodedata.category(char).startswith("P") else char
+                         for char in source)
+        return [(match.start(), match.end(), match.group())
+                for match in re.finditer(r"\S+", source)]
+
     message = _strip_command_message_prefixes(message)
+    word_matches = literal_words(message)
+    for prefix in _MODEL_ADD_COMMAND_PREFIXES:
+        if message.startswith(prefix):
+            end = len(prefix)
+            if prefix in {"加", "添加", "请加", "请添加"} and (
+                end == len(message) or not (
+                    message[end].isspace() or unicodedata.category(message[end]).startswith("P")
+                )
+            ):
+                continue
+            stripped = message[end:].lstrip()
+            stripped_words = literal_words(stripped)
+            if word_matches and word_matches[0][2] in words:
+                if stripped_words and stripped_words[0][2] in words and stripped_words[0][2] != word_matches[0][2]:
+                    return None
+            else:
+                if not stripped_words or len(stripped_words[0][2]) < 2:
+                    return None
+                message, word_matches = stripped, stripped_words
+            break
     code_matches = [(match.start(), match.end(), match.group().lower())
                     for match in re.finditer(r"[A-Za-z]+", message)]
     if len(code_matches) != len(codes) or {row[2] for row in code_matches} != set(codes):
         return None
-    if codes:
-        # Keep positions while enforcing complete word tokens, not substrings.
-        word_source = re.sub(r"[A-Za-z]", " ", message)
-        word_source = "".join(" " if unicodedata.category(char).startswith("P") else char
-                              for char in word_source)
-        word_matches = [(match.start(), match.end(), match.group())
-                        for match in re.finditer(r"\S+", word_source)]
-        if word_matches and word_matches[0][0] == 0 and word_matches[0][2] in {"加词", "添加"}:
-            end = word_matches[0][1]
-            if end == len(message) or message[end].isspace() or unicodedata.category(message[end]).startswith("P"):
-                word_matches.pop(0)
-    else:
+    if not codes:
         word_matches = [(match.start(), match.end(), word) for word in words
                         for match in re.finditer(re.escape(word), message)]
         # A shorter operand inside another named word is not a second occurrence.

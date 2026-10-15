@@ -83,6 +83,25 @@ GROUP_TRIGGER_KEYWORD_START = "键道"
 GROUP_TRIGGER_KEYWORD_ANY = "喵喵"
 
 
+AFFIRMATIVE_REPLY_TEXTS = frozenset({
+    "确认", "同意", "好", "好的", "好滴", "可以", "行", "加入", "加", "嗯", "嗯嗯",
+    "对", "是", "是的", "ok", "OK", "没问题", "就这样", "就这个", "确定",
+})
+
+
+def normalize_affirmative_reply(message_text: str) -> str:
+    """Recognize only whole-message assent, retaining question semantics."""
+    if re.search(r"[?？]", message_text):
+        return ""
+    text = strip_self_mention_tokens(message_text).strip()
+    text = re.sub(r"^(?:@?(?:喵喵|键道))[\s:：，,]*", "", text)
+    text = re.sub(r"\s+", "", text)
+    while text and (unicodedata.category(text[-1])[0] in {"P", "S"}
+                    or text[-1] in "\ufe0f\ufe0e\u200d"):
+        text = text[:-1]
+    return text if text in AFFIRMATIVE_REPLY_TEXTS else ""
+
+
 _ADVERTISED_COMMAND_QUOTE_SPAN_PATTERNS = (
     re.compile(r"「(?P<content>[^「」]*)」", re.DOTALL),
     re.compile(r"“(?P<content>[^“”]*)”", re.DOTALL),
@@ -439,7 +458,7 @@ _ACTION_SPECIFIC_DRAFT_SUBMIT_COMMANDS = {
 }
 
 
-_PENDING_CONFIRM_ASSENT_TEXTS = PENDING_CONFIRM_ASSENT_TEXTS
+_PENDING_CONFIRM_ASSENT_TEXTS = AFFIRMATIVE_REPLY_TEXTS
 
 
 _PENDING_CONTROL_TEXTS = {
@@ -936,10 +955,7 @@ def _is_target_bound_add_and_submit_request(
 
 # Rendering/compatibility vocabulary only. Acceptance is owned exclusively by
 # ``parse_pending_assent_phrase`` and the structural live-state parsers above.
-_QUOTED_PENDING_ADD_CONFIRM_TEXTS = {
-    *_PENDING_CONFIRM_ASSENT_TEXTS,
-    *PENDING_BATCH_ADD_ASSENT_TEXTS,
-}
+_QUOTED_PENDING_ADD_CONFIRM_TEXTS = AFFIRMATIVE_REPLY_TEXTS
 
 
 def _quoted_pending_add_control_intent(
@@ -1289,7 +1305,7 @@ _ORIGINAL_COMMAND_LINE_RE = re.compile(
 )
 
 # Compatibility/rendering vocabulary; stale acceptance is parser-owned below.
-_STALE_CONFIRMATION_ONLY_TEXTS = _PENDING_CONFIRM_ASSENT_TEXTS
+_STALE_CONFIRMATION_ONLY_TEXTS = AFFIRMATIVE_REPLY_TEXTS
 
 
 def _is_unambiguous_stale_confirmation(message_text: str) -> bool:
@@ -1934,6 +1950,23 @@ def _resolve_reviewed_multi_word_selection(
     if unquoted is not None:
         source = unquoted
     selection = parse_reviewed_selection_command(source)
+    scoped_pairs = None
+    if selection is None and not re.search(r"[?？]", source):
+        for word in live_words:
+            if not source.startswith((word + " ", word + "\t")):
+                continue
+            closed = _closed_candidate_selection(source[len(word):].strip())
+            if closed is None:
+                continue
+            indices, codes, submit_after = closed
+            selectors = tuple(map(str, indices)) or codes
+            if not selectors or len(set(selectors)) != len(selectors):
+                continue
+            selection = parse_reviewed_selection_command(
+                f"{word} {selectors[0]}" + ("，加入并提交" if submit_after else "，加入")
+            )
+            scoped_pairs = tuple((word, selector) for selector in selectors)
+            break
     # Bare ordinals have a unique word only when the entire live query does.
     bare = parse_pending_candidate_selection(source)
     query_words = state.args.get("_query_words", live_words)
@@ -1943,7 +1976,7 @@ def _resolve_reviewed_multi_word_selection(
             selection = parse_reviewed_selection_command(
                 f"{live_words[0]} {selectors[0]}" + ("，加入并提交" if bare.submit_after else "")
             )
-    pairs = selection.pairs if selection is not None else None
+    pairs = (scoped_pairs or selection.pairs) if selection is not None else None
 
     def explain(reason: str) -> str:
         command = f"{live_words[0]} {items[0]['code']}，加入" if items and scopes else "查看草稿"
@@ -2042,7 +2075,11 @@ def _resolve_reviewed_multi_word_selection(
         return None, None, explain("；".join(skipped) + "；本次未写入")
     derived_args = dict(state.args)
     derived_args["items"] = selected_items
-    derived_args["_resolved_advertised_words"] = selected_words
+    if len(set(selected_words)) == len(selected_words):
+        derived_args["_resolved_advertised_words"] = selected_words
+    else:
+        # A scoped multi-code selection is sealed by its reviewed candidate scope.
+        derived_args.pop("_resolved_advertised_words", None)
     derived_args["_selection_skipped"] = skipped
     derived_args["_unselected_words"] = [
         word for word in items_by_word if word not in selected_words

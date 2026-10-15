@@ -418,10 +418,17 @@ def schedule_discovery(bot, event, chat, *, addressed=False):
 
 
 async def discovery_reply_route(bot, event, chat):
-    """Admit only discovery-owned controls to the existing normal matcher."""
+    """Admit bound discovery controls while preserving vote-receipt priority."""
     if os.getenv("KEYTAO_WORD_DISCOVERY") != "1":
         return None
     try:
+        from ..utils import community_vote
+
+        vote_reply_id = chat.extract_onebot_reply_id(event)
+        if (community_vote.enabled() and vote_reply_id is not None
+                and community_vote._is_assent(event.get_plaintext())
+                and community_vote.get_store().resolve("qq", str(event.group_id), vote_reply_id) is not None):
+            return True
         if await _discovery._handle_opt_out(bot, event, chat):
             return False
         address = ConversationAddress.group("qq", str(event.group_id), str(event.get_user_id()))
@@ -448,7 +455,10 @@ async def discovery_reply_route(bot, event, chat):
             if text.startswith(prefix):
                 text = text[len(prefix):].lstrip(" \t:：，,")
                 break
-        answers = {*PENDING_CONFIRM_ADVERTISED_FORMS, "取消"}
+        affirmative = chat._chat_routing.normalize_affirmative_reply(text)
+        if affirmative:
+            text = affirmative
+        answers = {*chat._chat_routing.AFFIRMATIVE_REPLY_TEXTS, *PENDING_CONFIRM_ADVERTISED_FORMS, "取消"}
         candidates = record.state.server_candidates
         answers.update(str(index) for index in range(1, len(candidates) + 1))
         answers.update(code for code, _ in candidates)
@@ -472,8 +482,14 @@ async def discovery_reply_route(bot, event, chat):
                 return False
         elif not addressed:
             return False
+        if affirmative and reply is None:
+            latest = chat._get_latest_assistant_message(chat.get_history(address))
+            if not record.origin_prompt_digest or chat._prompt_capability_digest(latest) != record.origin_prompt_digest:
+                return False
+        if record.execution_id:
+            return False
         intent = (chat._chat_routing._closed_candidate_selection(text)
-                  or chat._chat_routing._pending_tool_assent_intent(record.state, text))
+                  or chat._chat_routing._pending_tool_assent_intent(record.state, "确认" if affirmative else text))
         return intent is not None and chat.conversation_state_store.get_record(address) is record
     except Exception as error:
         logger.warning("[word_discovery] reply skipped: %s", type(error).__name__)

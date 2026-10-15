@@ -21,7 +21,7 @@ def raw_operation(**changes):
     payload = {
         "op": "add", "operands": ["奈飞"], "codes": ["nhfw"],
         "submit_after": False, "refers_to_pending": False,
-        "frame": "direct", "_model": "offline-model",
+        "frame": "direct", "confidence": "high", "_model": "offline-model",
     }
     payload.update(changes)
     return payload
@@ -249,6 +249,105 @@ class SemanticValidatorTests(unittest.TestCase):
         self.assertIn("operand_not_in_message:喵喵", violations)
         self.assertEqual(request.source, "model:offline-model")
 
+    def test_glued_codes_match_separate_model_output_without_violations(self):
+        message = "把“吃饱了撑 wblj”换成“我本来就 wblj”"
+        separate = raw_operation(
+            op="recode", operands=["吃饱了撑", "我本来就"], codes=["wblj"], relation="replace",
+        )
+        expected, violations = validate_operation(separate, message, None)
+        self.assertEqual((expected.operands, expected.codes), (("吃饱了撑", "我本来就"), ("wblj",)))
+        self.assertEqual(violations, [])
+        for codes in ([], ["wblj"]):
+            with self.subTest(codes=codes):
+                raw = {**separate, "operands": ["吃饱了撑 wblj", "我本来就 wblj"], "codes": codes}
+                before = json.dumps(raw, sort_keys=True)
+                with patch("keytao_bot.harness.semantic_parser.logger.info") as info:
+                    self.assertEqual(validate_operation(raw, message, None), (expected, []))
+                self.assertEqual(info.call_count, 2)
+                self.assertTrue(all("normalization=operand_code" in call.args[0]
+                                    for call in info.call_args_list))
+                self.assertEqual(json.dumps(raw, sort_keys=True), before)
+
+    def test_glued_codes_keep_operand_order(self):
+        for operands, codes in (
+            (["吃饱了撑\twblj", "我本来就 abcd"], ["abcd"]),
+            (["吃饱了撑\twblj", "我本来就"], ["abcd"]),
+            (["吃饱了撑", "我本来就 abcd"], ["wblj"]),
+        ):
+            with self.subTest(operands=operands, codes=codes):
+                raw = raw_operation(op="recode", operands=operands, codes=codes)
+                request, violations = validate_operation(raw, "把吃饱了撑 wblj 换成我本来就 abcd", None)
+                self.assertEqual((request.operands, request.codes), (("吃饱了撑", "我本来就"), ("wblj", "abcd")))
+                self.assertEqual(violations, [])
+
+    def test_compact_code_requires_non_latin_word_and_literal_concatenation(self):
+        for operand, message, expected, codes, violations in (
+            ("燃面rfmm", "添加燃面rfmm", ("燃面",), ("rfmm",), []),
+            ("燃面RFMM", "添加燃面RFMM", ("燃面RFMM",), (), []),
+            ("燃面rfmm", "添加燃面 rfmm", (), (), ["operand_not_in_message:燃面rfmm"]),
+            ("OpenAI", "添加OpenAI", ("OpenAI",), (), []),
+            ("燃面A rfmm", "添加燃面A rfmm", ("燃面A",), ("rfmm",), []),
+            ("燃A面rfmm", "添加燃A面rfmm", ("燃A面rfmm",), (), []),
+            ("燃面a" + "b" * 12, "添加燃面a" + "b" * 12, ("燃面a" + "b" * 12,), (), []),
+        ):
+            with self.subTest(operand=operand, message=message):
+                request, actual_violations = validate_operation(
+                    raw_operation(operands=[operand], codes=[]), message, None,
+                )
+                self.assertEqual((request.operands, request.codes), (expected, codes))
+                self.assertEqual(actual_violations, violations)
+
+    def test_operand_code_split_requires_lowercase_message_token_of_three_letters(self):
+        for op, message, operand in (
+            ("add", "加词 维生素C", "维生素C"),
+            ("add", "加 卡拉OK", "卡拉OK"),
+            ("delete", "删除 卡拉OK", "卡拉OK"),
+            ("add", "加词 维生素 C", "维生素 C"),
+            ("add", "加 卡拉 OK", "卡拉 OK"),
+            ("delete", "删除 卡拉 OK", "卡拉 OK"),
+            ("add", "加词 维生素c", "维生素c"),
+            ("add", "加 卡拉ok", "卡拉ok"),
+            ("add", "加词 维生素 c", "维生素 c"),
+            ("delete", "删除 卡拉 ok", "卡拉 ok"),
+            ("add", "加词 维生素Abc", "维生素Abc"),
+            ("add", "加词 维生素 ABC", "维生素 ABC"),
+            ("add", "加词 维生素ABC abc", "维生素ABC"),
+            ("add", "加词 维生素 abcDEF", "维生素 abc"),
+        ):
+            with self.subTest(op=op, message=message, operand=operand):
+                request, violations = validate_operation(
+                    raw_operation(op=op, operands=[operand], codes=[]), message, None,
+                )
+                self.assertEqual((request.op, request.operands, request.codes), (op, (operand,), ()))
+                self.assertEqual(violations, [])
+        for operand, message in (
+            ("燃面abc", "添加燃面abc"),
+            ("燃面 abc", "添加燃面 abc"),
+            ("燃面 ABC", "添加燃面 abc"),
+        ):
+            with self.subTest(operand=operand, message=message):
+                request, violations = validate_operation(
+                    raw_operation(operands=[operand], codes=[]), message, None,
+                )
+                self.assertEqual((request.operands, request.codes), (("燃面",), ("abc",)))
+                self.assertEqual(violations, [])
+
+    def test_absent_trailing_code_is_not_split_and_literal_check_drops_operand(self):
+        with patch("keytao_bot.harness.semantic_parser.logger.info") as info:
+            request, violations = validate_operation(
+                raw_operation(operands=["燃面 rfmm"], codes=[]), "添加燃面", None,
+            )
+        self.assertEqual((request.operands, request.codes), ((), ()))
+        self.assertEqual(violations, ["operand_not_in_message:燃面 rfmm"])
+        info.assert_not_called()
+
+    def test_spaced_operand_code_cannot_bind_inside_a_message_latin_token(self):
+        request, violations = validate_operation(
+            raw_operation(operands=["燃面A abc"], codes=[]), "添加燃面Aabc", None,
+        )
+        self.assertEqual((request.operands, request.codes), ((), ()))
+        self.assertEqual(violations, ["operand_not_in_message:燃面A abc"])
+
     def test_pending_operands_and_candidates_require_actual_boolean_and_ticket(self):
         pending = PendingAddWord("奈飞", "nhfw", [("nhfw", False), ("nhfwa", False)])
         for flag, allowed in ((False, False), ("true", False), (1, False), (True, True)):
@@ -285,12 +384,111 @@ class SemanticValidatorTests(unittest.TestCase):
         self.assertEqual(request.codes, ())
         self.assertIn("code_not_in_message:nhfw", violations)
 
+    def test_write_ops_never_inherit_ticket_operands_or_pending_flag(self):
+        pending = PendingAddWord("奈飞", "nhfw", [("nhfw", False)])
+        for op in (
+            "swap", "delete", "recode", "move", "reorder", "batch_replace",
+            "draft_submit", "draft_recall", "draft_clear", "draft_keep_only",
+        ):
+            with self.subTest(op=op):
+                operands = ["奈飞", "午时"] if op == "swap" else ["奈飞"]
+                raw = raw_operation(op=op, operands=operands, refers_to_pending=True)
+                request, violations = validate_operation(raw, "奈飞 午时 nhfw", pending)
+                self.assertFalse(request.refers_to_pending)
+                self.assertEqual(violations, [])
+                request, violations = validate_operation(raw, "执行", pending)
+                self.assertFalse(request.refers_to_pending)
+                self.assertEqual((request.operands, request.codes), ((), ()))
+                self.assertIn("operand_not_in_message:奈飞", violations)
+                self.assertIn("code_not_in_message:nhfw", violations)
+        for op in ("confirm", "select_candidate", "cancel", "pending_recode"):
+            with self.subTest(op=op):
+                request, violations = validate_operation(
+                    raw_operation(op=op, refers_to_pending=True), "确认", pending,
+                )
+                self.assertTrue(request.refers_to_pending)
+                self.assertEqual(violations, [])
+
+    def test_add_preserves_pending_reference_without_inheriting_ticket_operands(self):
+        pending = PendingAddWord("奈飞", "nhfw", [("nhfw", False)])
+        request, violations = validate_operation(raw_operation(refers_to_pending=True), "添加奈飞 nhfw", pending)
+        self.assertTrue(request.refers_to_pending)
+        self.assertEqual(violations, [])
+        request, violations = validate_operation(raw_operation(refers_to_pending=True), "执行", pending)
+        self.assertTrue(request.refers_to_pending)
+        self.assertEqual((request.operands, request.codes), ((), ()))
+        self.assertEqual(violations, ["operand_not_in_message:奈飞", "code_not_in_message:nhfw"])
+
     def test_code_format_and_evidence_are_both_required(self):
         raw = raw_operation(codes=["nhfw", "NHFW", "abc123", "a" * 13, "", "other", None])
         request, violations = validate_operation(raw, "添加奈飞 NHFW", None)
         self.assertEqual(request.codes, ("nhfw",))
         self.assertIn("code_not_in_message:other", violations)
         self.assertEqual(sum(value.startswith("invalid_code:") for value in violations), 5)
+
+    def test_direct_submission_supersedes_non_add_tickets(self):
+        pending = PendingToolConfirm("keytao_choice_offer", {"options": []})
+        for submit_after in (False, True, None, "yes"):
+            with self.subTest(submit_after=submit_after):
+                request, violations = validate_operation(raw_operation(
+                    op="draft_submit", operands=["invented"], codes=["B"], relation="replace",
+                    submit_after=submit_after, refers_to_pending=True,
+                ), "直接提交现在草稿，不修改", pending)
+                self.assertEqual((request.op, request.operands, request.codes, request.relation),
+                                 ("draft_submit", (), (), ""))
+                self.assertEqual((request.frame, request.refers_to_pending, request.submit_after),
+                                 ("direct", False, False))
+                self.assertEqual(violations, [])
+
+    def test_submit_after_preserves_write_and_ticket_answer_operations(self):
+        tickets = (
+            PendingToolConfirm("keytao_delete_from_draft", {"word": "秋高气爽"}),
+            PendingToolConfirm("keytao_choice_offer", {"options": [
+                {"label": "A", "description": "Delete", "plan": None},
+                {"label": "B", "description": "Keep", "plan": None},
+            ]}),
+        )
+        for pending in tickets:
+            for op, message, operands, refers_to_pending in (
+                ("delete", "删除 秋高气爽 并提交", ["秋高气爽"], False),
+                ("confirm", "确认并提交", [], True),
+                ("select_candidate", "A 并提交", [], True),
+            ):
+                with self.subTest(ticket=pending.function_name, op=op, message=message):
+                    request, violations = validate_operation(raw_operation(
+                        op=op, operands=operands, codes=[], submit_after=True, refers_to_pending=True,
+                    ), message, pending)
+                    self.assertEqual((request.op, request.operands, request.codes), (op, tuple(operands), ()))
+                    self.assertEqual((request.frame, request.refers_to_pending, request.submit_after),
+                                     ("direct", refers_to_pending, True))
+                    self.assertEqual(violations, [])
+
+    def test_add_candidate_submission_keeps_ticket_semantics(self):
+        tickets = (
+            PendingAddWord("奈飞", "nhfw", [("nhfw", False)]),
+            PendingToolConfirm("keytao_batch_add_to_draft", {"items": [
+                {"action": "Create", "word": "奈飞", "code": "nhfw"},
+                {"action": "Create", "word": "午时", "code": "wj"},
+            ]}),
+        )
+        for pending in tickets:
+            with self.subTest(pending=pending):
+                request, violations = validate_operation(raw_operation(
+                    op="confirm", operands=[], codes=[], submit_after=True, refers_to_pending=True,
+                ), "加入并提交", pending)
+                self.assertEqual((request.op, request.refers_to_pending, request.submit_after),
+                                 ("confirm", True, True))
+                self.assertEqual(violations, [])
+
+    def test_direct_submission_respects_non_direct_frames(self):
+        pending = PendingToolConfirm("keytao_choice_offer", {"options": []})
+        for message, frame in (("不要提交草稿", "negated"), ("能直接提交吗", "question")):
+            with self.subTest(message=message):
+                request, violations = validate_operation(raw_operation(
+                    op="draft_submit", operands=[], codes=[], submit_after=True, refers_to_pending=True,
+                ), message, pending)
+                self.assertEqual(request.frame, frame)
+                self.assertEqual(violations, [f"frame_backstop:{frame}"])
 
     def test_swap_requires_exactly_two_distinct_valid_operands(self):
         for operands, expected in ((["午时", "务实"], "swap"), (["午时"], "none"),

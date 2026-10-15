@@ -208,14 +208,13 @@ class SemanticSwapRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.ctx.scoped_pending_response, "old ticket response")
         self.swap.assert_not_awaited()
 
-    async def test_refers_to_pending_true_never_routes_even_with_author_ticket(self):
+    async def test_complete_swap_ignores_model_pending_reference(self):
         pending = PendingAddWord("午时", "wj", [("wj", False)])
         self.ctx.current_pending_record = MagicMock(state=pending)
         self.set_model(refers_to_pending=True)
-        self.assertFalse(await self.chat._stage_understand_operation(self.ctx))
-        self.assertTrue(self.ctx.operation_request.refers_to_pending)
-        self.swap.assert_not_awaited()
-        self.assertEqual(self.ctx.scoped_pending_response, "old ticket response")
+        self.assertTrue(await self.chat._stage_understand_operation(self.ctx))
+        self.assertFalse(self.ctx.operation_request.refers_to_pending)
+        self.assert_swap()
 
     async def test_author_live_add_tickets_do_not_claim_complete_model_swaps(self):
         states = (
