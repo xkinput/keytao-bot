@@ -2396,6 +2396,93 @@ async def _auto_approve_submitted_batch(
         }
 
 
+async def _community_approve_submitted_batch(
+    platform: str,
+    platform_id: str,
+    batch_id: str,
+    voters: list[dict],
+    expected_content_version: int,
+) -> dict:
+    """Make one request; only an explicit successful response proves approval."""
+    safe_batch_id = _safe_path_segment(batch_id)
+    creator = (platform, platform_id)
+    if (
+        not isinstance(batch_id, str)
+        or safe_batch_id != batch_id
+        or not isinstance(expected_content_version, int)
+        or isinstance(expected_content_version, bool)
+        or expected_content_version < 0
+        or any(
+            not isinstance(value, str) or _safe_path_segment(value) != value
+            for value in creator
+        )
+        or not isinstance(voters, list)
+        or len(voters) < 3
+    ):
+        return {"success": False, "retryable": False, "message": "投票批准参数不完整或非法"}
+    request_voters = []
+    identities = set()
+    for voter in voters:
+        if not isinstance(voter, dict):
+            return {"success": False, "retryable": False, "message": "投票人信息非法"}
+        identity = (voter.get("platform"), voter.get("platformId"))
+        if (
+            any(
+                not isinstance(value, str) or _safe_path_segment(value) != value
+                for value in identity
+            )
+            or identity == creator
+            or identity in identities
+        ):
+            return {"success": False, "retryable": False, "message": "投票人必须互不重复且不能包含提交人"}
+        identities.add(identity)
+        request_voters.append({"platform": identity[0], "platformId": identity[1]})
+    path = f"/api/bot/batches/{safe_batch_id}/community-approve"
+    request_body = _json_request_body({
+        "platform": platform,
+        "platformId": platform_id,
+        "voters": request_voters,
+        "expectedContentVersion": expected_content_version,
+    })
+    try:
+        headers = get_bot_headers(
+            platform,
+            platform_id,
+            content_type=True,
+            method="POST",
+            path=path,
+            raw_body=request_body,
+        )
+    except Exception:
+        return {"success": False, "retryable": False, "message": "投票批准签名配置异常"}
+    try:
+        # An uncertain write is retried only by the next explicit vote.
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{get_keytao_url()}{path}",
+                headers=headers,
+                content=request_body,
+            )
+    except Exception:
+        return {"success": False, "retryable": True, "message": "投票批准暂未确认，请再次回复同意重试"}
+    try:
+        data = response.json()
+    except Exception:
+        data = None
+    if response.is_success and isinstance(data, dict) and data.get("success") is True:
+        return {**data, "retryable": False}
+    retryable = response.is_success or response.status_code >= 500
+    message = data.get("message") or data.get("error") if isinstance(data, dict) else None
+    return {
+        "success": False,
+        "retryable": retryable,
+        "message": message if isinstance(message, str) and message else (
+            "投票批准暂未确认，请再次回复同意重试"
+            if retryable else f"投票批准被拒绝（HTTP {response.status_code}）"
+        ),
+    }
+
+
 async def keytao_submit_batch(
     platform: str,
     platform_id: str,
@@ -7004,6 +7091,7 @@ TOOLS += [
 
 # Tool registry for dynamic calling
 TOOL_FUNCTIONS = {
+    "_community_approve_submitted_batch": _community_approve_submitted_batch,
     "keytao_pending_items_by_words": keytao_pending_items_by_words,
     "keytao_create_phrase": keytao_create_phrase,
     "keytao_submit_batch": keytao_submit_batch,

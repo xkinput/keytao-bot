@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from nonebot.log import logger
 
+from ..utils.community_vote import submitted_vote_receipt
 from ..harness.orchestrator import AUTHORITATIVE_LINK_TOOLS, AgentRequestContext
 from ..harness.conversation import (
     ConversationAddress,
@@ -4909,6 +4910,9 @@ async def _perform_add_to_draft_and_submit(
             data=submit_result.data or create_data,
         )
     if submit_result.success:
+        vote_reply = submitted_vote_receipt(submit_result.data or {})
+        if vote_reply:
+            return DraftActionResult(vote_reply, success=True, data=submit_result.data)
         submit_lines = [
             line for line in submit_result.text.splitlines()[1:]
             if line.strip()
@@ -7191,7 +7195,7 @@ async def _execute_confirmed_tool(
             if pr_url:
                 parts.append(f"PR：{pr_url}")
             from .chat_render import finalize_draft_receipt
-            return finalize_draft_receipt("\n".join(parts), data, platform=platform)
+            return submitted_vote_receipt(data) or finalize_draft_receipt("\n".join(parts), data, platform=platform)
         if data.get("uncertain"):
             return _append_batch_url_if_missing(
                 "⚠️ " + str(
@@ -7777,7 +7781,7 @@ async def _perform_submit_current_draft(
         parts.append(f"PR：{pr_url}")
     from .chat_render import finalize_draft_receipt
     return DraftActionResult(
-        finalize_draft_receipt("\n".join(parts), submit_data, platform=platform),
+        submitted_vote_receipt(submit_data) or finalize_draft_receipt("\n".join(parts), submit_data, platform=platform),
         success=True, data=submit_data,
     )
 

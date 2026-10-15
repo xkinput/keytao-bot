@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from nonebot.log import logger
 
+from keytao_bot.utils.community_vote import submitted_vote_receipt, submitted_vote_receipts
 from keytao_bot.utils.llm_policy import (
     chat_usage_metrics,
     is_deepseek_model,
@@ -3614,6 +3615,8 @@ class AgentOrchestrator:
         """Project one actual successful mutation into truthful reply evidence."""
         if result.get("success") is not True and result.get("partialWrite") is not True:
             return None
+        if tool_name == "keytao_submit_batch" and submitted_vote_receipt(result):
+            return {**result, "tool": tool_name}
         if "writtenItems" in result or "updatedItems" in result:
             return {
                 **{key: result[key] for key in (
@@ -3715,6 +3718,9 @@ class AgentOrchestrator:
     @staticmethod
     def _receipt_completion_reply(receipts: List[Dict[str, Any]]) -> str:
         """Render completed writes only from authoritative same-turn receipts."""
+        vote_reply = submitted_vote_receipts(receipts)
+        if vote_reply:
+            return vote_reply
         if any("writtenItems" in receipt or "updatedItems" in receipt for receipt in receipts):
             from ..utils.draft_receipts import merge_receipt_deltas, receipt_change_lines
             from ..plugins.chat_render import finalize_draft_receipt, _plain_warning_line
@@ -3906,6 +3912,9 @@ class AgentOrchestrator:
     ) -> Optional[str]:
         """Suppress requests to resend this turn's failed text at final emission."""
         receipts = list(successful_write_receipts or [])
+        vote_reply = submitted_vote_receipts(receipts)
+        if vote_reply:
+            return vote_reply
         if reply is None:
             return cls._receipt_completion_reply(receipts) if receipts else None
         if (
