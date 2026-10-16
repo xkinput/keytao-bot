@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import test_state_machine as harness
 
@@ -30,6 +30,8 @@ def make_reference(path):
         conn.execute("CREATE TABLE word_commonness (word TEXT PRIMARY KEY, "
                      "corpus_frequency INTEGER, part_of_speech TEXT, "
                      "dictionary_presence_count INTEGER)")
+        conn.execute("CREATE TABLE bcc_frequency (dataset TEXT, token TEXT, raw_count INTEGER, "
+                     "PRIMARY KEY(dataset, token)) WITHOUT ROWID")
         conn.executemany("INSERT INTO word_commonness VALUES (?, ?, ?, ?)", [
             (word, discovery.DISCOVERY_MIN_COMMONNESS + 10, "n", 2)
             for word in ("午时", "阳光", "清风", "笑声")
@@ -42,6 +44,21 @@ def make_reference(path):
             ("AI", 100000, "n", 2),
             ("春夏秋冬天", 100000, "n", 2),
         ])
+
+
+def add_bcc(path, word="燃面", counts=(60, 40)):
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.executemany("INSERT INTO bcc_frequency VALUES (?, ?, ?)", [
+            (dataset, word, count)
+            for dataset, count in zip(discovery.BCC_DATASETS, counts)
+        ])
+
+
+def learning_messages(word="晕碳"):
+    # Unique background characters make the five target occurrences cohesive.
+    for index, actor in enumerate(("100", "101", "102", "100", "101")):
+        background = "".join(chr(0x5200 + index * 40 + offset) for offset in range(36))
+        yield background[:18] + word + background[18:], actor
 
 
 def reviewed(word):
@@ -176,6 +193,183 @@ class DiscoveryStoreTests(unittest.TestCase):
             self.assertTrue(self.store.is_offer(self.actor, "sent-nonce", "sent-message"))
             reader.rollback()
 
+    def test_model_reservation_is_atomic_and_failed_words_retry_only_next_day(self):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: self.store.begin_verification("燃面"), range(2)))
+        self.assertEqual(sorted(status for _, status in results), ["call", "failed"])
+        self.assertIsNone(self.store.get_verdict("燃面"))
+        self.now[0] += 60
+        self.assertEqual(self.store.begin_verification("燃面"), (None, "call"))
+        self.store.cache_verdict("燃面", False)
+        self.now[0] += 30 * 86400
+        restarted = discovery.DiscoveryStore(self.path, clock=lambda: self.now[0])
+        self.assertEqual(restarted.begin_verification("燃面"), (False, "cached"))
+
+    def test_learning_requires_distinct_senders_and_ignores_repetition_and_known_words(self):
+        for text, _ in learning_messages():
+            self.store.observe(text, self.actor, set())
+        self.assertNotIn("晕碳", self.store.learned_words({"晕碳"}))
+        self.store.observe("哈哈哈哈", self.actor, set())
+        self.store.observe("午时燃面", self.actor, {"午时", "燃面"})
+        with closing(sqlite3.connect(self.path)) as conn:
+            words = {row[0] for row in conn.execute("SELECT word FROM discovery_ngrams")}
+        self.assertTrue({"哈哈", "哈哈哈", "哈哈哈哈", "午时", "燃面"}.isdisjoint(words))
+
+    def test_learning_promotes_once_with_varied_contexts_and_expires(self):
+        with patch.object(discovery.logger, "info") as info:
+            for text, actor in learning_messages():
+                self.store.observe(text, ConversationAddress.group("qq", "g", actor), set())
+            self.assertIn("晕碳", self.store.learned_words({"晕碳"}))
+            self.store.observe("又晕碳啦", self.actor, set())
+        promotions = [call for call in info.call_args_list if "learned=" in str(call)]
+        self.assertEqual(sum("晕碳" in str(call) for call in promotions), 1)
+        self.now[0] += 14 * 86400 + 1
+        self.assertNotIn("晕碳", self.store.learned_words({"晕碳"}))
+
+    def test_expired_observations_cannot_be_refreshed_into_promotion(self):
+        samples = list(learning_messages())
+        for text, actor in samples[:4]:
+            self.store.observe(text, ConversationAddress.group("qq", "g", actor), set())
+        self.now[0] += 14 * 86400 + 1
+        text, actor = samples[-1]
+        self.store.observe(text, ConversationAddress.group("qq", "g", actor), set())
+        self.assertNotIn("晕碳", self.store.learned_words({"晕碳"}))
+
+    def test_learning_rejects_fixed_neighbours_despite_count_and_sender_thresholds(self):
+        for text, actor in learning_messages():
+            text = text.replace("晕碳", "甲晕碳乙")
+            self.store.observe(text, ConversationAddress.group("qq", "g", actor), set())
+        self.assertNotIn("晕碳", self.store.learned_words({"晕碳"}))
+
+    def test_learning_rejects_low_cohesion_despite_varied_neighbours(self):
+        for text, actor in learning_messages():
+            self.store.observe(text + "，晕，碳" * 20,
+                               ConversationAddress.group("qq", "g", actor), set())
+        self.assertNotIn("晕碳", self.store.learned_words({"晕碳"}))
+
+    def test_learning_missing_split_statistics_fail_closed(self):
+        for text, actor in learning_messages():
+            self.store.observe(text, ConversationAddress.group("qq", "g", actor), set())
+        self.assertIn("晕碳", self.store.learned_words({"晕碳"}))
+        with closing(sqlite3.connect(self.path)) as conn, conn:
+            conn.execute("DELETE FROM discovery_counts WHERE token='晕'")
+        self.assertNotIn("晕碳", self.store.learned_words({"晕碳"}))
+
+    def test_learning_sqlite_write_failure_is_logged_and_ignored(self):
+        with (
+            patch.object(self.store, "_connect", side_effect=sqlite3.OperationalError("Offline lock")),
+            patch.object(discovery.logger, "warning") as warning,
+        ):
+            self.store.observe("甲晕碳乙", self.actor, set())
+        warning.assert_called_once()
+        self.assertIn("learning_failed=OperationalError", str(warning.call_args))
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM discovery_ngrams").fetchone()[0], 0)
+
+    def test_learning_prunes_stale_rows_and_hard_caps_substrings(self):
+        self.store.observe("甲乙丙丁", self.actor, set())
+        self.now[0] += 14 * 86400 + 1
+        with patch.object(discovery, "LEARNED_MAX_ROWS", 8):
+            self.store.observe("戊己庚辛壬癸子丑寅卯辰巳", self.actor, set())
+        with closing(sqlite3.connect(self.path)) as conn:
+            words = {row[0] for row in conn.execute("SELECT word FROM discovery_ngrams")}
+        self.assertLessEqual(len(words), 8)
+        self.assertNotIn("甲乙", words)
+
+    def test_learning_buckets_follow_shanghai_days_instead_of_hours(self):
+        self.now[0] -= 2 * 3600
+        self.store.observe("甲晕碳乙", self.actor, set())
+        self.now[0] += 3600
+        self.store.observe("丙晕碳丁", self.actor, set())
+        self.now[0] += 3660
+        self.store.observe("戊晕碳己", self.actor, set())
+        with closing(sqlite3.connect(self.path)) as conn:
+            rows = conn.execute("SELECT first_seen,total_count FROM discovery_ngrams "
+                                "WHERE word='晕碳' ORDER BY first_seen").fetchall()
+        self.assertEqual([count for _, count in rows], [2, 1])
+        self.assertEqual(rows[1][0] - rows[0][0], 86400)
+        self.assertTrue(all(datetime.fromtimestamp(bucket, discovery._DAY_ZONE).hour == 0
+                            for bucket, _ in rows))
+
+    def test_steady_load_preserves_multi_sender_evidence_across_ten_days(self):
+        start = self.now[0]
+        samples = list(learning_messages())
+        cap = 4000
+        observed = 0
+        evicted = False
+        with patch.object(discovery, "LEARNED_MAX_ROWS", cap):
+            for day in range(10):
+                self.now[0] = start + day * 86400
+                if day in (0, 1, 2, 4, 9):
+                    index = (0, 1, 2, 4, 9).index(day)
+                    text, actor = samples[index]
+                    self.store.observe(text, ConversationAddress.group("qq", "g", actor), set())
+                for hour in range(12):
+                    self.now[0] = start + day * 86400 + hour * 3600
+                    offset = (day * 12 + hour) * 40
+                    text = "".join(chr(0x6000 + offset + index) for index in range(36))
+                    self.store.observe(text, self.actor, set())
+                    observed += 1
+                with closing(sqlite3.connect(self.path)) as conn:
+                    rows = conn.execute("SELECT COUNT(*) FROM discovery_ngrams").fetchone()[0]
+                    evicted |= rows < observed * 102
+                    total = rows + conn.execute("SELECT COUNT(*) FROM discovery_counts").fetchone()[0]
+                    self.assertLessEqual(total, cap)
+                if day < 9:
+                    self.assertNotIn("晕碳", self.store.learned_words({"晕碳"}))
+        self.assertTrue(evicted)
+        self.assertIn("晕碳", self.store.learned_words({"晕碳"}))
+        with closing(sqlite3.connect(self.path)) as conn:
+            count, first, last = conn.execute("SELECT SUM(total_count),MIN(first_seen),MAX(first_seen) "
+                                              "FROM discovery_ngrams WHERE word='晕碳'").fetchone()
+        self.assertEqual(count, 5)
+        self.assertEqual(last - first, 9 * 86400)
+
+    def test_counts_overflow_preserves_strong_words_and_whole_token_statistics(self):
+        for text, actor in learning_messages():
+            self.store.observe(text, ConversationAddress.group("qq", "g", actor), set())
+        self.assertIn("晕碳", self.store.learned_words({"晕碳"}))
+        with closing(sqlite3.connect(self.path)) as conn:
+            old_counts = [conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                          for table in ("discovery_ngrams", "discovery_counts")]
+        cap = 2 * (max(old_counts) + 10)
+        self.now[0] += 86400
+        text = "".join(chr(0x7200 + index) for index in range(100))
+        known_words = {text[index:index + size] for index in range(len(text))
+                       for size in range(2, min(4, len(text) - index) + 1)}
+        with patch.object(discovery, "LEARNED_MAX_ROWS", cap):
+            self.store.observe(text, self.actor, known_words)
+        with closing(sqlite3.connect(self.path)) as conn:
+            totals = []
+            for table in ("discovery_ngrams", "discovery_counts"):
+                totals.append(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            self.assertEqual(conn.execute("SELECT SUM(total_count) FROM discovery_ngrams WHERE word='晕碳'")
+                             .fetchone()[0], 5)
+            for token in ("晕", "碳"):
+                self.assertEqual(conn.execute("SELECT SUM(total_count) FROM discovery_counts WHERE token=?",
+                                              (token,)).fetchone()[0], 5)
+        self.assertGreater(totals[1], 0)
+        self.assertLessEqual(sum(totals), cap)
+        self.assertIn("晕碳", self.store.learned_words({"晕碳"}))
+
+    def test_learning_stores_only_bounded_statistics_and_salted_sender_hashes(self):
+        actor_text = "private-sender-identity"
+        for index in range(30):
+            actor = ConversationAddress.group("qq", "g", actor_text + str(index))
+            self.store.observe(chr(0x6200 + index) + "晕碳" + chr(0x6300 + index), actor, set())
+        with closing(sqlite3.connect(self.path)) as conn:
+            rows = conn.execute("SELECT senders,left_neighbours,right_neighbours "
+                                "FROM discovery_ngrams WHERE word='晕碳'").fetchall()
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(discovery_ngrams)")}
+        self.assertTrue(rows)
+        self.assertNotIn("message", columns)
+        self.assertNotIn("text", columns)
+        for senders, left, right in rows:
+            self.assertNotIn(actor_text, senders)
+            self.assertLessEqual(len(json.loads(senders)), 10)
+            self.assertLessEqual(len(json.loads(left)), 20)
+            self.assertLessEqual(len(json.loads(right)), 20)
+
 
 class CandidateExtractionTests(unittest.TestCase):
     def setUp(self):
@@ -186,11 +380,96 @@ class CandidateExtractionTests(unittest.TestCase):
 
     def test_only_common_two_to_four_character_words_with_suitable_pos(self):
         candidates = discovery.extract_candidates("午时，阳光！冷词 张三 台北 怪词 好 AI 123 春夏秋冬天", self.path)
-        self.assertEqual(candidates, ["午时", "阳光"])
+        self.assertEqual(candidates, [discovery.DiscoveryCandidate(word, "commonness")
+                                      for word in ("午时", "阳光")])
 
     def test_repeated_candidates_and_long_messages_are_bounded(self):
-        self.assertEqual(discovery.extract_candidates("午时，午时", self.path), ["午时"])
+        self.assertEqual(discovery.extract_candidates("午时，午时", self.path),
+                         [discovery.DiscoveryCandidate("午时", "commonness")])
         self.assertEqual(discovery.extract_candidates("午时" * 10000, self.path), [])
+
+    def test_bcc_sums_only_modern_word_datasets_and_prefers_longest_match(self):
+        add_bcc(self.path)
+        add_bcc(self.path, "燃面馆", (100,))
+        add_bcc(self.path, "冷门", (99,))
+        with closing(sqlite3.connect(self.path)) as conn, conn:
+            conn.execute("INSERT INTO bcc_frequency VALUES (?, ?, ?)",
+                         ("ancient_word_freq.txt", "冷门", 10000))
+        self.assertEqual(discovery.extract_candidates("燃面，冷门，燃面馆", self.path), [
+            discovery.DiscoveryCandidate("燃面", "bcc"),
+            discovery.DiscoveryCandidate("燃面馆", "bcc"),
+        ])
+
+    def test_commonness_wins_source_tie_and_bcc_wins_longer_match(self):
+        add_bcc(self.path, "午时", (100,))
+        add_bcc(self.path, "午时光", (100,))
+        self.assertEqual(discovery.extract_candidates("午时，午时光", self.path), [
+            discovery.DiscoveryCandidate("午时", "commonness"),
+            discovery.DiscoveryCandidate("午时光", "bcc"),
+        ])
+
+    def test_bcc_cannot_override_excluded_commonness_pos(self):
+        for word in ("张三", "台北", "冷词", "怪词"):
+            add_bcc(self.path, word, (100,))
+        self.assertEqual(discovery.extract_candidates("张三，台北，冷词，怪词", self.path), [
+            discovery.DiscoveryCandidate("冷词", "bcc"),
+            discovery.DiscoveryCandidate("怪词", "bcc"),
+        ])
+
+
+class VerificationTests(unittest.IsolatedAsyncioTestCase):
+    def make_chat(self, content):
+        response = types.SimpleNamespace(choices=[types.SimpleNamespace(
+            message=types.SimpleNamespace(content=content),
+        )])
+        create = AsyncMock(return_value=response)
+        client = types.SimpleNamespace(chat=types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=create),
+        ))
+        context = AsyncMock()
+        context.__aenter__.return_value = client
+        factory = Mock(return_value=context)
+        chat = types.SimpleNamespace(AsyncOpenAI=factory, OPENAI_API_KEY="offline-key",
+                                     OPENAI_BASE_URL="https://offline.invalid/v1",
+                                     WORD_QUERY_INTENT_MODEL="offline-model")
+        return chat, factory, create
+
+    async def test_client_policy_json_context_and_usage_contract(self):
+        chat, factory, create = self.make_chat('{"word_ok":true}')
+        with (
+            patch.object(discovery, "with_deepseek_chat_policy", side_effect=lambda body, **_: body) as policy,
+            patch.object(discovery, "log_chat_usage") as usage,
+        ):
+            self.assertIs(await discovery._verify_word(chat, "燃面", "甲" * 256 + "私密尾部"), True)
+        factory.assert_called_once_with(api_key="offline-key", base_url="https://offline.invalid/v1",
+                                        timeout=8.0, max_retries=1)
+        body = create.await_args.kwargs
+        self.assertEqual(body["model"], "offline-model")
+        self.assertEqual(body["temperature"], 0)
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertLessEqual(body["max_tokens"], 128)
+        self.assertGreater(body["max_tokens"], 0)
+        prompt = " ".join(message["content"] for message in body["messages"])
+        self.assertIn("燃面", prompt)
+        self.assertNotIn("私密尾部", prompt)
+        policy.assert_called_once()
+        self.assertEqual(policy.call_args.kwargs, {"thinking": False, "json_output": True})
+        usage.assert_called_once()
+        self.assertEqual(usage.call_args.kwargs["operation"], "word_discovery_verify")
+        self.assertEqual(usage.call_args.kwargs["model"], "offline-model")
+
+    async def test_malformed_verdicts_and_transport_failures_close_without_accepting(self):
+        for content in ('{"word_ok":"true"}', '{"word_ok":1}', '{}', '[]', 'broken'):
+            with self.subTest(content=content):
+                chat, _, _ = self.make_chat(content)
+                self.assertIsNone(await discovery._verify_word(chat, "燃面", "燃面"))
+        for error in (asyncio.TimeoutError(), RuntimeError("Offline model failure")):
+            with self.subTest(error=type(error).__name__):
+                chat, _, create = self.make_chat('{"word_ok":true}')
+                create.side_effect = error
+                self.assertIsNone(await discovery._verify_word(chat, "燃面", "燃面"))
+        chat, _, _ = self.make_chat('{"word_ok":false}')
+        self.assertIs(await discovery._verify_word(chat, "周佛海", "周佛海"), False)
 
 
 class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -253,6 +532,160 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def offer(self, event=None):
         await self.discovery.discover(self.bot, event or self.event, self.chat)
         return self.pending.get_record(self.actor)
+
+    async def test_bcc_missing_word_is_verified_before_offer_and_acceptance_is_cached(self):
+        add_bcc(self.reference)
+        with patch.object(discovery, "_verify_word", AsyncMock(return_value=True)) as verify:
+            record = await self.offer(FakeEvent("今天吃燃面"))
+            self.assertIsNotNone(record)
+            self.assertEqual(record.state.word, "燃面")
+            verify.assert_awaited_once_with(self.chat, "燃面", "今天吃燃面")
+            self.assertIs(self.store.get_verdict("燃面"), True)
+            self.pending.delete(self.actor)
+            self.discovery = discovery.WordDiscovery(discovery.DiscoveryStore(self.store.path),
+                                                     reference_path=self.reference)
+            await self.discovery.discover(self.bot, FakeEvent("燃面", group="other-group"), self.chat)
+            self.assertEqual(verify.await_count, 1)
+            other = ConversationAddress.group("qq", "other-group", "100")
+            self.assertEqual(self.pending.get_record(other).state.word, "燃面")
+
+    async def test_bcc_model_rejects_are_permanent_and_person_names_are_not_offered(self):
+        for word in ("燃面", "周佛海"):
+            add_bcc(self.reference, word)
+            with self.subTest(word=word), patch.object(
+                discovery, "_verify_word", AsyncMock(return_value=False),
+            ) as verify:
+                for _ in range(2):
+                    self.assertIsNone(await self.offer(FakeEvent(word)))
+                verify.assert_awaited_once()
+                self.assertIs(self.store.get_verdict(word), False)
+        self.bot.send.assert_not_awaited()
+        self.assertTrue(all(call.args[0] == "keytao_lookup_by_words_batch"
+                            for call in self.tools.await_args_list))
+
+    async def test_commonness_and_existing_bcc_words_do_not_call_verifier(self):
+        with patch.object(discovery, "_verify_word", AsyncMock()) as verify:
+            self.assertIsNotNone(await self.offer())
+            self.pending.delete(self.actor)
+            add_bcc(self.reference)
+            self.tools.side_effect = None
+            self.tools.return_value = json.dumps({"success": True, "results": [{
+                "success": True, "word": "燃面", "phrases": [{"word": "燃面", "code": "rm"}],
+            }]})
+            self.assertIsNone(await self.offer(FakeEvent("燃面")))
+        verify.assert_not_awaited()
+
+    async def test_unavailable_bcc_candidates_do_not_hide_later_commonness_word(self):
+        for word in ("发截图", "燃面"):
+            add_bcc(self.reference, word)
+        with closing(sqlite3.connect(self.reference)) as conn, conn:
+            conn.execute("INSERT INTO word_commonness VALUES ('内卷',3,'n',2)")
+        for status in ("reject", "cached-reject", "capped", "failed", "cached-failed"):
+            with self.subTest(status=status):
+                self.store = discovery.DiscoveryStore(self.root / f"fallback-{status}.db")
+                self.discovery = discovery.WordDiscovery(self.store, reference_path=self.reference)
+                if status.startswith("cached"):
+                    self.store.begin_verification("发截图")
+                    if status == "cached-reject":
+                        self.store.cache_verdict("发截图", False)
+                elif status == "capped":
+                    for index in range(discovery.VERIFY_DAILY_CAP):
+                        self.store.begin_verification(f"offline-{index}")
+                self.bot.send.reset_mock()
+                verdict = None if status == "failed" else False
+                with patch.object(discovery, "_verify_word", AsyncMock(return_value=verdict)) as verify:
+                    record = await self.offer(FakeEvent("我发截图给燃面内卷的人"))
+                self.assertIsNotNone(record)
+                self.assertEqual(record.state.word, "内卷")
+                self.assertEqual(verify.await_count, 1 if status in {"reject", "cached-reject", "failed",
+                                                                      "cached-failed"} else 0)
+                self.bot.send.assert_awaited_once()
+                with closing(sqlite3.connect(self.store.path)) as conn:
+                    calls = conn.execute("SELECT SUM(calls) FROM discovery_model_days").fetchone()[0]
+                self.assertEqual(calls, discovery.VERIFY_DAILY_CAP if status == "capped"
+                                 else 2 if status.startswith("cached") else 1)
+                self.pending.delete(self.actor)
+
+    async def test_cached_acceptance_is_available_after_an_earlier_model_reject(self):
+        for word in ("发截图", "燃面"):
+            add_bcc(self.reference, word)
+        self.store.begin_verification("燃面")
+        self.store.cache_verdict("燃面", True)
+        with patch.object(discovery, "_verify_word", AsyncMock(return_value=False)) as verify:
+            record = await self.offer(FakeEvent("发截图，燃面"))
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.word, "燃面")
+        verify.assert_awaited_once_with(self.chat, "发截图", "发截图，燃面")
+        self.bot.send.assert_awaited_once()
+
+    async def test_unsuccessful_bcc_lookup_rows_never_verify_or_reserve_budget(self):
+        add_bcc(self.reference)
+        self.tools.side_effect = None
+        with patch.object(discovery, "_verify_word", AsyncMock(return_value=True)) as verify:
+            for row in ({"word": "燃面", "success": False, "phrases": []},
+                        {"word": "燃面", "phrases": []}):
+                with self.subTest(row=row):
+                    self.tools.return_value = json.dumps({"success": True, "results": [row]})
+                    self.assertIsNone(await self.offer(FakeEvent("燃面")))
+            verify.assert_not_awaited()
+        with closing(sqlite3.connect(self.store.path)) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM discovery_model_days").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM discovery_verdicts").fetchone()[0], 0)
+        self.bot.send.assert_not_awaited()
+        self.assertEqual(self.tools.await_count, 2)
+
+    async def test_global_model_daily_cap_prevents_the_thirty_first_call(self):
+        words = [chr(0x6800 + number) + "面" for number in range(31)]
+        for word in words:
+            add_bcc(self.reference, word)
+        with patch.object(discovery, "_verify_word", AsyncMock(return_value=False)) as verify:
+            for index, word in enumerate(words):
+                await self.offer(FakeEvent(word, group=f"group-{index}"))
+        self.assertEqual(verify.await_count, 30)
+        self.assertIsNone(self.store.get_verdict(words[-1]))
+        self.bot.send.assert_not_awaited()
+
+    async def test_failed_verification_is_not_cached_or_retried_until_next_day(self):
+        add_bcc(self.reference)
+        now = [datetime(2026, 10, 15, 15, 59, tzinfo=timezone.utc).timestamp()]
+        self.store = discovery.DiscoveryStore(self.root / "failure.db", clock=lambda: now[0])
+        self.discovery = discovery.WordDiscovery(self.store, reference_path=self.reference)
+        with patch.object(discovery, "_verify_word", AsyncMock(return_value=None)) as verify:
+            self.assertIsNone(await self.offer(FakeEvent("燃面")))
+            self.assertIsNone(await self.offer(FakeEvent("燃面")))
+            self.assertEqual(verify.await_count, 1)
+            self.assertIsNone(self.store.get_verdict("燃面"))
+            now[0] += 60
+            self.assertIsNone(await self.offer(FakeEvent("燃面")))
+            self.assertEqual(verify.await_count, 2)
+        self.bot.send.assert_not_awaited()
+
+    async def test_learned_word_is_available_next_message_and_requires_verification(self):
+        with patch.object(discovery, "_verify_word", AsyncMock(return_value=True)) as verify:
+            for text, actor in learning_messages():
+                self.assertIsNone(await self.offer(FakeEvent(text, actor=actor)))
+            verify.assert_not_awaited()
+            self.tools.assert_not_awaited()
+            self.assertEqual(discovery.extract_candidates("晕碳", self.reference, self.store),
+                             [discovery.DiscoveryCandidate("晕碳", "learned")])
+            record = await self.offer(FakeEvent("晕碳"))
+            self.assertIsNotNone(record)
+            self.assertEqual(record.state.word, "晕碳")
+            verify.assert_awaited_once_with(self.chat, "晕碳", "晕碳")
+        self.bot.send.assert_awaited_once()
+
+    async def test_learning_uses_existing_message_filters_and_survives_offer_ineligibility(self):
+        observe = Mock(wraps=self.store.observe)
+        with patch.object(self.store, "observe", observe):
+            addressed = FakeEvent("甲晕碳乙")
+            addressed.to_me = True
+            for event in (addressed, FakeEvent("甲晕碳乙", kind="forward"), FakeEvent("加词 晕碳")):
+                await self.offer(event)
+            observe.assert_not_called()
+            self.store.opt_out(self.actor)
+            await self.offer(FakeEvent("甲晕碳乙"))
+        observe.assert_called_once()
+        self.tools.assert_not_awaited()
 
     async def test_missing_common_word_creates_normal_sender_owned_ticket(self):
         record = await self.offer()
