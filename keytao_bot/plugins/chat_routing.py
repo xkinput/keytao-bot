@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -75,6 +76,17 @@ from .chat_adapters import (
     config,
 )
 from .chat_render import _format_pending_state_details
+
+
+def note_rule_use(rule_id: str) -> None:
+    try:
+        commands = sys.modules.get(f"{__package__}.chat_commands")
+        context = getattr(commands, "_semantic_direct_words", None)
+        if context is not None and context.get() is not None:
+            return
+        logger.info(f'[rule_usage] {rule_id}')
+    except Exception:
+        pass
 
 
 GROUP_TRIGGER_KEYWORD_START = "键道"
@@ -334,6 +346,8 @@ def _parse_word_list_reorder_command(
         )
         if token
     )
+    if len(words) > 1:
+        note_rule_use("R:_parse_word_list_reorder_command:re.split")
     if (
         len(words) < 2
         or len(set(words)) != len(words)
@@ -619,6 +633,7 @@ class KeepOnlyDraftCommand:
 def _keep_only_command_from_intent(command_intent: MessageCommandIntent) -> Optional[KeepOnlyDraftCommand]:
     if command_intent.intent != "draft_keep_only" or not command_intent.keep_words:
         return None
+    note_rule_use("R:_keep_only_command_from_intent")
     return KeepOnlyDraftCommand(
         keep_words=command_intent.keep_words,
         submit_after=command_intent.submit_after,
@@ -944,13 +959,16 @@ def _is_target_bound_add_and_submit_request(
     code_clause = rf"(?:(?:用|以|按)?(?:编码)?(?:为|是)?)?{re.escape(code)}"
     submit_clause = r"(?:并|并且|然后|再|同时|以及)?(?:提交|提审|送审)(?:审核|草稿|批次)?"
     polite = r"(?:一下)?(?:吧|啦|了)?"
-    return bool(
+    matched = bool(
         re.fullmatch(
             rf"{request_prefix}{add_clause}{re.escape(word)}{code_clause}{submit_clause}{polite}",
             compact,
             flags=re.IGNORECASE,
         )
     )
+    if matched:
+        note_rule_use("R:_is_target_bound_add_and_submit_request")
+    return matched
 
 
 # Rendering/compatibility vocabulary only. Acceptance is owned exclusively by
@@ -1110,9 +1128,12 @@ def _canonical_draft_management_command(
 
 
 def _message_requests_draft_clear_all(message_text: str) -> bool:
-    return _compact_requests_draft_clear_all(
+    matched = _compact_requests_draft_clear_all(
         _compact_command_text(trusted_mutation_source(message_text))
     )
+    if matched:
+        note_rule_use("R:_message_requests_draft_clear_all")
+    return matched
 
 
 def _message_authorizes_draft_recall(
@@ -2412,6 +2433,7 @@ def _is_prefixed_fresh_word_query(message_text: str, normalized_message_text: st
         or _canonical_draft_management_command(normalized) is not None
     ):
         return False
+    note_rule_use("R:_is_prefixed_fresh_word_query")
     return True
 
 
@@ -2726,6 +2748,7 @@ async def _classify_message_command_intent(
         return MessageCommandIntent()
     draft_view = parse_draft_view_command(message_text)
     if draft_view is not None:
+        note_rule_use("R:_classify_message_command_intent")
         return draft_view
     from ..utils.same_code_reorder import parse_same_code_reorder
     from ..utils.explicit_code import parse_explicit_entry_code_request
@@ -2735,12 +2758,14 @@ async def _classify_message_command_intent(
         message_text,
     )
     if pending_positional_add is not None:
+        note_rule_use("R:_classify_message_command_intent")
         return pending_positional_add
     pending_tool_assent = _pending_tool_assent_intent(
         pending_state,
         message_text,
     )
     if pending_tool_assent is not None:
+        note_rule_use("R:_classify_message_command_intent")
         return pending_tool_assent
     if (
         _is_explicit_draft_submit_request(message_text)
@@ -2750,17 +2775,23 @@ async def _classify_message_command_intent(
             isinstance(pending_state, PendingToolConfirm)
             and pending_state.function_name == "keytao_submit_batch"
         ):
+            note_rule_use("R:_classify_message_command_intent")
             return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
+        note_rule_use("R:_classify_message_command_intent")
         return MessageCommandIntent(intent="draft_submit", confidence=1.0)
+    command_source = _strip_command_message_prefixes(message_text)
     compact_message = re.sub(
         r"[\s，,。.!！?？~～]+",
         "",
-        _strip_command_message_prefixes(message_text),
+        command_source,
     )
+    if compact_message != command_source:
+        note_rule_use("R:_classify_message_command_intent:re.sub")
     if (
         isinstance(pending_state, PendingAddWord)
         and _is_target_bound_add_and_submit_request(message_text, pending_state)
     ):
+        note_rule_use("R:_classify_message_command_intent")
         return MessageCommandIntent(intent="pending_add_and_submit", confidence=1.0)
     if isinstance(pending_state, PendingAddWord):
         # Keep intent recognition separate from authorization. A historical
@@ -2768,6 +2799,7 @@ async def _classify_message_command_intent(
         # server-backed state may pass the pending-state authorization gate.
         assent = _pending_assent_phrase_for_state(pending_state, message_text)
         if assent.matched:
+            note_rule_use("R:_classify_message_command_intent")
             return MessageCommandIntent(
                 intent=(
                     "pending_add_and_submit"
@@ -2782,17 +2814,20 @@ async def _classify_message_command_intent(
             pending_state,
         )
         if structural_pending_intent is not None:
+            note_rule_use("R:_classify_message_command_intent")
             return structural_pending_intent
     if (
         isinstance(pending_state, PendingToolConfirm)
         and _pending_tool_confirmation_matches(pending_state, message_text)
     ):
+        note_rule_use("R:_classify_message_command_intent")
         return MessageCommandIntent(intent="pending_confirm", confidence=1.0)
     if pending_state is not None and compact_message.startswith("确认票据"):
         # The retired code form is handled deterministically as non-executable.
         return MessageCommandIntent()
     structural_draft_intent = _structural_draft_management_intent(message_text)
     if structural_draft_intent is not None:
+        note_rule_use("R:_classify_message_command_intent")
         return structural_draft_intent
     if isinstance(pending_state, PendingTrustedWordRecord) and message_authorizes_live_pending_mutation(message_text, pending_state):
         # The trusted-word handler owns contextual code validation and execution.
@@ -2880,7 +2915,10 @@ async def _classify_message_command_intent(
         if not response.choices:
             return MessageCommandIntent()
         payload = _load_json_object_from_model_text(response.choices[0].message.content or "")
-        return _parse_message_command_intent_payload(payload)
+        intent = _parse_message_command_intent_payload(payload)
+        if intent.intent != "none" or intent.has_operation_intent is True:
+            note_rule_use("R:_classify_message_command_intent")
+        return intent
     except Exception as error:
         logger.warning(f"Failed to classify command intent: {error}")
         return MessageCommandIntent()
@@ -2945,7 +2983,10 @@ async def _classify_simple_word_query_intent(
             return SimpleWordQueryIntent(False)
         content = response.choices[0].message.content or ""
         payload = _load_json_object_from_model_text(content)
-        return _parse_simple_word_query_intent_payload(payload, structural_words)
+        intent = _parse_simple_word_query_intent_payload(payload, structural_words)
+        if intent.should_handle:
+            note_rule_use("R:_classify_simple_word_query_intent")
+        return intent
     except Exception as error:
         logger.warning(f"Failed to classify simple word-query intent: {error}")
         return SimpleWordQueryIntent(False)
@@ -2993,6 +3034,7 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
         _strip_command_message_prefixes(message_text),
     )
     if explicit is not None:
+        note_rule_use("R:_get_simple_word_query_words:re.fullmatch")
         return (explicit.group("word"),)
     if is_conversational_text(_strip_command_message_prefixes(message_text)):
         return ()
@@ -3145,6 +3187,7 @@ def _scope_language_only_reply(message_text: str, response: str) -> str:
 
     for pattern, factual_answer in _KNOWN_CONTEXTUAL_LANGUAGE_ANSWERS:
         if pattern.search(message_text):
+            note_rule_use("R:_KNOWN_CONTEXTUAL_LANGUAGE_ANSWERS[0][0]")
             return factual_answer
 
     kept_lines: List[str] = []
@@ -3390,7 +3433,11 @@ def _is_referenced_word_presence_query(message_text: str) -> bool:
     """Detect deictic quoted-message questions like "这两个词词库都有吗"."""
     text = _strip_command_message_prefixes(message_text)
     text = re.sub(r"\s+", "", text)
-    return _REFERENCED_WORD_PRESENCE_WHOLE_RE.fullmatch(text) is not None
+    matched = _REFERENCED_WORD_PRESENCE_WHOLE_RE.fullmatch(text) is not None
+    if matched:
+        note_rule_use("R:_REFERENCED_WORD_PRESENCE_WHOLE_RE")
+        note_rule_use("R:_is_referenced_word_presence_query")
+    return matched
 
 
 def _dedupe_words(words: List[str], limit: int) -> List[str]:

@@ -151,6 +151,7 @@ from .chat_render import (
     _trusted_batch_url,
 )
 from .chat_routing import (
+    note_rule_use,
     is_conversational_text,
     KeepOnlyDraftCommand,
     MessageCommandIntent,
@@ -1101,6 +1102,8 @@ def _latest_unresolved_review_word(history: Optional[List[Dict]]) -> str:
         r"的[^\r\n]{0,20}读音[^\r\n]{0,20}(?:冲突|未确定))",
         latest,
     )
+    if match is not None:
+        note_rule_use("C:_latest_unresolved_review_word:re.search")
     return match.group("word").strip() if match is not None else ""
 
 
@@ -1124,6 +1127,7 @@ def _extract_explicit_reading_request(
         re.IGNORECASE,
     )
     if character_reading is not None:
+        note_rule_use("C:_extract_explicit_reading_request:re.fullmatch")
         word = character_reading.group("word").strip()
         character = character_reading.group("char")
         pinyin = keytao_review.normalize_pinyin_syllable(
@@ -1162,6 +1166,10 @@ def _extract_explicit_reading_request(
         match = pattern.fullmatch(source)
         if match is None:
             continue
+        if pattern is patterns[2]:
+            note_rule_use("C:_extract_explicit_reading_request:patterns[2]")
+        if pattern is patterns[3]:
+            note_rule_use("C:_extract_explicit_reading_request:patterns[3]")
         word = str(match.groupdict().get("word") or "").strip()
         if not word:
             word = _latest_unresolved_review_word(history)
@@ -1186,6 +1194,7 @@ def _extract_explicit_reading_meaning_request(
         or not re.search(r"(?:意思|含义|指的是|语境|用法|那个)", source)
     ):
         return None
+    note_rule_use("C:_extract_explicit_reading_meaning_request:re.search")
     explicit = re.fullmatch(
         r"(?:(?:请|麻烦)?\s*(?:帮我|帮忙|给我)?\s*"
         r"(?:加词|添加词|新增词)\s*)"
@@ -1194,12 +1203,16 @@ def _extract_explicit_reading_meaning_request(
         source,
     )
     if explicit is not None:
+        note_rule_use("C:_extract_explicit_reading_meaning_request:re.fullmatch")
         word = explicit.group("word").strip()
         meaning = explicit.group("meaning").strip()
+        if meaning:
+            note_rule_use("C:_extract_explicit_reading_meaning_request")
         return (word, meaning) if meaning else None
     word = _latest_unresolved_review_word(history)
     if not word or re.search(r"(?:不要|别|取消|删除|移除|提交)", source):
         return None
+    note_rule_use("C:_extract_explicit_reading_meaning_request")
     return word, source
 
 
@@ -1263,6 +1276,8 @@ async def _try_handle_complete_add_command(
     )
     record = conversation_state_store.get_record(conv_key)
     if record is None or not isinstance(record.state, PendingAddWord):
+        if refreshed:
+            note_rule_use("C:_try_handle_complete_add_command")
         return refreshed
     completed = await _try_handle_explicit_pending_replacement(
         record.state,
@@ -1273,7 +1288,10 @@ async def _try_handle_complete_add_command(
         space_key,
         owner_label,
     )
-    return completed or refreshed
+    response = completed or refreshed
+    if response:
+        note_rule_use("C:_try_handle_complete_add_command")
+    return response
 
 
 async def _try_handle_compound_shift_modified_add_command(
@@ -1289,6 +1307,7 @@ async def _try_handle_compound_shift_modified_add_command(
     if plan is None:
         return None
     if conv_key is None:
+        note_rule_use("C:_try_handle_compound_shift_modified_add_command")
         return (
             "已识别两行添加并顺延指令，但当前会话无法保存共同确认票据；"
             "本次未写入。"
@@ -1296,6 +1315,7 @@ async def _try_handle_compound_shift_modified_add_command(
 
     def refuse(message: str) -> str:
         conversation_state_store.delete(conv_key)
+        note_rule_use("C:_try_handle_compound_shift_modified_add_command")
         return message
 
     base_reviewed_states: Dict[str, PendingAddWord] = {}
@@ -1313,11 +1333,14 @@ async def _try_handle_compound_shift_modified_add_command(
         record = conversation_state_store.get_record(conv_key)
         state = record.state if record is not None else None
         if not isinstance(state, PendingAddWord) or not state.server_candidates:
-            reason = re.split(
+            reason_parts = re.split(
                 r"(?:请|回复|可复制)",
                 str(refreshed or "服务端审词没有返回完整候选"),
                 maxsplit=1,
-            )[0].strip().rstrip("；;。")
+            )
+            if len(reason_parts) > 1:
+                note_rule_use("C:_try_handle_compound_shift_modified_add_command:re.split")
+            reason = reason_parts[0].strip().rstrip("；;。")
             return refuse(
                 f"无法为「{item.word}」建立两行共同顺延计划；"
                 f"原因：{reason or '服务端审词没有返回完整候选'}；本次未写入。"
@@ -1410,7 +1433,7 @@ async def _try_handle_compound_shift_modified_add_command(
         })
 
     primary = shift_targets[0]
-    return await _execute_shift_to_code(
+    response = await _execute_shift_to_code(
         str(primary["word"]),
         str(primary["code"]),
         platform,
@@ -1423,6 +1446,9 @@ async def _try_handle_compound_shift_modified_add_command(
         reviewed_pinyin=str(primary["reviewedPinyin"]),
         reviewed_candidate_codes=tuple(primary["reviewedCandidateCodes"]),
     )
+    if response:
+        note_rule_use("C:_try_handle_compound_shift_modified_add_command")
+    return response
 
 
 async def _try_handle_shift_modified_add_command(
@@ -1473,6 +1499,7 @@ async def _try_handle_shift_modified_add_command(
         r"其他(?:相关(?:的)?)?词条",
         explicitly_named_occupant,
     ):
+        note_rule_use("C:_try_handle_shift_modified_add_command:re.fullmatch:explicitly_named_occupant")
         explicitly_named_occupant = ""
     command = explicit_shift_modified_add_item(message_text)
     if command is None:
@@ -1548,6 +1575,7 @@ async def _try_handle_shift_modified_add_command(
         or ""
     ).strip()
     if re.fullmatch(r"其他(?:相关(?:的)?)?词条", named_occupant):
+        note_rule_use("C:_try_handle_shift_modified_add_command:re.fullmatch:named_occupant")
         named_occupant = ""
     if named_occupant:
         actual_occupants = tuple(dict.fromkeys(
@@ -3280,10 +3308,15 @@ _CODE_APPENDIX_WORD_PATTERNS = (
 def _extract_code_appendix_query_words(message_text: str) -> Tuple[str, ...]:
     """Extract one explicit code-query target without relying on model routing."""
     text = re.sub(r"[？?！!。]+$", "", message_text.strip())
+    original_text = text
     text = re.sub(r"^(?:请问|麻烦|帮我|帮忙|给我|查一下|看一下|看看)\s*", "", text)
+    if text != original_text:
+        note_rule_use("C:_extract_code_appendix_query_words:re.sub")
     for pattern in _CODE_APPENDIX_WORD_PATTERNS:
         match = pattern.fullmatch(text)
         if match is not None:
+            if pattern is _CODE_APPENDIX_WORD_PATTERNS[0]:
+                note_rule_use("C:_CODE_APPENDIX_WORD_PATTERNS[0]")
             word = match.group("word").strip()
             if word:
                 return (word,)
@@ -3421,6 +3454,8 @@ async def _try_handle_referenced_word_presence_query(
         )
 
     expected_count = 2 if re.search(r"(两个|俩)", message_text) else 6
+    if expected_count == 2:
+        note_rule_use("C:_try_handle_referenced_word_presence_query:re.search")
     words = _extract_referenced_word_targets(reply_reference.text, expected_count=expected_count)
     if not words:
         return render_remediation_reply(
@@ -3542,7 +3577,10 @@ async def _prepare_multi_word_query(
         for line in diagnostic.splitlines():
             if "格式为：加入编码" in line:
                 continue
+            original_line = line
             line = re.sub(r"^\s*\d+[.)、]\s*(?=[a-z]+\s*[—–-])", "", line)
+            if line != original_line:
+                note_rule_use("C:_prepare_multi_word_query:re.sub")
             line = line.replace(f"「{scope['word']}」候选编码：", f"「{scope['word']}」占用情况：")
             diagnostic_lines.append(line)
         diagnostic_lines.append(
@@ -3956,6 +3994,8 @@ async def _try_handle_simple_single_word_query(
             for code in item.get("candidateCodes") or []
             if re.fullmatch(r"[a-z]+", str(code or "").strip().lower())
         ))
+        if candidate_codes:
+            note_rule_use("C:_try_handle_simple_single_word_query:re.fullmatch")
         frequency = offline_reference.get("frequency")
         corpus_frequency = (
             frequency.get("corpusFrequency")
@@ -7967,18 +8007,25 @@ async def _try_handle_draft_view_command(
 
     list_data = await _fetch_current_draft_items(platform, user_id)
     if list_data.get("not_bound"):
+        note_rule_use("C:_try_handle_draft_view_command")
         return _BIND_HELP_TEXT
     if not list_data.get("success"):
-        return _append_batch_url_if_missing(
+        response = _append_batch_url_if_missing(
             f"查看草稿失败：{list_data.get('message', '未知错误')}",
             list_data,
         )
+        if response:
+            note_rule_use("C:_try_handle_draft_view_command")
+        return response
 
     data = {
         "draft_snapshot": _draft_snapshot_from_list_data(list_data),
         "batchUrl": list_data.get("batchUrl", ""),
     }
-    return await _format_draft_response(data, platform, user_id)
+    response = await _format_draft_response(data, platform, user_id)
+    if response:
+        note_rule_use("C:_try_handle_draft_view_command")
+    return response
 
 
 async def _try_handle_draft_submit_command(
@@ -8379,13 +8426,17 @@ async def _perform_clear_current_draft(
 
 
 def _quoted_draft_display_lines(response: str) -> List[str]:
-    return [
+    lines = [
         re.sub(r"\s+", " ", match.group(0)).strip()
         for match in re.finditer(
             r"(?m)^\s*•\s*\d+\.\s*(?:新增|修改|删除)\s+.+$",
             str(response or ""),
         )
     ]
+    if lines:
+        note_rule_use("C:_quoted_draft_display_lines:re.sub")
+        note_rule_use("C:_quoted_draft_display_lines:re.finditer")
+    return lines
 
 
 def _quoted_draft_selection_request(
@@ -8919,32 +8970,48 @@ async def _try_handle_keep_only_draft_items_command(
 
     list_data, recall_note = await _list_draft_items_after_optional_recall(command, platform, user_id)
     if list_data.get("not_bound"):
+        note_rule_use("C:_try_handle_keep_only_draft_items_command")
         return _BIND_HELP_TEXT
     if not list_data.get("success"):
         if recall_note:
-            return _append_batch_url_if_missing(recall_note, list_data)
-        return _append_batch_url_if_missing(
+            response = _append_batch_url_if_missing(recall_note, list_data)
+            if response:
+                note_rule_use("C:_try_handle_keep_only_draft_items_command")
+            return response
+        response = _append_batch_url_if_missing(
             f"获取草稿失败：{list_data.get('message', '未知错误')}",
             list_data,
         )
+        if response:
+            note_rule_use("C:_try_handle_keep_only_draft_items_command")
+        return response
 
     items = list_data.get("items", [])
     if not isinstance(items, list) or not items:
         if recall_note:
-            return _append_batch_url_if_missing(recall_note, list_data)
-        return _append_batch_url_if_missing(
+            response = _append_batch_url_if_missing(recall_note, list_data)
+            if response:
+                note_rule_use("C:_try_handle_keep_only_draft_items_command")
+            return response
+        response = _append_batch_url_if_missing(
             "当前没有可处理的草稿条目。",
             list_data,
         )
+        if response:
+            note_rule_use("C:_try_handle_keep_only_draft_items_command")
+        return response
 
     keep_set = set(command.keep_words)
     kept_items = [item for item in items if isinstance(item, dict) and _draft_item_word(item) in keep_set]
     if not kept_items:
         keep_label = "、".join(command.keep_words)
-        return _append_batch_url_if_missing(
+        response = _append_batch_url_if_missing(
             f"草稿里没找到「{keep_label}」，我不会删除其他条目。",
             list_data,
         )
+        if response:
+            note_rule_use("C:_try_handle_keep_only_draft_items_command")
+        return response
 
     delete_items = [
         item for item in items
@@ -8956,14 +9023,17 @@ async def _try_handle_keep_only_draft_items_command(
     ]
     missing_id_count = len(delete_items) - len(delete_ids)
     if missing_id_count > 0:
-        return _append_batch_url_if_missing(
+        response = _append_batch_url_if_missing(
             "草稿列表里有条目缺少内部 ID，我先不批量删除，避免误删。",
             list_data,
         )
+        if response:
+            note_rule_use("C:_try_handle_keep_only_draft_items_command")
+        return response
 
     keep_label = "、".join(command.keep_words)
     if delete_ids:
-        return await _execute_confirmed_tool(
+        response = await _execute_confirmed_tool(
             PendingToolConfirm(
                 function_name="keytao_batch_remove_draft_items",
                 args={
@@ -8979,6 +9049,9 @@ async def _try_handle_keep_only_draft_items_command(
             space_key,
             owner_label,
         )
+        if response:
+            note_rule_use("C:_try_handle_keep_only_draft_items_command")
+        return response
     else:
         remove_data = {
             "success": True,
@@ -8998,11 +9071,15 @@ async def _try_handle_keep_only_draft_items_command(
 
     if command.submit_after:
         submit_response = await _submit_current_draft(platform, user_id, space_key, owner_label)
+        note_rule_use("C:_try_handle_keep_only_draft_items_command")
         return "\n".join([*prefix_parts, submit_response])
 
-    return "\n".join(prefix_parts) + "\n" + await _format_draft_response(
+    response = "\n".join(prefix_parts) + "\n" + await _format_draft_response(
         remove_data, platform, user_id, compact=True,
     )
+    if response:
+        note_rule_use("C:_try_handle_keep_only_draft_items_command")
+    return response
 
 
 def _chain_reorder_ask(code: str, reason: str) -> str:
