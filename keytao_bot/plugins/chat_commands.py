@@ -9077,6 +9077,22 @@ async def try_handle_model_entry_swap(
             "服务端无法为这两个词各锁定唯一的词库或草稿记录；"
             "本次未生成换位计划"
         )
+    return await _execute_entry_swap_plan(
+        expected_words, resolved, platform, user_id, space_key, owner_label,
+    )
+
+
+async def _execute_entry_swap_plan(
+    expected_words: Tuple[str, str],
+    resolved: Dict[str, Dict[str, Any]],
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]],
+    owner_label: str,
+) -> str:
+    """Build the shared swap plan from the same snapshot used to decide intent."""
+    set_turn_flow("draft-op")
+    first_word, second_word = expected_words
     first = resolved[first_word]
     second = resolved[second_word]
     first_code = str(first.get("code") or "").strip().lower()
@@ -9473,12 +9489,12 @@ async def _try_handle_dictionary_recode_command(
     )
 
 
-async def _load_merged_word_entries(
+async def _load_merged_reorder_entries(
     words: Tuple[str, ...],
     platform: str,
     user_id: str,
-) -> Optional[Dict[str, Dict[str, Any]]]:
-    """Resolve one unique effective row per word from live plus current draft."""
+) -> Optional[List[Dict[str, Any]]]:
+    """Read the validated live and draft view without discarding ambiguous rows."""
     lookup_json = await call_tool_function(
         "keytao_lookup_by_words_batch",
         {"words": list(words)},
@@ -9503,10 +9519,19 @@ async def _load_merged_word_entries(
     draft_snapshot = _validated_draft_reorder_snapshot(draft_data)
     if live_entries is None or draft_snapshot is None:
         return None
-    merged = _merge_live_and_draft_reorder_entries(
+    return _merge_live_and_draft_reorder_entries(
         live_entries,
         draft_snapshot,
     )
+
+
+async def _load_merged_word_entries(
+    words: Tuple[str, ...],
+    platform: str,
+    user_id: str,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Resolve one unique effective row per word from live plus current draft."""
+    merged = await _load_merged_reorder_entries(words, platform, user_id)
     if merged is None:
         return None
     resolved: Dict[str, Dict[str, Any]] = {}
@@ -12085,6 +12110,34 @@ async def execute_understood_command(request, command, platform, user_id, conv_k
         response = await try_handle_move_to_code_command(command, platform, user_id, space_key, owner_label)
         if response is not None:
             return response
+    if op == "reorder" and len(words) == 2 and (not codes or len(codes) == 2 and codes[0] != codes[1]):
+        merged = await _load_merged_reorder_entries(words, platform, user_id)
+        if merged is None:
+            return "无法读取完整的词库和草稿记录，本次未生成调序计划。"
+        entries = [[entry for entry in merged if entry["word"] == word] for word in words]
+        code_labels = " / ".join(
+            f"「{word}」{'、'.join(dict.fromkeys(entry['code'] for entry in rows)) or '无现有编码'}"
+            for word, rows in zip(words, entries)
+        )
+        if any(len(rows) != 1 for rows in entries):
+            ambiguous = "、".join(f"「{word}」" for word, rows in zip(words, entries) if len(rows) > 1)
+            reason = f"{ambiguous}有多个词条，无法唯一确定" if ambiguous else "未能锁定双方的现有词条"
+            return f"{code_labels}；{reason}，本次未修改。"
+        first_code, second_code = (rows[0]["code"] for rows in entries)
+        if codes and codes != (first_code, second_code):
+            return f"{code_labels}；现有编码与指令不一致，本次未修改。"
+        if first_code != second_code:
+            if not (first_code.startswith(second_code) or second_code.startswith(first_code)):
+                return f"{code_labels}；两个词不在同一编码链，本次未修改。"
+            if len(first_code) < len(second_code):
+                return (
+                    f"「{words[0]}」已经排在「{words[1]}」前面"
+                    f"（{words[0]} {first_code} / {words[1]} {second_code}），本次未修改。"
+                )
+            return await _execute_entry_swap_plan(
+                words, {word: rows[0] for word, rows in zip(words, entries)},
+                platform, user_id, space_key, owner_label,
+            )
     intent = MessageCommandIntent(
         intent={"delete": "dictionary_delete", "recode": "dictionary_recode",
                 "move": "replace_at_code", "reorder": "word_list_reorder",

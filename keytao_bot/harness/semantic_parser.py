@@ -68,7 +68,7 @@ pending_recode: request a different code for the pending ticket (换码/换一�
 swap: swap two existing entries' codes, positions or priority.
 delete: delete an existing entry.
 recode: change an existing entry to a different code.
-reorder: change candidate order on a code or chain, including X 优先于 Y or 提到前面.
+reorder: change candidate order on a code or chain, including X 优先于 Y or 提到前面. operands: the word to put first, then the word it goes ahead of.
 move: move/insert an entry at a specific code position, or replace the entry at a code.
 batch_replace: replace a character across a listed set of codes.
 draft_view: view one's personal draft batch.
