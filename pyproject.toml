@@ -12,9 +12,9 @@ dependencies = [
     "pillow>=12.1.1,<13",
     "python-socks>=2.8.1",
     "nonebot-plugin-status>=0.9.0",
-    "nonebot-plugin-ncm>=1.6.18",
     "nonebot-plugin-auto-emojimix>=0.2.1",
     "nonebot-plugin-github-release-notifier>=0.1.10",
+    "nonebot-plugin-plus-one>=0.1.10",
 ]
 
 [tool.nonebot]
@@ -35,6 +35,7 @@ nonebot-adapter-onebot = [
 nonebot-plugin-status = ["nonebot_plugin_status"]
 # nonebot-plugin-ncm = ["nonebot-plugin-ncm"]
 nonebot-plugin-auto-emojimix = ["nonebot_plugin_auto_emojimix"]
+nonebot-plugin-plus-one = ["nonebot_plugin_plus_one"]
 nonebot-plugin-github-release-notifier = [
     "nonebot_plugin_github_release_notifier",
 ]
