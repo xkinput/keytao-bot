@@ -17,8 +17,10 @@ from ..utils.pinyin_reference import reference_db_path
 from ..utils.pending_confirmation import PENDING_CONFIRM_ADVERTISED_FORMS
 
 
-# Local 2-4 character corpus ranks: 50,000th = 41; round up conservatively.
-DISCOVERY_MIN_COMMONNESS = 50
+# Frequency >= 50 only reached basic words KeyTao already has; neologisms (内卷, 发薪日) sit at 3.
+# Listing in >= 2 reference dictionaries keeps out made-up strings.
+DISCOVERY_MIN_COMMONNESS = 3
+DISCOVERY_MIN_PRESENCE = 2
 MAX_MESSAGE_CHARS = 256
 MAX_CANDIDATES = 12
 PRESENT_CACHE_MAX_WORDS = 5000
@@ -56,7 +58,7 @@ def extract_candidates(text, db_path=None):
                 word, frequency, pos, presence = row
                 index += len(word)
                 if (2 <= len(word) <= 4 and (frequency or 0) >= DISCOVERY_MIN_COMMONNESS
-                        and presence >= 1 and pos in _COMMON_POS and word not in candidates):
+                        and (presence or 0) >= DISCOVERY_MIN_PRESENCE and pos in _COMMON_POS and word not in candidates):
                     candidates.append(word)
                     if len(candidates) == MAX_CANDIDATES:
                         return candidates
@@ -340,6 +342,7 @@ class WordDiscovery:
                     self._present_words.popitem(last=False)
             elif phrases == [] and not word:
                 word = candidate
+        logger.info(f"[word_discovery] candidates={len(candidates)} missing={word or '-'}")
         if not word:
             return
         if (os.getenv("KEYTAO_WORD_DISCOVERY") != "1" or _foreground_busy(chat, address)
