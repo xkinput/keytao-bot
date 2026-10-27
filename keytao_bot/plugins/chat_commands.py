@@ -7663,6 +7663,55 @@ def _submit_preview_matches_authorized_items(
     )
 
 
+async def _submit_preview_is_authors_own(submit_data: Dict) -> bool:
+    """Bind row authorship to the actor-owned, versioned server submit ticket."""
+    from ..utils import http_client
+
+    batch_id = submit_data.get("batchId")
+    version = submit_data.get("contentVersion")
+    items = submit_data.get("snapshotItems")
+    ticket = _pending_state_from_server_warning(
+        PendingToolConfirm("keytao_submit_batch", {}), submit_data,
+    )
+    if (not server_warning_ticket_is_complete(ticket)
+            or not isinstance(batch_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", batch_id)
+            or type(version) is not int or not _normalized_submit_items(items)):
+        return False
+    try:
+        # The submit endpoint checks creatorId against the authenticated actor;
+        # its projected snapshot omits userId, so read it from the same batch.
+        data = await http_client.keytao_json("GET", f"/api/batches/{batch_id}", timeout=10.0)
+        batch = data.get("batch")
+        if (not isinstance(batch, dict) or batch.get("id") != batch_id
+                or type(batch.get("contentVersion")) is not int or batch["contentVersion"] != version
+                or batch.get("status") not in {"Draft", "Rejected"}
+                or type(batch.get("creatorId")) is not int or batch["creatorId"] <= 0):
+            return False
+        rows = batch.get("pullRequests")
+        if not isinstance(rows, list) or len(rows) != len(items):
+            return False
+        by_id = {}
+        for row in rows:
+            if (not isinstance(row, dict) or type(row.get("id")) is not int
+                    or row["id"] in by_id or type(row.get("userId")) is not int
+                    or row["userId"] != batch["creatorId"]):
+                return False
+            by_id[row["id"]] = row
+        seen = set()
+        for item in items:
+            item_id = item.get("id")
+            if type(item_id) is not int or item_id in seen or item_id not in by_id:
+                return False
+            seen.add(item_id)
+            if any(item.get(field) != by_id[item_id].get(field)
+                   for field in ("action", "word", "code", "type", "oldWord", "remark")):
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def submit_snapshot_extra_items(
     submit_data: Dict,
     authorized_items: Optional[List[Dict]],
@@ -7769,6 +7818,19 @@ async def _perform_submit_current_draft(
             PendingToolConfirm(function_name="keytao_submit_batch", args=arguments),
             submit_data,
         )
+        expected = _normalized_submit_items(authorized_items)
+        remaining = list(_normalized_submit_items(submit_data.get("snapshotItems")) or [])
+        for item in expected or []:
+            if item not in remaining:
+                remaining = []
+                break
+            remaining.remove(item)
+        own_leftovers = bool(
+            auto_confirm and not confirmed and expected and remaining
+            and (authorized_content_version is None
+                 or submit_data.get("contentVersion") == authorized_content_version)
+            and await _submit_preview_is_authors_own(submit_data)
+        )
         if (
             auto_confirm
             and not confirmed
@@ -7793,6 +7855,7 @@ async def _perform_submit_current_draft(
                     and isinstance(submit_data.get("snapshotItems"), list)
                     and bool(submit_data["snapshotItems"])
                 )
+                or own_leftovers
             )
         ):
             exact_args = pending_state.args
@@ -7814,6 +7877,31 @@ async def _perform_submit_current_draft(
                     exact_args.get("expected_audit_digest") or ""
                 ),
             )
+            if own_leftovers and confirmed_result.success:
+                current = list(expected or [])
+                submitted = []
+                for item in submit_data["snapshotItems"]:
+                    key = _normalized_submit_items([item])[0]
+                    earlier = key not in current
+                    if not earlier:
+                        current.remove(key)
+                    submitted.append({**item, "earlierRound": earlier})
+                receipt_data = {
+                    **{key: submit_data[key] for key in (
+                        "batchId", "batchUrl", "contentVersion", "snapshotItems", "autoReview",
+                    ) if key in submit_data},
+                    **(confirmed_result.data or {}), "submittedItems": submitted,
+                }
+                vote_receipt = submitted_vote_receipt(receipt_data)
+                if vote_receipt:
+                    receipt_text = vote_receipt
+                else:
+                    receipt_text = confirmed_result.text + "\n提交内容：\n" + "\n".join(
+                        f"• {item['action']} {item['word']} → {item['code']}"
+                        + ("（本轮之前）" if item["earlierRound"] else "")
+                        for item in submitted
+                    )
+                confirmed_result = replace(confirmed_result, text=receipt_text, data=receipt_data)
             return _preserve_action_result_link(
                 confirmed_result,
                 submit_data,

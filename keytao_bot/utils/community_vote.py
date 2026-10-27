@@ -60,7 +60,7 @@ def submitted_vote_receipt(data: dict) -> str | None:
         return None
     install_delivery_hook()
     frozen = json.loads(json.dumps({key: data[key] for key in (
-        "success", "batchId", "batchUrl", "contentVersion", "snapshotItems", "autoReview",
+        "success", "batchId", "batchUrl", "contentVersion", "snapshotItems", "autoReview", "submittedItems",
     ) if key in data}, ensure_ascii=False))
     receipts = _pending_receipts.get()
     if receipts is None:
@@ -69,7 +69,14 @@ def submitted_vote_receipt(data: dict) -> str | None:
     # Background actions run in child tasks; update their turn's shared collector in place.
     receipts[:] = [item for item in receipts if item["batchId"] != data["batchId"]]
     receipts.append(frozen)
-    return (f"批次已加入提交，审核中。\n草稿地址：{data['batchUrl']}\n\n"
+    contents = ""
+    if data.get("submittedItems"):
+        contents = "\n提交内容：\n" + "\n".join(
+            f"• {item['action']} {item['word']} → {item['code']}"
+            + ("（本轮之前）" if item.get("earlierRound") else "")
+            for item in data["submittedItems"]
+        )
+    return (f"批次已加入提交，审核中。\n草稿地址：{data['batchUrl']}{contents}\n\n"
             "当前投票：0/3\n可以引用该条消息，回复同意来投票通过")
 
 

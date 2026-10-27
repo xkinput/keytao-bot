@@ -3416,6 +3416,60 @@ async def _state_metrics_loop() -> None:
             logger.warning(
                 f"[state_metrics_error] collection_failed error={type(error).__name__}"
             )
+        try:
+            await _scan_draft_reminders_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(f"[draft_reminder_error] scan_failed error={type(error).__name__}")
+
+
+def _draft_reminder_store():
+    from ..utils.draft_reminder import DraftReminderStore
+    return DraftReminderStore(get_default_draft_mutation_claim_store().db_path)
+
+
+async def _read_reminder_draft(candidate: Dict) -> Dict:
+    tool = skills_manager.get_tool_function("keytao_list_draft_items")
+    if tool is None:
+        return {}
+    # The per-user latest selector only returns Draft; an explicit batch ID
+    # would also permit Rejected batches, so deliberately omit it.
+    draft = await tool(platform=candidate["platform"], platform_id=candidate["actor"])
+    return {"status": "Draft", **draft} if isinstance(draft, dict) else {}
+
+
+async def _send_draft_reminder(candidate: Dict, text: str) -> str:
+    from nonebot import get_bots
+
+    platform, group_id, actor = candidate["platform"], candidate["group_id"], candidate["actor"]
+    for bot in get_bots().values():
+        module = bot.__class__.__module__.lower()
+        if platform == "qq" and "onebot" in module:
+            from nonebot.adapters.onebot.v11 import MessageSegment
+            result = await bot.send_group_msg(
+                group_id=int(group_id), message=MessageSegment.at(actor) + " " + text,
+            )
+        elif platform == "telegram" and "telegram" in module:
+            from html import escape
+            chat_id, _, thread_id = group_id.partition(":thread:")
+            result = await bot.send_message(
+                chat_id=int(chat_id),
+                text=f'<a href="tg://user?id={int(actor)}">@{escape(actor)}</a> {escape(text)}',
+                parse_mode="HTML",
+                **({"message_thread_id": int(thread_id)} if thread_id else {}),
+            )
+        else:
+            continue
+        message_id = result.get("message_id") if isinstance(result, dict) else getattr(result, "message_id", None)
+        return str(message_id) if message_id is not None else ""
+    return ""
+
+
+async def _scan_draft_reminders_once() -> int:
+    if os.getenv("KEYTAO_DRAFT_REMINDER") != "1":
+        return 0
+    return await _draft_reminder_store().scan(_read_reminder_draft, _send_draft_reminder)
 
 
 async def _start_state_metrics() -> None:
@@ -3835,7 +3889,41 @@ async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
         ctx.message_text,
         ctx.normalized_message_text,
     )
+    if await _stage_draft_reminder_reply(ctx):
+        return True
     return await _stage_community_vote(ctx)
+
+
+async def _stage_draft_reminder_reply(ctx: TurnContext) -> bool:
+    if os.getenv("KEYTAO_DRAFT_REMINDER") != "1":
+        return False
+    command = ctx.normalized_message_text.strip().rstrip("。.!！ ")
+    memory = ctx.memory_context
+    if (command not in {"提交", "清空草稿"} or memory is None
+            or memory.space_type != "group" or not ctx.reply_reference.is_reply):
+        return False
+    if ctx.platform == "qq":
+        message_id = extract_onebot_reply_id(ctx.event)
+    elif ctx.platform == "telegram":
+        message_id = getattr(getattr(ctx.event, "reply_to_message", None), "message_id", None)
+    else:
+        return False
+    receipt = _draft_reminder_store().resolve_receipt(ctx.platform, memory.space_id, str(message_id or ""))
+    if receipt is None:
+        return False
+    if receipt["actor"] != ctx.user_id:
+        ctx.response = "这条提议不是发给你的，本次未执行。"
+    elif (active := draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id))) is not None:
+        ctx.response = _active_operation_message_for_request(active, ctx.platform, ctx.user_id)
+    else:
+        ctx.response = await _try_handle_draft_management_command(
+            command, ctx.platform, ctx.user_id, ctx.space_key, ctx.owner_label,
+            command_intent=MessageCommandIntent(
+                intent="draft_submit" if command == "提交" else "draft_clear", confidence=1.0,
+            ),
+        )
+    await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, memory, ctx.response, ctx.QQMessageSegment)
+    return True
 
 
 async def _stage_community_vote(ctx: TurnContext) -> bool:

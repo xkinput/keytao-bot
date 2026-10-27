@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 
 from .draft_mutation_store import get_default_draft_mutation_claim_store
+from .draft_reminder import record_draft_write
 from . import http_client
 from .observability import observe_tool_call
 
@@ -57,6 +58,16 @@ def start_operation_turn(key: Any) -> OperationCapture:
     capture = OperationCapture(scope, key.platform, key.actor_id, turn_id, previous)
     current_operation_capture.set(capture)
     return capture
+
+
+def _record_reminder_write(store: Any, scope: str, identity: Dict, batch_id: str,
+                           snapshot: Optional[Dict], batch_url: str = "") -> None:
+    """Track undo writes without extending the original undo capability's lifetime."""
+    with store._lock, store._connect() as connection:
+        record_draft_write(connection, scope, identity["platform"], identity["platform_id"], {
+            "completedAt": time.time(), "batchId": batch_id, "batchUrl": batch_url,
+            "after": snapshot, "submitted": False,
+        })
 
 
 def _snapshot(data: Any, expected_batch: str = "") -> Optional[Dict]:
@@ -324,6 +335,8 @@ async def invoke_with_operation_journal(name: str, args: Dict, invoke: Callable,
     if result.get("replayedResolvedMutation") or result.get("alreadyApplied") or result.get("noWrite"):
         return _attach_receipt_delta(name, args, result, before, before)
     batch_id = str(result.get("batchId") or batch_id or "")
+    if result.get("partialWrite"):
+        _record_reminder_write(store, capture.scope, identity, batch_id, None, str(result.get("batchUrl") or ""))
     if name == "keytao_submit_batch":
         after = dict(before or {})
         version = result.get("contentVersion")
@@ -333,6 +346,7 @@ async def invoke_with_operation_journal(name: str, args: Dict, invoke: Callable,
         after = await _read_snapshot(listed, identity, batch_id) if batch_id else None
     result = _attach_receipt_delta(name, args, result, before, after)
     if result.get("success") is not True:
+        _record_reminder_write(store, capture.scope, identity, batch_id, after, str(result.get("batchUrl") or ""))
         return result
     if capture.before is None:
         capture.before = before
@@ -480,7 +494,18 @@ async def handle_completed_undo(key: Any, message: str, reply_reference: Any, ge
     )
     @observe_tool_call
     async def call(name: str, **arguments: Any) -> Dict:
-        result = await get_tool(name)(**identity, **arguments)
+        try:
+            result = await get_tool(name)(**identity, **arguments)
+        except Exception:
+            if _will_write(name, arguments):
+                _record_reminder_write(store, scope, identity, record["batchId"], None, link)
+            raise
+        if (
+            _will_write(name, arguments) and isinstance(result, dict)
+            and (result.get("success") is True or result.get("partialWrite"))
+            and not any(result.get(flag) for flag in ("noWrite", "alreadyApplied", "replayedResolvedMutation"))
+        ):
+            _record_reminder_write(store, scope, identity, record["batchId"], None, link)
         return result if isinstance(result, dict) else {"success": False, "message": "工具返回格式不完整"}
 
     async def ask(reason: str, snapshot: Optional[Dict] = None) -> str:
@@ -551,6 +576,7 @@ async def handle_completed_undo(key: Any, message: str, reply_reference: Any, ge
         snapshot = await _read_snapshot(get_tool("keytao_list_draft_items"), identity, batch_id)
         if snapshot is None or snapshot["items"] != record["before"]["items"]:
             return f"已撤回提审，但草稿条目仍待核验。草稿地址：{link}"
+        _record_reminder_write(store, scope, identity, batch_id, snapshot, link)
         receipt = f"✅ 已撤销本次提审，原草稿条目已保留。草稿地址：{link}"
         record["undoReceipt"] = receipt
         store.update_completed_operation(scope, record["operationId"], "undoing", "undone", record)
@@ -603,6 +629,7 @@ async def handle_completed_undo(key: Any, message: str, reply_reference: Any, ge
     verified_by_id = {item["id"]: item for item in verified["items"]}
     if any(verified_by_id.get(item["id"]) != item for item in record.get("undoRemaining", [])):
         return f"本次操作的条目已撤销，但其余草稿又有变化，尚未确认完整恢复。草稿地址：{link}"
+    _record_reminder_write(store, scope, identity, batch_id, verified, link)
     if restoring:
         restore_error = await _restore_original_rows(store, scope, record, verified, restoring, identity, get_tool)
         if restore_error:
@@ -670,6 +697,7 @@ async def _restore_original_rows(store: Any, scope: str, record: Dict, snapshot:
 
     if record.get("restoreStarted"):
         if is_restored(snapshot):
+            _record_reminder_write(store, scope, identity, batch_id, snapshot, link)
             record["restoreVerified"] = True
             store.update_completed_operation(scope, record["operationId"], "undoing", "undoing", record)
             return None
@@ -707,7 +735,10 @@ async def _restore_original_rows(store: Any, scope: str, record: Dict, snapshot:
             expectedContentVersion=record["restoreVersion"], expectedWarningDigest=record["restoreWarningDigest"],
         )
     except Exception:
+        _record_reminder_write(store, scope, identity, batch_id, None, link)
         return f"本次新条目已移除，恢复原草稿的结果不确定；已锁定原操作，未重复写入。草稿地址：{link}"
+    if result.get("success") is True or result.get("partialWrite"):
+        _record_reminder_write(store, scope, identity, batch_id, None, link)
     record["restoreResult"] = result
     if result.get("success") is False:
         record["restoreStarted"] = False
@@ -717,6 +748,7 @@ async def _restore_original_rows(store: Any, scope: str, record: Dict, snapshot:
     verified = await _read_snapshot(get_tool("keytao_list_draft_items"), identity, batch_id)
     if verified is None or not is_restored(verified):
         return f"原草稿恢复请求已返回，但编码、权重、审词标记或备注仍未全部核验。草稿地址：{link}"
+    _record_reminder_write(store, scope, identity, batch_id, verified, link)
     record["restoreVerified"] = True
     store.update_completed_operation(scope, record["operationId"], "undoing", "undoing", record)
     return None

@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, Optional
 
+from .draft_reminder import initialize_reminder_schema, record_draft_write
+
 
 _DEFAULT_STORE: Optional["DraftMutationClaimStore"] = None
 _DEFAULT_STORE_LOCK = threading.Lock()
@@ -108,6 +110,7 @@ class DraftMutationClaimStore:
                 "platform TEXT NOT NULL, actor TEXT NOT NULL, operation_id TEXT NOT NULL, "
                 "PRIMARY KEY (platform, actor))"
             )
+            initialize_reminder_schema(connection)
 
     def note_operation_turn(self, scope: str, turn_id: str) -> str:
         """Persist immediate-turn identity without interpreting chat history."""
@@ -140,6 +143,7 @@ class DraftMutationClaimStore:
                 "ON CONFLICT(platform, actor) DO UPDATE SET operation_id = excluded.operation_id",
                 (platform, actor, operation_id),
             )
+            record_draft_write(connection, scope, platform, actor, payload)
 
     def completed_operation(self, scope: str) -> Optional[Dict]:
         with self._lock, self._connect() as connection:
