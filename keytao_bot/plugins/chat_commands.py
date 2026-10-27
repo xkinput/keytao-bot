@@ -3542,6 +3542,7 @@ async def _prepare_multi_word_query(
         return f"一次最多查询 {_MAX_BARE_MULTI_WORD_QUERY_ITEMS} 个词，请拆分后重新发送。"
     scopes: List[Dict[str, Any]] = []
     other_blocks: List[str] = list(query_other_blocks)
+    other_block_words: Dict[int, str] = {}
     for word in words:
         count = len(scopes)
         request = next((row for row in reading_requests if row.word == word), None)
@@ -3552,6 +3553,7 @@ async def _prepare_multi_word_query(
             requested_code=request.code if request else "",
         )
         if len(scopes) == count:
+            other_block_words[len(other_blocks)] = word
             other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
 
     actionable_scopes: List[Dict[str, Any]] = []
@@ -3586,6 +3588,7 @@ async def _prepare_multi_word_query(
         diagnostic_lines.append(
             f"「{scope['word']}」本次未选中；请单独查询此词，再指定完整编码或点名顶替。"
         )
+        other_block_words[len(other_blocks)] = scope["word"]
         other_blocks.append("\n".join(diagnostic_lines))
     scopes = actionable_scopes
 
@@ -3593,6 +3596,12 @@ async def _prepare_multi_word_query(
         if conv_key is not None:
             conversation_state_store.delete(conv_key)
         return "\n\n".join(other_blocks)
+    from ..utils.pending_confirmation import advertised_reply_contract
+
+    # Diagnostic instructions cannot borrow the resolved words' batch ticket.
+    for index, word in other_block_words.items():
+        if advertised_reply_contract(other_blocks[index]).requires_live_state:
+            other_blocks[index] = f"「{word}」未能确认读音或候选编码，请提供读音或具体编码。"
     items: List[Dict[str, Any]] = []
     for scope in scopes:
         reviewed = scope["reviewedState"]
