@@ -126,17 +126,37 @@ def readings_match(left: str, right: str) -> bool:
 
 
 def select_explicit_candidate_inventory(review, code: str, pinyin: str = ""):
-    """Resolve only a declared reading ambiguity using each trusted group's codes."""
+    """Bind the requested candidate to one reviewed reading, ignoring other chains."""
     matches = []
     failures = []
+    valid_unlisted_code = False
     for group in review.get("pronunciations") or []:
         if not isinstance(group, dict):
             continue
-        reading = str(group.get("pinyin") or "").strip()
-        if not reading or (pinyin and not readings_match(pinyin, reading)):
+        statuses = group.get("candidateStatuses")
+        codes = group.get("codes") or ([
+            status.get("code") for status in statuses if isinstance(status, dict)
+        ] if isinstance(statuses, list) else [])
+        if not isinstance(codes, list):
             continue
-        inventory = select_candidate_inventory({"pronunciations": [group]})
-        if inventory is None:
+        reading = str(group.get("pinyin") or "").strip()
+        if pinyin and not readings_match(pinyin, reading):
+            continue
+        if not reading:
+            if code in codes:
+                return None, f"编码 {code} 缺少可核验的读音候选"
+            continue
+        if statuses is None:
+            statuses = [
+                status for status in review.get("candidateStatuses") or []
+                if isinstance(status, dict) and status.get("code") in codes
+            ]
+        inventory = select_candidate_inventory({
+            "pronunciations": [{**group, "candidateStatuses": statuses}],
+        })
+        if inventory is None or (code in codes and code not in inventory.readings):
+            if code in codes:
+                return None, f"编码 {code} 缺少可核验的读音候选"
             continue
         state = SimpleNamespace(
             word=review["word"], phrase_type=review.get("type") or "Phrase",
@@ -144,15 +164,25 @@ def select_explicit_candidate_inventory(review, code: str, pinyin: str = ""):
             pronunciation_codes=dict(inventory.readings),
         )
         validation = validate_explicit_code(state, code, pinyin)
-        if validation.valid:
-            matches.append(inventory)
-        else:
+        if not validation.valid:
             failures.append(validation.reason)
+            continue
+        if code not in codes:
+            # Scheme validity supplies diagnostics, never group membership.
+            valid_unlisted_code = True
+            continue
+        matches.append((reading, inventory))
+    if pinyin:
+        exact_matches = [(reading, inventory) for reading, inventory in matches if reading == pinyin.strip()]
+        matches = exact_matches or matches
     if matches:
-        return matches[0], ""
-    if failures:
+        return matches[0][1], ""
+    if failures and not valid_unlisted_code:
         return None, failures[0]
-    return None, (f"指定读音 {pinyin} 不在可核验的候选读音中" if pinyin else "当前缺少可核验的读音候选")
+    return None, (
+        f"指定读音 {pinyin} 与编码 {code} 不在同一已审候选读音组中"
+        if pinyin else f"编码 {code} 不在已审读音候选组中"
+    )
 
 
 def validate_explicit_code(state, code: str, pinyin: str = "") -> ExplicitCodeValidation:

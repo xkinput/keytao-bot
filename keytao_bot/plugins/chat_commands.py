@@ -1266,29 +1266,11 @@ async def _try_handle_complete_add_command(
     word = str(command.get("word") or "").strip()
     if not word:
         return None
-    refreshed = await _try_handle_simple_single_word_query(
-        f"加词 {word}",
-        platform,
-        user_id,
-        conv_key,
-        space_key,
-        owner_label,
+    request = ExplicitEntryCodeRequest(word, str(command["code"]), submit_after=bool(command["submitAfter"]))
+    response = await _execute_explicit_entry_code_request(
+        request, f"添加 {word} {request.code}" + (" 并提交" if request.submit_after else ""),
+        platform, user_id, conv_key, space_key, owner_label,
     )
-    record = conversation_state_store.get_record(conv_key)
-    if record is None or not isinstance(record.state, PendingAddWord):
-        if refreshed:
-            note_rule_use("C:_try_handle_complete_add_command")
-        return refreshed
-    completed = await _try_handle_explicit_pending_replacement(
-        record.state,
-        message_text,
-        platform,
-        user_id,
-        conv_key,
-        space_key,
-        owner_label,
-    )
-    response = completed or refreshed
     if response:
         note_rule_use("C:_try_handle_complete_add_command")
     return response
@@ -13272,14 +13254,11 @@ async def _execute_explicit_entry_code_request(
         or (review.get("pronunciationUnresolved") is True and not resolvable_ambiguity)
     ):
         return f"未能取得「{request.word}」的已审读音和正确词条类型，本次未写入。"
-    if resolvable_ambiguity or request.pinyin:
-        from ..utils.explicit_code import select_explicit_candidate_inventory
+    from ..utils.explicit_code import select_explicit_candidate_inventory
 
-        inventory, failure = select_explicit_candidate_inventory(review, request.code, request.pinyin)
-        if failure:
-            return f"已收到「{request.word}」的编码 {request.code}；{failure}，本次未写入。"
-    else:
-        inventory = select_candidate_inventory(review)
+    inventory, failure = select_explicit_candidate_inventory(review, request.code, request.pinyin)
+    if failure:
+        return f"已收到「{request.word}」的编码 {request.code}；{failure}，本次未写入。"
     if inventory is None or any(
         not str(inventory.readings.get(code) or "").strip()
         for code, _occupied in inventory.candidates
