@@ -383,7 +383,20 @@ class SemanticAssentTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(self.store.begin_execution(record))
                 original = copy.deepcopy(record)
                 ctx = self.context("好", quoted=prompt, addressed=True, actor=actor, **options)
-                self.assertFalse(await self.chat._stage_understand_operation_early(ctx))
+                if actor != self.author:
+                    ctx.memory_context = harness.ChatMemoryContext(
+                        platform=actor.platform, user_id=actor.actor_id,
+                        space_type="group", space_id=actor.space_id, speaker_name="Offline owner",
+                    )
+                with patch.object(self.chat, "get_history", side_effect=lambda key: (
+                    self.history if key == self.author else []
+                )):
+                    handled = await self.chat._stage_understand_operation_early(ctx)
+                self.assertEqual(handled, scenario in {"other_owner", "space"})
+                if handled:
+                    self.assertEqual(ctx.response, "这条提议不是发给你的，本次未执行。")
+                    self.client.create.assert_not_awaited()
+                self.tool.assert_not_awaited()
                 self.assert_untouched(record, original)
 
     async def test_non_affirmative_extra_content_never_uses_bound_assent(self):
@@ -499,7 +512,7 @@ class SemanticAssentTests(unittest.IsolatedAsyncioTestCase):
                         patch.object(discovery, "_discovery", discovery.WordDiscovery(offers)),
                     ):
                         admitted = await discovery.discovery_reply_route(SimpleNamespace(), event, self.chat)
-                    self.assertEqual(admitted, scenario == "older_own_quote")
+                    self.assertEqual(admitted, None if scenario == "other_owner" else scenario == "older_own_quote")
                     self.assert_untouched(record, original)
 
 

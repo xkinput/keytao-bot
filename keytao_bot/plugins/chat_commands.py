@@ -4209,6 +4209,7 @@ _DRAFT_WRITE_RECEIPT_TOOLS = frozenset({
     "keytao_shift_phrase_code",
     "keytao_remove_draft_item",
     "keytao_batch_remove_draft_items",
+    "keytao_update_draft_item_weight",
 })
 
 
@@ -4218,25 +4219,40 @@ def _capture_successful_draft_write_delivery(
     platform: Optional[str],
     user_id: Optional[str],
 ) -> None:
-    """Keep an exact batch receipt until the corresponding reply is delivered."""
+    """Keep a successful operation receipt until its reply is delivered."""
     deliveries = current_draft_delivery_claims.get()
     if deliveries is None or not platform or not user_id:
         return
+    pending_items = []
+    if tool_name == "keytao_pending_items_by_words" and result.get("success") is True and result.get("complete") is True:
+        pending_items = trusted_pending_word_items(result.get("items"))
+    elif tool_name in _DRAFT_MUTATION_TOOLS and (result.get("success") is True or result.get("requiresConfirmation") is True):
+        pending_items = trusted_pending_word_items(result.get("pendingItems"))
+    if pending_items:
+        read_receipt = {
+            "platform": str(platform), "platformId": str(user_id),
+            "operationKind": "pending_read", "toolName": tool_name, "pendingItems": pending_items,
+        }
+        if read_receipt not in deliveries:
+            deliveries.append(read_receipt)
     is_write = tool_name in _DRAFT_WRITE_RECEIPT_TOOLS
     is_submit = tool_name == "keytao_submit_batch"
+    if is_submit and result.get("success") is not True:
+        return
     if not (is_write or is_submit) or not (result.get("success") is True or result.get("partialWrite") is True):
         return
     if result.get("requiresConfirmation") is True:
         return
     batch_id = str(result.get("batchId") or "").strip()
-    if not batch_id:
-        return
     receipt = {
         "platform": str(platform),
         "platformId": str(user_id),
         "operationKind": "draft_submit" if is_submit else "draft_write",
         "batchId": batch_id,
+        "toolName": tool_name,
     }
+    if is_submit:
+        receipt["autoApproved"] = result.get("autoApproved") is True
     if "writtenItems" in result or "updatedItems" in result:
         receipt["writeReceipt"] = {
             **{key: result[key] for key in (
@@ -4260,7 +4276,10 @@ def _capture_resolved_mutation_delivery(
     tool_name: str,
     platform: Optional[str],
     user_id: Optional[str],
+    result: Optional[Dict[str, Any]] = None,
 ) -> None:
+    if result is not None and result.get("success") is not True:
+        return
     deliveries = current_draft_delivery_claims.get()
     operation_kind = _DRAFT_RESOLUTION_TOOL_KINDS.get(tool_name)
     if deliveries is None or not operation_kind or not platform or not user_id:
@@ -4283,6 +4302,7 @@ def _capture_resolved_mutation_delivery(
             if not (
                 existing.get("platform") == str(platform)
                 and existing.get("platformId") == str(user_id)
+                and existing.get("operationKind") not in {"pending_read", "dictionary_approval", "ticket_replacement"}
             )
         ]
         return
@@ -4291,6 +4311,7 @@ def _capture_resolved_mutation_delivery(
         "platformId": str(user_id),
         "operationKind": operation_kind,
         "fingerprint": str(claim.get("fingerprint") or ""),
+        "toolName": tool_name,
     }
     deliveries[:] = [
         existing
@@ -4298,6 +4319,7 @@ def _capture_resolved_mutation_delivery(
         if not (
             existing.get("platform") == receipt["platform"]
             and existing.get("platformId") == receipt["platformId"]
+            and existing.get("operationKind") not in {"pending_read", "dictionary_approval", "ticket_replacement"}
         )
     ]
     if receipt["fingerprint"]:
@@ -4310,7 +4332,7 @@ def _acknowledge_delivered_draft_mutations(delivered_response: str = "") -> None
         return
     mutation_claims = [
         receipt for receipt in deliveries
-        if receipt.get("operationKind") not in {"draft_write", "draft_submit"}
+        if receipt.get("operationKind") in {"recall", "delete"}
     ]
     for receipt in mutation_claims:
         try:
@@ -4451,7 +4473,7 @@ async def call_tool_function(
             operation_links = current_draft_result_links.get()
             if operation_links is not None and tool_name in AUTHORITATIVE_LINK_TOOLS:
                 _capture_trusted_result_links(parsed_result, operation_links)
-            _capture_resolved_mutation_delivery(tool_name, platform, user_id)
+            _capture_resolved_mutation_delivery(tool_name, platform, user_id, parsed_result)
             _capture_successful_draft_write_delivery(
                 tool_name,
                 parsed_result,
@@ -9273,7 +9295,7 @@ async def _try_handle_dictionary_delete_command(
     space_key: Optional[Tuple[str, str]],
     owner_label: str,
 ) -> Optional[str]:
-    """Resolve a live dictionary row, then stage one typed Delete item."""
+    """Stage a live dictionary Delete, or remove an exact pending Create."""
     command = parse_dictionary_delete_command(message_text)
     if (
         command is None
@@ -9304,6 +9326,41 @@ async def _try_handle_dictionary_delete_command(
         if not command.code or entry["code"] == command.code
     ]
     if not matches:
+        draft_data = {}
+        if command.code:
+            try:
+                draft_data = await _fetch_current_draft_items(platform, user_id)
+            except Exception:
+                pass
+        if isinstance(draft_data, dict) and draft_data.get("not_bound"):
+            return _BIND_HELP_TEXT
+        draft_items = (
+            draft_data["items"]
+            if isinstance(draft_data, dict) and draft_data.get("success") is True
+            and isinstance(draft_data.get("items"), list) else []
+        )
+        draft_matches = [
+            item for item in draft_items
+            if isinstance(item, dict) and item.get("action") == "Create"
+            and _draft_item_word(item) == command.word
+            and item.get("code") == command.code
+        ]
+        if draft_matches:
+            targets = [_canonical_draft_delete_target(item) for item in draft_matches]
+            if len(targets) != 1 or any(target is None for target in targets):
+                return "草稿中有多条匹配记录或条目 ID 不完整，请先查看草稿；本次未执行删除。"
+            target = targets[0]
+            result = await _perform_exact_batch_remove(
+                [target["id"]], platform, user_id,
+                batch_id=str(draft_data.get("batchId") or ""),
+                source_content_version=draft_data.get("contentVersion"),
+                source_targets=[target],
+            )
+            if result.pending_state is not None and not conversation_state_store.set(
+                (platform, user_id), result.pending_state, space_key=space_key, owner_label=owner_label,
+            ):
+                return "草稿条目删除确认无法保存，本次未执行删除。"
+            return f"「{command.word}」@ {target['code']} 是草稿中的待添加条目。\n" + result.text
         qualifier = f" @ {command.code}" if command.code else ""
         return _assert_plain_user_facing_reply(
             f"词库没有可删除的「{command.word}」{qualifier}。"
@@ -9410,16 +9467,31 @@ async def _try_handle_replace_at_code_command(
         if entry["code"] != command.code
     ))
 
-    reviewed_reply = await _try_handle_simple_single_word_query(
-        command.new_word,
-        platform,
-        user_id,
-        conv_key,
-        space_key,
-        owner_label,
-        _literal_word=True,
-    )
-    record = conversation_state_store.get_record(conv_key)
+    previous = conversation_state_store.get_record(conv_key)
+    try:
+        reviewed_reply = await _try_handle_simple_single_word_query(
+            command.new_word,
+            platform,
+            user_id,
+            conv_key,
+            space_key,
+            owner_label,
+            _literal_word=True,
+        )
+    finally:
+        record = conversation_state_store.get_record(conv_key)
+        if (
+            previous is not None and isinstance(previous.state, PendingToolConfirm)
+            and previous.state.function_name == "keytao_submit_batch"
+            and record is not previous
+            and (record is None or (
+                not record.execution_id and isinstance(record.state, PendingAddWord)
+                and record.state.word == command.new_word
+            ))
+        ):
+            # Reviewing candidates is read-only; restore the exact original authorization before any write.
+            if not conversation_state_store.put_back(previous) and record is not None:
+                conversation_state_store.complete_execution(record)
     reviewed_state = record.state if record is not None else None
     if (
         not isinstance(reviewed_state, PendingAddWord)
@@ -9436,7 +9508,8 @@ async def _try_handle_replace_at_code_command(
         command.code,
     )
     if command.code not in candidates or not reviewed_pinyin:
-        conversation_state_store.delete(conv_key)
+        if conversation_state_store.get_record(conv_key) is record:
+            conversation_state_store.complete_execution(record)
         return _assert_plain_user_facing_reply(
             f"编码 {command.code} 不在「{command.new_word}」"
             "本轮服务端已核验的读音候选中；本次未生成替换计划。"
@@ -9468,7 +9541,8 @@ async def _try_handle_replace_at_code_command(
         items,
         phrase_type=target["type"],
     ):
-        conversation_state_store.delete(conv_key)
+        if conversation_state_store.get_record(conv_key) is record:
+            conversation_state_store.complete_execution(record)
         return render_remediation_reply(
             "替换计划未能与本轮词库记录完整对应；本次未写入"
         )
@@ -10557,7 +10631,44 @@ async def _try_handle_word_list_reorder_command(
     )
 
 
+def _announce_replaced_submit(previous, conv_key, response):
+    current = conversation_state_store.get_record(conv_key)
+    if (
+        response is not None and previous is not None
+        and isinstance(previous.state, PendingToolConfirm)
+        and previous.state.function_name == "keytao_submit_batch"
+        and current is not None and current is not previous
+        and current.owner_key == previous.owner_key
+    ):
+        deliveries = current_draft_delivery_claims.get()
+        receipt = {
+            "platform": current.owner_key.platform, "platformId": current.owner_key.actor_id,
+            "operationKind": "ticket_replacement", "nonce": current.nonce, "previousNonce": previous.nonce,
+        }
+        if deliveries is not None and receipt not in deliveries:
+            deliveries.append(receipt)
+        if "原待确认提交已取消" not in response:
+            return "原待确认提交已取消，已改为以下新操作。\n" + response
+    return response
+
+
 async def _try_handle_draft_management_command(
+    message_text: str,
+    platform: str,
+    user_id: str,
+    space_key: Optional[Tuple[str, str]] = None,
+    owner_label: str = "",
+    command_intent: Optional[MessageCommandIntent] = None,
+) -> Optional[str]:
+    conv_key = normalize_conversation_key((platform, user_id), space_key)
+    previous = conversation_state_store.get_record(conv_key)
+    response = await _try_handle_draft_management_command_core(
+        message_text, platform, user_id, space_key, owner_label, command_intent,
+    )
+    return _announce_replaced_submit(previous, conv_key, response)
+
+
+async def _try_handle_draft_management_command_core(
     message_text: str,
     platform: str,
     user_id: str,
@@ -12015,13 +12126,15 @@ async def try_handle_model_command(request, platform, user_id, conv_key, space_k
         space_key=space_key, owner_label=owner_label,
     ):
         return "确认计划无法保存，本次未写入。"
-    return _append_pending_ticket_challenge(
+    response = _append_pending_ticket_challenge(
         render_pending_understood_command(PendingToolConfirm("keytao_understood_command", args)),
         conv_key,
     )
+    return _announce_replaced_submit(record, conv_key, response)
 
 
 async def try_handle_model_command_options(options, explanation, conv_key, space_key, owner_label):
+    record = conversation_state_store.get_record(conv_key)
     args = {"options": []}
     for request in options:
         command = render_understood_command(request)
@@ -12035,7 +12148,8 @@ async def try_handle_model_command_options(options, explanation, conv_key, space
     state = PendingToolConfirm("keytao_understood_command", args)
     if not conversation_state_store.set(conv_key, state, space_key=space_key, owner_label=owner_label):
         return "候选方案无法保存，本次未写入。"
-    return render_pending_understood_command(state)
+    response = render_pending_understood_command(state)
+    return _announce_replaced_submit(record, conv_key, response)
 
 
 def _understood_command_options(state):
@@ -12256,8 +12370,12 @@ async def execute_model_command_direct(request, named_words, platform, user_id, 
     if record is not None and (
         record.owner_key != normalize_conversation_key(conv_key, space_key)
         or record.owner_key.platform != platform or record.owner_key.actor_id != str(user_id)
-        or not conversation_state_store.begin_execution(record)
-        or not conversation_state_store.complete_execution(record)
+    ):
+        return "原候选无法安全释放，本次未执行。"
+    if (
+        record is not None
+        and not (isinstance(record.state, PendingToolConfirm) and record.state.function_name == "keytao_submit_batch")
+        and (not conversation_state_store.begin_execution(record) or not conversation_state_store.complete_execution(record))
     ):
         return "原候选无法安全释放，本次未执行。"
     if request.op == "add":
@@ -12265,7 +12383,8 @@ async def execute_model_command_direct(request, named_words, platform, user_id, 
         command = render_understood_command(request)
         if not command:
             return "还没有核对出可执行的词条和编码；本次未写入。"
-        return await execute_understood_command(request, command, platform, user_id, conv_key, space_key, owner_label)
+        response = await execute_understood_command(request, command, platform, user_id, conv_key, space_key, owner_label)
+        return _announce_replaced_submit(record, conv_key, response)
     token = _semantic_direct_words.set(tuple(named_words))
     replacement = (
         (request.operands[0], request.codes[0])
@@ -12277,15 +12396,16 @@ async def execute_model_command_direct(request, named_words, platform, user_id, 
         if request.op == "swap":
             if len(request.operands) != 2 or len(set(request.operands)) != 2 or request.codes or request.submit_after:
                 return "还没有核对出唯一换位方案；本次未写入。"
-            return await try_handle_model_entry_swap(*request.operands, platform, user_id, space_key, owner_label)
-        command = render_understood_command(request)
-        if not command:
-            return "还没有核对出可执行的词条和编码；本次未写入。"
-        response = await execute_understood_command(request, command, platform, user_id, conv_key, space_key, owner_label)
+            response = await try_handle_model_entry_swap(*request.operands, platform, user_id, space_key, owner_label)
+        else:
+            command = render_understood_command(request)
+            if not command:
+                return "还没有核对出可执行的词条和编码；本次未写入。"
+            response = await execute_understood_command(request, command, platform, user_id, conv_key, space_key, owner_label)
         reviewed = conversation_state_store.get_record(conv_key)
         if reviewed is not record and isinstance(getattr(reviewed, "state", None), PendingAddWord):
             conversation_state_store.complete_execution(reviewed)
-        return response
+        return _announce_replaced_submit(record, conv_key, response)
     finally:
         _semantic_direct_replace_entry.reset(replacement_token)
         _semantic_direct_words.reset(token)
@@ -13098,7 +13218,12 @@ async def _execute_explicit_entry_code_request(
             assessment for assessment in derived.server_ordering_assessments
             if assessment.get("occupantCode") == request.code
         ]
-    if not conversation_state_store.set(conv_key, derived, space_key=space_key, owner_label=owner_label):
+    previous = conversation_state_store.get_record(conv_key)
+    preserve_submit = bool(
+        not prepare_only and previous is not None and isinstance(previous.state, PendingToolConfirm)
+        and previous.state.function_name == "keytao_submit_batch"
+    )
+    if not preserve_submit and not conversation_state_store.set(conv_key, derived, space_key=space_key, owner_label=owner_label):
         return "指定编码的核验记录未能保存，本次未写入。"
     if prepare_only:
         from .openai_chat import _render_live_single_candidate_record
@@ -13106,8 +13231,10 @@ async def _execute_explicit_entry_code_request(
         rendered = _render_live_single_candidate_record(conversation_state_store.get_record(conv_key))
         if not rendered:
             conversation_state_store.delete(conv_key)
+            if previous is not None and isinstance(previous.state, PendingToolConfirm) and previous.state.function_name == "keytao_submit_batch":
+                conversation_state_store.put_back(previous)
             return "指定编码的候选展示未能通过核验，本次未写入。"
-        return "已重新核验指定编码，本次尚未写入。\n" + rendered
+        return _announce_replaced_submit(previous, conv_key, "已重新核验指定编码，本次尚未写入。\n" + rendered)
     existing_codes = tuple(dict.fromkeys(
         row["code"] for row in review.get("existing", [])
         if isinstance(row, dict) and row.get("word") == request.word
@@ -13123,10 +13250,19 @@ async def _execute_explicit_entry_code_request(
     )
     capability_token = _current_explicit_additional_code.set(capability)
     try:
-        response = await handle_pending_message_core(
-            message, platform, user_id, conv_key,
-            space_key=space_key, owner_label=owner_label, allow_intent_model=False,
-        )
+        if preserve_submit:
+            intent = _structural_pending_add_word_intent(message, derived)
+            if intent is None:
+                return "指定编码未能与已审记录绑定，本次未写入。"
+            response = await _handle_pending_add_word(
+                derived, message, platform, user_id, [], space_key, owner_label,
+                intent, lambda: None,
+            )
+        else:
+            response = await handle_pending_message_core(
+                message, platform, user_id, conv_key,
+                space_key=space_key, owner_label=owner_label, allow_intent_model=False,
+            )
     finally:
         _current_explicit_additional_code.reset(capability_token)
     if response is None:

@@ -1287,6 +1287,9 @@ def _message_authorizes_pending_control(
         )
     if command_intent.intent == "pending_code_request":
         code = command_intent.requested_code
+        compact = _compact_command_text(
+            _normalize_pending_candidate_selection_text(message_text)
+        ).lower()
         code_match = re.fullmatch(
             r"(?:(?:用|以|选|改成)|"
             r"(?:确认)?(?:加|添加)(?:用|以|选|改成)?|"
@@ -1621,6 +1624,7 @@ def _structural_pending_add_word_intent(
             reply_number.group("selector")
             + ("并提交" if reply_number.group("submit") else "")
         )
+    stripped = _normalize_pending_candidate_selection_text(stripped)
     compact = _compact_command_text(stripped).lower()
     if not compact:
         return None
@@ -1649,13 +1653,21 @@ def _structural_pending_add_word_intent(
                 for index in multi_selection.indices
             )
         if (
-            not multi_selection.submit_after
-            and not multi_selection.recode_indices
+            not multi_selection.recode_indices
             and len(multi_selection.indices) == 1
+            and (
+                not multi_selection.submit_after
+                or not 1 <= multi_selection.indices[0] <= len(state.candidates)
+            )
         ):
             return MessageCommandIntent(
-                intent="pending_choice",
+                intent=(
+                    "pending_add_and_submit"
+                    if multi_selection.submit_after
+                    else "pending_choice"
+                ),
                 confidence=1.0,
+                submit_after=multi_selection.submit_after,
                 choice_index=multi_selection.indices[0],
             )
         if (
@@ -1841,10 +1853,27 @@ def message_authorizes_live_pending_mutation(
     return _message_authorizes_pending_control(message_text, intent)
 
 
+def _normalize_pending_candidate_selection_text(text: str) -> str:
+    """Normalize discovery labels and a closed trailing add assent."""
+    source = unicodedata.normalize("NFKC", str(text or "")).strip()
+    source = re.sub(r"^(?:选)?(?:编号|编码)\s*", "", source, count=1)
+    selection, separator, action = source.rpartition(",")
+    if separator:
+        assent = parse_pending_assent_phrase(action)
+        if (
+            assent.matched
+            and assent.add_requested
+            and parse_pending_candidate_selection(selection) is not None
+        ):
+            source = selection + ("并提交" if assent.submit_after else "")
+    return source
+
+
 def _closed_candidate_selection(
     text: str,
 ) -> Optional[Tuple[Tuple[int, ...], Tuple[str, ...], bool]]:
     """Parse the exact numbered/code selection forms advertised in discovery."""
+    text = _normalize_pending_candidate_selection_text(text)
     parsed = parse_pending_candidate_selection(text)
     if parsed is not None:
         if parsed.recode_indices:

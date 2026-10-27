@@ -18,7 +18,6 @@ from nonebot.log import logger
 
 from .conversation import ConversationAddress
 from ..utils.pinyin_reference import reference_db_path
-from ..utils.pending_confirmation import PENDING_CONFIRM_ADVERTISED_FORMS
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 
 
@@ -763,6 +762,57 @@ def schedule_discovery(bot, event, chat, *, addressed=False):
         return False
 
 
+def _discovery_reply_control(message_text, state, chat):
+    text = message_text.strip()
+    for prefix in ("@" + chat.GROUP_TRIGGER_KEYWORD_ANY, "@" + chat.GROUP_TRIGGER_KEYWORD_START,
+                   chat.GROUP_TRIGGER_KEYWORD_ANY, chat.GROUP_TRIGGER_KEYWORD_START):
+        if text.startswith(prefix):
+            text = text[len(prefix):].lstrip(" \t:：，,")
+            break
+    affirmative = chat._chat_routing.normalize_affirmative_reply(text)
+    if affirmative:
+        text = affirmative
+    selection = chat._chat_routing._closed_candidate_selection(text)
+    selected = bool(selection is not None
+                    and all(1 <= index <= len(state.server_candidates) for index in selection[0])
+                    and all(code in dict(state.server_candidates) for code in selection[1]))
+    assent = (chat._chat_routing._pending_tool_assent_intent(state, "确认" if affirmative else text)
+              if not text.startswith("@") else None)
+    accepted_assent = bool(assent is not None and (
+        affirmative or assent.intent in {"pending_add_and_submit", "pending_cancel"}
+    ))
+    return text, affirmative, selected or accepted_assent
+
+
+async def handle_discovery_reply(bot, event, chat):
+    """Apply discovery side effects only after a foreground handler starts."""
+    if os.getenv("KEYTAO_WORD_DISCOVERY") != "1" or not getattr(event, "group_id", None):
+        return False
+    if await _discovery._handle_opt_out(bot, event, chat):
+        return True
+    address = ConversationAddress.group("qq", str(event.group_id), str(event.get_user_id()))
+    record = chat.conversation_state_store.get_record(address)
+    from .state import PendingAddWord
+
+    if record is None or record.execution_id or not isinstance(record.state, PendingAddWord):
+        return False
+    await _discovery._ensure_store(chat)
+    if not await asyncio.to_thread(_discovery.store.is_offer, address, record.nonce):
+        return False
+    message_text = event.get_plaintext().strip()
+    _text, _affirmative, control = _discovery_reply_control(message_text, record.state, chat)
+    if control:
+        return False
+    addressed = (await chat.to_me()(bot, event, {})
+                 or chat.GROUP_TRIGGER_KEYWORD_ANY in message_text
+                 or message_text.startswith(chat.GROUP_TRIGGER_KEYWORD_START))
+    if addressed and chat.conversation_state_store.get_record(address) is record:
+        if (not chat.conversation_state_store.complete_execution(record)
+                and chat.conversation_state_store.get_record(address) is record):
+            return True
+    return False
+
+
 async def discovery_reply_route(bot, event, chat):
     """Admit bound discovery controls while preserving vote-receipt priority."""
     if os.getenv("KEYTAO_WORD_DISCOVERY") != "1":
@@ -775,8 +825,6 @@ async def discovery_reply_route(bot, event, chat):
                 and community_vote._is_assent(event.get_plaintext())
                 and community_vote.get_store().resolve("qq", str(event.group_id), vote_reply_id) is not None):
             return True
-        if await _discovery._handle_opt_out(bot, event, chat):
-            return False
         address = ConversationAddress.group("qq", str(event.group_id), str(event.get_user_id()))
         record = chat.conversation_state_store.get_record(address)
         from .state import PendingAddWord
@@ -791,40 +839,39 @@ async def discovery_reply_route(bot, event, chat):
         quoted_offer = reply_id and await asyncio.to_thread(
             _discovery.store.is_offer_message, address, reply_id,
         )
-        if (record is None or not isinstance(record.state, PendingAddWord)
-                or not await asyncio.to_thread(_discovery.store.is_offer, address, record.nonce)):
-            return False if quoted_offer else None
         message_text = event.get_plaintext().strip()
-        text = message_text
-        for prefix in ("@" + chat.GROUP_TRIGGER_KEYWORD_ANY, "@" + chat.GROUP_TRIGGER_KEYWORD_START,
-                       chat.GROUP_TRIGGER_KEYWORD_ANY, chat.GROUP_TRIGGER_KEYWORD_START):
-            if text.startswith(prefix):
-                text = text[len(prefix):].lstrip(" \t:：，,")
-                break
-        affirmative = chat._chat_routing.normalize_affirmative_reply(text)
-        if affirmative:
-            text = affirmative
-        answers = {*chat._chat_routing.AFFIRMATIVE_REPLY_TEXTS, *PENDING_CONFIRM_ADVERTISED_FORMS, "取消"}
-        candidates = record.state.server_candidates
-        answers.update(str(index) for index in range(1, len(candidates) + 1))
-        answers.update(code for code, _ in candidates)
-        addressed = (reply is None or text not in answers) and (
+        if (message_text.rstrip("。！! ") in _OPT_OUT
+                and (reply_id or getattr(event, "to_me", False))
+                and await asyncio.to_thread(
+                    _discovery.store.is_offer, address,
+                    record.nonce if record and not reply_id else "", reply_id,
+                )):
+            return True
+        live_offer = (record is not None and isinstance(record.state, PendingAddWord)
+                      and await asyncio.to_thread(_discovery.store.is_offer, address, record.nonce))
+        _text, affirmative, control = (
+            _discovery_reply_control(message_text, record.state, chat)
+            if live_offer else (message_text, "", False)
+        )
+        addressed = (reply is None or not control) and (
             await chat.to_me()(bot, event, {})
             or chat.GROUP_TRIGGER_KEYWORD_ANY in message_text
             or message_text.startswith(chat.GROUP_TRIGGER_KEYWORD_START)
         )
-        if text not in answers:
-            if not addressed:
-                return False
-            # Retire this exact offer before normal routing can infer assent.
-            if (not chat.conversation_state_store.complete_execution(record)
-                    and chat.conversation_state_store.get_record(address) is record):
-                return False
-            return None
+        if not live_offer:
+            return False if quoted_offer and not addressed else None
+        if not control:
+            return None if addressed else False
         if reply is not None:
             if not reply_id or not await asyncio.to_thread(
                 _discovery.store.is_offer, address, record.nonce, reply_id,
             ):
+                if quoted_offer and (
+                    await chat.to_me()(bot, event, {})
+                    or chat.GROUP_TRIGGER_KEYWORD_ANY in message_text
+                    or message_text.startswith(chat.GROUP_TRIGGER_KEYWORD_START)
+                ):
+                    return None
                 return False
         elif not addressed:
             return False
@@ -834,9 +881,7 @@ async def discovery_reply_route(bot, event, chat):
                 return False
         if record.execution_id:
             return False
-        intent = (chat._chat_routing._closed_candidate_selection(text)
-                  or chat._chat_routing._pending_tool_assent_intent(record.state, "确认" if affirmative else text))
-        return intent is not None and chat.conversation_state_store.get_record(address) is record
+        return chat.conversation_state_store.get_record(address) is record
     except Exception as error:
         logger.warning("[word_discovery] reply skipped: %s", type(error).__name__)
         return False

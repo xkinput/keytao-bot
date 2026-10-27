@@ -843,6 +843,20 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.pending.get_record(self.actor))
         self.assertEqual(self.tools.await_count, 2)
 
+    async def test_opt_out_rule_repeats_without_writing_preferences_or_consuming_ticket(self):
+        record = await self.offer()
+        event = FakeEvent("别问我")
+        event.reply = types.SimpleNamespace(message_id="400")
+        event.to_me = True
+        with qq_runtime(self.chat, self.bot) as bot, patch.object(discovery, "_discovery", self.discovery):
+            self.assertTrue(await self.chat.should_handle(bot, event))
+            self.assertTrue(await self.chat.should_handle(bot, event))
+            self.assertIs(self.pending.get_record(self.actor), record)
+            self.assertFalse(self.store.opted_out(self.actor))
+            self.assertTrue(await discovery.handle_discovery_reply(bot, event, self.chat))
+        self.assertIsNone(self.pending.get_record(self.actor))
+        self.assertTrue(self.store.opted_out(self.actor))
+
     async def test_ordinary_opt_out_phrase_without_offer_does_not_persist_preference(self):
         await self.offer(FakeEvent("别问我"))
         self.assertTrue(self.store.eligible(self.actor))
@@ -951,16 +965,95 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIs(self.pending.get(other), normal)
                     self.pending.delete(other)
 
-    async def test_addressed_non_closed_answers_release_offer_before_normal_handling(self):
+    async def test_all_advertised_offer_controls_survive_repeated_group_rules_until_resolver(self):
+        messages = (
+            *sorted(self.chat._chat_routing.AFFIRMATIVE_REPLY_TEXTS),
+            "加入并提交", "选编号 2", "编号 2", "编码 wja", "2", "wja", "添加2", "添加 2",
+            "添加2、4", "添加2，加入", "取消",
+        )
+        original_reviewed = reviewed
+
+        def four_candidates(word):
+            payload = original_reviewed(word)
+            payload["pronunciations"][0]["candidateStatuses"].extend([
+                {"code": code, "occupied": False, "label": "空位", "words": []}
+                for code in ("wjb", "wjc")
+            ])
+            return payload
+
+        resolver = self.chat.handle_pending_message_core
+        for index, message in enumerate(messages):
+            with self.subTest(message=message):
+                self.pending.delete(self.actor)
+                self.store = discovery.DiscoveryStore(self.root / f"all-controls-{index}.db")
+                self.discovery = discovery.WordDiscovery(self.store, reference_path=self.reference)
+                with patch(__name__ + ".reviewed", side_effect=four_candidates):
+                    record = await self.offer()
+                event = FakeEvent(message)
+                event.reply = types.SimpleNamespace(message_id="400")
+                event.to_me = True
+                add = AsyncMock(return_value="offline addition")
+                add_submit = AsyncMock(return_value="offline addition and submit")
+                add_multi = AsyncMock(return_value="offline multiple additions")
+
+                async def resolve_with_live_ticket(*args, **kwargs):
+                    self.assertIs(self.pending.get_record(self.actor), record)
+                    return await resolver(*args, **kwargs)
+
+                with (
+                    qq_runtime(self.chat, self.bot) as bot,
+                    patch.object(discovery, "_discovery", self.discovery),
+                    patch.object(self.chat, "_execute_add_to_draft", add),
+                    patch.object(self.chat, "_execute_add_to_draft_and_submit", add_submit),
+                    patch.object(self.chat, "_execute_add_multiple_codes_to_draft", add_multi),
+                    patch.object(self.chat, "handle_pending_message_core", AsyncMock(side_effect=resolve_with_live_ticket)),
+                    patch.object(self.chat, "remember_conversation"),
+                    patch.object(self.chat, "_finish_ai_chat_response", AsyncMock()),
+                ):
+                    self.assertTrue(await self.chat.should_handle(bot, event))
+                    self.assertTrue(await self.chat.should_handle(bot, event))
+                    self.assertIs(self.pending.get_record(self.actor), record)
+                    self.assertFalse(await discovery.handle_discovery_reply(bot, event, self.chat))
+                    ctx = self.chat.TurnContext(
+                        bot=bot, event=event, platform="qq", user_id="100",
+                        message_text=message, normalized_message_text=message,
+                        conv_key=self.actor, space_key=self.actor.space_key,
+                        owner_label="Offline sender", history=self.history,
+                        memory_context=types.SimpleNamespace(space_type="group"),
+                        reply_reference=harness.ReplyReferenceInfo(
+                            is_reply=True, is_to_bot=True,
+                            text=self.chat._get_latest_assistant_message(self.history),
+                        ),
+                    )
+                    self.assertTrue(await self.chat._try_bound_pending_reply(ctx))
+                self.assertIsNotNone(ctx.response)
+                if message == "加入并提交":
+                    add_submit.assert_awaited_once()
+                    add.assert_not_awaited()
+                    self.assertEqual(add_submit.await_args.args[:2], ("午时", "wj"))
+                elif message == "添加2、4":
+                    add_multi.assert_awaited_once()
+                elif message != "取消":
+                    add.assert_awaited_once()
+                    expected_code = "wja" if message in {
+                        "选编号 2", "编号 2", "编码 wja", "2", "wja", "添加2", "添加 2", "添加2，加入",
+                    } else "wj"
+                    self.assertEqual(add.await_args.args[:2], ("午时", expected_code))
+
+    async def test_addressed_non_closed_answers_release_only_in_handler(self):
         cases = (
             ("@喵喵 查一下 你好", None),
             ("@喵喵 查一下 你好", "different-message"),
             ("查一下 你好", None),
             ("查一下 你好", "different-message"),
-            *((text, None) for text in ("好的呀哈哈", "加吧", "3", "unknown", "1并提交")),
+            *((text, None) for text in (
+                "无关的话题", "好的呀哈哈", "加吧", "3", "unknown",
+                "添加2，加入别词", "添加2，加入？", "选编号 2 删除别词",
+            )),
         )
         for index, (text, reply_id) in enumerate(cases):
             with self.subTest(text=text, reply_id=reply_id):
+                self.pending.delete(self.actor)
                 self.store = discovery.DiscoveryStore(self.root / f"addressed-{index}.db")
                 self.discovery = discovery.WordDiscovery(self.store, reference_path=self.reference)
                 await self.offer()
@@ -972,12 +1065,16 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                     qq_runtime(self.chat, self.bot) as bot,
                     patch.object(discovery, "_discovery", self.discovery),
                 ):
+                    record = self.pending.get_record(self.actor)
                     self.assertTrue(await self.chat.should_handle(bot, event))
+                    self.assertTrue(await self.chat.should_handle(bot, event))
+                    self.assertIs(self.pending.get_record(self.actor), record)
+                    self.assertFalse(await discovery.handle_discovery_reply(bot, event, self.chat))
                     self.assertIsNone(self.pending.get_record(self.actor))
                 self.assertEqual(event.text, text)
                 self.assertEqual(event.reply.message_id if event.reply else None, reply_id)
 
-    async def test_addressed_non_closed_route_is_neutral_only_after_offer_removal(self):
+    async def test_addressed_non_closed_rule_never_attempts_offer_removal(self):
         record = await self.offer()
         event = FakeEvent("@喵喵 查一下 你好")
         event.to_me = True
@@ -985,10 +1082,14 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             qq_runtime(self.chat, self.bot) as bot,
             patch.object(discovery, "_discovery", self.discovery),
         ):
-            with patch.object(self.pending, "_delete_persisted", return_value=False):
-                self.assertFalse(await discovery.discovery_reply_route(bot, event, self.chat))
+            with patch.object(self.pending, "complete_execution", side_effect=AssertionError("Rule consumed ticket")):
+                self.assertIsNone(await discovery.discovery_reply_route(bot, event, self.chat))
+                self.assertIsNone(await discovery.discovery_reply_route(bot, event, self.chat))
                 self.assertIs(self.pending.get_record(self.actor), record)
-            self.assertIsNone(await discovery.discovery_reply_route(bot, event, self.chat))
+            with patch.object(self.pending, "_delete_persisted", return_value=False):
+                self.assertTrue(await discovery.handle_discovery_reply(bot, event, self.chat))
+                self.assertIs(self.pending.get_record(self.actor), record)
+            self.assertFalse(await discovery.handle_discovery_reply(bot, event, self.chat))
             self.assertIsNone(self.pending.get_record(self.actor))
 
     async def test_addressed_non_closed_reply_never_deletes_a_different_ticket(self):
@@ -1058,7 +1159,7 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIs(self.pending.get_record(self.actor), record)
                     self.assertEqual(record, original)
 
-    async def test_retired_offer_quotes_and_store_errors_fail_closed(self):
+    async def test_addressed_retired_offer_quotes_enter_normal_handling(self):
         await self.offer()
         reply = FakeEvent("好")
         reply.to_me = True
@@ -1067,9 +1168,19 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(self.store, "is_offer", side_effect=sqlite3.OperationalError("Offline read failure")):
                 self.assertFalse(await self.chat.should_handle(bot, reply))
             self.pending.delete(self.actor)
-            self.assertFalse(await self.chat.should_handle(bot, reply))
+            self.assertTrue(await self.chat.should_handle(bot, reply))
             reply.user_id = "101"
-            self.assertFalse(await self.chat.should_handle(bot, reply))
+            self.assertTrue(await self.chat.should_handle(bot, reply))
+            replacement = self.pending.set(
+                self.actor, PendingAddWord("阳光", "yg", [("yg", False)], server_candidates=[("yg", False)]),
+            )
+            self.assertTrue(replacement)
+            record = self.pending.get_record(self.actor)
+            self.assertTrue(self.store.claim(self.actor, "阳光"))
+            self.store.bind_offer(self.actor, "阳光", record.nonce, "new-offer")
+            reply.user_id = "100"
+            self.assertTrue(await self.chat.should_handle(bot, reply))
+            self.assertIs(self.pending.get_record(self.actor), record)
 
     async def test_failed_preparation_render_and_send_leave_quota_and_word_available(self):
         for failure in ("prepare", "render", "send"):
@@ -1208,7 +1319,9 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(entered.wait(), timeout=1)
                 opt_out = FakeEvent("别问我", group="old-group")
                 opt_out.reply = types.SimpleNamespace(message_id="old-offer-message")
-                self.assertFalse(await discovery.discovery_reply_route(self.bot, opt_out, self.chat))
+                self.assertTrue(await discovery.discovery_reply_route(self.bot, opt_out, self.chat))
+                self.assertFalse(discovery.DiscoveryStore(self.store.path).opted_out(self.actor))
+                self.assertTrue(await discovery.handle_discovery_reply(self.bot, opt_out, self.chat))
                 self.assertTrue(discovery.DiscoveryStore(self.store.path).opted_out(self.actor))
             finally:
                 resume.set()

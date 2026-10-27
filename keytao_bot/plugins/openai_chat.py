@@ -81,7 +81,7 @@ from ..utils.image_input import (
 )
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver as _user_resolver
-from ..utils.community_vote import _stage_community_vote
+from ..utils import community_vote as _community_vote
 from ..utils.observability import (
     begin_turn_metrics,
     emit_turn_metrics,
@@ -2841,6 +2841,8 @@ def _append_unreported_submit_status(
     prepared: str,
     deliveries: List[Dict[str, Any]],
     conv_key: Optional[ConversationKey],
+    *,
+    platform: Optional[str] = None,
 ) -> str:
     """Never end a 提交 turn with a write receipt that is silent about the submit.
 
@@ -2848,6 +2850,57 @@ def _append_unreported_submit_status(
     facts: the batch was submitted, a live ticket is still asking about it, or
     the plain reason it was not submitted.
     """
+    platform = platform or (normalize_conversation_key(conv_key).platform if conv_key is not None else "web")
+    claim_text = prepared
+    record = conversation_state_store.get_record(conv_key) if conv_key is not None else None
+    if (
+        record is not None and isinstance(record.state, PendingToolConfirm)
+        and _state.pending_duplicate_confirmation_is_complete(record.state)
+    ):
+        # This exact server-backed prompt describes earlier submissions.
+        prompt = strip_warning_count_copy(_chat_render._format_pending_duplicate_confirmation(record.state))
+        claim_text = claim_text.replace(prompt, "")
+        claim_text = claim_text.replace(render_platform_public_links(prompt, platform), "")
+    for receipt in deliveries:
+        if receipt.get("operationKind") == "pending_read":
+            for item in receipt.get("pendingItems", []):
+                reminder = _chat_commands.prepend_pending_word_reminders("", [item]).strip()
+                if reminder:
+                    claim_text = claim_text.replace(reminder, "")
+                    claim_text = claim_text.replace(render_platform_public_links(reminder, platform), "")
+    submit_receipts = [receipt for receipt in deliveries if receipt.get("operationKind") == "draft_submit"]
+    claim_receipts = {
+        "submit": bool(submit_receipts),
+        "dictionary": any(receipt.get("operationKind") == "dictionary_approval" for receipt in deliveries) or any(
+            receipt.get("autoApproved") is True
+            or receipt.get("writeReceipt", {}).get("autoApproved") is True
+            for receipt in submit_receipts
+        ),
+        "write": any(receipt.get("operationKind") == "draft_write" for receipt in deliveries),
+        "delete": any(
+            receipt.get("operationKind") == "delete"
+            or receipt.get("toolName") in {"keytao_remove_draft_item", "keytao_batch_remove_draft_items"}
+            for receipt in deliveries
+        ),
+    }
+    for kind, pattern in (
+        ("submit", r"已(?:经)?(?:成功)?(?:为你)?(?:重新)?提交|提交成功|审核中"),
+        ("dictionary", r"已(?:经)?(?:加入|写入)词库|已入库|入库成功|(?:已)?审核通过|已通过审核|已批准|批准成功"),
+        ("write", r"已(?:经)?(?:成功)?写入(?!词库)|写入成功|已加入草稿|(?:已添加|添加成功|已更新|更新成功)(?=[^。！？\n]{0,20}(?:草稿|词库|批次|条目|编码))"),
+        ("delete", r"已(?:经)?(?:成功)?(?:删除|移除)|(?:删除|移除)成功"),
+    ):
+        if claim_receipts[kind]:
+            continue
+        for match in re.finditer(r"(?<![未没不无])(?:" + pattern + r")", claim_text):
+            prefix = re.split(r"[\n。！？；]", claim_text[:match.start()])[-1].strip()
+            prefix = re.sub(r"^(?:好的|好|收到)[，,：:]\s*", "", prefix)
+            # Describing an existing batch or word is not a receipt for this turn.
+            current_action = re.match(r"(?:✅|本次|本轮|现在|刚刚|现已|我(?:$|已)|已确认)", prefix)
+            bare_result = prefix in {"", "批次", "整批", "草稿"} and match.group() != "审核中"
+            if current_action or bare_result:
+                return "本次没有可核验的对应操作成功回执，无法确认操作已完成；请查看草稿核对。"
+    if not claim_receipts["write"]:
+        return prepared
     asked_to_submit = parse_pending_assent_phrase(_current_turn_message.get(""))
     if (
         not asked_to_submit.submit_after
@@ -2942,11 +2995,12 @@ def _prepare_user_facing_reply(
         )
         prepared = _enforce_advertised_reply_contract(prepared, conv_key)
     prepared = strip_warning_count_copy(prepared)
-    deliveries = [receipt for receipt in current_draft_delivery_claims.get() or []
-                  if memory_context is not None
-                  and receipt.get("platform") == platform
-                  and receipt.get("platformId") == memory_context.user_id
-                  and receipt.get("operationKind") in {"draft_write", "draft_submit"}
+    own_deliveries = [receipt for receipt in current_draft_delivery_claims.get() or []
+                     if memory_context is not None
+                     and receipt.get("platform") == platform
+                     and receipt.get("platformId") == memory_context.user_id]
+    deliveries = [receipt for receipt in own_deliveries
+                  if receipt.get("operationKind") in {"draft_write", "draft_submit"}
                   and receipt.get("batchId")]
     if deliveries:
         from .chat_render import finalize_draft_receipt
@@ -2959,7 +3013,7 @@ def _prepare_user_facing_reply(
             prepared = finalize_draft_receipt(prepared, *reversed(deltas), platform=platform)
         for receipt in deliveries:
             if receipt.get("operationKind") == "draft_submit":
-                status = ("✅ 批次已加入词库。" if receipt.get("writeReceipt", {}).get("autoApproved")
+                status = ("✅ 批次已加入词库。" if receipt.get("autoApproved") or receipt.get("writeReceipt", {}).get("autoApproved")
                           else "✅ 批次已提交审核。")
                 if status not in prepared:
                     prepared += "\n" + status
@@ -2968,11 +3022,26 @@ def _prepare_user_facing_reply(
         ) for receipt in deliveries))
         prepared = _dedupe_authoritative_link_lines(prepared)
         prepared = "\n".join([prepared, *filter(None, link_lines)])
-        prepared = _append_unreported_submit_status(prepared, deliveries, conv_key)
+    from ..utils import community_vote
+    vote_deliveries = [
+        {"operationKind": "draft_submit", "batchId": receipt["batchId"]}
+        for receipt in tuple(community_vote._pending_receipts.get() or ())
+        if receipt.get("batchUrl") and (
+            receipt["batchUrl"] in prepared or render_platform_public_links(receipt["batchUrl"], platform) in prepared
+        )
+        and community_vote.submitted_vote_receipt(receipt)
+    ] if community_vote.enabled() else []
+    prepared = _append_unreported_submit_status(prepared, [*own_deliveries, *vote_deliveries], conv_key, platform=platform)
     prepared = render_platform_public_links(prepared, platform)
     prepared = strip_bare_batch_ids(prepared)
-    from ..utils.community_vote import prepare_delivery
-    prepared = prepare_delivery(prepared, memory_context)
+    prepared = community_vote.prepare_delivery(prepared, memory_context)
+    if live_record is not None and any(
+        receipt.get("operationKind") == "ticket_replacement" and receipt.get("nonce") == live_record.nonce
+        for receipt in own_deliveries
+    ):
+        notice = "原待确认提交已取消，已改为以下新操作。"
+        if notice not in prepared:
+            prepared = notice + "\n" + prepared
     if live_record is not None and not live_record.execution_id and (
         (
             advertised_reply_contract(prepared).requires_live_state
@@ -3143,6 +3212,16 @@ async def _run_background_draft_operation(
             )
             return
         current_operation.trusted_links = dict(operation_links)
+        if result.success is True and result.pending_state is None and operation.kind in {
+            "submit", "add_and_submit", "batch_add_and_submit",
+        }:
+            # Structured background results remain receipts even without a batch link.
+            receipts = current_draft_delivery_claims.get()
+            for kind in ("draft_submit", "draft_write") if operation.kind != "submit" else ("draft_submit",):
+                receipts.append({
+                    "platform": memory_context.platform, "platformId": memory_context.user_id,
+                    "operationKind": kind, "autoApproved": (result.data or {}).get("autoApproved") is True,
+                })
         if result.pending_state is not None:
             draft_operation_coordinator.mark_awaiting_confirmation(
                 conv_key,
@@ -3759,6 +3838,52 @@ async def _stage_initialize_conversation(ctx: TurnContext) -> bool:
     return await _stage_community_vote(ctx)
 
 
+async def _stage_community_vote(ctx: TurnContext) -> bool:
+    """Record direct community approval receipts before the common delivery guard."""
+    _community_vote._pending_receipts.set([])
+    if not _community_vote.enabled():
+        return False
+    _community_vote.install_delivery_hook()
+    memory = ctx.memory_context
+    if (memory is None or memory.space_type != "group" or not ctx.reply_reference.is_reply
+            or not _community_vote._is_assent(ctx.message_text)):
+        return False
+    if ctx.platform == "qq":
+        message_id = extract_onebot_reply_id(ctx.event)
+    elif ctx.platform == "telegram":
+        message_id = getattr(getattr(ctx.event, "reply_to_message", None), "message_id", None)
+    else:
+        return False
+    store = _community_vote.get_store()
+    if message_id is None or store.resolve(ctx.platform, memory.space_id, message_id) is None:
+        return False
+    tool = skills_manager.get_tool_function("_community_approve_submitted_batch")
+    if tool is None:
+        ctx.response = "投票批准暂时不可用，请稍后重试"
+    else:
+        async def approve(platform, user_id, batch_id, voters, version):
+            result = await tool(platform, user_id, batch_id, voters, version)
+            if result.get("success") is True:
+                receipts = current_draft_delivery_claims.get()
+                if receipts is None:
+                    receipts = []
+                    current_draft_delivery_claims.set(receipts)
+                receipts.append({
+                    "platform": ctx.platform, "platformId": ctx.user_id,
+                    "operationKind": "dictionary_approval", "batchId": batch_id,
+                    "contentVersion": version, "toolName": "_community_approve_submitted_batch",
+                })
+            return result
+
+        ctx.response = await _community_vote.record_vote(
+            store, ctx.platform, memory.space_id, message_id, ctx.user_id, ctx.owner_label,
+            lookup=_community_vote.find_user_by_platform, approve=approve,
+        )
+    if ctx.response:
+        await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, memory, ctx.response, ctx.QQMessageSegment)
+    return True
+
+
 async def _stage_handle_commonness_query(ctx: TurnContext) -> bool:
     """Answer bounded commonness queries before any intent-model call."""
     from ..utils.commonness_query import commonness_query_reply
@@ -3775,6 +3900,16 @@ async def _stage_handle_commonness_query(ctx: TurnContext) -> bool:
         ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment,
     )
     return True
+
+
+async def _stage_handle_discovery_reply(ctx: TurnContext) -> bool:
+    """Release discovery offers only after the message matcher has admitted a turn."""
+    if ctx.platform != "qq":
+        return False
+    import sys
+    from ..harness.word_discovery import handle_discovery_reply
+
+    return await handle_discovery_reply(ctx.bot, ctx.event, sys.modules[__name__])
 
 
 async def _stage_handle_explicit_draft_conversation_reset(ctx: TurnContext) -> bool:
@@ -3849,7 +3984,7 @@ async def _stage_handle_completed_draft_undo(ctx: TurnContext) -> bool:
     return True
 
 
-async def _stage_claim_offered_answer(ctx: TurnContext) -> bool:
+async def _stage_claim_offered_answer(ctx: TurnContext, *, stale_affirmative: bool = False) -> bool:
     """Keep the actor's previous offered answer out of word discovery."""
     if getattr(ctx, "semantic_pending_released", False):
         return False
@@ -3862,7 +3997,7 @@ async def _stage_claim_offered_answer(ctx: TurnContext) -> bool:
 
     history = get_history(ctx.conv_key)
     force = is_force_assent(ctx.normalized_message_text)
-    closed_assent = ctx.normalized_message_text.strip().rstrip("。.!！") in {
+    closed_assent = stale_affirmative or ctx.normalized_message_text.strip().rstrip("。.!！") in {
         "确认调整", "确认执行", "确认", "执行", "好",
     }
     offered = matches_previous_bot_option(ctx.normalized_message_text, history)
@@ -3874,17 +4009,33 @@ async def _stage_claim_offered_answer(ctx: TurnContext) -> bool:
             return False
     reply_reference = getattr(ctx, "reply_reference", None)
     if (
-        (reply_reference is not None and reply_reference.is_reply)
+        (reply_reference is not None and reply_reference.is_reply
+         and not stale_affirmative)
         or draft_operation_coordinator.get(ctx.conv_key) is not None
         or (
-            ctx.memory_context is not None
+            not stale_affirmative
+            and ctx.memory_context is not None
             and ctx.memory_context.space_type == "group"
             and _can_use_unrelated_group_pending(reply_reference or ReplyReferenceInfo())
             and conversation_state_store.find_pending_for_other_owner(ctx.space_key, ctx.conv_key) is not None
         )
     ):
         return False
-    ctx.response = render_missing_option_ticket(history).replace("\n", " ")
+    unbound_quote = False
+    if stale_affirmative and reply_reference.is_reply and reply_reference.is_to_bot:
+        referenced_owner = _referenced_owner_key_from_reply_reference(reply_reference, ctx.platform)
+        unbound_quote = referenced_owner not in {None, (ctx.platform, str(ctx.user_id))} or not any(
+            item.get("role") == "assistant" and reply_reference.text
+            and _prompt_capability_digest(str(item.get("content") or ""))
+            == _prompt_capability_digest(reply_reference.text)
+            for item in history
+        )
+        if not unbound_quote:
+            history = [{"role": "assistant", "content": reply_reference.text}]
+    ctx.response = (
+        "这条提议不是发给你的，本次未执行。" if unbound_quote
+        else render_missing_option_ticket(history).replace("\n", " ")
+    )
     set_turn_flow("pending-confirmation")
     remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
     await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment)
@@ -4427,10 +4578,37 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     return True
 
 
+async def _try_stale_affirmative_reply(ctx: TurnContext) -> bool:
+    """A closed answer without an actor-owned ticket never reaches a model."""
+    if not _chat_routing.normalize_affirmative_reply(ctx.normalized_message_text) or ctx.conv_key is None:
+        return False
+    if (
+        conversation_state_store.get_record(ctx.conv_key) is not None
+        or draft_operation_coordinator.get(ctx.conv_key) is not None
+    ):
+        return False
+    addressed = bool(
+        ctx.memory_context is not None and ctx.memory_context.space_type == "private"
+        or ctx.reply_reference.is_reply and ctx.reply_reference.is_to_bot
+        or GROUP_TRIGGER_KEYWORD_ANY in ctx.message_text
+        or ctx.message_text.lstrip().startswith((GROUP_TRIGGER_KEYWORD_START, "@" + GROUP_TRIGGER_KEYWORD_START))
+    )
+    if not addressed and ctx.event is not None:
+        try:
+            addressed = await to_me()(ctx.bot, ctx.event, {})
+        except (AttributeError, TypeError):
+            pass
+    if not addressed:
+        return False
+    return await _stage_claim_offered_answer(ctx, stale_affirmative=True)
+
+
 async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     """Await enabled routing before command stages; retain the legacy shadow slot."""
     if ctx.operation_understood_early:
         return False
+    if await _try_stale_affirmative_reply(ctx):
+        return True
     if await _try_bound_pending_reply(ctx):
         return True
     enabled = _chat_commands.SEMANTIC_ROUTE_OPS & {
@@ -6810,6 +6988,7 @@ STAGES: Tuple[ChatStage, ...] = (
     _stage_handle_image_turn,
     _stage_handle_visual_probe_timeout,
     _stage_initialize_conversation,
+    _stage_handle_discovery_reply,
     _stage_understand_operation_early,
     _stage_handle_understood_command_control,
     _stage_handle_explicit_draft_conversation_reset,
