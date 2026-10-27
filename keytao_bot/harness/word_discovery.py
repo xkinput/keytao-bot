@@ -26,6 +26,8 @@ from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 # Listing in >= 2 reference dictionaries keeps out made-up strings.
 DISCOVERY_MIN_COMMONNESS = 3
 DISCOVERY_MIN_PRESENCE = 2
+FRAGMENT_PRONOUN_PREFIXES = frozenset("我你他她它咱您")
+FRAGMENT_PARTICLE_SUFFIXES = frozenset("了的着过吗呢吧啊呀嘛")
 MAX_MESSAGE_CHARS = 256
 MAX_CANDIDATES = 12
 PRESENT_CACHE_MAX_WORDS = 5000
@@ -118,6 +120,9 @@ def extract_candidates(text, db_path=None, store=None, *, matches=None):
             word = next((run[index:index + size] for size in range(min(16, len(run) - index), 1, -1)
                          if run[index:index + size] in matches), "")
             index += len(word) or 1
+            if len(word) == 2 and (word[0] in FRAGMENT_PRONOUN_PREFIXES
+                                   or word[-1] in FRAGMENT_PARTICLE_SUFFIXES):
+                continue
             if word and 2 <= len(word) <= 4 and matches[word] and word not in seen:
                 candidates.append(DiscoveryCandidate(word, matches[word]))
                 seen.add(word)
@@ -662,17 +667,20 @@ class WordDiscovery:
         model_called = False
         for candidate in missing:
             source = candidate.source
-            verdict, verdict_status = True, "-"
-            if source != "commonness":
+            try:
                 verdict, verdict_status = await asyncio.to_thread(
                     self.store.begin_verification, candidate.word, allow_call=not model_called,
                 )
-                if verdict_status == "call":
-                    model_called = True
-                    verdict = await _verify_word(chat, candidate.word, text)
-                    verdict_status = "failed" if verdict is None else "ok" if verdict else "reject"
-                    if verdict is not None:
-                        await asyncio.to_thread(self.store.cache_verdict, candidate.word, verdict)
+            except sqlite3.OperationalError as error:
+                if getattr(error, "sqlite_errorcode", None) not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    raise
+                verdict, verdict_status = None, "failed"
+            if verdict_status == "call":
+                model_called = True
+                verdict = await _verify_word(chat, candidate.word, text)
+                verdict_status = "failed" if verdict is None else "ok" if verdict else "reject"
+                if verdict is not None:
+                    await asyncio.to_thread(self.store.cache_verdict, candidate.word, verdict)
             if verdict is True:
                 word = candidate.word
                 break

@@ -388,6 +388,16 @@ class CandidateExtractionTests(unittest.TestCase):
                          [discovery.DiscoveryCandidate("午时", "commonness")])
         self.assertEqual(discovery.extract_candidates("午时" * 10000, self.path), [])
 
+    def test_two_character_fragments_are_filtered_for_all_sources(self):
+        fragments = [char + "觉" for char in "我你他她它咱您"]
+        fragments += ["学" + char for char in "了的着过吗呢吧啊呀嘛"]
+        words = fragments + ["我觉得", "忘记了", "阳光"]
+        for source in ("commonness", "bcc", "learned"):
+            with self.subTest(source=source):
+                self.assertEqual(discovery.extract_candidates(
+                    "，".join(words), matches=dict.fromkeys(words, source),
+                ), [discovery.DiscoveryCandidate(word, source) for word in words[-3:]])
+
     def test_bcc_sums_only_modern_word_datasets_and_prefers_longest_match(self):
         add_bcc(self.path)
         add_bcc(self.path, "燃面馆", (100,))
@@ -488,6 +498,7 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.actor = ConversationAddress.group("qq", "200", "100")
         self.bot = types.SimpleNamespace(self_id="999", send=AsyncMock(return_value={"message_id": "400"}))
         self.tools = AsyncMock(side_effect=self.tool)
+        self.verify = AsyncMock(return_value=True)
         self.history = []
         onebot = types.ModuleType("nonebot.adapters.onebot.v11")
         onebot.MessageSegment = types.SimpleNamespace(at=lambda actor: f"[CQ:at,qq={actor}]")
@@ -497,6 +508,7 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.chat, "conversation_state_store", self.pending),
             patch.object(self.chat, "draft_operation_coordinator", DraftOperationCoordinator()),
             patch.object(self.chat, "call_tool_function", self.tools),
+            patch.object(discovery, "_verify_word", self.verify),
             patch.object(self.chat, "add_to_history", side_effect=lambda key, message, response: self.history.extend([
                 {"role": "user", "content": message}, {"role": "assistant", "content": response},
             ])),
@@ -563,17 +575,61 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(call.args[0] == "keytao_lookup_by_words_batch"
                             for call in self.tools.await_args_list))
 
-    async def test_commonness_and_existing_bcc_words_do_not_call_verifier(self):
-        with patch.object(discovery, "_verify_word", AsyncMock()) as verify:
-            self.assertIsNotNone(await self.offer())
-            self.pending.delete(self.actor)
-            add_bcc(self.reference)
-            self.tools.side_effect = None
-            self.tools.return_value = json.dumps({"success": True, "results": [{
-                "success": True, "word": "燃面", "phrases": [{"word": "燃面", "code": "rm"}],
-            }]})
-            self.assertIsNone(await self.offer(FakeEvent("燃面")))
-        verify.assert_not_awaited()
+    async def test_commonness_word_requires_model_acceptance_before_offer(self):
+        record = await self.offer()
+        self.assertIsNotNone(record)
+        self.assertEqual(record.state.word, "午时")
+        self.verify.assert_awaited_once_with(self.chat, "午时", "午时")
+        self.assertIs(self.store.get_verdict("午时"), True)
+        self.bot.send.assert_awaited_once()
+
+    async def test_commonness_model_rejects_are_cached_and_never_offered(self):
+        with closing(sqlite3.connect(self.reference)) as conn, conn:
+            conn.executemany("INSERT INTO word_commonness VALUES (?,?,?,?)", [
+                ("时会", 257, "n", 2), ("文峰", 262, "n", 2),
+            ])
+        self.verify.return_value = False
+        for word in ("时会", "文峰"):
+            with self.subTest(word=word):
+                self.verify.reset_mock()
+                for _ in range(2):
+                    self.assertIsNone(await self.offer(FakeEvent(word)))
+                self.verify.assert_awaited_once_with(self.chat, word, word)
+                self.assertIs(self.store.get_verdict(word), False)
+        self.bot.send.assert_not_awaited()
+        self.assertTrue(all(call.args[0] == "keytao_lookup_by_words_batch"
+                            for call in self.tools.await_args_list))
+
+    async def test_commonness_rejection_or_failure_uses_only_one_call_per_message(self):
+        for verdict in (False, None):
+            with self.subTest(verdict=verdict):
+                self.store = discovery.DiscoveryStore(self.root / f"commonness-{verdict}.db")
+                self.discovery = discovery.WordDiscovery(self.store, reference_path=self.reference)
+                self.verify.reset_mock()
+                self.verify.return_value = verdict
+                self.assertIsNone(await self.offer(FakeEvent("午时，阳光")))
+                self.verify.assert_awaited_once_with(self.chat, "午时", "午时，阳光")
+                self.assertEqual(self.store.begin_verification("阳光"), (None, "call"))
+        self.bot.send.assert_not_awaited()
+
+    async def test_pronoun_fragment_never_reaches_lookup_or_model_for_any_source(self):
+        for source in ("commonness", "bcc", "learned"):
+            with self.subTest(source=source), patch.object(
+                discovery, "_reference_matches", return_value={"我觉": source},
+            ):
+                self.assertIsNone(await self.offer(FakeEvent("我觉")))
+        self.tools.assert_not_awaited()
+        self.verify.assert_not_awaited()
+        self.bot.send.assert_not_awaited()
+
+    async def test_existing_bcc_word_does_not_call_verifier(self):
+        add_bcc(self.reference)
+        self.tools.side_effect = None
+        self.tools.return_value = json.dumps({"success": True, "results": [{
+            "success": True, "word": "燃面", "phrases": [{"word": "燃面", "code": "rm"}],
+        }]})
+        self.assertIsNone(await self.offer(FakeEvent("燃面")))
+        self.verify.assert_not_awaited()
 
     async def test_unavailable_bcc_candidates_do_not_hide_later_commonness_word(self):
         for word in ("发截图", "燃面"):
@@ -584,6 +640,8 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(status=status):
                 self.store = discovery.DiscoveryStore(self.root / f"fallback-{status}.db")
                 self.discovery = discovery.WordDiscovery(self.store, reference_path=self.reference)
+                self.store.begin_verification("内卷")
+                self.store.cache_verdict("内卷", True)
                 if status.startswith("cached"):
                     self.store.begin_verification("发截图")
                     if status == "cached-reject":
@@ -603,7 +661,7 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 with closing(sqlite3.connect(self.store.path)) as conn:
                     calls = conn.execute("SELECT SUM(calls) FROM discovery_model_days").fetchone()[0]
                 self.assertEqual(calls, discovery.VERIFY_DAILY_CAP if status == "capped"
-                                 else 2 if status.startswith("cached") else 1)
+                                 else 3 if status.startswith("cached") else 2)
                 self.pending.delete(self.actor)
 
     async def test_cached_acceptance_is_available_after_an_earlier_model_reject(self):
