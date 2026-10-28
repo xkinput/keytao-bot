@@ -10902,6 +10902,9 @@ def _announce_replaced_submit(previous, conv_key, response):
         and current is not None and current is not previous
         and current.owner_key == previous.owner_key
     ):
+        if _candidate_origin_for_ticket(current.state):
+            # Add-and-submit still previews the whole draft, including old items.
+            return response
         deliveries = current_draft_delivery_claims.get()
         receipt = {
             "platform": current.owner_key.platform, "platformId": current.owner_key.actor_id,

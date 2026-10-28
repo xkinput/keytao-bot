@@ -49,7 +49,7 @@ class B8CancelTests(unittest.IsolatedAsyncioTestCase):
         await replay.turn({"message": message, "to_me": True}, raw_operation(
             op="add", operands=list(WORDS), codes=[], frame="direct", refers_to_pending=False,
         ))
-        self.assertIn("原待确认提交已取消，已改为以下新操作。", replay.last_response)
+        self.assertNotIn("原待确认提交已取消", replay.last_response)
         message_token = replay.chat._current_turn_message.set(message)
         try:
             # Delivery can redraw the prompt after the stage has remembered it.
@@ -122,7 +122,7 @@ class B8CancelTests(unittest.IsolatedAsyncioTestCase):
             if digestless:
                 self.assertTrue(replay.store.bind_origin_prompt_digest(replay.author, ""))
             original = copy.deepcopy(record)
-            raw_prompt = replay.history[-1]["content"]
+            raw_prompt = "Earlier candidate prompt\n" + replay.history[-1]["content"]
             self.assertNotEqual(replay.chat._prompt_capability_digest(raw_prompt), record.origin_prompt_digest)
             replay.client.create.return_value.choices[0].message.content = json.dumps({
                 "intent": "word_lookup", "words": [message], "confidence": 0.99,
