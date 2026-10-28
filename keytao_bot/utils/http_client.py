@@ -302,10 +302,12 @@ async def request_with_retries(
     retry_connect_errors: bool = False,
     retry_transport_errors: bool = False,
     retry_exceptions: Iterable[type[BaseException]] = (),
+    retry_timeouts: bool = True,
 ) -> Any:
     """Run one HTTP request with timeout retries that respect replay safety.
 
-    Reads retry any ``httpx.TimeoutException``. Writes retry only
+    Unless disabled by ``retry_timeouts``, reads retry any
+    ``httpx.TimeoutException``. Writes retry only
     ``httpx.ConnectTimeout``, which happens before a request reaches the
     server. Callers may opt into the existing transport/status retry behavior
     used by :func:`keytao_request`; bare-client call sites use timeout retries
@@ -332,12 +334,12 @@ async def request_with_retries(
         try:
             response = await request_call()
         except httpx.ConnectTimeout as error:
-            if attempt >= attempts:
+            if not retry_timeouts or attempt >= attempts:
                 raise
             await wait_before_retry(attempt, f"{type(error).__name__}: {error}")
             continue
         except httpx.TimeoutException as error:
-            if not replay_safe or attempt >= attempts:
+            if not retry_timeouts or not replay_safe or attempt >= attempts:
                 raise
             await wait_before_retry(attempt, f"{type(error).__name__}: {error}")
             continue

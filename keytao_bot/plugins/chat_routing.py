@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import unicodedata
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -51,7 +52,7 @@ from ..utils.conversational_reply import is_conversational_text
 from ..utils.explicit_code import parse_explicit_code_request, readings_match, validate_explicit_code
 from ..utils.literal_phrase import parse_explicit_single_phrase_add, parse_literal_phrase_query
 from ..utils.reading_request import parse_parenthesised_readings
-from ..utils.observability import observe_model_call, set_turn_flow
+from ..utils.observability import current_turn_metrics, observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     ADD_OPERATION_VERB_PATTERN,
     PENDING_ASSENT_TEXTS,
@@ -3104,6 +3105,11 @@ def _is_bare_word_query_target(word: str) -> bool:
     )
 
 
+_word_query_intent_cache: ContextVar[Optional[Tuple[Any, Dict[str, SimpleWordQueryIntent]]]] = ContextVar(
+    "word_query_intent_cache", default=None,
+)
+
+
 async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     """Positive lexical grammar precedes the optional semantic fallback."""
     literal = parse_literal_phrase_query(message_text)
@@ -3140,7 +3146,17 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
         and not looks_like_mutation_grammar_gap(message_text)
     ):
         return structural_words
-    intent = await _classify_simple_word_query_intent(message_text, structural_words)
+    metrics = current_turn_metrics()
+    cached = _word_query_intent_cache.get()
+    if metrics is not None and (cached is None or cached[0] is not metrics):
+        cached = (metrics, {})
+        _word_query_intent_cache.set(cached)
+    if metrics is not None and message_text in cached[1]:
+        intent = cached[1][message_text]
+    else:
+        intent = await _classify_simple_word_query_intent(message_text, structural_words)
+        if metrics is not None:
+            cached[1][message_text] = intent
     if not intent.should_handle:
         logger.info(
             "Simple Chinese message fell through to main AI: "

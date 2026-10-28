@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import html
 import importlib.util
@@ -417,6 +418,7 @@ REVIEW_CACHE_TTL_SECONDS = 6 * 60 * 60
 REVIEW_CACHE_MAX_ENTRIES = 512
 
 _review_cache: "OrderedDict[Tuple[str, str], Tuple[float, Any]]" = OrderedDict()
+_evidence_host_failures: Dict[str, Tuple[int, float]] = {}
 
 
 def _cache_get(word: str, purpose: str) -> Optional[Any]:
@@ -445,6 +447,7 @@ def _clear_review_caches() -> None:
     """Reset the in-process review caches. Exposed for tests; never called automatically."""
     _review_cache.clear()
     _semantic_review_cache.clear()
+    _evidence_host_failures.clear()
 
 
 def review_cache_entry_counts() -> Dict[str, int]:
@@ -988,7 +991,15 @@ async def _fetch_review_url(
     params: Optional[Dict[str, Any]] = None,
     max_attempts: int = PRONUNCIATION_FETCH_MAX_ATTEMPTS,
     attempt_timeout: float = PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT,
+    **fetch_options: Any,
 ) -> Any:
+    host = str(urlparse(url).hostname or "").lower().rstrip(".")
+    _, retry_after = _evidence_host_failures.get(host, (0, 0.0))
+    if retry_after > time.monotonic():
+        raise TimeoutError(f"Evidence host circuit is open: {host}")
+    if retry_after:
+        _evidence_host_failures.pop(host, None)
+
     async def attempt() -> Any:
         try:
             return await asyncio.wait_for(
@@ -996,6 +1007,7 @@ async def _fetch_review_url(
                     url,
                     params=params,
                     timeout=attempt_timeout,
+                    **fetch_options,
                 ),
                 timeout=attempt_timeout,
             )
@@ -1004,16 +1016,30 @@ async def _fetch_review_url(
                 raise http_client.TransientFetchError(str(error)) from error
             raise
 
-    return await http_client.request_with_retries(
-        attempt,
-        method="GET",
-        url=url,
-        max_attempts=max_attempts,
-        retry_statuses=PRONUNCIATION_FETCH_RETRYABLE_STATUSES,
-        retry_connect_errors=True,
-        retry_transport_errors=True,
-        retry_exceptions=(TimeoutError, http_client.TransientFetchError),
-    )
+    try:
+        response = await http_client.request_with_retries(
+            attempt,
+            method=fetch_options.get("method", "GET"),
+            idempotent=True,
+            url=url,
+            max_attempts=max_attempts,
+            retry_statuses=PRONUNCIATION_FETCH_RETRYABLE_STATUSES,
+            retry_connect_errors=True,
+            retry_transport_errors=True,
+            retry_exceptions=(http_client.TransientFetchError,),
+            retry_timeouts=False,
+        )
+    except Exception as error:
+        if _is_timeout_error(error):
+            failures = _evidence_host_failures.get(host, (0, 0.0))[0] + 1
+            _evidence_host_failures[host] = (
+                failures, time.monotonic() + 600 if failures >= 3 else 0.0,
+            )
+        else:
+            _evidence_host_failures.pop(host, None)
+        raise
+    _evidence_host_failures.pop(host, None)
+    return response
 
 
 async def _search_web(query: str, max_results: int = 3) -> List[Dict[str, str]]:
@@ -1285,6 +1311,23 @@ def _collect_local_pronunciation_evidence(word: str) -> Dict[str, Any]:
             for source in LOCAL_REFERENCE_SOURCES
         ],
     }
+
+
+def _can_skip_pronunciation_web_evidence(word: str, local_evidence: Dict[str, Any]) -> bool:
+    entries = local_evidence["entries"]
+    datasets = {entry.get("dataset") for entry in entries if entry.get("dataset")}
+    sequences = {tuple(entry["normalized"]) for entry in entries}
+    if len(datasets) < 2 or len(sequences) != 1:
+        return False
+    sequence = next(iter(sequences))
+    if len(sequence) != len(_pronunciation_indexes(word)) or not all(sequence):
+        return False
+    try:
+        return not detect_polyphonic_characters(word) and all(
+            query_reference_readings(character) for character in set(word)
+        )
+    except PinyinReferenceUnavailable:
+        return False
 
 
 async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
@@ -1582,7 +1625,7 @@ async def collect_pronunciation_evidence(word: str) -> Dict[str, Any]:
         source
         for source in AUTHORITATIVE_SOURCES
         if _source_applies_to_word(source, word)
-    ]
+    ] if not _can_skip_pronunciation_web_evidence(word, local_evidence) else []
     inspected = await asyncio.gather(*(
         inspect_source(source) for source in applicable_sources
     ))
@@ -2882,6 +2925,12 @@ async def _registered_web_search(
             raise RuntimeError("web-search channel registry has no enabled web channel")
         if not callable(function):
             raise RuntimeError("web-search skill has no callable web_search")
+        # This private module serves pronunciation evidence only.
+        module._guarded_request = functools.partial(
+            _fetch_review_url, attempt_timeout=min(
+                PRONUNCIATION_FETCH_ATTEMPT_TIMEOUT, module.SEARCH_BACKEND_TIMEOUT * 0.75,
+            ),
+        )
         _registered_web_search_function = function
     return await _registered_web_search_function(
         query,

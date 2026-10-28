@@ -76,6 +76,13 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def lookup(self, name, args, platform, user_id, **kwargs):
         self.assertEqual((platform, user_id), ("qq", self.author.actor_id))
+        if name == "keytao_lookup_by_words_batch":
+            return json.dumps({"success": True, "results": [
+                {"success": True, "word": word, "phrases": [
+                    {"word": word, "code": self.entries[word], "type": "Phrase"},
+                ] if word in self.entries else []}
+                for word in args["words"]
+            ]}, ensure_ascii=False)
         if name == "keytao_pending_items_by_words":
             self.assertEqual(set(args), {"words"})
             return json.dumps({

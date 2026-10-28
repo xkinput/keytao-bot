@@ -368,6 +368,13 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((platform, user_id), ("qq", self.author.actor_id))
                     if name == "keytao_pending_items_by_words":
                         return json.dumps({"success": True, "complete": True, "items": []})
+                    if name == "keytao_lookup_by_words_batch":
+                        return json.dumps({"success": True, "results": [
+                            {"success": True, "word": word, "phrases": [
+                                {"word": word, "code": code_by_word[word], "type": "Phrase"},
+                            ] if existing else []}
+                            for word in args["words"]
+                        ]})
                     word = args["word"]
                     code = code_by_word[word]
                     if name == "keytao_lookup_by_word":

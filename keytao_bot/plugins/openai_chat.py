@@ -4652,7 +4652,8 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     cancel_control = bool(canonical and assent is not None and assent.intent == "pending_cancel")
 
     def unbound_answer() -> bool:
-        if canonical and (record.origin_prompt_digest or record.origin_message_id):
+        if (canonical and (record.origin_prompt_digest or record.origin_message_id)
+                or affirmative and not _chat_routing._pending_assent_phrase_for_state(state, message).matched):
             ctx.response = "这条回复未对应当前待确认操作；请引用当前候选消息后再回复。"
             ctx.scoped_pending_response = ctx.response
             ctx.operation_understood_early = True
@@ -5353,6 +5354,26 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
         ctx.generic_command_intent = MessageCommandIntent()
     elif ctx.quoted_pending_add_control:
         ctx.generic_command_intent = ctx.quoted_pending_add_intent
+    elif (
+        not ctx.released_pending_turn
+        and ctx.current_pending_record is not None
+        and ctx.operation_request is not None
+        and ctx.operation_request.refers_to_pending is True
+        and not ctx.operation_request.submit_after
+        and ctx.operation_request.op in {"confirm", "cancel", "select_candidate"}
+    ):
+        ctx.generic_command_intent = await ctx.command_intent_for(ctx.current_pending_record.state)
+        if (
+            ctx.generic_command_intent.intent == "none"
+            and isinstance(ctx.current_pending_record.state, PendingAddWord)
+            and _chat_routing._pending_assent_phrase_for_state(
+                ctx.current_pending_record.state, ctx.normalized_message_text,
+            ).matched
+        ):
+            ctx.response = "当前没有可验证的可执行操作，本次未写入。"
+            remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+            await _finish_ai_chat_matcher(ctx.response)
+            return True
     elif (
         _is_short_add_and_submit_request(ctx.normalized_message_text)
         and live_ticket_assent is None

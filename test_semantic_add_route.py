@@ -100,6 +100,10 @@ class SemanticAddRouteTests(unittest.IsolatedAsyncioTestCase):
             }, ensure_ascii=False)
         if name in {"keytao_lookup_by_word", "keytao_lookup_by_code"}:
             return json.dumps({"success": True, "phrases": []})
+        if name == "keytao_lookup_by_words_batch":
+            return json.dumps({"success": True, "results": [
+                {"success": True, "word": word, "phrases": []} for word in args["words"]
+            ]})
         if name == "keytao_pending_items_by_words":
             return json.dumps({"success": True, "complete": True, "items": []})
         self.assertIn(name, {"keytao_create_phrase", "keytao_batch_add_to_draft", "keytao_submit_batch"},

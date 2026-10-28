@@ -3554,6 +3554,29 @@ async def _prepare_multi_word_query(
     present_word_codes: Optional[Dict[str, Tuple[str, ...]]] = (
         {} if len(combined_words) > 1 else None
     )
+    prepared_data: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    for start in range(0, len(words), 50):
+        chunk = list(words[start:start + 50])
+        lookup_json = await call_tool_function(
+            "keytao_lookup_by_words_batch", {"words": chunk}, platform, user_id,
+        )
+        try:
+            lookup_data = json.loads(lookup_json)
+        except Exception:
+            lookup_data = {}
+        lookup_rows = {
+            row.get("word"): row for row in lookup_data.get("results", [])
+            if isinstance(row, dict)
+        } if lookup_data.get("success") else {}
+        pending_json = await call_tool_function(
+            "keytao_pending_items_by_words", {"words": chunk}, platform, user_id,
+        )
+        try:
+            pending_data = json.loads(pending_json)
+        except Exception:
+            pending_data = {}
+        for word in chunk:
+            prepared_data[word] = (lookup_rows.get(word, {}), pending_data)
     for word in words:
         count = len(scopes)
         request = next((row for row in reading_requests if row.word == word), None)
@@ -3561,6 +3584,7 @@ async def _prepare_multi_word_query(
             word, platform, user_id, conv_key, space_key, owner_label,
             _prepared_scopes=scopes,
             _prepared_existing_words=present_word_codes,
+            _prepared_data=prepared_data[word],
             requested_reading=request.reading if request else "",
             requested_code=request.code if request else "",
         )
@@ -3670,6 +3694,7 @@ async def _try_handle_simple_single_word_query(
     actionable_lookup: bool = False,
     _prepared_scopes: Optional[List[Dict[str, Any]]] = None,
     _prepared_existing_words: Optional[Dict[str, Tuple[str, ...]]] = None,
+    _prepared_data: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None,
     preserve_pending: bool = False,
     query_only: bool = False,
     _missing_words: Optional[List[str]] = None,
@@ -3730,27 +3755,30 @@ async def _try_handle_simple_single_word_query(
     set_turn_flow("word-query" if query_only else "word-discovery")
 
     word = words[0]
-    lookup_json = await call_tool_function(
-        "keytao_lookup_by_word", {"word": word}, platform, user_id,
-    )
-    try:
-        lookup_data = json.loads(lookup_json)
-    except Exception:
-        lookup_data = {}
-
-    if query_only:
-        pending_data = {"success": True, "complete": True, "items": []}
+    if _prepared_data is not None:
+        lookup_data, pending_data = _prepared_data
     else:
-        pending_json = await call_tool_function(
-            "keytao_pending_items_by_words",
-            {"words": [word]},
-            platform,
-            user_id,
+        lookup_json = await call_tool_function(
+            "keytao_lookup_by_word", {"word": word}, platform, user_id,
         )
         try:
-            pending_data = json.loads(pending_json)
+            lookup_data = json.loads(lookup_json)
         except Exception:
-            pending_data = {}
+            lookup_data = {}
+
+        if query_only:
+            pending_data = {"success": True, "complete": True, "items": []}
+        else:
+            pending_json = await call_tool_function(
+                "keytao_pending_items_by_words",
+                {"words": [word]},
+                platform,
+                user_id,
+            )
+            try:
+                pending_data = json.loads(pending_json)
+            except Exception:
+                pending_data = {}
     if (
         pending_data.get("success") is not True
         or pending_data.get("complete") is not True

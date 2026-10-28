@@ -100,6 +100,10 @@ class HotfixMultiwordTests(unittest.IsolatedAsyncioTestCase):
             result = {"success": True, "complete": True, "items": []}
         elif name == "keytao_lookup_by_word":
             result = {"success": True, "phrases": []}
+        elif name == "keytao_lookup_by_words_batch":
+            result = {"success": True, "results": [
+                {"success": True, "word": word, "phrases": []} for word in args["words"]
+            ]}
         elif name == "keytao_prepare_reviewed_add":
             word = args["word"]
             manual = word in {"国潮", "棉麻"}
@@ -384,6 +388,13 @@ class HotfixMultiwordTests(unittest.IsolatedAsyncioTestCase):
         async def lookup(name, args, *unused, **kwargs):
             if name == "keytao_lookup_by_word" and args["word"] in {"顺治", "努尔哈赤"}:
                 return json.dumps({"success": True, "phrases": [{"word": args["word"], "code": "abcd", "type": "Phrase"}]})
+            if name == "keytao_lookup_by_words_batch":
+                return json.dumps({"success": True, "results": [
+                    {"success": True, "word": word, "phrases": [
+                        {"word": word, "code": "abcd", "type": "Phrase"},
+                    ] if word in {"顺治", "努尔哈赤"} else []}
+                    for word in args["words"]
+                ]})
             return await original_lookup(name, args, *unused, **kwargs)
 
         args = ("qq", self.author.actor_id, self.author, self.author.space_key, "Offline owner")
