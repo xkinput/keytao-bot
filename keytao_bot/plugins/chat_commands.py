@@ -3464,7 +3464,7 @@ async def _try_handle_referenced_word_presence_query(
     return _format_referenced_word_presence_response(words, lookup_data)
 
 
-_MAX_BARE_MULTI_WORD_QUERY_ITEMS = 10
+_MAX_BARE_MULTI_WORD_QUERY_ITEMS = 15
 
 
 def _bare_multi_word_query_words(message_text: str) -> Tuple[str, ...]:
