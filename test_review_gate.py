@@ -5749,7 +5749,7 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
             and "茂才：古语，词典收录但语料频次低" in rendered
             and "推荐：\n- " in rendered
             and "「冒菜」占 mzch、「茂才」顺延" in rendered
-            and "不重排选 2（mzchi）" in rendered,
+            and "换 2（mzchi）" in rendered,
         )
 
     asyncio.run(_run())

@@ -860,9 +860,9 @@ def already_existing_word_copy(
         return ""
     actions: list[str] = []
     if can_choose_other_code:
-        actions.append("选择其他编码")
+        actions.append("选择其他编码（回复「换码」）" if advertise_controls else "选择其他编码")
     if can_reorder:
-        actions.append("按下列选项调整现有排序")
+        actions.append("调整现有排序（回复「重排」）" if advertise_controls else "按下列选项调整现有排序")
     action_copy = (
         "仍可" + "或".join(actions) + "；若保留现状，无需操作。"
         if actions
@@ -870,7 +870,7 @@ def already_existing_word_copy(
     )
     # Without a matching contextual control, name the word in the template so
     # an older pending operation cannot supply a different omitted operand.
-    extra_code_format = f"给 {word} 加一个码 <code>"
+    extra_code_format = "加入编码 <code>" if advertise_controls else f"给 {word} 加一个码 <code>"
     return "\n".join(filter(None, (
         f"「{word}」已在词库（{'、'.join(clean_codes)}）。", action_copy,
         f"可再追加一个编码，格式为：{extra_code_format}（将 <code> 换成实际编码）。",
@@ -1108,16 +1108,8 @@ def _quoted_choices(forms: tuple[str, ...]) -> str:
     return "、".join(f"「{form}」" for form in forms)
 
 
-def pending_confirmation_copy(state: object = None) -> str:
+def pending_confirmation_copy() -> str:
     """Render the generic forms accepted by a single actor-owned ticket."""
-    if state is not None:
-        from keytao_bot.harness.state import PendingAddWord, PendingToolConfirm
-
-        if isinstance(state, PendingAddWord) or (
-            isinstance(state, PendingToolConfirm)
-            and state.function_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"}
-        ):
-            return pending_single_candidate_confirmation_copy()
     return "回复「确认」执行，或「取消」。"
 
 
@@ -1700,7 +1692,12 @@ def front_insert_recommendation_copy(
 def single_word_candidate_footer(candidate_count: int) -> str:
     """Render truthful selection and whole-state actions for one word."""
     if candidate_count > 1:
-        return "回复「换 2」选择其他编码；\n" + pending_single_candidate_confirmation_copy()
+        example = "2、4" if candidate_count >= 4 else "1、2"
+        return (
+            "回复「换 2」选择其他编码；"
+            f"可多选，如「添加{example}」；\n"
+            + pending_single_candidate_confirmation_copy()
+        )
     return pending_single_candidate_confirmation_copy()
 
 
@@ -1741,6 +1738,23 @@ def candidate_commonness_guard_copy(
             "occupantWord": occupant, "freeCode": "",
         }))
     if include_controls:
+        base_code = str(candidates[0][0]) if candidates else ""
+        lines.append(f"当前候选没有空位；可指定形码后的完整编码，格式为：加入编码 {base_code}+形码（请替换形码部分）。")
+        explicit_choice = next((
+            (code, occupant) for code, occupant in protected
+            if occupied_words.get(code) in ([occupant], (occupant,))
+        ), None)
+        if explicit_choice is not None:
+            code, occupant = explicit_choice
+            lines.append("若要顶替，请点名现有词条：")
+            lines.append(render_executable_suggestion(
+                f"添加 {normalized_word} {code}，挤掉 {occupant}",
+                words=(normalized_word, occupant),
+            ))
+            lines.append(render_executable_suggestion(
+                f"添加 {normalized_word} {code}，顶替 {occupant}",
+                words=(normalized_word, occupant),
+            ))
         lines.append("回复「取消」。")
     return "\n".join(lines)
 

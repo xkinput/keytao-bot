@@ -2545,14 +2545,24 @@ def _append_pending_ticket_challenge(
         )
         return text
 
-    if isinstance(record.state, PendingAddWord) or record.state.function_name == _PENDING_CHOICE_OFFER_FUNCTION:
+    if (
+        isinstance(record.state, PendingAddWord)
+        or record.state.function_name == _PENDING_CHOICE_OFFER_FUNCTION
+        or (
+            record.state.args.get("_reviewed_multi_word") is True
+            and record.state.confirmation_source == "local_preview"
+        )
+    ):
         return bind_prompt(response if "「取消」" in response else response.rstrip() + "\n或「取消」。")
-    challenge = pending_confirmation_copy(record.state)
-    response = response.replace(pending_confirmation_copy(), challenge)
+    challenge = pending_confirmation_copy()
     if pending_batch_confirmation_copy() in response:
-        compact = response.replace(pending_confirmation_copy(), "").rstrip()
-        if "「取消」" not in compact:
-            compact += "或「取消」。"
+        compact = re.sub(
+            r"\n+\s*" + re.escape(challenge) + r"\s*$",
+            " " + challenge,
+            response.rstrip(),
+        )
+        if challenge not in compact:
+            compact += " " + challenge
         return bind_prompt(compact)
     if challenge in response:
         return bind_prompt(response)
@@ -2996,7 +3006,51 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
             response,
             len(pending.candidates),
         )
-    return response
+        if (
+            re.search(r"(?m)^\s*推荐[：:](?:.+顺延(?:[；;].*)?|\s*\n[-•].+顺延.+)$", response)
+            and re.search(r"(?m)^\s*(?:不重排选|换)\s+\d+", response)
+        ):
+            return response
+
+    if pending is None:
+        fallback_occupied = re.search(
+            r"(?m)^\s*(?P<index>[1-9]\d{0,2})[.)、]\s*[a-z]{1,12}\s*"
+            r"(?:—|–|-)\s*[^\n]*已有「(?P<words>[^」]+)」",
+            response,
+            re.IGNORECASE,
+        )
+        if fallback_occupied is None:
+            return response
+        occupied_index = int(fallback_occupied.group("index"))
+        occupied_word = fallback_occupied.group("words").split("、", 1)[0].strip()
+    else:
+        occupied_choice = next(
+            (
+                (index, code)
+                for index, (code, occupied) in enumerate(pending.candidates, start=1)
+                if occupied
+            ),
+            None,
+        )
+        if occupied_choice is None:
+            return response
+        occupied_index, occupied_code = occupied_choice
+        occupied_word = next(
+            (
+                str(word or "").strip()
+                for word in pending.occupied_words.get(occupied_code, [])
+                if str(word or "").strip()
+            ),
+            "",
+        )
+    target_copy = f"已有词「{occupied_word}」" if occupied_word else "该已有词"
+    guidance = (
+        f"第 {occupied_index} 项已被占用；直接回复“{occupied_index}”表示添加重码。"
+        f"若要挪开{target_copy}，回复“{occupied_index} 重新编码”。"
+    )
+    if guidance in response:
+        return response
+    return response.rstrip() + f"\n{guidance}"
 
 
 def _build_existing_word_priority_note(word: str, lookup_entry: Dict, encode_data: Dict) -> Optional[str]:

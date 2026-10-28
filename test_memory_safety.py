@@ -2921,7 +2921,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             "回复“编号 重新编码”或“原词 重新编码”则挪开原词。"
         )
         rendered = chat_module._ensure_pending_add_word_guidance(multi_word)
-        self.assertIn("载流子 添加1", rendered)
+        self.assertIn("载流子 1", rendered)
         self.assertNotIn("载流子 添加2、4", rendered)
         self.assertNotIn("可多选，如「添加2、4」", rendered)
         self.assertNotIn("直接回复该编号表示添加重码", rendered)
@@ -4723,7 +4723,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
             model_candidate
         )
         self.assertEqual(rendered_candidate.count(advertised_copy), 1)
-        self.assertIn("载流子 添加1", rendered_candidate)
+        self.assertIn("载流子 1", rendered_candidate)
         self.assertNotIn("载流子 添加2、4", rendered_candidate)
         self.assertNotIn("可多选，如「添加2、4」", rendered_candidate)
         parsed_candidate = chat_module._parse_pending_batch_add(rendered_candidate)
@@ -12594,7 +12594,7 @@ class ServerBoundDeleteConfirmationTests(unittest.IsolatedAsyncioTestCase):
 
         rendered = await orchestrator.run("查询词库里的箭头", context)
         self.assertTrue(rendered.startswith("「箭头」已在词库（jmtdu）。"))
-        self.assertIn("若保留现状，无需操作", rendered)
+        self.assertIn("可再追加一个编码", rendered)
         self.assertTrue(rendered.endswith(lookup_reply))
         record = state_store.get_record(context.conversation_address)
         self.assertIsNotNone(record)
@@ -13046,9 +13046,9 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertTrue(result.startswith("「参考价值」已在词库（ckjf）。"))
-        self.assertIn("「情绪价值」已在词库（qxjf）。", result)
-        self.assertIn("若保留现状，无需操作", result)
+        self.assertTrue(result.startswith("已在词库：参考价值 ckjf、情绪价值 qxjf"))
+        self.assertIn("情绪价值 qxjf", result)
+        self.assertIn("已在词库：参考价值 ckjf、情绪价值 qxjf", result)
         self.assertIn("这两个词都可以考虑其他编码", result)
 
     class _CountingStateStore(MemoryConversationStateStore):
@@ -13213,7 +13213,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             "   1. zlzu — 空位（推荐）\n"
             "   自动审核：可自动通过\n"
             + pending_batch_confirmation_copy()
-            + "\n每个词的编号都从 1 开始；回复「载流子 添加1」；"
+            + "或「取消」。\n每个词的编号都从 1 开始；回复「载流子 1」；"
             "多选时，用顿号分隔该词列表中实际存在的编号。"
         )
         client = _FakeClient([
@@ -16818,7 +16818,7 @@ class PendingPositionalCreateOrchestratorTests(unittest.IsolatedAsyncioTestCase)
         self.assertFalse(follow_up.get("本次操作已拒绝", False))
         self.assertEqual(follow_up.get("reason"), "code_required")
         self.assertTrue(result.startswith("「赤溪」已在词库（wkxk、wkxka）。"))
-        self.assertIn("若保留现状，无需操作", result)
+        self.assertIn("可再追加一个编码", result)
         self.assertTrue(result.endswith("destination is ambiguous"))
 
     async def test_ask_then_word_lookup_then_create_converges_once(self) -> None:

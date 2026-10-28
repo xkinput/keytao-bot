@@ -3558,7 +3558,7 @@ def test_plain_query_then_bare_add_and_submit_uses_first_render_record():
         check(
             "first plain query renders a selector instead of read-only candidates",
             first_reply is not None
-            and "回复编号或编码选择" in first_reply
+            and "回复「换 2」选择其他编码" in first_reply
             and "本次仅查询" not in first_reply,
         )
         check(
@@ -3753,7 +3753,7 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
     check(
         "front branch has one coherent executable recommendation",
         "- “「射覆」占 eefj、「慑服」顺延”（射覆、慑服）" in front_prompt
-        and "不重排选 2（eefju）" in front_prompt
+        and "换 2（eefju）" in front_prompt
         and "回复「1 重新编码」执行" not in front_prompt,
     )
     check(
@@ -4023,7 +4023,7 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
             "presentation returns the coherent ordering recommendation",
             response is not None
             and "- “「射覆」占 eefj、「慑服」顺延”（射覆、慑服）" in response
-            and "不重排选 2（eefju）" in response
+            and "换 2（eefju）" in response
             and "推荐编码：" not in response
             and advertised_single_word_lookup_codes(response)
             == ("eefj", "eefju"),
@@ -17461,7 +17461,7 @@ def test_live_actionable_reply_advertises_complete_reply_contract():
     )
     check(
         "restarted numbering advertises a word-scoped selector",
-        "中登 添加" in restored or "小登 添加" in restored,
+        "中登 1" in restored or "小登 1" in restored,
     )
     check(
         "restored affordances stay within two compact lines",

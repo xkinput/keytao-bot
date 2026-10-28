@@ -915,7 +915,7 @@ def _pending_assent_rejection_response(
 
 def _format_live_ticket_precedence_message(state: PendingState) -> str:
     details = _describe_pending_state(state)
-    return f"{details}\n{pending_confirmation_copy(state)}"
+    return f"{details}\n{pending_confirmation_copy()}"
 
 
 def _compact_command_text(message_text: str) -> str:
@@ -2029,10 +2029,11 @@ def _resolve_reviewed_multi_word_selection(
     # Only live candidate scopes can supply the omitted word.
     if selection is None and bare is not None and len(live_words) == 1:
         selectors = tuple(map(str, bare.indices)) or bare.codes
-        if len(selectors) == 1:
+        if selectors and len(set(selectors)) == len(selectors):
             selection = parse_reviewed_selection_command(
                 f"{live_words[0]} {selectors[0]}" + ("，加入并提交" if bare.submit_after else "")
             )
+            scoped_pairs = tuple((live_words[0], selector) for selector in selectors)
     pairs = (scoped_pairs or selection.pairs) if selection is not None else None
 
     def explain(reason: str) -> str:
