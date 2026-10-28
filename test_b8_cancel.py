@@ -63,7 +63,7 @@ class B8CancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item["word"] for item in record.state.args["items"]], ["哀声叹气"])
         self.assertIn("加入", replay.last_response)
         self.assertIn("加入并提交", replay.last_response)
-        self.assertIn("哀声叹气 2", replay.last_response)
+        self.assertIn("换 2", replay.last_response)
         self.assertTrue(replay.chat._advertised_reply_matches_live_record(replay.last_response, record))
         self.assertEqual(understand_message("取消", record.state).op, "cancel")
         return record

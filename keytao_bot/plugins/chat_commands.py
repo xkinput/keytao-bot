@@ -88,6 +88,7 @@ from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     ServerBackedQueryReply,
     already_existing_word_copy,
+    already_existing_words_copy,
     append_unbound_binding_notice,
     advertised_batch_binding_pairs,
     advertised_single_word_lookup_codes,
@@ -2545,16 +2546,13 @@ def _append_pending_ticket_challenge(
         return text
 
     if isinstance(record.state, PendingAddWord) or record.state.function_name == _PENDING_CHOICE_OFFER_FUNCTION:
-        return bind_prompt(response)
-    challenge = pending_confirmation_copy()
+        return bind_prompt(response if "「取消」" in response else response.rstrip() + "\n或「取消」。")
+    challenge = pending_confirmation_copy(record.state)
+    response = response.replace(pending_confirmation_copy(), challenge)
     if pending_batch_confirmation_copy() in response:
-        compact = re.sub(
-            r"\n+\s*" + re.escape(challenge) + r"\s*$",
-            " " + challenge,
-            response.rstrip(),
-        )
-        if challenge not in compact:
-            compact += " " + challenge
+        compact = response.replace(pending_confirmation_copy(), "").rstrip()
+        if "「取消」" not in compact:
+            compact += "或「取消」。"
         return bind_prompt(compact)
     if challenge in response:
         return bind_prompt(response)
@@ -2986,10 +2984,6 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
         "",
         response,
     )
-    # The reviewed-candidate renderer already knows the first occupied word,
-    # while this delivery normalizer adds the full duplicate-vs-shift choice.
-    # Remove the shorter line before appending so the advertised recode footer
-    # is emitted exactly once.
     response = re.sub(
         r"(?m)^若要挪开(?:已有词「[^」\n]+」|该已有词)，"
         r"回复[“\"][1-9]\d{0,2} 重新编码[”\"]。\s*$",
@@ -3002,54 +2996,7 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
             response,
             len(pending.candidates),
         )
-        if (
-            re.search(r"(?m)^\s*推荐[：:].+顺延(?:[；;].*)?$", response)
-            and re.search(r"(?m)^\s*不重排选\s+\d+", response)
-        ):
-            return response
-
-    if pending is None:
-        fallback_occupied = re.search(
-            r"(?m)^\s*(?P<index>[1-9]\d{0,2})[.)、]\s*[a-z]{1,12}\s*"
-            r"(?:—|–|-)\s*[^\n]*已有「(?P<words>[^」]+)」",
-            response,
-            re.IGNORECASE,
-        )
-        if fallback_occupied is None:
-            return response
-        occupied_index = int(fallback_occupied.group("index"))
-        occupied_word = fallback_occupied.group("words").split("、", 1)[0].strip()
-        logger.info("🧭 Appending bound occupied-choice guidance via fallback matcher")
-    else:
-        occupied_choice = next(
-            (
-                (index, code)
-                for index, (code, occupied) in enumerate(pending.candidates, start=1)
-                if occupied
-            ),
-            None,
-        )
-        if occupied_choice is None:
-            return response
-        occupied_index, occupied_code = occupied_choice
-        occupied_word = next(
-            (
-                str(word or "").strip()
-                for word in pending.occupied_words.get(occupied_code, [])
-                if str(word or "").strip()
-            ),
-            "",
-        )
-    target_copy = f"已有词「{occupied_word}」" if occupied_word else "该已有词"
-    guidance = (
-        f"第 {occupied_index} 项已被占用；直接回复“{occupied_index}”表示添加重码。"
-        f"若要挪开{target_copy}，回复“{occupied_index} 重新编码”。"
-    )
-    if guidance in response:
-        return response
-    if pending is not None:
-        logger.info("🧭 Appending occupied-choice guidance via parsed pending-add matcher")
-    return response.rstrip() + f"\n{guidance}"
+    return response
 
 
 def _build_existing_word_priority_note(word: str, lookup_entry: Dict, encode_data: Dict) -> Optional[str]:
@@ -3605,7 +3552,7 @@ async def _prepare_multi_word_query(
     other_blocks: List[str] = list(query_other_blocks)
     other_block_words: Dict[int, str] = {}
     present_word_codes: Optional[Dict[str, Tuple[str, ...]]] = (
-        {} if explicit_add and len(combined_words) > 1 else None
+        {} if len(combined_words) > 1 else None
     )
     for word in words:
         count = len(scopes)
@@ -3622,16 +3569,7 @@ async def _prepare_multi_word_query(
             other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
 
     if present_word_codes:
-        existing_lines = [
-            f"{word} 已在词库（{'、'.join(codes)}）"
-            for word, codes in present_word_codes.items()
-        ]
-        first_word = next(iter(present_word_codes))
-        existing_lines.append(already_existing_word_copy(
-            first_word, present_word_codes[first_word],
-            can_choose_other_code=False, advertise_controls=False,
-        ).splitlines()[-1])
-        other_blocks.append("\n".join(existing_lines))
+        other_blocks.append(already_existing_words_copy(present_word_codes))
 
     actionable_scopes: List[Dict[str, Any]] = []
     if preserve_pending:
@@ -13835,8 +13773,8 @@ def _candidate_origin_for_ticket(state) -> Dict:
         if state.args.get("_reviewed_multi_word") is True:
             scopes = state.args.get("_candidate_scopes") or []
             words = state.args.get("_query_words") or [scope.get("word") for scope in scopes]
-            return {"queryWords": words, "reviewedState": scopes[0].get("reviewedState")
-                    if len(words) == len(scopes) == 1 else None}
+            return {"queryWords": words, "reviewedState": json.loads(json.dumps(scopes[0].get("reviewedState")))
+                    if len(scopes) == 1 and scopes[0].get("word") in words else None}
     return {}
 
 
@@ -13857,14 +13795,15 @@ async def try_reselect_live_ticket(message, platform, user_id, conv_key, space_k
     if selection is None or not selection.indices:
         return None
     origin = state.args.get("_candidate_origin") or {}
-    if len(origin.get("queryWords") or []) > 1:
+    if len(origin.get("queryWords") or []) > 1 and not origin.get("reviewedState"):
         return "原候选列表包含多个词，请明确词名和编码后重新审词；本次未写入，原确认计划未执行。"
     try:
         reviewed = _pending_add_word_from_payload(origin.get("reviewedState"))
     except (ValueError, TypeError, KeyError):
         return "当前确认缺少完整的原候选记录，未能核验该编号；请重新查询，本次未写入。"
     if (not reviewed.server_candidates or reviewed.server_candidates != reviewed.candidates
-            or origin.get("queryWords") != [reviewed.word]):
+            or not isinstance(origin.get("queryWords"), list)
+            or reviewed.word not in origin["queryWords"]):
         return "当前确认缺少完整的原候选记录，未能核验该编号；请重新查询，本次未写入。"
     if len(selection.indices) != 1 or not 1 <= selection.indices[0] <= len(reviewed.candidates):
         return f"请从原候选 1-{len(reviewed.candidates)} 中选择一个编号；本次未写入。"

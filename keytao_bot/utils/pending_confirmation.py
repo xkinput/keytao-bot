@@ -837,6 +837,13 @@ def plain_warning_message(warning: Any) -> str:
     return "服务端返回了一项需要确认的风险"
 
 
+def already_existing_words_copy(word_codes: dict[str, tuple[str, ...]]) -> str:
+    """Keep a multi-word lookup's existing facts on one line."""
+    return "已在词库：" + "、".join(
+        f"{word} {'、'.join(codes)}" for word, codes in word_codes.items()
+    )
+
+
 def already_existing_word_copy(
     word: str,
     codes: tuple[str, ...],
@@ -853,21 +860,21 @@ def already_existing_word_copy(
         return ""
     actions: list[str] = []
     if can_choose_other_code:
-        actions.append("选择其他编码（回复「换码」）" if advertise_controls else "选择其他编码")
+        actions.append("选择其他编码")
     if can_reorder:
-        actions.append("调整现有排序（回复「重排」）" if advertise_controls else "按下列选项调整现有排序")
+        actions.append("按下列选项调整现有排序")
     action_copy = (
         "仍可" + "或".join(actions) + "；若保留现状，无需操作。"
         if actions
-        else "当前没有必须执行的变更；若保留现状，无需操作。"
+        else ""
     )
     # Without a matching contextual control, name the word in the template so
     # an older pending operation cannot supply a different omitted operand.
-    extra_code_format = "加入编码 <code>" if advertise_controls else f"给 {word} 加一个码 <code>"
-    return (
-        f"「{word}」已在词库（{'、'.join(clean_codes)}）。\n{action_copy}\n"
-        f"可再追加一个编码，格式为：{extra_code_format}（将 <code> 换成实际编码）。"
-    )
+    extra_code_format = f"给 {word} 加一个码 <code>"
+    return "\n".join(filter(None, (
+        f"「{word}」已在词库（{'、'.join(clean_codes)}）。", action_copy,
+        f"可再追加一个编码，格式为：{extra_code_format}（将 <code> 换成实际编码）。",
+    )))
 
 
 _WARNING_COUNT_COPY_RE = re.compile(
@@ -1068,6 +1075,9 @@ def parse_pending_candidate_selection(text: str) -> PendingCandidateSelection | 
     ):
         return None
     source = re.sub(r"^回复\s*", "", source, count=1)
+    change = re.fullmatch(r"换\s*([1-9]\d{0,2})", source)
+    if change is not None:
+        return PendingCandidateSelection(indices=(int(change.group(1)),))
     compound = _parse_compound_number_selection(source)
     if compound is not None:
         return compound
@@ -1098,8 +1108,16 @@ def _quoted_choices(forms: tuple[str, ...]) -> str:
     return "、".join(f"「{form}」" for form in forms)
 
 
-def pending_confirmation_copy() -> str:
+def pending_confirmation_copy(state: object = None) -> str:
     """Render the generic forms accepted by a single actor-owned ticket."""
+    if state is not None:
+        from keytao_bot.harness.state import PendingAddWord, PendingToolConfirm
+
+        if isinstance(state, PendingAddWord) or (
+            isinstance(state, PendingToolConfirm)
+            and state.function_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"}
+        ):
+            return pending_single_candidate_confirmation_copy()
     return "回复「确认」执行，或「取消」。"
 
 
@@ -1135,7 +1153,7 @@ def render_server_backed_word_set(words: object) -> str:
         _SERVER_BACKED_WORD_SET_HEADER,
         *(f"- 「{word}」" for word in normalized),
         _SERVER_BACKED_WORD_SET_FOOTER,
-        pending_batch_confirmation_copy(),
+        pending_batch_confirmation_copy() + "或「取消」。",
     ))
 
 
@@ -1146,7 +1164,7 @@ def advertised_word_set_words(text: str) -> tuple[str, ...]:
         len(lines) < 5
         or lines[0] != _SERVER_BACKED_WORD_SET_HEADER
         or lines[-2] != _SERVER_BACKED_WORD_SET_FOOTER
-        or lines[-1] != pending_batch_confirmation_copy()
+        or lines[-1] not in {pending_batch_confirmation_copy(), pending_batch_confirmation_copy() + "或「取消」。"}
     ):
         return ()
     words: list[str] = []
@@ -1325,10 +1343,12 @@ def render_server_backed_batch_candidates(
                 reviewed_prompt=scope["reviewedPrompt"],
                 ordering_assessments=ordering_assessments_by_scope[word],
                 actionable_controls=True,
-                include_controls=False,
+                include_controls=include_controls and len(normalized_items) == 1,
             )
             if not block:
                 return ""
+            if len(normalized_items) == 1:
+                return block
             lines.extend((f"{index}. 「{word}」", block))
             selected_index = next(
                 candidate_index
@@ -1348,11 +1368,7 @@ def render_server_backed_batch_candidates(
             )
             if parse_reviewed_multi_word_selection(selection_command) != tuple(selections):
                 return ""
-            lines.append("回复以下任一项；直接加入时，每个词采用推荐方案（含推荐调序）：")
-            for command in ("加入", "加入并提交"):
-                if not parse_pending_assent_phrase(command).matched:
-                    return ""
-                lines.append(render_executable_suggestion(command))
+            lines.append(pending_batch_confirmation_copy() + "或「取消」。")
             lines.append("按词选择（词名加空格，再写编号或编码；多词用逗号分隔）：")
             lines.append(render_executable_suggestion(selection_command))
             lines.append("可只写其中部分词；选择后即加入草稿，提交需明确回复提交指令。")
@@ -1449,7 +1465,7 @@ def render_server_backed_batch_candidates(
         lines.append(f"   自动审核：{review_copy}")
 
     if include_controls:
-        lines.append(pending_batch_confirmation_copy())
+        lines.append(pending_batch_confirmation_copy() + "或「取消」。")
         scoped_copy = scoped_multi_word_candidate_copy(tuple(
             word for word, _code, _needs_review in normalized_items
         ), candidate_counts={word: len(candidates) for word, candidates in scopes_by_word.items()})
@@ -1494,7 +1510,7 @@ def render_query_retry_reply(words: object) -> str:
 
 def pending_single_candidate_confirmation_copy() -> str:
     """Render the only whole-state assent forms for one-word candidates."""
-    return "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
+    return pending_batch_confirmation_copy() + "或「取消」。"
 
 
 def validated_front_insert_recommendation(
@@ -1669,9 +1685,9 @@ def front_insert_recommendation_copy(
         return ""
     selector = str(fallback_selector or "").strip()
     opt_out = (
-        f"不重排选 {selector}（{free_code}）。"
+        f"换 {selector}（{free_code}）。"
         if selector
-        else f"不重排选 {free_code}。"
+        else f"不调序备选编码：{free_code}。"
     )
     lines = ["推荐：", recommendation_line]
     if summary:
@@ -1684,13 +1700,7 @@ def front_insert_recommendation_copy(
 def single_word_candidate_footer(candidate_count: int) -> str:
     """Render truthful selection and whole-state actions for one word."""
     if candidate_count > 1:
-        example = "2、4" if candidate_count >= 4 else "1、2"
-        return (
-            "回复编号或编码选择"
-            f"（可多选，如「添加{example}」）；"
-            "\n"
-            "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
-        )
+        return "回复「换 2」选择其他编码；\n" + pending_single_candidate_confirmation_copy()
     return pending_single_candidate_confirmation_copy()
 
 
@@ -1730,19 +1740,8 @@ def candidate_commonness_guard_copy(
             **assessment, "newWord": normalized_word,
             "occupantWord": occupant, "freeCode": "",
         }))
-    base_code = str(candidates[0][0]) if candidates else ""
-    lines.append(f"当前候选没有空位；可指定形码后的完整编码，格式为：加入编码 {base_code}+形码（请替换形码部分）。")
     if include_controls:
-        code, occupant = protected[0]
-        lines.append("若要顶替，请点名现有词条：")
-        lines.append(render_executable_suggestion(
-            f"添加 {normalized_word} {code}，挤掉 {occupant}",
-            words=(normalized_word, occupant),
-        ))
-        lines.append(render_executable_suggestion(
-            f"添加 {normalized_word} {code}，顶替 {occupant}",
-            words=(normalized_word, occupant),
-        ))
+        lines.append("回复「取消」。")
     return "\n".join(lines)
 
 
@@ -1943,7 +1942,7 @@ def render_server_backed_single_word_lookup(
             rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延[”』]"
             rf"(?:\s*[（(][^）)\n]*[）)])?\s*\n"
             rf"(?:\s*依据[：:][^\n]*\n)?"
-            r"\s*不重排选\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
+            r"\s*(?:不重排选|换)\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
             source,
             re.IGNORECASE,
         )
@@ -1951,7 +1950,7 @@ def render_server_backed_single_word_lookup(
             reorder_copy = re.search(
                 rf"(?m)^\s*推荐[：:]\s*「{re.escape(normalized_word)}」\s*占\s*"
                 rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延(?:[；;][^\n]*)?\n"
-                r"\s*不重排选\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
+                r"\s*(?:不重排选|换)\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
                 source,
                 re.IGNORECASE,
             )
@@ -2037,7 +2036,7 @@ def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
             r"(?m)^推荐:\s*\n[-•]\s*[“『]「[^「」\r\n]{1,128}」占\s*"
             r"(?P<code>[a-z]{1,12})、\s*「[^「」\r\n]{1,128}」顺延[”』]"
             r"(?:\s*\([^\r\n)]*\))?\s*\n(?:依据:[^\r\n]*\n)?"
-            r"不重排选\s+[1-9]\d{0,2}"
+            r"(?:不重排选|换)\s+[1-9]\d{0,2}"
             r"(?:\([a-z]{1,12}\))?[。.]*\s*$",
             normalized,
             re.IGNORECASE,
@@ -2046,7 +2045,7 @@ def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
             recommended = re.search(
                 r"(?m)^推荐:\s*「[^「」\r\n]{1,128}」占\s*"
                 r"(?P<code>[a-z]{1,12})、\s*「[^「」\r\n]{1,128}」顺延"
-                r"(?:;[^\r\n]*)?\n不重排选\s+[1-9]\d{0,2}"
+                r"(?:;[^\r\n]*)?\n(?:不重排选|换)\s+[1-9]\d{0,2}"
                 r"(?:\([a-z]{1,12}\))?[。.]*\s*$",
                 normalized,
                 re.IGNORECASE,
@@ -2121,11 +2120,11 @@ def scoped_multi_word_candidate_copy(
     if counts.get(example, 0) >= 2:
         return (
             "每个词的编号都从 1 开始；"
-            f"回复「{example} 添加1」，多选回复「{example} 添加1、2」。"
+            f"回复「{example} 1」，多选回复「{example} 1、2」。"
         )
     return (
         "每个词的编号都从 1 开始；"
-        f"回复「{example} 添加1」；多选时，用顿号分隔该词列表中实际存在的编号。"
+        f"回复「{example} 1」；多选时，用顿号分隔该词列表中实际存在的编号。"
     )
 
 
@@ -2378,15 +2377,22 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
                 found.append(form)
         return tuple(found)
 
+    suggestions = advertised_command_suggestions(normalized)
+    from keytao_bot.harness.authorization_grammar import parse_reviewed_multi_word_selection
+
     candidate_selection = any(
         re.search(
-            re.escape(left) + r"添加[1-9]\d*(?:[、,，][1-9]\d*)*" + re.escape(right),
+            re.escape(left) + r"(?:添加[1-9]\d*(?:[、,，][1-9]\d*)*|换\s*[1-9]\d*)" + re.escape(right),
             normalized,
         )
         is not None
         or f" 添加1{right}" in normalized
         or f" 添加2、4{right}" in normalized
         for left, right in _ADVERTISED_QUOTE_PAIRS
+    ) or any(
+        parse_pending_candidate_selection(command) is not None
+        or parse_reviewed_multi_word_selection(command) is not None
+        for command in suggestions
     )
     displayed_binding_pairs = advertised_batch_binding_pairs(normalized)
     code_choice_advertisement = bool(
@@ -2432,7 +2438,7 @@ def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
         binding_advertisement=binding_advertisement,
         word_set_advertisement=word_set_advertisement,
         read_only_single_word_lookup=read_only_single_word_lookup,
-        command_suggestions=advertised_command_suggestions(normalized),
+        command_suggestions=suggestions,
     )
 
 
@@ -2463,7 +2469,7 @@ def ensure_multi_word_candidate_copy(text: str) -> str:
     confirmation_copy = pending_batch_confirmation_copy()
     additions = [
         copy
-        for copy in (confirmation_copy, scoped_copy)
+        for copy in (confirmation_copy, scoped_copy, "或「取消」。")
         if copy and copy not in response
     ]
     return response + (("\n\n" + "\n".join(additions)) if additions else "")
@@ -2477,7 +2483,7 @@ def pending_confirmation_prompt_instruction() -> str:
         + "\n多词的每个候选列表都从 1 开始，禁止广告或接受不带词条的编号选择；"
         "必须把当前候选消息里的真实词语逐一代入作用域命令，"
         "禁止输出“词条”“编号”“原词”等占位词。"
-        "单词候选才可提示裸编号及「添加2、4」。"
+        "单词候选可提示「换 N」，候选消息必须提示「取消」。"
     )
 
 

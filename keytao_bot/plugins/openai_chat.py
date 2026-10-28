@@ -116,6 +116,7 @@ from ..utils.pending_confirmation import (
     pending_confirmation_copy,
     pending_confirmation_prompt_instruction,
     parse_pending_assent_phrase,
+    already_existing_words_copy,
     render_executable_suggestion,
     render_remediation_reply,
     render_query_retry_reply,
@@ -4623,6 +4624,7 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
             not affirmative and isinstance(record.state, PendingToolConfirm)
             and record.state.args.get("_reviewed_multi_word") is True
             and record.state.confirmation_source == "local_preview"
+            and parse_pending_candidate_selection(_strip_command_message_prefixes(message)) is None
             and _authorization_grammar.parse_reviewed_selection_command(
                 _strip_command_message_prefixes(message)
             ) is not None
@@ -4702,10 +4704,12 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
 
 async def _try_stale_affirmative_reply(ctx: TurnContext) -> bool:
     """A closed answer without an actor-owned ticket never reaches a model."""
-    if not _chat_routing.normalize_affirmative_reply(ctx.normalized_message_text) or ctx.conv_key is None:
+    cancel = parse_pending_assent_phrase(ctx.normalized_message_text).cancel_requested
+    if not (cancel or _chat_routing.normalize_affirmative_reply(ctx.normalized_message_text)) or ctx.conv_key is None:
         return False
+    record = conversation_state_store.get_record(ctx.conv_key)
     if (
-        conversation_state_store.get_record(ctx.conv_key) is not None
+        record is not None and not (cancel and isinstance(record.state, PendingTrustedWordRecord))
         or draft_operation_coordinator.get(ctx.conv_key) is not None
     ):
         return False
@@ -4722,6 +4726,13 @@ async def _try_stale_affirmative_reply(ctx: TurnContext) -> bool:
             pass
     if not addressed:
         return False
+    if cancel:
+        ctx.response = "当前没有待取消的操作。"
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+        await _finish_ai_chat_response(
+            ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+        )
+        return True
     return await _stage_claim_offered_answer(ctx, stale_affirmative=True)
 
 
@@ -4912,13 +4923,17 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 ctx.simple_word_query_words = validated.operands
                 replies = []
                 missing_words = []
+                present_word_codes = {} if len(validated.operands) > 1 else None
                 for word in validated.operands:
                     replies.append(await _try_handle_simple_single_word_query(
                         word, ctx.platform, ctx.user_id, ctx.conv_key,
                         ctx.space_key, ctx.owner_label,
                         preserve_pending=True, query_only=True,
                         _missing_words=missing_words,
+                        _prepared_existing_words=present_word_codes,
                     ))
+                if present_word_codes:
+                    replies.append(already_existing_words_copy(present_word_codes))
                 missing_words = list(dict.fromkeys(missing_words))
                 ctx.semantic_query_reply = "\n\n".join(reply for reply in replies if reply)
                 if missing_words:
@@ -7397,6 +7412,7 @@ _CHAT_COMPAT_NAMES = (
     "PENDING_BATCH_ADD_ASSENT_TEXTS",
     "PENDING_CONFIRM_ASSENT_TEXTS",
     "advertised_batch_binding_pairs",
+    "already_existing_words_copy",
     "ensure_multi_word_candidate_copy",
     "parse_pending_assent_phrase",
     "parse_pending_candidate_selection",

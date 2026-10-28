@@ -914,7 +914,7 @@ def _pending_assent_rejection_response(
 
 def _format_live_ticket_precedence_message(state: PendingState) -> str:
     details = _describe_pending_state(state)
-    return f"{details}\n{pending_confirmation_copy()}"
+    return f"{details}\n{pending_confirmation_copy(state)}"
 
 
 def _compact_command_text(message_text: str) -> str:
@@ -2006,7 +2006,8 @@ def _resolve_reviewed_multi_word_selection(
         for occupants in scope.get("occupiedWords", {}).values() if isinstance(occupants, list)
         for occupant in occupants if isinstance(occupant, str) and occupant
     ) if scopes else ()
-    selection = parse_reviewed_selection_command(source, known_shift_words=known_shift_words)
+    bare = parse_pending_candidate_selection(source)
+    selection = None if bare is not None else parse_reviewed_selection_command(source, known_shift_words=known_shift_words)
     scoped_pairs = None
     if selection is None and not re.search(r"[?？]", source):
         for word in live_words:
@@ -2024,10 +2025,8 @@ def _resolve_reviewed_multi_word_selection(
             )
             scoped_pairs = tuple((word, selector) for selector in selectors)
             break
-    # Bare ordinals have a unique word only when the entire live query does.
-    bare = parse_pending_candidate_selection(source)
-    query_words = state.args.get("_query_words", live_words)
-    if selection is None and bare is not None and len(live_words) == len(query_words) == 1:
+    # Only live candidate scopes can supply the omitted word.
+    if selection is None and bare is not None and len(live_words) == 1:
         selectors = tuple(map(str, bare.indices)) or bare.codes
         if len(selectors) == 1:
             selection = parse_reviewed_selection_command(
@@ -3094,7 +3093,8 @@ def _is_bare_word_query_target(word: str) -> bool:
     return bool(
         looks_like_lexical_review_target(word)
         and not _is_deictic_add_command(word)
-        and word not in {"加", "删", "查", "审词", "提交", "确认", "取消"}
+        and word not in _PENDING_CONTROL_TEXTS | {"加", "删", "查", "审词"}
+        and not parse_pending_assent_phrase(word).cancel_requested
         and not re.match(
             r"^(?:请|麻烦|帮我|帮忙|给我|加词|添加|加入|删除|删掉|提交|查询|查词|查看|解释|比较|批量|不要|取消|确认)",
             word,
@@ -3109,6 +3109,11 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
     literal = parse_literal_phrase_query(message_text)
     if literal is not None:
         return (literal,)
+    if (
+        _compact_command_text(message_text) in _PENDING_CONTROL_TEXTS | {"加", "删", "查", "审词"}
+        or parse_pending_assent_phrase(message_text).cancel_requested
+    ):
+        return ()
     if is_interrogative_message(message_text) or _is_deictic_add_command(message_text):
         return ()
     explicit = re.fullmatch(
@@ -3144,7 +3149,7 @@ async def _get_simple_word_query_words(message_text: str) -> Tuple[str, ...]:
         return ()
     return tuple(
         word for word in intent.words
-        if looks_like_lexical_review_target(word)
+        if _is_bare_word_query_target(word)
     )
 
 

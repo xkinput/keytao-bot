@@ -31,10 +31,10 @@ class B8PresentWordsTests(unittest.IsolatedAsyncioTestCase):
         )
 
     def assert_present_copy(self, response):
-        for word, code in self.present.items():
-            self.assertEqual(response.splitlines().count(f"{word} 已在词库（{code}）"), 1)
-        self.assertEqual(response.count("可再追加一个编码"), 1)
-        self.assertIn("给 喜上眉梢 加一个码 <code>", response)
+        self.assertEqual(response.splitlines().count(
+            "已在词库：" + "、".join(f"{word} {code}" for word, code in self.present.items())
+        ), 1)
+        self.assertNotIn("可再追加一个编码", response)
         self.assertNotIn("当前没有必须执行的变更", response)
 
     async def assert_candidates(self, missing):
@@ -67,13 +67,10 @@ class B8PresentWordsTests(unittest.IsolatedAsyncioTestCase):
     async def test_seven_present_and_two_candidates_keep_exact_controls_and_bindings(self):
         await self.assert_candidates(("哀声叹气", "发薪"))
 
-    async def test_all_present_have_adjacent_fact_lines_and_one_hint(self):
+    async def test_all_present_share_one_fact_line_without_hint(self):
         response = await self.add(tuple(self.present))
         self.assert_present_copy(response)
-        self.assertEqual(response.splitlines()[:7], [
-            f"{word} 已在词库（{code}）" for word, code in self.present.items()
-        ])
-        self.assertEqual(len(response.splitlines()), 8)
+        self.assertEqual(len(response.splitlines()), 1)
         self.assertIsNone(self.store.get_record(self.author))
         self.assertFalse(advertised_reply_contract(response).requires_live_state)
 

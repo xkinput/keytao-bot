@@ -43,6 +43,7 @@ from keytao_bot.utils.pending_confirmation import (
     SYSTEM_REPLY_TEMPLATE_MARKERS,
     append_unbound_binding_notice,
     already_existing_word_copy,
+    already_existing_words_copy,
     advertised_batch_binding_pairs,
     advertised_command_suggestions,
     advertised_reply_contract,
@@ -1710,7 +1711,14 @@ class AgentOrchestrator:
             if not response_tool_calls:
                 from keytao_bot.plugins import chat_routing
 
-                existing_fact_blocks = [
+                existing_word_codes = {
+                    word: tuple(sorted(codes))
+                    for word, codes in trusted_word_lookup_codes_by_word.items()
+                    if word in message and codes
+                }
+                existing_fact_blocks = [already_existing_words_copy(existing_word_codes)] if (
+                    existing_word_codes and len(trusted_word_lookup_codes_by_word) > 1
+                ) else [
                     (
                         already_existing_word_copy(
                             word,
@@ -1729,8 +1737,7 @@ class AgentOrchestrator:
                             ),
                         )
                     )
-                    for word, codes in trusted_word_lookup_codes_by_word.items()
-                    if word in message and codes
+                    for word, codes in existing_word_codes.items()
                 ]
                 existing_fact_prefix = "\n\n".join(
                     block for block in existing_fact_blocks if block
@@ -1740,6 +1747,16 @@ class AgentOrchestrator:
                     rendered = str(reply or "").strip()
                     if not existing_fact_prefix:
                         return rendered
+                    if len(trusted_word_lookup_codes_by_word) > 1:
+                        old_fact_lines = {
+                            f"「{word}」已在词库（{'、'.join(codes)}）"
+                            for word, codes in existing_word_codes.items()
+                        }
+                        rendered = "\n".join(
+                            line for line in rendered.splitlines()
+                            if line.strip().rstrip("。.") not in old_fact_lines
+                            and not line.strip().startswith("可再追加一个编码")
+                        ).strip()
                     if all(
                         block.splitlines()[0] in rendered
                         for block in existing_fact_blocks

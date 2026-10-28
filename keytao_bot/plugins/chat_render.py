@@ -909,7 +909,7 @@ def _format_pending_duplicate_confirmation(state: PendingToolConfirm) -> str:
     return _assert_plain_user_facing_reply(prepend_pending_word_reminders(
         _format_pending_state_details(state)
         + "\n该词已在审核中，确认再提交一条相同词条吗？\n"
-        + pending_confirmation_copy(),
+        + pending_confirmation_copy(state),
         state.args["_pending_display"]["pendingItems"],
     ))
 
@@ -920,7 +920,7 @@ def _format_server_bound_confirmation_prompt(state: PendingToolConfirm) -> str:
         raise ValueError("Server-bound confirmation prompt requires a server ticket")
     details = _format_pending_state_details(state)
     return _assert_plain_user_facing_reply(
-        f"{details}\n{pending_confirmation_copy()}"
+        f"{details}\n{pending_confirmation_copy(state)}"
     )
 
 
@@ -1606,32 +1606,6 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         lines.append(f"• 「{word}」→ {recommended_code}（推荐）")
     if not guard_copy:
         lines.append(single_word_candidate_footer(candidate_index - 1))
-    occupied_choice = next(
-        (
-            (
-                candidate_indexes.get(str(status.get("code") or "").strip().lower()),
-                next(
-                    (
-                        str(phrase.get("word") or "").strip()
-                        for phrase in status.get("phrases") or []
-                        if isinstance(phrase, dict)
-                        and str(phrase.get("word") or "").strip()
-                    ),
-                    "",
-                ),
-            )
-            for pronunciation in pronunciations
-            for status in pronunciation.get("candidateStatuses", [])
-            if isinstance(status, dict) and status.get("occupied") is True
-        ),
-        None,
-    )
-    if not guard_copy and reorder_recommendation is None and occupied_choice and occupied_choice[0]:
-        occupied_index, occupied_word = occupied_choice
-        target_copy = f"已有词「{occupied_word}」" if occupied_word else "该已有词"
-        lines.append(
-            f"若要挪开{target_copy}，回复“{occupied_index} 重新编码”。"
-        )
     return "\n".join(lines).strip()
 
 
