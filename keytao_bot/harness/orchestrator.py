@@ -83,6 +83,7 @@ from .state import (
 )
 from .conversation import ConversationAddress
 from .authorization_grammar import (
+    _tool_intent_pattern,
     explicit_same_code_requested,
     is_character_composition_question,
     is_interrogative_message,
@@ -1017,6 +1018,7 @@ class AgentOrchestrator:
             if supports_thinking_control(self._runtime.model):
                 current_reasoning_effort = "low"
         seen_tool_calls: Dict[tuple, tuple[int, bool]] = {}
+        blocked_tool_families: Dict[str, int] = {}
         seen_tool_call_ids: set[str] = set()
         total_tool_calls = 0
         dispatched_tool_call = False
@@ -1061,6 +1063,24 @@ class AgentOrchestrator:
         queued_batch_total = 0
         queued_batch_completed = 0
         queued_budget_omitted: List[str] = []
+
+        def repeated_policy_block_reply(
+            tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any],
+        ) -> Optional[str]:
+            if result.get("policyBlocked") is not True:
+                return None
+            intent_pattern = _tool_intent_pattern(tool_name, arguments)
+            family = intent_pattern.pattern if intent_pattern is not None else tool_name
+            blocked_tool_families[family] = blocked_tool_families.get(family, 0) + 1
+            if blocked_tool_families[family] < 2:
+                return None
+            if termination_state is not None:
+                termination_state["reason"] = "policy_tool_runaway"
+                termination_state["model_authored_reply"] = False
+            return self._append_authoritative_result_links(
+                str(result.get("message") or "当前操作未通过校验，本次未执行。"),
+                authoritative_result_links,
+            )
 
         def tool_free_turn() -> bool:
             if turn_metrics is not None:
@@ -2733,6 +2753,13 @@ class AgentOrchestrator:
                             and failure_state is not None
                         ):
                             failure_state.clear()
+                    policy_block_counted = result_data.get("policyBlocked") is True
+                    policy_reply = (
+                        repeated_policy_block_reply(fn_name, canonical_fn_args, result_data)
+                        if not review_target_blocked and not encode_blocked else None
+                    )
+                    if policy_reply is not None:
+                        return policy_reply
                     if (
                         isinstance(result_data, dict)
                         and (result_data.get("success") is True or result_data.get("partialWrite") is True)
@@ -2899,6 +2926,10 @@ class AgentOrchestrator:
                             ),
                         }
                         result_str = json.dumps(result_data, ensure_ascii=False)
+                        if not policy_block_counted:
+                            policy_reply = repeated_policy_block_reply(fn_name, canonical_fn_args, result_data)
+                            if policy_reply is not None:
+                                return policy_reply
                     if result_data.get("requiresConfirmation") and pending_saved:
                         pending_record = self._state_store.get_record(conv_key)
                         pending_state = (
@@ -5373,18 +5404,15 @@ class AgentOrchestrator:
             if fn_name in MUTATING_TOOL_NAMES:
                 if first_call_succeeded:
                     duplicate_hint = (
-                        f"工具 {fn_name} 已执行过，数据已写入。"
-                        "禁止重复调用。请直接根据上方执行结果回复用户。"
+                        "这项操作已完成，数据已写入；本次没有重复写入。"
                     )
                 else:
                     duplicate_hint = (
-                        f"工具 {fn_name} 首次调用未写入。"
-                        "禁止重复调用。请直接根据上方结果回复用户。"
+                        "这项操作首次调用未写入，本次没有重复执行。"
                     )
             else:
                 duplicate_hint = (
-                    f"工具 {fn_name} 已调用过，结果已在上方消息中。"
-                    "禁止再次调用此工具。请直接使用上方已有数据继续下一步操作。"
+                    "这项查询已有结果，本次没有重复查询。"
                 )
             seen_tool_calls[call_fingerprint] = (
                 duplicate_count + 1,

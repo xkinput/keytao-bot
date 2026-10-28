@@ -131,6 +131,16 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
         return record
 
     async def stage_command_family(self, op):
+        if op == "delete":
+            lookup = AsyncMock(return_value=json.dumps({"success": True, "phrases": [
+                {"word": "午时", "code": "wj", "type": "Phrase"},
+            ]}))
+            with patch.object(self.commands, "call_tool_function", lookup):
+                handled = await self.chat._stage_understand_operation(self.ctx)
+            lookup.assert_awaited_once_with(
+                "keytao_lookup_by_word", {"word": "午时"}, "qq", self.author.actor_id,
+            )
+            return handled
         if op != "move":
             return await self.chat._stage_understand_operation(self.ctx)
 
@@ -224,6 +234,7 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_non_swap_families_only_seal_before_confirmation(self):
         for op, message, operands, codes in self.command_families():
             with self.subTest(op=op):
+                self.tool.reset_mock()
                 os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] = op
                 self.store.delete(self.author)
                 self.ctx = self.context(message)
@@ -239,6 +250,7 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_understood_families_survive_real_delivery_boundaries(self):
         for op, message, operands, codes in self.command_families():
             with self.subTest(op=op):
+                self.tool.reset_mock()
                 os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] = op
                 self.store.delete(self.author)
                 self.ctx = self.context(message)
@@ -264,6 +276,7 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
         )
         for op, message, operands, codes in self.command_families():
             with self.subTest(op=op):
+                self.tool.reset_mock()
                 os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] = op
                 self.store.delete(self.author)
                 self.ctx = self.context(message)
@@ -309,7 +322,7 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
                 self.ctx = self.context("调整午时的 wj wja")
                 self.set_model(op, ("午时",), codes)
                 self.tool.reset_mock()
-                self.assertTrue(await self.chat._stage_understand_operation(self.ctx))
+                self.assertTrue(await self.stage_command_family(op))
                 self.tool.assert_not_awaited()
 
                 async def call(name, args, platform, user_id, **kwargs):

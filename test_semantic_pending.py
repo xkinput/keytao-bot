@@ -880,6 +880,111 @@ class SemanticPendingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.add.await_args.args[:2], ("午时", "wja"))
                 self.assertIsNone(self.store.get_record(self.author))
 
+    def b7_multiword_ticket(self):
+        items, scopes = [], []
+        for word, recommended, candidates, occupied in (
+            ("皇太极", "htju", [("htj", True), ("htju", True), ("htjuv", False), ("htjuvv", False)],
+             {"htj": ["火腿肠"], "htju": ["航天局"]}),
+            ("福临", "fjlb", [("fjlb", True), ("fjlbo", False), ("fjlboi", False)],
+             {"fjlb": ["富临"]}),
+        ):
+            reviewed = PendingAddWord(
+                word, recommended, candidates, occupied_words=occupied,
+                server_candidates=candidates, server_occupied_words=occupied,
+            )
+            items.append({"action": "Create", "word": word, "code": recommended})
+            scopes.append({
+                "word": word, "candidates": candidates, "occupiedWords": occupied,
+                "orderingAssessments": [], "reviewedState": self.commands._pending_add_word_payload(reviewed),
+                "reviewedPrompt": self.chat.render_server_backed_single_word_candidates(
+                    word, recommended, candidates, occupied, [],
+                ),
+            })
+        self.assertTrue(self.store.set(self.author, PendingToolConfirm("keytao_batch_add_to_draft", {
+            "items": items, "_candidate_scopes": scopes, "_reviewed_multi_word": True,
+            "_query_words": ["皇太极", "福临"],
+        })))
+        record = self.store.get_record(self.author)
+        prompt = self.chat._render_live_batch_record(record)
+        self.assertTrue(prompt)
+        self.assertTrue(self.store.bind_origin_prompt_digest(
+            self.author, self.chat._prompt_capability_digest(prompt),
+        ))
+        self.history = [
+            {"role": "assistant", "content": prompt},
+            {"role": "assistant", "content": "看到了你的选词请求，但其中有无法识别的附加内容；本次未写入。"},
+        ]
+        return record, prompt
+
+    async def test_b7_named_multiword_selection_survives_rejection_and_parse_failure(self):
+        for scenario in ("model_agrees", "timeout", "tokens_absent", "no_digest"):
+            with self.subTest(scenario=scenario):
+                self.b7_multiword_ticket()
+                self.client.create.reset_mock()
+                self.ctx = self.context("皇太极 3， 福临 2")
+                self.set_model("select_candidate", ("皇太极", "福临"), refers_to_pending=True)
+                if scenario == "timeout":
+                    self.client.create.side_effect = asyncio.TimeoutError()
+                if scenario == "no_digest":
+                    self.assertTrue(self.store.bind_origin_prompt_digest(self.author, ""))
+                os.environ["KEYTAO_SEMANTIC_ROUTE_OPS"] = (
+                    "swap,delete,recode,move,reorder,batch_replace,draft_submit,draft_recall,"
+                    "draft_clear,draft_keep_only,query,chat,help,pending_release,pending_answer,direct_exec,add"
+                    if scenario != "tokens_absent" else ""
+                )
+                execute = AsyncMock(return_value="offline multiword receipt")
+                with patch.object(self.chat, "handle_pending_message_core", execute):
+                    self.assertTrue(await self.chat._stage_understand_operation_early(self.ctx))
+                execute.assert_awaited_once()
+                self.assertEqual(execute.await_args.args[0], "皇太极 3， 福临 2")
+                self.assertFalse(execute.await_args.kwargs["allow_intent_model"])
+                self.assertEqual(self.ctx.response, "offline multiword receipt")
+                self.client.create.assert_not_awaited()
+                self.assertFalse(self.ctx.semantic_pending_released)
+
+    async def test_b7_named_multiword_selection_keeps_quote_and_live_ticket_guards(self):
+        for scenario in ("foreign_quote", "stale_quote", "missing_ticket", "executing"):
+            with self.subTest(scenario=scenario):
+                record, prompt = self.b7_multiword_ticket()
+                self.ctx = self.context("皇太极 3， 福临 2")
+                self.set_model("select_candidate", ("皇太极", "福临"), refers_to_pending=True)
+                if scenario in {"foreign_quote", "stale_quote"}:
+                    self.ctx.reply_reference = harness.ReplyReferenceInfo(
+                        is_reply=True, is_to_bot=True,
+                        text="另一条无关候选消息" if scenario == "foreign_quote" else prompt.replace("htjuv", "htjua"),
+                    )
+                elif scenario == "missing_ticket":
+                    self.store.delete(self.author)
+                else:
+                    self.assertTrue(self.store.begin_execution(record))
+                execute = AsyncMock(return_value="unexpected stale execution")
+                with patch.object(self.chat, "handle_pending_message_core", execute):
+                    self.assertFalse(await self.chat._stage_understand_operation_early(self.ctx))
+                execute.assert_not_awaited()
+
+    async def test_b7_stale_single_word_review_requires_name_for_early_selection(self):
+        for message, should_handle in (("3", False), ("htjuv", False), ("皇太极 3", True)):
+            with self.subTest(message=message):
+                record, _ = self.b7_multiword_ticket()
+                record.state.args["items"] = record.state.args["items"][:1]
+                record.state.args["_candidate_scopes"] = record.state.args["_candidate_scopes"][:1]
+                record.state.args["_query_words"] = ["皇太极"]
+                prompt = self.chat._render_live_batch_record(record)
+                self.assertTrue(prompt)
+                self.assertTrue(self.store.bind_origin_prompt_digest(
+                    self.author, self.chat._prompt_capability_digest(prompt),
+                ))
+                self.history = [
+                    {"role": "assistant", "content": prompt},
+                    {"role": "assistant", "content": "另一个不相关的选择：1. 保留；2. 取消；3. 查看。"},
+                ]
+                self.ctx = self.context(message)
+                self.client.create.side_effect = asyncio.TimeoutError()
+                execute = AsyncMock(return_value="offline named selection receipt")
+                with patch.object(self.chat, "handle_pending_message_core", execute):
+                    self.assertEqual(await self.chat._stage_understand_operation_early(self.ctx), should_handle)
+                self.assertEqual(execute.await_count, int(should_handle))
+
 
 if __name__ == "__main__":
     unittest.main()

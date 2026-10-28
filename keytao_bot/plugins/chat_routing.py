@@ -65,6 +65,7 @@ from ..utils.pending_confirmation import (
     pending_confirmation_copy,
     render_executable_suggestion,
     render_remediation_reply,
+    validated_front_insert_recommendation,
 )
 from .chat_adapters import (
     AsyncOpenAI,
@@ -1999,7 +2000,13 @@ def _resolve_reviewed_multi_word_selection(
     unquoted = _whole_message_unquoted_source(source, live_words)
     if unquoted is not None:
         source = unquoted
-    selection = parse_reviewed_selection_command(source)
+    known_shift_words = tuple(
+        occupant
+        for scope in state.args["_candidate_scopes"]
+        for occupants in scope.get("occupiedWords", {}).values() if isinstance(occupants, list)
+        for occupant in occupants if isinstance(occupant, str) and occupant
+    ) if scopes else ()
+    selection = parse_reviewed_selection_command(source, known_shift_words=known_shift_words)
     scoped_pairs = None
     if selection is None and not re.search(r"[?？]", source):
         for word in live_words:
@@ -2043,6 +2050,34 @@ def _resolve_reviewed_multi_word_selection(
         ):
             return None, None, "当前多词候选记录不完整，请重新查询；本次未写入。"
         return None, None, None
+    if selection is not None and selection.shift_words:
+        bound_pairs = list(pairs)
+        for occupant in selection.shift_words:
+            recommendations = [
+                recommendation
+                for scope in state.args["_candidate_scopes"]
+                if (recommendation := validated_front_insert_recommendation(
+                    scope["word"], scope["candidates"], scope["occupiedWords"], scope["orderingAssessments"],
+                )) is not None and recommendation["occupantWord"] == occupant
+            ]
+            if len(recommendations) != 1:
+                return None, None, explain(f"「{occupant}」没有当前可核验的推荐顺延方案；本次未写入")
+            recommendation = recommendations[0]
+            word, code = recommendation["newWord"], recommendation["newCode"]
+            existing = [selector for target, selector in bound_pairs if target == word]
+            if existing:
+                selector = existing[0]
+                candidates = scopes[word]
+                selected_code = (
+                    candidates[int(selector) - 1][0]
+                    if selector.isdecimal() and 1 <= int(selector) <= len(candidates)
+                    else selector
+                )
+                if selected_code != code:
+                    return None, None, explain(f"「{word}」的候选选择与「{occupant}」顺延方案冲突；本次未写入")
+            else:
+                bound_pairs.append((word, code))
+        pairs = tuple(bound_pairs)
     if pairs is None:
         if parse_entry_swap(message_text) is not None:
             return None, None, None
@@ -2061,6 +2096,7 @@ def _resolve_reviewed_multi_word_selection(
         r"^(?:请)?(?:(?:先|暂时|暂)?(?:不要|不必|不能|不准|不许|不用|别|莫|勿|甭)|"
         r"(?:先|暂时|暂)不|并非|尚未|绝不能|无须|毋须|原话(?:是)?|转述|引用|"
         r"翻译|解释|假设|比如|例如|如果|备查|留存|存证|摘记|纪要|"
+        r"删除|删掉|移除|修改|改成|改为|撤销|撤回|提交|"
         r"[\u3400-\u9fff]{0,8}(?:说|提到|要求|表示|认为|声称|称))"
     )
     if any(word not in scopes and unbound_control.match(word) for word, _ in pairs):
@@ -2116,7 +2152,10 @@ def _resolve_reviewed_multi_word_selection(
         item["remark"] = (
             raw_scope["reviewedState"].get("codeRemarks", {}).get(code, "")
         )
-        if dict(candidates)[code]:
+        recommendation = validated_front_insert_recommendation(
+            word, candidates, raw_scope["occupiedWords"], raw_scope["orderingAssessments"],
+        )
+        if dict(candidates)[code] and not (recommendation and recommendation["newCode"] == code):
             item["needsManualReview"] = True
             item["manualReviewReason"] = "重码添加需管理员审核"
         selected_items.append(item)
@@ -2135,10 +2174,24 @@ def _resolve_reviewed_multi_word_selection(
         word for word in items_by_word if word not in selected_words
     ]
     derived_args["_candidate_scopes"] = [
-        {**scope, "orderingAssessments": [], "reviewedState": {
+        {**scope, "orderingAssessments": [
+            assessment for assessment in scope["orderingAssessments"]
+            if assessment.get("occupantCode") == (validated_front_insert_recommendation(
+                scope["word"], scope["candidates"], scope["occupiedWords"], scope["orderingAssessments"],
+            ) or {}).get("newCode") and assessment.get("occupantCode") in {
+                item["code"] for item in selected_items if item["word"] == scope["word"]
+            }
+        ], "reviewedState": {
             **scope["reviewedState"],
             "recommendedCode": next(item["code"] for item in selected_items if item["word"] == scope["word"]),
-            "serverOrderingAssessments": [],
+            "serverOrderingAssessments": [
+                assessment for assessment in scope["orderingAssessments"]
+                if assessment.get("occupantCode") == (validated_front_insert_recommendation(
+                    scope["word"], scope["candidates"], scope["occupiedWords"], scope["orderingAssessments"],
+                ) or {}).get("newCode") and assessment.get("occupantCode") in {
+                    item["code"] for item in selected_items if item["word"] == scope["word"]
+                }
+            ],
         }}
         for scope in state.args["_candidate_scopes"]
         if scope["word"] in selected_words

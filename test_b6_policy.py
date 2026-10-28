@@ -8,6 +8,7 @@ import unittest
 from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from keytao_bot.utils.draft_reminder import DAY_SECONDS, SHANGHAI, DraftReminderStore
@@ -427,6 +428,144 @@ class B6ReminderIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await self.chat._stage_draft_reminder_reply(ctx))
         normal.assert_not_awaited()
         self.assertIs(coordinator.get(memory.conversation_address), active)
+
+
+class B7BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
+    policy_message = "当前编码与已核验的词条不一致，本次未写入。"
+
+    def orchestrator(self, calls, results=None):
+        import test_state_machine as harness
+        from keytao_bot.harness.orchestrator import AgentOrchestrator, AgentRuntimeConfig
+        from keytao_bot.harness.tools import ToolExecutor
+
+        responses = [SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="tool_calls", message=SimpleNamespace(content="", tool_calls=[
+                SimpleNamespace(type="function", id=f"b7-{index}", function=SimpleNamespace(
+                    name=name, arguments=json.dumps(arguments, ensure_ascii=False),
+                )),
+            ]),
+        )], usage=None) for index, (name, arguments) in enumerate(calls)]
+        responses.append(SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop", message=SimpleNamespace(content="核验已结束。", tool_calls=[]),
+        )], usage=None))
+        create = AsyncMock(side_effect=responses)
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        executor = ToolExecutor(lambda name: None, frozenset())
+        executor.call = AsyncMock(side_effect=[json.dumps(result, ensure_ascii=False) for result in results]
+                                  if results is not None else None,
+                                  return_value=json.dumps({
+                                      "success": False, "policyBlocked": True,
+                                      "blockReason": "binding_incomplete", "message": self.policy_message,
+                                  }, ensure_ascii=False))
+        tools = [{"type": "function", "function": {"name": name, "parameters": {}}}
+                 for name in dict(calls)]
+        agent = AgentOrchestrator(
+            client_factory=lambda: client,
+            runtime=AgentRuntimeConfig(model="offline-model", max_tokens=1000, temperature=0.2, timeout=1),
+            skills_manager=SimpleNamespace(get_skill_instructions=lambda: "", has_tools=lambda: True,
+                                          get_tools=lambda: tools),
+            tool_executor=executor, state_store=harness.MemoryConversationStateStore(),
+            bind_help_text="Offline binding help", system_prompt_core="Offline system prompt",
+        )
+        return agent, create, executor.call
+
+    async def run_loop(self, agent):
+        from keytao_bot.harness.orchestrator import AgentRequestContext
+        termination = {}
+        reply = await agent._run_loop(
+            "修改编码：我送给为wsgu，纯音乐为jyya",
+            AgentRequestContext(platform="qq", user_id="b7-loop", mutations_allowed=True),
+            termination_state=termination,
+        )
+        return reply, termination
+
+    async def test_second_policy_block_stops_without_counting_cached_duplicates(self):
+        for second_word in ("纯音乐", "我送给"):
+            with self.subTest(second_word=second_word):
+                calls = [("keytao_shift_phrase_code", {"word": word, "target_code": "wsgu"})
+                         for word in ("我送给", second_word, "皇太极")]
+                agent, create, execute = self.orchestrator(calls)
+                reply, termination = await self.run_loop(agent)
+                self.assertEqual(reply, self.policy_message)
+                self.assertEqual(termination["reason"], "policy_tool_runaway")
+                self.assertEqual(create.await_count, 3 if second_word == "我送给" else 2)
+                self.assertEqual(execute.await_count, 2)
+
+    async def test_existing_intent_mapping_groups_different_tools(self):
+        agent, create, execute = self.orchestrator([
+            ("keytao_create_phrase", {"word": "我送给", "code": "wsgu"}),
+            ("keytao_batch_add_to_draft", {"items": [{"word": "纯音乐", "code": "jyya"}]}),
+        ])
+        reply, termination = await self.run_loop(agent)
+        self.assertEqual(reply, self.policy_message)
+        self.assertEqual(termination["reason"], "policy_tool_runaway")
+        self.assertEqual((create.await_count, execute.await_count), (2, 2))
+
+    async def test_policy_block_counts_reset_for_each_turn(self):
+        agent, create, execute = self.orchestrator([
+            ("keytao_shift_phrase_code", {"word": "我送给", "target_code": "wsgu"}),
+            ("keytao_shift_phrase_code", {"word": "纯音乐", "target_code": "jyya"}),
+        ] * 2)
+        for _ in range(2):
+            reply, termination = await self.run_loop(agent)
+            self.assertEqual(reply, self.policy_message)
+            self.assertEqual(termination["reason"], "policy_tool_runaway")
+        self.assertEqual((create.await_count, execute.await_count), (4, 4))
+
+    async def test_one_block_in_each_family_does_not_stop_the_turn(self):
+        agent, create, execute = self.orchestrator([
+            ("keytao_shift_phrase_code", {"word": "我送给", "target_code": "wsgu"}),
+            ("keytao_remove_draft_item", {"pr_id": 1}),
+        ])
+        reply, termination = await self.run_loop(agent)
+        self.assertEqual(reply, "核验已结束。")
+        self.assertNotIn("reason", termination)
+        self.assertEqual((create.await_count, execute.await_count), (3, 2))
+
+    async def test_locally_rejected_confirmation_counts_as_a_policy_block(self):
+        incomplete = {"success": False, "requiresConfirmation": True, "message": "Offline incomplete plan"}
+        agent, create, execute = self.orchestrator([
+            ("keytao_shift_phrase_code", {"word": "我送给", "target_code": "wsgu"}),
+            ("keytao_shift_phrase_code", {"word": "纯音乐", "target_code": "jyya"}),
+        ], [incomplete, incomplete])
+        with patch.object(agent, "_save_pending_tool_confirm", return_value=False):
+            reply, termination = await self.run_loop(agent)
+        self.assertIn("待确认内容不完整，本次未执行", reply)
+        self.assertEqual(termination["reason"], "policy_tool_runaway")
+        self.assertEqual((create.await_count, execute.await_count), (2, 2))
+
+    async def test_stopping_keeps_earlier_successful_write_receipt(self):
+        from keytao_bot.harness.orchestrator import AgentRequestContext
+        blocked = {"success": False, "policyBlocked": True, "blockReason": "binding_incomplete",
+                   "message": self.policy_message}
+        agent, create, execute = self.orchestrator([
+            ("keytao_create_phrase", {"word": "栗子", "code": "lizi"}),
+            ("keytao_shift_phrase_code", {"word": "我送给", "target_code": "wsgu"}),
+            ("keytao_shift_phrase_code", {"word": "纯音乐", "target_code": "jyya"}),
+        ], [{"success": True, "batchId": "b7-batch", "batchUrl": "https://offline.invalid/b7-batch"},
+            blocked, blocked])
+        reply = await agent.run(
+            "修改编码：我送给为wsgu，纯音乐为jyya",
+            AgentRequestContext(platform="qq", user_id="b7-loop", mutations_allowed=True),
+        )
+        self.assertIn("「栗子」 → lizi", reply)
+        self.assertIn("当前编码与已核验的词条不一致", reply)
+        self.assertIn("https://offline.invalid/b7-batch", reply)
+        self.assertEqual((create.await_count, execute.await_count), (3, 3))
+
+    async def test_duplicate_copy_does_not_expose_internal_fragments(self):
+        from keytao_bot.harness.tools import ToolContext, project_tool_result_for_model
+        from keytao_bot.plugins.chat_render import _reply_has_internal_fragment
+        for tool_name, succeeded in (("keytao_create_phrase", True), ("keytao_create_phrase", False),
+                                     ("keytao_lookup_by_word", True)):
+            with self.subTest(tool_name=tool_name, succeeded=succeeded):
+                agent, _, execute = self.orchestrator([])
+                args = {"word": "我送给", "code": "wsg"}
+                seen = {(tool_name, json.dumps(args, sort_keys=True, ensure_ascii=False)): (1, succeeded)}
+                result = await agent._call_tool_once(tool_name, args, ToolContext(), seen)
+                message = json.loads(project_tool_result_for_model(tool_name, result, args))["message"]
+                self.assertFalse(_reply_has_internal_fragment(message), message)
+                execute.assert_not_awaited()
 
 
 if __name__ == "__main__":

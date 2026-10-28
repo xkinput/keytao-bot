@@ -3001,9 +3001,59 @@ class ReviewedSelectionCommand:
     pairs: Tuple[Tuple[str, str], ...]
     action: str = ""
     readings: Tuple[Tuple[str, str], ...] = ()
+    shift_words: Tuple[str, ...] = ()
 
 
-def parse_reviewed_selection_command(message: str) -> Optional[ReviewedSelectionCommand]:
+_REVIEWED_SHIFT_WORD = (
+    r'(?:「[\u3400-\u9fff]{1,32}」|“[\u3400-\u9fff]{1,32}”|"[\u3400-\u9fff]{1,32}"|'
+    r'[\u3400-\u9fff]{1,32}?(?=[ \t]*和[ \t]*[「“"\u3400-\u9fff]|[ \t]*$))'
+)
+
+
+def parse_reviewed_shift_words(
+    message: str, *, known_words: Tuple[str, ...] = (),
+) -> Optional[Tuple[str, ...]]:
+    """Parse named displacements; the caller must bind every word to a plan."""
+    source = str(message or "").strip().rstrip("。.").strip()
+    if not source or len(source) > 4096:
+        return None
+    words: List[str] = []
+    for clause in re.split(r"[，、,；;]", source):
+        match = re.fullmatch(r"(?P<body>.+?)[ \t]*顺延", clause.strip())
+        if match is None:
+            return None
+        body = match.group("body").strip()
+        while body:
+            known = next((word for word in sorted(set(known_words), key=len, reverse=True)
+                          if body.startswith(word) and (
+                              not body[len(word):].strip()
+                              or body[len(word):].strip().startswith("和")
+                          )), "")
+            if known:
+                word, consumed = known, len(known)
+            else:
+                operand = re.match(_REVIEWED_SHIFT_WORD, body)
+                if operand is None:
+                    return None
+                quoted = operand.group().startswith(('「', '“', '"'))
+                word, consumed = operand.group().strip('「」“”"'), operand.end()
+                if not quoted and (
+                    _NEGATIVE_MODAL_RE.match(word)
+                    or _POSITIONAL_REPORTED_CONTEXT_RE.match(word)
+                ):
+                    return None
+            words.append(word)
+            body = body[consumed:].strip()
+            if body:
+                if not body.startswith("和") or not body[1:].strip():
+                    return None
+                body = body[1:].strip()
+    return tuple(dict.fromkeys(words))
+
+
+def parse_reviewed_selection_command(
+    message: str, *, known_shift_words: Tuple[str, ...] = (),
+) -> Optional[ReviewedSelectionCommand]:
     """Consume the complete selection and optional action, without granting authority."""
     source = str(message or "").strip().rstrip("。.").strip()
     if not source or len(source) > 4096:
@@ -3018,27 +3068,41 @@ def parse_reviewed_selection_command(message: str) -> Optional[ReviewedSelection
         action, source = match.group("action"), match.group("body")
     pairs: List[Tuple[str, str]] = []
     readings: List[Tuple[str, str]] = []
+    shift_words: List[str] = []
     seen_words: set[str] = set()
     for clause in re.split(r"[，、,；;]", source):
-        match = re.fullmatch(
-            r"\s*(?P<word>[\u3400-\u9fff]{1,32})[ \t]+"
-            r"(?P<add>添加[ \t]+)?"
-            r"(?:(?P<reading>[a-zA-ZüÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ \t]+)[:：][ \t]*)?"
-            r"(?P<selector>[1-9][0-9]{0,2}|[a-zA-Z]{1,12})\s*",
-            clause,
-        )
-        if match is None or match.group("word") in seen_words:
+        remaining = clause.strip()
+        if not remaining:
             return None
-        word = match.group("word")
-        seen_words.add(word)
-        pairs.append((word, match.group("selector").lower()))
-        if match.group("reading"):
-            if match.group("selector").isdecimal():
+        while remaining:
+            shift_end = remaining.find("顺延") + len("顺延")
+            shifted = parse_reviewed_shift_words(
+                remaining[:shift_end], known_words=known_shift_words,
+            ) if shift_end >= len("顺延") else None
+            if shifted is not None and (shift_end == len(remaining) or remaining[shift_end] in " \t"):
+                shift_words.extend(shifted)
+                remaining = remaining[shift_end:].strip()
+                continue
+            match = re.match(
+                r"(?P<word>[\u3400-\u9fff]{1,32})[ \t]+"
+                r"(?P<add>添加[ \t]+)?"
+                r"(?:(?P<reading>[a-zA-ZüÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ \t]+)[:：][ \t]*)?"
+                r"(?P<selector>[1-9][0-9]{0,2}|[a-zA-Z]{1,12})(?=$|[ \t])",
+                remaining,
+            )
+            if match is None or match.group("word") in seen_words:
                 return None
-            readings.append((word, " ".join(match.group("reading").split())))
-        if match.group("add") and not action:
-            action = "加入"
-    return ReviewedSelectionCommand(tuple(pairs), action, tuple(readings))
+            word = match.group("word")
+            seen_words.add(word)
+            pairs.append((word, match.group("selector").lower()))
+            if match.group("reading"):
+                if match.group("selector").isdecimal():
+                    return None
+                readings.append((word, " ".join(match.group("reading").split())))
+            if match.group("add") and not action:
+                action = "加入"
+            remaining = remaining[match.end():].strip()
+    return ReviewedSelectionCommand(tuple(pairs), action, tuple(readings), tuple(dict.fromkeys(shift_words)))
 
 
 def parse_reviewed_multi_word_selection(

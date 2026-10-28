@@ -100,7 +100,7 @@ def understand_message(
         if command is not None:
             return matched(
                 "parse_reviewed_selection_command", "select_candidate",
-                tuple(word for word, _selector in command.pairs),
+                tuple(word for word, _selector in command.pairs) + command.shift_words,
                 tuple(selector for _word, selector in command.pairs if not selector.isdecimal()),
                 "并提交" in command.action, pending=True,
             )

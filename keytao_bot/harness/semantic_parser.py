@@ -68,6 +68,10 @@ pending_recode: request a different code for the pending ticket (换码/换一�
 swap: swap two existing entries' codes, positions or priority.
 delete: delete an existing entry.
 recode: change an existing entry to a different code.
+修改编码: X为C，Y为D means multiple recodes: operands [X, Y], codes [C, D], in the same order.
+Keep 为/是/改为/改成 out of operands; they connect each literal word to its target code.
+删除"X"编码，添加"X"为C and 删除"X"的编码C0，添加"X"的编码为C mean one same-word recode,
+not delete or add: operands [X], codes [C] or [C0, C] when the old code is explicit.
 reorder: change candidate order on a code or chain, including X 优先于 Y or 提到前面. operands: the word to put first, then the word it goes ahead of.
 move: move/insert an entry at a specific code position, or replace the entry at a code.
 batch_replace: replace a character across a listed set of codes.
@@ -148,6 +152,16 @@ _FRAME_MUTATION_RE = re.compile(
     _MUTATION_INTENT_RE.pattern + "|" + _POSITIONAL_COMMAND_VERB_RE.pattern + "|"
     r"加|删|改|换|对调|移|挪|执行|确认|选|排序|重排|优先于|"
     r"(?:作为|设为|选为).{0,8}(?:首选|次选|备选)"
+)
+_RECODE_WORD_PATTERN = (
+    r'(?:「[^」\r\n,，;；]+」|“[^”\r\n,，;；]+”|"[^"\r\n,，;；]+"|'
+    r'[\u3400-\u9fffA-Za-z0-9_-]+?)'
+)
+_SAME_WORD_RECODE_RE = re.compile(
+    rf"删除\s*(?P<old_word>{_RECODE_WORD_PATTERN})\s*(?:的)?编码\s*"
+    rf"(?P<old_code>[a-z]{{1,12}})?\s*[,，]\s*添加\s*"
+    rf"(?P<new_word>{_RECODE_WORD_PATTERN})\s*(?:的编码|编码)?\s*为\s*"
+    r"(?P<new_code>[a-z]{1,12})[。.!！]?"
 )
 
 
@@ -274,6 +288,17 @@ def validate_operation(
         frame = _backstop_frame(message, op)
         if frame != "direct":
             violations.append(f"frame_backstop:{frame}")
+    if frame == "direct" and op in {"delete", "recode", "add"}:
+        source = re.sub(r"^\s*@?喵喵[\s，,:：]*", "", message, count=1).strip()
+        same_word = _SAME_WORD_RECODE_RE.fullmatch(source)
+        if same_word:
+            old_word = same_word["old_word"].strip('「」“”"')
+            new_word = same_word["new_word"].strip('「」“”"')
+            if old_word == new_word:
+                op, relation = "recode", ""
+                raw = {**raw, "operands": [old_word], "codes": [
+                    code for code in (same_word["old_code"], same_word["new_code"]) if code
+                ], "submit_after": False, "refers_to_pending": False}
     if submit_command and frame == "direct":
         # Submission supersedes unrelated tickets; discard inferred choices and the redundant suffix.
         op, relation = "draft_submit", ""
@@ -313,6 +338,12 @@ def validate_operation(
             )
             operand = word
             operand_codes.setdefault(code, index)
+        if op == "recode":
+            connector = re.fullmatch(r"(.+?)(?:改为|改成|为|是)", operand)
+            if connector and re.search(
+                re.escape(operand) + r"[a-z]{1,12}(?![a-zA-Z])", text,
+            ):
+                operand = connector[1]
         if operand in text or operand in pending_words:
             operands.append(operand)
         else:

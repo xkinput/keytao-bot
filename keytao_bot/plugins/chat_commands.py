@@ -3507,6 +3507,74 @@ def _render_pending_preserving_lookup(word, code, candidates, occupied, ordering
     return text.replace("候选编码", "编码参考").replace("候选", "编码参考")
 
 
+def _mergeable_add_candidate_scopes(
+    platform: str, user_id: str, conv_key: Optional[ConversationKey],
+    space_key: Optional[Tuple[str, str]],
+) -> List[Dict[str, Any]]:
+    if draft_operation_coordinator.find_for_actor((platform, user_id)) is not None:
+        return []
+    address = normalize_conversation_key(conv_key or (platform, user_id), space_key)
+    if address != normalize_conversation_key((platform, user_id), space_key):
+        return []
+    record = conversation_state_store.get_record(address)
+    if record is None or record.execution_id or record.owner_key != address:
+        return []
+    state = record.state
+    if isinstance(state, PendingAddWord) and state.server_candidates:
+        return [{
+            "word": state.word, "candidates": list(state.server_candidates),
+            "occupiedWords": dict(state.server_occupied_words),
+            "orderingAssessments": list(state.server_ordering_assessments),
+            "reviewedState": _pending_add_word_payload(state),
+            "reviewedPrompt": render_server_backed_single_word_lookup(
+                state.word, state.recommended_code, state.server_candidates,
+                state.server_occupied_words,
+                ordering_assessments=state.server_ordering_assessments,
+            ),
+        }]
+    if not (
+        isinstance(state, PendingToolConfirm)
+        and state.function_name == "keytao_batch_add_to_draft"
+        and state.confirmation_source == "local_preview"
+        and state.args.get("_reviewed_multi_word") is True
+        and state.args.get("_explicit_add") is not False
+        and not state.args.get("_resolved_advertised_words")
+        and not state.args.get("_resolved_candidate_plan")
+    ):
+        return []
+    unanswered = {
+        item.get("word") for item in state.args.get("items", [])
+        if isinstance(item, dict) and item.get("action") == "Create"
+    }
+    return [
+        dict(scope) for scope in state.args.get("_candidate_scopes", [])
+        if isinstance(scope, dict) and scope.get("word") in unanswered
+    ]
+
+
+def _explicit_add_candidate_words(message: str) -> Tuple[str, ...]:
+    source = _strip_command_message_prefixes(message).strip()
+    match = re.match(r"^(?:加词|添加)(?:\s*[:：]\s*|\s+)", source)
+    if match is None:
+        return ()
+    words = _bare_multi_word_query_words(source[match.end():])
+    single = _extract_explicit_reviewed_add_word(source) if not words else ""
+    return words or ((single,) if single else ())
+
+
+async def try_merge_add_candidates(
+    message: str, platform: str, user_id: str, conv_key: Optional[ConversationKey],
+    space_key: Optional[Tuple[str, str]], owner_label: str,
+) -> Optional[str]:
+    """Extend a live add inventory before semantic parsing can replace it."""
+    words = _explicit_add_candidate_words(message)
+    if not words or not _mergeable_add_candidate_scopes(platform, user_id, conv_key, space_key):
+        return None
+    return await _prepare_multi_word_query(
+        words, platform, user_id, conv_key, space_key, owner_label, explicit_add=True,
+    )
+
+
 async def _prepare_multi_word_query(
     words: Tuple[str, ...],
     platform: str,
@@ -3518,11 +3586,22 @@ async def _prepare_multi_word_query(
     reading_requests: tuple = (),
     preserve_pending: bool = False,
     query_other_blocks: Tuple[str, ...] = (),
+    explicit_add: bool = False,
 ) -> str:
     """Collect the single-word pipeline into one durable candidate capability."""
     if len(words) > _MAX_BARE_MULTI_WORD_QUERY_ITEMS:
         return f"一次最多查询 {_MAX_BARE_MULTI_WORD_QUERY_ITEMS} 个词，请拆分后重新发送。"
-    scopes: List[Dict[str, Any]] = []
+    previous_scopes = (
+        _mergeable_add_candidate_scopes(platform, user_id, conv_key, space_key)
+        if explicit_add and not preserve_pending else []
+    )
+    combined_words = tuple(dict.fromkeys([*(scope["word"] for scope in previous_scopes), *words]))
+    if len(combined_words) > _MAX_BARE_MULTI_WORD_QUERY_ITEMS:
+        return (
+            f"合并后超过 {_MAX_BARE_MULTI_WORD_QUERY_ITEMS} 个词；本次保留原候选"
+            f"（{'、'.join(scope['word'] for scope in previous_scopes)}），请先选择后再加新词。"
+        )
+    scopes: List[Dict[str, Any]] = [scope for scope in previous_scopes if scope["word"] not in words]
     other_blocks: List[str] = list(query_other_blocks)
     other_block_words: Dict[int, str] = {}
     for word in words:
@@ -3602,8 +3681,9 @@ async def _prepare_multi_word_query(
         function_name="keytao_batch_add_to_draft",
         args={
             "items": items, "_candidate_scopes": scopes,
-            "_reviewed_multi_word": True, "_query_words": list(words),
+            "_reviewed_multi_word": True, "_query_words": list(combined_words),
             "_query_other_blocks": other_blocks,
+            "_explicit_add": explicit_add,
         },
     )
     target_key = conv_key or (
@@ -3643,6 +3723,15 @@ async def _try_handle_simple_single_word_query(
     """Handle a single Chinese word add/query via tools before the model can invent codes."""
     from ..utils.reading_request import parse_parenthesised_readings
 
+    explicit_words = (
+        _explicit_add_candidate_words(message_text)
+        if _prepared_scopes is None and not query_only and not _literal_word else ()
+    )
+    if len(explicit_words) > 1:
+        return await _prepare_multi_word_query(
+            explicit_words, platform, user_id, conv_key, space_key, owner_label,
+            preserve_pending=preserve_pending, explicit_add=True,
+        )
     reading_requests = (
         parse_parenthesised_readings(message_text)
         if _prepared_scopes is None and not query_only and not _literal_word else ()
@@ -3668,6 +3757,14 @@ async def _try_handle_simple_single_word_query(
         _extract_explicit_reviewed_add_word(message_text)
         if not query_only and not _literal_word else ""
     )
+    if (
+        explicit_add_word and _prepared_scopes is None and not preserve_pending
+        and _mergeable_add_candidate_scopes(platform, user_id, conv_key, space_key)
+    ):
+        return await _prepare_multi_word_query(
+            (explicit_add_word,), platform, user_id, conv_key, space_key, owner_label,
+            explicit_add=True,
+        )
     words = (
         (message_text,) if _prepared_scopes is not None or query_only or _literal_word
         else (explicit_add_word,) if explicit_add_word
@@ -6671,6 +6768,7 @@ async def _execute_confirmed_tool(
     args.pop("_reviewed_batch_readings", None)
     args.pop("_query_words", None)
     args.pop("_query_other_blocks", None)
+    args.pop("_explicit_add", None)
     receipt_requested_words = args.pop("_receipt_requested_words", None) or [
         item.get("word") for item in state.args.get("items", []) if isinstance(item, dict) and item.get("word")
     ]
@@ -9659,55 +9757,49 @@ async def _try_handle_dictionary_recode_command(
     owner_label: str,
 ) -> Optional[str]:
     """Stage an explicit same-word delete/create pair without model routing."""
-    command = parse_dictionary_recode_command(message_text)
+    commands = [parse_dictionary_recode_command(message_text)]
+    if commands[0] is None:
+        commands = [parse_dictionary_recode_command(line) for line in message_text.splitlines()]
+    codes = tuple(code for command in commands if command for code in (command.old_code, command.new_code))
     if (
-        command is None
+        not commands or any(command is None for command in commands)
         or command_intent.intent != "dictionary_recode"
-        or command_intent.keep_words != (command.word,)
-        or command_intent.requested_code != command.old_code
-        or command_intent.requested_codes != (command.new_code,)
+        or command_intent.keep_words != tuple(command.word for command in commands)
+        or len(set(command_intent.keep_words)) != len(commands)
+        or command_intent.requested_code != codes[0]
+        or command_intent.requested_codes != codes[1:]
     ):
         return None
     set_turn_flow("draft-op")
-    lookup_json = await call_tool_function(
-        "keytao_lookup_by_word",
-        {"word": command.word},
-        platform,
-        user_id,
-    )
-    try:
-        lookup_data = json.loads(lookup_json)
-    except Exception:
-        lookup_data = {}
-    entries = _validated_dictionary_delete_entries(lookup_data, command.word)
-    if entries is None:
-        return render_remediation_reply(
-            f"无法取得「{command.word}」的完整词库记录；本次未生成改码草稿"
+    items = []
+    for command in commands:
+        lookup_json = await call_tool_function(
+            "keytao_lookup_by_word", {"word": command.word}, platform, user_id,
         )
-    matches = [entry for entry in entries if entry["code"] == command.old_code]
-    if len(matches) != 1:
-        return _assert_plain_user_facing_reply(
-            f"词库无法唯一锁定「{command.word}」@{command.old_code}；本次未写入。"
-        )
-    target = matches[0]
+        try:
+            lookup_data = json.loads(lookup_json)
+        except Exception:
+            lookup_data = {}
+        entries = _validated_dictionary_delete_entries(lookup_data, command.word)
+        if entries is None:
+            return render_remediation_reply(
+                f"无法取得「{command.word}」的完整词库记录；本次未生成改码草稿"
+            )
+        matches = [entry for entry in entries if entry["code"] == command.old_code]
+        if len(matches) != 1:
+            return _assert_plain_user_facing_reply(
+                f"词库无法唯一锁定「{command.word}」@{command.old_code}；本次未写入。"
+            )
+        target = matches[0]
+        items.extend([
+            {"action": "Delete", "word": target["word"], "code": target["code"], "type": target["type"]},
+            {"action": "Create", "word": target["word"], "code": command.new_code, "type": target["type"]},
+        ])
     return await _execute_confirmed_tool(
         PendingToolConfirm(
             function_name="keytao_batch_add_to_draft",
             args={
-                "items": [
-                    {
-                        "action": "Delete",
-                        "word": target["word"],
-                        "code": target["code"],
-                        "type": target["type"],
-                    },
-                    {
-                        "action": "Create",
-                        "word": target["word"],
-                        "code": command.new_code,
-                        "type": target["type"],
-                    },
-                ],
+                "items": items,
             },
             confirmation_source="local_preview",
         ),
@@ -9771,6 +9863,139 @@ async def _load_merged_word_entries(
             return None
         resolved[word] = matches[0]
     return resolved
+
+
+async def try_handle_advertised_shift(
+    message: str, platform: str, user_id: str, conv_key: Optional[ConversationKey],
+    space_key: Optional[Tuple[str, str]], owner_label: str,
+) -> Optional[str]:
+    """Repair an author's same-code duplicate through the existing shift planner."""
+    from ..harness.authorization_grammar import parse_reviewed_shift_words
+
+    address = normalize_conversation_key(conv_key or (platform, user_id), space_key)
+    record = conversation_state_store.get_record(address)
+    known_words = tuple(
+        word for occupants in record.state.server_occupied_words.values() for word in occupants
+    ) if record is not None and isinstance(record.state, PendingAddWord) else ()
+    words = parse_reviewed_shift_words(message, known_words=known_words)
+    if not words:
+        return None
+    if address != normalize_conversation_key((platform, user_id), space_key):
+        return "顺延请求与当前作者或对话不一致，本次未写入。"
+    active = draft_operation_coordinator.find_for_actor((platform, user_id))
+    if active is not None:
+        return _active_operation_message_for_request(active, platform, user_id)
+    if record is not None and (
+        record.execution_id or isinstance(record.state, PendingToolConfirm)
+        and record.state.confirmation_source == "server_warning"
+    ):
+        return None
+    if record is not None and isinstance(record.state, PendingAddWord):
+        recommendation = _pending_add_reorder_recommendation(record.state)
+        if recommendation is not None and words == (recommendation["occupantWord"],):
+            return await handle_pending_message_core(
+                f"加入，顶替 {words[0]}", platform, user_id, address, space_key=space_key,
+                owner_label=owner_label, allow_intent_model=False,
+            )
+    set_turn_flow("draft-op")
+    try:
+        lookup = json.loads(await call_tool_function(
+            "keytao_lookup_by_words_batch", {"words": list(words)}, platform, user_id,
+        ))
+        draft = json.loads(await call_tool_function(
+            "keytao_list_draft_items", {}, platform, user_id,
+        ))
+    except (TypeError, ValueError):
+        lookup, draft = {}, {}
+    if not isinstance(lookup, dict) or not isinstance(draft, dict):
+        lookup, draft = {}, {}
+    live = _validated_word_lookup_entries(lookup, words)
+    snapshot = _validated_draft_reorder_snapshot(draft)
+    merged = _merge_live_and_draft_reorder_entries(live, snapshot) if live is not None and snapshot is not None else None
+    if merged is None:
+        return "无法读取完整的词库和当前草稿记录，本次未执行顺延。"
+    plans = []
+    for word in words:
+        targets = [row for row in merged if row["word"] == word]
+        if len(targets) != 1:
+            return f"无法唯一锁定「{word}」的现有编码，本次未执行顺延。"
+        target = targets[0]
+        try:
+            data = json.loads(await call_tool_function(
+                "keytao_lookup_by_code", {"code": target["code"]}, platform, user_id,
+            ))
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        phrases = data.get("phrases")
+        if data.get("success") is not True or not isinstance(phrases, list):
+            return f"无法核验编码 {target['code']} 的完整占用记录，本次未执行顺延。"
+        code_words = tuple(dict.fromkeys(row.get("word") for row in phrases if isinstance(row, dict)))
+        code_live = _validated_word_lookup_entries({
+            "success": True, "results": [
+                {"word": value, "phrases": [row for row in phrases if isinstance(row, dict) and row.get("word") == value]}
+                for value in code_words
+            ],
+        }, code_words) if all(isinstance(row, dict) and row.get("code") == target["code"] for row in phrases) else None
+        occupants = _merge_live_and_draft_reorder_entries(code_live, snapshot) if code_live is not None else None
+        keepers = [
+            row for row in occupants or []
+            if row["code"] == target["code"] and row["type"] == target["type"] and row["word"] != word
+        ]
+        if occupants is None or len(keepers) != 1 or keepers[0]["word"] in words:
+            return f"「{word}」没有可唯一确认的同码重码词条，本次未执行顺延。"
+        keeper = keepers[0]
+        next_code = ""
+        if keeper.get("source") == "live":
+            try:
+                encoding = json.loads(await call_tool_function(
+                    "keytao_encode", {"word": word, "requested_code": target["code"]}, platform, user_id,
+                ))
+            except (TypeError, ValueError):
+                encoding = {}
+            chain = _candidate_codes_from_encode(encoding, word) if isinstance(encoding, dict) else ()
+            if target["code"] not in chain or chain.index(target["code"]) + 1 >= len(chain):
+                return f"「{word}」的当前编码之后没有可核验的候选位置，本次未执行顺延。"
+            next_code = chain[chain.index(target["code"]) + 1]
+        plans.append((keeper, target, next_code))
+    direct = "direct_exec" in {token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")}
+    token = _semantic_direct_words.set(tuple(dict.fromkeys([*words, *(row["word"] for row, _, _ in plans)])) if direct else None)
+    try:
+        replies = []
+        for keeper, target, next_code in plans:
+            shifted_word = target["word"]
+            if next_code:
+                replies.append(await _execute_shift_to_code(
+                    shifted_word, next_code, platform, user_id, space_key, owner_label,
+                    target_item={"type": target["type"]}, auto_confirm_shift_plan=direct,
+                    auto_confirm_only_if_no_shifts=True,
+                    receipt_requested_words=[shifted_word, keeper["word"]],
+                ))
+                pending = conversation_state_store.get_record(address)
+                if pending is not None and isinstance(pending.state, PendingToolConfirm) and pending.state.confirmation_source == "server_warning":
+                    break
+                continue
+            keeper_item = {"type": keeper["type"]}
+            if keeper.get("source") == "draft":
+                original = next(item for item in snapshot["items"] if str(item.get("id")) == str(keeper["draftId"]))
+                keeper_item.update(
+                    remark=str(original.get("remark") or ""),
+                    needsManualReview=original.get("needsManualReview", True),
+                )
+            replies.append(await _execute_shift_to_code(
+                keeper["word"], keeper["code"], platform, user_id, space_key, owner_label,
+                target_item=keeper_item,
+                auto_confirm_shift_plan=direct,
+                auto_confirm_expected_shifted_words=(shifted_word,),
+                receipt_requested_words=[shifted_word, keeper["word"]],
+            ))
+            pending = conversation_state_store.get_record(address)
+            if pending is not None and isinstance(pending.state, PendingToolConfirm) and pending.state.confirmation_source == "server_warning":
+                break
+        return "\n\n".join(replies)
+    finally:
+        _semantic_direct_words.reset(token)
 
 
 async def try_handle_move_to_code_command(
@@ -11921,8 +12146,107 @@ def _semantic_warnings_are_named(data: Dict, args: Dict) -> bool:
     return True
 
 
-async def resolve_model_replace(request, platform, user_id):
+async def _resolve_target_recodes(request, message, original_operands, platform, user_id):
+    """Bind targets to literal clauses and resolve connector ambiguity against live rows."""
+    from collections import Counter
+    from ..harness.semantic_parser import _SAME_WORD_RECODE_RE
+
+    source = _strip_command_message_prefixes(message).strip()
+    same_word = _SAME_WORD_RECODE_RE.fullmatch(source)
+    candidates = list(request.operands)
+    for word in request.operands:
+        connector = re.fullmatch(r"(.+?)(?:改为|改成|为|是)", word)
+        if connector and re.search(re.escape(word) + r"\s*[a-z]{1,12}(?![a-zA-Z])", source):
+            candidates.append(connector[1])
+    for operand in original_operands if isinstance(original_operands, (list, tuple)) else ():
+        if not isinstance(operand, str):
+            continue
+        base = re.sub(r"\s*[a-zA-Z]{1,12}$", "", operand).strip()
+        if any(base == word + connector for word in request.operands for connector in ("改为", "改成", "为", "是")):
+            candidates.append(base)
+    candidates = list(dict.fromkeys(candidates))
+    clauses = []
+    if same_word and same_word["old_word"].strip('「」“”"') == same_word["new_word"].strip('「」“”"'):
+        clauses = [[(same_word["new_word"].strip('「」“”"'), same_word["new_code"])]]
+    else:
+        source, prefixed = re.subn(r"^(?:修改编码|改码)\s*[:：]?\s*", "", source, count=1)
+        for clause in re.split(r"[,，;；\n]+", source.rstrip("。.!！")):
+            matches = []
+            for word in candidates:
+                literal = re.escape(word)
+                match = re.fullmatch(
+                    r"\s*(?:把|将)?(?:" + literal + "|「" + literal + "」|“" + literal + '”|"' + literal + r'")'
+                    + r"\s*(?:(?:的)?编码\s*)?(?P<connector>改为|改成|为|是)?\s*(?P<code>[a-z]{1,12})\s*",
+                    clause,
+                )
+                if match and (prefixed or match["connector"]):
+                    matches.append((word, match["code"]))
+            clauses.append(matches)
+    if (len(clauses) != len(request.operands) or any(not matches for matches in clauses)
+        or Counter(matches[0][1] for matches in clauses) != Counter(request.codes)):
+        return None, (), "改码目标无法与本条消息逐项对应；请逐项写明词条和目标编码，本次未写入。"
+    entries = {}
+    words, codes = [], []
+    for matches in clauses:
+        resolved = []
+        for word, new_code in matches:
+            if word not in entries:
+                try:
+                    data = json.loads(await call_tool_function(
+                        "keytao_lookup_by_word", {"word": word}, platform, user_id,
+                    ))
+                    entries[word] = _validated_dictionary_delete_entries(data, word)
+                except (ValueError, TypeError, OSError, TimeoutError):
+                    entries[word] = None
+            rows = entries[word]
+            if rows is None:
+                return None, (), f"无法取得「{word}」的完整词库记录；本次未写入。"
+            resolved.extend((row, new_code) for row in rows)
+        if len(resolved) != 1:
+            return None, (), "词条或旧码无法唯一确定。请指定旧码；本次未写入。"
+        row, new_code = resolved[0]
+        if row["word"] in words or row["code"] == new_code:
+            return None, (), "改码词条重复或目标编码与旧码相同；本次未写入。"
+        words.append(row["word"])
+        codes.extend((row["code"], new_code))
+    return replace(request, operands=tuple(words), codes=tuple(codes)), (), ""
+
+
+async def resolve_model_replace(request, platform, user_id, *, message="", original_operands=()):
     """Resolve model old/new fields against exact dictionary rows, never prose."""
+    if request.op == "delete" and len(request.operands) == len(request.codes) == 1 and render_understood_command(request):
+        word, code = request.operands[0], request.codes[0]
+        try:
+            data = json.loads(await call_tool_function(
+                "keytao_lookup_by_word", {"word": word}, platform, user_id,
+            ))
+            rows = _validated_dictionary_delete_entries(data, word)
+            if rows is None:
+                raise ValueError("invalid word lookup")
+            if any(row["code"] == code for row in rows):
+                return request, (), ""
+            draft = await _fetch_current_draft_items(platform, user_id)
+            items = draft.get("items") if isinstance(draft, dict) and draft.get("success") is True else None
+            if not isinstance(items, list):
+                raise ValueError("incomplete draft lookup")
+            draft_rows = [item for item in items if isinstance(item, dict)
+                          and item.get("action") == "Create" and _draft_item_word(item) == word
+                          and _canonical_draft_delete_target(item) is not None]
+            if any(row["code"] == code for row in draft_rows):
+                return request, (), ""
+        except (ValueError, TypeError, OSError, TimeoutError):
+            return None, (), "无法核验完整词库和草稿记录；本次未生成删除计划。"
+        current_codes = "、".join(dict.fromkeys(row["code"] for row in rows + draft_rows)) or "未找到"
+        return None, (), f"「{word}」当前的编码是 {current_codes}，没有 {code}。请确认要删除的编码；本次未写入。"
+    if request.op == "recode" and not request.relation and request.operands:
+        target_request = request
+        if (len(request.codes) == 2 * len(request.operands)
+            and (len(request.operands) > 1
+                 or re.match(r"^(?:修改编码|改码)\s*[:：]?", _strip_command_message_prefixes(message)))):
+            target_request = replace(request, codes=request.codes[1::2])
+        if (len(target_request.operands) == len(target_request.codes)
+            and len(set(target_request.operands)) == len(target_request.operands)):
+            return await _resolve_target_recodes(target_request, message, original_operands, platform, user_id)
     words, codes = request.operands, tuple(dict.fromkeys(request.codes))
     candidate = (
         request.op in {"move", "recode"}
@@ -12112,6 +12436,10 @@ def render_understood_command(request) -> str:
         return ""
     if len(set(words)) != len(words):
         return ""
+    if op == "recode" and len(words) > 1 and len(codes) == 2 * len(words) and not request.submit_after and not request.relation:
+        commands = [render_understood_command(replace(request, operands=(word,), codes=codes[index * 2:index * 2 + 2]))
+                    for index, word in enumerate(words)]
+        return "\n".join(commands) if all(commands) else ""
     command = ""
     if op == "add":
         from ..harness.authorization_grammar import _multi_add_authorization_contract, _parse_complete_add_clause
@@ -12365,7 +12693,7 @@ async def execute_understood_command(request, command, platform, user_id, conv_k
             ), platform, user_id, conv_key, space_key, owner_label))
         if missing:
             preserve = bool(pairs and conversation_state_store.get_record(conv_key) is not None)
-            if len(missing) == 1:
+            if len(missing) == 1 and not _mergeable_add_candidate_scopes(platform, user_id, conv_key, space_key):
                 replies.append(await _try_handle_simple_single_word_query(
                     missing[0], platform, user_id, conv_key, space_key, owner_label,
                     _literal_word=True, preserve_pending=preserve,
@@ -12374,6 +12702,7 @@ async def execute_understood_command(request, command, platform, user_id, conv_k
                 replies.append(await _prepare_multi_word_query(
                     missing, platform, user_id, conv_key, space_key, owner_label,
                     preserve_pending=preserve,
+                    explicit_add=True,
                 ))
         return "\n\n".join(reply for reply in replies if reply)
     if op == "move":
@@ -13353,7 +13682,7 @@ async def _execute_explicit_entry_code_request(
 def fresh_entry_code_selection(message: str) -> Optional[ExplicitEntryCodeRequest]:
     """Recognize one closed lexical pair without granting mutation authority."""
     selection = parse_reviewed_selection_command(message)
-    if selection is None or selection.action:
+    if selection is None or selection.action or selection.shift_words:
         return None
     pairs = parse_reviewed_multi_word_selection(message)
     if pairs is None or len(pairs) != 1:

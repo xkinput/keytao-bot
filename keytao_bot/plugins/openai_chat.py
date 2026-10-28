@@ -4576,6 +4576,22 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
             return False
         prompt = ctx.reply_reference.text
     else:
+        closed_reviewed_selection = False
+        if (
+            not affirmative and isinstance(record.state, PendingToolConfirm)
+            and record.state.args.get("_reviewed_multi_word") is True
+            and record.state.confirmation_source == "local_preview"
+            and _authorization_grammar.parse_reviewed_selection_command(
+                _strip_command_message_prefixes(message)
+            ) is not None
+        ):
+            derived, intent, error = _resolve_multi_word_pending_candidate_selection(record.state, message)
+            closed_reviewed_selection = derived is not None and intent is not None and not error
+        if closed_reviewed_selection:
+            # Named selections bind to the live inventory even after a rejected reply.
+            latest = _render_live_batch_record(record)
+            if not latest:
+                return False
         addressed_text = ctx.message_text or message
         addressed = bool(
             GROUP_TRIGGER_KEYWORD_ANY in addressed_text
@@ -4590,10 +4606,10 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
         advertised_assent = message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms)
         if (affirmative and not addressed and not advertised_assent) or not latest:
             return False
-        if record.origin_prompt_digest:
+        if record.origin_prompt_digest and not closed_reviewed_selection:
             if _prompt_capability_digest(latest) != record.origin_prompt_digest:
                 return False
-        elif not (
+        elif not closed_reviewed_selection and not (
             advertised_reply_contract(latest).requires_live_state
             and _advertised_reply_matches_live_record(latest, record)
         ) and not (
@@ -4698,6 +4714,23 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     if await _try_stale_affirmative_reply(ctx):
         return True
     if await _try_bound_pending_reply(ctx):
+        return True
+    response = await _chat_commands.try_merge_add_candidates(
+        ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
+        ctx.space_key, ctx.owner_label,
+    )
+    if response is None:
+        response = await _chat_commands.try_handle_advertised_shift(
+            ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
+            ctx.space_key, ctx.owner_label,
+        )
+    if response is not None:
+        ctx.operation_understood_early = True
+        ctx.response = response
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, response)
+        await _finish_ai_chat_response(
+            ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment,
+        )
         return True
     enabled = _chat_commands.SEMANTIC_ROUTE_OPS & {
         token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
@@ -4882,7 +4915,17 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                             query_other_blocks=tuple(reply for reply in replies if reply),
                         )
                     ctx.semantic_query_candidates_prepared = True
-                if missing_words or message.strip() == " ".join(validated.operands):
+                query_source = re.sub(
+                    r"^(?:查询|查看|查一下|查)(?:编码|代码)?\s*[:：]?\s*", "",
+                    _strip_command_message_prefixes(message).strip(), count=1,
+                )
+                word_pattern = "(?:" + "|".join(re.escape(word) for word in validated.operands) + ")"
+                plain_lookup = re.fullmatch(
+                    r'[\s「」“”\"\']*' + word_pattern
+                    + r'(?:[\s，,、；;「」“”\"\']+' + word_pattern + r')*[\s。.!！「」“”\"\']*',
+                    query_source,
+                )
+                if missing_words or plain_lookup or message.strip() == " ".join(validated.operands):
                     ctx.response = ServerBackedQueryReply(ctx.semantic_query_reply)
             for stage in RESPONSE_STAGES:
                 if await stage(ctx):
@@ -4968,12 +5011,13 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             named_words = validated.operands
             resolved, options, explanation = await _chat_commands.resolve_model_replace(
                 validated, ctx.platform, ctx.user_id,
+                message=message, original_operands=pending_decision.get("operands", ()),
             )
             if not high_confidence and (
                 resolved is None or options
                 or not _chat_commands.render_understood_command(resolved)
                 or resolved.op == "add" and not all(resolved.codes)
-            ):
+            ) and not (validated.op == "delete" and resolved is None and explanation):
                 return False
             if options:
                 response = await _chat_commands.try_handle_model_command_options(
@@ -4982,6 +5026,8 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             elif resolved is None:
                 response = explanation
             elif direct or high_confidence and resolved.op == "add" and not any(resolved.codes):
+                if resolved.op == "recode" and not resolved.relation:
+                    named_words = resolved.operands
                 response = await _chat_commands.execute_model_command_direct(
                     resolved, named_words, ctx.platform, ctx.user_id, ctx.conv_key,
                     ctx.space_key, ctx.owner_label,

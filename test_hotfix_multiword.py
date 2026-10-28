@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 import test_state_machine as harness
 from test_semantic_parser import FakeClient, raw_operation
 
-from keytao_bot.harness.state import MemoryConversationStateStore, PendingToolConfirm
+from keytao_bot.harness.state import DraftOperationCoordinator, MemoryConversationStateStore, PendingAddWord, PendingToolConfirm
 from keytao_bot.utils import keytao_review
 from keytao_bot.utils.pending_confirmation import render_remediation_reply
 
@@ -297,6 +297,253 @@ class HotfixMultiwordTests(unittest.IsolatedAsyncioTestCase):
         record = self.store.get_record(self.author)
         self.assertEqual([row["word"] for row in record.state.args["items"]], ["国潮"])
         self.assertTrue(self.chat._advertised_reply_matches_live_record(delivered, record))
+
+    async def test_explicit_add_merges_live_single_word_candidates(self):
+        await self.commands._try_handle_simple_single_word_query(
+            "加词 国潮", "qq", self.author.actor_id, self.author,
+            self.author.space_key, "Offline owner",
+        )
+        reply = await self.commands._try_handle_simple_single_word_query(
+            "加词 泥炭", "qq", self.author.actor_id, self.author,
+            self.author.space_key, "Offline owner",
+        )
+        state = self.store.get(self.author)
+        self.assertIsInstance(state, PendingToolConfirm)
+        self.assertEqual([row["word"] for row in state.args["items"]], ["国潮", "泥炭"])
+        self.assertIn("国潮", reply)
+        self.assertIn("泥炭", reply)
+
+    async def test_standalone_shift_reuses_shared_code_plan(self):
+        keeper = {"word": "吴三桂", "code": "wsg", "type": "Phrase", "weight": 100}
+        occupant = {"word": "我送给", "code": "wsg", "type": "Phrase", "weight": 100}
+
+        async def lookup(name, args, *unused, **kwargs):
+            if name == "keytao_lookup_by_words_batch":
+                return json.dumps({"success": True, "results": [{"word": "我送给", "phrases": [occupant]}]})
+            if name == "keytao_list_draft_items":
+                return json.dumps({"success": True, "batchId": "offline", "contentVersion": 1,
+                                   "items": [{**keeper, "action": "Create", "id": 1}]})
+            if name == "keytao_lookup_by_code":
+                self.assertEqual(args, {"code": "wsg"})
+                return json.dumps({"success": True, "phrases": [occupant]})
+            if name == "keytao_shift_phrase_code":
+                result = {
+                    "success": True, "batchId": "offline", "contentVersion": 2,
+                    "shiftPlan": {"word": "吴三桂", "targetCode": "wsg", "items": [],
+                                  "shifted": [{"word": "我送给", "fromCode": "wsg", "toCode": "wsgu"}]},
+                }
+                if not args.get("confirmed_plan_digest"):
+                    result.update(success=False, requiresConfirmation=True, confirmationKind="shiftPlan",
+                                  planDigest="a" * 64, warningDigest="b" * 64, warnings=[])
+                return json.dumps(result)
+            raise AssertionError(name)
+
+        execute = AsyncMock(wraps=self.commands._execute_shift_to_code)
+        with patch.object(self.commands, "call_tool_function", side_effect=lookup), patch.object(
+            self.commands, "_execute_shift_to_code", execute,
+        ), patch.object(
+            self.commands, "_format_draft_response", AsyncMock(return_value="草稿地址：https://offline.invalid/draft"),
+        ), patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "direct_exec"}):
+            reply = await self.commands.try_handle_advertised_shift(
+                '"我送给"顺延', "qq", self.author.actor_id, self.author,
+                self.author.space_key, "Offline owner",
+            )
+        self.assertIn("我送给", reply)
+        self.assertIn("wsgu", reply)
+        self.assertEqual(execute.await_args.args[:2], ("吴三桂", "wsg"))
+        self.assertTrue(execute.await_args.kwargs["auto_confirm_shift_plan"])
+        self.assertEqual(execute.await_args.kwargs["auto_confirm_expected_shifted_words"], ("我送给",))
+
+    async def test_explicit_multi_add_merges_one_inventory_and_skips_readonly_query(self):
+        prepare = self.commands._prepare_multi_word_query
+        args = ("qq", self.author.actor_id, self.author, self.author.space_key, "Offline owner")
+        await prepare(("国潮", "泥炭"), *args, explicit_add=True)
+        reply = await prepare(("棉麻",), *args, explicit_add=True)
+        state = self.store.get(self.author)
+        self.assertEqual(state.args["_query_words"], ["国潮", "泥炭", "棉麻"])
+        self.assertEqual([row["word"] for row in state.args["items"]], ["国潮", "泥炭", "棉麻"])
+        self.assertTrue(self.chat._advertised_reply_matches_live_record(reply, self.store.get_record(self.author)))
+        selected, intent, error = self.chat._resolve_multi_word_pending_candidate_selection(state, "国潮 1，泥炭 2，棉麻 1")
+        self.assertIsNone(error)
+        self.assertIsNotNone(intent)
+        self.assertEqual([row["code"] for row in selected.args["items"]], ["gljz", "nktfa", "mmms"])
+        await prepare(("国潮", "泥炭"), *args)
+        await prepare(("棉麻",), *args, explicit_add=True)
+        self.assertEqual(self.store.get(self.author).args["_query_words"], ["棉麻"])
+
+    async def test_incident_six_then_four_explicit_add_keeps_eight_actionable_words(self):
+        earlier = ("一夫一妻", "一夫多妻", "吴三桂", "陈圆圆", "李自成", "多尔衮")
+        added = ("皇太极", "顺治", "福临", "努尔哈赤")
+        self.codes.update({
+            word: (code, code + "o") for word, code in zip(
+                (*earlier, "皇太极", "福临"), ("yfyq", "yfdq", "wsg", "jyy", "lzj", "drg", "htj", "fjl"),
+            )
+        })
+        original_lookup = self.lookup
+
+        async def lookup(name, args, *unused, **kwargs):
+            if name == "keytao_lookup_by_word" and args["word"] in {"顺治", "努尔哈赤"}:
+                return json.dumps({"success": True, "phrases": [{"word": args["word"], "code": "abcd", "type": "Phrase"}]})
+            return await original_lookup(name, args, *unused, **kwargs)
+
+        args = ("qq", self.author.actor_id, self.author, self.author.space_key, "Offline owner")
+        with patch.object(self.commands, "call_tool_function", side_effect=lookup):
+            await self.commands._try_handle_simple_single_word_query("加词：" + "，".join(earlier), *args)
+            reply = await self.commands.try_merge_add_candidates("加词：" + "，".join(added), *args)
+        expected = [*earlier, "皇太极", "福临"]
+        self.assertEqual([row["word"] for row in self.store.get(self.author).args["items"]], expected)
+        self.assertEqual(self.store.get_record(self.author).owner_key, self.author)
+        for word in expected:
+            self.assertIn(word, reply)
+        selected, intent, error = self.chat._resolve_multi_word_pending_candidate_selection(
+            self.store.get(self.author), "，".join(f"{word} 1" for word in expected),
+        )
+        self.assertIsNone(error)
+        self.assertIsNotNone(intent)
+        self.assertEqual([row["word"] for row in selected.args["items"]], expected)
+
+    async def test_merge_excludes_warning_submit_and_preserving_query(self):
+        args = ("qq", self.author.actor_id, self.author, self.author.space_key, "Offline owner")
+        for function_name, source in (("keytao_batch_add_to_draft", "server_warning"), ("keytao_submit_batch", "local_preview")):
+            with self.subTest(function_name=function_name):
+                await self.commands._prepare_multi_word_query(("国潮", "泥炭"), *args, explicit_add=True)
+                state = self.store.get(self.author)
+                state.function_name, state.confirmation_source = function_name, source
+                self.assertEqual(self.commands._mergeable_add_candidate_scopes(*args[:4]), [])
+                record = self.store.get_record(self.author)
+                await self.commands._prepare_multi_word_query(("棉麻",), *args, preserve_pending=True, explicit_add=True)
+                self.assertIs(self.store.get_record(self.author), record)
+
+    async def test_add_extension_preserves_active_operation_and_ticket(self):
+        args = ("qq", self.author.actor_id, self.author, self.author.space_key, "Offline owner")
+        await self.commands._prepare_multi_word_query(("国潮", "泥炭"), *args, explicit_add=True)
+        record = self.store.get_record(self.author)
+        coordinator = DraftOperationCoordinator()
+        self.assertIsNotNone(coordinator.begin(self.author, "add"))
+        with patch.object(self.commands, "draft_operation_coordinator", coordinator):
+            self.assertIsNone(await self.commands.try_merge_add_candidates("加词 棉麻", *args))
+        self.assertIs(self.store.get_record(self.author), record)
+
+    async def test_standalone_shift_single_advertised_pair_uses_real_preview_and_receipt(self):
+        state = PendingAddWord(
+            "吴三桂", "wsg", [("wsg", True), ("wsgo", False)],
+            server_candidates=[("wsg", True), ("wsgo", False)],
+            server_occupied_words={"wsg": ["我送给"]},
+            server_ordering_assessments=[{
+                "verdict": "front_more_common", "newWord": "吴三桂", "occupantWord": "我送给",
+                "occupantCode": "wsg", "freeCode": "wsgo", "newCode": "wsg",
+            }],
+            pronunciation_codes={"wsg": "wu san gui", "wsgo": "wu san gui"},
+            needs_manual_review=False,
+        )
+        self.store.set(self.author, state)
+        calls = []
+
+        async def shift(name, args, *unused, **kwargs):
+            self.assertEqual(name, "keytao_shift_phrase_code")
+            calls.append(args)
+            data = {
+                "success": True, "batchId": "offline", "contentVersion": 1,
+                "shiftPlan": {"word": "吴三桂", "targetCode": "wsg", "items": [],
+                              "shifted": [{"word": "我送给", "fromCode": "wsg", "toCode": "wsgu"}]},
+            }
+            if not args.get("confirmed_plan_digest"):
+                data.update(success=False, requiresConfirmation=True, confirmationKind="shiftPlan",
+                            planDigest="a" * 64, warningDigest="b" * 64, warnings=[])
+            return json.dumps(data)
+
+        with patch.object(self.commands, "call_tool_function", side_effect=shift), patch.object(
+            self.commands, "_format_draft_response", AsyncMock(return_value="草稿地址：https://offline.invalid/draft"),
+        ):
+            reply = await self.commands.try_handle_advertised_shift(
+                "「我送给」顺延", "qq", self.author.actor_id, self.author,
+                self.author.space_key, "Offline owner",
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["target_code"], "wsg")
+        self.assertNotIn("confirmed_plan_digest", calls[0])
+        self.assertEqual(calls[1]["confirmed_plan_digest"], "a" * 64)
+        self.assertIn("我送给", reply)
+        self.assertIn("wsgu", reply)
+
+    async def test_standalone_shift_rejects_unrelated_or_foreign_words(self):
+        with patch.object(self.commands, "_execute_shift_to_code", AsyncMock()) as execute:
+            self.assertIsNone(await self.commands.try_handle_advertised_shift(
+                "他说我送给顺延", "qq", self.author.actor_id, self.author, self.author.space_key, "Offline owner",
+            ))
+            reply = await self.commands.try_handle_advertised_shift(
+                "我送给顺延", "qq", "different-owner", self.author, self.author.space_key, "Offline owner",
+            )
+            self.assertIn("本次未写入", reply)
+            execute.assert_not_awaited()
+
+    async def test_standalone_shift_real_server_plan_preserves_existing_draft_review(self):
+        await self._check_standalone_shift_real_server_plan(keeper_in_draft=True)
+
+    async def test_standalone_shift_real_server_plan_keeps_live_keeper_unchanged(self):
+        await self._check_standalone_shift_real_server_plan(keeper_in_draft=False)
+
+    async def _check_standalone_shift_real_server_plan(self, *, keeper_in_draft):
+        tools = harness._draft_tools
+        occupant = {"word": "我送给", "code": "wsg", "type": "Phrase", "weight": 100}
+        keeper = {"word": "吴三桂", "code": "wsg", "type": "Phrase", "weight": 100,
+                  "action": "Create", "id": "7", "needsManualReview": False, "remark": "Offline reviewed"}
+        snapshot = {"success": True, "batchId": "offline", "contentVersion": 1, "items": [keeper] if keeper_in_draft else []}
+        writes = []
+
+        async def words(requested):
+            return {"success": True, "results": [
+                {"word": word, "phrases": [occupant] if word == "我送给" else [keeper] if not keeper_in_draft else []}
+                for word in requested
+            ]}
+
+        async def codes(requested):
+            return {"success": True, "results": [
+                {"code": code, "phrases": ([occupant] + ([] if keeper_in_draft else [keeper])) if code == "wsg" else []}
+                for code in requested
+            ]}
+
+        async def strict(platform, user, items, **kwargs):
+            self.assertNotIn("吴三桂", [row["word"] for row in items])
+            if kwargs.get("confirmed"):
+                writes.extend(items)
+                return {"success": True, "batchId": "offline", "contentVersion": 2, "successCount": len(items)}
+            return {"success": False, "requiresConfirmation": True, "warningDigest": "c" * 64, "warnings": []}
+
+        async def call(name, args, platform, user, **kwargs):
+            if name == "keytao_lookup_by_words_batch":
+                result = await words(args["words"])
+            elif name == "keytao_list_draft_items":
+                result = snapshot
+            elif name == "keytao_lookup_by_code":
+                result = {"success": True, "phrases": [occupant] + ([] if keeper_in_draft else [keeper])}
+            elif name == "keytao_encode":
+                self.assertEqual(args, {"word": "我送给", "requested_code": "wsg"})
+                result = {"success": True, "word": "我送给", "candidateCodes": ["wsg", "wsgu", "wsgo"]}
+            elif name == "keytao_shift_phrase_code":
+                result = await tools.keytao_shift_phrase_code(platform, user, **args)
+            else:
+                raise AssertionError(name)
+            return json.dumps(result)
+
+        with (
+            patch.object(self.commands, "call_tool_function", side_effect=call),
+            patch.object(self.commands, "_format_draft_response", AsyncMock(return_value="草稿地址：https://offline.invalid/draft")),
+            patch.object(tools, "_lookup_words_raw", side_effect=words),
+            patch.object(tools, "_lookup_codes_raw", side_effect=codes),
+            patch.object(tools, "_fetch_encode_candidates", AsyncMock(return_value={"success": True, "candidateCodes": ["wsg", "wsgu", "wsgo"]})),
+            patch.object(tools, "keytao_list_draft_items", AsyncMock(return_value=snapshot)),
+            patch.object(tools, "_keytao_strict_batch_add_to_draft", side_effect=strict),
+            patch.dict(os.environ, {"KEYTAO_SEMANTIC_ROUTE_OPS": "direct_exec"}),
+        ):
+            reply = await self.commands.try_handle_advertised_shift(
+                "我送给 顺延", "qq", self.author.actor_id, self.author, self.author.space_key, "Offline owner",
+            )
+        self.assertEqual([(row["action"], row["word"], row["code"]) for row in writes], [
+            ("Delete", "我送给", "wsg"), ("Create", "我送给", "wsgu"),
+        ])
+        self.assertIn("我送给", reply)
+        self.assertIn("wsgu", reply)
 
 
 if __name__ == "__main__":
