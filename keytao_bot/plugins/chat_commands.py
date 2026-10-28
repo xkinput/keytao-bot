@@ -3577,18 +3577,43 @@ async def _prepare_multi_word_query(
             pending_data = {}
         for word in chunk:
             prepared_data[word] = (lookup_rows.get(word, {}), pending_data)
-    for word in words:
-        count = len(scopes)
-        request = next((row for row in reading_requests if row.word == word), None)
-        response = await _try_handle_simple_single_word_query(
-            word, platform, user_id, conv_key, space_key, owner_label,
-            _prepared_scopes=scopes,
-            _prepared_existing_words=present_word_codes,
-            _prepared_data=prepared_data[word],
-            requested_reading=request.reading if request else "",
-            requested_code=request.code if request else "",
-        )
-        if len(scopes) == count and not (present_word_codes is not None and word in present_word_codes):
+    semaphore = asyncio.Semaphore(2)
+
+    async def prepare_word(word: str):
+        async with semaphore:
+            word_scopes: List[Dict[str, Any]] = []
+            existing_words = {} if present_word_codes is not None else None
+            binding_notices: List[bool] = []
+            request = next((row for row in reading_requests if row.word == word), None)
+            response = await _try_handle_simple_single_word_query(
+                word, platform, user_id, conv_key, space_key, owner_label,
+                _prepared_scopes=word_scopes,
+                _prepared_existing_words=existing_words,
+                _prepared_binding_notices=binding_notices,
+                _prepared_data=prepared_data[word],
+                requested_reading=request.reading if request else "",
+                requested_code=request.code if request else "",
+            )
+            return word_scopes, existing_words, response, keytao_review.current_commonness_evidence(), binding_notices
+
+    results = await asyncio.gather(*(prepare_word(word) for word in words), return_exceptions=True)
+    for word, result in zip(words, results):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, BaseException):
+            logger.warning(f"Per-word review failed for {word}: {result}")
+            word_scopes, existing_words, response, evidence, binding_notices = [], None, None, (), []
+        else:
+            word_scopes, existing_words, response, evidence, binding_notices = result
+        scopes.extend(word_scopes)
+        if present_word_codes is not None:
+            present_word_codes.update(existing_words or {})
+        # Child task ContextVar writes must reach the parent delivery guard.
+        keytao_review.record_commonness_evidence({"evidenceLines": list(evidence)})
+        if binding_notices:
+            actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
+            response = append_unbound_binding_notice(response, actor_is_bound)
+        if not word_scopes and not (present_word_codes is not None and word in present_word_codes):
             other_block_words[len(other_blocks)] = word
             other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
 
@@ -3694,6 +3719,7 @@ async def _try_handle_simple_single_word_query(
     actionable_lookup: bool = False,
     _prepared_scopes: Optional[List[Dict[str, Any]]] = None,
     _prepared_existing_words: Optional[Dict[str, Tuple[str, ...]]] = None,
+    _prepared_binding_notices: Optional[List[bool]] = None,
     _prepared_data: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None,
     preserve_pending: bool = False,
     query_only: bool = False,
@@ -4043,6 +4069,9 @@ async def _try_handle_simple_single_word_query(
                 if not reviewed_prompt:
                     conversation_state_store.delete(target_key)
                     raise ValueError("persisted candidate inventory could not be rendered")
+        if _prepared_binding_notices is not None:
+            _prepared_binding_notices.append(True)
+            return reviewed_prompt
         actor_is_bound = await user_resolver.resolve_actor_binding(platform, user_id)
         rendered_reply = append_unbound_binding_notice(reviewed_prompt, actor_is_bound)
         return (
