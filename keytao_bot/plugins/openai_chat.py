@@ -4187,6 +4187,8 @@ async def _stage_prepare_fresh_code_selection(ctx: TurnContext) -> bool:
 
 async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
     """Production scenario: bind live pending state to the current reply and actor scope."""
+    if ctx.operation_understood_early and ctx.scoped_pending_response is not None:
+        return False
     if getattr(ctx, "semantic_pending_released", False):
         return False
     current_record = conversation_state_store.get_record(ctx.conv_key)
@@ -4571,9 +4573,49 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
         return False
     history = ctx.history if ctx.history is not None else get_history(ctx.conv_key)
     latest = _get_latest_assistant_message(history)
+    canonical = ""
+    state = record.state
+    contract = advertised_reply_contract(ctx.reply_reference.text if ctx.reply_reference.is_reply else latest)
+    assent = _pending_tool_assent_intent(state, message)
+    if not affirmative:
+        if message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms, "取消") and assent is not None:
+            canonical = message
+        if isinstance(state, PendingAddWord):
+            intent = _structural_pending_add_word_intent(message, state)
+            if intent is not None:
+                indices = intent.choice_indices or ((intent.choice_index,) if intent.choice_index is not None else ())
+                codes = intent.requested_codes or ((intent.requested_code,) if intent.requested_code else ())
+                if (indices or codes) and all(1 <= index <= len(state.candidates) for index in indices) and all(code in dict(state.candidates) for code in codes):
+                    canonical = message
+        else:
+            derived, intent, error = _resolve_multi_word_pending_candidate_selection(state, message)
+            if derived is not None and intent is not None and not error:
+                canonical = message
+            elif state.function_name == "keytao_choice_offer" and _chat_commands._parse_pending_choice_label(message):
+                canonical = message
+            elif state.function_name == "keytao_understood_command":
+                control = _strip_command_message_prefixes(message).strip()
+                options = _chat_commands._understood_command_options(state)
+                if control in {"确认", "取消"} or (control.isascii() and control.isdigit() and 1 <= int(control) <= len(options)):
+                    canonical = message
+    cancel_control = bool(canonical and assent is not None and assent.intent == "pending_cancel")
+
+    def unbound_answer() -> bool:
+        if canonical and record.origin_prompt_digest:
+            ctx.response = "这条回复未对应当前待确认操作；请引用当前候选消息后再回复。"
+            ctx.scoped_pending_response = ctx.response
+            ctx.operation_understood_early = True
+            if ctx.reply_reference.is_reply:
+                ctx.released_pending_turn = ctx.semantic_pending_released = True
+        return False
+
     if ctx.reply_reference.is_reply:
         if not _verified_pending_reply(ctx, record):
-            return False
+            if not affirmative and assent is not None and (
+                assent.intent == "pending_cancel" or message.strip() == "都加入"
+            ):
+                canonical = message
+            return unbound_answer()
         prompt = ctx.reply_reference.text
     else:
         closed_reviewed_selection = False
@@ -4604,12 +4646,12 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
                 return False
         contract = advertised_reply_contract(latest)
         advertised_assent = message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms)
-        if (affirmative and not addressed and not advertised_assent) or not latest:
-            return False
-        if record.origin_prompt_digest and not closed_reviewed_selection:
+        if (affirmative and not addressed and not advertised_assent) or (not latest and not cancel_control):
+            return unbound_answer()
+        if record.origin_prompt_digest and not closed_reviewed_selection and not cancel_control:
             if _prompt_capability_digest(latest) != record.origin_prompt_digest:
-                return False
-        elif not closed_reviewed_selection and not (
+                return unbound_answer()
+        elif not closed_reviewed_selection and not cancel_control and not (
             advertised_reply_contract(latest).requires_live_state
             and _advertised_reply_matches_live_record(latest, record)
         ) and not (
@@ -4620,15 +4662,15 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
             and all(word in latest and code in latest for word, code in _pending_state_binding_pairs(record.state))
             and _pending_state_binding_pairs(record.state)
         ):
-            return False
+            return unbound_answer()
         prompt = latest
     from ..harness.operation_request import OperationRequest
 
-    request = OperationRequest(op="confirm", frame="direct", refers_to_pending=True)
-    canonical = (
-        _chat_commands.render_understood_pending_answer(request, record.state, prompt, message)
-        if affirmative else ""
-    )
+    request = OperationRequest(op="cancel" if cancel_control else "confirm", frame="direct", refers_to_pending=True)
+    if affirmative:
+        canonical = _chat_commands.render_understood_pending_answer(
+            request, record.state, prompt, message,
+        )
     if affirmative and not canonical and isinstance(record.state, PendingToolConfirm) and record.state.function_name == "keytao_submit_batch":
         canonical = "确认"
     response = None
@@ -4637,30 +4679,6 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
             response = _chat_commands.render_pending_choice_offer(record.state) or None
         elif record.state.function_name == "keytao_understood_command":
             response = _chat_commands.render_pending_understood_command(record.state) or None
-    if not affirmative:
-        state = record.state
-        contract = advertised_reply_contract(prompt)
-        if (message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms, "取消")
-                and _pending_tool_assent_intent(state, message) is not None):
-            canonical = message
-        if isinstance(state, PendingAddWord):
-            intent = _structural_pending_add_word_intent(message, state)
-            if intent is not None:
-                indices = intent.choice_indices or ((intent.choice_index,) if intent.choice_index is not None else ())
-                codes = intent.requested_codes or ((intent.requested_code,) if intent.requested_code else ())
-                if (indices or codes) and all(1 <= index <= len(state.candidates) for index in indices) and all(code in dict(state.candidates) for code in codes):
-                    canonical = message
-        else:
-            derived, intent, error = _resolve_multi_word_pending_candidate_selection(state, message)
-            if derived is not None and intent is not None and not error:
-                canonical = message
-            elif state.function_name == "keytao_choice_offer" and _chat_commands._parse_pending_choice_label(message):
-                canonical = message
-            elif state.function_name == "keytao_understood_command":
-                control = _strip_command_message_prefixes(message).strip()
-                options = _chat_commands._understood_command_options(state)
-                if control in {"确认", "取消"} or (control.isascii() and control.isdigit() and 1 <= int(control) <= len(options)):
-                    canonical = message
     if (not canonical and response is None
             or conversation_state_store.get_record(ctx.conv_key) is not record or record.execution_id):
         return False
@@ -4715,6 +4733,9 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
         return True
     if await _try_bound_pending_reply(ctx):
         return True
+    if ctx.operation_understood_early:
+        # A failed ticket binding never releases a closed answer into query routing.
+        return False
     response = await _chat_commands.try_merge_add_candidates(
         ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
         ctx.space_key, ctx.owner_label,
@@ -4865,6 +4886,14 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             else:
                 ctx.operation_request = fast_request
                 return False
+        if (
+            owned_ticket and fast_request is not None and fast_request.refers_to_pending
+            and fast_request.op in {"confirm", "cancel", "select_candidate", "pending_recode"}
+            and validated.op in {"query", "chat", "help"}
+        ):
+            # Model routing cannot release an answer already recognized for this ticket.
+            ctx.operation_request = fast_request
+            return False
         if (
             validated.op in {"query", "chat", "help"} & route_ops
             and isinstance(pending_decision, dict)
@@ -6817,6 +6846,34 @@ async def _stage_handle_replace_character(ctx: TurnContext) -> bool:
 
 async def _stage_handle_simple_word_query(ctx: TurnContext) -> bool:
     """Production scenario: simple word lookup runs before general model fallback."""
+    record = conversation_state_store.get_record(ctx.conv_key)
+    if (
+        (not ctx.released_pending_turn or ctx.semantic_pending_released)
+        and record is not None and not record.execution_id
+        and isinstance(record.state, (PendingAddWord, PendingToolConfirm))
+        and record.owner_key == normalize_conversation_key(ctx.conv_key, ctx.space_key)
+        and record.owner_key.platform == ctx.platform and record.owner_key.actor_id == str(ctx.user_id)
+        and draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is None
+        and (
+            _pending_tool_assent_intent(record.state, ctx.normalized_message_text) is not None
+            or _chat_routing.message_authorizes_live_pending_mutation(ctx.normalized_message_text, record.state)
+        )
+    ):
+        if ctx.response is None:
+            if ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, record):
+                ctx.response = "这条回复未对应当前待确认操作；请引用当前候选消息后再回复。"
+            else:
+                ctx.response = await handle_pending_message_core(
+                    ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
+                    history=ctx.history, space_key=ctx.space_key,
+                    owner_label=ctx.owner_label, allow_intent_model=False,
+                )
+        if ctx.response is not None:
+            remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+            await _finish_ai_chat_response(
+                ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+            )
+            return True
     if getattr(ctx, "semantic_pending_released", False):
         if ctx.response is None:
             ctx.response = await _try_handle_simple_single_word_query(

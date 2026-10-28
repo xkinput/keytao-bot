@@ -3604,18 +3604,34 @@ async def _prepare_multi_word_query(
     scopes: List[Dict[str, Any]] = [scope for scope in previous_scopes if scope["word"] not in words]
     other_blocks: List[str] = list(query_other_blocks)
     other_block_words: Dict[int, str] = {}
+    present_word_codes: Optional[Dict[str, Tuple[str, ...]]] = (
+        {} if explicit_add and len(combined_words) > 1 else None
+    )
     for word in words:
         count = len(scopes)
         request = next((row for row in reading_requests if row.word == word), None)
         response = await _try_handle_simple_single_word_query(
             word, platform, user_id, conv_key, space_key, owner_label,
             _prepared_scopes=scopes,
+            _prepared_existing_words=present_word_codes,
             requested_reading=request.reading if request else "",
             requested_code=request.code if request else "",
         )
-        if len(scopes) == count:
+        if len(scopes) == count and not (present_word_codes is not None and word in present_word_codes):
             other_block_words[len(other_blocks)] = word
             other_blocks.append(str(response or f"「{word}」暂时没有可核验的候选。"))
+
+    if present_word_codes:
+        existing_lines = [
+            f"{word} 已在词库（{'、'.join(codes)}）"
+            for word, codes in present_word_codes.items()
+        ]
+        first_word = next(iter(present_word_codes))
+        existing_lines.append(already_existing_word_copy(
+            first_word, present_word_codes[first_word],
+            can_choose_other_code=False, advertise_controls=False,
+        ).splitlines()[-1])
+        other_blocks.append("\n".join(existing_lines))
 
     actionable_scopes: List[Dict[str, Any]] = []
     if preserve_pending:
@@ -3715,6 +3731,7 @@ async def _try_handle_simple_single_word_query(
     requested_code: str = "",
     actionable_lookup: bool = False,
     _prepared_scopes: Optional[List[Dict[str, Any]]] = None,
+    _prepared_existing_words: Optional[Dict[str, Tuple[str, ...]]] = None,
     preserve_pending: bool = False,
     query_only: bool = False,
     _missing_words: Optional[List[str]] = None,
@@ -3843,6 +3860,9 @@ async def _try_handle_simple_single_word_query(
             for phrase in matching_rows
         ))
         if existing_codes:
+            if _prepared_existing_words is not None:
+                _prepared_existing_words[word] = existing_codes
+                return ""
             if conv_key is not None and _prepared_scopes is None and not preserve_pending and not query_only:
                 phrase_types = tuple(dict.fromkeys(
                     str(phrase.get("type") or "").strip()
