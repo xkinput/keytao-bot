@@ -734,6 +734,7 @@ class WordDiscovery:
                         chat.conversation_state_store.delete(address)
                     return
                 result = await bot.send(event=event, message=MessageSegment.at(user_id) + " " + response)
+                chat._bind_pending_reply_message_ids(record, result)
                 message_id = result.get("message_id", "") if isinstance(result, dict) else ""
                 self.store.record_offer(conn, address, word, record.nonce, message_id)
         except BaseException as error:

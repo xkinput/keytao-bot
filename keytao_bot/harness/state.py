@@ -29,6 +29,15 @@ from .conversation import (
 ActorKey = Tuple[str, str]
 
 
+def _normalize_message_id(value: object) -> str:
+    if type(value) not in (int, str):
+        return ""
+    text = str(value)
+    if not re.fullmatch(r"-?[0-9]{1,20}", text) or int(text) == 0:
+        return ""
+    return str(int(text))
+
+
 @dataclass
 class PendingAddWord:
     """User has been shown candidate codes, waiting for choice."""
@@ -882,6 +891,17 @@ class PendingStateRecord:
         self.owner_key = normalize_conversation_key(self.owner_key, self.space_key)
         self.space_key = self.owner_key.space_key
 
+    @property
+    def origin_message_ids(self) -> Tuple[str, ...]:
+        try:
+            values = json.loads(self.origin_message_id) if self.origin_message_id.startswith("[") else [self.origin_message_id]
+        except (TypeError, ValueError):
+            return ()
+        if not isinstance(values, list) or not values:
+            return ()
+        ids = tuple(_normalize_message_id(value) for value in values)
+        return tuple(dict.fromkeys(ids)) if all(ids) else ()
+
     def arm_reconfirmation(
         self,
         confirmation_message: str = "确认",
@@ -1263,6 +1283,36 @@ class MemoryConversationStateStore:
             return True
         record.origin_prompt_digest = previous
         return False
+
+    def bind_origin_message_ids(self, record: PendingStateRecord, message_ids: List[object]) -> bool:
+        if self.get_record(record.owner_key) is not record or record.execution_id:
+            return False
+        ids = tuple(_normalize_message_id(value) for value in message_ids)
+        if not ids or not all(ids):
+            return False
+        ids = tuple(dict.fromkeys((*record.origin_message_ids, *ids)))
+        previous = record.origin_message_id
+        record.origin_message_id = ids[0] if len(ids) == 1 else json.dumps(ids)
+        if self._persist_record(record):
+            return True
+        record.origin_message_id = previous
+        return False
+
+    def reply_message_id_matches(self, record: PendingStateRecord, message_id: object) -> Optional[bool]:
+        """Return None only when legacy prompt verification may be used."""
+        self._purge_expired()
+        normalized = _normalize_message_id(message_id)
+        if not normalized:
+            return False if record.origin_message_id or message_id not in (None, "") else None
+        if any(
+            other is not record and other.owner_key.platform == record.owner_key.platform
+            and normalized in other.origin_message_ids
+            for other in self._records.values()
+        ):
+            return False
+        if record.origin_message_id and not record.origin_message_ids:
+            return False
+        return True if normalized in record.origin_message_ids else None
 
     def _persist_record(self, record: PendingStateRecord) -> bool:
         """Persistence hook used by the durable production implementation."""

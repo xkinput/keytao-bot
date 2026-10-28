@@ -58,6 +58,7 @@ class ReplyReferenceInfo:
     text: str = ""
     mentioned_user_ids: Tuple[str, ...] = ()
     images: Tuple[ImageAttachment, ...] = ()
+    message_id: str = ""
 
 
 try:
@@ -392,6 +393,9 @@ def _space_key_from_memory_context(memory_context: ChatMemoryContext) -> Tuple[s
 def extract_onebot_reply_id(event: Event) -> Optional[str]:
     """Extract replied message id from OneBot v11 message segments."""
     try:
+        native_id = getattr(getattr(event, 'reply', None), 'message_id', None)
+        if native_id is not None:
+            return str(native_id)
         message_to_check = getattr(event, 'original_message', None) or getattr(event, 'message', None)
         if not message_to_check:
             return None
@@ -549,13 +553,17 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
     if QQBot and isinstance(bot, QQBot):
         reply_message_id = extract_onebot_reply_id(event)
         if not reply_message_id:
-            return ReplyReferenceInfo()
+            message = getattr(event, 'original_message', None) or getattr(event, 'message', None) or ()
+            is_reply = getattr(event, 'reply', None) is not None or any(
+                getattr(segment, 'type', None) == 'reply' for segment in islice(iter(message), 64)
+            )
+            return ReplyReferenceInfo(is_reply=is_reply)
         logger.info(f"Detected OneBot reply segment, reply message_id: {reply_message_id}")
         try:
             reply_payload = await bot.get_msg(message_id=int(reply_message_id))
         except Exception as error:
             logger.warning(f"Failed to fetch replied OneBot message {reply_message_id}: {error}")
-            return ReplyReferenceInfo(is_reply=True)
+            return ReplyReferenceInfo(is_reply=True, message_id=reply_message_id)
 
         sender = reply_payload.get('sender', {}) if isinstance(reply_payload, dict) else {}
         reply_from_id = str(sender.get('user_id') or reply_payload.get('user_id', ''))
@@ -584,6 +592,7 @@ async def extract_reply_reference_info(bot: Bot, event: Event) -> ReplyReference
             text=reply_text,
             mentioned_user_ids=mentioned_user_ids,
             images=reply_images,
+            message_id=reply_message_id,
         )
 
     return ReplyReferenceInfo()

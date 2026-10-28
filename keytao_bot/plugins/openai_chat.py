@@ -3072,6 +3072,7 @@ async def _send_event_response(
     emit_metrics: bool = True,
 ) -> bool:
     text = _prepare_user_facing_reply(text, memory_context)
+    record = _pending_reply_record(text, memory_context)
     try:
         bot_module = bot.__class__.__module__
         if (
@@ -3087,7 +3088,8 @@ async def _send_event_response(
                     _strip_markdown(text),
                     memory_context.space_type == "group",
                 )
-                await bot.send(event=event, message=message)
+                result = await bot.send(event=event, message=message)
+                _bind_pending_reply_message_ids(record, result)
                 if emit_metrics:
                     _acknowledge_delivered_draft_mutations(_strip_markdown(text))
                     emit_turn_metrics(logger)
@@ -3103,7 +3105,8 @@ async def _send_event_response(
                 _acknowledge_delivered_draft_mutations(text)
                 emit_turn_metrics(logger)
             return True
-        await bot.send(event=event, message=text)
+        result = await bot.send(event=event, message=text)
+        _bind_pending_reply_message_ids(record, result)
         if emit_metrics:
             _acknowledge_delivered_draft_mutations(text)
             emit_turn_metrics(logger)
@@ -3513,11 +3516,35 @@ def _set_conversational_turn(message, history, intent, *, other_intents=(), quer
         _current_conversational_turn.set((message, list(history or [])))
 
 
+def _pending_reply_record(response: str, memory_context: Optional[ChatMemoryContext]) -> Optional[PendingStateRecord]:
+    if memory_context is None or memory_context.platform != "qq":
+        return None
+    record = conversation_state_store.get_record(memory_context.conversation_address)
+    if record is not None and not record.execution_id and record.origin_prompt_digest == _prompt_capability_digest(_strip_markdown(response)):
+        return record
+    return None
+
+
+def _bind_pending_reply_message_ids(record: Optional[PendingStateRecord], result: object) -> None:
+    if record is None:
+        return
+    results = result if isinstance(result, (list, tuple)) else [result]
+    conversation_state_store.bind_origin_message_ids(
+        record, [item.get("message_id") if isinstance(item, dict) else None for item in results],
+    )
+
+
 async def _finish_ai_chat_matcher(response: str) -> None:
     """Dispatch a matcher reply and close metrics at the same boundary."""
     memory_context = current_memory_context.get()
     response = _prepare_user_facing_reply(response, memory_context)
+    record = _pending_reply_record(response, memory_context)
     try:
+        if record is not None and callable(getattr(ai_chat, "send", None)):
+            result = await ai_chat.send(response)
+            _bind_pending_reply_message_ids(record, result)
+            await ai_chat.finish()
+            return
         await ai_chat.finish(response)
     finally:
         emit_turn_metrics(logger)
@@ -3534,6 +3561,7 @@ async def _finish_ai_chat_response(
     """Send one foreground reply with the existing platform formatting."""
 
     response = _prepare_user_facing_reply(response, memory_context)
+    record = _pending_reply_record(response, memory_context)
     bot_module = bot.__class__.__module__
     if "telegram" in bot_module.lower():
         tg_text = _to_markdownv2(response)
@@ -3572,7 +3600,7 @@ async def _finish_ai_chat_response(
         qq_msg_id = getattr(event, "message_id", None)
         if qq_msg_id and qq_message_segment:
             try:
-                await bot.send(
+                result = await bot.send(
                     event=event,
                     message=_build_qq_reply_message(
                         qq_message_segment,
@@ -3582,13 +3610,15 @@ async def _finish_ai_chat_response(
                         memory_context.space_type == "group",
                     ),
                 )
+                _bind_pending_reply_message_ids(record, result)
                 _acknowledge_delivered_draft_mutations(qq_text)
                 emit_turn_metrics(logger)
                 return
             except Exception:
                 pass
         if callable(getattr(bot, "send", None)):
-            await bot.send(event=event, message=qq_text)
+            result = await bot.send(event=event, message=qq_text)
+            _bind_pending_reply_message_ids(record, result)
             _acknowledge_delivered_draft_mutations(qq_text)
             emit_turn_metrics(logger)
         else:
@@ -3596,7 +3626,8 @@ async def _finish_ai_chat_response(
         return
 
     if callable(getattr(bot, "send", None)):
-        await bot.send(event=event, message=response)
+        result = await bot.send(event=event, message=response)
+        _bind_pending_reply_message_ids(record, result)
         _acknowledge_delivered_draft_mutations(response)
         emit_turn_metrics(logger)
     else:
@@ -3670,8 +3701,12 @@ class TurnContext:
 
 
 def _verified_pending_reply(ctx: TurnContext, record: Optional[PendingStateRecord]) -> bool:
-    """Bind digest-less legacy tickets only to this author's latest bot reply."""
+    """Keep owner checks ahead of transport-ID and legacy prompt binding."""
     reply = ctx.reply_reference
+    if ctx.platform == "qq" and getattr(reply, "message_id", "") in (None, ""):
+        message_id = extract_onebot_reply_id(ctx.event)
+        if message_id:
+            reply = ctx.reply_reference = replace(reply, message_id=message_id)
     referenced_owner = _referenced_owner_key_from_reply_reference(reply, ctx.platform)
     if (
         record is None or record.execution_id
@@ -3681,11 +3716,9 @@ def _verified_pending_reply(ctx: TurnContext, record: Optional[PendingStateRecor
         or referenced_owner not in {None, (ctx.platform, str(ctx.user_id))}
     ):
         return False
-    if record.origin_prompt_digest:
-        return _verified_bot_reply_matches_record(ctx.reply_reference, record)
-    return bool(
-        reply.is_reply and reply.is_to_bot and reply.text
-        and reply.text == _get_latest_assistant_message(get_history(ctx.conv_key))
+    return _verified_bot_reply_matches_record(
+        reply, record,
+        legacy_prompt=_get_latest_assistant_message(get_history(ctx.conv_key)) if not record.origin_prompt_digest else "",
     )
 
 
@@ -4556,6 +4589,16 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
 _semantic_shadow_tasks: set[asyncio.Task] = set()
 
 
+def _bound_pending_reply_prompt(record: PendingStateRecord) -> str:
+    return (
+        _render_live_single_candidate_record(record)
+        or _render_live_batch_record(record)
+        or _render_live_choice_record(record)
+        or _render_live_shift_record(record)
+        or _format_live_ticket_precedence_message(record.state)
+    )
+
+
 async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     """Resolve the author's closed ticket answers before model routing."""
     message = ctx.normalized_message_text
@@ -4576,7 +4619,14 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     latest = _get_latest_assistant_message(history)
     canonical = ""
     state = record.state
-    contract = advertised_reply_contract(ctx.reply_reference.text if ctx.reply_reference.is_reply else latest)
+    reply_prompt = ctx.reply_reference.text
+    if (
+        ctx.reply_reference.is_reply and ctx.platform == "qq"
+        and _verified_pending_reply(ctx, record)
+        and conversation_state_store.reply_message_id_matches(record, ctx.reply_reference.message_id) is True
+    ):
+        reply_prompt = _bound_pending_reply_prompt(record)
+    contract = advertised_reply_contract(reply_prompt if ctx.reply_reference.is_reply else latest)
     assent = _pending_tool_assent_intent(state, message)
     if not affirmative:
         if message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms, "取消") and assent is not None:
@@ -4602,7 +4652,7 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     cancel_control = bool(canonical and assent is not None and assent.intent == "pending_cancel")
 
     def unbound_answer() -> bool:
-        if canonical and record.origin_prompt_digest:
+        if canonical and (record.origin_prompt_digest or record.origin_message_id):
             ctx.response = "这条回复未对应当前待确认操作；请引用当前候选消息后再回复。"
             ctx.scoped_pending_response = ctx.response
             ctx.operation_understood_early = True
@@ -4617,7 +4667,7 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
             ):
                 canonical = message
             return unbound_answer()
-        prompt = ctx.reply_reference.text
+        prompt = reply_prompt
     else:
         closed_reviewed_selection = False
         if (
@@ -4976,7 +5026,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     return True
             return True
         live_owned_ticket = bool(
-            owned_ticket and current_record.origin_prompt_digest
+            owned_ticket and (current_record.origin_prompt_digest or current_record.origin_message_id)
             and not complete_command and not model_command
             and isinstance(pending_decision, dict)
             and isinstance(pending_decision.get("refers_to_pending"), bool)
@@ -5028,8 +5078,16 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     ctx.semantic_pending_released = True
                     ctx.current_pending_record = current_record
                     return False
+                id_bound = bool(
+                    ctx.reply_reference.is_reply and ctx.platform == "qq"
+                    and conversation_state_store.reply_message_id_matches(
+                        current_record, ctx.reply_reference.message_id,
+                    ) is True
+                )
+                if id_bound:
+                    prompt = _bound_pending_reply_prompt(current_record)
                 latest_matches = bool(
-                    current_record.origin_prompt_digest
+                    id_bound or current_record.origin_prompt_digest
                     and _chat_routing._prompt_capability_digest(prompt) == current_record.origin_prompt_digest
                 )
                 canonical = _chat_commands.render_understood_pending_answer(

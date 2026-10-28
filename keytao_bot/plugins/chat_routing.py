@@ -3489,15 +3489,24 @@ def _prompt_capability_digest(text: str) -> str:
 def _verified_bot_reply_matches_record(
     reply_reference: ReplyReferenceInfo,
     record: Optional[PendingStateRecord],
+    legacy_prompt: str = "",
 ) -> bool:
+    if record is None or not reply_reference.is_reply or not reply_reference.is_to_bot:
+        return False
+    if record.owner_key.platform == "qq":
+        from .chat_commands import conversation_state_store
+
+        matched = conversation_state_store.reply_message_id_matches(
+            record, getattr(reply_reference, "message_id", ""),
+        )
+        if matched is not None:
+            return matched
     return bool(
-        record is not None
-        and reply_reference.is_reply
-        and reply_reference.is_to_bot
-        and reply_reference.text
-        and record.origin_prompt_digest
-        and _prompt_capability_digest(reply_reference.text)
-        == record.origin_prompt_digest
+        reply_reference.text and (
+            _prompt_capability_digest(reply_reference.text) == record.origin_prompt_digest
+            if record.origin_prompt_digest
+            else legacy_prompt and reply_reference.text == legacy_prompt
+        )
     )
 
 
