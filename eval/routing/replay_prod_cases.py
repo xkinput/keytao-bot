@@ -113,7 +113,7 @@ class Replay:
             result = {"success": True, "phrases": [item for item in self.entries if item[field] == args[field]]}
         elif name == "keytao_lookup_by_words_batch":
             result = {"success": True, "results": [
-                {"word": word, "phrases": [item for item in self.entries if item["word"] == word]}
+                {"success": True, "word": word, "phrases": [item for item in self.entries if item["word"] == word]}
                 for word in args["words"]
             ]}
         elif name == "keytao_pending_items_by_words":
