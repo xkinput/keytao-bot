@@ -31,6 +31,7 @@ from ..utils.pending_confirmation import (
     pending_confirmation_copy,
     prepend_pending_word_reminders,
     plain_warning_message,
+    shift_plan_warnings,
     front_insert_recommendation_copy,
     render_executable_suggestion,
     render_remediation_reply,
@@ -884,11 +885,7 @@ def _format_pending_state_details(state: PendingState) -> str:
         lines.append("顺延变化：")
         lines.extend(shifted_lines)
 
-    warnings = (
-        display.get("warnings")
-        if isinstance(display.get("warnings"), list)
-        else []
-    )
+    warnings = shift_plan_warnings(display)
     if warnings:
         lines.append("风险：")
         lines.extend(

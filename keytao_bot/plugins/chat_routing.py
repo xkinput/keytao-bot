@@ -1581,6 +1581,17 @@ def _structural_pending_add_word_intent(
     stripped = _strip_command_message_prefixes(
         trusted_mutation_source(message_text)
     ).strip()
+    selection = parse_reviewed_selection_command(stripped)
+    if (
+        selection is not None and not selection.shift_words
+        and len(selection.pairs) == 1 and selection.pairs[0][0] == state.word
+        and selection.pairs[0][1].isdecimal()
+    ):
+        index = int(selection.pairs[0][1])
+        return MessageCommandIntent(
+            intent="pending_add_and_submit" if "提交" in selection.action else "pending_choice",
+            confidence=1.0, choice_index=index, submit_after="提交" in selection.action,
+        )
     complete_eviction = parse_eviction_modified_add(stripped)
     if (
         complete_eviction is not None
@@ -1929,7 +1940,7 @@ def _multi_word_candidate_scope_rows(
     words = [str(item.get("word") or "").strip() for item in clean_items]
     if (
         len(clean_items) != len(items)
-        or len(words) < (1 if state.args.get("_reviewed_multi_word") is True else 2)
+        or (state.args.get("_reviewed_multi_word") is not True and len(words) < 2)
         or any(not word for word in words)
         or len(set(words)) != len(words)
     ):
@@ -1954,7 +1965,7 @@ def _multi_word_candidate_scope_rows(
             return clean_items, {}
         word = str(raw_scope.get("word") or "").strip()
         raw_candidates = raw_scope.get("candidates")
-        if word not in words or word in scopes or not isinstance(raw_candidates, list):
+        if not word or word in scopes or not isinstance(raw_candidates, list):
             return clean_items, {}
         candidates: List[Tuple[str, bool]] = []
         seen_codes: set[str] = set()
@@ -1973,11 +1984,14 @@ def _multi_word_candidate_scope_rows(
             candidates.append((code, occupied))
         if not candidates:
             return clean_items, {}
-        current_code = str(
-            next(item for item in clean_items if str(item.get("word") or "").strip() == word).get("code")
-            or ""
-        ).strip().lower()
-        if current_code not in seen_codes:
+        current_item = next((item for item in clean_items if str(item.get("word") or "").strip() == word), None)
+        current_code = str(current_item.get("code") or "").strip().lower() if current_item is not None else ""
+        if current_item is not None and current_code not in seen_codes:
+            return clean_items, {}
+        if current_item is None and not (
+            state.args.get("_reviewed_multi_word") is True
+            and all(occupied for _code, occupied in candidates)
+        ):
             return clean_items, {}
         if state.args.get("_reviewed_multi_word") is True:
             try:
@@ -1996,7 +2010,7 @@ def _multi_word_candidate_scope_rows(
             ):
                 return clean_items, {}
         scopes[word] = candidates
-    if set(scopes) != set(words):
+    if not set(words).issubset(scopes):
         return clean_items, {}
     return clean_items, scopes
 
@@ -2009,7 +2023,7 @@ def _resolve_reviewed_multi_word_selection(
 ) -> Tuple[Optional[PendingToolConfirm], Optional[MessageCommandIntent], Optional[str]]:
     """Bind each canonical pair to its own sealed review; omit every other word."""
     source = _strip_command_message_prefixes(message_text).strip()
-    live_words = tuple(str(item["word"]).strip() for item in items)
+    live_words = tuple(scopes) or tuple(str(item["word"]).strip() for item in items)
     unquoted = _whole_message_unquoted_source(source, live_words)
     if unquoted is not None:
         source = unquoted
@@ -2056,7 +2070,7 @@ def _resolve_reviewed_multi_word_selection(
             render_remediation_reply(reason, command=command, words=live_words),
             source_message=message_text, source_state=state,
         )
-    if not items or not scopes:
+    if not scopes:
         assent = _pending_tool_assent_intent(state, message_text)
         if pairs is not None or (
             assent is not None and assent.intent in {"pending_confirm", "pending_add_and_submit"}
@@ -2094,6 +2108,10 @@ def _resolve_reviewed_multi_word_selection(
     if pairs is None:
         if parse_entry_swap(message_text) is not None:
             return None, None, None
+        if not items:
+            assent = _pending_tool_assent_intent(state, message_text)
+            if assent is not None and assent.intent in {"pending_confirm", "pending_add_and_submit"}:
+                return None, None, "当前没有可验证的可执行操作，本次未写入。"
         if (
             re.search(r"[\u3400-\u9fff]+[ \t]+(?:[0-9]+|[a-zA-Z]+)", source)
             or any(re.match(rf"{re.escape(word)}\s+", source) for word in live_words)
@@ -2141,8 +2159,6 @@ def _resolve_reviewed_multi_word_selection(
             if code not in dict(candidates):
                 skipped.append(f"「{word}」的编码 {code} 不在当前候选中，未加入")
                 continue
-        item = dict(items_by_word[word])
-        item["code"] = code
         raw_scope = next(
             scope for scope in state.args["_candidate_scopes"]
             if scope["word"] == word
@@ -2160,8 +2176,20 @@ def _resolve_reviewed_multi_word_selection(
             else:
                 occupants = "、".join(f"「{occupant}」" for occupant in protected)
                 reason = f"占位词{occupants}尚无更弱的常用度证据"
-            skipped.append(f"「{word}」的编码 {code} {reason}，未加入")
+            skipped.append(
+                f"{word} {selector}（{code}）已有「{'、'.join(protected)}」，未加入。"
+                if "" not in protected and selector.isdecimal()
+                else f"「{word}」的编码 {code} {reason}，未加入"
+            )
             continue
+        reviewed = raw_scope["reviewedState"]
+        item = dict(items_by_word.get(word) or {
+            "action": "Create", "word": word,
+            "type": reviewed.get("phraseType", "Phrase"),
+            "needsManualReview": reviewed["needsManualReview"] is not False,
+            "manualReviewReason": reviewed["manualReviewReason"],
+        })
+        item["code"] = code
         item["remark"] = (
             raw_scope["reviewedState"].get("codeRemarks", {}).get(code, "")
         )
@@ -2184,7 +2212,7 @@ def _resolve_reviewed_multi_word_selection(
         derived_args.pop("_resolved_advertised_words", None)
     derived_args["_selection_skipped"] = skipped
     derived_args["_unselected_words"] = [
-        word for word in items_by_word if word not in selected_words
+        word for word in scopes if word not in selected_words
     ]
     derived_args["_candidate_scopes"] = [
         {**scope, "orderingAssessments": [

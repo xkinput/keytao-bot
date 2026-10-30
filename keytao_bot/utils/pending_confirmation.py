@@ -767,6 +767,47 @@ def _humanize_warning_text(text: str) -> str:
     return rendered.replace("将创建多编码词条", "这次会形成多编码词条")
 
 
+def shift_plan_warnings(data: dict[str, Any]) -> list[Any]:
+    """Exclude a word's verified source code from skipped empty slots."""
+    warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+    plan = data.get("shiftPlan")
+    if not isinstance(plan, dict):
+        return warnings
+    items = plan.get("items") if isinstance(plan.get("items"), list) else []
+    sources = [
+        item for item in items
+        if isinstance(item, dict) and item.get("action") == "Delete"
+    ]
+    if isinstance(plan.get("sourcePhrase"), dict):
+        sources.append(plan["sourcePhrase"])
+    if plan.get("word") and plan.get("sourceCode"):
+        sources.append({"word": plan["word"], "code": plan["sourceCode"]})
+    source_pairs = {
+        (str(item.get("word") or "").strip(), str(item.get("code") or "").strip().lower())
+        for item in sources
+    }
+    result = []
+    for warning in warnings:
+        if not isinstance(warning, dict) or warning.get("warningType") != "skipped_candidate_slot":
+            result.append(warning)
+            continue
+        item = warning.get("item") if isinstance(warning.get("item"), dict) else warning
+        word = str(item.get("word") or "").strip()
+        skipped = warning.get("skippedCodes") or [warning.get("skippedCode")]
+        if not isinstance(skipped, list) or any(not isinstance(code, str) or not code.strip() for code in skipped):
+            result.append(warning)
+            continue
+        remaining = [code for code in skipped if (word, code.strip().lower()) not in source_pairs]
+        if remaining == skipped:
+            result.append(warning)
+        elif remaining:
+            narrowed = dict(warning, skippedCodes=remaining, skippedCode=remaining[0])
+            for field in ("message", "impact", "reason", "summary"):
+                narrowed.pop(field, None)
+            result.append(narrowed)
+    return result
+
+
 def plain_warning_message(warning: Any) -> str:
     """Verbalize one structured server warning without reducing it to a count."""
     if is_dataclass(warning) and not isinstance(warning, type):
@@ -1182,8 +1223,8 @@ def render_server_backed_batch_candidates(
     """Render one complete batch solely from sealed server-record fields."""
     if (
         not isinstance(items, list)
-        or not items
         or not isinstance(candidate_scopes, list)
+        or not candidate_scopes
     ):
         return ""
 
@@ -1313,17 +1354,22 @@ def render_server_backed_batch_candidates(
             (word, code, bool(raw_item.get("needsManualReview", True)))
         )
         seen_words.add(word)
-    if seen_words != set(scopes_by_word):
-        return ""
+    for word in set(scopes_by_word) - seen_words:
+        scope = reviewed_scopes_by_word.get(word)
+        if (
+            scope is None or scope["reviewedState"].get("recommendedCode") != ""
+            or not all(occupied for _code, occupied in scopes_by_word[word])
+        ):
+            return ""
 
     if reviewed_scopes_by_word:
-        if seen_words != set(reviewed_scopes_by_word):
+        if set(scopes_by_word) != set(reviewed_scopes_by_word):
             return ""
-        lines = [f"{len(normalized_items)} 个词的候选："]
+        display_items = {word: (code, needs_review) for word, code, needs_review in normalized_items}
+        lines = [f"{len(scopes_by_word)} 个词的候选："]
         selections: list[tuple[str, str]] = []
-        for index, (word, recommended_code, _needs_review) in enumerate(
-            normalized_items, start=1,
-        ):
+        for index, word in enumerate(scopes_by_word, start=1):
+            recommended_code, _needs_review = display_items.get(word, ("", True))
             scope = reviewed_scopes_by_word[word]
             if scope["reviewedState"].get("recommendedCode") != recommended_code:
                 return ""
@@ -1334,14 +1380,16 @@ def render_server_backed_batch_candidates(
                 occupied_words_by_scope[word],
                 reviewed_prompt=scope["reviewedPrompt"],
                 ordering_assessments=ordering_assessments_by_scope[word],
-                actionable_controls=True,
-                include_controls=include_controls and len(normalized_items) == 1,
+                actionable_controls=bool(recommended_code),
+                include_controls=include_controls and len(scopes_by_word) == 1,
             )
             if not block:
                 return ""
-            if len(normalized_items) == 1:
+            if len(scopes_by_word) == 1:
                 return block
             lines.extend((f"{index}. 「{word}」", block))
+            if not recommended_code:
+                continue
             selected_index = next(
                 candidate_index
                 for candidate_index, (code, _occupied) in enumerate(
@@ -1350,7 +1398,7 @@ def render_server_backed_batch_candidates(
                 if code == recommended_code
             )
             selections.append((word, str(selected_index)))
-        if include_controls:
+        if include_controls and selections:
             from keytao_bot.harness.authorization_grammar import (
                 parse_reviewed_multi_word_selection,
             )
@@ -1369,6 +1417,8 @@ def render_server_backed_batch_candidates(
                 return ""
             lines.append("也可选择后直接加入并提交：")
             lines.append(render_executable_suggestion(combined_command))
+        elif include_controls:
+            lines.append("回复「取消」。")
         return "\n".join(lines)
 
     if len(normalized_items) < 2:
@@ -1939,7 +1989,7 @@ def render_server_backed_single_word_lookup(
         prefix = ""
         first_candidate = re.search(r"(?m)^\s*1[.)、]\s*[a-z]+\s*(?:—|–|-)", source)
         if first_candidate is not None:
-            prefix = re.sub(r"(?m)^\s*候选编码\s*[:：]\s*$", "", source[:first_candidate.start()]).strip()
+            prefix = re.sub(rf"(?m)^\s*(?:「{re.escape(normalized_word)}」)?候选编码\s*[:：]\s*$", "", source[:first_candidate.start()]).strip()
         guarded_body = render_server_backed_single_word_candidates(
             word, "", candidates, occupied_words, ordering_assessments,
             include_controls=include_controls and actionable_controls,

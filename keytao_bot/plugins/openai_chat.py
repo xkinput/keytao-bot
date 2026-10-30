@@ -3013,7 +3013,7 @@ def _prepare_user_facing_reply(
         deltas = [receipt["writeReceipt"] for receipt in deliveries if receipt.get("writeReceipt")]
         if deltas:
             if any(delta.get("writtenItems") or delta.get("updatedItems") for delta in deltas) and re.search(
-                r"(?:本次|本轮)(?:没有|未)(?:执行(?:任何)?(?:新的?)?写入|写入|添加)", prepared,
+                r"(?:^|[，,。\n])(?:本次|本轮)(?:没有|未)(?:执行(?:任何)?(?:新的?)?写入|写入|添加)", prepared,
             ):
                 prepared = "本轮写入结果如下。"
             prepared = finalize_draft_receipt(prepared, *reversed(deltas), platform=platform)
@@ -4221,7 +4221,7 @@ async def _stage_prepare_fresh_code_selection(ctx: TurnContext) -> bool:
     if ctx.response is not None or ctx.scoped_pending_response is not None:
         return False
     request = _chat_commands.fresh_entry_code_selection(ctx.normalized_message_text)
-    if request is None or ctx.reply_reference.is_reply:
+    if request is None or (ctx.reply_reference.is_reply and not request.code.isdecimal()):
         return False
     record = conversation_state_store.get_record(ctx.conv_key)
     if record is not None:
@@ -4232,10 +4232,16 @@ async def _stage_prepare_fresh_code_selection(ctx: TurnContext) -> bool:
         ctx.response = _format_active_draft_operation_message(active, active.pending_state)
     else:
         set_turn_flow("explicit-code")
-        ctx.response = await _chat_commands.prepare_fresh_entry_code_selection(
-            request, ctx.normalized_message_text, ctx.platform, ctx.user_id,
-            ctx.conv_key, ctx.space_key, ctx.owner_label,
-        )
+        if request.code.isdecimal():
+            ctx.response = await _chat_commands._try_handle_simple_single_word_query(
+                f"加词：{request.word}", ctx.platform, ctx.user_id,
+                ctx.conv_key, ctx.space_key, ctx.owner_label,
+            )
+        else:
+            ctx.response = await _chat_commands.prepare_fresh_entry_code_selection(
+                request, ctx.normalized_message_text, ctx.platform, ctx.user_id,
+                ctx.conv_key, ctx.space_key, ctx.owner_label,
+            )
     remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
     await _finish_ai_chat_response(
         ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
@@ -4643,6 +4649,9 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     latest = _get_latest_assistant_message(history)
     canonical = ""
     state = record.state
+    occupied_reply = _chat_commands.occupied_add_ticket_reply(state, message)
+    if occupied_reply:
+        canonical = message
     if isinstance(state, PendingAddWord):
         ordinal = re.fullmatch(r"到\s*([0-9]+)号", message.strip())
         shift = _authorization_grammar.parse_standalone_shift(message, known_words=(state.word,))
@@ -4772,13 +4781,13 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     from ..harness.operation_request import OperationRequest
 
     request = OperationRequest(op="cancel" if cancel_control else "confirm", frame="direct", refers_to_pending=True)
-    if affirmative:
+    if affirmative and not occupied_reply:
         canonical = _chat_commands.render_understood_pending_answer(
             request, record.state, prompt, message,
         )
     if affirmative and not canonical and isinstance(record.state, PendingToolConfirm) and record.state.function_name == "keytao_submit_batch":
         canonical = "确认"
-    response = None
+    response = occupied_reply or None
     if affirmative and not canonical and isinstance(record.state, PendingToolConfirm):
         if record.state.function_name == "keytao_choice_offer":
             response = _chat_commands.render_pending_choice_offer(record.state) or None
@@ -4881,6 +4890,16 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
         return True
     if await _try_bound_pending_reply(ctx):
         return True
+    source = _strip_command_message_prefixes(ctx.normalized_message_text)
+    from ..utils.explicit_code import parse_explicit_entry_code_request
+
+    if parse_explicit_entry_code_request(source) is not None and re.search(r"加入\s*编码", source):
+        if await _stage_handle_explicit_entry_operation(ctx):
+            return True
+    fresh = _chat_commands.fresh_entry_code_selection(source)
+    if fresh is not None and fresh.code.isdecimal():
+        if await _stage_prepare_fresh_code_selection(ctx):
+            return True
     if re.fullmatch(r"到\s*[0-9]+号", ctx.normalized_message_text.strip()):
         ctx.response = "当前没有与这条回复绑定的编号候选；请写明目标编码。"
         remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)

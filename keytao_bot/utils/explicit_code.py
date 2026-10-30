@@ -36,6 +36,7 @@ def parse_explicit_entry_code_request(message: str):
         return rf'(?:{pattern}|"\s*{pattern}\s*"|“\s*{pattern}\s*”|「\s*{pattern}\s*」|『\s*{pattern}\s*』)'
 
     word_operand = operand(word)
+    quoted_word = rf'(?:"\s*{word}\s*"|“\s*{word}\s*”|「\s*{word}\s*」|『\s*{word}\s*』)'
     code_operand = operand(code)
     action = r'(?:加入草稿|加到草稿|写入草稿|加入|添加到草稿|添加草稿|添加)(?P<submit>并提交)?'
     separator = r'(?:\s*[,，、；;]\s*|\s+)'
@@ -52,19 +53,24 @@ def parse_explicit_entry_code_request(message: str):
         )
 
         selected_word = combined.group("word").strip(' "“”「」『』')
+        selected_code = combined.group("code").strip(' "“”「」『』')
         if (
-            not looks_like_lexical_review_target(selected_word)
+            selected_code.isdecimal()
+            or not looks_like_lexical_review_target(selected_word)
             or re.match(r"^(?:请)?(?:先|暂时|暂)?" + _NEGATIVE_MODAL_RE.pattern, selected_word)
             or _POSITIONAL_REPORTED_CONTEXT_RE.match(selected_word)
         ):
             return None
         return ExplicitEntryCodeRequest(
             selected_word,
-            combined.group("code").strip(' "“”「」『』'),
+            selected_code,
             bool(combined.group("submit")),
             str(combined.group("pinyin") or "").strip(),
         )
     patterns = (
+        rf'(?P<word>{word_operand})\s+加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
+        rf'(?P<word>{quoted_word})\s*加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
+        rf'给\s*(?P<word>{word_operand})\s*加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
         rf'(?:添加|加入)\s*(?P<type>单字|词组|词条)?\s*(?P<word>{word_operand})'
         rf'(?:\s*[,，]?\s*编码\s*(?:为|是)?\s*[:：]?\s*|\s+)(?P<code>{code_operand})',
         rf'给\s*(?P<word>{word_operand})\s*加(?:一个|个)?\s*(?:编码|码)\s*(?P<code>{code_operand})',
@@ -76,6 +82,8 @@ def parse_explicit_entry_code_request(message: str):
             continue
         selected_word = match.group("word").strip(' "“”「」『』')
         selected_code = match.group("code").strip(' "“”「」『』')
+        if selected_code.isdecimal():
+            return None
         if match.groupdict().get("type") == "单字" and len(selected_word) != 1:
             return None
         return ExplicitEntryCodeRequest(selected_word, selected_code, bool(match.group("submit")))

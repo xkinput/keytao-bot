@@ -93,6 +93,7 @@ from ..utils.pending_confirmation import (
     advertised_batch_binding_pairs,
     advertised_single_word_lookup_codes,
     advertised_single_word_lookup_word,
+    shift_plan_warnings,
     ensure_single_word_candidate_copy,
     ensure_multi_word_candidate_copy,
     parse_advertised_set_reference,
@@ -2139,6 +2140,16 @@ async def _canonicalize_pending_ticket_intent(
     """Freeze the exact action and target that the ticket will later execute."""
     if not isinstance(state, PendingAddWord):
         return command_intent, None
+    named_selection = parse_reviewed_selection_command(message_text)
+    if (
+        named_selection is not None and not named_selection.shift_words
+        and len(named_selection.pairs) == 1 and named_selection.pairs[0][0] == state.word
+        and named_selection.pairs[0][1].isdecimal()
+    ):
+        index = int(named_selection.pairs[0][1])
+        if 1 <= index <= len(state.candidates):
+            return _structural_pending_add_word_intent(message_text, state), None
+        return None, f"只接受 1-{len(state.candidates)} 之间的编号；本次未写入。"
     explicit = parse_explicit_code_request(
         _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
     )
@@ -3543,10 +3554,13 @@ def _mergeable_add_candidate_scopes(
         and not state.args.get("_resolved_candidate_plan")
     ):
         return []
+    from .chat_routing import _multi_word_candidate_scope_rows
+
     unanswered = {
         item.get("word") for item in state.args.get("items", [])
         if isinstance(item, dict) and item.get("action") == "Create"
     }
+    unanswered.update(_multi_word_candidate_scope_rows(state)[1])
     return [
         dict(scope) for scope in state.args.get("_candidate_scopes", [])
         if isinstance(scope, dict) and scope.get("word") in unanswered
@@ -3674,7 +3688,7 @@ async def _prepare_multi_word_query(
     if present_word_codes:
         other_blocks.append(already_existing_words_copy(present_word_codes))
 
-    actionable_scopes: List[Dict[str, Any]] = []
+    selectable_scopes: List[Dict[str, Any]] = []
     if preserve_pending:
         for scope in scopes:
             other_blocks.append(_render_pending_preserving_lookup(
@@ -3684,8 +3698,10 @@ async def _prepare_multi_word_query(
             ))
         return ServerBackedQueryReply("\n\n".join(other_blocks))
     for scope in scopes:
-        if scope["reviewedState"]["recommendedCode"]:
-            actionable_scopes.append(scope)
+        if scope["reviewedState"]["recommendedCode"] or (
+            scope["candidates"] and all(occupied for _code, occupied in scope["candidates"])
+        ):
+            selectable_scopes.append(scope)
             continue
         diagnostic = render_server_backed_single_word_lookup(
             scope["word"], "", scope["candidates"], scope["occupiedWords"],
@@ -3708,7 +3724,7 @@ async def _prepare_multi_word_query(
         )
         other_block_words[len(other_blocks)] = scope["word"]
         other_blocks.append("\n".join(diagnostic_lines))
-    scopes = actionable_scopes
+    scopes = selectable_scopes
 
     if not scopes:
         if conv_key is not None:
@@ -3724,6 +3740,8 @@ async def _prepare_multi_word_query(
     for scope in scopes:
         reviewed = scope["reviewedState"]
         code = reviewed["recommendedCode"]
+        if not code:
+            continue
         item = {
             "action": "Create", "word": scope["word"], "code": code,
             "type": reviewed.get("phraseType", "Phrase"), "remark": reviewed["codeRemarks"].get(code, ""),
@@ -6017,12 +6035,12 @@ def _prepend_resolved_advertised_words(
         if isinstance(unselected, list) and unselected else ""
     )
     skipped = state.args.get("_selection_skipped")
-    skipped_line = "；".join(skipped) + "。\n" if isinstance(skipped, list) and skipped else ""
+    skipped_line = "\n".join(line if line.endswith("。") else line + "。" for line in skipped) + "\n" if isinstance(skipped, list) and skipped else ""
     if skipped_line:
         selected = "、".join(f"{item['word']} → {item['code']}" for item in state.args.get("items", []))
         completed = "✅ 已加入草稿" in response or "已提交审核" in response
         label = "已按你的选择加入" if completed else "本次选择"
-        return f"{label}：{selected}；{skipped_line}{remainder}\n{response}"
+        return f"{label}：{selected}；\n{skipped_line}{remainder}\n{response}"
     return f"词：{'、'.join(words)}{remainder}\n" + skipped_line + str(response or "")
 
 
@@ -6328,7 +6346,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
                             else "（原占用词顺延）"
                         )
                 lines.append(line)
-            warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+            warnings = shift_plan_warnings(data)
             lines.extend(
                 f"提示：{_plain_warning_message(warning)}"
                 for warning in warnings
@@ -6457,7 +6475,7 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
             reason = str(item.get("manualReviewReason") or "").strip()
             if reason:
                 lines.append(f"提示：「{item.get('word', '')}」@ {item.get('code', '')}：{reason}")
-        warnings = data.get("warnings") if isinstance(data.get("warnings"), list) else []
+        warnings = shift_plan_warnings(data)
         if warnings:
             rendered_warnings = [
                 _ranked_shift_warning_copy(warning, proposed_state)
@@ -6774,6 +6792,7 @@ def _shift_plan_warnings_are_bound(data: Dict, args: Dict) -> bool:
     warnings = data.get("warnings")
     if not isinstance(warnings, list):
         return False
+    warnings = shift_plan_warnings(data)
     requested = [{"word": args.get("word"), "code": args.get("target_code")}]
     for key in ("additional_items", "additional_shift_items"):
         requested.extend(item for item in args.get(key) or [] if isinstance(item, dict))
@@ -12309,6 +12328,7 @@ def _semantic_warnings_are_named(data: Dict, args: Dict) -> bool:
     warnings = data.get("warnings")
     if named is None or not isinstance(warnings, list) or server_warning_confirmation_binding(data) is None:
         return False
+    warnings = shift_plan_warnings(data)
     if any(data.get(key) for key in ("failedCount", "skippedCount", "failed", "skipped", "partialWrite")):
         return False
 
@@ -14006,14 +14026,16 @@ async def _execute_explicit_entry_code_request(
 def fresh_entry_code_selection(message: str) -> Optional[ExplicitEntryCodeRequest]:
     """Recognize one closed lexical pair without granting mutation authority."""
     selection = parse_reviewed_selection_command(message)
-    if selection is None or selection.action or selection.shift_words:
+    if selection is None or selection.shift_words:
         return None
     pairs = parse_reviewed_multi_word_selection(message)
     if pairs is None or len(pairs) != 1:
         return None
     word, code = pairs[0]
+    if code.isdecimal():
+        return ExplicitEntryCodeRequest(word, code)
     if (
-        not code.isalpha()
+        selection.action or not code.isalpha()
         or not looks_like_lexical_review_target(word)
         or _NEGATIVE_MODAL_RE.match(word)
         or _POSITIONAL_REPORTED_CONTEXT_RE.match(word)
@@ -14144,6 +14166,24 @@ def _candidate_origin_for_ticket(state) -> Dict:
     return {}
 
 
+def occupied_add_ticket_reply(state, message: str) -> str:
+    """Keep an exact occupied-code follow-up bound to its current ticket."""
+    if not isinstance(state, PendingAddWord) or state.server_candidates != state.candidates:
+        return ""
+    code = state.recommended_code
+    source = _strip_command_message_prefixes(trusted_mutation_source(message)).strip()
+    explicit = parse_explicit_code_request(source, state.word)
+    if source not in {"加入", "加入并提交"} and not (explicit and explicit.code == code):
+        return ""
+    occupants = state.server_occupied_words.get(code, [])
+    if dict(state.server_candidates).get(code) is not True or not occupants or state.word in occupants:
+        return ""
+    if not protected_candidate_occupants(state.word, code, state.server_candidates, state.server_occupied_words, state.server_ordering_assessments):
+        return ""
+    names = "、".join(occupants)
+    return f"{code} 已有「{names}」；回复「加入，顶替 {names}」顶替，或换一个编码。"
+
+
 async def try_reselect_live_ticket(message, platform, user_id, conv_key, space_key=None, owner_label=""):
     """A live ordinal replaces the preview; it never confirms the old plan."""
     record = conversation_state_store.get_record(conv_key)
@@ -14254,6 +14294,12 @@ async def handle_pending_message_core(
         if uncertain_action == "read":
             return None
         return uncertain_response
+
+    source = _strip_command_message_prefixes(trusted_mutation_source(message)).strip()
+    if re.fullmatch(r"加入(?:并提交|\s*编码\s*[a-z]+)?", source):
+        occupied_reply = occupied_add_ticket_reply(state, source)
+        if occupied_reply:
+            return occupied_reply
 
     reselected = await try_reselect_live_ticket(message, platform, user_id, conv_key, space_key, owner_label)
     if reselected is not None:
@@ -14419,6 +14465,7 @@ async def handle_pending_message_core(
         isinstance(state, PendingToolConfirm)
         and _is_pending_tool_confirm_message(state, pending_command_intent)
     ):
+        receipt_start = len(current_draft_delivery_claims.get() or [])
         if not _resolved_advertised_items_match(state):
             conversation_state_store.complete_execution(state_record)
             invalid_words = tuple(
@@ -14514,7 +14561,57 @@ async def handle_pending_message_core(
         response = _prepend_resolved_advertised_words(state, response)
         if preserve_after_response:
             conversation_state_store.abort_execution(state_record)
-        else:
+        original = state_record.state
+        remainder = original.args.get("_candidate_origin", {}).get("remainder")
+        inherited_remainder = bool(remainder)
+        if (
+            original.args.get("_reviewed_multi_word") is True
+            and original.confirmation_source == "local_preview"
+            and (scoped_state is not None or len(original.args["items"]) < len(original.args["_candidate_scopes"]))
+        ):
+            remainder = {
+                "args": original.args,
+                **{field: getattr(state_record, field) for field in (
+                    "origin_message_id", "origin_prompt_digest", "nonce", "created_at", "expires_at",
+                )},
+            }
+        if remainder and not preserve_after_response:
+            receipts = (current_draft_delivery_claims.get() or [])[receipt_start:]
+            written = {
+                item.get("word") for receipt in receipts
+                if receipt.get("platform") == platform and receipt.get("platformId") == str(user_id)
+                for field in ("writtenItems", "updatedItems")
+                for item in receipt.get("writeReceipt", {}).get(field, [])
+                if isinstance(item, dict) and item.get("action") == "Create"
+            }
+            args = dict(remainder["args"])
+            args["items"] = [item for item in args["items"] if item["word"] not in written]
+            args["_candidate_scopes"] = [scope for scope in args["_candidate_scopes"] if scope["word"] not in written]
+            args["_query_words"] = [word for word in args.get("_query_words", []) if word not in written]
+            current = conversation_state_store.get_record(conv_key)
+            if args["_candidate_scopes"] and current is not None:
+                if current is state_record and (written or inherited_remainder):
+                    restored = replace(
+                        state_record, state=PendingToolConfirm("keytao_batch_add_to_draft", args),
+                        execution_id="", execution_started_at=0.0,
+                        **{field: value for field, value in remainder.items() if field != "args"},
+                    )
+                elif current is not state_record and isinstance(current.state, PendingToolConfirm):
+                    origin = dict(current.state.args.get("_candidate_origin") or {})
+                    origin["remainder"] = {**remainder, "args": args}
+                    restored = replace(current, state=replace(current.state, args={
+                        **current.state.args, "_candidate_origin": origin,
+                    }))
+                else:
+                    restored = None
+                saved = restored is None or conversation_state_store.put_back(restored)
+                if not saved:
+                    if current is not state_record:
+                        conversation_state_store.begin_execution(current)
+                    return response + "\n这批词的候选编码暂时无法保存，请重新查询后再选择。"
+                if restored is not None and current is state_record:
+                    return response
+        if not preserve_after_response:
             conversation_state_store.complete_execution(state_record)
         return _append_pending_ticket_challenge(response, conv_key)
 
