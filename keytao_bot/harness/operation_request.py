@@ -20,6 +20,7 @@ class OperationRequest:
     frame: str = "unknown"
     source: str = "none"
     relation: str = ""
+    code_selector: str = ""
 
 
 def understand_message(

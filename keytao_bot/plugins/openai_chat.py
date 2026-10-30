@@ -64,6 +64,8 @@ from ..utils.draft_mutation_store import (
     get_default_draft_mutation_claim_store,
 )
 from ..utils.completed_draft_undo import (
+    _operation_rows,
+    conversation_scope,
     current_operation_capture,
     handle_completed_undo,
     start_operation_turn,
@@ -4755,14 +4757,42 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     return True
 
 
-async def _try_stale_affirmative_reply(ctx: TurnContext) -> bool:
+def _recent_completed_write_summary(ctx: TurnContext) -> str:
+    record = get_default_draft_mutation_claim_store().completed_operation(conversation_scope(ctx.conv_key))
+    if not record or record.get("status") != "ready" or (
+        record.get("latestActorWrite") != record.get("operationId")
+        or not isinstance(record.get("completedAt"), (int, float))
+        or not 0 <= time.time() - record["completedAt"] <= 120
+    ):
+        return ""
+    rows = _operation_rows(record)
+    if rows is None:
+        return ""
+    parts = [f"{'删除 ' if row['action'] == 'Delete' else ''}{row['word']} → {row['code']}" for row in rows]
+    summary = "、".join(parts) or ("提交草稿" if record.get("submitted") else "")
+    return "\n上一条已执行：" + summary if summary else ""
+
+
+async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: bool = False) -> bool:
     """A closed answer without an actor-owned ticket never reaches a model."""
     cancel = parse_pending_assent_phrase(ctx.normalized_message_text).cancel_requested
-    if not (cancel or _chat_routing.normalize_affirmative_reply(ctx.normalized_message_text)) or ctx.conv_key is None:
+    source = _strip_command_message_prefixes(ctx.normalized_message_text).strip()
+    confirm = understood_confirm or re.fullmatch(
+        r"(?:(?:请)?(?:确认|执行)(?:吧)?|好的?\s*[,，]?\s*执行(?:吧)?)"
+        r"(?:[,，]\s*不要复读我的话)?[。.!！]?", source,
+    ) is not None
+    if confirm and _is_explicit_draft_submit_request(source):
+        return False
+    if not (cancel or confirm or _chat_routing.normalize_affirmative_reply(ctx.normalized_message_text)) or ctx.conv_key is None:
         return False
     record = conversation_state_store.get_record(ctx.conv_key)
     if (
-        record is not None and not (cancel and isinstance(record.state, PendingTrustedWordRecord))
+        record is not None and not (
+            (cancel or confirm) and isinstance(record.state, PendingTrustedWordRecord)
+            or confirm and isinstance(record.state, PendingToolConfirm)
+            and record.state.function_name == "keytao_submit_batch" and record.state.args.get("_recent_own_write") is True
+            and not _verified_pending_reply(ctx, record)
+        )
         or draft_operation_coordinator.get(ctx.conv_key) is not None
     ):
         return False
@@ -4779,8 +4809,13 @@ async def _try_stale_affirmative_reply(ctx: TurnContext) -> bool:
             pass
     if not addressed:
         return False
-    if cancel:
-        ctx.response = "当前没有待取消的操作。"
+    if confirm and not _chat_commands.SEMANTIC_ROUTE_OPS.intersection(
+        token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
+    ):
+        # Legacy routing retains its original stale-command recovery guidance.
+        return await _stage_claim_offered_answer(ctx, stale_affirmative=True)
+    if cancel or confirm:
+        ctx.response = "当前没有待取消的操作。" if cancel else "当前没有待确认的操作。" + _recent_completed_write_summary(ctx)
         remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
         await _finish_ai_chat_response(
             ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
@@ -4902,6 +4937,10 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 except ValueError:
                     pending_decision = None
         high_confidence = isinstance(pending_decision, dict) and pending_decision.get("confidence") == "high"
+        if validated.op == "confirm" and validated.frame == "direct" and await _try_stale_affirmative_reply(
+            ctx, understood_confirm=True,
+        ):
+            return True
         if validated.op == "add" and "add" in route_ops:
             if (not isinstance(pending_decision, dict)
                 or pending_decision.get("refers_to_pending") is not False
@@ -5130,7 +5169,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 )
             elif resolved is None:
                 response = explanation
-            elif direct or high_confidence and resolved.op == "add" and not any(resolved.codes):
+            elif direct or high_confidence and resolved.op == "add" and not any(resolved.codes) and not resolved.code_selector:
                 if resolved.op == "recode" and not resolved.relation:
                     named_words = resolved.operands
                 response = await _chat_commands.execute_model_command_direct(

@@ -38,8 +38,10 @@ FRAME_ENUM = frozenset({"direct", "question", "negated", "reported", "none"})
 # Frozen LABEL_SPEC semantics, without row identifiers or request-specific data.
 SYSTEM_PROMPT = """You interpret messages to 喵喵, the KeyTao Chinese dictionary bot.
 Return one JSON object only, never execute an operation or answer the user.
-Fields: op, operands, codes, submit_after, refers_to_pending, frame, confidence, note, relation.
+Fields: op, operands, codes, code_selector, submit_after, refers_to_pending, frame, confidence, note, relation.
 operands: exact words in the user's order; codes: lowercase letter codes named by the user.
+新增/加/添加 X 的飞键编码/飞键码/飞键 and 给 X 加飞键 mean add, operands [X], codes [], code_selector fly_key.
+Quotes around X delimit the literal word. Otherwise code_selector is an empty string.
 For 换成/替换/顶替, set relation to replace and operands to [old, new], or [new] if only a target code is named.
 把 X 换成 Y, X 换成 Y, 把 X 替换为 Y, 把 X 替换成 Y, and 用 Y 替换 X, where X is an existing word and Y is a word,
 mean replacing entry X with Y at X's code: op recode, operands [X, Y], codes [] (or the literal code if given), relation replace.
@@ -369,6 +371,12 @@ def validate_operation(
     if op == "swap" and (len(operands) != 2 or len(set(operands)) != 2):
         op = "none"
         violations.append("swap_arity")
+    code_selector = raw.get("code_selector", "")
+    if code_selector not in ("", "fly_key") or code_selector and (
+        op != "add" or len(operands) != 1 or raw.get("codes") or "飞键" not in text
+    ):
+        code_selector = ""
+        violations.append("invalid_code_selector")
     model = raw.get("_model")
     return OperationRequest(
         op=op, operands=tuple(operands), codes=tuple(codes),
@@ -376,4 +384,5 @@ def validate_operation(
         refers_to_pending=refers_to_pending, frame=frame,
         source=f"model:{model if isinstance(model, str) and model else 'unknown'}",
         relation=relation,
+        code_selector=code_selector,
     ), violations

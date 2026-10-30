@@ -12062,6 +12062,19 @@ def resolve_model_add(request, message):
         or len(set(codes)) != len(codes)):
         return None
 
+    if request.code_selector == "fly_key":
+        if len(words) != 1 or codes or request.submit_after:
+            return None
+        word = re.escape(words[0])
+        literal = rf'''(?:{word}|「{word}」|“{word}”|"{word}"|'{word}'|‘{word}’|『{word}』)'''
+        source = _strip_command_message_prefixes(message).strip()
+        if re.fullmatch(
+            rf"(?:(?:新增|添加|加)\s*{literal}\s*(?:的)?|给\s*{literal}\s*加)"
+            r"\s*飞键(?:编码|码)?[。.!！]?", source,
+        ):
+            return replace(request, codes=("",))
+        return None
+
     def literal_words(source):
         source = re.sub(r"[A-Za-z]", " ", source)
         source = "".join(" " if unicodedata.category(char).startswith("P") else char
@@ -12518,6 +12531,11 @@ def render_understood_command(request) -> str:
 
         if not words or len(words) != len(codes) or len(set(filter(None, codes))) != len(tuple(filter(None, codes))):
             return ""
+        if request.code_selector:
+            return f"添加 {words[0]} 的飞键编码" if (
+                request.code_selector == "fly_key" and len(words) == 1
+                and codes == ("",) and not request.submit_after and not request.relation
+            ) else ""
         command = "；".join(f"添加 {word}" + (f" {code}" if code else "") for word, code in zip(words, codes))
         if request.submit_after:
             if len(words) != 1 or not codes[0]:
@@ -12599,6 +12617,8 @@ async def try_handle_model_command(request, platform, user_id, conv_key, space_k
         return "上一项操作仍在处理中，本次未替换确认计划。"
     args = {"command_text": command, "op": request.op, "operands": list(request.operands),
             "codes": list(request.codes), "submit_after": request.submit_after}
+    if request.code_selector:
+        args["code_selector"] = request.code_selector
     args["digest"] = _understood_command_digest(args)
     if not conversation_state_store.set(
         conv_key, PendingToolConfirm("keytao_understood_command", args),
@@ -12655,6 +12675,7 @@ def _understood_command_request(state):
     request = OperationRequest(
         op=args.get("op"), operands=tuple(args["operands"]),
         codes=tuple(args["codes"]), submit_after=args["submit_after"],
+        code_selector=args.get("code_selector", ""),
     )
     command = render_understood_command(request)
     if not command or command != args.get("command_text") or args.get("digest") != _understood_command_digest(args):
@@ -12715,6 +12736,8 @@ async def execute_understood_command(request, command, platform, user_id, conv_k
     if op == "add":
         if render_understood_command(request) != command:
             return "规范加词指令校验失败，本次未写入。"
+        if request.code_selector == "fly_key":
+            return await _execute_fly_key_add(words[0], platform, user_id, conv_key, space_key, owner_label)
         pairs = [(word, code) for word, code in zip(words, codes) if code]
         missing = tuple(word for word, code in zip(words, codes) if not code)
         replies = []
@@ -13619,6 +13642,60 @@ async def try_verify_pending_fly_proposal(message, platform, user_id, conv_key, 
             + "本次仅核验，未写入。")
 
 
+async def _execute_fly_key_add(word, platform, user_id, conv_key, space_key, owner_label):
+    """Select only server-marked fly keys, retaining the reviewed write route."""
+    try:
+        review = json.loads(await call_tool_function(
+            "keytao_prepare_reviewed_add", {"word": word}, platform, user_id,
+        ))
+    except (TypeError, ValueError):
+        review = {}
+    if (not isinstance(review, dict) or review.get("success") is not True
+        or review.get("word") != word or review.get("reviewDisposition") == "BLOCK"
+        or review.get("type", "Phrase") != ("Single" if len(word) == 1 else "Phrase")
+        or review.get("pronunciationUnresolved") or review.get("lookupFailed")):
+        return f"未能取得「{word}」的已审飞键候选，本次未写入。"
+    groups = []
+    for group in review.get("pronunciations") or []:
+        if not isinstance(group, dict):
+            continue
+        statuses = [row for row in group.get("candidateStatuses") or []
+                    if isinstance(row, dict) and row.get("flyKey") is True]
+        if statuses:
+            groups.append({**group, "candidateStatuses": statuses,
+                           "recommendedCode": next((row.get("code") for row in statuses
+                                                    if row.get("occupied") is False), statuses[0].get("code"))})
+    statuses = [row for group in groups for row in group["candidateStatuses"]]
+    if not statuses:
+        return f"「{word}」没有飞键编码。"
+    review = {**review, "pronunciations": groups,
+              "recommendedCode": next((row.get("code") for row in statuses
+                                       if row.get("occupied") is False), statuses[0].get("code"))}
+    review.pop("candidateStatuses", None)
+    inventory = select_candidate_inventory(review)
+    if inventory is None or not all(inventory.readings.get(code) for code, _ in inventory.candidates):
+        return f"「{word}」缺少可核验的飞键读音候选，本次未写入。"
+    code = next((code for code, occupied in inventory.candidates if not occupied), "")
+    if code:
+        return await _execute_explicit_entry_code_request(
+            ExplicitEntryCodeRequest(word, code), f"添加 {word} {code}",
+            platform, user_id, conv_key, space_key, owner_label, _review=review,
+        )
+    pending = _parse_pending_add_word(_format_reviewed_add_prompt(review) or "")
+    if pending is None:
+        return f"「{word}」的飞键候选未能通过核验，本次未写入。"
+    pending.phrase_type = str(review.get("type") or "Phrase")
+    pending.pronunciation_codes = dict(inventory.readings)
+    _attach_server_candidate_snapshot(pending, list(inventory.statuses), review.get("candidateOrderingAssessments"))
+    if not conversation_state_store.set(conv_key, pending, space_key=space_key, owner_label=owner_label):
+        return f"「{word}」的飞键候选暂时无法保存，本次未写入。"
+    from .openai_chat import _render_live_single_candidate_record
+
+    response = _render_live_single_candidate_record(conversation_state_store.get_record(conv_key))
+    conversation_state_store.bind_origin_prompt_digest(conv_key, _prompt_capability_digest(response))
+    return response
+
+
 async def _execute_explicit_entry_code_request(
     request: ExplicitEntryCodeRequest,
     message: str,
@@ -13629,15 +13706,18 @@ async def _execute_explicit_entry_code_request(
     owner_label: str,
     *,
     prepare_only: bool = False,
+    _review: Optional[Dict] = None,
 ) -> str:
     """Review the named item before granting its additional-code capability."""
-    raw = await call_tool_function(
-        "keytao_prepare_reviewed_add", {"word": request.word}, platform, user_id,
-    )
-    try:
-        review = json.loads(raw)
-    except (TypeError, ValueError):
-        review = {}
+    review = _review
+    if review is None:
+        raw = await call_tool_function(
+            "keytao_prepare_reviewed_add", {"word": request.word}, platform, user_id,
+        )
+        try:
+            review = json.loads(raw)
+        except (TypeError, ValueError):
+            review = {}
     phrase_type = "Single" if len(request.word) == 1 else "Phrase"
     resolvable_ambiguity = bool(
         isinstance(review, dict)
