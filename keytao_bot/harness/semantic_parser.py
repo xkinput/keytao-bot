@@ -19,6 +19,7 @@ from .authorization_grammar import (
     _STANDALONE_NEGATION_CLAUSE_RE,
     _has_standalone_negation_before_mutation,
     trusted_mutation_source,
+    parse_standalone_shift,
 )
 from .operation_request import OperationRequest
 from .state import PendingAddWord
@@ -76,6 +77,9 @@ Keep 为/是/改为/改成 out of operands; they connect each literal word to it
 not delete or add: operands [X], codes [C] or [C0, C] when the old code is explicit.
 reorder: change candidate order on a code or chain, including X 优先于 Y or 提到前面. operands: the word to put first, then the word it goes ahead of.
 move: move/insert an entry at a specific code position, or replace the entry at a code.
+顺延X, 把X顺延, X顺延 and 顺延X一位 mean move only when X is quoted or exactly names a word in the quoted bot reply or OWN live ticket.
+Never infer X from conversational text beside 顺延 (确认顺延, 取消顺延, 先别顺延, 顺延就行).
+顺延X到C means move with operands [X], codes [C]. 到N号 selects only an OWN live numbered ticket.
 batch_replace: replace a character across a listed set of codes.
 draft_view: view one's personal draft batch.
 draft_submit: submit one's personal draft batch for review.
@@ -251,7 +255,7 @@ def _pending_values(pending_state) -> Tuple[set, set]:
 
 
 def validate_operation(
-    raw: Optional[dict], message: str, pending_state,
+    raw: Optional[dict], message: str, pending_state, *, shift_known_words: Tuple[str, ...] = (),
 ) -> Tuple[OperationRequest, List[str]]:
     """Pure fail-closed projection. Write callers must require frame == 'direct'."""
     if not isinstance(raw, dict):
@@ -271,6 +275,18 @@ def validate_operation(
     op = raw.get("op")
     if not isinstance(op, str) or op not in OP_ENUM:
         return OperationRequest(source="model:invalid"), ["invalid_op"]
+
+    shift = parse_standalone_shift(message, known_words=shift_known_words)
+    pair_context = bool(_multi_word_candidate_scope_rows(pending_state)[0]) or (
+        isinstance(pending_state, PendingAddWord) and shift is not None
+        and any(shift.word in words for words in pending_state.server_occupied_words.values())
+    )
+    if shift is not None and not pair_context:
+        op = "move"
+        raw = {**raw, "op": op, "operands": [shift.word],
+               "codes": [shift.target_code] if shift.target_code.isalpha() else [],
+               "frame": "direct", "relation": "", "refers_to_pending": False,
+               "submit_after": False}
 
     violations = []
     relation = raw.get("relation", "")

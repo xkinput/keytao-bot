@@ -68,6 +68,7 @@ from ..utils.completed_draft_undo import (
     conversation_scope,
     current_operation_capture,
     handle_completed_undo,
+    note_completed_operation_reply,
     start_operation_turn,
 )
 from ..utils.image_input import (
@@ -948,7 +949,8 @@ async def should_handle(bot: Bot, event: Event) -> bool:
                     pass
 
                 if (GROUP_TRIGGER_KEYWORD_ANY in message_text
-                        or message_text.startswith(GROUP_TRIGGER_KEYWORD_START)):
+                        or message_text.startswith(GROUP_TRIGGER_KEYWORD_START)
+                        or _chat_routing._strip_leading_self_mentions(message_text) != message_text):
                     return True
                 return False
             return False
@@ -968,7 +970,8 @@ async def should_handle(bot: Bot, event: Event) -> bool:
                     return True
                 message_text = event.get_plaintext().strip()
                 if (GROUP_TRIGGER_KEYWORD_ANY in message_text
-                        or message_text.startswith(GROUP_TRIGGER_KEYWORD_START)):
+                        or message_text.startswith(GROUP_TRIGGER_KEYWORD_START)
+                        or _chat_routing._strip_leading_self_mentions(message_text) != message_text):
                     return True
                 return False
             return await to_me()(bot, event, {})
@@ -3095,8 +3098,10 @@ async def _send_event_response(
                 result = await bot.send(event=event, message=message)
                 _bind_pending_reply_message_ids(record, result)
                 if emit_metrics:
-                    _acknowledge_delivered_draft_mutations(_strip_markdown(text))
+                    _record_delivered_reply(_strip_markdown(text), memory_context)
                     emit_turn_metrics(logger)
+                else:
+                    note_completed_operation_reply([], memory_context)
                 return True
         if "telegram" in bot_module.lower():
             await _send_telegram_plain_chunks(
@@ -3106,14 +3111,18 @@ async def _send_event_response(
                 reply_to_message_id=getattr(event, "message_id", None),
             )
             if emit_metrics:
-                _acknowledge_delivered_draft_mutations(text)
+                _record_delivered_reply(text, memory_context)
                 emit_turn_metrics(logger)
+            else:
+                note_completed_operation_reply([], memory_context)
             return True
         result = await bot.send(event=event, message=text)
         _bind_pending_reply_message_ids(record, result)
         if emit_metrics:
-            _acknowledge_delivered_draft_mutations(text)
+            _record_delivered_reply(text, memory_context)
             emit_turn_metrics(logger)
+        else:
+            note_completed_operation_reply([], memory_context)
         return True
     except Exception as error:
         logger.warning(f"Failed to send background response: {error}")
@@ -3520,6 +3529,11 @@ def _set_conversational_turn(message, history, intent, *, other_intents=(), quer
         _current_conversational_turn.set((message, list(history or [])))
 
 
+def _record_delivered_reply(response: str, memory_context: Optional[ChatMemoryContext]) -> None:
+    note_completed_operation_reply(current_draft_delivery_claims.get() or [], memory_context)
+    _acknowledge_delivered_draft_mutations(response)
+
+
 def _pending_reply_record(response: str, memory_context: Optional[ChatMemoryContext]) -> Optional[PendingStateRecord]:
     if memory_context is None or memory_context.platform != "qq":
         return None
@@ -3547,9 +3561,15 @@ async def _finish_ai_chat_matcher(response: str) -> None:
         if record is not None and callable(getattr(ai_chat, "send", None)):
             result = await ai_chat.send(response)
             _bind_pending_reply_message_ids(record, result)
+            _record_delivered_reply(response, memory_context)
             await ai_chat.finish()
             return
-        await ai_chat.finish(response)
+        try:
+            await ai_chat.finish(response)
+        except FinishedException:
+            _record_delivered_reply(response, memory_context)
+            raise
+        _record_delivered_reply(response, memory_context)
     finally:
         emit_turn_metrics(logger)
 
@@ -3580,7 +3600,7 @@ async def _finish_ai_chat_response(
                 if message_id:
                     kwargs["reply_to_message_id"] = message_id
                 await bot.send(**kwargs)
-                _acknowledge_delivered_draft_mutations(response)
+                _record_delivered_reply(response, memory_context)
                 emit_turn_metrics(logger)
                 return
             except Exception:
@@ -3595,7 +3615,7 @@ async def _finish_ai_chat_response(
         except Exception as error:
             logger.warning(f"Telegram plain-text chunk send failed: {error}")
             raise
-        _acknowledge_delivered_draft_mutations(response)
+        _record_delivered_reply(response, memory_context)
         emit_turn_metrics(logger)
         return
 
@@ -3615,7 +3635,7 @@ async def _finish_ai_chat_response(
                     ),
                 )
                 _bind_pending_reply_message_ids(record, result)
-                _acknowledge_delivered_draft_mutations(qq_text)
+                _record_delivered_reply(qq_text, memory_context)
                 emit_turn_metrics(logger)
                 return
             except Exception:
@@ -3623,7 +3643,7 @@ async def _finish_ai_chat_response(
         if callable(getattr(bot, "send", None)):
             result = await bot.send(event=event, message=qq_text)
             _bind_pending_reply_message_ids(record, result)
-            _acknowledge_delivered_draft_mutations(qq_text)
+            _record_delivered_reply(qq_text, memory_context)
             emit_turn_metrics(logger)
         else:
             await _finish_ai_chat_matcher(qq_text)
@@ -3632,7 +3652,7 @@ async def _finish_ai_chat_response(
     if callable(getattr(bot, "send", None)):
         result = await bot.send(event=event, message=response)
         _bind_pending_reply_message_ids(record, result)
-        _acknowledge_delivered_draft_mutations(response)
+        _record_delivered_reply(response, memory_context)
         emit_turn_metrics(logger)
     else:
         await _finish_ai_chat_matcher(response)
@@ -4623,6 +4643,19 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     latest = _get_latest_assistant_message(history)
     canonical = ""
     state = record.state
+    if isinstance(state, PendingAddWord):
+        ordinal = re.fullmatch(r"到\s*([0-9]+)号", message.strip())
+        shift = _authorization_grammar.parse_standalone_shift(message, known_words=(state.word,))
+        if shift is not None and shift.word == state.word and shift.target_code.rstrip("号").isdigit():
+            message = shift.target_code.rstrip("号")
+        elif ordinal:
+            message = ordinal[1]
+    word_code_answer = bool(
+        isinstance(state, PendingToolConfirm) and state.function_name == "keytao_understood_command"
+        and state.args.get("word_code_choice") is True and message.strip() in {"改码", "加入"}
+    )
+    if word_code_answer:
+        affirmative = ""
     reply_prompt = ctx.reply_reference.text
     if (
         ctx.reply_reference.is_reply and ctx.platform == "qq"
@@ -4651,7 +4684,22 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
             elif state.function_name == "keytao_understood_command":
                 control = _strip_command_message_prefixes(message).strip()
                 options = _chat_commands._understood_command_options(state)
-                if control in {"确认", "取消"} or (control.isascii() and control.isdigit() and 1 <= int(control) <= len(options)):
+                ordinal = re.fullmatch(r"到\s*([0-9]+)号", control)
+                numbered = options and state.args.get("word_code_choice") is not True
+                if numbered and ordinal:
+                    control = ordinal[1]
+                    message = control
+                shift = _authorization_grammar.parse_standalone_shift(
+                    control, known_words=tuple(word for option in options for word in option["operands"]),
+                )
+                if numbered and shift is not None and shift.target_code.rstrip("号").isdigit() and all(
+                    option["operands"] == [shift.word] for option in options
+                ):
+                    control = shift.target_code.rstrip("号")
+                    message = control
+                if word_code_answer:
+                    canonical = message
+                if control in {"确认", "取消"} or (numbered and control.isascii() and control.isdigit() and 1 <= int(control) <= len(options)):
                     canonical = message
     cancel_control = bool(canonical and assent is not None and assent.intent == "pending_cancel")
 
@@ -4761,6 +4809,7 @@ def _recent_completed_write_summary(ctx: TurnContext) -> str:
     record = get_default_draft_mutation_claim_store().completed_operation(conversation_scope(ctx.conv_key))
     if not record or record.get("status") != "ready" or (
         record.get("latestActorWrite") != record.get("operationId")
+        or record.get("lastReplyOperationId") != record.get("operationId")
         or not isinstance(record.get("completedAt"), (int, float))
         or not 0 <= time.time() - record["completedAt"] <= 120
     ):
@@ -4832,6 +4881,11 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
         return True
     if await _try_bound_pending_reply(ctx):
         return True
+    if re.fullmatch(r"到\s*[0-9]+号", ctx.normalized_message_text.strip()):
+        ctx.response = "当前没有与这条回复绑定的编号候选；请写明目标编码。"
+        remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
+        await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment)
+        return True
     if ctx.operation_understood_early:
         # A failed ticket binding never releases a closed answer into query routing.
         return False
@@ -4842,7 +4896,8 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     if response is None:
         response = await _chat_commands.try_handle_advertised_shift(
             ctx.normalized_message_text, ctx.platform, ctx.user_id, ctx.conv_key,
-            ctx.space_key, ctx.owner_label,
+            ctx.space_key, ctx.owner_label, reply_reference=ctx.reply_reference,
+            require_bound_operand=True,
         )
     if response is not None:
         ctx.operation_understood_early = True
@@ -4913,7 +4968,12 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                     message, pending_context, client=client,
                     model=WORD_QUERY_INTENT_MODEL, timeout=8.0,
                 )
-            validated, violations = validate_operation(raw, message, pending_snapshot)
+            validated, violations = validate_operation(raw, message, pending_snapshot, shift_known_words=(
+                _chat_commands._standalone_shift_bound_words(
+                    conversation_state_store.get_record(ctx.conv_key),
+                    normalize_conversation_key((ctx.platform, ctx.user_id), ctx.space_key), ctx.reply_reference,
+                ) if ctx.conv_key is not None else ()
+            ))
             ctx.operation_request = validated
             ctx.operation_violations = tuple(violations)
             logger.info(
@@ -4937,6 +4997,21 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 except ValueError:
                     pending_decision = None
         high_confidence = isinstance(pending_decision, dict) and pending_decision.get("confidence") == "high"
+        bare_add = bool(
+            validated.op == "add" and len(validated.operands) == len(validated.codes) == 1
+            and message.strip() == f"{validated.operands[0]} {validated.codes[0]}"
+        )
+        complete_fast_command = fast_request is not None and fast_request.op in _chat_commands.SEMANTIC_ROUTE_OPS
+        if (validated.op in {"query", "other", "chat", "help", "recode", "move"} or bare_add) and not validated.refers_to_pending and not complete_fast_command:
+            response = await _chat_commands.try_handle_bare_word_code(
+                message, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+                existing_only=bare_add,
+            )
+            if response is not None:
+                ctx.response = response
+                remember_conversation(ctx.conv_key, ctx.memory_context, message, response)
+                await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment)
+                return True
         if validated.op == "confirm" and validated.frame == "direct" and await _try_stale_affirmative_reply(
             ctx, understood_confirm=True,
         ):
@@ -5233,7 +5308,12 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                                 message, pending_context, client=client,
                                 model=WORD_QUERY_INTENT_MODEL,
                             )
-                        validated, violations = validate_operation(raw, message, pending_snapshot)
+                        validated, violations = validate_operation(raw, message, pending_snapshot, shift_known_words=(
+                            _chat_commands._standalone_shift_bound_words(
+                                conversation_state_store.get_record(ctx.conv_key),
+                                normalize_conversation_key((ctx.platform, ctx.user_id), ctx.space_key), ctx.reply_reference,
+                            ) if ctx.conv_key is not None else ()
+                        ))
                         logger.info(
                             f"[semantic_shadow] fast_op={fast_op} model_op={validated.op} "
                             f"model_frame={validated.frame} refers_to_pending={validated.refers_to_pending} "
@@ -7439,9 +7519,11 @@ async def handle_ai_chat(bot: Bot, event: Event):
             )
             delivery_token = current_draft_delivery_claims.set([])
             completed_operation_token = current_operation_capture.set(None)
+            reply_context_token = current_memory_context.set(generation_context)
             try:
                 await _handle_ai_chat_serialized(bot, event, platform, user_id)
             finally:
+                current_memory_context.reset(reply_context_token)
                 current_operation_capture.reset(completed_operation_token)
                 current_draft_delivery_claims.reset(delivery_token)
                 current_history_generation.reset(history_token)

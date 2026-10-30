@@ -1930,6 +1930,8 @@ class ToolExecutor:
         # their value.
         call_args.pop("_reviewed_pinyin", None)
         call_args.pop("_reviewed_candidate_codes", None)
+        if context.current_message:
+            call_args.pop("_source_code", None)
         internal_same_code = call_args.pop("_allow_same_code", None) is True
 
         def inject_reviewed_validation(

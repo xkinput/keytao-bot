@@ -479,7 +479,7 @@ class B7BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         return reply, termination
 
-    async def test_second_policy_block_stops_without_counting_cached_duplicates(self):
+    async def test_second_policy_block_stops_including_cached_duplicates(self):
         for second_word in ("纯音乐", "我送给"):
             with self.subTest(second_word=second_word):
                 calls = [("keytao_shift_phrase_code", {"word": word, "target_code": "wsgu"})
@@ -488,8 +488,8 @@ class B7BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
                 reply, termination = await self.run_loop(agent)
                 self.assertEqual(reply, self.policy_message)
                 self.assertEqual(termination["reason"], "policy_tool_runaway")
-                self.assertEqual(create.await_count, 3 if second_word == "我送给" else 2)
-                self.assertEqual(execute.await_count, 2)
+                self.assertEqual(create.await_count, 2)
+                self.assertEqual(execute.await_count, 1 if second_word == "我送给" else 2)
 
     async def test_existing_intent_mapping_groups_different_tools(self):
         agent, create, execute = self.orchestrator([

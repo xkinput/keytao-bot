@@ -5477,6 +5477,7 @@ async def _execute_shift_to_code(
     auto_confirm_only_if_no_shifts: bool = False,
     expected_occupants_by_code: Optional[Dict[str, List[str]]] = None,
     receipt_requested_words: Optional[List[str]] = None,
+    source_code: str = "",
 ) -> str:
     """Start a server-generated full-plan confirmation stage for a shift."""
     receipt_requested_words = receipt_requested_words or listed_words or ordered_words
@@ -5497,6 +5498,7 @@ async def _execute_shift_to_code(
             args={
                 "word": word,
                 "target_code": target_code,
+                **({"_source_code": source_code} if source_code else {}),
                 **(
                     {
                         "target_type": str(target_item.get("type") or "Phrase"),
@@ -9934,23 +9936,68 @@ async def _load_merged_word_entries(
     return resolved
 
 
+def _standalone_shift_bound_words(record, address, reply_reference=None) -> Tuple[str, ...]:
+    """Use only the quoted bot reply and this author's live structured ticket."""
+    words = []
+    if (reply_reference is not None and reply_reference.is_reply
+            and reply_reference.is_to_bot):
+        literal = r'(?:「([\u3400-\u9fff]{1,32})」|“([\u3400-\u9fff]{1,32})”|"([\u3400-\u9fff]{1,32})"|『([\u3400-\u9fff]{1,32})』)'
+        for line in (reply_reference.text or "").splitlines():
+            # Bind word headings and code subjects, never quoted reply controls.
+            matches = list(re.finditer(
+                literal + r'(?=\s*(?:(?:目前|当前)?(?:在|位于)\s*[a-z]|已在词库|的(?:当前)?编码|候选编码|以编码|→\s*[a-z]))',
+                line,
+            ))
+            heading = re.fullmatch(r'\s*(?:#{1,6}\s*)?' + literal + r'\s*', line)
+            for match in (*matches, *((heading,) if heading else ())):
+                words.append(next(value for value in match.groups() if value is not None))
+    if record is not None and record.owner_key == address and not record.execution_id:
+        if isinstance(record.state, PendingAddWord):
+            words.append(record.state.word)
+        elif isinstance(record.state, PendingToolConfirm):
+            word = record.state.args.get("word")
+            if isinstance(word, str):
+                words.append(word)
+            for option in _understood_command_options(record.state):
+                words.extend(option["operands"])
+            request = _understood_command_request(record.state)
+            if request is not None:
+                words.extend(request.operands)
+    return tuple(dict.fromkeys(words))
+
+
 async def try_handle_advertised_shift(
     message: str, platform: str, user_id: str, conv_key: Optional[ConversationKey],
-    space_key: Optional[Tuple[str, str]], owner_label: str,
+    space_key: Optional[Tuple[str, str]], owner_label: str, *, reply_reference=None,
+    require_bound_operand: bool = False,
 ) -> Optional[str]:
-    """Repair an author's same-code duplicate through the existing shift planner."""
-    from ..harness.authorization_grammar import parse_reviewed_shift_words
+    """Keep the B7 pair API; user-message callers must require bound operands."""
+    from ..harness.authorization_grammar import parse_reviewed_shift_words, parse_standalone_shift
+    from .chat_routing import _multi_word_candidate_scope_rows
 
     address = normalize_conversation_key(conv_key or (platform, user_id), space_key)
     record = conversation_state_store.get_record(address)
     known_words = tuple(
         word for occupants in record.state.server_occupied_words.values() for word in occupants
     ) if record is not None and isinstance(record.state, PendingAddWord) else ()
+    shift = parse_standalone_shift(message, known_words=_standalone_shift_bound_words(
+        record, normalize_conversation_key((platform, user_id), space_key), reply_reference,
+    ))
     words = parse_reviewed_shift_words(message, known_words=known_words)
-    if not words:
+    standalone = shift is not None and shift.word not in known_words and not _multi_word_candidate_scope_rows(
+        record.state if record else None,
+    )[0]
+    if not words and not standalone:
         return None
     if address != normalize_conversation_key((platform, user_id), space_key):
         return "顺延请求与当前作者或对话不一致，本次未写入。"
+    if require_bound_operand and shift is None and not (
+        record is not None and not record.execution_id and words
+        and all(word in known_words for word in words)
+    ):
+        return None
+    if standalone and (shift.target_code or words != (shift.word,)):
+        return await _try_handle_standalone_shift(shift, platform, user_id, address, space_key, owner_label)
     active = draft_operation_coordinator.find_for_actor((platform, user_id))
     if active is not None:
         return _active_operation_message_for_request(active, platform, user_id)
@@ -9987,6 +10034,8 @@ async def try_handle_advertised_shift(
     for word in words:
         targets = [row for row in merged if row["word"] == word]
         if len(targets) != 1:
+            if standalone:
+                return await _try_handle_standalone_shift(shift, platform, user_id, address, space_key, owner_label)
             return f"无法唯一锁定「{word}」的现有编码，本次未执行顺延。"
         target = targets[0]
         try:
@@ -10013,6 +10062,8 @@ async def try_handle_advertised_shift(
             if row["code"] == target["code"] and row["type"] == target["type"] and row["word"] != word
         ]
         if occupants is None or len(keepers) != 1 or keepers[0]["word"] in words:
+            if standalone and occupants is not None and not keepers:
+                return await _try_handle_standalone_shift(shift, platform, user_id, address, space_key, owner_label)
             return f"「{word}」没有可唯一确认的同码重码词条，本次未执行顺延。"
         keeper = keepers[0]
         next_code = ""
@@ -10065,6 +10116,103 @@ async def try_handle_advertised_shift(
         return "\n\n".join(replies)
     finally:
         _semantic_direct_words.reset(token)
+
+
+async def _try_handle_standalone_shift(shift, platform, user_id, conv_key, space_key, owner_label):
+    from ..harness.operation_request import OperationRequest
+
+    if shift.target_code and not shift.target_code.isalpha():
+        return "当前没有与这条顺延请求绑定的编号候选；请写明目标编码。"
+    active = draft_operation_coordinator.find_for_actor((platform, user_id))
+    if active is not None:
+        return _active_operation_message_for_request(active, platform, user_id)
+    entries = await _load_merged_reorder_entries((shift.word,), platform, user_id)
+    if not entries:
+        return f"无法读取「{shift.word}」的现有词库或草稿编码，本次未执行顺延。"
+    entries = [row for row in entries if row["word"] == shift.word]
+    options = []
+    for row in entries:
+        code = row["code"]
+        target = shift.target_code
+        if not target:
+            try:
+                encoding = json.loads(await call_tool_function(
+                    "keytao_encode", {"word": shift.word, "requested_code": code}, platform, user_id,
+                ))
+            except (TypeError, ValueError):
+                encoding = {}
+            chain = _candidate_codes_from_encode(encoding, shift.word) if isinstance(encoding, dict) else ()
+            if code not in chain or chain.index(code) + 1 >= len(chain):
+                return f"「{shift.word}」的当前编码之后没有可核验的候选位置，本次未执行顺延。"
+            target = chain[chain.index(code) + 1]
+        options.append(OperationRequest(
+            op="move" if code == target else "recode", operands=(shift.word,),
+            codes=(code,) if code == target else (code, target),
+        ))
+    if len(options) > 1:
+        return await try_handle_model_command_options(options, "", conv_key, space_key, owner_label, shift_options=True)
+    if not options or options[0].op == "move":
+        return "目标编码与现有编码相同，本次未执行顺延。"
+    direct = "direct_exec" in {token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")}
+    return await _execute_existing_shift(entries[0], options[0].codes[1], platform, user_id, space_key, owner_label, direct=direct)
+
+
+async def _execute_existing_shift(source, target_code, platform, user_id, space_key, owner_label, *, direct=True):
+    word = source["word"]
+    token = _semantic_direct_words.set((word,) if direct else None)
+    try:
+        return await _execute_shift_to_code(
+            word, target_code, platform, user_id, space_key, owner_label,
+            target_item={"type": source["type"]}, source_code=source["code"],
+            auto_confirm_shift_plan=direct, auto_confirm_only_if_no_shifts=True,
+            receipt_requested_words=[word],
+        )
+    finally:
+        _semantic_direct_words.reset(token)
+
+
+async def try_handle_bare_word_code(message, platform, user_id, conv_key, space_key, owner_label, *, existing_only=False):
+    """Ask whether an existing word's literal new code replaces or supplements it."""
+    from ..harness.operation_request import OperationRequest
+
+    word_pattern = r'(?:「[\u3400-\u9fff]{1,32}」|“[\u3400-\u9fff]{1,32}”|"[\u3400-\u9fff]{1,32}"|[\u3400-\u9fff]{1,32})'
+    match = re.fullmatch(rf'({word_pattern})\s+([a-z]{{1,12}})', message.strip())
+    if match is None:
+        return None
+    word, code = match.groups()
+    word = word.strip('「」“”"')
+    if existing_only:
+        data = json.loads(await call_tool_function("keytao_lookup_by_word", {"word": word}, platform, user_id))
+        if not data.get("phrases"):
+            return None
+    entries = await _load_merged_reorder_entries((word,), platform, user_id)
+    if entries is None:
+        return "无法核验完整词库和草稿记录，本次未写入。"
+    draft_occupied = any(row["code"] == code and row["word"] != word for row in entries)
+    entries = [row for row in entries if row["word"] == word]
+    if not entries:
+        return await try_handle_explicit_entry_code_command(
+            f"添加 {word} {code}", platform, user_id, conv_key, space_key, owner_label,
+        )
+    if any(row["code"] == code for row in entries):
+        return None
+    try:
+        data = json.loads(await call_tool_function("keytao_lookup_by_code", {"code": code}, platform, user_id))
+    except (TypeError, ValueError):
+        data = {}
+    if data.get("success") is not True or not isinstance(data.get("phrases"), list):
+        return "无法核验目标编码的占用记录，本次未写入。"
+    if data["phrases"] or draft_occupied:
+        return await try_handle_explicit_entry_code_command(
+            f"添加 {word} {code}", platform, user_id, conv_key, space_key, owner_label,
+        )
+    if len(entries) != 1:
+        return "词条有多个现有编码，请先指定旧码；本次未写入。"
+    old = entries[0]["code"]
+    return await try_handle_model_command_options((
+        OperationRequest(op="recode", operands=(word,), codes=(old, code)),
+        OperationRequest(op="add", operands=(word,), codes=(code,)),
+    ), "", conv_key, space_key, owner_label, word_code_choice=True)
 
 
 async def try_handle_move_to_code_command(
@@ -12632,9 +12780,10 @@ async def try_handle_model_command(request, platform, user_id, conv_key, space_k
     return _announce_replaced_submit(record, conv_key, response)
 
 
-async def try_handle_model_command_options(options, explanation, conv_key, space_key, owner_label):
+async def try_handle_model_command_options(options, explanation, conv_key, space_key, owner_label, *, word_code_choice=False, shift_options=False):
     record = conversation_state_store.get_record(conv_key)
-    args = {"options": []}
+    args = {"options": [], **({"word_code_choice": True} if word_code_choice else {}),
+            **({"shift_options": True} if shift_options else {})}
     for request in options:
         command = render_understood_command(request)
         if not command:
@@ -12687,6 +12836,10 @@ def render_pending_understood_command(state) -> str:
     """Expose controls only for the exact canonical command sealed in this ticket."""
     options = _understood_command_options(state)
     if options:
+        if state.args.get("word_code_choice") is True:
+            word = options[0]["operands"][0]
+            old, code = options[0]["codes"]
+            return f"「{word}」目前在 {old}。\n回复「改码」把它从 {old} 改到 {code}；回复「加入」保留 {old} 并在 {code} 再加一个；或「取消」。"
         return "\n".join([
             "词库记录不唯一，请选择具体方案；本次未写入。",
             *(f"{index}. {render_executable_suggestion(option['command_text']).removeprefix('- ')}"
@@ -12709,6 +12862,8 @@ async def handle_pending_understood_command(record, message, platform, user_id, 
         return None
     control = _strip_command_message_prefixes(message).strip()
     options = _understood_command_options(record.state)
+    if record.state.args.get("word_code_choice") is True and control in {"改码", "加入"}:
+        control = "1" if control == "改码" else "2"
     selected = options[int(control) - 1] if options and control.isascii() and control.isdigit() and 1 <= int(control) <= len(options) else None
     if control not in {"确认", "取消"} and selected is None:
         return None
@@ -12724,6 +12879,23 @@ async def handle_pending_understood_command(record, message, platform, user_id, 
     request = _understood_command_request(state)
     if request is None:
         return "确认计划校验失败，本次未写入。"
+    if record.state.args.get("shift_options") is True:
+        entries = await _load_merged_reorder_entries(request.operands, platform, user_id)
+        sources = [row for row in entries or [] if row["word"] == request.operands[0] and row["code"] == request.codes[0]]
+        if len(sources) != 1:
+            return "选中的原编码已变化，本次未执行顺延。"
+        if request.op == "move":
+            return f"「{request.operands[0]}」已在 {request.codes[0]}，本次未移动。"
+        return await _execute_existing_shift(sources[0], request.codes[1], platform, user_id, space_key, owner_label)
+    if record.state.args.get("word_code_choice") is True:
+        if request.op == "recode":
+            entries = await _load_merged_reorder_entries(request.operands, platform, user_id)
+            sources = [row for row in entries or [] if row["word"] == request.operands[0] and row["code"] == request.codes[0]]
+            if len(sources) != 1:
+                return "选中的原编码已变化，本次未写入。"
+            if sources[0].get("source") == "draft":
+                return await _execute_existing_shift(sources[0], request.codes[1], platform, user_id, space_key, owner_label)
+        return await execute_model_command_direct(request, request.operands, platform, user_id, conv_key, space_key, owner_label)
     return await execute_understood_command(request, state.args["command_text"], platform, user_id, conv_key, space_key, owner_label)
 
 

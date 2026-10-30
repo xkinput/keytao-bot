@@ -1,4 +1,5 @@
 """OpenAI-compatible agent/tool orchestration loop."""
+import asyncio
 import inspect
 import json
 import re
@@ -1020,6 +1021,7 @@ class AgentOrchestrator:
                 current_reasoning_effort = "low"
         seen_tool_calls: Dict[tuple, tuple[int, bool]] = {}
         blocked_tool_families: Dict[str, int] = {}
+        blocked_tool_results: Dict[tuple, Dict[str, Any]] = {}
         seen_tool_call_ids: set[str] = set()
         total_tool_calls = 0
         dispatched_tool_call = False
@@ -1068,8 +1070,15 @@ class AgentOrchestrator:
         def repeated_policy_block_reply(
             tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any],
         ) -> Optional[str]:
+            call_fingerprint = (
+                tool_name,
+                json.dumps(arguments, sort_keys=True, ensure_ascii=False),
+            )
+            if result.get("error") == "重复调用，已忽略":
+                result = blocked_tool_results.get(call_fingerprint, result)
             if result.get("policyBlocked") is not True:
                 return None
+            blocked_tool_results[call_fingerprint] = dict(result)
             intent_pattern = _tool_intent_pattern(tool_name, arguments)
             family = intent_pattern.pattern if intent_pattern is not None else tool_name
             blocked_tool_families[family] = blocked_tool_families.get(family, 0) + 1
@@ -2776,6 +2785,36 @@ class AgentOrchestrator:
                         if not review_target_blocked and not encode_blocked else None
                     )
                     if policy_reply is not None:
+                        blocked = blocked_tool_results.get((
+                            fn_name,
+                            json.dumps(canonical_fn_args, sort_keys=True, ensure_ascii=False),
+                        ), {})
+                        if (result_data.get("error") == "重复调用，已忽略"
+                                and blocked.get("requiresTextFollowUp") is True):
+                            messages.append({
+                                "role": "tool", "tool_call_id": tc.id, "name": fn_name,
+                                "content": project_tool_result_for_model(fn_name, result_str, canonical_fn_args),
+                            })
+                            completed_ids = {item.get("tool_call_id") for item in messages if item.get("role") == "tool"}
+                            for skipped, _ in parsed_tool_calls:
+                                if skipped.id not in completed_ids:
+                                    messages.append({
+                                        "role": "tool", "tool_call_id": skipped.id, "name": skipped.function.name,
+                                        "content": json.dumps({"success": False, "message": "本轮工具处理已停止；该调用未执行。"}, ensure_ascii=False),
+                                    })
+                            # Honor text follow-up once after closing every tool call; policy remains authoritative.
+                            try:
+                                completion_client = client.with_options(max_retries=0) if callable(getattr(client, "with_options", None)) else client
+                                async with asyncio.timeout(self._runtime.timeout):
+                                    follow_up = await observe_model_call(completion_client.chat.completions.create(**with_deepseek_chat_policy({
+                                        "model": self._runtime.model,
+                                        "messages": [*messages, {"role": "system", "content": "本轮工具处理已停止。仅说明以上拒绝结果，不得请求或执行任何工具。"}],
+                                        "max_tokens": current_max_tokens, "temperature": self._runtime.temperature,
+                                        "tool_choice": "none",
+                                    }, thinking=False)), system_prompt_chars=len(system_prompt))
+                                self._log_usage(follow_up)
+                            except Exception:
+                                logger.warning("Policy text follow-up failed; returning the verified policy message")
                         return policy_reply
                     if (
                         isinstance(result_data, dict)

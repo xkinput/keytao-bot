@@ -318,7 +318,7 @@ _LEADING_MENTION_RE = re.compile(
     r"^\s*(?:@[^\s@]{1,24}|喵喵)[\s:：]+"
 )
 _SELF_MENTION_RE = re.compile(
-    r"(?:@(?:喵喵|键道)|(?<![\w@])(?:喵喵|键道))(?=$|[\s@:：，,、；;])"
+    r"(?:[＠@]\s*(?:喵喵|键道)|(?<![\w＠@])(?:喵喵|键道))(?=$|[\s＠@:：，,、；;])"
 )
 _IMPERATIVE_COMMAND_WRAPPER_RE = re.compile(
     r"^(?:(?:请\s*)?执行|请帮我|帮我|麻烦(?:你|帮我)?)"
@@ -1187,13 +1187,17 @@ def parse_dictionary_recode_command(
     message: str,
 ) -> Optional[DictionaryRecodeCommand]:
     """Parse one explicit same-word delete/create pair as an atomic plan."""
-    source = _safe_whole_entry_command_source(message)
-    if not source:
-        return None
+    source = _LEADING_MENTION_RE.sub("", trusted_mutation_source(message), count=1).strip()
     match = _DICTIONARY_RECODE_WHOLE_RE.fullmatch(
         source.rstrip("。.!！").strip()
     )
     if match is None:
+        return None
+    masked = source
+    for name in ("create_word", "delete_word"):
+        start, end = match.span(name)
+        masked = masked[:start] + "词条" + masked[end:]
+    if not _safe_whole_entry_command_source(masked):
         return None
     delete_word = match.group("delete_word").strip()
     create_word = match.group("create_word").strip()
@@ -3008,6 +3012,49 @@ _REVIEWED_SHIFT_WORD = (
     r'(?:「[\u3400-\u9fff]{1,32}」|“[\u3400-\u9fff]{1,32}”|"[\u3400-\u9fff]{1,32}"|'
     r'[\u3400-\u9fff]{1,32}?(?=[ \t]*和[ \t]*[「“"\u3400-\u9fff]|[ \t]*$))'
 )
+_UNQUOTED_SHIFT_NON_OPERAND_RE = re.compile(
+    r"怎么|怎样|如何|什么|为啥|咋|何时|何处|谁|啥|多少|"
+    r"^(?:到|往)?哪$|哪[个些种里儿天年月日次位一二三四五六七八九十几条样边头方款本只张片项部辆所座家套组段份间件篇把支块台批场点]|"
+    r"^几$|几[个位次条天年月日时种]|"
+    r"^(?:已经|正在|曾经)|"
+    r"^(?:请|麻烦)?(?:帮|替|给|为)(?:我|我们|你|你们)|"
+    r"^(?:(?:我|你|您|他|她|它|咱)(?:们)?|自己|大家|"
+    r"(?:这|那)(?:个|些|种|样|里|儿)?|请|请问|麻烦|帮忙|帮|替|给|为|"
+    r"要|想|该|应该|应当|能|能够|会|可以|可能|需|需要|必须|得|"
+    r"已|刚刚|刚才|正|即将|将|待|还|再|就|先|一下|一下子|一位|不|没|未|[吗呢吧啊呀嘛么了过的呗哦喔啦咯哇哟])+$"
+)
+
+
+def _unquoted_shift_word_is_literal(word: str) -> bool:
+    """Require quotes for function words and conversational fragments."""
+    return not (
+        _NEGATIVE_MODAL_RE.match(word) or _POSITIONAL_REPORTED_CONTEXT_RE.match(word)
+        or _QUESTION_RE.search(word) or _EXPLANATION_ONLY_RE.search(word)
+        or _UNQUOTED_SHIFT_NON_OPERAND_RE.search(word)
+    )
+
+
+def parse_standalone_shift(
+    message: str, *, known_words: Tuple[str, ...] = (),
+) -> Optional[ExistingEntryMove]:
+    """Bind a complete shift only to a quoted word or an exact live reference."""
+    source = str(message or "").strip()
+    while (mention := _SELF_MENTION_RE.match(source)) is not None:
+        source = source[mention.end():].lstrip(" \t:：，,")
+    source = source.rstrip("。.!！").strip()
+    word = r'(?:「[\u3400-\u9fff]{1,32}」|“[\u3400-\u9fff]{1,32}”|"[\u3400-\u9fff]{1,32}"|『[\u3400-\u9fff]{1,32}』)'
+    bound = "|".join(re.escape(value) for value in sorted(set(known_words), key=len, reverse=True)
+                     if re.fullmatch(r"[\u3400-\u9fff]{1,32}", value))
+    if bound:
+        word = rf'(?:{word}|{bound})'
+    match = re.fullmatch(
+        rf'(?:顺延\s*(?P<front>{word})|(?:把\s*)?(?P<back>{word})\s*顺延)(?:\s*一位)?'
+        r'(?:\s*到\s*(?P<code>[a-z]{1,12}|[0-9]+号?))?', source,
+    )
+    if match is None:
+        return None
+    value = match["front"] or match["back"]
+    return ExistingEntryMove(value.strip('「」“”"『』'), match["code"] or "", verb="顺延")
 
 
 def parse_reviewed_shift_words(
@@ -3037,10 +3084,7 @@ def parse_reviewed_shift_words(
                     return None
                 quoted = operand.group().startswith(('「', '“', '"'))
                 word, consumed = operand.group().strip('「」“”"'), operand.end()
-                if not quoted and (
-                    _NEGATIVE_MODAL_RE.match(word)
-                    or _POSITIONAL_REPORTED_CONTEXT_RE.match(word)
-                ):
+                if not quoted and not _unquoted_shift_word_is_literal(word):
                     return None
             words.append(word)
             body = body[consumed:].strip()

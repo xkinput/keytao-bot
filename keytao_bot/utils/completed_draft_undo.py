@@ -60,6 +60,25 @@ def start_operation_turn(key: Any) -> OperationCapture:
     return capture
 
 
+def note_completed_operation_reply(deliveries: list, memory_context: Any = None) -> None:
+    """Associate the last delivered reply with this conversation's write receipt."""
+    capture = current_operation_capture.get()
+    if capture is None and memory_context is None:
+        return
+    scope = conversation_scope(memory_context.conversation_address) if memory_context is not None else capture.scope
+    store = get_default_draft_mutation_claim_store()
+    record = store.completed_operation(scope)
+    if not record or record.get("status") != "ready":
+        return
+    own_write = capture is not None and capture.scope == scope and any(
+        item.get("operationKind") in {"draft_write", "draft_submit"}
+        and item.get("platform") == capture.platform and item.get("platformId") == capture.actor
+        for item in deliveries
+    )
+    record["lastReplyOperationId"] = capture.operation_id if own_write and record["operationId"] == capture.operation_id else ""
+    store.update_completed_operation(scope, record["operationId"], "ready", "ready", record)
+
+
 def _record_reminder_write(store: Any, scope: str, identity: Dict, batch_id: str,
                            snapshot: Optional[Dict], batch_url: str = "") -> None:
     """Track undo writes without extending the original undo capability's lifetime."""

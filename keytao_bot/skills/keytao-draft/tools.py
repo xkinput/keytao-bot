@@ -6072,12 +6072,20 @@ async def keytao_shift_phrase_code(
     _reviewed_pinyin: str = "",
     _reviewed_candidate_codes: Optional[List[str]] = None,
     _expected_occupants_by_code: Optional[Dict[str, List[str]]] = None,
+    _source_code: str = "",
 ) -> Dict:
     """Preview, bind, then CAS-write a complete code-shift plan."""
     word = word.strip()
     target_code = target_code.strip().lower()
     if not word or not target_code:
         return {"success": False, "message": "必须提供词条和目标编码"}
+    _source_code = str(_source_code or "").strip().lower()
+    if _source_code and (
+        re.fullmatch(r"[a-z]{1,12}", _source_code) is None
+        or str(target_type or "Phrase") not in VALID_PHRASE_TYPES
+        or ordered_words is not None or additional_items or additional_shift_items
+    ):
+        return {"success": False, "message": "顺延来源编码或类型不完整，本次未写入。"}
 
     trusted_reviewed_codes = _clean_code_list(_reviewed_candidate_codes)
     trusted_reviewed_code_set = set(trusted_reviewed_codes)
@@ -6578,6 +6586,81 @@ async def keytao_shift_phrase_code(
         )
         for target_word in target_words
     }
+    source_draft: Optional[Dict] = None
+    source_phrase: Optional[Dict] = None
+    source_draft_item: Optional[Dict] = None
+    source_original_phrase: Optional[Dict] = None
+    if _source_code:
+        source_type = str(target_type or "Phrase")
+        source_draft = await keytao_list_draft_items(platform, platform_id, batch_id=batch_id)
+        if source_draft.get("success") is not True or not isinstance(source_draft.get("items"), list):
+            return {"success": False, "message": source_draft.get("message") or "无法核验顺延来源草稿。"}
+        if batch_id and str(source_draft.get("batchId") or "") != str(batch_id):
+            return {"success": False, "staleConfirmation": True, "message": "顺延来源草稿批次已变化，本次未写入。"}
+        projection = _ranked_reorder_draft_projection(source_draft["items"])
+        if projection is None:
+            return {"success": False, "message": "当前草稿无法形成可验证的顺延来源，本次未写入。"}
+        projected, removed = projection
+        live_sources = [
+            phrase for phrase in word_results[word].get("phrases", [])
+            if isinstance(phrase, dict) and phrase.get("word") == word
+            and phrase.get("code") == _source_code
+            and str(phrase.get("type") or "Phrase") == source_type
+            and (source_type, _source_code, word) not in removed
+        ]
+        draft_sources = [
+            entry for entry in projected
+            if (entry["word"], entry["code"], entry["type"]) == (word, _source_code, source_type)
+        ]
+        if len(live_sources) + len(draft_sources) != 1:
+            return _inject_known_batch_url({
+                "success": False, "staleConfirmation": True,
+                "message": f"「{word}」在 {_source_code} 的来源已变化或不唯一，本次未写入。",
+            }, str(source_draft.get("batchId") or batch_id or ""))
+        source = live_sources[0] if live_sources else draft_sources[0]
+        source_phrase = {
+            "word": word, "code": _source_code, "type": source_type,
+            "weight": source.get("weight"), "remark": source.get("remark"),
+            "source": "live" if live_sources else "draft",
+        }
+        current_phrases[word] = source if live_sources else None
+        if draft_sources:
+            if not str(source_draft.get("batchId") or ""):
+                return {"success": False, "message": "顺延来源缺少原草稿批次，本次未写入。"}
+            original = next(item for item in source_draft["items"] if str(item.get("id")) == str(source["draftId"]))
+            source_draft_item = {**_shift_draft_semantics(original), "id": source["draftId"]}
+            if source.get("draftAction") == "Change":
+                old_word = str(original.get("oldWord") or original.get("old_word") or "").strip()
+                original_lookup = await _lookup_codes_raw([_source_code])
+                if original_lookup.get("success") is not True:
+                    return original_lookup
+                original_phrases = [
+                    phrase for result in original_lookup.get("results", [])
+                    if isinstance(result, dict) and result.get("code") == _source_code
+                    for phrase in result.get("phrases", [])
+                    if isinstance(phrase, dict)
+                    and (phrase.get("word"), phrase.get("code"), str(phrase.get("type") or "Phrase"))
+                    == (old_word, _source_code, source_type)
+                ]
+                if len(original_phrases) != 1:
+                    return _inject_known_batch_url({
+                        "success": False, "staleConfirmation": True,
+                        "message": f"原词「{old_word}」在 {_source_code} 的词库记录已变化或不唯一，本次未写入。",
+                    }, str(source_draft.get("batchId") or ""))
+                source_original_phrase = dict(original_phrases[0])
+            target_remark = target_remark or str(original.get("remark") or "")
+            target_needs_manual_review = bool(
+                target_needs_manual_review or original.get("needsManualReview") is not False
+                or review_flags.remark_indicates_manual_review(target_remark)
+            )
+            target_specs[0]["remark"] = target_remark
+            target_specs[0]["needsManualReview"] = target_needs_manual_review
+        if _source_code == target_code:
+            return _inject_known_batch_url({
+                "success": True, "noWrite": True,
+                "message": f"「{word}」已在 {target_code}，无需顺延。",
+                "batchId": source_draft.get("batchId"), "contentVersion": source_draft.get("contentVersion"),
+            }, str(source_draft.get("batchId") or ""))
     current_phrase = current_phrases.get(word)
     if (
         target_needs_manual_review is not None
@@ -6609,6 +6692,10 @@ async def keytao_shift_phrase_code(
         for item in code_lookup.get("results", []):
             item_code = item.get("code", "")
             occupants = _ordered_code_occupants(item.get("phrases", []), ignored_words)
+            if source_original_phrase:
+                occupants = [phrase for phrase in occupants
+                             if (phrase.get("word"), phrase.get("code"), str(phrase.get("type") or "Phrase"))
+                             != (source_original_phrase["word"], _source_code, str(target_type or "Phrase"))]
             code_phrase_map[item_code] = list(occupants)
             pending_occupants_by_code[item_code] = list(occupants)
         code_phrase_map.setdefault(code, [])
@@ -6728,6 +6815,11 @@ async def keytao_shift_phrase_code(
         for item in plan.get("items", [])
         if isinstance(item, dict)
     ]
+    if source_original_phrase:
+        plan_items.insert(0, {
+            "action": "Delete", "word": source_original_phrase["word"],
+            "code": _source_code, "type": str(target_type or "Phrase"),
+        })
     reviewed_targets = {(item["word"], item["code"]): item for item in target_specs}
     for item in plan_items:
         target = reviewed_targets.get((item.get("word"), item.get("code")))
@@ -6761,7 +6853,7 @@ async def keytao_shift_phrase_code(
     planned_words = {
         item.get("word") for item in plan_items if item.get("word")
     }
-    existing_draft = await keytao_list_draft_items(
+    existing_draft = source_draft if source_draft is not None else await keytao_list_draft_items(
         platform,
         platform_id,
         batch_id=batch_id,
@@ -6774,6 +6866,12 @@ async def keytao_shift_phrase_code(
     related_draft_items = [
         item for item in existing_draft.get("items", [])
         if isinstance(item, dict) and item.get("word") in planned_words
+        and not (source_draft_item and str(item.get("id")) == str(source_draft_item["id"]))
+        and not (
+            _source_code and item.get("word") == word
+            and (item.get("code") not in {_source_code, target_code}
+                 or str(item.get("type") or "Phrase") != str(target_type or "Phrase"))
+        )
     ]
     full_plan_items = [dict(item) for item in plan_items]
     merge_result = _merge_existing_shift_draft_rows(
@@ -6843,14 +6941,18 @@ async def keytao_shift_phrase_code(
         "remainingItems": plan_items,
         "shifted": plan.get("shifted", []),
         "removedDraftIds": [],
+        **({"sourceCode": _source_code, "sourcePhrase": source_phrase,
+            "sourceDraftItem": source_draft_item, "sourceOriginalPhrase": source_original_phrase}
+           if _source_code else {}),
     }
     warning_digest = str(expected_warning_digest or "").strip().lower()
     warnings: List[Any] = []
     if not plan_items:
         return _inject_known_batch_url({
-            "success": True,
+            "success": source_draft_item is None,
             "noWrite": True,
-            "message": "本轮顺延计划已完整存在于当前草稿，无需重复写入",
+            "message": (f"「{word}」的 {_source_code} 和 {target_code} 草稿均已存在，请先查看草稿核对。"
+                        if source_draft_item else "本轮顺延计划已完整存在于当前草稿，无需重复写入"),
             "batchId": current_batch_id,
             "contentVersion": current_content_version,
             "shiftPlan": shift_plan,
@@ -6939,6 +7041,87 @@ async def keytao_shift_phrase_code(
     )
     write_result["shiftPlan"] = shift_plan
     write_result["planDigest"] = plan_digest
+    if source_draft_item and write_result.get("uncertain"):
+        write_result["sourceCleanup"] = "not_attempted"
+        write_result["message"] = render_remediation_reply(
+            f"「{word}」的新编码 {target_code} 写入结果无法确认；"
+            f"未删除旧编码 {_source_code} 的草稿条目，不会自动重试",
+            command="查看草稿",
+        )
+        return _inject_known_batch_url(write_result, current_batch_id)
+    if source_draft_item and write_result.get("success") is True:
+        def partial_source_shift(reason: str, *, uncertain: bool = False) -> Dict:
+            return _inject_known_batch_url({
+                **write_result, "success": False, "partialWrite": True,
+                "uncertain": uncertain, "sourceCleanup": "uncertain" if uncertain else "incomplete",
+                "message": render_remediation_reply(
+                    f"「{word}」的新编码 {target_code} 已加入草稿；"
+                    f"旧编码 {_source_code} 的草稿条目移除尚未完成：{reason}；不会自动重试",
+                    command="查看草稿",
+                ),
+            }, current_batch_id)
+
+        appended_version = write_result.get("contentVersion")
+        if (
+            str(write_result.get("batchId") or "") != current_batch_id
+            or not isinstance(appended_version, int) or isinstance(appended_version, bool)
+            or appended_version != current_content_version + 1
+        ):
+            return partial_source_shift("新增结果缺少原批次的准确版本", uncertain=True)
+        try:
+            refreshed = await keytao_list_draft_items(platform, platform_id, batch_id=current_batch_id)
+            original_rows = [item for item in refreshed.get("items", []) if isinstance(item, dict)
+                             and str(item.get("id")) == str(source_draft_item["id"])]
+            target_rows = [item for item in refreshed.get("items", []) if isinstance(item, dict)
+                           and (item.get("word"), item.get("code"), item.get("type"), item.get("action"))
+                           == (word, target_code, str(target_type or "Phrase"), "Create")]
+            target_create = next(item for item in full_plan_items
+                                 if (item.get("word"), item.get("code"), item.get("action"))
+                                 == (word, target_code, "Create"))
+            if (
+                refreshed.get("success") is not True
+                or str(refreshed.get("batchId") or "") != current_batch_id
+                or refreshed.get("contentVersion") != appended_version
+                or len(original_rows) != 1 or len(target_rows) != 1
+                or {**_shift_draft_semantics(original_rows[0]), "id": source_draft_item["id"]} != source_draft_item
+                or not _shift_draft_row_matches_plan(target_rows[0], target_create)
+            ):
+                return partial_source_shift("草稿版本或原条目已变化，未继续删除")
+            targets = [_canonical_delete_target(original_rows[0])]
+            target_digest = hashlib.sha256(json.dumps({
+                "batchId": current_batch_id, "contentVersion": appended_version, "targets": targets,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            cleanup = await keytao_batch_remove_draft_items(
+                platform, platform_id, [source_draft_item["id"]], batch_id=current_batch_id,
+                expected_content_version=appended_version,
+                expected_target_digest=target_digest, expected_targets=targets,
+            )
+        except Exception as error:
+            logger.error(f"[keytao_shift_phrase_code] source cleanup error: {type(error).__name__}")
+            return partial_source_shift("移除结果无法确认", uncertain=True)
+        if cleanup.get("success") is not True or cleanup.get("uncertain"):
+            return partial_source_shift(str(cleanup.get("message") or "旧条目移除失败"),
+                                        uncertain=bool(cleanup.get("uncertain")))
+        if (
+            str(cleanup.get("batchId") or "") != current_batch_id
+            or cleanup.get("contentVersion") != appended_version + 1
+            or cleanup.get("successCount") != 1 or cleanup.get("failedCount")
+            or not isinstance(cleanup.get("draftItems"), list)
+            or any(not isinstance(item, dict) or str(item.get("id")) == str(source_draft_item["id"])
+                   for item in cleanup["draftItems"])
+            or not any((item.get("word"), item.get("code"), item.get("type"), item.get("action"))
+                       == (word, target_code, str(target_type or "Phrase"), "Create")
+                       for item in cleanup["draftItems"])
+        ):
+            return partial_source_shift("旧条目移除回执不完整", uncertain=True)
+        write_result["removedDraftIds"] = [source_draft_item["id"]]
+        write_result["contentVersion"] = cleanup["contentVersion"]
+        write_result["draft_snapshot"] = {
+            "count": len(cleanup["draftItems"]), "items": cleanup["draftItems"],
+            "summary": compute_draft_summary(cleanup["draftItems"]),
+        }
+        write_result["sourceCleanup"] = "applied"
+        write_result["message"] = f"已将「{word}」从 {_source_code} 顺延到 {target_code}"
     if plan.get("shifted"):
         shifted_text = "；".join(
             f"{item['word']} {item['fromCode']}→{item['toCode']}"

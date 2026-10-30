@@ -554,8 +554,20 @@ def _record_flow_for_intent(command_intent: MessageCommandIntent) -> None:
         set_turn_flow("draft-op")
 
 
+def _strip_leading_self_mentions(message_text: str) -> str:
+    nicknames = getattr(config, "nickname", ()) or ()
+    if isinstance(nicknames, str):
+        nicknames = (nicknames,)
+    names = {GROUP_TRIGGER_KEYWORD_ANY, GROUP_TRIGGER_KEYWORD_START}
+    names.update(str(name).strip() for name in nicknames if str(name).strip())
+    pattern = "|".join(re.escape(name) for name in sorted(names, key=len, reverse=True))
+    return re.sub(
+        rf"^(?:\s*[@＠]\s*(?:{pattern})[\s:：，,]*)+", "", str(message_text or ""),
+    ).strip()
+
+
 def _strip_command_message_prefixes(message_text: str) -> str:
-    text = strip_self_mention_tokens(message_text).strip()
+    text = strip_self_mention_tokens(_strip_leading_self_mentions(message_text)).strip()
     while text:
         stripped = _LEADING_COMMAND_PREFIX_RE.sub("", text, count=1).strip()
         if stripped == text:

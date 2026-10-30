@@ -147,6 +147,9 @@ class B10FlyKeyTests(unittest.IsolatedAsyncioTestCase):
         stack.enter_context(patch.object(self.replay.chat, "get_default_draft_mutation_claim_store", return_value=self.replay.claim_store))
         for context in self.replay.patches():
             stack.enter_context(context)
+        self.replay.chat._finish_ai_chat_response.side_effect = lambda *args: completed_draft_undo.note_completed_operation_reply(
+            self.replay.chat.current_draft_delivery_claims.get() or [],
+        )
         stack.enter_context(patch.object(socket.socket, "connect", side_effect=AssertionError("Offline only")))
         stack.enter_context(patch.object(socket.socket, "connect_ex", side_effect=AssertionError("Offline only")))
         self.general = stack.enter_context(patch.object(
