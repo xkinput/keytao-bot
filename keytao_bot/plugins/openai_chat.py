@@ -3036,6 +3036,8 @@ def _prepare_user_facing_reply(
     prepared = render_platform_public_links(prepared, platform)
     prepared = strip_bare_batch_ids(prepared)
     prepared = community_vote.prepare_delivery(prepared, memory_context)
+    if platform == "qq":
+        prepared = render_platform_public_links(prepared, platform)
     if live_record is not None and any(
         receipt.get("operationKind") == "ticket_replacement" and receipt.get("nonce") == live_record.nonce
         for receipt in own_deliveries
