@@ -371,7 +371,7 @@ def validate_operation(
     if op == "swap" and (len(operands) != 2 or len(set(operands)) != 2):
         op = "none"
         violations.append("swap_arity")
-    code_selector = raw.get("code_selector", "")
+    code_selector = raw.get("code_selector") or ""
     if code_selector not in ("", "fly_key") or code_selector and (
         op != "add" or len(operands) != 1 or raw.get("codes") or "飞键" not in text
     ):
