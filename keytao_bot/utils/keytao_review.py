@@ -1025,7 +1025,6 @@ async def _fetch_review_url(
             max_attempts=max_attempts,
             retry_statuses=PRONUNCIATION_FETCH_RETRYABLE_STATUSES,
             retry_connect_errors=True,
-            retry_transport_errors=True,
             retry_exceptions=(http_client.TransientFetchError,),
             retry_timeouts=False,
         )
@@ -3936,6 +3935,35 @@ async def prepare_reviewed_word(
             if pronunciation_resolution.get("status") == "not_applicable":
                 unknown_polyphone_ladder = False
             groups = list(pronunciation_resolution.get("groups") or [])
+            semantic_group = _semantic_pronunciation_group(
+                word, pronunciation_resolution.get("semantic") or {}, encode_data, default_sequence,
+            )
+            has_semantic_conflict = bool(
+                semantic_group
+                and tuple(semantic_group["normalized"]) != default_sequence
+                and not _pronunciation_sequence_rejection_reason(
+                    word, semantic_group["normalized"], encode_data,
+                )
+            )
+            if (
+                pronunciation_resolution.get("status") == "unresolved"
+                and not groups
+                and not has_semantic_conflict
+                and all(
+                    tuple(candidate.get("normalized") or ()) == default_sequence
+                    for candidate in pronunciation_resolution.get("web", {}).get("candidates") or []
+                )
+                and _context_pinyin_sequence(encode_data) in ((), default_sequence)
+                and returned_groups
+            ):
+                # Missing whole-word evidence alone does not invalidate encoder readings.
+                groups = [
+                    _review_group_from_returned(
+                        returned, evidence_kind="own_character", requires_manual_review=True,
+                    )
+                    for returned in returned_groups
+                ]
+                pronunciation_resolution.update(status="encode_default", groups=groups)
             if (
                 pronunciation_resolution.get("status") in {"unresolved", "no_resolution"}
                 and not groups
@@ -4109,6 +4137,8 @@ async def prepare_reviewed_word(
         multi_sense_choice = explicit_reading_choice
     elif forced_pronunciation_choice is not None:
         multi_sense_choice = forced_pronunciation_choice
+    elif pronunciation_resolution.get("status") == "encode_default":
+        multi_sense_choice = {"status": "not_applicable"}
     else:
         groups, multi_sense_choice = await _resolve_multi_sense_pronunciation_choice(
             word,
