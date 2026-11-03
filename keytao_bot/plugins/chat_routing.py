@@ -25,6 +25,8 @@ from ..harness.state import (
     trusted_word_record_is_complete,
 )
 from ..harness.authorization_grammar import (
+    _NEGATIVE_MODAL_RE,
+    _POSITIONAL_REPORTED_CONTEXT_RE,
     explicit_complete_add_item,
     is_interrogative_message,
     looks_like_lexical_review_target,
@@ -1649,7 +1651,7 @@ def _structural_pending_add_word_intent(
             reply_number.group("selector")
             + ("并提交" if reply_number.group("submit") else "")
         )
-    stripped = _normalize_pending_candidate_selection_text(stripped)
+    stripped = _normalize_pending_candidate_selection_text(stripped, state.word)
     compact = _compact_command_text(stripped).lower()
     if not compact:
         return None
@@ -1878,9 +1880,16 @@ def message_authorizes_live_pending_mutation(
     return _message_authorizes_pending_control(message_text, intent)
 
 
-def _normalize_pending_candidate_selection_text(text: str) -> str:
+def _normalize_pending_candidate_selection_text(text: str, word: str = "") -> str:
     """Normalize discovery labels and a closed trailing add assent."""
     source = unicodedata.normalize("NFKC", str(text or "")).strip()
+    named = parse_reviewed_selection_command(source) if word else None
+    if named is not None and not named.shift_words and not named.readings and all(
+        target == word for target, _selector in named.pairs
+    ):
+        source = "、".join(selector for _target, selector in named.pairs)
+        if named.action:
+            source += "，" + named.action
     source = re.sub(r"^(?:选)?(?:编号|编码)\s*", "", source, count=1)
     selection, separator, action = source.rpartition(",")
     if separator:
@@ -2027,6 +2036,8 @@ def _resolve_reviewed_multi_word_selection(
     unquoted = _whole_message_unquoted_source(source, live_words)
     if unquoted is not None:
         source = unquoted
+    if is_interrogative_message(source):
+        return None, None, None
     known_shift_words = tuple(
         occupant
         for scope in state.args["_candidate_scopes"]
@@ -2061,6 +2072,22 @@ def _resolve_reviewed_multi_word_selection(
             )
             scoped_pairs = tuple((live_words[0], selector) for selector in selectors)
     pairs = (scoped_pairs or selection.pairs) if selection is not None else None
+    named_selection = any(
+        re.search(rf"(?:^|[，、,；;])[ \t]*{re.escape(word)}[ \t]*[0-9a-zA-Z]", source)
+        for word in live_words
+    ) or any(
+        target in live_words
+        or (
+            (_NEGATIVE_MODAL_RE.match(target) or _POSITIONAL_REPORTED_CONTEXT_RE.match(target))
+            and any(word in target for word in live_words)
+        )
+        for target, _selector in pairs or ()
+    )
+    if (
+        bare is None and selection is not None and not named_selection
+        and not selection.action and not selection.shift_words
+    ):
+        return None, None, None
 
     def explain(reason: str) -> str:
         command = f"{live_words[0]} {items[0]['code']}，加入" if items and scopes else "查看草稿"
@@ -2112,53 +2139,35 @@ def _resolve_reviewed_multi_word_selection(
             assent = _pending_tool_assent_intent(state, message_text)
             if assent is not None and assent.intent in {"pending_confirm", "pending_add_and_submit"}:
                 return None, None, "当前没有可验证的可执行操作，本次未写入。"
-        if (
-            re.search(r"[\u3400-\u9fff]+[ \t]+(?:[0-9]+|[a-zA-Z]+)", source)
+        if not re.search(r"[?？]", source) and (
+            named_selection
             or any(re.match(rf"{re.escape(word)}\s+", source) for word in live_words)
             or re.fullmatch(r"[1-9][0-9]{0,2}", source)
             or bare is not None
         ):
-            return None, None, explain(
-                "看到了你的选词请求，但其中有重复词条、缺少选择或无法识别的附加内容；本次未写入"
-            )
+            return None, None, "看到了你的选词请求，但其中有重复词条、缺少选择或无法识别的附加内容；本次未写入"
         return None, None, None
     items_by_word = {str(item["word"]).strip(): item for item in items}
-    unbound_control = re.compile(
-        r"^(?:请)?(?:(?:先|暂时|暂)?(?:不要|不必|不能|不准|不许|不用|别|莫|勿|甭)|"
-        r"(?:先|暂时|暂)不|并非|尚未|绝不能|无须|毋须|原话(?:是)?|转述|引用|"
-        r"翻译|解释|假设|比如|例如|如果|备查|留存|存证|摘记|纪要|"
-        r"删除|删掉|移除|修改|改成|改为|撤销|撤回|提交|"
-        r"[\u3400-\u9fff]{0,8}(?:说|提到|要求|表示|认为|声称|称))"
-    )
-    if any(word not in scopes and unbound_control.match(word) for word, _ in pairs):
-        return None, None, explain(
-            "看到了候选选择，但未绑定词条前带有否定或转述内容，不能确定这是你要执行的操作；本次未写入"
-        )
     selected_items: List[Dict[str, Any]] = []
     selected_words: List[str] = []
+    selected_pairs: set[Tuple[str, str]] = set()
     skipped: List[str] = []
     for word, selector in pairs:
         candidates = scopes.get(word)
         if candidates is None:
-            blocks = state.args.get("_query_other_blocks", [])
-            reading_blocked = any(
-                f"「{word}」" in str(block) and re.search(r"多个读音|确定读音|读音.*(?:歧义|不明|待定|冲突)", str(block))
-                for block in blocks if isinstance(blocks, list)
-            )
-            skipped.append(f"「{word}」还没确定读音，未加入" if reading_blocked
-                           else f"「{word}」没有当前可用的候选记录，未加入")
-            continue
+            return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
         if selector.isdecimal():
             index = int(selector)
             if not 1 <= index <= len(candidates):
-                skipped.append(f"「{word}」的编号 {selector} 超出 1-{len(candidates)}，未加入")
-                continue
+                return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
             code = candidates[index - 1][0]
         else:
             code = selector
             if code not in dict(candidates):
-                skipped.append(f"「{word}」的编码 {code} 不在当前候选中，未加入")
-                continue
+                return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
+        if (word, code) in selected_pairs:
+            return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
+        selected_pairs.add((word, code))
         raw_scope = next(
             scope for scope in state.args["_candidate_scopes"]
             if scope["word"] == word
@@ -2256,6 +2265,44 @@ def _resolve_multi_word_pending_candidate_selection(
     message_text: str,
 ) -> Tuple[Optional[PendingToolConfirm], Optional[MessageCommandIntent], Optional[str]]:
     """Require word scope when several live candidate lists reuse numbers."""
+    if isinstance(state, PendingAddWord):
+        source = _strip_command_message_prefixes(message_text).strip()
+        source = _whole_message_unquoted_source(source, (state.word,)) or source
+        if (
+            is_interrogative_message(source)
+            or parse_pending_candidate_selection(source) is not None
+            or parse_explicit_code_request(source, state.word) is not None
+            or parse_eviction_modified_add(source) is not None
+            or _pending_assent_phrase_for_state(state, source).recognized
+        ):
+            return None, None, None
+        named = parse_reviewed_selection_command(source)
+        named_selection = re.search(
+            rf"(?:^|[，、,；;])[ \t]*{re.escape(state.word)}[ \t]*[0-9a-zA-Z]", source,
+        ) is not None or any(
+            target == state.word
+            or (
+                (_NEGATIVE_MODAL_RE.match(target) or _POSITIONAL_REPORTED_CONTEXT_RE.match(target))
+                and state.word in target
+            )
+            for target, _selector in (named.pairs if named is not None else ())
+        )
+        if named is not None and not named.shift_words and not named.readings and state.word in source:
+            if not named_selection and not named.action:
+                return None, None, None
+            codes = []
+            for word, selector in named.pairs:
+                code = (
+                    state.candidates[int(selector) - 1][0]
+                    if selector.isdecimal() and 1 <= int(selector) <= len(state.candidates)
+                    else selector
+                )
+                if word != state.word or code not in dict(state.candidates) or code in codes:
+                    return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
+                codes.append(code)
+        elif named is None and named_selection:
+            return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
+        return None, None, None
     items, scopes = _multi_word_candidate_scope_rows(state)
     if (
         isinstance(state, PendingToolConfirm)

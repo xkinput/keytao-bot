@@ -2635,6 +2635,24 @@ def _enforce_advertised_reply_contract(
         body = ServerBackedQueryReply(body)
     rendered = _enforce_candidate_reply_contract(body, conv_key, query_words=query_words)
     record = conversation_state_store.get_record(conv_key) if conv_key is not None else None
+    question = _current_turn_message.get("")
+    if rendered != body and record is not None and not record.execution_id and _authorization_grammar.is_interrogative_message(question):
+        _items, scopes = _chat_routing._multi_word_candidate_scope_rows(record.state)
+        if isinstance(record.state, PendingAddWord) and record.state.server_candidates == record.state.candidates:
+            scopes = {record.state.word: record.state.candidates}
+        asked = [word for word in scopes if word in question]
+        if asked:
+            word = asked[0]
+            selected = [(str(index), code) for index, (code, _occupied) in enumerate(scopes[word], 1)
+                        if re.search(rf"(?<![a-z]){re.escape(code)}(?![a-z])", question, re.IGNORECASE)]
+            if len(selected) < 2:
+                selected = [(str(index), code) for index, (code, occupied) in enumerate(scopes[word], 1)
+                            if not occupied][:2]
+            command = word + " " + "、".join(index for index, _code in selected)
+            if len(selected) >= 2 and _chat_routing.message_authorizes_live_pending_mutation(command, record.state):
+                rendered = f"「{word}」可多选：回复「{command}」同时加入 " + " 和 ".join(code for _index, code in selected) + "。"
+            else:
+                rendered = "候选编号无效或重复，请按原候选列表选择；本次未写入。"
     if (
         record is not None and not record.execution_id
         and _user_resolver.resolved_binding_for_notice(record.owner_key.platform, record.owner_key.actor_id) is False
@@ -4648,6 +4666,7 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
     history = ctx.history if ctx.history is not None else get_history(ctx.conv_key)
     latest = _get_latest_assistant_message(history)
     canonical = ""
+    selection_error = None
     state = record.state
     occupied_reply = _chat_commands.occupied_add_ticket_reply(state, message)
     if occupied_reply:
@@ -4678,6 +4697,7 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
         if message.strip() in (*contract.generic_assent_forms, *contract.batch_assent_forms, "取消") and assent is not None:
             canonical = message
         if isinstance(state, PendingAddWord):
+            _selected, _intent, selection_error = _resolve_multi_word_pending_candidate_selection(state, message)
             intent = _structural_pending_add_word_intent(message, state)
             if intent is not None:
                 indices = intent.choice_indices or ((intent.choice_index,) if intent.choice_index is not None else ())
@@ -4686,6 +4706,7 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
                     canonical = message
         else:
             derived, intent, error = _resolve_multi_word_pending_candidate_selection(state, message)
+            selection_error = error
             if derived is not None and intent is not None and not error:
                 canonical = message
             elif state.function_name == "keytao_choice_offer" and _chat_commands._parse_pending_choice_label(message):
@@ -4787,7 +4808,7 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
         )
     if affirmative and not canonical and isinstance(record.state, PendingToolConfirm) and record.state.function_name == "keytao_submit_batch":
         canonical = "确认"
-    response = occupied_reply or None
+    response = selection_error or occupied_reply or None
     if affirmative and not canonical and isinstance(record.state, PendingToolConfirm):
         if record.state.function_name == "keytao_choice_offer":
             response = _chat_commands.render_pending_choice_offer(record.state) or None
@@ -5170,6 +5191,18 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             and all(value.startswith("frame_backstop:") for value in violations)
         )
         if live_owned_ticket:
+            if (
+                "pending_answer" in route_ops and validated.refers_to_pending is True
+                and validated.frame == "question" and validated.op in {"query", "chat", "help"}
+                and validated.operands
+                and set(validated.operands).issubset(
+                    word for word, _code in _pending_state_binding_pairs(pending_snapshot)
+                )
+            ):
+                ctx.released_pending_turn = ctx.semantic_pending_released = True
+                ctx.current_pending_record = current_record
+                ctx.scoped_pending_state = ctx.scoped_pending_intent = ctx.scoped_pending_response = None
+                return False
             history = ctx.history if ctx.history is not None else get_history(ctx.conv_key)
             prompt = _get_latest_assistant_message(history)
             ticket_prompt = next((

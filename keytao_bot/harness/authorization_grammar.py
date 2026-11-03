@@ -3100,6 +3100,9 @@ def parse_reviewed_selection_command(
 ) -> Optional[ReviewedSelectionCommand]:
     """Consume the complete selection and optional action, without granting authority."""
     source = str(message or "").strip().rstrip("。.").strip()
+    unquoted = _whole_message_unquoted_source(source)
+    if unquoted is not None:
+        source = unquoted
     if not source or len(source) > 4096:
         return None
     action_pattern = r"(?:只要|只|仅|就|光)?\s*(?:加入草稿并提交|加到草稿并提交|加入并提交|加入草稿|加到草稿|写入草稿|加入|添加|加词)"
@@ -3114,7 +3117,8 @@ def parse_reviewed_selection_command(
     readings: List[Tuple[str, str]] = []
     shift_words: List[str] = []
     seen_words: set[str] = set()
-    for clause in re.split(r"[，、,；;]", source):
+    selector = r"(?:[1-9][0-9]{0,2}|[a-zA-Z]{1,12})"
+    for clause in re.split(r"[，、,；;](?![ \t]*[0-9a-zA-Z])", source):
         remaining = clause.strip()
         if not remaining:
             return None
@@ -3128,19 +3132,22 @@ def parse_reviewed_selection_command(
                 remaining = remaining[shift_end:].strip()
                 continue
             match = re.match(
-                r"(?P<word>[\u3400-\u9fff]{1,32})[ \t]+"
+                r"(?P<word>[\u3400-\u9fff]{1,32})[ \t]*"
                 r"(?P<add>添加[ \t]+)?"
                 r"(?:(?P<reading>[a-zA-ZüÜāáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜ \t]+)[:：][ \t]*)?"
-                r"(?P<selector>[1-9][0-9]{0,2}|[a-zA-Z]{1,12})(?=$|[ \t])",
+                rf"(?P<selectors>{selector}(?:(?:[ \t]*[，、,和][ \t]*|[ \t]+){selector})*)(?=$|[ \t])",
                 remaining,
             )
             if match is None or match.group("word") in seen_words:
                 return None
             word = match.group("word")
             seen_words.add(word)
-            pairs.append((word, match.group("selector").lower()))
+            selectors = re.split(r"[ \t，、,和]+", match.group("selectors").lower())
+            if len(set(selectors)) != len(selectors):
+                return None
+            pairs.extend((word, value) for value in selectors)
             if match.group("reading"):
-                if match.group("selector").isdecimal():
+                if any(value.isdecimal() for value in selectors):
                     return None
                 readings.append((word, " ".join(match.group("reading").split())))
             if match.group("add") and not action:

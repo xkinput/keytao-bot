@@ -179,6 +179,7 @@ from .chat_routing import (
     _message_authorizes_draft_recall,
     _message_authorizes_pending_state_control,
     _message_authorizes_replace_char,
+    _normalize_pending_candidate_selection_text,
     _parse_code_chain_reorder_command,
     _parse_word_list_reorder_command,
     _parse_pending_choice_index,
@@ -2160,7 +2161,9 @@ async def _canonicalize_pending_ticket_intent(
         return None, validation.reason + "；本次未写入。"
 
     multi_selection = parse_pending_candidate_selection(
-        _strip_command_message_prefixes(trusted_mutation_source(message_text))
+        _normalize_pending_candidate_selection_text(
+            _strip_command_message_prefixes(trusted_mutation_source(message_text)), state.word,
+        )
     )
     if multi_selection is not None:
         if multi_selection.indices:
