@@ -1981,6 +1981,16 @@ def render_server_backed_single_word_candidates(
     return "\n".join(lines)
 
 
+def rewrite_review_code_references(text: str, given_up_codes: tuple[str, ...], recommended_code: str) -> str:
+    """Relabel exact code references after a same-reading give-way."""
+    if not given_up_codes or not recommended_code:
+        return text
+    return re.sub(
+        r"(?<![a-z0-9_@])@(?:" + "|".join(map(re.escape, given_up_codes)) + r")(?![a-z0-9_])",
+        "@" + recommended_code, text, flags=re.IGNORECASE,
+    )
+
+
 def render_server_backed_single_word_lookup(
     word: object,
     recommended_code: object,
@@ -2029,7 +2039,6 @@ def render_server_backed_single_word_lookup(
             return ""
         candidates = display_candidates
         occupied_words = display_occupied_words
-        reviewed_prompt = ""
     actionable = render_server_backed_single_word_candidates(
         word,
         recommended_code,
@@ -2055,19 +2064,25 @@ def render_server_backed_single_word_lookup(
                 lambda match, label=label: match.group(1) + label,
                 actionable,
             )
+        actionable = actionable.replace(
+            f"\n• 「{normalized_word}」→ {recommended}（推荐）", "",
+        )
     expected_codes = advertised_single_word_candidate_codes(actionable)
     source = str(reviewed_prompt or "").strip()
     guard_copy = candidate_commonness_guard_copy(
         word, candidates, occupied_words, ordering_assessments,
         include_controls=include_controls and actionable_controls,
     )
+    prefix = ""
+    if sibling_recommendations or guard_copy:
+        first_candidate = re.search(r"(?m)^\s*1[.)、]\s*[a-z]+\s*(?:—|–|-)", source)
+        if first_candidate is not None:
+            prefix = re.sub(rf"(?m)^\s*(?:「{re.escape(normalized_word)}」)?候选编码(?:[（(]读音\s+\d+[）)])?\s*[:：]\s*$", "", source[:first_candidate.start()]).strip()
+    if sibling_recommendations:
+        prefix = rewrite_review_code_references(prefix, tuple(sibling_recommendations), recommended)
     if guard_copy and (not recommended or protected_candidate_occupants(
         word, recommended, candidates, occupied_words, ordering_assessments,
     )):
-        prefix = ""
-        first_candidate = re.search(r"(?m)^\s*1[.)、]\s*[a-z]+\s*(?:—|–|-)", source)
-        if first_candidate is not None:
-            prefix = re.sub(rf"(?m)^\s*(?:「{re.escape(normalized_word)}」)?候选编码\s*[:：]\s*$", "", source[:first_candidate.start()]).strip()
         guarded_body = actionable if sibling_recommendations else render_server_backed_single_word_candidates(
             word, "", candidates, occupied_words, ordering_assessments,
             include_controls=include_controls and actionable_controls,
@@ -2075,6 +2090,9 @@ def render_server_backed_single_word_lookup(
         if not guarded_body:
             return ""
         return ServerBackedQueryReply("\n".join(filter(None, (prefix, guarded_body))))
+    if sibling_recommendations:
+        actionable = "\n".join(filter(None, (prefix, actionable)))
+        source = ""
     body = ""
     has_reorder_copy = False
     if source and advertised_single_word_candidate_codes(source) == expected_codes:

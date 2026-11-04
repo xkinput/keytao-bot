@@ -2954,6 +2954,27 @@ class AgentOrchestrator:
                         and pending_tool_name == "keytao_shift_phrase_code"
                     ):
                         pending_arguments = canonical_fn_args
+                    if (
+                        pending_tool_name == "keytao_submit_batch"
+                        and result_data.get("requiresConfirmation")
+                    ):
+                        from keytao_bot.plugins.chat_commands import (
+                            _lookup_submit_others_submitted,
+                            _ticket_shown_others_submitted,
+                        )
+
+                        words, others = await _lookup_submit_others_submitted(
+                            dict(result_data), context.platform, context.user_id,
+                        )
+                        shown = _ticket_shown_others_submitted(context.platform, context.user_id)
+                        reminders = pending_word_reminder_lines(
+                            [item for item in others if item not in shown], words=tuple(words),
+                        )
+                        if reminders:
+                            authoritative_result_links["_pendingReminders"] = "\n".join(dict.fromkeys([
+                                *authoritative_result_links.get("_pendingReminders", "").splitlines(),
+                                *reminders,
+                            ]))
                     pending_saved = self._save_pending_tool_confirm(
                         conv_key,
                         context.space_key,

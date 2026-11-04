@@ -107,6 +107,7 @@ from ..utils.pending_confirmation import (
     render_server_backed_batch_candidates,
     render_remediation_reply,
     render_server_backed_single_word_lookup,
+    rewrite_review_code_references,
     single_word_candidate_footer,
     trusted_pending_word_items,
     validated_front_insert_recommendation,
@@ -3718,6 +3719,9 @@ async def _prepare_multi_word_query(
                     break
             reviewed["recommendedCode"] = replacement
             reviewed["pronunciationRecommendedCodes"] = [replacement] if replacement else []
+            reviewed["manualReviewReason"] = rewrite_review_code_references(
+                reviewed["manualReviewReason"], (code,), replacement,
+            )
             code = replacement
         if code:
             reserved[code] = scope["word"]
@@ -4676,6 +4680,10 @@ async def call_tool_function(
                     user_id,
                 ),
             }, ensure_ascii=False)
+    shown_others = (
+        _ticket_shown_others_submitted(platform, user_id)
+        if platform and user_id and tool_name in _DRAFT_MUTATION_TOOLS else []
+    )
     result_json = await tool_executor.call(
         tool_name,
         arguments,
@@ -4691,6 +4699,12 @@ async def call_tool_function(
         parsed_result = json.loads(result_json)
         if isinstance(parsed_result, dict):
             result_data = parsed_result
+            if shown_others and parsed_result.get("pendingDuplicateConfirmation") is not True:
+                pending_items = trusted_pending_word_items(parsed_result.get("pendingItems"))
+                if any(item in shown_others for item in pending_items):
+                    # Filter before capture and serialization while the ticket is still available.
+                    parsed_result["pendingItems"] = [item for item in pending_items if item not in shown_others]
+                    result_json = json.dumps(parsed_result, ensure_ascii=False)
             operation_links = current_draft_result_links.get()
             if operation_links is not None and tool_name in AUTHORITATIVE_LINK_TOOLS:
                 _capture_trusted_result_links(parsed_result, operation_links)
@@ -8035,6 +8049,58 @@ def _ticket_shown_others_submitted(platform: str, user_id: str) -> List[Dict]:
     return []
 
 
+SUBMIT_OTHERS_LOOKUP_TIMEOUT_SECONDS = 5
+
+
+async def _lookup_submit_others_submitted(
+    submit_data: Dict,
+    platform: str,
+    user_id: str,
+) -> Tuple[List[str], List[Dict]]:
+    """Find advisory overlaps for a submit preview outside the submit tool."""
+    words = list(dict.fromkeys(
+        str(item.get(field) or "").strip()
+        for item in submit_data.get("snapshotItems", [])
+        if isinstance(item, dict)
+        for field in ("word", "oldWord", "old_word")
+        if str(item.get(field) or "").strip()
+    ))
+    pending_items = []
+    checked_words = 0
+    try:
+        async with asyncio.timeout(SUBMIT_OTHERS_LOOKUP_TIMEOUT_SECONDS):
+            for offset in range(0, len(words), 50):
+                chunk = words[offset:offset + 50]
+                try:
+                    pending = json.loads(await tool_executor.call(
+                        "keytao_pending_items_by_words", {"words": chunk}, ToolContext(platform, user_id),
+                    ))
+                    if pending.get("success") is not True or pending.get("complete") is not True:
+                        raise ValueError("pending advisory lookup was incomplete")
+                    pending_items.extend(
+                        item for item in trusted_pending_word_items(pending.get("items"))
+                        if item["source"] == "others_submitted"
+                        and (item["word"] in chunk or item.get("oldWord") in chunk)
+                    )
+                    checked_words += len(chunk)
+                except Exception as error:
+                    logger.warning(
+                        "[submit_preview] Pending advisory lookup skipped: "
+                        f"{type(error).__name__}"
+                    )
+    except TimeoutError:
+        logger.warning(
+            "[submit_preview] Pending advisory lookup timed out: "
+            f"{len(words) - checked_words} words were not checked"
+        )
+    if pending_items:
+        submit_data["pendingItems"] = trusted_pending_word_items(pending_items)
+    others = [item for item in trusted_pending_word_items(submit_data.get("pendingItems"))
+              if item["source"] == "others_submitted"
+              and (item["word"] in words or item.get("oldWord") in words)]
+    return words, others
+
+
 async def _perform_submit_current_draft(
     platform: str,
     user_id: str,
@@ -8079,43 +8145,13 @@ async def _perform_submit_current_draft(
             PendingToolConfirm(function_name="keytao_submit_batch", args=arguments),
             submit_data,
         )
-        words = list(dict.fromkeys(
-            str(item.get(field) or "").strip()
-            for item in submit_data.get("snapshotItems", [])
-            if isinstance(item, dict)
-            for field in ("word", "oldWord", "old_word")
-            if str(item.get(field) or "").strip()
-        ))
-        pending_items = []
-        for offset in range(0, len(words), 50):
-            chunk = words[offset:offset + 50]
-            try:
-                pending = json.loads(await tool_executor.call(
-                    "keytao_pending_items_by_words", {"words": chunk}, ToolContext(platform, user_id),
-                ))
-                if pending.get("success") is not True or pending.get("complete") is not True:
-                    raise ValueError("pending advisory lookup was incomplete")
-                pending_items.extend(
-                    item for item in trusted_pending_word_items(pending.get("items"))
-                    if item["source"] == "others_submitted"
-                    and (item["word"] in chunk or item.get("oldWord") in chunk)
-                )
-            except Exception as error:
-                logger.warning(
-                    "[submit_preview] Pending advisory lookup skipped: "
-                    f"{type(error).__name__}"
-                )
-        if pending_items:
-            submit_data["pendingItems"] = trusted_pending_word_items(pending_items)
-        others = [item for item in trusted_pending_word_items(submit_data.get("pendingItems"))
-                  if item["source"] == "others_submitted"
-                  and (item["word"] in words or item.get("oldWord") in words)]
-        if others:
+        words, others = await _lookup_submit_others_submitted(submit_data, platform, user_id)
+        unseen = [item for item in others if item not in (shown_others_submitted or [])]
+        if unseen:
             _capture_successful_draft_write_delivery(
                 "keytao_pending_items_by_words",
-                {"success": True, "complete": True, "items": others}, platform, user_id,
+                {"success": True, "complete": True, "items": unseen}, platform, user_id,
             )
-        unseen = [item for item in others if item not in (shown_others_submitted or [])]
         if unseen:
             submit_data["pendingItems"] = unseen
         expected = _normalized_submit_items(authorized_items)
@@ -8131,10 +8167,9 @@ async def _perform_submit_current_draft(
                  or submit_data.get("contentVersion") == authorized_content_version)
             and await _submit_preview_is_authors_own(submit_data)
         )
-        if (
+        can_auto_confirm = (
             auto_confirm
             and not confirmed
-            and not unseen
             and (
                 _semantic_direct_words.get() is None
                 or server_warning_ticket_is_complete(pending_state)
@@ -8158,7 +8193,8 @@ async def _perform_submit_current_draft(
                 )
                 or own_leftovers
             )
-        ):
+        )
+        if can_auto_confirm and not unseen:
             exact_args = pending_state.args
             confirmed_result = await _perform_submit_current_draft(
                 platform,
@@ -8214,6 +8250,17 @@ async def _perform_submit_current_draft(
         )
         warning_prompt = prepend_pending_word_reminders(warning_prompt, unseen, words=tuple(words))
         if len(warning_prompt) > MAX_REPLACE_CONFIRMATION_CHARS:
+            if can_auto_confirm and unseen and not submit_data.get("warnings"):
+                return DraftActionResult(
+                    _append_batch_url_if_missing(
+                        prepend_pending_word_reminders(
+                            pending_confirmation_copy(), unseen, words=tuple(words),
+                        ),
+                        submit_data,
+                    ),
+                    pending_state=pending_state,
+                    data=submit_data,
+                )
             return DraftActionResult(
                 _append_batch_url_if_missing(
                     render_remediation_reply(
