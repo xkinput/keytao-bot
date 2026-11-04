@@ -1999,7 +1999,7 @@ def _multi_word_candidate_scope_rows(
             return clean_items, {}
         if current_item is None and not (
             state.args.get("_reviewed_multi_word") is True
-            and all(occupied for _code, occupied in candidates)
+            and all(occupied or code in raw_scope.get("siblingRecommendations", {}) for code, occupied in candidates)
         ):
             return clean_items, {}
         if state.args.get("_reviewed_multi_word") is True:
@@ -2147,11 +2147,8 @@ def _resolve_reviewed_multi_word_selection(
         ):
             return None, None, "看到了你的选词请求，但其中有重复词条、缺少选择或无法识别的附加内容；本次未写入"
         return None, None, None
-    items_by_word = {str(item["word"]).strip(): item for item in items}
-    selected_items: List[Dict[str, Any]] = []
-    selected_words: List[str] = []
+    resolved_pairs: List[Tuple[str, str, str]] = []
     selected_pairs: set[Tuple[str, str]] = set()
-    skipped: List[str] = []
     for word, selector in pairs:
         candidates = scopes.get(word)
         if candidates is None:
@@ -2168,6 +2165,21 @@ def _resolve_reviewed_multi_word_selection(
         if (word, code) in selected_pairs:
             return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
         selected_pairs.add((word, code))
+        resolved_pairs.append((word, selector, code))
+    selected_code_words: Dict[str, List[str]] = {}
+    for word in scopes:
+        for selected_word, _selector, code in resolved_pairs:
+            if selected_word == word:
+                selected_code_words.setdefault(code, []).append(word)
+    for code, words in selected_code_words.items():
+        if len(words) > 1:
+            return None, None, f"{'、'.join(words)} 选了同一个编码 {code}，请改选；本次未写入。"
+    items_by_word = {str(item["word"]).strip(): item for item in items}
+    selected_items: List[Dict[str, Any]] = []
+    selected_words: List[str] = []
+    skipped: List[str] = []
+    for word, selector, code in resolved_pairs:
+        candidates = scopes[word]
         raw_scope = next(
             scope for scope in state.args["_candidate_scopes"]
             if scope["word"] == word

@@ -3023,6 +3023,15 @@ def _prepare_user_facing_reply(
                      if memory_context is not None
                      and receipt.get("platform") == platform
                      and receipt.get("platformId") == memory_context.user_id]
+    pending_reminders = _chat_commands.pending_word_reminder_lines([
+        item for receipt in own_deliveries if receipt.get("operationKind") == "pending_read"
+        for item in receipt.get("pendingItems", [])
+        if isinstance(item, dict) and item.get("source") == "others_submitted"
+    ])
+    if pending_reminders:
+        reminder_prefixes = {line.rsplit("：", 1)[0] + "：" for line in pending_reminders}
+        prepared = "\n".join(line for line in prepared.splitlines()
+                             if line not in pending_reminders and line not in reminder_prefixes)
     deliveries = [receipt for receipt in own_deliveries
                   if receipt.get("operationKind") in {"draft_write", "draft_submit"}
                   and receipt.get("batchId")]
@@ -3046,6 +3055,8 @@ def _prepare_user_facing_reply(
         ) for receipt in deliveries))
         prepared = _dedupe_authoritative_link_lines(prepared)
         prepared = "\n".join([prepared, *filter(None, link_lines)])
+    if pending_reminders:
+        prepared = "\n".join([*pending_reminders, prepared])
     from ..utils import community_vote
     vote_deliveries = [
         {"operationKind": "draft_submit", "batchId": receipt["batchId"]}

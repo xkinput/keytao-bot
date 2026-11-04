@@ -97,7 +97,7 @@ def trusted_pending_word_items(items: object) -> list[dict[str, str]]:
     if not isinstance(items, list):
         return []
     trusted: list[dict[str, str]] = []
-    seen: set[tuple[str, str, str, str]] = set()
+    seen: set[tuple[str, ...]] = set()
     for raw in items:
         if not isinstance(raw, dict):
             continue
@@ -121,7 +121,7 @@ def trusted_pending_word_items(items: object) -> list[dict[str, str]]:
         valid_status = (
             source == "draft"
             and status == "Draft"
-            or source == "submitted"
+            or source in {"submitted", "others_submitted"}
             and status == "Submitted"
             and item_status == "Pending"
         )
@@ -139,7 +139,10 @@ def trusted_pending_word_items(items: object) -> list[dict[str, str]]:
             }
         ):
             continue
+        old_word = str(raw.get("oldWord") or "").strip()
         key = (source, batch_id, word, code)
+        if source == "others_submitted":
+            key += (action, old_word)
         if key in seen:
             continue
         seen.add(key)
@@ -154,6 +157,8 @@ def trusted_pending_word_items(items: object) -> list[dict[str, str]]:
             "code": code,
             "type": phrase_type,
         })
+        if source == "others_submitted" and old_word:
+            trusted[-1]["oldWord"] = old_word
     return trusted
 
 
@@ -170,8 +175,15 @@ def pending_word_reminder_lines(
     for item in trusted_pending_word_items(items):
         word = item["word"]
         if word_filter and word not in word_filter:
-            continue
-        if item["source"] == "submitted":
+            word = item.get("oldWord", "")
+            if word not in word_filter:
+                continue
+        if item["source"] == "others_submitted":
+            line = (
+                f"「{word}」已有其他用户提交"
+                f"（→ {item['code']}，审核中）：{item['batchUrl']}"
+            )
+        elif item["source"] == "submitted":
             line = (
                 f"「{word}」已在待审核批次中"
                 f"（→ {item['code']}，审核中）：{item['batchUrl']}"
@@ -1232,6 +1244,7 @@ def render_server_backed_batch_candidates(
     occupied_words_by_scope: dict[str, dict[str, tuple[str, ...]]] = {}
     ordering_assessments_by_scope: dict[str, list[dict[str, object]]] = {}
     reviewed_scopes_by_word: dict[str, dict[str, object]] = {}
+    sibling_recommendations_by_scope: dict[str, dict[str, str]] = {}
     for raw_scope in candidate_scopes:
         if not isinstance(raw_scope, dict):
             return ""
@@ -1266,6 +1279,17 @@ def render_server_backed_batch_candidates(
             candidates.append((code, occupied))
             seen_codes.add(code)
         scopes_by_word[word] = tuple(candidates)
+        sibling_recommendations = raw_scope.get("siblingRecommendations", {})
+        if not isinstance(sibling_recommendations, dict) or any(
+            not isinstance(code, str)
+            or code not in {value for value, occupied in candidates if not occupied}
+            or not isinstance(earlier_word, str)
+            or earlier_word not in reviewed_scopes_by_word
+            or reviewed_scopes_by_word[earlier_word]["reviewedState"].get("recommendedCode") != code
+            for code, earlier_word in sibling_recommendations.items()
+        ):
+            return ""
+        sibling_recommendations_by_scope[word] = sibling_recommendations
         raw_occupied_words = raw_scope.get("occupiedWords", {})
         if not isinstance(raw_occupied_words, dict):
             return ""
@@ -1358,7 +1382,10 @@ def render_server_backed_batch_candidates(
         scope = reviewed_scopes_by_word.get(word)
         if (
             scope is None or scope["reviewedState"].get("recommendedCode") != ""
-            or not all(occupied for _code, occupied in scopes_by_word[word])
+            or not all(
+                occupied or code in sibling_recommendations_by_scope[word]
+                for code, occupied in scopes_by_word[word]
+            )
         ):
             return ""
 
@@ -1379,6 +1406,7 @@ def render_server_backed_batch_candidates(
                 scopes_by_word[word],
                 occupied_words_by_scope[word],
                 reviewed_prompt=scope["reviewedPrompt"],
+                sibling_recommendations=sibling_recommendations_by_scope[word],
                 ordering_assessments=ordering_assessments_by_scope[word],
                 actionable_controls=bool(recommended_code),
                 include_controls=include_controls and len(scopes_by_word) == 1,
@@ -1960,23 +1988,73 @@ def render_server_backed_single_word_lookup(
     occupied_words: object,
     *,
     reviewed_prompt: object = "",
+    sibling_recommendations: object = None,
     actionable_controls: bool = False,
     ordering_assessments: object = None,
     include_controls: bool = True,
 ) -> str:
     """Render a rich query snapshot backed by the persisted candidate record."""
+    if sibling_recommendations is None:
+        sibling_recommendations = {}
+    if not isinstance(sibling_recommendations, dict):
+        return ""
+    if sibling_recommendations:
+        if (
+            not isinstance(candidates, (list, tuple))
+            or not isinstance(occupied_words, dict)
+            or str(recommended_code or "").strip().lower() in sibling_recommendations
+        ):
+            return ""
+        display_candidates = []
+        display_occupied_words = dict(occupied_words)
+        for pair in candidates:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                return ""
+            code, occupied = pair
+            if not isinstance(code, str) or not isinstance(occupied, bool):
+                return ""
+            if code in sibling_recommendations:
+                earlier_word = sibling_recommendations[code]
+                if (
+                    occupied is not False
+                    or not isinstance(earlier_word, str)
+                    or not earlier_word
+                    or len(earlier_word) > 128
+                    or any(marker in earlier_word for marker in ("\r", "\n", "「", "」"))
+                ):
+                    return ""
+                display_occupied_words[code] = [earlier_word]
+            display_candidates.append((code, occupied or code in sibling_recommendations))
+        if set(sibling_recommendations) - {code for code, _occupied in display_candidates}:
+            return ""
+        candidates = display_candidates
+        occupied_words = display_occupied_words
+        reviewed_prompt = ""
     actionable = render_server_backed_single_word_candidates(
         word,
         recommended_code,
         candidates,
         occupied_words,
         ordering_assessments,
-        include_controls=include_controls,
+        include_controls=include_controls and (not sibling_recommendations or actionable_controls),
     )
     if not actionable:
         return ""
     normalized_word = str(word or "").strip()
     recommended = str(recommended_code or "").strip().lower()
+    if sibling_recommendations:
+        for index, (code, occupied) in enumerate(candidates, start=1):
+            if code in sibling_recommendations:
+                label = f"本次推荐给「{sibling_recommendations[code]}」"
+            elif code == recommended and not occupied:
+                label = "✅ 推荐（空位）"
+            else:
+                continue
+            actionable = re.sub(
+                rf"(?m)^({index}\. {re.escape(code)} — )[^\n]+$",
+                lambda match, label=label: match.group(1) + label,
+                actionable,
+            )
     expected_codes = advertised_single_word_candidate_codes(actionable)
     source = str(reviewed_prompt or "").strip()
     guard_copy = candidate_commonness_guard_copy(
@@ -1990,7 +2068,7 @@ def render_server_backed_single_word_lookup(
         first_candidate = re.search(r"(?m)^\s*1[.)、]\s*[a-z]+\s*(?:—|–|-)", source)
         if first_candidate is not None:
             prefix = re.sub(rf"(?m)^\s*(?:「{re.escape(normalized_word)}」)?候选编码\s*[:：]\s*$", "", source[:first_candidate.start()]).strip()
-        guarded_body = render_server_backed_single_word_candidates(
+        guarded_body = actionable if sibling_recommendations else render_server_backed_single_word_candidates(
             word, "", candidates, occupied_words, ordering_assessments,
             include_controls=include_controls and actionable_controls,
         )

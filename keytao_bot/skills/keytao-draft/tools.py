@@ -3600,7 +3600,7 @@ async def keytao_pending_items_by_words(
                         )
                         if (
                             candidate_id
-                            and creator_id == actor_id
+                            and creator_id is not None
                             and batch.get("status") == "Submitted"
                         ):
                             candidate_batches[candidate_id] = batch
@@ -3608,29 +3608,48 @@ async def keytao_pending_items_by_words(
                         break
                     page += 1
 
-            for batch_id in candidate_batches:
-                response = await http_client.request_with_retries(
-                    lambda batch_id=batch_id: client.get(
-                        f"{api_base}/api/batches/{batch_id}"
-                    ),
-                    method="GET",
-                    url="/api/batches/{id}",
-                    idempotent=True,
-                )
-                if response.status_code != 200:
-                    raise KeytaoApiError(
-                        f"batch detail returned HTTP {response.status_code}"
+            other_details = 0
+            for batch_id, candidate in candidate_batches.items():
+                creator_id = _safe_numeric_id(candidate["creator"]["id"])
+                own_batch = creator_id == actor_id
+                if not own_batch:
+                    if other_details >= 10:
+                        continue
+                    other_details += 1
+                try:
+                    if own_batch:
+                        response = await http_client.request_with_retries(
+                            lambda batch_id=batch_id: client.get(
+                                f"{api_base}/api/batches/{batch_id}"
+                            ),
+                            method="GET",
+                            url="/api/batches/{id}",
+                            idempotent=True,
+                        )
+                    else:
+                        response = await client.get(f"{api_base}/api/batches/{batch_id}")
+                    if response.status_code != 200:
+                        raise KeytaoApiError(
+                            f"batch detail returned HTTP {response.status_code}"
+                        )
+                    payload = response.json()
+                    batch = payload.get("batch") if isinstance(payload, dict) else None
+                    if (
+                        not isinstance(batch, dict)
+                        or str(batch.get("id") or "") != batch_id
+                        or _safe_numeric_id(batch.get("creatorId")) != creator_id
+                        or batch.get("status") != "Submitted"
+                        or not isinstance(batch.get("pullRequests"), list)
+                    ):
+                        raise KeytaoApiError("batch detail did not match the actor/status claim")
+                except Exception as error:
+                    if own_batch:
+                        raise
+                    logger.warning(
+                        "[pending_items_by_words] Other submitted detail skipped: "
+                        f"{type(error).__name__}"
                     )
-                payload = response.json()
-                batch = payload.get("batch") if isinstance(payload, dict) else None
-                if (
-                    not isinstance(batch, dict)
-                    or str(batch.get("id") or "") != batch_id
-                    or _safe_numeric_id(batch.get("creatorId")) != actor_id
-                    or batch.get("status") != "Submitted"
-                    or not isinstance(batch.get("pullRequests"), list)
-                ):
-                    raise KeytaoApiError("batch detail did not match the actor/status claim")
+                    continue
                 batch_url = make_batch_url(batch_id)
                 for item in batch["pullRequests"]:
                     if not isinstance(item, dict):
@@ -3644,7 +3663,7 @@ async def keytao_pending_items_by_words(
                     ):
                         continue
                     pending_items.append({
-                        "source": "submitted",
+                        "source": "submitted" if own_batch else "others_submitted",
                         "batchId": batch_id,
                         "batchUrl": batch_url,
                         "batchStatus": "Submitted",
@@ -3730,7 +3749,7 @@ async def _pending_create_guard(
     }
     duplicates = [
         item for item in pending_items
-        if item["source"] == "submitted"
+        if item["source"] in {"submitted", "others_submitted"}
         and item["action"] == "Create"
         and (item["word"], item["code"]) in requested_pairs
     ]

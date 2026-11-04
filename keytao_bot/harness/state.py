@@ -68,6 +68,7 @@ class PendingAddWord:
     needs_manual_review: Optional[bool] = None
     manual_review_reason: str = ""
     phrase_type: str = "Phrase"
+    shown_others_submitted: List[Dict[str, str]] = field(default_factory=list)
 
 
 def _pending_add_word_payload(state: PendingAddWord) -> Dict[str, object]:
@@ -87,6 +88,7 @@ def _pending_add_word_payload(state: PendingAddWord) -> Dict[str, object]:
         "needsManualReview": state.needs_manual_review,
         "manualReviewReason": state.manual_review_reason,
         "phraseType": state.phrase_type,
+        "shownOthersSubmitted": state.shown_others_submitted,
     }
 
 
@@ -221,6 +223,14 @@ def _pending_add_word_from_payload(payload: object) -> PendingAddWord:
     server_candidates = candidate_pairs("serverCandidates")
     if server_candidates and server_candidates != candidates:
         raise ValueError("server candidates differ from displayed candidates")
+    raw_shown = payload.get("shownOthersSubmitted", [])
+    shown = trusted_pending_word_items(raw_shown)
+    if shown != raw_shown or any(
+        item["source"] != "others_submitted"
+        or word not in {item["word"], item.get("oldWord")}
+        for item in shown
+    ):
+        raise ValueError("invalid shown submitted items")
     return PendingAddWord(
         word=word,
         recommended_code=recommended_code,
@@ -236,6 +246,7 @@ def _pending_add_word_from_payload(payload: object) -> PendingAddWord:
         needs_manual_review=needs_manual_review,
         manual_review_reason=manual_review_reason,
         phrase_type=phrase_type,
+        shown_others_submitted=shown,
     )
 
 
@@ -391,7 +402,7 @@ def _server_confirmation_display(data: Dict) -> Dict:
 
 def pending_duplicate_confirmation_state(state: PendingToolConfirm, data: Dict) -> PendingToolConfirm:
     """Preserve a local duplicate warning's server facts and exact requested batch."""
-    args = dict(state.args)
+    args = json.loads(json.dumps(state.args, ensure_ascii=False))
     args.pop("_pending_display", None)
     args["_pending_submitted_confirmed"] = True
     if data.get("pendingDuplicateConfirmation") is True and data.get("requiresConfirmation") is True:
@@ -445,7 +456,8 @@ def pending_duplicate_confirmation_is_complete(state: PendingToolConfirm) -> boo
             return False
     submitted = {
         (item["word"], item["code"], item["type"])
-        for item in pending_items if item["source"] == "submitted" and item["action"] == "Create"
+        for item in pending_items
+        if item["source"] in {"submitted", "others_submitted"} and item["action"] == "Create"
     }
     return any(
         item.get("action", "Create") == "Create"
@@ -1350,6 +1362,7 @@ class MemoryConversationStateStore:
                     and left.server_entries_by_code == right.server_entries_by_code
                     and left.server_ordering_assessments
                     == right.server_ordering_assessments
+                    and left.shown_others_submitted == right.shown_others_submitted
                 )
             # Parsed display text may select an already-live record, but it can
             # never create the server capability that is absent from the text.

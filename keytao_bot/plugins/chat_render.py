@@ -29,6 +29,7 @@ from ..utils.pending_confirmation import (
     already_existing_word_copy,
     candidate_commonness_guard_copy,
     pending_confirmation_copy,
+    pending_word_reminder_lines,
     prepend_pending_word_reminders,
     plain_warning_message,
     shift_plan_warnings,
@@ -1908,6 +1909,14 @@ def _append_batch_url_if_missing(
     label: str = "草稿地址",
 ) -> str:
     """Append trusted batch and PR links while keeping each URL once."""
+    reminders = pending_word_reminder_lines([
+        item for source in sources if isinstance(source, dict)
+        for item in source.get("pendingItems", [])
+        if isinstance(item, dict) and item.get("source") == "others_submitted"
+    ])
+    preserved = [line for line in reminders if line in text.splitlines()]
+    if preserved:
+        text = "\n".join(line for line in text.splitlines() if line not in preserved)
     bundle = _trusted_link_bundle(*sources)
     if not bundle.get("batchUrl") and not bundle.get("prUrl"):
         output = _dedupe_authoritative_link_lines(text)
@@ -1924,7 +1933,7 @@ def _append_batch_url_if_missing(
     ):
         separator = "\n\n" if output.rstrip() else ""
         output = output.rstrip() + separator + f"{label}：待确认后生成"
-    return output
+    return "\n".join([*preserved, output]) if preserved else output
 
 
 def finalize_draft_receipt(

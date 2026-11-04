@@ -3691,6 +3691,37 @@ async def _prepare_multi_word_query(
     if present_word_codes:
         other_blocks.append(already_existing_words_copy(present_word_codes))
 
+    shown_others = trusted_pending_word_items([
+        item for lookup, pending in prepared_data.values()
+        for item in pending.get("items", [])
+        if isinstance(item, dict) and item.get("source") == "others_submitted"
+    ] + [item for scope in scopes
+         for item in scope["reviewedState"].get("shownOthersSubmitted", [])])
+    reserved: Dict[str, str] = {}
+    scopes.sort(key=lambda scope: combined_words.index(scope["word"]))
+    for scope in scopes:
+        reviewed = scope["reviewedState"]
+        code = reviewed["recommendedCode"]
+        siblings = {candidate: reserved[candidate] for candidate, occupied in scope["candidates"]
+                    if not occupied and candidate in reserved}
+        scope["siblingRecommendations"] = siblings
+        if code in siblings:
+            reading = reviewed["pronunciationCodes"].get(code)
+            following = False
+            replacement = ""
+            for candidate, occupied in scope["candidates"]:
+                if candidate == code:
+                    following = True
+                if (following and not occupied and candidate not in reserved
+                        and reviewed["pronunciationCodes"].get(candidate) == reading):
+                    replacement = candidate
+                    break
+            reviewed["recommendedCode"] = replacement
+            reviewed["pronunciationRecommendedCodes"] = [replacement] if replacement else []
+            code = replacement
+        if code:
+            reserved[code] = scope["word"]
+
     selectable_scopes: List[Dict[str, Any]] = []
     if preserve_pending:
         for scope in scopes:
@@ -3699,10 +3730,15 @@ async def _prepare_multi_word_query(
                 scope["candidates"], scope["occupiedWords"],
                 scope["orderingAssessments"],
             ))
-        return ServerBackedQueryReply("\n\n".join(other_blocks))
+        return ServerBackedQueryReply(prepend_pending_word_reminders(
+            "\n\n".join(other_blocks), shown_others, words=combined_words,
+        ))
     for scope in scopes:
         if scope["reviewedState"]["recommendedCode"] or (
-            scope["candidates"] and all(occupied for _code, occupied in scope["candidates"])
+            scope["candidates"] and all(
+                occupied or code in scope.get("siblingRecommendations", {})
+                for code, occupied in scope["candidates"]
+            )
         ):
             selectable_scopes.append(scope)
             continue
@@ -3739,6 +3775,7 @@ async def _prepare_multi_word_query(
     for index, word in other_block_words.items():
         if advertised_reply_contract(other_blocks[index]).requires_live_state:
             other_blocks[index] = f"「{word}」未能确认读音或候选编码，请提供读音或具体编码。"
+    other_blocks[:0] = pending_word_reminder_lines(shown_others, words=combined_words)
     items: List[Dict[str, Any]] = []
     for scope in scopes:
         reviewed = scope["reviewedState"]
@@ -3762,6 +3799,7 @@ async def _prepare_multi_word_query(
             "_reviewed_multi_word": True, "_query_words": list(combined_words),
             "_query_other_blocks": other_blocks,
             "_explicit_add": explicit_add,
+            "_shown_others_submitted": shown_others,
         },
     )
     target_key = conv_key or (
@@ -3888,9 +3926,9 @@ async def _try_handle_simple_single_word_query(
             pending_data.get("message")
             or "暂时无法核验当前草稿和待审核批次，本次未继续"
         ).strip()
-    pending_items = pending_data.get("items") or []
+    pending_items = trusted_pending_word_items(pending_data.get("items"))
     reminder_lines = pending_word_reminder_lines(
-        pending_items,
+        [item for item in pending_items if item["source"] != "others_submitted"],
         words=(word,),
     )
     if reminder_lines and not explicit_add_word:
@@ -3992,7 +4030,7 @@ async def _try_handle_simple_single_word_query(
                 conversation_state_store.bind_origin_prompt_digest(
                     conv_key, _prompt_capability_digest(response),
                 )
-            return response
+            return prepend_pending_word_reminders(response, pending_items, words=(word,))
         if matching_rows or len(word) != 1:
             return "词库查询返回了不完整的已有词条记录；本次未继续。"
 
@@ -4050,13 +4088,16 @@ async def _try_handle_simple_single_word_query(
 
     reviewed_prompt = _format_reviewed_add_prompt(review)
     if reviewed_prompt:
-        reviewed_prompt = prepend_pending_word_reminders(
-            reviewed_prompt,
-            pending_items,
-            words=(word,),
-        )
+        if _prepared_scopes is None:
+            reviewed_prompt = prepend_pending_word_reminders(
+                reviewed_prompt, pending_items, words=(word,),
+            )
         pending = _parse_pending_add_word(reviewed_prompt)
         if pending is not None:
+            pending.shown_others_submitted = [
+                item for item in pending_items if item["source"] == "others_submitted"
+                and word in {item["word"], item.get("oldWord")}
+            ]
             pending.phrase_type = str(review.get("type") or "Phrase")
             if len(word) == 1 and pending.phrase_type != "Single":
                 return f"「{word}」未取得可核验的单字编码，本次不展示可执行候选。"
@@ -4140,7 +4181,9 @@ async def _try_handle_simple_single_word_query(
                     reviewed_prompt=reviewed_prompt,
                     actionable_controls=True,
                 )
-                reviewed_prompt = read_only_candidates
+                reviewed_prompt = ServerBackedQueryReply(prepend_pending_word_reminders(
+                    read_only_candidates, pending_items, words=(word,),
+                ))
                 if not reviewed_prompt:
                     conversation_state_store.delete(target_key)
                     raise ValueError("persisted candidate inventory could not be rendered")
@@ -5065,7 +5108,10 @@ async def _perform_add_to_draft_and_submit(
             ordering_summary
             or _create_warning_ordering_summary(create_data, args)
         )
-        pending_args = {**args, "_submit_after": True}
+        pending_args = {
+            **args, "_submit_after": True,
+            "_shown_others_submitted": _ticket_shown_others_submitted(platform, user_id),
+        }
         if reviewed_pinyin and reviewed_candidate_codes:
             pending_args["_reviewed_pinyin"] = reviewed_pinyin
             pending_args["_reviewed_candidate_codes"] = list(
@@ -5154,6 +5200,7 @@ async def _perform_add_to_draft_and_submit(
         batch_id=submit_batch_id,
         preview_only=True,
         auto_confirm=auto_confirm,
+        shown_others_submitted=_ticket_shown_others_submitted(platform, user_id),
         authorized_items=[
             {
                 "action": "Create",
@@ -5334,6 +5381,7 @@ async def _perform_batch_add_to_draft_and_submit(
         pending_args = {
             "items": effective_items,
             "_submit_after": True,
+            "_shown_others_submitted": _ticket_shown_others_submitted(platform, user_id),
             **(
                 {"_allow_same_code": True}
                 if allow_same_code
@@ -5447,6 +5495,7 @@ async def _perform_batch_add_to_draft_and_submit(
         batch_id=str(add_data.get("batchId") or ""),
         preview_only=True,
         auto_confirm=auto_confirm,
+        shown_others_submitted=_ticket_shown_others_submitted(platform, user_id),
         authorized_items=effective_items,
     )
     item_lines = "\n".join(
@@ -6861,6 +6910,7 @@ async def _execute_confirmed_tool(
     args.pop("_reviewed_batch_readings", None)
     args.pop("_query_words", None)
     args.pop("_query_other_blocks", None)
+    args.pop("_shown_others_submitted", None)
     args.pop("_explicit_add", None)
     receipt_requested_words = args.pop("_receipt_requested_words", None) or [
         item.get("word") for item in state.args.get("items", []) if isinstance(item, dict) and item.get("word")
@@ -7212,7 +7262,11 @@ async def _execute_confirmed_tool(
             origin = _candidate_origin_for_ticket(conversation_state_store.get(origin_key))
             if origin:
                 state = replace(state, args={**state.args, "_candidate_origin": origin})
-        pending_state = _pending_state_from_server_warning(state, data)
+        pending_state = (
+            pending_duplicate_confirmation_state(state, data)
+            if data.get("pendingDuplicateConfirmation") is True
+            else _pending_state_from_server_warning(state, data)
+        )
         if state.confirmation_source == "server_warning":
             if not server_warning_ticket_is_complete(pending_state):
                 return render_remediation_reply(
@@ -7325,8 +7379,10 @@ async def _execute_confirmed_tool(
                 else {}
             ),
         }
+        from .chat_render import _format_pending_duplicate_confirmation
         warning_prompt = (
-            render_pending_replace_at_code_plan(pending_state)
+            _format_pending_duplicate_confirmation(pending_state)
+            or render_pending_replace_at_code_plan(pending_state)
             or (
                 _format_changed_server_confirmation_prompt(state, pending_state)
                 if state.confirmation_source == "server_warning"
@@ -7370,6 +7426,11 @@ async def _execute_confirmed_tool(
                 "操作完成，但响应缺少精确批次，已停止后续提交",
                 command="查看草稿",
             )
+        if state.args.get("_pending_submitted_confirmed") is True:
+            authorized_items = (
+                state.args.get("items") if state.function_name == "keytao_batch_add_to_draft"
+                else [{"action": "Create", **state.args}]
+            )
         if authorized_items:
             submit_result = await _perform_submit_current_draft(
                 platform,
@@ -7378,6 +7439,7 @@ async def _execute_confirmed_tool(
                 preview_only=True,
                 auto_confirm=True,
                 authorized_items=authorized_items,
+                shown_others_submitted=_ticket_shown_others_submitted(platform, user_id),
             )
             if submit_result.pending_state is not None:
                 target_key: ConversationKey = conv_key or (platform, user_id)
@@ -7957,6 +8019,22 @@ def subset_submit_refusal(message: str, state: object) -> str:
     )
 
 
+def _ticket_shown_others_submitted(platform: str, user_id: str) -> List[Dict]:
+    context = current_memory_context.get()
+    address = (context.conversation_address if context is not None
+               and context.platform == platform and context.user_id == user_id
+               else (platform, user_id))
+    state = conversation_state_store.get(address)
+    if isinstance(state, PendingAddWord):
+        return state.shown_others_submitted
+    if isinstance(state, PendingToolConfirm):
+        return trusted_pending_word_items([
+            *state.args.get("_shown_others_submitted", []),
+            *state.args.get("_candidate_origin", {}).get("shownOthersSubmitted", []),
+        ])
+    return []
+
+
 async def _perform_submit_current_draft(
     platform: str,
     user_id: str,
@@ -7972,6 +8050,7 @@ async def _perform_submit_current_draft(
     authorized_items: Optional[List[Dict]] = None,
     authorized_content_version: Optional[int] = None,
     authorize_current_draft: bool = False,
+    shown_others_submitted: Optional[List[Dict]] = None,
 ) -> DraftActionResult:
     """Submit a draft without writing follow-up state into the conversation slot."""
     # A confirmed server ticket is the mutation stage. Keeping the public
@@ -8000,6 +8079,45 @@ async def _perform_submit_current_draft(
             PendingToolConfirm(function_name="keytao_submit_batch", args=arguments),
             submit_data,
         )
+        words = list(dict.fromkeys(
+            str(item.get(field) or "").strip()
+            for item in submit_data.get("snapshotItems", [])
+            if isinstance(item, dict)
+            for field in ("word", "oldWord", "old_word")
+            if str(item.get(field) or "").strip()
+        ))
+        pending_items = []
+        for offset in range(0, len(words), 50):
+            chunk = words[offset:offset + 50]
+            try:
+                pending = json.loads(await tool_executor.call(
+                    "keytao_pending_items_by_words", {"words": chunk}, ToolContext(platform, user_id),
+                ))
+                if pending.get("success") is not True or pending.get("complete") is not True:
+                    raise ValueError("pending advisory lookup was incomplete")
+                pending_items.extend(
+                    item for item in trusted_pending_word_items(pending.get("items"))
+                    if item["source"] == "others_submitted"
+                    and (item["word"] in chunk or item.get("oldWord") in chunk)
+                )
+            except Exception as error:
+                logger.warning(
+                    "[submit_preview] Pending advisory lookup skipped: "
+                    f"{type(error).__name__}"
+                )
+        if pending_items:
+            submit_data["pendingItems"] = trusted_pending_word_items(pending_items)
+        others = [item for item in trusted_pending_word_items(submit_data.get("pendingItems"))
+                  if item["source"] == "others_submitted"
+                  and (item["word"] in words or item.get("oldWord") in words)]
+        if others:
+            _capture_successful_draft_write_delivery(
+                "keytao_pending_items_by_words",
+                {"success": True, "complete": True, "items": others}, platform, user_id,
+            )
+        unseen = [item for item in others if item not in (shown_others_submitted or [])]
+        if unseen:
+            submit_data["pendingItems"] = unseen
         expected = _normalized_submit_items(authorized_items)
         remaining = list(_normalized_submit_items(submit_data.get("snapshotItems")) or [])
         for item in expected or []:
@@ -8016,6 +8134,7 @@ async def _perform_submit_current_draft(
         if (
             auto_confirm
             and not confirmed
+            and not unseen
             and (
                 _semantic_direct_words.get() is None
                 or server_warning_ticket_is_complete(pending_state)
@@ -8093,6 +8212,7 @@ async def _perform_submit_current_draft(
             "keytao_submit_batch",
             submit_data,
         )
+        warning_prompt = prepend_pending_word_reminders(warning_prompt, unseen, words=tuple(words))
         if len(warning_prompt) > MAX_REPLACE_CONFIRMATION_CHARS:
             return DraftActionResult(
                 _append_batch_url_if_missing(
@@ -14076,7 +14196,8 @@ async def prepare_fresh_entry_code_selection(
     phrase_type = "Single" if len(request.word) == 1 else "Phrase"
     matching = [
         item for item in trusted_pending_word_items(pending.get("items"))
-        if item["word"] == request.word and item["code"] == request.code
+        if item["source"] in {"draft", "submitted"}
+        and item["word"] == request.word and item["code"] == request.code
         and item["type"] == phrase_type and item["action"] in {"Create", "Change"}
     ]
     if matching:
@@ -14157,14 +14278,16 @@ async def try_handle_explicit_entry_code_command(
 def _candidate_origin_for_ticket(state) -> Dict:
     """Retain the original numbered inventory across a server plan preview."""
     if isinstance(state, PendingAddWord) and state.server_candidates and state.server_candidates == state.candidates:
-        return {"queryWords": [state.word], "reviewedState": json.loads(json.dumps(_pending_add_word_payload(state)))}
+        return {"queryWords": [state.word], "reviewedState": json.loads(json.dumps(_pending_add_word_payload(state))),
+                "shownOthersSubmitted": state.shown_others_submitted}
     if isinstance(state, PendingToolConfirm):
         if state.args.get("_candidate_origin"):
             return state.args["_candidate_origin"]
         if state.args.get("_reviewed_multi_word") is True:
             scopes = state.args.get("_candidate_scopes") or []
             words = state.args.get("_query_words") or [scope.get("word") for scope in scopes]
-            return {"queryWords": words, "reviewedState": json.loads(json.dumps(scopes[0].get("reviewedState")))
+            return {"queryWords": words, "shownOthersSubmitted": state.args.get("_shown_others_submitted", []),
+                    "reviewedState": json.loads(json.dumps(scopes[0].get("reviewedState")))
                     if len(scopes) == 1 and scopes[0].get("word") in words else None}
     return {}
 
