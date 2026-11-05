@@ -39,7 +39,6 @@ from ..harness.authorization_grammar import (
     parse_eviction_modified_add,
     parse_pending_positional_add,
     parse_replace_at_code,
-    parse_reviewed_multi_word_selection,
     parse_reviewed_selection_command,
 )
 from ..harness.tools import (
@@ -1594,6 +1593,19 @@ def _structural_pending_add_word_intent(
             intent="pending_add_and_submit" if "提交" in selection.action else "pending_choice",
             confidence=1.0, choice_index=index, submit_after="提交" in selection.action,
         )
+    if (
+        selection is not None and selection.rest_recommended and not selection.shift_words
+        and len(selection.pairs) == 1 and selection.pairs[0][0] == state.word
+        and (reading := dict(selection.readings).get(state.word))
+        and selection.pairs[0][1] in dict(state.candidates)
+        and validate_explicit_code(state, selection.pairs[0][1], reading).valid
+    ):
+        code = selection.pairs[0][1]
+        return MessageCommandIntent(
+            intent="pending_add_and_submit" if "提交" in selection.action else "pending_code_request",
+            confidence=1.0, requested_code=code, requested_codes=(code,),
+            submit_after="提交" in selection.action,
+        )
     complete_eviction = parse_eviction_modified_add(stripped)
     if (
         complete_eviction is not None
@@ -1871,7 +1883,7 @@ def message_authorizes_live_pending_mutation(
         "pending_choice",
     }:
         return False
-    if intent.intent == "pending_choice" and intent.choice_index is not None:
+    if intent.intent in {"pending_choice", "pending_add_and_submit"} and intent.choice_index is not None:
         return 1 <= intent.choice_index <= len(state.server_candidates)
     if intent.intent == "pending_choice" and intent.choice_indices:
         return True
@@ -2030,7 +2042,7 @@ def _resolve_reviewed_multi_word_selection(
     items: List[Dict[str, Any]],
     scopes: Dict[str, List[Tuple[str, bool]]],
 ) -> Tuple[Optional[PendingToolConfirm], Optional[MessageCommandIntent], Optional[str]]:
-    """Bind each canonical pair to its own sealed review; omit every other word."""
+    """Bind named choices and optional remaining defaults to sealed reviews."""
     source = _strip_command_message_prefixes(message_text).strip()
     live_words = tuple(scopes) or tuple(str(item["word"]).strip() for item in items)
     unquoted = _whole_message_unquoted_source(source, live_words)
@@ -2166,6 +2178,15 @@ def _resolve_reviewed_multi_word_selection(
             return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
         selected_pairs.add((word, code))
         resolved_pairs.append((word, selector, code))
+    items_by_word = {str(item["word"]).strip(): item for item in items}
+    rest_words: set[str] = set()
+    if selection.rest_recommended:
+        named_words = {word for word, _selector, _code in resolved_pairs}
+        for word in scopes:
+            if word not in named_words and word in items_by_word:
+                code = str(items_by_word[word]["code"]).strip().lower()
+                resolved_pairs.append((word, code, code))
+                rest_words.add(word)
     selected_code_words: Dict[str, List[str]] = {}
     for word in scopes:
         for selected_word, _selector, code in resolved_pairs:
@@ -2174,11 +2195,14 @@ def _resolve_reviewed_multi_word_selection(
     for code, words in selected_code_words.items():
         if len(words) > 1:
             return None, None, f"{'、'.join(words)} 选了同一个编码 {code}，请改选；本次未写入。"
-    items_by_word = {str(item["word"]).strip(): item for item in items}
     selected_items: List[Dict[str, Any]] = []
     selected_words: List[str] = []
     skipped: List[str] = []
     for word, selector, code in resolved_pairs:
+        if word in rest_words:
+            selected_items.append(dict(items_by_word[word]))
+            selected_words.append(word)
+            continue
         candidates = scopes[word]
         raw_scope = next(
             scope for scope in state.args["_candidate_scopes"]
@@ -2299,7 +2323,7 @@ def _resolve_multi_word_pending_candidate_selection(
             )
             for target, _selector in (named.pairs if named is not None else ())
         )
-        if named is not None and not named.shift_words and not named.readings and state.word in source:
+        if named is not None and not named.shift_words and (not named.readings or named.rest_recommended) and state.word in source:
             if not named_selection and not named.action:
                 return None, None, None
             codes = []
@@ -2311,6 +2335,9 @@ def _resolve_multi_word_pending_candidate_selection(
                 )
                 if word != state.word or code not in dict(state.candidates) or code in codes:
                     return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
+                reading = dict(named.readings).get(word)
+                if reading and not (validation := validate_explicit_code(state, code, reading)).valid:
+                    return None, None, validation.reason + "；本次未写入。"
                 codes.append(code)
         elif named is None and named_selection:
             return None, None, "候选编号无效或重复，请按原候选列表选择；本次未写入。"
@@ -2321,7 +2348,7 @@ def _resolve_multi_word_pending_candidate_selection(
         and state.args.get("_reviewed_multi_word") is True
     ):
         if state.confirmation_source != "local_preview":
-            if parse_reviewed_multi_word_selection(message_text) is not None:
+            if parse_reviewed_selection_command(_strip_command_message_prefixes(message_text)) is not None:
                 return None, None, (
                     "当前已进入风险确认，不能再按候选编号或编码换选；本次未写入。\n"
                     + pending_confirmation_copy()

@@ -19,11 +19,12 @@ from .authorization_grammar import (
     _STANDALONE_NEGATION_CLAUSE_RE,
     _has_standalone_negation_before_mutation,
     trusted_mutation_source,
+    parse_reviewed_selection_command,
     parse_standalone_shift,
 )
 from .operation_request import OperationRequest
 from .state import PendingAddWord
-from ..plugins.chat_routing import _load_json_object_from_model_text, _multi_word_candidate_scope_rows
+from ..plugins.chat_routing import _load_json_object_from_model_text, _multi_word_candidate_scope_rows, _strip_command_message_prefixes
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils.observability import observe_model_call
 
@@ -276,6 +277,9 @@ def validate_operation(
     if not isinstance(op, str) or op not in OP_ENUM:
         return OperationRequest(source="model:invalid"), ["invalid_op"]
 
+    selection = parse_reviewed_selection_command(_strip_command_message_prefixes(message))
+    if selection is not None and selection.rest_recommended:
+        return OperationRequest(source="model:unsupported"), ["unsupported_rest_recommended"]
     shift = parse_standalone_shift(message, known_words=shift_known_words)
     pair_context = bool(_multi_word_candidate_scope_rows(pending_state)[0]) or (
         isinstance(pending_state, PendingAddWord) and shift is not None

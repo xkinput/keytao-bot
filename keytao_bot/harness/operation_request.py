@@ -35,6 +35,9 @@ def understand_message(
             frame="direct", source=f"fast_path:{parser}",
         )
 
+    selection = grammar.parse_reviewed_selection_command(routing._strip_command_message_prefixes(message))
+    if selection is not None and selection.rest_recommended:
+        return OperationRequest()
     command = grammar.parse_entry_swap(message)
     if command is not None:
         return matched("parse_entry_swap", "swap", (command.first_word, command.second_word))

@@ -6089,6 +6089,10 @@ def _prepend_resolved_advertised_words(
 ) -> str:
     """Echo the exact record-derived set before its execution result."""
     expected = state.args.get("_resolved_advertised_words")
+    if not expected and state.args.get("_reviewed_multi_word") is True and (
+        state.args.get("_unselected_words") or state.args.get("_selection_skipped")
+    ):
+        expected = list(dict.fromkeys(item["word"] for item in state.args.get("items", [])))
     if not isinstance(expected, list) or not expected:
         return response
     words = [str(word).strip() for word in expected if str(word).strip()]
@@ -12756,6 +12760,9 @@ def render_understood_pending_answer(request, state, prompt: str, message: str =
     from ..utils.pending_confirmation import advertised_reply_contract
     from .chat_routing import _multi_word_candidate_scope_rows
 
+    selection = parse_reviewed_selection_command(_strip_command_message_prefixes(message))
+    if selection is not None and selection.rest_recommended:
+        return ""
     words, codes = _pending_values(state)
     if (
         request.frame != "direct" or request.refers_to_pending is not True
@@ -14196,7 +14203,7 @@ async def _execute_explicit_entry_code_request(
 def fresh_entry_code_selection(message: str) -> Optional[ExplicitEntryCodeRequest]:
     """Recognize one closed lexical pair without granting mutation authority."""
     selection = parse_reviewed_selection_command(message)
-    if selection is None or selection.shift_words:
+    if selection is None or selection.shift_words or selection.rest_recommended:
         return None
     pairs = parse_reviewed_multi_word_selection(message)
     if pairs is None or len(pairs) != 1:

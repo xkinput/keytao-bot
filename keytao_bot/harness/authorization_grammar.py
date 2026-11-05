@@ -2950,6 +2950,10 @@ def message_authorizes_mutation(message: str) -> bool:
     unquoted = legacy_tools._whole_message_unquoted_source(message)
     if unquoted is not None:
         message = unquoted
+    if "推荐" in message or "默认" in message:
+        selection = parse_reviewed_selection_command(normalize_mutation_command_source(message))
+        if selection is not None and selection.rest_recommended:
+            return False
     raw_source = re.sub(r"\s+", "", trusted_mutation_source(message))
     # The authorization view intentionally keeps a later standalone command
     # clause after harmless chatter.  Report/record frames are not harmless:
@@ -3006,6 +3010,7 @@ class ReviewedSelectionCommand:
     action: str = ""
     readings: Tuple[Tuple[str, str], ...] = ()
     shift_words: Tuple[str, ...] = ()
+    rest_recommended: bool = False
 
 
 _REVIEWED_SHIFT_WORD = (
@@ -3113,6 +3118,13 @@ def parse_reviewed_selection_command(
     if leading or trailing:
         match = leading or trailing
         action, source = match.group("action"), match.group("body")
+    rest = re.fullmatch(
+        r"(?P<body>.+?)(?:[ \t]*[，,][ \t]*|[ \t]+)"
+        r"(?:其他|其它|其余|剩下的?)(?:的)?(?:词)?(?:都|全)?(?:用|按|走)?"
+        r"(?:推荐|默认)(?:的|编码|的编码)?", source,
+    )
+    if rest is not None:
+        source = rest.group("body")
     pairs: List[Tuple[str, str]] = []
     readings: List[Tuple[str, str]] = []
     shift_words: List[str] = []
@@ -3153,7 +3165,12 @@ def parse_reviewed_selection_command(
             if match.group("add") and not action:
                 action = "加入"
             remaining = remaining[match.end():].strip()
-    return ReviewedSelectionCommand(tuple(pairs), action, tuple(readings), tuple(dict.fromkeys(shift_words)))
+    if rest is not None and not pairs:
+        return None
+    return ReviewedSelectionCommand(
+        tuple(pairs), action, tuple(readings), tuple(dict.fromkeys(shift_words)),
+        rest_recommended=rest is not None,
+    )
 
 
 def parse_reviewed_multi_word_selection(
@@ -3161,7 +3178,7 @@ def parse_reviewed_multi_word_selection(
 ) -> Optional[Tuple[Tuple[str, str], ...]]:
     """Compatibility projection; mutation still needs an action and live binding."""
     parsed = parse_reviewed_selection_command(message)
-    return parsed.pairs if parsed is not None else None
+    return parsed.pairs if parsed is not None and not parsed.rest_recommended else None
 
 
 def looks_like_mutation_grammar_gap(message: str) -> bool:
@@ -3169,6 +3186,9 @@ def looks_like_mutation_grammar_gap(message: str) -> bool:
     source = _LEADING_MENTION_RE.sub(
         "", trusted_mutation_source(message), count=1
     ).strip()
+    selection = parse_reviewed_selection_command(source)
+    if selection is not None and selection.rest_recommended:
+        return False
     compact = re.sub(r"\s+", "", source)
     masked_source = _mask_quoted_record_frames(source)
     if (
