@@ -322,6 +322,7 @@ async def _record_sent_receipts(bot, exception, api, data, result):
     if not enabled() or exception is not None or api not in {"send_msg", "send_group_msg", "send_message"}:
         return
     from ..plugins.chat_commands import current_memory_context
+    from ..plugins.chat_render import render_platform_public_links
     memory = current_memory_context.get()
     if memory is None or memory.space_type != "group":
         return
@@ -341,9 +342,12 @@ async def _record_sent_receipts(bot, exception, api, data, result):
     message_id = result.get("message_id") if isinstance(result, dict) else getattr(result, "message_id", None)
     if message_id is None:
         return
+    text = render_platform_public_links(text, platform)
     try:
         for receipt in tuple(_pending_receipts.get() or ()):
             expected = submitted_vote_receipt(receipt)
+            if expected:
+                expected = render_platform_public_links(expected, platform)
             if expected and expected in text:
                 get_store().bind_receipt(receipt, platform, memory.user_id, group_id, str(message_id))
     except (OSError, sqlite3.Error):
@@ -352,9 +356,10 @@ async def _record_sent_receipts(bot, exception, api, data, result):
 
 def _is_assent(text):
     text = re.sub(r"\[CQ:at,[^\]]+\]|@[\w-]+", "", text).strip()
+    text = re.sub(r"^(?:喵喵|键道)[\s:：，,]*", "", text)
     while text and unicodedata.category(text[-1]).startswith("P"):
         text = text[:-1].rstrip()
-    return re.sub(r"\s+", "", text) == "同意"
+    return re.sub(r"\s+", "", text) in {"同意", "支持", "赞成", "投票"}
 
 
 async def _stage_community_vote(ctx):

@@ -325,7 +325,8 @@ def _strip_unbound_command_suggestions(
             quote_stack.pop()
         elif character in quote_pairs:
             quote_stack.append(quote_pairs[character])
-        elif character in "。！？!?" and not quote_stack:
+        elif (character in "。！？!?" and not quote_stack
+              and (character == "。" or rendered[index + 1:index + 2] != "@")):
             sentences.append(rendered[start:index + 1])
             start = index + 1
     sentences.append(rendered[start:])
