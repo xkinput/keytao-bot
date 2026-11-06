@@ -5916,7 +5916,16 @@ def _reference_comparison_summary(
         front_bcc.get('available') and behind_bcc.get('available')
         and bool(front_bcc.get('attested')) != bool(behind_bcc.get('attested'))
     )
-    if reason.startswith('bcc_historical_'):
+    if reason in {'incumbent_frequency_vs_absent', 'incumbent_historical_frequency_vs_absent'}:
+        if reason == 'incumbent_historical_frequency_vs_absent':
+            evidence = format_historical(front_bcc, observed_only=True)
+        elif front_bcc.get('attested'):
+            evidence = bcc_summary(front_bcc)
+        else:
+            evidence = f"语料频次 {front_frequency}"
+        basis = (f"「{second_word}」无语料频次；「{first_word}」"
+                 f"{evidence}；保留现有排序")
+    elif reason.startswith('bcc_historical_'):
         channel = '近代汉语' if 'early_modern' in reason else '古代汉语'
         rows = [next(row for row in item['historicalChannels'] if row['channel'] == channel)
                 for item in (front_bcc, behind_bcc)]
@@ -5959,6 +5968,7 @@ def _reference_comparison_summary(
                               f"「{second_word}」{bcc_summary(behind_bcc)}")
                 basis += "；单边 BCC 收录不决定高低"
     if (not reason.startswith('bcc_historical_')
+            and reason != 'incumbent_historical_frequency_vs_absent'
             and all(item.get('available') and not item.get('attested') for item in (front_bcc, behind_bcc))):
         basis += (f"；历史补充：「{first_word}」{format_historical(front_bcc, other=behind_bcc, observed_only=True)}；"
                   f"「{second_word}」{format_historical(behind_bcc, other=front_bcc, observed_only=True)}（未参与判定）")
@@ -6200,6 +6210,8 @@ async def compare_word_commonness(front_word: str, behind_word: str) -> Dict:
             behind_reference,
         )
         if (front_reference.get('attested') or behind_reference.get('attested')
+                or any(historical_attested(item.get('bcc') or {})
+                       for item in (front_reference, behind_reference))
                 or comparison['decisionReason'].startswith('bcc_historical_')):
             record_commonness_evidence(comparison)
             return comparison
@@ -6555,6 +6567,54 @@ async def assess_candidate_chain_commonness(
                 )
             )
         else:
+            references = [
+                (comparison.get(side) or {}).get("reference")
+                for side in ("front", "behind")
+            ]
+            if ((comparison.get("verdict") == "not_enough_evidence"
+                 or comparison.get("decisionReason") == "dictionary_presence_margin")
+                    and all(isinstance(item, dict) for item in references)):
+                front, behind = references
+                front_bcc, behind_bcc = [item.get("bcc") or {} for item in references]
+                if (front.get("corpusFrequency") is None and not front_bcc.get("attested")
+                        and not historical_attested(front_bcc)
+                        and (behind.get("corpusFrequency") is not None or behind_bcc.get("attested")
+                             or historical_attested(behind_bcc))):
+                    reason = ("incumbent_historical_frequency_vs_absent"
+                              if behind.get("corpusFrequency") is None and not behind_bcc.get("attested")
+                              else "incumbent_frequency_vs_absent")
+                    comparison = {
+                        **comparison,
+                        "verdict": "behind_more_common",
+                        "decisionReason": reason,
+                        "summary": _reference_comparison_summary(
+                            "behind_more_common", pair["newWord"], pair["occupantWord"],
+                            front, behind, reason,
+                        ),
+                    }
+            if (comparison.get("verdict") == "front_more_common"
+                    and (all(isinstance(item, dict) for item in references)
+                         or comparison.get("webFallback") is True)):
+                front, behind = [item or {} for item in references]
+                modern_signal = comparison_signal(front.get("bcc") or {}, behind.get("bcc") or {})
+                if modern_signal is None and all(
+                    isinstance(item.get("corpusFrequency"), int) and item["corpusFrequency"] > 0
+                    for item in (front, behind)
+                ):
+                    modern_signal = (front["corpusFrequency"], behind["corpusFrequency"], "frequency_ratio")
+                if (modern_signal is None
+                        or modern_signal[0] < modern_signal[1] * COMMONNESS_FREQUENCY_RATIO_THRESHOLD):
+                    comparison = {
+                        **comparison,
+                        "verdict": "not_enough_evidence",
+                        "decisionReason": "modern_frequency_insufficient",
+                        "summary": (
+                            _reference_comparison_summary(
+                                "not_enough_evidence", pair["newWord"], pair["occupantWord"],
+                                front, behind, "modern_frequency_insufficient",
+                            ) + "；现代语料频次不足以支持重排，维持现有排序"
+                        ),
+                    }
             assessments.append(_candidate_commonness_assessment(
                 pair,
                 _modern_semantic_commonness_override(
@@ -6795,6 +6855,14 @@ async def rank_code_chain_by_commonness(
                 right_word,
                 _comparison_evidence_line(right_word, comparison.get("behind")),
             )
+
+            if comparison.get("decisionReason") == "dictionary_presence_margin":
+                comparison = {
+                    **comparison,
+                    "verdict": "not_enough_evidence",
+                    "decisionReason": "modern_frequency_insufficient",
+                    "summary": "词典收录数量不足以支持重排，维持现有排序",
+                }
 
             possible_overrides: List[Dict[str, Any]] = []
             if _comparison_side_is_dictionary_dominated(comparison.get("behind")):
@@ -7625,6 +7693,7 @@ async def _audit_single_item(
             css_review["commonnessComparison"] = comparison
             if (
                 comparison.get("verdict") == "front_more_common"
+                and comparison.get("decisionReason") != "dictionary_presence_margin"
                 and baseline_issue in outcome.issues
             ):
                 outcome.issues.remove(baseline_issue)
@@ -7980,7 +8049,8 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
                 "summary": "常用度建议暂不可用",
             }
         commonness_results.append({**comparison, "result": commonness})
-        if commonness.get("verdict") == "front_more_common":
+        if (commonness.get("verdict") == "front_more_common"
+                and commonness.get("decisionReason") != "dictionary_presence_margin"):
             approved_items.append(
                 f"顺序调整：{comparison['frontWord']}@{comparison['code']} 排在 {comparison['behindWord']} 前，常用度证据一致"
             )

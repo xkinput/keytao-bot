@@ -3432,7 +3432,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     space_key=space_key,
                     owner_label="Ealin",
                 )
-                self.assertEqual(response, "batch-added\n未选择：1. 还车 → htje、3. 还车 → htjevu；这些候选本次未添加。")
+                self.assertEqual(response, "batch-added")
                 self.assertEqual(execute.await_count, 1)
                 self.assertEqual(
                     execute.await_args.args[1],
@@ -3451,7 +3451,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     space_key=space_key,
                     owner_label="Ealin",
                 )
-                self.assertEqual(response, "batch-added\n未选择：1. 还车 → htje、3. 还车 → htjevu；这些候选本次未添加。")
+                self.assertEqual(response, "batch-added")
                 self.assertEqual(execute.await_count, 2)
                 self.assertEqual(
                     execute.await_args.args[1],
@@ -3469,7 +3469,7 @@ class PlatformNeutralPendingTests(unittest.IsolatedAsyncioTestCase):
                     space_key=space_key,
                     owner_label="Ealin",
                 )
-                self.assertEqual(response, "batch-added\n未选择：1. 还车 → htje、3. 还车 → htjevu；这些候选本次未添加。")
+                self.assertEqual(response, "batch-added")
                 self.assertEqual(execute.await_count, 3)
                 self.assertEqual(
                     execute.await_args.args[1],

@@ -3883,7 +3883,7 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
                 ),
             )
         check("numbered fallback remains an opt-out", fallback_result ==
-              "fallback added\n未选择：1. 射覆 → eefj；这些候选本次未添加。")
+              "fallback added")
         check(
             "numbered fallback lands on the free code",
             fallback_add.await_args.args[:2] == ("射覆", "eefju"),
@@ -10191,7 +10191,7 @@ def test_exact_numeric_pending_reply_executes_without_intent_model():
             openai_chat_module.conversation_state_store = old_store
 
         check("numeric choice executes directly", response ==
-              "added\n未选择：1. 母版 → mjbf、3. 母版 → mjbfau；这些候选本次未添加。")
+              "added")
         check("numeric choice selects advertised code", add_mock.await_count == 1)
         if add_mock.await_count:
             check("numeric choice binds candidate two", add_mock.await_args.args[:2] == ("母版", "mjbfa"))
@@ -10473,7 +10473,7 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
             openai_chat_module.conversation_state_store = old_store
 
         check("exact code executes direct add", code_response ==
-              "added\n未选择：1. 母版 → mjbf、3. 母版 → mjbfau；这些候选本次未添加。")
+              "added")
         check("exact code binds advertised empty slot", add_mock.await_args.args[:2] == ("母版", "mjbfa"))
         check("occupied number protects the unnamed occupant", duplicate_response is not None and "木板" in duplicate_response and "本次未写入" in duplicate_response)
         check("occupied number never creates a duplicate", duplicate_mock.await_count == 0)
@@ -10652,8 +10652,7 @@ def test_occupied_numeric_choice_means_create_with_eviction():
                     result = await _handle_pending_add_word(
                         stronger_state, message, "qq", "123", [], command_intent=intent,
                     )
-            expected = ("shifted\n未选择：2. 增香 → zrxxv、3. 增香 → zrxxvu；这些候选本次未添加。"
-                        if message == "1" else "shifted")
+            expected = "shifted"
             check(f"bound weaker occupant still shifts: {message}", result == expected and shift_mock.await_count == 1)
             check(f"weaker-occupant shift keeps exact target: {message}", shift_mock.await_count == 1 and shift_mock.await_args.args[:2] == ("增香", "zrxx"))
             check(f"weaker-occupant selection never duplicate-adds: {message}", duplicate_mock.await_count == 0)

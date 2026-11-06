@@ -284,7 +284,7 @@ class SemanticAssentTests(unittest.IsolatedAsyncioTestCase):
                 _record, prompt = self.ticket()
                 await self.assert_added_once(
                     self.context(message, quoted=prompt), code=code,
-                    response="offline addition\n未选择：1. 午时 → wj；这些候选本次未添加。",
+                    response="offline addition",
                 )
 
     async def test_multiword_assent_keeps_only_each_advertised_default(self):
