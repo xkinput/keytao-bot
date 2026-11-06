@@ -103,6 +103,7 @@ from ..utils.pending_confirmation import (
     PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
     PENDING_CONFIRM_ASSENT_TEXTS,
+    RestoredCandidateReply,
     ReviewedSelectionReply,
     ServerBackedQueryReply,
     UNBOUND_BINDING_PRECHECK_NOTICE,
@@ -2573,6 +2574,26 @@ def _numbered_candidates_match_record(text: str, record: Optional[PendingStateRe
     return False
 
 
+def _restored_candidate_reply_matches_live_record(
+    response: RestoredCandidateReply,
+    record: Optional[PendingStateRecord],
+) -> bool:
+    """Keep a restored remainder receipt bound to its exact live owner and state."""
+    if (
+        record is None or record.execution_id
+        or not isinstance(record.state, PendingToolConfirm)
+        or record.state.args.get("_reviewed_multi_word") is not True
+        or record.state.confirmation_source != "local_preview"
+    ):
+        return False
+    _items, scopes = _chat_routing._multi_word_candidate_scope_rows(record.state)
+    return bool(
+        scopes and response.owner_key == record.owner_key
+        and response.nonce == record.nonce
+        and response.state_snapshot == asdict(record.state)
+    )
+
+
 def _reviewed_selection_reply_matches_live_record(
     response: ReviewedSelectionReply,
     record: Optional[PendingStateRecord],
@@ -2620,9 +2641,18 @@ def _enforce_advertised_reply_contract(
     from ..utils.commonness_query import matches_commonness_delivery
     if matches_commonness_delivery(response, conv_key, _current_turn_message.get("")):
         return response
-    if isinstance(response, ReviewedSelectionReply):
+    if isinstance(response, (ReviewedSelectionReply, RestoredCandidateReply)):
         record = conversation_state_store.get_record(conv_key) if conv_key is not None else None
-        if _reviewed_selection_reply_matches_live_record(response, record):
+        if isinstance(response, RestoredCandidateReply):
+            matches = _restored_candidate_reply_matches_live_record(response, record)
+        else:
+            matches = _reviewed_selection_reply_matches_live_record(response, record)
+        if matches:
+            if isinstance(response, RestoredCandidateReply):
+                logger.info(
+                    "[advertised_reply_contract] branch=send_backed "
+                    f"state={record.state.__class__.__name__} restored_remainder=True"
+                )
             return response
         replacement = _render_live_batch_record(record)
         if replacement and _advertised_reply_matches_live_record(replacement, record):
@@ -3087,6 +3117,10 @@ def _prepare_user_facing_reply(
         or (
             isinstance(response, ReviewedSelectionReply)
             and _reviewed_selection_reply_matches_live_record(response, live_record)
+        )
+        or (
+            isinstance(response, RestoredCandidateReply)
+            and _restored_candidate_reply_matches_live_record(response, live_record)
         )
     ):
         conversation_state_store.bind_origin_prompt_digest(
@@ -4756,8 +4790,9 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
 
     if ctx.reply_reference.is_reply:
         if not _verified_pending_reply(ctx, record):
-            if not affirmative and assent is not None and (
-                assent.intent == "pending_cancel" or message.strip() == "都加入"
+            if assent is not None and (
+                assent.intent in {"pending_confirm", "pending_add_and_submit", "pending_cancel"}
+                or message.strip() == "都加入"
             ):
                 canonical = message
             return unbound_answer()
@@ -7376,7 +7411,7 @@ async def _stage_augment_word_query(ctx: TurnContext) -> bool:
 
 async def _stage_scope_language_only_response(ctx: TurnContext) -> bool:
     """Production scenario: reading/meaning turns cannot expose code diagnostics."""
-    if isinstance(ctx.response, ReviewedSelectionReply):
+    if isinstance(ctx.response, (ReviewedSelectionReply, RestoredCandidateReply)):
         return False
     if getattr(ctx, "semantic_query_candidates_prepared", False):
         return False
@@ -7656,6 +7691,7 @@ _CHAT_COMPAT_NAMES = (
     "PendingStateRecord",
     "PendingTrustedWordRecord",
     "PendingToolConfirm",
+    "RestoredCandidateReply",
     "ReviewedSelectionReply",
     "ServerBackedQueryReply",
     "SQLiteConversationStateStore",

@@ -86,6 +86,7 @@ from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
+    RestoredCandidateReply,
     ServerBackedQueryReply,
     already_existing_word_copy,
     already_existing_words_copy,
@@ -14790,7 +14791,9 @@ async def handle_pending_message_core(
                         conversation_state_store.begin_execution(current)
                     return response + "\n这批词的候选编码暂时无法保存，请重新查询后再选择。"
                 if restored is not None and current is state_record:
-                    return response + "\n候选仍有效，请逐词处理"
+                    return RestoredCandidateReply(
+                        response + "\n候选仍有效，请逐词处理", record=restored,
+                    )
         if not preserve_after_response:
             conversation_state_store.complete_execution(state_record)
         return _append_pending_ticket_challenge(response, conv_key)

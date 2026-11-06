@@ -26,6 +26,17 @@ class ReviewedSelectionReply(ServerBackedQueryReply):
         return reply
 
 
+class RestoredCandidateReply(ServerBackedQueryReply):
+    """A deterministic write receipt tied to its restored candidate ticket."""
+
+    def __new__(cls, text: str, *, record: Any):
+        reply = super().__new__(cls, text)
+        reply.state_snapshot = asdict(record.state)
+        reply.owner_key = record.owner_key
+        reply.nonce = record.nonce
+        return reply
+
+
 PENDING_CONFIRM_ADVERTISED_FORMS = ("确认",)
 PENDING_CONFIRM_ASSENT_TEXTS = frozenset({
     *PENDING_CONFIRM_ADVERTISED_FORMS,
