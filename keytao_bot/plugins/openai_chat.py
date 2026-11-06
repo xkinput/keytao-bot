@@ -3056,12 +3056,14 @@ def _prepare_user_facing_reply(
     pending_reminders = _chat_commands.pending_word_reminder_lines([
         item for receipt in own_deliveries if receipt.get("operationKind") == "pending_read"
         for item in receipt.get("pendingItems", [])
-        if isinstance(item, dict) and item.get("source") == "others_submitted"
+        if isinstance(item, dict)
     ])
+    pending_reminders = list(dict.fromkeys(render_platform_public_links(line, platform) for line in pending_reminders))
     if pending_reminders:
         reminder_prefixes = {line.rsplit("：", 1)[0] + "：" for line in pending_reminders}
         prepared = "\n".join(line for line in prepared.splitlines()
-                             if line not in pending_reminders and line not in reminder_prefixes)
+                             if render_platform_public_links(line, platform) not in pending_reminders
+                             and line not in reminder_prefixes)
     deliveries = [receipt for receipt in own_deliveries
                   if receipt.get("operationKind") in {"draft_write", "draft_submit"}
                   and receipt.get("batchId")]
@@ -4291,7 +4293,15 @@ async def _stage_prepare_fresh_code_selection(ctx: TurnContext) -> bool:
         # Live selection keeps its existing sealed, actor-bound executor.
         return False
     active = draft_operation_coordinator.get(ctx.conv_key)
-    if active is not None:
+    referenced_owner = _referenced_owner_key_from_reply_reference(ctx.reply_reference, ctx.platform)
+    if request.code.isdecimal() and ctx.reply_reference.is_to_bot and (
+        referenced_owner not in {None, (ctx.platform, str(ctx.user_id))}
+        or conversation_state_store.find_pending_for_other_owner(
+            ctx.space_key, ctx.conv_key, reply_message_id=ctx.reply_reference.message_id,
+        ) is not None
+    ):
+        ctx.response = "这条提议不是发给你的，本次未执行。"
+    elif active is not None:
         ctx.response = _format_active_draft_operation_message(active, active.pending_state)
     else:
         set_turn_flow("explicit-code")

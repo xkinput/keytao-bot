@@ -1424,6 +1424,8 @@ class MemoryConversationStateStore:
         self,
         space_key: Optional[SpaceKey],
         owner_key: ConversationKey,
+        *,
+        reply_message_id: object = None,
     ) -> Optional[PendingStateRecord]:
         """Return a pending state in the same space that belongs to another user."""
         if space_key is None:
@@ -1432,6 +1434,8 @@ class MemoryConversationStateStore:
         owner_address = normalize_conversation_key(owner_key, space_key)
         for record in self._records.values():
             if isinstance(record.state, PendingTrustedWordRecord):
+                continue
+            if reply_message_id is not None and _normalize_message_id(reply_message_id) not in record.origin_message_ids:
                 continue
             if record.space_key == space_key and record.owner_key != owner_address:
                 return record
