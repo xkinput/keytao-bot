@@ -709,8 +709,8 @@ def _pending_batch_front_insert_plan(
     scopes = state.args.get("_candidate_scopes")
     if not isinstance(items, list) or not isinstance(scopes, list):
         return None
-    items_by_word = {
-        str(item.get("word") or "").strip(): item
+    items_by_key = {
+        (str(item.get("word") or "").strip(), str(item.get("code") or "").strip().lower()): item
         for item in items
         if isinstance(item, dict) and str(item.get("word") or "").strip()
     }
@@ -727,7 +727,7 @@ def _pending_batch_front_insert_plan(
         )
         if recommendation is None:
             continue
-        item = items_by_word.get(word)
+        item = items_by_key.get((word, recommendation["occupantCode"]))
         if (
             not isinstance(item, dict)
             or str(item.get("code") or "").strip().lower()
@@ -14790,7 +14790,7 @@ async def handle_pending_message_core(
                         conversation_state_store.begin_execution(current)
                     return response + "\n这批词的候选编码暂时无法保存，请重新查询后再选择。"
                 if restored is not None and current is state_record:
-                    return response
+                    return response + "\n候选仍有效，请逐词处理"
         if not preserve_after_response:
             conversation_state_store.complete_execution(state_record)
         return _append_pending_ticket_challenge(response, conv_key)

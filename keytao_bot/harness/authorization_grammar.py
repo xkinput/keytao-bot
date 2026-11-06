@@ -3100,6 +3100,24 @@ def parse_reviewed_shift_words(
     return tuple(dict.fromkeys(words))
 
 
+_REVIEWED_SELECTION_ACTION_PATTERN = r"(?:只要|只|仅|就|光)?\s*(?:加入草稿并提交|加到草稿并提交|加入并提交|加入草稿|加到草稿|写入草稿|加入|添加|加词)"
+_REVIEWED_REST_PATTERN = (
+    r"(?:其他|其它|其余|剩下的?)(?:的)?(?:词)?(?:都|全)?(?:用|按|走)?"
+    r"(?:推荐|默认)(?:的|编码|的编码)?"
+)
+
+
+def parse_reviewed_rest_command(message: str) -> Optional[str]:
+    """Recognize a whole-ticket default request without granting write authority."""
+    source = str(message or "").strip().rstrip("。.").strip()
+    source = _whole_message_unquoted_source(source) or source
+    match = re.fullmatch(
+        rf"{_REVIEWED_REST_PATTERN}(?:(?:[ \t]*[，,][ \t]*|[ \t]+)"
+        rf"(?P<action>{_REVIEWED_SELECTION_ACTION_PATTERN}))?", source,
+    )
+    return (match.group("action") or "加入") if match is not None else None
+
+
 def parse_reviewed_selection_command(
     message: str, *, known_shift_words: Tuple[str, ...] = (),
 ) -> Optional[ReviewedSelectionCommand]:
@@ -3110,7 +3128,7 @@ def parse_reviewed_selection_command(
         source = unquoted
     if not source or len(source) > 4096:
         return None
-    action_pattern = r"(?:只要|只|仅|就|光)?\s*(?:加入草稿并提交|加到草稿并提交|加入并提交|加入草稿|加到草稿|写入草稿|加入|添加|加词)"
+    action_pattern = _REVIEWED_SELECTION_ACTION_PATTERN
     separator = r"(?:[ \t]*[，、,；;][ \t]*|[ \t]+)"
     action = ""
     leading = re.fullmatch(rf"(?P<action>{action_pattern}){separator}(?P<body>.+)", source)
@@ -3120,8 +3138,7 @@ def parse_reviewed_selection_command(
         action, source = match.group("action"), match.group("body")
     rest = re.fullmatch(
         r"(?P<body>.+?)(?:[ \t]*[，,][ \t]*|[ \t]+)"
-        r"(?:其他|其它|其余|剩下的?)(?:的)?(?:词)?(?:都|全)?(?:用|按|走)?"
-        r"(?:推荐|默认)(?:的|编码|的编码)?", source,
+        + _REVIEWED_REST_PATTERN, source,
     )
     if rest is not None:
         source = rest.group("body")

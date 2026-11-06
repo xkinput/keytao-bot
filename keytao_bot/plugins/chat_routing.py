@@ -39,6 +39,7 @@ from ..harness.authorization_grammar import (
     parse_eviction_modified_add,
     parse_pending_positional_add,
     parse_replace_at_code,
+    parse_reviewed_rest_command,
     parse_reviewed_selection_command,
 )
 from ..harness.tools import (
@@ -2050,6 +2051,9 @@ def _resolve_reviewed_multi_word_selection(
         source = unquoted
     if is_interrogative_message(source):
         return None, None, None
+    rest_action = parse_reviewed_rest_command(source)
+    if rest_action is not None and scopes:
+        return state, _pending_tool_assent_intent(state, rest_action), None
     known_shift_words = tuple(
         occupant
         for scope in state.args["_candidate_scopes"]

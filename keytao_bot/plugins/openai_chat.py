@@ -4769,9 +4769,14 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
             and record.state.args.get("_reviewed_multi_word") is True
             and record.state.confirmation_source == "local_preview"
             and parse_pending_candidate_selection(_strip_command_message_prefixes(message)) is None
-            and _authorization_grammar.parse_reviewed_selection_command(
-                _strip_command_message_prefixes(message)
-            ) is not None
+            and (
+                _authorization_grammar.parse_reviewed_selection_command(
+                    _strip_command_message_prefixes(message)
+                ) is not None
+                or _authorization_grammar.parse_reviewed_rest_command(
+                    _strip_command_message_prefixes(message)
+                ) is not None
+            )
         ):
             derived, intent, error = _resolve_multi_word_pending_candidate_selection(record.state, message)
             closed_reviewed_selection = derived is not None and intent is not None and not error
@@ -4867,7 +4872,8 @@ async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: 
     """A closed answer without an actor-owned ticket never reaches a model."""
     cancel = parse_pending_assent_phrase(ctx.normalized_message_text).cancel_requested
     source = _strip_command_message_prefixes(ctx.normalized_message_text).strip()
-    confirm = understood_confirm or re.fullmatch(
+    rest_action = _authorization_grammar.parse_reviewed_rest_command(source)
+    confirm = understood_confirm or rest_action is not None or re.fullmatch(
         r"(?:(?:请)?(?:确认|执行)(?:吧)?|好的?\s*[,，]?\s*执行(?:吧)?)"
         r"(?:[,，]\s*不要复读我的话)?[。.!！]?", source,
     ) is not None
@@ -4899,7 +4905,7 @@ async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: 
             pass
     if not addressed:
         return False
-    if confirm and not _chat_commands.SEMANTIC_ROUTE_OPS.intersection(
+    if confirm and rest_action is None and not _chat_commands.SEMANTIC_ROUTE_OPS.intersection(
         token.strip() for token in os.getenv("KEYTAO_SEMANTIC_ROUTE_OPS", "").split(",")
     ):
         # Legacy routing retains its original stale-command recovery guidance.
@@ -5063,7 +5069,10 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                 remember_conversation(ctx.conv_key, ctx.memory_context, message, response)
                 await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment)
                 return True
-        if validated.op == "confirm" and validated.frame == "direct" and await _try_stale_affirmative_reply(
+        if validated.op == "confirm" and (
+            validated.frame == "direct"
+            or isinstance(pending_decision, dict) and pending_decision.get("refers_to_pending") is True
+        ) and await _try_stale_affirmative_reply(
             ctx, understood_confirm=True,
         ):
             return True

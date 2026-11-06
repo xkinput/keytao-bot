@@ -6164,8 +6164,8 @@ async def keytao_shift_phrase_code(
     if additional_items is not None:
         if not isinstance(additional_items, list) or len(additional_items) > 20:
             return {"success": False, "message": "同批附加词条集合无效"}
-        seen_companion_words: set[str] = set()
         seen_companion_keys: set[Tuple[str, str]] = set()
+        seen_companion_codes = {target_code, *(item["code"] for item in multi_shift_items)}
         for raw_item in additional_items:
             if not isinstance(raw_item, dict):
                 return {"success": False, "message": "同批附加词条集合无效"}
@@ -6184,11 +6184,8 @@ async def keytao_shift_phrase_code(
                         or companion_code not in trusted_reviewed_code_set
                     )
                 )
-                or (
-                    companion_word != word
-                    and companion_word in seen_companion_words
-                )
                 or (companion_word, companion_code) in seen_companion_keys
+                or companion_code in seen_companion_codes
                 or re.fullmatch(r"[a-z]{1,12}", companion_code) is None
                 or companion_type not in PHRASE_TYPE_BASE_WEIGHTS
                 or not isinstance(needs_manual_review, bool)
@@ -6213,8 +6210,8 @@ async def keytao_shift_phrase_code(
                 companion_item["_reviewed_pinyin"] = companion_pinyin
                 companion_item["_reviewed_candidate_codes"] = companion_codes
             companion_items.append(companion_item)
-            seen_companion_words.add(companion_word)
             seen_companion_keys.add((companion_word, companion_code))
+            seen_companion_codes.add(companion_code)
 
     if ordered_words is not None:
         if companion_items or multi_shift_items:
@@ -6801,7 +6798,7 @@ async def keytao_shift_phrase_code(
                 for item in code_phrase_map.get(requested_target_code, [])
                 if str(item.get("word") or "").strip()
             )
-            if not expected or actual != expected:
+            if actual != expected:
                 return {
                     "success": False,
                     "message": (
