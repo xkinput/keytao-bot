@@ -22,6 +22,7 @@ from ..harness.conversation import (
     normalize_conversation_key,
 )
 from ..harness.authorization_grammar import (
+    DISPLACEMENT_VERBS,
     _NEGATIVE_MODAL_RE,
     _PHRASE_TYPE_BASE_WEIGHTS,
     _POSITIONAL_REPORTED_CONTEXT_RE,
@@ -10374,6 +10375,8 @@ async def try_handle_bare_word_code(message, platform, user_id, conv_key, space_
     if match is None:
         return None
     word, code = match.groups()
+    if word in DISPLACEMENT_VERBS:
+        return None
     word = word.strip('「」“”"')
     if existing_only:
         data = json.loads(await call_tool_function("keytao_lookup_by_word", {"word": word}, platform, user_id))
@@ -14196,6 +14199,8 @@ def fresh_entry_code_selection(message: str) -> Optional[ExplicitEntryCodeReques
     if pairs is None or len(pairs) != 1:
         return None
     word, code = pairs[0]
+    if word in DISPLACEMENT_VERBS:
+        return None
     if code.isdecimal():
         return ExplicitEntryCodeRequest(word, code)
     if (

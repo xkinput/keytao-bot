@@ -26,6 +26,8 @@ class ExplicitEntryCodeRequest:
 
 def parse_explicit_entry_code_request(message: str):
     """Bind a complete add-code command to its explicitly named item."""
+    from ..harness.authorization_grammar import DISPLACEMENT_VERBS
+
     source = unicodedata.normalize("NFKC", message).strip().rstrip("。.!！").strip()
     if re.match(r"加入\s*编码", source):
         return None
@@ -55,7 +57,8 @@ def parse_explicit_entry_code_request(message: str):
         selected_word = combined.group("word").strip(' "“”「」『』')
         selected_code = combined.group("code").strip(' "“”「」『』')
         if (
-            selected_code.isdecimal()
+            re.search(r"[A-Za-z]", selected_code) is None
+            or combined.group("word") in DISPLACEMENT_VERBS
             or not looks_like_lexical_review_target(selected_word)
             or re.match(r"^(?:请)?(?:先|暂时|暂)?" + _NEGATIVE_MODAL_RE.pattern, selected_word)
             or _POSITIONAL_REPORTED_CONTEXT_RE.match(selected_word)
@@ -82,7 +85,7 @@ def parse_explicit_entry_code_request(message: str):
             continue
         selected_word = match.group("word").strip(' "“”「」『』')
         selected_code = match.group("code").strip(' "“”「」『』')
-        if selected_code.isdecimal():
+        if re.search(r"[A-Za-z]", selected_code) is None or match.group("word") in DISPLACEMENT_VERBS:
             return None
         if match.groupdict().get("type") == "单字" and len(selected_word) != 1:
             return None

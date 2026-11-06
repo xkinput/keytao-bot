@@ -4965,10 +4965,89 @@ async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: 
     return await _stage_claim_offered_answer(ctx, stale_affirmative=True)
 
 
+async def _try_stale_displacement_reply(ctx: TurnContext) -> bool:
+    """Keep consumed displacement replies out of lexical add discovery."""
+    source = _strip_command_message_prefixes(ctx.normalized_message_text).strip()
+    if re.fullmatch(r"(?:顶替|顶掉|挤掉|替换)\s*[a-z]{1,12}\s*(?:为|成)\s*.+", source, re.IGNORECASE):
+        return False
+    displacement = re.fullmatch(
+        r"(?:加入(?:并提交)?\s*[,，]?\s*)?(?:顶替|顶掉|挤掉|替换)\s+"
+        r"(?P<occupant>[\u3400-\u9fffA-Za-z][\u3400-\u9fffA-Za-z0-9_-]{0,31})[。.!！]?", source,
+    )
+    numbered_shift = re.fullmatch(r"(?:换\s*)?[1-9]\d{0,2}\s*[,，]?\s*顺延[。.!！]?", source)
+    if (ctx.conv_key is None or not (displacement or numbered_shift)
+            or not ctx.reply_reference.is_reply or not ctx.reply_reference.is_to_bot):
+        return False
+    referenced_owner = _referenced_owner_key_from_reply_reference(ctx.reply_reference, ctx.platform)
+    foreign = ctx.reply_reference.is_to_bot and (
+        referenced_owner not in {None, (ctx.platform, str(ctx.user_id))}
+        or conversation_state_store.find_pending_for_other_owner(
+            ctx.space_key, ctx.conv_key, reply_message_id=ctx.reply_reference.message_id,
+        ) is not None
+    )
+    record = conversation_state_store.get_record(ctx.conv_key)
+    recent_write = bool(record and isinstance(record.state, PendingToolConfirm)
+                        and record.state.function_name == "keytao_submit_batch"
+                        and record.state.args.get("_recent_own_write") is True)
+    if foreign:
+        response = "这条提议不是发给你的，本次未执行。"
+    elif (record is not None and not recent_write) or numbered_shift or draft_operation_coordinator.get(ctx.conv_key):
+        return False
+    else:
+        response = "当前没有待确认的操作。"
+        if ctx.reply_reference.is_reply and ctx.reply_reference.is_to_bot:
+            occupant = displacement["occupant"]
+            quoted = ctx.reply_reference.text
+            candidate = _parse_pending_add_word(quoted)
+            comparison = re.search(rf"「{re.escape(occupant)}」不弱于「([^」\n]+)」", quoted)
+            word = (candidate.word if candidate else advertised_single_word_lookup_word(quoted))
+            if not word and comparison:
+                word = comparison[1]
+            if word and word != occupant:
+                occupied_codes = set(re.findall(
+                    rf"(?m)^\s*\d+\.\s*([a-z]+)\s*[-—–]\s*已有「{re.escape(occupant)}」", quoted,
+                ))
+                if not occupied_codes and comparison:
+                    occupied_codes = set(re.findall(r"加入编码\s+([a-z]+)\+形码", quoted))
+                try:
+                    draft = json.loads(await call_tool_function(
+                        "keytao_list_draft_items", {}, ctx.platform, ctx.user_id,
+                    ))
+                except (TypeError, ValueError):
+                    draft = {}
+                items = []
+                if (isinstance(draft, dict) and draft.get("success") is True
+                        and draft.get("batchStatus", draft.get("status", "Draft")) == "Draft"
+                        and isinstance(draft.get("items"), list)
+                        and draft.get("count") == len(draft["items"]) and not draft.get("itemsTruncationNotice")):
+                    items = _chat_commands.trusted_pending_word_items([
+                        {**row, "source": "draft", "batchStatus": "Draft",
+                         "batchId": draft.get("batchId"), "batchUrl": draft.get("batchUrl")}
+                        for row in draft["items"] if isinstance(row, dict)
+                    ])
+                for item in items:
+                    if item["word"] != word or item["action"] != "Create" or item["code"] not in occupied_codes:
+                        continue
+                    shifted = [row for row in items if row["source"] == "draft"
+                               and row["batchId"] == item["batchId"] and row["word"] == occupant
+                               and row["type"] == item["type"]]
+                    if (any(row["action"] == "Delete" and row["code"] == item["code"] for row in shifted)
+                            and any(row["action"] == "Create" and row["code"] != item["code"] for row in shifted)):
+                        response = _chat_commands.prepend_pending_word_reminders("", [item], words=(word,))
+                        break
+    ctx.response = response
+    ctx.operation_understood_early = True
+    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, response)
+    await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment)
+    return True
+
+
 async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     """Await enabled routing before command stages; retain the legacy shadow slot."""
     if ctx.operation_understood_early:
         return False
+    if await _try_stale_displacement_reply(ctx):
+        return True
     if await _try_stale_affirmative_reply(ctx):
         return True
     if await _try_bound_pending_reply(ctx):

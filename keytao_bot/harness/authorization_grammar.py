@@ -14,6 +14,8 @@ from keytao_bot.utils.pending_confirmation import (
     render_remediation_reply,
 )
 
+DISPLACEMENT_VERBS = frozenset({"顶替", "顶掉", "挤掉", "替换"})
+
 _DELETE_INTENT_RE = re.compile(
     r"删除|删掉|删了|删干净|去掉|移除|撤销|清空|清理|全部删|都删"
 )
@@ -517,13 +519,16 @@ def _parse_complete_add_clause(clause: str) -> Optional[_AuthorizedAddClause]:
         remainder,
     )
     if natural_code_first is not None:
+        if natural_code_first.group("word") in DISPLACEMENT_VERBS:
+            return None
         return _AuthorizedAddClause(
             word=natural_code_first.group("word"),
             code=natural_code_first.group("code").lower(),
         )
 
     word = ""
-    if remainder[0] in "「“‘\"'":
+    quoted_word = remainder[0] in "「“‘\"'"
+    if quoted_word:
         closing = {"「": "」", "“": "”", "‘": "’", '"': '"', "'": "'"}[
             remainder[0]
         ]
@@ -576,7 +581,7 @@ def _parse_complete_add_clause(clause: str) -> Optional[_AuthorizedAddClause]:
         "",
         remainder,
     ).strip()
-    if remainder:
+    if remainder or (code and not quoted_word and word in DISPLACEMENT_VERBS):
         return None
     return _AuthorizedAddClause(word=word, code=code)
 

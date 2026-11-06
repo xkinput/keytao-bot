@@ -1631,6 +1631,17 @@ def _structural_pending_add_word_intent(
                 intent="pending_recode", confidence=1.0,
                 requested_code=codes[0], target_word=occupant,
             )
+    numbered_shift = re.fullmatch(r"(?:换\s*)?([1-9]\d{0,2})\s*[,，]?\s*顺延", stripped)
+    if numbered_shift is not None and state.server_candidates == state.candidates:
+        index = int(numbered_shift[1])
+        if 1 <= index <= len(state.server_candidates):
+            code, occupied = state.server_candidates[index - 1]
+            occupants = state.server_occupied_words.get(code, [])
+            if occupied and len(occupants) == 1:
+                return MessageCommandIntent(
+                    intent="pending_recode", confidence=1.0, choice_index=index,
+                    requested_code=code, target_word=occupants[0],
+                )
     explicit = parse_explicit_code_request(stripped, state.word)
     if explicit is not None and validate_explicit_code(state, explicit.code, explicit.pinyin).valid:
         return MessageCommandIntent(
