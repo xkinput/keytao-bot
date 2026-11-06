@@ -99,8 +99,10 @@ class ReceiptFinalizerTests(unittest.TestCase):
                               "items": [pr(91, "未写词", "wxc")]}}
         changes = self.assert_exact_created_coverage(data, ("沃集鲜",), 1)
         self.assertEqual(changes[0].word, "沃集鲜")
-        final = render.finalize_draft_receipt("✅ 操作已完成\n已变更：未写词 → wxc、旧草稿词 → jcgc", data)
-        self.assertIn("沃集鲜 → wjxa", final)
+        final = render.finalize_draft_receipt(
+            "✅ 操作已完成\n已变更：未写词 → wxc、旧草稿词 → jcgc\n草稿内容：沃集鲜 wjxa", data,
+        )
+        self.assertIn("草稿内容：沃集鲜 wjxa", final)
         self.assertNotIn("旧草稿词", final)
         self.assertNotIn("未写词", final)
 

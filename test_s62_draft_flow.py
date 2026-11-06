@@ -267,7 +267,7 @@ class DraftFlowTests(unittest.IsolatedAsyncioTestCase):
         with self.runtime():
             response = await commands._execute_confirmed_tool(selected, "qq", self.key.actor_id, self.key)
             delivered = chat._prepare_user_facing_reply(response, self.memory)
-        self.assertIn("已变更：加亮 → jslxa", delivered)
+        self.assertIn("草稿内容：加亮 jslxa", delivered)
         self.assertNotIn("未新增变更", delivered)
         self.assertNotIn("排列以上词的使用频率", delivered)
 

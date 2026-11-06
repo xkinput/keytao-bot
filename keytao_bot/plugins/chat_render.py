@@ -1949,6 +1949,17 @@ def finalize_draft_receipt(
         delta = merge_receipt_deltas([source for source in reversed(sources) if isinstance(source, dict)])
         delta["noWrite"] = all(source.get("noWrite") for source in deltas)
         lines = receipt_change_lines(delta, requested_words)
+        draft_contents = [
+            set(re.sub(r" 等 \d+ 条$", "", line.removeprefix("草稿内容：")).split("、"))
+            for line in text.splitlines() if line.startswith("草稿内容：")
+        ]
+        if delta["writtenItems"] and not delta["updatedItems"] and all(
+            item.get("action") == "Create" for item in delta["writtenItems"]
+        ) and any(
+            all(f"{item.get('word')} {item.get('code')}" in pairs for item in delta["writtenItems"])
+            for pairs in draft_contents
+        ):
+            lines = [line for line in lines if not line.startswith("已变更：")]
         body = [line for line in text.splitlines() if not line.startswith(("已变更：", "未新增变更：", "发布状态："))]
         new_lines = [line for line in lines if line not in body]
         insert_at = 1 if body else 0

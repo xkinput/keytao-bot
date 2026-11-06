@@ -1406,6 +1406,7 @@ def render_server_backed_batch_candidates(
         display_items = {word: (code, needs_review) for word, code, needs_review in normalized_items}
         lines = [f"{len(scopes_by_word)} 个词的候选："]
         selections: list[tuple[str, str]] = []
+        multi_code_example = ""
         for index, word in enumerate(scopes_by_word, start=1):
             recommended_code, _needs_review = display_items.get(word, ("", True))
             scope = reviewed_scopes_by_word[word]
@@ -1437,6 +1438,20 @@ def render_server_backed_batch_candidates(
                 if code == recommended_code
             )
             selections.append((word, str(selected_index)))
+            if not multi_code_example:
+                other_recommendations = {code for other, (code, _) in display_items.items() if other != word}
+                empty_indices = [
+                    candidate_index
+                    for candidate_index, (code, occupied) in enumerate(scopes_by_word[word], start=1)
+                    if not occupied and code not in other_recommendations
+                    and not protected_candidate_occupants(
+                        word, code, scopes_by_word[word], occupied_words_by_scope[word],
+                        ordering_assessments_by_scope[word],
+                    )
+                ]
+                next_index = next((index for index in empty_indices if index > selected_index), None)
+                if selected_index in empty_indices and next_index is not None:
+                    multi_code_example = f"{word} {selected_index} {next_index}，其他用推荐的 加入并提交"
         if include_controls and selections:
             from keytao_bot.harness.authorization_grammar import (
                 parse_reviewed_multi_word_selection,
@@ -1451,6 +1466,8 @@ def render_server_backed_batch_candidates(
             lines.append("按词选择（词名加空格，再写编号或编码；多词用逗号分隔）：")
             lines.append(render_executable_suggestion(selection_command))
             lines.append("可只写其中部分词；选择后即加入草稿，提交需明确回复提交指令。")
+            if multi_code_example:
+                lines.append(f"同一词可选多个编码、其余词用推荐：如「{multi_code_example}」")
             combined_command = selection_command + "，加入并提交"
             if parse_reviewed_multi_word_selection(combined_command) != tuple(selections):
                 return ""
@@ -2379,7 +2396,7 @@ _COMMAND_SUGGESTION_LEAD_RE = re.compile(
     r"(?:确认执行)?请发|请发送|请按以下命令(?:逐条)?发送|"
     r"请按(?:下面|以下)格式(?:重发|发送)|发送下面|直接回复|"
     # The actor noun is not an instruction introducing a later quoted operation.
-    r"可以改为|比如|例如|回复|发送(?!者)"
+    r"可以改为|比如|例如|回复|发送(?!者)|同一词可选多个编码、其余词用推荐：如"
 )
 _REPORTED_QUOTED_COMMAND_PREFIX_RE = re.compile(
     r"(?:刚才发送了|上一条回复提到了)\s*$"
