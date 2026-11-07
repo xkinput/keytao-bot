@@ -17,23 +17,22 @@
 
 ```
 keytao-bot/
-├── bot.py                 # 入口文件
-├── pyproject.toml         # 项目配置和依赖
-├── .env.dev              # 开发环境配置
-├── .env.prod             # 生产环境配置
-├── .env.example          # 配置模板
-├── test_skills.py        # Skills 系统测试
-└── keytao_bot/
-    ├── __init__.py
-    ├── plugins/          # 插件目录
-    │   ├── __init__.py
-    │   └── openai_chat.py    # OpenAI 兼容 AI 聊天插件
-    └── skills/           # AI Skills (Function Calling)
-        ├── __init__.py       # Skills Manager
-        ├── README.md         # Skills 开发文档
-        └── keytao-lookup/    # 键道查词 skill
-            ├── SKILL.md      # Skill 说明
-            └── tools.py      # 工具实现
+├── bot.py                 # Bot entry point
+├── keytao_bot/
+│   ├── plugins/           # Platform adapters and chat pipeline
+│   ├── harness/           # Conversation state and authorization
+│   ├── skills/            # Skill definitions and tools
+│   └── utils/             # Shared services and storage
+├── scripts/               # Offline data builders and diagnostics
+├── e2e/                   # End-to-end scenarios and safety checks
+├── eval/routing/          # Routing fixtures and replay tools
+├── tests/                 # Unit and regression suites
+├── vendor/                # Bundled reference sources and licenses
+├── data/                  # Local runtime databases
+├── Dockerfile             # Container entry point
+├── docker-compose.yml     # Bot and QQ client services
+├── pyproject.toml         # Project configuration and dependencies
+└── CHANGELOG.md           # User-visible changes and incident conclusions
 ```
 
 ## 🚀 快速开始
@@ -232,7 +231,7 @@ AI 会根据对话内容自动识别需求并调用相应工具（Function Calli
 运行测试脚本验证 skills 是否正常工作：
 
 ```bash
-python3 test_skills.py
+python3 tests/test_skills.py
 ```
 
 ### 测试机器人
@@ -334,9 +333,8 @@ ai_chat = on_message(priority=99, block=True)
 
 **解决方法**：
 1. 检查 `OPENAI_API_KEY` 是否配置正确
-2. 运行测试脚本：`python test_openai.py`
-3. 查看详细日志：`LOG_LEVEL=DEBUG nb run`
-4. 检查你当前服务商的账户状态、配额和模型权限
+2. 查看详细日志：`LOG_LEVEL=DEBUG nb run`
+3. 检查你当前服务商的账户状态、配额和模型权限
 
 ### 如何切换模型
 
