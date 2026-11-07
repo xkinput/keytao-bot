@@ -1,5 +1,6 @@
 """Tool execution adapter for the agent harness."""
 import hashlib
+import inspect
 import json
 import re
 from dataclasses import dataclass
@@ -1332,7 +1333,18 @@ class ToolExecutor:
         tool_func = self._get_tool_function(tool_name)
         if not tool_func:
             return {"error": f"Tool {tool_name} not found"}
-        call_args = dict(arguments)
+        # Pending metadata is not an argument; declared private execution capabilities are.
+        parameters = set()
+        if any(key.startswith("_") for key in arguments):
+            signature = inspect.signature(tool_func)
+            parameters.update(signature.parameters)
+            if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+                parameters.update({
+                    "_reviewed_pinyin", "_reviewed_candidate_codes", "_pending_submitted_confirmed",
+                    "_allow_same_code", "_expected_occupants_by_code", "_source_code",
+                })
+        call_args = {key: value for key, value in arguments.items()
+                     if not key.startswith("_") or key in parameters}
         if tool_name in self._context_tools:
             if not context.platform or not context.user_id:
                 return {"error": "内部错误：无法获取用户平台信息"}

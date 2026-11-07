@@ -23,9 +23,11 @@ from ..harness.conversation import (
 )
 from ..harness.authorization_grammar import (
     DISPLACEMENT_VERBS,
+    EXPLICIT_ADD_FILLER_WORDS,
     _NEGATIVE_MODAL_RE,
     _PHRASE_TYPE_BASE_WEIGHTS,
     _POSITIONAL_REPORTED_CONTEXT_RE,
+    _QUESTION_RE,
     dictionary_recode_items_match,
     explicit_same_code_requested,
     explicit_complete_add_item,
@@ -87,6 +89,7 @@ from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
+    ADD_OPERATION_VERB_FORMS,
     RestoredCandidateReply,
     ServerBackedQueryReply,
     already_existing_word_copy,
@@ -9857,6 +9860,138 @@ async def _try_handle_dictionary_delete_command(
         space_key,
         owner_label,
     )
+
+
+def parse_reviewed_displacement(
+    message: str, *, known_words: Tuple[str, ...] = (),
+) -> Optional[Tuple[str, str, str]]:
+    """Recognize a closed replacement without inventing its candidate code."""
+    source = _strip_command_message_prefixes(trusted_mutation_source(message)).strip().rstrip("。.!！")
+    if (
+        _NEGATIVE_MODAL_RE.search(source) or _POSITIONAL_REPORTED_CONTEXT_RE.search(source)
+        or _QUESTION_RE.search(source) or re.match(r"^(?:(?:能|可以)\s*用|请问)", source)
+    ):
+        return None
+    word = r'[\u3400-\u9fff]{1,20}'
+    operand = rf'(?:「{word}」|“{word}”|『{word}』|"{word}"|{word})'
+    verb = r'(?:替代|取代|顶替|替换|换掉)'
+    patterns = (
+        rf'(?P<use>用(?=\s|[「“『"]))?\s*(?P<word>{operand})(?P<before_verb>\s*)'
+        rf'{verb}(?P<after_verb>\s*)(?P<occupant>{operand})',
+        rf'(?P<word>{operand})\s+(?P<selector>[1-9][0-9]{{0,2}})\s*[,，]?\s*'
+        rf'(?:顺延|{verb})\s*(?P<occupant>{operand})',
+        rf'(?:添加|加入)\s*(?P<word>{operand})\s*(?P<selector>[a-z]{{1,6}})\s*[,，]\s*'
+        rf'{verb}\s*(?P<occupant>{operand})',
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, source)
+        if match is not None:
+            target = match["word"].strip('「」“”『』"')
+            occupant = match["occupant"].strip('「」“”『』"')
+            if (
+                match.groupdict().get("before_verb") and not match.groupdict().get("after_verb")
+                and match["word"] == target and match["occupant"] == occupant
+            ):
+                # Separated bare operands need a boundary after the verb too.
+                return None
+            if match["word"] == target and target.startswith("用") and not match.groupdict().get("use"):
+                # A glued prefix needs a reviewed word boundary; never guess from Han shape.
+                if target not in known_words:
+                    if target[1:] not in known_words:
+                        return None
+                    target = target[1:]
+            if any(
+                not looks_like_lexical_review_target(value)
+                or (raw[0] not in '「“『"' and (value in ADD_OPERATION_VERB_FORMS or value in EXPLICIT_ADD_FILLER_WORDS))
+                for raw, value in ((match["word"], target), (match["occupant"], occupant))
+            ):
+                return None
+            if target != occupant:
+                return target, occupant, str(match.groupdict().get("selector") or "")
+    return None
+
+
+async def try_handle_reviewed_displacement(
+    command: Tuple[str, str, str], platform: str, user_id: str,
+    conv_key: ConversationKey, space_key: Optional[Tuple[str, str]], owner_label: str,
+) -> str:
+    """Resolve named consent against reviewed occupancy, then reuse exact replacement."""
+    word, occupant, selector = command
+    active = draft_operation_coordinator.find_for_actor((platform, user_id))
+    if active is not None:
+        return _active_operation_message_for_request(active, platform, user_id)
+    original = conversation_state_store.get_record(conv_key)
+    if original is not None and original.execution_id:
+        return "上一项操作仍在处理中，本次未执行。"
+    scopes = _mergeable_add_candidate_scopes(platform, user_id, conv_key, space_key)
+    matches = [scope for scope in scopes if scope.get("word") == word]
+    if not matches and not selector.isdecimal():
+        try:
+            review = json.loads(await call_tool_function(
+                "keytao_prepare_reviewed_add", {"word": word}, platform, user_id,
+            ))
+        except (TypeError, ValueError):
+            review = {}
+        inventory = select_candidate_inventory(review) if (
+            isinstance(review, dict) and review.get("success") is True and review.get("word") == word
+            and review.get("reviewDisposition") != "BLOCK" and not review.get("pronunciationUnresolved")
+        ) else None
+        if inventory is not None:
+            matches = [{"candidates": inventory.candidates, "occupiedWords": {
+                status["code"]: status["words"] for status in inventory.statuses
+            }}]
+    if len(matches) != 1:
+        return "当前没有可验证的可执行操作，本次未写入。"
+    scope = matches[0]
+    candidates = scope.get("candidates") or []
+    occupied = scope.get("occupiedWords") or {}
+    codes = [code for code, taken in candidates if taken and occupied.get(code) == [occupant]]
+    if selector.isdecimal():
+        index = int(selector) - 1
+        codes = [code for code in codes if 0 <= index < len(candidates) and candidates[index][0] == code]
+    elif selector:
+        codes = [code for code in codes if code == selector]
+    if len(codes) != 1:
+        return "当前没有可验证的可执行操作，本次未写入。"
+    code = codes[0]
+    receipt_start = len(current_draft_delivery_claims.get() or [])
+    response = await _try_handle_replace_at_code_command(
+        f"把 {code} 的「{occupant}」改成「{word}」",
+        MessageCommandIntent(intent="replace_at_code", confidence=1.0,
+                             keep_words=(occupant, word), requested_code=code),
+        platform, user_id, space_key, owner_label,
+    )
+    current = conversation_state_store.get_record(conv_key)
+    written = any(
+        receipt.get("platform") == platform and receipt.get("platformId") == str(user_id)
+        for receipt in (current_draft_delivery_claims.get() or [])[receipt_start:]
+    )
+    if (
+        not written
+        and draft_operation_coordinator.find_for_actor((platform, user_id)) is None
+        and (current is None or isinstance(current.state, PendingAddWord))
+    ):
+        if original is not None:
+            conversation_state_store.put_back(original)
+        elif current is not None:
+            conversation_state_store.complete_execution(current)
+    if (
+        original is not None and isinstance(original.state, PendingToolConfirm)
+        and original.state.args.get("_reviewed_multi_word") is True
+        and current is not None and current is not original
+        and isinstance(current.state, PendingToolConfirm)
+        and current.state.confirmation_source == "server_warning"
+    ):
+        origin = dict(current.state.args.get("_candidate_origin") or {})
+        origin["remainder"] = {"args": original.state.args, **{
+            field: getattr(original, field) for field in (
+                "origin_message_id", "origin_prompt_digest", "nonce", "created_at", "expires_at",
+            )
+        }}
+        conversation_state_store.put_back(replace(current, state=replace(
+            current.state, args={**current.state.args, "_candidate_origin": origin},
+        )))
+    return response or "当前没有可验证的可执行操作，本次未写入。"
 
 
 async def _try_handle_replace_at_code_command(

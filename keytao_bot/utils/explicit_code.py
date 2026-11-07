@@ -26,7 +26,7 @@ class ExplicitEntryCodeRequest:
 
 def parse_explicit_entry_code_request(message: str):
     """Bind a complete add-code command to its explicitly named item."""
-    from ..harness.authorization_grammar import DISPLACEMENT_VERBS
+    from ..harness.authorization_grammar import DISPLACEMENT_VERBS, EXPLICIT_ADD_FILLER_WORDS
 
     source = unicodedata.normalize("NFKC", message).strip().rstrip("。.!！").strip()
     if re.match(r"加入\s*编码", source):
@@ -59,6 +59,7 @@ def parse_explicit_entry_code_request(message: str):
         if (
             re.search(r"[A-Za-z]", selected_code) is None
             or combined.group("word") in DISPLACEMENT_VERBS
+            or selected_word in EXPLICIT_ADD_FILLER_WORDS
             or not looks_like_lexical_review_target(selected_word)
             or re.match(r"^(?:请)?(?:先|暂时|暂)?" + _NEGATIVE_MODAL_RE.pattern, selected_word)
             or _POSITIONAL_REPORTED_CONTEXT_RE.match(selected_word)
@@ -85,7 +86,11 @@ def parse_explicit_entry_code_request(message: str):
             continue
         selected_word = match.group("word").strip(' "“”「」『』')
         selected_code = match.group("code").strip(' "“”「」『』')
-        if re.search(r"[A-Za-z]", selected_code) is None or match.group("word") in DISPLACEMENT_VERBS:
+        if (
+            re.search(r"[A-Za-z]", selected_code) is None
+            or match.group("word") in DISPLACEMENT_VERBS
+            or selected_word in EXPLICIT_ADD_FILLER_WORDS
+        ):
             return None
         if match.groupdict().get("type") == "单字" and len(selected_word) != 1:
             return None
@@ -112,14 +117,16 @@ def parse_explicit_code_request(message: str, word: str):
     if entry is not None:
         return ExplicitCodeRequest(entry.code, entry.submit_after, entry.pinyin) if entry.word == word else None
     match = re.fullmatch(
-        rf"(?:加入\s*编码\s*|加入\s+|添加\s+{re.escape(word)}\s+|用\s+)"
+        rf"(?:加入\s*编码\s*|加\s*编码\s*|再\s*加\s*(?:一个\s*)?|"
+        rf"加入\s+|添加\s+{re.escape(word)}\s+|用\s+)"
         r"(?P<code>[^\s，,；;。？?「」“”]+?)(?:\s*(?P<submit>并提交))?",
         message.strip(),
     )
     if match is None:
         return None
     if match.group("code").isdigit() and not re.match(
-        rf"(?:加入\s*编码|添加\s+{re.escape(word)}\s+)", message.strip(),
+        rf"(?:加入\s*编码|加\s*编码|再\s*加\s*(?:一个\s*)?|添加\s+{re.escape(word)}\s+)",
+        message.strip(),
     ):
         return None
     return ExplicitCodeRequest(match.group("code"), bool(match.group("submit")))

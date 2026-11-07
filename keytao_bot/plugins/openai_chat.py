@@ -4860,6 +4860,13 @@ async def _try_bound_pending_reply(ctx: TurnContext) -> bool:
         ):
             return unbound_answer()
         prompt = latest
+    if (
+        not cancel_control and isinstance(state, PendingToolConfirm)
+        and state.function_name == "keytao_submit_batch"
+        and state.args.get("_recent_own_write") is True
+    ):
+        # The recent-write handler seals and submits the exact receipt snapshot.
+        return False
     from ..harness.operation_request import OperationRequest
 
     request = OperationRequest(op="cancel" if cancel_control else "confirm", frame="direct", refers_to_pending=True)
@@ -5042,10 +5049,89 @@ async def _try_stale_displacement_reply(ctx: TurnContext) -> bool:
     return True
 
 
+async def _try_reviewed_operand_reply(ctx: TurnContext) -> bool:
+    """Bind omitted codes or words before semantic fallback can replace their target."""
+    from ..utils.explicit_code import parse_explicit_code_request
+
+    message = _strip_command_message_prefixes(ctx.normalized_message_text)
+    known_words = tuple(
+        scope["word"] for scope in _chat_commands._mergeable_add_candidate_scopes(
+            ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key,
+        )
+    ) if ctx.conv_key is not None and message.startswith("用") else ()
+    displacement = _chat_commands.parse_reviewed_displacement(message, known_words=known_words)
+    explicit = parse_explicit_code_request(message, "") if re.match(
+        r"(?:再\s*加|(?:加入|加)\s*编码)", message,
+    ) else None
+    if ctx.conv_key is None or (displacement is None and explicit is None):
+        return False
+    set_turn_flow("pending-confirmation" if explicit is not None else "draft-op")
+    quoted_words = set(re.findall(
+        r"(?m)^(?:词库暂无收录)?「([\u3400-\u9fff]{1,20})」(?:已在词库[（(]|候选编码[:：]|[:：])",
+        ctx.reply_reference.text,
+    ))
+    record = conversation_state_store.get_record(ctx.conv_key)
+    if (
+        explicit is not None and record is not None and isinstance(record.state, PendingToolConfirm)
+        and re.fullmatch(r"[a-z]{1,6}", explicit.code) is None
+    ):
+        return False
+    referenced_owner = _referenced_owner_key_from_reply_reference(ctx.reply_reference, ctx.platform)
+    foreign = ctx.reply_reference.is_to_bot and (
+        referenced_owner not in {None, (ctx.platform, str(ctx.user_id))}
+        or conversation_state_store.find_pending_for_other_owner(
+            ctx.space_key, ctx.conv_key, reply_message_id=ctx.reply_reference.message_id,
+            include_context_records=True,
+        ) is not None
+    )
+    if foreign:
+        response = "这条提议不是发给你的，本次未执行。"
+    elif draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is not None:
+        return False
+    elif displacement is not None:
+        if record is not None and ctx.reply_reference.is_reply and not _verified_pending_reply(ctx, record):
+            response = "这条回复未对应当前待确认操作；请引用当前候选消息后再回复。"
+        else:
+            response = await _chat_commands.try_handle_reviewed_displacement(
+                displacement, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+            )
+    elif (
+        record is not None and isinstance(record.state, (PendingAddWord, PendingTrustedWordRecord))
+        and _verified_pending_reply(ctx, record)
+    ):
+        response = await _chat_commands._execute_explicit_entry_code_request(
+            _chat_commands.ExplicitEntryCodeRequest(record.state.word, explicit.code, explicit.submit_after, explicit.pinyin),
+            message, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+        )
+    elif (
+        record is None and ctx.reply_reference.is_reply and ctx.reply_reference.is_to_bot
+        and len(quoted_words) == 1 and any(
+            row.get("role") == "assistant" and _prompt_capability_digest(str(row.get("content") or ""))
+            == _prompt_capability_digest(ctx.reply_reference.text)
+            for row in get_history(ctx.conv_key)
+        )
+    ):
+        response = await _chat_commands._execute_explicit_entry_code_request(
+            _chat_commands.ExplicitEntryCodeRequest(next(iter(quoted_words)), explicit.code, explicit.submit_after, explicit.pinyin),
+            message, ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key, ctx.owner_label,
+        )
+    else:
+        response = render_remediation_reply(
+            "当前没有待添加的候选，请先提供具体词条和编码；本次未写入", command="查看草稿",
+        )
+    ctx.operation_understood_early = True
+    ctx.response = response
+    remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, response)
+    await _finish_ai_chat_response(ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, response, ctx.QQMessageSegment)
+    return True
+
+
 async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     """Await enabled routing before command stages; retain the legacy shadow slot."""
     if ctx.operation_understood_early:
         return False
+    if await _try_reviewed_operand_reply(ctx):
+        return True
     if await _try_stale_displacement_reply(ctx):
         return True
     if await _try_stale_affirmative_reply(ctx):

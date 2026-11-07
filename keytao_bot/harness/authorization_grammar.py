@@ -15,6 +15,12 @@ from keytao_bot.utils.pending_confirmation import (
 )
 
 DISPLACEMENT_VERBS = frozenset({"顶替", "顶掉", "挤掉", "替换"})
+EXPLICIT_ADD_FILLER_WORDS = frozenset({
+    "一个", "个", "一条", "一项", "一下", "再", "再加", "编码", "代码", "码",
+    "一个编码", "一个码", "一个词", "一个词条",
+    "这个", "那个", "这些", "那些", "它", "它们", "这", "那", "这个词", "那个词",
+    "这个词条", "那个词条",
+})
 
 _DELETE_INTENT_RE = re.compile(
     r"删除|删掉|删了|删干净|去掉|移除|撤销|清空|清理|全部删|都删"
@@ -519,7 +525,7 @@ def _parse_complete_add_clause(clause: str) -> Optional[_AuthorizedAddClause]:
         remainder,
     )
     if natural_code_first is not None:
-        if natural_code_first.group("word") in DISPLACEMENT_VERBS:
+        if natural_code_first.group("word") in DISPLACEMENT_VERBS | EXPLICIT_ADD_FILLER_WORDS:
             return None
         return _AuthorizedAddClause(
             word=natural_code_first.group("word"),
@@ -546,6 +552,7 @@ def _parse_complete_add_clause(clause: str) -> Optional[_AuthorizedAddClause]:
 
     if (
         not word
+        or word in EXPLICIT_ADD_FILLER_WORDS
         or _MULTI_ADD_VERB_RE.fullmatch(word)
         or re.fullmatch(
             r"(?:并|并且|然后|再|同时|以及)?"
@@ -1033,6 +1040,12 @@ _DICTIONARY_DELETE_PATTERNS = (
         rf"[「“]?(?P<word>{_DICTIONARY_DELETE_WORD_PATTERN})[」”]?\s*"
         rf"@\s*(?P<code>{_POSITIONAL_REORDER_CODE_PATTERN})"
         r"(?:吧|啦|了)?$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"^{_COMMAND_PREFIX_PATTERN}(?:删除|删掉)(?:\s*[:：]\s*|\s+)"
+        r"(?!(?:(?:当前|这个|我的)?(?:草稿|批次|条目|词条)|全部|所有)(?:吧|啦|了)?$)"
+        rf"{_DICTIONARY_DELETE_WORD_TOKEN}$",
         re.IGNORECASE,
     ),
 )
