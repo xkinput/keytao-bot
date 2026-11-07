@@ -359,7 +359,7 @@ class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(remaining.created_at, record.created_at)
         self.assertEqual(remaining.expires_at, record.expires_at)
         self.assertEqual(remaining.expires_at - remaining.created_at, 14400)
-        self.assertIn("候选仍有效，请逐词处理", self.replay.last_response)
+        self.assertNotIn("候选仍有效，请逐词处理", self.replay.last_response)
         self.assertIn("未选择：" + "、".join("「" + word + "」" for word in rest), self.replay.last_response)
         await self.turn("其它的用默认编码")
         self.assertCountEqual(self.created(), [("马哲", "msqea"), ("马哲", "msfea")] + [

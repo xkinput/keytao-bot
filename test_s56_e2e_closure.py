@@ -57,7 +57,7 @@ class S56AdvertisedClosureTests(unittest.TestCase):
                 self.assertEqual(record.state.server_candidates, [("qx", True)])
                 contract = advertised_reply_contract(reply)
                 self.assertEqual(contract.batch_assent_forms, ())
-                self.assertEqual(contract.command_suggestions, ("添加 鎗 qx,挤掉 强", "添加 鎗 qx,顶替 强"))
+                self.assertEqual(contract.command_suggestions, ("添加 鎗 qx,顶替 强",))
                 self.assertTrue(chat._advertised_reply_matches_live_record(reply, record), reply)
                 for command in contract.command_suggestions:
                     parsed = parse_eviction_modified_add(command)

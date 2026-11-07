@@ -5054,12 +5054,16 @@ async def _try_reviewed_operand_reply(ctx: TurnContext) -> bool:
     from ..utils.explicit_code import parse_explicit_code_request
 
     message = _strip_command_message_prefixes(ctx.normalized_message_text)
-    known_words = tuple(
-        scope["word"] for scope in _chat_commands._mergeable_add_candidate_scopes(
-            ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key,
-        )
-    ) if ctx.conv_key is not None and message.startswith("用") else ()
-    displacement = _chat_commands.parse_reviewed_displacement(message, known_words=known_words)
+    scopes = _chat_commands._mergeable_add_candidate_scopes(
+        ctx.platform, ctx.user_id, ctx.conv_key, ctx.space_key,
+    ) if ctx.conv_key is not None else ()
+    displacement = _chat_commands.parse_reviewed_displacement(
+        message, known_words=tuple(scope["word"] for scope in scopes),
+        known_occupants={scope["word"]: tuple(
+            occupant for code, occupied in scope["candidates"] if occupied
+            for occupant in scope["occupiedWords"].get(code, ())
+        ) for scope in scopes},
+    )
     explicit = parse_explicit_code_request(message, "") if re.match(
         r"(?:再\s*加|(?:加入|加)\s*编码)", message,
     ) else None

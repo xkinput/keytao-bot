@@ -29,6 +29,11 @@ class ReviewedSelectionReply(ServerBackedQueryReply):
 class RestoredCandidateReply(ServerBackedQueryReply):
     """A deterministic write receipt tied to its restored candidate ticket."""
 
+    def __str__(self) -> str:
+        text = super().__str__()
+        # Stateful advertisements must retain their exact live-record provenance.
+        return self if advertised_reply_contract(text).requires_live_state else text
+
     def __new__(cls, text: str, *, record: Any):
         reply = super().__new__(cls, text)
         reply.state_snapshot = asdict(record.state)
@@ -1846,21 +1851,33 @@ def candidate_commonness_guard_copy(
     if include_controls:
         base_code = str(candidates[0][0]) if candidates else ""
         lines.append(f"当前候选没有空位；可指定形码后的完整编码，格式为：加入编码 {base_code}+形码（请替换形码部分）。")
-        explicit_choice = next((
-            (code, occupant) for code, occupant in protected
-            if occupied_words.get(code) in ([occupant], (occupant,))
-        ), None)
-        if explicit_choice is not None:
-            code, occupant = explicit_choice
+        choices = [
+            (str(code), occupants[0])
+            for code, occupied in candidates if occupied is True
+            for occupants in [occupied_words.get(code, ())]
+            if isinstance(occupants, (list, tuple)) and len(occupants) == 1
+            and occupants[0] and occupants[0] != normalized_word
+        ]
+        preferred = [
+            (code, occupant) for code, occupant in choices
+            if not any(
+                isinstance(item, dict) and item.get("newWord") == normalized_word
+                and item.get("occupantWord") == occupant and item.get("occupantCode") == code
+                and item.get("verdict") in {"behind_more_common", "close"}
+                for item in (assessments or [])
+            )
+        ]
+        unique_choices = {}
+        for code, occupant in preferred or choices:
+            unique_choices.setdefault(occupant, (code, occupant))
+        choices = list(unique_choices.values())[:2]
+        if choices:
             lines.append("若要顶替，请点名现有词条：")
-            lines.append(render_executable_suggestion(
-                f"添加 {normalized_word} {code}，挤掉 {occupant}",
-                words=(normalized_word, occupant),
-            ))
-            lines.append(render_executable_suggestion(
-                f"添加 {normalized_word} {code}，顶替 {occupant}",
-                words=(normalized_word, occupant),
-            ))
+            for code, occupant in choices:
+                lines.append(render_executable_suggestion(
+                    f"添加 {normalized_word} {code}，顶替 {occupant}",
+                    words=(normalized_word, occupant),
+                ))
         lines.append("回复「取消」。")
     return "\n".join(lines)
 

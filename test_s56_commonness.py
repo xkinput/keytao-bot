@@ -124,7 +124,7 @@ class S56CommonnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("回复「加入」", rendered)
         self.assertEqual(("qx",), advertised_single_word_lookup_codes(rendered))
         commands = advertised_command_suggestions(rendered)
-        self.assertEqual(("添加 鎗 qx，挤掉 强", "添加 鎗 qx，顶替 强"), commands)
+        self.assertEqual(("添加 鎗 qx，顶替 强",), commands)
         for command in commands:
             parsed = parse_eviction_modified_add(command)
             self.assertIsNotNone(parsed, command)

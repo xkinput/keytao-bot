@@ -24,6 +24,7 @@ from ..harness.conversation import (
 from ..harness.authorization_grammar import (
     DISPLACEMENT_VERBS,
     EXPLICIT_ADD_FILLER_WORDS,
+    _ACTION_TOKENS,
     _NEGATIVE_MODAL_RE,
     _PHRASE_TYPE_BASE_WEIGHTS,
     _POSITIONAL_REPORTED_CONTEXT_RE,
@@ -89,7 +90,6 @@ from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
-    ADD_OPERATION_VERB_FORMS,
     RestoredCandidateReply,
     ServerBackedQueryReply,
     already_existing_word_copy,
@@ -164,6 +164,7 @@ from .chat_routing import (
     KeepOnlyDraftCommand,
     MessageCommandIntent,
     _DIRECT_OWNER_PENDING_ADD_INTENTS,
+    _TRUSTED_WORD_ACTION_NAMES,
     _canonical_draft_management_command,
     _canonical_keep_only_command,
     _classify_message_command_intent,
@@ -6110,7 +6111,7 @@ def _prepend_resolved_advertised_words(
         if isinstance(unselected, list) and unselected else ""
     )
     skipped = state.args.get("_selection_skipped")
-    skipped_line = "\n".join(line if line.endswith("。") else line + "。" for line in skipped) + "\n" if isinstance(skipped, list) and skipped else ""
+    skipped_line = "\n".join(line if line.partition("\n")[0].endswith("。") else line + "。" for line in skipped) + "\n" if isinstance(skipped, list) and skipped else ""
     if skipped_line:
         selected = "、".join(f"{item['word']} → {item['code']}" for item in state.args.get("items", []))
         completed = "✅ 已加入草稿" in response or "已提交审核" in response
@@ -7843,7 +7844,8 @@ async def _format_draft_response(
         items = snapshot.get("items", [])
         if isinstance(items, list) and items:
             visible_items = [
-                f"{str(item.get('word') or '').strip()} {str(item.get('code') or '').strip()}"
+                ("删除 " if item.get("action") == "Delete" else "")
+                + f"{str(item.get('word') or '').strip()} {str(item.get('code') or '').strip()}"
                 for item in items[:5]
                 if isinstance(item, dict)
                 and str(item.get("word") or "").strip()
@@ -9864,6 +9866,7 @@ async def _try_handle_dictionary_delete_command(
 
 def parse_reviewed_displacement(
     message: str, *, known_words: Tuple[str, ...] = (),
+    known_occupants: Optional[Dict[str, Tuple[str, ...]]] = None,
 ) -> Optional[Tuple[str, str, str]]:
     """Recognize a closed replacement without inventing its candidate code."""
     source = _strip_command_message_prefixes(trusted_mutation_source(message)).strip().rstrip("。.!！")
@@ -9894,6 +9897,14 @@ def parse_reviewed_displacement(
             ):
                 # Separated bare operands need a boundary after the verb too.
                 return None
+            if (
+                match.groupdict().get("before_verb") and match.groupdict().get("after_verb")
+                and not match.groupdict().get("use")
+                and match["word"] == target and match["occupant"] == occupant
+                and occupant not in (known_occupants or {}).get(target, ())
+            ):
+                # Bare chat needs both operands bound to the same reviewed candidate.
+                return None
             if match["word"] == target and target.startswith("用") and not match.groupdict().get("use"):
                 # A glued prefix needs a reviewed word boundary; never guess from Han shape.
                 if target not in known_words:
@@ -9902,7 +9913,12 @@ def parse_reviewed_displacement(
                     target = target[1:]
             if any(
                 not looks_like_lexical_review_target(value)
-                or (raw[0] not in '「“『"' and (value in ADD_OPERATION_VERB_FORMS or value in EXPLICIT_ADD_FILLER_WORDS))
+                or ((raw == match["word"] or raw[0] not in '「“『"') and (
+                    not _is_bare_word_query_target(value)
+                    or any(pattern.fullmatch(value) for pattern in _ACTION_TOKENS.values())
+                    or value in _TRUSTED_WORD_ACTION_NAMES | EXPLICIT_ADD_FILLER_WORDS
+                    or value in {"查一下", "搜", "搜索", "删词"}
+                ))
                 for raw, value in ((match["word"], target), (match["occupant"], occupant))
             ):
                 return None
@@ -14918,7 +14934,8 @@ async def handle_pending_message_core(
                     return response + "\n这批词的候选编码暂时无法保存，请重新查询后再选择。"
                 if restored is not None and current is state_record:
                     return RestoredCandidateReply(
-                        response + "\n候选仍有效，请逐词处理", record=restored,
+                        response if "\n未选择：" in response else response + "\n候选仍有效，请逐词处理",
+                        record=restored,
                     )
         if not preserve_after_response:
             conversation_state_store.complete_execution(state_record)

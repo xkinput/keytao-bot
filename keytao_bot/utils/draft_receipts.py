@@ -104,13 +104,15 @@ def receipt_change_lines(data: dict, requested_words=()) -> list[str]:
             status = next((item.get("_revisionStatus", "Draft")
                            for field in ("writtenItems", "updatedItems") for item in data.get(field) or []
                            if isinstance(item, dict) and item.get("word") == word), "Draft")
-            states.setdefault(status, []).append(f"「{word}」")
+            if status != "Draft":
+                states.setdefault(status, []).append(f"「{word}」")
         labels = {"Draft": "草稿（未发布）", "Submitted": "待审核（未发布）",
                   "Approved": "已入库（尚未发布）", "Published": "已发布"}
-        lines.append("发布状态：" + "；".join(
-            "、".join(words) + "的本次修改现为" + labels.get(status, "状态待核验")
-            for status, words in states.items()
-        ) + "。")
+        if states:
+            lines.append("发布状态：" + "；".join(
+                "、".join(words) + "的本次修改现为" + labels.get(status, "状态待核验")
+                for status, words in states.items()
+            ) + "。")
     if data.get("receiptItemsUnavailable"):
         lines.append("写入结果已返回，但本轮变更明细未能完整核验；请查看原批次。")
     written_words = {change.word for change in changes}

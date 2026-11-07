@@ -2241,6 +2241,11 @@ def _resolve_reviewed_multi_word_selection(
                 if "" not in protected and selector.isdecimal()
                 else f"「{word}」的编码 {code} {reason}，未加入"
             )
+            if (
+                selector.isdecimal() and len(protected) == 1 and protected[0]
+                and raw_scope["occupiedWords"].get(code) in (list(protected), protected)
+            ):
+                skipped[-1] += f"\n要顶替请回复「{word} {selector}，顶替 {protected[0]}」"
             continue
         reviewed = raw_scope["reviewedState"]
         item = dict(items_by_word.get(word) or {

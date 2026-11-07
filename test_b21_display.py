@@ -86,7 +86,6 @@ class B21DisplayTests(unittest.IsolatedAsyncioTestCase):
                     "✅ 操作已完成\n+0 新增\n草稿内容：保留原内容", data, platform="qq",
                 )
                 expected = (f"✅ 操作已完成\n已变更：{summary}\n"
-                            f"发布状态：「{revised_word}」的本次修改现为草稿（未发布）。\n"
                             "+0 新增\n草稿内容：保留原内容\n\n"
                             "草稿地址：https://keytao.rea.ink/batch/b21-batch")
                 self.assertEqual(actual.encode(), expected.encode())

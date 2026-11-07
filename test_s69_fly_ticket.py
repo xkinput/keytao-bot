@@ -323,11 +323,7 @@ class PublishReceiptTests(unittest.TestCase):
         result = chat_render.finalize_draft_receipt("✅ 操作已完成", {
             "success": True, "batchId": "s69-fixture", "writtenItems": rows,
         })
-        line = next((line for line in result.splitlines() if line.startswith("发布状态：")), "")
-        self.assertIn("衣品", line)
-        self.assertIn("一品", line)
-        self.assertIn("草稿", line)
-        self.assertIn("未发布", line)
+        self.assertNotIn("发布状态：", result)
 
     def test_submission_receipt_does_not_claim_revision_is_still_a_draft(self):
         change = {"id": 1, "action": "Change", "word": "衣品", "code": "ykpb", "type": "Phrase"}
