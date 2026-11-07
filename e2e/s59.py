@@ -9,15 +9,17 @@ def main():
     root = Path(__file__).resolve().parents[1]
     launcher = root / ".tmp-work/s59-offline/run_checks.py"
     modules = (
-        "test_s59_commonness_route", "test_s59_commonness_evidence",
-        "test_s59_tool_prompt", "test_s59_general_cap",
+        ("tests.test_commonness.S59CommonnessRouteTests",),
+        ("tests.test_commonness.CommonnessEvidenceTests",),
+        ("tests.test_tool_prompt.CommonnessToolTests", "tests.test_tool_prompt.ModelCopyTests"),
+        ("tests.test_general_cap.GeneralCapTests", "tests.test_general_cap.GuidanceTests"),
     )
     results = []
-    for module in modules:
+    for names in modules:
         result = subprocess.run([
-            sys.executable, str(launcher), "-m", "unittest", module,
+            sys.executable, str(launcher), "-m", "unittest", *names,
         ], cwd=root, timeout=120, check=False)
-        results.append({"module": module, "exit": result.returncode})
+        results.append({"module": ",".join(names), "exit": result.returncode})
     summary = {"scenario": "S59", "mode": "fixtures/fake-model",
                "paidModelCalls": 0, "realProviderCalls": 0,
                "passed": all(row["exit"] == 0 for row in results), "checks": results}

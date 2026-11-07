@@ -6,7 +6,11 @@ import subprocess
 import sys
 import unittest
 
-MODULES = ('test_s63_bcc', 'test_s63_bcc_ingest', 'test_s63_bcc_delivery')
+MODULES = (
+    'tests.test_commonness.BccCommonnessTests',
+    'tests.test_commonness.BccIngestTests',
+    'tests.test_commonness.BccDeliveryTests',
+)
 ROOT = Path(__file__).resolve().parents[1]
 
 

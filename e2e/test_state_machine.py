@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-import test_state_machine as legacy_state_machine
+from tests import test_state_machine as legacy_state_machine
 
 
 def _run_legacy_state_machine_suite() -> None:

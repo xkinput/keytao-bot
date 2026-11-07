@@ -9,7 +9,12 @@ import sys
 def main():
     root = Path(__file__).resolve().parents[1]
     launcher = root / "e2e/offline_checks.py"
-    modules = ("test_s60_scenario", "test_s60_receipt", "test_s60_delta", "test_s60_finalizers")
+    modules = (
+        "tests.test_receipts_and_display.S60ScenarioTests",
+        "tests.test_receipts_and_display.ReceiptRegressionTests",
+        "tests.test_receipts_and_display.ReceiptDeltaTests",
+        "tests.test_receipts_and_display.ReceiptFinalizerTests",
+    )
     results = []
     for module in modules:
         result = subprocess.run([

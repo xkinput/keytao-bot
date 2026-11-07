@@ -16,12 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = Path(__file__).resolve()
 LOG_ROOT = Path("/tmp/keytao-s60-offline")
 CHECKS = (
-    ["test_state_machine.py"],
-    ["test_memory_safety.py"],
-    ["test_security_fixes.py"],
-    ["test_review_gate.py"],
-    ["test_llm_policy.py"],
-    ["test_word_discovery.py"],
+    ["tests/test_state_machine.py"],
+    ["tests/test_memory_safety.py"],
+    ["tests/test_security_fixes.py"],
+    ["tests/test_review_gate.py"],
+    ["tests/test_llm_policy.py"],
+    ["tests/test_word_discovery.py"],
     ["-m", "e2e.test_safety"],
 )
 

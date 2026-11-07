@@ -325,8 +325,8 @@ async def run(rows, *, live=False, record_path=None):
         import httpx
         import openai
         real_modules = {"httpx": httpx, "openai": openai}
-    import test_state_machine as harness
-    from test_semantic_parser import FakeClient
+    from tests import test_state_machine as harness
+    from tests.test_semantic_parser import FakeClient
     if live:
         sys.modules.update(real_modules)
     from keytao_bot.harness.semantic_parser import parse_operation
