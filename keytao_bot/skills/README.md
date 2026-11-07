@@ -133,7 +133,7 @@ TOOL_FUNCTIONS = {
 运行测试脚本验证 skills 是否正常工作：
 
 ```bash
-python3 test_skills.py
+python3 tests/test_skills.py
 ```
 
 预期输出：
@@ -191,10 +191,6 @@ Testing Skills System
 2. 调用 `web_search(query="nonebot2 function calling 文档")`
 3. 获取结构化结果（标题、摘要、链接）
 4. 结合结果生成回复，并附上原始链接
-
-### 最大迭代次数
-
-默认限制为 3 次迭代，防止无限循环。可在 `openai_chat.py` 中的 `get_openai_response()` 函数修改 `max_iterations` 参数。
 
 ### 工具定义格式
 

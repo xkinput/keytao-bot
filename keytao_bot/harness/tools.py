@@ -1,5 +1,4 @@
 """Tool execution adapter for the agent harness."""
-import hashlib
 import inspect
 import json
 import re
@@ -13,7 +12,6 @@ from keytao_bot.utils.pending_confirmation import (
     advertised_batch_assent_verb,
     parse_pending_candidate_selection,
     parse_pending_assent_phrase,
-    pending_confirmation_copy,
     render_remediation_reply,
 )
 
@@ -584,82 +582,6 @@ def large_model_tool_result_has_policy(tool_name: str, result_json: str) -> bool
         or tool_name in MODEL_TOOL_RESULT_SMALL_RAW_WHITELIST
     )
 
-_STAGED_ARGUMENT_LABELS = {
-    "action": "动作",
-    "batch_id": "批次",
-    "code": "编码",
-    "expected_content_version": "内容版本",
-    "ids": "草稿条目",
-    "items": "词条",
-    "needs_manual_review": "管理员复核标记",
-    "old_word": "原词",
-    "pr_id": "草稿条目",
-    "remark": "备注",
-    "target_code": "目标编码",
-    "type": "类型",
-    "weight": "权重",
-    "word": "词语",
-}
-
-_STAGED_ACTION_LABELS = {
-    "Change": "修改",
-    "Create": "新增",
-    "Delete": "删除",
-}
-
-_STAGED_TOOL_LABELS = {
-    "keytao_create_phrase": "加入词条草稿",
-    "keytao_remove_draft_item": "删除草稿条目",
-    "keytao_update_draft_item_weight": "调整草稿权重",
-    "keytao_batch_add_to_draft": "批量加入词条草稿",
-    "keytao_batch_remove_draft_items": "批量删除草稿条目",
-    "keytao_shift_phrase_code": "顺延词条编码",
-    "keytao_recall_batch": "撤回提审批次",
-    "keytao_submit_batch": "提交草稿批次",
-}
-
-
-def _staged_argument_label(key: Any) -> str:
-    key_text = str(key)
-    return _STAGED_ARGUMENT_LABELS.get(key_text, "")
-
-
-def _staged_argument_value(value: Any) -> str:
-    if isinstance(value, dict):
-        parts = []
-        for key, item in value.items():
-            label = _staged_argument_label(key)
-            if label:
-                parts.append(f"{label}：{_staged_argument_value(item)}")
-        return "；".join(parts) or "无可展示内容"
-    if isinstance(value, (list, tuple)):
-        return "、".join(_staged_argument_value(item) for item in value) or "空"
-    if isinstance(value, bool):
-        return "是" if value else "否"
-    if value is None:
-        return "未设置"
-    text = str(value)
-    return _STAGED_ACTION_LABELS.get(text, text)
-
-
-def _describe_staged_mutation(tool_name: str, arguments: Dict) -> str:
-    action_label = _STAGED_TOOL_LABELS.get(tool_name, "待确认操作")
-    lines = [f"拟执行{action_label}，已锁定以下内容："]
-    for key, value in arguments.items():
-        label = _staged_argument_label(key)
-        if not label:
-            continue
-        if isinstance(value, (list, tuple)):
-            lines.append(f"• {label}（{len(value)} 项）：")
-            lines.extend(
-                f"  {index}. {_staged_argument_value(item)}"
-                for index, item in enumerate(value, start=1)
-            )
-        else:
-            lines.append(f"• {label}：{_staged_argument_value(value)}")
-    return "\n".join(lines)
-
-
 def _tool_exception_payload(error: Exception) -> Dict[str, Any]:
     """Preserve whether a failed call is safe to retry as a transport attempt."""
     transport_error = isinstance(error, (TimeoutError, ConnectionError))
@@ -926,20 +848,17 @@ from .authorization_grammar import (
     _POSITIONAL_COMMAND_VERB_RE,
     _POSITIONAL_REORDER_ORDINAL_PATTERN,
     _POSITIONAL_REORDER_DESTINATION_PATTERN,
-    _POSITIONAL_REORDER_DESTINATION_EXPRESSION_PATTERN,
     _POSITIONAL_REORDER_COMMAND_DESTINATION_EXPRESSION_PATTERN,
     _POSITIONAL_REORDER_RELATIVE_EXPRESSION_PATTERN,
     _POSITIONAL_REORDER_INTENT_PATTERN,
     _POSITIONAL_REORDER_INTENT_RE,
     _NON_POSITIONAL_MUTATION_INTENT_PATTERN,
-    _NON_POSITIONAL_MUTATION_INTENT_RE,
     _MUTATION_INTENT_RE,
     _POSITIONAL_REORDER_SUBJECT_PATTERN,
     _POSITIONAL_REORDER_BARE_SUBJECT_PATTERN,
     _POSITIONAL_REORDER_COMMAND_RE,
     _POSITIONAL_REORDER_RAW_COMMAND_RE,
     _POSITIONAL_REORDER_DESTINATION_CAPTURE_RE,
-    _POSITIONAL_REORDER_QUOTED_TARGET_RE,
     _POSITIONAL_REORDER_PLAIN_LOCATIVE_SUFFIX_RE,
     _POSITIONAL_REORDER_RELATIVE_FRAGMENT_RE,
     _POSITIONAL_REORDER_NARRATIVE_TAIL_RE,
@@ -953,7 +872,6 @@ from .authorization_grammar import (
     _NEGATED_POSITIONAL_REORDER_RE,
     _POSITIONAL_REORDER_EXPLANATION_RE,
     _POSITIONAL_REORDER_LOCATIVE_DESTINATION_RE,
-    _NEGATED_MUTATION_RE,
     _NEGATED_NON_POSITIONAL_MUTATION_RE,
     _STANDALONE_NEGATION_CLAUSE_RE,
     _EXPLANATION_ONLY_RE,
@@ -972,9 +890,6 @@ from .authorization_grammar import (
     _INLINE_CODE_RE,
     _COMMAND_CLAUSE_SPLIT_RE,
     _LEADING_MENTION_RE,
-    _WHOLE_MESSAGE_LEADING_ADDRESS_RE,
-    _WHOLE_MESSAGE_CLOSING_FILLER_RE,
-    _WHOLE_MESSAGE_QUOTE_PATTERNS,
     _COMMAND_LEAD_IN_PREFIXES,
     _COMMAND_PREFIX_PATTERN,
     _COMMAND_PREFIX_RE,
@@ -1018,14 +933,12 @@ from .authorization_grammar import (
     BLOCK_REASON_TICKET_REQUIRED,
     BLOCK_REASON_BULK_DELETE_NOT_REQUESTED,
     BLOCK_REASON_MANUAL_SHIFT_FORBIDDEN,
-    BLOCK_REASON_ORDERING_NOT_EXPRESSIBLE,
     BLOCK_REASON_BATCH_TOO_LARGE,
     BLOCK_REASON_UNTRUSTED_BATCH,
     SUGGESTION_MENTION_PREFIX,
     _MAX_SUGGESTED_BATCH_ITEMS,
     _MAX_SUGGESTED_DELETE_IDS,
     MUTATING_TOOL_NAMES,
-    _MAX_STAGED_MUTATION_PREVIEW_CHARS,
     _MAX_STAGED_MUTATION_LIST_ITEMS,
     _PROTECTED_WORD_RE,
     _TYPE_HINTS,
@@ -2376,49 +2289,6 @@ class ToolExecutor:
                 "系统会按每个原词自己的候选链自动顺延；本次未写入。"
             ),
             "blockedReassignments": blocked_labels,
-        }
-
-    @staticmethod
-    def _stage_agent_mutation(
-        tool_name: str,
-        arguments: Dict,
-        context: ToolContext,
-    ) -> Optional[Dict]:
-        message = context.current_message or ""
-        if (
-            not message
-            or tool_name not in MUTATING_TOOL_NAMES
-            or context.mutation_confirmed
-        ):
-            return None
-        preview = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
-        oversized_lists = {
-            key: len(value)
-            for key, value in arguments.items()
-            if isinstance(value, list)
-            and len(value) > _MAX_STAGED_MUTATION_LIST_ITEMS
-        }
-        if oversized_lists or len(preview) > _MAX_STAGED_MUTATION_PREVIEW_CHARS:
-            return {
-                "success": False,
-                "policyBlocked": True,
-                "message": (
-                    render_remediation_reply(
-                        "确认内容过长，本次未写入；请拆分操作"
-                    )
-                ),
-                "previewCharacters": len(preview),
-                "oversizedLists": oversized_lists,
-            }
-        preview_digest = hashlib.sha256(preview.encode("utf-8")).hexdigest()[:16]
-        return {
-            "success": False,
-            "requiresConfirmation": True,
-            "localConfirmationRequired": True,
-            "message": (
-                f"{_describe_staged_mutation(tool_name, arguments)}\n"
-                f"尚未写入。{pending_confirmation_copy()}"
-            ),
         }
 
     _validate_current_message_binding = staticmethod(

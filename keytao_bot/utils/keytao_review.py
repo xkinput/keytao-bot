@@ -61,7 +61,6 @@ from .pronunciation_resolution import (
     score_web_pronunciations,
 )
 from .review_flags import (
-    MANUAL_REVIEW_PREFIXES,
     apply_review_disposition,
     apply_manual_review_flag,
     build_auto_review_remark,
@@ -75,10 +74,6 @@ SEARCH_ENDPOINT = "https://html.duckduckgo.com/html/"
 DUCKDUCKGO_LITE_ENDPOINT = "https://lite.duckduckgo.com/lite/"
 BING_ENDPOINT = "https://www.bing.com/search"
 SO360_ENDPOINT = "https://www.so.com/s"
-# Kept as a re-export: outbound requests now use the shared external client,
-# which sets this same User-Agent.
-USER_AGENT = http_client.EXTERNAL_USER_AGENT
-
 REVIEW_SIGNAL_WEIGHTS = {
     "corpus": 0.45,
     "search": 0.25,
@@ -242,8 +237,6 @@ PRONUNCIATION_WEB_RESOLUTION_TIMEOUT = 8.0
 PRONUNCIATION_UNKNOWN_RESOLUTION_TIMEOUT = 10.0
 SEMANTIC_PRONUNCIATION_HIGH_CONFIDENCE = 0.85
 KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER = (10.0, 20.0, 30.0)
-# Backward-compatible name for callers that need the first interactive budget.
-KEYTAO_ENCODE_REQUEST_TIMEOUT = KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER[0]
 KEYTAO_ENCODE_MAX_ATTEMPTS = len(KEYTAO_ENCODE_REQUEST_TIMEOUT_LADDER)
 KEYTAO_ENCODE_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 REVIEW_LOOKUP_REQUEST_TIMEOUT = 3.0
@@ -4521,11 +4514,6 @@ def _common_known_review_label(commonness: Dict) -> str:
     if (commonness.get("personAlias") or {}).get("accepted"):
         return "名人字号/别名"
     return "常见词/熟语"
-
-
-# Legacy remark markers live in review_flags now; re-exported so existing
-# importers keep working.
-_MANUAL_PREAUDIT_MARKERS = MANUAL_REVIEW_PREFIXES
 
 
 def manual_preaudit_issue_for_item(item: Dict) -> str:

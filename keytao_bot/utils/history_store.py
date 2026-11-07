@@ -923,55 +923,6 @@ class HistoryStore:
             logger.info(f"Cleared {deleted} messages for {address}")
             return deleted
     
-    def cleanup_old_messages(self, days: int = 30):
-        """
-        Clean up messages older than specified days
-        
-        Args:
-            days: Keep messages from last N days
-        
-        Returns:
-            Number of messages deleted
-        """
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                DELETE FROM conversations 
-                WHERE timestamp < datetime('now', '-' || ? || ' days')
-            """, (days,))
-            deleted = cursor.rowcount
-            self._enforce_generation_state_limit(cursor)
-            conn.commit()
-            logger.info(f"Cleaned up {deleted} old messages (older than {days} days)")
-            return deleted
-    
-    def get_stats(self) -> Dict:
-        """Get statistics about stored conversations"""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            
-            # Total messages
-            cursor.execute("SELECT COUNT(*) FROM conversations")
-            total_messages = cursor.fetchone()[0]
-            
-            # Unique users
-            cursor.execute("""
-                SELECT COUNT(DISTINCT platform || ':' || space_type || ':' || space_id || ':' || user_id)
-                FROM conversations
-            """)
-            unique_users = cursor.fetchone()[0]
-            
-            # Database size
-            db_size = os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
-            
-            return {
-                "total_messages": total_messages,
-                "unique_users": unique_users,
-                "db_size_bytes": db_size,
-                "db_size_mb": round(db_size / 1024 / 1024, 2)
-            }
-
-
 # Global instance (lazy initialization)
 _history_store: Optional[HistoryStore] = None
 

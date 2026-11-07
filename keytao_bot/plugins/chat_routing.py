@@ -58,9 +58,7 @@ from ..utils.observability import current_turn_metrics, observe_model_call, set_
 from ..utils.pending_confirmation import (
     ADD_OPERATION_VERB_PATTERN,
     PENDING_ASSENT_TEXTS,
-    PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS,
     PENDING_BATCH_ADD_ASSENT_TEXTS,
-    PENDING_CONFIRM_ASSENT_TEXTS,
     ReviewedSelectionReply,
     parse_advertised_set_reference,
     parse_pending_assent_phrase,
@@ -251,25 +249,6 @@ _PURE_CHINESE_TOKEN_RE = re.compile(r'^[\u4e00-\u9fff]{1,30}$')
 _CODE_TOKEN_RE = re.compile(r"^[a-z]{2,12}$", re.IGNORECASE)
 
 
-_REFERENCED_WORD_QUERY_HINTS = (
-    "这两个词",
-    "这俩词",
-    "这几个词",
-    "这些词",
-    "上面两个词",
-    "上面几个词",
-    "引用里",
-    "引用的",
-)
-
-
-_WORD_LIBRARY_QUERY_HINTS = (
-    "词库",
-    "收录",
-    "编码",
-)
-
-
 _REFERENCED_WORD_PRESENCE_WHOLE_RE = re.compile(
     r"^(?:这两个词|这俩词|这几个词|这些词|上面两个词|上面几个词|"
     r"引用里(?:的)?这些?词|引用的(?:这两个|这俩|这几个|这些)?词)"
@@ -457,26 +436,10 @@ def _parse_code_chain_reorder_command(
     )
 
 
-_DRAFT_SUBMIT_COMMANDS = {
-    "提交",
-    "提审",
-    "送审",
-    "提交草稿",
-    "提交批次",
-    "提交审核",
-    "提交当前草稿",
-    "提交这个草稿",
-    "发起审核",
-}
-
-
 _ACTION_SPECIFIC_DRAFT_SUBMIT_COMMANDS = {
     "确认提交",
     "继续提交",
 }
-
-
-_PENDING_CONFIRM_ASSENT_TEXTS = AFFIRMATIVE_REPLY_TEXTS
 
 
 _PENDING_CONTROL_TEXTS = {
@@ -490,9 +453,6 @@ _PENDING_CONTROL_TEXTS = {
     "不了",
     "算了",
 }
-
-
-_PENDING_ADD_AND_SUBMIT_COMMANDS = PENDING_BATCH_ADD_AND_SUBMIT_ASSENT_TEXTS
 
 
 WORD_QUERY_INTENT_MODEL = (
@@ -989,11 +949,6 @@ def _is_target_bound_add_and_submit_request(
     return matched
 
 
-# Rendering/compatibility vocabulary only. Acceptance is owned exclusively by
-# ``parse_pending_assent_phrase`` and the structural live-state parsers above.
-_QUOTED_PENDING_ADD_CONFIRM_TEXTS = AFFIRMATIVE_REPLY_TEXTS
-
-
 def _quoted_pending_add_control_intent(
     message_text: str,
     state: PendingAddWord,
@@ -1143,15 +1098,6 @@ def _canonical_draft_management_command(
     if re.fullmatch(rf"{prefix}{clear_clause}{polite}", compact):
         return MessageCommandIntent(intent="draft_clear", confidence=1.0)
     return None
-
-
-def _message_requests_draft_clear_all(message_text: str) -> bool:
-    matched = _compact_requests_draft_clear_all(
-        _compact_command_text(trusted_mutation_source(message_text))
-    )
-    if matched:
-        note_rule_use("R:_message_requests_draft_clear_all")
-    return matched
 
 
 def _message_authorizes_draft_recall(
@@ -1345,10 +1291,6 @@ def _message_authorizes_pending_control(
 _ORIGINAL_COMMAND_LINE_RE = re.compile(
     r"^(?:原始操作指令|原始指令|原指令)\s*[：:]\s*[「“\"]?(.+?)[」”\"]?$"
 )
-
-# Compatibility/rendering vocabulary; stale acceptance is parser-owned below.
-_STALE_CONFIRMATION_ONLY_TEXTS = AFFIRMATIVE_REPLY_TEXTS
-
 
 def _is_unambiguous_stale_confirmation(message_text: str) -> bool:
     """Accept only a positive whole-message generic assent as stale control."""

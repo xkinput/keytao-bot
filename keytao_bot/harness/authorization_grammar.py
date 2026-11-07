@@ -94,10 +94,6 @@ _POSITIONAL_REORDER_DESTINATION_PATTERN = (
     rf"(?:{_POSITIONAL_REORDER_RELATION_PATTERN})?"
     rf")"
 )
-_POSITIONAL_REORDER_DESTINATION_EXPRESSION_PATTERN = (
-    rf"{_POSITIONAL_DESTINATION_VERB_PATTERN}"
-    rf"{_POSITIONAL_REORDER_DESTINATION_PATTERN}"
-)
 _POSITIONAL_REORDER_COMMAND_DESTINATION_EXPRESSION_PATTERN = (
     rf"{_POSITIONAL_DESTINATION_VERB_PATTERN}\s*"
     rf"{_POSITIONAL_REORDER_DESTINATION_PATTERN}"
@@ -119,9 +115,6 @@ _NON_POSITIONAL_MUTATION_INTENT_PATTERN = (
     r"撤销|撤回|召回|回退|修改|改成|改为|改到|换到|调整到|替换|顺延|挪开|重新编码|保留|批量处理|"
     r"调整权重|修改权重|权重调整(?:为|到)?|权重修改(?:为|到)?|权重改(?:为|到)"
     r"|都删|其余删|其他删"
-)
-_NON_POSITIONAL_MUTATION_INTENT_RE = re.compile(
-    _NON_POSITIONAL_MUTATION_INTENT_PATTERN
 )
 _MUTATION_INTENT_RE = re.compile(
     _NON_POSITIONAL_MUTATION_INTENT_PATTERN
@@ -154,9 +147,6 @@ _POSITIONAL_REORDER_DESTINATION_CAPTURE_RE = re.compile(
     rf"{_POSITIONAL_DESTINATION_VERB_PATTERN}\s*"
     rf"(?P<destination>{_POSITIONAL_REORDER_DESTINATION_PATTERN})"
     r"(?:一下|吧|了|好吗|行吗|可以吗)?[。.!！?？]?$"
-)
-_POSITIONAL_REORDER_QUOTED_TARGET_RE = re.compile(
-    r"^(?:「[^」]{1,16}」|“[^”]{1,16}”|‘[^’]{1,16}’)$"
 )
 _POSITIONAL_REORDER_PLAIN_LOCATIVE_SUFFIX_RE = re.compile(
     r"(?:里|上|下|中|内|外|旁|边|侧|处|口|角|前|后|附近|周围)$"
@@ -227,13 +217,6 @@ _POSITIONAL_REORDER_EXPLANATION_RE = re.compile(
 _POSITIONAL_REORDER_LOCATIVE_DESTINATION_RE = re.compile(
     _POSITIONAL_COMMAND_VERB_PATTERN
     + r"[\u3400-\u9fff]{1,4}[里上下中内外](?:一下|吧|了)?[。.!！?？]?$"
-)
-_NEGATED_MUTATION_RE = re.compile(
-    rf"(?:"
-    rf"(?<![把将])"
-    rf"(?:不要|别(?!的)|无需|不用|禁止|不要真的|先不|暂时不|不必|不再|不需要|甭|勿)"
-    rf".{{0,12}}(?:{_MUTATION_INTENT_RE.pattern})"
-    rf")"
 )
 _NEGATED_NON_POSITIONAL_MUTATION_RE = re.compile(
     rf"(?:"
@@ -343,21 +326,6 @@ _WHOLE_MESSAGE_CLOSING_FILLER_PATTERN = (
     r"(?:谢谢|谢谢你|多谢|辛苦了|拜托了|麻烦了|感谢|感谢你|"
     r"劳驾|拜托|有劳|谢啦)"
     r"[。.!！?？]*\s*"
-)
-# Compatibility exports retained for callers/tests that historically patched
-# these names through ``harness.tools``.  The authorization predicate below no
-# longer composes them with successive substitutions.
-_WHOLE_MESSAGE_LEADING_ADDRESS_RE = re.compile(
-    rf"^\s*{_WHOLE_MESSAGE_ADDRESS_PATTERN}",
-    re.IGNORECASE,
-)
-_WHOLE_MESSAGE_CLOSING_FILLER_RE = re.compile(
-    rf"{_WHOLE_MESSAGE_CLOSING_FILLER_PATTERN}$"
-)
-_WHOLE_MESSAGE_QUOTE_PATTERNS = (
-    re.compile(r"^「(?P<content>[^「」]*)」$", re.DOTALL),
-    re.compile(r"^“(?P<content>[^“”]*)”$", re.DOTALL),
-    re.compile(r"^『(?P<content>[^『』]*)』$", re.DOTALL),
 )
 # This is the complete outside-residue allowlist.  Fullmatching one pattern
 # permits only: whitespace; one pre-existing address/@ mention; at most one
@@ -2134,7 +2102,6 @@ BLOCK_REASON_CANDIDATE_RECORD_MISSING = "candidate_record_missing"
 BLOCK_REASON_TICKET_REQUIRED = "ticket_required"
 BLOCK_REASON_BULK_DELETE_NOT_REQUESTED = "bulk_delete_not_requested"
 BLOCK_REASON_MANUAL_SHIFT_FORBIDDEN = "manual_shift_forbidden"
-BLOCK_REASON_ORDERING_NOT_EXPRESSIBLE = "ordering_not_expressible"
 BLOCK_REASON_BATCH_TOO_LARGE = "batch_too_large"
 BLOCK_REASON_UNTRUSTED_BATCH = "untrusted_batch_reference"
 # Group chats drop any message that does not mention the bot, so every
@@ -2152,7 +2119,6 @@ MUTATING_TOOL_NAMES = frozenset({
     "keytao_recall_batch",
     "keytao_submit_batch",
 })
-_MAX_STAGED_MUTATION_PREVIEW_CHARS = 3500
 _MAX_STAGED_MUTATION_LIST_ITEMS = 50
 _PROTECTED_WORD_RE = (
     r"(?:别动|不要动|别改|不要改|不动|保持(?:原样)?|"

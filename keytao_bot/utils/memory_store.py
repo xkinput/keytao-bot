@@ -15,7 +15,6 @@ from nonebot.log import logger
 from keytao_bot.harness.conversation import ConversationAddress
 
 
-GLOBAL_SCOPE_ID = "global"
 DEFAULT_RECENT_LIMITS = {
     "group": 8,
     "user": 12,

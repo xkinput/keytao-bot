@@ -9,8 +9,8 @@ import time
 import unicodedata
 from collections import OrderedDict
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, is_dataclass, replace
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from nonebot.log import logger
 
@@ -86,9 +86,8 @@ from ..utils.explicit_code import (
     parse_explicit_entry_code_request,
     validate_explicit_code,
 )
-from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver
-from ..utils.observability import observe_model_call, set_turn_flow
+from ..utils.observability import set_turn_flow
 from ..utils.pending_confirmation import (
     RestoredCandidateReply,
     ServerBackedQueryReply,
@@ -123,10 +122,6 @@ from ..utils.memory_store import (
     get_memory_store,
 )
 from .chat_adapters import (
-    AsyncOpenAI,
-    OPENAI_API_KEY,
-    OPENAI_BASE_URL,
-    OPENAI_MODEL,
     OPENAI_TIMEOUT,
     ReplyReferenceInfo,
     _as_float,
@@ -141,7 +136,6 @@ from .chat_render import (
     _assert_plain_user_facing_reply,
     _capture_trusted_result_links,
     _create_notice_lines,
-    _dedupe_authoritative_link_lines,
     _draft_item_display_line,
     _format_active_draft_operation_message,
     _format_changed_server_confirmation_prompt,
@@ -1878,25 +1872,6 @@ async def _handle_relative_position_command(
     )
 
 
-def _looks_like_submit_reconfirm_prompt(response: str) -> bool:
-    """Detect a prior assistant message asking the user to reconfirm submission."""
-    text = (response or "").strip()
-    if not text or "提交" not in text or "加入草稿" in text:
-        return False
-
-    hints = (
-        "是否继续提交",
-        "确认提交",
-        "继续提交吗",
-        "继续提审",
-        "确认后继续提交",
-        "回复「确认」继续提交",
-        "回复“确认”继续提交",
-        "确认继续提交",
-    )
-    return any(hint in text for hint in hints)
-
-
 def _parse_pending_state_from_response(response: str) -> PendingState:
     """Parse any pending operation represented by an assistant response."""
     batch_pending = _parse_pending_batch_add(response)
@@ -2049,14 +2024,6 @@ def _is_contextual_reply_to_current_user_history(
 
 def _recover_pending_state_from_history(history: Optional[List[Dict]]) -> PendingState:
     """Never recreate an authorization ticket from assistant prose."""
-    return None
-
-
-def _recover_matching_pending_state_from_history(
-    referenced_state: PendingState,
-    history: Optional[List[Dict]],
-) -> PendingState:
-    """Never recreate an authorization ticket from stored assistant text."""
     return None
 
 
@@ -2614,14 +2581,6 @@ def _active_operation_message_for_request(
 _UNCERTAIN_TICKET_READ_RE = re.compile(
     r"^(?:查看(?:我的|当前)?草稿|草稿详情)$"
 )
-_UNCERTAIN_TICKET_READ_COMMANDS = frozenset({
-    "查看草稿",
-    "查看我的草稿",
-    "查看当前草稿",
-    "草稿详情",
-})
-
-
 def _resolve_uncertain_ticket_action(
     record: PendingStateRecord,
     message_text: str,
@@ -9574,24 +9533,6 @@ def _chain_reorder_ask(code: str, reason: str) -> str:
     return _assert_plain_user_facing_reply(
         f"编码 {code} 无法确定常用度顺序：{reason}。"
     )
-
-
-def _server_codes_for_exact_word(data: Dict[str, Any], word: str) -> Tuple[str, ...]:
-    """Read only exact word/code rows from one successful lookup response."""
-    phrases = data.get("phrases")
-    if data.get("success") is not True or not isinstance(phrases, list):
-        return ()
-    codes: List[str] = []
-    for phrase in phrases:
-        if not isinstance(phrase, dict):
-            return ()
-        phrase_word = str(phrase.get("word") or "").strip()
-        code = str(phrase.get("code") or "").strip().lower()
-        if phrase_word != word or not re.fullmatch(r"[a-z]{1,12}", code):
-            continue
-        if code not in codes:
-            codes.append(code)
-    return tuple(codes)
 
 
 async def _try_handle_entry_swap_command(

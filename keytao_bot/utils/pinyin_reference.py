@@ -7,7 +7,7 @@ import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 
 PINYIN_REFERENCE_DB_ENV = "PINYIN_REFERENCE_DB"
@@ -86,10 +86,6 @@ def normalize_pinyin_syllable(value: str) -> str:
         char for char in normalized
         if unicodedata.category(char) != "Mn"
     ).replace("ê", "e")
-
-
-def normalize_pinyin_tokens(tokens: Sequence[str]) -> tuple[str, ...]:
-    return tuple(normalize_pinyin_syllable(token) for token in tokens)
 
 
 def reference_db_path(path: Optional[Path | str] = None) -> Path:

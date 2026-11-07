@@ -1229,20 +1229,6 @@ def _json_request_body(payload: Dict) -> bytes:
     ).encode("utf-8")
 
 
-def _parse_json_mapping(value: object) -> Dict[str, str]:
-    if isinstance(value, dict):
-        return {str(k): str(v) for k, v in value.items() if v}
-    if not isinstance(value, str) or not value.strip():
-        return {}
-    try:
-        data = json.loads(value)
-    except Exception:
-        return {}
-    if not isinstance(data, dict):
-        return {}
-    return {str(k): str(v) for k, v in data.items() if v}
-
-
 def get_user_api_key(platform: str, platform_id: str) -> Optional[str]:
     """Return the API key bound to exactly this platform account."""
     return http_client.get_user_api_key(platform, platform_id)

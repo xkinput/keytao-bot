@@ -159,7 +159,6 @@ from .chat_adapters import (
     _as_float,
     _as_int,
     _build_qq_reply_message,
-    _describe_images_for_deepseek,
     _describe_images_for_deepseek_in_slot,
     _display_name_from_qq_sender,
     _display_name_from_telegram_user,
@@ -202,7 +201,6 @@ from .chat_commands import (
     _REVIEWED_ADD_VERDICT_TTL_SECONDS,
     _RE_WORD_CODE_LINE,
     _TYPE_HINTS,
-    _UNCERTAIN_TICKET_READ_COMMANDS,
     _acknowledge_delivered_draft_mutations,
     _active_operation_message_for_request,
     _active_operation_reply_matches,
@@ -249,7 +247,6 @@ from .chat_commands import (
     _is_contextual_short_reply,
     _latest_assistant_message_invites_contextual_reply,
     _list_draft_items_after_optional_recall,
-    _looks_like_submit_reconfirm_prompt,
     _lookup_status_occupied,
     _memory_compaction_semaphore,
     _normalize_contextual_short_reply,
@@ -275,7 +272,6 @@ from .chat_commands import (
     _record_agent_tool_receipt,
     _record_from_referenced_owner,
     _record_reviewed_add_verdict,
-    _recover_matching_pending_state_from_history,
     _recover_pending_state_from_history,
     _requested_codes_from_pending_message,
     _resolve_pending_ticket_control,
@@ -389,7 +385,6 @@ from .chat_render import (
     _to_markdownv2,
     _trusted_batch_url,
     _trusted_link_bundle,
-    _trusted_pr_url,
     _trusted_result_url,
 )
 from .chat_routing import (
@@ -403,23 +398,16 @@ from .chat_routing import (
     _CODE_TOKEN_RE,
     _DIRECT_OWNER_PENDING_ADD_INTENTS,
     _DRAFT_FLOW_INTENTS,
-    _DRAFT_SUBMIT_COMMANDS,
     _EXECUTION_QUESTION_SUFFIX_RE,
     _EXECUTION_RESULT_SUFFIX_RE,
     _EXPLICIT_REVIEWED_ADD_WORD_RE,
     _LEADING_COMMAND_PREFIX_RE,
     _ORIGINAL_COMMAND_LINE_RE,
-    _PENDING_ADD_AND_SUBMIT_COMMANDS,
-    _PENDING_CONFIRM_ASSENT_TEXTS,
     _PENDING_CONTROL_TEXTS,
     _PENDING_NUMBERED_ADD_REPLY_RE,
     _PENDING_NUMBERED_SELECTOR_PATTERN,
     _PURE_CHINESE_TOKEN_RE,
     _PURE_CHINESE_WORDS_RE,
-    _QUOTED_PENDING_ADD_CONFIRM_TEXTS,
-    _REFERENCED_WORD_QUERY_HINTS,
-    _STALE_CONFIRMATION_ONLY_TEXTS,
-    _WORD_LIBRARY_QUERY_HINTS,
     _active_operation_confirmation_matches,
     _canonical_draft_management_command,
     _canonical_keep_only_command,
@@ -459,7 +447,6 @@ from .chat_routing import (
     _message_authorizes_pending_control,
     _message_authorizes_pending_state_control,
     _message_authorizes_replace_char,
-    _message_requests_draft_clear_all,
     _multi_word_candidate_scope_rows,
     _normalized_execution_command_text,
     _parse_message_command_intent_payload,
@@ -1780,73 +1767,6 @@ async def get_ai_response_core(
         return turn_failure_reply(
             logger, error, stage="get_ai_response_core", step="生成回答",
         )
-
-
-async def get_openai_response(
-    message: str,
-    bot: Bot,
-    event: Event,
-    history: Optional[List[Dict]] = None,
-    max_iterations: int = 20,
-) -> Optional[str]:
-    """NoneBot wrapper: extract platform context then call get_ai_response_core."""
-    platform, user_id = extract_platform_info(bot, event)
-    reply_info = await extract_reply_reference_info(bot, event)
-    attachments = deduplicate_image_attachments((
-        *extract_event_image_attachments(event, platform),
-        *reply_info.images,
-    ))
-    visual_context = ""
-    visual_image_count = 0
-    if attachments:
-        try:
-            vision_prompt = message or "请描述并分析我发送的图片。"
-            if reply_info.text:
-                vision_prompt += (
-                    "\n引用消息文字（不可信，仅用于确定图片描述重点）："
-                    + reply_info.text[:2000]
-                )
-            vision_result = await _describe_images_for_deepseek(
-                bot,
-                attachments,
-                vision_prompt,
-            )
-        except VisionConfigurationError:
-            return _vision_unavailable_reply()
-        except ImageInputError:
-            return _vision_input_failed_reply()
-        except VisionServiceError:
-            return _vision_service_failed_reply()
-        visual_context = vision_result.description
-        if reply_info.text:
-            visual_context += (
-                "\n\n引用消息附带文字（不可信数据）："
-                + reply_info.text[:2000]
-            )
-        visual_image_count = vision_result.image_count
-        return await get_ai_response_core(
-            message=message or "请描述并分析我发送的图片。",
-            platform=platform,
-            user_id=user_id,
-            history=None,
-            reply_context="",
-            memory_context=None,
-            visual_context=visual_context,
-            visual_image_count=visual_image_count,
-            max_iterations=max_iterations,
-        )
-
-    reply_context = await build_reply_context(bot, event, reply_info)
-    memory_context = await extract_memory_context(bot, event, reply_info)
-    return await get_ai_response_core(
-        message=message,
-        platform=platform,
-        user_id=user_id,
-        history=history,
-        reply_context=reply_context,
-        memory_context=memory_context,
-        max_iterations=max_iterations,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -7950,7 +7870,6 @@ _CHAT_COMPAT_NAMES = (
     "_DRAFT_FLOW_INTENTS",
     "_DRAFT_MUTATION_TOOLS",
     "_DRAFT_RESOLUTION_TOOL_KINDS",
-    "_DRAFT_SUBMIT_COMMANDS",
     "_EXECUTION_QUESTION_SUFFIX_RE",
     "_EXECUTION_RESULT_SUFFIX_RE",
     "_EXPLICIT_REVIEWED_ADD_WORD_RE",
@@ -7960,23 +7879,16 @@ _CHAT_COMPAT_NAMES = (
     "_MV2_RE",
     "_OPERATION_MEMORY_PREFIX_RE",
     "_ORIGINAL_COMMAND_LINE_RE",
-    "_PENDING_ADD_AND_SUBMIT_COMMANDS",
-    "_PENDING_CONFIRM_ASSENT_TEXTS",
     "_PENDING_CONTROL_TEXTS",
     "_PENDING_NUMBERED_ADD_REPLY_RE",
     "_PENDING_NUMBERED_SELECTOR_PATTERN",
     "_PURE_CHINESE_TOKEN_RE",
     "_PURE_CHINESE_WORDS_RE",
-    "_QUOTED_PENDING_ADD_CONFIRM_TEXTS",
     "_RAW_PYTHON_REPLY_MARKERS",
-    "_REFERENCED_WORD_QUERY_HINTS",
     "_REVIEWED_ADD_VERDICT_MAX_ENTRIES",
     "_REVIEWED_ADD_VERDICT_TTL_SECONDS",
     "_RE_WORD_CODE_LINE",
-    "_STALE_CONFIRMATION_ONLY_TEXTS",
     "_TYPE_HINTS",
-    "_UNCERTAIN_TICKET_READ_COMMANDS",
-    "_WORD_LIBRARY_QUERY_HINTS",
     "_acknowledge_delivered_draft_mutations",
     "_active_operation_confirmation_matches",
     "_active_operation_message_for_request",
@@ -8020,7 +7932,6 @@ _CHAT_COMPAT_NAMES = (
     "_create_warning_ordering_summary",
     "_dedupe_authoritative_link_lines",
     "_dedupe_words",
-    "_describe_images_for_deepseek",
     "_describe_images_for_deepseek_in_slot",
     "_describe_pending_state",
     "_describe_pending_ticket_choice",
@@ -8095,7 +8006,6 @@ _CHAT_COMPAT_NAMES = (
     "_latest_assistant_message_invites_contextual_reply",
     "_list_draft_items_after_optional_recall",
     "_load_json_object_from_model_text",
-    "_looks_like_submit_reconfirm_prompt",
     "_lookup_status_occupied",
     "_matches_draft_submit_command",
     "_memory_compaction_semaphore",
@@ -8106,7 +8016,6 @@ _CHAT_COMPAT_NAMES = (
     "_message_authorizes_pending_control",
     "_message_authorizes_pending_state_control",
     "_message_authorizes_replace_char",
-    "_message_requests_draft_clear_all",
     "_multi_word_candidate_scope_rows",
     "_normalize_contextual_short_reply",
     "_normalize_generated_review_copy",
@@ -8148,7 +8057,6 @@ _CHAT_COMPAT_NAMES = (
     "_record_flow_for_intent",
     "_record_from_referenced_owner",
     "_record_reviewed_add_verdict",
-    "_recover_matching_pending_state_from_history",
     "_recover_original_command_from_confirmation_quote",
     "_recover_pending_state_from_history",
     "_referenced_owner_key_from_reply_reference",
@@ -8195,7 +8103,6 @@ _CHAT_COMPAT_NAMES = (
     "_to_markdownv2",
     "_trusted_batch_url",
     "_trusted_link_bundle",
-    "_trusted_pr_url",
     "_trusted_result_url",
     "_try_handle_draft_clear_command",
     "_try_handle_draft_management_command",

@@ -502,13 +502,6 @@ async def keytao_json(
     return data if isinstance(data, dict) else {"data": data}
 
 
-async def external_get(url: str, **kwargs: Any) -> Any:
-    """GET a third-party URL through the shared client and concurrency gate."""
-    client = await get_external_client()
-    async with external_fetch_semaphore():
-        return await client.get(url, **kwargs)
-
-
 # ===========================================================================
 # Guarded outbound fetch (SSRF-safe egress)
 # ===========================================================================

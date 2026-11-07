@@ -23,14 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import functools
 import html
-import ipaddress
 import json
 import re
-import socket
 import xml.etree.ElementTree as ElementTree
-import zlib
 from time import monotonic
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
@@ -47,21 +43,8 @@ BING_ENDPOINT = "https://www.bing.com/search"
 SO360_ENDPOINT = "https://www.so.com/s"
 EXA_SEARCH_ENDPOINT = "https://api.exa.ai/search"
 GITHUB_API_PREFIX = "https://api.github.com"
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/123.0.0.0 Safari/537.36"
-)
-DEFAULT_TIMEOUT = 12.0
-
 # Hard ceiling on any single response body we are willing to buffer and regex.
 MAX_FETCH_BYTES = http_client.MAX_FETCH_BYTES
-# Maximum number of redirects we will follow manually (initial request excluded).
-MAX_REDIRECT_HOPS = http_client.MAX_REDIRECT_HOPS
-ALLOWED_SCHEMES = http_client.ALLOWED_FETCH_SCHEMES
-_REDIRECT_STATUS = http_client._REDIRECT_STATUS
-# Cloud instance-metadata endpoints. Both already fall inside a blocked range
-# (link-local / unique-local) but are listed explicitly as a tripwire.
 
 JINA_READER_PREFIX = "https://r.jina.ai/"
 
@@ -457,15 +440,9 @@ def web_channels_doctor() -> Dict[str, Any]:
 # These names are kept as thin aliases so this module and its tests have one
 # vocabulary, but there is deliberately no second implementation to drift.
 
-_unwrap_ipv6 = http_client._unwrap_ipv6
 _is_blocked_ip = http_client.is_blocked_ip
 _assert_peer_allowed = http_client._assert_peer_allowed
-_peer_addresses = http_client._peer_addresses
 _read_capped_body = http_client.read_capped_body
-_decode_body = http_client.decode_body
-_decompress_bounded = http_client._decompress_bounded
-
-
 def _validate_scheme(url: str) -> Optional[str]:
     """Return an error message when ``url`` does not use http/https."""
     try:
@@ -905,15 +882,6 @@ async def _fetch_via_jina(url: str, max_chars: int) -> Dict[str, Any]:
         "truncated": len(parsed["text"]) >= max_chars,
         "provider": "jina-reader",
     }
-
-
-async def _web_fetch_via_jina(url: str, max_chars: int, reason: str) -> Dict[str, Any]:
-    """Compatibility wrapper retained for existing direct callers/tests."""
-    try:
-        return await _fetch_via_jina(url, max_chars)
-    except Exception as error:
-        logger.warning(f"Jina reader fetch failed for {url}: {error}")
-        return {"success": False, "url": url, "error": reason or f"网页抓取失败: {error}"}
 
 
 async def _fetch_direct(url: str, max_chars: int) -> Dict[str, Any]:

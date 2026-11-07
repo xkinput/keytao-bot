@@ -230,8 +230,6 @@ def prepend_pending_word_reminders(
     ]
     body = "\n".join(body_lines).strip()
     return "\n".join(reminders) + (("\n\n" + body) if body else "")
-PENDING_SINGLE_ADD_ADVERTISED_FORMS = ("加入",)
-PENDING_SINGLE_ADD_AND_SUBMIT_ADVERTISED_FORMS = ("加入并提交",)
 PENDING_BATCH_ADD_ASSENT_TEXTS = frozenset({
     *PENDING_BATCH_ADD_ADVERTISED_FORMS,
     "加",
@@ -1171,10 +1169,6 @@ def parse_pending_candidate_selection(text: str) -> PendingCandidateSelection | 
             submit_after=submit_after,
         )
     return None
-
-
-def _quoted_choices(forms: tuple[str, ...]) -> str:
-    return "、".join(f"「{form}」" for form in forms)
 
 
 def pending_confirmation_copy() -> str:

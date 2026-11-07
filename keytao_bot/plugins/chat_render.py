@@ -4,7 +4,7 @@ import ast
 import json
 import re
 import unicodedata
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from nonebot.log import logger
@@ -1878,15 +1878,6 @@ def _trusted_batch_url(*sources: Dict) -> str:
     """Return one display-safe batch URL from trusted tool responses."""
     for source in sources:
         value = _trusted_result_url(source, "batchUrl")
-        if value:
-            return value
-    return ""
-
-
-def _trusted_pr_url(*sources: Dict) -> str:
-    """Return one display-safe PR URL from trusted tool responses."""
-    for source in sources:
-        value = _trusted_result_url(source, "prUrl")
         if value:
             return value
     return ""

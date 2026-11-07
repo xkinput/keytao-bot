@@ -4,20 +4,18 @@ import asyncio
 import re
 from dataclasses import dataclass
 from itertools import islice
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import nonebot
 from nonebot import get_driver
 from nonebot.adapters import Bot, Event
 from nonebot.log import logger
 
-from ..harness.conversation import ConversationAddress
 from ..utils.image_input import (
     ImageAttachment,
     VisionConfigurationError,
     VisionProxyResult,
     VisionRuntimeConfig,
-    VisionServiceError,
     extract_image_attachments,
     request_vision_description,
 )
@@ -687,25 +685,6 @@ async def _describe_images_for_deepseek_in_slot(
         f"warnings={len(result.warnings)} description_len={len(result.description)}"
     )
     return result
-
-
-async def _describe_images_for_deepseek(
-    bot: Bot,
-    attachments: Tuple[ImageAttachment, ...],
-    user_prompt: str,
-) -> VisionProxyResult:
-    """Run the full independent vision path under one local deadline and slot."""
-
-    try:
-        async with asyncio.timeout(VISION_CONFIG.timeout):
-            async with _vision_request_semaphore:
-                return await _describe_images_for_deepseek_in_slot(
-                    bot,
-                    attachments,
-                    user_prompt,
-                )
-    except TimeoutError as error:
-        raise VisionServiceError("vision processing timed out") from error
 
 
 def _vision_unavailable_reply() -> str:

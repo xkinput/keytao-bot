@@ -2,7 +2,6 @@
 Skills loader for AI chat
 加载和管理 AI skills
 """
-import os
 import re
 import importlib.util
 from pathlib import Path
