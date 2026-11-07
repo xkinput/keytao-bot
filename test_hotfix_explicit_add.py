@@ -75,7 +75,7 @@ class ExplicitAddHotfixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((platform, user_id), ("qq", self.author.actor_id))
         self.calls.append((name, copy.deepcopy(args)))
         if name == "keytao_prepare_reviewed_add":
-            self.assertEqual(args, {"word": WORD})
+            self.assertEqual(args, {"word": WORD, "requested_code": "mtmwi" if self._testMethodName == "test_code_outside_reviewed_groups_is_rejected" else "mtmw"})
             audit = {"success": True, "verdict": "pass", "autoApprove": True,
                      "needsManualReview": False, "summary": "Offline reviewed fixture", "issues": []}
             # Run the real tool wrapper; all evidence, audit and ordering IO is replaced.

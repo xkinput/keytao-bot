@@ -2310,11 +2310,17 @@ def strip_self_mention_tokens(message: str) -> str:
     return _SELF_MENTION_RE.sub("", str(message or ""))
 
 
+def strip_add_command_modifier(message: str) -> str:
+    """Treat emphasis before an add as syntax, never as extra authority."""
+    return re.sub(r"^(?:强制|强行|硬加)\s*(?=(?:加入|添加|加词))", "", message)
+
+
 def normalize_mutation_command_source(message: str) -> str:
     """Remove routing metadata and explicit imperative wrappers once, upstream."""
     source = strip_self_mention_tokens(message)
     source = _LEADING_MENTION_RE.sub("", source, count=1).strip()
-    return _IMPERATIVE_COMMAND_WRAPPER_RE.sub("", source, count=1).strip()
+    source = _IMPERATIVE_COMMAND_WRAPPER_RE.sub("", source, count=1).strip()
+    return strip_add_command_modifier(source)
 
 
 def trusted_mutation_source(message: str) -> str:
@@ -3144,6 +3150,7 @@ def parse_reviewed_selection_command(
     unquoted = _whole_message_unquoted_source(source)
     if unquoted is not None:
         source = unquoted
+    source = strip_add_command_modifier(source)
     if not source or len(source) > 4096:
         return None
     action_pattern = _REVIEWED_SELECTION_ACTION_PATTERN

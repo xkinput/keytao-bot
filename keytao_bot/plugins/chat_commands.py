@@ -3386,6 +3386,24 @@ async def _augment_simple_word_query_response(
             encode_data = json.loads(encode_json)
         except Exception:
             continue
+        if len(words) == 1 and encode_data.get("success"):
+            from ..utils.keytao_review import _returned_pronunciation_groups
+
+            existing_codes = set(_existing_word_codes(lookup_entry))
+            returned_groups = _returned_pronunciation_groups(word, encode_data)
+            additional_codes = {
+                group["codes"][0]
+                for group in returned_groups
+                if not group.get("isDefault") and group.get("codes")
+                and not existing_codes.intersection(group["codes"])
+            }
+            if len(returned_groups) > 1 and len(additional_codes) == 1:
+                additional_code = next(iter(additional_codes))
+                response = "\n".join(
+                    line.replace("<code>（将 <code> 换成实际编码）", additional_code)
+                    if line.startswith("可再追加一个编码，格式为：") else line
+                    for line in response.splitlines()
+                )
         note = _build_existing_word_priority_note(word, lookup_entry, encode_data)
         note_lines = []
         if note:
@@ -14222,7 +14240,7 @@ async def _execute_explicit_entry_code_request(
     review = _review
     if review is None:
         raw = await call_tool_function(
-            "keytao_prepare_reviewed_add", {"word": request.word}, platform, user_id,
+            "keytao_prepare_reviewed_add", {"word": request.word, "requested_code": request.code}, platform, user_id,
         )
         try:
             review = json.loads(raw)
@@ -14256,11 +14274,18 @@ async def _execute_explicit_entry_code_request(
     ):
         return f"「{request.word}」缺少可核验的读音候选，本次未写入。"
     manual_reason = str(review.get("manualReviewReason") or "")
+    if any(
+        group.get("fallback") and group.get("readingEvidenceKind") == "own_character"
+        and request.code in (group.get("codes") or [])
+        for group in review.get("pronunciations") or []
+        if isinstance(group, dict)
+    ):
+        manual_reason = "未找到权威来源，仅使用编码服务默认读音，需要管理员审核"
     if resolvable_ambiguity or request.pinyin:
         manual_reason = "用户指定编码或读音已匹配候选，采用所列读音，需管理员复核"
     reviewed = PendingAddWord(
         word=request.word,
-        recommended_code=str(review.get("recommendedCode") or ""),
+        recommended_code=inventory.group_recommended_code or inventory.candidates[0][0],
         candidates=list(inventory.candidates),
         occupied_words={status["code"]: list(status["words"]) for status in inventory.statuses},
         pronunciation_codes=dict(inventory.readings),

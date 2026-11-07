@@ -158,6 +158,7 @@ async def keytao_prepare_reviewed_add(
     platform_id: Optional[str] = None,
     requested_reading: str = "",
     requested_meaning: str = "",
+    requested_code: str = "",
 ) -> Dict:
     config = _review_config()
     semantic_requester = _semantic_requester_for_actor(platform, platform_id)
@@ -168,6 +169,8 @@ async def keytao_prepare_reviewed_add(
         review_kwargs["requested_reading"] = requested_reading
     if requested_meaning:
         review_kwargs["requested_meaning"] = requested_meaning
+    if requested_code:
+        review_kwargs["requested_code"] = requested_code
     review = await prepare_reviewed_word(config, word, **review_kwargs)
     recommended_code = str(review.get("recommendedCode") or "").strip()
     reviewed_word = str(review.get("word") or word or "").strip()

@@ -413,7 +413,7 @@ class B11ShiftTests(unittest.IsolatedAsyncioTestCase):
         self.replay.entries.clear()
         await self.turn(f"{WORD} xlblu", "query", ("xlblu",), frame="none")
         self.assertEqual(len(self.replay.writes), 1, self.replay.last_response)
-        self.assertIn(("keytao_prepare_reviewed_add", {"word": WORD}), self.replay.calls)
+        self.assertIn(("keytao_prepare_reviewed_add", {"word": WORD, "requested_code": "xlblu"}), self.replay.calls)
         self.general.assert_not_awaited()
 
     async def test_literal_word_code_ignores_model_frame_and_operation(self):
@@ -436,7 +436,7 @@ class B11ShiftTests(unittest.IsolatedAsyncioTestCase):
     async def test_bare_word_code_occupied_code_keeps_explicit_add_route(self):
         self.replay.entries.append({"word": "别的词", "code": "xlblu", "type": "Phrase", "weight": 100})
         await self.turn(f"{WORD} xlblu", "query", ("xlblu",), frame="none")
-        self.assertIn(("keytao_prepare_reviewed_add", {"word": WORD}), self.replay.calls)
+        self.assertIn(("keytao_prepare_reviewed_add", {"word": WORD, "requested_code": "xlblu"}), self.replay.calls)
         self.assertNotIn("目前在 xlbl", self.replay.last_response)
         self.general.assert_not_awaited()
 

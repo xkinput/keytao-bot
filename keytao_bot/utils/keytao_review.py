@@ -3577,6 +3577,7 @@ async def prepare_reviewed_word(
     semantic_requester: Optional[str] = None,
     requested_reading: str = "",
     requested_meaning: str = "",
+    requested_code: str = "",
 ) -> Dict:
     word = word.strip()
     pronunciation_indexes = _pronunciation_indexes(word)
@@ -4144,6 +4145,30 @@ async def prepare_reviewed_word(
             word,
             groups,
             requester=semantic_requester,
+        )
+
+    if (
+        requested_code
+        and explicit_reading_choice is None
+        and multi_sense_choice.get("status") != "ambiguous"
+        and not punctuated_phrase
+        and (not pronunciation_resolution or pronunciation_resolution.get("status") == "encode_default")
+        and not any(
+            group.get("semanticPronunciation") or group.get("contextPronunciation")
+            for group in groups
+        )
+    ):
+        reviewed_sequences = {tuple(group.get("normalized") or ()) for group in groups}
+        groups.extend(
+            _review_group_from_returned(
+                returned, evidence_kind="own_character", requires_manual_review=True,
+            )
+            for returned in returned_groups
+            if tuple(returned.get("normalized") or ()) not in reviewed_sequences
+            and requested_code in (returned.get("codes") or [])
+            and not _pronunciation_sequence_rejection_reason(
+                word, returned.get("normalized") or (), encode_data,
+            )
         )
 
     baseline_sequence = _encode_default_pinyin_sequence(encode_data)

@@ -77,7 +77,13 @@ class SemanticAddRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((platform, user_id), ("qq", self.author.actor_id))
         self.calls.append((name, copy.deepcopy(args)))
         if name == "keytao_prepare_reviewed_add":
-            self.assertEqual(set(args), {"word"})
+            self.assertEqual(args, {
+                "word": args["word"],
+                **({"requested_code": self.codes[args["word"]]}
+                   if len(json.loads(self.client.create.return_value.choices[0].message.content)["codes"]) == 1
+                   and args["word"] == json.loads(self.client.create.return_value.choices[0].message.content)["operands"][0]
+                   else {}),
+            })
             word = args["word"]
             code = self.codes[word]
             return json.dumps({

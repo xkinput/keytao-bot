@@ -575,7 +575,9 @@ def _strip_command_message_prefixes(message_text: str) -> str:
         if stripped == text:
             break
         text = stripped
-    return text
+    from ..harness.authorization_grammar import strip_add_command_modifier
+
+    return strip_add_command_modifier(text)
 
 
 _EXECUTION_QUESTION_SUFFIX_RE = re.compile(

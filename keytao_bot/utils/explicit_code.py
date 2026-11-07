@@ -26,9 +26,12 @@ class ExplicitEntryCodeRequest:
 
 def parse_explicit_entry_code_request(message: str):
     """Bind a complete add-code command to its explicitly named item."""
-    from ..harness.authorization_grammar import DISPLACEMENT_VERBS, EXPLICIT_ADD_FILLER_WORDS
+    from ..harness.authorization_grammar import (
+        DISPLACEMENT_VERBS, EXPLICIT_ADD_FILLER_WORDS, strip_add_command_modifier,
+    )
 
     source = unicodedata.normalize("NFKC", message).strip().rstrip("。.!！").strip()
+    source = strip_add_command_modifier(source)
     if re.match(r"加入\s*编码", source):
         return None
     word = r'[\u3400-\u9fff\U00020000-\U0003134f]{1,32}'
@@ -113,6 +116,9 @@ class ExplicitCodeValidation:
 
 def parse_explicit_code_request(message: str, word: str):
     """Consume one direct command; never discard an extra target or clause."""
+    from ..harness.authorization_grammar import strip_add_command_modifier
+
+    message = strip_add_command_modifier(message.strip())
     entry = parse_explicit_entry_code_request(message)
     if entry is not None:
         return ExplicitCodeRequest(entry.code, entry.submit_after, entry.pinyin) if entry.word == word else None
