@@ -7,6 +7,9 @@ from nonebot.message import run_preprocessor
 from nonebot.typing import T_State
 
 
+_group_streaks = {}
+
+
 @run_preprocessor
 async def guard_plus_one(bot: Bot, event: Event, matcher: Matcher, state: T_State) -> None:
     if matcher.plugin_name != "nonebot_plugin_plus_one":
@@ -22,3 +25,13 @@ async def guard_plus_one(bot: Bot, event: Event, matcher: Matcher, state: T_Stat
         or str(getattr(reply_sender, "user_id", "")) == bot.self_id
     ):
         raise IgnoredException("Bot-directed message or command")
+    if hasattr(event, "group_id"):
+        from nonebot_plugin_plus_one.handler import is_equal
+
+        group_id = str(event.group_id)
+        message = event.get_message()
+        last_message, count = _group_streaks.get(group_id, (None, 0))
+        count = count + 1 if last_message is not None and is_equal(last_message, message) else 1
+        _group_streaks[group_id] = (message, count)
+        if count > 2:
+            raise IgnoredException("Already repeated this streak")
