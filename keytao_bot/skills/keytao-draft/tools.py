@@ -1694,6 +1694,7 @@ async def keytao_create_phrase(
     _reviewed_pinyin: str = "",
     _reviewed_candidate_codes: Optional[List[str]] = None,
     _pending_submitted_confirmed: bool = False,
+    _shown_others_submitted: Optional[List[Dict]] = None,
 ) -> Dict:
     """Guard Create writes with current actor-bound draft/submitted facts."""
     guard, pending_items = await _pending_create_guard(
@@ -1701,6 +1702,7 @@ async def keytao_create_phrase(
         platform_id,
         [{"action": action, "word": word, "code": code, "type": type}],
         duplicate_confirmed=_pending_submitted_confirmed is True,
+        shown_others_submitted=_shown_others_submitted,
     )
     if guard is not None:
         return guard
@@ -3705,6 +3707,7 @@ async def _pending_create_guard(
     items: List[Dict],
     *,
     duplicate_confirmed: bool,
+    shown_others_submitted: Optional[List[Dict]] = None,
 ) -> Tuple[Optional[Dict], List[Dict]]:
     creates = [
         item for item in items
@@ -3733,11 +3736,13 @@ async def _pending_create_guard(
         )
         for item in creates
     }
+    shown_others = trusted_pending_word_items(shown_others_submitted)
     duplicates = [
         item for item in pending_items
         if item["source"] in {"submitted", "others_submitted"}
         and item["action"] == "Create"
         and (item["word"], item["code"]) in requested_pairs
+        and item not in shown_others
     ]
     if duplicates and not duplicate_confirmed:
         return {
@@ -4855,6 +4860,7 @@ async def keytao_batch_add_to_draft(
     preview_only: bool = False,
     _allow_same_code: bool = False,
     _pending_submitted_confirmed: bool = False,
+    _shown_others_submitted: Optional[List[Dict]] = None,
 ) -> Dict:
     """Guard every model/deterministic batch Create at the shared sink."""
     guard, pending_items = await _pending_create_guard(
@@ -4862,6 +4868,7 @@ async def keytao_batch_add_to_draft(
         platform_id,
         items,
         duplicate_confirmed=_pending_submitted_confirmed is True,
+        shown_others_submitted=_shown_others_submitted,
     )
     if guard is not None:
         return guard
@@ -6838,8 +6845,27 @@ async def keytao_shift_phrase_code(
         for item in plan_items
         if str(item.get("code") or "").strip()
     }
+    released_slots = set()
+    for companion in companion_items:
+        slot = (companion["type"], companion["code"])
+        same_slot = [item for item in plan_items if (item.get("type"), item.get("code")) == slot]
+        if not same_slot or any(item.get("action") != "Delete" for item in same_slot):
+            continue
+        lookup = await _lookup_codes_raw([slot[1]])
+        results = lookup.get("results") if lookup.get("success") is True else None
+        if not isinstance(results, list) or len(results) != 1 or results[0].get("code") != slot[1]:
+            return {"success": False, "message": "无法核验同批腾出的编码，本次未写入"}
+        occupants = results[0].get("phrases")
+        if not isinstance(occupants, list) or any(not isinstance(row, dict) or not row.get("word") for row in occupants):
+            return {"success": False, "message": "无法核验同批腾出的编码，本次未写入"}
+        deleted = {(item["type"], item["code"], item["word"]) for item in same_slot}
+        if all(
+            (str(row.get("type") or "Phrase"), slot[1], row["word"]) in deleted
+            for row in occupants if str(row.get("type") or "Phrase") == slot[0]
+        ):
+            released_slots.add(slot)
     if any(
-        item["code"] in shift_codes
+        item["code"] in shift_codes and (item["type"], item["code"]) not in released_slots
         or (
             item["word"] in shift_words
             and not (

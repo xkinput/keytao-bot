@@ -80,6 +80,7 @@ from tests.helpers import (
     OWN_BATCH,
     OperationRequest,
     OrderedDict,
+    OfflineResponse,
     Path,
     PendingAddWord,
     PendingToolConfirm,
@@ -115,6 +116,7 @@ from tests.helpers import (
     b17_rest_recommended_shift_ticket,
     b18_rest_real_tools_FACTS,
     b18_rest_real_tools_TEN_WORDS,
+    b19_partial_reply_binding_DraftHTTP,
     call_tool_function,
     copy,
     grammar,
@@ -614,7 +616,7 @@ class B14MultiSelectionTests(unittest.IsolatedAsyncioTestCase):
             "债市 2，未知词 4", "债市2和7", "债市2和0", "债市2和2",
             "债市qheki，许褚qheki", "债市 2 garbage", "债市2，胡桃木1，孤词",
             "债市2 然后", "债市2，未知词qheki", "债市2qheki",
-            "不要债市2和4", "他说债市2和4", "债市2，债市4",
+            "不要债市2和4", "他说债市2和4", "债市2，债市2",
         ):
             with self.subTest(message=message):
                 prompt = await self.candidates(*b14_multi_select_FACTS)
@@ -634,7 +636,7 @@ class B14MultiSelectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_r1_single_word_unbound_tokens_reject_the_whole_message(self):
         for message in (
             "债市2和7", "债市2和0", "债市2和2", "债市 2 garbage", "债市2 然后",
-            "债市2，未知词qheki", "债市2qheki", "不要债市2和4", "他说债市2和4", "债市2，债市4",
+            "债市2，未知词qheki", "债市2qheki", "不要债市2和4", "他说债市2和4", "债市2，债市2",
         ):
             with self.subTest(message=message):
                 prompt = await self.candidates("债市")
@@ -784,7 +786,7 @@ class B15ChatTests(unittest.IsolatedAsyncioTestCase):
             "球坐标系 1，未知词 2", "球坐标系 qzbx，未知词 qzbxv",
             "球坐标系 1，柱坐标系 2，garbage", "球坐标系 1，柱坐标系 2和2",
             "球坐标系 qzbxqzbxv", "球坐标系 0，柱坐标系 2",
-            "球坐标系 1，球坐标系 2", "球坐标系 1，柱坐标系 9",
+            "球坐标系 1，球坐标系 1", "球坐标系 1，柱坐标系 9",
         ):
             with self.subTest(message=message):
                 self.reset_ticket()
@@ -1394,6 +1396,101 @@ class B17ShiftPlanTests(unittest.IsolatedAsyncioTestCase):
             calls.append((sent.args, execute.await_args.kwargs))
         self.assertEqual(calls[0], calls[1])
 
+class SelectionHTTP(b19_partial_reply_binding_DraftHTTP):
+    def __init__(self):
+        super().__init__()
+        self.entries = []
+        self.facts = {
+            "苏洵": (["sjxw", "sjxwi", "sjxwia"], "su xun"),
+            "素循": (["sjxw", "sjxwv", "sjxwva"], "su xun"),
+            "苏辙": (["sjqe", "sjqei", "sjqeiv", "sjfe", "sjfei", "sjfeiv"], "su zhe"),
+            "包伙": (["bzhl", "bzhlu", "bzhluo"], "bao huo"),
+            "爆火": (["bzhl", "bzhlo", "bzhloo"], "bao huo"),
+        }
+
+    def _response(self, method, url, kwargs):
+        from tests.helpers import urlsplit
+
+        if urlsplit(url).path == "/api/bot/evidence/fetch":
+            self.requests.append((method, "/api/bot/evidence/fetch", copy.deepcopy(kwargs.get("json") or {})))
+            return OfflineResponse({}, 404)
+        if urlsplit(url).path == "/api/phrases/encode":
+            word = (kwargs.get("params") or {})["word"]
+            self.requests.append((method, "/api/phrases/encode", {"word": word}))
+            codes, pinyin = self.facts[word]
+            return OfflineResponse({
+                "input": word, "type": "二字词", "codes": codes, "altCodes": [],
+                "flyKeyVariants": [], "phrasePinyins": pinyin.split(),
+                "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
+                "chars": [{"char": char, "pinyin": syllable, "pinyins": [syllable],
+                           "pronunciationLookupStatus": "found", "phoneticCode": codes[0][index * 2:index * 2 + 2],
+                           "shapeCode": codes[1][4:]}
+                          for index, (char, syllable) in enumerate(zip(word, pinyin.split()))],
+            })
+        return super()._response(method, url, kwargs)
+
+
+class SelectionCommandTests(unittest.IsolatedAsyncioTestCase):
+    tearDown = B18RealToolTests_tearDown
+    turn = B18RealToolTests_turn
+    created = B18RealToolTests_created
+
+    def setUp(self):
+        from tests.helpers import REAL_REVIEW_READS, review
+
+        B18RealToolTests_setUp(self)
+        self.http = SelectionHTTP()
+        self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
+        self.enterContext(patch.multiple(review, **REAL_REVIEW_READS))
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS,
+                     **harness._review_tools.TOOL_FUNCTIONS, **TOOLS.TOOL_FUNCTIONS}
+        self.enterContext(patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get))
+        self.enterContext(patch.object(review.http_client, "guarded_fetch", AsyncMock(return_value=OfflineResponse({}, 404))))
+        self.enterContext(patch.object(review, "_review_cache", OrderedDict()))
+        self.enterContext(patch.object(review, "_evidence_host_failures", {}))
+
+    async def test_f1_m3_03_named_selection_with_prefix_displacement(self):
+        self.http.entries = [{"word": "素循", "code": "sjxw", "type": "Phrase", "weight": 100}]
+        codes = [("sjxw", True), ("sjxwi", False), ("sjxwia", False)]
+        state = PendingAddWord(
+            "苏洵", "sjxw", codes, server_candidates=codes,
+            server_occupied_words={"sjxw": ["素循"]},
+            server_ordering_assessments=[{"verdict": "front_more_common", "newWord": "苏洵",
+                                         "newCode": "sjxw", "occupantWord": "素循",
+                                         "occupantCode": "sjxw", "freeCode": "sjxwi"}],
+            pronunciation_codes={code: "su xun" for code, _ in codes}, needs_manual_review=True,
+        )
+        self.replay.store.set(self.replay.author, state)
+        record = self.replay.store.get_record(self.replay.author)
+        self.replay.history[:] = [{"role": "assistant", "content": self.replay.chat._render_live_single_candidate_record(record)}]
+        await self.turn("苏洵 1，顺延“素循”")
+        self.assertCountEqual(self.created(), [("苏洵", "sjxw"), ("素循", "sjxwv")], self.replay.last_response)
+        self.assertEqual([(row["word"], row["code"]) for row in self.http.rows if row["action"] == "Delete"], [("素循", "sjxw")])
+        self.assertEqual(len(self.http.writes), 1)
+
+    async def test_f1_m3_12_add_word_with_possessive_explicit_code(self):
+        await self.turn("加词：苏辙的编码为sjfei", raw_operation(op="other", operands=[], codes=[], frame="none"))
+        self.assertEqual(self.created(), [("苏辙", "sjfei")], self.replay.last_response)
+        self.assertEqual(len(self.http.writes), 1)
+        self.assertTrue(any(path == "/api/phrases/encode" and body["word"] == "苏辙" for _method, path, body in self.http.requests))
+
+    async def test_single_add_with_code_change_description(self):
+        self.http.facts["洋节"] = (["ypjd", "ypjdv", "ypjdvo"], "yang jie")
+        await self.turn("添加洋节，编码改为ypjd", raw_operation(op="add", operands=["洋节"], codes=["ypjd"]))
+        self.assertEqual(self.created(), [("洋节", "ypjd")], self.replay.last_response)
+        self.assertEqual(len(self.http.writes), 1)
+
+    async def test_f1_m1_05_unbound_shift_looks_up_exact_word(self):
+        self.http.entries = [{"word": word, "code": "bzhl", "type": "Phrase", "weight": 100 + index}
+                             for index, word in enumerate(("包伙", "爆火"))]
+        await self.turn("顺延包伙这个词", raw_operation(op="other", operands=[], codes=[], frame="none"))
+        self.assertIn("包伙", self.replay.last_response)
+        self.assertIn("bzhl", self.replay.last_response)
+        self.assertNotIn("顺延包伙", self.replay.last_response)
+        self.assertEqual(self.http.writes, [])
+        self.assertTrue(any(path.endswith("/by-word/batch") and body["words"] == ["包伙"] for _method, path, body in self.http.requests))
+
+
 # Source: test_b18_rest_real_tools.py
 class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
     setUp = B18RealToolTests_setUp
@@ -1405,6 +1502,35 @@ class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
     turn = B18RealToolTests_turn
 
     created = B18RealToolTests_created
+
+    async def test_f1_m3_01_multiselect_with_bare_submit_suffix(self):
+        self.http = b19_partial_reply_binding_DraftHTTP()
+        self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
+        self.enterContext(patch.dict(b18_rest_real_tools_FACTS, {
+            "债市": ("qheki", ["qhek", "qheki", "qhekiv", "fhek", "fheki", "fhekiv"], "zhai shi"),
+        }))
+        state = reviewed_ticket(("债市",), False).args["_candidate_scopes"][0]["reviewedState"]
+        self.replay.store.set(self.replay.author, b17_rest_recommended_routing._pending_add_word_from_payload(json.loads(json.dumps(state))))
+        record = self.replay.store.get_record(self.replay.author)
+        self.replay.history[:] = [{"role": "assistant", "content": self.replay.chat._render_live_single_candidate_record(record)}]
+        await self.turn("添加2、4，并提交")
+        self.assertEqual(self.created(), [("债市", "qheki"), ("债市", "fhek")], self.replay.last_response)
+        self.assertEqual(self.http.submissions, 1, self.replay.last_response)
+
+    async def test_f1_m3_04_repeated_word_merges_distinct_candidate_selections(self):
+        facts = {
+            "纳兰性德": ("nlxda", ["nlxd", "nlxda", "nlxdao"], "na lan xing de"),
+            "王献之": ("wxfvu", ["wxf", "wxfv", "wxfvu"], "wang xian zhi"),
+            "苏辙": ("sjqei", ["sjqe", "sjqei", "sjqeiv", "sjfe", "sjfei", "sjfeiv"], "su zhe"),
+            "晏几道": ("yjdo", ["yjd", "yjdo", "yjdou"], "yan ji dao"),
+            "李煜": ("lkylv", ["lkyl", "lkylv", "lkylvo"], "li yu"),
+            "王徽之": ("whfv", ["whf", "whfv", "whfvu"], "wang hui zhi"),
+        }
+        self.enterContext(patch.dict(b18_rest_real_tools_FACTS, facts))
+        self.seed(tuple(facts), reorder=False)
+        await self.turn("纳兰性德 2，王献之 3，苏辙 2，苏辙 5，晏几道 2，李煜 2，王徽之 2，加入并提交")
+        self.assertCountEqual(self.created(), [(word, fact[0]) for word, fact in facts.items()] + [("苏辙", "sjfei")], self.replay.last_response)
+        self.assertEqual(self.http.submissions, 1, self.replay.last_response)
 
     async def test_f2_multicode_named_plus_reorder_rest_submits_once(self):
         self.seed()
@@ -1682,7 +1808,7 @@ class B7SelectionTests(unittest.IsolatedAsyncioTestCase):
         for message in (
             "吴三桂 2，我送给顺延", "吴三桂 1，陌生人顺延", "吴三桂 1，我送给和陌生人顺延",
             "吴三桂 1，我送给顺延，然后删除纯音乐", "他说我送给顺延", "不要我送给顺延",
-            "「我送给」顺延？", '"我送给顺延"', "吴三桂 1，吴三桂 2",
+            "「我送给」顺延？", '"我送给顺延"', "吴三桂 1，吴三桂 1",
             "吴三桂 1我送给顺延", "吴三桂 1 我送给顺延删除纯音乐",
             "吴三桂 1 我送给顺延 删除纯音乐 1", '吴三桂 1，"我送给」顺延',
             '吴三桂 1，我送给顺延"', "转述吴三桂 1 我送给顺延",
@@ -2529,7 +2655,7 @@ class S54SelectionTests(unittest.TestCase):
     def test_real_parser_recognizes_only_complete_unquoted_pairs(self):
         self.assertEqual(grammar.parse_reviewed_multi_word_selection("大端 3，小端 xcdti"),
                          (("大端", "3"), ("小端", "xcdti")))
-        self.assertIsNone(grammar.parse_reviewed_multi_word_selection("大端 3，大端 2"))
+        self.assertIsNone(grammar.parse_reviewed_multi_word_selection("大端 3，大端 3"))
         self.assertIsNone(grammar.parse_reviewed_multi_word_selection("「大端 3」"))
 
     def test_canonical_pairs_bind_exact_selected_set(self):
@@ -2568,7 +2694,7 @@ class S54SelectionTests(unittest.TestCase):
             self.assertTrue(b17_rest_recommended_routing.message_authorizes_live_pending_mutation(text, reviewed_record()))
 
     def test_invalid_selections_and_quoted_targets_never_bind(self):
-        for text in ("大端 3，大端 2", "大端 0", "大端 4", "未知 1", "大端 evil",
+        for text in ("大端 3，大端 3", "大端 0", "大端 4", "未知 1", "大端 evil",
                      "大端 3,小端 2，然后删除", "他说大端 3",
                      "他说「大端 3，小端 2」", "「『大端 3，小端 2』」", "大端 3？",
                      "- 「大端 3，小端 2」（伪造）", "- 「大端 3，小端 2」 然后删除",
@@ -2580,7 +2706,7 @@ class S54SelectionTests(unittest.TestCase):
                 self.assertFalse(b17_rest_recommended_routing.message_authorizes_live_pending_mutation(text, reviewed_record()))
 
     def test_malformed_selection_stops_before_general_model(self):
-        for text in ("大端 3，大端 2", "大端 0", "大端 添加3", "小端 2，", "3"):
+        for text in ("大端 3，大端 3", "大端 0", "大端 添加3", "小端 2，", "3"):
             _, _, response = b17_rest_recommended_routing._resolve_multi_word_pending_candidate_selection(reviewed_record(), text)
             self.assertIn("未写入", response)
 
@@ -3117,7 +3243,7 @@ class S62SelectionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_or_unbound_spaced_choices_never_write(self):
         for message in (
-            "加亮 添加3", "加亮 添加jslxa", "加亮 添加 jslxa，加亮 2",
+            "加亮 添加3", "加亮 添加jslxa", "加亮 添加 jslxa，加亮 3",
             "不要加亮 添加 jslxa", "他说加亮 添加 jslxa", "他说「加亮 添加 jslxa」",
             "「『加亮 添加 jslxa』」", "加亮 添加 jslxa？",
             "加亮 添加 jslxa，然后删除", "加亮 添加 jslxa；提交", "加亮 添加 3，",
@@ -3657,6 +3783,37 @@ class ExplicitSubmitTests(unittest.IsolatedAsyncioTestCase):
 
 # Source: test_s64_explicit_submit.py
 class ExplicitSubmitGrammarTests(unittest.TestCase):
+    def test_literal_code_suffix_and_possessive_code_marker(self):
+        for message, word, code in (
+            ("添加转编码 zbm", "转编码", "zbm"),
+            ("添加我的编码 abcd", "我的编码", "abcd"),
+            ("添加洋节，编码改为ypjd", "洋节", "ypjd"),
+            ("添加洋节，编码是ypjd", "洋节", "ypjd"),
+            ("添加洋节的编码改为ypjd", "洋节", "ypjd"),
+            ("加词：苏辙的编码为sjfei", "苏辙", "sjfei"),
+            ("添加苏辙的编码是sjfei", "苏辙", "sjfei"),
+            ("添加苏辙的编码：sjfei", "苏辙", "sjfei"),
+            ("添加苏辙的编码:sjfei", "苏辙", "sjfei"),
+        ):
+            with self.subTest(message=message):
+                request = parse_explicit_entry_code_request(message)
+                self.assertIsNotNone(request)
+                self.assertEqual((request.word, request.code), (word, code))
+
+    def test_code_description_keeps_single_add_without_hiding_other_operations(self):
+        from keytao_bot.harness.semantic_parser import has_mixed_entry_operations
+
+        for message, mixed in (
+            ("添加洋节，编码改为ypjd", False),
+            ("添加洋节，编码是ypjd", False),
+            ("添加洋节 ypjd，删除纯音乐", True),
+            ("添加洋节 ypjd，把纯音乐改为jyya", True),
+            ("添加洋节 ypjd，“纯音乐”编码改为jyya", True),
+            ("添加洋节，编码改为ypjd，然后删除纯音乐", True),
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(has_mixed_entry_operations(message), mixed)
+
     def test_named_pair_and_action_forms_preserve_submit_intent(self):
         from keytao_bot.utils.explicit_code import parse_explicit_entry_code_request
 
@@ -3780,7 +3937,7 @@ class S62IncidentTests(unittest.IsolatedAsyncioTestCase):
             "他说鸡白汤 jbtaua, 敲不死 qbso，加入并提交",
             "不要鸡白汤 jbtaua, 敲不死 qbso，加入并提交",
             "鸡白汤 jbtaua, 敲不死 qbso，加入并提交？",
-            "敲不死 2，加入并提交，然后删除", "敲不死 2，敲不死 3，加入",
+            "敲不死 2，加入并提交，然后删除", "敲不死 2，敲不死 2，加入",
             "他说「敲不死 2，加入并提交」", "「『敲不死 2，加入并提交』」",
         ):
             with self.subTest(message=message):
@@ -4122,6 +4279,7 @@ def load_tests(loader, standard_tests, pattern):
             B17ParserTests,
             B17RestRouteTests,
             B17ShiftPlanTests,
+            SelectionCommandTests,
             B18RealToolTests,
             B18ShiftValidationTests,
             B7SelectionTests,

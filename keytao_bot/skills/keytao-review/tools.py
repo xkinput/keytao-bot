@@ -1,6 +1,7 @@
 """KeyTao review skill tools."""
 from __future__ import annotations
 
+import copy
 import itertools
 from typing import Any, Dict, List, Optional
 
@@ -172,6 +173,9 @@ async def keytao_prepare_reviewed_add(
     if requested_code:
         review_kwargs["requested_code"] = requested_code
     review = await prepare_reviewed_word(config, word, **review_kwargs)
+    if review.get("success") and platform and platform_id:
+        review = copy.deepcopy(review)
+        await _project_draft_candidate_occupancy(review, platform, platform_id)
     recommended_code = str(review.get("recommendedCode") or "").strip()
     reviewed_word = str(review.get("word") or word or "").strip()
     if review.get("success") and reviewed_word and recommended_code:
@@ -253,6 +257,103 @@ async def keytao_prepare_reviewed_add(
         await assess_candidate_chain_commonness(review),
     )
     return review
+
+
+async def _project_draft_candidate_occupancy(review: Dict, platform: str, platform_id: str) -> None:
+    """Apply only this actor's complete draft to the reviewed live slots."""
+    groups = [review, *[item for item in review.get("pronunciations") or [] if isinstance(item, dict)]]
+    if not any(group.get("candidateStatuses") for group in groups) and not isinstance(review.get("existing"), list):
+        return
+    try:
+        draft = await http_client.keytao_json(
+            "GET", "/api/bot/batches/latest-draft/items",
+            platform=platform, platform_id=platform_id,
+            params={"platform": platform, "platformId": platform_id},
+        )
+    except Exception as error:
+        logger.debug(f"[prepare_reviewed_add] draft occupancy unavailable: {type(error).__name__}")
+        return
+    if not isinstance(draft, dict):
+        return
+    items = draft.get("items")
+    count = draft.get("count")
+    version = draft.get("contentVersion")
+    if (
+        draft.get("success") is not True
+        or not isinstance(items, list)
+        or not isinstance(count, int) or isinstance(count, bool) or count != len(items)
+        or not isinstance(version, int) or isinstance(version, bool) or version < 0
+        or (items and not str(draft.get("batchId") or "").strip())
+        or draft.get("itemsTruncationNotice") or draft.get("truncated") or draft.get("hasMore")
+        or draft.get("status") not in (None, "Draft")
+    ):
+        return
+    removed = set()
+    created = {}
+    for item in items:
+        if not isinstance(item, dict):
+            return
+        action = item.get("action")
+        identity = (item.get("type"), item.get("code"), item.get("word"))
+        if action not in {"Create", "Change", "Delete"} or not all(isinstance(value, str) and value for value in identity):
+            return
+        if action == "Change":
+            old_word = item.get("oldWord") or item.get("old_word")
+            if not isinstance(old_word, str) or not old_word:
+                return
+            removed.add((identity[0], identity[1], old_word))
+        elif action == "Delete":
+            removed.add(identity)
+            continue
+        if identity in created:
+            return
+        created[identity] = copy.deepcopy(item)
+    phrase_type = str(review.get("type") or review.get("phraseType") or ("Single" if len(str(review.get("word") or "")) == 1 else "Phrase"))
+    existing = review.get("existing")
+    if isinstance(existing, list) and all(isinstance(row, dict) and row.get("word") and row.get("code") for row in existing):
+        merged_existing = {
+            (str(row.get("type") or phrase_type), row["code"], row["word"]): row
+            for row in existing
+        }
+        merged_existing = {identity: row for identity, row in merged_existing.items() if identity not in removed}
+        merged_existing.update({identity: row for identity, row in created.items()
+                                if identity[0] == phrase_type and identity[2] == review.get("word")})
+        review["existing"] = list(merged_existing.values())
+    for group in groups:
+        for status in group.get("candidateStatuses") or []:
+            if not isinstance(status, dict) or not isinstance(status.get("occupied"), bool) or status.get("lookupFailed"):
+                continue
+            code = status.get("code")
+            phrases = status.get("phrases")
+            if not isinstance(code, str) or not code or not isinstance(phrases, list) or any(
+                not isinstance(row, dict) or not isinstance(row.get("word"), str) or not row["word"]
+                for row in phrases
+            ):
+                continue
+            if status["occupied"] and not phrases:
+                continue
+            if set(status.get("words") or []) - {row["word"] for row in phrases}:
+                continue
+            merged = {(str(row.get("type") or phrase_type), code, row["word"]): row for row in phrases}
+            merged = {identity: row for identity, row in merged.items() if identity not in removed}
+            merged.update({identity: row for identity, row in created.items() if identity[:2] == (phrase_type, code)})
+            rows = list(merged.values())
+            status.update(phrases=rows, words=list(dict.fromkeys(row["word"] for row in rows)), occupied=bool(rows))
+            status["label"] = "已有" + "、".join(f"「{row['word']}」" for row in rows) if rows else "空位"
+        statuses = group.get("candidateStatuses") or []
+        if (statuses and not review.get("lookupFailed") and not review.get("pronunciationUnresolved")
+                and all(isinstance(status, dict) and isinstance(status.get("code"), str) and status["code"]
+                        for status in statuses)):
+            fully_known = all(isinstance(status.get("occupied"), bool) and not status.get("lookupFailed")
+                              for status in statuses)
+            group["recommendedCode"] = next((status["code"] for status in statuses
+                                             if status.get("occupied") is False and not status.get("lookupFailed")),
+                                            statuses[0]["code"] if fully_known else "")
+    if not review.get("lookupFailed") and not review.get("pronunciationUnresolved"):
+        recommended = next((str(group.get("recommendedCode") or "") for group in groups[1:]
+                            if group.get("recommendedCode")), "")
+        if groups[1:]:
+            review["recommendedCode"] = recommended
 
 
 async def keytao_audit_draft_items(items: List[Dict]) -> Dict:

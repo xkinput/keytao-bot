@@ -391,5 +391,128 @@ class B5DeleteTests(unittest.IsolatedAsyncioTestCase):
         }])
 
 
+class CompoundEntryTests(unittest.IsolatedAsyncioTestCase):
+    from tests.helpers import (
+        B19PartialReplyBindingTests_matcher_send as matcher_send,
+        B19PartialReplyBindingTests_matcher_finish as matcher_finish,
+        B19PartialReplyBindingTests_turn as turn,
+        B24DisplaceTests_tearDown as tearDown,
+    )
+
+    def setUp(self):
+        from tests.helpers import (
+            B24DisplaceTests_setUp, DisplaceHTTP, OfflineResponse, TOOLS, urlsplit,
+        )
+
+        B24DisplaceTests_setUp(self)
+
+        class CompoundHTTP(DisplaceHTTP):
+            def _response(self, method, url, kwargs):
+                path = urlsplit(url).path
+                if path == "/api/bot/evidence/fetch":
+                    self.requests.append((method, path, copy.deepcopy(kwargs.get("json") or {})))
+                    return OfflineResponse({"success": False}, 404)
+                if path == "/api/phrases/encode":
+                    word = (kwargs.get("params") or {})["word"]
+                    codes = ["ypjd", "ypjdv", "ypjdvo"] if word in {"杨杰", "洋节"} else ["lwfr", "lwfro", "lwfrov"]
+                    pinyins = ["yang", "jie"] if word in {"杨杰", "洋节"} else ["liang", "wen", "feng"]
+                    self.requests.append((method, path, {"word": word}))
+                    return OfflineResponse({
+                        "input": word, "type": "二字词", "codes": codes, "altCodes": [],
+                        "flyKeyVariants": [], "phrasePinyins": [" ".join(pinyins)],
+                        "pronunciationSource": "zdic-phrase", "standardPronunciationStatus": "found",
+                        "chars": [{"char": char, "pinyin": pinyin, "pinyins": [pinyin],
+                                   "pronunciationLookupStatus": "found", "phoneticCode": code, "shapeCode": "v"}
+                                  for char, pinyin, code in zip(word, pinyins, ("yp", "jd") if len(word) == 2 else ("lx", "wf", "fr"))],
+                    })
+                return super()._response(method, url, kwargs)
+
+        self.http = CompoundHTTP()
+        self.enterContext(patch.object(TOOLS.http_client, "_keytao_client", self.http))
+        self.enterContext(patch.object(TOOLS.httpx, "AsyncClient", side_effect=lambda **_kwargs: self.http, create=True))
+
+    async def test_m3_02_compound_operations_keep_every_clause_and_vacated_slot(self):
+        from tests.helpers import OfflineResponse, raw_operation, urlsplit
+
+        for message in (
+            "如果这样安排更合适。把「洋节」编码成ypjd，「杨杰」的编码改成 ypjdv。",
+            "把「洋节」编码成ypjd，「杨杰」的编码改成 ypjdv。",
+            "「杨杰」的编码改成 ypjdv，添加「洋节」ypjd。",
+            "删除「梁文峰」，添加「梁文锋」",
+        ):
+            with self.subTest(message=message):
+                self.http.rows.clear()
+                self.http.writes.clear()
+                self.replay.store.delete(self.replay.author)
+                replacing = message.startswith("删除")
+                old, new, code = ("梁文峰", "梁文锋", "lwfr") if replacing else ("杨杰", "洋节", "ypjd")
+                self.http.entries = [{"word": old, "code": code, "type": "Phrase", "weight": 100}]
+                greeting = await self.bot.deliver(event=None, message="喵喵在。")
+                await self.turn(message, str(greeting["message_id"]), raw=raw_operation(
+                    op="delete" if replacing else "recode", operands=[old],
+                    codes=[] if replacing else ["ypjdv"], refers_to_pending=False, confidence="low",
+                    note="also add the other word",
+                ))
+                self.assertEqual(self.http.writes, [], self.replay.last_response)
+                self.assertIn(old, self.replay.last_response)
+                self.assertIn(new, self.replay.last_response)
+                await self.turn("确认", self.bot.last_id)
+                expected = [("Delete", old, code), ("Create", new, code)]
+                if not replacing:
+                    expected.append(("Create", old, "ypjdv"))
+                self.assertCountEqual([(row["action"], row["word"], row["code"]) for row in self.http.rows], expected,
+                                      self.replay.last_response)
+                self.assertEqual(len(self.http.writes), 1, self.replay.last_response)
+                if not replacing:
+                    self.http.rows = [row for row in self.http.rows if row["word"] != new]
+                    await self.turn(f"加词「{new}」{code}。", self.bot.last_id, raw=raw_operation(
+                        op="add", operands=[new], codes=[code], refers_to_pending=False,
+                    ))
+                    record = self.replay.store.get_record(self.replay.author)
+                    if record is not None and isinstance(record.state, PendingToolConfirm):
+                        await self.turn("确认", self.bot.last_id)
+                    self.assertIn(("Create", new, code), [(row["action"], row["word"], row["code"]) for row in self.http.rows],
+                                  self.replay.last_response)
+        for message in (
+            "杨杰编码改成 zzzz，添加洋节 ypjd",
+            "杨杰编码改成 ypjdv，添加洋节 ypjd，删除梁文峰",
+        ):
+            with self.subTest(invalid=message):
+                self.http.rows.clear()
+                self.http.writes.clear()
+                self.http.entries = [{"word": "杨杰", "code": "ypjd", "type": "Phrase", "weight": 100}]
+                self.replay.store.delete(self.replay.author)
+                greeting = await self.bot.deliver(event=None, message="喵喵在。")
+                await self.turn(message, str(greeting["message_id"]), raw=raw_operation(
+                    op="recode", operands=["杨杰"], codes=["ypjdv"], refers_to_pending=False, confidence="low",
+                ))
+                self.assertIsNone(self.replay.store.get_record(self.replay.author), self.replay.last_response)
+                await self.turn("确认", self.bot.last_id)
+                self.assertEqual(self.http.writes, [], self.replay.last_response)
+        self.http.rows.clear()
+        self.http.writes.clear()
+        self.replay.store.delete(self.replay.author)
+        greeting = await self.bot.deliver(event=None, message="喵喵在。")
+        await self.turn("加词 洋节", str(greeting["message_id"]), raw=raw_operation(
+            op="add", operands=["洋节"], codes=[], refers_to_pending=False,
+        ))
+        prior = self.replay.store.get_record(self.replay.author)
+        self.assertIsNotNone(prior, self.replay.last_response)
+        original_response = self.http._response
+
+        def fail_pending(method, url, kwargs):
+            if method == "GET" and urlsplit(url).path == "/api/batches":
+                return OfflineResponse({"message": "pending lookup unavailable"}, 500)
+            return original_response(method, url, kwargs)
+
+        with patch.object(self.http, "_response", fail_pending):
+            await self.turn("「杨杰」的编码改成 ypjdv，添加「洋节」ypjd。", self.bot.last_id, raw=raw_operation(
+                op="recode", operands=["杨杰"], codes=["ypjdv"], refers_to_pending=False,
+            ))
+        self.assertIs(self.replay.store.get_record(self.replay.author), prior, self.replay.last_response)
+        self.assertEqual(self.http.writes, [], self.replay.last_response)
+        self.assertNotIn("将执行", self.replay.last_response)
+
+
 if __name__ == "__main__":
     unittest.main()

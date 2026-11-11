@@ -856,6 +856,84 @@ class B24DisplaceTests(unittest.IsolatedAsyncioTestCase):
 
     finish_shift = B24DisplaceTests_finish_shift
 
+    async def seed_recommended_displacement(self):
+        state = await self.seed()
+        state.recommended_code = b24_displace_CODES[0]
+        state.server_ordering_assessments = [{
+            "newWord": b24_displace_WORD, "occupantWord": b24_displace_OCCUPANT,
+            "occupantCode": b24_displace_CODES[0], "freeCode": b24_displace_CODES[1],
+            "newCode": b24_displace_CODES[0], "verdict": "front_more_common",
+            "summary": "本轮已核验常用度建议调序",
+        }]
+        self.assertTrue(self.replay.store.set(self.replay.author, state))
+        prompt = b19_partial_reply_binding_chat._chat_commands.render_server_backed_single_word_lookup(
+            state.word, state.recommended_code, state.server_candidates, state.server_occupied_words,
+            ordering_assessments=state.server_ordering_assessments, actionable_controls=True,
+        )
+        self.assertIn("「豪横」占 hzhr、「毫亨」顺延", prompt)
+        await REAL_FINISH(self.bot, SimpleNamespace(message_id=1), self.replay.author.actor_id,
+                          self.replay.memory, prompt)
+        self.original_id = self.bot.last_id
+        return state
+
+    async def test_m1_06_recommended_displacement_add_and_submit_is_consent(self):
+        await self.seed_recommended_displacement()
+        await self.turn("加入并提交", self.original_id)
+        self.assertEqual(self.http.submissions, 1, self.replay.last_response)
+        self.assertCountEqual(self.created(), [(b24_displace_WORD, b24_displace_CODES[0]),
+                                               (b24_displace_OCCUPANT, b24_displace_CODES[1])])
+        self.assertNotIn("回复「确认」", self.replay.last_response)
+
+    async def test_m2_2_recommended_displacement_add_is_consent(self):
+        await self.seed_recommended_displacement()
+        await self.turn("加入", self.original_id)
+        self.assertEqual(len(self.http.writes), 1, self.replay.last_response)
+        self.assertCountEqual(self.created(), [(b24_displace_WORD, b24_displace_CODES[0]),
+                                               (b24_displace_OCCUPANT, b24_displace_CODES[1])])
+        self.assertNotIn("回复「确认」", self.replay.last_response)
+
+    async def test_m1_07_shown_pending_duplicate_add_and_submit_is_consent(self):
+        from tests.helpers import DisplaceHTTP, OfflineResponse
+        from urllib.parse import urlsplit
+
+        class PendingDisplaceHTTP(DisplaceHTTP):
+            def _response(self, method, url, kwargs):
+                path = urlsplit(url).path
+                if method == "GET" and path == "/api/batches":
+                    return OfflineResponse({"batches": [{
+                        "id": "other-pending-batch", "status": "Submitted", "creator": {"id": 43},
+                    }], "pagination": {"page": 1, "totalPages": 1}})
+                if method == "GET" and path == "/api/batches/other-pending-batch":
+                    return OfflineResponse({"batch": {
+                        "id": "other-pending-batch", "status": "Submitted", "creatorId": 43,
+                        "pullRequests": [{"id": 51, "action": "Create", "word": b24_displace_WORD,
+                                          "code": b24_displace_CODES[1], "type": "Phrase", "status": "Pending"}],
+                    }})
+                if method == "POST" and path.endswith("/auto-approve"):
+                    return OfflineResponse({"success": False, "message": "本轮交管理员审核"})
+                return super()._response(method, url, kwargs)
+
+        self.http = PendingDisplaceHTTP()
+        self.enterContext(patch.object(b11_shift_draft_tools.http_client, "_keytao_client", self.http))
+        state = await self.seed()
+        self.assertEqual([(item["word"], item["code"]) for item in state.shown_others_submitted],
+                         [(b24_displace_WORD, b24_displace_CODES[1])])
+        for changes in ({"word": "其他词"}, {"code": b24_displace_CODES[2]},
+                        {"batchId": "another-pending-batch"}):
+            with self.subTest(changes=changes):
+                guard, _items = await b11_shift_draft_tools._pending_create_guard(
+                    "qq", self.replay.author.actor_id,
+                    [{"action": "Create", "word": state.word, "code": state.recommended_code}],
+                    duplicate_confirmed=False,
+                    shown_others_submitted=[{**state.shown_others_submitted[0], **changes}],
+                )
+                self.assertTrue(guard["pendingDuplicateConfirmation"])
+                self.assertEqual(self.http.writes, [])
+        await self.turn("加入并提交", self.original_id)
+        self.assertEqual(self.http.submissions, 1, self.replay.last_response)
+        self.assertEqual(self.created(), [(b24_displace_WORD, b24_displace_CODES[1])])
+        self.assertNotIn("确认再提交", self.replay.last_response)
+
     def test_f1_displacement_verbs_are_never_explicit_word_code_adds(self):
         for prefix in ("", "加入，", "加入并提交，"):
             for verb in ("顶替", "顶掉", "挤掉", "替换"):

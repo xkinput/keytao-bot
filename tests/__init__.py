@@ -136,6 +136,7 @@ _DISCOVERY = (
     ('tests.test_skills', ()),
     ('tests.test_state_machine', ()),
     ('tests.test_word_discovery', ()),
+    ('tests.test_add_and_select', ('tests.test_add_and_select.SelectionCommandTests',)),
 )
 
 

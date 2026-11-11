@@ -1950,6 +1950,16 @@ class QueryPrecedenceTests(unittest.IsolatedAsyncioTestCase):
 
     delivered = QueryPrecedenceTests_delivered
 
+    async def test_bare_words_with_move_verb_prefixes_query_without_classifier(self):
+        for word in ("移民", "调查", "挪威", "调整", "移动", "调值"):
+            with self.subTest(word=word), patch.object(
+                b17_rest_recommended_routing, "_classify_simple_word_query_intent",
+                AsyncMock(side_effect=AssertionError("Unexpected intent classifier")),
+            ) as classifier:
+                self.assertTrue(b17_rest_recommended_routing._is_bare_word_query_target(word))
+                self.assertEqual(await b17_rest_recommended_routing._get_simple_word_query_words(word), (word,))
+                classifier.assert_not_awaited()
+
     async def test_query_matrix_wins_over_no_intent_classifier(self):
         for message, words in (
             ("练枪 得吃", ("练枪", "得吃")),

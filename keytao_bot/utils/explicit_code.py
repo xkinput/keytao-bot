@@ -43,7 +43,7 @@ def parse_explicit_entry_code_request(message: str):
     word_operand = operand(word)
     quoted_word = rf'(?:"\s*{word}\s*"|“\s*{word}\s*”|「\s*{word}\s*」|『\s*{word}\s*』)'
     code_operand = operand(code)
-    action = r'(?:加入草稿|加到草稿|写入草稿|加入|添加到草稿|添加草稿|添加)(?P<submit>并提交)?'
+    action = r'(?:加入草稿|加到草稿|写入草稿|加入|添加到草稿|添加草稿|添加|加词)(?P<submit>并提交)?'
     separator = r'(?:\s*[,，、；;]\s*|\s+)'
     reading = r'(?:(?P<pinyin>[A-Za-z\u00c0-\u024f\u1e00-\u1eff0-5]+(?:\s+[A-Za-z\u00c0-\u024f\u1e00-\u1eff0-5]+)*)\s*:\s*)?'
     pair = rf'(?P<word>{word_operand})\s+{reading}(?P<code>{code_operand})'
@@ -78,8 +78,11 @@ def parse_explicit_entry_code_request(message: str):
         rf'(?P<word>{word_operand})\s+加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
         rf'(?P<word>{quoted_word})\s*加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
         rf'给\s*(?P<word>{word_operand})\s*加入\s*编码\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
-        rf'(?:添加|加入)\s*(?P<type>单字|词组|词条)?\s*(?P<word>{word_operand})'
-        rf'(?:\s*[,，]?\s*编码\s*(?:为|是)?\s*[:：]?\s*|\s+)(?P<code>{code_operand})',
+        rf'(?:添加|加入|加词)\s*[:：]?\s*(?P<word>{quoted_word})\s*(?P<code>[a-zA-Z][a-zA-Z0-9]*)',
+        rf'(?:添加|加入|加词)\s*[:：]?\s*(?P<type>单字|词组|词条)?\s*(?P<word>{word_operand})'
+        rf'\s*[,，]?\s*的编码\s*(?=改为|[为是:：])(?:改为|为|是)?\s*[:：]?\s*(?P<code>{code_operand})',
+        rf'(?:添加|加入|加词)\s*[:：]?\s*(?P<type>单字|词组|词条)?\s*(?P<word>{word_operand})'
+        rf'(?:\s*[,，]?\s*(?:的)?编码\s*(?:改为|为|是)?\s*[:：]?\s*|\s+)(?P<code>{code_operand})',
         rf'给\s*(?P<word>{word_operand})\s*加(?:一个|个)?\s*(?:编码|码)\s*(?P<code>{code_operand})',
         rf'(?P<word>{word_operand})\s*也放到\s*(?P<code>{code_operand})',
     )

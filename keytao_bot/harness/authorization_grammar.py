@@ -775,6 +775,17 @@ class EntryMovePlanCommand:
 
 
 @dataclass(frozen=True)
+class CompoundEntryCommand:
+    """An existing-entry move or delete followed by one exact addition."""
+
+    source_word: str
+    add_word: str
+    target_code: str
+    add_code: str
+    delete_source: bool = False
+
+
+@dataclass(frozen=True)
 class IndirectEntryMove:
     """A bounded deictic selection whose literal referent needs model recovery."""
 
@@ -1353,6 +1364,52 @@ def parse_entry_move_plan(message: str) -> Optional[EntryMovePlanCommand]:
             and first.target_code != second.target_code
         ):
             return EntryMovePlanCommand(moves=(first, second))
+    return None
+
+
+def parse_compound_entry_command(message: str) -> Optional[CompoundEntryCommand]:
+    """Consume both operations before issuing any executable preview."""
+    source = trusted_mutation_source(message).strip().rstrip("。.!！").strip()
+    if (
+        not source or re.search(r"[?？]", source)
+        or _NEGATIVE_MODAL_RE.search(source)
+        or _POSITIONAL_REPORTED_CONTEXT_RE.search(source)
+        or _DATA_CONTEXT_RE.search(source)
+    ):
+        return None
+    if "。" in source:
+        preamble, source = source.rsplit("。", 1)
+        if _MUTATION_INTENT_RE.search(preamble):
+            return None
+    if _EXPLANATION_ONLY_RE.search(source):
+        return None
+    clauses = re.split(r"[，,；;\n]+", source)
+    if len(clauses) != 2:
+        return None
+    operand = _REPLACE_AT_CODE_ENTRY_PATTERN
+    add_pattern = (
+        rf"(?:添加|加入|加词)\s*[:：]?\s*(?P<word>{operand})"
+        r"\s*(?:的?编码\s*(?:为|是)?\s*)?(?P<code>[a-z]{1,12})?"
+    )
+    encoded_pattern = rf"(?:把|将)\s*(?P<word>{operand})\s*编码成\s*(?P<code>[a-z]{{1,12}})"
+    move_pattern = rf"(?:把|将)?\s*(?P<word>{operand})\s*(?:的)?编码\s*(?:改成|改为|调整为)\s*(?P<code>[a-z]{{1,12}})"
+    for add_index in (0, 1):
+        add_clause = clauses[add_index].strip()
+        add = re.fullmatch(add_pattern, add_clause) or re.fullmatch(encoded_pattern, add_clause)
+        if add is None:
+            continue
+        other = clauses[1 - add_index].strip()
+        move = parse_existing_entry_move(other)
+        recode = re.fullmatch(move_pattern, other)
+        deletion = parse_dictionary_delete_command(other)
+        delete_match = re.fullmatch(rf"(?:删除|删词)\s*(?P<word>{operand})", other)
+        delete_word = deletion.word if deletion and not deletion.code else _replace_at_code_word(delete_match["word"]) if delete_match else ""
+        source_word = move.word if move else _replace_at_code_word(recode["word"]) if recode else delete_word
+        add_word = _replace_at_code_word(add["word"])
+        target_code = move.target_code if move else recode["code"] if recode else ""
+        add_code = add["code"] or ""
+        if source_word and add_word and source_word != add_word and (delete_word or add_code):
+            return CompoundEntryCommand(source_word, add_word, target_code, add_code, bool(delete_word))
     return None
 
 
@@ -2981,6 +3038,8 @@ def message_authorizes_mutation(message: str) -> bool:
         return True
     if parse_entry_move_plan(message) is not None:
         return True
+    if parse_compound_entry_command(message) is not None:
+        return True
     if parse_indirect_entry_move(message) is not None:
         return True
     if _positive_bare_entry_mutation(message):
@@ -3030,9 +3089,9 @@ def _unquoted_shift_word_is_literal(word: str) -> bool:
 
 
 def parse_standalone_shift(
-    message: str, *, known_words: Tuple[str, ...] = (),
+    message: str, *, known_words: Tuple[str, ...] = (), allow_unbound_word: bool = False,
 ) -> Optional[ExistingEntryMove]:
-    """Bind a complete shift only to a quoted word or an exact live reference."""
+    """Bind a shift; unbound discovery requires an exact lookup before use."""
     source = str(message or "").strip()
     while (mention := _SELF_MENTION_RE.match(source)) is not None:
         source = source[mention.end():].lstrip(" \t:：，,")
@@ -3042,13 +3101,22 @@ def parse_standalone_shift(
                      if re.fullmatch(r"[\u3400-\u9fff]{1,32}", value))
     if bound:
         word = rf'(?:{word}|{bound})'
+    if allow_unbound_word:
+        word = rf'(?:{word}|[\u3400-\u9fff]{{1,32}}?)'
     match = re.fullmatch(
-        rf'(?:顺延\s*(?P<front>{word})|(?:把\s*)?(?P<back>{word})\s*顺延)(?:\s*一位)?'
+        rf'(?:顺延\s*(?P<front>{word})|(?:把\s*)?(?P<back>{word})\s*顺延)'
+        r'(?:\s*这个词)?(?:\s*一位)?'
         r'(?:\s*到\s*(?P<code>[a-z]{1,12}|[0-9]+号?))?', source,
     )
     if match is None:
         return None
     value = match["front"] or match["back"]
+    if (
+        allow_unbound_word and value not in known_words
+        and not value.startswith(('「', '“', '"', '『'))
+        and not _unquoted_shift_word_is_literal(value)
+    ):
+        return None
     return ExistingEntryMove(value.strip('「」“”"『』'), match["code"] or "", verb="顺延")
 
 
@@ -3061,10 +3129,10 @@ def parse_reviewed_shift_words(
         return None
     words: List[str] = []
     for clause in re.split(r"[，、,；;]", source):
-        match = re.fullmatch(r"(?P<body>.+?)[ \t]*顺延", clause.strip())
+        match = re.fullmatch(r"(?:顺延[ \t]*(?P<front>.+)|(?P<back>.+?)[ \t]*顺延)", clause.strip())
         if match is None:
             return None
-        body = match.group("body").strip()
+        body = (match.group("front") or match.group("back")).strip()
         while body:
             known = next((word for word in sorted(set(known_words), key=len, reverse=True)
                           if body.startswith(word) and (
@@ -3136,13 +3204,17 @@ def parse_reviewed_selection_command(
     pairs: List[Tuple[str, str]] = []
     readings: List[Tuple[str, str]] = []
     shift_words: List[str] = []
-    seen_words: set[str] = set()
+    seen_pairs: set[Tuple[str, str]] = set()
     selector = r"(?:[1-9][0-9]{0,2}|[a-zA-Z]{1,12})"
     for clause in re.split(r"[，、,；;](?![ \t]*[0-9a-zA-Z])", source):
         remaining = clause.strip()
         if not remaining:
             return None
         while remaining:
+            shifted = parse_reviewed_shift_words(remaining, known_words=known_shift_words)
+            if shifted is not None:
+                shift_words.extend(shifted)
+                break
             shift_end = remaining.find("顺延") + len("顺延")
             shifted = parse_reviewed_shift_words(
                 remaining[:shift_end], known_words=known_shift_words,
@@ -3158,18 +3230,22 @@ def parse_reviewed_selection_command(
                 rf"(?P<selectors>{selector}(?:(?:[ \t]*[，、,和][ \t]*|[ \t]+){selector})*)(?=$|[ \t])",
                 remaining,
             )
-            if match is None or match.group("word") in seen_words:
+            if match is None:
                 return None
             word = match.group("word")
-            seen_words.add(word)
             selectors = re.split(r"[ \t，、,和]+", match.group("selectors").lower())
-            if len(set(selectors)) != len(selectors):
+            selected = [(word, value) for value in selectors]
+            if len(set(selectors)) != len(selectors) or any(pair in seen_pairs for pair in selected):
                 return None
-            pairs.extend((word, value) for value in selectors)
+            seen_pairs.update(selected)
+            pairs.extend(selected)
             if match.group("reading"):
                 if any(value.isdecimal() for value in selectors):
                     return None
-                readings.append((word, " ".join(match.group("reading").split())))
+                reading = " ".join(match.group("reading").split())
+                if word in dict(readings) and dict(readings)[word] != reading:
+                    return None
+                readings.append((word, reading))
             if match.group("add") and not action:
                 action = "加入"
             remaining = remaining[match.end():].strip()

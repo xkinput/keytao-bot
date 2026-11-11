@@ -5008,6 +5008,11 @@ async def _try_reviewed_operand_reply(ctx: TurnContext) -> bool:
             include_context_records=True,
         ) is not None
     )
+    if displacement is not None and not foreign and record is not None and isinstance(record.state, PendingAddWord):
+        selection = _chat_routing._structural_pending_add_word_intent(message, record.state)
+        if (selection is not None and selection.intent == "pending_recode" and selection.target_word
+                and "顺延" in message and record.owner_key.actor_id == str(ctx.user_id)):
+            return False
     if foreign:
         response = "这条提议不是发给你的，本次未执行。"
     elif draft_operation_coordinator.find_for_actor((ctx.platform, ctx.user_id)) is not None:
@@ -5054,6 +5059,11 @@ async def _stage_understand_operation_early(ctx: TurnContext) -> bool:
     """Await enabled routing before command stages; retain the legacy shadow slot."""
     if ctx.operation_understood_early:
         return False
+    from ..harness.authorization_grammar import parse_compound_entry_command
+
+    if parse_compound_entry_command(_strip_command_message_prefixes(ctx.normalized_message_text)) is not None:
+        if await _stage_handle_explicit_entry_operation(ctx):
+            return True
     if await _try_reviewed_operand_reply(ctx):
         return True
     if await _try_stale_displacement_reply(ctx):
@@ -5432,6 +5442,15 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
                         )
                         return True
         if model_command:
+            from ..harness.semantic_parser import has_mixed_entry_operations
+
+            if has_mixed_entry_operations(message):
+                ctx.response = "这条消息包含多个操作，尚未取得完整计划；本次未写入。"
+                remember_conversation(ctx.conv_key, ctx.memory_context, message, ctx.response)
+                await _finish_ai_chat_response(
+                    ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
+                )
+                return True
             direct = high_confidence and _chat_commands.semantic_direct_exec_allowed(validated, violations)
             named_words = validated.operands
             resolved, options, explanation = await _chat_commands.resolve_model_replace(

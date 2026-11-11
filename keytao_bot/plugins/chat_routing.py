@@ -1527,7 +1527,30 @@ def _structural_pending_add_word_intent(
     stripped = _strip_command_message_prefixes(
         trusted_mutation_source(message_text)
     ).strip()
-    selection = parse_reviewed_selection_command(stripped)
+    selection = parse_reviewed_selection_command(stripped, known_shift_words=tuple(
+        occupant for occupants in state.server_occupied_words.values() for occupant in occupants
+    ))
+    if (
+        selection is not None and selection.shift_words
+        and len(selection.pairs) == 1 and selection.pairs[0][0] == state.word
+        and state.server_candidates and state.server_candidates == state.candidates
+    ):
+        selector = selection.pairs[0][1]
+        index = int(selector) if selector.isdecimal() else None
+        code = (
+            state.server_candidates[index - 1][0]
+            if index is not None and 1 <= index <= len(state.server_candidates) else selector
+        )
+        if (
+            dict(state.server_candidates).get(code) is True
+            and tuple(state.server_occupied_words.get(code, ())) == selection.shift_words
+            and len(selection.shift_words) == 1
+        ):
+            return MessageCommandIntent(
+                intent="pending_recode", confidence=1.0, choice_index=index,
+                requested_code=code, target_word=selection.shift_words[0],
+                submit_after="提交" in selection.action,
+            )
     if (
         selection is not None and not selection.shift_words
         and len(selection.pairs) == 1 and selection.pairs[0][0] == state.word
@@ -1863,11 +1886,10 @@ def _normalize_pending_candidate_selection_text(text: str, word: str = "") -> st
     if separator:
         assent = parse_pending_assent_phrase(action)
         if (
-            assent.matched
-            and assent.add_requested
+            (assent.matched and assent.add_requested or action.strip() == "并提交")
             and parse_pending_candidate_selection(selection) is not None
         ):
-            source = selection + ("并提交" if assent.submit_after else "")
+            source = selection + ("并提交" if assent.submit_after or action.strip() == "并提交" else "")
     return source
 
 
@@ -1881,6 +1903,8 @@ def _closed_candidate_selection(
         if parsed.recode_indices:
             return None
         return parsed.indices, parsed.codes, parsed.submit_after
+    if re.search(r"[0-9][\s、,，;；]+[0-9]", text):
+        return None
     compact = _compact_command_text(text).lower()
     if compact.startswith("回复"):
         compact = compact[2:]
@@ -3188,7 +3212,7 @@ def _is_bare_word_query_target(word: str) -> bool:
         and word not in _PENDING_CONTROL_TEXTS | {"加", "删", "查", "审词"}
         and not parse_pending_assent_phrase(word).cancel_requested
         and not re.match(
-            r"^(?:请|麻烦|帮我|帮忙|给我|加词|添加|加入|删除|删掉|提交|查询|查词|查看|解释|比较|批量|不要|取消|确认)",
+            r"^(?:请|麻烦|帮我|帮忙|给我|加词|添加|加入|删除|删掉|顺延|提交|查询|查词|查看|解释|比较|批量|不要|取消|确认)",
             word,
         )
         and not re.match(r"^(?:我|你|他|她|它|我们|你们|他们)(?:说|觉得|认为|感觉|想|要)", word)

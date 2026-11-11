@@ -15,6 +15,12 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from tests import test_state_machine as harness
+from tests.helpers import (
+    REAL_CALL_TOOL,
+    TOOLS,
+    b18_rest_real_tools_FACTS,
+    b19_partial_reply_binding_DraftHTTP,
+)
 
 from keytao_bot.harness.conversation import ConversationAddress
 from keytao_bot.harness.state import (
@@ -544,6 +550,43 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
     async def offer(self, event=None):
         await self.discovery.discover(self.bot, event or self.event, self.chat)
         return self.pending.get_record(self.actor)
+
+    async def test_discovery_add_and_submit_accepts_both_word_orders_with_real_tools(self):
+        for index, message in enumerate(("提交并加入", "加入并提交")):
+            with self.subTest(message=message):
+                self.pending.delete(self.actor)
+                self.store = discovery.DiscoveryStore(self.root / f"submit-order-{index}.db")
+                self.discovery = discovery.WordDiscovery(self.store, reference_path=self.reference)
+                record = await self.offer()
+                http = b19_partial_reply_binding_DraftHTTP()
+                http.entries = []
+                event = FakeEvent(message)
+                event.reply = types.SimpleNamespace(message_id="400")
+                event.to_me = True
+                tool_functions = {**TOOLS.TOOL_FUNCTIONS, **harness._review_tools.TOOL_FUNCTIONS}
+                with (
+                    qq_runtime(self.chat, self.bot) as bot,
+                    patch.object(discovery, "_discovery", self.discovery),
+                    patch.object(self.chat, "call_tool_function", REAL_CALL_TOOL),
+                    patch.object(self.commands.tool_executor, "_get_tool_function", tool_functions.get),
+                    patch.object(TOOLS.httpx, "AsyncClient", side_effect=lambda **_: http, create=True),
+                    patch.object(TOOLS.http_client, "_keytao_client", http),
+                    patch.dict(b18_rest_real_tools_FACTS, {"午时": ("wj", ["wj", "wja"], "wu shi")}),
+                    patch.dict(os.environ, {"KEYTAO_COMMUNITY_VOTE": "0"}),
+                ):
+                    self.assertTrue(await self.chat.should_handle(bot, event))
+                    self.assertFalse(await discovery.handle_discovery_reply(bot, event, self.chat))
+                    self.assertIs(self.pending.get_record(self.actor), record)
+                    response = await self.chat.handle_pending_message_core(
+                        message, "qq", "100", self.actor, history=self.history,
+                        space_key=self.actor.space_key, owner_label="Offline sender",
+                        allow_intent_model=False,
+                    )
+                self.assertEqual([(item["word"], item["code"]) for item in http.rows], [("午时", "wj")], response)
+                self.assertEqual(http.submissions, 1, response)
+                self.assertIn("已提交审核", response)
+                self.assertIsNone(self.pending.get_record(self.actor), response)
+                self.assertEqual(http.errors, [])
 
     async def test_bcc_missing_word_is_verified_before_offer_and_acceptance_is_cached(self):
         add_bcc(self.reference)

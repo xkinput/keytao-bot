@@ -4667,6 +4667,11 @@ async def call_tool_function(
         _ticket_shown_others_submitted(platform, user_id)
         if platform and user_id and tool_name in _DRAFT_MUTATION_TOOLS else []
     )
+    if tool_name in {"keytao_create_phrase", "keytao_batch_add_to_draft"}:
+        arguments = {key: value for key, value in arguments.items()
+                     if key != "_shown_others_submitted"}
+        if shown_others:
+            arguments["_shown_others_submitted"] = shown_others
     result_json = await tool_executor.call(
         tool_name,
         arguments,
@@ -7611,7 +7616,7 @@ async def _execute_confirmed_tool(
                 )
             response = stage_next_replace_char_chunk(response)
             if submit_after:
-                return await continue_with_submit_preview(response)
+                return await continue_with_submit_preview(response, authorized_items=state.args.get("items"))
             return prepend_pending_word_reminders(
                 response,
                 data.get("pendingItems"),
@@ -10047,7 +10052,8 @@ async def _try_handle_replace_at_code_command(
                 conversation_state_store.complete_execution(record)
     reviewed_state = record.state if record is not None else None
     if (
-        not isinstance(reviewed_state, PendingAddWord)
+        record is previous
+        or not isinstance(reviewed_state, PendingAddWord)
         or reviewed_state.word != command.new_word
         or not reviewed_state.server_candidates
     ):
@@ -10288,6 +10294,16 @@ async def try_handle_advertised_shift(
     shift = parse_standalone_shift(message, known_words=_standalone_shift_bound_words(
         record, normalize_conversation_key((platform, user_id), space_key), reply_reference,
     ))
+    if (shift is None and require_bound_operand
+            and _strip_command_message_prefixes(message).lstrip().startswith("顺延")
+            and address == normalize_conversation_key((platform, user_id), space_key)):
+        unbound = parse_standalone_shift(message, allow_unbound_word=True)
+        if unbound is not None:
+            resolved = await _load_merged_word_entries((unbound.word,), platform, user_id)
+            if resolved is None:
+                return f"无法唯一锁定「{unbound.word}」的现有编码；请指定旧码，本次未写入。"
+            source = resolved[unbound.word]
+            return f"「{unbound.word}」当前在 {source['code']}；请指定要顺延到的编码，本次未写入。"
     words = parse_reviewed_shift_words(message, known_words=known_words)
     standalone = shift is not None and shift.word not in known_words and not _multi_word_candidate_scope_rows(
         record.state if record else None,
@@ -10527,7 +10543,13 @@ async def try_handle_move_to_code_command(
     space_key: Optional[Tuple[str, str]] = None, owner_label: str = "",
 ) -> Optional[str]:
     """Resolve a literal existing-item move before model routing and preview it."""
-    from ..harness.authorization_grammar import parse_existing_entry_move
+    from ..harness.authorization_grammar import parse_compound_entry_command, parse_existing_entry_move
+
+    compound = parse_compound_entry_command(message_text)
+    if compound is not None:
+        return await _try_handle_compound_entry_command(
+            compound, platform, user_id, space_key, owner_label,
+        )
 
     plan = parse_entry_move_plan(message_text)
     if plan is not None:
@@ -10559,6 +10581,71 @@ async def try_handle_move_to_code_command(
     return await _execute_shift_to_code(
         move.word, move.target_code, platform, user_id, space_key, owner_label,
         target_item={"type": resolved[move.word]["type"]},
+    )
+
+
+async def _try_handle_compound_entry_command(command, platform, user_id, space_key, owner_label):
+    """Keep every clause inside one server-bound preview and confirmation."""
+    active = draft_operation_coordinator.find_for_actor((platform, user_id))
+    if active is not None:
+        return _active_operation_message_for_request(active, platform, user_id)
+    conv_key = normalize_conversation_key((platform, user_id), space_key)
+    record = conversation_state_store.get_record(conv_key)
+    if record is not None and record.execution_id:
+        return "上一项操作仍在处理中，本次未执行。"
+    resolved = await _load_merged_word_entries((command.source_word,), platform, user_id)
+    if resolved is None:
+        return f"无法唯一锁定「{command.source_word}」的现有编码；请指定旧码，本次未写入。"
+    source = resolved[command.source_word]
+
+    def restore_candidate():
+        current = conversation_state_store.get_record(conv_key)
+        if (current is not None and current is not record and isinstance(current.state, PendingAddWord)
+                and current.state.word == command.add_word):
+            if record is not None:
+                conversation_state_store.put_back(record)
+            else:
+                conversation_state_store.complete_execution(current)
+
+    if command.delete_source:
+        if command.add_code and command.add_code != source["code"]:
+            return "删除与添加的编码不同，请分别写明完整目标；本次未写入。"
+        message = f"把 {source['code']} 的「{command.source_word}」改成「{command.add_word}」"
+        try:
+            return await _try_handle_replace_at_code_command(
+                message, MessageCommandIntent(
+                    intent="replace_at_code", confidence=1.0,
+                    keep_words=(command.source_word, command.add_word), requested_code=source["code"],
+                ), platform, user_id, space_key, owner_label,
+            )
+        finally:
+            restore_candidate()
+    if command.add_code != source["code"] or command.target_code == source["code"]:
+        return "添加编码必须对应本次调码腾出的原位；请核对完整目标，本次未写入。"
+    try:
+        reviewed_reply = await _try_handle_simple_single_word_query(
+            command.add_word, platform, user_id, conv_key, space_key, owner_label, _literal_word=True,
+        )
+        reviewed_record = conversation_state_store.get_record(conv_key)
+        state = reviewed_record.state if reviewed_record is not None else None
+    finally:
+        restore_candidate()
+    if reviewed_record is record or not isinstance(state, PendingAddWord) or state.word != command.add_word:
+        return reviewed_reply or f"无法核验「{command.add_word}」的候选；本次未写入。"
+    pinyin, codes = _pending_reviewed_reading(state, command.add_code)
+    if not pinyin or command.add_code not in codes:
+        return f"编码 {command.add_code} 不在「{command.add_word}」的已核验候选中；本次未写入。"
+    create_args = _create_phrase_args(state, command.add_code)
+    return await _execute_shift_to_code(
+        command.source_word, command.target_code, platform, user_id, space_key, owner_label,
+        target_item={"type": source["type"]},
+        additional_items=[{
+            "action": "Create", "word": command.add_word, "code": command.add_code,
+            "type": source["type"], "remark": str(create_args.get("remark") or ""),
+            "needsManualReview": bool(create_args.get("needs_manual_review", True)),
+            "_reviewed_pinyin": pinyin, "_reviewed_candidate_codes": list(codes),
+        }],
+        receipt_requested_words=[command.source_word, command.add_word],
     )
 
 
@@ -12188,6 +12275,8 @@ async def _execute_pending_add_word(
             },
             reviewed_pinyin=_pending_reviewed_reading(state, state.recommended_code)[0],
             reviewed_candidate_codes=_pending_reviewed_reading(state, state.recommended_code)[1],
+            auto_confirm_shift_plan=True,
+            auto_confirm_expected_shifted_words=(reorder_recommendation["occupantWord"],),
         )
 
     if len(requested_codes) == 1:
@@ -14050,6 +14139,15 @@ async def _bind_explicit_pending_code(state, request, platform, user_id):
         return None, f"未能核验编码 {request.code} 是否有占用，本次未写入。"
     rows = [row for row in lookup["phrases"] if isinstance(row, dict)
             and row.get("code") == request.code and row.get("type") == state.phrase_type]
+    if rows and dict(state.server_candidates).get(request.code) is False:
+        try:
+            draft = json.loads(await call_tool_function("keytao_list_draft_items", {}, platform, user_id))
+            snapshot = _validated_draft_reorder_snapshot(draft)
+            merged = _merge_live_and_draft_reorder_entries(rows, snapshot) if snapshot is not None else None
+        except Exception:
+            merged = None
+        if merged is not None:
+            rows = [row for row in merged if row["code"] == request.code and row["type"] == state.phrase_type]
     if any(row.get("word") == state.word for row in rows):
         return None, f"「{state.word}」已有编码 {request.code}，不能重复添加同一词条和编码；本次未写入。"
     if any(not isinstance(row.get("word"), str) or not row["word"] for row in rows):
