@@ -114,7 +114,7 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(subject["recommendedCode"], "yygla", prompt)
         self.assertEqual(assessment["verdict"], "behind_more_common")
         self.assertEqual(assessment["newCode"], "yygla")
-        self.assertIn("2. yygla — ✅ 推荐（空位）", prompt)
+        self.assertIn("2. yygla — ✅推荐", prompt)
         self.assertNotIn("需重排", prompt)
         self.assertIn("1,952", assessment["summary"])
 
@@ -218,7 +218,7 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(subject["recommendedCode"], "yygl", prompt)
         self.assertEqual(assessment["verdict"], "front_more_common")
         self.assertEqual(assessment["decisionReason"], "frequency_ratio")
-        self.assertIn("需重排", prompt)
+        self.assertIn("「羽衣甘蓝」占 yygl、「用过」顺延", prompt)
 
     async def test_comparable_modern_bcc_frequency_still_reorders(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
@@ -229,7 +229,7 @@ class B23CommonnessTests(unittest.IsolatedAsyncioTestCase):
         subject, assessment, prompt = await self.candidate_review()
         self.assertEqual(subject["recommendedCode"], "yygl", prompt)
         self.assertEqual(assessment["decisionReason"], "bcc_frequency_ratio")
-        self.assertIn("需重排", prompt)
+        self.assertIn("「羽衣甘蓝」占 yygl、「用过」顺延", prompt)
 
     async def test_historical_frequency_alone_cannot_displace_incumbent(self):
         with closing(sqlite3.connect(self.db)) as connection, connection:
@@ -395,7 +395,7 @@ class S56CommonnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("qxi", subject["recommendedCode"])
         rendered = _format_reviewed_add_prompt(subject)
         self.assertNotIn("占 qx", rendered)
-        self.assertIn("→ qxi（推荐）", rendered)
+        self.assertIn("2. qxi — ✅推荐", rendered)
 
     async def test_explicit_code_occupant_uses_shared_comparator(self):
         compare = AsyncMock(return_value={"success": True, "verdict": "front_more_common"})
@@ -418,7 +418,7 @@ class S56CommonnessTests(unittest.IsolatedAsyncioTestCase):
             reviewed_prompt=source, actionable_controls=True,
             ordering_assessments=subject["candidateOrderingAssessments"],
         )
-        self.assertIn("读音 qiāng", rendered)
+        self.assertIn("qiāng", rendered)
         self.assertIn("不弱于", rendered)
         self.assertIn("加入编码 qx+形码", rendered)
         self.assertNotIn("推荐编码：qx", rendered)
@@ -481,7 +481,7 @@ class CommonnessBindingTests(unittest.TestCase):
             )), patch.object(s56_commonness_binding_commands.user_resolver, "resolve_actor_binding", AsyncMock(return_value=True)):
                 reply = await s56_commonness_binding_commands._try_handle_simple_single_word_query("鎗", "qq", "s56-binding", key)
                 self.assertIn("推荐编码：暂无", reply)
-                self.assertIn("审词：读音 qiāng", reply)
+                self.assertIn("qiāng", reply)
                 reloaded = SQLiteConversationStateStore(db_path=path)
                 record = reloaded.get_record(key)
                 self.assertIsNotNone(record)
@@ -1507,7 +1507,7 @@ class ExistingQueryTests(unittest.TestCase):
                     self.assertEqual(calls, list(fixture))
                     self.assertIn("「单份」已在词库（dffn）", raw)
                     self.assertIn("加入并提交", raw)
-                    self.assertIn("回复编号或编码选择", raw)
+                    self.assertIn("「换 2」改选", raw)
                     with patch.object(s64_existing_query_chat, "conversation_state_store", store):
                         self.assertEqual(s64_existing_query_chat._enforce_advertised_reply_contract(raw, context.conversation_address), raw)
                         async def repeat_lookup(name, args, *_args, **_kwargs):
@@ -1534,6 +1534,169 @@ class CommonnessRenderTests(unittest.TestCase):
 
     assert_delivery = CommonnessRenderTests_assert_delivery
 
+    def test_compact_web_values_are_ordered_numerically_and_keep_precision(self):
+        assessment = {
+            "newWord": "新词", "occupantWord": "旧词",
+            "verdict": "behind_more_common", "webFallback": True,
+            "summary": "Incorrect legacy verdict wording must not determine numeric order",
+            "front": {"score": 1.5}, "behind": {"score": 1.25},
+        }
+        self.assertEqual("词频：新词 1.5 > 旧词 1.25",
+                         commonness_copy.candidate_commonness_summary_copy(assessment))
+        assessment["front"]["score"] = 1.0000001
+        assessment["behind"]["score"] = 1.0000002
+        self.assertEqual("旧词 1.0000002 > 新词 1.0000001",
+                         commonness_copy.render_commonness_comparison(assessment))
+
+    def test_modern_semantic_override_omits_contradictory_frequency_comparison(self):
+        pair = {
+            "newWord": "新词", "occupantWord": "旧词",
+            "occupantCode": "qbs", "freeCode": "qbso",
+        }
+        semantic = {"preSubmitAudit": {"semanticContextAutoPassItems": [{
+            "word": "新词", "assessment": {
+                "accepted": True, "confidence": 0.99, "meaning": "现代用语",
+                "nonObscurity": {
+                    "route": "common_characters_and_llm",
+                    "characterReferences": [{"corpusFrequency": 10000}] * 2,
+                },
+            },
+        }]}}
+        comparison = review._modern_semantic_commonness_override(semantic, pair, {
+            "frontWord": "新词", "behindWord": "旧词",
+            "front": {"reference": {"corpusFrequency": None}},
+            "behind": {
+                "reference": {"dictionaryPresenceCount": 2, "corpusFrequency": None},
+                "bcc": {"channels": [{"channel": "文学", "count": 50, "perMillion": 1}]},
+            },
+        })
+        assessment = review._candidate_commonness_assessment(pair, comparison)
+        self.assertEqual("front_more_common", assessment["verdict"])
+        self.assertEqual("modern_semantic_vs_dictionary_dominated", assessment["decisionReason"])
+        self.assertEqual(("", "50"), (assessment["frontFrequency"], assessment["behindFrequency"]))
+        self.assertIn("（语义判断）", assessment["summary"])
+        for include_controls in (False, True):
+            with self.subTest(include_controls=include_controls):
+                rendered = pending.front_insert_recommendation_copy(
+                    assessment, include_controls=include_controls,
+                )
+                self.assertIn("「新词」占 qbs", rendered)
+                self.assertIn("「旧词」顺延", rendered)
+                self.assertNotIn("词频：", rendered)
+        for snapshot in (comparison, assessment):
+            self.assertEqual("", commonness_copy.render_commonness_comparison(snapshot))
+            self.assertEqual("", commonness_copy.candidate_commonness_summary_copy(snapshot))
+
+    def test_compact_absence_equal_values_and_invalid_numbers(self):
+        assessment = {"newWord": "甲词", "occupantWord": "乙词", "webFallback": True}
+        for left, right, expected in (
+            (None, None, ""), (None, 3, "乙词 3 > 甲词 无"),
+            (0, None, "甲词 0 > 乙词 无"), (3, 3, "甲词 3 = 乙词 3"),
+            (float("nan"), float("inf"), ""), (True, -1, ""),
+        ):
+            with self.subTest(left=left, right=right):
+                assessment.update(front={"score": left}, behind={"score": right})
+                self.assertEqual(expected, commonness_copy.render_commonness_comparison(assessment))
+
+    def test_compact_bcc_uses_the_decision_channel_not_the_largest_count(self):
+        assessment = {
+            "newWord": "甲词", "occupantWord": "乙词", "decisionReason": "bcc_frequency_ratio",
+            "front": {"bcc": {"channels": [
+                {"channel": "多领域", "count": 235, "perMillion": 0.58},
+                {"channel": "新闻", "count": 832, "perMillion": 0.9},
+            ]}},
+            "behind": {"bcc": {"channels": [
+                {"channel": "多领域", "count": 1000, "perMillion": 0.1},
+                {"channel": "新闻", "count": 12, "perMillion": 0.2},
+            ]}},
+        }
+        self.assertEqual("甲词 0.9 > 乙词 0.2", commonness_copy.render_commonness_comparison(assessment))
+        assessment["decisionReason"] += "_balanced_tiebreak"
+        self.assertEqual("甲词 0.58 > 乙词 0.1", commonness_copy.render_commonness_comparison(assessment))
+        assessment["decisionReason"] = "bcc_relative_rank_ratio"
+        for side, ranks in (("front", (0.25, 0.5)), ("behind", (0.5, 0.125))):
+            for row, rank in zip(assessment[side]["bcc"]["channels"], ranks):
+                row["rankFraction"] = rank
+        self.assertEqual("乙词 8 > 甲词 4", commonness_copy.render_commonness_comparison(assessment))
+        assessment["decisionReason"] += "_balanced_tiebreak"
+        self.assertEqual("甲词 4 > 乙词 2", commonness_copy.render_commonness_comparison(assessment))
+
+    def test_compact_cross_channel_rates_match_verdict_and_persisted_values(self):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executemany(
+                "INSERT INTO bcc_frequency SELECT filename, ?, ?, ?, 1 FROM bcc_dataset "
+                "WHERE channel=? AND token_type='word'",
+                [("新词", 300, 2.0, "口语"), ("旧词", 900, 0.97, "新闻")],
+            )
+        for first, second, verdict, values in (
+            ("新词", "旧词", "front_more_common", ("2.0", "0.97")),
+            ("旧词", "新词", "behind_more_common", ("0.97", "2.0")),
+        ):
+            with self.subTest(first=first):
+                comparison = self.local_comparison(first, second)
+                self.assertEqual("bcc_frequency_ratio", comparison["decisionReason"])
+                self.assertEqual(verdict, comparison["verdict"])
+                self.assertEqual("词频：新词 2 > 旧词 0.97",
+                                 commonness_copy.candidate_commonness_summary_copy(comparison))
+                assessment, _, _ = candidate_fixture(comparison)
+                self.assertEqual(values, (assessment["frontFrequency"], assessment["behindFrequency"]))
+                self.assertIn("词频：新词 2 > 旧词 0.97", self.assert_delivery(comparison))
+                if verdict == "front_more_common":
+                    recommendation = pending.front_insert_recommendation_copy(assessment, include_controls=False)
+                    self.assertIn("推荐调序：「新词」占 qbs，「旧词」顺延", recommendation)
+                    self.assertIn("词频：新词 2 > 旧词 0.97", recommendation)
+
+    def test_compact_dictionary_margin_uses_presence_instead_of_corpus_counts(self):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executemany("INSERT INTO word_commonness VALUES (?, ?, NULL, ?)",
+                                   [("新词", None, 3), ("旧词", 40, 0)])
+            connection.execute(
+                "INSERT INTO bcc_frequency SELECT filename, '新词', 3, 0.02, 1 "
+                "FROM bcc_dataset WHERE channel='口语' AND token_type='word'",
+            )
+        for first, second, verdict, values in (
+            ("新词", "旧词", "front_more_common", ("3", "0")),
+            ("旧词", "新词", "behind_more_common", ("0", "3")),
+        ):
+            with self.subTest(first=first):
+                comparison = self.local_comparison(first, second)
+                self.assertEqual("dictionary_presence_margin", comparison["decisionReason"])
+                self.assertEqual(verdict, comparison["verdict"])
+                self.assertEqual("词频：新词 3 > 旧词 0",
+                                 commonness_copy.candidate_commonness_summary_copy(comparison))
+                assessment, _, _ = candidate_fixture(comparison)
+                self.assertEqual(values, (assessment["frontFrequency"], assessment["behindFrequency"]))
+                self.assertIn("词频：新词 3 > 旧词 0", self.assert_delivery(comparison))
+
+    def test_compact_legacy_values_do_not_switch_to_one_sided_bcc(self):
+        assessment = {
+            "newWord": "甲词", "occupantWord": "乙词", "decisionReason": "frequency_ratio",
+            "front": {"reference": {"corpusFrequency": 10}, "bcc": {"channels": [
+                {"channel": "新闻", "count": 999, "perMillion": 1},
+            ]}},
+            "behind": {"reference": {"corpusFrequency": 30}},
+        }
+        self.assertEqual("乙词 30 > 甲词 10", commonness_copy.render_commonness_comparison(assessment))
+
+    def test_candidate_assessment_keeps_structured_comparison_snapshot(self):
+        comparison = {
+            "success": True, "verdict": "close", "webFallback": True,
+            "front": {"score": 1.34}, "behind": {"score": 1.44},
+            "summary": "Full evidence remains available for the admin note",
+        }
+        assessment = review._candidate_commonness_assessment({
+            "newWord": "甲词", "occupantWord": "乙词", "occupantCode": "jc", "freeCode": "jca",
+        }, comparison)
+        self.assertEqual(comparison["summary"], commonness_copy.render_commonness_summary(assessment))
+        self.assertEqual("乙词 1.44 > 甲词 1.34", commonness_copy.render_commonness_comparison(assessment))
+        self.assertEqual(
+            "甲词 9007199254740993 > 乙词 9007199254740992",
+            commonness_copy.render_commonness_comparison({
+                "newWord": "甲词", "occupantWord": "乙词",
+                "frontFrequency": "9007199254740993", "behindFrequency": "9007199254740992",
+            }),
+        )
+
     def test_one_sided_candidate_keeps_bcc_evidence(self):
         comparison = asyncio.run(review.compare_word_commonness("敲不死", "情报所"))
         self.assertEqual(comparison["verdict"], "not_enough_evidence")
@@ -1544,10 +1707,7 @@ class CommonnessRenderTests(unittest.TestCase):
         rendered = chat_render._format_candidate_ordering_assessment(
             assessment, {"qbs": 1, "qbso": 2},
         )
-        self.assertIn("多领域 34（每百万 0.08）", rendered)
-        self.assertIn("新闻 99（每百万 0.11）", rendered)
-        self.assertIn("单边", rendered)
-        self.assertIn("推荐空位 qbso", rendered)
+        self.assertEqual("词频：情报所 99 > 敲不死 无", rendered)
         self.assertNotIn("常用度信号不足", rendered)
         self.assertNotIn("口语", rendered)
         self.assertNotIn("文学", rendered)
@@ -1562,10 +1722,9 @@ class CommonnessRenderTests(unittest.TestCase):
                 comparison = asyncio.run(review.compare_word_commonness(first, second))
                 self.assertEqual(comparison["verdict"], verdict)
                 text = self.assert_delivery(comparison, "dffn")
-                self.assertIn("每百万 0.09", text)
-                self.assertIn("每百万 0.04", text)
-                self.assertIn("2.54×", text)
-                self.assertIn("「蛋粉」较「单份」更常用", text)
+                self.assertIn("词频：蛋粉 0.0944 > 单份 0.0371", text)
+                self.assertNotIn("每百万", text)
+                self.assertNotIn("×", text)
                 self.assertNotIn("历史", text)
                 self.assertNotIn("新闻", text)
 
@@ -1574,19 +1733,15 @@ class CommonnessRenderTests(unittest.TestCase):
         comparison = asyncio.run(review.compare_word_commonness("蛋粉", "单份"))
         self.assertEqual(comparison["verdict"], "close")
         text = self.assert_delivery(comparison, "dffn")
-        self.assertIn("常用度接近", text)
+        self.assertEqual("词频：蛋粉 0.0944 > 单份 0.08", text)
         self.assertNotIn("更常用", text)
-        self.assertIn("推荐空位 dffno", text)
 
     def test_neither_attested_keeps_insufficient_and_historical_supplement(self):
         # Local comparator seam avoids exercising the unrelated web fallback.
         comparison = self.local_comparison("空例甲", "空例乙")
         self.assertEqual(comparison["verdict"], "not_enough_evidence")
         text = self.assert_delivery(comparison)
-        self.assertIn("常用度信号不足", text)
-        self.assertIn("四个现代频道均未收录", text)
-        self.assertIn("历史补充", text)
-        self.assertIn("未参与判定", text)
+        self.assertEqual("", text)
         self.assertNotIn("每百万", text)
         self.assertNotIn("古代汉语", text)
         self.assertNotIn("近代汉语", text)
@@ -1596,9 +1751,7 @@ class CommonnessRenderTests(unittest.TestCase):
         comparison = self.local_comparison("古例甲", "古例乙")
         self.assertEqual(comparison["verdict"], "not_enough_evidence")
         text = self.assert_delivery(comparison)
-        self.assertIn("历史补充", text)
-        self.assertIn("古代汉语 12（每百万 1200）", text)
-        self.assertIn("未参与判定", text)
+        self.assertEqual("", text)
         self.assertNotIn("近代汉语", text)
 
     def test_historical_supplement_is_explicit_only_when_allowed(self):
@@ -1606,11 +1759,8 @@ class CommonnessRenderTests(unittest.TestCase):
         comparison = asyncio.run(review.compare_word_commonness("古例甲", "古例乙"))
         self.assertEqual(comparison["decisionReason"], "bcc_historical_classical_frequency_ratio")
         text = self.assert_delivery(comparison)
-        self.assertIn("现代四频道均未收录", text)
-        self.assertIn("按古代汉语频次", text)
-        self.assertIn("1,234（每百万 123400）", text)
-        self.assertIn("12（每百万 1200）", text)
-        self.assertIn("仅作历史语料末级破平", text)
+        self.assertIn("词频：古例甲 123400 > 古例乙 1200", text)
+        self.assertNotIn("每百万", text)
         comparison = asyncio.run(review.compare_word_commonness("古例甲", "情报所"))
         text = self.assert_delivery(comparison)
         self.assertNotIn("古代汉语", text)
@@ -1627,7 +1777,8 @@ class CommonnessRenderTests(unittest.TestCase):
         )
         protected = harness.chat_commands_module._protected_eviction_response(state, "qbs", ("情报所",))
         advisory = same_code_reorder._advisory("敲不死", "情报所")
-        for text in (guard, protected, advisory):
+        self.assertIn("词频：情报所 99 > 敲不死 无", guard)
+        for text in (protected, advisory):
             self.assertIn(comparison["summary"], text)
 
     def test_render_sites_use_the_shared_evidence_renderer(self):
@@ -1636,8 +1787,10 @@ class CommonnessRenderTests(unittest.TestCase):
         # Runtime guard: all candidate variants must deliver the shared result.
         for module in (commonness_copy, pending, commonness_query,
                        same_code_reorder, harness.chat_commands_module):
-            original = module.render_commonness_summary
-            with patch.object(module, "render_commonness_summary", return_value=marker) as render:
+            name = ("render_commonness_comparison" if module is commonness_copy else
+                    "candidate_commonness_summary_copy" if module is pending else "render_commonness_summary")
+            original = getattr(module, name)
+            with patch.object(module, name, return_value=marker) as render:
                 if module is commonness_copy:
                     assessment, _, _ = candidate_fixture(comparison)
                     text = chat_render._format_candidate_ordering_assessment(assessment, {})
@@ -1656,7 +1809,7 @@ class CommonnessRenderTests(unittest.TestCase):
                     text = module._protected_eviction_response(state, "qbs", ("情报所",))
                 self.assertIn(marker, text, module.__name__)
                 render.assert_called()
-            self.assertIs(module.render_commonness_summary, original)
+            self.assertIs(getattr(module, name), original)
 
 # Source: test_s65_commonness_render.py
 class CommonnessRenderArchitectureTests(unittest.TestCase):
@@ -1674,7 +1827,7 @@ class CommonnessRenderArchitectureTests(unittest.TestCase):
                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
         def reaches_shared(name, seen):
-            if name == "render_commonness_summary":
+            if name in {"render_commonness_summary", "render_commonness_comparison"}:
                 return True
             if name in seen or name not in functions:
                 return False

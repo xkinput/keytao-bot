@@ -420,6 +420,9 @@ def _parse_pending_add_word(
         review_reading_pinyin(legacy_review_text(response))
         or compact_card_reading_pinyin(response, word)
     )
+    if displayed_pinyin:
+        for code, _occupied in candidates:
+            pronunciation_codes.setdefault(code, displayed_pinyin)
     if isinstance(review, dict) and str(review.get("word") or "").strip() == word:
         inventory = select_candidate_inventory(review)
         if inventory is not None and list(inventory.candidates) == candidates and all(
@@ -453,6 +456,7 @@ def _parse_pending_add_word(
     if structured_inventory is not None:
         for code, _occupied in candidates:
             pronunciation_codes[code] = structured_inventory.readings[code]
+            code_remarks[code] = "喵喵审词：" + _structured_add_review_text(structured_review, code)
     needs_manual_review, manual_review_reason = _take_reviewed_add_verdict(word)
     return PendingAddWord(
         word=word,
@@ -938,7 +942,7 @@ def _batch_review_remark(
             or compact_card_reading_pinyin(response, word)
         )
         review_text = (
-            _structured_add_review_text(review)
+            _structured_add_review_text(review, selected_code)
             if inventory is not None and selected_code in dict(inventory.candidates)
             and (not displayed_pinyin or inventory.readings.get(selected_code) == displayed_pinyin)
             else ""
@@ -1844,10 +1848,15 @@ async def _handle_relative_position_command(
     )
 
 
-def _parse_pending_state_from_response(response: str) -> PendingState:
-    """Parse any pending operation represented by an assistant response."""
+def _parse_pending_state_from_response(
+    response: str,
+    structured_state: PendingState = None,
+) -> PendingState:
+    """Parse display targets, preferring an equivalent actor-owned ticket."""
     batch_pending = _parse_pending_batch_add(response)
     if batch_pending is not None:
+        if conversation_state_store.states_equivalent(batch_pending, structured_state):
+            return structured_state
         return batch_pending
 
     pending_add = _parse_pending_add_word(response)
@@ -4363,18 +4372,52 @@ def _take_reviewed_add_verdict(word: str) -> Tuple[Optional[bool], str]:
     return flag, reason
 
 
-def _structured_add_review_text(review: Optional[Dict]) -> str:
-    """Preserve the complete single-reading admin note independently of copy."""
+def _structured_add_review_text(review: Optional[Dict], code: str = "") -> str:
+    """Preserve the selected reading's complete admin note independently of copy."""
     if not isinstance(review, dict):
         return ""
     pronunciations = [
         item for item in review.get("pronunciations") or []
         if isinstance(item, dict) and item.get("candidateStatuses")
+        and (not code or any(
+            isinstance(status, dict) and status.get("code") == code
+            for status in item["candidateStatuses"]
+        ))
     ]
-    return (
+    text = (
         _reviewed_add_review_text(review, pronunciations[0])
         if len(pronunciations) == 1 else ""
     )
+    if not text:
+        return ""
+    evidence = [text]
+    correction = review.get("readingCorrection")
+    if isinstance(correction, dict):
+        evidence.append(str(correction.get("note") or "").strip())
+    evidence.append(review_flags.manual_review_reason(review))
+    audit = review.get("preSubmitAudit")
+    if isinstance(audit, dict):
+        evidence.append(str(audit.get("summary") or "").strip())
+        evidence.extend(str(issue).strip() for issue in audit.get("issues") or [] if issue)
+        for item in audit.get("semanticContextAutoPassItems") or []:
+            if isinstance(item, dict):
+                evidence.append(str(item.get("basisLine") or "").strip())
+        for item in audit.get("commonKnownItems") or []:
+            if not isinstance(item, dict):
+                continue
+            evidence.append(str(item.get("summary") or "").strip())
+            commonness = item.get("commonness") if isinstance(item.get("commonness"), dict) else {}
+            entity = commonness.get("entityKnowledge") or {}
+            if isinstance(entity, dict):
+                evidence.extend(str(entity.get(key) or "").strip() for key in ("label", "summary"))
+                evidence.extend(str(value).strip() for key in ("canonicalNames", "aliases") for value in entity.get(key) or [])
+    semantic = review.get("semanticContextAutoPass")
+    if isinstance(semantic, dict):
+        evidence.append(str(semantic.get("basisLine") or "").strip())
+    for assessment in review.get("candidateOrderingAssessments") or []:
+        if isinstance(assessment, dict):
+            evidence.append(str(assessment.get("summary") or "").strip())
+    return "\n".join(dict.fromkeys(part for part in evidence if part))
 
 
 _DRAFT_RESOLUTION_TOOL_KINDS = {
@@ -8378,7 +8421,9 @@ def _active_operation_reply_matches(
             and _prompt_capability_digest(reply_reference.text)
             == _prompt_capability_digest(operation.prompt_text)
         )
-    referenced_state = _parse_pending_state_from_response(reply_reference.text)
+    referenced_state = _parse_pending_state_from_response(
+        reply_reference.text, operation.pending_state,
+    )
     if conversation_state_store.states_equivalent(referenced_state, operation.pending_state):
         return True
     referenced_text = reply_reference.text or ""
@@ -11961,7 +12006,10 @@ async def _try_update_pending_pronunciation(
         lines.append(f"{index}. {code} — {label}{marker}")
     lines.extend((
         f"• 「{state.word}」→ {recommended_code}（推荐）",
-        single_word_candidate_footer(len(variant_codes)),
+        single_word_candidate_footer(
+            len(variant_codes), variant_codes.index(recommended_code) + 1,
+            tuple(index for index, code in enumerate(variant_codes, start=1) if not status_map[code].get("occupied")),
+        ),
     ))
     response = "\n".join(lines)
     updated_state = _parse_pending_add_word(response)

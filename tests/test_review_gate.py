@@ -814,11 +814,12 @@ def test_semantic_context_pass_clears_prepare_seal_and_enters_autoapprove_chain(
         from keytao_bot.utils import review_flags as rf
 
         prompt = chat._format_reviewed_add_prompt(prepared) or ""
+        admin_note = chat._chat_commands._structured_add_review_text(prepared)
         check(
-            "review copy is one honest auto-pass basis line",
-            f"审词：读音 chan ji；来源" in prompt
-            and "自动审核：语境读音与含义明确" in prompt
-            and "语料/词典证据" in prompt
+            "review header names semantic evidence and retains the full admin basis",
+            "「产季」未收录：chan ji，可自动通过（语义判断）" in prompt
+            and basis_line in admin_note
+            and "语料/词典证据" in admin_note
             and prompt.count("可自动通过") == 1
             and "需管理员审核" not in prompt,
         )
@@ -2662,9 +2663,12 @@ def test_s53_thin_muscle_prepare_and_render_contract():
     reviewed, rendered, web_search, semantic = asyncio.run(_run())
     pronunciation = reviewed.get("pronunciations", [{}])[0]
     review_line = next(
-        (line for line in rendered.splitlines() if line.startswith("审词：")),
+        (line for line in rendered.splitlines() if line.startswith("「薄肌」未收录：")),
         "",
     )
+    import keytao_bot.plugins.openai_chat as chat
+
+    admin_note = chat._chat_commands._structured_add_review_text(reviewed)
     check(
         "absent word plus reference polyphone triggers the new ladder",
         web_search.await_count == 2
@@ -2682,9 +2686,10 @@ def test_s53_thin_muscle_prepare_and_render_contract():
     )
     check(
         "rendered review names web evidence and exposes only the resolved chain",
-        "审词：读音 bó jī；来源 网络（baike.baidu.com）" in rendered
-        and review_line.endswith("；语义判断；")
-        and "https://" not in review_line
+        "「薄肌」未收录：bó jī，可自动通过" in review_line
+        and "网络（baike.baidu.com）" in review_line
+        and "https://baike.baidu.com/item/%E8%96%84%E8%82%8C" in review_line
+        and "语义判断" in admin_note
         and "bljk" in rendered
         and "bzjk" not in rendered,
     )
@@ -5743,10 +5748,13 @@ def test_modern_semantic_vs_dictionary_dominated_commonness_matrix():
             archaic_asymmetry,
             {"mzch": 1, "mzchi": 2},
         )
+        admin_note = review_module.build_review_note({"commonnessComparisons": [{
+            "frontWord": "冒菜", "behindWord": "茂才", "code": "mzch", "result": archaic_asymmetry,
+        }]})
         check(
-            "ordering copy cites both semantic and dictionary/corpus evidence",
-            "冒菜：现代常用饮食词（语义判断）" in rendered
-            and "茂才：古语，词典收录但语料频次低" in rendered
+            "ordering controls retain the complete semantic evidence for admins",
+            "冒菜：现代常用饮食词（语义判断）" in admin_note
+            and "茂才：古语，词典收录但语料频次低" in admin_note
             and "推荐：\n- " in rendered
             and "「冒菜」占 mzch、「茂才」顺延" in rendered
             and "换 2（mzchi）" in rendered,
@@ -6464,7 +6472,7 @@ def test_explicit_reading_selects_one_group_from_the_single_encode_result():
         sealed_prompt = chat._format_reviewed_add_prompt(sealed_preview) or ""
         check(
             "rendering cannot advertise auto-pass for an explicit-reading seal",
-            "需要管理员审核" in sealed_prompt
+            "需管理员审核" in sealed_prompt
             and "可自动通过" not in sealed_prompt,
         )
 

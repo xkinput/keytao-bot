@@ -702,15 +702,25 @@ def _format_pending_candidate_review_details(state: PendingAddWord) -> str:
         reading = state.pronunciation_codes.get(code)
         if isinstance(reading, str) and reading.strip():
             reading_codes.setdefault(reading.strip(), []).append(code)
-    lines = [
-        f"读音：{reading}" if len(reading_codes) == 1 and len(codes) == len(state.server_candidates)
-        else f"读音 {reading}：{'、'.join(codes)}"
-        for reading, codes in reading_codes.items()
-    ]
-    if state.needs_manual_review is True:
-        reason = _compact_review_reason(state.manual_review_reason)
-        lines.append(f"审核：{reason}；需要管理员审核。" if reason else "需要管理员审核。")
-    return "\n".join(lines)
+    if state.needs_manual_review is None:
+        return f"「{state.word}」未收录：{' / '.join(reading_codes) or '待确认'}，预审未完成"
+    sources = []
+    for remark in state.code_remarks.values():
+        match = re.search(r"来源\s+([^\n]+)", remark)
+        if match:
+            for source in match[1].split("；"):
+                if not source or source.startswith(("自动审核", "审词", "常用度", "类型", "编码", "异体")):
+                    break
+                if source not in {"暂无", "无"} and source not in [item["source"] for item in sources]:
+                    sources.append({"source": source, "category": "dictionary" if "汉典" in source or "百科" in source else ""})
+    review = {
+        "preSubmitAudit": {"autoApprove": state.needs_manual_review is False},
+        "needsManualReview": state.needs_manual_review,
+        "manualReviewReason": state.manual_review_reason,
+    }
+    pronunciation = {"pinyin": " / ".join(reading_codes) or "待确认", "sources": sources}
+    preview = _format_pre_submit_audit_preview(review, state.recommended_code)
+    return f"「{state.word}」未收录：" + _compact_review_header(review, pronunciation, preview)
 
 
 def _format_pending_state_details(state: PendingState) -> str:
@@ -1157,7 +1167,10 @@ def _format_tool_encoded_add_prompt(word: str, encoding: Dict) -> Optional[str]:
     )
     lines.extend((
         f"• 「{word}」→ {recommended_code}（推荐）",
-        single_word_candidate_footer(len(statuses)),
+        single_word_candidate_footer(
+            len(statuses), status_codes.index(recommended_code) + 1,
+            tuple(index for index, status in enumerate(statuses, start=1) if not status.get("occupied")),
+        ),
     ))
     return "\n".join(lines)
 
@@ -1317,9 +1330,22 @@ def _format_pronunciation_source(pronunciation: Dict) -> str:
 def _reviewed_add_review_text(review: Dict, pronunciation: Dict) -> str:
     """Build the complete review note directly from its structured evidence."""
     pinyin = str(pronunciation.get("pinyin") or "").strip()
+    sources = []
+    for source in pronunciation.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        label = " ".join(filter(None, (
+            str(source.get("source") or "").strip(),
+            str(source.get("url") or "").strip(),
+        )))
+        if label and label not in sources:
+            sources.append(label)
+    source_text = "；".join(sources) or _format_pronunciation_source(pronunciation)
+    if sources and pronunciation.get("semanticPronunciation") is True and pronunciation.get("readingEvidenceKind") == "web_semantic_agreement":
+        source_text += "；语义判断"
     parts = [
         f"读音 {pinyin}" if pinyin else "读音待确认",
-        f"来源 {_format_pronunciation_source(pronunciation)}",
+        f"来源 {source_text}",
     ]
     if review.get("type") == "Single" and review.get("variantNote"):
         parts.append(str(review["variantNote"]))
@@ -1353,13 +1379,19 @@ def _format_review_candidate_line(
     occupied = bool(status.get("occupied"))
     if occupied:
         label = str(status.get("label") or "已有占用").strip()
+        label = re.sub(r"已有「([^」]+)」", r"\1", label)
+        words = status.get("words") or [item.get("word") for item in status.get("phrases", []) if isinstance(item, dict)]
+        if words:
+            label = "、".join(str(word) for word in words if word)
         if code == ordering_recommended_code:
-            label += " ← 常用度推荐（需重排）"
+            label += " ✅推荐（需重排）"
+        elif code == recommended_code:
+            label += " ✅推荐"
     elif code == recommended_code:
         label = (
             "空位（不调序备选）"
             if ordering_recommended_code
-            else "✅ 推荐（空位）"
+            else "✅推荐"
         )
     else:
         label = "空位"
@@ -1436,6 +1468,49 @@ def _format_pre_submit_audit_preview(review: Dict, recommended_code: str) -> Opt
     reason = issues[0] if issues else summary or "证据不足"
     reason = _compact_review_reason(reason) or "证据不足"
     return f"自动审核：{reason}，需要管理员审核"
+
+
+def _compact_review_header(review: Dict, pronunciation: Dict, preview: Optional[str]) -> str:
+    pinyin = str(pronunciation.get("pinyin") or "待确认").strip()
+    if preview and "可自动通过" in preview:
+        sources = [source for source in pronunciation.get("sources", []) if isinstance(source, dict)]
+        sources.sort(key=lambda source: source.get("category") not in {"dictionary", "encyclopedia"})
+        labels = []
+        for source in sources:
+            name = str(source.get("source") or "").strip()
+            if name in {"暂无", "无"}:
+                continue
+            name = re.sub(r"（经编码服务）|\s*\([^)]*\)", "", name)
+            url = str(source.get("url") or "").strip()
+            label = " ".join(filter(None, (name, url)))
+            if label and label not in labels:
+                labels.append(label)
+        if not labels:
+            source = str(pronunciation.get("sourceSummary") or "").strip()
+            if pronunciation.get("semanticPronunciation") or "语义判断" in source:
+                labels.append("语义判断")
+            elif source and "暂无" not in source:
+                labels.extend(source.split("；")[:2])
+            elif (review.get("preSubmitAudit") or {}).get("commonKnownItems"):
+                labels.append("语义判断")
+            elif (review.get("preSubmitAudit") or {}).get("llmFallback"):
+                labels.append("语义判断")
+        evidence = f"（{'；'.join(labels[:2])}）" if labels else ""
+        return f"{pinyin}，可自动通过{evidence}"
+    reason = str(preview or "")
+    if review.get("readingCorrection"):
+        reason = "实体纠音"
+    elif "读音" in reason:
+        reason = "读音待核"
+    elif "编码" in reason:
+        reason = "编码待核"
+    elif "常用" in reason:
+        reason = "常用度待核"
+    elif "来源" in reason or "权威" in reason:
+        reason = "无权威来源"
+    else:
+        reason = "证据不足"
+    return f"{pinyin}，需管理员审核（{reason}）"
 
 
 def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
@@ -1534,12 +1609,11 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
     pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)
     if len(pronunciations) == 1:
         pronunciation = pronunciations[0]
-        lines.append("审词：" + _reviewed_add_review_text(review, pronunciation))
-        correction = review.get("readingCorrection")
-        if isinstance(correction, dict) and correction.get("note"):
-            lines.append(str(correction["note"]))
-        lines.append(pre_submit_preview or "自动审核：预审未完成")
-        lines.append("候选编码:")
+        header = _compact_review_header(review, pronunciation, pre_submit_preview)
+        if existing_copy:
+            lines.append(header)
+        else:
+            lines[0] = f"「{word}」未收录：{header}"
         for status in pronunciation.get("candidateStatuses", []):
             code = str(status.get("code") or "").strip().lower()
             candidate_recommended = recommended_code if code not in candidate_indexes else ""
@@ -1554,18 +1628,19 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             )
             candidate_index += 1
     else:
-        lines.append("读音与来源:")
-        for index, pronunciation in enumerate(pronunciations, start=1):
-            pinyin = str(pronunciation.get("pinyin") or "").strip()
-            lines.append(f"{index}. {pinyin or '待确认'}；来源 {_format_pronunciation_source(pronunciation)}")
-        if pre_submit_preview:
-            lines.append(pre_submit_preview)
+        combined = {
+            "pinyin": " / ".join(str(item.get("pinyin") or "待确认") for item in pronunciations),
+            "sources": [source for item in pronunciations for source in item.get("sources", []) if isinstance(source, dict)],
+            "semanticPronunciation": any(item.get("semanticPronunciation") for item in pronunciations),
+        }
+        header = _compact_review_header(review, combined, pre_submit_preview)
+        if existing_copy:
+            lines.append(header)
         else:
-            lines.append("自动审核：预审未完成")
+            lines[0] = f"「{word}」未收录：{header}"
 
         for index, pronunciation in enumerate(pronunciations, start=1):
             pinyin = str(pronunciation.get("pinyin") or "").strip()
-            lines.append(f"候选编码（读音 {index}）:")
             for status in pronunciation.get("candidateStatuses", []):
                 code = str(status.get("code") or "").strip().lower()
                 candidate_recommended = recommended_code if code not in candidate_indexes else ""
@@ -1576,7 +1651,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
                         status,
                         candidate_recommended,
                         ordering_recommended_code,
-                    )
+                    ) + f"（读音 {pinyin or '待确认'}）"
                 )
                 candidate_index += 1
     if reorder_recommendation is not None:
@@ -1587,17 +1662,20 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             )
         )
     elif ordering_assessments and not guard_copy:
-        lines.extend(
-            _format_candidate_ordering_assessment(assessment, candidate_indexes)
+        comparisons = [
+            candidate_commonness_summary_copy(assessment).removeprefix("词频：")
             for assessment in ordering_assessments
             if assessment.get("verdict") != "front_more_common"
-        )
+        ]
+        if any(comparisons):
+            lines.append("词频：" + "；".join(filter(None, comparisons)))
     if guard_copy:
         lines.append(guard_copy)
-    elif reorder_recommendation is None:
-        lines.append(f"• 「{word}」→ {recommended_code}（推荐）")
     if not guard_copy:
-        lines.append(single_word_candidate_footer(candidate_index - 1))
+        lines.append(single_word_candidate_footer(
+            candidate_index - 1, candidate_indexes.get(recommended_code, 0),
+            tuple(candidate_indexes[code] for code, occupied in snapshot_candidates if not occupied),
+        ))
     occupied_choice = next(
         (
             (

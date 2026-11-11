@@ -950,22 +950,14 @@ from keytao_bot.plugins.chat_commands import call_tool_function as call_tool_fun
 from keytao_bot.utils.pending_confirmation import pending_confirmation_copy as pending_confirmation_copy
 from keytao_bot.utils.pending_confirmation import render_server_backed_single_word_lookup as render_server_backed_single_word_lookup
 FIRST_WORD_BASELINE = (
-    "2 个词的候选：\n1. 「球坐标系」\n"
-    "词库暂无收录「球坐标系」：\n"
-    "审词：读音 qiu zuo biao xi；来源 offline；\n"
-    "自动审核：Offline reviewed fixture，可自动通过\n"
-    "候选编码:\n1. qzbx — ✅ 推荐（空位）\n"
-    "2. qzbxv — 空位\n3. qzbxvi — 空位\n推荐编码：qzbx\n"
+    "2 个词的候选：\n1. 「球坐标系」qiu zuo biao xi，可自动通过（offline）\n"
+    "1. qzbx — ✅推荐\n"
+    "2. qzbxv — 空位\n3. qzbxvi — 空位\n"
 )
 
 FOOTER_BASELINE = (
-    "回复「加入」写入草稿，或回复「加入并提交」写入并提交。或「取消」。\n"
-    "按词选择（词名加空格，再写编号或编码；多词用逗号分隔）：\n"
-    "- 「球坐标系 1，柱坐标系 2」\n"
-    "可只写其中部分词；选择后即加入草稿，提交需明确回复提交指令。\n"
-    "同一词可选多个编码、其余词用推荐：如「球坐标系 1 3，其他用推荐的 加入并提交」\n"
-    "也可选择后直接加入并提交：\n"
-    "- 「球坐标系 1，柱坐标系 2，加入并提交」"
+    "回复「加入」或「加入并提交」用推荐码，或「取消」。\n"
+    "或改选如「球坐标系 3」（末尾加「，加入并提交」直接提交）"
 )
 
 def B16ItemTwoTests_setUp(self):
@@ -1633,9 +1625,9 @@ async def B20DisplayTests_assert_pending_link(self, source, label):
 # Source: test_b21_display.py
 from keytao_bot.harness.orchestrator import _command_suggestions_match_pending_batch as _command_suggestions_match_pending_batch
 from keytao_bot.utils.pending_confirmation import advertised_command_suggestions as advertised_command_suggestions
-HINT = "同一词可选多个编码、其余词用推荐：如「{}」"
+HINT = "或改选如「{}」（末尾加「，加入并提交」直接提交）"
 
-FOOTER = "可只写其中部分词；选择后即加入草稿，提交需明确回复提交指令。"
+FOOTER = "回复「加入」或「加入并提交」用推荐码，或「取消」。"
 
 def B21DisplayTests_setUp(self):
     B19PartialReplyBindingTests_setUp(self)
@@ -1883,8 +1875,8 @@ async def B24DisplaceTests_seed(self):
     self.assertIsInstance(state, harness.PendingAddWord)
     self.assertEqual(state.recommended_code, b24_displace_CODES[1], self.replay.last_response)
     self.assertEqual(state.server_occupied_words[b24_displace_CODES[0]], [b24_displace_OCCUPANT])
-    self.assertIn("1. hzhr — 已有「毫亨」", self.replay.last_response)
-    self.assertIn("2. hzhro — ✅ 推荐（空位）", self.replay.last_response)
+    self.assertIn("1. hzhr — 毫亨", self.replay.last_response)
+    self.assertIn("2. hzhro — ✅推荐", self.replay.last_response)
     return state
 
 async def B24DisplaceTests_finish_shift(self, message):
@@ -2343,7 +2335,7 @@ async def B8CancelTests_offer(self, replay):
     self.assertEqual([item["word"] for item in record.state.args["items"]], ["哀声叹气"])
     self.assertIn("加入", replay.last_response)
     self.assertIn("加入并提交", replay.last_response)
-    self.assertIn("换 2", replay.last_response)
+    self.assertNotIn("「换 ", replay.last_response)
     self.assertTrue(replay.chat._advertised_reply_matches_live_record(replay.last_response, record))
     self.assertEqual(understand_message("取消", record.state).op, "cancel")
     return record
@@ -5539,7 +5531,10 @@ def CommonnessRenderTests_assert_delivery(self, comparison, code="qbs"):
         )
         for name, text in (("reviewed", prompt), ("rebuilt", rebuilt), ("lookup", lookup), ("batch", batch)):
             with self.subTest(path=name, verdict=comparison["verdict"]):
-                self.assertIn(comparison["summary"], text)
+                compact = commonness_copy.render_commonness_comparison(assessment)
+                if compact:
+                    self.assertIn("词频：" + compact, text)
+                self.assertNotIn("常用度评估：", text)
         self.assertIn(comparison["summary"], review.build_review_note({
             "commonnessComparisons": [{"frontWord": state.word,
                 "behindWord": assessment["occupantWord"], "code": code, "result": comparison}],
@@ -5547,9 +5542,10 @@ def CommonnessRenderTests_assert_delivery(self, comparison, code="qbs"):
         review.record_commonness_evidence(comparison)
         with patch.object(chat, "conversation_state_store", store):
             delivered = chat._enforce_advertised_reply_contract(prompt, key)
-            self.assertIn(comparison["summary"], delivered)
-            self.assertIn(comparison["summary"], chat._prepare_user_facing_reply(
-                delivered, SimpleNamespace(conversation_address=key, platform="qq")))
+            if compact:
+                self.assertIn("词频：" + compact, delivered)
+                self.assertIn("词频：" + compact, chat._prepare_user_facing_reply(
+                    delivered, SimpleNamespace(conversation_address=key, platform="qq")))
     self.web.assert_not_called()
     return chat_render._format_candidate_ordering_assessment(assessment, {code: 1, code + "o": 2})
 

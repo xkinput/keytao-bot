@@ -186,6 +186,7 @@ from keytao_bot.harness.state import (
     ConversationLockStore,
     DraftOperationCoordinator,
     MemoryConversationStateStore,
+    SQLiteConversationStateStore,
     PendingAdvertisedWordSets,
     PendingStateRecord,
     PendingTrustedWordRecord,
@@ -2243,8 +2244,8 @@ def test_s45_real_long_words_still_enter_review_flow():
 
         check("all legitimate words are reviewed", review_calls == list(words))
         check("all legitimate words receive normal review copy", all(
-            reply is not None and "审词：" in reply
-            for reply in replies
+            reply is not None and f"「{word}」未收录：" in reply
+            for word, reply in zip(words, replies)
         ))
 
     asyncio.run(_run())
@@ -2695,10 +2696,11 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
         check("pending facts called second", tool_calls[1] == ("keytao_pending_items_by_words", {"words": ["洛阳纸贵"]}))
         check("review called third", tool_calls[2] == ("keytao_prepare_reviewed_add", {"word": "洛阳纸贵"}))
         check("encode not needed on reviewed success", all(name != "keytao_encode" for name, _ in tool_calls))
-        check("source shown", result is not None and "汉典" in result)
+        check("incomplete review status shown", result is not None and "需管理员审核（证据不足）" in result)
         check("valid code shown", result is not None and "lyfg" in result)
         check("invalid hallucinated code absent", result is not None and "loyfg" not in result)
-        check("read response does not mint authority by parsing display text", _parse_pending_add_word(result or "") is None)
+        parsed = _parse_pending_add_word(result or "")
+        check("read response does not mint authority by parsing display text", isinstance(parsed, PendingAddWord) and not parsed.server_candidates)
         check(
             "displayed candidates persist one server-backed selection record",
             stored_pending is not None
@@ -2713,7 +2715,12 @@ def test_simple_single_word_query_uses_review_tool_before_ai():
         check(
             "read response still shows trusted candidate occupancy",
             result is not None
-            and "lyfgb — 已有「洛阳」" in result,
+            and "lyfgb — 洛阳" in result,
+        )
+        check(
+            "incomplete review keeps full source evidence in admin remarks",
+            stored_pending is not None
+            and any("汉典" in remark for remark in stored_pending.state.code_remarks.values()),
         )
 
     asyncio.run(_run())
@@ -3558,7 +3565,7 @@ def test_plain_query_then_bare_add_and_submit_uses_first_render_record():
         check(
             "first plain query renders a selector instead of read-only candidates",
             first_reply is not None
-            and "回复「换 2」选择其他编码" in first_reply
+            and "「换 2」改选" in first_reply
             and "本次仅查询" not in first_reply,
         )
         check(
@@ -3766,18 +3773,20 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
         "添加1、2"
     )
     check(
-        "multi-select hint is advertised by a closed parser form",
-        "可多选，如「添加1、2」" in front_prompt
+        "protected candidate is not advertised as a multi-select hint",
+        "添加1、2" not in front_prompt
         and hinted_selection is not None
         and hinted_selection.indices == (1, 2),
     )
     check(
         "occupant branch keeps the current order and free recommendation",
-        "「射覆」与「慑服」的常用度信号不足，维持现有排序，推荐空位 eefju" in behind_prompt,
+        "1. eefj — 慑服\n2. eefju — ✅推荐" in behind_prompt
+        and "常用度评估：" not in behind_prompt,
     )
     check(
         "insufficient branch degrades to the free recommendation",
-        "常用度信号不足，按空位 eefju 推荐" in insufficient_prompt,
+        "2. eefju — ✅推荐" in insufficient_prompt
+        and "常用度评估：" not in insufficient_prompt,
     )
     parsed = _parse_pending_add_word(front_prompt)
     check(
@@ -4044,7 +4053,8 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
                 )
                 for command in advertised_command_suggestions(response)
             )
-            and "可多选，如「添加1、2」" in response
+            and "「换 2」改选" in response
+            and "添加1、2" not in response
             and "重新编码" not in response,
         )
 
@@ -4362,7 +4372,7 @@ def test_explicit_add_word_query_uses_review_tool_before_ai():
         check("review called for explicit add", tool_calls[2] == ("keytao_prepare_reviewed_add", {"word": "平替"}))
         check("encode not called for explicit reviewed add", all(name != "keytao_encode" for name, _ in tool_calls))
         check("authority source shown", result is not None and "百度百科" in result)
-        check("concise reviewed template used", result is not None and "审词：读音 ping ti" in result)
+        check("concise reviewed template used", result is not None and "「平替」未收录：ping ti，" in result)
         check("old split template absent", result is not None and "逐字拆分" not in result)
         check("pending parsed", isinstance(pending, PendingAddWord))
         check("pending recommended code", pending.recommended_code == "pgtk")
@@ -5026,7 +5036,7 @@ def test_word_discovery_prechecks_binding_without_blocking_review():
         from keytao_bot.utils.pending_confirmation import UNBOUND_BINDING_PRECHECK_NOTICE
 
         notice = UNBOUND_BINDING_PRECHECK_NOTICE
-        check("unbound review still renders candidates", unbound is not None and "候选编码" in unbound)
+        check("unbound review still renders candidates", unbound is not None and "1. ldll — ✅推荐" in unbound)
         check("unbound first candidate reply carries one short notice", unbound is not None and unbound.count(notice) == 1)
         check("bound candidate reply carries no binding notice", bound is not None and notice not in bound)
 
@@ -5057,9 +5067,9 @@ def test_reviewed_add_prompt_explains_fallback_review_policy():
 
     check("fallback prompt generated", bool(prompt))
     check("fallback prompt does not say cannot auto approve", "不能自动通过" not in (prompt or ""))
-    check("fallback prompt mentions no authoritative page", "来源 暂无；" in (prompt or ""))
-    check("fallback prompt keeps one concise review line", "审词：读音 bai sui shan" in (prompt or ""))
-    check("fallback prompt states preaudit is incomplete", "自动审核：预审未完成" in (prompt or ""))
+    check("fallback prompt gives a compact evidence reason", "需管理员审核（证据不足）" in (prompt or ""))
+    check("fallback prompt keeps pronunciation on the header", "「百岁山」未收录：bai sui shan，" in (prompt or ""))
+    check("fallback prompt keeps incomplete preaudit manual", "需管理员审核" in (prompt or "") and "可自动通过" not in (prompt or ""))
     check("fallback prompt hides internal submit review", "提交后复审" not in (prompt or ""))
     check("fallback candidate line avoids repeated source", "1. bse — 已有「不算数」；来源" not in (prompt or ""))
 
@@ -5097,8 +5107,8 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
     check("pre-submit preview is concise", "预审结论（同提交审核逻辑）" not in (prompt or ""))
     check("pre-submit preview confirms word auto approval", "，可自动通过" in (prompt or ""))
     check("pre-submit preview hides internal batch re-review", "提交整批时会重审" not in (prompt or ""))
-    check("pre-submit preview keeps common-known reason", "实体常识" in (prompt or ""))
-    check("pre-submit preview appears once", (prompt or "").count("自动审核：") == 1)
+    check("pre-submit preview keeps common-known reason", "（语义判断）" in (prompt or ""))
+    check("pre-submit preview appears once", (prompt or "").count("，可自动通过") == 1)
 
     encode_authority_prompt = _format_reviewed_add_prompt({
         "success": True,
@@ -5130,7 +5140,7 @@ def test_reviewed_add_prompt_shows_pre_submit_audit_result():
     })
     check(
         "encode authority prompt shows truthful Handian-via-encode provenance",
-        "来源 汉典（经编码服务） https://www.zdic.net/hans/%E8%AF%89%E8%AE%BC%E8%B4%B9"
+        "（汉典 https://www.zdic.net/hans/%E8%AF%89%E8%AE%BC%E8%B4%B9）"
         in (encode_authority_prompt or ""),
     )
     check(
@@ -5188,9 +5198,9 @@ def test_reviewed_add_prompt_explains_entity_common_knowledge():
     })
 
     text = prompt or ""
-    check("entity prompt still states no authority page", "来源 暂无；" in text)
-    check("entity prompt names inferred type", "识别为历史人物" in text)
-    check("entity prompt names canonical identity", "尉迟恭" in text)
+    check("entity prompt names its compact evidence", "（语义判断）" in text)
+    check("entity prompt omits the long inferred-type explanation", "识别为历史人物" not in text)
+    check("entity prompt omits the long identity explanation", "尉迟恭" not in text)
     check("entity prompt says word auto approval once", text.count("，可自动通过") == 1)
     check("entity candidate lines stay compact", "1. jgde — 已有「惊得」；来源" not in text)
 
@@ -5229,7 +5239,7 @@ def test_reviewed_add_prompt_confirms_idiom_auto_approval():
 
     text = prompt or ""
     check("idiom prompt confirms auto approval", "，可自动通过" in text)
-    check("idiom prompt names idiom evidence", "属于成语/熟语" in text)
+    check("idiom prompt names compact evidence", "（语义判断）" in text)
     check("idiom prompt avoids prediction wording", "预计" not in text)
     check("idiom prompt hides internal re-review", "重审" not in text and "复审" not in text)
 
@@ -5267,9 +5277,9 @@ def test_reviewed_add_prompt_keeps_waiting_review_concise():
 
     text = prompt or ""
     check("uncertain prompt generated", bool(prompt))
-    check("uncertain prompt uses one review line", text.count("自动审核：") == 1)
-    check("uncertain prompt confirms word needs admin review", "需要管理员审核" in text)
-    check("uncertain prompt keeps concrete reason", "没有读音来源，且常用词信号不足" in text)
+    check("uncertain prompt uses one header verdict", text.count("，需管理员审核") == 1)
+    check("uncertain prompt confirms word needs admin review", "需管理员审核" in text)
+    check("uncertain prompt keeps compact reason", "（读音待核）" in text)
     check("uncertain prompt omits old long preview", "预审结论（同提交审核逻辑）" not in text)
     check("uncertain candidate lines omit repeated pronunciation", "1. hebs — 已有「喝吧」；读音" not in text)
 
@@ -5396,7 +5406,7 @@ def test_reviewed_word_corrects_polyphone_from_entity_context():
         check("wrong cang chain is not retained", "ylcb" not in pronunciation.get("codes", []))
         check("semantic pronunciation alone is not authority", review.get("autoReviewable") is False)
         check("correction records default pronunciation", pronunciation.get("contextPronunciation", {}).get("defaultPinyin") == "ya lu cang bu")
-        check("prompt explains missing source compactly", "来源 暂无；" in prompt)
+        check("prompt explains pronunciation review compactly", "需管理员审核（读音待核）" in prompt)
         check("low-confidence context cannot override default", keytao_review_module._entity_pronunciation_group(
             "雅鲁藏布",
             {**entity, "confidence": 0.70},
@@ -11697,6 +11707,265 @@ def test_native_quoted_batch_assent_executes_only_the_live_payload():
     asyncio.run(_run())
 
 
+def test_compact_quoted_batch_fallback_preserves_structured_review():
+    """The reply-reference fallback keeps admin evidence and reading bindings."""
+    from keytao_bot.utils import completed_draft_undo
+    from keytao_bot.harness.state import _pending_add_word_payload
+    from keytao_bot.utils.pending_confirmation import render_server_backed_batch_candidates
+
+    print("\n🧪 compact quoted batch fallback preserves structured review")
+    items, scopes = [], []
+    for word, code, alternate, pinyin, manual in (
+        ("窨茶", "xwwso", "xwwsoi", "xun cha", True),
+        ("公义", "gylo", "gyloa", "gong yi", False),
+    ):
+        sources = [{"source": f"review source {index}", "url": f"https://evidence.invalid/{index}"}
+                   for index in range(1, 5)]
+        review = {
+            "success": True, "word": word, "recommendedCode": code,
+            "needsManualReview": manual,
+            "pronunciations": [{
+                "pinyin": pinyin, "recommendedCode": code, "sources": sources,
+                "candidateStatuses": [
+                    {"code": code, "occupied": False},
+                    {"code": alternate, "occupied": False},
+                ],
+            }],
+            "preSubmitAudit": {
+                "success": True, "autoApprove": not manual,
+                "summary": f"{word} complete preaudit summary",
+                "semanticContextAutoPassItems": [{"word": word, "code": code, "basisLine": f"{word} complete semantic basis"}],
+                "commonKnownItems": [{"word": word, "code": code, "summary": f"{word} complete common-known explanation"}],
+            },
+            "candidateOrderingAssessments": [{"summary": f"{word} complete commonness evidence"}],
+        }
+        compact = _format_reviewed_add_prompt(review) or ""
+        reviewed = _parse_pending_add_word(compact, review)
+        check(
+            f"new compact card keeps all structured admin evidence for {word}",
+            reviewed is not None and all(fragment in reviewed.code_remarks.get(code, "") for fragment in (
+                *(source["source"] + " " + source["url"] for source in sources),
+                review["preSubmitAudit"]["summary"],
+                review["preSubmitAudit"]["semanticContextAutoPassItems"][0]["basisLine"],
+                review["preSubmitAudit"]["commonKnownItems"][0]["summary"],
+                review["candidateOrderingAssessments"][0]["summary"],
+            )),
+        )
+        check(f"new compact card hides expanded admin evidence for {word}", "complete" not in compact and "https://evidence.invalid/4" not in compact)
+        item = {
+            "action": "Create", "word": word, "code": code, "type": "Phrase",
+            "remark": reviewed.code_remarks.get(code, ""),
+            "needsManualReview": manual,
+            "_reviewed_pinyin": pinyin,
+            "_reviewed_candidate_codes": [code, alternate],
+        }
+        reviewed.server_candidates = list(reviewed.candidates)
+        reviewed.server_occupied_words = dict(reviewed.occupied_words)
+        items.append(item)
+        scopes.append({
+            "word": word, "candidates": list(reviewed.candidates),
+            "occupiedWords": dict(reviewed.occupied_words), "orderingAssessments": [],
+            "reviewedPrompt": compact, "reviewedState": _pending_add_word_payload(reviewed),
+        })
+    prompt = render_server_backed_batch_candidates(items, scopes)
+    standalone_batch = _parse_pending_state_from_response(prompt)
+    check(
+        "standalone compact batch preserves header recommendations without review authority",
+        isinstance(standalone_batch, PendingToolConfirm)
+        and standalone_batch.args == {"items": [
+            {"word": item["word"], "code": item["code"], "action": "Create"}
+            for item in items
+        ]},
+    )
+    standalone_single = _parse_pending_state_from_response("""「窨茶」未收录：xun cha，需管理员审核（无权威来源）
+1. xwws — 巡查
+2. xwwso — ✅推荐
+3. xwwsoi — 空位
+回复「加入」或「加入并提交」，或「换 3」改选、「添加2、3」多选。""")
+    check(
+        "standalone compact single preserves its word recommendation and displayed reading",
+        isinstance(standalone_single, PendingAddWord)
+        and standalone_single.word == "窨茶"
+        and standalone_single.recommended_code == "xwwso"
+        and standalone_single.candidates == [("xwws", True), ("xwwso", False), ("xwwsoi", False)]
+        and standalone_single.pronunciation_codes == {
+            code: "xun cha" for code in ("xwws", "xwwso", "xwwsoi")
+        },
+    )
+    check(
+        "standalone compact single has no server mutation authority",
+        isinstance(standalone_single, PendingAddWord)
+        and not standalone_single.server_candidates and not standalone_single.code_remarks,
+    )
+
+    async def _run():
+        user_id = "compact-quoted-batch-actor"
+        memory = ChatMemoryContext(
+            platform="qq", user_id=user_id, space_type="group",
+            space_id="compact-quoted-batch-group", speaker_name="Rea",
+        )
+        with tempfile.TemporaryDirectory(prefix="keytao-compact-quote-") as tmp:
+            state_path = Path(tmp) / "pending.db"
+            saved = SQLiteConversationStateStore(str(state_path))
+            saved.set(
+                memory.conversation_address,
+                PendingToolConfirm(
+                    function_name="keytao_batch_add_to_draft",
+                    args={
+                        "items": items, "batch_id": "compact-batch",
+                        "expected_content_version": 11,
+                        "expected_warning_digest": "a" * 64,
+                    },
+                    confirmation_source="server_warning",
+                ),
+                space_key=("qq", memory.space_scope_id), owner_label="Rea",
+            )
+            store = SQLiteConversationStateStore(str(state_path))
+            claim_store = DraftMutationClaimStore(str(Path(tmp) / "claims.db"))
+            mismatched = _parse_pending_state_from_response(
+                prompt.replace("gylo —", "gylu —"),
+                store.get(memory.conversation_address),
+            )
+            check(
+                "mismatched compact quote cannot borrow persisted admin evidence",
+                isinstance(mismatched, PendingToolConfirm)
+                and all(not item.get("remark") for item in mismatched.args["items"]),
+            )
+            captured = []
+
+            async def fallback_scope(ctx):
+                await openai_chat_module._stage_resolve_current_pending_scope(ctx)
+                captured.append(ctx.referenced_pending)
+                return False
+
+            stages = tuple(
+                fallback_scope if stage is openai_chat_module._stage_resolve_current_pending_scope else stage
+                for stage in openai_chat_module.STAGES
+                if stage is not openai_chat_module._stage_understand_operation_early
+            )
+            tool_call = AsyncMock(return_value=json.dumps({
+                "success": True, "successCount": 2, "failedCount": 0,
+                "batchId": "compact-batch",
+            }))
+            finish = AsyncMock(side_effect=FinishedException())
+            event = types.SimpleNamespace(
+                original_message=[], message=[], get_plaintext=lambda: "都加",
+            )
+            with (
+                patch.object(openai_chat_module, "STAGES", stages),
+                patch.object(openai_chat_module, "conversation_state_store", store),
+                patch.object(openai_chat_module, "get_default_draft_mutation_claim_store", return_value=claim_store),
+                patch.object(completed_draft_undo, "get_default_draft_mutation_claim_store", return_value=claim_store),
+                patch.object(openai_chat_module, "draft_operation_coordinator", DraftOperationCoordinator()),
+                patch.object(openai_chat_module.ai_chat, "finish", finish),
+                patch.object(openai_chat_module, "extract_reply_reference_info", AsyncMock(return_value=ReplyReferenceInfo(
+                    is_reply=True, is_to_bot=True, text=prompt,
+                ))),
+                patch.object(openai_chat_module, "extract_memory_context", AsyncMock(return_value=memory)),
+                patch.object(openai_chat_module, "_classify_message_command_intent", AsyncMock(return_value=MessageCommandIntent())),
+                patch.object(openai_chat_module, "call_tool_function", tool_call),
+                patch.object(openai_chat_module, "_format_draft_response", AsyncMock(return_value="exact persisted draft")),
+                patch.object(openai_chat_module, "get_history", return_value=[]),
+                patch.object(openai_chat_module, "get_ai_response_core", AsyncMock(return_value="unexpected model fallback")),
+                patch.object(openai_chat_module, "remember_conversation", MagicMock()),
+            ):
+                try:
+                    await openai_chat_module._handle_ai_chat_serialized(
+                        types.SimpleNamespace(), event, "qq", user_id,
+                    )
+                except FinishedException:
+                    pass
+            check(
+                "compact fallback reference keeps complete persisted admin remarks and readings",
+                bool(captured) and captured[0] is not None
+                and captured[0].args.get("items") == items,
+            )
+            check("compact fallback performs one batch write", tool_call.await_count == 1)
+            if tool_call.await_count:
+                check(
+                    "compact fallback writes full admin remarks",
+                    tool_call.await_args.args[1].get("items") == items,
+                )
+                check(
+                    "compact fallback binds each written code to its persisted pronunciation",
+                    tool_call.await_args.kwargs.get("trusted_reviewed_items_by_key") == {
+                        (item["word"], item["code"]): {
+                            "type": "Phrase", "pinyin": item["_reviewed_pinyin"],
+                            "candidate_codes": tuple(item["_reviewed_candidate_codes"]),
+                            "needs_manual_review": item["needsManualReview"],
+                            "remark": item["remark"],
+                        }
+                        for item in items
+                    },
+                )
+
+    asyncio.run(_run())
+
+
+def test_compact_discovery_parser_and_flat_comparison_roundtrip():
+    """Live redraws keep readable bindings and persisted comparator values."""
+    from keytao_bot.utils.commonness_copy import render_commonness_comparison
+    from keytao_bot.utils.pending_confirmation import discovery_question_copy
+
+    print("\n🧪 compact discovery parser and flat comparison roundtrip")
+    assessment = keytao_review_module._candidate_commonness_assessment({
+        "newWord": "图形界面", "occupantWord": "图像界面",
+        "occupantCode": "txjm", "freeCode": "txjmi",
+    }, {
+        "success": True, "verdict": "behind_more_common", "webFallback": True,
+        "front": {"score": 1.34}, "behind": {"score": 1.44},
+        "summary": "Full saved comparator evidence with both original scores",
+    })
+    candidates = [("txjm", True), ("txjmi", False), ("txjmiv", False)]
+    readings = {code: "tu xing jie mian" for code, _occupied in candidates}
+    state = PendingAddWord(
+        word="图形界面", recommended_code="txjmi", candidates=candidates,
+        occupied_words={"txjm": ["图像界面"]},
+        server_candidates=list(candidates), server_occupied_words={"txjm": ["图像界面"]},
+        pronunciation_codes=readings, needs_manual_review=False,
+        server_ordering_assessments=[assessment],
+    )
+    address = ConversationAddress.group("qq", "discovery-copy-group", "discovery-copy-actor")
+    with tempfile.TemporaryDirectory(prefix="keytao-flat-comparison-") as tmp:
+        path = str(Path(tmp) / "pending.db")
+        store = SQLiteConversationStateStore(path)
+        check("flat comparison state passes persistence schema", store.set(address, state, space_key=address.space_key))
+        restored_store = SQLiteConversationStateStore(path)
+        restored = restored_store.get(address)
+        check(
+            "flat comparison values and full summary survive SQLite reload",
+            isinstance(restored, PendingAddWord)
+            and restored.server_ordering_assessments == [assessment]
+            and all(isinstance(value, str) for value in restored.server_ordering_assessments[0].values()),
+        )
+        check(
+            "reloaded comparison renders the same numerically sorted values",
+            isinstance(restored, PendingAddWord)
+            and render_commonness_comparison(restored.server_ordering_assessments[0])
+            == "图像界面 1.44 > 图形界面 1.34",
+        )
+        rendered = openai_chat_module._render_live_single_candidate_record(restored_store.get_record(address))
+        question = discovery_question_copy(state.word, rendered)
+        parsed = _parse_pending_state_from_response(question)
+        check(
+            "actual discovery helper preserves the live card word and recommendation",
+            isinstance(parsed, PendingAddWord) and parsed.word == state.word
+            and parsed.recommended_code == state.recommended_code and parsed.candidates == candidates,
+        )
+        check(
+            "actual discovery helper preserves each displayed pronunciation binding",
+            isinstance(parsed, PendingAddWord) and parsed.pronunciation_codes == readings,
+        )
+        check(
+            "actual discovery helper offers a valid non-recommended selector",
+            "「换 3」改选" in question and "「取消」" in question and "「别问我」" in question,
+        )
+        check(
+            "discovery text alone cannot mint server mutation authority",
+            isinstance(parsed, PendingAddWord) and not parsed.server_candidates,
+        )
+
+
 def test_target_bound_add_submit_rejects_questions_negation_and_substrings():
     """Only the canonical exact word/code command can replace a native quote."""
     print("\n🧪 target-bound add-submit negative syntax")
@@ -12083,8 +12352,29 @@ def test_revalidated_quote_requires_current_semantic_snapshot():
                 "issues": [],
             },
         }
+        multireading_review["preSubmitAudit"]["summary"] = "Complete multi-reading audit evidence"
+        for index, pronunciation in enumerate(multireading_review["pronunciations"], start=1):
+            pronunciation["sources"] = [{"source": f"reading source {index}", "url": f"https://reading.invalid/{index}"}]
         multireading_prompt = _format_reviewed_add_prompt(multireading_review) or ""
         multireading_state = _parse_pending_add_word(multireading_prompt)
+        structured_multireading = _parse_pending_add_word(multireading_prompt, multireading_review)
+        check(
+            "multi-reading compact card keeps each code's own full source and audit note",
+            isinstance(structured_multireading, PendingAddWord)
+            and all(
+                f"reading source {index} https://reading.invalid/{index}" in structured_multireading.code_remarks.get(status["code"], "")
+                and "Complete multi-reading audit evidence" in structured_multireading.code_remarks.get(status["code"], "")
+                for index, pronunciation in enumerate(multireading_review["pronunciations"], start=1)
+                for status in pronunciation["candidateStatuses"]
+            )
+            and "reading source 1" not in structured_multireading.code_remarks.get("hhje", ""),
+        )
+        check(
+            "multi-reading batch remark uses the selected code's structured reading",
+            "reading source 2 https://reading.invalid/2" in openai_chat_module._batch_review_remark(
+                multireading_prompt, "还车", multireading_review, "hhje",
+            ),
+        )
         check(
             "multi-reading display binds each candidate code to its reading",
             isinstance(multireading_state, PendingAddWord)
@@ -17324,9 +17614,9 @@ def test_outgoing_advertisement_requires_matching_live_state():
         )
         restored_contract = advertised_reply_contract(restored_action_list)
         check(
-            "action-list model summary restores its missing scoped selector",
+            "action-list model summary restores only available actions",
             restored_action_list != action_list_summary
-            and restored_contract.candidate_selection
+            and not restored_contract.candidate_selection
             and {"加入", "加入并提交"}.issubset(
                 restored_contract.batch_assent_forms
             )
@@ -17460,7 +17750,7 @@ def test_live_actionable_reply_advertises_complete_reply_contract():
     )
     check(
         "restarted numbering advertises a word-scoped selector",
-        "中登 1" in restored or "小登 1" in restored,
+        any(f"{word} 2" in restored for word, _code, _fallback, _occupant in cases),
     )
     check(
         "restored affordances stay within two compact lines",
@@ -17585,8 +17875,8 @@ def test_live_actionable_reply_advertises_complete_reply_contract():
         set(single_contract.batch_assent_forms) >= {"加入", "加入并提交"},
     )
     check(
-        "live single-word numbering advertises its selector",
-        single_contract.candidate_selection,
+        "live single-word card does not advertise a protected selector",
+        not single_contract.candidate_selection and "换 1" not in restored_single,
     )
 
     store.set(
@@ -23205,6 +23495,8 @@ if __name__ == "__main__":
     test_inline_live_batch_ticket_accepts_bare_advertised_submit()
     test_inline_live_batch_modifier_bypasses_both_models()
     test_native_quoted_batch_assent_executes_only_the_live_payload()
+    test_compact_quoted_batch_fallback_preserves_structured_review()
+    test_compact_discovery_parser_and_flat_comparison_roundtrip()
     test_target_bound_add_submit_rejects_questions_negation_and_substrings()
     test_draft_suggestion_routes_share_authorization_lead_ins()
     test_cross_user_bot_quote_creates_only_current_actor_operation()

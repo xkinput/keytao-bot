@@ -150,9 +150,14 @@ def record_commonness_evidence(value: Any) -> None:
 
     def collect(current: Any) -> None:
         if isinstance(current, dict):
+            from .commonness_copy import render_commonness_comparison
+
             summary = str(current.get("summary") or "").strip()
             if summary:
                 lines.append(summary)
+            comparison = render_commonness_comparison(current)
+            if comparison:
+                lines.append(comparison)
             evidence_lines = current.get("evidenceLines")
             if isinstance(evidence_lines, list):
                 lines.extend(
@@ -6365,6 +6370,9 @@ def _candidate_commonness_assessment(
     *,
     degradation: str = "",
 ) -> Dict[str, Any]:
+    from .commonness_copy import comparison_frequency_values
+
+    front_frequency, behind_frequency = comparison_frequency_values(comparison or {})
     raw_verdict = str((comparison or {}).get("verdict") or "")
     allowed_verdicts = {
         "front_more_common",
@@ -6389,6 +6397,8 @@ def _candidate_commonness_assessment(
         "decisionReason": str(
             (comparison or {}).get("decisionReason") or ""
         ).strip(),
+        "frontFrequency": str(front_frequency) if front_frequency is not None else "",
+        "behindFrequency": str(behind_frequency) if behind_frequency is not None else "",
         "degradation": degradation,
     }
 

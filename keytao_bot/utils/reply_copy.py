@@ -6,7 +6,7 @@ import unicodedata
 
 WORD_CARD_HEADER_RE = re.compile(
     r"(?m)^\s*(?:词库暂无收录)?「(?P<word>[^「」\r\n]{1,128})」"
-    r"(?:未收录[:：][^\n]*|(?:候选编码)?[:：]\s*$|已在词库[（(][^\n]*)"
+    r"(?:未收录[:：][^\n]*|词库里还没有，要加入吗？[^\n]*|(?:候选编码)?[:：]\s*$|已在词库[（(][^\n]*)"
 )
 NUMBERED_WORD_HEADER_RE = re.compile(
     r"(?m)^\s*\d{1,3}[.)、]\s*(?:"
@@ -26,7 +26,7 @@ NUMBERED_CANDIDATE_ROW_RE = re.compile(
     r"(?:已有|占用|占位|空位|推荐)"
 )
 COMPACT_CANDIDATE_HEADER_RE = re.compile(
-    r"(?m)^\s*(?:「[^」\n]+」未收录[:：]|"
+    r"(?m)^\s*(?:「[^」\n]+」(?:未收录[:：]|候选编码[:：]|词库里还没有，要加入吗？)|"
     r"\d+[.)、]\s*「[^」\n]+」[^\n]+，(?:可自动通过|需管理员审核))"
 )
 CANDIDATE_RECOMMENDATION_LABEL_RE = re.compile(
@@ -75,8 +75,8 @@ COMPACT_SINGLE_WORD_FOOTER_RE = re.compile(
     r"(?m)^回复「加入」或「加入并提交」[^\n]*(?:\n|$)"
 )
 FREQUENCY_COMPARISON_RE = re.compile(
-    r"(?:词频[:：]|[；;])\s*(?P<first>[^\s；;>]+)\s+(?:\d+(?:\.\d+)?|无)"
-    r"\s*>\s*(?P<second>[^\s；;>]+)\s+(?:\d+(?:\.\d+)?|无)"
+    r"(?:词频[:：]|[；;])\s*(?P<first>[^\s；;>=]+)\s+(?:\d+(?:\.\d+)?(?:e[+-]?\d+)?|无)"
+    r"\s*[>=]\s*(?P<second>[^\s；;>=]+)\s+(?:\d+(?:\.\d+)?(?:e[+-]?\d+)?|无)"
 )
 DRAFT_DISPLAY_ROW_RE = re.compile(r"^\s*(?:[•-]\s*)?\d+[.、]\s*(?:新增|修改|删除)\s+")
 COMMONNESS_COMPARISON_COPY_RE = re.compile(
@@ -178,7 +178,8 @@ def has_pending_add_card_contract(text):
                   r"(?m:^\s*[•-]\s*「[^」\n]+」\s*→\s*[a-z]+\s*[（(]推荐[）)]\s*$)|"
                   r"「[^」\n]+」\s*占\s*[a-z]+\s*、\s*「[^」\n]+」顺延", source)
         or no_recommended_candidate(source)
-        or "未收录：" in source and COMPACT_SINGLE_WORD_FOOTER_RE.search(source)
+        or ("未收录：" in source or "候选编码：" in source or "词库里还没有，要加入吗？" in source)
+        and COMPACT_SINGLE_WORD_FOOTER_RE.search(source)
     )
 
 
@@ -305,10 +306,7 @@ def candidate_cards_match(first, second):
     second_lines = tuple(line.strip() for line in str(second).splitlines() if line.strip())
     if first_lines == second_lines:
         return True
-    compact_sources = [str(text) for text in (first, second) if re.search(
-        r"(?m)^\s*(?:「[^」\n]+」未收录[:：]|\d+[.)、]\s*「[^」\n]+」[^\n]+，(?:可自动通过|需管理员审核))",
-        str(text),
-    )]
+    compact_sources = [str(text) for text in (first, second) if COMPACT_CANDIDATE_HEADER_RE.search(str(text))]
     if not compact_sources:
         return False
     for source in compact_sources:
@@ -318,7 +316,7 @@ def candidate_cards_match(first, second):
             if (WORD_CARD_HEADER_RE.fullmatch(line) or NUMBERED_WORD_HEADER_RE.fullmatch(line)
                     or CANDIDATE_ROW_RE.fullmatch(line) or FREQUENCY_COMPARISON_RE.match(line)
                     or re.fullmatch(r"\d+ 个词的候选[:：]", line)
-                    or re.fullmatch(r"回复「加入」或「加入并提交」(?:用推荐码)?[，,](?:或「取消」。|或「换 \d+」改选、?「添加\d+(?:、\d+)+」多选。)", line)
+                    or re.fullmatch(r"回复「加入」或「加入并提交」(?:用推荐码)?[，,](?:或「取消」。|或「换 \d+」改选(?:、?「添加\d+(?:、\d+)+」多选)?(?:，或「取消」)?。)", line)
                     or re.fullmatch(r"或改选如「[^」\n]+」[（(]末尾加「，加入并提交」直接提交[）)]", line)):
                 continue
             return False
@@ -441,9 +439,9 @@ def review_reading_pinyin(text):
 
 def compact_card_reading_pinyin(text, word):
     match = re.search(
-        rf"(?m)^\s*(?:\d+[.)、]\s*)?「{re.escape(word)}」(?:未收录[:：])?\s*"
+        rf"(?m)^\s*(?:\d+[.)、]\s*)?「{re.escape(word)}」(?:未收录[:：]|词库里还没有，要加入吗？读音\s*)?\s*"
         r"(?P<pinyin>[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ\s]+?)"
-        r"\s*[，,](?:可自动通过|需(?:要)?管理员审核)",
+        r"\s*[，,](?:可自动通过|需(?:要)?管理员审核|预审未完成)",
         str(text or ""),
     )
     return re.sub(r"\s+", " ", match["pinyin"]).strip() if match is not None else ""

@@ -54,7 +54,7 @@ class SemanticAdvertisedAnswerTests(unittest.IsolatedAsyncioTestCase):
         actual = await replay.turn(replay.row, replay.row["model_raw"])
         self.assertEqual((actual["kind"], actual["candidates"], actual["write_count"]),
                          ("candidates", ["燃面", "晕碳"], 0))
-        self.assertIn("燃面 1，晕碳 1", replay.last_response)
+        self.assertIn("或改选如「燃面 2，晕碳 2」", replay.last_response)
         if advertise_scoped_format:
             prompt = replay.last_response + "\n回复「晕碳 添加1」，多选回复「晕碳 添加1、2」。"
             replay.history[-1]["content"] = prompt

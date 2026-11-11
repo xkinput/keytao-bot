@@ -416,7 +416,8 @@ class B13DefaultReadingTests(unittest.IsolatedAsyncioTestCase):
         result = await harness._review_tools.keytao_prepare_reviewed_add("大肥鱼")
         response = harness.chat_commands_module._format_reviewed_add_prompt(result)
         self.assertIn("dfyvo", response, response)
-        self.assertIn("自动审核：未找到权威来源，仅使用编码服务默认读音，需要管理员审核", response)
+        self.assertIn("dà féi yú，需管理员审核", response)
+        self.assertEqual(result["autoReviewReason"], "未找到权威来源，仅使用编码服务默认读音")
         self.assertEqual(result["pronunciations"][0]["normalized"], ["da", "fei", "yu"])
         self.assertIs(result["autoReviewable"], False)
         self.assertIs(result["needsManualReview"], True)
@@ -432,7 +433,7 @@ class B13DefaultReadingTests(unittest.IsolatedAsyncioTestCase):
         response = harness.chat_commands_module._format_reviewed_add_prompt(result)
         self.assertIn("dfyvo", response, response)
         self.assertNotIn("dfyva", response, response)
-        self.assertIn("需要管理员审核", response)
+        self.assertIn("需管理员审核", response)
         self.assertEqual([item["normalized"] for item in result["pronunciations"]],
                          [["da", "fei", "yu"]])
         self.assertEqual(result["reviewDisposition"], "SEAL")
@@ -444,7 +445,7 @@ class B13DefaultReadingTests(unittest.IsolatedAsyncioTestCase):
         result = await harness._review_tools.keytao_prepare_reviewed_add("大肥鱼")
         response = harness.chat_commands_module._format_reviewed_add_prompt(result)
         self.assertIn("dfyvo", response, response)
-        self.assertIn("需要管理员审核", response)
+        self.assertIn("需管理员审核", response)
         self.assertEqual(result["reviewDisposition"], "SEAL")
         self.assertIs(result["autoReviewable"], False)
 

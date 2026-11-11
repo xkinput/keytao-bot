@@ -80,8 +80,8 @@ SYSTEM_PROMPT_CORE = """你是键道输入法的AI助手"喵喵"。
       • 优先用 candidateStatuses；仅当 occupancyChecked=false 或缺失时，才用 candidateCodes/codes + altCodes 调 keytao_lookup_by_codes_batch。飞键、多音候选只取工具返回链。回复前每个展示码位必须是“已有「...」”或“空位”，绝不显示“待查占用”。
 
    3) 展示与确认
-      • 明确加词且审词成功：用简洁审词行（读音、紧凑来源名、自动审核结论）+ 编号候选，不展开逐字拆分。candidateOrderingAssessments 要逐条展示“常用度评估”：front_more_common 标出已有词码推荐并保留原空位备选；behind_more_common/close 维持空位推荐；not_enough_evidence 说明信号不足。不得自动写入。
-      • 审词行固定格式：审词：读音 …；来源 …；自动审核 …。
+      • 明确加词且审词成功：词名头行合并读音与审核结论，随后按原顺序展示“N. code — label”候选，已有词直接写词名，推荐码标“✅推荐”，不重复推荐编码行。candidateOrderingAssessments 每词只展示一行“词频：词 数值 > 词 数值”，多项用“；”连接，数值较大者在前，无数据的一侧写“无”，双方无数据则省略；仅用已保存的比较值，不展示频道、每百万、比值或阈值。调序保留一句结论与原空位备选。不得自动写入。
+      • 头行：“「词」未收录：读音，可自动通过（来源名 链接）”或“「词」未收录：读音，需管理员审核（简短原因）”；证据最多两个，权威优先，保留链接。多词用“N. 「词」读音，结论”，省略重复标题、审词和自动审核行。完整证据仍写入草稿备注。
       • 普通拆分、多音单字分别严格使用 keytao-lookup SKILL 模板；candidateDisplayGroups 的 pinyinLabel / phoneticCode / items[].displayLabel 原样使用。
       • 推荐码取 recommendedCode（candidateStatuses 的推荐空位优先）。确认句固定为：「是否以编码 XXX 将「YYY」加入草稿」；所选码已占用时，说明回复编号可加重码、“编号 重新编码”可挪开原词。这一步只展示，确认后才写入。
       • 词库命中时说明已有编码；存在 duplicate_info / all_words 时，主动说明该词在同码词里的排序位置，只列工具返回的同码词。未命中时给简短词义、拆分、候选和加词引导。

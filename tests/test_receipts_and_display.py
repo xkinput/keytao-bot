@@ -163,22 +163,20 @@ class B16ItemOneTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_f1_give_way_keeps_review_lines_without_recommendation_arrow(self):
         prompt = await self.candidates()
-        first, separator, second = prompt.partition("2. 「柱坐标系」\n")
+        first, separator, second = prompt.partition("2. 「柱坐标系」")
         self.assertTrue(separator)
         self.assertEqual(first.encode(), FIRST_WORD_BASELINE.encode())
         self.assertTrue(second.endswith(FOOTER_BASELINE), second)
         candidate_list = (
             "「柱坐标系」候选编码：\n"
             "1. qzbx — 本次推荐给「球坐标系」\n"
-            "2. qzbxv — ✅ 推荐（空位）\n3. qzbxvi — 空位"
+            "2. qzbxv — ✅推荐\n3. qzbxvi — 空位"
         )
         self.assertIn(candidate_list, second)
-        self.assertIn("推荐编码：qzbxv", second)
+        self.assertNotIn("推荐编码：qzbxv", second)
         with self.subTest(part="review_prefix"):
             self.assertTrue(second.startswith(
-                "词库暂无收录「柱坐标系」：\n"
-                "审词：读音 zhu zuo biao xi；来源 offline；\n"
-                "自动审核：Offline reviewed fixture，可自动通过\n"
+                "zhu zuo biao xi，可自动通过（offline）\n"
                 + candidate_list
             ), second)
         with self.subTest(part="recommendation_arrow"):
@@ -224,7 +222,7 @@ class B16ItemOneTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(pending_item["needsManualReview"], True)
             self.assertEqual(pending_item["manualReviewReason"], expected_reason)
             with self.subTest(part="visible_reason"):
-                self.assertIn(f"自动审核：{expected_reason}，需要管理员审核", prompt)
+                self.assertIn("「柱坐标系」zhu zuo biao xi，需管理员审核（证据不足）", prompt)
             await self.turn("加入", prompt)
         written_item = next(item for item in self.replay.draft if item["word"] == b15_sibling_and_others_WORDS[1])
         self.assertEqual(written_item, pending_item)
@@ -253,12 +251,16 @@ class B16ItemOneTests(unittest.IsolatedAsyncioTestCase):
                         actionable_controls=True, include_controls=False,
                     )
                     audit_line = f"自动审核：{reason}，需要管理员审核"
-                    self.assertIn(audit_line, reviewed_prompt)
-                    self.assertIn("词库暂无收录「柱坐标系」：", rendered)
-                    self.assertIn("审词：读音 zhu zuo biao xi；来源 offline；", rendered)
+                    self.assertEqual(audit_line, self.replay.commands._format_pre_submit_audit_preview(review, "qzbx"))
+                    self.assertIn("「柱坐标系」未收录：zhu zuo biao xi，需管理员审核（证据不足）", reviewed_prompt)
+                    self.assertIn("「柱坐标系」未收录：zhu zuo biao xi，需管理员审核（证据不足）", rendered)
                     expected_code = "qzbxv" if code.lower() == "qzbx" else code
-                    self.assertIn(f"自动审核：「柱坐标系」@{expected_code} 证据不足，需要管理员审核", rendered)
-                    self.assertIn("推荐编码：qzbxv", rendered)
+                    self.assertEqual(
+                        self.replay.commands.rewrite_review_code_references(audit_line, ("qzbx",), "qzbxv"),
+                        f"自动审核：「柱坐标系」@{expected_code} 证据不足，需要管理员审核",
+                    )
+                    self.assertIn("2. qzbxv — ✅推荐", rendered)
+                    self.assertNotIn("推荐编码：qzbxv", rendered)
                     self.assertNotIn("• 「柱坐标系」→ qzbxv（推荐）", rendered)
 
     def test_give_way_preserves_plain_syllable_and_longer_code_tokens(self):
@@ -286,9 +288,10 @@ class B16ItemOneTests(unittest.IsolatedAsyncioTestCase):
             "candidateStatuses": [{"code": "czbx", "occupied": False, "words": [], "phrases": []}],
         })
         reviewed_prompt = self.replay.commands._format_reviewed_add_prompt(review)
-        self.assertIn("候选编码（读音 1）:", reviewed_prompt)
-        self.assertEqual(reviewed_prompt.count("✅ 推荐"), 1, reviewed_prompt)
-        marker_line = next(line for line in reviewed_prompt.splitlines() if "✅ 推荐" in line)
+        self.assertIn("「柱坐标系」未收录：zhu zuo biao xi / chu zuo biao xi", reviewed_prompt)
+        self.assertIn("4. czbx — 空位（读音 chu zuo biao xi）", reviewed_prompt)
+        self.assertEqual(reviewed_prompt.count("✅推荐"), 1, reviewed_prompt)
+        marker_line = next(line for line in reviewed_prompt.splitlines() if "✅推荐" in line)
         self.assertIn(review["recommendedCode"], marker_line)
         rendered = render_server_backed_single_word_lookup(
             b15_sibling_and_others_WORDS[1], "qzbxv", [(code, False) for code in [*b15_sibling_and_others_CODES, "czbx"]], {},
@@ -929,15 +932,20 @@ class B21DisplayTests(unittest.IsolatedAsyncioTestCase):
     async def test_c2_exact_footer_example_executes_and_submits(self):
         record = await self.seed(("小美", "马哲", "小帅"))
         prompt = self.bot.messages[self.original_id]["message"]
-        command = "小美 1 2，其他用推荐的 加入并提交"
+        command = "小美 2，马哲 2，小帅 2"
         self.assertEqual(prompt.count(HINT.format(command)), 1)
         self.assertIn(FOOTER + "\n" + HINT.format(command), prompt)
         self.assertIn(command, advertised_command_suggestions(prompt))
         self.assertTrue(_command_suggestions_match_pending_batch(prompt, record.state))
-        quoted_example = re.search(r"同一词可选多个编码、其余词用推荐：如「([^」]+)」", prompt).group(1)
-        await self.turn(quoted_example, self.original_id)
-        self.assertCountEqual(self.created(), [("小美", "xmww"), ("小美", "xmwwi"),
-                                              ("马哲", "msqe"), ("小帅", "xkeu")])
+        quoted_example = re.search(r"或改选如「([^」]+)」", prompt).group(1)
+        self.assertEqual(quoted_example, command)
+        for scope in record.state.args["_candidate_scopes"]:
+            code, occupied = scope["candidates"][1]
+            self.assertFalse(occupied)
+            self.assertNotEqual(code, scope["reviewedState"]["recommendedCode"])
+        self.assertIn(command + "，加入并提交", advertised_command_suggestions(prompt))
+        await self.turn(quoted_example + "，加入并提交", self.original_id)
+        self.assertCountEqual(self.created(), [("小美", "xmwwi"), ("马哲", "msqea"), ("小帅", "xkeui")])
         self.assertEqual(self.http.submissions, 1, self.replay.last_response)
         self.assertIsNone(self.replay.store.get_record(self.replay.author))
 
@@ -958,8 +966,9 @@ class B21DisplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.replay.store.set(self.replay.author, ticket))
         record = self.replay.store.get_record(self.replay.author)
         prompt = self.replay.chat._render_live_batch_record(record)
-        self.assertIn(HINT.format("马哲 2 4，其他用推荐的 加入并提交"), prompt)
-        self.assertEqual(prompt.count("同一词可选多个编码、其余词用推荐"), 1)
+        self.assertIn(HINT.format("马哲 1，小帅 2"), prompt)
+        self.assertEqual(prompt.count("或改选如"), 1)
+        self.assertNotIn("小美 1", prompt)
         self.assertTrue(_command_suggestions_match_pending_batch(prompt, record.state))
 
     async def test_c2_no_qualifying_word_omits_hint(self):
@@ -969,11 +978,13 @@ class B21DisplayTests(unittest.IsolatedAsyncioTestCase):
         }))
         await self.seed(("小美", "小帅"))
         self.assertNotIn("同一词可选多个编码", self.replay.prompt)
+        self.assertNotIn("或改选如", self.replay.prompt)
         self.assertIn(FOOTER, self.replay.prompt)
 
     async def test_c2_single_word_ticket_omits_hint(self):
         await self.seed(("小美",))
         self.assertNotIn("同一词可选多个编码", self.replay.prompt)
+        self.assertNotIn("或改选如", self.replay.prompt)
 
 # Source: test_b23_display.py
 class B23DisplayTests(unittest.IsolatedAsyncioTestCase):
@@ -1112,7 +1123,8 @@ class B26DisplayTests(unittest.IsolatedAsyncioTestCase):
         await self.seed()
         suggestions = self.displacement_suggestions(self.replay.last_response)
         self.assertEqual(suggestions, [(b25_session_CODES[2], b25_session_OCCUPANT)], self.replay.last_response)
-        self.assertIn("常用度信号不足", self.replay.last_response)
+        self.assertNotIn("常用度信号不足", self.replay.last_response)
+        self.assertNotIn("词频：", self.replay.last_response)
         self.assertEqual(self.http.writes, [])
 
     def test_h2_weaker_occupants_are_unique_and_limited_to_two(self):
@@ -1583,13 +1595,13 @@ class S54RendererTests(unittest.TestCase):
         self.assertNotIn("dhdt", rendered)
         self.assertNotIn("thdt", rendered)
         self.assertIn("1. dsdt — 已有「打断」", rendered)
-        self.assertIn("推荐编码：dsdtvo", rendered)
-        self.assertIn("推荐编码：xcdti", rendered)
+        self.assertIn("3. dsdtvo — 空位（推荐）", rendered)
+        self.assertIn("2. xcdti — 空位（推荐）", rendered)
+        self.assertNotIn("推荐编码：", rendered)
         self.assertNotIn("添加1、2", rendered)
         self.assertNotIn("小端 添加1", rendered)
-        self.assertIn("「大端 3，小端 2」", rendered)
-        self.assertIn("选择后即加入草稿", rendered)
-        self.assertIn("提交需明确回复", rendered)
+        self.assertIn(HINT.format("小端 3"), rendered)
+        self.assertIn(FOOTER, rendered)
         self.assertEqual(
             (("大端", "dsdtvo"), ("小端", "xcdti")),
             advertised_batch_binding_pairs(rendered),
@@ -1978,9 +1990,10 @@ class S58AdvertisementTests(unittest.TestCase):
                     self.assertNotIn("chū juàn", reply)
                     self.assertIn("管理员审核", reply)
                     self.assertNotIn("可自动通过", reply)
-                    self.assertIn(reason, reply)
-                    self.assertRegex(reply, r"(?m)^1\. jjqt — 已有「除权」")
-                    self.assertRegex(reply, r"(?m)^2\. jjqta — .*空位")
+                    self.assertIn("需管理员审核（读音待核）", reply)
+                    self.assertEqual(record.state.manual_review_reason, reason)
+                    self.assertRegex(reply, r"(?m)^1\. jjqt — 除权")
+                    self.assertRegex(reply, r"(?m)^2\. jjqta — ✅推荐")
                     self.assertRegex(reply, r"(?m)^3\. jjqtai — 空位")
                     self.assertTrue(s58_advertisement_chat._advertised_reply_matches_live_record(reply, record))
                     for command in advertised_command_suggestions(reply):

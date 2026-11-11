@@ -727,7 +727,9 @@ class WordDiscovery:
             if not rendered:
                 chat.conversation_state_store.delete(address)
                 return
-            response = f"「{word}」词库里还没有，要加入吗？\n{rendered}\n回复：确认 / 选编号 / 取消；以后不想收到询问可回复“别问我”。"
+            from keytao_bot.utils.pending_confirmation import discovery_question_copy
+
+            response = discovery_question_copy(word, rendered)
             if not chat.conversation_state_store.bind_origin_prompt_digest(
                 address, chat._prompt_capability_digest(response),
             ):

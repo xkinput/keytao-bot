@@ -2014,6 +2014,7 @@ def _advertised_reply_matches_live_record(
         and contract.batch_assent_forms
         and not contract.candidate_selection
         and pending_batch_confirmation_copy() not in response
+        and not _reply_copy.candidate_cards_match(response, _render_live_batch_record(record))
     ):
         # A candidate-scoped batch must use the complete deterministic trailer.
         # Exact operands alone do not make a model-authored one-line assent safe.
@@ -2302,7 +2303,18 @@ def _render_live_single_candidate_record(
     if not rendered:
         return ""
     details = _chat_render._format_pending_candidate_review_details(record.state)
-    return f"{details}\n{rendered}" if details else rendered
+    rendered = rendered.replace(f"「{record.state.word}」候选编码：", details, 1)
+    readings = set(record.state.pronunciation_codes.values())
+    if len(readings) > 1:
+        for index, (code, _) in enumerate(record.state.server_candidates, start=1):
+            reading = record.state.pronunciation_codes.get(code)
+            if reading:
+                rendered = re.sub(
+                    rf"(?m)^({index}\. {re.escape(code)} — [^\n]+)$",
+                    lambda match, reading=reading: match[1] + f"（读音 {reading}）",
+                    rendered,
+                )
+    return rendered
 
 
 def _reply_carries_live_candidate_state(
@@ -2414,10 +2426,13 @@ def _live_candidate_affordances_are_complete(
     if isinstance(record.state, PendingAddWord):
         return (
             contract.candidate_selection
-            if len(record.state.server_candidates) > 1
+            if any(not occupied and code != record.state.recommended_code for code, occupied in record.state.server_candidates)
             else True
         )
-    return contract.candidate_selection
+    return contract.candidate_selection or bool(
+        isinstance(record.state, PendingToolConfirm)
+        and _reply_copy.candidate_cards_match(response, _render_live_batch_record(record))
+    )
 
 
 _COMMONNESS_COMPARISON_COPY_RE = _reply_copy.COMMONNESS_COMPARISON_COPY_RE
@@ -2681,6 +2696,22 @@ def _enforce_candidate_reply_contract(
         if _advertised_reply_matches_live_record(response, record):
             return _chat_commands.render_pending_understood_command(record.state)
     evidence = keytao_review.current_commonness_evidence()
+    if record is not None and not record.execution_id:
+        from keytao_bot.utils.commonness_copy import render_commonness_comparison
+
+        if isinstance(record.state, PendingAddWord):
+            assessments = record.state.server_ordering_assessments
+        elif isinstance(record.state, PendingToolConfirm):
+            assessments = tuple(
+                assessment
+                for scope in record.state.args.get("_candidate_scopes", [])
+                if isinstance(scope, dict)
+                for assessment in scope.get("orderingAssessments", [])
+                if isinstance(assessment, dict)
+            )
+        else:
+            assessments = ()
+        evidence = (*evidence, *(render_commonness_comparison(item) for item in assessments))
     if record is not None and not record.execution_id and isinstance(record.state, PendingToolConfirm) and _state.server_warning_ticket_is_complete(record.state):
         plan = (record.state.args.get("_pending_display") or {}).get("shiftPlan") or {}
         evidence = (*evidence, *(
@@ -4288,7 +4319,11 @@ async def _stage_resolve_current_pending_scope(ctx: TurnContext) -> bool:
         ctx.current_pending_record = current_record
         return False
     parsed_referenced_pending = (
-        _parse_pending_state_from_response(ctx.reply_reference.text)
+        _parse_pending_state_from_response(
+            ctx.reply_reference.text,
+            current_record.state
+            if current_record is not None and not current_record.execution_id else None,
+        )
         if ctx.reply_reference.is_to_bot and ctx.reply_reference.text
         else None
     )

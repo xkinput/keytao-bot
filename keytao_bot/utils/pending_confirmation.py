@@ -17,9 +17,11 @@ from .reply_copy import (
     NUMBERED_WORD_HEADER_RE,
     batch_block_recommended_code,
     candidate_rows,
+    candidate_label_is_available,
     missing_word_card_word,
     no_recommended_candidate,
     recommended_candidate_code,
+    strip_legacy_occupied_guidance,
 )
 
 
@@ -1410,7 +1412,7 @@ def render_server_backed_batch_candidates(
         display_items = {word: (code, needs_review) for word, code, needs_review in normalized_items}
         lines = [f"{len(scopes_by_word)} 个词的候选："]
         selections: list[tuple[str, str]] = []
-        multi_code_example = ""
+        example_codes: set[str] = set()
         for index, word in enumerate(scopes_by_word, start=1):
             recommended_code, _needs_review = display_items.get(word, ("", True))
             scope = reviewed_scopes_by_word[word]
@@ -1431,7 +1433,11 @@ def render_server_backed_batch_candidates(
                 return ""
             if len(scopes_by_word) == 1:
                 return block
-            lines.extend((f"{index}. 「{word}」", block))
+            compact_header = f"「{word}」未收录："
+            if block.startswith(compact_header):
+                lines.append(f"{index}. 「{word}」" + block[len(compact_header):])
+            else:
+                lines.extend((f"{index}. 「{word}」", block))
             if not recommended_code:
                 continue
             selected_index = next(
@@ -1441,21 +1447,20 @@ def render_server_backed_batch_candidates(
                 )
                 if code == recommended_code
             )
-            selections.append((word, str(selected_index)))
-            if not multi_code_example:
-                other_recommendations = {code for other, (code, _) in display_items.items() if other != word}
-                empty_indices = [
-                    candidate_index
-                    for candidate_index, (code, occupied) in enumerate(scopes_by_word[word], start=1)
-                    if not occupied and code not in other_recommendations
-                    and not protected_candidate_occupants(
-                        word, code, scopes_by_word[word], occupied_words_by_scope[word],
-                        ordering_assessments_by_scope[word],
-                    )
-                ]
-                next_index = next((index for index in empty_indices if index > selected_index), None)
-                if selected_index in empty_indices and next_index is not None:
-                    multi_code_example = f"{word} {selected_index} {next_index}，其他用推荐的 加入并提交"
+            alternative_index = next((
+                candidate_index
+                for candidate_index, (code, occupied) in enumerate(scopes_by_word[word], start=1)
+                if code != recommended_code and not occupied
+                and code not in example_codes
+                and code not in {other_code for other, (other_code, _) in display_items.items() if other != word}
+                and not protected_candidate_occupants(
+                    word, code, scopes_by_word[word], occupied_words_by_scope[word],
+                    ordering_assessments_by_scope[word],
+                )
+            ), None)
+            if alternative_index is not None:
+                selections.append((word, str(alternative_index)))
+                example_codes.add(scopes_by_word[word][alternative_index - 1][0])
         if include_controls and selections:
             from keytao_bot.harness.authorization_grammar import (
                 parse_reviewed_multi_word_selection,
@@ -1466,19 +1471,13 @@ def render_server_backed_batch_candidates(
             )
             if parse_reviewed_multi_word_selection(selection_command) != tuple(selections):
                 return ""
-            lines.append(pending_batch_confirmation_copy() + "或「取消」。")
-            lines.append("按词选择（词名加空格，再写编号或编码；多词用逗号分隔）：")
-            lines.append(render_executable_suggestion(selection_command))
-            lines.append("可只写其中部分词；选择后即加入草稿，提交需明确回复提交指令。")
-            if multi_code_example:
-                lines.append(f"同一词可选多个编码、其余词用推荐：如「{multi_code_example}」")
+            lines.append("回复「加入」或「加入并提交」用推荐码，或「取消」。")
             combined_command = selection_command + "，加入并提交"
             if parse_reviewed_multi_word_selection(combined_command) != tuple(selections):
                 return ""
-            lines.append("也可选择后直接加入并提交：")
-            lines.append(render_executable_suggestion(combined_command))
+            lines.append(f"或改选如「{selection_command}」（末尾加「，加入并提交」直接提交）")
         elif include_controls:
-            lines.append("回复「取消」。")
+            lines.append("回复「加入」或「加入并提交」用推荐码，或「取消」。" if normalized_items else "回复「取消」。")
         return "\n".join(lines)
 
     if len(normalized_items) < 2:
@@ -1505,7 +1504,8 @@ def render_server_backed_batch_candidates(
             for code, _occupied in scopes_by_word[word]
             if word in occupied_words_by_scope[word].get(code, ())
         )
-        lines.append(f"{word_index}. 「{word}」")
+        review_copy = "需管理员审核（证据不足）" if needs_review else "可自动通过"
+        lines.append(f"{word_index}. 「{word}」{review_copy}")
         existing_copy = already_existing_word_copy(
             word,
             existing_codes,
@@ -1517,14 +1517,13 @@ def render_server_backed_batch_candidates(
         )
         if existing_copy:
             lines.extend(f"   {line}" for line in existing_copy.splitlines())
-        lines.append("   候选：")
         for candidate_index, (code, occupied) in enumerate(
             scopes_by_word[word],
             start=1,
         ):
             occupied_words = occupied_words_by_scope[word].get(code, ())
             occupancy_copy = (
-                "已有「" + "、".join(occupied_words) + "」"
+                "、".join(occupied_words)
                 if occupied and occupied_words
                 else "已占用"
                 if occupied
@@ -1532,13 +1531,15 @@ def render_server_backed_batch_candidates(
             )
             if reorder_recommendation is not None:
                 if code == reorder_recommendation["occupantCode"]:
-                    recommended_copy = "（推荐：需重排）"
+                    recommended_copy = " ✅推荐（需重排）"
                 elif code == reorder_recommendation["freeCode"]:
                     recommended_copy = "（不调序备选）"
                 else:
                     recommended_copy = ""
             else:
-                recommended_copy = "（推荐）" if code == recommended_code else ""
+                recommended_copy = " ✅推荐" if code == recommended_code else ""
+                if not occupied and code == recommended_code:
+                    occupancy_copy = ""
             lines.append(
                 f"   {candidate_index}. {code} — {occupancy_copy}{recommended_copy}"
             )
@@ -1558,21 +1559,38 @@ def render_server_backed_batch_candidates(
                 ).splitlines()
             )
         else:
-            lines.extend(candidate_commonness_summary_copy(assessment)
+            comparisons = [candidate_commonness_summary_copy(assessment)
                          for assessment in ordering_assessments_by_scope[word][:2]
                          if assessment.get("newWord") == word
                          and assessment.get("occupantWord") in occupied_words_by_scope[word].get(
-                             assessment.get("occupantCode"), ()))
-        review_copy = "需管理员审核" if needs_review else "可自动通过"
-        lines.append(f"   自动审核：{review_copy}")
+                             assessment.get("occupantCode"), ())]
+            if any(comparisons):
+                lines.append("词频：" + "；".join(line.removeprefix("词频：") for line in comparisons if line))
 
     if include_controls:
-        lines.append(pending_batch_confirmation_copy() + "或「取消」。")
-        scoped_copy = scoped_multi_word_candidate_copy(tuple(
-            word for word, _code, _needs_review in normalized_items
-        ), candidate_counts={word: len(candidates) for word, candidates in scopes_by_word.items()})
-        if scoped_copy:
-            lines.append(scoped_copy)
+        lines.append("回复「加入」或「加入并提交」用推荐码，或「取消」。")
+        selections = []
+        example_codes = set()
+        for word, recommended, _needs_review in normalized_items:
+            alternative = next((
+                (index, code) for index, (code, occupied) in enumerate(scopes_by_word[word], start=1)
+                if not occupied and code != recommended and code not in example_codes
+                and code not in {other for _, other, _ in normalized_items}
+                and not protected_candidate_occupants(
+                    word, code, scopes_by_word[word], occupied_words_by_scope[word], ordering_assessments_by_scope[word],
+                )
+            ), None)
+            if alternative:
+                selections.append((word, str(alternative[0])))
+                example_codes.add(alternative[1])
+        if selections:
+            from keytao_bot.harness.authorization_grammar import parse_reviewed_multi_word_selection
+
+            selections = selections[-1:]
+            command = "，".join(f"{word} {index}" for word, index in selections)
+            if parse_reviewed_multi_word_selection(command) != tuple(selections) or parse_reviewed_multi_word_selection(command + "，加入并提交") != tuple(selections):
+                return ""
+            lines.append(f"或改选如「{command}」（末尾加「，加入并提交」直接提交）")
     return "\n".join(lines)
 
 
@@ -1688,6 +1706,7 @@ def validated_front_insert_recommendation(
         ):
             continue
         return {
+            **assessment,
             "verdict": "front_more_common",
             "newWord": new_word,
             "occupantWord": occupant_word,
@@ -1768,11 +1787,11 @@ def front_insert_recommendation_copy(
     occupant = str(recommendation.get("occupantWord") or "").strip()
     occupant_code = str(recommendation.get("occupantCode") or "").strip().lower()
     free_code = str(recommendation.get("freeCode") or "").strip().lower()
-    summary = render_commonness_summary(recommendation)
+    summary = candidate_commonness_summary_copy(recommendation)
     if not include_controls:
         lines = [f"推荐调序：「{word}」占 {occupant_code}，「{occupant}」顺延"]
         if summary:
-            lines.append(f"依据：{summary}")
+            lines.append(summary)
         if free_code:
             lines.append(f"不调序备选编码：{free_code}")
         return "\n".join(lines)
@@ -1793,22 +1812,47 @@ def front_insert_recommendation_copy(
     )
     lines = ["推荐：", recommendation_line]
     if summary:
-        lines.append(f"依据：{summary}")
+        lines.append(summary)
     if free_code:
         lines.append(opt_out)
     return "\n".join(lines)
 
 
-def single_word_candidate_footer(candidate_count: int) -> str:
+def single_word_candidate_footer(
+    candidate_count: int,
+    recommended_index: int = 0,
+    available_indices: Optional[tuple[int, ...]] = None,
+) -> str:
     """Render truthful selection and whole-state actions for one word."""
-    if candidate_count > 1:
-        example = "2、4" if candidate_count >= 4 else "1、2"
-        return (
-            "回复「换 2」选择其他编码；"
-            f"可多选，如「添加{example}」；\n"
-            + pending_single_candidate_confirmation_copy()
-        )
-    return pending_single_candidate_confirmation_copy()
+    available = available_indices if available_indices is not None else tuple(range(1, candidate_count + 1))
+    alternative = next((index for index in (2, *available) if index in available and index != recommended_index), None)
+    line = "回复「加入」或「加入并提交」"
+    if alternative is not None:
+        line += f"，或「换 {alternative}」改选"
+    if len(available) > 1:
+        example = "、".join(str(index) for index in available[:2])
+        line += f"、「添加{example}」多选"
+    return line + "，或「取消」。"
+
+
+def discovery_question_copy(word: str, rendered: str) -> str:
+    """Build the discovery prompt once before sealing its origin digest."""
+    body = COMPACT_SINGLE_WORD_FOOTER_RE.sub("", str(rendered)).strip()
+    body = body.replace(f"「{word}」未收录：", f"「{word}」词库里还没有，要加入吗？读音 ", 1)
+    if f"「{word}」词库里还没有，要加入吗？" not in body:
+        reading = re.search(r"(?m)^读音[：:]\s*([^\n]+)$", body)
+        heading = f"「{word}」词库里还没有，要加入吗？"
+        if reading is not None:
+            heading += "读音 " + reading[1]
+            body = body[:reading.start()] + body[reading.end():]
+        body = re.sub(rf"(?m)^「{re.escape(word)}」候选编码[：:]\s*$", "", body)
+        body = re.sub(rf"(?m)^[•-]\s*「{re.escape(word)}」→\s*[a-z]+（推荐）\s*$", "", body)
+        body = heading + "\n" + body.strip()
+    rows = candidate_rows(body)
+    recommended = recommended_candidate_code(body)
+    alternative = next((row["index"] for row in rows if row["code"] != recommended and candidate_label_is_available(row["label"])), "")
+    change = f"，或「换 {alternative}」改选" if alternative else ""
+    return body + f"\n回复「加入」或「加入并提交」{change}，或「取消」；不想被问回「别问我」。"
 
 
 def candidate_commonness_guard_copy(
@@ -1835,6 +1879,7 @@ def candidate_commonness_guard_copy(
     if any(not occupant for _code, occupant in protected):
         return "候选编码的占用词条未能核验，请重新查询；本次未写入。"
     lines = ["推荐编码：暂无（现有候选均需点名顶替）"]
+    comparisons = []
     for code, occupant in protected:
         assessment = next((
             item for item in (assessments or [])
@@ -1843,10 +1888,12 @@ def candidate_commonness_guard_copy(
             and item.get("occupantWord") == occupant
             and item.get("occupantCode") == code
         ), {})
-        lines.append(candidate_commonness_summary_copy({
+        comparisons.append(candidate_commonness_summary_copy({
             **assessment, "newWord": normalized_word,
             "occupantWord": occupant, "freeCode": "",
         }))
+    if any(comparisons):
+        lines.append("词频：" + "；".join(line.removeprefix("词频：") for line in comparisons if line))
     if include_controls:
         base_code = str(candidates[0][0]) if candidates else ""
         lines.append(f"当前候选没有空位；可指定形码后的完整编码，格式为：加入编码 {base_code}+形码（请替换形码部分）。")
@@ -1978,16 +2025,16 @@ def render_server_backed_single_word_candidates(
             ]
             if not words:
                 return ""
-            label = "已有「" + "、".join(words) + "」"
+            label = "、".join(words)
         else:
             label = "空位"
         if reorder_recommendation is not None:
             if code == reorder_recommendation["occupantCode"]:
-                label += "（推荐：需重排）"
+                label += " ✅推荐（需重排）"
             elif code == reorder_recommendation["freeCode"]:
                 label += "（不调序备选）"
         elif code == recommended:
-            label += "（推荐）"
+            label = (label + " " if occupied else "") + "✅推荐"
         lines.append(f"{index}. {code} — {label}")
     if reorder_recommendation is not None:
         fallback_index = next((
@@ -2006,7 +2053,7 @@ def render_server_backed_single_word_candidates(
             )
         )
     elif recommended:
-        lines.extend(candidate_commonness_summary_copy({
+        comparisons = [candidate_commonness_summary_copy({
                          **assessment,
                          "freeCode": recommended if dict(normalized_candidates)[recommended] is False else "",
                      })
@@ -2014,12 +2061,14 @@ def render_server_backed_single_word_candidates(
                      if isinstance(assessment, dict)
                      and assessment.get("newWord") == normalized_word
                      and assessment.get("occupantWord") in occupied_words.get(
-                         assessment.get("occupantCode"), ()))
-        lines.append(f"• 「{normalized_word}」→ {recommended}（推荐）")
+                         assessment.get("occupantCode"), ())]
+        if any(comparisons):
+            lines.append("词频：" + "；".join(line.removeprefix("词频：") for line in comparisons if line))
     else:
         lines.append(guard_copy)
     if include_controls and recommended:
-        lines.append(single_word_candidate_footer(len(normalized_candidates)))
+        recommended_index = next((index for index, (code, _) in enumerate(normalized_candidates, start=1) if code == recommended), 0)
+        lines.append(single_word_candidate_footer(len(normalized_candidates), recommended_index, tuple(index for index, (_, occupied) in enumerate(normalized_candidates, start=1) if not occupied)))
     return "\n".join(lines)
 
 
@@ -2098,7 +2147,7 @@ def render_server_backed_single_word_lookup(
             if code in sibling_recommendations:
                 label = f"本次推荐给「{sibling_recommendations[code]}」"
             elif code == recommended and not occupied:
-                label = "✅ 推荐（空位）"
+                label = "✅推荐"
             else:
                 continue
             actionable = re.sub(
@@ -2138,12 +2187,14 @@ def render_server_backed_single_word_lookup(
     body = ""
     has_reorder_copy = False
     if source and advertised_single_word_candidate_codes(source) == expected_codes:
+        if source.startswith(f"「{normalized_word}」未收录："):
+            body = strip_legacy_occupied_guidance(COMPACT_SINGLE_WORD_FOOTER_RE.sub("", source)).rstrip()
         reorder_copy = re.search(
             rf"(?m)^\s*推荐[：:]\s*\n"
             rf"\s*[-•]\s*[“『]「{re.escape(normalized_word)}」\s*占\s*"
             rf"{re.escape(recommended)}\s*、\s*「[^」\n]+」顺延[”』]"
             rf"(?:\s*[（(][^）)\n]*[）)])?\s*\n"
-            rf"(?:\s*依据[：:][^\n]*\n)?"
+            rf"(?:\s*(?:依据|词频)[：:][^\n]*\n)?"
             r"\s*(?:不重排选|换)\s+\d+(?:\s*[（(][a-z]{1,12}[）)])?[。.]?\s*$",
             source,
             re.IGNORECASE,
@@ -2201,11 +2252,9 @@ def render_server_backed_single_word_lookup(
         return ""
     if has_reorder_copy:
         if not include_controls:
-            return ServerBackedQueryReply("\n".join((
-                body, f"推荐编码：{recommended}",
-            )))
+            return ServerBackedQueryReply(body)
         trailer = (
-            single_word_candidate_footer(len(expected_codes))
+            single_word_candidate_footer(len(expected_codes), expected_codes.index(recommended) + 1, tuple(index for index, (_, occupied) in enumerate(candidates, start=1) if not occupied))
             if actionable_controls
             else "本次仅查询，不建立写入确认。"
         )
@@ -2213,9 +2262,11 @@ def render_server_backed_single_word_lookup(
     recommendation = f"推荐编码：{recommended}"
     if not actionable_controls:
         recommendation += "（本次仅查询）"
-    lines = [body, recommendation]
+    lines = [body]
+    if not recommended_candidate_code(body):
+        lines.append(recommendation)
     if actionable_controls and include_controls:
-        lines.append(single_word_candidate_footer(len(expected_codes)))
+        lines.append(single_word_candidate_footer(len(expected_codes), expected_codes.index(recommended) + 1, tuple(index for index, (_, occupied) in enumerate(candidates, start=1) if not occupied)))
     return ServerBackedQueryReply("\n".join(lines))
 
 
@@ -2284,7 +2335,10 @@ def ensure_single_word_candidate_copy(text: str, candidate_count: int) -> str:
             "",
             response,
         )
-    footer = single_word_candidate_footer(candidate_count)
+    recommended = recommended_candidate_code(response)
+    rows = candidate_rows(response)
+    recommended_index = next((int(row["index"]) for row in rows if row["code"] == recommended), 0)
+    footer = single_word_candidate_footer(candidate_count, recommended_index, tuple(int(row["index"]) for row in rows if candidate_label_is_available(row["label"])))
     response = response.replace(footer, "")
     confirmation_copy = pending_single_candidate_confirmation_copy()
     response = response.replace(confirmation_copy, "")
@@ -2508,6 +2562,8 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
     suggestions: list[str] = []
     seen: set[str] = set()
     for _position, command in sorted(positioned):
+        if command == "取消" and re.search(r"(?m)^回复「加入」或「加入并提交」", normalized):
+            continue
         if command not in seen:
             suggestions.append(command)
             seen.add(command)

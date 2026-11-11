@@ -258,7 +258,7 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.prepared_words(), ["发薪"])
         self.assertIsInstance(self.store.get(self.author), PendingAddWord)
         self.assertEqual(self.store.get(self.author).word, "发薪")
-        self.assertEqual(ctx.response.count("候选编码"), 1)
+        self.assertEqual(ctx.response.count("「发薪」未收录："), 1)
         self.assertIn("1. fsxb", ctx.response)
         self.main.assert_not_awaited()
 
@@ -276,7 +276,8 @@ class SemanticQueryRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.state.args["_query_words"], ["发薪", "发薪日"])
         self.assertEqual([scope["word"] for scope in record.state.args["_candidate_scopes"]], ["发薪", "发薪日"])
         self.assertEqual(self.prepared_words(), ["发薪", "发薪日"])
-        self.assertEqual(ctx.response.count("候选编码"), 2)
+        self.assertEqual(ctx.response.count("1. fsxb"), 1)
+        self.assertEqual(ctx.response.count("1. fxr"), 1)
         self.assertNotIn("「发薪 发薪日」", ctx.response)
         self.assertTrue(self.chat._advertised_reply_matches_live_record(ctx.response, record))
         self.assert_preserved(self.other, other_record, original)

@@ -949,7 +949,7 @@ class WordDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.bot.send.assert_awaited_once()
         message = self.bot.send.await_args.kwargs["message"]
-        for text in ("[CQ:at,qq=100]", "「午时」词库里还没有，要加入吗？", "1", "wj", "确认", "取消"):
+        for text in ("[CQ:at,qq=100]", "「午时」词库里还没有，要加入吗？", "1", "wj", "加入", "取消"):
             self.assertIn(text, str(message))
         offered = copy.deepcopy(record.state)
         self.pending.delete(self.actor)

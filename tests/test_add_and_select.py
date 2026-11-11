@@ -746,9 +746,9 @@ class B15ChatTests(unittest.IsolatedAsyncioTestCase):
                 self.reset_ticket()
                 prompt = await self.candidates()
                 self.assertIn("1. qzbx — 本次推荐给「球坐标系」", prompt)
-                self.assertIn("2. qzbxv — ✅ 推荐（空位）", prompt)
-                self.assertIn("推荐编码：qzbxv", prompt)
-                self.assertIn("球坐标系 1，柱坐标系 2", prompt)
+                self.assertIn("2. qzbxv — ✅推荐", prompt)
+                self.assertNotIn("推荐编码：qzbxv", prompt)
+                self.assertIn("或改选如「球坐标系 3」", prompt)
                 record = self.replay.store.get_record(self.replay.author)
                 self.assertEqual([(item["word"], item["code"]) for item in record.state.args["items"]],
                                  [(b15_sibling_and_others_WORDS[0], "qzbx"), (b15_sibling_and_others_WORDS[1], "qzbxv")])
@@ -821,7 +821,7 @@ class B15ChatTests(unittest.IsolatedAsyncioTestCase):
                     await self.turn(prefix + "，".join(words))
                     prompt = self.replay.last_response
                     self.assertTrue(prompt.startswith(notice(item)), prompt)
-                    self.assertIn("1. qzbx — ✅ 推荐（空位）", prompt)
+                    self.assertIn("1. qzbx — ✅推荐", prompt)
                     self.assertNotIn("若需撤回", prompt)
                     record = self.replay.store.get_record(self.replay.author)
                     self.assertIsNotNone(record)
@@ -1567,13 +1567,13 @@ class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["pronunciations"][0]["codes"], ["jxle", "jxlea", "jxleaa"])
         self.assertEqual(result["pronunciationResolution"]["status"], "encode_default")
         self.assertTrue(result["requiresManualPronunciationReview"])
-        self.assertEqual(prompt.count("✅ 推荐"), 1, prompt)
-        marker_line = next(line for line in prompt.splitlines() if "✅ 推荐" in line)
-        self.assertIn(result["recommendedCode"], marker_line)
-        self.assertIn(f"• 「降了」→ {result['recommendedCode']}（推荐）", prompt)
+        self.assertEqual(prompt.count("✅推荐"), 1, prompt)
+        marker_line = next(line for line in prompt.splitlines() if "✅推荐" in line)
+        self.assertRegex(marker_line, rf"^\d+\. {re.escape(result['recommendedCode'])} — [^\n]*✅推荐")
+        self.assertNotIn(f"• 「降了」→ {result['recommendedCode']}（推荐）", prompt)
         self.assertEqual(self.http.writes, [])
         await self.turn("加词「降了」", raw_operation(op="add", operands=["降了"], codes=[]))
-        self.assertEqual(self.replay.last_response.count("✅ 推荐"), 1, self.replay.last_response)
+        self.assertEqual(self.replay.last_response.count("✅推荐"), 1, self.replay.last_response)
         candidate_prompt = self.replay.last_response
         self.assertTrue(self.replay.store.bind_origin_prompt_digest(
             self.replay.author, self.replay.chat._prompt_capability_digest(candidate_prompt),
@@ -3028,12 +3028,13 @@ class SinglePipelineTests(unittest.TestCase):
                 s55_single_pipeline_chat, "_classify_simple_word_query_intent", AsyncMock(return_value=harness.SimpleWordQueryIntent(True, ("鎗",), "word_lookup", 1.0)),
             ), patch.object(s55_single_pipeline_commands.user_resolver, "resolve_actor_binding", AsyncMock(return_value=True)):
                 reply = await s55_single_pipeline_commands._try_handle_simple_single_word_query("鎗", "qq", "s55-single", key)
-                for expected in ("单字", "审词：读音 qiāng", "异体字", "1. qx", "加入", "加入并提交"):
+                for expected in ("单字", "qiāng，需管理员审核", "1. qx", "加入", "加入并提交"):
                     self.assertIn(expected, reply)
                 reloaded = SQLiteConversationStateStore(db_path=db_path)
                 record = reloaded.get_record(key)
                 self.assertEqual(record.state.phrase_type, "Single")
                 self.assertEqual(record.state.server_candidates, [("qx", False)])
+                self.assertIn("异体字", record.state.code_remarks["qx"])
                 self.assertTrue(s55_single_pipeline_chat._advertised_reply_matches_live_record(reply, record))
                 for action in ("1", "qx"):
                     self.assertTrue(s55_single_pipeline_chat._chat_routing.message_authorizes_live_pending_mutation(action, record.state), action)
@@ -3416,7 +3417,7 @@ class S57OptionClaimTests(unittest.TestCase):
                 reply = await harness.chat_commands_module._try_handle_simple_single_word_query(
                     "海阔天空", "qq", "s57-word", key,
                 )
-            self.assertIn("审词", reply)
+            self.assertIn("hǎi kuò tiān kōng，需管理员审核", reply)
             self.assertIsInstance(store.get(key), harness.PendingAddWord)
             self.assertIn(("keytao_prepare_reviewed_add", {"word": "海阔天空"}), calls)
         asyncio.run(run())
@@ -3589,10 +3590,10 @@ class FreshSelectionTests(unittest.IsolatedAsyncioTestCase):
         with self.runtime():
             response = await self.turn("加亮 jslxa")
             self.assertIn("尚未写入", response)
-            self.assertIn("jslxa — 空位（推荐）", response)
+            self.assertIn("1. jslxa — ✅推荐", response)
             self.assertNotIn("jslxao", response)
             self.assertIn("jiā liàng", response)
-            self.assertIn("需要管理员审核", response)
+            self.assertIn("需管理员审核", response)
             state = self.store.get(self.key)
             self.assertIsInstance(state, harness.PendingAddWord)
             self.assertEqual(state.recommended_code, "jslxa")
@@ -3684,7 +3685,7 @@ class FreshSelectionTests(unittest.IsolatedAsyncioTestCase):
         with self.runtime():
             response = await self.turn("加亮 jslxa")
             response = s63_fresh_selection_chat._enforce_advertised_reply_contract(response, self.key)
-        self.assertIn("jslxa — 空位（推荐）", response)
+        self.assertIn("1. jslxa — ✅推荐", response)
         self.assertNotIn("需重排", response)
         self.assertEqual(self.store.get(self.key).recommended_code, "jslxa")
         self.assertEqual(self.store.get(self.key).server_ordering_assessments, [])

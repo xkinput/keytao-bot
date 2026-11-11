@@ -1108,9 +1108,8 @@ class B9ParallelTests(unittest.IsolatedAsyncioTestCase):
                 ordering_assessments=[{**assessment, "verdict": "close", "newCode": "rdjpi"}],
                 actionable_controls=True,
             )
-            self.assertIn("推荐空位 rdjpii", second)
-            self.assertIn("rdjpii — ✅ 推荐（空位）", second)
-            self.assertIn("推荐编码：rdjpii", second)
+            self.assertIn("3. rdjpii — ✅推荐", second)
+            self.assertNotIn("推荐编码：rdjpii", second)
 
         async def prepare_word(word, *_args, **kwargs):
             kwargs["_prepared_scopes"].append(scopes[word])
@@ -1123,8 +1122,8 @@ class B9ParallelTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(state, response)
             self.assertEqual([item["code"] for item in state.args["items"]], ["rdjpi", "rdjpii"], response)
             second = response.split("2. 「肉偿」", 1)[1]
-            self.assertIn("rdjpii — ✅ 推荐（空位）", second)
-            self.assertIn("推荐编码：rdjpii", second)
+            self.assertIn("3. rdjpii — ✅推荐", second)
+            self.assertNotIn("推荐编码：rdjpii", second)
             self.assertNotIn("推荐空位 rdjpi", second)
             self.assertIsNone(self.replay.commands._pending_batch_front_insert_plan(state))
 
@@ -2132,7 +2131,7 @@ class QueryPrecedenceTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn("hjm", reply)
                         self.assertIsNone(fixture.replay.store.get(fixture.replay.author))
                     else:
-                        self.assertIn("推荐编码", reply)
+                        self.assertIn("— ✅推荐", reply)
                         self.assertIsNotNone(fixture.replay.store.get(fixture.replay.author))
                     self.assertEqual(fixture.replay.chat._finish_ai_chat_response.await_args.args[4], reply)
             self.assertEqual(fixture.http.writes, [])
