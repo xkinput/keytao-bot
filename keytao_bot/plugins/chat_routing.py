@@ -54,6 +54,7 @@ from ..utils.conversational_reply import is_conversational_text
 from ..utils.explicit_code import parse_explicit_code_request, readings_match, validate_explicit_code
 from ..utils.literal_phrase import parse_explicit_single_phrase_add, parse_literal_phrase_query
 from ..utils.reading_request import parse_parenthesised_readings
+from ..utils import reply_copy as _reply_copy
 from ..utils.observability import current_turn_metrics, observe_model_call, set_turn_flow
 from ..utils.pending_confirmation import (
     ADD_OPERATION_VERB_PATTERN,
@@ -1297,9 +1298,7 @@ def _message_authorizes_pending_control(
     return False
 
 
-_ORIGINAL_COMMAND_LINE_RE = re.compile(
-    r"^(?:原始操作指令|原始指令|原指令)\s*[：:]\s*[「“\"]?(.+?)[」”\"]?$"
-)
+_ORIGINAL_COMMAND_LINE_RE = _reply_copy.ORIGINAL_COMMAND_LINE_RE
 
 def _is_unambiguous_stale_confirmation(message_text: str) -> bool:
     """Accept only a positive whole-message generic assent as stale control."""
@@ -3751,8 +3750,8 @@ def _split_reference_word_group(text: str) -> List[str]:
 
 def _clean_reference_heading_line(line: str) -> str:
     text = line.strip()
-    text = re.sub(r"^[\s#>*\-•·\d.、:：|]+", "", text)
-    text = re.sub(r"^[^\u4e00-\u9fff「」]+", "", text)
+    text = _reply_copy.REFERENCE_HEADING_CLEAN_PREFIX_RE.sub("", text)
+    text = _reply_copy.REFERENCE_HEADING_NONWORD_RE.sub("", text)
     return text.strip()
 
 
@@ -3778,7 +3777,9 @@ def _extract_referenced_word_targets(reference_text: str, expected_count: int = 
         return words
 
     comparison_words: List[str] = []
-    for match in re.finditer(r"([\u4e00-\u9fff]{1,12})\s*(?:≫|>|＞|更常用|优于|高于|大于)\s*([\u4e00-\u9fff]{1,12})", reference_text or ""):
+    for match in _reply_copy.FREQUENCY_COMPARISON_RE.finditer(reference_text or ""):
+        comparison_words.extend((match["first"], match["second"]))
+    for match in _reply_copy.LEGACY_REFERENCE_COMPARISON_RE.finditer(reference_text or ""):
         comparison_words.extend([match.group(1), match.group(2)])
 
     words = _dedupe_words(words + comparison_words, limit)

@@ -484,6 +484,35 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
             harness.chat_commands_module.current_memory_context.reset(memory_token)
             vote._pending_receipts.reset(pending_token)
 
+    async def test_short_receipt_binds_same_batch_and_combined_batches_stay_unbound(self):
+        second = submitted_data()
+        second["batchId"] = "bc32871a-1111-2222-3333-555555555555"
+        second["batchUrl"] = f"https://keytao.rea.ink/batch/{second['batchId']}"
+        short_receipt = f"✅ 已提交审核，投票 0/3（引用本条回复「同意」）\n草稿地址：{BATCH_URL}"
+        memory = SimpleNamespace(platform="qq", space_type="group", space_id="group", user_id="creator")
+        memory_token = harness.chat_commands_module.current_memory_context.set(memory)
+        pending_token = vote._pending_receipts.set([submitted_data()])
+        try:
+            with patch.object(vote, "_default_store", self.store):
+                await vote._record_sent_receipts(None, None, "send_group_msg", {
+                    "group_id": "group", "message": short_receipt,
+                }, {"message_id": 47})
+                self.assertEqual(self.store.resolve("qq", "group", "47"), BATCH_ID)
+                vote.submitted_vote_receipt(second)
+                combined = short_receipt + (
+                    f"\n✅ 已提交审核，投票 0/3（引用本条回复「同意」）\n草稿地址：{second['batchUrl']}"
+                )
+                prepared = vote.prepare_delivery(combined, memory)
+                self.assertNotIn("投票", prepared)
+                await vote._record_sent_receipts(None, None, "send_group_msg", {
+                    "group_id": "group", "message": prepared,
+                }, {"message_id": 48})
+                self.assertIsNone(self.store.resolve("qq", "group", "48"))
+                self.assertIsNone(self.store.get(second["batchId"]))
+        finally:
+            harness.chat_commands_module.current_memory_context.reset(memory_token)
+            vote._pending_receipts.reset(pending_token)
+
     async def test_combined_batch_receipts_never_bind_an_ambiguous_quote(self):
         second = submitted_data()
         second["batchId"] = "bc32871a-1111-2222-3333-555555555555"

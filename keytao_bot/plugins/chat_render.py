@@ -23,6 +23,16 @@ from ..utils import review_flags
 from ..utils import http_client
 from ..utils.commonness_copy import candidate_commonness_summary_copy
 from ..utils.draft_receipts import merge_receipt_deltas, receipt_change_lines
+from ..utils.reply_copy import (
+    AUTHORITATIVE_LINK_END_RE,
+    BASIC_AUTHORITATIVE_LINK_END_RE,
+    DRAFT_RECEIPT_CHANGE_PREFIX,
+    DRAFT_RECEIPT_REPLACED_PREFIXES,
+    OPERATION_MEMORY_PREFIX_RE,
+    PROVISIONAL_DRAFT_LINK_COPY,
+    draft_receipt_contents,
+    normalize_generated_review_copy,
+)
 from ..utils.pending_confirmation import (
     _BIND_HELP_TEXT,
     _humanize_warning_text,
@@ -984,30 +994,7 @@ def _format_full_add_and_submit_instruction(
 
 def _normalize_generated_review_copy(response: str) -> str:
     """Normalize model-generated review status text to the deterministic UI wording."""
-    text = str(response or "")
-    replacements = (
-        ("自动审核：预计需管理员审核", "自动审核：需管理员审核"),
-        ("自动审核:预计需管理员审核", "自动审核：需管理员审核"),
-        ("自动审核：预计需要管理员审核", "自动审核：需管理员审核"),
-        ("自动审核:预计需要管理员审核", "自动审核：需管理员审核"),
-        ("自动审核：该词需管理员审核", "自动审核：需管理员审核"),
-        ("自动审核：预计可通过", "自动审核：可自动通过"),
-        ("自动审核:预计可通过", "自动审核：可自动通过"),
-        ("自动审核：该词可自动通过", "自动审核：可自动通过"),
-    )
-    for old, new in replacements:
-        text = text.replace(old, new)
-    text = re.sub(
-        r"(?P<term>[\u3400-\u9fff]{1,12})[？?]\s*(?:不|不是)[，,]\s*"
-        r"(?=(?P=term))",
-        "",
-        text,
-    )
-    return re.sub(
-        r"[；;]\s*提交整批时会(?:重新审核|重审|复审)",
-        "",
-        text,
-    )
+    return normalize_generated_review_copy(response)
 
 
 def _format_active_draft_operation_message(
@@ -1327,6 +1314,20 @@ def _format_pronunciation_source(pronunciation: Dict) -> str:
     return summary
 
 
+def _reviewed_add_review_text(review: Dict, pronunciation: Dict) -> str:
+    """Build the complete review note directly from its structured evidence."""
+    pinyin = str(pronunciation.get("pinyin") or "").strip()
+    parts = [
+        f"读音 {pinyin}" if pinyin else "读音待确认",
+        f"来源 {_format_pronunciation_source(pronunciation)}",
+    ]
+    if review.get("type") == "Single" and review.get("variantNote"):
+        parts.append(str(review["variantNote"]))
+    if review.get("type") == "Single" and review.get("encodingNote"):
+        parts.append(str(review["encodingNote"]))
+    return "；".join(parts) + "；"
+
+
 def _format_common_known_brief_reason(item: Optional[Dict], fallback: str) -> str:
     if not isinstance(item, dict):
         return _clean_review_audit_reason(fallback)
@@ -1533,16 +1534,7 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
     pre_submit_preview = _format_pre_submit_audit_preview(review, recommended_code)
     if len(pronunciations) == 1:
         pronunciation = pronunciations[0]
-        pinyin = str(pronunciation.get("pinyin") or "").strip()
-        review_parts = [
-            f"读音 {pinyin}" if pinyin else "读音待确认",
-            f"来源 {_format_pronunciation_source(pronunciation)}",
-        ]
-        if review.get("type") == "Single" and review.get("variantNote"):
-            review_parts.append(str(review["variantNote"]))
-        if review.get("type") == "Single" and review.get("encodingNote"):
-            review_parts.append(str(review["encodingNote"]))
-        lines.append("审词：" + "；".join(review_parts) + "；")
+        lines.append("审词：" + _reviewed_add_review_text(review, pronunciation))
         correction = review.get("readingCorrection")
         if isinstance(correction, dict) and correction.get("note"):
             lines.append(str(correction["note"]))
@@ -1651,11 +1643,7 @@ def _dedupe_authoritative_link_lines(text: str) -> str:
 
         cleaned = re.sub(r"https?://[^\s)\]]+", replace_url, line)
         cleaned = re.sub(r"\[[^\]\n]*\]\(\s*\)", "", cleaned)
-        cleaned = re.sub(
-            r"\s*(?:草稿地址|批次地址|草稿/批次地址|PR)[：:]?\s*$",
-            "",
-            cleaned,
-        )
+        cleaned = BASIC_AUTHORITATIVE_LINK_END_RE.sub("", cleaned)
         if re.fullmatch(r"\s*[-*+]\s*", cleaned):
             cleaned = ""
         output.append(cleaned.rstrip())
@@ -1697,12 +1685,7 @@ def _canonicalize_authoritative_result_links(
             )
             cleaned = cleaned.replace(url, "")
         cleaned = re.sub(r"\[[^\]\n]*\]\(\s*\)", "", cleaned)
-        cleaned = re.sub(
-            r"\s*(?:草稿地址|批次地址|草稿/批次地址|PR|"
-            r"旧\s*PR(?:地址|可见于)?|查看旧\s*PR)[：:]?\s*$",
-            "",
-            cleaned,
-        )
+        cleaned = AUTHORITATIVE_LINK_END_RE.sub("", cleaned)
         if re.fullmatch(r"\s*[-*+]\s*", cleaned):
             cleaned = ""
         output.append(cleaned.rstrip())
@@ -1922,10 +1905,10 @@ def _append_batch_url_if_missing(
     if (
         bundle.get("_provisionalBatch") == "true"
         and not bundle.get("batchUrl")
-        and "待确认后生成" not in output
+        and PROVISIONAL_DRAFT_LINK_COPY not in output
     ):
         separator = "\n\n" if output.rstrip() else ""
-        output = output.rstrip() + separator + f"{label}：待确认后生成"
+        output = output.rstrip() + separator + f"{label}：{PROVISIONAL_DRAFT_LINK_COPY}"
     return "\n".join([*preserved, output]) if preserved else output
 
 
@@ -1942,18 +1925,15 @@ def finalize_draft_receipt(
         delta = merge_receipt_deltas([source for source in reversed(sources) if isinstance(source, dict)])
         delta["noWrite"] = all(source.get("noWrite") for source in deltas)
         lines = receipt_change_lines(delta, requested_words)
-        draft_contents = [
-            set(re.sub(r" 等 \d+ 条$", "", line.removeprefix("草稿内容：")).split("、"))
-            for line in text.splitlines() if line.startswith("草稿内容：")
-        ]
+        draft_contents = draft_receipt_contents(text)
         if delta["writtenItems"] and not delta["updatedItems"] and all(
             item.get("action") == "Create" for item in delta["writtenItems"]
         ) and any(
             all(f"{item.get('word')} {item.get('code')}" in pairs for item in delta["writtenItems"])
             for pairs in draft_contents
         ):
-            lines = [line for line in lines if not line.startswith("已变更：")]
-        body = [line for line in text.splitlines() if not line.startswith(("已变更：", "未新增变更：", "发布状态："))]
+            lines = [line for line in lines if not line.startswith(DRAFT_RECEIPT_CHANGE_PREFIX)]
+        body = [line for line in text.splitlines() if not line.startswith(DRAFT_RECEIPT_REPLACED_PREFIXES)]
         new_lines = [line for line in lines if line not in body]
         insert_at = 1 if body else 0
         body[insert_at:insert_at] = new_lines
@@ -1967,9 +1947,7 @@ def finalize_draft_receipt(
     return re.sub(r"\n{3,}", "\n\n", _append_batch_url_if_missing(text, bundle)).strip()
 
 
-_OPERATION_MEMORY_PREFIX_RE = re.compile(
-    r"^词库操作：(?P<actor>.+?)(?:[（(][^)）]+[）)])?\s+(?P<rest>(?:已提交审核|已加入草稿).*)$"
-)
+_OPERATION_MEMORY_PREFIX_RE = OPERATION_MEMORY_PREFIX_RE
 
 
 def _format_replace_char_confirmation(

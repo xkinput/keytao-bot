@@ -1465,6 +1465,116 @@ class DiscoveryMessageIdTests(unittest.IsolatedAsyncioTestCase):
 class S54RendererTests(unittest.TestCase):
     setUp = S54RendererTests_setUp
 
+    def test_structured_review_note_survives_compact_candidate_card(self):
+        from keytao_bot.utils.reply_copy import candidate_cards_match, numbered_candidate_codes
+
+        commands = harness.chat_commands_module
+        evidence = {
+            "success": True,
+            "word": "大端",
+            "recommendedCode": "dsdtv",
+            "needsManualReview": False,
+            "pronunciations": [{
+                "pinyin": "dà duān",
+                "sources": [{"source": "test dictionary", "url": "https://example.invalid/review"}],
+                "candidateStatuses": [
+                    {"code": "dsdt", "occupied": True, "words": ["打断"]},
+                    {"code": "dsdtv", "occupied": False, "words": []},
+                ],
+            }],
+        }
+        old_card = (
+            "词库暂无收录「大端」：\n"
+            "审词：读音 dà duān；来源 test dictionary https://example.invalid/review；\n"
+            "自动审核：证据一致，可自动通过\n"
+            "1. dsdt — 已有「打断」\n"
+            "2. dsdtv — ✅ 推荐（空位）\n"
+            "• 「大端」→ dsdtv（推荐）\n"
+            "回复「加入」写入草稿，或回复「加入并提交」写入并提交。"
+        )
+        compact_card = (
+            "「大端」未收录：dà duān，可自动通过\n"
+            "1. dsdt — 打断\n"
+            "2. dsdtv — ✅推荐\n"
+            "词频：打断 200 > 大端 10\n"
+            "回复「加入」或「加入并提交」，或「换 2」改选、「添加1、2」多选。"
+        )
+        old_state = commands._parse_pending_add_word(old_card, evidence)
+        compact_state = commands._parse_pending_add_word(compact_card, evidence)
+        self.assertEqual(_pending_add_word_payload(old_state), _pending_add_word_payload(compact_state))
+        self.assertEqual(
+            old_state.code_remarks["dsdtv"],
+            "喵喵审词：读音 dà duān；来源 test dictionary https://example.invalid/review；",
+        )
+        self.assertEqual(compact_state.pronunciation_codes, {"dsdt": "dà duān", "dsdtv": "dà duān"})
+        self.assertTrue(candidate_cards_match(old_card, compact_card))
+        self.assertFalse(candidate_cards_match(old_card, compact_card.replace("dsdtv", "dsdtvo")))
+        self.assertFalse(candidate_cards_match(old_card, compact_card.replace("— 打断", "— 大段")))
+        self.assertFalse(candidate_cards_match(old_card, compact_card.replace("dà duān", "dài duān")))
+        self.assertEqual(numbered_candidate_codes("1. Rime 是输入法框架"), ())
+        compact_batch_footer = (
+            "回复「加入」或「加入并提交」用推荐码，或「取消」。\n"
+            "或改选如「大端 1，小端 1」（末尾加「，加入并提交」直接提交）"
+        )
+        advertised = tuple(
+            command.replace(",", "，")
+            for command in advertised_command_suggestions(compact_batch_footer)
+        )
+        self.assertIn("大端 1，小端 1，加入并提交", advertised)
+        self.assertNotIn("，加入并提交", advertised)
+        self.assertEqual(
+            commands._batch_review_remark(compact_card, "大端", evidence, "dsdtv"),
+            old_state.code_remarks["dsdtv"],
+        )
+        self.assertEqual(
+            commands._batch_review_remark(compact_card, "大端", _pending_add_word_payload(compact_state), "dsdtv"),
+            old_state.code_remarks["dsdtv"],
+        )
+        with patch.dict(commands._reviewed_add_verdicts, {}, clear=True):
+            other_reading = copy.deepcopy(evidence)
+            other_reading["pronunciations"][0]["pinyin"] = "dài duān"
+            other_reading["pronunciations"][0]["sources"] = [{"source": "another dictionary"}]
+            commands._record_reviewed_add_verdict(
+                "keytao_prepare_reviewed_add", {"word": "大端"},
+                json.dumps(other_reading, ensure_ascii=False),
+            )
+            self.assertEqual(commands._batch_review_remark(compact_card, "大端"), "")
+            self.assertEqual(
+                commands._parse_pending_add_word(old_card).code_remarks,
+                old_state.code_remarks,
+            )
+            self.assertEqual(
+                commands._parse_pending_add_word(old_card).pronunciation_codes,
+                old_state.pronunciation_codes,
+            )
+            self.assertEqual(
+                commands._parse_pending_add_word(old_card, other_reading).code_remarks,
+                old_state.code_remarks,
+            )
+            self.assertEqual(commands._parse_pending_add_word(compact_card, other_reading).code_remarks, {})
+
+        scopes = copy.deepcopy(self.scopes)
+        for scope in scopes:
+            state = commands._parse_pending_add_word(scope["reviewedPrompt"])
+            state.server_candidates = state.candidates
+            state.server_occupied_words = state.occupied_words
+            state.needs_manual_review = True
+            scope["reviewedState"] = commands._pending_add_word_payload(state)
+        pending = harness.PendingToolConfirm("keytao_batch_add_to_draft", {
+            "items": [{"action": "Create", "type": "Phrase", **item} for item in self.items],
+            "_candidate_scopes": scopes, "_reviewed_multi_word": True,
+        })
+        compact_batch = (
+            "2 个词的候选：\n1. 「大端」dà duān，需管理员审核（无权威来源）\n"
+            "1. dsdt — 打断\n2. dsdtv — 大段\n3. dsdtvo — ✅推荐\n"
+            "2. 「小端」xiǎo duān，需管理员审核（无权威来源）\n"
+            "1. xcdt — 小段\n2. xcdti — ✅推荐\n3. xcdtio — 空位\n"
+            "回复「加入」或「加入并提交」用推荐码，或「取消」。\n"
+            "或改选如「大端 3，小端 3」（末尾加「，加入并提交」直接提交）"
+        )
+        record = SimpleNamespace(state=pending, execution_id=None)
+        self.assertTrue(harness.openai_chat_module._advertised_reply_matches_live_record(compact_batch, record))
+
     def test_batch_preserves_each_shared_review_block(self):
         rendered = render_server_backed_batch_candidates(self.items, self.scopes)
         self.assertIn("审词：读音 dà duān", rendered)

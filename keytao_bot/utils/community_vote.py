@@ -13,6 +13,7 @@ from weakref import WeakValueDictionary
 
 from nonebot.log import logger
 
+from .reply_copy import community_vote_receipt_matches
 from .user_resolver import find_user_by_platform
 
 
@@ -69,6 +70,10 @@ def submitted_vote_receipt(data: dict) -> str | None:
     # Background actions run in child tasks; update their turn's shared collector in place.
     receipts[:] = [item for item in receipts if item["batchId"] != data["batchId"]]
     receipts.append(frozen)
+    return _render_submitted_vote_receipt(data)
+
+
+def _render_submitted_vote_receipt(data: dict, *, voting: bool = True) -> str:
     contents = ""
     if data.get("submittedItems"):
         contents = "\n提交内容：\n" + "\n".join(
@@ -76,8 +81,9 @@ def submitted_vote_receipt(data: dict) -> str | None:
             + ("（本轮之前）" if item.get("earlierRound") else "")
             for item in data["submittedItems"]
         )
-    return (f"批次已加入提交，审核中。\n草稿地址：{data['batchUrl']}{contents}\n\n"
-            "当前投票：0/3\n可以引用该条消息，回复同意来投票通过")
+    heading = "批次已加入提交，审核中。" if voting else "✅ 批次已提交审核。"
+    footer = "\n\n当前投票：0/3\n可以引用该条消息，回复同意来投票通过" if voting else ""
+    return f"{heading}\n草稿地址：{data['batchUrl']}{contents}{footer}"
 
 
 def submitted_vote_receipts(receipts) -> str | None:
@@ -94,15 +100,16 @@ def prepare_delivery(text: str, memory_context) -> str:
         return text
     from ..plugins.chat_render import render_platform_public_links
     replies = []
+    matched = []
     for data in tuple(_pending_receipts.get() or ()):
         url = render_platform_public_links(data["batchUrl"], memory_context.platform)
         if url in text or data["batchUrl"] in text:
             replies.append(submitted_vote_receipt(data))
+            matched.append(data)
     if len(replies) > 1:
         # A native quote identifies one message, so it cannot select between batches.
         _pending_receipts.get().clear()
-        return "\n\n".join(reply.split("\n\n", 1)[0].replace(
-            "批次已加入提交，审核中。", "✅ 批次已提交审核。") for reply in replies)
+        return "\n\n".join(_render_submitted_vote_receipt(data, voting=False) for data in matched)
     return "\n\n".join(dict.fromkeys(filter(None, replies))) or text
 
 
@@ -225,6 +232,12 @@ def _escape_name(name):
     return str(name).replace("&", "&amp;").replace("[", "&#91;").replace("]", "&#93;")
 
 
+def _pending_approval_reply(data, names):
+    instruction = "请等待管理员处理" if data["attempts"] >= 2 else "请再次回复同意重试"
+    return (f"投票已达 3/3，批准待确认，{instruction}。\n"
+            f"草稿地址：{data['batch_url']}\n同意：{names}")
+
+
 async def record_vote(store, platform, group_id, message_id, user_id, name, *, lookup, approve):
     if not enabled():
         return None
@@ -271,9 +284,7 @@ async def record_vote(store, platform, group_id, message_id, user_id, name, *, l
         if len(data["voters"]) < 3:
             return (f"@{_escape_name(name or user_id)} 已记录同意。\n草稿地址：{data['batch_url']}\n"
                     f"当前投票：{len(data['voters'])}/3\n同意：{names}")
-        pending = ("投票已达 3/3，批准待确认，请等待管理员处理。" if data["attempts"] >= 2 else
-                   "投票已达 3/3，批准待确认，请再次回复同意重试。")
-        pending += f"\n草稿地址：{data['batch_url']}\n同意：{names}"
+        pending = _pending_approval_reply(data, names)
         if data["attempts"] >= 2:
             return store.notify_once(data, platform, user_id, pending)
         # A concurrent arrival cannot retry an attempt that was still in progress when it arrived.
@@ -283,7 +294,7 @@ async def record_vote(store, platform, group_id, message_id, user_id, name, *, l
         if not store.save(data):
             return "投票已结束。"
         if data["attempts"] == 2:
-            pending = pending.replace("请再次回复同意重试", "请等待管理员处理")
+            pending = _pending_approval_reply(data, names)
         try:
             result = await approve(data["creator_platform"], data["creator_id"], batch_id,
                                    [{"platform": voter["platform"], "platformId": voter["platformId"]}
@@ -345,10 +356,8 @@ async def _record_sent_receipts(bot, exception, api, data, result):
     text = render_platform_public_links(text, platform)
     try:
         for receipt in tuple(_pending_receipts.get() or ()):
-            expected = submitted_vote_receipt(receipt)
-            if expected:
-                expected = render_platform_public_links(expected, platform)
-            if expected and expected in text:
+            if (submitted_vote_receipt(receipt) and community_vote_receipt_matches(
+                    text, render_platform_public_links(receipt["batchUrl"], platform))):
                 get_store().bind_receipt(receipt, platform, memory.user_id, group_id, str(message_id))
     except (OSError, sqlite3.Error):
         logger.warning("Failed to persist a sent community vote receipt")

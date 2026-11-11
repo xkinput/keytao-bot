@@ -13,6 +13,7 @@ from typing import Awaitable, Callable, Dict, Iterator, List, Optional, Tuple
 from nonebot.log import logger
 
 from keytao_bot.harness.conversation import ConversationAddress
+from keytao_bot.utils import reply_copy
 
 
 DEFAULT_RECENT_LIMITS = {
@@ -1394,7 +1395,7 @@ class ScopedMemoryStore:
 
     def _compress_content(self, content: str, role: str) -> str:
         text = _strip_markdown(content or "")
-        text = re.sub(r"diff\s+\S+[\s\S]*?(?=\n\n|当前草稿|草稿地址|$)", "[diff omitted]", text)
+        text = reply_copy.MEMORY_DIFF_RE.sub("[diff omitted]", text)
         text = re.sub(r"https?://\S+", "[url]", text)
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
@@ -1496,10 +1497,7 @@ def _classify_importance(scope: str, role: str, content: str) -> str:
     if _is_low_value_memory(text):
         return "low"
 
-    high_markers = (
-        "偏好", "习惯", "记住", "以后", "称呼", "不要", "别再",
-        "词库操作", "已处理加词草稿", "已提交当前用户草稿审核", "已确认添加到草稿",
-    )
+    high_markers = reply_copy.MEMORY_HIGH_MARKERS
     if scope == "user" and any(marker in text for marker in high_markers):
         return "high"
 

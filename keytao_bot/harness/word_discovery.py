@@ -516,7 +516,7 @@ async def _prepare_offer(chat, word, address):
         return None
     prompt = commands._format_reviewed_add_prompt(review)
     inventory = commands.select_candidate_inventory(review)
-    pending = commands._parse_pending_add_word(prompt) if prompt else None
+    pending = commands._parse_pending_add_word(prompt, review) if prompt else None
     if (pending is None or pending.word != word or inventory is None
             or not pending.recommended_code or any(not inventory.readings.get(code)
                                                   for code, _ in inventory.candidates)):

@@ -10,6 +10,17 @@ from urllib.parse import urlsplit
 
 from .candidate_inventory import protected_candidate_occupants
 from .commonness_copy import candidate_commonness_summary_copy, render_commonness_summary
+from .reply_copy import (
+    COMPACT_SINGLE_WORD_FOOTER_RE,
+    COMPACT_SELECTION_SUFFIX_RE,
+    LEGACY_SINGLE_WORD_FOOTERS,
+    NUMBERED_WORD_HEADER_RE,
+    batch_block_recommended_code,
+    candidate_rows,
+    missing_word_card_word,
+    no_recommended_candidate,
+    recommended_candidate_code,
+)
 
 
 class ServerBackedQueryReply(str):
@@ -281,6 +292,7 @@ SYSTEM_REPLY_TEMPLATE_MARKERS = (
     "这轮是普通问答。",
     "目前没有对应的操作请求",
     "当前没有可验证的可执行操作",
+    "没找到要执行的操作，本次未写入。",
     FAILED_WRITE_TEMPLATE_PREFIX,
     FAILED_WRITE_TEMPLATE_MARKER,
     REMEDIATION_FALLBACK_GUIDANCE,
@@ -358,17 +370,7 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
         for match in pattern.finditer(normalized)
     )
 
-    numbered_heading = re.compile(
-        r"(?m)^\s*\d{1,3}[.)、]\s*"
-        r"[「“『]?(?P<word>[\u3400-\u9fffA-Za-z0-9_-]{1,128})[」”』]?\s*$"
-    )
-    recommended_candidate = re.compile(
-        r"(?:^|[：:｜|])\s*\d{1,3}[.)、]\s*"
-        r"(?P<code>[a-z]{1,12})\s*(?:—|–|-)\s*"
-        r"[^\n｜|]{0,64}[（(]\s*(?:✅\s*)?推荐\s*[）)]",
-        re.MULTILINE | re.IGNORECASE,
-    )
-    headings = list(numbered_heading.finditer(normalized))
+    headings = list(NUMBERED_WORD_HEADER_RE.finditer(normalized))
     for index, heading in enumerate(headings):
         block_end = (
             headings[index + 1].start()
@@ -376,19 +378,13 @@ def advertised_batch_binding_pairs(text: str) -> tuple[tuple[str, str], ...]:
             else len(normalized)
         )
         block = normalized[heading.end():block_end]
-        if "候选" not in block:
+        if "候选" not in block and not candidate_rows(block):
             continue
-        candidate = recommended_candidate.search(block)
-        if candidate is None:
-            candidate = re.search(
-                r"(?m)^推荐编码:(?P<code>[a-z]{1,12})\s*$",
-                block,
-                re.IGNORECASE,
-            )
-        if candidate is None:
+        code = batch_block_recommended_code(block)
+        if not code:
             continue
         positioned_pairs.append(
-            (heading.start(), heading.group("word"), candidate.group("code"))
+            (heading.start(), heading.group("quoted_word") or heading.group("word"), code)
         )
 
     for _position, raw_word, raw_code in sorted(positioned_pairs):
@@ -1887,12 +1883,7 @@ def candidate_commonness_guard_copy(
 
 def advertised_single_word_candidate_codes(text: str) -> tuple[str, ...]:
     """Read the ordered codes in a numbered one-word CODE-CHOICE display."""
-    matches = list(re.finditer(
-        r"(?m)^\s*(?P<index>[1-9]\d{0,2})[.)、]\s*"
-        r"(?P<code>[a-z]{1,12})\s*(?:—|–|-)\s*[^\n]+$",
-        unicodedata.normalize("NFKC", str(text or "")),
-        re.IGNORECASE,
-    ))
+    matches = candidate_rows(text)
     if not matches:
         return ()
     indexes = [int(match.group("index")) for match in matches]
@@ -2231,12 +2222,8 @@ def render_server_backed_single_word_lookup(
 def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
     """Return ordered codes only from the deterministic server-backed contract."""
     normalized = unicodedata.normalize("NFKC", str(text or ""))
-    blocked = re.search(
-        r"(?m)^推荐编码:暂无\(现有候选均需点名顶替\)\s*$",
-        normalized,
-    )
-    if blocked is not None:
-        return advertised_single_word_candidate_codes(normalized[:blocked.start()])
+    if no_recommended_candidate(normalized):
+        return advertised_single_word_candidate_codes(normalized)
     recommended = re.search(
         r"(?m)^推荐编码:(?P<code>[a-z]{1,12})(?:\(本次仅查询\))?\s*$",
         normalized,
@@ -2262,7 +2249,9 @@ def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
                 re.IGNORECASE,
             )
         if recommended is None:
-            return ()
+            codes = advertised_single_word_candidate_codes(normalized)
+            code = recommended_candidate_code(normalized)
+            return codes if code and code in codes else ()
         candidate_source = normalized[:recommended.start()]
     else:
         candidate_source = normalized[:recommended.start()]
@@ -2277,28 +2266,18 @@ def advertised_single_word_lookup_codes(text: str) -> tuple[str, ...]:
 def advertised_single_word_lookup_word(text: str) -> str:
     """Extract only the referent from the deterministic read-only renderer."""
     normalized = unicodedata.normalize("NFKC", str(text or ""))
-    match = re.search(
-        r"(?m)^(?:词库暂无收录)?「(?P<word>[^「」\r\n]{1,128})」"
-        r"(?:候选编码)?[:：]\s*$",
-        normalized,
-    )
-    if match is None or not advertised_single_word_lookup_codes(normalized):
+    word = missing_word_card_word(normalized)
+    if not word or not advertised_single_word_lookup_codes(normalized):
         return ""
-    return match.group("word").strip()
+    return word
 
 
 def ensure_single_word_candidate_copy(text: str, candidate_count: int) -> str:
     """Normalize legacy one-word footers to the shared truthful contract."""
     response = str(text or "")
-    for old in (
-        "可回复编号、编码，或「都加」；可多选，如「添加2、4」。",
-        "可回复编号、编码，或「都加」；",
-        "可回复编号、编码，或「都加」。",
-        "也可回复编号选其他编码。",
-        "可回复编号或编码选择其他编码；可多选，如「添加2、4」。",
-        "可回复编号或编码选择其他编码；可多选，如「添加1、2」。",
-    ):
+    for old in LEGACY_SINGLE_WORD_FOOTERS:
         response = response.replace(old, "")
+    response = COMPACT_SINGLE_WORD_FOOTER_RE.sub("", response)
     if candidate_count <= 1:
         response = re.sub(
             r"可多选，如[「“『]添加\d+(?:、\d+)+[」”』][。.]?",
@@ -2419,7 +2398,7 @@ _COMMAND_SUGGESTION_LEAD_RE = re.compile(
     r"(?:确认执行)?请发|请发送|请按以下命令(?:逐条)?发送|"
     r"请按(?:下面|以下)格式(?:重发|发送)|发送下面|直接回复|"
     # The actor noun is not an instruction introducing a later quoted operation.
-    r"可以改为|比如|例如|回复|发送(?!者)|同一词可选多个编码、其余词用推荐：如"
+    r"可以改为|或改选如|比如|例如|回复|发送(?!者)|同一词可选多个编码、其余词用推荐：如"
 )
 _REPORTED_QUOTED_COMMAND_PREFIX_RE = re.compile(
     r"(?:刚才发送了|上一条回复提到了)\s*$"
@@ -2460,6 +2439,14 @@ def advertised_command_suggestions(text: str) -> tuple[str, ...]:
                 continue
             command = normalized[start + 1:index].strip()
             prefix = re.split(r"[。！？]", normalized[max(0, start - 120):start])[-1]
+            suffix_example = COMPACT_SELECTION_SUFFIX_RE.search(prefix)
+            if suffix_example is not None and command in {",加入并提交", "，加入并提交"}:
+                from keytao_bot.harness.authorization_grammar import parse_reviewed_multi_word_selection
+
+                combined = suffix_example["example"] + command
+                if parse_reviewed_multi_word_selection(combined) is not None:
+                    positioned.append((start, combined))
+                continue
             reported_prefix = _REPORTED_QUOTED_COMMAND_PREFIX_RE.search(prefix)
             # Skip only the past report's verb; other introducers remain active.
             command_lead = any(

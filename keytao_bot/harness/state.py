@@ -17,6 +17,7 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional,
 from nonebot.log import logger
 
 from keytao_bot.utils.observability import mark_turn_outcome
+from keytao_bot.utils import reply_copy
 from keytao_bot.utils.pending_confirmation import pending_confirmation_copy, trusted_pending_word_items
 
 from .conversation import (
@@ -392,7 +393,7 @@ def _server_confirmation_display(data: Dict) -> Dict:
     collision_replan_line = str(data.get("collisionReplanLine") or "").strip()
     if (
         data.get("collisionReplanned") is True
-        and collision_replan_line.startswith("已调整：")
+        and collision_replan_line.startswith(reply_copy.COLLISION_REPLAN_PREFIX)
         and "\n" not in collision_replan_line
         and len(collision_replan_line) <= 500
     ):

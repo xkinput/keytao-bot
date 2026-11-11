@@ -5,6 +5,8 @@ import re
 import unicodedata
 from typing import Mapping, Sequence
 
+from . import reply_copy
+
 
 FORCE_ASSENT_TEXTS = frozenset({
     "强制", "硬加", "硬来", "强行", "就按我说的", "强制调序", "就这样", "照做",
@@ -152,9 +154,9 @@ def option_questions_bind_live_state(text: str, state: object) -> bool:
 
 def render_missing_option_ticket(history: Sequence[Mapping[str, object]]) -> str:
     """Recall display context without reviving a mutation from assistant prose."""
-    empty = "当前没有待执行的操作；本次未写入。需要引用原提议确认后重新核对。"
-    missing = "当前没有可执行的确认记录；本次未写入。需要引用原提议确认后重新核对。"
-    stale_missing = "当前没有可执行的确认记录；之前的确认已过期或记录已不存在；本次未写入。需要引用原提议确认后重新核对。"
+    empty = reply_copy.STALE_OPTION_EMPTY_COPY
+    missing = reply_copy.STALE_OPTION_MISSING_COPY
+    stale_missing = reply_copy.STALE_OPTION_EXPIRED_COPY
     previous = (
         str(history[-1].get("content") or "").strip()
         if history and history[-1].get("role") == "assistant"
@@ -162,7 +164,7 @@ def render_missing_option_ticket(history: Sequence[Mapping[str, object]]) -> str
     )
     if not previous or previous == empty:
         return empty
-    if previous.startswith(("上一条提议是：", "上一条提议的选项是：")) and previous.endswith((missing, stale_missing)):
+    if previous.startswith(reply_copy.STALE_OPTION_PREFIXES) and previous.endswith((missing, stale_missing)):
         return previous
     options = previous_bot_options(history)
     if options:
@@ -176,7 +178,7 @@ def render_missing_option_ticket(history: Sequence[Mapping[str, object]]) -> str
     suggestions = advertised_command_suggestions(previous)
     if any(parse_pending_assent_phrase(command).matched for command in suggestions):
         missing = stale_missing
-    if not suggestions and not re.search(r"计划|方案|将执行|将把|是否|建议|要不要", previous):
+    if not suggestions and not reply_copy.OPTION_PROPOSAL_RE.search(previous):
         return empty
     display_lines = [
         line.strip() for line in previous.splitlines()

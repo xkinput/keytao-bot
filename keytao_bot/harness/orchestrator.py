@@ -23,6 +23,7 @@ from keytao_bot.utils.llm_policy import (
 )
 from keytao_bot.utils.history_store import _parse_stored_timestamp
 from keytao_bot.utils import keytao_review, review_flags
+from keytao_bot.utils import reply_copy as _reply_copy
 from keytao_bot.utils.candidate_inventory import select_candidate_inventory
 from keytao_bot.utils.offered_options import (
     option_questions_bind_live_state,
@@ -1766,7 +1767,7 @@ class AgentOrchestrator:
                         rendered = "\n".join(
                             line for line in rendered.splitlines()
                             if line.strip().rstrip("。.") not in old_fact_lines
-                            and not line.strip().startswith("可再追加一个编码")
+                            and not _reply_copy.is_additional_code_hint(line.strip())
                         ).strip()
                     if all(
                         block.splitlines()[0] in rendered
@@ -4158,10 +4159,7 @@ class AgentOrchestrator:
                 if batch_url:
                     lines.extend(("", f"批次地址：{batch_url}"))
                 return "\n".join(lines)
-        reply_denies_write = bool(re.search(
-            r"(?:未|没有|并未|尚未)(?:(?:成功)?写入|执行(?:任何)?(?:新)?写入)|无法执行",
-            reply,
-        ))
+        reply_denies_write = _reply_copy.WRITE_DENIAL_RE.search(reply) is not None
         termination_reason = str(
             (termination_state or {}).get("reason") or ""
         ).strip()
@@ -4172,7 +4170,7 @@ class AgentOrchestrator:
                 for receipt in receipts
             )
             lines = cls._receipt_completion_reply(receipts).splitlines()
-            if submitted and not any("已提交审核" in line or "已加入词库" in line for line in lines):
+            if submitted and not any(_reply_copy.has_submitted_draft_receipt(line) for line in lines):
                 lines.append("- 已提交审核。")
             if failure_state:
                 failed_tool = str(failure_state.get("_failedTool") or "")
@@ -4582,11 +4580,7 @@ class AgentOrchestrator:
         cleaned_lines: List[str] = []
         for line in content.splitlines():
             cleaned = line
-            if re.search(
-                r"(?:草稿地址|批次地址|草稿/批次地址|PR|"
-                r"旧\s*PR(?:地址|可见于)?|查看旧\s*PR)[：:]?",
-                cleaned,
-            ):
+            if _reply_copy.AUTHORITATIVE_LINK_LABEL_RE.search(cleaned):
                 # Link labels are authoritative-record surfaces.  Remove every
                 # model/failure-path URL here; the exact trusted record URL is
                 # appended below from ``links``.
@@ -4609,12 +4603,7 @@ class AgentOrchestrator:
                 )
                 cleaned = cleaned.replace(url, "")
             cleaned = re.sub(r"\[[^\]\n]*\]\(\s*\)", "", cleaned)
-            cleaned = re.sub(
-                r"\s*(?:草稿地址|批次地址|草稿/批次地址|PR|"
-                r"旧\s*PR(?:地址|可见于)?|查看旧\s*PR)[：:]?\s*$",
-                "",
-                cleaned,
-            )
+            cleaned = _reply_copy.AUTHORITATIVE_LINK_END_RE.sub("", cleaned)
             if re.fullmatch(r"\s*[-*+]\s*", cleaned):
                 cleaned = ""
             cleaned_lines.append(cleaned.rstrip())

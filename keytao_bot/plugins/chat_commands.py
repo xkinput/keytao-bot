@@ -88,6 +88,37 @@ from ..utils.explicit_code import (
 )
 from ..utils import keytao_review, review_flags, user_resolver
 from ..utils.observability import set_turn_flow
+from ..utils.reply_copy import (
+    CANDIDATE_CODE_LINE_RE,
+    LEGACY_BATCH_PROMPT_MARKERS,
+    OPERATION_COMPLETE_PREFIX,
+    UNRESOLVED_REVIEW_WORD_RE,
+    append_pending_challenge,
+    candidate_diagnostic_header_copy,
+    candidate_label_is_available,
+    candidate_label_occupants,
+    candidate_reference_copy,
+    compact_card_reading_pinyin,
+    draft_display_lines,
+    ensure_cancel_control,
+    first_occupied_candidate,
+    has_completed_draft_receipt,
+    has_pending_add_card_contract,
+    has_reorder_choice_copy,
+    has_skipped_candidate_notice,
+    is_explicit_code_template_hint,
+    legacy_batch_add_pairs,
+    legacy_card_reading_bindings,
+    legacy_review_text,
+    no_recommended_candidate,
+    pending_add_card_word,
+    pending_add_recommended_code,
+    replace_additional_code_template,
+    review_reading_pinyin,
+    strip_candidate_row_numbers,
+    strip_legacy_occupied_guidance,
+    word_card_section,
+)
 from ..utils.pending_confirmation import (
     RestoredCandidateReply,
     ServerBackedQueryReply,
@@ -148,6 +179,7 @@ from .chat_render import (
     _format_reviewed_add_prompt,
     _format_submit_conflict_failure,
     _normalize_generated_review_copy,
+    _reviewed_add_review_text,
     _plain_warning_line,
     _plain_warning_message,
     _trusted_batch_url,
@@ -334,48 +366,20 @@ current_recall_clear_batch_id: ContextVar[Optional[str]] = ContextVar(
 )
 
 
-def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
+def _parse_pending_add_word(
+    response: str,
+    review: Optional[Dict] = None,
+) -> Optional[PendingAddWord]:
     """Parse AI response for the candidate code confirmation pattern.
 
     Looks for: 是否以编码 XXX 将「YYY」加入草稿
     and the numbered candidate list.
     """
-    if "本次仅查询" in response:
+    if "本次仅查询" in response or not has_pending_add_card_contract(response):
         return None
-    confirm_match = re.search(r'以编码\s*([a-z]+)\s*将「(.+?)」加入草稿', response)
-    compact_match = re.search(
-        r'(?m)^\s*[•-]\s*「(?P<word>[^」\n]+)」\s*→\s*'
-        r'(?P<code>[a-z]+)\s*[（(]推荐[）)]\s*$',
-        response,
-    )
-    reorder_match = re.search(
-        r'(?m)^\s*[-•]\s*[“『]「(?P<word>[^」\n]+)」\s*占\s*'
-        r'(?P<code>[a-z]+)\s*、\s*「[^」\n]+」顺延[”』]'
-        r'(?:\s*[（(][^）)\n]*[）)])?\s*$',
-        response,
-    )
-    if reorder_match is None:
-        reorder_match = re.search(
-            r'(?m)^\s*推荐[：:]\s*「(?P<word>[^」\n]+)」\s*占\s*'
-            r'(?P<code>[a-z]+)\s*、\s*「[^」\n]+」顺延(?:[；;].*)?$',
-            response,
-        )
-    if confirm_match is not None:
-        recommended_code = confirm_match.group(1)
-        word = confirm_match.group(2)
-    elif reorder_match is not None:
-        recommended_code = reorder_match.group("code")
-        word = reorder_match.group("word")
-    elif compact_match is not None:
-        recommended_code = compact_match.group("code")
-        word = compact_match.group("word")
-    elif "推荐编码：暂无（现有候选均需点名顶替）" in response:
-        blocked_word = re.search(r"(?:词库暂无收录「([^」]+)」|「([^」]+)」候选编码：)", response)
-        if blocked_word is None:
-            return None
-        word = blocked_word.group(1) or blocked_word.group(2)
-        recommended_code = ""
-    else:
+    word = pending_add_card_word(response)
+    recommended_code = pending_add_recommended_code(response)
+    if not word or (not recommended_code and not no_recommended_candidate(response)):
         return None
 
     candidates: List[Tuple[str, bool]] = []
@@ -384,93 +388,71 @@ def _parse_pending_add_word(response: str) -> Optional[PendingAddWord]:
     pronunciation_codes: Dict[str, str] = {}
     pronunciation_recommended_codes: List[str] = []
     seen_codes = set()
-    for m in re.finditer(r'(?m)^\s*(?:\d+\.\s*)?([a-z]+)\s*[-—–]\s*(.+?)\s*$', response):
-        code = m.group(1)
-        desc = m.group(2)
+    for m in CANDIDATE_CODE_LINE_RE.finditer(response):
+        code = m.group("code")
+        desc = m.group("label")
         if code in seen_codes:
             continue
         seen_codes.add(code)
 
         desc_text = desc.strip()
-        is_available = desc_text.startswith("✅") or "空位" in desc_text
+        is_available = candidate_label_is_available(desc_text)
         candidates.append((code, not is_available))
         if "读音" in desc_text or "来源" in desc_text:
             code_remarks[code] = "喵喵审词：" + desc_text
-        pinyin_match = re.search(r'读音\s*([A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ\s]+)', desc_text)
-        if pinyin_match:
-            pronunciation_codes[code] = re.sub(r"\s+", " ", pinyin_match.group(1)).strip()
+        pinyin = review_reading_pinyin(desc_text)
+        if pinyin:
+            pronunciation_codes[code] = pinyin
         if "该读音推荐" in desc_text or "推荐" in desc_text:
             pronunciation_recommended_codes.append(code)
-        occupied_match = re.search(r'已有「(.+?)」', desc)
-        if occupied_match:
-            occupied_words[code] = [
-                part.strip()
-                for part in occupied_match.group(1).split('、')
-                if part.strip()
-            ]
-        elif not is_available:
-            cleaned_desc = re.sub(r'已有\s*', '', desc_text)
-            cleaned_desc = cleaned_desc.replace("✔️", "")
-            cleaned_desc = re.sub(r'[（(].*?[）)]', '', cleaned_desc)
-            occupied_words[code] = [
-                part.strip()
-                for part in re.split(r'[、,，]\s*', cleaned_desc)
-                if part.strip()
-            ]
+        occupants = candidate_label_occupants(desc_text)
+        if occupants:
+            occupied_words[code] = list(occupants)
 
     if not candidates:
         candidates = [(recommended_code, False)]
 
-    reading_pinyins = {
-        int(match.group("index")): re.sub(
-            r"\s+",
-            " ",
-            match.group("pinyin"),
-        ).strip()
-        for match in re.finditer(
-            r"(?m)^\s*(?P<index>\d+)\.\s*"
-            r"(?P<pinyin>[A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ\s]+?)"
-            r"\s*[；;]\s*来源(?:\s|$)",
-            response,
-        )
-    }
-    group_headings = list(re.finditer(
-        r"(?m)^\s*候选编码[（(]读音\s*(?P<index>\d+)[）)]\s*[:：]\s*$",
-        response,
-    ))
-    for heading_index, heading in enumerate(group_headings):
-        pinyin = reading_pinyins.get(int(heading.group("index")), "")
-        if not pinyin:
-            continue
-        section_end = (
-            group_headings[heading_index + 1].start()
-            if heading_index + 1 < len(group_headings)
-            else len(response)
-        )
-        section = response[heading.end():section_end]
-        for match in re.finditer(
-            r"(?m)^\s*(?:\d+\.\s*)?(?P<code>[a-z]+)\s*[-—–]\s*.+$",
-            section,
-        ):
-            code = match.group("code")
-            if code in seen_codes:
-                pronunciation_codes[code] = pinyin
+    pronunciation_codes.update(legacy_card_reading_bindings(response, seen_codes))
 
-    review_line_match = re.search(
-        r'(?m)^\s*(?:喵喵)?审词：(.+?)\s*$',
-        response,
+    structured_review = None
+    structured_inventory = None
+    displayed_pinyin = (
+        review_reading_pinyin(legacy_review_text(response))
+        or compact_card_reading_pinyin(response, word)
     )
-    if review_line_match:
-        review_text = review_line_match.group(1).strip()
-        if review_text:
+    if isinstance(review, dict) and str(review.get("word") or "").strip() == word:
+        inventory = select_candidate_inventory(review)
+        if inventory is not None and list(inventory.candidates) == candidates and all(
+            inventory.readings.get(code)
+            and (not pronunciation_codes.get(code)
+                 or pronunciation_codes[code] == inventory.readings[code])
+            and (not displayed_pinyin or displayed_pinyin == inventory.readings[code])
+            for code, _occupied in candidates
+        ):
+            structured_review = review
+            structured_inventory = inventory
+    review_text = _structured_add_review_text(structured_review)
+    structured_review_text = bool(review_text)
+    if not review_text:
+        review_text = legacy_review_text(response)
+    if review_text:
+        for code, _ in candidates:
+            code_remarks.setdefault(code, "喵喵审词：" + review_text)
+        if structured_review_text:
+            pronunciation = next(
+                item for item in structured_review.get("pronunciations") or []
+                if isinstance(item, dict) and item.get("candidateStatuses")
+            )
+            pinyin = str(pronunciation.get("pinyin") or "").strip()
+        else:
+            pinyin = review_reading_pinyin(review_text)
+        if pinyin:
             for code, _ in candidates:
-                code_remarks.setdefault(code, "喵喵审词：" + review_text)
-            pinyin_match = re.search(r'读音\s*([A-Za-züÜvV:āáǎàōóǒòēéěèīíǐìūúǔùǖǘǚǜńňǹḿ\s]+)', review_text)
-            if pinyin_match:
-                pinyin = re.sub(r"\s+", " ", pinyin_match.group(1)).strip()
-                for code, _ in candidates:
-                    pronunciation_codes.setdefault(code, pinyin)
+                pronunciation_codes.setdefault(code, pinyin)
 
+    if structured_inventory is not None:
+        for code, _occupied in candidates:
+            pronunciation_codes[code] = structured_inventory.readings[code]
     needs_manual_review, manual_review_reason = _take_reviewed_add_verdict(word)
     return PendingAddWord(
         word=word,
@@ -929,76 +911,68 @@ def _reviewed_create_capability(
     }
 
 
-def _batch_review_remark(response: str, word: str) -> str:
-    """Extract the reviewed-add line belonging to one word section."""
-    header = re.search(rf"(?m)^「{re.escape(word)}」[^\n]*$", response)
-    if not header:
+def _batch_review_remark(
+    response: str,
+    word: str,
+    review: Optional[Dict | PendingAddWord] = None,
+    code: str = "",
+) -> str:
+    """Prefer reviewed evidence, with a compatibility fallback for old cards."""
+    if isinstance(review, PendingAddWord) and review.word == word:
+        selected_code = code or review.recommended_code
+        return (
+            str(review.code_remarks.get(selected_code) or "")
+            if selected_code in dict(review.candidates) else ""
+        )
+    if isinstance(review, dict) and str(review.get("word") or "").strip() == word:
+        selected_code = code or str(review.get("recommendedCode") or "")
+        remarks = review.get("codeRemarks")
+        if isinstance(remarks, dict):
+            return (
+                str(remarks.get(selected_code) or "")
+                if selected_code in dict(review.get("candidates") or []) else ""
+            )
+        inventory = select_candidate_inventory(review)
+        displayed_pinyin = (
+            review_reading_pinyin(legacy_review_text(word_card_section(response, word)))
+            or compact_card_reading_pinyin(response, word)
+        )
+        review_text = (
+            _structured_add_review_text(review)
+            if inventory is not None and selected_code in dict(inventory.candidates)
+            and (not displayed_pinyin or inventory.readings.get(selected_code) == displayed_pinyin)
+            else ""
+        )
+    else:
+        review_text = ""
+    if review_text:
+        return "喵喵审词：" + _normalize_generated_review_copy(review_text)
+    review_text = legacy_review_text(word_card_section(response, word))
+    if not review_text:
         return ""
-    block_start = header.end()
-    next_header = re.search(r"(?m)^「[^」]+」[^\n]*$", response[block_start:])
-    block_end = block_start + next_header.start() if next_header else len(response)
-    block = response[block_start:block_end]
-    review_match = re.search(r"(?m)^\s*(?:喵喵)?审词：(.+?)\s*$", block)
-    if not review_match:
-        return ""
-    review_text = _normalize_generated_review_copy(review_match.group(1).strip())
+    review_text = _normalize_generated_review_copy(review_text)
     return f"喵喵审词：{review_text}" if review_text else ""
 
 
-def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
+def _parse_pending_batch_add(
+    response: str,
+    reviews: Optional[Dict[str, Dict | PendingAddWord]] = None,
+) -> Optional[PendingToolConfirm]:
     """Parse AI response for a multi-word add confirmation prompt."""
     normalized_response = _normalize_generated_review_copy(response)
-    batch_prompt_markers = (
-        "一起加入草稿",
-        "一起加这两个词",
-        "两个词是否一起加",
-        "两词是否一起加",
-    )
     visible_pairs = advertised_batch_binding_pairs(normalized_response)
     if (
         len(visible_pairs) < 2
-        and not any(marker in normalized_response for marker in batch_prompt_markers)
+        and not any(marker in normalized_response for marker in LEGACY_BATCH_PROMPT_MARKERS)
     ):
         return None
 
-    confirm_line = next(
-        (
-            line.strip()
-            for line in normalized_response.splitlines()
-            if "一起加入草稿" in line and "将「" in line
-        ),
-        "",
-    )
-
     items = []
     seen = set()
-    inline_pairs = re.findall(
-        r'(?:以编码\s*)?([a-z]{2,12})\s*将「(.+?)」',
-        confirm_line,
-        re.IGNORECASE,
-    ) if confirm_line else []
-    arrow_pairs = [
-        (match.group(2), match.group(1))
-        for match in re.finditer(
-            r'(?m)^\s*[-•]\s*「([^」]+)」\s*(?:→|->)\s*([a-z]{2,12})\s*$',
-            normalized_response,
-            re.IGNORECASE,
-        )
-    ]
-    inline_arrow_pairs = [
-        (match.group(3), match.group(1) or match.group(2))
-        for match in re.finditer(
-            r'(?:「([^」]+)」|([\u4e00-\u9fff]{1,12}))\s*(?:→|->)\s*([a-z]{2,12})',
-            normalized_response,
-            re.IGNORECASE,
-        )
-    ]
     exact_line_pairs = [(code, word) for word, code in visible_pairs]
     for code, word in [
         *exact_line_pairs,
-        *inline_pairs,
-        *arrow_pairs,
-        *inline_arrow_pairs,
+        *legacy_batch_add_pairs(normalized_response),
     ]:
         code = code.lower()
         word = word.strip()
@@ -1007,7 +981,7 @@ def _parse_pending_batch_add(response: str) -> Optional[PendingToolConfirm]:
             continue
         seen.add(key)
         item = {"word": word, "code": code, "action": "Create"}
-        remark = _batch_review_remark(normalized_response, word)
+        remark = _batch_review_remark(normalized_response, word, (reviews or {}).get(word), code)
         if remark:
             item["remark"] = remark
         verdict, verdict_reason = _take_reviewed_add_verdict(word)
@@ -1103,11 +1077,7 @@ _EXPLICIT_READING_TOKEN_PATTERN = (
 
 def _latest_unresolved_review_word(history: Optional[List[Dict]]) -> str:
     latest = _get_latest_assistant_message(history)
-    match = re.search(
-        r"「(?P<word>[^「」\r\n]{1,20})」(?:存在[^\r\n]{0,40}多个读音|"
-        r"的[^\r\n]{0,20}读音[^\r\n]{0,20}(?:冲突|未确定))",
-        latest,
-    )
+    match = UNRESOLVED_REVIEW_WORD_RE.search(latest)
     if match is not None:
         note_rule_use("C:_latest_unresolved_review_word:re.search")
     return match.group("word").strip() if match is not None else ""
@@ -1631,7 +1601,7 @@ async def _try_handle_shift_modified_add_command(
             else ()
         ),
     )
-    if response.startswith("✅ 操作已完成"):
+    if response.startswith(OPERATION_COMPLETE_PREFIX):
         conversation_state_store.complete_execution(record)
     return response
 
@@ -2543,20 +2513,9 @@ def _append_pending_ticket_challenge(
             and record.state.confirmation_source == "local_preview"
         )
     ):
-        return bind_prompt(response if "「取消」" in response else response.rstrip() + "\n或「取消」。")
+        return bind_prompt(ensure_cancel_control(response))
     challenge = pending_confirmation_copy()
-    if pending_batch_confirmation_copy() in response:
-        compact = re.sub(
-            r"\n+\s*" + re.escape(challenge) + r"\s*$",
-            " " + challenge,
-            response.rstrip(),
-        )
-        if challenge not in compact:
-            compact += " " + challenge
-        return bind_prompt(compact)
-    if challenge in response:
-        return bind_prompt(response)
-    return bind_prompt(response.rstrip() + "\n\n" + challenge)
+    return bind_prompt(append_pending_challenge(response, challenge, pending_batch_confirmation_copy()))
 
 
 def _active_operation_message_for_request(
@@ -2965,46 +2924,21 @@ def _ensure_pending_add_word_guidance(response: str) -> str:
     if _parse_pending_batch_add(response) is not None:
         return ensure_multi_word_candidate_copy(response)
 
-    response = re.sub(
-        r"(?m)^若所选编号显示[“\"]已有…[”\"]，直接回复该编号表示添加重码；"
-        r"回复[“\"]编号 重新编码[”\"]或[“\"]原词 重新编码[”\"]则挪开原词。\s*$",
-        "",
-        response,
-    )
-    response = re.sub(
-        r"(?m)^若选的是已有词编码，回复[“\"]编号 重新编码[”\"]可挪开原词。\s*$",
-        "",
-        response,
-    )
-    response = re.sub(
-        r"(?m)^若要挪开(?:已有词「[^」\n]+」|该已有词)，"
-        r"回复[“\"][1-9]\d{0,2} 重新编码[”\"]。\s*$",
-        "",
-        response,
-    )
+    response = strip_legacy_occupied_guidance(response)
     pending = _parse_pending_add_word(response)
     if pending is not None:
         response = ensure_single_word_candidate_copy(
             response,
             len(pending.candidates),
         )
-        if (
-            re.search(r"(?m)^\s*推荐[：:](?:.+顺延(?:[；;].*)?|\s*\n[-•].+顺延.+)$", response)
-            and re.search(r"(?m)^\s*(?:不重排选|换)\s+\d+", response)
-        ):
+        if has_reorder_choice_copy(response):
             return response
 
     if pending is None:
-        fallback_occupied = re.search(
-            r"(?m)^\s*(?P<index>[1-9]\d{0,2})[.)、]\s*[a-z]{1,12}\s*"
-            r"(?:—|–|-)\s*[^\n]*已有「(?P<words>[^」]+)」",
-            response,
-            re.IGNORECASE,
-        )
+        fallback_occupied = first_occupied_candidate(response)
         if fallback_occupied is None:
             return response
-        occupied_index = int(fallback_occupied.group("index"))
-        occupied_word = fallback_occupied.group("words").split("、", 1)[0].strip()
+        occupied_index, occupied_word = fallback_occupied
     else:
         occupied_choice = next(
             (
@@ -3360,11 +3294,7 @@ async def _augment_simple_word_query_response(
             }
             if len(returned_groups) > 1 and len(additional_codes) == 1:
                 additional_code = next(iter(additional_codes))
-                response = "\n".join(
-                    line.replace("<code>（将 <code> 换成实际编码）", additional_code)
-                    if line.startswith("可再追加一个编码，格式为：") else line
-                    for line in response.splitlines()
-                )
+                response = replace_additional_code_template(response, additional_code)
         note = _build_existing_word_priority_note(word, lookup_entry, encode_data)
         note_lines = []
         if note:
@@ -3504,8 +3434,7 @@ def _render_pending_preserving_lookup(word, code, candidates, occupied, ordering
         word, code, candidates, occupied, ordering_assessments=ordering,
         actionable_controls=False, include_controls=False,
     )
-    text = re.sub(r"(?m)^\s*\d+[.)、]\s*(?=[a-z]+\s*[—–-])", "", text)
-    return text.replace("候选编码", "编码参考").replace("候选", "编码参考")
+    return candidate_reference_copy(text)
 
 
 def _mergeable_add_candidate_scopes(
@@ -3762,13 +3691,13 @@ async def _prepare_multi_word_query(
         )
         diagnostic_lines = []
         for line in diagnostic.splitlines():
-            if "格式为：加入编码" in line:
+            if is_explicit_code_template_hint(line):
                 continue
             original_line = line
-            line = re.sub(r"^\s*\d+[.)、]\s*(?=[a-z]+\s*[—–-])", "", line)
+            line = strip_candidate_row_numbers(line)
             if line != original_line:
                 note_rule_use("C:_prepare_multi_word_query:re.sub")
-            line = line.replace(f"「{scope['word']}」候选编码：", f"「{scope['word']}」占用情况：")
+            line = candidate_diagnostic_header_copy(line, scope["word"])
             diagnostic_lines.append(line)
         diagnostic_lines.append(
             f"「{scope['word']}」本次未选中；请单独查询此词，再指定完整编码或点名顶替。"
@@ -4108,7 +4037,7 @@ async def _try_handle_simple_single_word_query(
             reviewed_prompt = prepend_pending_word_reminders(
                 reviewed_prompt, pending_items, words=(word,),
             )
-        pending = _parse_pending_add_word(reviewed_prompt)
+        pending = _parse_pending_add_word(reviewed_prompt, review)
         if pending is not None:
             pending.shown_others_submitted = [
                 item for item in pending_items if item["source"] == "others_submitted"
@@ -4432,6 +4361,20 @@ def _take_reviewed_add_verdict(word: str) -> Tuple[Optional[bool], str]:
         _reviewed_add_verdicts.pop(normalized_word, None)
         return None, ""
     return flag, reason
+
+
+def _structured_add_review_text(review: Optional[Dict]) -> str:
+    """Preserve the complete single-reading admin note independently of copy."""
+    if not isinstance(review, dict):
+        return ""
+    pronunciations = [
+        item for item in review.get("pronunciations") or []
+        if isinstance(item, dict) and item.get("candidateStatuses")
+    ]
+    return (
+        _reviewed_add_review_text(review, pronunciations[0])
+        if len(pronunciations) == 1 else ""
+    )
 
 
 _DRAFT_RESOLUTION_TOOL_KINDS = {
@@ -6125,7 +6068,7 @@ def _prepend_resolved_advertised_words(
     skipped_line = "\n".join(line if line.partition("\n")[0].endswith("。") else line + "。" for line in skipped) + "\n" if isinstance(skipped, list) and skipped else ""
     if skipped_line:
         selected = "、".join(f"{item['word']} → {item['code']}" for item in state.args.get("items", []))
-        completed = "✅ 已加入草稿" in response or "已提交审核" in response
+        completed = has_completed_draft_receipt(response)
         label = "已按你的选择加入" if completed else "本次选择"
         return f"{label}：{selected}；\n{skipped_line}{remainder}\n{response}"
     return f"词：{'、'.join(words)}{remainder}\n" + skipped_line + str(response or "")
@@ -8907,13 +8850,7 @@ async def _perform_clear_current_draft(
 
 
 def _quoted_draft_display_lines(response: str) -> List[str]:
-    lines = [
-        re.sub(r"\s+", " ", match.group(0)).strip()
-        for match in re.finditer(
-            r"(?m)^\s*•\s*\d+\.\s*(?:新增|修改|删除)\s+.+$",
-            str(response or ""),
-        )
-    ]
+    lines = list(draft_display_lines(response))
     if lines:
         note_rule_use("C:_quoted_draft_display_lines:re.sub")
         note_rule_use("C:_quoted_draft_display_lines:re.finditer")
@@ -8998,11 +8935,11 @@ async def _try_handle_quoted_draft_selection(
     selection = _quoted_draft_selection_request(message_text, items)
     if selection is None:
         return None
-    expected_lines = [
-        re.sub(r"\s+", " ", _draft_item_display_line(item, index)).strip()
+    expected_lines = list(draft_display_lines("\n".join(
+        _draft_item_display_line(item, index)
         for index, item in enumerate(items, start=1)
         if isinstance(item, dict)
-    ]
+    )))
     if quoted_lines != expected_lines:
         return render_remediation_reply(
             "引用的草稿列表已变化，本次未执行",
@@ -13914,7 +13851,7 @@ async def _try_handle_explicit_pending_replacement(
 
     reviewed_prompt = _format_reviewed_add_prompt(review)
     replacement = (
-        _parse_pending_add_word(reviewed_prompt)
+        _parse_pending_add_word(reviewed_prompt, review)
         if reviewed_prompt
         else None
     )
@@ -14280,7 +14217,7 @@ async def _execute_fly_key_add(word, platform, user_id, conv_key, space_key, own
             ExplicitEntryCodeRequest(word, code), f"添加 {word} {code}",
             platform, user_id, conv_key, space_key, owner_label, _review=review,
         )
-    pending = _parse_pending_add_word(_format_reviewed_add_prompt(review) or "")
+    pending = _parse_pending_add_word(_format_reviewed_add_prompt(review) or "", review)
     if pending is None:
         return f"「{word}」的飞键候选未能通过核验，本次未写入。"
     pending.phrase_type = str(review.get("type") or "Phrase")
@@ -15030,7 +14967,7 @@ async def handle_pending_message_core(
                     return response + "\n这批词的候选编码暂时无法保存，请重新查询后再选择。"
                 if restored is not None and current is state_record:
                     return RestoredCandidateReply(
-                        response if "\n未选择：" in response else response + "\n候选仍有效，请逐词处理",
+                        response if has_skipped_candidate_notice(response) else response + "\n候选仍有效，请逐词处理",
                         record=restored,
                     )
         if not preserve_after_response:

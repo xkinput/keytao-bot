@@ -85,6 +85,7 @@ from ..utils.image_input import (
 from ..utils.llm_policy import log_chat_usage, with_deepseek_chat_policy
 from ..utils import keytao_review, review_flags, user_resolver as _user_resolver
 from ..utils import community_vote as _community_vote
+from ..utils import reply_copy as _reply_copy
 from ..utils.observability import (
     begin_turn_metrics,
     emit_turn_metrics,
@@ -1982,7 +1983,7 @@ def _advertised_reply_matches_live_record(
         and record.state.confirmation_source == "local_preview"
     ):
         rendered = _render_live_batch_record(record)
-        if not rendered or _candidate_render_lines(response) != _candidate_render_lines(rendered):
+        if not rendered or not _reply_copy.candidate_cards_match(response, rendered):
             return bool(
                 _candidate_render_lines(response) == _candidate_render_lines(
                     _chat_routing._format_live_ticket_precedence_message(record.state)
@@ -1991,7 +1992,12 @@ def _advertised_reply_matches_live_record(
             )
         for command in advertised_reply_contract(response).command_suggestions:
             if not _chat_routing.message_authorizes_live_pending_mutation(command, record.state):
-                return False
+                intent = _pending_tool_assent_intent(record.state, command)
+                if not (
+                    intent is not None and intent.intent == "pending_cancel"
+                    and _message_authorizes_pending_state_control(record.state, command, intent)
+                ):
+                    return False
         return True
     contract = advertised_reply_contract(response)
     if not contract.requires_live_state:
@@ -2137,7 +2143,7 @@ def _advertised_reply_matches_live_record(
         and isinstance(state.args.get("_pending_display"), dict)
         and str(
             state.args["_pending_display"].get("collisionReplanLine") or ""
-        ).startswith("已调整：")
+        ).startswith(_reply_copy.COLLISION_REPLAN_PREFIX)
     )
     if advertises_batch_action and not (
         (
@@ -2304,7 +2310,7 @@ def _reply_carries_live_candidate_state(
     record: Optional[PendingStateRecord],
 ) -> bool:
     """Recognize a candidate display whose live affordance trailer was removed."""
-    if record is None or record.execution_id or "候选" not in response:
+    if record is None or record.execution_id or not _reply_copy.has_candidate_card(response):
         return False
     state = record.state
     if (
@@ -2395,7 +2401,7 @@ def _live_candidate_affordances_are_complete(
         expected = _render_live_single_candidate_record(record)
         expected_contract = advertised_reply_contract(expected)
         return bool(
-            "推荐编码：暂无（现有候选均需点名顶替）" in response
+            _reply_copy.no_recommended_candidate(response)
             and expected_contract.command_suggestions
             and set(expected_contract.command_suggestions).issubset(contract.command_suggestions)
             and not contract.batch_assent_forms
@@ -2414,12 +2420,8 @@ def _live_candidate_affordances_are_complete(
     return contract.candidate_selection
 
 
-_COMMONNESS_COMPARISON_COPY_RE = re.compile(
-    r"(?:常用度(?:对比|比较)|较[^\n，。；]{0,16}常用|"
-    r"更[^\n，。；]{0,16}常用|频率[^\n，。；]{0,16}(?:高|低)|"
-    r"日常语感|直觉比较)"
-)
-_COMMONNESS_SPECULATION_RE = re.compile(r"(?:日常语感|直觉|凭感觉|我觉得|可能略?[高低])")
+_COMMONNESS_COMPARISON_COPY_RE = _reply_copy.COMMONNESS_COMPARISON_COPY_RE
+_COMMONNESS_SPECULATION_RE = _reply_copy.COMMONNESS_SPECULATION_RE
 
 
 def _normalized_commonness_copy(value: object) -> str:
@@ -2444,7 +2446,9 @@ def _commonness_line_is_backed(
     if not normalized_evidence:
         return False
     payload = re.sub(r"^[•*-]+", "", normalized_line)
-    payload = re.sub(r"^(?:常用度(?:对比|比较)|依据)[:：]", "", payload)
+    if payload in normalized_evidence:
+        return True
+    payload = _reply_copy.COMMONNESS_PREFIX_RE.sub("", payload)
     if payload in normalized_evidence:
         return True
     matched = [evidence for evidence in normalized_evidence if evidence in payload]
@@ -2478,16 +2482,12 @@ def _strip_unbacked_commonness_copy(
     return "\n".join(kept)
 
 
-_NUMBERED_CANDIDATE_ROW_RE = re.compile(
-    r"(?mi)^\s*\d+\s*[.．、)）]\s*(?:`|\*\*)?([a-z]{1,12})(?:`|\*\*)?"
-    r"\s*(?:[—–\-:：]|\s)\s*[^\n]*"
-    r"(?:已有|占用|占位|空位|推荐)"
-)
+_NUMBERED_CANDIDATE_ROW_RE = _reply_copy.NUMBERED_CANDIDATE_ROW_RE
 
 
 def _numbered_candidates_match_record(text: str, record: Optional[PendingStateRecord]) -> bool:
     """Numbered occupancy rows need the exact trusted inventory, even sans footer."""
-    codes = tuple(match.group(1).lower() for match in _NUMBERED_CANDIDATE_ROW_RE.finditer(text))
+    codes = _reply_copy.numbered_candidate_codes(text)
     if not codes:
         return True
     if record is None or record.execution_id:
@@ -2501,8 +2501,8 @@ def _numbered_candidates_match_record(text: str, record: Optional[PendingStateRe
         )
     if isinstance(state, PendingToolConfirm):
         rendered = _render_live_batch_record(record)
-        expected = tuple(match.group(1).lower() for match in _NUMBERED_CANDIDATE_ROW_RE.finditer(rendered))
-        return bool(expected and codes == expected and _candidate_render_lines(text) == _candidate_render_lines(rendered))
+        expected = _reply_copy.numbered_candidate_codes(rendered)
+        return bool(expected and codes == expected and _reply_copy.candidate_cards_match(text, rendered))
     return False
 
 
@@ -2676,7 +2676,7 @@ def _enforce_candidate_reply_contract(
         record is not None and isinstance(record.state, PendingToolConfirm)
         and record.state.function_name == "keytao_understood_command"
     ):
-        if record.execution_id and str(response).startswith("我理解为：「"):
+        if record.execution_id and str(response).startswith(_reply_copy.UNDERSTOOD_COMMAND_PREFIX):
             return "当前确认正在处理中，本次未重复执行。"
         if _advertised_reply_matches_live_record(response, record):
             return _chat_commands.render_pending_understood_command(record.state)
@@ -2685,7 +2685,7 @@ def _enforce_candidate_reply_contract(
         plan = (record.state.args.get("_pending_display") or {}).get("shiftPlan") or {}
         evidence = (*evidence, *(
             line for line in plan.get("evidenceLines", [])
-            if isinstance(line, str) and line.startswith("常用度提示：")
+            if isinstance(line, str) and line.startswith(_reply_copy.COMMONNESS_HINT_PREFIX)
         ))
     text = _strip_unbacked_commonness_copy(
         str(response or ""),
@@ -2869,20 +2869,15 @@ def _append_unreported_submit_status(
             for receipt in deliveries
         ),
     }
-    for kind, pattern in (
-        ("submit", r"已(?:经)?(?:成功)?(?:为你)?(?:重新)?提交|提交成功|审核中"),
-        ("dictionary", r"已(?:经)?(?:加入|写入)词库|已入库|入库成功|(?:已)?审核通过|已通过审核|已批准|批准成功"),
-        ("write", r"已(?:经)?(?:成功)?写入(?!词库)|写入成功|已加入草稿|(?:已添加|添加成功|已更新|更新成功)(?=[^。！？\n]{0,20}(?:草稿|词库|批次|条目|编码))"),
-        ("delete", r"已(?:经)?(?:成功)?(?:删除|移除)|(?:删除|移除)成功"),
-    ):
+    for kind, pattern in _reply_copy.SUCCESS_CLAIM_RES:
         if claim_receipts[kind]:
             continue
-        for match in re.finditer(r"(?<![未没不无])(?:" + pattern + r")", claim_text):
+        for match in pattern.finditer(claim_text):
             prefix = re.split(r"[\n。！？；]", claim_text[:match.start()])[-1].strip()
-            prefix = re.sub(r"^(?:好的|好|收到)[，,：:]\s*", "", prefix)
+            prefix = _reply_copy.ACTION_CLAIM_LEAD_RE.sub("", prefix)
             # Describing an existing batch or word is not a receipt for this turn.
-            current_action = re.match(r"(?:✅|本次|本轮|现在|刚刚|现已|我(?:$|已)|已确认)", prefix)
-            bare_result = prefix in {"", "批次", "整批", "草稿"} and match.group() != "审核中"
+            current_action = _reply_copy.CURRENT_ACTION_PREFIX_RE.match(prefix)
+            bare_result = prefix in _reply_copy.BARE_ACTION_CLAIM_PREFIXES and match.group() != _reply_copy.PENDING_REVIEW_CLAIM
             if current_action or bare_result:
                 return "本次没有可核验的对应操作成功回执，无法确认操作已完成；请查看草稿核对。"
     if not claim_receipts["write"]:
@@ -2896,7 +2891,7 @@ def _append_unreported_submit_status(
         return prepared
     if any(receipt.get("operationKind") == "draft_submit" for receipt in deliveries):
         return prepared
-    if any(status in prepared for status in ("已提交审核", "已加入词库", "尚未提交审核")):
+    if _reply_copy.has_submitted_draft_receipt(prepared):
         return prepared
     record = (
         conversation_state_store.get_record(conv_key)
@@ -3003,16 +2998,15 @@ def _prepare_user_facing_reply(
         from .chat_render import finalize_draft_receipt
         deltas = [receipt["writeReceipt"] for receipt in deliveries if receipt.get("writeReceipt")]
         if deltas:
-            if any(delta.get("writtenItems") or delta.get("updatedItems") for delta in deltas) and re.search(
-                r"(?:^|[，,。\n])(?:本次|本轮)(?:没有|未)(?:执行(?:任何)?(?:新的?)?写入|写入|添加)", prepared,
-            ):
+            if any(delta.get("writtenItems") or delta.get("updatedItems") for delta in deltas) and _reply_copy.NEGATIVE_WRITE_CLAIM_RE.search(prepared):
                 prepared = "本轮写入结果如下。"
             prepared = finalize_draft_receipt(prepared, *reversed(deltas), platform=platform)
         for receipt in deliveries:
             if receipt.get("operationKind") == "draft_submit":
-                status = ("✅ 批次已加入词库。" if receipt.get("autoApproved") or receipt.get("writeReceipt", {}).get("autoApproved")
+                auto_approved = receipt.get("autoApproved") or receipt.get("writeReceipt", {}).get("autoApproved")
+                status = ("✅ 批次已加入词库。" if auto_approved
                           else "✅ 批次已提交审核。")
-                if status not in prepared:
+                if not _reply_copy.has_exact_submission_status(prepared, auto_approved):
                     prepared += "\n" + status
         link_lines = list(dict.fromkeys(finalize_draft_receipt(
             "", {"batchId": receipt["batchId"]}, platform=platform,
@@ -4944,19 +4938,17 @@ async def _try_stale_displacement_reply(ctx: TurnContext) -> bool:
             occupant = displacement["occupant"]
             quoted = ctx.reply_reference.text
             candidate = _parse_pending_add_word(quoted)
-            comparison = re.search(
-                rf"「{re.escape(occupant)}」(?:不弱于|较)「([^」\n]+)」"
-                rf"|「([^」\n]+)」与「{re.escape(occupant)}」(?:的)?常用度", quoted,
-            )
+            compared_word = _reply_copy.protected_occupant_comparison_word(quoted, occupant)
             word = (candidate.word if candidate else advertised_single_word_lookup_word(quoted))
-            if not word and comparison:
-                word = comparison[1] or comparison[2]
+            if not word and compared_word:
+                word = compared_word
             if word and word != occupant:
-                occupied_codes = set(re.findall(
-                    rf"(?m)^\s*\d+\.\s*([a-z]+)\s*[-—–]\s*已有「{re.escape(occupant)}」", quoted,
-                ))
-                if not occupied_codes and comparison:
-                    occupied_codes = set(re.findall(r"加入编码\s+([a-z]+)\+形码", quoted))
+                occupied_codes = {
+                    row["code"] for row in _reply_copy.candidate_rows(quoted)
+                    if occupant in _reply_copy.candidate_label_occupants(row["label"])
+                }
+                if not occupied_codes and compared_word:
+                    occupied_codes = set(_reply_copy.SHAPE_CODE_HINT_RE.findall(quoted))
                 try:
                     draft = json.loads(await call_tool_function(
                         "keytao_list_draft_items", {}, ctx.platform, ctx.user_id,
@@ -5857,48 +5849,11 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
                     )
                 ):
                     refreshed_pairs = advertised_batch_binding_pairs(recovered)
-                    def displayed_statuses(
-                        display_text: str,
-                        pairs: tuple[tuple[str, str], ...],
-                    ) -> dict[str, tuple[bool | None, bool | None]]:
-                        normalized = unicodedata.normalize("NFKC", display_text)
-                        statuses: dict[str, tuple[bool | None, bool | None]] = {}
-                        for status_word, status_code in pairs:
-                            match = re.search(
-                                re.escape(status_word)
-                                + r"[」”』]?\s*(?:→|->)\s*"
-                                + re.escape(status_code)
-                                + r"\s*(?:[（(](?P<annotation>[^）)\n]{0,128})[）)])?",
-                                normalized,
-                                re.IGNORECASE,
-                            )
-                            annotation = str(
-                                (match.group("annotation") or "")
-                                if match is not None
-                                else ""
-                            )
-                            occupied = (
-                                False
-                                if re.search(r"空位|未占用", annotation)
-                                else True
-                                if re.search(r"已有|已占用|占用中", annotation)
-                                else None
-                            )
-                            needs_review = (
-                                True
-                                if re.search(r"需(?:要)?管理员审核|待管理员审核", annotation)
-                                else False
-                                if re.search(r"可自动通过|无需管理员审核|自动通过", annotation)
-                                else None
-                            )
-                            statuses[status_word] = (occupied, needs_review)
-                        return statuses
-
-                    previous_statuses = displayed_statuses(
+                    previous_statuses = _reply_copy.displayed_candidate_statuses(
                         ctx.reply_reference.text,
                         displayed_pairs,
                     )
-                    refreshed_statuses = displayed_statuses(
+                    refreshed_statuses = _reply_copy.displayed_candidate_statuses(
                         str(recovered),
                         refreshed_pairs,
                     )
@@ -7851,6 +7806,7 @@ _CHAT_COMPAT_STDLIB_TYPING_WHITELIST = frozenset({
 # New cross-module shared names must be registered here so legacy
 # ``patch.object(openai_chat, ...)`` writes reach every extracted owner.
 _CHAT_COMPAT_NAMES = (
+    "_reply_copy",
     "render_server_backed_batch_candidates",
     "get_driver",
     "Bot",
