@@ -120,10 +120,30 @@ def receipt_change_lines(data: dict, requested_words=()) -> list[str]:
         str(item.get("word") or ""): str(item.get("reason") or item.get("message") or "服务端未返回具体原因")
         for field in ("failed", "skipped") for item in data.get(field) or [] if isinstance(item, dict)
     }
+    snapshot = data.get("draft_snapshot")
+    draft_items = snapshot.get("items") if isinstance(snapshot, dict) else data.get("draftItems")
+    if (not data.get("batchId") or
+            isinstance(snapshot, dict) and snapshot.get("batchId") not in (None, data["batchId"])):
+        draft_items = []
     for word in requested:
         if word not in written_words:
+            existing = [item for item in draft_items or []
+                        if isinstance(item, dict) and item.get("word") == word]
+            codes = list(dict.fromkeys(
+                item["code"] for item in existing
+                if item.get("action") in {"Create", "Change"} and item.get("code")
+            ))
+            moved_codes = list(dict.fromkeys(
+                item["code"] for item in existing
+                if item.get("action") == "Create" and item.get("code") and any(
+                    old.get("action") == "Delete" and old.get("type") == item.get("type")
+                    and old.get("code") and old["code"] != item["code"] for old in existing
+                )
+            ))
             reason = failures.get(word) or (
-                "已在草稿中，本轮未重复写入" if data.get("noWrite") else
+                "已在本批草稿中调整为 " + "、".join(moved_codes) if moved_codes else
+                "已在本批草稿中（→ " + "、".join(codes) + "）" if codes else
+                "已在草稿中，本轮未重复写入" if data.get("noWrite") or word in data.get("noWriteWords", []) else
                 "未取得该词的本轮写入回执，原因尚未确认"
             )
             lines.append(f"未新增变更：{word}（{reason}）")
@@ -132,10 +152,18 @@ def receipt_change_lines(data: dict, requested_words=()) -> list[str]:
 
 def merge_receipt_deltas(receipts: list[dict[str, Any]]) -> dict:
     """Merge actual same-turn evidence without counting a PR again on submit."""
-    merged = {"writtenItems": [], "updatedItems": [], "requestedWords": [], "failed": [], "skipped": []}
+    merged = {"writtenItems": [], "updatedItems": [], "requestedWords": [], "failed": [], "skipped": [],
+              "noWriteWords": []}
     positions = {}
     batch_statuses = {}
+    batch_ids = {receipt["batchId"] for receipt in receipts if receipt.get("batchId")}
+    draft_items_by_batch = {}
     for receipt in receipts:
+        snapshot = receipt.get("draft_snapshot")
+        draft_items = snapshot.get("items") if isinstance(snapshot, dict) else receipt.get("draftItems")
+        if (receipt.get("batchId") and isinstance(draft_items, list)
+                and (not isinstance(snapshot, dict) or snapshot.get("batchId") in (None, receipt["batchId"]))):
+            draft_items_by_batch[receipt["batchId"]] = draft_items
         if receipt.get("autoApproved") is True:
             batch_statuses[receipt.get("batchId")] = "Approved"
         elif receipt.get("tool") == "keytao_submit_batch" or receipt.get("operationKind") == "draft_submit":
@@ -143,13 +171,14 @@ def merge_receipt_deltas(receipts: list[dict[str, Any]]) -> dict:
         elif receipt.get("status") in {"Draft", "Submitted", "Approved", "Published"}:
             batch_statuses[receipt.get("batchId")] = receipt["status"]
     for receipt in receipts:
+        words = list(receipt.get("noWriteWords") or [])
         if receipt.get("noWrite"):
-            words = receipt.get("requestedWords") or [
+            words.extend(receipt.get("requestedWords") or [
                 item.get("word") for item in receipt.get("requestedItems") or [] if isinstance(item, dict)
-            ]
-            for word in words:
-                if word:
-                    merged["skipped"].append({"word": word, "reason": "已在草稿中，本轮未重复写入"})
+            ])
+        for word in words:
+            if word and word not in merged["noWriteWords"]:
+                merged["noWriteWords"].append(word)
         for field in ("requestedWords", "failed", "skipped"):
             for value in receipt.get(field) or []:
                 if value not in merged[field]:
@@ -173,4 +202,8 @@ def merge_receipt_deltas(receipts: list[dict[str, Any]]) -> dict:
                 else:
                     positions[identity] = (field, len(merged[field]))
                     merged[field].append(dict(row))
+    if len(batch_ids) == 1:
+        merged["batchId"] = next(iter(batch_ids))
+        if merged["batchId"] in draft_items_by_batch:
+            merged["draftItems"] = draft_items_by_batch[merged["batchId"]]
     return merged

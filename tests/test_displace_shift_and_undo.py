@@ -2881,9 +2881,61 @@ class MoveToCodeGrammarTests(unittest.TestCase):
         ))
 
 
+class F3RecodeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_f3_m1_11_same_code_aborts_multiclause_without_writes(self):
+        from tests.helpers import B18RealToolTests_setUp, TOOLS
+
+        B18RealToolTests_setUp(self)
+        self.http.entries = [
+            {"word": "甲", "code": "jxa", "type": "Phrase", "weight": 100},
+            {"word": "蛋白质", "code": "dbfa", "type": "Phrase", "weight": 100},
+        ]
+        before = copy.deepcopy(self.http.entries)
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **TOOLS.TOOL_FUNCTIONS}
+        with patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get):
+            for words, codes, message in (
+                (["甲", "蛋白质"], ["aaa", "dbfa"], "改码 甲 aaa，蛋白质 dbfa"),
+                (["蛋白质", "甲"], ["dbfa", "aaa"], "改码 蛋白质 dbfa，甲 aaa"),
+            ):
+                with self.subTest(message=message):
+                    await self.replay.turn({"message": message, "to_me": True}, raw_operation(
+                        op="recode", operands=words, codes=codes,
+                    ))
+                    self.assertIn("「蛋白质」已经是 dbfa，无需修改。", self.replay.last_response)
+                    self.assertIn("本次未写入", self.replay.last_response)
+                    self.assertEqual(self.http.writes, [])
+                    self.assertEqual(self.http.rows, [])
+                    self.assertEqual(self.http.entries, before)
+        self.assertEqual(self.http.errors, [])
+
+    async def test_f3_m1_11_same_code_and_duplicate_recodes_have_specific_reasons(self):
+        from keytao_bot.harness.operation_request import OperationRequest
+        from tests.helpers import B18RealToolTests_setUp, TOOLS
+
+        B18RealToolTests_setUp(self)
+        self.http.entries = [{"word": "蛋白质", "code": "dbfa", "type": "Phrase", "weight": 100}]
+        functions = {**harness._lookup_tools.TOOL_FUNCTIONS, **TOOLS.TOOL_FUNCTIONS}
+        with patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get):
+            for operands, codes, message, expected in (
+                (("蛋白质",), ("dbfa",), "蛋白质 编码改为 dbfa", "「蛋白质」已经是 dbfa，无需修改。"),
+                (("蛋白质", "蛋白质"), ("dbfaa", "dbfai"),
+                 "改码 蛋白质 dbfaa，蛋白质 dbfai", "「蛋白质」重复指定改码；本次未写入。"),
+            ):
+                with self.subTest(message=message):
+                    request = OperationRequest(op="recode", operands=operands, codes=codes)
+                    resolved, _notes, error = await self.replay.commands._resolve_target_recodes(
+                        request, message, (), "qq", self.replay.author.actor_id,
+                    )
+                    self.assertIsNone(resolved)
+                    self.assertEqual(error, expected)
+        self.assertEqual(self.http.writes, [])
+        self.assertEqual(self.http.errors, [])
+
+
 def load_tests(loader, standard_tests, pattern):
     return _stage_t_unittest.TestSuite(
         loader.loadTestsFromTestCase(case) for case in (
+            F3RecodeTests,
             B11ShiftTests,
             B11BlockedToolLoopTests,
             B11SourceShiftTests,

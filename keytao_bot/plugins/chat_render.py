@@ -1550,12 +1550,13 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
         lines.append("候选编码:")
         for status in pronunciation.get("candidateStatuses", []):
             code = str(status.get("code") or "").strip().lower()
+            candidate_recommended = recommended_code if code not in candidate_indexes else ""
             candidate_indexes.setdefault(code, candidate_index)
             lines.append(
                 _format_review_candidate_line(
                     candidate_index,
                     status,
-                    str(pronunciation.get("recommendedCode") or ""),
+                    candidate_recommended,
                     ordering_recommended_code,
                 )
             )
@@ -1575,12 +1576,13 @@ def _format_reviewed_add_prompt(review: Dict) -> Optional[str]:
             lines.append(f"候选编码（读音 {index}）:")
             for status in pronunciation.get("candidateStatuses", []):
                 code = str(status.get("code") or "").strip().lower()
+                candidate_recommended = recommended_code if code not in candidate_indexes else ""
                 candidate_indexes.setdefault(code, candidate_index)
                 lines.append(
                     _format_review_candidate_line(
                         candidate_index,
                         status,
-                        str(pronunciation.get("recommendedCode") or ""),
+                        candidate_recommended,
                         ordering_recommended_code,
                     )
                 )

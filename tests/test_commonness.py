@@ -508,6 +508,40 @@ class CommonnessEvidenceTests(unittest.TestCase):
 
     insert = CommonnessEvidenceTests_insert
 
+    def test_f3_m2_04_commonness_conclusion_matches_displayed_evidence(self):
+        self.insert(("卡脖子", 6, "v", 3), ("这辈子", 3, "n", 0))
+        front = review._query_commonness_reference("卡脖子")
+        behind = review._query_commonness_reference("这辈子")
+        front["bcc"].update(available=True, attested=True, perMillion=2.63,
+                            channels=[{"channel": "新闻", "count": 2442, "perMillion": 2.63}])
+        behind["bcc"]["available"] = True
+        for frequencies, expected in (
+            ((6, 3), "not_enough_evidence"),
+            ((3, 3), "close"),
+            ((30000, 1), "front_more_common"),
+        ):
+            with self.subTest(frequencies=frequencies):
+                result = review._compare_reference_commonness(
+                    "卡脖子", "这辈子", dict(front, corpusFrequency=frequencies[0]),
+                    dict(behind, corpusFrequency=frequencies[1]),
+                )
+                self.assertEqual(result["verdict"], expected, result)
+                if expected == "not_enough_evidence":
+                    self.assertNotIn("更常用", result["summary"])
+        for front_score, expected, displayed_scores in (
+            (1.34, "behind_more_common", "1.44 vs 1.34"),
+            (1.64, "front_more_common", "1.64 vs 1.44"),
+        ):
+            with self.subTest(front_score=front_score):
+                result = review._compare_web_commonness_results(
+                    "大肥羊", "大肥鱼",
+                    {"success": True, "score": front_score, "signals": {"search": .8, "encyclopedia": .3}},
+                    {"success": True, "score": 1.44, "signals": {"search": .5, "encyclopedia": .7}},
+                    reference_available=True,
+                )
+                self.assertEqual(result["verdict"], expected, result)
+                self.assertIn(displayed_scores, result["summary"])
+
     def test_incident_words_use_review_rule_and_retain_absence(self):
         self.insert(
             ("耶博", 100, "n", 2),

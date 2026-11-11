@@ -4927,10 +4927,13 @@ async def _try_stale_displacement_reply(ctx: TurnContext) -> bool:
             occupant = displacement["occupant"]
             quoted = ctx.reply_reference.text
             candidate = _parse_pending_add_word(quoted)
-            comparison = re.search(rf"「{re.escape(occupant)}」不弱于「([^」\n]+)」", quoted)
+            comparison = re.search(
+                rf"「{re.escape(occupant)}」(?:不弱于|较)「([^」\n]+)」"
+                rf"|「([^」\n]+)」与「{re.escape(occupant)}」(?:的)?常用度", quoted,
+            )
             word = (candidate.word if candidate else advertised_single_word_lookup_word(quoted))
             if not word and comparison:
-                word = comparison[1]
+                word = comparison[1] or comparison[2]
             if word and word != occupant:
                 occupied_codes = set(re.findall(
                     rf"(?m)^\s*\d+\.\s*([a-z]+)\s*[-—–]\s*已有「{re.escape(occupant)}」", quoted,

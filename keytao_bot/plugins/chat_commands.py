@@ -619,6 +619,7 @@ def _server_ordering_snapshot(
             "occupantCode": occupant_code,
             "freeCode": free_code,
             "newCode": new_code,
+            "summary": str(assessment.get("summary") or "").strip(),
         })
     return snapshot
 
@@ -3701,7 +3702,19 @@ async def _prepare_multi_word_query(
         siblings = {candidate: reserved[candidate] for candidate, occupied in scope["candidates"]
                     if not occupied and candidate in reserved}
         scope["siblingRecommendations"] = siblings
-        if code in siblings:
+        scope["orderingAssessments"] = [
+            assessment for assessment in scope["orderingAssessments"]
+            if not (assessment.get("verdict") == "front_more_common" and (
+                assessment.get("occupantCode") in reserved
+                or assessment.get("freeCode") in reserved
+            ))
+        ]
+        reviewed["serverOrderingAssessments"] = scope["orderingAssessments"]
+        if code in reserved or (dict(scope["candidates"]).get(code) is True
+                and validated_front_insert_recommendation(
+                    scope["word"], scope["candidates"], scope["occupiedWords"],
+                    scope["orderingAssessments"],
+                ) is None):
             reading = reviewed["pronunciationCodes"].get(code)
             following = False
             replacement = ""
@@ -12837,8 +12850,11 @@ async def _resolve_target_recodes(request, message, original_operands, platform,
         if len(resolved) != 1:
             return None, (), "词条或旧码无法唯一确定。请指定旧码；本次未写入。"
         row, new_code = resolved[0]
-        if row["word"] in words or row["code"] == new_code:
-            return None, (), "改码词条重复或目标编码与旧码相同；本次未写入。"
+        if row["word"] in words:
+            return None, (), f"「{row['word']}」重复指定改码；本次未写入。"
+        if row["code"] == new_code:
+            error = f"「{row['word']}」已经是 {new_code}，无需修改。"
+            return None, (), error + ("本次未写入。" if len(clauses) > 1 else "")
         words.append(row["word"])
         codes.extend((row["code"], new_code))
     return replace(request, operands=tuple(words), codes=tuple(codes)), (), ""

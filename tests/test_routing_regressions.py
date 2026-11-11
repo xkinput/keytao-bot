@@ -1057,6 +1057,77 @@ class B9ParallelTests(unittest.IsolatedAsyncioTestCase):
 
     prepare = B9ParallelTests_prepare
 
+    async def test_f3_m2_3_ordering_evidence_and_sibling_recommendation_agree(self):
+        from keytao_bot.harness.state import _pending_add_word_payload
+        from keytao_bot.utils.commonness_copy import candidate_commonness_summary_copy
+        from keytao_bot.utils.pending_confirmation import (
+            front_insert_recommendation_copy, render_server_backed_single_word_candidates,
+            render_server_backed_single_word_lookup,
+        )
+
+        self.words = ("肉肠", "肉偿")
+        scopes = {}
+        for word, tail, recommended in (("肉肠", "rdjpiu", "rdjpi"), ("肉偿", "rdjpii", "rdjp")):
+            state = PendingAddWord(
+                word, recommended, [("rdjp", True), ("rdjpi", False), (tail, False)],
+                occupied_words={"rdjp": ["柔肠"]},
+                pronunciation_codes={code: "rou chang" for code in ("rdjp", "rdjpi", tail)},
+                needs_manual_review=True, manual_review_reason="需要管理员审核",
+            )
+            assessment = {
+                "verdict": "front_more_common" if word == "肉偿" else "close",
+                "newWord": word, "occupantWord": "柔肠", "occupantCode": "rdjp",
+                "freeCode": "rdjpi", "newCode": recommended,
+                "summary": "语料频次 20 vs 10，词典收录 2 vs 2",
+            }
+            state.server_candidates = state.candidates
+            state.server_occupied_words = state.occupied_words
+            state.server_ordering_assessments = self.replay.commands._server_ordering_snapshot(
+                state, state.candidates, state.occupied_words, [assessment],
+            )
+            scopes[word] = {
+                "word": word, "candidates": state.candidates,
+                "occupiedWords": state.occupied_words,
+                "orderingAssessments": state.server_ordering_assessments,
+                "reviewedState": _pending_add_word_payload(state),
+                "reviewedPrompt": render_server_backed_single_word_candidates(
+                    word, recommended, state.candidates, state.occupied_words,
+                    state.server_ordering_assessments,
+                ),
+            }
+        with self.subTest(case="snapshot"):
+            self.assertEqual(scopes["肉偿"]["orderingAssessments"][0].get("summary"), assessment["summary"])
+        with self.subTest(case="missing evidence"):
+            legacy = {**assessment, "summary": ""}
+            self.assertNotIn("依据：", front_insert_recommendation_copy(legacy))
+            self.assertNotIn("不弱于", candidate_commonness_summary_copy({**legacy, "verdict": "behind_more_common"}))
+        with self.subTest(case="reserved free slot"):
+            second = render_server_backed_single_word_lookup(
+                "肉偿", "rdjpii", scopes["肉偿"]["candidates"], {"rdjp": ["柔肠"]},
+                sibling_recommendations={"rdjpi": "肉肠"},
+                ordering_assessments=[{**assessment, "verdict": "close", "newCode": "rdjpi"}],
+                actionable_controls=True,
+            )
+            self.assertIn("推荐空位 rdjpii", second)
+            self.assertIn("rdjpii — ✅ 推荐（空位）", second)
+            self.assertIn("推荐编码：rdjpii", second)
+
+        async def prepare_word(word, *_args, **kwargs):
+            kwargs["_prepared_scopes"].append(scopes[word])
+            return ""
+
+        with patch.object(self.replay.commands, "_try_handle_simple_single_word_query", side_effect=prepare_word):
+            response = await self.prepare()
+        with self.subTest(case="sibling"):
+            state = self.replay.store.get(self.replay.author)
+            self.assertIsNotNone(state, response)
+            self.assertEqual([item["code"] for item in state.args["items"]], ["rdjpi", "rdjpii"], response)
+            second = response.split("2. 「肉偿」", 1)[1]
+            self.assertIn("rdjpii — ✅ 推荐（空位）", second)
+            self.assertIn("推荐编码：rdjpii", second)
+            self.assertNotIn("推荐空位 rdjpi", second)
+            self.assertIsNone(self.replay.commands._pending_batch_front_insert_plan(state))
+
     async def test_reviews_overlap_at_most_two_and_keep_input_order(self):
         response = await self.prepare()
         self.assertEqual(self.peak, 2)

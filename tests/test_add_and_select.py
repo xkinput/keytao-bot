@@ -449,7 +449,7 @@ class B12SelectionTests(unittest.IsolatedAsyncioTestCase):
                 await self.turn("正手刀 3，加入", prompt)
                 self.assertEqual(self.created(), [("正手刀", "qsdzia")], self.replay.last_response)
                 await self.turn(action, prompt)
-                self.assertEqual(self.created(), [("正手刀", "qsdzia"), ("削刀", "xhdzi")], self.replay.last_response)
+                self.assertEqual(self.created(), [("正手刀", "qsdzia"), ("削刀", "xhdzia")], self.replay.last_response)
                 self.assert_offline_route()
 
     async def test_r6_only_unbound_occupied_candidates_cannot_write(self):
@@ -1542,6 +1542,70 @@ class B18RealToolTests(unittest.IsolatedAsyncioTestCase):
                      **harness._review_tools.TOOL_FUNCTIONS, **TOOLS.TOOL_FUNCTIONS}
         self.enterContext(patch.object(self.replay.chat.tool_executor, "_get_tool_function", functions.get))
         return review
+
+    async def test_f3_m2_08_polyphonic_card_has_one_global_recommendation(self):
+        self.install_f2_review_http({"降了": ("jxle", "jiàng le")}, {"降了"})
+        self.http.encode_overrides["降了"] = {
+            "codes": ["jxle", "jxlea", "jxleaa"],
+            "pronunciationSource": "pinyin-pro-context", "standardPronunciationStatus": "absent",
+            "alternatePhrasePronunciationCodes": [
+                {"pinyins": ["xiáng", "le"], "codes": ["xxle", "xxlea", "xxleaa"]},
+                {"pinyins": ["jiàng", "liǎo"], "codes": ["jxlc", "jxlca", "jxlcaa"]},
+            ],
+            "chars": [
+                {"char": "降", "pinyin": "jiàng", "pinyins": ["jiàng", "xiáng"], "pronunciationLookupStatus": "found"},
+                {"char": "了", "pinyin": "le", "pinyins": ["le", "liǎo"], "pronunciationLookupStatus": "found"},
+            ],
+        }
+        self.http.entries = [{"word": word, "code": code, "type": "Phrase", "weight": 100}
+                             for word, code in (("讲了", "jxle"), ("想了", "xxle"), ("浆料", "jxlc"))]
+        result = await harness._review_tools.keytao_prepare_reviewed_add("降了")
+        from keytao_bot.plugins.chat_render import _format_reviewed_add_prompt
+        prompt = _format_reviewed_add_prompt(result)
+        self.assertEqual(len(result["pronunciations"]), 1, result)
+        self.assertEqual(result["pronunciations"][0]["pinyin"], "jiàng le")
+        self.assertEqual(result["pronunciations"][0]["codes"], ["jxle", "jxlea", "jxleaa"])
+        self.assertEqual(result["pronunciationResolution"]["status"], "encode_default")
+        self.assertTrue(result["requiresManualPronunciationReview"])
+        self.assertEqual(prompt.count("✅ 推荐"), 1, prompt)
+        marker_line = next(line for line in prompt.splitlines() if "✅ 推荐" in line)
+        self.assertIn(result["recommendedCode"], marker_line)
+        self.assertIn(f"• 「降了」→ {result['recommendedCode']}（推荐）", prompt)
+        self.assertEqual(self.http.writes, [])
+        await self.turn("加词「降了」", raw_operation(op="add", operands=["降了"], codes=[]))
+        self.assertEqual(self.replay.last_response.count("✅ 推荐"), 1, self.replay.last_response)
+        candidate_prompt = self.replay.last_response
+        self.assertTrue(self.replay.store.bind_origin_prompt_digest(
+            self.replay.author, self.replay.chat._prompt_capability_digest(candidate_prompt),
+        ))
+        self.replay.history[:] = [{"role": "assistant", "content": candidate_prompt}]
+        await self.replay.turn({"message": "降了 8，加入", "to_me": True, "quote_target": candidate_prompt},
+                               raw_operation(op="select_candidate", refers_to_pending=True))
+        self.assertEqual(self.http.writes, [], self.replay.last_response)
+        self.assertIn("候选编号无效", self.replay.last_response)
+        self.assertNotIn("jxlca", self.replay.last_response)
+        await self.replay.turn({"message": "降了 2，加入", "to_me": True, "quote_target": candidate_prompt},
+                               raw_operation(op="select_candidate", refers_to_pending=True))
+        self.assertEqual(self.created(), [("降了", "jxlea")], self.replay.last_response)
+        self.assertEqual(len(self.http.writes), 1)
+
+    async def test_f3_m3_10_explicit_reading_survives_pre_submit_audit(self):
+        self.install_f2_review_http({"什饼": ("ekbg", "shí bǐng")}, {"什饼"})
+        self.http.encode_overrides["什饼"] = {"codes": ["ekbg", "ekbgi", "ekbgiu"]}
+        self.http.entries = [{"word": "士兵", "code": "ekbg", "type": "Phrase", "weight": 100}]
+        result = await harness._review_tools.keytao_prepare_reviewed_add("什饼", requested_reading="shi2 bing3")
+        self.assertEqual(result["recommendedCode"], "ekbgi", result)
+        self.assertIn("ekbgi", result["pronunciations"][0]["codes"])
+        audited = result["preSubmitAudit"]["reviewedWords"]["什饼@Phrase"]
+        self.assertTrue(audited["pronunciations"], audited)
+        self.assertIn("ekbgi", audited["pronunciations"][0]["codes"], audited)
+        self.assertEqual(audited["requestedReading"], "shi2 bing3")
+        from keytao_bot.plugins.chat_render import _format_reviewed_add_prompt
+        prompt = _format_reviewed_add_prompt(result)
+        self.assertNotIn("不在读音候选链", prompt)
+        self.assertNotIn("可选：无", prompt)
+        self.assertIn("管理员审核", prompt)
+        self.assertEqual(self.http.writes, [])
 
     async def test_f2_m1_08_unconfirmed_whole_word_uses_default_candidate_in_ten_word_list(self):
         facts = {

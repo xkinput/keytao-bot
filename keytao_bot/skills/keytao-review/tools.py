@@ -132,8 +132,12 @@ async def _try_llm_auto_review_for_preview(
         return None
 
 
-async def _build_pre_submit_audit(config: ReviewHttpConfig, word: str, code: str) -> Dict[str, Any]:
+async def _build_pre_submit_audit(
+    config: ReviewHttpConfig, word: str, code: str, *, requested_reading: str = "",
+) -> Dict[str, Any]:
     item = _preview_create_item(word, code)
+    if requested_reading:
+        item["requestedReading"] = requested_reading
     deterministic_audit = await audit_draft_items(config, [item])
     deterministic_audit["previewOnly"] = True
     if deterministic_audit.get("autoApprove") or not can_llm_override_audit_issues(deterministic_audit):
@@ -184,6 +188,7 @@ async def keytao_prepare_reviewed_add(
                 config,
                 reviewed_word,
                 recommended_code,
+                **({"requested_reading": requested_reading} if requested_reading else {}),
             )
         except Exception as error:
             logger.warning(f"[prepare_reviewed_add] pre-submit audit failed: {error}")

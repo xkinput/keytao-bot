@@ -3773,7 +3773,7 @@ def test_candidate_commonness_copy_snapshot_and_zero_writes():
     )
     check(
         "occupant branch keeps the current order and free recommendation",
-        "「慑服」不弱于「射覆」，维持现有排序，推荐空位 eefju" in behind_prompt,
+        "「射覆」与「慑服」的常用度信号不足，维持现有排序，推荐空位 eefju" in behind_prompt,
     )
     check(
         "insufficient branch degrades to the free recommendation",

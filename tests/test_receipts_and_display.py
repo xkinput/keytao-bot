@@ -282,10 +282,14 @@ class B16ItemOneTests(unittest.IsolatedAsyncioTestCase):
         ))
         review["pronunciations"].append({
             **review["pronunciations"][0], "pinyin": "chu zuo biao xi",
+            "recommendedCode": "czbx",
             "candidateStatuses": [{"code": "czbx", "occupied": False, "words": [], "phrases": []}],
         })
         reviewed_prompt = self.replay.commands._format_reviewed_add_prompt(review)
         self.assertIn("候选编码（读音 1）:", reviewed_prompt)
+        self.assertEqual(reviewed_prompt.count("✅ 推荐"), 1, reviewed_prompt)
+        marker_line = next(line for line in reviewed_prompt.splitlines() if "✅ 推荐" in line)
+        self.assertIn(review["recommendedCode"], marker_line)
         rendered = render_server_backed_single_word_lookup(
             b15_sibling_and_others_WORDS[1], "qzbxv", [(code, False) for code in [*b15_sibling_and_others_CODES, "czbx"]], {},
             reviewed_prompt=reviewed_prompt, sibling_recommendations={"qzbx": b15_sibling_and_others_WORDS[0]},
@@ -2616,6 +2620,77 @@ class ReceiptDeltaTests(unittest.IsolatedAsyncioTestCase):
     tearDown = ReceiptDeltaTests_tearDown
 
     invoke = ReceiptDeltaTests_invoke
+
+    async def test_f3_m3_11_already_moved_occupant_receipt_uses_current_draft_code(self):
+        from tests.helpers import b19_partial_reply_binding_DraftHTTP
+
+        tools = harness._draft_tools
+        http = b19_partial_reply_binding_DraftHTTP()
+        with (
+            patch.object(tools.httpx, "AsyncClient", return_value=http, create=True),
+            patch.object(tools.http_client, "_keytao_client", http),
+            patch.dict("os.environ", {"BOT_API_TOKEN": "offline-token"}),
+        ):
+            move_items = [
+                {"action": "Delete", "word": "义举", "code": "ykjlo", "type": "Phrase"},
+                {"action": "Create", "word": "义举", "code": "ykjloa", "type": "Phrase"},
+            ]
+            moved = await tools.keytao_batch_add_to_draft(
+                "qq", "f3-receipt-owner", move_items, batch_id=http.batch_id,
+                confirmed=True, expected_content_version=0, expected_warning_digest="a" * 64,
+            )
+            self.assertTrue(moved.get("success"), moved)
+            before = completed_draft_undo._snapshot(await tools.keytao_list_draft_items(
+                "qq", "f3-receipt-owner", batch_id=http.batch_id,
+            ))
+            args = {
+                "items": [{"action": "Create", "word": "宜居", "code": "ykjlo", "type": "Phrase"}],
+                "batch_id": http.batch_id, "confirmed": True,
+                "expected_content_version": 1, "expected_warning_digest": "a" * 64,
+            }
+            added = await tools.keytao_batch_add_to_draft("qq", "f3-receipt-owner", **args)
+            self.assertTrue(added.get("success"), added)
+            after = completed_draft_undo._snapshot(await tools.keytao_list_draft_items(
+                "qq", "f3-receipt-owner", batch_id=http.batch_id,
+            ))
+        self.assertEqual(http.errors, [])
+        self.assertEqual(len(http.writes), 2)
+        receipt = completed_draft_undo._attach_receipt_delta(
+            "keytao_batch_add_to_draft", args, added, before, after,
+        )
+        for snapshot_field in ("draftItems", "draft_snapshot"):
+            with self.subTest(snapshot_field=snapshot_field):
+                source = {key: value for key, value in receipt.items() if key != "draftItems"}
+                source[snapshot_field] = (receipt["draftItems"] if snapshot_field == "draftItems"
+                                          else {"items": receipt["draftItems"]})
+                final = render.finalize_draft_receipt(
+                    "✅ 操作已完成", source, platform="qq", requested_words=("宜居", "义举"),
+                )
+                self.assertIn("已变更：宜居 → ykjlo", final)
+                self.assertIn("未新增变更：义举（已在本批草稿中调整为 ykjloa）", final)
+                self.assertNotIn("原因尚未确认", final)
+                self.assertNotIn("义举 ykjlo→ykjloa", final)
+        no_write = {**receipt, "noWrite": True, "writtenItems": [], "updatedItems": [],
+                    "requestedWords": ["义举"]}
+        final = render.finalize_draft_receipt("✅ 操作已完成", no_write, platform="qq")
+        self.assertIn("未新增变更：义举（已在本批草稿中调整为 ykjloa）", final)
+        for field in ("failed", "skipped"):
+            with self.subTest(reason_field=field):
+                source = {**no_write, field: [{"word": "义举", "reason": "编码已变化"}]}
+                final = render.finalize_draft_receipt("✅ 操作已完成", source, platform="qq")
+                self.assertIn("未新增变更：义举（编码已变化）", final)
+                self.assertNotIn("已在本批草稿中调整", final)
+        source = {**no_write, "draftItems": [
+            item for item in receipt["draftItems"] if item.get("action") != "Delete"
+        ]}
+        final = render.finalize_draft_receipt("✅ 操作已完成", source, platform="qq")
+        self.assertIn("未新增变更：义举（已在本批草稿中（→ ykjloa））", final)
+        self.assertNotIn("调整为", final)
+        other_batch = {"batchId": "another-batch", "writtenItems": [], "draftItems": receipt["draftItems"]}
+        source = {**no_write, "noWrite": False, "draftItems": []}
+        final = render.finalize_draft_receipt("✅ 操作已完成", source, other_batch, platform="qq")
+        self.assertIn("未新增变更：义举（未取得该词的本轮写入回执，原因尚未确认）", final)
+        self.assertNotIn("已在本批草稿中", final)
 
     async def test_one_three_and_four_actual_pr_rows_exclude_old_unrelated_ids(self):
         for items in ([CREATES[3]], CREATES[:3], CREATES):

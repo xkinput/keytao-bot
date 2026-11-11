@@ -423,7 +423,7 @@ class B13DefaultReadingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reviewDisposition"], "SEAL")
         self.fetch_encode.assert_awaited_once_with(None, "大肥鱼")
 
-    async def test_no_evidence_keeps_all_encoder_reading_groups(self):
+    async def test_no_evidence_keeps_only_default_encoder_reading_group(self):
         self.encode["candidateCodes"].append("dfyva")
         self.encode["alternatePhrasePronunciationCodes"] = [{
             "char": "大", "charIndex": 0, "pinyin": "dài", "codes": ["dfyva"],
@@ -431,10 +431,10 @@ class B13DefaultReadingTests(unittest.IsolatedAsyncioTestCase):
         result = await harness._review_tools.keytao_prepare_reviewed_add("大肥鱼")
         response = harness.chat_commands_module._format_reviewed_add_prompt(result)
         self.assertIn("dfyvo", response, response)
-        self.assertIn("dfyva", response, response)
+        self.assertNotIn("dfyva", response, response)
         self.assertIn("需要管理员审核", response)
         self.assertEqual([item["normalized"] for item in result["pronunciations"]],
-                         [["da", "fei", "yu"], ["dai", "fei", "yu"]])
+                         [["da", "fei", "yu"]])
         self.assertEqual(result["reviewDisposition"], "SEAL")
         self.assertIs(result["autoReviewable"], False)
         self.fetch_encode.assert_awaited_once_with(None, "大肥鱼")

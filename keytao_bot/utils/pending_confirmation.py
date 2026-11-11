@@ -2015,7 +2015,10 @@ def render_server_backed_single_word_candidates(
             )
         )
     elif recommended:
-        lines.extend(candidate_commonness_summary_copy(assessment)
+        lines.extend(candidate_commonness_summary_copy({
+                         **assessment,
+                         "freeCode": recommended if dict(normalized_candidates)[recommended] is False else "",
+                     })
                      for assessment in (ordering_assessments or [])[:2]
                      if isinstance(assessment, dict)
                      and assessment.get("newWord") == normalized_word

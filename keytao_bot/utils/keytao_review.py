@@ -3951,14 +3951,15 @@ async def prepare_reviewed_word(
                     for candidate in pronunciation_resolution.get("web", {}).get("candidates") or []
                 )
                 and _context_pinyin_sequence(encode_data) in ((), default_sequence)
-                and returned_groups
+                and any(returned.get("isDefault") for returned in returned_groups)
             ):
-                # Missing whole-word evidence alone does not invalidate encoder readings.
+                # Missing whole-word evidence only supports the encoder's default reading.
                 groups = [
                     _review_group_from_returned(
                         returned, evidence_kind="own_character", requires_manual_review=True,
                     )
                     for returned in returned_groups
+                    if returned.get("isDefault")
                 ]
                 pronunciation_resolution.update(status="encode_default", groups=groups)
             if (
@@ -6063,6 +6064,12 @@ def _compare_reference_commonness(
         else:
             verdict = "close"
             reason = "frequency_ratio_below_threshold"
+        if (
+            verdict in {"front_more_common", "behind_more_common"}
+            and max(front_frequency, behind_frequency) < COMMONNESS_SINGLE_FREQUENCY_MIN_COUNT
+        ):
+            verdict = "not_enough_evidence"
+            reason = "frequency_below_minimum"
     elif isinstance(front_frequency, int) != isinstance(behind_frequency, int):
         frequency_is_front = isinstance(front_frequency, int)
         frequency = front_frequency if frequency_is_front else behind_frequency
@@ -6082,7 +6089,7 @@ def _compare_reference_commonness(
             verdict = frequency_verdict
             reason = "corpus_attested_with_no_presence_deficit"
 
-    if verdict == "not_enough_evidence":
+    if verdict == "not_enough_evidence" and reason != "frequency_below_minimum":
         presence_delta = front_presence - behind_presence
         if presence_delta >= COMMONNESS_DICTIONARY_PRESENCE_MARGIN:
             verdict = "front_more_common"
@@ -6134,6 +6141,8 @@ def _web_fallback_summary(
     *,
     reference_available: bool,
 ) -> str:
+    if verdict == "behind_more_common":
+        front, behind = behind, front
     basis_label = "离线均无收录" if reference_available else "离线词库不可用"
     basis = (
         f"{basis_label}，网页回退得分 "
@@ -6191,7 +6200,7 @@ def _compare_web_commonness_results(
             behind,
             reference_available=reference_available,
         )
-    elif behind_wins:
+    elif behind_wins and score_delta < 0:
         verdict = "behind_more_common"
         summary = _web_fallback_summary(
             verdict,
@@ -7638,13 +7647,17 @@ async def _shared_prepare_reviewed_word(
     config: ReviewHttpConfig,
     word: str,
     phrase_type: str,
-    review_tasks: Dict[Tuple[str, str], Any],
+    review_tasks: Dict[Tuple[str, ...], Any],
+    *,
+    requested_reading: str = "",
 ) -> Dict:
-    """Review each (word, type) at most once per audit, even under concurrency."""
-    key = (word, phrase_type)
+    """Review each (word, type, reading) once per audit, even under concurrency."""
+    key = (word, phrase_type, requested_reading)
     task = review_tasks.get(key)
     if task is None:
-        task = asyncio.ensure_future(prepare_reviewed_word(config, word))
+        task = asyncio.ensure_future(prepare_reviewed_word(
+            config, word, **({"requested_reading": requested_reading} if requested_reading else {}),
+        ))
         review_tasks[key] = task
     # Shielded: one item hitting its per-item timeout must not cancel the review
     # that other items are also waiting on.
@@ -7655,7 +7668,7 @@ async def _audit_single_item(
     config: ReviewHttpConfig,
     item: Dict,
     move_pairs: Dict[Tuple[str, str], Dict],
-    review_tasks: Dict[Tuple[str, str], Any],
+    review_tasks: Dict[Tuple[str, ...], Any],
     progress: Optional[_AuditProgress] = None,
 ) -> _ItemOutcome:
     progress = progress or _AuditProgress()
@@ -7796,7 +7809,10 @@ async def _audit_single_item(
     cache_key = (word, phrase_type)
     review = await progress.run_stage(
         "review",
-        _shared_prepare_reviewed_word(config, word, phrase_type, review_tasks),
+        _shared_prepare_reviewed_word(
+            config, word, phrase_type, review_tasks,
+            requested_reading=str(item.get("requestedReading") or "").strip(),
+        ),
         AUDIT_REVIEW_STAGE_TIMEOUT,
     )
     outcome.reviewed_words[cache_key] = review
@@ -7984,7 +8000,7 @@ async def audit_draft_items(config: ReviewHttpConfig, items: Sequence[Dict]) -> 
     priority_comparisons = _find_priority_comparisons(items)
 
     semaphore = asyncio.Semaphore(AUDIT_ITEM_CONCURRENCY)
-    review_tasks: Dict[Tuple[str, str], Any] = {}
+    review_tasks: Dict[Tuple[str, ...], Any] = {}
 
     async def run_item(item: Dict) -> _ItemOutcome:
         word = _normalized_pair_word(item) or "该词"
