@@ -279,7 +279,7 @@ class B10FlyKeyTests(unittest.IsolatedAsyncioTestCase):
             await self.replay.turn({"message": "请执行", "to_me": True}, raw_operation(
                 op="confirm", operands=[], codes=[], refers_to_pending=True,
             ))
-        self.assertIn(f"上一条已执行：{b10_flykey_WORD} → fmfva", self.replay.last_response)
+        self.assertEqual(self.replay.last_response, "当前没有待确认的操作（上一条已执行）。")
         self.assertEqual(self.replay.calls, [])
         self.replay.client.create.assert_not_awaited()
         self.general.assert_not_awaited()
@@ -312,7 +312,7 @@ class B10FlyKeyTests(unittest.IsolatedAsyncioTestCase):
             await self.replay.turn({
                 "message": "确认", "to_me": True, "quote_target": receipt,
             }, raw_operation(op="confirm", operands=[], codes=[], refers_to_pending=True))
-        self.assertEqual(self.replay.last_response, f"当前没有待确认的操作。\n上一条已执行：{b10_flykey_WORD} → fmfva")
+        self.assertEqual(self.replay.last_response, "当前没有待确认的操作（上一条已执行）。")
         self.assertEqual(self.replay.calls, [])
         self.assertEqual(self.replay.writes, [])
         self.replay.client.create.assert_not_awaited()
@@ -617,7 +617,7 @@ class B27ReadingTests(unittest.IsolatedAsyncioTestCase):
     async def test_k3_existing_word_hint_uses_second_reading_first_code(self):
         await self.seed(b27_reading_WORD)
         self.assertIn("「周内」已在词库（fdnsu）", self.replay.last_response)
-        self.assertIn("可再追加一个编码，格式为：加入编码 fdnw", self.replay.last_response)
+        self.assertIn("可再追加一个编码：「加入编码 fdnw」", self.replay.last_response)
         self.assertNotIn("<code>", self.replay.last_response)
 
     async def test_k3_existing_word_commonness_comparison_is_kept(self):
@@ -628,18 +628,18 @@ class B27ReadingTests(unittest.IsolatedAsyncioTestCase):
     async def test_k3_without_second_reading_keeps_placeholder(self):
         self.http.extra_readings = []
         await self.seed(b27_reading_WORD)
-        self.assertIn("可再追加一个编码，格式为：加入编码 <code>", self.replay.last_response)
+        self.assertIn("可再追加一个编码：「加入编码 <code>」", self.replay.last_response)
 
     async def test_k3_single_reading_with_legacy_code_keeps_placeholder(self):
         self.http.extra_readings = []
         self.http.entries[0]["code"] = "fdnsuo"
         await self.seed(b27_reading_WORD)
-        self.assertIn("可再追加一个编码，格式为：加入编码 <code>", self.replay.last_response)
+        self.assertIn("可再追加一个编码：「加入编码 <code>」", self.replay.last_response)
 
     async def test_k3_multiple_other_readings_keep_placeholder(self):
         self.http.extra_readings.append(("ne", ["fdnf", "fdnfu", "fdnfui"]))
         await self.seed(b27_reading_WORD)
-        self.assertIn("可再追加一个编码，格式为：加入编码 <code>", self.replay.last_response)
+        self.assertIn("可再追加一个编码：「加入编码 <code>」", self.replay.last_response)
 
     async def test_other_speaker_cannot_use_owner_ticket(self):
         original = copy.deepcopy(await self.seed(b27_reading_WORD))
@@ -968,9 +968,9 @@ class ExplicitCodeTests(unittest.TestCase):
                 shift = AsyncMock(side_effect=AssertionError("unexpected shift"))
                 with patch.object(s56_explicit_code_commands, "_execute_shift_to_code", shift):
                     reply = await s56_explicit_code_commands.handle_pending_message_core(text, "qq", "s56-protected", key, allow_intent_model=False)
-                self.assertIn("本次未写入", reply)
+                self.assertIn("未写入", reply)
                 self.assertIn("强", reply)
-                self.assertIn("完整编码", reply)
+                self.assertIn("完整码", reply)
                 record = s56_explicit_code_chat.conversation_state_store.get_record(key)
                 self.assertIsNotNone(record)
                 self.assertFalse(record.execution_id)
@@ -2266,7 +2266,7 @@ class ReadingRereviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
             "prose", "", message="帮我把天调加进词库，读音 tian diao", word="天调",
         )
         self.assertEqual(self.before_final_reply, before)
-        self.assertEqual(text, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(text, "没找到要执行的操作，本次未写入。")
         self.assertEqual(self.store.get(self.key), before.state)
 
     async def test_prose_without_fresh_review_does_not_render_old_candidates(self):
@@ -2275,7 +2275,7 @@ class ReadingRereviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.client.completions.responses.append(harness._FakeAIResponse("stop", REPLIES["prose"]))
         text = await self.turn(REREVIEW, quote)
         self.assertEqual(self.flow, "general")
-        self.assertEqual(text, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(text, "没找到要执行的操作，本次未写入。")
         self.assertEqual(self.store.get_record(self.key).nonce, before.nonce)
         self.assertEqual(self.store.get(self.key), before.state)
         self.assertEqual(self.writes, [])
@@ -2330,7 +2330,7 @@ class ReadingRereviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.review = review_fixture(corrected=True)
         with patch.dict(REPLIES, {"prose": REPLIES["prose"].replace("田调", "天调")}):
             text = await self.rereview("prose", quote)
-        self.assertEqual(text, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(text, "没找到要执行的操作，本次未写入。")
         self.assertEqual(self.store.get(self.key).recommended_code, "tmdc")
 
     async def test_unresolved_review_removes_stale_ticket(self):
@@ -2372,7 +2372,7 @@ class ReadingRereviewPersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prose_without_state_still_fails_honestly(self):
         text = s73_reading_rereview_persistence_chat._enforce_advertised_reply_contract(REPLIES["prose"], self.key)
-        self.assertEqual(text, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(text, "没找到要执行的操作，本次未写入。")
 
 
 def load_tests(loader, standard_tests, pattern):

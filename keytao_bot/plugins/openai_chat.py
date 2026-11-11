@@ -2414,7 +2414,6 @@ def _live_candidate_affordances_are_complete(
         expected_contract = advertised_reply_contract(expected)
         return bool(
             _reply_copy.no_recommended_candidate(response)
-            and expected_contract.command_suggestions
             and set(expected_contract.command_suggestions).issubset(contract.command_suggestions)
             and not contract.batch_assent_forms
             and _advertised_reply_matches_live_record(response, record)
@@ -2781,7 +2780,7 @@ def _enforce_candidate_reply_contract(
             )
             return replacement
         logger.warning("[advertised_reply_contract] branch=unbacked_option_question")
-        return "当前没有可验证的可执行操作，本次未写入。"
+        return "没找到要执行的操作，本次未写入。"
     if not _numbered_candidates_match_record(text, record):
         replacement = (
             _render_live_single_candidate_record(record)
@@ -2794,7 +2793,7 @@ def _enforce_candidate_reply_contract(
             )
             return replacement
         logger.warning("[advertised_reply_contract] branch=unbacked_numbered_candidates")
-        return "当前没有可验证的可执行操作，本次未写入。"
+        return "没找到要执行的操作，本次未写入。"
     carries_live_candidates = _reply_carries_live_candidate_state(text, record)
     if (
         carries_live_candidates
@@ -2851,7 +2850,7 @@ def _enforce_candidate_reply_contract(
     )
     if query_words:
         return render_query_retry_reply(query_words)
-    return "当前没有可验证的可执行操作，本次未写入。"
+    return "没找到要执行的操作，本次未写入。"
 
 
 def _append_unreported_submit_status(
@@ -3068,6 +3067,18 @@ def _prepare_user_facing_reply(
         notice = "原待确认提交已取消，已改为以下新操作。"
         if notice not in prepared:
             prepared = notice + "\n" + prepared
+    if (
+        live_record is not None and not live_record.execution_id
+        and _reply_copy.has_candidate_card(prepared)
+        and advertised_reply_contract(prepared).requires_live_state
+        and _advertised_reply_matches_live_record(prepared, live_record)
+    ):
+        lines = prepared.splitlines()
+        if lines and lines[0] in {
+            "后续处理未能生成安全回复；本次未执行新的写入。",
+            "这次服务没有完成处理，本次未写入。",
+        }:
+            prepared = "\n".join(lines[1:]).lstrip()
     if live_record is not None and not live_record.execution_id and (
         (
             advertised_reply_contract(prepared).requires_live_state
@@ -4882,9 +4893,7 @@ def _recent_completed_write_summary(ctx: TurnContext) -> str:
     rows = _operation_rows(record)
     if rows is None:
         return ""
-    parts = [f"{'删除 ' if row['action'] == 'Delete' else ''}{row['word']} → {row['code']}" for row in rows]
-    summary = "、".join(parts) or ("提交草稿" if record.get("submitted") else "")
-    return "\n上一条已执行：" + summary if summary else ""
+    return "（上一条已执行）。" if rows or record.get("submitted") else ""
 
 
 async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: bool = False) -> bool:
@@ -4930,7 +4939,9 @@ async def _try_stale_affirmative_reply(ctx: TurnContext, *, understood_confirm: 
         # Legacy routing retains its original stale-command recovery guidance.
         return await _stage_claim_offered_answer(ctx, stale_affirmative=True)
     if cancel or confirm:
-        ctx.response = "当前没有待取消的操作。" if cancel else "当前没有待确认的操作。" + _recent_completed_write_summary(ctx)
+        ctx.response = "当前没有待取消的操作。" if cancel else (
+            "当前没有待确认的操作" + (_recent_completed_write_summary(ctx) or "。")
+        )
         remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
         await _finish_ai_chat_response(
             ctx.bot, ctx.event, ctx.user_id, ctx.memory_context, ctx.response, ctx.QQMessageSegment,
@@ -5366,7 +5377,7 @@ async def _stage_understand_operation(ctx: TurnContext) -> bool:
             if validated.op == "chat" and "query" in route_ops:
                 await _stage_generate_ai_response(ctx)
                 if isinstance(ctx.response, UnansweredChatReply) or re.fullmatch(
-                    r"(?:目前没有对应的操作请求|当前没有可验证的可执行操作|"
+                    r"(?:目前没有对应的操作请求|当前没有可验证的可执行操作|没找到要执行的操作(?:，本次未写入)?|"
                     r"这轮是普通问答(?:，没有触发写入或安全拦截)?)[。.!！]?",
                     str(ctx.response or "").strip(),
                 ):
@@ -5807,7 +5818,7 @@ async def _stage_apply_scoped_pending_intent(ctx: TurnContext) -> bool:
                 ctx.current_pending_record.state, ctx.normalized_message_text,
             ).matched
         ):
-            ctx.response = "当前没有可验证的可执行操作，本次未写入。"
+            ctx.response = "没找到要执行的操作，本次未写入。"
             remember_conversation(ctx.conv_key, ctx.memory_context, ctx.normalized_message_text, ctx.response)
             await _finish_ai_chat_matcher(ctx.response)
             return True

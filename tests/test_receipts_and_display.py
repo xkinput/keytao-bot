@@ -515,7 +515,7 @@ class B16ItemFourTests(unittest.IsolatedAsyncioTestCase):
         for answer, expected_submissions in (("确认", 1), ("取消", 0)):
             with self.subTest(answer=answer):
                 self.reset_ticket()
-                words = [b15_sibling_and_others_WORDS[0], *[f"offline-word-{index}" for index in range(1, 151)]]
+                words = [b15_sibling_and_others_WORDS[0], *[f"offline-word-{index}" for index in range(1, 201)]]
                 self.replay.draft = [
                     {"action": "Create", "word": word, "code": "qzbx", "type": "Phrase"}
                     for word in words
@@ -562,7 +562,7 @@ class B16ItemFourTests(unittest.IsolatedAsyncioTestCase):
                 self.replay.draft = [
                     {"action": "Create", "word": f"offline-word-{index}",
                      "code": "qzbx", "type": "Phrase"}
-                    for index in range(151)
+                    for index in range(201)
                 ]
                 item = pending_item(word=self.replay.draft[0]["word"])
                 self.replay.pending_items = [item] if overlap else []
@@ -606,7 +606,7 @@ class B16ItemFourTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.replay.last_response, expected)
                 self.assertIsNone(self.replay.store.get_record(self.replay.author))
                 self.assertEqual(self.submissions(), 0)
-                self.assertEqual(len(self.replay.draft), 151)
+                self.assertEqual(len(self.replay.draft), 201)
                 self.general.assert_not_awaited()
 
     async def test_total_lookup_timeout_keeps_finished_chunks_and_submit_works(self):
@@ -875,16 +875,16 @@ class B21DisplayTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.assertEqual(self.created(), [("名创", "mgwm")], self.replay.last_response)
         self.assertNotIn("已变更：", self.replay.last_response)
-        self.assertIn("✅ 已加入草稿", self.replay.last_response)
-        self.assertIn("+1 新增", self.replay.last_response)
-        self.assertIn("草稿内容：名创 mgwm", self.replay.last_response)
+        self.assertIn("✅ 已加入草稿：名创 mgwm", self.replay.last_response)
+        self.assertNotIn("+1 新增", self.replay.last_response)
+        self.assertNotIn("草稿内容：", self.replay.last_response)
 
     async def test_c1_multiple_creates_name_only_selected_codes(self):
         await self.seed(("马哲", "小美"))
         await self.turn("马哲 2 5", self.original_id)
         self.assertCountEqual(self.created(), [("马哲", "msqea"), ("马哲", "msfea")])
         self.assertNotIn("已变更：", self.replay.last_response)
-        self.assertIn("草稿内容：马哲 msqea、马哲 msfea", self.replay.last_response)
+        self.assertIn("✅ 已加入草稿：马哲 msqea、马哲 msfea", self.replay.last_response)
         self.assertIn("未选择：「小美」", self.replay.last_response)
 
     def test_c1_create_receipts_without_complete_draft_contents_keep_change_line(self):
@@ -903,7 +903,7 @@ class B21DisplayTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(contents=contents):
                 original = "✅ 已加入草稿\n" + change_line + contents
                 actual = b19_partial_reply_binding_chat._chat_render.finalize_draft_receipt(original, data)
-                self.assertEqual(actual, original)
+                self.assertEqual(actual, "✅ 已加入草稿：名创 mgwm、马哲 msqea")
 
     def test_c1_change_delete_and_mixed_receipts_are_byte_identical(self):
         cases = (
@@ -914,17 +914,16 @@ class B21DisplayTests(unittest.IsolatedAsyncioTestCase):
              "删除 旧词 @ jc", "旧词"),
             ([{"id": 1, "word": "新词", "code": "xc", "type": "Phrase", "action": "Create"},
               {"id": 2, "word": "旧词", "code": "jc", "type": "Phrase", "action": "Delete"}],
-             "新词 → xc；删除 旧词 @ jc", "旧词"),
+             "新词 xc、删除 旧词 @ jc", "旧词"),
         )
         for rows, summary, revised_word in cases:
             with self.subTest(summary=summary):
                 data = {"batchId": "b21-batch", "writtenItems": rows}
                 original = copy.deepcopy(data)
                 actual = b19_partial_reply_binding_chat._chat_render.finalize_draft_receipt(
-                    "✅ 操作已完成\n+0 新增\n草稿内容：保留原内容", data, platform="qq",
+                    "✅ 操作已完成\n+0 新增 ~0 修改 -0 删除\n草稿内容：保留原内容", data, platform="qq",
                 )
-                expected = (f"✅ 操作已完成\n已变更：{summary}\n"
-                            "+0 新增\n草稿内容：保留原内容\n\n"
+                expected = (f"✅ 操作已完成：{summary}\n"
                             "草稿地址：https://keytao.rea.ink/batch/b21-batch")
                 self.assertEqual(actual.encode(), expected.encode())
                 self.assertEqual(data, original)
@@ -1016,7 +1015,7 @@ class B23DisplayTests(unittest.IsolatedAsyncioTestCase):
             )
             await self.turn("换 2", self.bot.last_id)
         self.assertEqual(self.created(), [(word, "yygla")], self.replay.last_response)
-        self.assertIn("草稿内容：羽衣甘蓝 yygla", self.replay.last_response)
+        self.assertIn("✅ 已确认添加到草稿：羽衣甘蓝 yygla", self.replay.last_response)
         self.assertNotIn("未选择：", self.replay.last_response)
         self.assertNotIn("这些候选本次未添加", self.replay.last_response)
 
@@ -1143,12 +1142,32 @@ class B26DisplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len({word for _code, word in suggestions}), 2, text)
         self.assertEqual(suggestions, [(b25_session_CODES[0], "收拾"), (b25_session_CODES[1], "首饰")], text)
 
+    def test_h2_no_free_slot_lookup_advertises_named_eviction_and_full_code(self):
+        occupants = {"dpdz": ["挡道"], "dpdzi": ["当道"], "dpdzia": ["挡刀"]}
+        assessments = [
+            {"newWord": "荡刀", "occupantCode": code, "occupantWord": words[0],
+             "verdict": "behind_more_common", "freeCode": ""}
+            for code, words in occupants.items()
+        ]
+        rendered = render_server_backed_single_word_lookup(
+            "荡刀", "", [(code, True) for code in occupants], occupants,
+            ordering_assessments=assessments, actionable_controls=True,
+        )
+        for index, (code, words) in enumerate(occupants.items(), 1):
+            self.assertIn(f"{index}. {code} — {words[0]}", rendered)
+        self.assertIn("加入编码 dpdz+形码", rendered)
+        self.assertNotIn("单独发", rendered)
+        self.assertEqual(
+            s58_advertisement_chat.advertised_reply_contract(rendered).command_suggestions,
+            ("添加 荡刀 dpdz,顶替 挡道", "添加 荡刀 dpdzi,顶替 当道", "取消"),
+        )
+
     async def test_h3_replacement_receipt_labels_deleted_draft_item(self):
         await self.seed()
         await self.finish_replacement("添加 守时 edekoo，顶替 首诗")
-        draft_lines = [line for line in self.replay.last_response.splitlines() if line.startswith("草稿内容：")]
+        draft_lines = [line for line in self.replay.last_response.splitlines() if line.startswith("✅ 已加入草稿：")]
         self.assertEqual(len(draft_lines), 1, self.replay.last_response)
-        self.assertIn("删除 首诗 edekoo", draft_lines[0])
+        self.assertIn("删除 首诗 @ edekoo", draft_lines[0])
         self.assertIn("守时 edekoo", draft_lines[0])
         self.assertNotIn("、首诗 edekoo", draft_lines[0])
         self.assertEqual(self.http.submissions, 0)
@@ -2482,7 +2501,7 @@ class S58AdvertisementTests(unittest.TestCase):
             {"action": "Create", "word": "奈飞", "code": "nhfw", "type": "Phrase"},
             {"action": "Create", "word": "浓厚氛围", "code": "nhfwa", "type": "Phrase"},
         ]
-        expected_moves = "将执行：「奈飞」：nhfwv → nhfw、「浓厚氛围」：nhfw → nhfwa。"
+        expected_moves = "将执行：「奈飞」nhfwv → nhfw、「浓厚氛围」nhfw → nhfwa。"
         snapshot = s58_advertisement_shift_ticket().args["_pending_display"]["shiftPlan"]
         cases = (
             ({"word": "奈飞", "targetCode": "nhfw", "items": moves, "shifted": snapshot["shifted"]}, expected_moves),
@@ -2494,7 +2513,7 @@ class S58AdvertisementTests(unittest.TestCase):
                 {"action": "Delete", "word": "旧词", "code": "jqcu", "type": "Phrase"},
             ]}, "将执行：加词「新词」→ xkcu、删除「旧词」@ jqcu。"),
             ({"word": "奈飞", "targetCode": "nhfw", "shifted": snapshot["shifted"]},
-             "将执行：调码「奈飞」→ nhfw、「浓厚氛围」：nhfw → nhfwa。"),
+             "将执行：调码「奈飞」→ nhfw、「浓厚氛围」nhfw → nhfwa。"),
         )
         for plan, expected in cases:
             with self.subTest(expected=expected, fields=tuple(plan)):
@@ -2789,7 +2808,7 @@ class ReceiptDeltaTests(unittest.IsolatedAsyncioTestCase):
                 final = render.finalize_draft_receipt(
                     "✅ 操作已完成", source, platform="qq", requested_words=("宜居", "义举"),
                 )
-                self.assertIn("已变更：宜居 → ykjlo", final)
+                self.assertIn("✅ 操作已完成：宜居 ykjlo", final)
                 self.assertIn("未新增变更：义举（已在本批草稿中调整为 ykjloa）", final)
                 self.assertNotIn("原因尚未确认", final)
                 self.assertNotIn("义举 ykjlo→ykjloa", final)
@@ -3075,6 +3094,54 @@ class ReceiptDeltaTests(unittest.IsolatedAsyncioTestCase):
 class ReceiptFinalizerTests(unittest.TestCase):
     assert_exact_created_coverage = ReceiptFinalizerTests_assert_exact_created_coverage
 
+    def test_compact_draft_count_only_reports_earlier_extra_items(self):
+        current = pr(2, "新词", "xc")
+        earlier = pr(1, "旧词", "jc")
+        for snapshot_items, updated_items, expected_count in (
+            ([current], [], None),
+            ([earlier, current], [], 2),
+            ([earlier, current], [earlier], None),
+        ):
+            with self.subTest(earlier=expected_count, updated=bool(updated_items)):
+                reply = render.finalize_draft_receipt("✅ 已加入草稿", {
+                    "success": True, "batchId": "s3-draft-count",
+                    "writtenItems": [current], "updatedItems": updated_items,
+                    "draft_snapshot": {"batchId": "s3-draft-count", "items": snapshot_items},
+                }, platform="qq")
+                if expected_count is None:
+                    self.assertNotIn("草稿共 ", reply)
+                else:
+                    self.assertIn(f"草稿共 {expected_count} 条", reply)
+                self.assertIn("草稿地址：", reply)
+
+    def test_negative_submission_copy_cannot_promote_a_write_receipt(self):
+        reply = render.finalize_draft_receipt(
+            "✅ 已加入草稿\n本轮尚未提交审核，也尚未加入词库。", {
+                "success": True, "batchId": "s3-unsubmitted",
+                "writtenItems": [pr(1, "新词", "xc")],
+            }, platform="qq",
+        )
+        self.assertTrue(reply.startswith("✅ 已加入草稿：新词 xc\n"), reply)
+        self.assertIn("尚未提交审核", reply)
+        self.assertNotIn("✅ 已入库", reply)
+        self.assertNotIn("✅ 已提交审核", reply)
+
+    def test_successful_submit_without_write_delta_keeps_its_snapshot_details(self):
+        for approved, header in ((False, "✅ 批次已提交审核。"), (True, "✅ 批次已加入词库。")):
+            with self.subTest(approved=approved):
+                reply = render.finalize_draft_receipt(header, {
+                    "success": True, "batchId": "s3-snapshot-submit", "autoApproved": approved,
+                    "snapshotItems": [pr(1, "杨杰", "ypjd", "Delete"), pr(2, "杨杰", "ypjdv")],
+                }, platform="qq")
+                action = "已入库" if approved else "已提交审核"
+                self.assertEqual(reply, f"✅ {action}：杨杰 ypjd→ypjdv\n草稿地址：https://keytao.rea.ink/batch/s3-snapshot-submit")
+        preview = render.finalize_draft_receipt("提交前需要确认。", {
+            "success": False, "requiresConfirmation": True, "batchId": "s3-snapshot-submit",
+            "snapshotItems": [pr(1, "杨杰", "ypjdv")],
+        }, platform="qq")
+        self.assertNotIn("✅ 已提交审核", preview)
+        self.assertNotIn("✅ 已入库", preview)
+
     def test_one_three_four_actual_prs_create_shift_and_mixed_cover_every_id(self):
         mixed = mixed_items()
         cases = (
@@ -3116,7 +3183,7 @@ class ReceiptFinalizerTests(unittest.TestCase):
         final = render.finalize_draft_receipt("✅ 操作已完成\n已变更：夜泊 yebo 权重 101→100",
                                                data, platform="qq")
         self.assertIn("耶博 yebo 权重 100→101", final)
-        self.assertIn("沃集鲜 → wjxa", final)
+        self.assertIn("沃集鲜 wjxa", final)
 
     def test_existing_pr_updates_do_not_inflate_created_pr_count(self):
         data = {"writtenItems": [pr(4, "沃集鲜", "wjxa")],
@@ -3137,7 +3204,7 @@ class ReceiptFinalizerTests(unittest.TestCase):
         final = render.finalize_draft_receipt(
             "✅ 操作已完成\n已变更：未写词 → wxc、旧草稿词 → jcgc\n草稿内容：沃集鲜 wjxa", data,
         )
-        self.assertIn("草稿内容：沃集鲜 wjxa", final)
+        self.assertIn("✅ 操作已完成：沃集鲜 wjxa", final)
         self.assertNotIn("旧草稿词", final)
         self.assertNotIn("未写词", final)
 
@@ -3192,9 +3259,9 @@ class ReceiptFinalizerTests(unittest.TestCase):
         second = {"success": True, "batchId": s60_finalizers_BATCH_ID, "writtenItems": mixed_items()[3:]}
         final = render.finalize_draft_receipt("✅ 批次已提交审核。", first, second,
                                                platform="qq", requested_words=("吊杠", "沃集鲜"))
-        self.assertIn("吊杠 → dcgp", final)
+        self.assertIn("吊杠 dcgp", final)
         self.assertIn("掉岗 dcgp→dcgpi", final)
-        self.assertIn("沃集鲜 → wjxa", final)
+        self.assertIn("沃集鲜 wjxa", final)
         self.assertNotIn("未新增变更：沃集鲜", final)
 
     def test_missing_url_is_reconstructed_from_exact_batch_for_each_platform(self):
@@ -3254,7 +3321,7 @@ class ReceiptRegressionTests(unittest.TestCase):
         ):
             with self.subTest(failure=failure, termination=termination):
                 reply = AgentOrchestrator._finalize_reply("加入并提交", "已变更：吊杠 → dcgp", failure, receipts, termination)
-                for expected in ("吊杠 → dcgp", "掉岗 dcgp→dcgpi", "沃集鲜 → wjxa", "/batch/e4d21c4d"):
+                for expected in ("吊杠 dcgp", "掉岗 dcgp→dcgpi", "沃集鲜 wjxa", "/batch/e4d21c4d"):
                     self.assertIn(expected, reply)
                 self.assertEqual(reply.count("已提交审核"), 1 if submitted in receipts else 0)
 
@@ -3313,9 +3380,9 @@ class ReceiptRegressionTests(unittest.TestCase):
 
     def test_mixed_shift_success_keeps_the_companion_create(self):
         reply = s60_receipt_commands._format_ranked_shift_success(mixed_receipt())
-        self.assertIn("吊杠 → dcgp", reply)
+        self.assertIn("吊杠 dcgp", reply)
         self.assertIn("掉岗 dcgp→dcgpi", reply)
-        self.assertIn("沃集鲜 → wjxa", reply)
+        self.assertIn("沃集鲜 wjxa", reply)
 
     def test_submit_without_url_keeps_exact_platform_batch_link(self):
         async def run():
@@ -3361,7 +3428,7 @@ class S61SubmitReplayTests(unittest.IsolatedAsyncioTestCase):
             "keytao_create_phrase", "keytao_create_phrase",
             "keytao_submit_batch", "keytao_submit_batch",
         ])
-        self.assertIn(f"{s61_submit_replay_WORD} → {CODE}", delivered)
+        self.assertIn(f"{s61_submit_replay_WORD} {CODE}", delivered)
         self.assertIn("已提交审核", delivered)
         self.assertEqual(delivered.count(f"https://keytao.rea.ink/batch/{s61_submit_replay_BATCH_ID}"), 1, delivered)
         self.assertIsNone(self.coordinator.get(self.key))
@@ -3384,7 +3451,7 @@ class S61SubmitReplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server.tool_names(), [
             "keytao_shift_phrase_code", "keytao_submit_batch", "keytao_submit_batch",
         ])
-        self.assertIn(f"{s61_submit_replay_WORD} → {CODE}", reply)
+        self.assertIn(f"{s61_submit_replay_WORD} {CODE}", reply)
         self.assertIn("已提交审核", reply)
         self.assertIsNone(self.store.get_record(self.key))
 
@@ -3421,7 +3488,7 @@ class S61SubmitReplayTests(unittest.IsolatedAsyncioTestCase):
             "keytao_create_phrase", "keytao_create_phrase", "keytao_submit_batch",
         ])
         # C: never a write-only receipt that stays silent about the submit.
-        self.assertIn(f"{s61_submit_replay_WORD} → {CODE}", delivered)
+        self.assertIn(f"{s61_submit_replay_WORD} {CODE}", delivered)
         self.assertIn("旧词 → qtxx", delivered)
         self.assertIn("确认", delivered)
         self.assertNotIn("当前没有可验证的可执行操作", delivered)
@@ -3602,7 +3669,7 @@ class S61SubmitReplayTests(unittest.IsolatedAsyncioTestCase):
                     s61_submit_replay_commands.current_draft_delivery_claims.reset(delivery_token)
         finally:
             s61_submit_replay_chat._current_turn_message.reset(token)
-        self.assertIn(f"{s61_submit_replay_WORD} → {CODE}", prepared)
+        self.assertIn(f"{s61_submit_replay_WORD} {CODE}", prepared)
         self.assertIn("尚未提交", prepared)
         self.assertNotIn("已提交审核", prepared)
         self.assertEqual(bot.messages, [])
@@ -3778,7 +3845,7 @@ class DraftFlowTests(unittest.IsolatedAsyncioTestCase):
         with self.runtime():
             response = await s62_draft_flow_commands._execute_confirmed_tool(selected, "qq", self.key.actor_id, self.key)
             delivered = s62_draft_flow_chat._prepare_user_facing_reply(response, self.memory)
-        self.assertIn("草稿内容：加亮 jslxa", delivered)
+        self.assertIn("✅ 已加入草稿：加亮 jslxa", delivered)
         self.assertNotIn("未新增变更", delivered)
         self.assertNotIn("排列以上词的使用频率", delivered)
 
@@ -3820,6 +3887,26 @@ class DraftFlowTests(unittest.IsolatedAsyncioTestCase):
 
 # Source: test_s62_stale_draft.py
 class S62DraftViewTests(unittest.IsolatedAsyncioTestCase):
+    async def test_create_only_draft_omits_diff_but_revisions_keep_it(self):
+        for action in ("Create", "Change", "Delete"):
+            with self.subTest(action=action):
+                item = pr(1, "草稿词", "cgc", action)
+                snapshot_data = {
+                    "success": True, "batchId": "s3-view-diff",
+                    "draft_snapshot": {"batchId": "s3-view-diff", "count": 1, "items": [item]},
+                }
+                async def tool(name, args, *_args, **_kwargs):
+                    self.assertEqual(name, "keytao_get_batch_preview")
+                    return json.dumps({
+                        "success": True, "batchId": "s3-view-diff",
+                        "diff_text": "S3_NEIGHBOR_DIFF",
+                    })
+                with patch.object(s62_draft_flow_commands, "call_tool_function", side_effect=tool):
+                    reply = await s62_draft_flow_commands._format_draft_response(snapshot_data, "qq", "s3-view-owner")
+                self.assertEqual("S3_NEIGHBOR_DIFF" in reply, action != "Create", reply)
+                self.assertIn("当前草稿（1 条）：", reply)
+                self.assertIn("草稿地址：", reply)
+
     async def test_live_candidates_do_not_replace_delivered_draft_view(self):
         for items in ([], [{
             "id": 62, "word": "现有草稿", "code": "abcd",
@@ -3891,7 +3978,7 @@ class S62DraftViewTests(unittest.IsolatedAsyncioTestCase):
                             stack.enter_context(patcher)
                         await s62_stale_draft_chat._stage_handle_draft_management(ctx)
                         draft_reply = ctx.response
-                        self.assertIn(f"当前草稿（{len(items)} 条）", draft_reply)
+                        self.assertIn(f"当前草稿（{len(items)} 条，+{len(items)}）：" if items else "当前草稿为空。", draft_reply)
                         self.assertEqual(
                             s62_stale_draft_chat._enforce_advertised_reply_contract(draft_reply, key),
                             draft_reply,

@@ -54,7 +54,7 @@ class SemanticDirectExecTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.chat, "remember_conversation"),
             patch.object(self.chat, "_finish_ai_chat_response", self.finish),
             patch.object(self.commands, "_try_handle_simple_single_word_query", self.review),
-            patch.object(self.commands, "_format_draft_response", AsyncMock(return_value="草稿地址：https://offline.invalid/draft/offline-batch")),
+            patch.object(self.commands, "_format_draft_response", AsyncMock(side_effect=lambda *args, **kwargs: kwargs.get("receipt_header", "✅ 已加入草稿") + "\n草稿地址：https://offline.invalid/draft/offline-batch")),
         )
         for context in patches:
             context.start()

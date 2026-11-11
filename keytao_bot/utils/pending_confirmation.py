@@ -18,6 +18,7 @@ from .reply_copy import (
     batch_block_recommended_code,
     candidate_rows,
     candidate_label_is_available,
+    community_vote_receipt_matches,
     missing_word_card_word,
     no_recommended_candidate,
     recommended_candidate_code,
@@ -861,7 +862,7 @@ def plain_warning_message(warning: Any) -> str:
     weight = source.get("weight", warning.get("weight"))
     weight_copy = (
         f"（权重 {weight}）"
-        if isinstance(weight, int) and not isinstance(weight, bool)
+        if isinstance(weight, int) and not isinstance(weight, bool) and weight != 100
         else ""
     )
 
@@ -893,17 +894,23 @@ def plain_warning_message(warning: Any) -> str:
                 f"确认后{target_copy}将作为重码写入{weight_copy}"
             )
 
+    if warning_type == "code_chain_priority" and word and code:
+        return f"「{word}」写入 {code} 后会改变同码顺序{weight_copy}"
+    if warning_type == "skipped_candidate_slot" and word and code:
+        skipped = warning.get("skippedCodes") or [warning.get("skippedCode")]
+        skipped_codes = tuple(dict.fromkeys(
+            value.strip().lower() for value in skipped
+            if isinstance(value, str) and value.strip()
+        )) if isinstance(skipped, (list, tuple)) else ()
+        if skipped_codes:
+            return f"更短的 {'、'.join(skipped_codes)} 还空着，跳过会留空位。"
+        return f"「{word}」将写入 {code}，并跳过更短的空位{weight_copy}"
+    if warning_type == "multiple_code" and word and code:
+        return f"「{word}」将以 {code} 形成多编码词条{weight_copy}"
     for field in ("message", "impact", "reason", "summary"):
         value = warning.get(field)
         if isinstance(value, str) and value.strip():
             return _humanize_warning_text(value)
-
-    if warning_type == "code_chain_priority" and word and code:
-        return f"「{word}」写入 {code} 后会改变同码顺序{weight_copy}"
-    if warning_type == "skipped_candidate_slot" and word and code:
-        return f"「{word}」将写入 {code}，并跳过更短的空位{weight_copy}"
-    if warning_type == "multiple_code" and word and code:
-        return f"「{word}」将以 {code} 形成多编码词条{weight_copy}"
     if word and code:
         return f"「{word}」写入编码 {code} 前需要确认{weight_copy}"
     if word:
@@ -932,22 +939,16 @@ def already_existing_word_copy(
     ))
     if not word or not clean_codes:
         return ""
-    actions: list[str] = []
-    if can_choose_other_code:
-        actions.append("选择其他编码（回复「换码」）" if advertise_controls else "选择其他编码")
-    if can_reorder:
-        actions.append("调整现有排序（回复「重排」）" if advertise_controls else "按下列选项调整现有排序")
-    action_copy = (
-        "仍可" + "或".join(actions) + "；若保留现状，无需操作。"
-        if actions
-        else ""
-    )
     # Without a matching contextual control, name the word in the template so
     # an older pending operation cannot supply a different omitted operand.
     extra_code_format = "加入编码 <code>" if advertise_controls else f"给 {word} 加一个码 <code>"
+    action_copy = f"可再追加一个编码：「{extra_code_format}」"
+    if can_choose_other_code:
+        action_copy += "；或回复「换码」" if advertise_controls else "；也可选择其他编码"
+    if can_reorder:
+        action_copy += "；或回复「重排」" if advertise_controls else "；也可按下列选项重排"
     return "\n".join(filter(None, (
-        f"「{word}」已在词库（{'、'.join(clean_codes)}）。", action_copy,
-        f"可再追加一个编码，格式为：{extra_code_format}（将 <code> 换成实际编码）。",
+        f"「{word}」已在词库（{'、'.join(clean_codes)}）。", action_copy + "。",
     )))
 
 
@@ -2589,7 +2590,14 @@ def command_suggestions_are_closed_candidate_selections(
 
 def advertised_reply_contract(text: str) -> AdvertisedReplyContract:
     """Detect only stateful forms emitted by the shared reply renderers."""
-    normalized = unicodedata.normalize("NFKC", str(text or ""))
+    source = str(text or "")
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if index and line.startswith("草稿地址：") and community_vote_receipt_matches(
+            "\n".join(lines[index - 1:index + 1]), line.removeprefix("草稿地址："),
+        ):
+            lines[index - 1] = lines[index - 1].replace("（引用本条回复「同意」）", "")
+    normalized = unicodedata.normalize("NFKC", "\n".join(lines))
 
     def advertised_forms(forms: tuple[str, ...]) -> tuple[str, ...]:
         found = []

@@ -18,6 +18,10 @@ from keytao_bot.utils import community_vote as vote
 BATCH_ID = "bc32871a-1111-2222-3333-444444444444"
 BATCH_URL = f"https://keytao.rea.ink/batch/{BATCH_ID}"
 RECEIPT = (
+    "✅ 已提交审核，投票 0/3（引用本条回复「同意」）\n"
+    f"草稿地址：{BATCH_URL}"
+)
+LEGACY_RECEIPT = (
     "批次已加入提交，审核中。\n"
     f"草稿地址：{BATCH_URL}\n\n"
     "当前投票：0/3\n"
@@ -83,6 +87,35 @@ class ReceiptTests(unittest.TestCase):
             self.assertEqual(harness.openai_chat_module._prepare_user_facing_reply(RECEIPT, memory), RECEIPT)
         finally:
             vote._pending_receipts.reset(pending_token)
+
+    def test_submitted_items_pair_moves_and_preserve_each_round_and_code(self):
+        data = submitted_data()
+        data["submittedItems"] = [
+            {"action": "Create", "word": "旧甲", "code": "aaaa", "earlierRound": True},
+            {"action": "Create", "word": "旧乙", "code": "bbbbv", "earlierRound": True},
+            {"action": "Delete", "word": "旧乙", "code": "bbbb", "earlierRound": True},
+            {"action": "Create", "word": "新甲", "code": "cccc"},
+            {"action": "Delete", "word": "开团", "code": "khtt"},
+            {"action": "Create", "word": "开团", "code": "khttv"},
+            {"action": "Create", "word": "开团", "code": "khtta"},
+            {"action": "Delete", "word": "开团", "code": "khtti"},
+        ]
+        self.assertEqual(vote.submitted_vote_receipt(data), RECEIPT + (
+            "\n本轮：新甲 cccc、开团 khtt→khttv、开团 khtti→khtta"
+            "\n之前：旧甲 aaaa、旧乙 bbbb→bbbbv"
+        ))
+
+    def test_submitted_items_never_pair_across_rounds_or_dictionaries(self):
+        data = submitted_data()
+        data["submittedItems"] = [
+            {"action": "Create", "word": "开团", "code": "khttv"},
+            {"action": "Delete", "word": "开团", "code": "khtt", "earlierRound": True},
+            {"action": "Delete", "word": "开团", "code": "khtta", "type": "English"},
+            {"action": "Change", "word": "开团", "code": "khtti"},
+        ]
+        self.assertEqual(vote.submitted_vote_receipt(data), RECEIPT + (
+            "\n本轮：开团 khttv、删除 开团 khtta、修改 开团 khtti\n之前：删除 开团 khtt"
+        ))
 
 
 class VoteTests(unittest.IsolatedAsyncioTestCase):
@@ -448,9 +481,10 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
         pending_token = vote._pending_receipts.set([submitted_data()])
         try:
             with patch.object(vote, "_default_store", self.store):
-                await vote._record_sent_receipts(None, None, "send_group_msg", {
-                    "group_id": "group", "message": RECEIPT,
-                }, {"message_id": 42})
+                for message_id, receipt in ((42, LEGACY_RECEIPT), (45, RECEIPT)):
+                    await vote._record_sent_receipts(None, None, "send_group_msg", {
+                        "group_id": "group", "message": receipt,
+                    }, {"message_id": message_id})
                 await vote._record_sent_receipts(None, None, "send_group_msg", {
                     "group_id": "other-group", "message": RECEIPT,
                 }, {"message_id": 43})
@@ -458,8 +492,12 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
                     "group_id": "group", "message": RECEIPT,
                 }, {"message_id": 44})
             self.assertEqual(self.store.resolve("qq", "group", "42"), BATCH_ID)
+            self.assertEqual(self.store.resolve_round("qq", "group", "45"), (BATCH_ID, 7))
             self.assertIsNone(self.store.resolve("qq", "other-group", "43"))
             self.assertIsNone(self.store.resolve("qq", "group", "44"))
+            self.store = vote.CommunityVoteStore(self.db_path)
+            self.assertIn("当前投票：1/3", await self.cast("one", message_id="42"))
+            self.assertIn("当前投票：2/3", await self.cast("two", message_id="45"))
         finally:
             harness.chat_commands_module.current_memory_context.reset(memory_token)
             vote._pending_receipts.reset(pending_token)
@@ -559,7 +597,7 @@ class VoteTests(unittest.IsolatedAsyncioTestCase):
                     )
                 self.assertTrue(result.success)
                 if bare_delete:
-                    self.assertTrue(result.text.startswith("✅ 批次已提交审核。\n"))
+                    self.assertTrue(result.text.startswith("✅ 已提交审核：删除 开团 @ khtt\n"))
                     self.assertIn(BATCH_URL, result.text)
                     self.assertNotIn("当前投票", result.text)
                     self.assertNotIn("回复同意", result.text)

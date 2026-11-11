@@ -79,7 +79,7 @@ from ..harness.tools import (
 from ..utils.history_store import HistoryGenerationToken, get_history_store
 from ..utils.draft_mutation_store import get_default_draft_mutation_claim_store
 from ..utils.candidate_inventory import select_candidate_inventory, protected_candidate_occupants
-from ..utils.commonness_copy import render_commonness_summary
+from ..utils.commonness_copy import candidate_commonness_summary_copy, render_commonness_summary
 from ..utils.explicit_code import (
     ExplicitEntryCodeRequest,
     parse_explicit_code_request,
@@ -657,18 +657,23 @@ def _protected_eviction_response(
     occupants = protected or tuple(dict.fromkeys(
         word for words in state.server_occupied_words.values() for word in words
     ))
+    code = code or next((candidate for candidate, occupied in state.server_candidates
+                         if occupied and any(word in state.server_occupied_words.get(candidate, ())
+                                             for word in occupants)), "")
     base = next(iter(state.server_candidates), ("", False))[0]
     suggestions = "\n".join(f"- 「加入，顶替 {word}」" for word in occupants)
-    reason = "；".join(render_commonness_summary(next((
-        assessment for assessment in state.server_ordering_assessments
-        if assessment.get("newWord") == state.word
-        and assessment.get("occupantWord") == word
-        and assessment.get("occupantCode") == code
-    ), {"newWord": state.word, "occupantWord": word})) for word in occupants)
+    comparisons = [candidate_commonness_summary_copy(assessment)
+                   for assessment in state.server_ordering_assessments
+                   if assessment.get("newWord") == state.word
+                   and assessment.get("occupantWord") in occupants
+                   and assessment.get("occupantCode") == code]
     return (
-        reason + "，保留现有位置；本次未写入。\n"
-        f"可指定形码后的完整编码，格式为：加入编码 {base}+形码（请替换形码部分）。"
-        + ("\n若要顶替，请点名：\n" + suggestions if suggestions else "")
+        "、".join(f"「{word}」" for word in occupants)
+        + f"不弱于「{state.word}」，{code} 保留原位，未写入。\n"
+        + ("词频：" + "；".join(line.removeprefix("词频：") for line in comparisons if line) + "\n"
+           if any(comparisons) else "")
+        + ("要顶替回复：\n" + suggestions + "\n" if suggestions else "")
+        + f"或指定完整码，格式为：加入编码 {base}+形码，或「取消」。"
     )
 
 
@@ -4904,9 +4909,9 @@ async def _execute_add_to_draft(
             words=(word,),
         )
 
-    header = f"✅ 已将「{word}」以编码 {code} 加入草稿\n"
-    response = header + await _format_draft_response(
+    response = await _format_draft_response(
         data, platform, user_id, compact=True,
+        receipt_header=f"✅ 已加入草稿：{word} {code}",
     )
     return prepend_pending_word_reminders(
         response,
@@ -5236,7 +5241,7 @@ async def _perform_add_to_draft_and_submit(
     if submit_result.pending_state is not None:
         return DraftActionResult(
             with_pending_reminder(_append_batch_url_if_missing((
-                f"✅ 「{word}」→ {code} 已加入草稿。\n"
+                f"✅ 已加入草稿：{word} {code}\n"
                 + ("\n".join(create_notice_lines) + "\n" if create_notice_lines else "")
                 + submit_result.text
             ), create_data, submit_result.data or {})),
@@ -5252,13 +5257,14 @@ async def _perform_add_to_draft_and_submit(
             if line.strip()
         ]
         final_status = (
-            f"✅ 已将「{word}」→ {code} 写入草稿，已提交审核并加入词库。"
+            f"✅ 已入库：{word} {code}"
             if isinstance(submit_result.data, dict)
             and submit_result.data.get("autoApproved") is True
-            else f"✅ 已将「{word}」→ {code} 写入草稿，已提交审核。"
+            else f"✅ 已提交审核：{word} {code}"
         )
+        from .chat_render import finalize_draft_receipt
         return DraftActionResult(
-            with_pending_reminder(_append_batch_url_if_missing(
+            with_pending_reminder(finalize_draft_receipt(
                 "\n".join([
                     final_status,
                     *create_notice_lines,
@@ -5266,7 +5272,7 @@ async def _perform_add_to_draft_and_submit(
                 ]),
                 submit_result.data or {},
                 create_data,
-                label="批次地址",
+                platform=platform,
             )),
             success=True,
             data=submit_result.data or create_data,
@@ -5274,7 +5280,7 @@ async def _perform_add_to_draft_and_submit(
     return DraftActionResult(
         with_pending_reminder(_append_batch_url_if_missing(
             "\n".join([
-                f"✅ 已将「{word}」以编码 {code} 加入草稿。",
+                f"✅ 已加入草稿：{word} {code}",
                 *create_notice_lines,
                 "",
                 submit_result.text,
@@ -5531,7 +5537,7 @@ async def _perform_batch_add_to_draft_and_submit(
             text,
             submit_result.data or {},
             add_data,
-            label="批次地址" if submit_result.success else "草稿地址",
+            label="草稿地址",
         )),
         pending_state=submit_result.pending_state,
         success=submit_result.success,
@@ -6112,9 +6118,11 @@ def _prepend_resolved_advertised_words(
     if skipped_line:
         selected = "、".join(f"{item['word']} → {item['code']}" for item in state.args.get("items", []))
         completed = has_completed_draft_receipt(response)
+        if completed:
+            return str(response or "") + "\n" + skipped_line.strip() + remainder
         label = "已按你的选择加入" if completed else "本次选择"
         return f"{label}：{selected}；\n{skipped_line}{remainder}\n{response}"
-    return f"词：{'、'.join(words)}{remainder}\n" + skipped_line + str(response or "")
+    return str(response or "") + remainder
 
 
 def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
@@ -6126,18 +6134,13 @@ def _append_submit_snapshot_lines(lines: List[str], data: Dict) -> None:
     )
     if not snapshot_items:
         return
-    lines.append("提交内容：")
-    for item in snapshot_items:
-        if not isinstance(item, dict):
-            continue
-        old_word = str(item.get("oldWord") or "")
-        word = str(item.get("word") or "")
-        code = str(item.get("code") or "")
-        action = str(item.get("action") or "")
-        label = f"{old_word} → {word}" if action == "Change" and old_word else word
-        lines.append(
-            f"• {action} {label} @ {code}（{item.get('type') or ''}）"
-        )
+    from ..utils.draft_receipts import compact_receipt_summary
+    summary = compact_receipt_summary({"writtenItems": [
+        {**item, "id": index} for index, item in enumerate(snapshot_items)
+        if isinstance(item, dict)
+    ]})
+    if summary:
+        lines.append("提交内容：" + summary)
 
 
 def _ranked_shift_warning_copy(
@@ -6569,6 +6572,11 @@ def _format_server_warning_confirmation(function_name: str, data: Dict) -> str:
     review_parts: List[str] = []
     if function_name == "keytao_submit_batch":
         _append_submit_review_lines(review_parts, data)
+        if not review_parts and warnings and all(
+            isinstance(warning, dict) and warning.get("warningType") == "skipped_candidate_slot"
+            for warning in warnings
+        ):
+            review_parts.append("本批需管理员审核。")
         _append_submit_snapshot_lines(review_parts, data)
     review_text = ("\n" + "\n".join(review_parts)) if review_parts else ""
     batch_url = _trusted_batch_url(data)
@@ -6801,9 +6809,7 @@ def _format_ranked_shift_success(data: Dict[str, Any]) -> str:
         )
     if target_word and target_code and shift_plan.get("scope") != "same_code":
         changes.insert(0, f"{target_word} → {target_code}")
-    lines = ["✅ 操作已完成"]
-    if changes:
-        lines.append("已变更：" + "、".join(OrderedDict.fromkeys(changes)))
+    lines = ["✅ 操作已完成" + ("：" + "、".join(OrderedDict.fromkeys(changes)) if changes else "")]
     batch_url = _trusted_batch_url(data)
     if batch_url:
         lines.append(f"草稿地址：{batch_url}")
@@ -7592,8 +7598,13 @@ async def _execute_confirmed_tool(
             failed_count = int(data.get("failedCount") or 0)
             partial = failed_count > 0 or success_count != expected_count
             header = "⚠️ 仅部分加入草稿\n" if partial else "✅ 已加入草稿\n"
-            response = header + await _format_draft_response(
-                data, platform, user_id, compact=True,
+            if not partial and "writtenItems" not in data and "updatedItems" not in data:
+                from ..utils.draft_receipts import compact_receipt_summary
+                header = "✅ 已加入草稿：" + compact_receipt_summary({"writtenItems": [
+                    {**item, "id": index} for index, item in enumerate(state.args.get("items", []))
+                ]})
+            response = await _format_draft_response(
+                data, platform, user_id, compact=True, receipt_header=header.strip(),
             )
             if partial:
                 suffix = f"\n仅成功加入 {success_count}/{expected_count} 条"
@@ -7690,11 +7701,12 @@ async def _execute_confirmed_tool(
                         authorized_items=authorized_items,
                     )
                 return response
-            response = "✅ 操作已完成\n" + await _format_draft_response(
+            response = await _format_draft_response(
                 data,
                 platform,
                 user_id,
                 compact=True,
+                receipt_header="✅ 操作已完成",
             )
             if expected_keep_words:
                 list_data = await _fetch_current_draft_items(
@@ -7734,9 +7746,12 @@ async def _execute_confirmed_tool(
         )
 
     if data.get("success"):
-        header = "✅ 已确认添加到草稿\n"
-        response = header + await _format_draft_response(
+        response = await _format_draft_response(
             data, platform, user_id, compact=True,
+            receipt_header="✅ 已确认添加到草稿" + (
+                f"：{state.args['word']} {state.args['code']}"
+                if state.args.get("word") and state.args.get("code") else ""
+            ),
         )
         if submit_after:
             return await continue_with_submit_preview(response)
@@ -7761,6 +7776,7 @@ async def _format_draft_response(
     batch_id: Optional[str] = None,
     *,
     compact: bool = False,
+    receipt_header: str = "✅ 已加入草稿",
 ) -> str:
     """Format a compact mutation result or the full current-draft view."""
     # "Current draft" is an implicit pointer to the newest draft batch, and a
@@ -7804,6 +7820,8 @@ async def _format_draft_response(
             }
 
     parts: List[str] = []
+    if compact:
+        parts.append(receipt_header)
     if pointer_batch_id:
         parts.append("⚠️ 当前草稿已切换；以下为操作批次。")
 
@@ -7823,41 +7841,25 @@ async def _format_draft_response(
         summary = snapshot.get("summary")
     if not summary and preview.get("success"):
         summary = preview.get("summary")
-    if summary:
-        parts.append(
-            f"+{summary.get('added', 0)} 新增  "
-            f"~{summary.get('modified', 0)} 修改  "
-            f"-{summary.get('deleted', 0)} 删除"
-        )
-
     # Diff block
     diff_text = preview.get("diff_text", "") if preview.get("success") else ""
-    if diff_text and not compact:
+    has_revisions = bool(summary and (summary.get("modified") or summary.get("deleted"))) or any(
+        isinstance(item, dict) and item.get("action") in {"Change", "Delete"}
+        for item in (snapshot or {}).get("items", [])
+    )
+    if diff_text and not compact and has_revisions:
         parts.append(f"\n{diff_text}")
 
     # Draft items
-    draft_count: Optional[int] = None
-    if snapshot and compact:
-        items = snapshot.get("items", [])
-        if isinstance(items, list) and items:
-            visible_items = [
-                ("删除 " if item.get("action") == "Delete" else "")
-                + f"{str(item.get('word') or '').strip()} {str(item.get('code') or '').strip()}"
-                for item in items[:5]
-                if isinstance(item, dict)
-                and str(item.get("word") or "").strip()
-                and str(item.get("code") or "").strip()
-            ]
-            if visible_items:
-                remainder = len(items) - len(visible_items)
-                suffix = f" 等 {len(items)} 条" if remainder > 0 else ""
-                parts.append("草稿内容：" + "、".join(visible_items) + suffix)
-    elif snapshot:
+    if snapshot and not compact:
         items = snapshot.get("items", [])
         count = snapshot.get("count", len(items))
-        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
-            draft_count = count
-        parts.append(f"当前草稿（{count} 条）：")
+        totals = "、".join(
+            f"{prefix}{summary.get(field, 0)}" for field, prefix in (
+                ("added", "+"), ("modified", "~"), ("deleted", "-"),
+            ) if summary and summary.get(field)
+        )
+        parts.append(f"当前草稿（{count} 条" + (f"，{totals}" if totals else "") + "）：" if count else "当前草稿为空。")
         for index, item in enumerate(items, start=1):
             parts.append(_draft_item_display_line(item, index))
 
@@ -7866,8 +7868,6 @@ async def _format_draft_response(
     if batch_url:
         parts.append(f"草稿地址：{batch_url}")
 
-    if not compact and draft_count != 0:
-        parts.append("提交前请核对上述草稿内容。")
     from .chat_render import finalize_draft_receipt
     return finalize_draft_receipt("\n".join(parts), data, preview, list_data, platform=platform)
 
@@ -8250,7 +8250,7 @@ async def _perform_submit_current_draft(
             return _preserve_action_result_link(
                 confirmed_result,
                 submit_data,
-                label="批次地址" if confirmed_result.success else "草稿地址",
+                label="草稿地址",
             )
         warning_prompt = _format_server_warning_confirmation(
             "keytao_submit_batch",
@@ -8329,7 +8329,7 @@ async def _perform_submit_current_draft(
     if submit_data.get("autoApproved"):
         parts = ["✅ 批次已加入词库。"]
     if batch_url:
-        parts.append(f"批次地址：{batch_url}")
+        parts.append(f"草稿地址：{batch_url}")
     if pr_url:
         parts.append(f"PR：{pr_url}")
     from .chat_render import finalize_draft_receipt
@@ -9330,7 +9330,7 @@ async def _perform_recall_latest_batch(
         platform,
         user_id,
         batch_id=exact_batch_id,
-        compact=True,
+        compact=False,
     )
     return DraftActionResult(
         "✅ 已撤回最近提审，批次已恢复为草稿。\n" + formatted,
@@ -9932,7 +9932,7 @@ async def try_handle_reviewed_displacement(
                 status["code"]: status["words"] for status in inventory.statuses
             }}]
     if len(matches) != 1:
-        return "当前没有可验证的可执行操作，本次未写入。"
+        return "没找到要执行的操作，本次未写入。"
     scope = matches[0]
     candidates = scope.get("candidates") or []
     occupied = scope.get("occupiedWords") or {}
@@ -9943,7 +9943,7 @@ async def try_handle_reviewed_displacement(
     elif selector:
         codes = [code for code in codes if code == selector]
     if len(codes) != 1:
-        return "当前没有可验证的可执行操作，本次未写入。"
+        return "没找到要执行的操作，本次未写入。"
     code = codes[0]
     receipt_start = len(current_draft_delivery_claims.get() or [])
     response = await _try_handle_replace_at_code_command(
@@ -9982,7 +9982,7 @@ async def try_handle_reviewed_displacement(
         conversation_state_store.put_back(replace(current, state=replace(
             current.state, args={**current.state.args, "_candidate_origin": origin},
         )))
-    return response or "当前没有可验证的可执行操作，本次未写入。"
+    return response or "没找到要执行的操作，本次未写入。"
 
 
 async def _try_handle_replace_at_code_command(

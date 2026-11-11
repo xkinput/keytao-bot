@@ -74,16 +74,33 @@ def submitted_vote_receipt(data: dict) -> str | None:
 
 
 def _render_submitted_vote_receipt(data: dict, *, voting: bool = True) -> str:
-    contents = ""
-    if data.get("submittedItems"):
-        contents = "\n提交内容：\n" + "\n".join(
-            f"• {item['action']} {item['word']} → {item['code']}"
-            + ("（本轮之前）" if item.get("earlierRound") else "")
-            for item in data["submittedItems"]
-        )
-    heading = "批次已加入提交，审核中。" if voting else "✅ 批次已提交审核。"
-    footer = "\n\n当前投票：0/3\n可以引用该条消息，回复同意来投票通过" if voting else ""
-    return f"{heading}\n草稿地址：{data['batchUrl']}{contents}{footer}"
+    heading = "✅ 已提交审核，投票 0/3（引用本条回复「同意」）" if voting else "✅ 批次已提交审核。"
+    lines = [heading, f"草稿地址：{data['batchUrl']}"]
+    for earlier, label in ((False, "本轮"), (True, "之前")):
+        items = [item for item in data.get("submittedItems") or []
+                 if bool(item.get("earlierRound")) == earlier]
+        remaining = set(range(len(items)))
+        contents = []
+        for index, item in enumerate(items):
+            if index not in remaining:
+                continue
+            remaining.remove(index)
+            opposite = {"Create": "Delete", "Delete": "Create"}.get(item["action"])
+            match = next((other for other in sorted(remaining)
+                          if items[other]["action"] == opposite
+                          and items[other]["word"] == item["word"]
+                          and items[other].get("type", "Phrase") == item.get("type", "Phrase")
+                          and items[other]["code"] != item["code"]), None)
+            if match is not None:
+                remaining.remove(match)
+                old, new = (item, items[match]) if item["action"] == "Delete" else (items[match], item)
+                contents.append(f"{item['word']} {old['code']}→{new['code']}")
+            else:
+                action = {"Delete": "删除 ", "Change": "修改 "}.get(item["action"], "")
+                contents.append(f"{action}{item['word']} {item['code']}")
+        if contents:
+            lines.append(f"{label}：" + "、".join(contents))
+    return "\n".join(lines)
 
 
 def submitted_vote_receipts(receipts) -> str | None:

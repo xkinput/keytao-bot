@@ -341,7 +341,7 @@ class SemanticModelFirstTests(unittest.IsolatedAsyncioTestCase):
                     })
 
                 self.tool.side_effect = call
-                with patch.object(self.commands, "_format_draft_response", AsyncMock(return_value="offline receipt")):
+                with patch.object(self.commands, "_format_draft_response", AsyncMock(side_effect=lambda *args, **kwargs: kwargs.get("receipt_header", "✅ 已加入草稿") + "\noffline receipt")):
                     response = await self.answer("确认")
                 self.assertIn("已加入草稿", response)
                 self.assertEqual([call.args[0] for call in self.tool.await_args_list], [

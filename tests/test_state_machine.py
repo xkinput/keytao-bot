@@ -6471,7 +6471,7 @@ def test_simple_single_word_query_existing_word_leads_with_exact_fact():
             result is not None
             and result.startswith("「寿司郎」已在词库（eslv）。")
             and "换码" in result
-            and "无需操作" in result,
+            and "无需操作" not in result,
         )
         record = state_store.get_record(conv_key)
         check(
@@ -6739,8 +6739,8 @@ def test_add_submit_extra_snapshot_shows_one_exact_confirmation():
         )
 
         check("extra snapshot blocks automatic confirmation", result.pending_state is not None)
-        check("extra snapshot shows authorized create", "Create 阻抑 @ zjyka" in result.text)
-        check("extra snapshot shows old delete", "Delete 旧草稿词 @ jqk" in result.text)
+        check("extra snapshot shows authorized create", "提交内容：阻抑 zjyka" in result.text)
+        check("extra snapshot shows old delete", "删除 旧草稿词 @ jqk" in result.text)
         check("extra snapshot hides internal digests", all(
             digest not in result.text
             for digest in ("1" * 64, "2" * 64, "3" * 64)
@@ -10485,9 +10485,9 @@ def test_exact_pending_selectors_execute_only_the_bound_action():
         check("exact code executes direct add", code_response ==
               "added")
         check("exact code binds advertised empty slot", add_mock.await_args.args[:2] == ("母版", "mjbfa"))
-        check("occupied number protects the unnamed occupant", duplicate_response is not None and "木板" in duplicate_response and "本次未写入" in duplicate_response)
+        check("occupied number protects the unnamed occupant", duplicate_response is not None and "木板" in duplicate_response and "未写入" in duplicate_response)
         check("occupied number never creates a duplicate", duplicate_mock.await_count == 0)
-        check("numbered recode protects the unnamed occupant", numbered_shift_response is not None and "木板" in numbered_shift_response and "本次未写入" in numbered_shift_response)
+        check("numbered recode protects the unnamed occupant", numbered_shift_response is not None and "木板" in numbered_shift_response and "未写入" in numbered_shift_response)
         check("named recode executes shift", named_shift_response == "shifted")
         check("occupant-first recode executes shift", occupant_first_response == "shifted")
         check("move-away form executes shift", move_away_response == "shifted")
@@ -10645,7 +10645,7 @@ def test_occupied_numeric_choice_means_create_with_eviction():
                         confidence=0.96,
                     ),
                 )
-        check("occupied choice explains that no write occurred", result is not None and "增翔" in result and "本次未写入" in result)
+        check("occupied choice explains that no write occurred", result is not None and "增翔" in result and "未写入" in result)
         check("duplicate helper is not called", duplicate_mock.await_count == 0)
         check("shift helper is not called", shift_mock.await_count == 0)
 
@@ -10854,7 +10854,7 @@ def test_pending_add_word_add_and_submit_uses_recommended():
             "confirmed": True,
         })
         check("submit uses current user", all(call[2:] == ("qq", "2002") for call in calls))
-        check("response says submitted", "写入草稿，已提交审核" in submitted)
+        check("response says submitted", submitted.startswith("✅ 已提交审核：室内乐 enyo"))
         check("combined success includes batch link", "https://keytao.test/batch/current" in submitted)
         check("combined command leaves no ticket", store.get_record(conv_key) is None)
         check("combined command shows no ticket code", "确认票据" not in submitted and "确认操作" not in submitted)
@@ -11315,7 +11315,7 @@ def test_inline_unquoted_add_submit_requires_live_or_target_binding():
             check("inline short command schedules no mutation", schedule.call_count == 0)
             check(
                 "inline short command without a server record fails closed",
-                response == "当前没有可验证的可执行操作，本次未写入。",
+                response == "没找到要执行的操作，本次未写入。",
             )
             check(
                 "inline short command preserves pending target",
@@ -17453,7 +17453,7 @@ def test_generic_ai_prose_does_not_persist_pending():
         check(
             "generic model prose is reduced to the honest no-command line",
             finish_response.await_count == 1
-            and "当前没有可验证的可执行操作" in delivered
+            and "没找到要执行的操作，本次未写入。" in delivered
             and "加词 伪造词" not in delivered,
         )
 
@@ -17550,7 +17550,7 @@ def test_outgoing_advertisement_requires_matching_live_state():
         )
         check(
             "orphan advertisement is replaced before delivery",
-            "加入并提交" not in replaced and "当前没有可验证的可执行操作" in replaced,
+            "加入并提交" not in replaced and "没找到要执行的操作，本次未写入。" in replaced,
         )
         check(
             "orphan replacement emits no invented command or operands",
@@ -17572,7 +17572,7 @@ def test_outgoing_advertisement_requires_matching_live_state():
         check(
             "orphan action-list advertisement is replaced before delivery",
             "加入并提交" not in action_list_replaced
-            and "当前没有可验证的可执行操作" in action_list_replaced,
+            and "没找到要执行的操作，本次未写入。" in action_list_replaced,
         )
 
         store.set(conv_key, batch_state, owner_label="Rea")
@@ -18297,7 +18297,7 @@ def test_refusal_remediation_copy_uses_bound_executable_suggestions():
     check("draft failure helper hides exception details", internal_detail not in draft_failure)
     check(
         "delivery-contract refusal emits the honest no-command line",
-        "当前没有可验证的可执行操作" in delivery_refusal
+        "没找到要执行的操作，本次未写入。" in delivery_refusal
         and suggestion_pattern.search(delivery_refusal) is None,
     )
     converted_template_cases = (
@@ -18664,7 +18664,7 @@ def test_partial_batch_add_never_uses_success_header():
             patch.object(
                 openai_chat_module,
                 "_format_draft_response",
-                AsyncMock(return_value="草稿快照"),
+                AsyncMock(side_effect=lambda *args, **kwargs: kwargs.get("receipt_header", "") + "\n草稿快照"),
             ),
         ):
             reply = await openai_chat_module._execute_confirmed_tool(
@@ -21569,7 +21569,7 @@ def test_ranked_shift_partial_receipts_stage_executable_continuation():
                 )
                 check(
                     "advertised continuation executes the remaining sealed delta",
-                    "已变更：幂等 mkdr 权重 101→100" in completed_reply
+                    "✅ 操作已完成：幂等 mkdr 权重 101→100" in completed_reply
                     and store.get(conv_key) is None
                     and len(calls) == 3,
                 )
@@ -22458,7 +22458,7 @@ def test_replace_char_chunks_and_preserves_sealed_progress():
                 patch.object(
                     openai_chat_module,
                     "_format_draft_response",
-                    AsyncMock(return_value="草稿快照"),
+                    AsyncMock(side_effect=lambda *args, **kwargs: kwargs.get("receipt_header", "") + "\n草稿快照"),
                 ),
             ):
                 first_response = await openai_chat_module.handle_pending_message_core(

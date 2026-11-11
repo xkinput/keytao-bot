@@ -958,7 +958,7 @@ class AgentOrchestrator:
                     replacement = render_server_backed_batch_candidates(
                         state.args.get("items"), state.args.get("_candidate_scopes"),
                     )
-                return replacement or "当前没有可验证的可执行操作，本次未写入。"
+                return replacement or "没找到要执行的操作，本次未写入。"
             if (
                 contract.command_suggestions
                 and contract.requires_live_state
@@ -3817,6 +3817,7 @@ class AgentOrchestrator:
                 ):
                     shifted.append(projected_move)
         return {
+            **{key: result[key] for key in ("autoApproved",) if key in result},
             "tool": tool_name,
             "batchId": str(
                 result.get("batchId") or arguments.get("batch_id") or ""
@@ -3833,24 +3834,26 @@ class AgentOrchestrator:
         if vote_reply:
             return vote_reply
         if any("writtenItems" in receipt or "updatedItems" in receipt for receipt in receipts):
-            from ..utils.draft_receipts import merge_receipt_deltas, receipt_change_lines
             from ..plugins.chat_render import finalize_draft_receipt, _plain_warning_line
-            lines = ["本轮已完成的写操作：", *receipt_change_lines(merge_receipt_deltas(receipts))]
+            batches: Dict[str, List[Dict[str, Any]]] = {}
             for receipt in receipts:
-                if receipt.get("tool") == "keytao_submit_batch":
-                    lines.append("✅ 批次已加入词库。" if receipt.get("autoApproved") else "✅ 批次已提交审核。")
-                for warning in receipt.get("warnings") or []:
-                    line = _plain_warning_line(warning)
-                    if line and line not in lines:
-                        lines.append(line)
-            # Separate batch identities must each retain their own link.
-            links = []
-            for receipt in receipts:
-                link = finalize_draft_receipt("", {key: receipt[key] for key in ("batchId", "batchUrl") if key in receipt})
-                if link and link not in links:
-                    links.append(link)
-            return "\n".join([*lines, *links])
-        written: List[tuple[str, str]] = []
+                batch_id = str(receipt.get("batchId") or receipt.get("batchUrl") or "")
+                batches.setdefault(batch_id, []).append(receipt)
+            parts = []
+            for batch_receipts in batches.values():
+                submitted = next((receipt for receipt in reversed(batch_receipts)
+                                  if receipt.get("tool") == "keytao_submit_batch"), None)
+                status = "✅ 已加入草稿"
+                if submitted is not None:
+                    status = "✅ 已入库：" if submitted.get("autoApproved") else "✅ 已提交审核："
+                text = finalize_draft_receipt(status, *reversed(batch_receipts))
+                warnings = list(dict.fromkeys(
+                    _plain_warning_line(warning)
+                    for receipt in batch_receipts for warning in receipt.get("warnings") or []
+                ))
+                parts.append("\n".join([text, *filter(None, warnings)]))
+            return "\n".join(parts)
+        written: List[Dict[str, str]] = []
         shifted: List[tuple[str, str, str]] = []
         batch_urls: List[str] = []
         for receipt in receipts:
@@ -3860,12 +3863,13 @@ class AgentOrchestrator:
             for item in receipt.get("items") or []:
                 if not isinstance(item, dict):
                     continue
-                pair = (
-                    str(item.get("word") or "").strip(),
-                    str(item.get("code") or "").strip().lower(),
-                )
-                if all(pair) and pair not in written:
-                    written.append(pair)
+                entry = {
+                    "word": str(item.get("word") or "").strip(),
+                    "code": str(item.get("code") or "").strip().lower(),
+                    "action": str(item.get("action") or "Create"),
+                }
+                if entry["word"] and entry["code"] and entry not in written:
+                    written.append(entry)
             for move in receipt.get("shifted") or []:
                 if not isinstance(move, dict):
                     continue
@@ -3878,16 +3882,20 @@ class AgentOrchestrator:
                     shifted.append(triple)
         lines: List[str] = []
         if written or shifted:
-            lines.append("本轮已完成的写操作：")
-            lines.extend(
-                f"- 已写入草稿：「{word}」 → {code}"
-                for word, code in written
-            )
-            lines.extend(
-                f"- 已顺延：「{word}」 {from_code} → {to_code}"
-                for word, from_code, to_code in shifted
-            )
-        lines.extend(f"草稿/批次地址：{url}" for url in batch_urls)
+            from ..utils.draft_receipts import compact_receipt_summary
+
+            moved_words = {word for word, _from_code, _to_code in shifted}
+            summary = compact_receipt_summary({"writtenItems": [
+                {**item, "id": index} for index, item in enumerate(written)
+                if item["word"] not in moved_words
+            ]})
+            changes = [summary] if summary else []
+            changes.extend(f"{word} {from_code}→{to_code}" for word, from_code, to_code in shifted)
+            submitted = next((receipt for receipt in reversed(receipts)
+                              if receipt.get("tool") == "keytao_submit_batch"), None)
+            action = "已加入草稿" if submitted is None else "已入库" if submitted.get("autoApproved") else "已提交审核"
+            lines.append(f"✅ {action}：" + "、".join(changes))
+        lines.extend(f"草稿地址：{url}" for url in batch_urls)
         return "\n".join(lines)
 
     @staticmethod
@@ -4143,22 +4151,7 @@ class AgentOrchestrator:
             ]
             if len(matching_pairs) == 1:
                 add_receipt, submit_receipt = matching_pairs[0]
-                batch_id = str(add_receipt.get("batchId") or "").strip()
-                word = str(authorized_item.get("word") or "").strip()
-                code = str(authorized_item.get("code") or "").strip().lower()
-                lines = [
-                    "✅ 本轮已完成两步：",
-                    f"- 已将「{word}」 → {code} 写入草稿。",
-                    "- 已提交审核。",
-                ]
-                batch_url = next((
-                    str(receipt.get("batchUrl") or "").strip()
-                    for receipt in (submit_receipt, add_receipt)
-                    if str(receipt.get("batchUrl") or "").strip()
-                ), "")
-                if batch_url:
-                    lines.extend(("", f"批次地址：{batch_url}"))
-                return "\n".join(lines)
+                return cls._receipt_completion_reply([add_receipt, submit_receipt])
         reply_denies_write = _reply_copy.WRITE_DENIAL_RE.search(reply) is not None
         termination_reason = str(
             (termination_state or {}).get("reason") or ""
@@ -4379,7 +4372,7 @@ class AgentOrchestrator:
 
         cleaned = str(reply or "")
         has_noop_marker = any(marker in cleaned for marker in (
-            "目前没有对应的操作请求", "当前没有可验证的可执行操作", "这轮是普通问答",
+            "目前没有对应的操作请求", "当前没有可验证的可执行操作", "没找到要执行的操作", "这轮是普通问答",
         ))
         for marker in SYSTEM_REPLY_TEMPLATE_MARKERS:
             cleaned = cleaned.replace(marker, "")

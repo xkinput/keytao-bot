@@ -427,6 +427,7 @@ class B12SelectionTests(unittest.IsolatedAsyncioTestCase):
                 self.replay.history.clear()
                 prompt = await self.candidates("正手刀", "点刀")
                 self.assertIn("推荐编码：暂无（现有候选均需点名顶替）", prompt)
+                self.assertNotIn("单独发", prompt)
                 state = self.replay.store.get_record(self.replay.author).state
                 self.assertEqual(state.args["_candidate_scopes"][1]["reviewedState"]["recommendedCode"], "")
                 self.assertEqual([item["word"] for item in state.args["items"]], ["正手刀"])
@@ -527,7 +528,7 @@ class B12SelectionTests(unittest.IsolatedAsyncioTestCase):
         response = self.replay.commands.render_pending_shift_plan(ticket)
         self.assertTrue(response)
         self.assertNotIn('"xlbl" 仍是空位', response)
-        self.assertIn('"xlblu" 仍是空位', response)
+        self.assertIn("⚠️ 更短的 xlblu 还空着，跳过会留空位。", response)
         self.assertEqual(ticket, original)
 
     def test_r7_mixed_source_and_empty_slots_preserve_sealed_data(self):
@@ -551,7 +552,7 @@ class B12SelectionTests(unittest.IsolatedAsyncioTestCase):
             "keytao_shift_phrase_code", {"word": b11_shift_WORD, "target_code": "xlbluv", "_source_code": "xlbl"},
         ), data)
         response = self.replay.commands.render_pending_shift_plan(ticket)
-        self.assertIn("更短的空位", response)
+        self.assertIn("⚠️ 更短的 xlblu 还空着，跳过会留空位。", response)
         self.assertNotIn('"xlbl"', response)
         self.assertEqual(ticket.args["confirmed_plan_digest"], data["planDigest"])
         self.assertEqual(ticket.args["expected_warning_digest"], data["warningDigest"])
@@ -3536,7 +3537,7 @@ class S62SelectionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([(row["word"], row["code"]) for row in writes], [("小端", "xcdti")])
                 self.assertEqual(len(calls), 2)
                 self.assertIsNone(pending)
-                self.assertIn("小端 → xcdti", response)
+                self.assertIn("✅ 已加入草稿：小端 xcdti", response)
                 self.assertIn("加量", response)
                 self.assertIn("常用度", response)
                 self.assertIn("未加入", response)
@@ -3709,7 +3710,7 @@ class FreshSelectionTests(unittest.IsolatedAsyncioTestCase):
                 space_key=self.key.space_key, allow_intent_model=False,
             )
             self.assertEqual(self.writes, [])
-            self.assertIn("其他编码", response)
+            self.assertIn("⚠️ 「加亮」将以 jslxa 形成多编码词条", response)
             ticket = self.store.get(self.key)
             self.assertTrue(server_warning_ticket_is_complete(ticket))
             self.assertEqual(ticket.args["code"], "jslxa")

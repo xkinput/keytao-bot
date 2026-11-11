@@ -8505,6 +8505,93 @@ class MutationAuthorizationTests(unittest.TestCase):
         asyncio.run(_run())
 
 class AlreadyExistingRenderingTests(unittest.TestCase):
+    def test_submit_skipped_slot_preflight_keeps_auto_review_verdict(self) -> None:
+        from keytao_bot.plugins.chat_commands import _format_server_warning_confirmation
+
+        item = {"action": "Create", "word": "杨杰", "code": "ypjdv", "type": "Phrase"}
+        for auto_approve, summary, expected_review in (
+            (True, "ok", "自动审核：ok，可自动通过"),
+            (False, "证据不足", "自动审核：证据不足，需管理员审核"),
+        ):
+            with self.subTest(auto_approve=auto_approve):
+                rendered = _format_server_warning_confirmation("keytao_submit_batch", {
+                    "requiresConfirmation": True,
+                    "warnings": [{
+                        "warningType": "skipped_candidate_slot",
+                        "item": item,
+                        "skippedCodes": ["ypjd"],
+                    }],
+                    "autoReview": {
+                        "success": True, "autoApprove": auto_approve,
+                        "verdict": "pass" if auto_approve else "manual_review",
+                        "summary": summary, "approvedItems": [item],
+                    },
+                    "batchUrl": "https://offline.invalid/batch/skipped-slot",
+                })
+
+                self.assertIn("⚠️ 更短的 ypjd 还空着，跳过会留空位。", rendered)
+                self.assertIn(expected_review, rendered)
+                self.assertNotIn("本批需管理员审核", rendered)
+                self.assertIn("草稿地址：https://offline.invalid/batch/skipped-slot", rendered)
+
+    def test_submit_skipped_slot_preflight_without_skipped_codes_is_clean(self) -> None:
+        from keytao_bot.plugins.chat_commands import _format_server_warning_confirmation
+
+        rendered = _format_server_warning_confirmation("keytao_submit_batch", {
+            "requiresConfirmation": True,
+            "warnings": [{
+                "warningType": "skipped_candidate_slot",
+                "item": {"action": "Create", "word": "吃席", "code": "wkxk"},
+            }],
+        })
+
+        self.assertEqual(rendered.splitlines()[0], "⚠️ 「吃席」将写入 wkxk，并跳过更短的空位")
+        self.assertIn("本批需管理员审核。", rendered)
+        self.assertNotIn("还空着", rendered)
+        self.assertEqual(rendered.count(pending_confirmation_copy()), 1)
+
+    def test_submit_skipped_slot_preflight_with_message_only_is_clean(self) -> None:
+        from keytao_bot.plugins.chat_commands import _format_server_warning_confirmation
+
+        rendered = _format_server_warning_confirmation("keytao_submit_batch", {
+            "requiresConfirmation": True,
+            "warnings": [{
+                "warningType": "skipped_candidate_slot",
+                "message": "不建议这样操作",
+            }],
+        })
+
+        self.assertEqual(rendered.splitlines()[0], "⚠️ 不建议这样操作")
+        self.assertIn("本批需管理员审核。", rendered)
+        self.assertNotIn("还空着", rendered)
+        self.assertEqual(rendered.count(pending_confirmation_copy()), 1)
+
+    def test_vote_receipt_assent_does_not_require_an_actor_pending_ticket(self) -> None:
+        receipt = (
+            "✅ 已提交审核，投票 0/3（引用本条回复「同意」）\n"
+            "草稿地址：https://offline.invalid/batch/vote-copy"
+        )
+        self.assertFalse(advertised_reply_contract(receipt).requires_live_state)
+        self.assertTrue(advertised_reply_contract(receipt.splitlines()[0]).requires_live_state)
+        self.assertTrue(advertised_reply_contract(receipt + "\n回复「同意」执行其他操作。").requires_live_state)
+
+    def test_known_warning_types_prefer_short_structured_copy(self) -> None:
+        self.assertEqual(plain_warning_message({
+            "warningType": "skipped_candidate_slot",
+            "item": {"word": "杨杰", "code": "ypjdv", "weight": 100},
+            "skippedCodes": ["ypjd"],
+            "message": "编码链中更短候选仍是空位，请核对后再确认。",
+        }), "更短的 ypjd 还空着，跳过会留空位。")
+        self.assertEqual(plain_warning_message({
+            "warningType": "code_chain_priority",
+            "item": {"word": "杨杰", "code": "ypjdv", "weight": 100},
+            "message": "服务端的较长说明。",
+        }), "「杨杰」写入 ypjdv 后会改变同码顺序")
+        self.assertEqual(plain_warning_message({
+            "warningType": "unknown_warning",
+            "message": "此项需要单独核对。",
+        }), "此项需要单独核对。")
+
     def test_already_existing_word_leads_single_multi_and_sink_copy(self) -> None:
         from keytao_bot.plugins.chat_render import _format_reviewed_add_prompt
 
@@ -8532,7 +8619,7 @@ class AlreadyExistingRenderingTests(unittest.TestCase):
         }) or ""
         self.assertTrue(reviewed.startswith("「参考价值」已在词库（ckjf）"))
         self.assertNotIn("词库暂无收录「参考价值」", reviewed)
-        self.assertIn("仍可选择其他编码", reviewed)
+        self.assertIn("可再追加一个编码：「给 参考价值 加一个码 <code>」；也可选择其他编码。", reviewed)
 
         single = render_server_backed_single_word_candidates(
             "参考价值",
@@ -13439,7 +13526,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         record = state_store.get_record(context.conversation_address)
         self.assertIsNone(record)
-        self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(delivered, "没找到要执行的操作，本次未写入。")
         self.assertNotRegex(delivered, r"(?m)^\s*[1-9]\d*[.)、]\s*[a-z]+\s*—")
         self.assertEqual(
             advertised_batch_binding_pairs(result),
@@ -14096,7 +14183,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNone(record)
-        self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(delivered, "没找到要执行的操作，本次未写入。")
         self.assertNotRegex(delivered, r"(?m)^\s*[1-9]\d*[.)、]\s*[a-z]+\s*—")
         self.assertEqual(
             set(advertised_batch_binding_pairs(result)),
@@ -14242,7 +14329,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
                         result,
                         context.conversation_address,
                     )
-                self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+                self.assertEqual(delivered, "没找到要执行的操作，本次未写入。")
                 self.assertNotRegex(delivered, r"(?m)^\s*[1-9]\d*[.)、]\s*[a-z]+\s*—")
                 self.assertEqual(state_store.set_count, 0)
                 establishment_logs = [
@@ -14432,7 +14519,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertIsNone(record)
-        self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(delivered, "没找到要执行的操作，本次未写入。")
         self.assertNotRegex(delivered, r"(?m)^\s*[1-9]\d*[.)、]\s*[a-z]+\s*—")
         self.assertEqual(
             set(advertised_batch_binding_pairs(result)),
@@ -14483,7 +14570,7 @@ class CleanBatchAddOrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(state_store.get_record(context.conversation_address))
         self.assertNotIn(model_only_word, delivered)
-        self.assertEqual(delivered, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(delivered, "没找到要执行的操作，本次未写入。")
 
     async def test_server_advertised_set_subtraction_stages_exact_confirmed_batch(
         self,
@@ -19427,6 +19514,51 @@ class WeightAdjustmentBindingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
+    def test_legacy_receipt_keeps_move_and_auto_approved_status(self) -> None:
+        url = "https://offline.invalid/batch/compact-legacy"
+        submitted = AgentOrchestrator._successful_write_receipt("keytao_submit_batch", {}, {
+            "success": True, "batchId": "compact-legacy", "batchUrl": url,
+            "autoApproved": True,
+        })
+        reply = AgentOrchestrator._receipt_completion_reply([{
+            "tool": "keytao_batch_add_to_draft", "batchId": "compact-legacy",
+            "batchUrl": url,
+            "items": [
+                {"action": "Delete", "word": "杨杰", "code": "ypjd"},
+                {"action": "Create", "word": "杨杰", "code": "ypjdv"},
+            ],
+        }, submitted])
+        self.assertEqual(reply, f"✅ 已入库：杨杰 ypjd→ypjdv\n草稿地址：{url}")
+
+    def test_generic_failure_header_is_removed_only_above_a_live_candidate_card(self) -> None:
+        from keytao_bot.plugins import openai_chat as chat_module
+
+        state_store = MemoryConversationStateStore()
+        context = ChatMemoryContext(
+            platform="qq", user_id="short-copy-owner",
+            space_type="private", space_id="short-copy-owner",
+        )
+        state_store.set(context.conversation_address, PendingAddWord(
+            word="载具", recommended_code="zhjlu",
+            candidates=[("zhjl", True), ("zhjlu", False)],
+            occupied_words={"zhjl": ["在距"]},
+            server_candidates=[("zhjl", True), ("zhjlu", False)],
+            server_occupied_words={"zhjl": ["在距"]},
+        ))
+        failure = "后续处理未能生成安全回复；本次未执行新的写入。"
+        with patch.object(chat_module, "conversation_state_store", state_store), patch.object(
+            chat_module._user_resolver, "resolved_binding_for_notice", return_value=True,
+        ):
+            card = chat_module._render_live_single_candidate_record(
+                state_store.get_record(context.conversation_address),
+            )
+            self.assertTrue(card)
+            self.assertEqual(chat_module._prepare_user_facing_reply(failure, context), failure)
+            delivered = chat_module._prepare_user_facing_reply(failure + "\n" + card, context)
+        self.assertNotIn(failure, delivered)
+        self.assertIn("1. zhjl — 在距", delivered)
+        self.assertIn("回复「加入」或「加入并提交」", delivered)
+
     def test_retired_runaway_copy_is_removed_at_delivery(self) -> None:
         from keytao_bot.plugins import openai_chat as chat_module
 
@@ -19493,7 +19625,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
         finally:
             chat_module._current_turn_message.reset(token)
 
-        self.assertIn("当前没有可验证的可执行操作", delivered)
+        self.assertIn("没找到要执行的操作", delivered)
         self.assertIn("本次未写入", delivered)
         self.assertNotIn("添加「出圈」 jjqt", delivered)
 
@@ -19586,7 +19718,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("已写入草稿", reply)
+        self.assertIn("✅ 已加入草稿：", reply)
         self.assertIn("炒冷饭", reply)
         self.assertIn("wlfoo", reply)
         self.assertNotIn(
@@ -19619,7 +19751,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
             max_iterations=1,
         )
 
-        self.assertIn("已写入草稿", reply)
+        self.assertIn("✅ 已加入草稿：", reply)
         self.assertNotIn("batch-iteration", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
 
@@ -19656,7 +19788,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("已写入草稿", reply)
+        self.assertIn("✅ 已加入草稿：", reply)
         self.assertNotIn("batch-transport", reply)
         self.assertIn("后续 AI 服务调用失败", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
@@ -19728,7 +19860,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("已写入草稿", reply)
+        self.assertIn("✅ 已加入草稿：", reply)
         self.assertNotIn("batch-budget", reply)
         self.assertIn("后续操作过多", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
@@ -19784,7 +19916,7 @@ class TurnTerminationReceiptTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("已写入草稿", reply)
+        self.assertIn("✅ 已加入草稿：", reply)
         self.assertNotIn("batch-exception", reply)
         self.assertIn("后续处理发生异常", reply)
         self.assertNotRegex(reply, r"未执行任何新写入|没有成功写入|本次未写入")
@@ -19844,7 +19976,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         self.assertNotIn(command, guarded)
         self.assertEqual(
             guarded,
-            "当前没有可验证的可执行操作，本次未写入。",
+            "没找到要执行的操作，本次未写入。",
         )
 
     def test_unquoted_refusal_commands_are_detected_before_delivery(self) -> None:
@@ -20088,7 +20220,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
         )
 
         self.assertIn("剪贴", finalized)
-        self.assertIn("jmtd → jmtdoa", finalized)
+        self.assertIn("jmtd→jmtdoa", finalized)
         self.assertIn("后续操作未完成", finalized)
         self.assertNotRegex(
             finalized,
@@ -20200,7 +20332,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             "items": [{"action": "Create", "word": "新词", "code": "xco"}],
         }])
 
-        self.assertIn(f"草稿/批次地址：{batch_url}", reply)
+        self.assertIn(f"草稿地址：{batch_url}", reply)
         self.assertNotIn("关联批次", reply)
         self.assertNotIn(batch_id, reply.replace(batch_url, ""))
         guarded = strip_bare_batch_ids(
@@ -20224,7 +20356,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             }],
         )
 
-        self.assertIn("已写入草稿", finalized)
+        self.assertIn("✅ 已加入草稿：", finalized)
         self.assertNotIn("batch-written", finalized)
         self.assertIn("按工具回执纠正", finalized)
         self.assertNotIn("本次未写入", finalized)
@@ -20267,7 +20399,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
                     {"reason": reason},
                 )
 
-                self.assertIn("已写入草稿", finalized)
+                self.assertIn("✅ 已加入草稿：", finalized)
                 self.assertIn("炒冷饭", finalized)
                 self.assertIn("wlfoo", finalized)
                 self.assertNotIn("batch-prior-write", finalized)
@@ -20299,7 +20431,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             }],
         )
 
-        self.assertIn("已写入草稿", finalized)
+        self.assertIn("✅ 已加入草稿：", finalized)
         self.assertIn("炒冷饭", finalized)
         self.assertIn("wlfoo", finalized)
         self.assertNotIn("batch-incident", finalized)
@@ -20329,7 +20461,7 @@ class FinalReplyLoopBreakerTests(unittest.TestCase):
             }],
         )
 
-        self.assertIn("已写入草稿", finalized)
+        self.assertIn("✅ 已加入草稿：", finalized)
         self.assertIn("提交服务暂时不可用", finalized)
         self.assertNotIn("本次未写入", finalized)
 

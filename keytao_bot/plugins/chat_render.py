@@ -22,7 +22,7 @@ from ..harness.state import (
 from ..utils import review_flags
 from ..utils import http_client
 from ..utils.commonness_copy import candidate_commonness_summary_copy
-from ..utils.draft_receipts import merge_receipt_deltas, receipt_change_lines
+from ..utils.draft_receipts import compact_receipt_summary, merge_receipt_deltas, receipt_change_lines
 from ..utils.reply_copy import (
     AUTHORITATIVE_LINK_END_RE,
     BASIC_AUTHORITATIVE_LINK_END_RE,
@@ -30,7 +30,6 @@ from ..utils.reply_copy import (
     DRAFT_RECEIPT_REPLACED_PREFIXES,
     OPERATION_MEMORY_PREFIX_RE,
     PROVISIONAL_DRAFT_LINK_COPY,
-    draft_receipt_contents,
     normalize_generated_review_copy,
 )
 from ..utils.pending_confirmation import (
@@ -852,7 +851,7 @@ def _format_pending_state_details(state: PendingState) -> str:
                 continue
             old_code, new_code = "、".join(before), "、".join(after)
             if old_code and new_code:
-                changes.append(f"「{word}」：{old_code} → {new_code}")
+                changes.append(f"「{word}」{old_code} → {new_code}")
             elif new_code:
                 changes.append(f"加词「{word}」→ {new_code}")
             elif old_code:
@@ -908,9 +907,8 @@ def _format_pending_state_details(state: PendingState) -> str:
 
     warnings = shift_plan_warnings(display)
     if warnings:
-        lines.append("风险：")
         lines.extend(
-            f"- {_plain_warning_message(warning)}"
+            f"⚠️ {_plain_warning_message(warning)}"
             for warning in warnings
         )
 
@@ -1872,7 +1870,8 @@ def _draft_item_display_line(item: Dict, index: int) -> str:
         "Create": "新增", "Change": "修改", "Delete": "删除",
     }.get(item.get("action", ""), "")
     display = item.get("display_label") or f"{item.get('word', '')} → {item.get('code', '')}"
-    return f"• {index}. {action_label} {display}"
+    display = re.sub(r"（权重\s*[:：]\s*100）", "", display)
+    return f"{index}. {action_label} {display}"
 
 
 def _append_submit_review_lines(parts: List[str], submit_data: object) -> None:
@@ -1999,19 +1998,66 @@ def finalize_draft_receipt(
     """Restore the complete local write delta and its exact trusted batch link."""
     deltas = [source for source in sources if isinstance(source, dict)
               and ("writtenItems" in source or "updatedItems" in source)]
+    receipt_headers = [line.strip() for line in text.splitlines() if line.startswith("✅ ")]
+    approved = any(line.startswith(("✅ 已入库：", "✅ 草稿已加入词库", "✅ 批次已加入词库"))
+                   or line.startswith("✅ 已将") and "已提交审核并加入词库" in line
+                   for line in receipt_headers)
+    submitted = any(line.startswith(("✅ 已提交审核", "✅ 草稿已提交审核", "✅ 批次已提交审核"))
+                    or line.startswith("✅ 已将") and "写入草稿，已提交审核" in line
+                    for line in receipt_headers)
+    if not deltas and (approved or submitted) and "投票 " not in text:
+        for source in sources:
+            if not isinstance(source, dict) or source.get("success") is not True:
+                continue
+            items = source.get("snapshotItems")
+            if not isinstance(items, list) and isinstance(source.get("autoReview"), dict):
+                items = source["autoReview"].get("snapshotItems")
+            if not isinstance(items, list) or not items:
+                continue
+            summary = compact_receipt_summary({"writtenItems": [
+                {**item, "id": index} for index, item in enumerate(items) if isinstance(item, dict)
+            ]})
+            if summary:
+                action = "已入库" if approved else "已提交审核"
+                text = "\n".join([f"✅ {action}：{summary}", *(
+                    line for line in text.splitlines() if line.strip() not in receipt_headers
+                )])
+            break
     if deltas:
         delta = merge_receipt_deltas([source for source in reversed(sources) if isinstance(source, dict)])
         delta["noWrite"] = all(source.get("noWrite") for source in deltas)
         lines = receipt_change_lines(delta, requested_words)
-        draft_contents = draft_receipt_contents(text)
-        if delta["writtenItems"] and not delta["updatedItems"] and all(
-            item.get("action") == "Create" for item in delta["writtenItems"]
-        ) and any(
-            all(f"{item.get('word')} {item.get('code')}" in pairs for item in delta["writtenItems"])
-            for pairs in draft_contents
-        ):
-            lines = [line for line in lines if not line.startswith(DRAFT_RECEIPT_CHANGE_PREFIX)]
         body = [line for line in text.splitlines() if not line.startswith(DRAFT_RECEIPT_REPLACED_PREFIXES)]
+        summary = compact_receipt_summary(delta, requested_words)
+        vote_receipt = "投票 " in text and "已提交审核" in text
+        if summary and not vote_receipt:
+            action = "已加入草稿"
+            if approved:
+                action = "已入库"
+            elif submitted:
+                action = "已提交审核"
+            elif "✅ 操作已完成" in text:
+                action = "操作已完成"
+            elif "✅ 已确认添加到草稿" in text:
+                action = "已确认添加到草稿"
+            prefix = "⚠️ 仅部分加入草稿" if "⚠️ 仅部分加入草稿" in text else f"✅ {action}"
+            body = [line for line in body if not (
+                line.startswith(("✅ ", "⚠️ 仅部分加入草稿", "草稿内容：", "词：", "草稿共 ", "审词：", "自动审核："))
+                and (line.startswith(("草稿内容：", "词：", "草稿共 ", "审词：", "自动审核：")) or any(
+                    marker in line for marker in ("加入草稿", "添加到草稿", "写入草稿", "已提交审核", "已加入词库", "已入库", "操作已完成")
+                ))
+            ) and not re.fullmatch(r"\+\d+ 新增\s+~\d+ 修改\s+-\d+ 删除", line.strip())
+                and not (line.startswith("未选择：") and "这些候选本次未添加" in line)]
+            body.insert(0, f"{prefix}：{summary}")
+            draft_items = delta.get("draftItems")
+            current_ids = {item["id"] for field in ("writtenItems", "updatedItems") for item in delta[field]}
+            if action in {"已加入草稿", "已确认添加到草稿", "操作已完成"} and isinstance(draft_items, list) and any(
+                isinstance(item, dict) and item.get("id") not in current_ids for item in draft_items
+            ):
+                body.insert(1, f"草稿共 {len(draft_items)} 条")
+            lines = [line for line in lines if not line.startswith(DRAFT_RECEIPT_CHANGE_PREFIX)]
+        elif vote_receipt:
+            lines = [line for line in lines if not line.startswith(DRAFT_RECEIPT_CHANGE_PREFIX)]
         new_lines = [line for line in lines if line not in body]
         insert_at = 1 if body else 0
         body[insert_at:insert_at] = new_lines
@@ -2022,7 +2068,9 @@ def finalize_draft_receipt(
         bundle["batchUrl"] = f"{public_base_for_platform(platform or 'web')}/batch/{batch_id}"
     if bundle.get("_provisionalBatch") == "true":
         bundle["batchIdProvisional"] = True
-    return re.sub(r"\n{3,}", "\n\n", _append_batch_url_if_missing(text, bundle)).strip()
+    text = _append_batch_url_if_missing(text, bundle)
+    text = re.sub(r"\n{2,}(?=草稿地址：)", "\n", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
 _OPERATION_MEMORY_PREFIX_RE = OPERATION_MEMORY_PREFIX_RE

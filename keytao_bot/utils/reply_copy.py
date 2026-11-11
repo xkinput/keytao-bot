@@ -297,7 +297,7 @@ def has_exact_submission_status(text, auto_approved):
     source = str(text or "")
     if auto_approved:
         return "✅ 批次已加入词库。" in source or "✅ 已入库：" in source
-    return "✅ 批次已提交审核。" in source or "✅ 已提交审核，投票 " in source
+    return any(marker in source for marker in ("✅ 批次已提交审核。", "✅ 已提交审核，投票 ", "✅ 已提交审核："))
 
 
 def candidate_cards_match(first, second):
@@ -594,7 +594,7 @@ def append_pending_challenge(text, challenge, batch_challenge):
 
 def replace_additional_code_template(text, code):
     return "\n".join(
-        line.replace("<code>（将 <code> 换成实际编码）", code)
+        line.replace("<code>（将 <code> 换成实际编码）", code).replace("<code>", code)
         if is_additional_code_hint(line) else line
         for line in text.splitlines()
     )

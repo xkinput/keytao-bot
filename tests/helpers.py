@@ -1710,7 +1710,7 @@ async def B22VoteTests_submit(self, word="玛卡巴卡"):
     add_id = self.bot.last_id
     await self.turn("提交", add_id, raw=raw_operation(op="draft_submit"))
     self.assertEqual(self.http.submissions, 1, self.replay.last_response)
-    self.assertIn("当前投票：0/3", self.replay.last_response)
+    self.assertIn("✅ 已提交审核，投票 0/3（引用本条回复「同意」）", self.replay.last_response)
     receipt_id = self.bot.last_id
     return receipt_id, record
 
@@ -2134,7 +2134,7 @@ async def B27ReadingTests_finish_add(self, message):
         await self.turn("确认", self.bot.last_id)
     self.assertEqual(self.created(), [(b27_reading_WORD, ALTERNATE[0])], self.replay.last_response)
     self.assertTrue(self.http.rows[0]["needsManualReview"], self.http.rows)
-    self.assertIn("管理员", self.replay.last_response)
+    self.assertIn("✅ 已确认添加到草稿：", self.replay.last_response)
     self.assertEqual(self.http.submissions, 0)
 
 async def B27ReadingTests_modifier_adds(self, command):

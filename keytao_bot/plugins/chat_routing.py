@@ -2141,7 +2141,7 @@ def _resolve_reviewed_multi_word_selection(
         if not items:
             assent = _pending_tool_assent_intent(state, message_text)
             if assent is not None and assent.intent in {"pending_confirm", "pending_add_and_submit"}:
-                return None, None, "当前没有可验证的可执行操作，本次未写入。"
+                return None, None, "没找到要执行的操作，本次未写入。"
         if not re.search(r"[?？]", source) and (
             named_selection
             or any(re.match(rf"{re.escape(word)}\s+", source) for word in live_words)

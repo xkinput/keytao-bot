@@ -1469,7 +1469,7 @@ class ExistingQueryTests(unittest.TestCase):
         self.assertEqual(advertised_reply_contract(unbound).command_suggestions, ("换码",))
         self.assertEqual(advertised_batch_binding_pairs(unbound), ())
         with patch.object(s64_existing_query_chat, "conversation_state_store", store), patch.object(s64_existing_query_chat.logger, "warning") as warnings:
-            self.assertEqual(s64_existing_query_chat._enforce_advertised_reply_contract(unbound, key), "当前没有可验证的可执行操作，本次未写入。")
+            self.assertEqual(s64_existing_query_chat._enforce_advertised_reply_contract(unbound, key), "没找到要执行的操作，本次未写入。")
             self.assertTrue(any("branch=replace_missing_state state=PendingAddWord bindings=0" in str(call) for call in warnings.call_args_list))
 
     def test_real_orchestrator_builds_and_delivers_existing_candidate_record(self):
@@ -1778,8 +1778,8 @@ class CommonnessRenderTests(unittest.TestCase):
         protected = harness.chat_commands_module._protected_eviction_response(state, "qbs", ("情报所",))
         advisory = same_code_reorder._advisory("敲不死", "情报所")
         self.assertIn("词频：情报所 99 > 敲不死 无", guard)
-        for text in (protected, advisory):
-            self.assertIn(comparison["summary"], text)
+        self.assertIn("词频：情报所 99 > 敲不死 无", protected)
+        self.assertIn(comparison["summary"], advisory)
 
     def test_render_sites_use_the_shared_evidence_renderer(self):
         comparison = asyncio.run(review.compare_word_commonness("敲不死", "情报所"))
@@ -1788,7 +1788,7 @@ class CommonnessRenderTests(unittest.TestCase):
         for module in (commonness_copy, pending, commonness_query,
                        same_code_reorder, harness.chat_commands_module):
             name = ("render_commonness_comparison" if module is commonness_copy else
-                    "candidate_commonness_summary_copy" if module is pending else "render_commonness_summary")
+                    "candidate_commonness_summary_copy" if module in (pending, harness.chat_commands_module) else "render_commonness_summary")
             original = getattr(module, name)
             with patch.object(module, name, return_value=marker) as render:
                 if module is commonness_copy:

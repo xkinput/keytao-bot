@@ -371,9 +371,9 @@ class B6SubmitTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"KEYTAO_COMMUNITY_VOTE": "1"}):
             result = await self.submit()
             delivered = community_vote.prepare_delivery(result.text, SimpleNamespace(platform="qq"))
-        self.assertIn("驴友 → llyd（本轮之前）", delivered)
-        self.assertIn("屡有 → llydav", delivered)
-        self.assertIn("当前投票：0/3", delivered)
+        self.assertIn("之前：驴友 llyd", delivered)
+        self.assertIn("本轮：屡有 llydav", delivered)
+        self.assertIn("✅ 已提交审核，投票 0/3（引用本条回复「同意」）", delivered)
 
 # Source: test_b6_policy.py
 class B6ReminderIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -545,7 +545,7 @@ class B7BlockedToolLoopTests(unittest.IsolatedAsyncioTestCase):
             "修改编码：我送给为wsgu，纯音乐为jyya",
             AgentRequestContext(platform="qq", user_id="b7-loop", mutations_allowed=True),
         )
-        self.assertIn("「栗子」 → lizi", reply)
+        self.assertIn("✅ 已加入草稿：栗子 lizi", reply)
         self.assertIn("当前编码与已核验的词条不一致", reply)
         self.assertIn("https://offline.invalid/b7-batch", reply)
         self.assertEqual((create.await_count, execute.await_count), (3, 3))
@@ -1430,7 +1430,7 @@ class B9RoutingSpeedTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await chat._stage_apply_scoped_pending_intent(ctx))
             await ctx.command_intent_for(state)
         self.assertLessEqual(client.create.await_count, 1)
-        self.assertEqual(ctx.response, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(ctx.response, "没找到要执行的操作，本次未写入。")
         finish.assert_awaited_once_with(ctx.response)
         self.assertIs(store.get_record(author), ctx.current_pending_record)
 
@@ -1859,7 +1859,7 @@ class GeneralReplyTests(unittest.IsolatedAsyncioTestCase):
             ))
         self.assertEqual(execute.await_count, 2)
         self.assertEqual(len(client.completions.calls), 1)
-        for text in ("本轮已完成的写操作", "炒冷饭", "wlfoo", "提交未完成", success["batchUrl"]):
+        for text in ("✅ 已加入草稿：", "炒冷饭", "wlfoo", "提交未完成", success["batchUrl"]):
             self.assertIn(text, response)
         self.assertNotIn("本次未写入", response)
 
@@ -2110,6 +2110,7 @@ class QueryPrecedenceTests(unittest.IsolatedAsyncioTestCase):
                 ("哈基米", "目前没有对应的操作请求。"), ("魔了", "这轮是普通问答。"),
                 ("哈基米", "“哈基米”是常见网络用语，目前没有对应的操作请求。"),
                 ("南北绿豆", "当前没有可验证的可执行操作。"),
+                ("南北绿豆", "没找到要执行的操作，本次未写入。"),
                 ("魔了", "这轮是普通问答，没有触发写入或安全拦截。"),
             ):
                 with self.subTest(word=word):
@@ -2472,14 +2473,14 @@ class StaleTicketReleaseTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_fresh_request("加词 测试词", reviewed_word="测试词")
 
     async def test_ticket_assent_and_selections_remain_bound(self):
-        # Exact HEAD 573a37e delivery, including selection receipts.
+        # Selection receipts retain skipped words without echoing the chosen words.
         for message, expected, receipt in (
             ("加入", [("你都没有上手", "ndme"), ("有点不切实际", "ydbjvi")], ""),
             ("都加", [("你都没有上手", "ndme"), ("有点不切实际", "ydbjvi")], ""),
             ("你都没有上手 1，有点不切实际 3", [("你都没有上手", "ndme"), ("有点不切实际", "ydbjvi")],
-             "词：你都没有上手、有点不切实际\n"),
+             ""),
             ("有点不切实际 3", [("有点不切实际", "ydbjvi")],
-             "词：有点不切实际\n未选择：「你都没有上手」；这些词本次未添加。\n"),
+             "\n未选择：「你都没有上手」；这些词本次未添加。"),
         ):
             for quote in ("", "ticket", QUOTE, "own-command"):
                 with self.subTest(message=message, quote=quote):
@@ -2491,7 +2492,7 @@ class StaleTicketReleaseTests(unittest.IsolatedAsyncioTestCase):
                     result["execute"].assert_awaited_once()
                     items = result["execute"].await_args.args[0].args["items"]
                     self.assertEqual([(item["word"], item["code"]) for item in items], expected)
-                    self.assertEqual(result["delivered"], [receipt + "Fixture ticket executed."])
+                    self.assertEqual(result["delivered"], ["Fixture ticket executed." + receipt])
                     result["model"].assert_not_awaited()
                     result["submit"].assert_not_awaited()
                     self.assertEqual(result["calls"], [])

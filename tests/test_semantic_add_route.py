@@ -51,7 +51,7 @@ class SemanticAddRouteTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.chat.logger, "info"),
             patch.object(self.chat.logger, "warning"),
             patch.object(self.commands.user_resolver, "resolve_actor_binding", AsyncMock(return_value=True)),
-            patch.object(self.commands, "_format_draft_response", AsyncMock(return_value="Offline draft receipt")),
+            patch.object(self.commands, "_format_draft_response", AsyncMock(side_effect=lambda *args, **kwargs: kwargs.get("receipt_header", "✅ 已加入草稿") + "\nOffline draft receipt")),
         )
         for context in patches:
             context.start()

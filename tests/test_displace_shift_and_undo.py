@@ -488,7 +488,7 @@ class B11ShiftTests(unittest.IsolatedAsyncioTestCase):
     async def test_last_receipt_summary_is_next_reply_only(self):
         self.seed_receipt()
         await self.turn("确认", "confirm", refers_to_pending=True)
-        self.assertEqual(self.replay.last_response, "当前没有待确认的操作。\n上一条已执行：电脑端 → dndi")
+        self.assertEqual(self.replay.last_response, "当前没有待确认的操作（上一条已执行）。")
         await self.turn("确认", "confirm", refers_to_pending=True)
         self.assertEqual(self.replay.last_response, "当前没有待确认的操作。")
 
@@ -496,7 +496,7 @@ class B11ShiftTests(unittest.IsolatedAsyncioTestCase):
         self.seed_receipt()
         completed_draft_undo.start_operation_turn(self.replay.author)
         await self.turn("确认", "confirm", refers_to_pending=True)
-        self.assertIn("电脑端 → dndi", self.replay.last_response)
+        self.assertEqual(self.replay.last_response, "当前没有待确认的操作（上一条已执行）。")
 
     async def test_image_reply_without_operation_capture_clears_receipt(self):
         self.seed_receipt()
@@ -995,7 +995,7 @@ class B24DisplaceTests(unittest.IsolatedAsyncioTestCase):
         state = await self.seed()
         await self.turn("1", self.original_id)
         self.assertEqual(self.http.writes, [])
-        self.assertIn("保留现有位置；本次未写入", self.replay.last_response)
+        self.assertIn("hzhr 保留原位，未写入。", self.replay.last_response)
         self.assertIs(self.replay.store.get_record(self.replay.author).state, state)
 
     async def test_f2_retry_after_consumed_ticket_reminds_without_writing(self):
@@ -1077,7 +1077,7 @@ class B24DisplaceTests(unittest.IsolatedAsyncioTestCase):
         await self.seed()
         await self.turn("2 顺延", self.original_id)
         self.assertEqual(self.http.writes, [])
-        self.assertIn("保留现有位置；本次未写入", self.replay.last_response)
+        self.assertIn("hzhr 保留原位，未写入。", self.replay.last_response)
 
     async def test_f3_multiple_occupants_keep_commonness_refusal(self):
         state = await self.seed()
@@ -1087,7 +1087,7 @@ class B24DisplaceTests(unittest.IsolatedAsyncioTestCase):
                               b19_partial_reply_binding_chat._render_live_single_candidate_record(record))
         await self.turn("1 顺延", self.bot.last_id)
         self.assertEqual(self.http.writes, [])
-        self.assertEqual(self.replay.last_response, "当前没有可验证的可执行操作，本次未写入。")
+        self.assertEqual(self.replay.last_response, "没找到要执行的操作，本次未写入。")
 
     async def test_f4_other_speaker_cannot_displace_on_owners_ticket(self):
         state = await self.seed()

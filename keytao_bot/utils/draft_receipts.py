@@ -150,6 +150,13 @@ def receipt_change_lines(data: dict, requested_words=()) -> list[str]:
     return lines
 
 
+def compact_receipt_summary(data: dict, requested_words=()) -> str:
+    return "、".join(
+        change.text.replace(f"{change.word} → ", f"{change.word} ")
+        for change in receipt_changes(data, requested_words)
+    )
+
+
 def merge_receipt_deltas(receipts: list[dict[str, Any]]) -> dict:
     """Merge actual same-turn evidence without counting a PR again on submit."""
     merged = {"writtenItems": [], "updatedItems": [], "requestedWords": [], "failed": [], "skipped": [],
