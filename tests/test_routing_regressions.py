@@ -1875,6 +1875,65 @@ class SmallTalkTests(unittest.IsolatedAsyncioTestCase):
 
     assert_natural = SmallTalkTests_assert_natural
 
+    async def test_f4_m3_07_private_help_is_fixed_without_model_calls(self):
+        expected = "我是喵喵，可以帮你查词、加词、改码、删词、提交键道词库草稿；绑定请在「我的资料」生成绑定码，使用 /bind 绑定码 完成绑定。"
+        state = harness.PendingAddWord(
+            word="加亮", recommended_code="jslxa", candidates=[("jslxa", False)],
+            server_candidates=[("jslxa", False)],
+        )
+        self.store.set(self.key, state)
+        with self.runtime(), patch.object(
+            s70_smalltalk_chat, "extract_platform_info",
+        ) as platform_info, patch.object(
+            s70_smalltalk_chat, "extract_memory_context", AsyncMock(return_value=self.memory),
+        ), patch.object(
+            s70_smalltalk_chat, "extract_reply_reference_info", AsyncMock(return_value=harness.ReplyReferenceInfo()),
+        ), patch.object(
+            s70_smalltalk_chat, "AsyncOpenAI", side_effect=AssertionError("Model client reached"),
+        ) as model_client, patch.object(
+            s70_smalltalk_chat._user_resolver, "resolve_actor_binding", AsyncMock(return_value=False),
+        ) as binding, patch.object(
+            s70_smalltalk_chat, "_describe_images_for_deepseek_in_slot",
+            AsyncMock(side_effect=AssertionError("Vision model reached")),
+        ) as vision:
+            for platform in ("qq", "telegram"):
+                platform_info.return_value = (platform, self.key.actor_id)
+                for message in ("/start", "/help", "/start"):
+                    with self.subTest(platform=platform, message=message):
+                        event = SimpleNamespace(
+                            message=[SimpleNamespace(type="image", data={"url": "https://example.invalid/help.png"})],
+                            get_plaintext=lambda: message,
+                        )
+                        await s70_smalltalk_chat._handle_ai_chat_serialized(
+                            object(), event, platform, self.key.actor_id,
+                        )
+                        s70_smalltalk_chat._finish_ai_chat_matcher.assert_awaited_once_with(expected)
+                        self.assertEqual(s70_smalltalk_chat._prepare_user_facing_reply(expected, self.memory), expected)
+                        self.assertIs(self.store.get(self.key), state)
+                        s70_smalltalk_chat._finish_ai_chat_matcher.reset_mock()
+                        s70_smalltalk_chat._finish_ai_chat_response.assert_not_awaited()
+            for platform in ("qq", "telegram", "web", "web-anon"):
+                for message in ("/start", "/help"):
+                    with self.subTest(core_platform=platform, message=message):
+                        self.assertEqual(await REAL_CORE(message, platform, self.key.actor_id), expected)
+            s70_smalltalk_chat.get_ai_response_core.assert_not_awaited()
+            s70_smalltalk_chat._classify_message_command_intent.assert_not_awaited()
+            s70_smalltalk_chat._classify_simple_word_query_intent.assert_not_awaited()
+            model_client.assert_not_called()
+            binding.assert_not_awaited()
+            vision.assert_not_awaited()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.writes, [])
+
+    def test_f4_m3_08_built_prompt_requires_docs_for_scheme_claims_and_conflicts(self):
+        prompt = s70_smalltalk_chat.representative_system_prompt()
+        for rule in (
+            "用户对方案规则（码规则、顶功、笔画归码等）的陈述或提问都不是闲聊，必须先调用 keytao_fetch_docs 核实再认同，不得编造规则。",
+            "用户纠正自己的前述说法或前后说法冲突时，不得两边都附和；涉及方案规则先查 keytao_fetch_docs，再指出哪种说法正确，无法核实时明确说不确定。",
+        ):
+            with self.subTest(rule=rule):
+                self.assertTrue(rule in prompt, "The built prompt must require docs for scheme claims and conflicts")
+
     async def test_incident_fake_model_reply_is_redrawn_at_delivery(self):
         reply = await self.delivered("喵喵 早", NARRATION)
         self.assert_natural(reply)

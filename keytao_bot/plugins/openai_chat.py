@@ -1594,6 +1594,12 @@ async def _try_handle_encoding_rule_question(
     return "\n".join(lines)
 
 
+def _private_help_reply(message: str, space_type: str) -> Optional[str]:
+    if space_type == "private" and message.strip() in {"/start", "/help"}:
+        return "我是喵喵，可以帮你查词、加词、改码、删词、提交键道词库草稿；绑定请在「我的资料」生成绑定码，使用 /bind 绑定码 完成绑定。"
+    return None
+
+
 async def get_ai_response_core(
     message: str,
     platform: str,
@@ -1616,6 +1622,11 @@ async def get_ai_response_core(
 
     Platform-agnostic: works for QQ, Telegram, and web API calls.
     """
+    help_reply = _private_help_reply(
+        message, memory_context.space_type if memory_context else "private",
+    )
+    if help_reply is not None:
+        return help_reply
     if not OPENAI_API_KEY or not AsyncOpenAI:
         return "❌ AI 服务未配置，请联系管理员"
 
@@ -3746,6 +3757,12 @@ async def _stage_load_platform_reply_adapter(ctx: TurnContext) -> bool:
 async def _stage_collect_message_inputs(ctx: TurnContext) -> bool:
     """Production scenario: collect text, reply metadata, and visual candidates."""
     ctx.message_text = ctx.event.get_plaintext().strip()
+    help_reply = _private_help_reply(ctx.message_text, "private")
+    if help_reply is not None and get_conversation_key(ctx.bot, ctx.event).space_type == "private":
+        _current_turn_message.set(ctx.message_text)
+        _current_conversational_turn.set(None)
+        await _finish_ai_chat_matcher(help_reply)
+        return True
     ctx.current_image_attachments = extract_event_image_attachments(ctx.event, ctx.platform)
     ctx.visual_candidate = bool(ctx.current_image_attachments) or event_may_reference_images(
         ctx.event,
